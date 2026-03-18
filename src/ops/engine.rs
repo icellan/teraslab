@@ -3,15 +3,17 @@
 //! Owns the index, device, locks, and secondary indexes. Provides the
 //! spend/unspend methods that are the public API for this phase.
 
+use crate::allocator::SlotAllocator;
 use crate::device::BlockDevice;
 use crate::index::{DahIndex, Index, TxIndexEntry, TxKey, UnminedIndex};
 use crate::io;
 use crate::locks::StripedLocks;
+use crate::ops::create::*;
 use crate::ops::delete_eval::{evaluate_delete_at_height, DahPatch};
 use crate::ops::error::SpendError;
-use crate::ops::signal::Signal;
 use crate::ops::mark_longest_chain::*;
 use crate::ops::set_mined::*;
+use crate::ops::signal::Signal;
 use crate::ops::spend::*;
 use crate::ops::unspend::*;
 use crate::record::*;
@@ -26,6 +28,7 @@ use std::sync::Arc;
 pub struct Engine {
     device: Arc<dyn BlockDevice>,
     index: parking_lot::RwLock<Index>,
+    allocator: parking_lot::Mutex<SlotAllocator>,
     locks: StripedLocks,
     dah_index: parking_lot::Mutex<DahIndex>,
     unmined_index: parking_lot::Mutex<UnminedIndex>,
@@ -36,6 +39,7 @@ impl Engine {
     pub fn new(
         device: Arc<dyn BlockDevice>,
         index: Index,
+        allocator: SlotAllocator,
         locks: StripedLocks,
         dah_index: DahIndex,
         unmined_index: UnminedIndex,
@@ -43,6 +47,7 @@ impl Engine {
         Self {
             device,
             index: parking_lot::RwLock::new(index),
+            allocator: parking_lot::Mutex::new(allocator),
             locks,
             dah_index: parking_lot::Mutex::new(dah_index),
             unmined_index: parking_lot::Mutex::new(unmined_index),
@@ -633,6 +638,213 @@ impl Engine {
         Ok(MarkOnLongestChainResponse { signal })
     }
 
+    // -----------------------------------------------------------------------
+    // Creation
+    // -----------------------------------------------------------------------
+
+    /// Create a new transaction record.
+    ///
+    /// Allocates space, writes the complete record (metadata + UTXO slots +
+    /// optional cold data) in one I/O operation, and registers it in the
+    /// index. The record is immediately available for spend/setMined.
+    pub fn create(&self, req: &CreateRequest) -> Result<CreateResponse, CreateError> {
+        let utxo_count = req.utxo_hashes.len() as u32;
+        if utxo_count == 0 {
+            return Err(CreateError::InvalidUtxoCount);
+        }
+
+        let key = req.tx_key();
+
+        // Check for duplicate txid
+        if self.index.read().lookup(&key).is_some() {
+            return Err(CreateError::DuplicateTxId);
+        }
+
+        // Calculate cold data size
+        let cold_data = build_cold_data(&req.inputs, &req.outputs, &req.inpoints);
+        let cold_size = cold_data.len();
+
+        // Calculate total record size
+        let base_size = TxMetadata::record_size_for(utxo_count);
+        let total_size = base_size + cold_size as u64;
+
+        // Allocate space
+        let record_offset = self
+            .allocator
+            .lock()
+            .allocate(total_size)
+            .map_err(|_| CreateError::DeviceFull)?;
+
+        // Build metadata
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = req.tx_id;
+        meta.tx_version = req.tx_version;
+        meta.locktime = req.locktime;
+        meta.fee = req.fee;
+        meta.size_in_bytes = req.size_in_bytes;
+        meta.extended_size = req.extended_size;
+        meta.spending_height = req.spending_height;
+        meta.created_at = req.created_at;
+        meta.record_size = total_size as u32;
+
+        // Set flags
+        let mut flags = TxFlags::empty();
+        if req.is_coinbase {
+            flags |= TxFlags::IS_COINBASE;
+        }
+        if req.is_external {
+            flags |= TxFlags::EXTERNAL;
+        }
+        if req.conflicting {
+            flags |= TxFlags::CONFLICTING;
+        }
+        if req.locked {
+            flags |= TxFlags::LOCKED;
+        }
+        meta.flags = flags;
+
+        // Set unmined_since
+        if req.mined_block_infos.is_empty() {
+            meta.unmined_since = req.block_height;
+        } else {
+            meta.unmined_since = 0;
+            // Populate inline block entries
+            let entries = req.block_entries();
+            let inline_count = entries.len().min(INLINE_BLOCK_ENTRIES);
+            for (i, entry) in entries.iter().take(inline_count).enumerate() {
+                meta.block_entries_inline[i] = *entry;
+            }
+            meta.block_entry_count = entries.len() as u8;
+        }
+
+        // Build UTXO slots
+        let slots: Vec<UtxoSlot> = req
+            .utxo_hashes
+            .iter()
+            .map(|hash| {
+                if req.frozen {
+                    UtxoSlot::new_frozen(*hash)
+                } else {
+                    UtxoSlot::new_unspent(*hash)
+                }
+            })
+            .collect();
+
+        // Write complete record in one operation
+        self.write_full_record_with_cold(record_offset, &meta, &slots, &cold_data)?;
+
+        // Register in index
+        let cold_offset = if cold_size > 0 {
+            record_offset + base_size
+        } else {
+            0
+        };
+        let index_entry = TxIndexEntry {
+            device_id: 0,
+            record_offset,
+            utxo_count,
+            cold_offset,
+            cold_size: cold_size as u32,
+            flags: flags.bits(),
+        };
+        self.index
+            .write()
+            .register(key, index_entry)
+            .map_err(|e| CreateError::StorageError {
+                detail: format!("{e}"),
+            })?;
+
+        // Update unmined secondary index if applicable
+        if meta.unmined_since != 0 {
+            self.unmined_index.lock().insert(meta.unmined_since, key);
+        }
+
+        Ok(CreateResponse {
+            record_offset,
+            utxo_count,
+        })
+    }
+
+    /// Create multiple transaction records in a batch.
+    ///
+    /// Each creation is independent — a failure in one does not affect others.
+    /// Allocations for failed creations are rolled back.
+    pub fn create_batch(
+        &self,
+        requests: &[CreateRequest],
+    ) -> Vec<Result<CreateResponse, CreateError>> {
+        requests.iter().map(|req| self.create(req)).collect()
+    }
+
+    /// Write a complete record including optional cold data.
+    fn write_full_record_with_cold(
+        &self,
+        record_offset: u64,
+        metadata: &TxMetadata,
+        slots: &[UtxoSlot],
+        cold_data: &[u8],
+    ) -> Result<(), CreateError> {
+        let align = self.device.alignment();
+        let data_len = METADATA_SIZE + slots.len() * UTXO_SLOT_SIZE + cold_data.len();
+        let aligned_len = data_len.div_ceil(align) * align;
+
+        let mut buf = crate::device::AlignedBuf::new(aligned_len, align);
+
+        // Write metadata
+        let mut meta_bytes = [0u8; METADATA_SIZE];
+        metadata.to_bytes(&mut meta_bytes);
+        buf[..METADATA_SIZE].copy_from_slice(&meta_bytes);
+
+        // Write slots
+        for (i, slot) in slots.iter().enumerate() {
+            let offset = METADATA_SIZE + i * UTXO_SLOT_SIZE;
+            let mut slot_bytes = [0u8; UTXO_SLOT_SIZE];
+            slot.to_bytes(&mut slot_bytes);
+            buf[offset..offset + UTXO_SLOT_SIZE].copy_from_slice(&slot_bytes);
+        }
+
+        // Write cold data
+        if !cold_data.is_empty() {
+            let cold_offset = METADATA_SIZE + slots.len() * UTXO_SLOT_SIZE;
+            buf[cold_offset..cold_offset + cold_data.len()].copy_from_slice(cold_data);
+        }
+
+        self.device
+            .pwrite(&buf, record_offset)
+            .map_err(|e| CreateError::StorageError {
+                detail: format!("{e}"),
+            })?;
+
+        Ok(())
+    }
+
+    /// Read cold data from a record (for testing).
+    pub fn read_cold_data(&self, key: &TxKey) -> Result<Vec<u8>, SpendError> {
+        let entry = self
+            .index
+            .read()
+            .lookup(key)
+            .ok_or(SpendError::TxNotFound)?;
+
+        if entry.cold_offset == 0 || entry.cold_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let align = self.device.alignment();
+        let aligned_base = entry.cold_offset / align as u64 * align as u64;
+        let intra = (entry.cold_offset - aligned_base) as usize;
+        let read_len = (intra + entry.cold_size as usize).div_ceil(align) * align;
+
+        let mut buf = crate::device::AlignedBuf::new(read_len, align);
+        self.device
+            .pread(&mut buf, aligned_base)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("{e}"),
+            })?;
+
+        Ok(buf[intra..intra + entry.cold_size as usize].to_vec())
+    }
+
     /// Get the unmined index (for testing).
     pub fn unmined_index(&self) -> parking_lot::MutexGuard<'_, UnminedIndex> {
         self.unmined_index.lock()
@@ -673,6 +885,33 @@ impl Engine {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Build inline cold data from optional inputs/outputs/inpoints.
+///
+/// Format: `[inputs_len:4 LE][inputs][outputs_len:4 LE][outputs][inpoints_len:4 LE][inpoints]`
+fn build_cold_data(
+    inputs: &Option<Vec<u8>>,
+    outputs: &Option<Vec<u8>>,
+    inpoints: &Option<Vec<u8>>,
+) -> Vec<u8> {
+    let inputs_data = inputs.as_deref().unwrap_or(&[]);
+    let outputs_data = outputs.as_deref().unwrap_or(&[]);
+    let inpoints_data = inpoints.as_deref().unwrap_or(&[]);
+
+    if inputs_data.is_empty() && outputs_data.is_empty() && inpoints_data.is_empty() {
+        return Vec::new();
+    }
+
+    let total = 4 + inputs_data.len() + 4 + outputs_data.len() + 4 + inpoints_data.len();
+    let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(&(inputs_data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(inputs_data);
+    buf.extend_from_slice(&(outputs_data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(outputs_data);
+    buf.extend_from_slice(&(inpoints_data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(inpoints_data);
+    buf
+}
 
 fn apply_dah_patch(metadata: &mut TxMetadata, patch: &DahPatch) {
     metadata.delete_at_height = patch.new_delete_at_height;
@@ -769,6 +1008,7 @@ mod tests {
             let engine = Arc::new(Engine::new(
                 dev,
                 index,
+                alloc,
                 StripedLocks::new(1024),
                 DahIndex::new(),
                 UnminedIndex::new(),
@@ -1608,6 +1848,7 @@ mod tests {
         let engine = Arc::new(Engine::new(
             dev,
             index,
+            alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
             UnminedIndex::new(),
@@ -2433,5 +2674,430 @@ mod tests {
         // Both should complete without corruption
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!(meta.block_entry_count, 1);
+    }
+
+    // ===================================================================
+    // Phase 5: Creation path tests
+    // ===================================================================
+
+    fn make_create_req(n: u8, utxo_count: usize) -> CreateRequest {
+        let mut tx_id = [0u8; 32];
+        tx_id[0] = n;
+        tx_id[8..16].copy_from_slice(&(n as u64 * 0x9E37).to_le_bytes());
+        tx_id[16] = n;
+        let utxo_hashes: Vec<[u8; 32]> = (0..utxo_count)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i as u8;
+                h[1] = (i >> 8) as u8;
+                h
+            })
+            .collect();
+        CreateRequest {
+            tx_id,
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes,
+            inputs: None,
+            outputs: None,
+            inpoints: None,
+            is_external: false,
+            created_at: 1710000000000,
+            block_height: 1000,
+            mined_block_infos: vec![],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+        }
+    }
+
+    fn create_engine() -> Arc<Engine> {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone());
+        let index = Index::new(1000).unwrap();
+        Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ))
+    }
+
+    #[test]
+    fn create_single_utxo() {
+        let engine = create_engine();
+        let req = make_create_req(1, 1);
+        let key = req.tx_key();
+        let resp = engine.create(&req).unwrap();
+
+        assert_eq!(resp.utxo_count, 1);
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.magic }, METADATA_MAGIC);
+        assert_eq!({ meta.schema_version }, METADATA_VERSION);
+        assert_eq!({ meta.utxo_count }, 1);
+        assert_eq!({ meta.spent_utxos }, 0);
+        assert_eq!(meta.block_entry_count, 0);
+
+        let slot = engine.read_slot(&key, 0).unwrap();
+        assert!(slot.is_unspent());
+        assert_eq!(slot.hash[0], 0);
+    }
+
+    #[test]
+    fn create_100_utxos() {
+        let engine = create_engine();
+        let req = make_create_req(2, 100);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.utxo_count }, 100);
+
+        for i in 0..100u32 {
+            let slot = engine.read_slot(&key, i).unwrap();
+            assert!(slot.is_unspent(), "slot {i} not unspent");
+            assert_eq!(slot.hash[0], i as u8);
+        }
+    }
+
+    #[test]
+    fn create_10000_utxos() {
+        let engine = create_engine();
+        let req = make_create_req(3, 10000);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.utxo_count }, 10000);
+
+        // Spot-check a few slots
+        let slot_0 = engine.read_slot(&key, 0).unwrap();
+        assert!(slot_0.is_unspent());
+        let slot_9999 = engine.read_slot(&key, 9999).unwrap();
+        assert!(slot_9999.is_unspent());
+    }
+
+    #[test]
+    fn create_metadata_fields_match() {
+        let engine = create_engine();
+        let mut req = make_create_req(4, 5);
+        req.tx_version = 2;
+        req.locktime = 500_000;
+        req.fee = 1234;
+        req.size_in_bytes = 999;
+        req.extended_size = 111;
+        req.created_at = 1710099999000;
+
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!(meta.tx_id, req.tx_id);
+        assert_eq!({ meta.tx_version }, 2);
+        assert_eq!({ meta.locktime }, 500_000);
+        assert_eq!({ meta.fee }, 1234);
+        assert_eq!({ meta.size_in_bytes }, 999);
+        assert_eq!({ meta.extended_size }, 111);
+        assert_eq!({ meta.created_at }, 1710099999000);
+    }
+
+    #[test]
+    fn create_index_lookup() {
+        let engine = create_engine();
+        let req = make_create_req(5, 10);
+        let key = req.tx_key();
+        let resp = engine.create(&req).unwrap();
+
+        let entry = engine.lookup(&key).unwrap();
+        assert_eq!(entry.record_offset, resp.record_offset);
+        assert_eq!(entry.utxo_count, 10);
+    }
+
+    #[test]
+    fn create_then_spend() {
+        let engine = create_engine();
+        let req = make_create_req(6, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let mut sd = [0u8; 36];
+        sd[0] = 0xAB;
+        let spend_req = SpendRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: req.utxo_hashes[0],
+            spending_data: sd,
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        engine.spend(&spend_req).unwrap();
+
+        let slot = engine.read_slot(&key, 0).unwrap();
+        assert!(slot.is_spent());
+    }
+
+    #[test]
+    fn create_then_set_mined() {
+        let engine = create_engine();
+        let req = make_create_req(7, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 42,
+                block_height: 1000,
+                subtree_idx: 3,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!(meta.block_entry_count, 1);
+        assert_eq!({ meta.block_entries_inline[0].block_id }, 42);
+    }
+
+    // -- Duplicate detection --
+
+    #[test]
+    fn create_duplicate_txid() {
+        let engine = create_engine();
+        let req = make_create_req(8, 5);
+        engine.create(&req).unwrap();
+
+        match engine.create(&req) {
+            Err(CreateError::DuplicateTxId) => {}
+            other => panic!("expected DuplicateTxId, got {other:?}"),
+        }
+    }
+
+    // -- Allocation --
+
+    #[test]
+    fn create_records_no_overlap() {
+        let engine = create_engine();
+        let r1 = engine.create(&make_create_req(10, 5)).unwrap();
+        let r2 = engine.create(&make_create_req(11, 10)).unwrap();
+
+        let size1 = TxMetadata::record_size_for(5);
+        let size2 = TxMetadata::record_size_for(10);
+
+        // Records should not overlap (offsets + sizes)
+        assert!(
+            r2.record_offset >= r1.record_offset + size1
+                || r1.record_offset >= r2.record_offset + size2
+        );
+    }
+
+    // -- Cold data --
+
+    #[test]
+    fn create_with_cold_data() {
+        let engine = create_engine();
+        let mut req = make_create_req(20, 3);
+        req.inputs = Some(vec![0x01, 0x02, 0x03, 0x04]);
+        req.outputs = Some(vec![0x0A, 0x0B, 0x0C]);
+
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let entry = engine.lookup(&key).unwrap();
+        assert_ne!(entry.cold_offset, 0);
+        assert!(entry.cold_size > 0);
+
+        // Read back cold data and verify
+        let cold = engine.read_cold_data(&key).unwrap();
+        // Format: [inputs_len:4][inputs][outputs_len:4][outputs][inpoints_len:4][inpoints]
+        assert_eq!(u32::from_le_bytes(cold[0..4].try_into().unwrap()), 4); // inputs len
+        assert_eq!(&cold[4..8], &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(u32::from_le_bytes(cold[8..12].try_into().unwrap()), 3); // outputs len
+        assert_eq!(&cold[12..15], &[0x0A, 0x0B, 0x0C]);
+    }
+
+    #[test]
+    fn create_without_cold_data() {
+        let engine = create_engine();
+        let req = make_create_req(21, 3);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let entry = engine.lookup(&key).unwrap();
+        assert_eq!(entry.cold_offset, 0);
+        assert_eq!(entry.cold_size, 0);
+    }
+
+    #[test]
+    fn cold_data_not_modified_by_spend() {
+        let engine = create_engine();
+        let mut req = make_create_req(22, 3);
+        req.inputs = Some(vec![0xDE, 0xAD]);
+        req.outputs = Some(vec![0xBE, 0xEF]);
+
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let cold_before = engine.read_cold_data(&key).unwrap();
+
+        // Spend a UTXO
+        let mut sd = [0u8; 36];
+        sd[0] = 0xAA;
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+
+        let cold_after = engine.read_cold_data(&key).unwrap();
+        assert_eq!(cold_before, cold_after);
+    }
+
+    // -- Batch creation --
+
+    #[test]
+    fn batch_create_10() {
+        let engine = create_engine();
+        let requests: Vec<CreateRequest> = (30..40u8)
+            .map(|n| make_create_req(n, 5))
+            .collect();
+        let results = engine.create_batch(&requests);
+
+        assert_eq!(results.len(), 10);
+        for (i, result) in results.iter().enumerate() {
+            assert!(result.is_ok(), "creation {i} failed: {result:?}");
+        }
+    }
+
+    #[test]
+    fn batch_create_with_duplicate() {
+        let engine = create_engine();
+        let mut requests: Vec<CreateRequest> = (40..50u8)
+            .map(|n| make_create_req(n, 5))
+            .collect();
+        // Duplicate the 5th entry
+        requests[5] = requests[4].clone();
+
+        let results = engine.create_batch(&requests);
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let duplicates = results
+            .iter()
+            .filter(|r| matches!(r, Err(CreateError::DuplicateTxId)))
+            .count();
+
+        assert_eq!(successes, 9);
+        assert_eq!(duplicates, 1);
+    }
+
+    // -- Edge cases --
+
+    #[test]
+    fn create_zero_utxos() {
+        let engine = create_engine();
+        let req = make_create_req(50, 0);
+        match engine.create(&req) {
+            Err(CreateError::InvalidUtxoCount) => {}
+            other => panic!("expected InvalidUtxoCount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_coinbase() {
+        let engine = create_engine();
+        let mut req = make_create_req(51, 1);
+        req.is_coinbase = true;
+        req.spending_height = 1100; // block_height + 100
+
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert!(meta.flags.contains(TxFlags::IS_COINBASE));
+        assert_eq!({ meta.spending_height }, 1100);
+    }
+
+    #[test]
+    fn create_frozen() {
+        let engine = create_engine();
+        let mut req = make_create_req(52, 3);
+        req.frozen = true;
+
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        for i in 0..3u32 {
+            let slot = engine.read_slot(&key, i).unwrap();
+            assert!(slot.is_frozen(), "slot {i} should be frozen");
+            assert_eq!(slot.spending_data, [0xFF; 36]);
+        }
+    }
+
+    #[test]
+    fn create_conflicting() {
+        let engine = create_engine();
+        let mut req = make_create_req(53, 2);
+        req.conflicting = true;
+
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert!(meta.flags.contains(TxFlags::CONFLICTING));
+    }
+
+    #[test]
+    fn create_unmined() {
+        let engine = create_engine();
+        let mut req = make_create_req(54, 2);
+        req.block_height = 800;
+
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.unmined_since }, 800);
+
+        // Should be in unmined index
+        let unmined = engine.unmined_index();
+        let results = unmined.range_query(800);
+        assert!(results.contains(&key));
+    }
+
+    #[test]
+    fn create_with_mined_block_info() {
+        let engine = create_engine();
+        let mut req = make_create_req(55, 2);
+        req.mined_block_infos = vec![MinedBlockInfo {
+            block_id: 42,
+            block_height: 900,
+            subtree_idx: 7,
+        }];
+
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.unmined_since }, 0);
+        assert_eq!(meta.block_entry_count, 1);
+        assert_eq!({ meta.block_entries_inline[0].block_id }, 42);
     }
 }
