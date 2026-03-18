@@ -359,6 +359,7 @@ Carried over from Lua/C implementation:
 | `UTXO_HASH_MISMATCH` | Expected hash does not match stored hash |
 | `UTXO_NOT_FROZEN` | UTXO is not in frozen state |
 | `INVALID_PARAMETER` | Invalid function parameter |
+| `STORAGE_ERROR` | Device I/O failure during operation |
 
 ### 3.2 Signal Codes
 
@@ -447,7 +448,7 @@ Operations return signals that drive follow-up actions:
 5. Per-UTXO validation:
    - Slot at offset must exist → `UTXO_NOT_FOUND`
    - Hash must match (native `memcmp`, not Lua byte-by-byte) → `UTXO_HASH_MISMATCH`
-   - If status == `0x00` and `u32_from_le(spending_data[0..4]) != 0` and `>= current_block_height` → `FROZEN_UNTIL`
+   - If status == `0x00` and `u32_from_le(spending_data[0..4]) != 0` and `u32_from_le(spending_data[0..4]) >= current_block_height` → `FROZEN_UNTIL`
    - If status == `PRUNED` (0x02) → `INVALID_SPEND` (child tx was pruned, UTXO is permanently consumed)
    - If already spent (status == 0x01):
      - Same spending data → idempotent success
@@ -667,6 +668,11 @@ Operations return signals that drive follow-up actions:
 **Atomicity**: Per-record.
 **Idempotency**: Setting same value is a no-op (writes same byte).
 
+**Response:**
+- `status: OK | ERROR`
+- `signal: Option<Signal>` — DAHSET
+- For each txid processed: UTXO slot spending data (needed by Go client for counter-conflicting cascade)
+
 **Disk regions written**: Metadata only (metadata).
 
 ### 3.11 setLocked
@@ -751,7 +757,68 @@ elif delete_at_height != 0:
 
 The Lua implementation (`teranode.lua` lines 1145-1199) with its clamping logic (lines 1172-1181) to paper over counter drift is entirely unnecessary. This removes a significant source of complexity and potential data inconsistency.
 
-### 3.15 Point Read / Batch Read
+### 3.15 markOnLongestChain
+
+**Go interface**: `MarkTransactionsOnLongestChain(ctx, txHashes, onLongestChain) error`
+
+This is a **separate operation** from `setMined`. It modifies only the `unmined_since` field without touching block entries. Used during chain reorganizations to bulk-update longest-chain status for transactions.
+
+**Request parameters:**
+- `txids: Vec<[u8; 32]>` — batch of transaction IDs
+- `on_longest_chain: bool`
+
+**Validation:**
+1. Record must exist → `TX_NOT_FOUND` (fatal — indicates data corruption if missing)
+
+**Behavior:**
+1. For each txid, acquire per-txid lock
+2. If `on_longest_chain == true`: set `unmined_since = 0` (transaction is on longest chain)
+3. If `on_longest_chain == false`: set `unmined_since = current_block_height` (transaction is not on longest chain)
+4. Update unmined secondary index accordingly:
+   - `on_longest_chain == true`: remove from unmined index
+   - `on_longest_chain == false`: insert/update in unmined index
+5. Evaluate `setDeleteAtHeight` (longest chain status affects DAH eligibility)
+6. `pwrite` metadata
+7. Release lock
+
+**Batch pattern**: Up to `MaxMinedBatchSize` (default 1024) transactions per batch, with `MaxMinedRoutines` (default 128) concurrent workers.
+
+**Atomicity**: Per-record.
+**Idempotency**: Setting same value is a no-op (writes same byte).
+
+**Disk regions written**: Metadata only.
+
+### 3.16 getSpend
+
+**Go interface**: `GetSpend(ctx, spend) (*SpendResponse, error)`
+
+Point read of a single UTXO slot plus the record's locktime. Used for double-spend detection — the validator needs to know "is this output already spent? if so, by whom?"
+
+**Request parameters:**
+- `txid: [u8; 32]`
+- `vout: u32`
+- `utxo_hash: [u8; 32]`
+
+**Validation:**
+1. Record must exist → `TX_NOT_FOUND`
+2. `vout` must be within bounds (`vout < utxo_count`) → `UTXO_NOT_FOUND`
+3. Hash must match → `UTXO_HASH_MISMATCH`
+
+**Behavior:**
+1. Index lookup: `txid → record_offset`
+2. Read metadata at `record_offset + 0` (for locktime and utxo_count)
+3. Read UTXO slot at `record_offset + METADATA_SIZE + vout * 69`
+4. Validate hash matches `utxo_hash`
+5. Return status, spending_data (if spent/frozen), locktime
+
+**Response:**
+- `status: u8` — UTXO status (0x00=unspent, 0x01=spent, 0x02=pruned, 0xFF=frozen)
+- `spending_data: Option<[u8; 36]>` — present when status is 0x01 (spent) or 0xFF (frozen)
+- `locktime: u32` — from record metadata
+
+**Disk regions read**: Metadata + single UTXO slot (2 reads, or 1 if metadata is cached).
+
+### 3.17 Point Read / Batch Read
 
 **Go interface**: `Get(ctx, hash, fields...) (*meta.Data, error)`
 
@@ -776,7 +843,7 @@ The Lua implementation (`teranode.lua` lines 1145-1199) with its clamping logic 
 
 **Disk regions read**: Varies by field selection — typically metadata only, or metadata + cold data.
 
-### 3.16 Delete / Prune
+### 3.18 Delete / Prune
 
 **Go interface**: `Delete(ctx, hash) error`
 

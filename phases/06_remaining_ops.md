@@ -10,7 +10,7 @@ Phases 1-5 must be complete with all tests passing.
 
 ## Reference
 
-- `specs/BSV_UTXO_STORE_SPEC.md` §3.7-3.12 (freeze, unfreeze, reassign, setConflicting, setLocked, preserveUntil)
+- `specs/BSV_UTXO_STORE_SPEC.md` §3.7-3.12 (freeze, unfreeze, reassign, setConflicting, setLocked, preserveUntil), §3.16 (getSpend)
 - `specs/teranode.lua` for original Lua validation logic
 
 ## What to build
@@ -157,7 +157,36 @@ Steps:
 6. Remove from index
 7. Release lock
 
-### 6.8 IncrementSpentExtraRecs — ELIMINATED
+### 6.8 GetSpend — `src/ops/get_spend.rs`
+
+Point read of a single UTXO slot plus the record's locktime. Used for double-spend detection — the validator needs to check "is this output already spent? if so, by whom?" See spec §3.16.
+
+```rust
+pub struct GetSpendRequest {
+    pub tx_key: TxKey,
+    pub offset: u32,
+    pub utxo_hash: [u8; 32],
+}
+
+pub struct GetSpendResponse {
+    pub status: u8,                     // UTXO status byte
+    pub spending_data: Option<[u8; 36]>, // present if spent or frozen
+    pub locktime: u32,                  // from record metadata
+}
+```
+
+Steps:
+1. Index lookup → record_offset
+2. If not found → TxNotFound
+3. Read metadata (for locktime and utxo_count)
+4. Validate offset < utxo_count → UTXO_NOT_FOUND
+5. Read UTXO slot at `record_offset + METADATA_SIZE + offset * 69`
+6. Validate hash matches utxo_hash → UTXO_HASH_MISMATCH
+7. Return status, spending_data (if present), locktime
+
+No lock needed — this is a read-only operation. Consistency guaranteed by the atomic metadata+slot write ordering in spend.
+
+### 6.9 IncrementSpentExtraRecs — ELIMINATED
 
 Document why this operation is eliminated: TeraSlab doesn't split transactions across multiple records. The entire master/child/extra-recs machinery is gone. The `spent_utxos` counter on the single record is sufficient.
 
@@ -241,6 +270,19 @@ pub fn increment_spent_extra_recs_compat(/* ... */) -> Result<Response> {
 - [ ] Delete then allocate new record: can reuse freed space
 - [ ] Delete non-existent record: no-op or TxNotFound
 - [ ] Concurrent delete and spend on same tx: one succeeds, other gets TxNotFound
+```
+
+### GetSpend tests
+
+```
+- [ ] GetSpend on unspent UTXO: returns status=0x00, spending_data=None, correct locktime
+- [ ] GetSpend on spent UTXO: returns status=0x01, spending_data=Some(txid+vin), correct locktime
+- [ ] GetSpend on frozen UTXO: returns status=0xFF, spending_data=Some(all 0xFF)
+- [ ] GetSpend on pruned UTXO: returns status=0x02
+- [ ] GetSpend non-existent tx: returns TxNotFound
+- [ ] GetSpend with wrong hash: returns UtxoHashMismatch
+- [ ] GetSpend with offset >= utxo_count: returns UtxoNotFound
+- [ ] GetSpend is read-only: does not modify any state
 ```
 
 ### Compatibility tests

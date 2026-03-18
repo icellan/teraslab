@@ -60,7 +60,35 @@ pub struct SetMinedResponse {
 12. Release lock
 13. Build response with current block_ids list and signal
 
-### 4.2 Collect block_ids helper
+### 4.2 MarkOnLongestChain operation — `src/ops/mark_longest_chain.rs`
+
+This is a **separate operation** from `setMined` (see spec §3.15). It modifies only `unmined_since` without touching block entries. Called during chain reorganizations to bulk-update longest-chain status.
+
+```rust
+pub struct MarkOnLongestChainRequest {
+    pub tx_key: TxKey,
+    pub on_longest_chain: bool,
+    pub current_block_height: u32,
+    pub block_height_retention: u32,
+}
+```
+
+#### Implementation (matching Go `longest_chain.go`):
+
+1. Acquire lock for `tx_key`
+2. Index lookup → record_offset
+3. If not found → TxNotFound (**fatal** — indicates data corruption)
+4. Read metadata from device
+5. If `on_longest_chain == true`: set `unmined_since = 0`
+6. If `on_longest_chain == false`: set `unmined_since = current_block_height`
+7. Update unmined secondary index:
+   - `true` → remove entry (tx is mined on longest chain)
+   - `false` → insert/update entry with `current_block_height`
+8. Evaluate `setDeleteAtHeight` (longest chain status affects DAH eligibility)
+9. Write metadata to device (metadata region only)
+10. Release lock
+
+### 4.3 Collect block_ids helper
 
 ```rust
 /// Extract the current list of block IDs from metadata.
@@ -131,6 +159,20 @@ pub fn collect_block_ids(metadata: &TxMetadata) -> Vec<u32> {
       final state is consistent (entry either present or absent, not corrupted)
 ```
 
+### MarkOnLongestChain tests
+
+```
+- [ ] markOnLongestChain(true) on tx with unmined_since != 0: unmined_since becomes 0
+- [ ] markOnLongestChain(false) on tx with unmined_since == 0: unmined_since set to current_block_height
+- [ ] markOnLongestChain(true) on already longest-chain tx: no-op (unmined_since stays 0)
+- [ ] markOnLongestChain(false) on already off-chain tx: unmined_since updated to new current height
+- [ ] markOnLongestChain on non-existent tx: returns TxNotFound (fatal indicator)
+- [ ] markOnLongestChain does NOT modify block_entries or UTXO slots
+- [ ] markOnLongestChain(true) on fully-spent tx: evaluates DAH (may set delete_at_height)
+- [ ] markOnLongestChain(false) on fully-spent tx with DAH set: clears delete_at_height
+- [ ] Concurrent markOnLongestChain and setMined: no corruption
+```
+
 ### Performance benchmarks
 
 ```
@@ -138,10 +180,10 @@ pub fn collect_block_ids(metadata: &TxMetadata) -> Vec<u32> {
 - [ ] setMined only writes metadata region: verify UTXO slots are not read/written
       (can check via I/O byte counters or by verifying read/write offsets)
 - [ ] Measure metadata read + modify + write latency
+- [ ] Single-threaded markOnLongestChain throughput: ops/sec
 ```
 
 ## NOT in this phase
 
 - No batch setMined across multiple transactions (each call is for one tx)
 - No networking
-- No longest chain management (that's Go-side logic)
