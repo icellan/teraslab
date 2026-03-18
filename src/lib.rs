@@ -5,6 +5,7 @@ pub mod index;
 pub mod io;
 pub mod locks;
 pub mod ops;
+pub mod protocol;
 pub mod record;
 pub mod recovery;
 pub mod redo;
