@@ -10,3 +10,4 @@ pub mod record;
 pub mod recovery;
 pub mod redo;
 pub mod replication;
+pub mod storage;
