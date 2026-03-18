@@ -3,12 +3,18 @@ name = "teraslab"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "teraslab-server"
+path = "src/bin/server.rs"
+
 [dependencies]
 bitflags = "2"
 crc32fast = "1"
 libc = "0.2"
 parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

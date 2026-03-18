@@ -372,7 +372,7 @@ mod tests {
             let size = 4096 + (i * 100); // Varying sizes
             let offset = alloc.allocate(size).unwrap();
             assert_eq!(offset % 4096, 0);
-            let aligned = (size + 4095) / 4096 * 4096;
+            let aligned = size.div_ceil(4096) * 4096;
             allocations.push((offset, aligned));
         }
 

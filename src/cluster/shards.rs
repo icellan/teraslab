@@ -166,7 +166,6 @@ pub enum RouteDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     fn nodes(ids: &[u64]) -> Vec<NodeId> {
         ids.iter().map(|&id| NodeId(id)).collect()

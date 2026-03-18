@@ -17,7 +17,6 @@ use teraslab::ops::error::SpendError;
 use teraslab::ops::mark_longest_chain::*;
 use teraslab::ops::remaining::*;
 use teraslab::ops::set_mined::*;
-use teraslab::ops::signal::Signal;
 use teraslab::ops::spend::*;
 use teraslab::ops::unspend::*;
 use teraslab::record::*;
@@ -116,6 +115,7 @@ struct ExpectedSlot {
     spending_data: [u8; 36],
 }
 
+#[allow(dead_code)]
 struct ExpectedRecord {
     utxo_count: u32,
     spent_utxos: u32,
@@ -131,6 +131,7 @@ struct StateVerifier {
     records: HashMap<TxKey, ExpectedRecord>,
 }
 
+#[allow(dead_code)]
 impl StateVerifier {
     fn new() -> Self {
         Self { records: HashMap::new() }
@@ -466,7 +467,7 @@ fn locked_cleared_by_set_mined() {
 #[test]
 fn preserve_until_blocks_pruning() {
     let engine = create_engine();
-    let mut req = CreateRequest {
+    let req = CreateRequest {
         tx_id: make_tx_id(1),
         tx_version: 1, locktime: 0, fee: 500, size_in_bytes: 250,
         extended_size: 0, is_coinbase: false, spending_height: 0,
@@ -620,7 +621,7 @@ fn spend_multi_partial_errors() {
 fn dah_set_and_cleared() {
     let engine = create_engine();
 
-    let mut req = CreateRequest {
+    let req = CreateRequest {
         tx_id: make_tx_id(1),
         tx_version: 1, locktime: 0, fee: 500, size_in_bytes: 250,
         extended_size: 0, is_coinbase: false, spending_height: 0,

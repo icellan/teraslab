@@ -336,15 +336,10 @@ mod tests {
     ) -> std::thread::JoinHandle<Vec<ReplicaBatch>> {
         std::thread::spawn(move || {
             let mut received = Vec::new();
-            loop {
-                match replica_transport.recv_batch(Duration::from_secs(1)) {
-                    Ok(batch) => {
-                        let ack = ReplicaAck::Ok { through_sequence: batch.last_sequence() };
-                        replica_transport.send_ack(&ack).unwrap();
-                        received.push(batch);
-                    }
-                    Err(_) => break,
-                }
+            while let Ok(batch) = replica_transport.recv_batch(Duration::from_secs(1)) {
+                let ack = ReplicaAck::Ok { through_sequence: batch.last_sequence() };
+                replica_transport.send_ack(&ack).unwrap();
+                received.push(batch);
             }
             received
         })
