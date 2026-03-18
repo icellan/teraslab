@@ -121,8 +121,43 @@ fn main() {
         unmined_index,
     ));
 
-    // 5. Setup server with shutdown signal
-    let server = Server::new(engine.clone(), config.clone());
+    // 5. Start cluster if configured
+    let cluster = if config.is_clustered() {
+        use teraslab::cluster::coordinator::{ClusterConfig, ClusterCoordinator};
+        use teraslab::cluster::shards::NodeId;
+
+        let self_addr: std::net::SocketAddr = config.listen_addr.parse()
+            .expect("invalid listen_addr");
+        let swim_bind: std::net::SocketAddr =
+            format!("0.0.0.0:{}", config.swim_port).parse().unwrap();
+        let seed_addrs: Vec<std::net::SocketAddr> = config.seed_nodes.iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+
+        let cluster_config = ClusterConfig {
+            self_id: NodeId(config.node_id),
+            self_addr,
+            swim_bind,
+            seed_nodes: seed_addrs,
+            replication_factor: config.replication_factor,
+            probe_interval: std::time::Duration::from_millis(config.swim_probe_interval_ms),
+            suspicion_timeout: std::time::Duration::from_millis(config.swim_suspicion_timeout_ms),
+        };
+
+        let coordinator = ClusterCoordinator::new(cluster_config);
+        let running = coordinator.start(engine.clone());
+        eprintln!("  cluster: node {} started with RF={}", config.node_id, config.replication_factor);
+        Some(Arc::new(running))
+    } else {
+        eprintln!("  cluster: single-node mode (node_id=0)");
+        None
+    };
+
+    // 6. Setup server
+    let mut server = Server::new(engine.clone(), config.clone());
+    if let Some(ref c) = cluster {
+        server = server.with_cluster(c.clone());
+    }
     let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_clone = shutdown_flag.clone();
     ctrlc_handler(move || {
@@ -130,16 +165,16 @@ fn main() {
         shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 
-    // Override server's shutdown with the ctrlc one
     let server = ServerWithShutdown {
         inner: server,
         shutdown: shutdown_flag,
         engine,
         snap_path: config.index_snapshot_path.clone(),
         device,
+        cluster,
     };
 
-    // 6. Start serving
+    // 7. Start serving
     if let Err(e) = server.run() {
         eprintln!("Server error: {e}");
         std::process::exit(1);
@@ -157,17 +192,21 @@ struct ServerWithShutdown {
     #[allow(dead_code)]
     snap_path: PathBuf,
     device: Arc<dyn BlockDevice>,
+    #[allow(dead_code)]
+    cluster: Option<Arc<teraslab::cluster::coordinator::RunningCluster>>,
 }
 
 impl ServerWithShutdown {
     fn run(&self) -> Result<(), String> {
-        // Run in a loop checking shutdown flag
         let result = self.inner.run();
 
-        // On shutdown: snapshot index
+        // On shutdown: stop cluster, sync device
+        if let Some(ref cluster) = self.cluster {
+            cluster.shutdown();
+            eprintln!("  cluster stopped");
+        }
+
         eprintln!("Persisting state...");
-        // Index snapshot would require access to the index, which is inside Engine.
-        // For now, sync the device.
         if let Err(e) = self.device.sync() {
             eprintln!("  device sync error: {e}");
         } else {

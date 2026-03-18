@@ -40,6 +40,27 @@ pub struct ServerConfig {
 
     /// Block height retention for DAH evaluation.
     pub block_height_retention: u32,
+
+    // -- Cluster settings --
+
+    /// Unique node ID. Must be different for each node in the cluster.
+    /// 0 = single-node mode (no clustering).
+    pub node_id: u64,
+
+    /// UDP port for SWIM membership protocol.
+    pub swim_port: u16,
+
+    /// Seed node addresses for cluster discovery (host:swim_port).
+    pub seed_nodes: Vec<String>,
+
+    /// Replication factor (1 = no replication, 2 = master + 1 replica).
+    pub replication_factor: u8,
+
+    /// SWIM probe interval in milliseconds.
+    pub swim_probe_interval_ms: u64,
+
+    /// SWIM suspicion timeout in milliseconds.
+    pub swim_suspicion_timeout_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -56,7 +77,20 @@ impl Default for ServerConfig {
             max_batch_size: 8192,
             max_connections: 1024,
             block_height_retention: 288,
+            node_id: 0,
+            swim_port: 3301,
+            seed_nodes: vec![],
+            replication_factor: 1,
+            swim_probe_interval_ms: 200,
+            swim_suspicion_timeout_ms: 5000,
         }
+    }
+}
+
+impl ServerConfig {
+    /// Whether clustering is enabled (node_id > 0).
+    pub fn is_clustered(&self) -> bool {
+        self.node_id > 0
     }
 }
 

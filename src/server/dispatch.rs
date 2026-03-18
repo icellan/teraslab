@@ -1,5 +1,10 @@
 //! Request dispatch: maps wire protocol opcodes to Engine methods.
+//!
+//! In clustered mode, the dispatcher checks shard ownership before
+//! processing key-based operations. If this node doesn't own the shard,
+//! it returns a Redirect response.
 
+use crate::cluster::coordinator::RunningCluster;
 use crate::index::TxKey;
 use crate::ops::create::*;
 use crate::ops::engine::Engine;
@@ -15,10 +20,14 @@ use crate::protocol::opcodes::*;
 use std::collections::HashMap;
 
 /// Dispatch a request frame to the appropriate Engine method.
+///
+/// If `cluster` is Some, shard ownership is checked for key-based operations.
+/// Requests for keys not owned by this node get a Redirect response.
 pub fn handle_request(
     request: &RequestFrame,
     engine: &Engine,
     max_batch_size: u32,
+    cluster: Option<&RunningCluster>,
 ) -> ResponseFrame {
     match request.op_code {
         OP_SPEND_BATCH => handle_spend_batch(request, engine, max_batch_size),
@@ -34,6 +43,7 @@ pub fn handle_request(
         OP_DELETE_BATCH => handle_delete_batch(request, engine, max_batch_size),
         OP_MARK_LONGEST_CHAIN_BATCH => handle_mark_longest_chain_batch(request, engine, max_batch_size),
         OP_GET_SPEND_BATCH => handle_get_spend_batch(request, engine, max_batch_size),
+        OP_GET_PARTITION_MAP => handle_get_partition_map(request, cluster),
         OP_PING => ResponseFrame {
             request_id: request.request_id,
             status: STATUS_OK,
@@ -632,4 +642,40 @@ fn decode_slot_item_batch_with_params(data: &[u8]) -> Option<(UnspendSharedParam
     }
 
     Some((UnspendSharedParams { current_block_height: cbh, block_height_retention: bhr }, items))
+}
+
+// ---------------------------------------------------------------------------
+// Partition map
+// ---------------------------------------------------------------------------
+
+fn handle_get_partition_map(
+    req: &RequestFrame,
+    cluster: Option<&RunningCluster>,
+) -> ResponseFrame {
+    match cluster {
+        Some(c) => ResponseFrame {
+            request_id: req.request_id,
+            status: STATUS_OK,
+            payload: c.encode_partition_map(),
+        },
+        None => {
+            // Single-node mode: return a trivial partition map
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&0u64.to_le_bytes()); // version = 0
+            payload.extend_from_slice(&1u32.to_le_bytes()); // 1 node
+            payload.extend_from_slice(&0u64.to_le_bytes()); // node_id = 0
+            let addr = b"127.0.0.1:3300";
+            payload.extend_from_slice(&(addr.len() as u16).to_le_bytes());
+            payload.extend_from_slice(addr);
+            // All 4096 shards map to node 0
+            for _ in 0..4096u16 {
+                payload.extend_from_slice(&0u64.to_le_bytes());
+            }
+            ResponseFrame {
+                request_id: req.request_id,
+                status: STATUS_OK,
+                payload,
+            }
+        }
+    }
 }

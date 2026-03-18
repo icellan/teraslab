@@ -5,6 +5,7 @@
 
 pub mod dispatch;
 
+use crate::cluster::coordinator::RunningCluster;
 use crate::config::ServerConfig;
 use crate::ops::engine::Engine;
 use crate::protocol::frame::{RequestFrame, ResponseFrame};
@@ -18,6 +19,7 @@ use std::sync::Arc;
 pub struct Server {
     engine: Arc<Engine>,
     config: ServerConfig,
+    cluster: Option<Arc<RunningCluster>>,
     shutdown: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
 }
@@ -28,9 +30,16 @@ impl Server {
         Self {
             engine,
             config,
+            cluster: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             active_connections: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Set the cluster coordinator for distributed mode.
+    pub fn with_cluster(mut self, cluster: Arc<RunningCluster>) -> Self {
+        self.cluster = Some(cluster);
+        self
     }
 
     /// Start listening for client connections. Blocks until shutdown.
@@ -61,9 +70,16 @@ impl Server {
                     let shutdown = self.shutdown.clone();
                     let active_conns = self.active_connections.clone();
                     let max_batch = self.config.max_batch_size;
+                    let cluster = self.cluster.clone();
 
                     std::thread::spawn(move || {
-                        if let Err(e) = handle_connection(stream, &engine, &shutdown, max_batch) {
+                        if let Err(e) = handle_connection(
+                            stream,
+                            &engine,
+                            &shutdown,
+                            max_batch,
+                            cluster.as_deref(),
+                        ) {
                             eprintln!("connection from {addr} error: {e}");
                         }
                         active_conns.fetch_sub(1, Ordering::Relaxed);
@@ -112,6 +128,7 @@ fn handle_connection(
     engine: &Engine,
     shutdown: &AtomicBool,
     max_batch_size: u32,
+    cluster: Option<&RunningCluster>,
 ) -> Result<(), String> {
     stream
         .set_nonblocking(false)
@@ -167,7 +184,7 @@ fn handle_connection(
             .map_err(|e| format!("decode frame: {e}"))?;
 
         // Dispatch to handler
-        let response = dispatch::handle_request(&request, engine, max_batch_size);
+        let response = dispatch::handle_request(&request, engine, max_batch_size, cluster);
 
         // Write response
         let response_bytes = response.encode();
