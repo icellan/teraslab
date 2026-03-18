@@ -59,6 +59,7 @@ pub const ERR_COINBASE_IMMATURE: u16 = 10;
 pub const ERR_VOUT_OUT_OF_RANGE: u16 = 11;
 pub const ERR_ALREADY_EXISTS: u16 = 12;
 pub const ERR_FROZEN_UNTIL: u16 = 13;
+pub const ERR_REDIRECT: u16 = 14;
 pub const ERR_INTERNAL: u16 = 255;
 
 /// Response status codes.

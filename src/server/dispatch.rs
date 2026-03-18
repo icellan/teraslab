@@ -30,19 +30,19 @@ pub fn handle_request(
     cluster: Option<&RunningCluster>,
 ) -> ResponseFrame {
     match request.op_code {
-        OP_SPEND_BATCH => handle_spend_batch(request, engine, max_batch_size),
-        OP_UNSPEND_BATCH => handle_unspend_batch(request, engine, max_batch_size),
-        OP_SET_MINED_BATCH => handle_set_mined_batch(request, engine, max_batch_size),
-        OP_CREATE_BATCH => handle_create_batch(request, engine, max_batch_size),
-        OP_FREEZE_BATCH => handle_freeze_batch(request, engine, max_batch_size),
-        OP_UNFREEZE_BATCH => handle_unfreeze_batch(request, engine, max_batch_size),
-        OP_REASSIGN_BATCH => handle_reassign_batch(request, engine, max_batch_size),
-        OP_SET_CONFLICTING_BATCH => handle_set_conflicting_batch(request, engine, max_batch_size),
-        OP_SET_LOCKED_BATCH => handle_set_locked_batch(request, engine, max_batch_size),
-        OP_PRESERVE_UNTIL_BATCH => handle_preserve_until_batch(request, engine, max_batch_size),
-        OP_DELETE_BATCH => handle_delete_batch(request, engine, max_batch_size),
-        OP_MARK_LONGEST_CHAIN_BATCH => handle_mark_longest_chain_batch(request, engine, max_batch_size),
-        OP_GET_SPEND_BATCH => handle_get_spend_batch(request, engine, max_batch_size),
+        OP_SPEND_BATCH => handle_spend_batch(request, engine, max_batch_size, cluster),
+        OP_UNSPEND_BATCH => handle_unspend_batch(request, engine, max_batch_size, cluster),
+        OP_SET_MINED_BATCH => handle_set_mined_batch(request, engine, max_batch_size, cluster),
+        OP_CREATE_BATCH => handle_create_batch(request, engine, max_batch_size, cluster),
+        OP_FREEZE_BATCH => handle_freeze_batch(request, engine, max_batch_size, cluster),
+        OP_UNFREEZE_BATCH => handle_unfreeze_batch(request, engine, max_batch_size, cluster),
+        OP_REASSIGN_BATCH => handle_reassign_batch(request, engine, max_batch_size, cluster),
+        OP_SET_CONFLICTING_BATCH => handle_set_conflicting_batch(request, engine, max_batch_size, cluster),
+        OP_SET_LOCKED_BATCH => handle_set_locked_batch(request, engine, max_batch_size, cluster),
+        OP_PRESERVE_UNTIL_BATCH => handle_preserve_until_batch(request, engine, max_batch_size, cluster),
+        OP_DELETE_BATCH => handle_delete_batch(request, engine, max_batch_size, cluster),
+        OP_MARK_LONGEST_CHAIN_BATCH => handle_mark_longest_chain_batch(request, engine, max_batch_size, cluster),
+        OP_GET_SPEND_BATCH => handle_get_spend_batch(request, engine, max_batch_size, cluster),
         OP_GET_PARTITION_MAP => handle_get_partition_map(request, cluster),
         OP_PING => ResponseFrame {
             request_id: request.request_id,
@@ -64,10 +64,47 @@ pub fn handle_request(
 }
 
 // ---------------------------------------------------------------------------
+// Shard ownership check
+// ---------------------------------------------------------------------------
+
+/// Check if a txid belongs to a shard owned by this node.
+///
+/// Returns `None` if the key is local (or no cluster is configured).
+/// Returns `Some(BatchItemError)` with a redirect error if the key belongs
+/// to a remote node, including the target node's address in `error_data`.
+fn check_shard_ownership(
+    txid: &[u8; 32],
+    item_index: u32,
+    cluster: Option<&RunningCluster>,
+) -> Option<BatchItemError> {
+    let cluster = cluster?;
+    let key = TxKey { txid: *txid };
+    if cluster.is_master(&key) {
+        return None;
+    }
+    // Determine the target node address for the redirect
+    let route = cluster.route(&key);
+    let error_data = match route {
+        crate::cluster::shards::RouteDecision::RedirectTo { node, .. } => {
+            match cluster.node_addr(&node) {
+                Some(addr) => addr.to_string().into_bytes(),
+                None => Vec::new(),
+            }
+        }
+        crate::cluster::shards::RouteDecision::HandleLocally => return None,
+    };
+    Some(BatchItemError {
+        item_index,
+        error_code: ERR_REDIRECT,
+        error_data,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Spend
 // ---------------------------------------------------------------------------
 
-fn handle_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> ResponseFrame {
+fn handle_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
     let (params, items) = match decode_spend_batch(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed spend batch"),
@@ -85,6 +122,19 @@ fn handle_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> Re
     let mut errors: Vec<BatchItemError> = Vec::new();
 
     for (txid, group) in &by_txid {
+        // Check shard ownership for the first item in the group (all share the same txid)
+        if let Some(redirect_err) = check_shard_ownership(txid, group[0].0 as u32, cluster) {
+            // All items in this group get redirect errors
+            for &(i, _) in group {
+                errors.push(BatchItemError {
+                    item_index: i as u32,
+                    error_code: redirect_err.error_code,
+                    error_data: redirect_err.error_data.clone(),
+                });
+            }
+            continue;
+        }
+
         let spend_items: Vec<SpendItem> = group
             .iter()
             .map(|(i, item)| SpendItem {
@@ -139,7 +189,7 @@ fn handle_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> Re
 // Unspend
 // ---------------------------------------------------------------------------
 
-fn handle_unspend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> ResponseFrame {
+fn handle_unspend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
     let (shared, items) = match decode_slot_item_batch_with_params(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed unspend batch"),
@@ -150,6 +200,10 @@ fn handle_unspend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> 
 
     let mut errors = Vec::new();
     for (i, item) in items.iter().enumerate() {
+        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster) {
+            errors.push(redirect_err);
+            continue;
+        }
         let result = engine.unspend(&UnspendRequest {
             tx_key: TxKey { txid: item.txid },
             offset: item.vout,
@@ -169,7 +223,7 @@ fn handle_unspend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> 
 // SetMined
 // ---------------------------------------------------------------------------
 
-fn handle_set_mined_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> ResponseFrame {
+fn handle_set_mined_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
     let (params, txids) = match decode_set_mined_batch(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed set_mined batch"),
@@ -180,6 +234,10 @@ fn handle_set_mined_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -
 
     let mut errors = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
+        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster) {
+            errors.push(redirect_err);
+            continue;
+        }
         let result = engine.set_mined(&SetMinedRequest {
             tx_key: TxKey { txid: *txid },
             block_id: params.block_id,
@@ -202,7 +260,7 @@ fn handle_set_mined_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -
 // Create
 // ---------------------------------------------------------------------------
 
-fn handle_create_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> ResponseFrame {
+fn handle_create_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
     // CreateBatch payload: [count:4][items...]
     // Each item is variable-length. For simplicity, use a simplified format:
     // [count:4][items: txid(32) + utxo_count(4) + utxo_hashes(32*N)]
@@ -250,6 +308,11 @@ fn handle_create_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> R
             h.copy_from_slice(&payload[pos..pos + 32]);
             utxo_hashes.push(h);
             pos += 32;
+        }
+
+        if let Some(redirect_err) = check_shard_ownership(&txid, i, cluster) {
+            errors.push(redirect_err);
+            continue;
         }
 
         let create_req = CreateRequest {
@@ -303,7 +366,7 @@ fn handle_create_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> R
 // Freeze / Unfreeze / Delete / SetLocked / etc — simple dispatch
 // ---------------------------------------------------------------------------
 
-fn handle_freeze_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> ResponseFrame {
+fn handle_freeze_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
     let items = match decode_slot_item_batch(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -313,6 +376,10 @@ fn handle_freeze_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> R
     }
     let mut errors = Vec::new();
     for (i, item) in items.iter().enumerate() {
+        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster) {
+            errors.push(redirect_err);
+            continue;
+        }
         if let Err(err) = engine.freeze(&FreezeRequest {
             tx_key: TxKey { txid: item.txid },
             offset: item.vout,
@@ -324,7 +391,7 @@ fn handle_freeze_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> R
     batch_response(req.request_id, &errors)
 }
 
-fn handle_unfreeze_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> ResponseFrame {
+fn handle_unfreeze_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
     let items = match decode_slot_item_batch(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -334,6 +401,10 @@ fn handle_unfreeze_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) ->
     }
     let mut errors = Vec::new();
     for (i, item) in items.iter().enumerate() {
+        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster) {
+            errors.push(redirect_err);
+            continue;
+        }
         if let Err(err) = engine.unfreeze(&UnfreezeRequest {
             tx_key: TxKey { txid: item.txid },
             offset: item.vout,
@@ -345,7 +416,7 @@ fn handle_unfreeze_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) ->
     batch_response(req.request_id, &errors)
 }
 
-fn handle_reassign_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> ResponseFrame {
+fn handle_reassign_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
     let (params, items) = match decode_reassign_batch(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -355,6 +426,10 @@ fn handle_reassign_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) ->
     }
     let mut errors = Vec::new();
     for (i, item) in items.iter().enumerate() {
+        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster) {
+            errors.push(redirect_err);
+            continue;
+        }
         if let Err(err) = engine.reassign(&ReassignRequest {
             tx_key: TxKey { txid: item.txid },
             offset: item.vout,
@@ -369,7 +444,7 @@ fn handle_reassign_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) ->
     batch_response(req.request_id, &errors)
 }
 
-fn handle_set_conflicting_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> ResponseFrame {
+fn handle_set_conflicting_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
     let (shared, txids) = match decode_txid_batch(&req.payload, 9) { // value(1) + cbh(4) + bhr(4)
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -383,6 +458,10 @@ fn handle_set_conflicting_batch(req: &RequestFrame, engine: &Engine, max_batch: 
 
     let mut errors = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
+        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster) {
+            errors.push(redirect_err);
+            continue;
+        }
         if let Err(err) = engine.set_conflicting(&SetConflictingRequest {
             tx_key: TxKey { txid: *txid },
             value,
@@ -395,7 +474,7 @@ fn handle_set_conflicting_batch(req: &RequestFrame, engine: &Engine, max_batch: 
     batch_response(req.request_id, &errors)
 }
 
-fn handle_set_locked_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> ResponseFrame {
+fn handle_set_locked_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
     let (shared, txids) = match decode_txid_batch(&req.payload, 1) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -407,6 +486,10 @@ fn handle_set_locked_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) 
 
     let mut errors = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
+        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster) {
+            errors.push(redirect_err);
+            continue;
+        }
         if let Err(err) = engine.set_locked(&SetLockedRequest {
             tx_key: TxKey { txid: *txid },
             value,
@@ -417,7 +500,7 @@ fn handle_set_locked_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) 
     batch_response(req.request_id, &errors)
 }
 
-fn handle_preserve_until_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> ResponseFrame {
+fn handle_preserve_until_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
     let (shared, txids) = match decode_txid_batch(&req.payload, 4) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -429,6 +512,10 @@ fn handle_preserve_until_batch(req: &RequestFrame, engine: &Engine, max_batch: u
 
     let mut errors = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
+        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster) {
+            errors.push(redirect_err);
+            continue;
+        }
         if let Err(err) = engine.preserve_until(&PreserveUntilRequest {
             tx_key: TxKey { txid: *txid },
             block_height: height,
@@ -439,7 +526,7 @@ fn handle_preserve_until_batch(req: &RequestFrame, engine: &Engine, max_batch: u
     batch_response(req.request_id, &errors)
 }
 
-fn handle_delete_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> ResponseFrame {
+fn handle_delete_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
     let (_, txids) = match decode_txid_batch(&req.payload, 0) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -449,6 +536,10 @@ fn handle_delete_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> R
     }
     let mut errors = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
+        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster) {
+            errors.push(redirect_err);
+            continue;
+        }
         if let Err(err) = engine.delete(&DeleteRequest {
             tx_key: TxKey { txid: *txid },
         }) {
@@ -458,7 +549,7 @@ fn handle_delete_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> R
     batch_response(req.request_id, &errors)
 }
 
-fn handle_mark_longest_chain_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> ResponseFrame {
+fn handle_mark_longest_chain_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
     let (shared, txids) = match decode_txid_batch(&req.payload, 9) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -472,6 +563,10 @@ fn handle_mark_longest_chain_batch(req: &RequestFrame, engine: &Engine, max_batc
 
     let mut errors = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
+        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster) {
+            errors.push(redirect_err);
+            continue;
+        }
         if let Err(err) = engine.mark_on_longest_chain(&MarkOnLongestChainRequest {
             tx_key: TxKey { txid: *txid },
             on_longest_chain,
@@ -488,7 +583,7 @@ fn handle_mark_longest_chain_batch(req: &RequestFrame, engine: &Engine, max_batc
 // GetSpend
 // ---------------------------------------------------------------------------
 
-fn handle_get_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -> ResponseFrame {
+fn handle_get_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
     let items = match decode_get_spend_batch(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -499,6 +594,20 @@ fn handle_get_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32) -
 
     let mut results = Vec::with_capacity(items.len());
     for item in &items {
+        // Check shard ownership for read operations too
+        if let Some(cluster) = cluster {
+            let key = TxKey { txid: item.txid };
+            if !cluster.is_master(&key) {
+                results.push(WireGetSpendResult {
+                    status: 1,
+                    error_code: ERR_REDIRECT,
+                    slot_status: 0,
+                    spending_data: [0; 36],
+                });
+                continue;
+            }
+        }
+
         // GetSpend needs the utxo_hash for validation. Since the wire format
         // only sends txid+vout, we skip hash validation at this level and
         // return whatever is at that slot offset.

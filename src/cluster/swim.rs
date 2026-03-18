@@ -10,12 +10,14 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// SWIM protocol message types.
 const MSG_PING: u8 = 1;
 const MSG_ACK: u8 = 2;
 const MSG_JOIN: u8 = 3;
+/// Indirect probe request: "please probe this node for me".
+const MSG_PING_REQ: u8 = 4;
 
 /// On-wire message format:
 /// [msg_type:1][sender_id:8][sender_incarnation:8][sender_addr_len:2][sender_addr:N]
@@ -33,6 +35,19 @@ pub struct SwimConfig {
     pub suspicion_timeout: Duration,
 }
 
+/// State of a pending direct probe awaiting an ACK.
+struct PendingProbe {
+    /// The node we are probing.
+    target: NodeId,
+    /// When the probe was sent.
+    started: Instant,
+    /// Whether indirect (PING_REQ) probes have been sent.
+    indirect_sent: bool,
+}
+
+/// Number of indirect probe peers to ask when direct probe fails.
+const INDIRECT_PROBE_K: usize = 3;
+
 /// A running SWIM protocol instance.
 pub struct SwimRunner {
     config: SwimConfig,
@@ -40,6 +55,13 @@ pub struct SwimRunner {
     peer_addrs: Arc<Mutex<HashMap<NodeId, SocketAddr>>>,
     shutdown: Arc<AtomicBool>,
     incarnation: u64,
+    /// Currently pending direct probe (at most one at a time).
+    pending_probe: Option<PendingProbe>,
+    /// Index for round-robin peer selection.
+    probe_round_robin: usize,
+    /// Tracks PING_REQ forwarding: maps (original_requester_addr) to pending
+    /// indirect probe targets so we can forward ACKs back.
+    ping_req_forwarding: HashMap<NodeId, SocketAddr>,
 }
 
 impl SwimRunner {
@@ -55,6 +77,9 @@ impl SwimRunner {
             peer_addrs: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             incarnation: 1,
+            pending_probe: None,
+            probe_round_robin: 0,
+            ping_req_forwarding: HashMap::new(),
         }
     }
 
@@ -117,7 +142,7 @@ impl SwimRunner {
         }
 
         let probe_interval = self.config.probe_interval;
-        let mut last_probe = std::time::Instant::now();
+        let mut last_probe = Instant::now();
         let mut recv_buf = [0u8; MAX_MSG_SIZE];
 
         while !self.shutdown.load(Ordering::Relaxed) {
@@ -135,10 +160,31 @@ impl SwimRunner {
                 }
             }
 
-            // Periodic probe
+            // Check pending probe timeout
+            let mut should_suspect = false;
+            if let Some(ref pending) = self.pending_probe {
+                let elapsed = pending.started.elapsed();
+                if !pending.indirect_sent && elapsed >= probe_interval {
+                    // Direct probe timed out — send indirect probes
+                    self.send_indirect_probes(&socket);
+                } else if pending.indirect_sent && elapsed >= probe_interval * 2 {
+                    // Both direct and indirect probes failed — mark suspect
+                    should_suspect = true;
+                }
+            }
+            if should_suspect
+                && let Some(pending) = self.pending_probe.take()
+            {
+                let events = self.membership.lock().unwrap().mark_suspect(pending.target);
+                for event in events {
+                    let _ = event_tx.send(event);
+                }
+            }
+
+            // Periodic probe: select one random peer
             if last_probe.elapsed() >= probe_interval {
-                self.send_probes(&socket);
-                last_probe = std::time::Instant::now();
+                self.send_probe(&socket);
+                last_probe = Instant::now();
 
                 // Expire suspects
                 let events = self.membership.lock().unwrap().expire_suspects();
@@ -233,18 +279,177 @@ impl SwimRunner {
             let _ = socket.send_to(&ack, from_addr);
         }
 
+        // Handle ACK: clear pending probe if it matches
+        if msg_type == MSG_ACK {
+            if let Some(ref pending) = self.pending_probe
+                && pending.target == sender_id
+            {
+                self.pending_probe = None;
+            }
+            // Check if we should forward this ACK to a requester (PING_REQ flow)
+            if let Some(requester_addr) = self.ping_req_forwarding.remove(&sender_id) {
+                // Forward the ACK back to the original requester
+                let updates = self.collect_member_updates();
+                let ack = self.encode_message(MSG_ACK, &updates);
+                let _ = socket.send_to(&ack, requester_addr);
+            }
+        }
+
+        // Handle PING_REQ: probe the target on behalf of the requester
+        if msg_type == MSG_PING_REQ {
+            // Parse the appended target info: [target_id:8][target_addr_len:2][target_addr:N]
+            let ping_req_offset = 19 + addr_len;
+            // Skip past the piggybacked updates to find the PING_REQ payload
+            let target_info = self.parse_ping_req_target(data, ping_req_offset);
+            if let Some((target_id, target_swim_addr)) = target_info {
+                // Remember that we need to forward the ACK back to the requester
+                self.ping_req_forwarding.insert(target_id, from_addr);
+                // Send PING to the target
+                let updates = self.collect_member_updates();
+                let ping = self.encode_message(MSG_PING, &updates);
+                let _ = socket.send_to(&ping, target_swim_addr);
+            }
+        }
+
         events
     }
 
-    fn send_probes(&self, socket: &UdpSocket) {
-        let peers = self.peer_addrs.lock().unwrap().clone();
+    /// Parse the target node info appended to a PING_REQ message.
+    ///
+    /// The target info is appended after the piggybacked membership updates:
+    /// `[target_id:8][target_addr_len:2][target_addr:N]`
+    ///
+    /// Returns `(target_node_id, target_swim_addr)` if parsing succeeds.
+    fn parse_ping_req_target(
+        &self,
+        data: &[u8],
+        updates_start: usize,
+    ) -> Option<(NodeId, SocketAddr)> {
+        // First skip past the piggybacked updates
+        if data.len() < updates_start + 2 {
+            return None;
+        }
+        let update_count =
+            u16::from_le_bytes(data[updates_start..updates_start + 2].try_into().unwrap()) as usize;
+        let mut pos = updates_start + 2;
+
+        // Skip each update entry
+        for _ in 0..update_count {
+            if pos + 19 > data.len() {
+                return None;
+            }
+            let alen = u16::from_le_bytes(data[pos + 17..pos + 19].try_into().unwrap()) as usize;
+            pos += 19 + alen;
+            if pos > data.len() {
+                return None;
+            }
+        }
+
+        // Now parse the target info
+        if pos + 10 > data.len() {
+            return None;
+        }
+        let target_id = NodeId(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
+        let target_addr_len =
+            u16::from_le_bytes(data[pos + 8..pos + 10].try_into().unwrap()) as usize;
+        pos += 10;
+
+        if pos + target_addr_len > data.len() {
+            return None;
+        }
+        let target_addr_str = std::str::from_utf8(&data[pos..pos + target_addr_len]).ok()?;
+        let target_addr: SocketAddr = target_addr_str.parse().ok()?;
+
+        // Convert to SWIM port (use same port as our bind_addr)
+        let swim_addr = SocketAddr::new(target_addr.ip(), self.config.bind_addr.port());
+        Some((target_id, swim_addr))
+    }
+
+    /// Select ONE random peer and send a direct PING probe.
+    ///
+    /// This is the standard SWIM protocol: each probe interval, one peer is
+    /// selected for probing. If it doesn't respond, indirect probes follow.
+    fn send_probe(&mut self, socket: &UdpSocket) {
+        let peers: Vec<(NodeId, SocketAddr)> = self
+            .peer_addrs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&id, &addr)| (id, addr))
+            .collect();
+
+        if peers.is_empty() {
+            return;
+        }
+
+        // Round-robin selection of the peer to probe
+        let idx = self.probe_round_robin % peers.len();
+        self.probe_round_robin = self.probe_round_robin.wrapping_add(1);
+        let (target_id, target_addr) = peers[idx];
+
         let updates = self.collect_member_updates();
         let msg = self.encode_message(MSG_PING, &updates);
+        let swim_addr = SocketAddr::new(target_addr.ip(), self.config.bind_addr.port());
+        let _ = socket.send_to(&msg, swim_addr);
 
-        for (&_node_id, &addr) in &peers {
-            // Send to the SWIM port (same port as bind_addr)
+        // Record the pending probe (overwriting any previous one that has
+        // already been resolved or timed out)
+        self.pending_probe = Some(PendingProbe {
+            target: target_id,
+            started: Instant::now(),
+            indirect_sent: false,
+        });
+    }
+
+    /// Send indirect PING_REQ probes to K other peers, asking them to probe
+    /// the suspect node on our behalf.
+    fn send_indirect_probes(&mut self, socket: &UdpSocket) {
+        let suspect_id = match self.pending_probe {
+            Some(ref p) => p.target,
+            None => return,
+        };
+
+        let peers: Vec<(NodeId, SocketAddr)> = self
+            .peer_addrs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&(&id, _)| id != suspect_id)
+            .map(|(&id, &addr)| (id, addr))
+            .collect();
+
+        if peers.is_empty() {
+            return;
+        }
+
+        // Get the suspect's address for the PING_REQ payload
+        let suspect_addr = match self.peer_addrs.lock().unwrap().get(&suspect_id).copied() {
+            Some(a) => a,
+            None => return,
+        };
+
+        // Build PING_REQ message with target info appended after updates
+        let updates = self.collect_member_updates();
+        let suspect_addr_str = suspect_addr.to_string();
+        let suspect_addr_bytes = suspect_addr_str.as_bytes();
+
+        let mut payload = updates;
+        payload.extend_from_slice(&suspect_id.0.to_le_bytes());
+        payload.extend_from_slice(&(suspect_addr_bytes.len() as u16).to_le_bytes());
+        payload.extend_from_slice(suspect_addr_bytes);
+
+        let msg = self.encode_message(MSG_PING_REQ, &payload);
+
+        // Send to up to K random other peers
+        let k = INDIRECT_PROBE_K.min(peers.len());
+        for &(_, addr) in peers.iter().take(k) {
             let swim_addr = SocketAddr::new(addr.ip(), self.config.bind_addr.port());
             let _ = socket.send_to(&msg, swim_addr);
+        }
+
+        // Mark that indirect probes have been sent
+        if let Some(ref mut p) = self.pending_probe {
+            p.indirect_sent = true;
         }
     }
 

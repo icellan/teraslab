@@ -70,6 +70,14 @@ impl Engine {
         self.index.read().lookup(key)
     }
 
+    /// Iterate over all registered transaction keys (for migration scanning).
+    ///
+    /// Returns a snapshot of all keys currently in the index. This acquires
+    /// a read lock briefly and collects all keys into a Vec.
+    pub fn all_keys(&self) -> Vec<TxKey> {
+        self.index.read().iter().map(|(k, _)| k).collect()
+    }
+
     /// Execute a batch of spends on a single transaction.
     ///
     /// All spends target the same txid. The per-txid lock is held for the

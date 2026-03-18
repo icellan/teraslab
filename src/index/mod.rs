@@ -150,6 +150,13 @@ impl Index {
         self.table.is_empty()
     }
 
+    /// Iterate over all `(TxKey, TxIndexEntry)` pairs in the primary index.
+    ///
+    /// Used for migration scanning and index snapshots.
+    pub fn iter(&self) -> impl Iterator<Item = (TxKey, TxIndexEntry)> + '_ {
+        self.table.iter()
+    }
+
     /// Statistics for monitoring.
     pub fn stats(&self) -> IndexStats {
         IndexStats {
