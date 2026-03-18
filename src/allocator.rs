@@ -303,6 +303,21 @@ impl SlotAllocator {
     fn free_region_count(&self) -> usize {
         self.freelist.len()
     }
+
+    /// Start of the data region on device.
+    pub fn data_region_start(&self) -> u64 {
+        self.data_region_start
+    }
+
+    /// Current high-water mark — all allocations are below this offset.
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
+
+    /// Device alignment in bytes.
+    pub fn device_alignment(&self) -> usize {
+        self.alignment
+    }
 }
 
 // ---------------------------------------------------------------------------

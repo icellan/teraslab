@@ -1,0 +1,215 @@
+//! DAH (delete-at-height) secondary index.
+//!
+//! Maps `delete_at_height` values to sets of transaction keys. The pruner
+//! queries `range_query(0..=current_height)` each block to find records
+//! eligible for deletion.
+//!
+//! NOT critical for crash safety — a stale DAH index only delays pruning.
+//! Rebuilt from a device scan on recovery.
+
+use crate::index::TxKey;
+use std::collections::{BTreeMap, HashMap};
+
+/// Secondary index mapping delete_at_height to transactions.
+pub struct DahIndex {
+    /// Forward map: height -> txids scheduled for deletion at that height.
+    by_height: BTreeMap<u32, Vec<TxKey>>,
+    /// Reverse map: txid -> current delete_at_height (for O(1) removal).
+    by_txid: HashMap<TxKey, u32>,
+}
+
+impl DahIndex {
+    /// Create an empty DAH index.
+    pub fn new() -> Self {
+        Self {
+            by_height: BTreeMap::new(),
+            by_txid: HashMap::new(),
+        }
+    }
+
+    /// Insert a transaction into the DAH index.
+    ///
+    /// If the txid already has a DAH entry at a different height, the old
+    /// entry is removed first (handles DAH updates on re-org).
+    pub fn insert(&mut self, height: u32, key: TxKey) {
+        // Remove old entry if it exists at a different height.
+        if let Some(&old_height) = self.by_txid.get(&key) {
+            if old_height == height {
+                return; // Already at this height, no-op.
+            }
+            self.remove_from_height_vec(old_height, &key);
+        }
+        self.by_txid.insert(key, height);
+        self.by_height.entry(height).or_default().push(key);
+    }
+
+    /// Remove a transaction from the DAH index.
+    ///
+    /// No-op if the key is not present.
+    pub fn remove(&mut self, key: &TxKey) {
+        if let Some(height) = self.by_txid.remove(key) {
+            self.remove_from_height_vec(height, key);
+        }
+    }
+
+    /// Return all txids with delete_at_height in `[0, current_height]`.
+    ///
+    /// Results are returned in ascending height order.
+    pub fn range_query(&self, current_height: u32) -> Vec<TxKey> {
+        let mut result = Vec::new();
+        for (_, keys) in self.by_height.range(..=current_height) {
+            result.extend_from_slice(keys);
+        }
+        result
+    }
+
+    /// Number of entries in the index.
+    pub fn len(&self) -> usize {
+        self.by_txid.len()
+    }
+
+    /// Whether the index is empty.
+    pub fn is_empty(&self) -> bool {
+        self.by_txid.is_empty()
+    }
+
+    /// Remove all entries.
+    pub fn clear(&mut self) {
+        self.by_height.clear();
+        self.by_txid.clear();
+    }
+
+    /// Iterate over all `(height, key)` pairs (for snapshot).
+    pub fn iter(&self) -> impl Iterator<Item = (u32, TxKey)> + '_ {
+        self.by_height
+            .iter()
+            .flat_map(|(&h, keys)| keys.iter().map(move |&k| (h, k)))
+    }
+
+    /// Remove a key from the Vec at the given height, cleaning up empty vecs.
+    fn remove_from_height_vec(&mut self, height: u32, key: &TxKey) {
+        if let Some(keys) = self.by_height.get_mut(&height) {
+            keys.retain(|k| k != key);
+            if keys.is_empty() {
+                self.by_height.remove(&height);
+            }
+        }
+    }
+}
+
+impl Default for DahIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(n: u8) -> TxKey {
+        let mut txid = [0u8; 32];
+        txid[0] = n;
+        TxKey { txid }
+    }
+
+    #[test]
+    fn insert_single_range_query() {
+        let mut idx = DahIndex::new();
+        idx.insert(100, key(1));
+        let result = idx.range_query(100);
+        assert_eq!(result, vec![key(1)]);
+    }
+
+    #[test]
+    fn insert_multiple_heights_range_query() {
+        let mut idx = DahIndex::new();
+        idx.insert(100, key(1));
+        idx.insert(100, key(2));
+        idx.insert(200, key(3));
+
+        let r100 = idx.range_query(100);
+        assert_eq!(r100.len(), 2);
+        assert!(r100.contains(&key(1)));
+        assert!(r100.contains(&key(2)));
+
+        let r200 = idx.range_query(200);
+        assert_eq!(r200.len(), 3);
+
+        let r99 = idx.range_query(99);
+        assert!(r99.is_empty());
+    }
+
+    #[test]
+    fn insert_then_remove() {
+        let mut idx = DahIndex::new();
+        idx.insert(100, key(1));
+        idx.remove(&key(1));
+        assert!(idx.range_query(100).is_empty());
+        assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn insert_updates_height() {
+        let mut idx = DahIndex::new();
+        idx.insert(100, key(1));
+        idx.insert(200, key(1)); // Move to height 200
+
+        assert!(idx.range_query(100).is_empty());
+        assert_eq!(idx.range_query(200), vec![key(1)]);
+        assert_eq!(idx.len(), 1);
+    }
+
+    #[test]
+    fn remove_nonexistent_is_noop() {
+        let mut idx = DahIndex::new();
+        idx.remove(&key(99)); // Should not panic
+        assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn ten_thousand_entries() {
+        let mut idx = DahIndex::new();
+        for i in 0u32..10_000 {
+            let height = (i % 100) * 10; // 100 distinct heights
+            let mut txid = [0u8; 32];
+            txid[0..4].copy_from_slice(&i.to_le_bytes());
+            idx.insert(height, TxKey { txid });
+        }
+        assert_eq!(idx.len(), 10_000);
+
+        // Range query for first 50 heights (0..490)
+        let result = idx.range_query(490);
+        assert_eq!(result.len(), 5_000); // 100 entries per height × 50 heights
+    }
+
+    #[test]
+    fn len_tracks_inserts_and_removes() {
+        let mut idx = DahIndex::new();
+        idx.insert(1, key(1));
+        idx.insert(2, key(2));
+        idx.insert(3, key(3));
+        assert_eq!(idx.len(), 3);
+
+        idx.remove(&key(2));
+        assert_eq!(idx.len(), 2);
+
+        idx.remove(&key(2)); // Already removed
+        assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn clear_empties_index() {
+        let mut idx = DahIndex::new();
+        idx.insert(1, key(1));
+        idx.insert(2, key(2));
+        idx.clear();
+        assert_eq!(idx.len(), 0);
+        assert!(idx.is_empty());
+        assert!(idx.range_query(u32::MAX).is_empty());
+    }
+}
