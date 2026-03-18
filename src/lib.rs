@@ -1,4 +1,5 @@
 pub mod allocator;
+pub mod cluster;
 pub mod device;
 pub mod index;
 pub mod io;
