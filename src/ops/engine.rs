@@ -12,6 +12,7 @@ use crate::ops::create::*;
 use crate::ops::delete_eval::{evaluate_delete_at_height, DahPatch};
 use crate::ops::error::SpendError;
 use crate::ops::mark_longest_chain::*;
+use crate::ops::remaining::*;
 use crate::ops::set_mined::*;
 use crate::ops::signal::Signal;
 use crate::ops::spend::*;
@@ -843,6 +844,297 @@ impl Engine {
             })?;
 
         Ok(buf[intra..intra + entry.cold_size as usize].to_vec())
+    }
+
+    // -----------------------------------------------------------------------
+    // Remaining operations (Phase 6)
+    // -----------------------------------------------------------------------
+
+    /// Freeze a UTXO (set status to FROZEN, spending_data all 0xFF).
+    ///
+    /// Does NOT modify metadata counters — frozen does not count as "spent".
+    pub fn freeze(&self, req: &FreezeRequest) -> Result<(), SpendError> {
+        let _guard = self.locks.lock(&req.tx_key);
+        let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
+        let ro = entry.record_offset;
+
+        let meta = io::read_metadata(&*self.device, ro)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        if req.offset >= { meta.utxo_count } {
+            return Err(SpendError::UtxoNotFound { offset: req.offset });
+        }
+
+        let slot = io::read_utxo_slot(&*self.device, ro, req.offset)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        if slot.hash != req.utxo_hash {
+            return Err(SpendError::UtxoHashMismatch { offset: req.offset });
+        }
+        match slot.status {
+            UTXO_FROZEN => return Err(SpendError::AlreadyFrozen { offset: req.offset }),
+            UTXO_SPENT => {
+                return Err(SpendError::AlreadySpent {
+                    offset: req.offset,
+                    spending_data: slot.spending_data,
+                });
+            }
+            UTXO_UNSPENT => {}
+            _ => {
+                return Err(SpendError::StorageError {
+                    detail: format!("unexpected status {:#04x}", slot.status),
+                });
+            }
+        }
+
+        let frozen = UtxoSlot::new_frozen(req.utxo_hash);
+        io::write_utxo_slot(&*self.device, ro, req.offset, &frozen)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        Ok(())
+    }
+
+    /// Unfreeze a UTXO (set status to UNSPENT, spending_data zeroed).
+    pub fn unfreeze(&self, req: &UnfreezeRequest) -> Result<(), SpendError> {
+        let _guard = self.locks.lock(&req.tx_key);
+        let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
+        let ro = entry.record_offset;
+
+        let meta = io::read_metadata(&*self.device, ro)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        if req.offset >= { meta.utxo_count } {
+            return Err(SpendError::UtxoNotFound { offset: req.offset });
+        }
+
+        let slot = io::read_utxo_slot(&*self.device, ro, req.offset)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        if slot.hash != req.utxo_hash {
+            return Err(SpendError::UtxoHashMismatch { offset: req.offset });
+        }
+        if slot.status != UTXO_FROZEN {
+            return Err(SpendError::NotFrozen { offset: req.offset });
+        }
+
+        let unspent = UtxoSlot::new_unspent(req.utxo_hash);
+        io::write_utxo_slot(&*self.device, ro, req.offset, &unspent)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        Ok(())
+    }
+
+    /// Reassign a frozen UTXO to a new hash with a spendable-after cooldown.
+    pub fn reassign(&self, req: &ReassignRequest) -> Result<(), SpendError> {
+        let _guard = self.locks.lock(&req.tx_key);
+        let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
+        let ro = entry.record_offset;
+
+        let mut meta = io::read_metadata(&*self.device, ro)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        if req.offset >= { meta.utxo_count } {
+            return Err(SpendError::UtxoNotFound { offset: req.offset });
+        }
+
+        let slot = io::read_utxo_slot(&*self.device, ro, req.offset)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        if slot.hash != req.utxo_hash {
+            return Err(SpendError::UtxoHashMismatch { offset: req.offset });
+        }
+        if slot.status != UTXO_FROZEN {
+            return Err(SpendError::NotFrozen { offset: req.offset });
+        }
+
+        // Write new slot with spendable height encoded in spending_data[0..4]
+        let spendable_height = req.block_height.saturating_add(req.spendable_after);
+        let mut new_slot = UtxoSlot::new_unspent(req.new_utxo_hash);
+        new_slot.spending_data[0..4].copy_from_slice(&spendable_height.to_le_bytes());
+
+        io::write_utxo_slot(&*self.device, ro, req.offset, &new_slot)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+
+        // Update metadata (generation, updated_at, reassignment_count)
+        meta.reassignment_count = meta.reassignment_count.saturating_add(1);
+        meta.generation = { meta.generation }.wrapping_add(1);
+        meta.updated_at = now_millis();
+        io::write_metadata(&*self.device, ro, &meta)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+
+        Ok(())
+    }
+
+    /// Set or clear the conflicting flag on a transaction.
+    pub fn set_conflicting(
+        &self,
+        req: &SetConflictingRequest,
+    ) -> Result<SetConflictingResponse, SpendError> {
+        let _guard = self.locks.lock(&req.tx_key);
+        let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
+        let ro = entry.record_offset;
+
+        let mut meta = io::read_metadata(&*self.device, ro)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let old_dah = { meta.delete_at_height };
+
+        if req.value {
+            meta.flags |= TxFlags::CONFLICTING;
+        } else {
+            meta.flags -= meta.flags & TxFlags::CONFLICTING;
+        }
+
+        meta.generation = { meta.generation }.wrapping_add(1);
+        meta.updated_at = now_millis();
+
+        let (signal, dah_patch) = evaluate_delete_at_height(
+            &meta,
+            req.current_block_height,
+            req.block_height_retention,
+        );
+        if let Some(ref patch) = dah_patch {
+            apply_dah_patch(&mut meta, patch);
+        }
+
+        io::write_metadata(&*self.device, ro, &meta)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+
+        let new_dah = { meta.delete_at_height };
+        if new_dah != old_dah {
+            let mut dah = self.dah_index.lock();
+            if old_dah != 0 { dah.remove(&req.tx_key); }
+            if new_dah != 0 { dah.insert(new_dah, req.tx_key); }
+        }
+
+        Ok(SetConflictingResponse { signal })
+    }
+
+    /// Set or clear the locked flag on a transaction.
+    pub fn set_locked(&self, req: &SetLockedRequest) -> Result<(), SpendError> {
+        let _guard = self.locks.lock(&req.tx_key);
+        let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
+        let ro = entry.record_offset;
+
+        let mut meta = io::read_metadata(&*self.device, ro)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let old_dah = { meta.delete_at_height };
+
+        if req.value {
+            meta.flags |= TxFlags::LOCKED;
+            // Locking clears deleteAtHeight
+            if old_dah != 0 {
+                meta.delete_at_height = 0;
+            }
+        } else {
+            meta.flags -= meta.flags & TxFlags::LOCKED;
+        }
+
+        meta.generation = { meta.generation }.wrapping_add(1);
+        meta.updated_at = now_millis();
+
+        io::write_metadata(&*self.device, ro, &meta)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+
+        let new_dah = { meta.delete_at_height };
+        if new_dah != old_dah {
+            let mut dah = self.dah_index.lock();
+            if old_dah != 0 { dah.remove(&req.tx_key); }
+            if new_dah != 0 { dah.insert(new_dah, req.tx_key); }
+        }
+
+        Ok(())
+    }
+
+    /// Preserve a record until a specific block height.
+    ///
+    /// Clears `delete_at_height` and sets `preserve_until`. If the record
+    /// has the EXTERNAL flag, returns signal PRESERVE.
+    pub fn preserve_until(
+        &self,
+        req: &PreserveUntilRequest,
+    ) -> Result<PreserveUntilResponse, SpendError> {
+        let _guard = self.locks.lock(&req.tx_key);
+        let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
+        let ro = entry.record_offset;
+
+        let mut meta = io::read_metadata(&*self.device, ro)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let old_dah = { meta.delete_at_height };
+
+        meta.delete_at_height = 0;
+        meta.preserve_until = req.block_height;
+        meta.generation = { meta.generation }.wrapping_add(1);
+        meta.updated_at = now_millis();
+
+        io::write_metadata(&*self.device, ro, &meta)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+
+        if old_dah != 0 {
+            self.dah_index.lock().remove(&req.tx_key);
+        }
+
+        let signal = if meta.flags.contains(TxFlags::EXTERNAL) {
+            Signal::Preserve
+        } else {
+            Signal::None
+        };
+        Ok(PreserveUntilResponse { signal })
+    }
+
+    /// Delete a transaction record.
+    ///
+    /// Removes from index, frees device space, and cleans up secondary indexes.
+    pub fn delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
+        let _guard = self.locks.lock(&req.tx_key);
+
+        let entry = match self.index.read().lookup(&req.tx_key) {
+            Some(e) => e,
+            None => return Err(SpendError::TxNotFound),
+        };
+
+        let record_size = {
+            let meta = io::read_metadata(&*self.device, entry.record_offset)
+                .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+            ({ meta.record_size }) as u64
+        };
+
+        // Free device space
+        self.allocator
+            .lock()
+            .free(entry.record_offset, record_size)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+
+        // Remove from index
+        self.index.write().unregister(&req.tx_key);
+
+        // Clean up secondary indexes
+        self.dah_index.lock().remove(&req.tx_key);
+        self.unmined_index.lock().remove(&req.tx_key);
+
+        Ok(())
+    }
+
+    /// Read spending data for a specific UTXO (point read, no lock needed).
+    pub fn get_spend(&self, req: &GetSpendRequest) -> Result<GetSpendResponse, SpendError> {
+        let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
+        let ro = entry.record_offset;
+
+        let meta = io::read_metadata(&*self.device, ro)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        if req.offset >= { meta.utxo_count } {
+            return Err(SpendError::UtxoNotFound { offset: req.offset });
+        }
+
+        let slot = io::read_utxo_slot(&*self.device, ro, req.offset)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        if slot.hash != req.utxo_hash {
+            return Err(SpendError::UtxoHashMismatch { offset: req.offset });
+        }
+
+        let spending_data = match slot.status {
+            UTXO_UNSPENT => None,
+            UTXO_SPENT | UTXO_FROZEN => Some(slot.spending_data),
+            UTXO_PRUNED => Some(slot.spending_data),
+            _ => None,
+        };
+
+        Ok(GetSpendResponse {
+            status: slot.status,
+            spending_data,
+            locktime: { meta.locktime },
+        })
     }
 
     /// Get the unmined index (for testing).
@@ -3099,5 +3391,629 @@ mod tests {
         assert_eq!({ meta.unmined_since }, 0);
         assert_eq!(meta.block_entry_count, 1);
         assert_eq!({ meta.block_entries_inline[0].block_id }, 42);
+    }
+
+    // ===================================================================
+    // Phase 6: Remaining operations tests
+    // ===================================================================
+
+    // -- Freeze tests --
+
+    #[test]
+    fn freeze_unspent() {
+        let engine = create_engine();
+        let req = make_create_req(60, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        engine.freeze(&FreezeRequest { tx_key: key, offset: 2, utxo_hash: req.utxo_hashes[2] }).unwrap();
+        let slot = engine.read_slot(&key, 2).unwrap();
+        assert!(slot.is_frozen());
+        assert_eq!(slot.spending_data, [0xFF; 36]);
+    }
+
+    #[test]
+    fn freeze_already_frozen() {
+        let engine = create_engine();
+        let req = make_create_req(61, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+
+        match engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }) {
+            Err(SpendError::AlreadyFrozen { offset: 0 }) => {}
+            other => panic!("expected AlreadyFrozen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn freeze_spent_utxo() {
+        let engine = create_engine();
+        let req = make_create_req(62, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        let mut sd = [0u8; 36]; sd[0] = 0xAB;
+        engine.spend(&SpendRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0], spending_data: sd,
+            ignore_conflicting: false, ignore_locked: false,
+            current_block_height: 1000, block_height_retention: 288,
+        }).unwrap();
+
+        match engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }) {
+            Err(SpendError::AlreadySpent { offset: 0, .. }) => {}
+            other => panic!("expected AlreadySpent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn freeze_nonexistent_tx() {
+        let engine = create_engine();
+        match engine.freeze(&FreezeRequest { tx_key: TxKey { txid: [0xFF; 32] }, offset: 0, utxo_hash: [0; 32] }) {
+            Err(SpendError::TxNotFound) => {}
+            other => panic!("expected TxNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn freeze_hash_mismatch() {
+        let engine = create_engine();
+        let req = make_create_req(63, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        match engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: [0xFF; 32] }) {
+            Err(SpendError::UtxoHashMismatch { .. }) => {}
+            other => panic!("expected UtxoHashMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn freeze_does_not_change_counter() {
+        let engine = create_engine();
+        let req = make_create_req(64, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.spent_utxos }, 0);
+    }
+
+    #[test]
+    fn freeze_then_spend_returns_frozen() {
+        let engine = create_engine();
+        let req = make_create_req(65, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+
+        let mut sd = [0u8; 36]; sd[0] = 0xAB;
+        match engine.spend(&SpendRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0], spending_data: sd,
+            ignore_conflicting: false, ignore_locked: false,
+            current_block_height: 1000, block_height_retention: 288,
+        }) {
+            Err(SpendError::Frozen { offset: 0 }) => {}
+            other => panic!("expected Frozen, got {other:?}"),
+        }
+    }
+
+    // -- Unfreeze tests --
+
+    #[test]
+    fn unfreeze_frozen() {
+        let engine = create_engine();
+        let req = make_create_req(70, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.freeze(&FreezeRequest { tx_key: key, offset: 1, utxo_hash: req.utxo_hashes[1] }).unwrap();
+        engine.unfreeze(&UnfreezeRequest { tx_key: key, offset: 1, utxo_hash: req.utxo_hashes[1] }).unwrap();
+
+        let slot = engine.read_slot(&key, 1).unwrap();
+        assert!(slot.is_unspent());
+        assert_eq!(slot.spending_data, [0u8; 36]);
+    }
+
+    #[test]
+    fn unfreeze_not_frozen() {
+        let engine = create_engine();
+        let req = make_create_req(71, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        match engine.unfreeze(&UnfreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }) {
+            Err(SpendError::NotFrozen { offset: 0 }) => {}
+            other => panic!("expected NotFrozen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unfreeze_then_spend() {
+        let engine = create_engine();
+        let req = make_create_req(72, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+        engine.unfreeze(&UnfreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+
+        let mut sd = [0u8; 36]; sd[0] = 0xAB;
+        engine.spend(&SpendRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0], spending_data: sd,
+            ignore_conflicting: false, ignore_locked: false,
+            current_block_height: 1000, block_height_retention: 288,
+        }).unwrap();
+        assert!(engine.read_slot(&key, 0).unwrap().is_spent());
+    }
+
+    // -- Reassign tests --
+
+    #[test]
+    fn reassign_frozen() {
+        let engine = create_engine();
+        let req = make_create_req(80, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+
+        let new_hash = [0xBBu8; 32];
+        engine.reassign(&ReassignRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
+            new_utxo_hash: new_hash, block_height: 1000, spendable_after: 100,
+        }).unwrap();
+
+        let slot = engine.read_slot(&key, 0).unwrap();
+        assert!(slot.is_unspent());
+        assert_eq!(slot.hash, new_hash);
+        let spendable_h = u32::from_le_bytes(slot.spending_data[0..4].try_into().unwrap());
+        assert_eq!(spendable_h, 1100);
+    }
+
+    #[test]
+    fn reassign_not_frozen() {
+        let engine = create_engine();
+        let req = make_create_req(81, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        match engine.reassign(&ReassignRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
+            new_utxo_hash: [0xBB; 32], block_height: 1000, spendable_after: 100,
+        }) {
+            Err(SpendError::NotFrozen { .. }) => {}
+            other => panic!("expected NotFrozen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reassign_hash_mismatch() {
+        let engine = create_engine();
+        let req = make_create_req(82, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+
+        match engine.reassign(&ReassignRequest {
+            tx_key: key, offset: 0, utxo_hash: [0xFF; 32],
+            new_utxo_hash: [0xBB; 32], block_height: 1000, spendable_after: 100,
+        }) {
+            Err(SpendError::UtxoHashMismatch { .. }) => {}
+            other => panic!("expected UtxoHashMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reassign_not_spendable_until_cooldown() {
+        let engine = create_engine();
+        let req = make_create_req(83, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+
+        let new_hash = [0xCC; 32];
+        engine.reassign(&ReassignRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
+            new_utxo_hash: new_hash, block_height: 1000, spendable_after: 100,
+        }).unwrap();
+
+        // Not spendable at block 1099
+        let mut sd = [0u8; 36]; sd[0] = 0xDD;
+        match engine.spend(&SpendRequest {
+            tx_key: key, offset: 0, utxo_hash: new_hash, spending_data: sd,
+            ignore_conflicting: false, ignore_locked: false,
+            current_block_height: 1099, block_height_retention: 288,
+        }) {
+            Err(SpendError::FrozenUntil { .. }) => {}
+            other => panic!("expected FrozenUntil, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reassign_spendable_after_cooldown() {
+        let engine = create_engine();
+        let req = make_create_req(84, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+
+        let new_hash = [0xDD; 32];
+        engine.reassign(&ReassignRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
+            new_utxo_hash: new_hash, block_height: 1000, spendable_after: 100,
+        }).unwrap();
+
+        // Spendable at block 1101 (> 1100)
+        let mut sd = [0u8; 36]; sd[0] = 0xEE;
+        engine.spend(&SpendRequest {
+            tx_key: key, offset: 0, utxo_hash: new_hash, spending_data: sd,
+            ignore_conflicting: false, ignore_locked: false,
+            current_block_height: 1101, block_height_retention: 288,
+        }).unwrap();
+        assert!(engine.read_slot(&key, 0).unwrap().is_spent());
+    }
+
+    #[test]
+    fn reassign_old_hash_spend_fails() {
+        let engine = create_engine();
+        let req = make_create_req(85, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+        engine.reassign(&ReassignRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
+            new_utxo_hash: [0xEE; 32], block_height: 1000, spendable_after: 100,
+        }).unwrap();
+
+        let mut sd = [0u8; 36]; sd[0] = 0xFF;
+        match engine.spend(&SpendRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0], spending_data: sd,
+            ignore_conflicting: false, ignore_locked: false,
+            current_block_height: 2000, block_height_retention: 288,
+        }) {
+            Err(SpendError::UtxoHashMismatch { .. }) => {}
+            other => panic!("expected UtxoHashMismatch, got {other:?}"),
+        }
+    }
+
+    // -- SetConflicting tests --
+
+    #[test]
+    fn set_conflicting_true() {
+        let engine = create_engine();
+        let req = make_create_req(90, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        engine.set_conflicting(&SetConflictingRequest {
+            tx_key: key, value: true, current_block_height: 1000, block_height_retention: 288,
+        }).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert!(meta.flags.contains(TxFlags::CONFLICTING));
+        assert_ne!({ meta.delete_at_height }, 0); // DAH set for conflicting
+    }
+
+    #[test]
+    fn set_conflicting_false() {
+        let engine = create_engine();
+        let mut req = make_create_req(91, 5);
+        req.conflicting = true;
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        engine.set_conflicting(&SetConflictingRequest {
+            tx_key: key, value: false, current_block_height: 1000, block_height_retention: 288,
+        }).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert!(!meta.flags.contains(TxFlags::CONFLICTING));
+    }
+
+    #[test]
+    fn set_conflicting_blocks_spend() {
+        let engine = create_engine();
+        let req = make_create_req(92, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.set_conflicting(&SetConflictingRequest {
+            tx_key: key, value: true, current_block_height: 1000, block_height_retention: 288,
+        }).unwrap();
+
+        let mut sd = [0u8; 36]; sd[0] = 0xAA;
+        match engine.spend(&SpendRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0], spending_data: sd,
+            ignore_conflicting: false, ignore_locked: false,
+            current_block_height: 1000, block_height_retention: 288,
+        }) {
+            Err(SpendError::Conflicting) => {}
+            other => panic!("expected Conflicting, got {other:?}"),
+        }
+    }
+
+    // -- SetLocked tests --
+
+    #[test]
+    fn set_locked_true() {
+        let engine = create_engine();
+        let req = make_create_req(100, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.set_locked(&SetLockedRequest { tx_key: key, value: true }).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert!(meta.flags.contains(TxFlags::LOCKED));
+    }
+
+    #[test]
+    fn set_locked_clears_dah() {
+        let engine = create_engine();
+        let req = make_create_req(101, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        // Set conflicting to get a DAH
+        engine.set_conflicting(&SetConflictingRequest {
+            tx_key: key, value: true, current_block_height: 1000, block_height_retention: 288,
+        }).unwrap();
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_ne!({ meta.delete_at_height }, 0);
+
+        // Lock clears DAH
+        engine.set_locked(&SetLockedRequest { tx_key: key, value: true }).unwrap();
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.delete_at_height }, 0);
+    }
+
+    #[test]
+    fn set_locked_false() {
+        let engine = create_engine();
+        let mut req = make_create_req(102, 5);
+        req.locked = true;
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.set_locked(&SetLockedRequest { tx_key: key, value: false }).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert!(!meta.flags.contains(TxFlags::LOCKED));
+    }
+
+    #[test]
+    fn locked_blocks_spend() {
+        let engine = create_engine();
+        let req = make_create_req(103, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.set_locked(&SetLockedRequest { tx_key: key, value: true }).unwrap();
+
+        let mut sd = [0u8; 36]; sd[0] = 0xAA;
+        match engine.spend(&SpendRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0], spending_data: sd,
+            ignore_conflicting: false, ignore_locked: false,
+            current_block_height: 1000, block_height_retention: 288,
+        }) {
+            Err(SpendError::Locked) => {}
+            other => panic!("expected Locked, got {other:?}"),
+        }
+    }
+
+    // -- PreserveUntil tests --
+
+    #[test]
+    fn preserve_until_stores_value() {
+        let engine = create_engine();
+        let req = make_create_req(110, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        // Set a DAH first
+        engine.set_conflicting(&SetConflictingRequest {
+            tx_key: key, value: true, current_block_height: 1000, block_height_retention: 288,
+        }).unwrap();
+
+        engine.preserve_until(&PreserveUntilRequest { tx_key: key, block_height: 5000 }).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.preserve_until }, 5000);
+        assert_eq!({ meta.delete_at_height }, 0); // DAH cleared
+    }
+
+    #[test]
+    fn preserve_until_blocks_dah_on_spend() {
+        let engine = create_engine();
+        let mut req = make_create_req(111, 2);
+        req.mined_block_infos = vec![MinedBlockInfo { block_id: 1, block_height: 900, subtree_idx: 0 }];
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.preserve_until(&PreserveUntilRequest { tx_key: key, block_height: 5000 }).unwrap();
+
+        // Spend all — DAH should NOT be set because preserve_until is active
+        let mut sd = [0u8; 36]; sd[0] = 0xAA;
+        engine.spend(&SpendRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0], spending_data: sd,
+            ignore_conflicting: false, ignore_locked: false,
+            current_block_height: 1000, block_height_retention: 288,
+        }).unwrap();
+        sd[0] = 0xBB;
+        engine.spend(&SpendRequest {
+            tx_key: key, offset: 1, utxo_hash: req.utxo_hashes[1], spending_data: sd,
+            ignore_conflicting: false, ignore_locked: false,
+            current_block_height: 1000, block_height_retention: 288,
+        }).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.delete_at_height }, 0);
+    }
+
+    #[test]
+    fn preserve_until_external_signals_preserve() {
+        let engine = create_engine();
+        let mut req = make_create_req(112, 2);
+        req.is_external = true;
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let resp = engine.preserve_until(&PreserveUntilRequest { tx_key: key, block_height: 5000 }).unwrap();
+        assert_eq!(resp.signal, Signal::Preserve);
+    }
+
+    // -- Delete tests --
+
+    #[test]
+    fn delete_existing() {
+        let engine = create_engine();
+        let req = make_create_req(120, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+        assert!(engine.lookup(&key).is_none());
+    }
+
+    #[test]
+    fn delete_then_lookup_none() {
+        let engine = create_engine();
+        let req = make_create_req(121, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+
+        match engine.read_metadata(&key) {
+            Err(SpendError::TxNotFound) => {}
+            other => panic!("expected TxNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_nonexistent() {
+        let engine = create_engine();
+        match engine.delete(&DeleteRequest { tx_key: TxKey { txid: [0xFF; 32] } }) {
+            Err(SpendError::TxNotFound) => {}
+            other => panic!("expected TxNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_frees_space_for_reuse() {
+        let engine = create_engine();
+        let req1 = make_create_req(122, 100);
+        let key1 = req1.tx_key();
+        let resp1 = engine.create(&req1).unwrap();
+        let offset1 = resp1.record_offset;
+
+        engine.delete(&DeleteRequest { tx_key: key1 }).unwrap();
+
+        // Create another record — should reuse the freed space
+        let req2 = make_create_req(123, 100);
+        let resp2 = engine.create(&req2).unwrap();
+        // Freed space should be reused (same offset)
+        assert_eq!(resp2.record_offset, offset1);
+    }
+
+    // -- GetSpend tests --
+
+    #[test]
+    fn get_spend_unspent() {
+        let engine = create_engine();
+        let mut req = make_create_req(130, 5);
+        req.locktime = 42_000;
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let resp = engine.get_spend(&GetSpendRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
+        }).unwrap();
+        assert_eq!(resp.status, UTXO_UNSPENT);
+        assert!(resp.spending_data.is_none());
+        assert_eq!(resp.locktime, 42_000);
+    }
+
+    #[test]
+    fn get_spend_spent() {
+        let engine = create_engine();
+        let req = make_create_req(131, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        let mut sd = [0u8; 36]; sd[0] = 0xAB;
+        engine.spend(&SpendRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0], spending_data: sd,
+            ignore_conflicting: false, ignore_locked: false,
+            current_block_height: 1000, block_height_retention: 288,
+        }).unwrap();
+
+        let resp = engine.get_spend(&GetSpendRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
+        }).unwrap();
+        assert_eq!(resp.status, UTXO_SPENT);
+        assert_eq!(resp.spending_data, Some(sd));
+    }
+
+    #[test]
+    fn get_spend_frozen() {
+        let engine = create_engine();
+        let req = make_create_req(132, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+
+        let resp = engine.get_spend(&GetSpendRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
+        }).unwrap();
+        assert_eq!(resp.status, UTXO_FROZEN);
+        assert_eq!(resp.spending_data, Some([0xFF; 36]));
+    }
+
+    #[test]
+    fn get_spend_nonexistent_tx() {
+        let engine = create_engine();
+        match engine.get_spend(&GetSpendRequest {
+            tx_key: TxKey { txid: [0xFF; 32] }, offset: 0, utxo_hash: [0; 32],
+        }) {
+            Err(SpendError::TxNotFound) => {}
+            other => panic!("expected TxNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_spend_hash_mismatch() {
+        let engine = create_engine();
+        let req = make_create_req(133, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        match engine.get_spend(&GetSpendRequest {
+            tx_key: key, offset: 0, utxo_hash: [0xFF; 32],
+        }) {
+            Err(SpendError::UtxoHashMismatch { .. }) => {}
+            other => panic!("expected UtxoHashMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_spend_offset_out_of_range() {
+        let engine = create_engine();
+        let req = make_create_req(134, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        match engine.get_spend(&GetSpendRequest {
+            tx_key: key, offset: 99, utxo_hash: [0; 32],
+        }) {
+            Err(SpendError::UtxoNotFound { offset: 99 }) => {}
+            other => panic!("expected UtxoNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_spend_is_readonly() {
+        let engine = create_engine();
+        let req = make_create_req(135, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let meta_before = engine.read_metadata(&key).unwrap();
+        engine.get_spend(&GetSpendRequest {
+            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
+        }).unwrap();
+        let meta_after = engine.read_metadata(&key).unwrap();
+
+        assert_eq!({ meta_before.generation }, { meta_after.generation });
+        assert_eq!({ meta_before.updated_at }, { meta_after.updated_at });
     }
 }

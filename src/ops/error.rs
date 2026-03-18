@@ -84,6 +84,20 @@ pub enum SpendError {
         offset: u32,
     },
 
+    /// UTXO is already frozen (for freeze operation).
+    #[error("ALREADY_FROZEN at offset {offset}")]
+    AlreadyFrozen {
+        /// The slot offset.
+        offset: u32,
+    },
+
+    /// UTXO is not in frozen state (for unfreeze/reassign).
+    #[error("UTXO_NOT_FROZEN at offset {offset}")]
+    NotFrozen {
+        /// The slot offset.
+        offset: u32,
+    },
+
     /// Device I/O error during operation.
     #[error("STORAGE_ERROR: {detail}")]
     StorageError {

@@ -15,4 +15,6 @@ pub enum Signal {
     DeleteAtHeightSet,
     /// `delete_at_height` was cleared on this record.
     DeleteAtHeightUnset,
+    /// `preserve_until` was set on an external record.
+    Preserve,
 }
