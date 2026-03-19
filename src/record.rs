@@ -338,6 +338,8 @@ struct TxMetadataRaw {
     _delete_at_height: u32,
     _preserve_until: u32,
     _external_ref: ExternalRef,
+    _conflicting_children_count: u8,
+    _conflicting_children_offset: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +412,11 @@ pub struct TxMetadata {
     /// External blob reference (for large transactions).
     pub external_ref: ExternalRef,
 
+    /// Number of conflicting children txids stored for this transaction.
+    pub conflicting_children_count: u8,
+    /// Device offset to a separately-allocated block of txids (0 = none).
+    pub conflicting_children_offset: u64,
+
     /// Padding to reach `METADATA_SIZE` (64-byte aligned).
     pub _padding: [u8; METADATA_PADDING],
 }
@@ -450,6 +457,8 @@ impl TxMetadata {
             delete_at_height: 0,
             preserve_until: 0,
             external_ref: ExternalRef::zeroed(),
+            conflicting_children_count: 0,
+            conflicting_children_offset: 0,
             _padding: [0u8; METADATA_PADDING],
         }
     }
@@ -537,6 +546,7 @@ const _: () = assert!(BLOCK_ENTRY_SIZE == 12);
 const _: () = assert!(UTXO_SLOT_SIZE == 69);
 const _: () = assert!(std::mem::size_of::<TxFlags>() == 1);
 const _: () = assert!(METADATA_SIZE.is_multiple_of(64));
+const _: () = assert!(METADATA_SIZE == 256); // must not grow — conflicting_children fits in padding
 const _: () = assert!(std::mem::size_of::<TxMetadata>() == METADATA_SIZE);
 
 // ---------------------------------------------------------------------------

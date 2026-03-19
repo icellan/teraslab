@@ -73,8 +73,9 @@ const (
 	FieldMetadata     uint16 = 0x0001
 	FieldUtxoSlots    uint16 = 0x0002
 	FieldColdData     uint16 = 0x0004
-	FieldBlockEntries uint16 = 0x0008
-	FieldAll          uint16 = 0x000F
+	FieldBlockEntries          uint16 = 0x0008
+	FieldConflictingChildren uint16 = 0x0010
+	FieldAll                 uint16 = 0x001F
 )
 
 // UTXO slot status values.

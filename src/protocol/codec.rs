@@ -326,6 +326,7 @@ pub struct WireCreateItem {
     pub mined_block_id: Option<u32>,
     pub mined_block_height: Option<u32>,
     pub mined_subtree_idx: Option<u32>,
+    pub parent_txids: Vec<[u8; 32]>,
 }
 
 /// Encode a CreateBatch request payload.
@@ -359,6 +360,10 @@ pub fn encode_create_batch(items: &[WireCreateItem]) -> Vec<u8> {
             put_u32(&mut buf, block_id);
             put_u32(&mut buf, item.mined_block_height.unwrap_or(0));
             put_u32(&mut buf, item.mined_subtree_idx.unwrap_or(0));
+        }
+        put_u32(&mut buf, item.parent_txids.len() as u32);
+        for ptx in &item.parent_txids {
+            buf.extend_from_slice(ptx);
         }
     }
     buf
@@ -411,10 +416,22 @@ pub fn decode_create_batch(data: &[u8]) -> Option<Vec<WireCreateItem>> {
             (None, None, None)
         };
 
+        if pos + 4 > data.len() { return None; }
+        let parent_count = get_u32(data, pos) as usize; pos += 4;
+        if pos + parent_count * 32 > data.len() { return None; }
+        let mut parent_txids = Vec::with_capacity(parent_count);
+        for _ in 0..parent_count {
+            let mut ptx = [0u8; 32];
+            ptx.copy_from_slice(&data[pos..pos+32]);
+            parent_txids.push(ptx);
+            pos += 32;
+        }
+
         items.push(WireCreateItem {
             txid, tx_version, locktime, fee, size_in_bytes, extended_size,
             is_coinbase, spending_height, created_at, flags, utxo_hashes,
             cold_data, mined_block_id, mined_block_height, mined_subtree_idx,
+            parent_txids,
         });
     }
     Some(items)
@@ -437,8 +454,10 @@ impl FieldMask {
     pub const COLD_DATA: u16    = 0x0004;
     /// Include block entries.
     pub const BLOCK_ENTRIES: u16 = 0x0008;
+    /// Include conflicting children txids.
+    pub const CONFLICTING_CHILDREN: u16 = 0x0010;
     /// Include all fields.
-    pub const ALL: u16          = 0x000F;
+    pub const ALL: u16          = 0x001F;
 
     /// Whether the mask includes the given flag.
     pub fn has(self, flag: u16) -> bool {
@@ -1079,6 +1098,7 @@ mod tests {
             mined_block_id: None,
             mined_block_height: None,
             mined_subtree_idx: None,
+            parent_txids: vec![],
         }).collect();
         let encoded = encode_create_batch(&items);
         let decoded = decode_create_batch(&encoded).unwrap();
@@ -1105,6 +1125,7 @@ mod tests {
             mined_block_id: Some(42),
             mined_block_height: Some(800_000),
             mined_subtree_idx: Some(7),
+            parent_txids: vec![],
         }];
         let encoded = encode_create_batch(&items);
         let decoded = decode_create_batch(&encoded).unwrap();

@@ -432,35 +432,57 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
         }
         ReplicaOp::Create {
             tx_key,
-            metadata_bytes: _,
+            metadata_bytes,
             utxo_hashes,
             cold_data: _,
         } => {
-            // Build a CreateRequest. The replica allocates independently
-            // from the master; the storage offsets may differ.
+            // Build a CreateRequest using metadata from the master.
+            // The metadata_bytes contains: tx_version(4) + locktime(4) + fee(8) +
+            // size_in_bytes(8) + extended_size(8) + is_coinbase(1) + spending_height(4) +
+            // created_at(8) + flags(1) = 46 bytes.
+            let (tx_version, locktime, fee, size_in_bytes, extended_size,
+                 is_coinbase, spending_height, created_at) =
+                if metadata_bytes.len() >= 46 {
+                    let m = metadata_bytes.as_slice();
+                    (
+                        u32::from_le_bytes(m[0..4].try_into().unwrap()),
+                        u32::from_le_bytes(m[4..8].try_into().unwrap()),
+                        u64::from_le_bytes(m[8..16].try_into().unwrap()),
+                        u64::from_le_bytes(m[16..24].try_into().unwrap()),
+                        u64::from_le_bytes(m[24..32].try_into().unwrap()),
+                        m[32] != 0,
+                        u32::from_le_bytes(m[33..37].try_into().unwrap()),
+                        u64::from_le_bytes(m[37..45].try_into().unwrap()),
+                    )
+                } else {
+                    (1, 0, 0, 0, 0, false, 0,
+                     std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64)
+                };
+
             let create_req = CreateRequest {
                 tx_id: tx_key.txid,
-                tx_version: 1,
-                locktime: 0,
-                fee: 0,
-                size_in_bytes: 0,
-                extended_size: 0,
-                is_coinbase: false,
-                spending_height: 0,
+                tx_version,
+                locktime,
+                fee,
+                size_in_bytes,
+                extended_size,
+                is_coinbase,
+                spending_height,
                 utxo_hashes: utxo_hashes.clone(),
                 inputs: None,
                 outputs: None,
                 inpoints: None,
                 is_external: false,
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
+                created_at,
                 block_height: 0,
                 mined_block_infos: vec![],
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                parent_txids: vec![],
             };
             match engine.create(&create_req) {
                 Ok(_) => Ok(()),
@@ -558,6 +580,7 @@ mod tests {
             frozen: false,
             conflicting: false,
             locked: false,
+            parent_txids: vec![],
         };
         engine.create(&req).unwrap();
     }

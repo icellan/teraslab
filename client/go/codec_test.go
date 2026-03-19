@@ -257,23 +257,26 @@ func TestCreateBatch100Items(t *testing.T) {
 	}
 }
 
-func TestCreateBatchWithColdData(t *testing.T) {
+func TestCreateBatchWithTxData(t *testing.T) {
 	bid := uint32(42)
 	bh := uint32(800_000)
 	si := uint32(7)
 	items := []CreateItem{{
-		TxID:             testTxID(1),
-		TxVersion:        1,
-		Locktime:         500_000,
-		Fee:              5000,
-		SizeInBytes:      1024,
-		ExtendedSize:     2048,
-		IsCoinbase:       true,
-		SpendingHeight:   100,
-		CreatedAt:        1700000000000,
-		Flags:            0x01,
-		UtxoHashes:       []UtxoHash{{0xAA}, {0xBB}},
-		ColdData:         []byte{0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03},
+		TxID:           testTxID(1),
+		TxVersion:      1,
+		Locktime:       500_000,
+		Fee:            5000,
+		SizeInBytes:    1024,
+		ExtendedSize:   2048,
+		IsCoinbase:     true,
+		SpendingHeight: 100,
+		CreatedAt:      1700000000000,
+		Flags:          0x01,
+		UtxoHashes:     []UtxoHash{{0xAA}, {0xBB}},
+		TxData: TxData{
+			Inputs:  []byte{0xDE, 0xAD, 0xBE, 0xEF},
+			Outputs: []byte{0x01, 0x02, 0x03},
+		},
 		MinedBlockID:     &bid,
 		MinedBlockHeight: &bh,
 		MinedSubtreeIdx:  &si,

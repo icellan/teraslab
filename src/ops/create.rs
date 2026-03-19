@@ -79,6 +79,8 @@ pub struct CreateRequest {
     pub conflicting: bool,
     /// Create as locked.
     pub locked: bool,
+    /// Parent txids for conflicting-children updates when conflicting=true.
+    pub parent_txids: Vec<[u8; 32]>,
 }
 
 impl CreateRequest {

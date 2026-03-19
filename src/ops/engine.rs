@@ -843,6 +843,14 @@ impl Engine {
             self.unmined_index.lock().insert(meta.unmined_since, key);
         }
 
+        // Update parent records' conflicting-children lists
+        if req.conflicting {
+            for parent_txid in &req.parent_txids {
+                let parent_key = TxKey { txid: *parent_txid };
+                let _ = self.append_conflicting_child(&parent_key, req.tx_id);
+            }
+        }
+
         Ok(CreateResponse {
             record_offset,
             utxo_count,
@@ -1040,6 +1048,118 @@ impl Engine {
         Ok(())
     }
 
+    /// Append a child txid to a parent record's conflicting-children list.
+    /// Deduplicates: if the child already exists, this is a no-op.
+    /// Returns Ok(()) if parent not found (may be on another node).
+    pub fn append_conflicting_child(
+        &self,
+        parent_key: &TxKey,
+        child_txid: [u8; 32],
+    ) -> Result<(), SpendError> {
+        let _guard = self.locks.lock(parent_key);
+        let entry = match self.index.read().lookup(parent_key) {
+            Some(e) => e,
+            None => return Ok(()),
+        };
+        let ro = entry.record_offset;
+        let mut meta = io::read_metadata(&*self.device, ro)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+
+        let count = { meta.conflicting_children_count } as usize;
+        let offset = { meta.conflicting_children_offset };
+
+        // Read existing children
+        let mut children: Vec<[u8; 32]> = Vec::with_capacity(count + 1);
+        if count > 0 && offset != 0 {
+            let align = self.device.alignment();
+            let aligned_base = offset / align as u64 * align as u64;
+            let intra = (offset - aligned_base) as usize;
+            let read_len = (intra + count * 32).div_ceil(align) * align;
+            let mut buf = crate::device::AlignedBuf::new(read_len, align);
+            self.device.pread(&mut buf, aligned_base)
+                .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+            for i in 0..count {
+                let start = intra + i * 32;
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&buf[start..start + 32]);
+                children.push(txid);
+            }
+        }
+
+        // Dedup
+        if children.iter().any(|c| *c == child_txid) {
+            return Ok(());
+        }
+        children.push(child_txid);
+
+        // Free old block
+        if count > 0 && offset != 0 {
+            let _ = self.allocator.lock().free(offset, (count * 32) as u64);
+        }
+
+        // Allocate and write new block
+        let new_size = (children.len() * 32) as u64;
+        let new_offset = self.allocator.lock().allocate(new_size)
+            .map_err(|_| SpendError::StorageError { detail: "device full for conflicting children".into() })?;
+
+        let align = self.device.alignment();
+        let aligned_base = new_offset / align as u64 * align as u64;
+        let intra = (new_offset - aligned_base) as usize;
+        let write_len = (intra + children.len() * 32).div_ceil(align) * align;
+        let mut wbuf = crate::device::AlignedBuf::new(write_len, align);
+        self.device.pread(&mut wbuf, aligned_base)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        for (i, child) in children.iter().enumerate() {
+            wbuf[intra + i * 32..intra + (i + 1) * 32].copy_from_slice(child);
+        }
+        self.device.pwrite(&wbuf, aligned_base)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+
+        // Update metadata
+        meta.conflicting_children_count = children.len() as u8;
+        meta.conflicting_children_offset = new_offset;
+        meta.generation = { meta.generation }.wrapping_add(1);
+        meta.updated_at = now_millis();
+        io::write_metadata(&*self.device, ro, &meta)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+
+        Ok(())
+    }
+
+    /// Read all conflicting children txids for a transaction.
+    pub fn read_conflicting_children(
+        &self,
+        key: &TxKey,
+    ) -> Result<Vec<[u8; 32]>, SpendError> {
+        let entry = self.index.read().lookup(key).ok_or(SpendError::TxNotFound)?;
+        let ro = entry.record_offset;
+        let meta = io::read_metadata(&*self.device, ro)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+
+        let count = { meta.conflicting_children_count } as usize;
+        let offset = { meta.conflicting_children_offset };
+        if count == 0 || offset == 0 {
+            return Ok(Vec::new());
+        }
+
+        let align = self.device.alignment();
+        let aligned_base = offset / align as u64 * align as u64;
+        let intra = (offset - aligned_base) as usize;
+        let read_len = (intra + count * 32).div_ceil(align) * align;
+        let mut buf = crate::device::AlignedBuf::new(read_len, align);
+        self.device.pread(&mut buf, aligned_base)
+            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+
+        let mut result = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = intra + i * 32;
+            let mut txid = [0u8; 32];
+            txid.copy_from_slice(&buf[start..start + 32]);
+            result.push(txid);
+        }
+        Ok(result)
+    }
+
     /// Set or clear the conflicting flag on a transaction.
     pub fn set_conflicting(
         &self,
@@ -1079,6 +1199,20 @@ impl Engine {
             let mut dah = self.dah_index.lock();
             if old_dah != 0 { dah.remove(&req.tx_key); }
             if new_dah != 0 { dah.insert(new_dah, req.tx_key); }
+        }
+
+        // Update parent records' conflicting-children lists
+        if req.value {
+            // Read cold data to find parent txids from inputs.
+            // Must drop the child lock first to avoid holding two locks.
+            drop(_guard);
+            if let Ok(cold_bytes) = self.read_cold_data(&req.tx_key) {
+                let parent_txids = extract_parent_txids_from_cold_data(&cold_bytes);
+                for parent_txid in parent_txids {
+                    let parent_key = TxKey { txid: parent_txid };
+                    let _ = self.append_conflicting_child(&parent_key, req.tx_key.txid);
+                }
+            }
         }
 
         Ok(SetConflictingResponse { signal })
@@ -1278,6 +1412,49 @@ impl Engine {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Extract unique parent txids from cold data bytes.
+///
+/// Cold data format: `[inputs_len:4 LE][inputs_blob][outputs_len:4 LE][...][inpoints_len:4 LE][...]`
+/// The inputs_blob contains length-prefixed entries: `[count:4 LE][per-input: [len:4 LE][extended-bytes]]`
+/// The first 32 bytes of each extended-input are the prev_txid.
+fn extract_parent_txids_from_cold_data(cold_bytes: &[u8]) -> Vec<[u8; 32]> {
+    if cold_bytes.len() < 4 {
+        return Vec::new();
+    }
+    // Outer wrapper: [inputs_blob_len:4][inputs_blob][...]
+    let inputs_blob_len = u32::from_le_bytes(cold_bytes[0..4].try_into().unwrap_or([0; 4])) as usize;
+    if inputs_blob_len == 0 || 4 + inputs_blob_len > cold_bytes.len() {
+        return Vec::new();
+    }
+    let inputs_blob = &cold_bytes[4..4 + inputs_blob_len];
+
+    // Inner format: [count:4][per-input: [len:4][extended-bytes]]
+    if inputs_blob.len() < 4 {
+        return Vec::new();
+    }
+    let count = u32::from_le_bytes(inputs_blob[0..4].try_into().unwrap_or([0; 4])) as usize;
+    let mut pos = 4usize;
+    let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..count {
+        if pos + 4 > inputs_blob.len() {
+            break;
+        }
+        let entry_len = u32::from_le_bytes(inputs_blob[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
+        pos += 4;
+        if entry_len < 32 || pos + entry_len > inputs_blob.len() {
+            break;
+        }
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&inputs_blob[pos..pos + 32]);
+        if seen.insert(txid) {
+            result.push(txid);
+        }
+        pos += entry_len;
+    }
+    result
+}
 
 /// Build inline cold data from optional inputs/outputs/inpoints.
 ///
@@ -4478,6 +4655,7 @@ mod tests {
             frozen: false,
             conflicting: false,
             locked: false,
+            parent_txids: vec![],
         }
     }
 

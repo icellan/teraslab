@@ -3,8 +3,13 @@
 //! In clustered mode, the dispatcher checks shard ownership before
 //! processing key-based operations. If this node doesn't own the shard,
 //! it returns a Redirect response.
+//!
+//! After successful mutations:
+//! - Redo log entries are appended for crash recovery.
+//! - Replication ops are sent to replica nodes (if in cluster mode with RF > 1).
 
 use crate::cluster::coordinator::RunningCluster;
+use crate::cluster::shards::ShardTable;
 use crate::index::TxKey;
 use crate::ops::create::*;
 use crate::ops::engine::Engine;
@@ -17,38 +22,55 @@ use crate::ops::unspend::*;
 use crate::protocol::codec::*;
 use crate::protocol::frame::*;
 use crate::protocol::opcodes::*;
+use crate::redo::{RedoLog, RedoOp};
+use crate::replication::protocol::{ReplicaBatch, ReplicaOp};
 use crate::replication::receiver::handle_replica_batch;
+use crate::replication::tcp_transport::TcpReplicaTransport;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 /// Dispatch a request frame to the appropriate Engine method.
 ///
 /// If `cluster` is Some, shard ownership is checked for key-based operations.
 /// Requests for keys not owned by this node get a Redirect response.
+///
+/// If `redo_log` is Some, successful mutations are logged for crash recovery.
+/// Redo log writes are best-effort: failures are logged but do not fail the
+/// client request (the data has already been applied to the engine).
 pub fn handle_request(
     request: &RequestFrame,
     engine: &Engine,
     max_batch_size: u32,
     cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
 ) -> ResponseFrame {
+    // Reject mutations when the cluster lacks quorum to prevent split-brain.
+    if is_mutation_opcode(request.op_code) {
+        if let Some(err_resp) = check_quorum(cluster, request.request_id) {
+            return err_resp;
+        }
+    }
+
     match request.op_code {
-        OP_SPEND_BATCH => handle_spend_batch(request, engine, max_batch_size, cluster),
-        OP_UNSPEND_BATCH => handle_unspend_batch(request, engine, max_batch_size, cluster),
-        OP_SET_MINED_BATCH => handle_set_mined_batch(request, engine, max_batch_size, cluster),
-        OP_CREATE_BATCH => handle_create_batch(request, engine, max_batch_size, cluster),
-        OP_FREEZE_BATCH => handle_freeze_batch(request, engine, max_batch_size, cluster),
-        OP_UNFREEZE_BATCH => handle_unfreeze_batch(request, engine, max_batch_size, cluster),
-        OP_REASSIGN_BATCH => handle_reassign_batch(request, engine, max_batch_size, cluster),
-        OP_SET_CONFLICTING_BATCH => handle_set_conflicting_batch(request, engine, max_batch_size, cluster),
-        OP_SET_LOCKED_BATCH => handle_set_locked_batch(request, engine, max_batch_size, cluster),
-        OP_PRESERVE_UNTIL_BATCH => handle_preserve_until_batch(request, engine, max_batch_size, cluster),
-        OP_DELETE_BATCH => handle_delete_batch(request, engine, max_batch_size, cluster),
-        OP_MARK_LONGEST_CHAIN_BATCH => handle_mark_longest_chain_batch(request, engine, max_batch_size, cluster),
+        OP_SPEND_BATCH => handle_spend_batch(request, engine, max_batch_size, cluster, redo_log),
+        OP_UNSPEND_BATCH => handle_unspend_batch(request, engine, max_batch_size, cluster, redo_log),
+        OP_SET_MINED_BATCH => handle_set_mined_batch(request, engine, max_batch_size, cluster, redo_log),
+        OP_CREATE_BATCH => handle_create_batch(request, engine, max_batch_size, cluster, redo_log),
+        OP_FREEZE_BATCH => handle_freeze_batch(request, engine, max_batch_size, cluster, redo_log),
+        OP_UNFREEZE_BATCH => handle_unfreeze_batch(request, engine, max_batch_size, cluster, redo_log),
+        OP_REASSIGN_BATCH => handle_reassign_batch(request, engine, max_batch_size, cluster, redo_log),
+        OP_SET_CONFLICTING_BATCH => handle_set_conflicting_batch(request, engine, max_batch_size, cluster, redo_log),
+        OP_SET_LOCKED_BATCH => handle_set_locked_batch(request, engine, max_batch_size, cluster, redo_log),
+        OP_PRESERVE_UNTIL_BATCH => handle_preserve_until_batch(request, engine, max_batch_size, cluster, redo_log),
+        OP_DELETE_BATCH => handle_delete_batch(request, engine, max_batch_size, cluster, redo_log),
+        OP_MARK_LONGEST_CHAIN_BATCH => handle_mark_longest_chain_batch(request, engine, max_batch_size, cluster, redo_log),
         OP_GET_BATCH => handle_get_batch(request, engine, max_batch_size, cluster),
         OP_GET_SPEND_BATCH => handle_get_spend_batch(request, engine, max_batch_size, cluster),
         OP_QUERY_OLD_UNMINED => handle_query_old_unmined(request, engine),
-        OP_PRESERVE_TRANSACTIONS => handle_preserve_transactions(request, engine, max_batch_size, cluster),
-        OP_PROCESS_EXPIRED_PRESERVATIONS => handle_process_expired(request, engine),
+        OP_PRESERVE_TRANSACTIONS => handle_preserve_transactions(request, engine, max_batch_size, cluster, redo_log),
+        OP_PROCESS_EXPIRED_PRESERVATIONS => handle_process_expired(request, engine, redo_log),
         OP_GET_PARTITION_MAP => handle_get_partition_map(request, cluster),
         OP_PING => ResponseFrame {
             request_id: request.request_id,
@@ -78,6 +100,170 @@ pub fn handle_request(
         }
         _ => error_response(request.request_id, ERR_INTERNAL, "unknown opcode"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Redo log helper
+// ---------------------------------------------------------------------------
+
+/// Append redo ops to the log and flush. Best-effort: errors are logged
+/// to stderr but do not propagate. The data is already on the device via
+/// the engine, so redo logging failures only affect crash recovery coverage.
+fn write_redo_ops(redo_log: Option<&Mutex<RedoLog>>, ops: &[RedoOp]) {
+    let redo = match redo_log {
+        Some(r) => r,
+        None => return,
+    };
+    let mut log = redo.lock();
+    for op in ops {
+        if let Err(e) = log.append(op.clone()) {
+            eprintln!("redo log append error: {e}");
+            return;
+        }
+    }
+    if let Err(e) = log.flush() {
+        eprintln!("redo log flush error: {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Replication helper
+// ---------------------------------------------------------------------------
+
+/// Send replication operations to replica nodes for the given key.
+///
+/// For each replica node that owns a copy of the key's shard, a background
+/// thread is spawned to send the batch via TCP. Replication failures are
+/// logged but do not affect the client response — the replica will catch up
+/// from the redo log or via anti-entropy.
+fn replicate_ops(cluster: Option<&RunningCluster>, tx_key: &TxKey, ops: Vec<ReplicaOp>) {
+    let cluster = match cluster {
+        Some(c) => c,
+        None => {
+            return;
+        }
+    };
+    if ops.is_empty() {
+        return;
+    }
+
+    let shard = ShardTable::shard_for_key(tx_key);
+    let table = cluster.shard_table();
+    let table_guard = table.read().unwrap();
+    let assignment = table_guard.assignment(shard);
+
+    if assignment.replicas.is_empty() {
+        return;
+    }
+
+    // Collect replica addresses before dropping the lock
+    let mut replica_addrs = Vec::new();
+    for replica_id in &assignment.replicas {
+        if let Some(addr) = cluster.node_addr(replica_id) {
+            replica_addrs.push(addr);
+        }
+    }
+    drop(table_guard);
+
+    if replica_addrs.is_empty() {
+        return;
+    }
+
+    let batch = ReplicaBatch {
+        first_sequence: 0, // Sequence tracking handled by ReplicationManager for formal replication
+        ops,
+    };
+
+    for addr in replica_addrs {
+        let batch_clone = batch.clone();
+        std::thread::spawn(move || {
+            match send_replica_batch_to(addr, &batch_clone) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("replication to {addr} failed: {e}");
+                }
+            }
+        });
+    }
+}
+
+/// Send a `ReplicaBatch` to a replica node via TCP using the wire protocol.
+fn send_replica_batch_to(
+    addr: std::net::SocketAddr,
+    batch: &ReplicaBatch,
+) -> std::result::Result<(), String> {
+    use crate::replication::manager::ReplicaTransport;
+
+    let mut transport = TcpReplicaTransport::connect(
+        &addr.to_string(),
+        Duration::from_secs(5),
+    ).map_err(|e| format!("connect: {e}"))?;
+
+    transport.send_batch(batch).map_err(|e| format!("send: {e}"))?;
+
+    match transport.recv_ack(Duration::from_secs(5)) {
+        Ok(crate::replication::protocol::ReplicaAck::Ok { .. }) => Ok(()),
+        Ok(crate::replication::protocol::ReplicaAck::Error { message, .. }) => {
+            Err(format!("replica error: {message}"))
+        }
+        Err(e) => Err(format!("recv_ack: {e}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quorum check
+// ---------------------------------------------------------------------------
+
+/// Check if the cluster has quorum (majority of nodes are alive).
+///
+/// Returns `None` if quorum is met or no cluster is configured (single-node mode).
+/// Returns `Some(ResponseFrame)` with an error if quorum is not met, meaning
+/// this node cannot safely accept mutations.
+///
+/// In a clustered deployment, a node must see at least 2 alive nodes (including
+/// itself) to accept writes. This prevents split-brain scenarios where isolated
+/// nodes diverge by independently accepting conflicting writes.
+fn check_quorum(cluster: Option<&RunningCluster>, request_id: u64) -> Option<ResponseFrame> {
+    let cluster = cluster?;
+    let alive = cluster.alive_node_count();
+    let peak = cluster.peak_cluster_size();
+
+    // A node that has only ever seen itself (peak=1) is a standalone cluster
+    // node — quorum is trivially met. This covers single-node test setups
+    // and bootstrap scenarios.
+    if peak <= 1 {
+        return None;
+    }
+
+    // For a node that was previously part of a multi-node cluster, require
+    // a majority (more than half of the peak observed cluster size) to prevent
+    // split-brain. With 3 nodes, need >= 2. With 5 nodes, need >= 3.
+    let quorum_needed = (peak / 2) + 1;
+    if alive < quorum_needed {
+        return Some(error_response(request_id, ERR_INTERNAL, "no quorum"));
+    }
+    None
+}
+
+/// Returns true if the given opcode is a mutation that requires quorum.
+fn is_mutation_opcode(op: u16) -> bool {
+    matches!(
+        op,
+        OP_SPEND_BATCH
+            | OP_UNSPEND_BATCH
+            | OP_SET_MINED_BATCH
+            | OP_CREATE_BATCH
+            | OP_FREEZE_BATCH
+            | OP_UNFREEZE_BATCH
+            | OP_REASSIGN_BATCH
+            | OP_SET_CONFLICTING_BATCH
+            | OP_SET_LOCKED_BATCH
+            | OP_PRESERVE_UNTIL_BATCH
+            | OP_DELETE_BATCH
+            | OP_MARK_LONGEST_CHAIN_BATCH
+            | OP_PRESERVE_TRANSACTIONS
+            | OP_PROCESS_EXPIRED_PRESERVATIONS
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +317,13 @@ fn check_shard_ownership(
 // Spend
 // ---------------------------------------------------------------------------
 
-fn handle_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+fn handle_spend_batch(
+    req: &RequestFrame,
+    engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+) -> ResponseFrame {
     let (params, items) = match decode_spend_batch(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed spend batch"),
@@ -147,6 +339,8 @@ fn handle_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clust
     }
 
     let mut errors: Vec<BatchItemError> = Vec::new();
+    let mut redo_ops: Vec<RedoOp> = Vec::new();
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
 
     for (txid, group) in &by_txid {
         // Check shard ownership for the first item in the group (all share the same txid)
@@ -183,6 +377,33 @@ fn handle_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clust
 
         match engine.spend_multi(&multi_req) {
             Ok(resp) => {
+                // Collect successful items for redo/replication
+                let error_indices: std::collections::HashSet<u32> =
+                    resp.errors.keys().copied().collect();
+
+                let key = TxKey { txid: *txid };
+                let mut key_repl_ops = Vec::new();
+
+                for &(i, item) in group {
+                    if !error_indices.contains(&(i as u32)) {
+                        redo_ops.push(RedoOp::Spend {
+                            tx_key: key,
+                            offset: item.vout,
+                            spending_data: item.spending_data,
+                            new_spent_count: 0, // Precise count not tracked per-item here
+                        });
+                        key_repl_ops.push(ReplicaOp::Spend {
+                            tx_key: key,
+                            offset: item.vout,
+                            spending_data: item.spending_data,
+                        });
+                    }
+                }
+
+                if !key_repl_ops.is_empty() {
+                    repl_ops_by_key.push((key, key_repl_ops));
+                }
+
                 for (idx, err) in resp.errors {
                     errors.push(spend_error_to_batch_error(idx, &err));
                 }
@@ -194,6 +415,11 @@ fn handle_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clust
                 }
             }
         }
+    }
+
+    write_redo_ops(redo_log, &redo_ops);
+    for (key, ops) in repl_ops_by_key {
+        replicate_ops(cluster, &key, ops);
     }
 
     if errors.is_empty() {
@@ -216,7 +442,13 @@ fn handle_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clust
 // Unspend
 // ---------------------------------------------------------------------------
 
-fn handle_unspend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+fn handle_unspend_batch(
+    req: &RequestFrame,
+    engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+) -> ResponseFrame {
     let (params, items) = match decode_unspend_batch(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed unspend batch"),
@@ -226,21 +458,43 @@ fn handle_unspend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clu
     }
 
     let mut errors = Vec::new();
+    let mut redo_ops: Vec<RedoOp> = Vec::new();
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
+        let key = TxKey { txid: item.txid };
         let result = engine.unspend(&UnspendRequest {
-            tx_key: TxKey { txid: item.txid },
+            tx_key: key,
             offset: item.vout,
             utxo_hash: item.utxo_hash,
             current_block_height: params.current_block_height,
             block_height_retention: params.block_height_retention,
         });
-        if let Err(err) = result {
-            errors.push(spend_error_to_batch_error(i as u32, &err));
+        match result {
+            Ok(_) => {
+                redo_ops.push(RedoOp::Unspend {
+                    tx_key: key,
+                    offset: item.vout,
+                    new_spent_count: 0,
+                });
+                repl_ops_by_key.push((key, vec![ReplicaOp::Unspend {
+                    tx_key: key,
+                    offset: item.vout,
+                }]));
+            }
+            Err(err) => {
+                errors.push(spend_error_to_batch_error(i as u32, &err));
+            }
         }
+    }
+
+    write_redo_ops(redo_log, &redo_ops);
+    for (key, ops) in repl_ops_by_key {
+        replicate_ops(cluster, &key, ops);
     }
 
     batch_response(req.request_id, &errors)
@@ -250,7 +504,13 @@ fn handle_unspend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clu
 // SetMined
 // ---------------------------------------------------------------------------
 
-fn handle_set_mined_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+fn handle_set_mined_batch(
+    req: &RequestFrame,
+    engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+) -> ResponseFrame {
     let (params, txids) = match decode_set_mined_batch(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed set_mined batch"),
@@ -260,13 +520,17 @@ fn handle_set_mined_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, c
     }
 
     let mut errors = Vec::new();
+    let mut redo_ops: Vec<RedoOp> = Vec::new();
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
+        let key = TxKey { txid: *txid };
         let result = engine.set_mined(&SetMinedRequest {
-            tx_key: TxKey { txid: *txid },
+            tx_key: key,
             block_id: params.block_id,
             block_height: params.block_height,
             subtree_idx: params.subtree_idx,
@@ -275,9 +539,39 @@ fn handle_set_mined_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, c
             on_longest_chain: params.on_longest_chain,
             unset_mined: params.unset_mined,
         });
-        if let Err(err) = result {
-            errors.push(spend_error_to_batch_error(i as u32, &err));
+        match result {
+            Ok(_) => {
+                redo_ops.push(RedoOp::SetMined {
+                    tx_key: key,
+                    block_id: params.block_id,
+                    block_height: params.block_height,
+                    subtree_idx: params.subtree_idx,
+                    unset: params.unset_mined,
+                });
+                if params.unset_mined {
+                    repl_ops_by_key.push((key, vec![ReplicaOp::UnsetMined {
+                        tx_key: key,
+                        block_id: params.block_id,
+                    }]));
+                } else {
+                    repl_ops_by_key.push((key, vec![ReplicaOp::SetMined {
+                        tx_key: key,
+                        block_id: params.block_id,
+                        block_height: params.block_height,
+                        subtree_idx: params.subtree_idx,
+                        on_longest_chain: params.on_longest_chain,
+                    }]));
+                }
+            }
+            Err(err) => {
+                errors.push(spend_error_to_batch_error(i as u32, &err));
+            }
         }
+    }
+
+    write_redo_ops(redo_log, &redo_ops);
+    for (key, ops) in repl_ops_by_key {
+        replicate_ops(cluster, &key, ops);
     }
 
     batch_response(req.request_id, &errors)
@@ -287,7 +581,47 @@ fn handle_set_mined_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, c
 // Create
 // ---------------------------------------------------------------------------
 
-fn handle_create_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+/// Parse the wire cold_data blob into separate inputs/outputs/inpoints fields.
+/// Wire format: [inputs_len:4 LE][inputs][outputs_len:4 LE][outputs][inpoints_len:4 LE][inpoints]
+fn parse_cold_data_fields(cold_data: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) {
+    if cold_data.len() < 12 {
+        return (None, None, None);
+    }
+    let mut pos = 0usize;
+
+    let il = u32::from_le_bytes(cold_data[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    if pos + il > cold_data.len() { return (None, None, None); }
+    let inputs = cold_data[pos..pos + il].to_vec();
+    pos += il;
+
+    if pos + 4 > cold_data.len() { return (Some(inputs).filter(|v| !v.is_empty()), None, None); }
+    let ol = u32::from_le_bytes(cold_data[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    if pos + ol > cold_data.len() { return (Some(inputs).filter(|v| !v.is_empty()), None, None); }
+    let outputs = cold_data[pos..pos + ol].to_vec();
+    pos += ol;
+
+    if pos + 4 > cold_data.len() { return (Some(inputs).filter(|v| !v.is_empty()), Some(outputs).filter(|v| !v.is_empty()), None); }
+    let pl = u32::from_le_bytes(cold_data[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    if pos + pl > cold_data.len() { return (Some(inputs).filter(|v| !v.is_empty()), Some(outputs).filter(|v| !v.is_empty()), None); }
+    let inpoints = cold_data[pos..pos + pl].to_vec();
+
+    (
+        Some(inputs).filter(|v| !v.is_empty()),
+        Some(outputs).filter(|v| !v.is_empty()),
+        Some(inpoints).filter(|v| !v.is_empty()),
+    )
+}
+
+fn handle_create_batch(
+    req: &RequestFrame,
+    engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+) -> ResponseFrame {
     let items = match decode_create_batch(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed create batch"),
@@ -297,6 +631,8 @@ fn handle_create_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clus
     }
 
     let mut errors = Vec::new();
+    let mut redo_ops: Vec<RedoOp> = Vec::new();
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
 
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
@@ -314,6 +650,9 @@ fn handle_create_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clus
             vec![]
         };
 
+        // Parse cold_data into inputs/outputs/inpoints for the engine.
+        let (inputs, outputs, inpoints) = parse_cold_data_fields(&item.cold_data);
+
         let create_req = CreateRequest {
             tx_id: item.txid,
             tx_version: item.tx_version,
@@ -324,9 +663,9 @@ fn handle_create_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clus
             is_coinbase: item.is_coinbase,
             spending_height: item.spending_height,
             utxo_hashes: item.utxo_hashes.clone(),
-            inputs: None,
-            outputs: None,
-            inpoints: None,
+            inputs,
+            outputs,
+            inpoints,
             is_external: false,
             created_at: item.created_at,
             block_height: item.mined_block_height.unwrap_or(0),
@@ -334,10 +673,41 @@ fn handle_create_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clus
             frozen: item.flags & 0x04 != 0,
             conflicting: item.flags & 0x02 != 0,
             locked: item.flags & 0x01 != 0,
+            parent_txids: item.parent_txids.clone(),
         };
 
         match engine.create(&create_req) {
-            Ok(_) => {}
+            Ok(_) => {
+                let key = TxKey { txid: item.txid };
+                // Look up the just-created record to get its offset for the redo log
+                if let Some(entry) = engine.lookup(&key) {
+                    redo_ops.push(RedoOp::Create {
+                        tx_key: key,
+                        record_offset: entry.record_offset,
+                        utxo_count: item.utxo_hashes.len() as u32,
+                    });
+                }
+                // Serialize metadata for the replica: tx_version(4) + locktime(4) +
+                // fee(8) + size_in_bytes(8) + extended_size(8) + is_coinbase(1) +
+                // spending_height(4) + created_at(8) + flags(1) = 46 bytes.
+                let mut meta_buf = Vec::with_capacity(46);
+                meta_buf.extend_from_slice(&item.tx_version.to_le_bytes());
+                meta_buf.extend_from_slice(&item.locktime.to_le_bytes());
+                meta_buf.extend_from_slice(&item.fee.to_le_bytes());
+                meta_buf.extend_from_slice(&item.size_in_bytes.to_le_bytes());
+                meta_buf.extend_from_slice(&item.extended_size.to_le_bytes());
+                meta_buf.push(if item.is_coinbase { 1 } else { 0 });
+                meta_buf.extend_from_slice(&item.spending_height.to_le_bytes());
+                meta_buf.extend_from_slice(&item.created_at.to_le_bytes());
+                meta_buf.push(item.flags);
+
+                repl_ops_by_key.push((key, vec![ReplicaOp::Create {
+                    tx_key: key,
+                    metadata_bytes: meta_buf,
+                    utxo_hashes: item.utxo_hashes.clone(),
+                    cold_data: if item.cold_data.is_empty() { None } else { Some(item.cold_data.clone()) },
+                }]));
+            }
             Err(CreateError::DuplicateTxId) => {
                 errors.push(BatchItemError {
                     item_index: i as u32,
@@ -355,6 +725,11 @@ fn handle_create_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clus
         }
     }
 
+    write_redo_ops(redo_log, &redo_ops);
+    for (key, ops) in repl_ops_by_key {
+        replicate_ops(cluster, &key, ops);
+    }
+
     batch_response(req.request_id, &errors)
 }
 
@@ -362,7 +737,13 @@ fn handle_create_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clus
 // Freeze / Unfreeze / Delete / SetLocked / etc — simple dispatch
 // ---------------------------------------------------------------------------
 
-fn handle_freeze_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+fn handle_freeze_batch(
+    req: &RequestFrame,
+    engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+) -> ResponseFrame {
     let items = match decode_slot_item_batch(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -371,23 +752,48 @@ fn handle_freeze_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clus
         return error_response(req.request_id, ERR_INTERNAL, "batch too large");
     }
     let mut errors = Vec::new();
+    let mut redo_ops: Vec<RedoOp> = Vec::new();
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
-        if let Err(err) = engine.freeze(&FreezeRequest {
-            tx_key: TxKey { txid: item.txid },
+        let key = TxKey { txid: item.txid };
+        match engine.freeze(&FreezeRequest {
+            tx_key: key,
             offset: item.vout,
             utxo_hash: item.utxo_hash,
         }) {
-            errors.push(spend_error_to_batch_error(i as u32, &err));
+            Ok(()) => {
+                redo_ops.push(RedoOp::Freeze { tx_key: key, offset: item.vout });
+                repl_ops_by_key.push((key, vec![ReplicaOp::Freeze {
+                    tx_key: key,
+                    offset: item.vout,
+                }]));
+            }
+            Err(err) => {
+                errors.push(spend_error_to_batch_error(i as u32, &err));
+            }
         }
     }
+
+    write_redo_ops(redo_log, &redo_ops);
+    for (key, ops) in repl_ops_by_key {
+        replicate_ops(cluster, &key, ops);
+    }
+
     batch_response(req.request_id, &errors)
 }
 
-fn handle_unfreeze_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+fn handle_unfreeze_batch(
+    req: &RequestFrame,
+    engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+) -> ResponseFrame {
     let items = match decode_slot_item_batch(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -396,23 +802,48 @@ fn handle_unfreeze_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cl
         return error_response(req.request_id, ERR_INTERNAL, "batch too large");
     }
     let mut errors = Vec::new();
+    let mut redo_ops: Vec<RedoOp> = Vec::new();
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
-        if let Err(err) = engine.unfreeze(&UnfreezeRequest {
-            tx_key: TxKey { txid: item.txid },
+        let key = TxKey { txid: item.txid };
+        match engine.unfreeze(&UnfreezeRequest {
+            tx_key: key,
             offset: item.vout,
             utxo_hash: item.utxo_hash,
         }) {
-            errors.push(spend_error_to_batch_error(i as u32, &err));
+            Ok(()) => {
+                redo_ops.push(RedoOp::Unfreeze { tx_key: key, offset: item.vout });
+                repl_ops_by_key.push((key, vec![ReplicaOp::Unfreeze {
+                    tx_key: key,
+                    offset: item.vout,
+                }]));
+            }
+            Err(err) => {
+                errors.push(spend_error_to_batch_error(i as u32, &err));
+            }
         }
     }
+
+    write_redo_ops(redo_log, &redo_ops);
+    for (key, ops) in repl_ops_by_key {
+        replicate_ops(cluster, &key, ops);
+    }
+
     batch_response(req.request_id, &errors)
 }
 
-fn handle_reassign_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+fn handle_reassign_batch(
+    req: &RequestFrame,
+    engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+) -> ResponseFrame {
     let (params, items) = match decode_reassign_batch(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -421,26 +852,60 @@ fn handle_reassign_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cl
         return error_response(req.request_id, ERR_INTERNAL, "batch too large");
     }
     let mut errors = Vec::new();
+    let mut redo_ops: Vec<RedoOp> = Vec::new();
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
-        if let Err(err) = engine.reassign(&ReassignRequest {
-            tx_key: TxKey { txid: item.txid },
+        let key = TxKey { txid: item.txid };
+        match engine.reassign(&ReassignRequest {
+            tx_key: key,
             offset: item.vout,
             utxo_hash: item.utxo_hash,
             new_utxo_hash: item.new_utxo_hash,
             block_height: params.block_height,
             spendable_after: params.spendable_after,
         }) {
-            errors.push(spend_error_to_batch_error(i as u32, &err));
+            Ok(()) => {
+                redo_ops.push(RedoOp::Reassign {
+                    tx_key: key,
+                    offset: item.vout,
+                    new_hash: item.new_utxo_hash,
+                    block_height: params.block_height,
+                    spendable_after: params.spendable_after,
+                });
+                repl_ops_by_key.push((key, vec![ReplicaOp::Reassign {
+                    tx_key: key,
+                    offset: item.vout,
+                    new_hash: item.new_utxo_hash,
+                    block_height: params.block_height,
+                    spendable_after: params.spendable_after,
+                }]));
+            }
+            Err(err) => {
+                errors.push(spend_error_to_batch_error(i as u32, &err));
+            }
         }
     }
+
+    write_redo_ops(redo_log, &redo_ops);
+    for (key, ops) in repl_ops_by_key {
+        replicate_ops(cluster, &key, ops);
+    }
+
     batch_response(req.request_id, &errors)
 }
 
-fn handle_set_conflicting_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+fn handle_set_conflicting_batch(
+    req: &RequestFrame,
+    engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+) -> ResponseFrame {
     let (shared, txids) = match decode_txid_batch(&req.payload, 9) { // value(1) + cbh(4) + bhr(4)
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -453,24 +918,56 @@ fn handle_set_conflicting_batch(req: &RequestFrame, engine: &Engine, max_batch: 
     let bhr = u32::from_le_bytes(shared[5..9].try_into().unwrap());
 
     let mut errors = Vec::new();
+    let mut redo_ops: Vec<RedoOp> = Vec::new();
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
-        if let Err(err) = engine.set_conflicting(&SetConflictingRequest {
-            tx_key: TxKey { txid: *txid },
+        let key = TxKey { txid: *txid };
+        match engine.set_conflicting(&SetConflictingRequest {
+            tx_key: key,
             value,
             current_block_height: cbh,
             block_height_retention: bhr,
         }) {
-            errors.push(spend_error_to_batch_error(i as u32, &err));
+            Ok(_) => {
+                redo_ops.push(RedoOp::SetConflicting {
+                    tx_key: key,
+                    value,
+                    current_block_height: cbh,
+                    block_height_retention: bhr,
+                });
+                repl_ops_by_key.push((key, vec![ReplicaOp::SetConflicting {
+                    tx_key: key,
+                    value,
+                    current_block_height: cbh,
+                    retention: bhr,
+                }]));
+            }
+            Err(err) => {
+                errors.push(spend_error_to_batch_error(i as u32, &err));
+            }
         }
     }
+
+    write_redo_ops(redo_log, &redo_ops);
+    for (key, ops) in repl_ops_by_key {
+        replicate_ops(cluster, &key, ops);
+    }
+
     batch_response(req.request_id, &errors)
 }
 
-fn handle_set_locked_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+fn handle_set_locked_batch(
+    req: &RequestFrame,
+    engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+) -> ResponseFrame {
     let (shared, txids) = match decode_txid_batch(&req.payload, 1) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -481,22 +978,47 @@ fn handle_set_locked_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, 
     let value = shared[0] != 0;
 
     let mut errors = Vec::new();
+    let mut redo_ops: Vec<RedoOp> = Vec::new();
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
-        if let Err(err) = engine.set_locked(&SetLockedRequest {
-            tx_key: TxKey { txid: *txid },
+        let key = TxKey { txid: *txid };
+        match engine.set_locked(&SetLockedRequest {
+            tx_key: key,
             value,
         }) {
-            errors.push(spend_error_to_batch_error(i as u32, &err));
+            Ok(()) => {
+                redo_ops.push(RedoOp::SetLocked { tx_key: key, value });
+                repl_ops_by_key.push((key, vec![ReplicaOp::SetLocked {
+                    tx_key: key,
+                    value,
+                }]));
+            }
+            Err(err) => {
+                errors.push(spend_error_to_batch_error(i as u32, &err));
+            }
         }
     }
+
+    write_redo_ops(redo_log, &redo_ops);
+    for (key, ops) in repl_ops_by_key {
+        replicate_ops(cluster, &key, ops);
+    }
+
     batch_response(req.request_id, &errors)
 }
 
-fn handle_preserve_until_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+fn handle_preserve_until_batch(
+    req: &RequestFrame,
+    engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+) -> ResponseFrame {
     let (shared, txids) = match decode_txid_batch(&req.payload, 4) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -507,22 +1029,50 @@ fn handle_preserve_until_batch(req: &RequestFrame, engine: &Engine, max_batch: u
     let height = u32::from_le_bytes(shared[0..4].try_into().unwrap());
 
     let mut errors = Vec::new();
+    let mut redo_ops: Vec<RedoOp> = Vec::new();
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
-        if let Err(err) = engine.preserve_until(&PreserveUntilRequest {
-            tx_key: TxKey { txid: *txid },
+        let key = TxKey { txid: *txid };
+        match engine.preserve_until(&PreserveUntilRequest {
+            tx_key: key,
             block_height: height,
         }) {
-            errors.push(spend_error_to_batch_error(i as u32, &err));
+            Ok(_) => {
+                redo_ops.push(RedoOp::PreserveUntil {
+                    tx_key: key,
+                    block_height: height,
+                });
+                repl_ops_by_key.push((key, vec![ReplicaOp::PreserveUntil {
+                    tx_key: key,
+                    block_height: height,
+                }]));
+            }
+            Err(err) => {
+                errors.push(spend_error_to_batch_error(i as u32, &err));
+            }
         }
     }
+
+    write_redo_ops(redo_log, &redo_ops);
+    for (key, ops) in repl_ops_by_key {
+        replicate_ops(cluster, &key, ops);
+    }
+
     batch_response(req.request_id, &errors)
 }
 
-fn handle_delete_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+fn handle_delete_batch(
+    req: &RequestFrame,
+    engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+) -> ResponseFrame {
     let (_, txids) = match decode_txid_batch(&req.payload, 0) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -531,21 +1081,51 @@ fn handle_delete_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clus
         return error_response(req.request_id, ERR_INTERNAL, "batch too large");
     }
     let mut errors = Vec::new();
+    let mut redo_ops: Vec<RedoOp> = Vec::new();
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
-        if let Err(err) = engine.delete(&DeleteRequest {
-            tx_key: TxKey { txid: *txid },
-        }) {
-            errors.push(spend_error_to_batch_error(i as u32, &err));
+        let key = TxKey { txid: *txid };
+        // Look up the record offset before deletion for the redo log
+        let entry_info = engine.lookup(&key);
+        match engine.delete(&DeleteRequest { tx_key: key }) {
+            Ok(()) => {
+                let (record_offset, record_size) = match entry_info {
+                    Some(e) => (e.record_offset, 0u64), // Size not tracked in index; use 0
+                    None => (0, 0),
+                };
+                redo_ops.push(RedoOp::Delete {
+                    tx_key: key,
+                    record_offset,
+                    record_size,
+                });
+                repl_ops_by_key.push((key, vec![ReplicaOp::Delete { tx_key: key }]));
+            }
+            Err(err) => {
+                errors.push(spend_error_to_batch_error(i as u32, &err));
+            }
         }
     }
+
+    write_redo_ops(redo_log, &redo_ops);
+    for (key, ops) in repl_ops_by_key {
+        replicate_ops(cluster, &key, ops);
+    }
+
     batch_response(req.request_id, &errors)
 }
 
-fn handle_mark_longest_chain_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+fn handle_mark_longest_chain_batch(
+    req: &RequestFrame,
+    engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+) -> ResponseFrame {
     let (shared, txids) = match decode_txid_batch(&req.payload, 9) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -558,20 +1138,38 @@ fn handle_mark_longest_chain_batch(req: &RequestFrame, engine: &Engine, max_batc
     let bhr = u32::from_le_bytes(shared[5..9].try_into().unwrap());
 
     let mut errors = Vec::new();
+    let mut redo_ops: Vec<RedoOp> = Vec::new();
+
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
-        if let Err(err) = engine.mark_on_longest_chain(&MarkOnLongestChainRequest {
-            tx_key: TxKey { txid: *txid },
+        let key = TxKey { txid: *txid };
+        match engine.mark_on_longest_chain(&MarkOnLongestChainRequest {
+            tx_key: key,
             on_longest_chain,
             current_block_height: cbh,
             block_height_retention: bhr,
         }) {
-            errors.push(spend_error_to_batch_error(i as u32, &err));
+            Ok(_) => {
+                redo_ops.push(RedoOp::MarkOnLongestChain {
+                    tx_key: key,
+                    on_longest_chain,
+                    current_block_height: cbh,
+                    block_height_retention: bhr,
+                });
+                // MarkOnLongestChain is metadata-only; no dedicated ReplicaOp
+                // needed — the SetMined replication already covers block tracking.
+            }
+            Err(err) => {
+                errors.push(spend_error_to_batch_error(i as u32, &err));
+            }
         }
     }
+
+    write_redo_ops(redo_log, &redo_ops);
+
     batch_response(req.request_id, &errors)
 }
 
@@ -588,10 +1186,14 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
         return error_response(req.request_id, ERR_INTERNAL, "batch too large");
     }
 
+    let local_read = req.flags & FLAG_LOCAL_READ != 0;
+
     let mut results = Vec::with_capacity(txids.len());
     for txid in &txids {
-        // Reads allowed during outbound migration
-        if let Some(cluster) = cluster {
+        // Reads allowed during outbound migration or when FLAG_LOCAL_READ is set
+        if !local_read
+            && let Some(cluster) = cluster
+        {
             let key = TxKey { txid: *txid };
             if !cluster.is_master(&key) && !cluster.is_migrating_outbound(&key) {
                 results.push(WireGetResult { status: 1, data: vec![] });
@@ -661,6 +1263,19 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
                         data.extend_from_slice(&{ be.subtree_idx }.to_le_bytes());
                     }
                 }
+                if field_mask.has(FieldMask::CONFLICTING_CHILDREN) {
+                    match engine.read_conflicting_children(&key) {
+                        Ok(children) => {
+                            data.push(children.len() as u8);
+                            for child in &children {
+                                data.extend_from_slice(child);
+                            }
+                        }
+                        Err(_) => {
+                            data.push(0u8);
+                        }
+                    }
+                }
                 results.push(WireGetResult { status: 0, data });
             }
             Err(SpendError::TxNotFound) => {
@@ -704,7 +1319,13 @@ fn handle_query_old_unmined(req: &RequestFrame, engine: &Engine) -> ResponseFram
     }
 }
 
-fn handle_preserve_transactions(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+fn handle_preserve_transactions(
+    req: &RequestFrame,
+    engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+) -> ResponseFrame {
     // Same format as PreserveUntilBatch: [count:4][block_height:4][txids]
     let (shared, txids) = match decode_txid_batch(&req.payload, 4) {
         Some(r) => r,
@@ -716,22 +1337,48 @@ fn handle_preserve_transactions(req: &RequestFrame, engine: &Engine, max_batch: 
     let height = u32::from_le_bytes(shared[0..4].try_into().unwrap());
 
     let mut errors = Vec::new();
+    let mut redo_ops: Vec<RedoOp> = Vec::new();
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
-        if let Err(err) = engine.preserve_until(&PreserveUntilRequest {
-            tx_key: TxKey { txid: *txid },
+        let key = TxKey { txid: *txid };
+        match engine.preserve_until(&PreserveUntilRequest {
+            tx_key: key,
             block_height: height,
         }) {
-            errors.push(spend_error_to_batch_error(i as u32, &err));
+            Ok(_) => {
+                redo_ops.push(RedoOp::PreserveUntil {
+                    tx_key: key,
+                    block_height: height,
+                });
+                repl_ops_by_key.push((key, vec![ReplicaOp::PreserveUntil {
+                    tx_key: key,
+                    block_height: height,
+                }]));
+            }
+            Err(err) => {
+                errors.push(spend_error_to_batch_error(i as u32, &err));
+            }
         }
     }
+
+    write_redo_ops(redo_log, &redo_ops);
+    for (key, ops) in repl_ops_by_key {
+        replicate_ops(cluster, &key, ops);
+    }
+
     batch_response(req.request_id, &errors)
 }
 
-fn handle_process_expired(req: &RequestFrame, engine: &Engine) -> ResponseFrame {
+fn handle_process_expired(
+    req: &RequestFrame,
+    engine: &Engine,
+    redo_log: Option<&Mutex<RedoLog>>,
+) -> ResponseFrame {
     // Payload: [current_height:4]
     if req.payload.len() < 4 {
         return error_response(req.request_id, ERR_INTERNAL, "malformed");
@@ -742,13 +1389,28 @@ fn handle_process_expired(req: &RequestFrame, engine: &Engine) -> ResponseFrame 
     let keys = engine.dah_index().range_query(current_height);
     let mut deleted = 0u32;
     let mut failed = 0u32;
+    let mut redo_ops: Vec<RedoOp> = Vec::new();
 
     for key in &keys {
+        let entry_info = engine.lookup(key);
         match engine.delete(&DeleteRequest { tx_key: *key }) {
-            Ok(()) => deleted += 1,
+            Ok(()) => {
+                deleted += 1;
+                let (record_offset, record_size) = match entry_info {
+                    Some(e) => (e.record_offset, 0u64),
+                    None => (0, 0),
+                };
+                redo_ops.push(RedoOp::Delete {
+                    tx_key: *key,
+                    record_offset,
+                    record_size,
+                });
+            }
             Err(_) => failed += 1,
         }
     }
+
+    write_redo_ops(redo_log, &redo_ops);
 
     let mut payload = Vec::with_capacity(8);
     payload.extend_from_slice(&deleted.to_le_bytes());
@@ -774,11 +1436,16 @@ fn handle_get_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, c
         return error_response(req.request_id, ERR_INTERNAL, "batch too large");
     }
 
+    let local_read = req.flags & FLAG_LOCAL_READ != 0;
+
     let mut results = Vec::with_capacity(items.len());
     for item in &items {
         // Check shard ownership — reads are allowed during outbound migration
         // because this node still holds the data until migration completes.
-        if let Some(cluster) = cluster {
+        // FLAG_LOCAL_READ bypasses this check for replication verification.
+        if !local_read
+            && let Some(cluster) = cluster
+        {
             let key = TxKey { txid: item.txid };
             if !cluster.is_master(&key) && !cluster.is_migrating_outbound(&key) {
                 results.push(WireGetSpendResult {

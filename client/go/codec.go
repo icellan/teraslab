@@ -91,10 +91,14 @@ func encodeCreateBatch(buf []byte, items []CreateItem) []byte {
 		for j := range item.UtxoHashes {
 			buf = append(buf, item.UtxoHashes[j][:]...)
 		}
-		hasCold := len(item.ColdData) > 0
-		buf = appendBool(buf, hasCold)
-		buf = appendU32(buf, uint32(len(item.ColdData)))
-		buf = append(buf, item.ColdData...)
+		hasTxData := len(item.TxData.Inputs) > 0 || len(item.TxData.Outputs) > 0 || len(item.TxData.Inpoints) > 0
+		buf = appendBool(buf, hasTxData)
+		buf = appendU32(buf, uint32(len(item.TxData.Inputs)))
+		buf = append(buf, item.TxData.Inputs...)
+		buf = appendU32(buf, uint32(len(item.TxData.Outputs)))
+		buf = append(buf, item.TxData.Outputs...)
+		buf = appendU32(buf, uint32(len(item.TxData.Inpoints)))
+		buf = append(buf, item.TxData.Inpoints...)
 		hasMined := item.MinedBlockID != nil
 		buf = appendBool(buf, hasMined)
 		if hasMined {
@@ -109,6 +113,14 @@ func encodeCreateBatch(buf []byte, items []CreateItem) []byte {
 				s = *item.MinedSubtreeIdx
 			}
 			buf = appendU32(buf, s)
+		}
+		hasParents := len(item.ParentTxIDs) > 0
+		buf = appendBool(buf, hasParents)
+		if hasParents {
+			buf = appendU32(buf, uint32(len(item.ParentTxIDs)))
+			for j := range item.ParentTxIDs {
+				buf = append(buf, item.ParentTxIDs[j][:]...)
+			}
 		}
 	}
 	return buf

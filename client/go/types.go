@@ -49,6 +49,14 @@ type SetMinedBatchParams struct {
 	BlockHeightRetention uint32
 }
 
+// TxData holds the three components of transaction data stored by TeraSlab.
+// Each field contains the raw serialized bytes as provided during creation.
+type TxData struct {
+	Inputs   []byte // Serialized transaction inputs
+	Outputs  []byte // Serialized transaction outputs
+	Inpoints []byte // Serialized transaction inpoints (parent txid + vout references)
+}
+
 // CreateItem is a single item in a CreateBatch request.
 type CreateItem struct {
 	TxID             TxID
@@ -62,10 +70,14 @@ type CreateItem struct {
 	CreatedAt        uint64
 	Flags            uint8
 	UtxoHashes       []UtxoHash
-	ColdData         []byte
+	TxData           TxData
 	MinedBlockID     *uint32
 	MinedBlockHeight *uint32
 	MinedSubtreeIdx  *uint32
+	// ParentTxIDs lists parent txids from the transaction's inputs.
+	// The server uses these to update each parent's conflicting-children
+	// list when creating a conflicting tx.
+	ParentTxIDs []TxID
 }
 
 // FreezeItem is a single item in a Freeze/Unfreeze batch request.
