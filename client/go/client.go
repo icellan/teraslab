@@ -183,9 +183,14 @@ func handleSignalResponse(resp responseFrame) (*SpendBatchResponse, error) {
 		}
 		return nil, &RedirectError{Addr: addr}
 	case StatusPartialError:
+		// Try signal format first (successes + errors), fall back to sparse errors only
 		successes, errs, err := decodePartialWithSignals(resp.Payload)
 		if err != nil {
-			return nil, fmt.Errorf("decode partial: %w", err)
+			// Server may send sparse errors without success section
+			errs, err = decodeSparseErrors(resp.Payload)
+			if err != nil {
+				return nil, fmt.Errorf("decode partial: %w", err)
+			}
 		}
 		result := &SpendBatchResponse{Successes: successes, Errors: errs}
 		return result, &PartialError{Successes: successes, Errors: errs}

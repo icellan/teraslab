@@ -91,14 +91,23 @@ func encodeCreateBatch(buf []byte, items []CreateItem) []byte {
 		for j := range item.UtxoHashes {
 			buf = append(buf, item.UtxoHashes[j][:]...)
 		}
+		// Encode TxData as a single cold_data blob for the wire protocol.
+		// Format: [has_cold:1][total_len:4][inputs_len:4][inputs][outputs_len:4][outputs][inpoints_len:4][inpoints]
 		hasTxData := len(item.TxData.Inputs) > 0 || len(item.TxData.Outputs) > 0 || len(item.TxData.Inpoints) > 0
 		buf = appendBool(buf, hasTxData)
-		buf = appendU32(buf, uint32(len(item.TxData.Inputs)))
-		buf = append(buf, item.TxData.Inputs...)
-		buf = appendU32(buf, uint32(len(item.TxData.Outputs)))
-		buf = append(buf, item.TxData.Outputs...)
-		buf = appendU32(buf, uint32(len(item.TxData.Inpoints)))
-		buf = append(buf, item.TxData.Inpoints...)
+		coldLen := 4 + len(item.TxData.Inputs) + 4 + len(item.TxData.Outputs) + 4 + len(item.TxData.Inpoints)
+		if !hasTxData {
+			coldLen = 0
+		}
+		buf = appendU32(buf, uint32(coldLen))
+		if hasTxData {
+			buf = appendU32(buf, uint32(len(item.TxData.Inputs)))
+			buf = append(buf, item.TxData.Inputs...)
+			buf = appendU32(buf, uint32(len(item.TxData.Outputs)))
+			buf = append(buf, item.TxData.Outputs...)
+			buf = appendU32(buf, uint32(len(item.TxData.Inpoints)))
+			buf = append(buf, item.TxData.Inpoints...)
+		}
 		hasMined := item.MinedBlockID != nil
 		buf = appendBool(buf, hasMined)
 		if hasMined {
@@ -114,13 +123,9 @@ func encodeCreateBatch(buf []byte, items []CreateItem) []byte {
 			}
 			buf = appendU32(buf, s)
 		}
-		hasParents := len(item.ParentTxIDs) > 0
-		buf = appendBool(buf, hasParents)
-		if hasParents {
-			buf = appendU32(buf, uint32(len(item.ParentTxIDs)))
-			for j := range item.ParentTxIDs {
-				buf = append(buf, item.ParentTxIDs[j][:]...)
-			}
+		buf = appendU32(buf, uint32(len(item.ParentTxIDs)))
+		for j := range item.ParentTxIDs {
+			buf = append(buf, item.ParentTxIDs[j][:]...)
 		}
 	}
 	return buf
