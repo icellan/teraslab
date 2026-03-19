@@ -1,0 +1,476 @@
+# TeraSlab Go Client
+
+Go client library for the [TeraSlab](../../) binary wire protocol. Provides full coverage of all
+server operations with connection pooling, request pipelining, cluster-aware shard routing, and
+typed error handling.
+
+- **Zero external dependencies** -- stdlib only
+- **Goroutine-safe** -- the `Client` is safe for concurrent use
+- **Pipelined connections** -- multiple in-flight requests per TCP connection
+- **Cluster-aware** -- automatic partition map routing and redirect handling
+- **Batch-first** -- all operations are batch operations (single items are batches of size 1)
+
+## Install
+
+```
+go get github.com/icellan/teraslab/client/go
+```
+
+## Connecting
+
+### Single node
+
+```go
+import teraslab "github.com/icellan/teraslab/client/go"
+
+ctx := context.Background()
+
+client, err := teraslab.New(ctx, teraslab.ClientConfig{
+    Addr: "localhost:3300",
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer client.Close()
+```
+
+### Cluster
+
+When connecting to a cluster, provide seed addresses. The client fetches the partition map
+on startup and automatically routes requests to the correct node based on the txid's shard.
+
+```go
+client, err := teraslab.New(ctx, teraslab.ClientConfig{
+    Seeds: []string{"node1:3300", "node2:3300", "node3:3300"},
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer client.Close()
+```
+
+### Connection pool tuning
+
+```go
+client, err := teraslab.New(ctx, teraslab.ClientConfig{
+    Addr: "localhost:3300",
+    Pool: teraslab.PoolConfig{
+        MinConns:    4,              // minimum idle connections (default: 2)
+        MaxConns:    32,             // maximum connections (default: 16)
+        DialTimeout: 5 * time.Second, // connect timeout (default: 5s)
+        HealthCheck: 15 * time.Second, // ping interval (default: 15s)
+    },
+    ClusterRefreshInterval: 30 * time.Second, // partition map refresh (default: 30s)
+    MaxRedirects:           3,                // redirect retries (default: 3)
+})
+```
+
+## Operations
+
+All methods accept a `context.Context` for cancellation and timeouts. Every operation is
+batch-first -- pass a slice of items and receive results for the entire batch.
+
+### Create transactions
+
+```go
+blockID := uint32(100)
+blockHeight := uint32(800000)
+subtreeIdx := uint32(0)
+
+items := []teraslab.CreateItem{
+    {
+        TxID:         txid,
+        TxVersion:    2,
+        Locktime:     0,
+        Fee:          1500,
+        SizeInBytes:  250,
+        IsCoinbase:   false,
+        CreatedAt:    uint64(time.Now().UnixMilli()),
+        UtxoHashes:   []teraslab.UtxoHash{utxoHash0, utxoHash1},
+        ColdData:     rawTxBytes,        // optional: full tx inputs/outputs
+        MinedBlockID:     &blockID,      // optional: set if already mined
+        MinedBlockHeight: &blockHeight,
+        MinedSubtreeIdx:  &subtreeIdx,
+    },
+}
+
+result, err := client.CreateBatch(ctx, items)
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+### Spend UTXOs
+
+```go
+params := teraslab.SpendBatchParams{
+    IgnoreConflicting:    false,
+    IgnoreLocked:         false,
+    CurrentBlockHeight:   800100,
+    BlockHeightRetention: 288,
+}
+
+items := []teraslab.SpendItem{
+    {
+        TxID:         txid,
+        Vout:         0,
+        UtxoHash:     utxoHash,
+        SpendingData: spendingData, // 36 bytes: spending txid (32) + vin (4 LE)
+    },
+}
+
+resp, err := client.SpendBatch(ctx, params, items)
+if err != nil {
+    // Check for partial errors (some items failed, some succeeded).
+    var pe *teraslab.PartialError
+    if errors.As(err, &pe) {
+        for _, e := range pe.Errors {
+            fmt.Printf("item %d failed: %s\n", e.ItemIndex, teraslab.ErrorCodeString(e.Code))
+            if e.Code == teraslab.ErrCodeAlreadySpent {
+                // e.Data contains the 36-byte existing spending data.
+            }
+        }
+        // Successes are still available:
+        for _, s := range pe.Successes {
+            if s.Signal == teraslab.SignalAllSpent {
+                // All UTXOs in this tx are now spent.
+            }
+        }
+    } else {
+        log.Fatal(err)
+    }
+}
+
+// On full success, inspect signals:
+for _, s := range resp.Successes {
+    switch s.Signal {
+    case teraslab.SignalAllSpent:
+        fmt.Printf("tx at index %d: all UTXOs spent\n", s.ItemIndex)
+    case teraslab.SignalDeleteAtHeightSet:
+        fmt.Printf("tx at index %d: queued for pruning\n", s.ItemIndex)
+    }
+}
+```
+
+### Unspend (reverse a spend)
+
+```go
+params := teraslab.UnspendBatchParams{
+    CurrentBlockHeight:   800100,
+    BlockHeightRetention: 288,
+}
+
+items := []teraslab.UnspendItem{
+    {TxID: txid, Vout: 0, UtxoHash: utxoHash},
+}
+
+result, err := client.UnspendBatch(ctx, params, items)
+```
+
+### Set mined
+
+```go
+params := teraslab.SetMinedBatchParams{
+    BlockID:              42,
+    BlockHeight:          800000,
+    SubtreeIdx:           7,
+    OnLongestChain:       true,
+    UnsetMined:           false,
+    CurrentBlockHeight:   800000,
+    BlockHeightRetention: 288,
+}
+
+resp, err := client.SetMinedBatch(ctx, params, []teraslab.TxID{txid1, txid2})
+// resp.Successes contains per-item signals and block IDs.
+```
+
+### Freeze / unfreeze UTXOs
+
+```go
+items := []teraslab.FreezeItem{
+    {TxID: txid, Vout: 0, UtxoHash: utxoHash},
+}
+
+_, err := client.FreezeBatch(ctx, items)
+
+// Later, unfreeze:
+_, err = client.UnfreezeBatch(ctx, items)
+```
+
+### Reassign frozen UTXOs
+
+```go
+params := teraslab.ReassignBatchParams{
+    BlockHeight:    800000,
+    SpendableAfter: 800100, // cooldown: not spendable until this height
+}
+
+items := []teraslab.ReassignItem{
+    {
+        TxID:        txid,
+        Vout:        0,
+        UtxoHash:    currentHash,
+        NewUtxoHash: newHash,
+    },
+}
+
+_, err := client.ReassignBatch(ctx, params, items)
+```
+
+### Set conflicting
+
+```go
+params := teraslab.SetConflictingParams{
+    Value:                true,
+    CurrentBlockHeight:   800100,
+    BlockHeightRetention: 288,
+}
+
+_, err := client.SetConflictingBatch(ctx, params, []teraslab.TxID{txid})
+```
+
+### Set locked
+
+```go
+// Lock transactions from being spent.
+_, err := client.SetLockedBatch(ctx, true, []teraslab.TxID{txid1, txid2})
+
+// Unlock:
+_, err = client.SetLockedBatch(ctx, false, []teraslab.TxID{txid1, txid2})
+```
+
+### Preserve until
+
+```go
+// Prevent pruning until block height 900000.
+_, err := client.PreserveUntilBatch(ctx, 900000, []teraslab.TxID{txid})
+```
+
+### Mark longest chain
+
+```go
+params := teraslab.MarkLongestChainParams{
+    OnLongestChain:       true,
+    CurrentBlockHeight:   800100,
+    BlockHeightRetention: 288,
+}
+
+_, err := client.MarkLongestChainBatch(ctx, params, []teraslab.TxID{txid})
+```
+
+### Delete transactions
+
+```go
+_, err := client.DeleteBatch(ctx, []teraslab.TxID{txid1, txid2, txid3})
+```
+
+### Get transaction data
+
+Use field mask constants to select which data to fetch. The response contains raw serialized
+data per item which can be parsed with the `DecodeTxMetadata`, `DecodeUtxoSlots`, and
+`DecodeBlockEntries` helpers.
+
+```go
+results, err := client.GetBatch(ctx, teraslab.FieldAll, []teraslab.TxID{txid})
+if err != nil {
+    log.Fatal(err)
+}
+
+for _, r := range results {
+    if r.Status != 0 {
+        fmt.Println("not found")
+        continue
+    }
+
+    meta, err := teraslab.DecodeTxMetadata(r.Data)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("fee=%d utxo_count=%d spent=%d\n", meta.Fee, meta.UtxoCount, meta.SpentUtxos)
+
+    // Parse UTXO slots (starts after metadata section).
+    slots, err := teraslab.DecodeUtxoSlots(r.Data[teraslab.MetadataSize:])
+    if err != nil {
+        log.Fatal(err)
+    }
+    for i, slot := range slots {
+        switch slot.Status {
+        case teraslab.SlotUnspent:
+            fmt.Printf("  vout %d: unspent\n", i)
+        case teraslab.SlotSpent:
+            fmt.Printf("  vout %d: spent\n", i)
+        case teraslab.SlotFrozen:
+            fmt.Printf("  vout %d: frozen\n", i)
+        }
+    }
+}
+```
+
+To fetch only metadata (lighter response):
+
+```go
+results, err := client.GetBatch(ctx, teraslab.FieldMetadata, []teraslab.TxID{txid})
+```
+
+Available field masks (combine with `|`):
+
+| Constant | Bit | Description |
+|----------|-----|-------------|
+| `FieldMetadata` | `0x01` | Transaction metadata (fee, flags, counts, timestamps) |
+| `FieldUtxoSlots` | `0x02` | UTXO slot data (hash, status, spending data) |
+| `FieldColdData` | `0x04` | Full transaction inputs/outputs |
+| `FieldBlockEntries` | `0x08` | Block entries (block ID, height, subtree index) |
+| `FieldAll` | `0x0F` | All fields |
+
+### Get spend status
+
+Check whether specific UTXOs are spent without fetching the full record.
+
+```go
+items := []teraslab.GetSpendItem{
+    {TxID: txid, Vout: 0},
+    {TxID: txid, Vout: 1},
+}
+
+results, err := client.GetSpendBatch(ctx, items)
+if err != nil {
+    log.Fatal(err)
+}
+
+for i, r := range results {
+    switch r.SlotStatus {
+    case teraslab.SlotUnspent:
+        fmt.Printf("vout %d: unspent\n", items[i].Vout)
+    case teraslab.SlotSpent:
+        fmt.Printf("vout %d: spent by %x\n", items[i].Vout, r.SpendingData)
+    case teraslab.SlotPruned:
+        fmt.Printf("vout %d: pruned\n", items[i].Vout)
+    case teraslab.SlotFrozen:
+        fmt.Printf("vout %d: frozen\n", items[i].Vout)
+    }
+}
+```
+
+### Pruner operations
+
+```go
+// Find transactions unmined since before height 799000.
+txids, err := client.QueryOldUnmined(ctx, 799000)
+
+// Preserve parent transactions from being pruned.
+_, err = client.PreserveTransactions(ctx, 900000, txids)
+
+// Delete expired preserved transactions.
+result, err := client.ProcessExpiredPreservations(ctx, 800100)
+fmt.Printf("deleted %d, failed %d\n", result.Deleted, result.Failed)
+```
+
+### Admin operations
+
+```go
+// Ping -- returns round-trip time.
+rtt, err := client.Ping(ctx)
+fmt.Printf("RTT: %v\n", rtt)
+
+// Health check.
+err = client.Health(ctx)
+
+// Fetch cluster partition map.
+pm, err := client.GetPartitionMap(ctx)
+fmt.Printf("version=%d nodes=%d\n", pm.Version, len(pm.Nodes))
+for _, node := range pm.Nodes {
+    fmt.Printf("  node %d: %s\n", node.ID, node.Addr)
+}
+```
+
+## Error Handling
+
+The client uses typed errors that work with `errors.Is` and `errors.As`:
+
+| Error type | When | Contents |
+|------------|------|----------|
+| `*PartialError` | Some items in a batch failed | `.Successes` (signals), `.Errors` (per-item) |
+| `*ServerError` | Global server error (all items failed) | `.Code`, `.Message` |
+| `*RedirectError` | Shard owned by another node (single-node mode) | `.Addr` |
+| `*NotFoundError` | Record not found | -- |
+| `*BatchItemError` | Individual item failure (inside `PartialError`) | `.ItemIndex`, `.Code`, `.Data` |
+
+### Partial error handling pattern
+
+```go
+result, err := client.SpendBatch(ctx, params, items)
+if err != nil {
+    var pe *teraslab.PartialError
+    if errors.As(err, &pe) {
+        // Mixed success/failure. Inspect per-item results.
+        for _, e := range pe.Errors {
+            switch e.Code {
+            case teraslab.ErrCodeTxNotFound:
+                // Transaction doesn't exist.
+            case teraslab.ErrCodeAlreadySpent:
+                // e.Data has the existing 36-byte spending data.
+            case teraslab.ErrCodeFrozen:
+                // UTXO is frozen.
+            case teraslab.ErrCodeCoinbaseImmature:
+                // e.Data has the 4-byte required block height (LE).
+            }
+        }
+        return
+    }
+
+    var se *teraslab.ServerError
+    if errors.As(err, &se) {
+        // Global failure (e.g., batch too large, internal error).
+        log.Printf("server error %d: %s", se.Code, se.Message)
+        return
+    }
+
+    log.Fatal(err) // connection error, context cancelled, etc.
+}
+```
+
+### Error codes
+
+| Constant | Code | Description |
+|----------|------|-------------|
+| `ErrCodeTxNotFound` | 1 | Transaction not in index |
+| `ErrCodeUtxoHashMismatch` | 2 | Expected hash does not match stored hash |
+| `ErrCodeAlreadySpent` | 3 | UTXO already spent (error data: 36-byte spending data) |
+| `ErrCodeAlreadyFrozen` | 4 | UTXO already frozen |
+| `ErrCodeUtxoNotFrozen` | 5 | Expected frozen but is not |
+| `ErrCodeInvalidSpend` | 6 | Attempting to spend a pruned/deleted UTXO |
+| `ErrCodeFrozen` | 7 | UTXO is frozen |
+| `ErrCodeConflicting` | 8 | Transaction is marked conflicting |
+| `ErrCodeLocked` | 9 | Transaction is locked |
+| `ErrCodeCoinbaseImmature` | 10 | Coinbase not mature (error data: 4-byte required height) |
+| `ErrCodeVoutOutOfRange` | 11 | Output index exceeds UTXO count |
+| `ErrCodeAlreadyExists` | 12 | Transaction already exists (on create) |
+| `ErrCodeFrozenUntil` | 13 | Reassignment cooldown not met |
+| `ErrCodeRedirect` | 14 | Shard owned by another node |
+| `ErrCodeInternal` | 255 | Unexpected server error |
+
+## Cluster Routing
+
+In cluster mode, the client computes a 12-bit shard from each txid:
+
+```go
+shard := teraslab.ShardForTxID(txid) // txid[0:2] as LE uint16, masked to 0x0FFF
+```
+
+The 4096 shards are mapped to nodes via the partition map fetched from the server.
+For batch operations spanning multiple txids, the client automatically splits the batch by
+target node, sends sub-batches in parallel, and merges the results back with correct item
+indices.
+
+If a node returns a redirect response (shard moved during rebalancing), the client retries
+against the indicated node and triggers a background partition map refresh.
+
+## Testing
+
+```bash
+# Unit tests (no server needed)
+go test ./...
+
+# Integration tests (requires running TeraSlab server)
+TERASLAB_ADDR=localhost:3300 go test -tags integration -v ./...
+```
