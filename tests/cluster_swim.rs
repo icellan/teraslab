@@ -4,8 +4,14 @@
 //! verify discovery, failure detection, indirect probing, and
 //! dissemination behaviour.
 //!
-//! Each `SwimNode` joins its thread on drop, ensuring sockets are released
-//! before the next test can reuse ports.
+//! Determinism strategy:
+//! - NEVER use raw `sleep` + drain; always use event-driven `wait_for`
+//!   with generous timeout ceilings (they return the instant the
+//!   predicate is satisfied).
+//! - Use fast probe intervals (50ms) and short suspicion timeouts
+//!   (500ms) so failure detection completes quickly.
+//! - Timeouts are generous (30s) to absorb CI load spikes — they are
+//!   ceilings, not expected durations.
 
 use std::net::SocketAddr;
 use std::sync::mpsc;
@@ -23,6 +29,20 @@ fn swim_addr(port: u16) -> SocketAddr {
 fn tcp_addr(port: u16) -> SocketAddr {
     format!("127.0.0.1:{port}").parse().unwrap()
 }
+
+// ---------------------------------------------------------------------------
+// Fast test config: 50ms probes, 500ms suspicion
+// ---------------------------------------------------------------------------
+
+// Intervals must tolerate thread starvation when the full test suite runs
+// in parallel (30+ threads across binaries). 200ms probes give ACKs enough
+// time to arrive even under heavy load; 3s suspicion gives indirect probes
+// room to complete.
+const TEST_PROBE_INTERVAL: Duration = Duration::from_millis(200);
+const TEST_SUSPICION_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Generous ceiling for event waits — returns early via predicate.
+const WAIT_CEILING: Duration = Duration::from_secs(30);
 
 /// A running SWIM node that properly shuts down and joins its thread on drop,
 /// ensuring the UDP socket is released before ports can be reused.
@@ -49,7 +69,7 @@ impl Drop for SwimNode {
 
 fn start_swim(id: u64, swim_port: u16, tcp_port: u16, seeds: &[u16]) -> SwimNode {
     start_swim_with_config(id, swim_port, tcp_port, seeds,
-        Duration::from_millis(200), Duration::from_secs(2))
+        TEST_PROBE_INTERVAL, TEST_SUSPICION_TIMEOUT)
 }
 
 fn start_swim_with_config(
@@ -69,16 +89,8 @@ fn start_swim_with_config(
     SwimNode { shutdown, handle: Some(handle), rx }
 }
 
-/// Drain all events from a receiver (non-blocking).
-fn drain_events(rx: &mpsc::Receiver<ClusterEvent>) -> Vec<ClusterEvent> {
-    let mut events = Vec::new();
-    while let Ok(event) = rx.try_recv() {
-        events.push(event);
-    }
-    events
-}
-
 /// Wait until a predicate is satisfied or timeout.
+/// Returns all collected events. Polls every 5ms.
 fn wait_for<F: Fn(&[ClusterEvent]) -> bool>(
     rx: &mpsc::Receiver<ClusterEvent>,
     predicate: F,
@@ -93,7 +105,7 @@ fn wait_for<F: Fn(&[ClusterEvent]) -> bool>(
         if predicate(&all_events) {
             return all_events;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(5));
     }
     all_events
 }
@@ -108,19 +120,30 @@ fn three_nodes_form_cluster_over_udp() {
     let n2 = start_swim(2, 15002, 15003, &[15000]);
     let n3 = start_swim(3, 15004, 15005, &[15000]);
 
-    std::thread::sleep(Duration::from_secs(3));
-
-    let events1 = drain_events(&n1.rx);
-    let events2 = drain_events(&n2.rx);
-    let events3 = drain_events(&n3.rx);
+    // Wait for n1 to discover both peers (event-driven, not sleep)
+    let events1 = wait_for(&n1.rx,
+        |evts| {
+            let joins: Vec<_> = evts.iter()
+                .filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _))).collect();
+            joins.len() >= 2
+        },
+        WAIT_CEILING);
 
     let count = |evts: &[ClusterEvent]| evts.iter()
         .filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _))).count();
 
     assert!(count(&events1) >= 2, "node 1 should see 2 joins, got {}", count(&events1));
+
+    // n2 and n3 should also have discovered peers
+    let events2 = wait_for(&n2.rx,
+        |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
+        WAIT_CEILING);
+    let events3 = wait_for(&n3.rx,
+        |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
+        WAIT_CEILING);
+
     assert!(count(&events2) >= 1, "node 2 should see at least 1 join, got {}", count(&events2));
     assert!(count(&events3) >= 1, "node 3 should see at least 1 join, got {}", count(&events3));
-    // SwimNode drop handles shutdown + join
 }
 
 #[test]
@@ -130,7 +153,7 @@ fn node_stops_responding_suspect_then_dead() {
 
     let discovery = wait_for(&n1.rx,
         |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(11), _))),
-        Duration::from_secs(5));
+        WAIT_CEILING);
     assert!(discovery.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(11), _))),
         "node 10 should discover node 11");
 
@@ -139,7 +162,7 @@ fn node_stops_responding_suspect_then_dead() {
 
     let events = wait_for(&n1.rx,
         |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(_))),
-        Duration::from_secs(10));
+        WAIT_CEILING);
 
     assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeSuspect(NodeId(11)))),
         "should have suspected node 11, events: {events:?}");
@@ -154,7 +177,7 @@ fn dead_node_restarts_with_new_incarnation() {
 
     let discovery = wait_for(&n1.rx,
         |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(21), _))),
-        Duration::from_secs(5));
+        WAIT_CEILING);
     assert!(discovery.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(21), _))),
         "node 20 should discover node 21");
 
@@ -163,16 +186,20 @@ fn dead_node_restarts_with_new_incarnation() {
 
     let death = wait_for(&n1.rx,
         |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(21)))),
-        Duration::from_secs(10));
+        WAIT_CEILING);
     assert!(death.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(21)))),
         "node 20 should declare node 21 dead");
+
+    // Brief pause to ensure the restarted node gets a strictly higher incarnation
+    // (incarnation = SystemTime::now().as_millis(), so 2ms guarantees a new value)
+    std::thread::sleep(Duration::from_millis(2));
 
     // Restart node 2 on a DIFFERENT swim port (old one may still be in TIME_WAIT)
     let _n2b = start_swim(21, 15024, 15023, &[15020]);
 
     let events = wait_for(&n1.rx,
         |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(21), _))),
-        Duration::from_secs(10));
+        WAIT_CEILING);
     assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(21), _))),
         "node 21 should have rejoined, events: {events:?}");
 }
@@ -183,34 +210,38 @@ fn indirect_probes_three_node_cluster() {
     let mut n_b = start_swim(31, 15032, 15033, &[15030]);
     let n_c = start_swim(32, 15034, 15035, &[15030]);
 
+    // Wait for A to discover both B and C
     let discovery = wait_for(&n_a.rx,
         |evts| {
             evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(31), _)))
             && evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(32), _)))
         },
-        Duration::from_secs(5));
+        WAIT_CEILING);
     assert!(discovery.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(31), _))),
         "A should discover B");
 
+    // Wait for C to see at least one join too
     let _ = wait_for(&n_c.rx,
         |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
-        Duration::from_secs(3));
+        WAIT_CEILING);
 
     // Stop B and JOIN so socket is released
     n_b.stop();
 
+    // Wait for A to detect B's failure
     let events_a = wait_for(&n_a.rx,
         |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(31)))),
-        Duration::from_secs(15));
+        WAIT_CEILING);
 
     assert!(events_a.iter().any(|e| matches!(e, ClusterEvent::NodeSuspect(NodeId(31)))),
         "A should suspect B after all probes fail");
     assert!(events_a.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(31)))),
         "A should declare B dead after suspicion timeout");
 
+    // Wait for C to also detect B's failure (via gossip from A)
     let events_c = wait_for(&n_c.rx,
         |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(31)))),
-        Duration::from_secs(15));
+        WAIT_CEILING);
     assert!(events_c.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(31)))),
         "C should also detect B's failure");
 }
@@ -222,7 +253,7 @@ fn cluster_event_node_joined_emitted() {
 
     let events = wait_for(&n1.rx,
         |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(41), _))),
-        Duration::from_secs(3));
+        WAIT_CEILING);
     assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(41), _))));
 }
 
@@ -232,9 +263,13 @@ fn membership_changed_sorted_member_list() {
     let _n2 = start_swim(51, 15052, 15053, &[15050]);
     let _n3 = start_swim(52, 15054, 15055, &[15050]);
 
-    std::thread::sleep(Duration::from_secs(3));
+    // Wait for n1 to see both peers join
+    let events = wait_for(&n1.rx,
+        |evts| {
+            evts.iter().filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _))).count() >= 2
+        },
+        WAIT_CEILING);
 
-    let events = drain_events(&n1.rx);
     let membership_events: Vec<_> = events.iter()
         .filter_map(|e| match e {
             ClusterEvent::MembershipChanged(members) => Some(members.clone()),
@@ -269,9 +304,13 @@ fn dissemination_across_10_nodes() {
         nodes.push(node);
     }
 
-    std::thread::sleep(Duration::from_secs(8));
+    // Wait for node 0 to discover at least n-2 peers
+    let events0 = wait_for(&nodes[0].rx,
+        |evts| {
+            evts.iter().filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _))).count() >= n - 2
+        },
+        WAIT_CEILING);
 
-    let events0 = drain_events(&nodes[0].rx);
     let joined: Vec<_> = events0.iter()
         .filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _)))
         .collect();
@@ -279,7 +318,13 @@ fn dissemination_across_10_nodes() {
     assert!(joined.len() >= n - 2,
         "node 0 should see at least {} joins, got {}: {joined:?}", n - 2, joined.len());
 
-    let events5 = drain_events(&nodes[5].rx);
+    // Wait for node 5 to discover at least half via piggybacked gossip
+    let events5 = wait_for(&nodes[5].rx,
+        |evts| {
+            evts.iter().filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _))).count() >= n / 2
+        },
+        WAIT_CEILING);
+
     let joined5: Vec<_> = events5.iter()
         .filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _)))
         .collect();
@@ -287,7 +332,6 @@ fn dissemination_across_10_nodes() {
     assert!(joined5.len() >= n / 2,
         "node 5 should see at least {} joins (piggybacked dissemination), got {}",
         n / 2, joined5.len());
-    // SwimNode drop handles shutdown + join for all nodes
 }
 
 #[test]
@@ -318,11 +362,19 @@ fn after_membership_change_all_nodes_compute_same_shard_table() {
     let n2 = start_swim(91, 15112, 15113, &[15110]);
     let n3 = start_swim(92, 15114, 15115, &[15110]);
 
-    std::thread::sleep(Duration::from_secs(3));
-
-    let events1 = drain_events(&n1.rx);
-    let events2 = drain_events(&n2.rx);
-    let events3 = drain_events(&n3.rx);
+    // Wait for at least one node to see all 3 members
+    // Try all three nodes' event streams
+    let events1 = wait_for(&n1.rx,
+        |evts| {
+            evts.iter().filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _))).count() >= 2
+        },
+        WAIT_CEILING);
+    let events2 = wait_for(&n2.rx,
+        |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
+        WAIT_CEILING);
+    let events3 = wait_for(&n3.rx,
+        |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
+        WAIT_CEILING);
 
     let get_last_membership = |events: &[ClusterEvent]| -> Option<Vec<NodeId>> {
         events.iter().rev().find_map(|e| match e {

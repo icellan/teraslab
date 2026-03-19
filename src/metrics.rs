@@ -278,7 +278,7 @@ impl ThreadHistograms {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn padded_counter_basic() {
@@ -327,8 +327,8 @@ mod tests {
     fn histogram_record_since() {
         let h = LatencyHistogram::new();
         let start = Instant::now();
-        // Do a tiny bit of work
-        std::hint::black_box(42u64.wrapping_mul(7));
+        // Sleep briefly to guarantee a non-zero elapsed time
+        std::thread::sleep(Duration::from_micros(50));
         h.record_since(start);
         assert_eq!(h.count(), 1);
         assert!(h.sum_ns() > 0);

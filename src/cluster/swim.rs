@@ -143,14 +143,16 @@ impl SwimRunner {
 
         eprintln!("SWIM listening on {}", self.config.bind_addr);
 
-        // Join seed nodes
+        // Initial join attempt to seed nodes
         for seed in &self.config.seed_nodes {
-            let msg = self.encode_message(MSG_JOIN, &[]);
+            let updates = self.collect_member_updates();
+            let msg = self.encode_message(MSG_JOIN, &updates);
             let _ = socket.send_to(&msg, seed);
         }
 
         let probe_interval = self.config.probe_interval;
         let mut last_probe = Instant::now();
+        let mut last_seed_retry = Instant::now();
         let mut recv_buf = [0u8; MAX_MSG_SIZE];
 
         while !self.shutdown.load(Ordering::Relaxed) {
@@ -199,6 +201,22 @@ impl SwimRunner {
                 for event in events {
                     let _ = event_tx.send(event);
                 }
+            }
+
+            // Retry seed JOINs periodically until we have peers.
+            // Handles the case where the initial JOIN was lost (seed not
+            // yet bound, UDP dropped, etc.). Once we have peers, no need
+            // to keep contacting seeds.
+            if !self.config.seed_nodes.is_empty()
+                && self.peer_addrs.lock().unwrap().is_empty()
+                && last_seed_retry.elapsed() >= probe_interval * 2
+            {
+                for seed in &self.config.seed_nodes {
+                    let updates = self.collect_member_updates();
+                    let msg = self.encode_message(MSG_JOIN, &updates);
+                    let _ = socket.send_to(&msg, seed);
+                }
+                last_seed_retry = Instant::now();
             }
 
             std::thread::sleep(Duration::from_millis(10));
@@ -251,6 +269,8 @@ impl SwimRunner {
             .mark_alive(sender_id, sender_tcp_addr, sender_incarnation);
 
         // Process piggybacked membership updates
+        // Wire format per entry:
+        // [node_id:8][state:1][incarnation:8][tcp_addr_len:2][tcp_addr:N][swim_addr_len:2][swim_addr:M]
         let updates_offset = 19 + addr_len;
         if data.len() > updates_offset + 2 {
             let update_count =
@@ -264,24 +284,41 @@ impl SwimRunner {
                 let nid = NodeId(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
                 let state = data[pos + 8];
                 let inc = u64::from_le_bytes(data[pos + 9..pos + 17].try_into().unwrap());
-                let alen = u16::from_le_bytes(data[pos + 17..pos + 19].try_into().unwrap()) as usize;
+                let tcp_alen = u16::from_le_bytes(data[pos + 17..pos + 19].try_into().unwrap()) as usize;
                 pos += 19;
-                if pos + alen > data.len() {
+                if pos + tcp_alen > data.len() {
                     break;
                 }
-                let addr_str = std::str::from_utf8(&data[pos..pos + alen]).unwrap_or("");
-                pos += alen;
+                let tcp_str = std::str::from_utf8(&data[pos..pos + tcp_alen]).unwrap_or("");
+                pos += tcp_alen;
 
-                if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-                    // Skip gossip about ourselves — a node's own state is
-                    // authoritative and must not be overridden by third-party gossip.
+                // Parse swim address (new field)
+                let swim_str = if pos + 2 <= data.len() {
+                    let swim_alen = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+                    pos += 2;
+                    if pos + swim_alen <= data.len() {
+                        let s = std::str::from_utf8(&data[pos..pos + swim_alen]).unwrap_or("");
+                        pos += swim_alen;
+                        s
+                    } else {
+                        ""
+                    }
+                } else {
+                    ""
+                };
+
+                if let Ok(tcp_addr) = tcp_str.parse::<SocketAddr>() {
                     if nid == self.config.self_id {
                         continue;
                     }
-                    self.peer_addrs.lock().unwrap().insert(nid, addr);
+                    self.peer_addrs.lock().unwrap().insert(nid, tcp_addr);
+                    // Store the swim address if present
+                    if let Ok(swim_addr) = swim_str.parse::<SocketAddr>() {
+                        self.swim_peer_addrs.lock().unwrap().insert(nid, swim_addr);
+                    }
                     let mut mem = self.membership.lock().unwrap();
                     let evts = match state {
-                        0 => mem.mark_alive(nid, addr, inc),
+                        0 => mem.mark_alive(nid, tcp_addr, inc),
                         1 => mem.mark_suspect(nid),
                         2 => mem.mark_dead(nid),
                         _ => vec![],
@@ -352,13 +389,18 @@ impl SwimRunner {
             u16::from_le_bytes(data[updates_start..updates_start + 2].try_into().unwrap()) as usize;
         let mut pos = updates_start + 2;
 
-        // Skip each update entry
+        // Skip each update entry (format: [id:8][state:1][inc:8][tcp_len:2][tcp:N][swim_len:2][swim:M])
         for _ in 0..update_count {
             if pos + 19 > data.len() {
                 return None;
             }
-            let alen = u16::from_le_bytes(data[pos + 17..pos + 19].try_into().unwrap()) as usize;
-            pos += 19 + alen;
+            let tcp_alen = u16::from_le_bytes(data[pos + 17..pos + 19].try_into().unwrap()) as usize;
+            pos += 19 + tcp_alen;
+            if pos + 2 > data.len() {
+                return None;
+            }
+            let swim_alen = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2 + swim_alen;
             if pos > data.len() {
                 return None;
             }
@@ -417,22 +459,24 @@ impl SwimRunner {
         let updates = self.collect_member_updates();
         let msg = self.encode_message(MSG_PING, &updates);
 
-        // Use the target's actual SWIM (UDP) address if known, otherwise
-        // fall back to deriving it from the TCP address.
+        // Use the target's actual SWIM (UDP) address. If we don't know it
+        // (node discovered via gossip but never contacted directly), skip
+        // this probe — a future gossip round will populate the swim address.
         let swim_addr = self
             .swim_peer_addrs
             .lock()
             .unwrap()
             .get(&target_id)
-            .copied()
-            .unwrap_or_else(|| SocketAddr::new(_target_tcp_addr.ip(), self.config.bind_addr.port()));
-        let _ = socket.send_to(&msg, swim_addr);
+            .copied();
 
-        self.pending_probe = Some(PendingProbe {
-            target: target_id,
-            started: Instant::now(),
-            indirect_sent: false,
-        });
+        if let Some(addr) = swim_addr {
+            let _ = socket.send_to(&msg, addr);
+            self.pending_probe = Some(PendingProbe {
+                target: target_id,
+                started: Instant::now(),
+                indirect_sent: false,
+            });
+        }
     }
 
     /// Send indirect PING_REQ probes to K other peers, asking them to probe
@@ -463,20 +507,15 @@ impl SwimRunner {
         }
 
         // Get the suspect's SWIM address for the PING_REQ payload
-        let suspect_swim_addr = self
+        // Get the suspect's SWIM address. If we don't know it, we can't
+        // ask others to probe it on our behalf.
+        let suspect_swim_addr = match self
             .swim_peer_addrs
             .lock()
             .unwrap()
             .get(&suspect_id)
             .copied()
-            .or_else(|| {
-                self.peer_addrs
-                    .lock()
-                    .unwrap()
-                    .get(&suspect_id)
-                    .map(|a| SocketAddr::new(a.ip(), self.config.bind_addr.port()))
-            });
-        let suspect_swim_addr = match suspect_swim_addr {
+        {
             Some(a) => a,
             None => return,
         };
@@ -493,15 +532,14 @@ impl SwimRunner {
 
         let msg = self.encode_message(MSG_PING_REQ, &payload);
 
-        // Send to up to K random other peers using their SWIM addresses
+        // Send to up to K random other peers using their SWIM addresses.
+        // Skip peers whose swim address is unknown.
         let swim_addrs = self.swim_peer_addrs.lock().unwrap();
         let k = INDIRECT_PROBE_K.min(peers.len());
-        for &(peer_id, tcp_addr) in peers.iter().take(k) {
-            let swim_addr = swim_addrs
-                .get(&peer_id)
-                .copied()
-                .unwrap_or_else(|| SocketAddr::new(tcp_addr.ip(), self.config.bind_addr.port()));
-            let _ = socket.send_to(&msg, swim_addr);
+        for &(peer_id, _tcp_addr) in peers.iter().take(k) {
+            if let Some(&addr) = swim_addrs.get(&peer_id) {
+                let _ = socket.send_to(&msg, addr);
+            }
         }
     }
 
@@ -522,10 +560,11 @@ impl SwimRunner {
     fn collect_member_updates(&self) -> Vec<u8> {
         let membership = self.membership.lock().unwrap();
         let peers = self.peer_addrs.lock().unwrap();
+        let swim_addrs = self.swim_peer_addrs.lock().unwrap();
 
         let alive = membership.alive_members();
         let mut buf = Vec::new();
-        let mut entries = Vec::new();
+        let mut entries: Vec<(NodeId, u8, u64, String, String)> = Vec::new();
 
         for &node in alive.iter().take(20) {
             let state: u8 = 0; // Alive
@@ -536,26 +575,32 @@ impl SwimRunner {
             } else {
                 self.incarnation
             };
-            let addr_str = if node == self.config.self_id {
-                self.config.self_addr.to_string()
-            } else if let Some(&addr) = peers.get(&node) {
-                addr.to_string()
+            let (tcp_str, swim_str) = if node == self.config.self_id {
+                (self.config.self_addr.to_string(), self.config.bind_addr.to_string())
+            } else if let Some(&tcp) = peers.get(&node) {
+                let swim = swim_addrs.get(&node).copied().unwrap_or(tcp);
+                (tcp.to_string(), swim.to_string())
             } else {
                 continue;
             };
-            entries.push((node, state, incarnation, addr_str));
+            entries.push((node, state, incarnation, tcp_str, swim_str));
         }
 
         let count = entries.len().min(20) as u16;
         buf.extend_from_slice(&count.to_le_bytes());
 
-        for (node, state, incarnation, addr_str) in &entries {
-            let addr_bytes = addr_str.as_bytes();
+        // Wire format per entry:
+        // [node_id:8][state:1][incarnation:8][tcp_addr_len:2][tcp_addr:N][swim_addr_len:2][swim_addr:M]
+        for (node, state, incarnation, tcp_str, swim_str) in &entries {
+            let tcp_bytes = tcp_str.as_bytes();
+            let swim_bytes = swim_str.as_bytes();
             buf.extend_from_slice(&node.0.to_le_bytes());
             buf.push(*state);
             buf.extend_from_slice(&incarnation.to_le_bytes());
-            buf.extend_from_slice(&(addr_bytes.len() as u16).to_le_bytes());
-            buf.extend_from_slice(addr_bytes);
+            buf.extend_from_slice(&(tcp_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(tcp_bytes);
+            buf.extend_from_slice(&(swim_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(swim_bytes);
         }
 
         buf
