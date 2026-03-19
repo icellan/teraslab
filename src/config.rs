@@ -38,6 +38,9 @@ pub struct ServerConfig {
     /// Maximum concurrent client connections.
     pub max_connections: usize,
 
+    /// HTTP listen address for observability endpoints (metrics, health, debug).
+    pub http_listen_addr: String,
+
     /// Block height retention for DAH evaluation.
     pub block_height_retention: u32,
 
@@ -76,6 +79,7 @@ impl Default for ServerConfig {
             lock_stripes: 65536,
             max_batch_size: 8192,
             max_connections: 1024,
+            http_listen_addr: "0.0.0.0:9100".to_string(),
             block_height_retention: 288,
             node_id: 0,
             swim_port: 3301,

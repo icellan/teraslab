@@ -4,6 +4,7 @@
 //! Engine, and writes response frames. One thread per connection.
 
 pub mod dispatch;
+pub mod http;
 
 use crate::cluster::coordinator::RunningCluster;
 use crate::config::ServerConfig;

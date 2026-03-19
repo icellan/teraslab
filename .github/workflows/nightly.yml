@@ -1,0 +1,38 @@
+name: Nightly E2E
+
+on:
+  schedule:
+    # Every day at 03:00 UTC
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  TERASLAB_FULL_WORKLOAD: "1"
+
+jobs:
+  full-e2e:
+    name: Full-volume E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Full workload tests
+        run: cargo test --test e2e_workload --test stress_tests -- --nocapture
+
+      - name: Criterion benchmarks
+        run: cargo bench -- --output-format bencher | tee bench-output.txt
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            bench-output.txt
+            target/criterion/

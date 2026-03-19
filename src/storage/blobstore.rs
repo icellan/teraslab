@@ -17,6 +17,11 @@ pub enum BlobError {
 
 pub type Result<T> = std::result::Result<T, BlobError>;
 
+/// Format a 32-byte key as a hex string.
+fn hex_key(key: &[u8; 32]) -> String {
+    key.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Trait for external blob storage.
 pub trait BlobStore: Send + Sync {
     /// Write a blob keyed by txid.
@@ -33,6 +38,12 @@ pub trait BlobStore: Send + Sync {
 
     /// Check if a blob exists.
     fn exists(&self, key: &[u8; 32]) -> Result<bool>;
+
+    /// Stream a blob to a writer (for large blobs).
+    ///
+    /// Returns the number of bytes written, or `BlobError::NotFound` if the
+    /// blob does not exist.
+    fn stream_to(&self, key: &[u8; 32], writer: &mut dyn std::io::Write) -> Result<u64>;
 }
 
 /// File-based blob store organized by hash prefix directories.
@@ -119,6 +130,20 @@ impl BlobStore for FileBlobStore {
     fn exists(&self, key: &[u8; 32]) -> Result<bool> {
         Ok(self.blob_path(key).exists())
     }
+
+    fn stream_to(&self, key: &[u8; 32], writer: &mut dyn std::io::Write) -> Result<u64> {
+        let path = self.blob_path(key);
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(BlobError::NotFound { key: hex_key(key) });
+            }
+            Err(e) => return Err(BlobError::Io(e)),
+        };
+        let mut reader = std::io::BufReader::new(file);
+        let bytes_written = std::io::copy(&mut reader, writer)?;
+        Ok(bytes_written)
+    }
 }
 
 /// In-memory blob store for testing.
@@ -174,6 +199,17 @@ impl BlobStore for MemoryBlobStore {
 
     fn exists(&self, key: &[u8; 32]) -> Result<bool> {
         Ok(self.blobs.lock().contains_key(key))
+    }
+
+    fn stream_to(&self, key: &[u8; 32], writer: &mut dyn std::io::Write) -> Result<u64> {
+        let blobs = self.blobs.lock();
+        match blobs.get(key) {
+            Some(data) => {
+                writer.write_all(data)?;
+                Ok(data.len() as u64)
+            }
+            None => Err(BlobError::NotFound { key: hex_key(key) }),
+        }
     }
 }
 
@@ -253,6 +289,61 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = FileBlobStore::new(dir.path(), 2);
         assert!(store.get(&test_key(99)).unwrap().is_none());
+    }
+
+    #[test]
+    fn file_stream_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileBlobStore::new(dir.path(), 2);
+        let data = b"stream this data to the writer";
+        store.put(&test_key(10), data).unwrap();
+
+        let mut buf = Vec::new();
+        let bytes = store.stream_to(&test_key(10), &mut buf).unwrap();
+        assert_eq!(bytes, data.len() as u64);
+        assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn file_stream_to_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileBlobStore::new(dir.path(), 2);
+        let mut buf = Vec::new();
+        let result = store.stream_to(&test_key(99), &mut buf);
+        assert!(matches!(result, Err(BlobError::NotFound { .. })));
+    }
+
+    #[test]
+    fn file_concurrent_puts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(FileBlobStore::new(dir.path(), 2));
+
+        let handles: Vec<_> = (0..10u8)
+            .map(|i| {
+                let s = store.clone();
+                std::thread::spawn(move || {
+                    let key = test_key(i);
+                    let data = vec![i; 1024];
+                    s.put(&key, &data).unwrap();
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        for i in 0..10u8 {
+            let data = store.get(&test_key(i)).unwrap().unwrap();
+            assert_eq!(data, vec![i; 1024]);
+        }
+    }
+
+    #[test]
+    fn file_put_non_writable_dir() {
+        let store = FileBlobStore::new(Path::new("/nonexistent/path/blobs"), 2);
+        let result = store.put(&test_key(1), b"data");
+        assert!(result.is_err());
     }
 
     // -- Memory blob store tests --

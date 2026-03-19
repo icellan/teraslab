@@ -76,6 +76,8 @@ pub struct IndexStats {
     pub capacity: usize,
     /// Load factor (0.0 – 1.0).
     pub load_factor: f64,
+    /// Whether 2 MB hugepages are backing the hash table.
+    pub hugepage_enabled: bool,
     /// Maximum observed probe distance.
     pub max_probe_distance: usize,
     /// Approximate memory usage in bytes.
@@ -163,6 +165,7 @@ impl Index {
             entry_count: self.table.len(),
             capacity: self.table.capacity(),
             load_factor: self.table.load_factor(),
+            hugepage_enabled: self.table.hugepage_enabled(),
             max_probe_distance: self.table.max_probe_distance(),
             memory_bytes: self.table.memory_bytes(),
         }

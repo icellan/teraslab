@@ -108,3 +108,17 @@ pub struct CreateResponse {
     /// Number of UTXO slots in the record.
     pub utxo_count: u32,
 }
+
+/// Request for a batch of record creations.
+#[derive(Debug, Clone)]
+pub struct BatchCreateRequest {
+    /// Individual creation requests.
+    pub transactions: Vec<CreateRequest>,
+}
+
+/// Response from a batch creation.
+#[derive(Debug, Clone)]
+pub struct BatchCreateResponse {
+    /// Per-transaction results. Index corresponds to the input order.
+    pub results: Vec<Result<CreateResponse, CreateError>>,
+}

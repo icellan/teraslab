@@ -82,9 +82,11 @@ impl Membership {
 
         match self.members.get_mut(&node) {
             Some(info) => {
-                if incarnation > info.incarnation
-                    || (info.state != NodeState::Alive && incarnation >= info.incarnation)
-                {
+                // SWIM protocol: a node can only override suspect/dead state
+                // with a strictly HIGHER incarnation (indicating the node itself
+                // refuted the suspicion). Same-incarnation alive gossip from
+                // third parties must not reset suspect/dead state.
+                if incarnation > info.incarnation {
                     let was_dead = info.state == NodeState::Dead;
                     info.state = NodeState::Alive;
                     info.incarnation = incarnation;
@@ -191,6 +193,17 @@ impl Membership {
     /// This node's ID.
     pub fn self_id(&self) -> NodeId {
         self.self_id
+    }
+
+    /// Iterate over all known members with their state and incarnation.
+    ///
+    /// Used by SWIM gossip to propagate state information (alive, suspect, dead)
+    /// to other nodes. Does NOT include self.
+    pub fn all_member_states(&self) -> Vec<(NodeId, NodeState, u64, SocketAddr)> {
+        self.members
+            .iter()
+            .map(|(&id, info)| (id, info.state, info.incarnation, info.addr))
+            .collect()
     }
 }
 

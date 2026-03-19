@@ -17,7 +17,9 @@ use crate::ops::unspend::*;
 use crate::protocol::codec::*;
 use crate::protocol::frame::*;
 use crate::protocol::opcodes::*;
+use crate::replication::receiver::handle_replica_batch;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 
 /// Dispatch a request frame to the appropriate Engine method.
 ///
@@ -42,7 +44,11 @@ pub fn handle_request(
         OP_PRESERVE_UNTIL_BATCH => handle_preserve_until_batch(request, engine, max_batch_size, cluster),
         OP_DELETE_BATCH => handle_delete_batch(request, engine, max_batch_size, cluster),
         OP_MARK_LONGEST_CHAIN_BATCH => handle_mark_longest_chain_batch(request, engine, max_batch_size, cluster),
+        OP_GET_BATCH => handle_get_batch(request, engine, max_batch_size, cluster),
         OP_GET_SPEND_BATCH => handle_get_spend_batch(request, engine, max_batch_size, cluster),
+        OP_QUERY_OLD_UNMINED => handle_query_old_unmined(request, engine),
+        OP_PRESERVE_TRANSACTIONS => handle_preserve_transactions(request, engine, max_batch_size, cluster),
+        OP_PROCESS_EXPIRED_PRESERVATIONS => handle_process_expired(request, engine),
         OP_GET_PARTITION_MAP => handle_get_partition_map(request, cluster),
         OP_PING => ResponseFrame {
             request_id: request.request_id,
@@ -59,6 +65,17 @@ pub fn handle_request(
             status: STATUS_OK,
             payload: vec![], // No-op compatibility shim
         },
+        OP_REPLICA_BATCH => {
+            // Dispatch replication batch to the receiver's apply logic.
+            // Uses a thread-local AtomicU64 for sequence tracking at the
+            // dispatch level (the real receiver manages its own counter).
+            thread_local! {
+                static DISPATCH_LAST_APPLIED: AtomicU64 = const { AtomicU64::new(0) };
+            }
+            DISPATCH_LAST_APPLIED.with(|la| {
+                handle_replica_batch(request, engine, la)
+            })
+        }
         _ => error_response(request.request_id, ERR_INTERNAL, "unknown opcode"),
     }
 }
@@ -72,14 +89,24 @@ pub fn handle_request(
 /// Returns `None` if the key is local (or no cluster is configured).
 /// Returns `Some(BatchItemError)` with a redirect error if the key belongs
 /// to a remote node, including the target node's address in `error_data`.
+///
+/// When `allow_if_migrating` is true (for read operations), the check
+/// allows local handling if this node is actively migrating the shard
+/// outbound — the data is still present locally until migration completes.
 fn check_shard_ownership(
     txid: &[u8; 32],
     item_index: u32,
     cluster: Option<&RunningCluster>,
+    allow_if_migrating: bool,
 ) -> Option<BatchItemError> {
     let cluster = cluster?;
     let key = TxKey { txid: *txid };
     if cluster.is_master(&key) {
+        return None;
+    }
+    // During outbound migration, reads can still be served locally
+    // because the data hasn't been removed yet.
+    if allow_if_migrating && cluster.is_migrating_outbound(&key) {
         return None;
     }
     // Determine the target node address for the redirect
@@ -123,7 +150,7 @@ fn handle_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clust
 
     for (txid, group) in &by_txid {
         // Check shard ownership for the first item in the group (all share the same txid)
-        if let Some(redirect_err) = check_shard_ownership(txid, group[0].0 as u32, cluster) {
+        if let Some(redirect_err) = check_shard_ownership(txid, group[0].0 as u32, cluster, false) {
             // All items in this group get redirect errors
             for &(i, _) in group {
                 errors.push(BatchItemError {
@@ -190,7 +217,7 @@ fn handle_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clust
 // ---------------------------------------------------------------------------
 
 fn handle_unspend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
-    let (shared, items) = match decode_slot_item_batch_with_params(&req.payload) {
+    let (params, items) = match decode_unspend_batch(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed unspend batch"),
     };
@@ -200,7 +227,7 @@ fn handle_unspend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clu
 
     let mut errors = Vec::new();
     for (i, item) in items.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster) {
+        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
@@ -208,8 +235,8 @@ fn handle_unspend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clu
             tx_key: TxKey { txid: item.txid },
             offset: item.vout,
             utxo_hash: item.utxo_hash,
-            current_block_height: shared.current_block_height,
-            block_height_retention: shared.block_height_retention,
+            current_block_height: params.current_block_height,
+            block_height_retention: params.block_height_retention,
         });
         if let Err(err) = result {
             errors.push(spend_error_to_batch_error(i as u32, &err));
@@ -234,7 +261,7 @@ fn handle_set_mined_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, c
 
     let mut errors = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster) {
+        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
@@ -261,97 +288,66 @@ fn handle_set_mined_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, c
 // ---------------------------------------------------------------------------
 
 fn handle_create_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
-    // CreateBatch payload: [count:4][items...]
-    // Each item is variable-length. For simplicity, use a simplified format:
-    // [count:4][items: txid(32) + utxo_count(4) + utxo_hashes(32*N)]
-    let payload = &req.payload;
-    if payload.len() < 4 {
-        return error_response(req.request_id, ERR_INTERNAL, "malformed create batch");
-    }
-    let count = u32::from_le_bytes(payload[0..4].try_into().unwrap());
-    if count > max_batch {
+    let items = match decode_create_batch(&req.payload) {
+        Some(r) => r,
+        None => return error_response(req.request_id, ERR_INTERNAL, "malformed create batch"),
+    };
+    if items.len() as u32 > max_batch {
         return error_response(req.request_id, ERR_INTERNAL, "batch too large");
     }
 
     let mut errors = Vec::new();
-    let mut pos = 4;
 
-    for i in 0..count {
-        if pos + 36 > payload.len() {
-            errors.push(BatchItemError {
-                item_index: i,
-                error_code: ERR_INTERNAL,
-                error_data: vec![],
-            });
-            break;
-        }
-
-        let mut txid = [0u8; 32];
-        txid.copy_from_slice(&payload[pos..pos + 32]);
-        pos += 32;
-
-        let utxo_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
-        pos += 4;
-
-        if pos + (utxo_count as usize) * 32 > payload.len() {
-            errors.push(BatchItemError {
-                item_index: i,
-                error_code: ERR_INTERNAL,
-                error_data: vec![],
-            });
-            break;
-        }
-
-        let mut utxo_hashes = Vec::with_capacity(utxo_count as usize);
-        for _ in 0..utxo_count {
-            let mut h = [0u8; 32];
-            h.copy_from_slice(&payload[pos..pos + 32]);
-            utxo_hashes.push(h);
-            pos += 32;
-        }
-
-        if let Some(redirect_err) = check_shard_ownership(&txid, i, cluster) {
+    for (i, item) in items.iter().enumerate() {
+        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
 
+        let mined_block_infos = if let Some(block_id) = item.mined_block_id {
+            vec![crate::ops::create::MinedBlockInfo {
+                block_id,
+                block_height: item.mined_block_height.unwrap_or(0),
+                subtree_idx: item.mined_subtree_idx.unwrap_or(0),
+            }]
+        } else {
+            vec![]
+        };
+
         let create_req = CreateRequest {
-            tx_id: txid,
-            tx_version: 1,
-            locktime: 0,
-            fee: 0,
-            size_in_bytes: 0,
-            extended_size: 0,
-            is_coinbase: false,
-            spending_height: 0,
-            utxo_hashes,
+            tx_id: item.txid,
+            tx_version: item.tx_version,
+            locktime: item.locktime,
+            fee: item.fee,
+            size_in_bytes: item.size_in_bytes,
+            extended_size: item.extended_size,
+            is_coinbase: item.is_coinbase,
+            spending_height: item.spending_height,
+            utxo_hashes: item.utxo_hashes.clone(),
             inputs: None,
             outputs: None,
             inpoints: None,
             is_external: false,
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            block_height: 0,
-            mined_block_infos: vec![],
-            frozen: false,
-            conflicting: false,
-            locked: false,
+            created_at: item.created_at,
+            block_height: item.mined_block_height.unwrap_or(0),
+            mined_block_infos,
+            frozen: item.flags & 0x04 != 0,
+            conflicting: item.flags & 0x02 != 0,
+            locked: item.flags & 0x01 != 0,
         };
 
         match engine.create(&create_req) {
             Ok(_) => {}
             Err(CreateError::DuplicateTxId) => {
                 errors.push(BatchItemError {
-                    item_index: i,
+                    item_index: i as u32,
                     error_code: ERR_ALREADY_EXISTS,
                     error_data: vec![],
                 });
             }
             Err(_) => {
                 errors.push(BatchItemError {
-                    item_index: i,
+                    item_index: i as u32,
                     error_code: ERR_INTERNAL,
                     error_data: vec![],
                 });
@@ -376,7 +372,7 @@ fn handle_freeze_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clus
     }
     let mut errors = Vec::new();
     for (i, item) in items.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster) {
+        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
@@ -401,7 +397,7 @@ fn handle_unfreeze_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cl
     }
     let mut errors = Vec::new();
     for (i, item) in items.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster) {
+        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
@@ -426,7 +422,7 @@ fn handle_reassign_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cl
     }
     let mut errors = Vec::new();
     for (i, item) in items.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster) {
+        if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
@@ -458,7 +454,7 @@ fn handle_set_conflicting_batch(req: &RequestFrame, engine: &Engine, max_batch: 
 
     let mut errors = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster) {
+        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
@@ -486,7 +482,7 @@ fn handle_set_locked_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, 
 
     let mut errors = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster) {
+        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
@@ -512,7 +508,7 @@ fn handle_preserve_until_batch(req: &RequestFrame, engine: &Engine, max_batch: u
 
     let mut errors = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster) {
+        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
@@ -536,7 +532,7 @@ fn handle_delete_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, clus
     }
     let mut errors = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster) {
+        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
@@ -563,7 +559,7 @@ fn handle_mark_longest_chain_batch(req: &RequestFrame, engine: &Engine, max_batc
 
     let mut errors = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
-        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster) {
+        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
@@ -577,6 +573,192 @@ fn handle_mark_longest_chain_batch(req: &RequestFrame, engine: &Engine, max_batc
         }
     }
     batch_response(req.request_id, &errors)
+}
+
+// ---------------------------------------------------------------------------
+// GetBatch
+// ---------------------------------------------------------------------------
+
+fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+    let (field_mask, txids) = match decode_get_batch(&req.payload) {
+        Some(r) => r,
+        None => return error_response(req.request_id, ERR_INTERNAL, "malformed get batch"),
+    };
+    if txids.len() as u32 > max_batch {
+        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
+    }
+
+    let mut results = Vec::with_capacity(txids.len());
+    for txid in &txids {
+        // Reads allowed during outbound migration
+        if let Some(cluster) = cluster {
+            let key = TxKey { txid: *txid };
+            if !cluster.is_master(&key) && !cluster.is_migrating_outbound(&key) {
+                results.push(WireGetResult { status: 1, data: vec![] });
+                continue;
+            }
+        }
+
+        let key = TxKey { txid: *txid };
+        match engine.read_metadata(&key) {
+            Ok(meta) => {
+                let mut data = Vec::new();
+                if field_mask.has(FieldMask::METADATA) {
+                    // Serialize key metadata fields
+                    data.extend_from_slice(&{ meta.tx_version }.to_le_bytes());
+                    data.extend_from_slice(&{ meta.locktime }.to_le_bytes());
+                    data.extend_from_slice(&{ meta.fee }.to_le_bytes());
+                    data.extend_from_slice(&{ meta.size_in_bytes }.to_le_bytes());
+                    data.extend_from_slice(&{ meta.extended_size }.to_le_bytes());
+                    data.push({ meta.flags }.bits());
+                    data.extend_from_slice(&{ meta.spending_height }.to_le_bytes());
+                    data.extend_from_slice(&{ meta.created_at }.to_le_bytes());
+                    data.extend_from_slice(&{ meta.spent_utxos }.to_le_bytes());
+                    data.extend_from_slice(&{ meta.pruned_utxos }.to_le_bytes());
+                    data.extend_from_slice(&{ meta.utxo_count }.to_le_bytes());
+                    data.extend_from_slice(&{ meta.generation }.to_le_bytes());
+                    data.extend_from_slice(&{ meta.updated_at }.to_le_bytes());
+                    data.extend_from_slice(&{ meta.unmined_since }.to_le_bytes());
+                    data.extend_from_slice(&{ meta.delete_at_height }.to_le_bytes());
+                    data.extend_from_slice(&{ meta.preserve_until }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::UTXO_SLOTS) {
+                    let utxo_count = { meta.utxo_count };
+                    data.extend_from_slice(&utxo_count.to_le_bytes());
+                    for v in 0..utxo_count {
+                        match engine.read_slot(&key, v) {
+                            Ok(slot) => {
+                                data.extend_from_slice(&slot.hash);
+                                data.push(slot.status);
+                                data.extend_from_slice(&slot.spending_data);
+                            }
+                            Err(_) => {
+                                // Slot read error — fill with zeros
+                                data.extend_from_slice(&[0u8; 69]);
+                            }
+                        }
+                    }
+                }
+                if field_mask.has(FieldMask::COLD_DATA) {
+                    match engine.read_cold_data(&key) {
+                        Ok(cold) => {
+                            data.extend_from_slice(&(cold.len() as u32).to_le_bytes());
+                            data.extend_from_slice(&cold);
+                        }
+                        Err(_) => {
+                            data.extend_from_slice(&0u32.to_le_bytes());
+                        }
+                    }
+                }
+                if field_mask.has(FieldMask::BLOCK_ENTRIES) {
+                    let count = { meta.block_entry_count };
+                    data.push(count);
+                    let inline_count = count.min(3);
+                    for i in 0..inline_count as usize {
+                        let be = { meta.block_entries_inline[i] };
+                        data.extend_from_slice(&{ be.block_id }.to_le_bytes());
+                        data.extend_from_slice(&{ be.block_height }.to_le_bytes());
+                        data.extend_from_slice(&{ be.subtree_idx }.to_le_bytes());
+                    }
+                }
+                results.push(WireGetResult { status: 0, data });
+            }
+            Err(SpendError::TxNotFound) => {
+                results.push(WireGetResult { status: 1, data: vec![] });
+            }
+            Err(_) => {
+                results.push(WireGetResult { status: 1, data: vec![] });
+            }
+        }
+    }
+
+    ResponseFrame {
+        request_id: req.request_id,
+        status: STATUS_OK,
+        payload: encode_get_response(&results),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pruner operations
+// ---------------------------------------------------------------------------
+
+fn handle_query_old_unmined(req: &RequestFrame, engine: &Engine) -> ResponseFrame {
+    // Payload: [cutoff_height:4]
+    if req.payload.len() < 4 {
+        return error_response(req.request_id, ERR_INTERNAL, "malformed query");
+    }
+    let cutoff = u32::from_le_bytes(req.payload[0..4].try_into().unwrap());
+    let keys = engine.unmined_index().range_query(cutoff);
+
+    let mut payload = Vec::with_capacity(4 + keys.len() * 32);
+    payload.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for key in &keys {
+        payload.extend_from_slice(&key.txid);
+    }
+
+    ResponseFrame {
+        request_id: req.request_id,
+        status: STATUS_OK,
+        payload,
+    }
+}
+
+fn handle_preserve_transactions(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+    // Same format as PreserveUntilBatch: [count:4][block_height:4][txids]
+    let (shared, txids) = match decode_txid_batch(&req.payload, 4) {
+        Some(r) => r,
+        None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
+    };
+    if txids.len() as u32 > max_batch {
+        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
+    }
+    let height = u32::from_le_bytes(shared[0..4].try_into().unwrap());
+
+    let mut errors = Vec::new();
+    for (i, txid) in txids.iter().enumerate() {
+        if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
+            errors.push(redirect_err);
+            continue;
+        }
+        if let Err(err) = engine.preserve_until(&PreserveUntilRequest {
+            tx_key: TxKey { txid: *txid },
+            block_height: height,
+        }) {
+            errors.push(spend_error_to_batch_error(i as u32, &err));
+        }
+    }
+    batch_response(req.request_id, &errors)
+}
+
+fn handle_process_expired(req: &RequestFrame, engine: &Engine) -> ResponseFrame {
+    // Payload: [current_height:4]
+    if req.payload.len() < 4 {
+        return error_response(req.request_id, ERR_INTERNAL, "malformed");
+    }
+    let current_height = u32::from_le_bytes(req.payload[0..4].try_into().unwrap());
+
+    // Query DAH index for transactions due for deletion
+    let keys = engine.dah_index().range_query(current_height);
+    let mut deleted = 0u32;
+    let mut failed = 0u32;
+
+    for key in &keys {
+        match engine.delete(&DeleteRequest { tx_key: *key }) {
+            Ok(()) => deleted += 1,
+            Err(_) => failed += 1,
+        }
+    }
+
+    let mut payload = Vec::with_capacity(8);
+    payload.extend_from_slice(&deleted.to_le_bytes());
+    payload.extend_from_slice(&failed.to_le_bytes());
+
+    ResponseFrame {
+        request_id: req.request_id,
+        status: STATUS_OK,
+        payload,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -594,10 +776,11 @@ fn handle_get_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, c
 
     let mut results = Vec::with_capacity(items.len());
     for item in &items {
-        // Check shard ownership for read operations too
+        // Check shard ownership — reads are allowed during outbound migration
+        // because this node still holds the data until migration completes.
         if let Some(cluster) = cluster {
             let key = TxKey { txid: item.txid };
-            if !cluster.is_master(&key) {
+            if !cluster.is_master(&key) && !cluster.is_migrating_outbound(&key) {
                 results.push(WireGetSpendResult {
                     status: 1,
                     error_code: ERR_REDIRECT,
@@ -727,31 +910,6 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
     BatchItemError { item_index, error_code: code, error_data: data }
 }
 
-/// Decode an unspend batch: [count:4][cbh:4][bhr:4][items: txid+vout+hash × count]
-struct UnspendSharedParams {
-    current_block_height: u32,
-    block_height_retention: u32,
-}
-
-fn decode_slot_item_batch_with_params(data: &[u8]) -> Option<(UnspendSharedParams, Vec<WireSlotItem>)> {
-    if data.len() < 12 { return None; }
-    let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-    let cbh = u32::from_le_bytes(data[4..8].try_into().unwrap());
-    let bhr = u32::from_le_bytes(data[8..12].try_into().unwrap());
-
-    let mut items = Vec::with_capacity(count);
-    let mut pos = 12;
-    for _ in 0..count {
-        if pos + 68 > data.len() { return None; }
-        let mut txid = [0u8; 32]; txid.copy_from_slice(&data[pos..pos + 32]);
-        let vout = u32::from_le_bytes(data[pos + 32..pos + 36].try_into().unwrap());
-        let mut uh = [0u8; 32]; uh.copy_from_slice(&data[pos + 36..pos + 68]);
-        items.push(WireSlotItem { txid, vout, utxo_hash: uh });
-        pos += 68;
-    }
-
-    Some((UnspendSharedParams { current_block_height: cbh, block_height_retention: bhr }, items))
-}
 
 // ---------------------------------------------------------------------------
 // Partition map

@@ -556,4 +556,194 @@ mod tests {
         );
         assert_eq!(mgr.required_ack_count(), 1);
     }
+
+    // -- Single-operation replication for each op type --
+
+    #[test]
+    fn create_op_replicated() {
+        let (mt, rt) = InMemoryTransport::pair();
+        let handle = spawn_auto_ack_replica(rt);
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig::default(),
+            vec![Box::new(mt)],
+        );
+
+        let ops = vec![ReplicaOp::Create {
+            tx_key: key(1),
+            metadata_bytes: vec![0x01; 64],
+            utxo_hashes: vec![[0xAA; 32]; 5],
+            cold_data: Some(vec![0xCC; 20]),
+        }];
+        mgr.replicate_batch(&ops).unwrap();
+
+        drop(mgr);
+        let received = handle.join().unwrap();
+        assert_eq!(received[0].ops, ops);
+    }
+
+    #[test]
+    fn delete_op_replicated() {
+        let (mt, rt) = InMemoryTransport::pair();
+        let handle = spawn_auto_ack_replica(rt);
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig::default(),
+            vec![Box::new(mt)],
+        );
+
+        let ops = vec![ReplicaOp::Delete { tx_key: key(1) }];
+        mgr.replicate_batch(&ops).unwrap();
+
+        drop(mgr);
+        let received = handle.join().unwrap();
+        assert_eq!(received[0].ops, ops);
+    }
+
+    #[test]
+    fn freeze_unfreeze_replicated() {
+        let (mt, rt) = InMemoryTransport::pair();
+        let handle = spawn_auto_ack_replica(rt);
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig::default(),
+            vec![Box::new(mt)],
+        );
+
+        let ops = vec![
+            ReplicaOp::Freeze { tx_key: key(1), offset: 3 },
+            ReplicaOp::Unfreeze { tx_key: key(1), offset: 3 },
+        ];
+        mgr.replicate_batch(&ops).unwrap();
+
+        drop(mgr);
+        let received = handle.join().unwrap();
+        assert_eq!(received[0].ops, ops);
+    }
+
+    #[test]
+    fn reassign_op_replicated() {
+        let (mt, rt) = InMemoryTransport::pair();
+        let handle = spawn_auto_ack_replica(rt);
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig::default(),
+            vec![Box::new(mt)],
+        );
+
+        let ops = vec![ReplicaOp::Reassign {
+            tx_key: key(1),
+            offset: 0,
+            new_hash: [0xBB; 32],
+            block_height: 1000,
+            spendable_after: 100,
+        }];
+        mgr.replicate_batch(&ops).unwrap();
+
+        drop(mgr);
+        let received = handle.join().unwrap();
+        assert_eq!(received[0].ops, ops);
+    }
+
+    #[test]
+    fn all_flag_ops_replicated() {
+        let (mt, rt) = InMemoryTransport::pair();
+        let handle = spawn_auto_ack_replica(rt);
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig::default(),
+            vec![Box::new(mt)],
+        );
+
+        let ops = vec![
+            ReplicaOp::SetConflicting { tx_key: key(1), value: true, current_block_height: 1000, retention: 288 },
+            ReplicaOp::SetLocked { tx_key: key(2), value: true },
+            ReplicaOp::PreserveUntil { tx_key: key(3), block_height: 5000 },
+        ];
+        mgr.replicate_batch(&ops).unwrap();
+
+        drop(mgr);
+        let received = handle.join().unwrap();
+        assert_eq!(received[0].ops, ops);
+    }
+
+    // -- Batch ACK sequence test --
+
+    #[test]
+    fn batch_ack_through_sequence_correct() {
+        let (mt, rt) = InMemoryTransport::pair();
+
+        // Custom replica that verifies ACK through_sequence
+        let handle = std::thread::spawn(move || {
+            let batch = rt.recv_batch(Duration::from_secs(1)).unwrap();
+            assert_eq!(batch.first_sequence, 1);
+            assert_eq!(batch.ops.len(), 10);
+            let expected_through = batch.last_sequence();
+            assert_eq!(expected_through, 10); // first_sequence(1) + 10 - 1
+
+            let ack = ReplicaAck::Ok { through_sequence: expected_through };
+            rt.send_ack(&ack).unwrap();
+            expected_through
+        });
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig::default(),
+            vec![Box::new(mt)],
+        );
+
+        let ops: Vec<ReplicaOp> = (0..10u8)
+            .map(|i| ReplicaOp::Freeze { tx_key: key(i), offset: i as u32 })
+            .collect();
+        mgr.replicate_batch(&ops).unwrap();
+
+        drop(mgr);
+        let through = handle.join().unwrap();
+        assert_eq!(through, 10);
+    }
+
+    // -- Idempotency under replication --
+
+    #[test]
+    fn idempotent_spend_via_replication() {
+        let (mt, rt) = InMemoryTransport::pair();
+        let handle = spawn_auto_ack_replica(rt);
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig::default(),
+            vec![Box::new(mt)],
+        );
+
+        let ops = vec![ReplicaOp::Spend {
+            tx_key: key(1), offset: 0, spending_data: [0xAB; 36],
+        }];
+        // Send same ops twice
+        mgr.replicate_batch(&ops).unwrap();
+        mgr.replicate_batch(&ops).unwrap();
+
+        drop(mgr);
+        let received = handle.join().unwrap();
+        // Both batches received (replication doesn't dedup at transport level;
+        // idempotency is handled at the application layer on the replica)
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].ops, ops);
+        assert_eq!(received[1].ops, ops);
+    }
+
+    #[test]
+    fn write_majority_rf2_succeeds() {
+        let (mt, rt) = InMemoryTransport::pair();
+        let _handle = spawn_auto_ack_replica(rt);
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteMajority,
+                ..Default::default()
+            },
+            vec![Box::new(mt)],
+        );
+
+        // RF=2: need 1 replica ACK (majority of 2 = 1 + master)
+        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0 }];
+        mgr.replicate_batch(&ops).unwrap();
+    }
 }

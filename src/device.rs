@@ -277,12 +277,17 @@ impl DirectDevice {
     ) -> Result<Self> {
         use std::fs::OpenOptions;
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+
+        // On Linux, open with O_DIRECT for zero-copy NVMe I/O.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_DIRECT);
+        }
+
+        let file = opts.open(path)?;
 
         // Pre-allocate the file to the requested size.
         file.set_len(size)?;

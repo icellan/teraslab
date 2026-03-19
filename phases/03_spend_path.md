@@ -42,7 +42,7 @@ pub enum SpendError {
     },
     AlreadySpent {
         offset: u32,
-        spending_data_hex: String,
+        spending_data: [u8; 36],  // raw bytes; hex encoding is client-side
     },
     Frozen {
         offset: u32,
@@ -53,7 +53,7 @@ pub enum SpendError {
     },
     InvalidSpend {
         offset: u32,
-        spending_data_hex: String,
+        spending_data: [u8; 36],  // raw bytes; hex encoding is client-side
     },
     Pruned {
         offset: u32,
@@ -506,16 +506,13 @@ Steps:
 9. **Secondary index update**: if `delete_at_height` changed, update the DAH index (see 3.5.1)
 10. Release lock
 
-### 3.8 Spending data encoding — `src/ops/encoding.rs`
+### 3.8 Spending data encoding — NOT in server
 
-```rust
-/// Encode spending data as hex string matching the Lua format.
-/// First 32 bytes (txid) are reversed, then 4 bytes (vin) in order.
-pub fn spending_data_to_hex(data: &[u8; 36]) -> String;
-
-/// Encode just the txid portion as reversed hex (for audit/debugging).
-pub fn spending_data_to_tx_hex(data: &[u8; 36]) -> String;
-```
+Hex encoding of spending data (reversed txid + vin) is the client's responsibility.
+TeraSlab returns raw bytes in error responses and over the wire protocol. The Lua
+`spendingDataBytesToHex` format is a display concern that belongs in the Go client,
+not in the storage server. This avoids unnecessary allocations on the hot path and
+keeps the server encoding-agnostic.
 
 ## Acceptance criteria
 
@@ -534,7 +531,7 @@ pub fn spending_data_to_tx_hex(data: &[u8; 36]) -> String;
 - [ ] Spend mature coinbase (spending_height=100, current=200): succeeds
 - [ ] Spend with non-matching utxoHash: returns UtxoHashMismatch
 - [ ] Spend already-spent with SAME spending_data: no error (idempotent), counter NOT incremented again
-- [ ] Spend already-spent with DIFFERENT spending_data: returns AlreadySpent with existing hex
+- [ ] Spend already-spent with DIFFERENT spending_data: returns AlreadySpent with existing raw bytes
 - [ ] Spend frozen UTXO: returns Frozen
 - [ ] Spend PRUNED UTXO (status=0x02): returns Pruned error (terminal state)
 - [ ] Spend UTXO with spendableIn height > current: returns FrozenUntil
@@ -599,16 +596,6 @@ pub fn spending_data_to_tx_hex(data: &[u8; 36]) -> String;
 - [ ] DAH index contains the (height, txid) entry after DAH is set
 - [ ] DAH index entry is removed after DAH is cleared
 - [ ] DAH index entry is moved when DAH value changes (e.g., bumped forward)
-```
-
-### Hex encoding tests
-
-```
-- [ ] spending_data_to_hex produces same output as Lua spendingDataBytesToHex
-      for known test vectors (create test vectors by running the Lua code)
-- [ ] spending_data_to_tx_hex matches Lua spendingDataBytesToTxHex
-- [ ] All-zero spending data: produces "0000...0000" string
-- [ ] All-0xFF spending data: produces "ffff...ffff" string (reversed txid portion)
 ```
 
 ### DeviceIo trait + io_uring tests

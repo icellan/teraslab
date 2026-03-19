@@ -805,4 +805,106 @@ mod tests {
         let entries = log2.recover().unwrap();
         assert_eq!(entries.len(), 1); // Only entry after checkpoint
     }
+
+    #[test]
+    fn truncated_entry_stops_recovery() {
+        let (dev, mut log) = make_log(1024 * 1024);
+        log.append_and_flush(RedoOp::Freeze { tx_key: test_key(1), offset: 0 }).unwrap();
+        log.append_and_flush(RedoOp::Freeze { tx_key: test_key(2), offset: 1 }).unwrap();
+
+        // Simulate truncation: zero out most of the second entry
+        let align = dev.alignment();
+        let mut buf = AlignedBuf::new(align, align);
+        dev.pread(&mut buf, 0).unwrap();
+        // Write a partial length at the second entry location, then zeros
+        // This simulates a power failure mid-write of the second entry
+        let first_entry_end = 60; // approximate size of first entry
+        // Zero out from midpoint of second entry onward
+        for b in buf[first_entry_end + 10..first_entry_end + 50].iter_mut() {
+            *b = 0;
+        }
+        dev.pwrite(&buf, 0).unwrap();
+
+        let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
+        let entries = log2.recover().unwrap();
+        // Should get at most the first entry (second is truncated)
+        assert!(entries.len() <= 1);
+    }
+
+    #[test]
+    fn rapid_checkpoint_append_cycles() {
+        let (_, mut log) = make_log(1024 * 1024);
+
+        for cycle in 0..20u8 {
+            for i in 0..10u8 {
+                log.append(RedoOp::Freeze {
+                    tx_key: test_key(cycle * 10 + i),
+                    offset: 0,
+                })
+                .unwrap();
+            }
+            log.flush().unwrap();
+            log.checkpoint().unwrap();
+
+            // Verify only entries after the most recent checkpoint are returned
+            let entries = log.recover().unwrap();
+            assert!(entries.is_empty(), "cycle {cycle}: should have 0 entries after checkpoint");
+        }
+
+        // After all cycles, total space used should not leak
+        assert!(log.available_space() > 0);
+    }
+
+    #[test]
+    fn zero_length_marks_end_of_valid_data() {
+        let (dev, mut log) = make_log(1024 * 1024);
+        log.append_and_flush(RedoOp::Freeze { tx_key: test_key(1), offset: 0 }).unwrap();
+
+        // The area after the last entry should have zero bytes (marking end)
+        // This is implicitly tested by recovery stopping at the right place
+        let entries = log.recover().unwrap();
+        assert_eq!(entries.len(), 1);
+
+        // Write zeros at position after the entry to ensure scan stops
+        let align = dev.alignment();
+        let pos = log.write_position();
+        if pos < 1024 * 1024 - align as u64 {
+            // Already zeroed by initial device state — verify scan stops
+            let all = log.scan_all().unwrap();
+            assert_eq!(all.len(), 1);
+        }
+    }
+
+    #[test]
+    fn crash_simulation_random_corruption() {
+        // Write 10 entries, then corrupt at random positions
+        // Recovery should always succeed (possibly with fewer entries)
+        let (dev, mut log) = make_log(1024 * 1024);
+        for i in 0..10u8 {
+            log.append_and_flush(RedoOp::Freeze { tx_key: test_key(i), offset: i as u32 }).unwrap();
+        }
+
+        // Try 50 different corruption points
+        for corrupt_offset in (20..500).step_by(10) {
+            let dev2 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+            // Copy original data
+            let align = dev.alignment();
+            let mut buf = AlignedBuf::new(align, align);
+            dev.pread(&mut buf, 0).unwrap();
+            dev2.pwrite(&buf, 0).unwrap();
+
+            // Corrupt one byte
+            let mut buf2 = AlignedBuf::new(align, align);
+            dev2.pread(&mut buf2, 0).unwrap();
+            if corrupt_offset < buf2.len() {
+                buf2[corrupt_offset] ^= 0xFF;
+                dev2.pwrite(&buf2, 0).unwrap();
+            }
+
+            // Recovery should not panic or error
+            let log2 = RedoLog::open(dev2, 0, 1024 * 1024).unwrap();
+            let result = log2.recover();
+            assert!(result.is_ok(), "recovery failed at corruption offset {corrupt_offset}");
+        }
+    }
 }

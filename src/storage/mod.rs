@@ -6,5 +6,7 @@
 //! - **External blob** (> 1 MiB): file or S3 backend
 
 pub mod blobstore;
+pub mod input_refs;
 pub mod manager;
 pub mod tiers;
+pub mod uploader;

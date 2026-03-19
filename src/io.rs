@@ -175,7 +175,7 @@ pub fn read_utxo_slots(
 }
 
 /// Round `size` up to the nearest multiple of `alignment`.
-fn align_up(size: usize, alignment: usize) -> usize {
+pub fn align_up(size: usize, alignment: usize) -> usize {
     size.div_ceil(alignment) * alignment
 }
 

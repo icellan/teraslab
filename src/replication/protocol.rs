@@ -352,6 +352,21 @@ pub struct CatchupRequest {
     pub last_ack_sequence: u64,
 }
 
+impl CatchupRequest {
+    /// Serialize to bytes: [last_ack_sequence:8].
+    pub fn serialize(&self) -> Vec<u8> {
+        self.last_ack_sequence.to_le_bytes().to_vec()
+    }
+
+    /// Deserialize from bytes.
+    pub fn deserialize(data: &[u8]) -> Result<Self> {
+        need(data, 8)?;
+        Ok(Self {
+            last_ack_sequence: u64::from_le_bytes(data[0..8].try_into().unwrap()),
+        })
+    }
+}
+
 impl ReplicaBatch {
     /// Serialize to bytes: [first_seq:8][count:4][op0][op1]...
     pub fn serialize(&self) -> Vec<u8> {
@@ -560,5 +575,14 @@ mod tests {
         let bytes = ack.serialize();
         let decoded = ReplicaAck::deserialize(&bytes).unwrap();
         assert_eq!(decoded, ack);
+    }
+
+    #[test]
+    fn catchup_request_round_trip() {
+        let req = CatchupRequest { last_ack_sequence: 12345 };
+        let bytes = req.serialize();
+        assert_eq!(bytes.len(), 8);
+        let decoded = CatchupRequest::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.last_ack_sequence, 12345);
     }
 }

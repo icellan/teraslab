@@ -4,7 +4,7 @@
 //! spend/unspend methods that are the public API for this phase.
 
 use crate::allocator::SlotAllocator;
-use crate::device::BlockDevice;
+use crate::device::{AlignedBuf, BlockDevice};
 use crate::index::{DahIndex, Index, TxIndexEntry, TxKey, UnminedIndex};
 use crate::io;
 use crate::locks::StripedLocks;
@@ -463,32 +463,72 @@ impl Engine {
         let old_dah = { metadata.delete_at_height };
 
         if req.unset_mined {
-            // Remove block entry by scanning for matching block_id
+            // Remove block entry by scanning inline and overflow entries
             let count = metadata.block_entry_count as usize;
             let inline_count = count.min(INLINE_BLOCK_ENTRIES);
             let mut found = false;
 
+            // Check inline entries first
             for i in 0..inline_count {
                 if { metadata.block_entries_inline[i].block_id } == req.block_id {
-                    // Swap with last inline entry, decrement count
-                    if i < inline_count - 1 {
+                    // Swap with last entry (may be inline or from overflow)
+                    if count > INLINE_BLOCK_ENTRIES {
+                        // Last entry is in overflow — pull it into the inline slot
+                        let mut overflow =
+                            read_overflow_entries(&*self.device, &metadata)
+                                .map_err(|e| SpendError::StorageError {
+                                    detail: format!("{e}"),
+                                })?;
+                        let last = overflow.pop().unwrap();
+                        metadata.block_entries_inline[i] = last;
+                        write_overflow_entries(
+                            &*self.device,
+                            &self.allocator,
+                            &mut metadata,
+                            &overflow,
+                        )
+                        .map_err(|e| SpendError::StorageError {
+                            detail: format!("{e}"),
+                        })?;
+                    } else if i < inline_count - 1 {
                         metadata.block_entries_inline[i] =
                             metadata.block_entries_inline[inline_count - 1];
                     }
-                    metadata.block_entries_inline[inline_count - 1] = BlockEntry {
-                        block_id: 0,
-                        block_height: 0,
-                        subtree_idx: 0,
-                    };
+                    if count <= INLINE_BLOCK_ENTRIES {
+                        let last_idx = inline_count - 1;
+                        metadata.block_entries_inline[last_idx] = BlockEntry {
+                            block_id: 0,
+                            block_height: 0,
+                            subtree_idx: 0,
+                        };
+                    }
                     metadata.block_entry_count -= 1;
                     found = true;
                     break;
                 }
             }
 
-            // Note: overflow entries (count > 3) not handled in this phase's
-            // inline implementation. Extension block I/O would go here.
-            let _ = found;
+            // Check overflow entries if not found inline
+            if !found && count > INLINE_BLOCK_ENTRIES {
+                let mut overflow =
+                    read_overflow_entries(&*self.device, &metadata)
+                        .map_err(|e| SpendError::StorageError {
+                            detail: format!("{e}"),
+                        })?;
+                if let Some(pos) = overflow.iter().position(|e| e.block_id == req.block_id) {
+                    overflow.swap_remove(pos);
+                    write_overflow_entries(
+                        &*self.device,
+                        &self.allocator,
+                        &mut metadata,
+                        &overflow,
+                    )
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("{e}"),
+                    })?;
+                    metadata.block_entry_count -= 1;
+                }
+            }
         } else {
             // Add block entry — check for duplicate
             let count = metadata.block_entry_count as usize;
@@ -502,17 +542,49 @@ impl Engine {
                 }
             }
 
-            if !exists && count < INLINE_BLOCK_ENTRIES {
-                metadata.block_entries_inline[count] = BlockEntry {
-                    block_id: req.block_id,
-                    block_height: req.block_height,
-                    subtree_idx: req.subtree_idx,
-                };
+            // Check overflow entries for duplicate
+            if !exists && count > INLINE_BLOCK_ENTRIES {
+                let overflow =
+                    read_overflow_entries(&*self.device, &metadata)
+                        .map_err(|e| SpendError::StorageError {
+                            detail: format!("{e}"),
+                        })?;
+                if overflow.iter().any(|e| e.block_id == req.block_id) {
+                    exists = true;
+                }
+            }
+
+            if !exists {
+                if count < INLINE_BLOCK_ENTRIES {
+                    metadata.block_entries_inline[count] = BlockEntry {
+                        block_id: req.block_id,
+                        block_height: req.block_height,
+                        subtree_idx: req.subtree_idx,
+                    };
+                } else {
+                    // Overflow: read existing overflow entries, append, write back
+                    let mut overflow =
+                        read_overflow_entries(&*self.device, &metadata)
+                            .map_err(|e| SpendError::StorageError {
+                                detail: format!("{e}"),
+                            })?;
+                    overflow.push(BlockEntry {
+                        block_id: req.block_id,
+                        block_height: req.block_height,
+                        subtree_idx: req.subtree_idx,
+                    });
+                    write_overflow_entries(
+                        &*self.device,
+                        &self.allocator,
+                        &mut metadata,
+                        &overflow,
+                    )
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("{e}"),
+                    })?;
+                }
                 metadata.block_entry_count += 1;
             }
-            // Note: overflow (count >= 3 and not exists) would allocate an
-            // extension block. For the vast majority of transactions (99.9%+),
-            // 3 inline entries suffice.
         }
 
         // Update unmined_since
@@ -569,9 +641,12 @@ impl Engine {
             }
         }
 
+        let block_ids = collect_all_block_ids(&*self.device, &metadata)
+            .unwrap_or_else(|_| collect_block_ids(&metadata));
+
         Ok(SetMinedResponse {
             signal,
-            block_ids: collect_block_ids(&metadata),
+            block_ids,
         })
     }
 
@@ -1180,6 +1255,24 @@ impl Engine {
     pub fn dah_index(&self) -> parking_lot::MutexGuard<'_, DahIndex> {
         self.dah_index.lock()
     }
+
+    /// Number of entries in the primary index.
+    pub fn index_len(&self) -> usize {
+        self.index.read().len()
+    }
+
+    /// Primary index statistics for monitoring.
+    pub fn index_stats(&self) -> crate::index::IndexStats {
+        self.index.read().stats()
+    }
+
+    /// Access the underlying block device.
+    ///
+    /// Used by the replication receiver for low-level slot operations
+    /// (e.g. prune) that bypass the normal engine API.
+    pub fn device(&self) -> &dyn BlockDevice {
+        &*self.device
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,6 +1322,100 @@ fn collect_block_ids(metadata: &TxMetadata) -> Vec<u32> {
         .iter()
         .map(|e| { e.block_id })
         .collect()
+}
+
+/// Collect all block IDs including overflow entries read from device.
+fn collect_all_block_ids(
+    device: &dyn BlockDevice,
+    metadata: &TxMetadata,
+) -> Result<Vec<u32>, crate::device::DeviceError> {
+    let count = metadata.block_entry_count as usize;
+    let inline = count.min(INLINE_BLOCK_ENTRIES);
+    let mut ids: Vec<u32> = metadata.block_entries_inline[..inline]
+        .iter()
+        .map(|e| { e.block_id })
+        .collect();
+    if count > INLINE_BLOCK_ENTRIES {
+        let overflow = read_overflow_entries(device, metadata)?;
+        ids.extend(overflow.iter().map(|e| e.block_id));
+    }
+    Ok(ids)
+}
+
+/// Read overflow block entries from the device.
+fn read_overflow_entries(
+    device: &dyn BlockDevice,
+    metadata: &TxMetadata,
+) -> Result<Vec<BlockEntry>, crate::device::DeviceError> {
+    let overflow_offset = { metadata.block_overflow_offset };
+    if overflow_offset == 0 {
+        return Ok(Vec::new());
+    }
+    let count = metadata.block_entry_count as usize;
+    let overflow_count = count.saturating_sub(INLINE_BLOCK_ENTRIES);
+    if overflow_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let alignment = device.alignment();
+    let data_size = overflow_count * BLOCK_ENTRY_SIZE;
+    let read_size = io::align_up(data_size, alignment);
+    let mut buf = AlignedBuf::new(read_size, alignment);
+    device.pread(&mut buf, overflow_offset)?;
+
+    let mut entries = Vec::with_capacity(overflow_count);
+    for i in 0..overflow_count {
+        let start = i * BLOCK_ENTRY_SIZE;
+        entries.push(BlockEntry::from_bytes(&buf[start..start + BLOCK_ENTRY_SIZE]));
+    }
+    Ok(entries)
+}
+
+/// Write overflow block entries to the device.
+///
+/// Allocates or reuses the overflow block. If `entries` is empty, frees the
+/// overflow block and clears the metadata pointer.
+fn write_overflow_entries(
+    device: &dyn BlockDevice,
+    allocator: &parking_lot::Mutex<SlotAllocator>,
+    metadata: &mut TxMetadata,
+    entries: &[BlockEntry],
+) -> Result<(), crate::device::DeviceError> {
+    let alignment = device.alignment();
+    let old_offset = { metadata.block_overflow_offset };
+
+    if entries.is_empty() {
+        // Free the overflow block if one exists
+        if old_offset != 0 {
+            let _ = allocator.lock().free(old_offset, alignment as u64);
+            metadata.block_overflow_offset = 0;
+        }
+        return Ok(());
+    }
+
+    let data_size = entries.len() * BLOCK_ENTRY_SIZE;
+    let block_size = io::align_up(data_size, alignment);
+
+    // Allocate new overflow block if needed (or reuse if same size)
+    let offset = if old_offset != 0 {
+        old_offset
+    } else {
+        allocator
+            .lock()
+            .allocate(block_size as u64)
+            .map_err(|e| crate::device::DeviceError::Io(std::io::Error::other(
+                format!("allocator: {e}"),
+            )))?
+    };
+
+    let mut buf = AlignedBuf::new(block_size, alignment);
+    for (i, entry) in entries.iter().enumerate() {
+        let start = i * BLOCK_ENTRY_SIZE;
+        entry.to_bytes(&mut buf[start..start + BLOCK_ENTRY_SIZE]);
+    }
+    device.pwrite(&buf, offset)?;
+    metadata.block_overflow_offset = offset;
+    Ok(())
 }
 
 fn now_millis() -> u64 {
@@ -2193,6 +2380,926 @@ mod tests {
         }
     }
 
+    // -- SpendMulti additional tests --
+
+    #[test]
+    fn spend_multi_mix_of_error_types() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        let entry = h.engine.lookup(&h.key).unwrap();
+
+        // Freeze slot 2
+        let frozen = UtxoSlot::new_frozen(h.slot_hash(2));
+        io::write_utxo_slot(&*h.engine.device, entry.record_offset, 2, &frozen).unwrap();
+
+        // Spend slot 4 with some data
+        h.engine.spend(&h.spend_req(4)).unwrap();
+
+        // Now batch: slot 0 (valid), slot 2 (frozen), slot 4 (already spent different data), slot 6 (hash mismatch)
+        let req = SpendMultiRequest {
+            tx_key: h.key,
+            spends: vec![
+                SpendItem {
+                    offset: 0,
+                    utxo_hash: h.slot_hash(0),
+                    spending_data: h.make_spending_data(0x01),
+                    idx: 0,
+                },
+                SpendItem {
+                    offset: 2,
+                    utxo_hash: h.slot_hash(2),
+                    spending_data: h.make_spending_data(0x02),
+                    idx: 1,
+                },
+                SpendItem {
+                    offset: 4,
+                    utxo_hash: h.slot_hash(4),
+                    spending_data: h.make_spending_data(0xCD), // Different from 0xAB
+                    idx: 2,
+                },
+                SpendItem {
+                    offset: 6,
+                    utxo_hash: [0xFF; 32], // Wrong hash
+                    spending_data: h.make_spending_data(0x03),
+                    idx: 3,
+                },
+            ],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        let resp = h.engine.spend_multi(&req).unwrap();
+        assert_eq!(resp.errors.len(), 3);
+        assert_eq!(resp.spent_count, 1); // Only slot 0 succeeded
+        assert!(matches!(resp.errors[&1], SpendError::Frozen { offset: 2 }));
+        assert!(matches!(resp.errors[&2], SpendError::AlreadySpent { offset: 4, .. }));
+        assert!(matches!(resp.errors[&3], SpendError::UtxoHashMismatch { offset: 6 }));
+    }
+
+    #[test]
+    fn spend_multi_single_item_matches_spend() {
+        let h = TestHarness::new(10, TxFlags::empty());
+
+        // Single spend via spend_multi
+        let req = SpendMultiRequest {
+            tx_key: h.key,
+            spends: vec![SpendItem {
+                offset: 3,
+                utxo_hash: h.slot_hash(3),
+                spending_data: h.make_spending_data(0xAB),
+                idx: 0,
+            }],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        let resp = h.engine.spend_multi(&req).unwrap();
+        assert!(resp.errors.is_empty());
+        assert_eq!(resp.spent_count, 1);
+
+        // Verify same result as single spend
+        let slot = h.engine.read_slot(&h.key, 3).unwrap();
+        assert!(slot.is_spent());
+        assert_eq!(slot.spending_data, h.make_spending_data(0xAB));
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!({ meta.spent_utxos }, 1);
+    }
+
+    #[test]
+    fn spend_multi_duplicate_offsets_same_data() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        let sd = h.make_spending_data(0xAB);
+
+        let req = SpendMultiRequest {
+            tx_key: h.key,
+            spends: vec![
+                SpendItem {
+                    offset: 5,
+                    utxo_hash: h.slot_hash(5),
+                    spending_data: sd,
+                    idx: 0,
+                },
+                SpendItem {
+                    offset: 5,
+                    utxo_hash: h.slot_hash(5),
+                    spending_data: sd, // Same data
+                    idx: 1,
+                },
+            ],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        let resp = h.engine.spend_multi(&req).unwrap();
+        assert!(resp.errors.is_empty()); // Both succeed (first spends, second is idempotent)
+        assert_eq!(resp.spent_count, 1); // Counter only incremented once
+    }
+
+    #[test]
+    fn spend_multi_duplicate_offsets_different_data() {
+        let h = TestHarness::new(10, TxFlags::empty());
+
+        let req = SpendMultiRequest {
+            tx_key: h.key,
+            spends: vec![
+                SpendItem {
+                    offset: 5,
+                    utxo_hash: h.slot_hash(5),
+                    spending_data: h.make_spending_data(0xAA),
+                    idx: 0,
+                },
+                SpendItem {
+                    offset: 5,
+                    utxo_hash: h.slot_hash(5),
+                    spending_data: h.make_spending_data(0xBB), // Different data
+                    idx: 1,
+                },
+            ],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        let resp = h.engine.spend_multi(&req).unwrap();
+        assert_eq!(resp.errors.len(), 1);
+        assert!(resp.errors.contains_key(&1)); // Second one fails
+        assert!(matches!(resp.errors[&1], SpendError::AlreadySpent { offset: 5, .. }));
+        assert_eq!(resp.spent_count, 1);
+    }
+
+    #[test]
+    fn spend_multi_response_includes_block_ids() {
+        let h = TestHarness::with_metadata(10, TxFlags::empty(), |m| {
+            m.block_entry_count = 2;
+            m.block_entries_inline[0] = BlockEntry {
+                block_id: 42, block_height: 900, subtree_idx: 0,
+            };
+            m.block_entries_inline[1] = BlockEntry {
+                block_id: 99, block_height: 901, subtree_idx: 1,
+            };
+        });
+
+        let req = SpendMultiRequest {
+            tx_key: h.key,
+            spends: vec![SpendItem {
+                offset: 0,
+                utxo_hash: h.slot_hash(0),
+                spending_data: h.make_spending_data(0xAB),
+                idx: 0,
+            }],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        let resp = h.engine.spend_multi(&req).unwrap();
+        assert!(resp.block_ids.contains(&42));
+        assert!(resp.block_ids.contains(&99));
+        assert_eq!(resp.block_ids.len(), 2);
+    }
+
+    // -- Unspend additional tests --
+
+    #[test]
+    fn unspend_counter_not_below_zero() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        // Metadata starts with spent_utxos = 0; unspending should not underflow
+        // First ensure slot is in unspent state but force spent_utxos = 0
+        // Actually, unspend of an unspent slot is a noop, so let's test with
+        // spent_utxos already at 0 but a slot that is actually spent
+        let entry = h.engine.lookup(&h.key).unwrap();
+        let spent_slot = UtxoSlot::new_spent(h.slot_hash(3), h.make_spending_data(0x11));
+        io::write_utxo_slot(&*h.engine.device, entry.record_offset, 3, &spent_slot).unwrap();
+        // metadata.spent_utxos is still 0 (we wrote the slot directly, bypassing counter)
+
+        let req = UnspendRequest {
+            tx_key: h.key,
+            offset: 3,
+            utxo_hash: h.slot_hash(3),
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        h.engine.unspend(&req).unwrap();
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!({ meta.spent_utxos }, 0); // Should not go below 0
+    }
+
+    #[test]
+    fn unspend_pruned_error() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        let entry = h.engine.lookup(&h.key).unwrap();
+        let mut pruned_slot = UtxoSlot::new_spent(h.slot_hash(3), h.make_spending_data(0x11));
+        pruned_slot.status = UTXO_PRUNED;
+        io::write_utxo_slot(&*h.engine.device, entry.record_offset, 3, &pruned_slot).unwrap();
+
+        let req = UnspendRequest {
+            tx_key: h.key,
+            offset: 3,
+            utxo_hash: h.slot_hash(3),
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        match h.engine.unspend(&req) {
+            Err(SpendError::Pruned { offset: 3 }) => {}
+            other => panic!("expected Pruned, got {other:?}"),
+        }
+    }
+
+    // -- Signal / deleteAtHeight additional tests --
+
+    #[test]
+    fn spend_non_last_utxo_signal_none() {
+        let h = TestHarness::with_metadata(5, TxFlags::empty(), |m| {
+            m.block_entry_count = 1;
+            m.block_entries_inline[0] = BlockEntry {
+                block_id: 1, block_height: 900, subtree_idx: 0,
+            };
+        });
+
+        let resp = h.engine.spend(&h.spend_req(0)).unwrap();
+        assert_eq!(resp.signal, Signal::None);
+    }
+
+    #[test]
+    fn unspend_triggers_not_all_spent_signal() {
+        let h = TestHarness::with_metadata(2, TxFlags::empty(), |m| {
+            m.block_entry_count = 1;
+            m.block_entries_inline[0] = BlockEntry {
+                block_id: 1, block_height: 900, subtree_idx: 0,
+            };
+        });
+
+        // Spend both UTXOs
+        h.engine.spend(&h.spend_req(0)).unwrap();
+        h.engine.spend(&h.spend_req(1)).unwrap();
+
+        // Now unspend one — should transition from all-spent to not-all-spent
+        let req = UnspendRequest {
+            tx_key: h.key,
+            offset: 0,
+            utxo_hash: h.slot_hash(0),
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        h.engine.unspend(&req).unwrap();
+        // Non-external tx: clearing DAH returns Signal::None but DAH is actually cleared
+        // The DAH index should be empty
+        assert!(h.engine.dah_index().range_query(u32::MAX).is_empty());
+    }
+
+    #[test]
+    fn signal_only_fires_on_state_change() {
+        let h = TestHarness::with_metadata(5, TxFlags::empty(), |m| {
+            m.block_entry_count = 1;
+            m.block_entries_inline[0] = BlockEntry {
+                block_id: 1, block_height: 900, subtree_idx: 0,
+            };
+        });
+
+        // Spend slots 0 and 1 — neither is the last, no transition
+        let r0 = h.engine.spend(&h.spend_req(0)).unwrap();
+        assert_eq!(r0.signal, Signal::None);
+        let r1 = h.engine.spend(&h.spend_req(1)).unwrap();
+        assert_eq!(r1.signal, Signal::None);
+    }
+
+    #[test]
+    fn last_spent_all_flag_updated() {
+        let h = TestHarness::with_metadata(2, TxFlags::empty(), |m| {
+            m.block_entry_count = 1;
+            m.block_entries_inline[0] = BlockEntry {
+                block_id: 1, block_height: 900, subtree_idx: 0,
+            };
+        });
+
+        // Before spending, LAST_SPENT_ALL should be clear
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert!(!meta.flags.contains(TxFlags::LAST_SPENT_ALL));
+
+        // Spend all UTXOs
+        h.engine.spend(&h.spend_req(0)).unwrap();
+        h.engine.spend(&h.spend_req(1)).unwrap();
+
+        // LAST_SPENT_ALL should now be set
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert!(meta.flags.contains(TxFlags::LAST_SPENT_ALL));
+
+        // Unspend one
+        let req = UnspendRequest {
+            tx_key: h.key,
+            offset: 0,
+            utxo_hash: h.slot_hash(0),
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        h.engine.unspend(&req).unwrap();
+
+        // LAST_SPENT_ALL should now be cleared
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert!(!meta.flags.contains(TxFlags::LAST_SPENT_ALL));
+    }
+
+    #[test]
+    fn conflicting_tx_no_existing_dah_sets_dah() {
+        let h = TestHarness::with_metadata(10, TxFlags::CONFLICTING, |_| {});
+        let mut req = h.spend_req(0);
+        req.ignore_conflicting = true;
+        h.engine.spend(&req).unwrap();
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_ne!({ meta.delete_at_height }, 0);
+    }
+
+    #[test]
+    fn conflicting_tx_existing_dah_no_signal() {
+        let h = TestHarness::with_metadata(10, TxFlags::CONFLICTING, |m| {
+            m.delete_at_height = 5000;
+        });
+        let mut req = h.spend_req(0);
+        req.ignore_conflicting = true;
+        let resp = h.engine.spend(&req).unwrap();
+        assert_eq!(resp.signal, Signal::None);
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        // DAH should remain at the existing value (5000), not be overwritten
+        assert_eq!({ meta.delete_at_height }, 5000);
+    }
+
+    #[test]
+    fn external_tx_dah_signal() {
+        let h = TestHarness::with_metadata(1, TxFlags::EXTERNAL, |m| {
+            m.block_entry_count = 1;
+            m.block_entries_inline[0] = BlockEntry {
+                block_id: 1, block_height: 900, subtree_idx: 0,
+            };
+        });
+
+        let resp = h.engine.spend(&h.spend_req(0)).unwrap();
+        assert_eq!(resp.signal, Signal::DeleteAtHeightSet);
+    }
+
+    #[test]
+    fn dah_index_contains_entry_after_set() {
+        let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
+            m.block_entry_count = 1;
+            m.block_entries_inline[0] = BlockEntry {
+                block_id: 1, block_height: 900, subtree_idx: 0,
+            };
+        });
+
+        h.engine.spend(&h.spend_req(0)).unwrap();
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        let expected_dah = { meta.delete_at_height };
+        assert_ne!(expected_dah, 0);
+
+        let dah = h.engine.dah_index();
+        let entries = dah.range_query(expected_dah);
+        assert!(entries.contains(&h.key));
+    }
+
+    #[test]
+    fn dah_index_removed_after_clear() {
+        let h = TestHarness::with_metadata(2, TxFlags::empty(), |m| {
+            m.block_entry_count = 1;
+            m.block_entries_inline[0] = BlockEntry {
+                block_id: 1, block_height: 900, subtree_idx: 0,
+            };
+        });
+
+        // Spend all to set DAH
+        h.engine.spend(&h.spend_req(0)).unwrap();
+        h.engine.spend(&h.spend_req(1)).unwrap();
+        assert!(!h.engine.dah_index().range_query(u32::MAX).is_empty());
+
+        // Unspend to clear DAH
+        let req = UnspendRequest {
+            tx_key: h.key,
+            offset: 0,
+            utxo_hash: h.slot_hash(0),
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        h.engine.unspend(&req).unwrap();
+        assert!(h.engine.dah_index().range_query(u32::MAX).is_empty());
+    }
+
+    #[test]
+    fn dah_index_moved_when_value_changes() {
+        let h = TestHarness::with_metadata(2, TxFlags::empty(), |m| {
+            m.block_entry_count = 1;
+            m.block_entries_inline[0] = BlockEntry {
+                block_id: 1, block_height: 900, subtree_idx: 0,
+            };
+        });
+
+        // Spend all at height 1000, retention 288 → DAH = 1288
+        let mut req0 = h.spend_req(0);
+        req0.current_block_height = 1000;
+        h.engine.spend(&req0).unwrap();
+        let mut req1 = h.spend_req(1);
+        req1.current_block_height = 1000;
+        h.engine.spend(&req1).unwrap();
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!({ meta.delete_at_height }, 1288);
+
+        // Unspend and re-spend at higher height → DAH should be bumped
+        let unreq = UnspendRequest {
+            tx_key: h.key,
+            offset: 0,
+            utxo_hash: h.slot_hash(0),
+            current_block_height: 2000,
+            block_height_retention: 288,
+        };
+        h.engine.unspend(&unreq).unwrap();
+
+        let mut req0b = h.spend_req(0);
+        req0b.current_block_height = 2000;
+        h.engine.spend(&req0b).unwrap();
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!({ meta.delete_at_height }, 2288); // Updated
+
+        // DAH index should have the new value, not the old
+        let dah = h.engine.dah_index();
+        let at_new = dah.range_query(2288);
+        assert!(at_new.contains(&h.key));
+    }
+
+    // -- Concurrency additional tests --
+
+    #[test]
+    fn concurrent_spend_and_unspend_mix() {
+        let h = TestHarness::new(100, TxFlags::empty());
+        let engine = h.engine.clone();
+        let key = h.key;
+
+        // First spend slots 50..100
+        for i in 50..100u32 {
+            let req = SpendRequest {
+                tx_key: key,
+                offset: i,
+                utxo_hash: {
+                    let mut hash = [0u8; 32];
+                    hash[0] = (i & 0xFF) as u8;
+                    hash[1] = ((i >> 8) & 0xFF) as u8;
+                    hash
+                },
+                spending_data: {
+                    let mut sd = [0u8; 36];
+                    sd[0] = i as u8;
+                    sd[32..36].copy_from_slice(&1u32.to_le_bytes());
+                    sd
+                },
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            };
+            engine.spend(&req).unwrap();
+        }
+
+        // Now concurrently: 50 threads spend slots 0..50, 50 threads unspend slots 50..100
+        let mut handles = Vec::new();
+
+        for i in 0..50u32 {
+            let engine = engine.clone();
+            handles.push(std::thread::spawn(move || {
+                let req = SpendRequest {
+                    tx_key: key,
+                    offset: i,
+                    utxo_hash: {
+                        let mut hash = [0u8; 32];
+                        hash[0] = (i & 0xFF) as u8;
+                        hash[1] = ((i >> 8) & 0xFF) as u8;
+                        hash
+                    },
+                    spending_data: {
+                        let mut sd = [0u8; 36];
+                        sd[0] = i as u8;
+                        sd[32..36].copy_from_slice(&1u32.to_le_bytes());
+                        sd
+                    },
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                };
+                engine.spend(&req).unwrap();
+            }));
+        }
+
+        for i in 50..100u32 {
+            let engine = engine.clone();
+            handles.push(std::thread::spawn(move || {
+                let req = UnspendRequest {
+                    tx_key: key,
+                    offset: i,
+                    utxo_hash: {
+                        let mut hash = [0u8; 32];
+                        hash[0] = (i & 0xFF) as u8;
+                        hash[1] = ((i >> 8) & 0xFF) as u8;
+                        hash
+                    },
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                };
+                engine.unspend(&req).unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // 50 new spends, 50 unspends of previously-spent → net = 50 spent
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.spent_utxos }, 50);
+    }
+
+    #[test]
+    fn concurrent_spend_multi_overlapping() {
+        let h = TestHarness::new(20, TxFlags::empty());
+        let engine = h.engine.clone();
+        let key = h.key;
+
+        // 10 threads each try to spend slots 0..5 with their own spending data
+        let results: Vec<_> = (0..10u8)
+            .map(|thread_id| {
+                let engine = engine.clone();
+                std::thread::spawn(move || {
+                    let req = SpendMultiRequest {
+                        tx_key: key,
+                        spends: (0..5)
+                            .map(|i| {
+                                let mut hash = [0u8; 32];
+                                hash[0] = (i & 0xFF) as u8;
+                                SpendItem {
+                                    offset: i,
+                                    utxo_hash: hash,
+                                    spending_data: {
+                                        let mut sd = [0u8; 36];
+                                        sd[0] = thread_id;
+                                        sd[1] = i as u8;
+                                        sd[32..36].copy_from_slice(&1u32.to_le_bytes());
+                                        sd
+                                    },
+                                    idx: i,
+                                }
+                            })
+                            .collect(),
+                        ignore_conflicting: false,
+                        ignore_locked: false,
+                        current_block_height: 1000,
+                        block_height_retention: 288,
+                    };
+                    engine.spend_multi(&req).unwrap()
+                })
+            })
+            .collect();
+
+        let mut total_success = 0u32;
+        for handle in results {
+            let resp = handle.join().unwrap();
+            total_success += resp.spent_count;
+        }
+
+        // Exactly 5 slots should be spent (each slot won by exactly one thread)
+        assert_eq!(total_success, 5);
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.spent_utxos }, 5);
+    }
+
+    // -- Mutation bookkeeping additional tests --
+
+    #[test]
+    fn idempotent_respend_increments_generation() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        h.engine.spend(&h.spend_req(5)).unwrap();
+        let g1 = { h.engine.read_metadata(&h.key).unwrap().generation };
+
+        // Spend again with same data (idempotent)
+        h.engine.spend(&h.spend_req(5)).unwrap();
+        let g2 = { h.engine.read_metadata(&h.key).unwrap().generation };
+
+        // Generation DOES increment even for idempotent re-spends
+        // (the mutation was evaluated, even if no status change occurred)
+        assert_eq!(g2, g1 + 1);
+    }
+
+    #[test]
+    fn noop_unspend_does_not_increment_generation() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        let g0 = { h.engine.read_metadata(&h.key).unwrap().generation };
+
+        // Unspend already-unspent slot — pure no-op
+        let req = UnspendRequest {
+            tx_key: h.key,
+            offset: 5,
+            utxo_hash: h.slot_hash(5),
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        h.engine.unspend(&req).unwrap();
+
+        let g1 = { h.engine.read_metadata(&h.key).unwrap().generation };
+        assert_eq!(g1, g0); // NOT incremented
+    }
+
+    #[test]
+    fn every_mutation_increments_generation_by_one() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        let g0 = { h.engine.read_metadata(&h.key).unwrap().generation };
+
+        // Spend
+        h.engine.spend(&h.spend_req(0)).unwrap();
+        let g1 = { h.engine.read_metadata(&h.key).unwrap().generation };
+        assert_eq!(g1, g0 + 1);
+
+        // Spend another
+        h.engine.spend(&h.spend_req(1)).unwrap();
+        let g2 = { h.engine.read_metadata(&h.key).unwrap().generation };
+        assert_eq!(g2, g1 + 1);
+
+        // Unspend
+        let req = UnspendRequest {
+            tx_key: h.key,
+            offset: 0,
+            utxo_hash: h.slot_hash(0),
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        h.engine.unspend(&req).unwrap();
+        let g3 = { h.engine.read_metadata(&h.key).unwrap().generation };
+        assert_eq!(g3, g2 + 1);
+
+        // SpendMulti
+        let req = SpendMultiRequest {
+            tx_key: h.key,
+            spends: vec![
+                SpendItem {
+                    offset: 3,
+                    utxo_hash: h.slot_hash(3),
+                    spending_data: h.make_spending_data(0x01),
+                    idx: 0,
+                },
+                SpendItem {
+                    offset: 4,
+                    utxo_hash: h.slot_hash(4),
+                    spending_data: h.make_spending_data(0x02),
+                    idx: 1,
+                },
+            ],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        h.engine.spend_multi(&req).unwrap();
+        let g4 = { h.engine.read_metadata(&h.key).unwrap().generation };
+        assert_eq!(g4, g3 + 1); // One increment for the whole batch
+    }
+
+    #[test]
+    fn updated_at_recent_for_all_mutations() {
+        let h = TestHarness::new(10, TxFlags::empty());
+
+        // Spend
+        let before = now_millis();
+        h.engine.spend(&h.spend_req(0)).unwrap();
+        let after = now_millis();
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert!({ meta.updated_at } >= before && { meta.updated_at } <= after + 1);
+
+        // Unspend
+        let before = now_millis();
+        let req = UnspendRequest {
+            tx_key: h.key,
+            offset: 0,
+            utxo_hash: h.slot_hash(0),
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        h.engine.unspend(&req).unwrap();
+        let after = now_millis();
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert!({ meta.updated_at } >= before && { meta.updated_at } <= after + 1);
+    }
+
+    // -- Secondary index integration tests --
+
+    #[test]
+    fn two_txs_both_set_dah_different_heights() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone());
+        let mut index = Index::new(200).unwrap();
+
+        // Create two transactions
+        let mut keys = Vec::new();
+        for i in 0..2u64 {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            txid[16..18].copy_from_slice(&(i as u16).to_le_bytes());
+            let key = TxKey { txid };
+            keys.push(key);
+
+            let record_size = TxMetadata::record_size_for(1);
+            let offset = alloc.allocate(record_size).unwrap();
+
+            let mut meta = TxMetadata::new(1);
+            meta.tx_id = txid;
+            meta.block_entry_count = 1;
+            meta.block_entries_inline[0] = BlockEntry {
+                block_id: (i + 1) as u32,
+                block_height: 900,
+                subtree_idx: 0,
+            };
+            let slots = vec![UtxoSlot::new_unspent([0u8; 32])];
+            io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+
+            index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: offset,
+                        utxo_count: 1,
+                        cold_offset: 0,
+                        cold_size: 0,
+                        flags: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        // Spend tx 0 at height 1000
+        let req0 = SpendRequest {
+            tx_key: keys[0],
+            offset: 0,
+            utxo_hash: [0u8; 32],
+            spending_data: {
+                let mut sd = [0u8; 36];
+                sd[0] = 1;
+                sd
+            },
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        engine.spend(&req0).unwrap();
+
+        // Spend tx 1 at height 2000
+        let req1 = SpendRequest {
+            tx_key: keys[1],
+            offset: 0,
+            utxo_hash: [0u8; 32],
+            spending_data: {
+                let mut sd = [0u8; 36];
+                sd[0] = 2;
+                sd
+            },
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 2000,
+            block_height_retention: 288,
+        };
+        engine.spend(&req1).unwrap();
+
+        // Both should be in DAH index at different heights
+        let dah = engine.dah_index();
+        let all = dah.range_query(u32::MAX);
+        assert_eq!(all.len(), 2);
+        assert!(all.contains(&keys[0]));
+        assert!(all.contains(&keys[1]));
+    }
+
+    #[test]
+    fn delete_record_removes_dah_entry() {
+        let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
+            m.block_entry_count = 1;
+            m.block_entries_inline[0] = BlockEntry {
+                block_id: 1, block_height: 900, subtree_idx: 0,
+            };
+        });
+
+        // Spend to trigger DAH set
+        h.engine.spend(&h.spend_req(0)).unwrap();
+        assert!(!h.engine.dah_index().range_query(u32::MAX).is_empty());
+
+        // Delete the record
+        let del_req = DeleteRequest { tx_key: h.key };
+        h.engine.delete(&del_req).unwrap();
+
+        // DAH index should be clean
+        assert!(h.engine.dah_index().range_query(u32::MAX).is_empty());
+    }
+
+    #[test]
+    fn dah_range_scan_returns_correct_set() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone());
+        let mut index = Index::new(200).unwrap();
+
+        // Create 5 transactions, each with 1 UTXO
+        let mut keys = Vec::new();
+        for i in 0..5u64 {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            txid[16..18].copy_from_slice(&(i as u16).to_le_bytes());
+            let key = TxKey { txid };
+            keys.push(key);
+
+            let record_size = TxMetadata::record_size_for(1);
+            let offset = alloc.allocate(record_size).unwrap();
+
+            let mut meta = TxMetadata::new(1);
+            meta.tx_id = txid;
+            meta.block_entry_count = 1;
+            meta.block_entries_inline[0] = BlockEntry {
+                block_id: (i + 1) as u32,
+                block_height: 900,
+                subtree_idx: 0,
+            };
+            let slots = vec![UtxoSlot::new_unspent([0u8; 32])];
+            io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+
+            index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: offset,
+                        utxo_count: 1,
+                        cold_offset: 0,
+                        cold_size: 0,
+                        flags: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        // Spend each at different heights
+        for (i, key) in keys.iter().enumerate() {
+            let height = 1000 + (i as u32) * 100; // 1000, 1100, 1200, 1300, 1400
+            let req = SpendRequest {
+                tx_key: *key,
+                offset: 0,
+                utxo_hash: [0u8; 32],
+                spending_data: {
+                    let mut sd = [0u8; 36];
+                    sd[0] = i as u8;
+                    sd
+                },
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: height,
+                block_height_retention: 288,
+            };
+            engine.spend(&req).unwrap();
+        }
+
+        // range_scan up to 1388 (1100 + 288) should include first 2 txs
+        let dah = engine.dah_index();
+        let up_to_1388 = dah.range_query(1388);
+        assert_eq!(up_to_1388.len(), 2);
+        assert!(up_to_1388.contains(&keys[0]));
+        assert!(up_to_1388.contains(&keys[1]));
+
+        // range_scan up to max should include all 5
+        let all = dah.range_query(u32::MAX);
+        assert_eq!(all.len(), 5);
+    }
+
     // ===================================================================
     // Phase 4: setMined / markOnLongestChain tests
     // ===================================================================
@@ -2976,6 +4083,364 @@ mod tests {
         assert_eq!(meta.block_entry_count, 1);
     }
 
+    // -- Phase 4 additional tests --
+
+    #[test]
+    fn set_mined_overflow_four_entries() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        for bid in 1..=4u32 {
+            let resp = h.engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: bid,
+                    block_height: 100 + bid,
+                    subtree_idx: bid,
+                    current_block_height: 200,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .unwrap();
+            assert_eq!(resp.block_ids.len(), bid as usize);
+        }
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!(meta.block_entry_count, 4);
+        assert_ne!({ meta.block_overflow_offset }, 0); // Overflow block allocated
+    }
+
+    #[test]
+    fn set_mined_overflow_read_back_all() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        for bid in 1..=5u32 {
+            h.engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: bid * 10,
+                    block_height: 100 + bid,
+                    subtree_idx: bid,
+                    current_block_height: 200,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .unwrap();
+        }
+
+        // Read back all entries via a dummy set_mined (idempotent)
+        let resp = h.engine
+            .set_mined(&SetMinedRequest {
+                tx_key: h.key,
+                block_id: 10, // Already exists
+                block_height: 101,
+                subtree_idx: 1,
+                current_block_height: 200,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+
+        assert_eq!(resp.block_ids.len(), 5);
+        for bid in [10, 20, 30, 40, 50] {
+            assert!(resp.block_ids.contains(&bid), "missing block_id {bid}");
+        }
+    }
+
+    #[test]
+    fn set_mined_overflow_unset_from_overflow() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        for bid in 1..=5u32 {
+            h.engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: bid,
+                    block_height: 100 + bid,
+                    subtree_idx: bid,
+                    current_block_height: 200,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .unwrap();
+        }
+
+        // Remove block 5 (in overflow)
+        h.engine
+            .set_mined(&SetMinedRequest {
+                tx_key: h.key,
+                block_id: 5,
+                block_height: 105,
+                subtree_idx: 5,
+                current_block_height: 200,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: true,
+            })
+            .unwrap();
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!(meta.block_entry_count, 4);
+
+        // Remove block 4 (in overflow)
+        h.engine
+            .set_mined(&SetMinedRequest {
+                tx_key: h.key,
+                block_id: 4,
+                block_height: 104,
+                subtree_idx: 4,
+                current_block_height: 200,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: true,
+            })
+            .unwrap();
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!(meta.block_entry_count, 3);
+        // Should only have inline entries now
+        let ids: Vec<u32> = (0..3)
+            .map(|i| { meta.block_entries_inline[i].block_id })
+            .collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
+        assert!(ids.contains(&3));
+    }
+
+    #[test]
+    fn set_mined_overflow_idempotent_in_overflow() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        for bid in 1..=4u32 {
+            h.engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: bid,
+                    block_height: 100 + bid,
+                    subtree_idx: bid,
+                    current_block_height: 200,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .unwrap();
+        }
+
+        // Try adding block_id 4 again (already in overflow) — should be idempotent
+        h.engine
+            .set_mined(&SetMinedRequest {
+                tx_key: h.key,
+                block_id: 4,
+                block_height: 104,
+                subtree_idx: 4,
+                current_block_height: 200,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!(meta.block_entry_count, 4); // Not duplicated
+    }
+
+    #[test]
+    fn multiple_set_mined_on_chain_stays_cleared() {
+        let h = TestHarness::with_metadata(10, TxFlags::empty(), |m| {
+            m.unmined_since = 500;
+        });
+
+        for bid in 1..=3u32 {
+            h.engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: bid,
+                    block_height: 600 + bid,
+                    subtree_idx: 0,
+                    current_block_height: 700,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .unwrap();
+        }
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!({ meta.unmined_since }, 0); // Stays cleared after multiple setMined
+    }
+
+    #[test]
+    fn set_mined_then_unset_all_sets_unmined() {
+        let h = TestHarness::new(10, TxFlags::empty());
+
+        // Add two blocks
+        for bid in [1, 2] {
+            h.engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: bid,
+                    block_height: 100,
+                    subtree_idx: 0,
+                    current_block_height: 100,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .unwrap();
+        }
+        assert_eq!({ h.engine.read_metadata(&h.key).unwrap().unmined_since }, 0);
+
+        // Remove both
+        for bid in [1, 2] {
+            h.engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: bid,
+                    block_height: 100,
+                    subtree_idx: 0,
+                    current_block_height: 300,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: true,
+                })
+                .unwrap();
+        }
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!({ meta.unmined_since }, 300);
+    }
+
+    #[test]
+    fn unset_mined_fully_spent_clears_dah() {
+        let h = TestHarness::new(2, TxFlags::empty());
+
+        // Add block, spend all, DAH should be set
+        h.engine
+            .set_mined(&SetMinedRequest {
+                tx_key: h.key,
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+        h.engine.spend(&h.spend_req(0)).unwrap();
+        h.engine.spend(&h.spend_req(1)).unwrap();
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_ne!({ meta.delete_at_height }, 0);
+
+        // Unset mined (remove block) → should clear DAH since no blocks remain
+        h.engine
+            .set_mined(&SetMinedRequest {
+                tx_key: h.key,
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: true,
+            })
+            .unwrap();
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        // With no blocks, DAH conditions are not met (has_blocks=false)
+        // The evaluate_delete_at_height would signal AllSpent but not set DAH
+        // Since DAH was previously set and conditions are now unmet, it should be cleared
+        assert_eq!({ meta.delete_at_height }, 0);
+    }
+
+    #[test]
+    fn concurrent_set_mined_10_threads() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        let engine = h.engine.clone();
+        let key = h.key;
+
+        let handles: Vec<_> = (0..10u32)
+            .map(|bid| {
+                let engine = engine.clone();
+                std::thread::spawn(move || {
+                    engine
+                        .set_mined(&SetMinedRequest {
+                            tx_key: key,
+                            block_id: bid + 1,
+                            block_height: 100 + bid,
+                            subtree_idx: 0,
+                            current_block_height: 200,
+                            block_height_retention: 288,
+                            on_longest_chain: true,
+                            unset_mined: false,
+                        })
+                        .unwrap();
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!(meta.block_entry_count, 10);
+    }
+
+    #[test]
+    fn concurrent_set_and_unset_same_block() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        let engine = h.engine.clone();
+        let key = h.key;
+
+        // First add the block
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 42,
+                block_height: 100,
+                subtree_idx: 0,
+                current_block_height: 100,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+
+        // Concurrently set and unset
+        let mut handles = Vec::new();
+        for i in 0..20u32 {
+            let engine = engine.clone();
+            let unset = i % 2 == 0;
+            handles.push(std::thread::spawn(move || {
+                engine
+                    .set_mined(&SetMinedRequest {
+                        tx_key: key,
+                        block_id: 42,
+                        block_height: 100,
+                        subtree_idx: 0,
+                        current_block_height: 100,
+                        block_height_retention: 288,
+                        on_longest_chain: true,
+                        unset_mined: unset,
+                    })
+                    .unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Final state should be consistent: either 0 or 1 entries, not corrupted
+        let meta = engine.read_metadata(&key).unwrap();
+        let count = meta.block_entry_count;
+        assert!(count <= 1, "corrupted: block_entry_count={count}");
+        if count == 1 {
+            assert_eq!({ meta.block_entries_inline[0].block_id }, 42);
+        }
+    }
+
     // ===================================================================
     // Phase 5: Creation path tests
     // ===================================================================
@@ -3399,6 +4864,130 @@ mod tests {
         assert_eq!({ meta.unmined_since }, 0);
         assert_eq!(meta.block_entry_count, 1);
         assert_eq!({ meta.block_entries_inline[0].block_id }, 42);
+    }
+
+    // -- Phase 5 additional tests --
+
+    #[test]
+    fn create_delete_recreate_same_txid() {
+        let engine = create_engine();
+        let req = make_create_req(60, 5);
+        let key = req.tx_key();
+
+        engine.create(&req).unwrap();
+        engine
+            .delete(&DeleteRequest { tx_key: key })
+            .unwrap();
+
+        // Should succeed — txid can be reused after deletion
+        engine.create(&req).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.utxo_count }, 5);
+    }
+
+    #[test]
+    fn create_record_at_aligned_offset() {
+        let engine = create_engine();
+        let req = make_create_req(61, 5);
+        let resp = engine.create(&req).unwrap();
+
+        // Record offset must be aligned to device alignment (4096)
+        assert_eq!(resp.record_offset % 4096, 0);
+    }
+
+    #[test]
+    fn create_record_size_matches_expected() {
+        let engine = create_engine();
+        let req = make_create_req(62, 7);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        let expected = METADATA_SIZE as u32 + 7 * UTXO_SLOT_SIZE as u32;
+        assert_eq!({ meta.record_size }, expected);
+    }
+
+    #[test]
+    fn create_record_size_with_cold_data() {
+        let engine = create_engine();
+        let mut req = make_create_req(63, 3);
+        req.inputs = Some(vec![0x01; 10]);
+        req.outputs = Some(vec![0x02; 20]);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        // Cold data: 4 + 10 + 4 + 20 + 4 + 0 = 42 bytes (inputs + outputs + empty inpoints)
+        let expected = METADATA_SIZE as u32 + 3 * UTXO_SLOT_SIZE as u32 + 42;
+        assert_eq!({ meta.record_size }, expected);
+    }
+
+    #[test]
+    fn batch_create_device_full() {
+        // DATA_REGION_OFFSET is 1MiB, so we need device > 1MiB.
+        // Create a device with ~1MiB + 20 blocks of data space.
+        // Each record with 5 UTXOs needs ~1 block (4KB).
+        let data_blocks = 20;
+        let total_size = 1024 * 1024 + data_blocks * 4096; // 1MiB header + 80KB data
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(total_size, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone());
+        let index = Index::new(1000).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        // Request more records than can fit in the data region
+        let requests: Vec<CreateRequest> = (0..50u8)
+            .map(|n| make_create_req(n + 100, 5)) // Each ~4KB
+            .collect();
+
+        let results = engine.create_batch(&requests);
+
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let full_errors = results
+            .iter()
+            .filter(|r| matches!(r, Err(CreateError::DeviceFull)))
+            .count();
+
+        assert!(successes > 0, "at least one should succeed");
+        assert!(full_errors > 0, "some should fail with DeviceFull");
+        assert_eq!(successes + full_errors, 50);
+    }
+
+    #[test]
+    fn create_non_coinbase_no_maturity_check() {
+        let engine = create_engine();
+        let req = make_create_req(64, 3);
+        // spending_height = 0 (default for non-coinbase)
+        assert_eq!(req.spending_height, 0);
+        assert!(!req.is_coinbase);
+
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        // Spend should succeed regardless of current_block_height (no maturity check)
+        let spend_req = SpendRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: req.utxo_hashes[0],
+            spending_data: {
+                let mut sd = [0u8; 36];
+                sd[0] = 0xAB;
+                sd
+            },
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1, // Very low height
+            block_height_retention: 288,
+        };
+        assert!(engine.spend(&spend_req).is_ok());
     }
 
     // ===================================================================
@@ -4023,5 +5612,145 @@ mod tests {
 
         assert_eq!({ meta_before.generation }, { meta_after.generation });
         assert_eq!({ meta_before.updated_at }, { meta_after.updated_at });
+    }
+
+    // -- Phase 6 additional tests --
+
+    #[test]
+    fn get_spend_pruned() {
+        let engine = create_engine();
+        let req = make_create_req(136, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        // Spend slot 0, then manually set status to PRUNED
+        let mut sd = [0u8; 36];
+        sd[0] = 0xAB;
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+
+        // Manually write PRUNED status
+        let entry = engine.lookup(&key).unwrap();
+        let mut slot = io::read_utxo_slot(&*engine.device, entry.record_offset, 0).unwrap();
+        slot.status = UTXO_PRUNED;
+        io::write_utxo_slot(&*engine.device, entry.record_offset, 0, &slot).unwrap();
+
+        let resp = engine
+            .get_spend(&GetSpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
+        assert_eq!(resp.status, UTXO_PRUNED);
+    }
+
+    #[test]
+    fn set_conflicting_external_signals_dah_set() {
+        let engine = create_engine();
+        let mut req = make_create_req(137, 5);
+        req.is_external = true;
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let resp = engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+
+        assert_eq!(resp.signal, Signal::DeleteAtHeightSet);
+    }
+
+    #[test]
+    fn concurrent_delete_and_spend() {
+        let engine = create_engine();
+        let req = make_create_req(138, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let e1 = engine.clone();
+        let hash0 = req.utxo_hashes[0];
+
+        let h1 = std::thread::spawn(move || {
+            e1.delete(&DeleteRequest { tx_key: key })
+        });
+
+        let e2 = engine.clone();
+        let h2 = std::thread::spawn(move || {
+            let mut sd = [0u8; 36];
+            sd[0] = 0xAB;
+            e2.spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: hash0,
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+        });
+
+        let r1 = h1.join().unwrap();
+        let r2 = h2.join().unwrap();
+
+        // One should succeed, the other should get TxNotFound (or both succeed
+        // if spend completes before delete)
+        let outcomes = [r1.is_ok(), r2.is_ok()];
+        // At least one should succeed, and no corruption (no panic)
+        assert!(
+            outcomes[0] || outcomes[1],
+            "at least one operation should succeed"
+        );
+    }
+
+    #[test]
+    fn increment_spent_extra_recs_compat_noop() {
+        // The compatibility shim is in the server dispatch layer.
+        // Here we verify the concept: there's no engine-level operation,
+        // because pagination is eliminated. The server returns OK for the
+        // opcode without calling any engine method.
+        //
+        // Verify that the engine has no spent_extra_recs state to corrupt:
+        let engine = create_engine();
+        let req = make_create_req(139, 10);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        // Spend some UTXOs
+        for i in 0..5u32 {
+            let mut sd = [0u8; 36];
+            sd[0] = i as u8;
+            engine
+                .spend(&SpendRequest {
+                    tx_key: key,
+                    offset: i,
+                    utxo_hash: req.utxo_hashes[i as usize],
+                    spending_data: sd,
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                })
+                .unwrap();
+        }
+
+        let meta = engine.read_metadata(&key).unwrap();
+        // spent_utxos tracks everything in a single record — no extra_recs needed
+        assert_eq!({ meta.spent_utxos }, 5);
     }
 }

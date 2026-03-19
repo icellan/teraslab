@@ -322,21 +322,132 @@ fn replay_delete(
 }
 
 fn replay_metadata_op(
-    _device: &dyn BlockDevice,
-    _index: &Index,
-    _entry: &RedoEntry,
+    device: &dyn BlockDevice,
+    index: &Index,
+    entry: &RedoEntry,
 ) -> ReplayResult {
-    // Metadata-only operations (setConflicting, setLocked, preserveUntil,
-    // markOnLongestChain, reassign, pruneSlot) are single metadata pwrites.
-    // If the write completed before crash, the data is correct. If not,
-    // the metadata is stale but the operation can be retried by the
-    // application layer. These are low-frequency operations where the
-    // application retries naturally on reconnect.
-    //
-    // For a fully robust implementation, each of these would re-read
-    // metadata, check if the change is already applied, and re-apply if not.
-    // This is deferred to avoid complexity in this phase.
-    ReplayResult::Skipped
+    match &entry.op {
+        RedoOp::Reassign { tx_key, offset, new_hash, block_height, spendable_after } => {
+            let ie = match index.lookup(tx_key) {
+                Some(e) => e,
+                None => return ReplayResult::Failed,
+            };
+            let slot = match io::read_utxo_slot(device, ie.record_offset, *offset) {
+                Ok(s) => s,
+                Err(_) => return ReplayResult::Failed,
+            };
+            // Idempotent: already reassigned if hash matches new_hash and status is UNSPENT
+            if slot.hash == *new_hash && slot.status == UTXO_UNSPENT {
+                return ReplayResult::Skipped;
+            }
+            let spendable_height = block_height.saturating_add(*spendable_after);
+            let mut new_slot = UtxoSlot::new_unspent(*new_hash);
+            new_slot.spending_data[0..4].copy_from_slice(&spendable_height.to_le_bytes());
+            if io::write_utxo_slot(device, ie.record_offset, *offset, &new_slot).is_err() {
+                return ReplayResult::Failed;
+            }
+            ReplayResult::Applied
+        }
+        RedoOp::PruneSlot { tx_key, offset } => {
+            let ie = match index.lookup(tx_key) {
+                Some(e) => e,
+                None => return ReplayResult::Failed,
+            };
+            let slot = match io::read_utxo_slot(device, ie.record_offset, *offset) {
+                Ok(s) => s,
+                Err(_) => return ReplayResult::Failed,
+            };
+            if slot.status == UTXO_PRUNED {
+                return ReplayResult::Skipped;
+            }
+            let mut pruned = slot;
+            pruned.status = UTXO_PRUNED;
+            if io::write_utxo_slot(device, ie.record_offset, *offset, &pruned).is_err() {
+                return ReplayResult::Failed;
+            }
+            ReplayResult::Applied
+        }
+        RedoOp::SetConflicting { tx_key, value, .. } => {
+            let ie = match index.lookup(tx_key) {
+                Some(e) => e,
+                None => return ReplayResult::Failed,
+            };
+            let mut meta = match io::read_metadata(device, ie.record_offset) {
+                Ok(m) => m,
+                Err(_) => return ReplayResult::Failed,
+            };
+            let has_flag = meta.flags.contains(TxFlags::CONFLICTING);
+            if has_flag == *value {
+                return ReplayResult::Skipped;
+            }
+            if *value {
+                meta.flags |= TxFlags::CONFLICTING;
+            } else {
+                meta.flags -= meta.flags & TxFlags::CONFLICTING;
+            }
+            let _ = io::write_metadata(device, ie.record_offset, &meta);
+            ReplayResult::Applied
+        }
+        RedoOp::SetLocked { tx_key, value } => {
+            let ie = match index.lookup(tx_key) {
+                Some(e) => e,
+                None => return ReplayResult::Failed,
+            };
+            let mut meta = match io::read_metadata(device, ie.record_offset) {
+                Ok(m) => m,
+                Err(_) => return ReplayResult::Failed,
+            };
+            let has_flag = meta.flags.contains(TxFlags::LOCKED);
+            if has_flag == *value {
+                return ReplayResult::Skipped;
+            }
+            if *value {
+                meta.flags |= TxFlags::LOCKED;
+                if { meta.delete_at_height } != 0 {
+                    meta.delete_at_height = 0;
+                }
+            } else {
+                meta.flags -= meta.flags & TxFlags::LOCKED;
+            }
+            let _ = io::write_metadata(device, ie.record_offset, &meta);
+            ReplayResult::Applied
+        }
+        RedoOp::PreserveUntil { tx_key, block_height } => {
+            let ie = match index.lookup(tx_key) {
+                Some(e) => e,
+                None => return ReplayResult::Failed,
+            };
+            let mut meta = match io::read_metadata(device, ie.record_offset) {
+                Ok(m) => m,
+                Err(_) => return ReplayResult::Failed,
+            };
+            if { meta.preserve_until } == *block_height {
+                return ReplayResult::Skipped;
+            }
+            meta.preserve_until = *block_height;
+            meta.delete_at_height = 0;
+            let _ = io::write_metadata(device, ie.record_offset, &meta);
+            ReplayResult::Applied
+        }
+        RedoOp::MarkOnLongestChain { tx_key, on_longest_chain, current_block_height, .. } => {
+            let ie = match index.lookup(tx_key) {
+                Some(e) => e,
+                None => return ReplayResult::Failed,
+            };
+            let mut meta = match io::read_metadata(device, ie.record_offset) {
+                Ok(m) => m,
+                Err(_) => return ReplayResult::Failed,
+            };
+            let target = if *on_longest_chain { 0 } else { *current_block_height };
+            if { meta.unmined_since } == target {
+                return ReplayResult::Skipped;
+            }
+            meta.unmined_since = target;
+            let _ = io::write_metadata(device, ie.record_offset, &meta);
+            ReplayResult::Applied
+        }
+        _ => ReplayResult::Skipped,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -645,5 +756,199 @@ mod tests {
         // Slot is already unspent
         let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
         assert_eq!(stats.entries_skipped, 1);
+    }
+
+    #[test]
+    fn crash_between_redo_and_create() {
+        let mut h = RecoveryTestHarness::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 20;
+        let key = TxKey { txid };
+
+        // Log a Create but don't actually create the record or add to index
+        let offset = h.alloc.allocate(TxMetadata::record_size_for(5)).unwrap();
+        let mut meta = TxMetadata::new(5);
+        meta.tx_id = txid;
+        let slots: Vec<UtxoSlot> = (0..5u32)
+            .map(|i| {
+                let mut hash = [0u8; 32];
+                hash[0] = i as u8;
+                UtxoSlot::new_unspent(hash)
+            })
+            .collect();
+        io::write_full_record(&*h.data_dev, offset, &meta, &slots).unwrap();
+        // Record is on device but NOT in index (simulating crash before index update)
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Create {
+            tx_key: key,
+            record_offset: offset,
+            utxo_count: 5,
+        })
+        .unwrap();
+
+        assert!(h.index.lookup(&key).is_none()); // Not in index yet
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+        assert!(h.index.lookup(&key).is_some()); // Now in index
+    }
+
+    #[test]
+    fn double_spend_after_recovery() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(21, 5);
+
+        // Log a spend but don't apply it (crash)
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Spend {
+            tx_key: key,
+            offset: 0,
+            spending_data: [0xAB; 36],
+            new_spent_count: 1,
+        })
+        .unwrap();
+
+        // Recovery applies it
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+
+        // Now try to re-spend with same data via another recovery
+        let mut redo2 = RedoLog::open(h.redo_dev.clone(), 0, 1024 * 1024).unwrap();
+        redo2
+            .append_and_flush(RedoOp::Spend {
+                tx_key: key,
+                offset: 0,
+                spending_data: [0xAB; 36],
+                new_spent_count: 1,
+            })
+            .unwrap();
+
+        let stats2 = recover(&*h.data_dev, &redo2, &mut h.index).unwrap();
+        // Already applied — skipped (idempotent)
+        assert_eq!(stats2.entries_skipped, 1);
+        assert_eq!(stats2.entries_replayed, 0);
+
+        let ie = h.index.lookup(&key).unwrap();
+        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!({ meta.spent_utxos }, 1); // Not double-incremented
+    }
+
+    #[test]
+    fn replay_reassign() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(22, 5);
+        let ie = h.index.lookup(&key).unwrap();
+
+        // Freeze slot 0 first (reassign requires frozen state)
+        let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        let frozen = UtxoSlot::new_frozen(slot.hash);
+        io::write_utxo_slot(&*h.data_dev, ie.record_offset, 0, &frozen).unwrap();
+
+        // Log a reassign
+        let new_hash = [0xCC; 32];
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Reassign {
+            tx_key: key,
+            offset: 0,
+            new_hash,
+            block_height: 1000,
+            spendable_after: 100,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+
+        let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        assert_eq!(slot.hash, new_hash);
+        assert_eq!(slot.status, UTXO_UNSPENT);
+        let spendable_h = u32::from_le_bytes(slot.spending_data[0..4].try_into().unwrap());
+        assert_eq!(spendable_h, 1100);
+    }
+
+    #[test]
+    fn replay_set_conflicting() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(23, 5);
+        let ie = h.index.lookup(&key).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SetConflicting {
+            tx_key: key,
+            value: true,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+
+        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert!(meta.flags.contains(TxFlags::CONFLICTING));
+    }
+
+    #[test]
+    fn replay_set_locked() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(24, 5);
+        let ie = h.index.lookup(&key).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SetLocked {
+            tx_key: key,
+            value: true,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+
+        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert!(meta.flags.contains(TxFlags::LOCKED));
+    }
+
+    #[test]
+    fn replay_preserve_until() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(25, 5);
+        let ie = h.index.lookup(&key).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::PreserveUntil {
+            tx_key: key,
+            block_height: 5000,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+
+        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!({ meta.preserve_until }, 5000);
+        assert_eq!({ meta.delete_at_height }, 0);
+    }
+
+    #[test]
+    fn replay_mark_on_longest_chain() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(26, 5);
+        let ie = h.index.lookup(&key).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::MarkOnLongestChain {
+            tx_key: key,
+            on_longest_chain: false,
+            current_block_height: 800,
+            block_height_retention: 288,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+
+        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!({ meta.unmined_since }, 800);
     }
 }

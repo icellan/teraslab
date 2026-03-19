@@ -109,6 +109,13 @@ impl MigrationManager {
         self.active.retain(|p| !p.is_complete());
     }
 
+    /// Check if a shard is currently being migrated outbound.
+    pub fn is_migrating_shard(&self, shard: u16) -> bool {
+        self.active
+            .iter()
+            .any(|p| p.shard == shard && !p.is_complete())
+    }
+
     /// Number of active (non-complete) migrations.
     pub fn active_count(&self) -> usize {
         self.active.iter().filter(|p| !p.is_complete()).count()

@@ -52,7 +52,11 @@ const INDIRECT_PROBE_K: usize = 3;
 pub struct SwimRunner {
     config: SwimConfig,
     membership: Arc<Mutex<Membership>>,
+    /// TCP addresses of peers (used for client routing / migration).
     peer_addrs: Arc<Mutex<HashMap<NodeId, SocketAddr>>>,
+    /// SWIM (UDP) addresses of peers, learned from the actual source address
+    /// of received UDP packets. Used for sending probes.
+    swim_peer_addrs: Arc<Mutex<HashMap<NodeId, SocketAddr>>>,
     shutdown: Arc<AtomicBool>,
     incarnation: u64,
     /// Currently pending direct probe (at most one at a time).
@@ -75,8 +79,12 @@ impl SwimRunner {
             config,
             membership,
             peer_addrs: Arc::new(Mutex::new(HashMap::new())),
+            swim_peer_addrs: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
-            incarnation: 1,
+            incarnation: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
             pending_probe: None,
             probe_round_robin: 0,
             ping_req_forwarding: HashMap::new(),
@@ -224,11 +232,17 @@ impl SwimRunner {
             Err(_) => from_addr, // fallback
         };
 
-        // Register the sender as alive
+        // Register the sender's TCP address (for client routing / migration)
         self.peer_addrs
             .lock()
             .unwrap()
             .insert(sender_id, sender_tcp_addr);
+
+        // Register the sender's SWIM address (from the actual UDP source)
+        self.swim_peer_addrs
+            .lock()
+            .unwrap()
+            .insert(sender_id, from_addr);
 
         let mut events = self
             .membership
@@ -259,6 +273,11 @@ impl SwimRunner {
                 pos += alen;
 
                 if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+                    // Skip gossip about ourselves — a node's own state is
+                    // authoritative and must not be overridden by third-party gossip.
+                    if nid == self.config.self_id {
+                        continue;
+                    }
                     self.peer_addrs.lock().unwrap().insert(nid, addr);
                     let mut mem = self.membership.lock().unwrap();
                     let evts = match state {
@@ -360,16 +379,24 @@ impl SwimRunner {
         let target_addr_str = std::str::from_utf8(&data[pos..pos + target_addr_len]).ok()?;
         let target_addr: SocketAddr = target_addr_str.parse().ok()?;
 
-        // Convert to SWIM port (use same port as our bind_addr)
-        let swim_addr = SocketAddr::new(target_addr.ip(), self.config.bind_addr.port());
-        Some((target_id, swim_addr))
+        // The address in the PING_REQ payload is already the target's SWIM address.
+        Some((target_id, target_addr))
     }
 
     /// Select ONE random peer and send a direct PING probe.
     ///
     /// This is the standard SWIM protocol: each probe interval, one peer is
     /// selected for probing. If it doesn't respond, indirect probes follow.
+    ///
+    /// If there is already a pending probe (awaiting ACK or indirect results),
+    /// we skip starting a new one to avoid resetting the suspicion timer.
     fn send_probe(&mut self, socket: &UdpSocket) {
+        // Don't start a new probe if one is already in flight.
+        // The existing probe's timeout will handle failure detection.
+        if self.pending_probe.is_some() {
+            return;
+        }
+
         let peers: Vec<(NodeId, SocketAddr)> = self
             .peer_addrs
             .lock()
@@ -385,15 +412,22 @@ impl SwimRunner {
         // Round-robin selection of the peer to probe
         let idx = self.probe_round_robin % peers.len();
         self.probe_round_robin = self.probe_round_robin.wrapping_add(1);
-        let (target_id, target_addr) = peers[idx];
+        let (target_id, _target_tcp_addr) = peers[idx];
 
         let updates = self.collect_member_updates();
         let msg = self.encode_message(MSG_PING, &updates);
-        let swim_addr = SocketAddr::new(target_addr.ip(), self.config.bind_addr.port());
+
+        // Use the target's actual SWIM (UDP) address if known, otherwise
+        // fall back to deriving it from the TCP address.
+        let swim_addr = self
+            .swim_peer_addrs
+            .lock()
+            .unwrap()
+            .get(&target_id)
+            .copied()
+            .unwrap_or_else(|| SocketAddr::new(_target_tcp_addr.ip(), self.config.bind_addr.port()));
         let _ = socket.send_to(&msg, swim_addr);
 
-        // Record the pending probe (overwriting any previous one that has
-        // already been resolved or timed out)
         self.pending_probe = Some(PendingProbe {
             target: target_id,
             started: Instant::now(),
@@ -409,6 +443,12 @@ impl SwimRunner {
             None => return,
         };
 
+        // Always mark indirect_sent so the suspicion timer advances,
+        // even if there are no other peers to ask (e.g. 2-node cluster).
+        if let Some(ref mut p) = self.pending_probe {
+            p.indirect_sent = true;
+        }
+
         let peers: Vec<(NodeId, SocketAddr)> = self
             .peer_addrs
             .lock()
@@ -422,15 +462,28 @@ impl SwimRunner {
             return;
         }
 
-        // Get the suspect's address for the PING_REQ payload
-        let suspect_addr = match self.peer_addrs.lock().unwrap().get(&suspect_id).copied() {
+        // Get the suspect's SWIM address for the PING_REQ payload
+        let suspect_swim_addr = self
+            .swim_peer_addrs
+            .lock()
+            .unwrap()
+            .get(&suspect_id)
+            .copied()
+            .or_else(|| {
+                self.peer_addrs
+                    .lock()
+                    .unwrap()
+                    .get(&suspect_id)
+                    .map(|a| SocketAddr::new(a.ip(), self.config.bind_addr.port()))
+            });
+        let suspect_swim_addr = match suspect_swim_addr {
             Some(a) => a,
             None => return,
         };
 
         // Build PING_REQ message with target info appended after updates
         let updates = self.collect_member_updates();
-        let suspect_addr_str = suspect_addr.to_string();
+        let suspect_addr_str = suspect_swim_addr.to_string();
         let suspect_addr_bytes = suspect_addr_str.as_bytes();
 
         let mut payload = updates;
@@ -440,16 +493,15 @@ impl SwimRunner {
 
         let msg = self.encode_message(MSG_PING_REQ, &payload);
 
-        // Send to up to K random other peers
+        // Send to up to K random other peers using their SWIM addresses
+        let swim_addrs = self.swim_peer_addrs.lock().unwrap();
         let k = INDIRECT_PROBE_K.min(peers.len());
-        for &(_, addr) in peers.iter().take(k) {
-            let swim_addr = SocketAddr::new(addr.ip(), self.config.bind_addr.port());
+        for &(peer_id, tcp_addr) in peers.iter().take(k) {
+            let swim_addr = swim_addrs
+                .get(&peer_id)
+                .copied()
+                .unwrap_or_else(|| SocketAddr::new(tcp_addr.ip(), self.config.bind_addr.port()));
             let _ = socket.send_to(&msg, swim_addr);
-        }
-
-        // Mark that indirect probes have been sent
-        if let Some(ref mut p) = self.pending_probe {
-            p.indirect_sent = true;
         }
     }
 
@@ -473,12 +525,17 @@ impl SwimRunner {
 
         let alive = membership.alive_members();
         let mut buf = Vec::new();
-        let count = alive.len().min(20) as u16; // Limit piggybacked updates
-        buf.extend_from_slice(&count.to_le_bytes());
+        let mut entries = Vec::new();
 
         for &node in alive.iter().take(20) {
             let state: u8 = 0; // Alive
-            let incarnation: u64 = 1;
+            let incarnation = if node == self.config.self_id {
+                self.incarnation
+            } else if let Some(info) = membership.member_info(&node) {
+                info.incarnation
+            } else {
+                self.incarnation
+            };
             let addr_str = if node == self.config.self_id {
                 self.config.self_addr.to_string()
             } else if let Some(&addr) = peers.get(&node) {
@@ -486,10 +543,16 @@ impl SwimRunner {
             } else {
                 continue;
             };
-            let addr_bytes = addr_str.as_bytes();
+            entries.push((node, state, incarnation, addr_str));
+        }
 
+        let count = entries.len().min(20) as u16;
+        buf.extend_from_slice(&count.to_le_bytes());
+
+        for (node, state, incarnation, addr_str) in &entries {
+            let addr_bytes = addr_str.as_bytes();
             buf.extend_from_slice(&node.0.to_le_bytes());
-            buf.push(state);
+            buf.push(*state);
             buf.extend_from_slice(&incarnation.to_le_bytes());
             buf.extend_from_slice(&(addr_bytes.len() as u16).to_le_bytes());
             buf.extend_from_slice(addr_bytes);

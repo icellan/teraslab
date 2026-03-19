@@ -3,6 +3,13 @@
 //! Uses the txid's first 8 bytes as the bucket index (the txid is already
 //! a cryptographic hash with excellent distribution) and bytes 8–16 as a
 //! fingerprint for fast rejection during probing.
+//!
+//! # Memory
+//!
+//! Backing memory is allocated via `mmap(MAP_ANONYMOUS | MAP_PRIVATE)`.
+//! On Linux, the allocator first attempts 2 MB hugepages (`MAP_HUGETLB`)
+//! for better TLB performance at scale, falling back to regular pages.
+//! On macOS (development), regular pages are used directly.
 
 use thiserror::Error;
 
@@ -79,9 +86,10 @@ pub struct TxIndexEntry {
 
 const BUCKET_EMPTY: u8 = 0;
 const BUCKET_OCCUPIED: u8 = 1;
+#[allow(dead_code)]
 const BUCKET_TOMBSTONE: u8 = 2;
 
-/// Entry size: 1 + 2 + 32 + 8 + 2 + 8 + 4 + 8 + 4 + 1 + 2 = 72, pad to 80.
+/// Entry size: 1 + 2 + 32 + 8 + 2 + 8 + 4 + 8 + 4 + 1 = 70, pad to 8-byte boundary.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Bucket {
@@ -133,10 +141,6 @@ impl Bucket {
         self.occupied == BUCKET_OCCUPIED
     }
 
-    fn is_tombstone(&self) -> bool {
-        self.occupied == BUCKET_TOMBSTONE
-    }
-
     fn entry(&self) -> TxIndexEntry {
         TxIndexEntry {
             device_id: self.device_id,
@@ -178,23 +182,108 @@ fn fingerprint(key: &TxKey) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// mmap helpers
+// ---------------------------------------------------------------------------
+
+/// Allocate a zeroed mmap region for `capacity` buckets.
+///
+/// On Linux, attempts 2 MB hugepages first. Falls back to regular pages.
+/// On macOS, uses regular pages directly.
+///
+/// Returns `(pointer, mmap_byte_length, hugepage_used)`.
+fn alloc_mmap_buckets(
+    capacity: usize,
+) -> Result<(*mut Bucket, usize, bool)> {
+    let byte_len = capacity
+        .checked_mul(std::mem::size_of::<Bucket>())
+        .ok_or_else(|| HashTableError::AllocFailed("capacity overflow".into()))?;
+
+    if byte_len == 0 {
+        return Err(HashTableError::AllocFailed(
+            "zero-size allocation".into(),
+        ));
+    }
+
+    // On Linux, try hugepages first.
+    #[cfg(target_os = "linux")]
+    {
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                byte_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB,
+                -1,
+                0,
+            )
+        };
+        if ptr != libc::MAP_FAILED {
+            return Ok((ptr.cast::<Bucket>(), byte_len, true));
+        }
+        // Hugepage allocation failed — fall through to regular mmap.
+    }
+
+    // Regular mmap (works on macOS and Linux).
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            byte_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+
+    if ptr == libc::MAP_FAILED {
+        return Err(HashTableError::AllocFailed(format!(
+            "mmap({byte_len} bytes) failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // MAP_ANONYMOUS returns zeroed memory, so all buckets start as BUCKET_EMPTY.
+    Ok((ptr.cast::<Bucket>(), byte_len, false))
+}
+
+/// Release a previously mmap'd region.
+///
+/// # Safety
+///
+/// `ptr` must point to a region of `byte_len` bytes allocated by `alloc_mmap_buckets`.
+unsafe fn dealloc_mmap_buckets(ptr: *mut Bucket, byte_len: usize) {
+    if byte_len > 0 && !ptr.is_null() {
+        unsafe { libc::munmap(ptr.cast(), byte_len) };
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HashTable
 // ---------------------------------------------------------------------------
 
-/// Robin Hood open-addressing hash table.
+/// Robin Hood open-addressing hash table backed by an mmap'd flat array.
 ///
-/// Backed by an mmap'd (or heap-allocated) flat array of [`Bucket`] structs.
 /// Capacity is always a power of two for fast modulo via bitmask.
 ///
 /// # Memory
 ///
 /// Attempts to use 2 MB hugepages on Linux (`MAP_HUGETLB`). Falls back to
-/// regular pages on macOS or when hugepages are unavailable.
+/// regular pages on macOS or when hugepages are unavailable. On drop, the
+/// mmap region is released via `munmap`.
 pub struct HashTable {
-    buckets: Vec<Bucket>,
+    /// Pointer to the mmap'd bucket array.
+    ptr: *mut Bucket,
+    /// Total number of buckets (always a power of 2).
     capacity: usize,
+    /// Number of occupied entries.
     count: usize,
+    /// `capacity - 1`, for fast modulo via bitmask.
     mask: usize,
+    /// Size of the mmap'd region in bytes.
+    mmap_len: usize,
+    /// Whether 2 MB hugepages are backing this table.
+    hugepage: bool,
+    /// Maximum probe distance observed so far.
     max_probe: usize,
 }
 
@@ -203,12 +292,14 @@ impl std::fmt::Debug for HashTable {
         f.debug_struct("HashTable")
             .field("capacity", &self.capacity)
             .field("count", &self.count)
+            .field("hugepage", &self.hugepage)
             .field("max_probe", &self.max_probe)
             .finish()
     }
 }
 
-// Safety: HashTable contains only owned data (Vec<Bucket>).
+// Safety: HashTable owns its mmap allocation exclusively. The contents are
+// plain Copy data with no interior mutability or thread-local state.
 unsafe impl Send for HashTable {}
 unsafe impl Sync for HashTable {}
 
@@ -216,84 +307,52 @@ impl HashTable {
     /// Create a new hash table with at least `initial_capacity` buckets.
     ///
     /// The capacity is rounded up to the next power of two.
+    /// Memory is allocated via `mmap` with `MAP_ANONYMOUS | MAP_PRIVATE`.
+    /// On Linux, 2 MB hugepages are attempted first.
     pub fn new(initial_capacity: usize) -> Result<Self> {
         let capacity = initial_capacity.next_power_of_two().max(16);
-        let buckets = vec![Bucket::empty(); capacity];
+        let (ptr, mmap_len, hugepage) = alloc_mmap_buckets(capacity)?;
         Ok(Self {
-            buckets,
+            ptr,
             capacity,
             count: 0,
             mask: capacity - 1,
+            mmap_len,
+            hugepage,
             max_probe: 0,
         })
     }
 
-    /// Look up a transaction by key. O(1) expected.
-    pub fn get(&self, key: &TxKey) -> Option<&TxIndexEntry> {
-        let fp = fingerprint(key);
-        let mut idx = bucket_index(key, self.mask);
-        let mut dist: u16 = 0;
-
-        loop {
-            let bucket = &self.buckets[idx];
-            if bucket.is_empty() {
-                return None;
-            }
-            if bucket.is_occupied() {
-                if dist > bucket.probe_distance {
-                    // Robin Hood invariant: if our probe distance exceeds
-                    // the stored entry's distance, the key cannot be further.
-                    return None;
-                }
-                if bucket.fingerprint == fp && bucket.txid == key.txid {
-                    // Exact match — return a reference to the entry fields.
-                    // Safety: we return a reference with lifetime tied to &self,
-                    // and the bucket won't move while &self is alive.
-                    //
-                    // We build a TxIndexEntry on the stack; to return a reference
-                    // we'd need to store the struct separately. Instead, we use
-                    // an internal helper that returns by value for correctness.
-                    //
-                    // Actually, let's just return None here and use get_entry()
-                    // for the value-returning version. But the phase spec says
-                    // get returns Option<&TxIndexEntry>... Let me store the
-                    // TxIndexEntry inline so we can reference it.
-                    //
-                    // The Bucket already has the fields inline. Let me cast.
-                    // Actually the simplest correct approach: we can't return
-                    // &TxIndexEntry because it's computed from bucket fields.
-                    // Let's change the API to return by value. The phase spec
-                    // is aspirational; correctness matters more.
-                    //
-                    // For now: use get_entry() which returns Option<TxIndexEntry>.
-                    // This method is kept for compatibility but won't be used
-                    // directly.
-                    unreachable!("use get_entry() instead");
-                }
-            }
-            // Tombstones are skipped during lookup.
-            idx = (idx + 1) & self.mask;
-            dist += 1;
-
-            if dist as usize >= self.capacity {
-                return None;
-            }
-        }
+    /// Safe accessor for bucket at `idx` (immutable).
+    #[inline]
+    fn bucket(&self, idx: usize) -> &Bucket {
+        debug_assert!(idx < self.capacity);
+        // Safety: idx is within the mmap'd region (checked by caller or mask).
+        unsafe { &*self.ptr.add(idx) }
     }
 
-    /// Look up a transaction by key, returning the entry by value.
+    /// Safe accessor for bucket at `idx` (mutable).
+    #[inline]
+    fn bucket_mut(&mut self, idx: usize) -> &mut Bucket {
+        debug_assert!(idx < self.capacity);
+        // Safety: idx is within the mmap'd region, &mut self guarantees exclusivity.
+        unsafe { &mut *self.ptr.add(idx) }
+    }
+
+    /// Look up a transaction by key, returning the entry by value. O(1) expected.
     pub fn get_entry(&self, key: &TxKey) -> Option<TxIndexEntry> {
         let fp = fingerprint(key);
         let mut idx = bucket_index(key, self.mask);
         let mut dist: u16 = 0;
 
         loop {
-            let bucket = &self.buckets[idx];
+            let bucket = self.bucket(idx);
             if bucket.is_empty() {
                 return None;
             }
             if bucket.is_occupied() {
                 if dist > bucket.probe_distance {
+                    // Robin Hood invariant: the key cannot be further.
                     return None;
                 }
                 if bucket.fingerprint == fp && bucket.txid == key.txid {
@@ -320,7 +379,7 @@ impl HashTable {
             let mut idx = bucket_index(&key, self.mask);
             let mut dist: u16 = 0;
             loop {
-                let bucket = &self.buckets[idx];
+                let bucket = self.bucket(idx);
                 if bucket.is_empty() {
                     break;
                 }
@@ -330,7 +389,7 @@ impl HashTable {
                     }
                     if bucket.fingerprint == fp && bucket.txid == key.txid {
                         let old = bucket.entry();
-                        self.buckets[idx].set_entry(&key, &entry, dist);
+                        self.bucket_mut(idx).set_entry(&key, &entry, dist);
                         return Ok(Some(old));
                     }
                 }
@@ -347,12 +406,12 @@ impl HashTable {
         let mut dist: u16 = 0;
         let mut cur_key = key;
         let mut cur_entry = entry;
-        let mut cur_fp = fp;
 
         loop {
-            let bucket = &self.buckets[idx];
-            if bucket.is_empty() || bucket.is_tombstone() {
-                self.buckets[idx].set_entry(&cur_key, &cur_entry, dist);
+            let bucket = self.bucket(idx);
+            if bucket.is_empty() {
+                self.bucket_mut(idx)
+                    .set_entry(&cur_key, &cur_entry, dist);
                 self.count += 1;
                 if dist as usize > self.max_probe {
                     self.max_probe = dist as usize;
@@ -361,19 +420,20 @@ impl HashTable {
             }
 
             // Robin Hood: if our displacement is greater, swap.
-            if dist > bucket.probe_distance {
-                let displaced_key = TxKey { txid: bucket.txid };
+            if bucket.is_occupied() && dist > bucket.probe_distance {
+                let displaced_key = TxKey {
+                    txid: bucket.txid,
+                };
                 let displaced_entry = bucket.entry();
                 let displaced_dist = bucket.probe_distance;
 
-                self.buckets[idx].set_entry(&cur_key, &cur_entry, dist);
+                self.bucket_mut(idx)
+                    .set_entry(&cur_key, &cur_entry, dist);
 
                 cur_key = displaced_key;
                 cur_entry = displaced_entry;
-                cur_fp = fingerprint(&cur_key);
                 dist = displaced_dist;
             }
-            let _ = cur_fp; // used implicitly via cur_key
 
             idx = (idx + 1) & self.mask;
             dist += 1;
@@ -389,8 +449,7 @@ impl HashTable {
 
     /// Remove an entry by key. Returns the removed entry if it existed.
     ///
-    /// Uses backward-shift deletion instead of tombstones for better
-    /// probe-chain performance.
+    /// Uses backward-shift deletion for better probe-chain performance.
     pub fn remove(&mut self, key: &TxKey) -> Option<TxIndexEntry> {
         let fp = fingerprint(key);
         let mut idx = bucket_index(key, self.mask);
@@ -398,7 +457,7 @@ impl HashTable {
 
         // Find the entry.
         loop {
-            let bucket = &self.buckets[idx];
+            let bucket = self.bucket(idx);
             if bucket.is_empty() {
                 return None;
             }
@@ -417,26 +476,27 @@ impl HashTable {
             }
         }
 
-        let removed = self.buckets[idx].entry();
+        let removed = self.bucket(idx).entry();
         self.count -= 1;
 
         // Backward-shift: move subsequent entries back to fill the gap.
         let mut empty_idx = idx;
         loop {
             let next_idx = (empty_idx + 1) & self.mask;
-            let next = &self.buckets[next_idx];
-            if next.is_empty() || (next.is_occupied() && next.probe_distance == 0) {
-                break;
-            }
-            if next.is_tombstone() {
+            let next = self.bucket(next_idx);
+            if next.is_empty()
+                || (next.is_occupied() && next.probe_distance == 0)
+            {
                 break;
             }
             // Shift this entry back.
-            self.buckets[empty_idx] = self.buckets[next_idx];
-            self.buckets[empty_idx].probe_distance -= 1;
+            let shifted = *self.bucket(next_idx);
+            let b = self.bucket_mut(empty_idx);
+            *b = shifted;
+            b.probe_distance -= 1;
             empty_idx = next_idx;
         }
-        self.buckets[empty_idx] = Bucket::empty();
+        *self.bucket_mut(empty_idx) = Bucket::empty();
 
         Some(removed)
     }
@@ -466,25 +526,34 @@ impl HashTable {
         self.max_probe
     }
 
-    /// Approximate memory usage in bytes.
+    /// Approximate memory usage in bytes (mmap region size).
     pub fn memory_bytes(&self) -> usize {
-        self.capacity * BUCKET_SIZE
+        self.mmap_len
+    }
+
+    /// Whether hugepages are backing this table.
+    pub fn hugepage_enabled(&self) -> bool {
+        self.hugepage
     }
 
     /// Resize the table to at least `new_capacity` buckets.
     ///
-    /// Rehashes all occupied entries into a fresh table.
+    /// Allocates a new mmap region, rehashes all occupied entries, and
+    /// releases the old mmap region.
     pub fn resize(&mut self, new_capacity: usize) -> Result<()> {
         let new_cap = new_capacity.next_power_of_two().max(16);
         let mut new_table = HashTable::new(new_cap)?;
 
-        for bucket in &self.buckets {
+        for i in 0..self.capacity {
+            let bucket = self.bucket(i);
             if bucket.is_occupied() {
                 let key = TxKey { txid: bucket.txid };
                 new_table.insert(key, bucket.entry())?;
             }
         }
 
+        // Replace self with new_table.
+        // The old self's Drop will run (munmapping the old region).
         *self = new_table;
         Ok(())
     }
@@ -492,8 +561,17 @@ impl HashTable {
     /// Iterate over all occupied `(TxKey, TxIndexEntry)` pairs.
     pub fn iter(&self) -> HashTableIter<'_> {
         HashTableIter {
-            buckets: &self.buckets,
+            table: self,
             pos: 0,
+        }
+    }
+}
+
+impl Drop for HashTable {
+    fn drop(&mut self) {
+        if self.mmap_len > 0 {
+            // Safety: ptr was allocated by alloc_mmap_buckets with mmap_len bytes.
+            unsafe { dealloc_mmap_buckets(self.ptr, self.mmap_len) };
         }
     }
 }
@@ -504,7 +582,7 @@ impl HashTable {
 
 /// Iterator over occupied hash table entries.
 pub struct HashTableIter<'a> {
-    buckets: &'a [Bucket],
+    table: &'a HashTable,
     pos: usize,
 }
 
@@ -512,8 +590,8 @@ impl<'a> Iterator for HashTableIter<'a> {
     type Item = (TxKey, TxIndexEntry);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.pos < self.buckets.len() {
-            let bucket = &self.buckets[self.pos];
+        while self.pos < self.table.capacity {
+            let bucket = self.table.bucket(self.pos);
             self.pos += 1;
             if bucket.is_occupied() {
                 return Some((
@@ -538,7 +616,9 @@ mod tests {
         let mut txid = [0u8; 32];
         txid[0..8].copy_from_slice(&n.to_le_bytes());
         // Put something in bytes 8-16 for fingerprint variation
-        txid[8..16].copy_from_slice(&(n.wrapping_mul(0x9E3779B97F4A7C15)).to_le_bytes());
+        txid[8..16].copy_from_slice(
+            &(n.wrapping_mul(0x9E3779B97F4A7C15)).to_le_bytes(),
+        );
         TxKey { txid }
     }
 
@@ -554,7 +634,11 @@ mod tests {
     }
 
     /// Create a key that hashes to a specific bucket (for collision testing).
-    fn make_colliding_key(bucket_target: usize, sequence: u64, mask: usize) -> TxKey {
+    fn make_colliding_key(
+        bucket_target: usize,
+        sequence: u64,
+        mask: usize,
+    ) -> TxKey {
         let mut txid = [0u8; 32];
         // Set bytes 0-7 so bucket_index == bucket_target
         let base = (bucket_target & mask) as u64;
@@ -562,7 +646,8 @@ mod tests {
         // Set bytes 8-16 uniquely per sequence for different fingerprints
         txid[8..16].copy_from_slice(&sequence.to_le_bytes());
         // Set bytes 16+ for additional uniqueness
-        txid[16..24].copy_from_slice(&(sequence.wrapping_mul(7)).to_le_bytes());
+        txid[16..24]
+            .copy_from_slice(&(sequence.wrapping_mul(7)).to_le_bytes());
         TxKey { txid }
     }
 
@@ -704,7 +789,9 @@ mod tests {
 
         assert!(t.capacity() >= old_cap * 2);
         for i in 0..12u64 {
-            let e = t.get_entry(&make_key(i)).expect("entry should survive resize");
+            let e = t
+                .get_entry(&make_key(i))
+                .expect("entry should survive resize");
             assert_eq!(e.record_offset, i * 100);
         }
     }
@@ -727,7 +814,10 @@ mod tests {
         }
         t.resize(32).unwrap();
         t.insert(make_key(100), make_entry(100)).unwrap();
-        assert_eq!(t.get_entry(&make_key(100)).unwrap().record_offset, 100);
+        assert_eq!(
+            t.get_entry(&make_key(100)).unwrap().record_offset,
+            100
+        );
     }
 
     #[test]
@@ -737,7 +827,10 @@ mod tests {
             t.insert(make_key(i), make_entry(i)).unwrap();
         }
         for i in 0..716u64 {
-            assert!(t.get_entry(&make_key(i)).is_some(), "missing key {i}");
+            assert!(
+                t.get_entry(&make_key(i)).is_some(),
+                "missing key {i}"
+            );
         }
     }
 
@@ -748,7 +841,10 @@ mod tests {
             t.insert(make_key(i), make_entry(i)).unwrap();
         }
         for i in 0..921u64 {
-            assert!(t.get_entry(&make_key(i)).is_some(), "missing key {i}");
+            assert!(
+                t.get_entry(&make_key(i)).is_some(),
+                "missing key {i}"
+            );
         }
     }
 
@@ -767,7 +863,8 @@ mod tests {
         }
 
         for (i, k) in keys.iter().enumerate() {
-            let e = t.get_entry(k).expect("colliding key should be found");
+            let e =
+                t.get_entry(k).expect("colliding key should be found");
             assert_eq!(e.record_offset, i as u64 * 100);
         }
     }
@@ -876,6 +973,44 @@ mod tests {
         assert_eq!(t.get_entry(&key).unwrap().record_offset, 42);
     }
 
+    // -- Memory mapping tests --
+
+    #[test]
+    fn hashtable_uses_mmap() {
+        // Verify that the hash table's memory is allocated via mmap
+        // by checking that memory_bytes() matches expected bucket * capacity.
+        let t = HashTable::new(1024).unwrap();
+        let expected = t.capacity() * BUCKET_SIZE;
+        assert_eq!(t.memory_bytes(), expected);
+        // The pointer should be page-aligned (mmap guarantees this).
+        assert_eq!(t.ptr as usize % 4096, 0);
+    }
+
+    #[test]
+    fn hugepage_fallback_works() {
+        // Even if hugepages aren't available (typical on macOS and unprivileged
+        // Linux), the table should still be created successfully with regular pages.
+        let t = HashTable::new(4096).unwrap();
+        assert_eq!(t.capacity(), 4096);
+        assert_eq!(t.len(), 0);
+        // On macOS, hugepage should always be false.
+        #[cfg(target_os = "macos")]
+        assert!(!t.hugepage_enabled());
+    }
+
+    #[test]
+    fn drop_releases_memory() {
+        // Allocate a reasonably sized table, then drop it.
+        // We can't directly verify munmap, but we can verify the table
+        // was created and dropped without error or leak.
+        let t = HashTable::new(1 << 16).unwrap(); // 64K buckets
+        let bytes = t.memory_bytes();
+        assert!(bytes > 0);
+        drop(t);
+        // If munmap failed, the process would continue but with a memory leak.
+        // Under valgrind or miri this would be caught.
+    }
+
     // -- Scale tests --
 
     #[test]
@@ -901,6 +1036,60 @@ mod tests {
         let actual = t.memory_bytes();
         // Should be exactly proportional
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn ten_million_entries() {
+        let mut t = HashTable::new(1 << 24).unwrap(); // 16M buckets
+        for i in 0..10_000_000u64 {
+            t.insert(make_key(i), make_entry(i)).unwrap();
+        }
+        assert_eq!(t.len(), 10_000_000);
+
+        // Spot check a sample of entries
+        for i in (0..10_000_000u64).step_by(1000) {
+            let e = t.get_entry(&make_key(i)).unwrap_or_else(|| {
+                panic!("key {i} not found at 10M scale")
+            });
+            assert_eq!(e.record_offset, i);
+        }
+    }
+
+    // -- Performance benchmarks (measured, informational) --
+
+    #[test]
+    fn bench_lookup_1m() {
+        let mut t = HashTable::new(1 << 21).unwrap();
+        for i in 0..1_000_000u64 {
+            t.insert(make_key(i), make_entry(i)).unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        let iters = 1_000_000;
+        for i in 0..iters {
+            let _ = t.get_entry(&make_key(i));
+        }
+        let elapsed = start.elapsed();
+        let ns_per_lookup = elapsed.as_nanos() / iters as u128;
+        eprintln!(
+            "[bench] 1M entries: avg lookup = {ns_per_lookup} ns ({} lookups/sec)",
+            1_000_000_000u128 / ns_per_lookup.max(1)
+        );
+    }
+
+    #[test]
+    fn bench_insert_throughput() {
+        let start = std::time::Instant::now();
+        let count = 1_000_000u64;
+        let mut t = HashTable::new((count as usize).next_power_of_two() * 2).unwrap();
+        for i in 0..count {
+            t.insert(make_key(i), make_entry(i)).unwrap();
+        }
+        let elapsed = start.elapsed();
+        let ops_per_sec = count as f64 / elapsed.as_secs_f64();
+        eprintln!(
+            "[bench] insert throughput: {ops_per_sec:.0} ops/sec ({count} inserts in {elapsed:?})"
+        );
     }
 
     // -- Iterator tests --

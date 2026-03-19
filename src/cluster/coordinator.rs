@@ -342,6 +342,16 @@ impl RunningCluster {
         }
     }
 
+    /// Check if this node is actively migrating a shard outbound.
+    ///
+    /// During outbound migration, reads can still be served locally
+    /// (the data hasn't been removed yet), but writes should redirect
+    /// to the new master.
+    pub fn is_migrating_outbound(&self, key: &TxKey) -> bool {
+        let shard = ShardTable::shard_for_key(key);
+        self.migration.lock().unwrap().is_migrating_shard(shard)
+    }
+
     /// Get the address of a node.
     pub fn node_addr(&self, node: &NodeId) -> Option<SocketAddr> {
         self.node_addrs.read().unwrap().get(node).copied()
