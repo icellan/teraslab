@@ -323,6 +323,7 @@ pub struct WireCreateItem {
     pub flags: u8,
     pub utxo_hashes: Vec<[u8; 32]>,
     pub cold_data: Vec<u8>,
+    pub block_height: u32,
     pub mined_block_id: Option<u32>,
     pub mined_block_height: Option<u32>,
     pub mined_subtree_idx: Option<u32>,
@@ -354,6 +355,7 @@ pub fn encode_create_batch(items: &[WireCreateItem]) -> Vec<u8> {
         buf.push(has_cold);
         put_u32(&mut buf, item.cold_data.len() as u32);
         buf.extend_from_slice(&item.cold_data);
+        put_u32(&mut buf, item.block_height);
         let has_mined = u8::from(item.mined_block_id.is_some());
         buf.push(has_mined);
         if let Some(block_id) = item.mined_block_id {
@@ -404,6 +406,9 @@ pub fn decode_create_batch(data: &[u8]) -> Option<Vec<WireCreateItem>> {
         if pos + cold_len > data.len() { return None; }
         let cold_data = data[pos..pos+cold_len].to_vec(); pos += cold_len;
 
+        if pos + 4 > data.len() { return None; }
+        let block_height = get_u32(data, pos); pos += 4;
+
         if pos >= data.len() { return None; }
         let has_mined = data[pos] != 0; pos += 1;
         let (mined_block_id, mined_block_height, mined_subtree_idx) = if has_mined {
@@ -430,7 +435,7 @@ pub fn decode_create_batch(data: &[u8]) -> Option<Vec<WireCreateItem>> {
         items.push(WireCreateItem {
             txid, tx_version, locktime, fee, size_in_bytes, extended_size,
             is_coinbase, spending_height, created_at, flags, utxo_hashes,
-            cold_data, mined_block_id, mined_block_height, mined_subtree_idx,
+            cold_data, block_height, mined_block_id, mined_block_height, mined_subtree_idx,
             parent_txids,
         });
     }

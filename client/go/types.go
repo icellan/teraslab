@@ -71,6 +71,7 @@ type CreateItem struct {
 	Flags            uint8
 	UtxoHashes       []UtxoHash
 	TxData           TxData
+	BlockHeight      uint32 // Current block height at creation time (sets unmined_since for non-mined txs)
 	MinedBlockID     *uint32
 	MinedBlockHeight *uint32
 	MinedSubtreeIdx  *uint32

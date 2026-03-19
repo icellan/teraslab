@@ -108,6 +108,7 @@ func encodeCreateBatch(buf []byte, items []CreateItem) []byte {
 			buf = appendU32(buf, uint32(len(item.TxData.Inpoints)))
 			buf = append(buf, item.TxData.Inpoints...)
 		}
+		buf = appendU32(buf, item.BlockHeight)
 		hasMined := item.MinedBlockID != nil
 		buf = appendBool(buf, hasMined)
 		if hasMined {

@@ -136,54 +136,59 @@ fn write_redo_ops(redo_log: Option<&Mutex<RedoLog>>, ops: &[RedoOp]) {
 /// thread is spawned to send the batch via TCP. Replication failures are
 /// logged but do not affect the client response — the replica will catch up
 /// from the redo log or via anti-entropy.
-fn replicate_ops(cluster: Option<&RunningCluster>, tx_key: &TxKey, ops: Vec<ReplicaOp>) {
+/// Replicate a list of (key, ops) pairs to the appropriate replica nodes.
+///
+/// Groups ops by target replica address and sends one batch per replica,
+/// avoiding the overhead of opening a new TCP connection per key.
+fn replicate_all_ops(
+    cluster: Option<&RunningCluster>,
+    ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)>,
+) {
     let cluster = match cluster {
         Some(c) => c,
-        None => {
-            return;
-        }
+        None => return,
     };
-    if ops.is_empty() {
+    if ops_by_key.is_empty() {
         return;
     }
 
-    let shard = ShardTable::shard_for_key(tx_key);
+    // Group all ops by target replica address
     let table = cluster.shard_table();
     let table_guard = table.read().unwrap();
-    let assignment = table_guard.assignment(shard);
+    let mut by_addr: HashMap<std::net::SocketAddr, Vec<ReplicaOp>> = HashMap::new();
 
-    if assignment.replicas.is_empty() {
-        return;
-    }
-
-    // Collect replica addresses before dropping the lock
-    let mut replica_addrs = Vec::new();
-    for replica_id in &assignment.replicas {
-        if let Some(addr) = cluster.node_addr(replica_id) {
-            replica_addrs.push(addr);
+    for (key, ops) in &ops_by_key {
+        let shard = ShardTable::shard_for_key(key);
+        let assignment = table_guard.assignment(shard);
+        for replica_id in &assignment.replicas {
+            if let Some(addr) = cluster.node_addr(replica_id) {
+                by_addr.entry(addr).or_default().extend(ops.clone());
+            }
         }
     }
     drop(table_guard);
 
-    if replica_addrs.is_empty() {
-        return;
-    }
-
-    let batch = ReplicaBatch {
-        first_sequence: 0, // Sequence tracking handled by ReplicationManager for formal replication
-        ops,
-    };
-
-    for addr in replica_addrs {
-        let batch_clone = batch.clone();
-        std::thread::spawn(move || {
-            match send_replica_batch_to(addr, &batch_clone) {
-                Ok(()) => {}
-                Err(e) => {
+    // Send one batch per replica node and wait for completion.
+    // Synchronous replication ensures data exists on replicas before the
+    // client gets the ACK, which is required for RF=2 durability.
+    let handles: Vec<_> = by_addr.into_iter()
+        .filter(|(_, ops)| !ops.is_empty())
+        .map(|(addr, ops)| {
+            let batch = ReplicaBatch {
+                first_sequence: 0,
+                ops,
+            };
+            std::thread::spawn(move || {
+                if let Err(e) = send_replica_batch_to(addr, &batch) {
                     eprintln!("replication to {addr} failed: {e}");
                 }
-            }
-        });
+            })
+        })
+        .collect();
+
+    // Wait for all replica sends to complete (best-effort: don't block forever)
+    for handle in handles {
+        let _ = handle.join();
     }
 }
 
@@ -418,9 +423,7 @@ fn handle_spend_batch(
     }
 
     write_redo_ops(redo_log, &redo_ops);
-    for (key, ops) in repl_ops_by_key {
-        replicate_ops(cluster, &key, ops);
-    }
+    replicate_all_ops(cluster, repl_ops_by_key);
 
     if errors.is_empty() {
         ResponseFrame {
@@ -493,9 +496,7 @@ fn handle_unspend_batch(
     }
 
     write_redo_ops(redo_log, &redo_ops);
-    for (key, ops) in repl_ops_by_key {
-        replicate_ops(cluster, &key, ops);
-    }
+    replicate_all_ops(cluster, repl_ops_by_key);
 
     batch_response(req.request_id, &errors)
 }
@@ -570,9 +571,7 @@ fn handle_set_mined_batch(
     }
 
     write_redo_ops(redo_log, &redo_ops);
-    for (key, ops) in repl_ops_by_key {
-        replicate_ops(cluster, &key, ops);
-    }
+    replicate_all_ops(cluster, repl_ops_by_key);
 
     batch_response(req.request_id, &errors)
 }
@@ -668,7 +667,7 @@ fn handle_create_batch(
             inpoints,
             is_external: false,
             created_at: item.created_at,
-            block_height: item.mined_block_height.unwrap_or(0),
+            block_height: item.block_height,
             mined_block_infos,
             frozen: item.flags & 0x04 != 0,
             conflicting: item.flags & 0x02 != 0,
@@ -726,9 +725,7 @@ fn handle_create_batch(
     }
 
     write_redo_ops(redo_log, &redo_ops);
-    for (key, ops) in repl_ops_by_key {
-        replicate_ops(cluster, &key, ops);
-    }
+    replicate_all_ops(cluster, repl_ops_by_key);
 
     batch_response(req.request_id, &errors)
 }
@@ -780,9 +777,7 @@ fn handle_freeze_batch(
     }
 
     write_redo_ops(redo_log, &redo_ops);
-    for (key, ops) in repl_ops_by_key {
-        replicate_ops(cluster, &key, ops);
-    }
+    replicate_all_ops(cluster, repl_ops_by_key);
 
     batch_response(req.request_id, &errors)
 }
@@ -830,9 +825,7 @@ fn handle_unfreeze_batch(
     }
 
     write_redo_ops(redo_log, &redo_ops);
-    for (key, ops) in repl_ops_by_key {
-        replicate_ops(cluster, &key, ops);
-    }
+    replicate_all_ops(cluster, repl_ops_by_key);
 
     batch_response(req.request_id, &errors)
 }
@@ -892,9 +885,7 @@ fn handle_reassign_batch(
     }
 
     write_redo_ops(redo_log, &redo_ops);
-    for (key, ops) in repl_ops_by_key {
-        replicate_ops(cluster, &key, ops);
-    }
+    replicate_all_ops(cluster, repl_ops_by_key);
 
     batch_response(req.request_id, &errors)
 }
@@ -954,9 +945,7 @@ fn handle_set_conflicting_batch(
     }
 
     write_redo_ops(redo_log, &redo_ops);
-    for (key, ops) in repl_ops_by_key {
-        replicate_ops(cluster, &key, ops);
-    }
+    replicate_all_ops(cluster, repl_ops_by_key);
 
     batch_response(req.request_id, &errors)
 }
@@ -1005,9 +994,7 @@ fn handle_set_locked_batch(
     }
 
     write_redo_ops(redo_log, &redo_ops);
-    for (key, ops) in repl_ops_by_key {
-        replicate_ops(cluster, &key, ops);
-    }
+    replicate_all_ops(cluster, repl_ops_by_key);
 
     batch_response(req.request_id, &errors)
 }
@@ -1059,9 +1046,7 @@ fn handle_preserve_until_batch(
     }
 
     write_redo_ops(redo_log, &redo_ops);
-    for (key, ops) in repl_ops_by_key {
-        replicate_ops(cluster, &key, ops);
-    }
+    replicate_all_ops(cluster, repl_ops_by_key);
 
     batch_response(req.request_id, &errors)
 }
@@ -1112,9 +1097,7 @@ fn handle_delete_batch(
     }
 
     write_redo_ops(redo_log, &redo_ops);
-    for (key, ops) in repl_ops_by_key {
-        replicate_ops(cluster, &key, ops);
-    }
+    replicate_all_ops(cluster, repl_ops_by_key);
 
     batch_response(req.request_id, &errors)
 }
@@ -1367,9 +1350,7 @@ fn handle_preserve_transactions(
     }
 
     write_redo_ops(redo_log, &redo_ops);
-    for (key, ops) in repl_ops_by_key {
-        replicate_ops(cluster, &key, ops);
-    }
+    replicate_all_ops(cluster, repl_ops_by_key);
 
     batch_response(req.request_id, &errors)
 }
