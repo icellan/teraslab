@@ -69,11 +69,8 @@ pub trait DeviceIo: Send + Sync {
 pub fn create_device_io(queue_depth: u32) -> Box<dyn DeviceIo> {
     #[cfg(target_os = "linux")]
     {
-        match IoUringBackend::new(queue_depth) {
-            Ok(backend) => {
-                return Box::new(backend);
-            }
-            Err(_) => {}
+        if let Ok(backend) = IoUringBackend::new(queue_depth) {
+            return Box::new(backend);
         }
     }
     let _ = queue_depth;
