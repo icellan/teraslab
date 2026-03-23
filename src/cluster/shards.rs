@@ -39,10 +39,13 @@ pub struct MigrationTask {
 ///
 /// Computed deterministically from a sorted member list so every node
 /// in the cluster arrives at the identical assignment independently.
+#[derive(Clone)]
 pub struct ShardTable {
     assignments: Vec<ShardAssignment>,
     /// Incremented on every topology change.
     pub version: u64,
+    /// Replication factor used to compute this table.
+    rf: u8,
 }
 
 impl ShardTable {
@@ -87,7 +90,13 @@ impl ShardTable {
         ShardTable {
             assignments,
             version: version_hash,
+            rf: replication_factor,
         }
+    }
+
+    /// The replication factor used to compute this table.
+    pub fn replication_factor(&self) -> u8 {
+        self.rf
     }
 
     /// Compute which shard a key belongs to (12-bit hash → 0–4095).
@@ -125,17 +134,89 @@ impl ShardTable {
     /// Compute which shards need to migrate between an old and new table.
     ///
     /// Only master migrations are tracked (replica migrations follow).
+    ///
+    /// When the old master is no longer in the new member list (dead node),
+    /// the migration source is set to the old replica instead (if one exists
+    /// and is still alive). If the new master was already the old replica,
+    /// no migration task is generated — the data is already in place.
     pub fn migration_plan(old: &ShardTable, new: &ShardTable) -> Vec<MigrationTask> {
+        // Determine which nodes are alive in the new table
+        let new_members: std::collections::HashSet<NodeId> = {
+            let mut set = std::collections::HashSet::new();
+            for a in &new.assignments {
+                set.insert(a.master);
+                for r in &a.replicas {
+                    set.insert(*r);
+                }
+            }
+            set
+        };
+
         let mut tasks = Vec::new();
         for shard in 0..NUM_SHARDS {
-            let old_master = old.assignments[shard].master;
+            let old_assignment = &old.assignments[shard];
+            let old_master = old_assignment.master;
             let new_master = new.assignments[shard].master;
-            if old_master != new_master {
+            if old_master == new_master {
+                continue;
+            }
+
+            // Check if the old master is dead (not in the new member set)
+            if !new_members.contains(&old_master) {
+                // Old master is dead. Check if the new master was the old replica.
+                // If so, the data is already on the new master — no migration needed.
+                if old_assignment.replicas.contains(&new_master) {
+                    continue; // Data already in place via replication
+                }
+                // New master is NOT the old replica. Find a surviving replica
+                // that can serve as the migration source.
+                let surviving_replica = old_assignment.replicas.iter()
+                    .find(|r| new_members.contains(r));
+                if let Some(&source) = surviving_replica {
+                    tasks.push(MigrationTask {
+                        shard: shard as u16,
+                        from_node: source,
+                        to_node: new_master,
+                        is_master: true,
+                    });
+                }
+                // If no surviving replica, the data is lost (RF=2, both nodes dead)
+            } else {
+                // Normal case: old master is alive, migrate from it
                 tasks.push(MigrationTask {
                     shard: shard as u16,
                     from_node: old_master,
                     to_node: new_master,
                     is_master: true,
+                });
+            }
+        }
+        tasks
+    }
+
+    /// Compute migration tasks for newly assigned replicas.
+    ///
+    /// When the shard table changes, replicas may be reassigned to different
+    /// nodes. This method identifies shards where a new replica was assigned
+    /// that was NOT a replica (or master) in the old table, meaning it needs
+    /// the shard data backfilled.
+    pub fn replica_migration_plan(old: &ShardTable, new: &ShardTable) -> Vec<MigrationTask> {
+        let mut tasks = Vec::new();
+        for shard in 0..NUM_SHARDS {
+            let old_a = &old.assignments[shard];
+            let new_a = &new.assignments[shard];
+
+            for &new_replica in &new_a.replicas {
+                // Skip if the node was already a replica or master for this shard
+                if old_a.replicas.contains(&new_replica) || old_a.master == new_replica {
+                    continue;
+                }
+                // This is a new replica — it needs data from the current master
+                tasks.push(MigrationTask {
+                    shard: shard as u16,
+                    from_node: new_a.master,
+                    to_node: new_replica,
+                    is_master: false,
                 });
             }
         }
@@ -330,11 +411,22 @@ mod tests {
         let new_table = ShardTable::compute(&new_members, 2);
 
         let plan = ShardTable::migration_plan(&old_table, &new_table);
-        assert!(!plan.is_empty());
 
-        // All migrations should be FROM node 4
-        let from_node4: Vec<_> = plan.iter().filter(|t| t.from_node == NodeId(4)).collect();
-        assert!(!from_node4.is_empty(), "node 4's shards should migrate away");
+        // When node4 is removed, shards previously mastered by node4 that
+        // had a replica on the new master need no migration (data already
+        // in place). Only shards where the new master differs from the old
+        // replica require migration from a surviving replica.
+        // There should be no tasks with from_node == NodeId(4) since it's dead.
+        let from_dead: Vec<_> = plan.iter().filter(|t| t.from_node == NodeId(4)).collect();
+        assert!(from_dead.is_empty(),
+            "dead node 4 should not be a migration source, but found {} tasks from it",
+            from_dead.len());
+
+        // All migration sources should be surviving nodes
+        for task in &plan {
+            assert!(new_members.contains(&task.from_node),
+                "migration source {:?} should be a surviving node", task.from_node);
+        }
     }
 
     #[test]

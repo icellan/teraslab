@@ -131,7 +131,7 @@ Using `criterion` for rigorous benchmarking:
 #### Comparison benchmarks:
 
 ```
-- Compare against Aerospike with identical workload
+- Compare against the previous implementation with an identical workload
   (requires running both systems with the same data and ops)
 - Measure: throughput, latency, SSD write amplification, memory usage
 ```
@@ -202,7 +202,7 @@ fn stress_cluster_churn() {
 - [ ] Cluster (3-node RF=2) spend throughput: > 300K ops/sec per node
 - [ ] Cluster replication overhead: < 30% throughput reduction vs single-node
 - [ ] SSD write amplification for spend: < 10x (compare bytes written to device vs logical data changed)
-- [ ] Memory per record: < 64 bytes (Aerospike baseline is 64 bytes)
+- [ ] Memory per record: < 64 bytes (the previous implementation's baseline is 64 bytes)
 ```
 
 Note: Exact targets may vary by hardware. Document the test hardware spec and provide context for all numbers.
@@ -232,7 +232,7 @@ Note: Exact targets may vary by hardware. Document the test hardware spec and pr
 - [ ] Performance report: throughput and latency for all operation types
 - [ ] Hardware recommendations: NVMe device requirements, memory sizing, network bandwidth
 - [ ] Tuning guide: key configuration parameters and their effect on performance
-- [ ] Comparison report: TeraSlab vs Aerospike on identical workload
+- [ ] Comparison report: TeraSlab vs the previous implementation on identical workload
 ```
 
 ## This is the final phase

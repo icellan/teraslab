@@ -1,6 +1,6 @@
 //! Error types for UTXO store operations.
 //!
-//! Each variant maps to a Lua/C error code from the Aerospike implementation.
+//! Each variant maps to an error code from the original Lua UDF implementation.
 //! Spending data is returned as raw bytes — hex encoding is a client concern.
 
 use thiserror::Error;

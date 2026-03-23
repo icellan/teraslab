@@ -447,47 +447,98 @@ pub fn decode_create_batch(data: &[u8]) -> Option<Vec<WireCreateItem>> {
 // ---------------------------------------------------------------------------
 
 /// Bitmask specifying which fields to include in a GetBatch response.
+///
+/// Each bit selects an individual metadata field. Variable-size sections
+/// (UTXO slots, cold data, block entries, conflicting children) and the
+/// raw debug dump each have their own bit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FieldMask(pub u16);
+pub struct FieldMask(pub u32);
 
 impl FieldMask {
-    /// Include metadata fields.
-    pub const METADATA: u16     = 0x0001;
-    /// Include UTXO slot data.
-    pub const UTXO_SLOTS: u16   = 0x0002;
-    /// Include cold data (inputs/outputs/inpoints).
-    pub const COLD_DATA: u16    = 0x0004;
-    /// Include block entries.
-    pub const BLOCK_ENTRIES: u16 = 0x0008;
-    /// Include conflicting children txids.
-    pub const CONFLICTING_CHILDREN: u16 = 0x0010;
-    /// Include all fields.
-    pub const ALL: u16          = 0x001F;
+    // Per-field bits for fixed-size metadata fields:
+    /// Transaction version (4 bytes).
+    pub const TX_VERSION: u32         = 1 << 0;
+    /// Transaction locktime (4 bytes).
+    pub const LOCKTIME: u32           = 1 << 1;
+    /// Transaction fee in satoshis (8 bytes).
+    pub const FEE: u32                = 1 << 2;
+    /// Transaction size in bytes (8 bytes).
+    pub const SIZE_IN_BYTES: u32      = 1 << 3;
+    /// Extended transaction size (8 bytes).
+    pub const EXTENDED_SIZE: u32      = 1 << 4;
+    /// Flags byte (1 byte).
+    pub const FLAGS: u32              = 1 << 5;
+    /// Spending height for coinbase maturity (4 bytes).
+    pub const SPENDING_HEIGHT: u32    = 1 << 6;
+    /// Creation timestamp in Unix millis (8 bytes).
+    pub const CREATED_AT: u32         = 1 << 7;
+    /// Number of spent UTXOs (4 bytes).
+    pub const SPENT_UTXOS: u32        = 1 << 8;
+    /// Number of pruned UTXOs (4 bytes).
+    pub const PRUNED_UTXOS: u32       = 1 << 9;
+    /// Total UTXO count (4 bytes).
+    pub const UTXO_COUNT: u32         = 1 << 10;
+    /// Record generation counter (4 bytes).
+    pub const GENERATION: u32         = 1 << 11;
+    /// Last update timestamp in Unix millis (8 bytes).
+    pub const UPDATED_AT: u32         = 1 << 12;
+    /// Block height since the transaction was unmined (4 bytes).
+    pub const UNMINED_SINCE: u32      = 1 << 13;
+    /// Block height at which the record should be deleted (4 bytes).
+    pub const DELETE_AT_HEIGHT: u32   = 1 << 14;
+    /// Block height until which the record is preserved (4 bytes).
+    pub const PRESERVE_UNTIL: u32     = 1 << 15;
+    /// External blob reference (65 bytes).
+    pub const EXTERNAL_REF: u32       = 1 << 16;
+    /// Number of reassignments recorded (1 byte).
+    pub const REASSIGNMENT_COUNT: u32 = 1 << 17;
+    /// Number of block entries (1 byte).
+    pub const BLOCK_ENTRY_COUNT: u32  = 1 << 18;
+
+    // Variable-size sections:
+    /// Include UTXO slot data (variable).
+    pub const UTXO_SLOTS: u32        = 1 << 19;
+    /// Include cold data — inputs/outputs/inpoints (variable).
+    pub const COLD_DATA: u32         = 1 << 20;
+    /// Include block entries (variable).
+    pub const BLOCK_ENTRIES: u32     = 1 << 21;
+    /// Include conflicting children txids (variable).
+    pub const CONFLICTING_CHILDREN: u32 = 1 << 22;
+    /// Include the raw on-disk metadata struct (256 bytes, for debugging).
+    /// When set, the full struct is returned as-is including internal
+    /// fields (magic, schema_version, device offsets, padding).
+    /// Takes precedence over per-field metadata bits if both are set.
+    pub const RAW_METADATA: u32      = 1 << 23;
+
+    /// Convenience alias: all per-field metadata bits (bits 0-18).
+    pub const ALL_METADATA: u32 = 0x0007_FFFF;
+    /// Include all client-facing fields (bits 0-22, excludes RAW_METADATA).
+    pub const ALL: u32          = 0x007F_FFFF;
 
     /// Whether the mask includes the given flag.
-    pub fn has(self, flag: u16) -> bool {
+    pub fn has(self, flag: u32) -> bool {
         self.0 & flag != 0
     }
 }
 
 /// Encode a GetBatch request payload.
 ///
-/// Format: `[count:4][field_mask:2][txids × count]`
-pub fn encode_get_batch(field_mask: u16, txids: &[[u8; 32]]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(6 + txids.len() * 32);
+/// Format: `[count:4][field_mask:4][txids × count]`
+pub fn encode_get_batch(field_mask: u32, txids: &[[u8; 32]]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + txids.len() * 32);
     put_u32(&mut buf, txids.len() as u32);
-    put_u16(&mut buf, field_mask);
+    put_u32(&mut buf, field_mask);
     for txid in txids { buf.extend_from_slice(txid); }
     buf
 }
 
 /// Decode a GetBatch request payload.
 pub fn decode_get_batch(data: &[u8]) -> Option<(FieldMask, Vec<[u8; 32]>)> {
-    if data.len() < 6 { return None; }
+    if data.len() < 8 { return None; }
     let count = get_u32(data, 0) as usize;
-    let field_mask = FieldMask(get_u16(data, 4));
+    let field_mask = FieldMask(get_u32(data, 4));
     let mut txids = Vec::with_capacity(count);
-    let mut pos = 6;
+    let mut pos = 8;
     for _ in 0..count {
         if pos + 32 > data.len() { return None; }
         let mut txid = [0u8; 32]; txid.copy_from_slice(&data[pos..pos+32]);
@@ -787,6 +838,77 @@ pub fn decode_get_spend_response(data: &[u8]) -> Option<Vec<WireGetSpendResult>>
         pos += 40;
     }
     Some(items)
+}
+
+// ---------------------------------------------------------------------------
+// Stream chunk (OP_STREAM_CHUNK = 200)
+// ---------------------------------------------------------------------------
+
+/// Encode an OP_STREAM_CHUNK payload.
+///
+/// Format: `[txid:32][offset:8 LE][chunk_data_len:4 LE][chunk_data]`
+pub fn encode_stream_chunk(txid: &[u8; 32], offset: u64, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32 + 8 + 4 + data.len());
+    buf.extend_from_slice(txid);
+    buf.extend_from_slice(&offset.to_le_bytes());
+    put_u32(&mut buf, data.len() as u32);
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Decoded stream chunk fields.
+pub struct StreamChunk<'a> {
+    pub txid: [u8; 32],
+    pub offset: u64,
+    pub data: &'a [u8],
+}
+
+/// Decode an OP_STREAM_CHUNK payload.
+///
+/// Returns None if the payload is too short or malformed.
+pub fn decode_stream_chunk(payload: &[u8]) -> Option<StreamChunk<'_>> {
+    if payload.len() < 44 { return None; } // 32 + 8 + 4
+    let mut txid = [0u8; 32];
+    txid.copy_from_slice(&payload[0..32]);
+    let offset = u64::from_le_bytes(payload[32..40].try_into().unwrap());
+    let data_len = get_u32(payload, 40) as usize;
+    if payload.len() < 44 + data_len { return None; }
+    Some(StreamChunk {
+        txid,
+        offset,
+        data: &payload[44..44 + data_len],
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Stream end (OP_STREAM_END = 201)
+// ---------------------------------------------------------------------------
+
+/// Encode an OP_STREAM_END payload.
+///
+/// Format: `[txid:32][total_size:8 LE]`
+pub fn encode_stream_end(txid: &[u8; 32], total_size: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(40);
+    buf.extend_from_slice(txid);
+    buf.extend_from_slice(&total_size.to_le_bytes());
+    buf
+}
+
+/// Decoded stream end fields.
+pub struct StreamEnd {
+    pub txid: [u8; 32],
+    pub total_size: u64,
+}
+
+/// Decode an OP_STREAM_END payload.
+///
+/// Returns None if the payload is too short.
+pub fn decode_stream_end(payload: &[u8]) -> Option<StreamEnd> {
+    if payload.len() < 40 { return None; }
+    let mut txid = [0u8; 32];
+    txid.copy_from_slice(&payload[0..32]);
+    let total_size = u64::from_le_bytes(payload[32..40].try_into().unwrap());
+    Some(StreamEnd { txid, total_size })
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,6 +1222,7 @@ mod tests {
                 let mut h = [0u8; 32]; h[0] = v as u8; h[1] = i; h
             }).collect(),
             cold_data: vec![],
+            block_height: 0,
             mined_block_id: None,
             mined_block_height: None,
             mined_subtree_idx: None,
@@ -1127,6 +1250,7 @@ mod tests {
             flags: 0x01,
             utxo_hashes: vec![[0xAA; 32], [0xBB; 32]],
             cold_data: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03],
+            block_height: 0,
             mined_block_id: Some(42),
             mined_block_height: Some(800_000),
             mined_subtree_idx: Some(7),
@@ -1147,6 +1271,7 @@ mod tests {
             let mut t = [0u8; 32]; t[0..2].copy_from_slice(&i.to_le_bytes()); t
         }).collect();
         let encoded = encode_get_batch(FieldMask::ALL, &txids);
+        assert_eq!(encoded.len(), 8 + 4096 * 32); // count(4) + mask(4) + txids
         let (mask, decoded) = decode_get_batch(&encoded).unwrap();
         assert_eq!(mask, FieldMask(FieldMask::ALL));
         assert_eq!(decoded.len(), 4096);
@@ -1421,5 +1546,65 @@ mod tests {
         let decoded = decode_slot_item_batch(&encoded).unwrap();
         assert_eq!(decoded.len(), 50);
         assert_eq!(decoded, items);
+    }
+
+    // -- StreamChunk --
+
+    #[test]
+    fn stream_chunk_round_trip() {
+        let mut txid = [0u8; 32];
+        txid[0] = 0xAA;
+        let data = vec![1u8, 2, 3, 4, 5];
+        let encoded = encode_stream_chunk(&txid, 1024, &data);
+        let decoded = decode_stream_chunk(&encoded).unwrap();
+        assert_eq!(decoded.txid, txid);
+        assert_eq!(decoded.offset, 1024);
+        assert_eq!(decoded.data, &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn stream_chunk_empty_data() {
+        let txid = [0xBBu8; 32];
+        let encoded = encode_stream_chunk(&txid, 0, &[]);
+        let decoded = decode_stream_chunk(&encoded).unwrap();
+        assert_eq!(decoded.txid, txid);
+        assert_eq!(decoded.offset, 0);
+        assert!(decoded.data.is_empty());
+    }
+
+    #[test]
+    fn stream_chunk_large_data() {
+        let txid = [0xCCu8; 32];
+        let data = vec![0x42u8; 4 * 1024 * 1024]; // 4 MiB
+        let encoded = encode_stream_chunk(&txid, 8 * 1024 * 1024, &data);
+        let decoded = decode_stream_chunk(&encoded).unwrap();
+        assert_eq!(decoded.txid, txid);
+        assert_eq!(decoded.offset, 8 * 1024 * 1024);
+        assert_eq!(decoded.data.len(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn stream_chunk_truncated_returns_none() {
+        let txid = [0u8; 32];
+        let encoded = encode_stream_chunk(&txid, 0, &[1, 2, 3]);
+        // Truncate the data portion
+        assert!(decode_stream_chunk(&encoded[..43]).is_none());
+    }
+
+    // -- StreamEnd --
+
+    #[test]
+    fn stream_end_round_trip() {
+        let mut txid = [0u8; 32];
+        txid[0] = 0xDD;
+        let encoded = encode_stream_end(&txid, 50 * 1024 * 1024);
+        let decoded = decode_stream_end(&encoded).unwrap();
+        assert_eq!(decoded.txid, txid);
+        assert_eq!(decoded.total_size, 50 * 1024 * 1024);
+    }
+
+    #[test]
+    fn stream_end_truncated_returns_none() {
+        assert!(decode_stream_end(&[0u8; 39]).is_none());
     }
 }

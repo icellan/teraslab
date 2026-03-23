@@ -37,6 +37,9 @@ pub const OP_STREAM_END: u16 = 201;
 // Replication (inter-node)
 pub const OP_REPLICA_BATCH: u16 = 240;
 pub const OP_REPLICA_ACK: u16 = 241;
+/// Sent after all migration batches for a shard to confirm the target
+/// has durably received the data. The target verifies and responds OK.
+pub const OP_MIGRATION_COMPLETE: u16 = 242;
 
 // Cluster (inter-node)
 pub const OP_HEARTBEAT: u16 = 250;
@@ -60,6 +63,19 @@ pub const ERR_VOUT_OUT_OF_RANGE: u16 = 11;
 pub const ERR_ALREADY_EXISTS: u16 = 12;
 pub const ERR_FROZEN_UNTIL: u16 = 13;
 pub const ERR_REDIRECT: u16 = 14;
+pub const ERR_NO_QUORUM: u16 = 15;
+
+/// Shard data is being migrated; client should retry after a brief delay.
+pub const ERR_MIGRATION_IN_PROGRESS: u16 = 19;
+
+// Streaming errors
+/// Blob stream not found for the given txid on this connection.
+pub const ERR_STREAM_NOT_FOUND: u16 = 16;
+/// Blob not found in blobstore (EXTERNAL_BLOB flag set but no pre-uploaded blob).
+pub const ERR_BLOB_NOT_FOUND: u16 = 17;
+/// Chunk offset does not match expected position in stream.
+pub const ERR_STREAM_OFFSET_MISMATCH: u16 = 18;
+
 pub const ERR_INTERNAL: u16 = 255;
 
 /// Response status codes.
@@ -69,5 +85,21 @@ pub const STATUS_NOT_FOUND: u8 = 2;
 pub const STATUS_REDIRECT: u8 = 3;
 pub const STATUS_PARTIAL_ERROR: u8 = 4;
 
-/// Maximum frame payload size (16 MiB).
-pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
+/// Wire flags bit indicating cold_data was pre-uploaded to blobstore.
+/// Set on CreateItem.flags byte (bit 3) when the client has already
+/// uploaded the blob via OP_STREAM_CHUNK/OP_STREAM_END.
+pub const FLAG_EXTERNAL_BLOB: u8 = 0x08;
+
+/// Request flag: bypass shard ownership check and read locally.
+///
+/// Used by test clients for replication verification — reading the same
+/// record from both master and replica for byte-for-byte comparison.
+pub const FLAG_LOCAL_READ: u16 = 0x0001;
+
+/// Maximum frame payload size (512 MiB).
+///
+/// BSV mainnet already has transactions exceeding 300 MB. The wire format
+/// uses a `u32` length prefix (max ~4 GB) so the encoding can handle any
+/// size up to the BSV block limit. We cap at 512 MiB to provide basic DoS
+/// protection while comfortably supporting the largest known transactions.
+pub const MAX_FRAME_SIZE: u32 = 512 * 1024 * 1024;

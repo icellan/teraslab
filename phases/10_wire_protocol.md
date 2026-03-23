@@ -647,7 +647,7 @@ For records with large inline cold data or external blob references:
 
 ### 10.10 Client-side batching expectations
 
-The Go client library (`teraslab-client-go`, separate repo) and its Teranode adapter (`stores/utxo/teraslab/`) will use the same batcher pattern as the Aerospike client:
+The Go client library (`teraslab-client-go`, separate repo) and its Teranode adapter (`stores/utxo/teraslab/`) will use a batcher pattern:
 
 | Batcher | Items accumulated | Flush trigger | Result |
 |---------|------------------|---------------|--------|

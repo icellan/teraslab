@@ -11,16 +11,53 @@ use crate::config::ServerConfig;
 use crate::ops::engine::Engine;
 use crate::protocol::frame::{RequestFrame, ResponseFrame};
 use crate::protocol::opcodes::*;
+use crate::redo::RedoLog;
+use crate::storage::blobstore::{BlobStore, BlobStreamWriter};
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// Per-connection state for streaming blob uploads.
+///
+/// Each active upload session is keyed by txid. Sessions are cleaned up
+/// (aborted) when the connection closes.
+pub(crate) struct ConnectionState {
+    pub(crate) streams: HashMap<[u8; 32], ActiveStream>,
+}
+
+/// An in-progress streaming blob upload for a single txid.
+pub(crate) struct ActiveStream {
+    pub(crate) writer: Box<dyn BlobStreamWriter>,
+    pub(crate) bytes_received: u64,
+}
+
+impl ConnectionState {
+    fn new() -> Self {
+        Self {
+            streams: HashMap::new(),
+        }
+    }
+}
+
+impl Drop for ConnectionState {
+    fn drop(&mut self) {
+        // Abort any in-progress streams on connection close.
+        for (_txid, stream) in self.streams.drain() {
+            let _ = stream.writer.abort();
+        }
+    }
+}
 
 /// Running TeraSlab server instance.
 pub struct Server {
     engine: Arc<Engine>,
     config: ServerConfig,
     cluster: Option<Arc<RunningCluster>>,
+    redo_log: Option<Arc<Mutex<RedoLog>>>,
+    blob_store: Option<Arc<dyn BlobStore>>,
     shutdown: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
 }
@@ -32,6 +69,8 @@ impl Server {
             engine,
             config,
             cluster: None,
+            redo_log: None,
+            blob_store: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             active_connections: Arc::new(AtomicUsize::new(0)),
         }
@@ -40,6 +79,18 @@ impl Server {
     /// Set the cluster coordinator for distributed mode.
     pub fn with_cluster(mut self, cluster: Arc<RunningCluster>) -> Self {
         self.cluster = Some(cluster);
+        self
+    }
+
+    /// Set the redo log for crash recovery durability.
+    pub fn with_redo_log(mut self, redo_log: Arc<Mutex<RedoLog>>) -> Self {
+        self.redo_log = Some(redo_log);
+        self
+    }
+
+    /// Set the blob store for external cold data storage.
+    pub fn with_blob_store(mut self, store: Arc<dyn BlobStore>) -> Self {
+        self.blob_store = Some(store);
         self
     }
 
@@ -72,6 +123,8 @@ impl Server {
                     let active_conns = self.active_connections.clone();
                     let max_batch = self.config.max_batch_size;
                     let cluster = self.cluster.clone();
+                    let redo_log = self.redo_log.clone();
+                    let blob_store = self.blob_store.clone();
 
                     std::thread::spawn(move || {
                         if let Err(e) = handle_connection(
@@ -80,6 +133,8 @@ impl Server {
                             &shutdown,
                             max_batch,
                             cluster.as_deref(),
+                            redo_log.as_deref(),
+                            blob_store.as_deref(),
                         ) {
                             eprintln!("connection from {addr} error: {e}");
                         }
@@ -124,12 +179,18 @@ impl Server {
 }
 
 /// Handle a single client connection: read frames, dispatch, respond.
+///
+/// Creates a [`ConnectionState`] that tracks in-progress streaming blob
+/// uploads. When the connection closes (normally or on error), the
+/// `ConnectionState` `Drop` impl aborts any incomplete streams.
 fn handle_connection(
     mut stream: TcpStream,
     engine: &Engine,
     shutdown: &AtomicBool,
     max_batch_size: u32,
     cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+    blob_store: Option<&dyn BlobStore>,
 ) -> Result<(), String> {
     stream
         .set_nonblocking(false)
@@ -139,6 +200,7 @@ fn handle_connection(
         .map_err(|e| format!("set_read_timeout: {e}"))?;
 
     let mut read_buf = vec![0u8; 256 * 1024]; // 256 KB read buffer
+    let mut conn_state = ConnectionState::new();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -185,7 +247,15 @@ fn handle_connection(
             .map_err(|e| format!("decode frame: {e}"))?;
 
         // Dispatch to handler
-        let response = dispatch::handle_request(&request, engine, max_batch_size, cluster);
+        let response = dispatch::handle_request(
+            &request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            &mut conn_state,
+            blob_store,
+        );
 
         // Write response
         let response_bytes = response.encode();

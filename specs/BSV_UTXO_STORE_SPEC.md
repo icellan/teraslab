@@ -1,9 +1,9 @@
-# BSV UTXO Store — Rust Replacement for Aerospike: Full OpenSpec
+# BSV UTXO Store — Purpose-Built Rust Implementation: Full OpenSpec
 
 **Version:** 1.0
 **Date:** 2026-03-18
 **Status:** Draft
-**Source:** Generated from [SPEC_BRIEFING.md](./SPEC_BRIEFING.md) (design session notes) validated against the `bsv-blockchain/teranode` Go codebase, `bsv-blockchain/aerospike-server` mod-teranode module, and `teranode.lua` Lua UDF
+**Source:** Generated from [SPEC_BRIEFING.md](./SPEC_BRIEFING.md) (design session notes) validated against the `bsv-blockchain/teranode` Go codebase, the legacy database server mod-teranode module, and `teranode.lua` Lua UDF
 **Companion:** [BSV_UTXO_STORE_RUST_CRATES.md](./BSV_UTXO_STORE_RUST_CRATES.md) — recommended Rust crates per subsystem
 
 ---
@@ -32,13 +32,13 @@
 
 ### 1.1 Project Purpose
 
-Build a purpose-built Rust database server to replace Aerospike as the UTXO store for BSV Teranode. The system exploits the known, fixed workload patterns of UTXO management to achieve dramatically higher throughput and efficiency than Aerospike's general-purpose copy-on-write architecture.
+Build a purpose-built Rust database server as the UTXO store for BSV Teranode, replacing the original general-purpose database backend. The system exploits the known, fixed workload patterns of UTXO management to achieve dramatically higher throughput and efficiency than a general-purpose copy-on-write architecture.
 
-The current implementation uses a forked Aerospike server (`bsv-blockchain/aerospike-server`, branch `master`, module `modules/mod-teranode`) with Lua UDFs (and an equivalent native C port in `mod-teranode`) for atomic record mutations. The Go client code resides in `bsv-blockchain/teranode` — specifically the `stores/utxo/` package and `stores/utxo/aerospike/` sub-package.
+The original implementation uses a forked general-purpose database server (branch `master`, module `modules/mod-teranode`) with Lua UDFs (and an equivalent native C port in `mod-teranode`) for atomic record mutations. The Go client code resides in `bsv-blockchain/teranode` — specifically the `stores/utxo/` package and its legacy sub-package.
 
 ### 1.2 Performance Targets
 
-| Metric | Current (Aerospike) | Target (Rust) |
+| Metric | Current (Legacy) | Target (Rust) |
 |--------|---------------------|---------------|
 | Sustained throughput | 3+ million ops/sec (current) | 10+ million ops/sec |
 | Latency p50 | Baseline | ≤ Baseline |
@@ -46,7 +46,7 @@ The current implementation uses a forked Aerospike server (`bsv-blockchain/aeros
 | Latency p99.9 | Baseline | 2-5x better |
 | SSD wear per spend | Full record rewrite | 69 bytes (10-50x reduction) |
 | Memory per index entry | 64 bytes (red-black tree) | ~16 bytes (hash table) |
-| Replication bandwidth (RF=2 at 10M TPS) | N/A (Aerospike can't sustain 10M) | ~400 MB/s |
+| Replication bandwidth (RF=2 at 10M TPS) | N/A (legacy backend can't sustain 10M) | ~400 MB/s |
 | Dataset scale | Billions of UTXO records | 10-100 billion UTXO records |
 | Largest single transaction | 320 MB | 320 MB (blob store) |
 | Replication factor | 2 (master + replica) | Configurable (2-3+, default 2) |
@@ -55,15 +55,15 @@ The current implementation uses a forked Aerospike server (`bsv-blockchain/aeros
 
 - **General-purpose database**: This system serves exactly one workload — UTXO management. No SQL, no secondary indexes, no ad-hoc queries.
 - **Multi-tenancy**: Single namespace, single dataset per cluster.
-- **ACID transactions spanning multiple records**: Atomicity is per-record only (matching Aerospike semantics).
-- **Aerospike wire protocol compatibility**: A new purpose-built binary protocol is designed for maximum performance. A new Go client will be created that speaks this protocol.
+- **ACID transactions spanning multiple records**: Atomicity is per-record only (matching the existing system's semantics).
+- **Legacy wire protocol compatibility**: A new purpose-built binary protocol is designed for maximum performance. A new Go client will be created that speaks this protocol.
 - **Strong consistency (initially)**: AP mode with operation-based replication. SC mode can be added later via Raft (note: SC requires RF≥3).
 
-### 1.4 Why Aerospike Is Suboptimal
+### 1.4 Why the Original Backend Is Suboptimal
 
-1. **Copy-on-write penalty**: `spend` (the hottest operation) flips a status byte and writes 36 bytes, but Aerospike rewrites the entire record (all UTXOs, all metadata) to a new SWB position. For a 1000-output transaction, spending output #1 copies all 1000 UTXOs.
+1. **Copy-on-write penalty**: `spend` (the hottest operation) flips a status byte and writes 36 bytes, but the existing system rewrites the entire record (all UTXOs, all metadata) to a new SWB position. For a 1000-output transaction, spending output #1 copies all 1000 UTXOs.
 
-2. **Lua UDF overhead**: Every mutation passes through the Lua interpreter — record deserialization into Lua tables, byte-by-byte hash comparison (not native `memcmp`), object allocation for response maps, full re-serialization on `aerospike:update(rec)`.
+2. **Lua UDF overhead**: Every mutation passes through the Lua interpreter — record deserialization into Lua tables, byte-by-byte hash comparison (not native `memcmp`), object allocation for response maps, full re-serialization on record update.
 
 3. **Three parallel lists**: `blockIDs`, `blockHeights`, `subtreeIdxs` maintained as separate lists requiring synchronized linear scans.
 
@@ -77,13 +77,13 @@ The current implementation uses a forked Aerospike server (`bsv-blockchain/aeros
 
 ### 2.1 Overview
 
-Each BSV transaction is stored as a single contiguous record on raw NVMe. There is no Aerospike record size limit — the multi-record pagination system (`totalExtraRecs`, `spentExtraRecs`, child records) is entirely eliminated.
+Each BSV transaction is stored as a single contiguous record on raw NVMe. There is no external record size limit — the multi-record pagination system (`totalExtraRecs`, `spentExtraRecs`, child records) is entirely eliminated.
 
 ### 2.2 Complete Field Inventory
 
-The following fields are derived from the Go field definitions (`stores/utxo/fields/fields.go`), Lua bin names (`teranode.lua`), and the Aerospike create/spend/setMined code paths:
+The following fields are derived from the Go field definitions (`stores/utxo/fields/fields.go`), Lua bin names (`teranode.lua`), and the legacy create/spend/setMined code paths:
 
-| # | Field Name | Aerospike Bin | Type | Size | Mutability | Operations |
+| # | Field Name | Legacy Bin | Type | Size | Mutability | Operations |
 |---|-----------|---------------|------|------|-----------|-----------|
 | 1 | `txid` | `txID` | `[u8; 32]` | 32B | Write-once | Create |
 | 2 | `version` | `version` | `u32` | 4B | Write-once | Create |
@@ -120,7 +120,7 @@ bitflags! {
 }
 ```
 
-This packs what was 5 separate fields into a single byte. The `CREATING` flag from the Aerospike design is eliminated — it only existed to block spending during multi-record 2-phase commit, which is no longer needed since records are single atomic writes. Flag mutations are atomic read-modify-write on the flags byte within the per-txid lock.
+This packs what was 5 separate fields into a single byte. The `CREATING` flag from the original design is eliminated — it only existed to block spending during multi-record 2-phase commit, which is no longer needed since records are single atomic writes. Flag mutations are atomic read-modify-write on the flags byte within the per-txid lock.
 | 19 | `reassignment_count` | (new) | `u8` | 1B | Mutable | Reassign (+1) |
 | 20 | `utxo_slots` | `utxos` | `[UtxoSlot; N]` | 69B × N | Mutable (in-place) | Spend, Unspend, Freeze, Unfreeze, Reassign |
 | 21 | `reassignments` | `reassignments` | `Vec<Reassignment>` | Variable | Mutable (append-only) | Reassign (extension block) |
@@ -243,10 +243,10 @@ struct UtxoSlot {
 
 **Spendable height in spending_data** (replaces `spendable_in` / `utxoSpendableIn`): For unspent slots, the first 4 bytes of `spending_data` encode a block height restriction. A value of 0 means immediately spendable (the common case — all 36 bytes zeroed). A non-zero value means the UTXO cannot be spent until `current_block_height > spendable_height`. This is set by the `reassign` operation to enforce a cooldown period. The data lives IN the slot that's already read during spend validation — zero extra I/O for any case.
 
-**`PRUNED` (0x02)** replaces the `deletedChildren` map from the Aerospike design. When a child transaction is pruned/deleted, the pruner sets the parent's UTXO slot status to `PRUNED`. This means:
+**`PRUNED` (0x02)** replaces the `deletedChildren` map from the original design. When a child transaction is pruned/deleted, the pruner sets the parent's UTXO slot status to `PRUNED`. This means:
 - The spending_data is preserved (for audit/debugging) but the UTXO cannot be re-spent
 - Spend validation rejects `PRUNED` slots the same way it rejects `FROZEN` — a single byte comparison instead of a map lookup + string comparison against `deletedChildren`
-- No per-record variable-size map to maintain, no Aerospike `MapPutOp`, no hex-encoded txid keys
+- No per-record variable-size map to maintain, no `MapPutOp`, no hex-encoded txid keys
 
 **Pruner write path:** When deleting child TX C that spent parent output N:
 1. Set parent's `utxo_slots[N].status = 0x02` (PRUNED) via `pwrite` of 1 byte
@@ -269,7 +269,7 @@ struct BlockEntry {
 // 3 inline entries (36 bytes) in metadata region
 ```
 
-This replaces the three synchronized Aerospike lists (`blockIDs`, `blockHeights`, `subtreeIdxs`) with a single array of structs, eliminating the fragile parallel-list synchronization.
+This replaces the three synchronized legacy lists (`blockIDs`, `blockHeights`, `subtreeIdxs`) with a single array of structs, eliminating the fragile parallel-list synchronization.
 
 **Inline capacity**: 3 entries covers 99.9%+ of cases (transactions are typically in 1-2 blocks).
 
@@ -983,7 +983,7 @@ For the 320 MB case: **NEVER** on the NVMe UTXO devices. A 320 MB write would mo
 
 ### 4.5 No Defragmentation
 
-Unlike Aerospike's log-structured storage, records are updated **in-place**. There is no copy-on-write and therefore no fragmentation. The `spend` operation writes 69 bytes at a known offset — the original record space is reused.
+Unlike the previous system's log-structured storage, records are updated **in-place**. There is no copy-on-write and therefore no fragmentation. The `spend` operation writes 69 bytes at a known offset — the record space is reused.
 
 Deleted record space is returned to the freelist. Over time, the freelist may become fragmented (many small blocks where large records cannot fit), but this can be addressed by:
 - Background compaction of adjacent free blocks
@@ -1045,7 +1045,7 @@ The index is a derived data structure — it can be rebuilt from a scan of all r
 
 ### 5.5 Secondary Indexes for Pruner Queries
 
-The pruner needs to efficiently find records by `delete_at_height` and `unmined_since` — queries that the primary txid hash index cannot serve. In Aerospike, these used secondary indexes on those bins. The Rust system maintains two lightweight secondary structures:
+The pruner needs to efficiently find records by `delete_at_height` and `unmined_since` — queries that the primary txid hash index cannot serve. The previous system used secondary indexes on those bins. The Rust system maintains two lightweight secondary structures:
 
 #### 5.5.1 DAH Index (delete_at_height)
 
@@ -1087,7 +1087,7 @@ Both indexes are checkpointed alongside the primary index for fast normal-case s
 
 ### 6.1 Per-Transaction Lock Striping
 
-Replace Aerospike's per-record write lock + Lua VM with:
+Replace the original system's per-record write lock + Lua VM with:
 
 ```rust
 const LOCK_STRIPES: usize = 65536;
@@ -1217,7 +1217,7 @@ For each mutation batch:
 
 ### 8.1 Operation-Based Protocol
 
-Replace Aerospike's full-record replication with operation-level replication:
+Replace the previous system's full-record replication with operation-level replication:
 
 ```rust
 enum ReplicaOp {
@@ -1290,7 +1290,7 @@ enum ReplicaOp {
 
 ### 8.2 Bandwidth Comparison
 
-| Operation | Aerospike (full record) | Rust (operation-based) |
+| Operation | Legacy (full record) | Rust (operation-based) |
 |-----------|------------------------|----------------------|
 | Spend | ~500-5000 bytes | ~72 bytes |
 | SetMined | ~500-5000 bytes | ~52 bytes |
@@ -1298,7 +1298,7 @@ enum ReplicaOp {
 | SetConflicting | ~500-5000 bytes | ~44 bytes |
 
 At 10M TPS with RF=2: **~400 MB/s** fabric traffic (operation-based replication).
-At 10M TPS with RF=3: **~800 MB/s** — still manageable on 10 GbE. Aerospike's full-record replication would require ~2+ GB/s at this throughput.
+At 10M TPS with RF=3: **~800 MB/s** — still manageable on 10 GbE. Full-record replication (as in the legacy system) would require ~2+ GB/s at this throughput.
 
 ### 8.3 Configurable Replication Factor
 
@@ -1307,7 +1307,7 @@ The replication factor (RF) is configurable per deployment:
 | RF | Behavior | Use Case |
 |----|----------|----------|
 | 1 | No replication (master only) | Development, testing |
-| 2 | Master + 1 replica (default) | Production — matches current Aerospike deployment |
+| 2 | Master + 1 replica (default) | Production — matches current deployment |
 | 3 | Master + 2 replicas | High availability, prerequisite for SC mode (Raft) |
 
 With RF=3, the master sends `ReplicaOp` to **both** replicas in parallel. Acknowledgment policy is configurable:
@@ -1478,7 +1478,7 @@ Each node processes its batch independently, returns per-item results.
 
 ### 10.3 OpCodes
 
-**Every operation is batch-first.** Single-item operations are batches of size 1 — no separate code paths. This matches the Aerospike Go client, which uses `BatchOperate` for all operations.
+**Every operation is batch-first.** Single-item operations are batches of size 1 — no separate code paths. This matches the existing Go client pattern, which uses batch operations for all calls.
 
 | OpCode | Operation | Direction | Notes |
 |--------|----------|-----------|-------|
@@ -1553,11 +1553,11 @@ A reusable Go client library (`teraslab-client-go`, separate repo) handles the w
 - Client-side batcher architecture preserved (storeBatcher, spendBatcher, getBatcher, etc.), submitting batch requests natively
 - Zero-copy where possible: reuse `bytes.Buffer` pools, avoid intermediate serialization
 
-**What is removed vs the Aerospike client:**
+**What is removed vs the legacy client:**
 - All Lua UDF registration and invocation
-- All Aerospike expression-based alternative paths
+- All expression-based alternative paths
 - All multi-record pagination logic (`totalExtraRecs`, `spentExtraRecs`, `incrementSpentExtraRecs`)
-- Aerospike Go SDK dependency entirely
+- Legacy database Go SDK dependency entirely
 
 ---
 
@@ -2014,29 +2014,29 @@ The Go client is split across two repositories:
 ### 13.2 Backend selection
 
 Teranode selects the UTXO store backend based on the URL scheme in configuration:
-- `aerospike://...` → existing Aerospike client (unchanged)
+- `legacy://...` → existing legacy client (unchanged)
 - `teraslab://host:port` → new TeraSlab adapter using `teraslab-client-go`
 
-Both coexist as selectable backends. The Aerospike implementation is not modified or replaced.
+Both coexist as selectable backends. The legacy implementation is not modified or replaced.
 
 ### 13.3 `teraslab-client-go` design
 
 - **Batch-first**: All operations use the batch wire protocol opcodes. Single-item calls are batch-of-1.
 - **Connection pooling**: Per-node connection pool with configurable size. Long-lived TCP connections with pipelining.
 - **Partition map**: Client fetches the shard table on connect (`OP_GET_PARTITION_MAP`), caches it, and routes requests directly to the correct master node. Refreshed automatically on `Redirect` responses.
-- **Zero Aerospike dependencies**: Clean implementation — no Aerospike Go SDK, no Lua, no expressions, no multi-record pagination.
+- **Zero legacy dependencies**: Clean implementation — no legacy database Go SDK, no Lua, no expressions, no multi-record pagination.
 - **Reusable**: The client exposes a clean Go API (`teraslab.Client`) that any application can use, independent of Teranode.
 
 ### 13.4 `stores/utxo/teraslab/` adapter
 
-- Implements `stores/utxo.Store` interface (same as the Aerospike adapter)
+- Implements `stores/utxo.Store` interface (same as the legacy adapter)
 - Preserves the batcher architecture (storeBatcher, spendBatcher, getBatcher, etc.), flushing accumulated items as batch frames via `teraslab-client-go`
 - Translates between Teranode's internal types (`meta.Data`, `spend.SpendingData`, `fields.FieldName`) and the wire protocol types
 - Handles Teranode-specific concerns: circuit breaker, external blob cache, pruner integration
 
 ### 13.5 No migration needed
 
-TeraSlab is deployed as a fresh cluster. There is no data migration from Aerospike. Nodes in a new TeraSlab cluster start empty and receive data through normal Teranode operations (create, spend, setMined, etc.). The Aerospike cluster continues operating independently for nodes configured to use it.
+TeraSlab is deployed as a fresh cluster. There is no data migration from the legacy system. Nodes in a new TeraSlab cluster start empty and receive data through normal Teranode operations (create, spend, setMined, etc.). The legacy cluster continues operating independently for nodes configured to use it.
 
 ---
 

@@ -552,11 +552,22 @@ func (c *Client) SetMinedBatch(ctx context.Context, params SetMinedBatchParams, 
 }
 
 // CreateBatch creates new transaction records.
+//
+// If any item's cold_data exceeds BlobUploadThreshold, the cold data is
+// pre-uploaded via OP_STREAM_CHUNK / OP_STREAM_END and the item's Flags
+// are updated to include FlagExternalBlob. The inlined TxData in the batch
+// payload is cleared for those items. The caller's items slice is not modified;
+// a shallow copy is made when blob uploads are needed.
 func (c *Client) CreateBatch(ctx context.Context, items []CreateItem) (*BatchResult, error) {
+	// Check for items that need blob upload and upload them first.
+	items, err := c.uploadLargeBlobs(ctx, items)
+	if err != nil {
+		return nil, err
+	}
+
 	buf := getBuf(4 + len(items)*128)
 	payload := encodeCreateBatch(buf, items)
 	var conn *pipeConn
-	var err error
 	if c.cluster != nil && len(items) > 0 {
 		conn, err = c.getConnForTxID(ctx, items[0].TxID)
 	} else {
@@ -571,6 +582,117 @@ func (c *Client) CreateBatch(ctx context.Context, items []CreateItem) (*BatchRes
 		return nil, err
 	}
 	return handleMutationResponse(resp)
+}
+
+// uploadLargeBlobs checks each item's cold_data size and pre-uploads any that
+// exceed BlobUploadThreshold via chunked streaming. Items that are uploaded
+// have their TxData cleared and FlagExternalBlob set. Returns a (possibly
+// copied) items slice; the original is never mutated.
+func (c *Client) uploadLargeBlobs(ctx context.Context, items []CreateItem) ([]CreateItem, error) {
+	// Fast path: check if any item needs blob upload.
+	needsCopy := false
+	for i := range items {
+		if coldDataSize(&items[i]) > BlobUploadThreshold {
+			needsCopy = true
+			break
+		}
+	}
+	if !needsCopy {
+		return items, nil
+	}
+
+	// Make a shallow copy so we don't mutate the caller's slice.
+	copied := make([]CreateItem, len(items))
+	copy(copied, items)
+
+	for i := range copied {
+		cdSize := coldDataSize(&copied[i])
+		if cdSize <= BlobUploadThreshold {
+			continue
+		}
+
+		coldBytes := encodeColdData(&copied[i])
+		if err := c.uploadBlob(ctx, copied[i].TxID, coldBytes); err != nil {
+			return nil, fmt.Errorf("blob upload for item %d: %w", i, err)
+		}
+
+		// Clear TxData and set the external blob flag.
+		copied[i].TxData = TxData{}
+		copied[i].Flags |= FlagExternalBlob
+	}
+
+	return copied, nil
+}
+
+// uploadBlob uploads large cold_data in chunks via OP_STREAM_CHUNK / OP_STREAM_END.
+// All chunks are sent to the shard master for the given txid. Each chunk is
+// sent as an independent request-response round trip; the server accumulates
+// them keyed by txid.
+func (c *Client) uploadBlob(ctx context.Context, txid TxID, data []byte) error {
+	var offset uint64
+	for offset < uint64(len(data)) {
+		end := offset + BlobChunkSize
+		if end > uint64(len(data)) {
+			end = uint64(len(data))
+		}
+		chunk := data[offset:end]
+
+		buf := getBuf(32 + 8 + 4 + len(chunk))
+		payload := encodeStreamChunk(buf, txid, offset, chunk)
+
+		conn, err := c.connForBlob(ctx, txid)
+		if err != nil {
+			putBuf(payload)
+			return err
+		}
+		resp, err := c.sendAndRecycle(ctx, conn, OpStreamChunk, payload)
+		if err != nil {
+			return fmt.Errorf("stream chunk at offset %d: %w", offset, err)
+		}
+		if resp.Status != StatusOK {
+			code, msg, decErr := decodeErrorPayload(resp.Payload)
+			recyclePayload(resp.Payload)
+			if decErr != nil {
+				return fmt.Errorf("stream chunk at offset %d: status %d", offset, resp.Status)
+			}
+			return &ServerError{Code: code, Message: msg}
+		}
+		recyclePayload(resp.Payload)
+
+		offset = end
+	}
+
+	// Finalize the upload.
+	buf := getBuf(40)
+	payload := encodeStreamEnd(buf, txid, uint64(len(data)))
+	conn, err := c.connForBlob(ctx, txid)
+	if err != nil {
+		putBuf(payload)
+		return err
+	}
+	resp, err := c.sendAndRecycle(ctx, conn, OpStreamEnd, payload)
+	if err != nil {
+		return fmt.Errorf("stream end: %w", err)
+	}
+	if resp.Status != StatusOK {
+		code, msg, decErr := decodeErrorPayload(resp.Payload)
+		recyclePayload(resp.Payload)
+		if decErr != nil {
+			return fmt.Errorf("stream end: status %d", resp.Status)
+		}
+		return &ServerError{Code: code, Message: msg}
+	}
+	recyclePayload(resp.Payload)
+
+	return nil
+}
+
+// connForBlob returns a connection routed to the correct node for the given txid.
+func (c *Client) connForBlob(ctx context.Context, txid TxID) (*pipeConn, error) {
+	if c.cluster != nil {
+		return c.getConnForTxID(ctx, txid)
+	}
+	return c.getConn(ctx)
 }
 
 // FreezeBatch freezes specific UTXO slots.
@@ -679,8 +801,11 @@ func (c *Client) MarkLongestChainBatch(ctx context.Context, params MarkLongestCh
 // ---------------------------------------------------------------------------
 
 // GetBatch retrieves transaction data for multiple txids.
-func (c *Client) GetBatch(ctx context.Context, fieldMask uint16, txids []TxID) ([]GetResult, error) {
-	buf := getBuf(6 + len(txids)*32)
+//
+// Returns a [GetBatchResult] that bundles the field mask with the per-item
+// results, enabling zero-alloc field accessors.
+func (c *Client) GetBatch(ctx context.Context, fieldMask uint32, txids []TxID) (*GetBatchResult, error) {
+	buf := getBuf(8 + len(txids)*32)
 	payload := encodeGetBatch(buf, fieldMask, txids)
 	conn, err := c.getConnForAnyTxID(ctx, txids)
 	if err != nil {
@@ -693,9 +818,12 @@ func (c *Client) GetBatch(ctx context.Context, fieldMask uint16, txids []TxID) (
 	}
 	switch resp.Status {
 	case StatusOK:
-		results, err := decodeGetResponse(resp.Payload)
+		items, err := decodeGetResponse(resp.Payload)
 		recyclePayload(resp.Payload)
-		return results, err
+		if err != nil {
+			return nil, err
+		}
+		return &GetBatchResult{FieldMask: fieldMask, Items: items}, nil
 	case StatusError:
 		code, msg, err := decodeErrorPayload(resp.Payload)
 		recyclePayload(resp.Payload)

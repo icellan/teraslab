@@ -523,6 +523,21 @@ impl RedoLog {
         }
     }
 
+    /// Read all entries with sequence >= `from_seq` from the log.
+    ///
+    /// Used for replica catch-up: the master replays redo entries that
+    /// the replica missed while it was disconnected. Returns an empty
+    /// vec if the requested sequence has already been reclaimed.
+    pub fn read_from_sequence(&self, from_seq: u64) -> Result<Vec<RedoEntry>> {
+        let all = self.scan_all()?;
+        Ok(all.into_iter().filter(|e| e.sequence >= from_seq).collect())
+    }
+
+    /// The next sequence number that will be assigned.
+    pub fn current_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
     /// Advance the checkpoint, allowing entries before it to be reclaimed.
     pub fn advance_checkpoint(&mut self, up_to_sequence: u64) -> Result<()> {
         if up_to_sequence > self.checkpoint_seq {
@@ -906,5 +921,364 @@ mod tests {
             let result = log2.recover();
             assert!(result.is_ok(), "recovery failed at corruption offset {corrupt_offset}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-trip serialization tests — one per RedoOp variant
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a TxKey where txid is filled with a repeating byte pattern.
+    fn make_txid(byte: u8) -> TxKey {
+        let mut txid = [0u8; 32];
+        for (i, b) in txid.iter_mut().enumerate() {
+            *b = byte.wrapping_add(i as u8);
+        }
+        TxKey { txid }
+    }
+
+    /// Helper: round-trip a single RedoOp through the redo log and assert equality.
+    fn assert_round_trip(op: RedoOp) {
+        let (_, mut log) = make_log(1024 * 1024);
+        log.append_and_flush(op.clone()).unwrap();
+        let entries = log.recover().unwrap();
+        assert_eq!(entries.len(), 1, "expected exactly 1 recovered entry");
+        assert_eq!(entries[0].op, op, "round-tripped op does not match original");
+    }
+
+    #[test]
+    fn round_trip_spend() {
+        let mut spending_data = [0u8; 36];
+        for (i, b) in spending_data.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7);
+        }
+        assert_round_trip(RedoOp::Spend {
+            tx_key: make_txid(0xA1),
+            offset: 42,
+            spending_data,
+            new_spent_count: 17,
+        });
+    }
+
+    #[test]
+    fn round_trip_unspend() {
+        assert_round_trip(RedoOp::Unspend {
+            tx_key: make_txid(0xB2),
+            offset: 99,
+            new_spent_count: 3,
+        });
+    }
+
+    #[test]
+    fn round_trip_set_mined() {
+        assert_round_trip(RedoOp::SetMined {
+            tx_key: make_txid(0xC3),
+            block_id: 123456,
+            block_height: 800_000,
+            subtree_idx: 15,
+            unset: false,
+        });
+    }
+
+    #[test]
+    fn round_trip_set_mined_unset() {
+        assert_round_trip(RedoOp::SetMined {
+            tx_key: make_txid(0xC4),
+            block_id: 654321,
+            block_height: 900_001,
+            subtree_idx: 0,
+            unset: true,
+        });
+    }
+
+    #[test]
+    fn round_trip_freeze() {
+        assert_round_trip(RedoOp::Freeze {
+            tx_key: make_txid(0xD5),
+            offset: 7,
+        });
+    }
+
+    #[test]
+    fn round_trip_unfreeze() {
+        assert_round_trip(RedoOp::Unfreeze {
+            tx_key: make_txid(0xE6),
+            offset: 255,
+        });
+    }
+
+    #[test]
+    fn round_trip_reassign() {
+        let mut new_hash = [0u8; 32];
+        for (i, b) in new_hash.iter_mut().enumerate() {
+            *b = 0xFF_u8.wrapping_sub(i as u8);
+        }
+        assert_round_trip(RedoOp::Reassign {
+            tx_key: make_txid(0xF7),
+            offset: 10,
+            new_hash,
+            block_height: 1_000_000,
+            spendable_after: 500,
+        });
+    }
+
+    #[test]
+    fn round_trip_prune_slot() {
+        assert_round_trip(RedoOp::PruneSlot {
+            tx_key: make_txid(0x08),
+            offset: 31,
+        });
+    }
+
+    #[test]
+    fn round_trip_create() {
+        assert_round_trip(RedoOp::Create {
+            tx_key: make_txid(0x19),
+            record_offset: 0x0000_DEAD_BEEF_0000,
+            utxo_count: 250,
+        });
+    }
+
+    #[test]
+    fn round_trip_delete() {
+        assert_round_trip(RedoOp::Delete {
+            tx_key: make_txid(0x2A),
+            record_offset: 0x0000_CAFE_BABE_0000,
+            record_size: 4096,
+        });
+    }
+
+    #[test]
+    fn round_trip_set_conflicting() {
+        assert_round_trip(RedoOp::SetConflicting {
+            tx_key: make_txid(0x3B),
+            value: true,
+            current_block_height: 750_000,
+            block_height_retention: 288,
+        });
+    }
+
+    #[test]
+    fn round_trip_set_conflicting_false() {
+        assert_round_trip(RedoOp::SetConflicting {
+            tx_key: make_txid(0x3C),
+            value: false,
+            current_block_height: 100,
+            block_height_retention: 1000,
+        });
+    }
+
+    #[test]
+    fn round_trip_set_locked() {
+        assert_round_trip(RedoOp::SetLocked {
+            tx_key: make_txid(0x4C),
+            value: true,
+        });
+    }
+
+    #[test]
+    fn round_trip_set_locked_false() {
+        assert_round_trip(RedoOp::SetLocked {
+            tx_key: make_txid(0x4D),
+            value: false,
+        });
+    }
+
+    #[test]
+    fn round_trip_preserve_until() {
+        assert_round_trip(RedoOp::PreserveUntil {
+            tx_key: make_txid(0x5D),
+            block_height: 999_999,
+        });
+    }
+
+    #[test]
+    fn round_trip_mark_on_longest_chain() {
+        assert_round_trip(RedoOp::MarkOnLongestChain {
+            tx_key: make_txid(0x6E),
+            on_longest_chain: true,
+            current_block_height: 800_123,
+            block_height_retention: 576,
+        });
+    }
+
+    #[test]
+    fn round_trip_mark_on_longest_chain_false() {
+        assert_round_trip(RedoOp::MarkOnLongestChain {
+            tx_key: make_txid(0x6F),
+            on_longest_chain: false,
+            current_block_height: 1,
+            block_height_retention: 0,
+        });
+    }
+
+    #[test]
+    fn round_trip_checkpoint() {
+        // Checkpoint is special: it is the last entry, so scan_all is needed
+        // since recover() filters entries before the last checkpoint.
+        let (_, mut log) = make_log(1024 * 1024);
+        log.append_and_flush(RedoOp::Checkpoint).unwrap();
+        let all = log.scan_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].op, RedoOp::Checkpoint);
+    }
+
+    // -----------------------------------------------------------------------
+    // RedoLog integration: append 5 ops, flush, reopen, recover
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn redo_log_integration_reopen_recovers_five_ops() {
+        let ops = vec![
+            RedoOp::Spend {
+                tx_key: make_txid(0x01),
+                offset: 0,
+                spending_data: [0xDD; 36],
+                new_spent_count: 1,
+            },
+            RedoOp::SetMined {
+                tx_key: make_txid(0x02),
+                block_id: 42,
+                block_height: 100_000,
+                subtree_idx: 3,
+                unset: false,
+            },
+            RedoOp::Create {
+                tx_key: make_txid(0x03),
+                record_offset: 8192,
+                utxo_count: 5,
+            },
+            RedoOp::SetConflicting {
+                tx_key: make_txid(0x04),
+                value: true,
+                current_block_height: 200_000,
+                block_height_retention: 288,
+            },
+            RedoOp::MarkOnLongestChain {
+                tx_key: make_txid(0x05),
+                on_longest_chain: true,
+                current_block_height: 300_000,
+                block_height_retention: 144,
+            },
+        ];
+
+        let (dev, mut log) = make_log(1024 * 1024);
+        for op in &ops {
+            log.append(op.clone()).unwrap();
+        }
+        log.flush().unwrap();
+        drop(log);
+
+        // Simulate restart: reopen the log from the same device
+        let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
+        let entries = log2.recover().unwrap();
+        assert_eq!(entries.len(), 5, "expected 5 recovered entries after reopen");
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.sequence, (i + 1) as u64, "sequence mismatch at index {i}");
+            assert_eq!(entry.op, ops[i], "op mismatch at index {i}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Log full test: fill until LogFull error
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn log_full_error_not_panic() {
+        // Use a very small log (4KB) so it fills quickly
+        let (_, mut log) = make_log(4096);
+        let mut appended = 0u32;
+        loop {
+            let result = log.append(RedoOp::Delete {
+                tx_key: make_txid(appended as u8),
+                record_offset: appended as u64 * 4096,
+                record_size: 4096,
+            });
+            match result {
+                Ok(_) => appended += 1,
+                Err(RedoError::LogFull { used, capacity }) => {
+                    assert!(used > 0, "used should be > 0 when log is full");
+                    assert_eq!(capacity, 4096, "capacity should match log size");
+                    break;
+                }
+                Err(e) => panic!("expected LogFull, got: {e}"),
+            }
+        }
+        assert!(appended > 0, "should have appended at least one entry before LogFull");
+    }
+
+    // -----------------------------------------------------------------------
+    // Corrupted entry recovery: entries before corruption are returned
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn corrupted_entry_recovery_returns_entries_before_corruption() {
+        let (dev, mut log) = make_log(1024 * 1024);
+
+        // Write 5 entries
+        let ops: Vec<RedoOp> = (0..5u8)
+            .map(|i| RedoOp::Freeze { tx_key: make_txid(i), offset: i as u32 })
+            .collect();
+        for op in &ops {
+            log.append_and_flush(op.clone()).unwrap();
+        }
+
+        // Determine where the third entry starts (after two entries).
+        // Each Freeze entry is: 4 (length) + 8 (seq) + 1 (type) + 32 (txid) + 4 (offset) + 4 (crc) = 53 bytes
+        let entry_size = 53usize;
+        let corrupt_target = entry_size * 2 + 10; // middle of the third entry
+
+        let align = dev.alignment();
+        let mut buf = AlignedBuf::new(align, align);
+        dev.pread(&mut buf, 0).unwrap();
+        buf[corrupt_target] ^= 0xFF;
+        dev.pwrite(&buf, 0).unwrap();
+
+        // Reopen and recover
+        let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
+        let entries = log2.recover().unwrap();
+
+        // We should get exactly the 2 entries before the corruption
+        assert_eq!(entries.len(), 2, "should recover entries before corruption");
+        assert_eq!(entries[0].op, ops[0]);
+        assert_eq!(entries[1].op, ops[1]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoint test: only post-checkpoint ops returned
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn checkpoint_returns_only_post_checkpoint_ops() {
+        let (dev, mut log) = make_log(1024 * 1024);
+
+        // Append 3 pre-checkpoint ops
+        let pre_ops = vec![
+            RedoOp::Freeze { tx_key: make_txid(0x10), offset: 0 },
+            RedoOp::Unfreeze { tx_key: make_txid(0x11), offset: 1 },
+            RedoOp::PruneSlot { tx_key: make_txid(0x12), offset: 2 },
+        ];
+        for op in &pre_ops {
+            log.append(op.clone()).unwrap();
+        }
+        log.flush().unwrap();
+        log.checkpoint().unwrap();
+
+        // Append 2 post-checkpoint ops
+        let post_ops = vec![
+            RedoOp::SetLocked { tx_key: make_txid(0x20), value: true },
+            RedoOp::PreserveUntil { tx_key: make_txid(0x21), block_height: 12345 },
+        ];
+        for op in &post_ops {
+            log.append(op.clone()).unwrap();
+        }
+        log.flush().unwrap();
+        drop(log);
+
+        // Reopen and recover — only post-checkpoint ops should appear
+        let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
+        let entries = log2.recover().unwrap();
+        assert_eq!(entries.len(), 2, "expected 2 post-checkpoint entries");
+        assert_eq!(entries[0].op, post_ops[0], "first post-checkpoint op mismatch");
+        assert_eq!(entries[1].op, post_ops[1], "second post-checkpoint op mismatch");
     }
 }

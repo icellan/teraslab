@@ -259,6 +259,90 @@ impl ReplicationManager {
     pub fn sender(&self, index: usize) -> &ReplicaSender {
         &self.senders[index]
     }
+
+    /// Check for reconnected replicas and transition them to catch-up state.
+    ///
+    /// Call this periodically. Any replica that was `Down` but whose
+    /// transport is now connected transitions to `CatchingUp { from_sequence }`.
+    pub fn check_reconnected(&mut self) {
+        for sender in &mut self.senders {
+            if sender.state == ReplicaState::Down && sender.transport.is_connected() {
+                sender.state = ReplicaState::CatchingUp {
+                    from_sequence: sender.last_acked + 1,
+                };
+            }
+        }
+    }
+
+    /// Run catch-up for all replicas in the `CatchingUp` state using
+    /// redo log entries.
+    ///
+    /// For each catching-up replica, reads entries from its `from_sequence`
+    /// through the master's current sequence and sends them in batches.
+    /// After all entries are sent and acknowledged, transitions to `Live`.
+    ///
+    /// The `entries_fn` callback provides redo entries for a given sequence
+    /// range, abstracting the redo log. In production, callers pass
+    /// `|from_seq| redo_log.read_from_sequence(from_seq)` converted to
+    /// `ReplicaOp`s.
+    pub fn run_catchup<F>(&mut self, ops_from_seq: F) -> std::result::Result<(), ReplicationError>
+    where
+        F: Fn(u64) -> Vec<ReplicaOp>,
+    {
+        let batch_size = self.config.catchup_batch_size;
+        let timeout = self.config.replication_timeout;
+        let master_seq = self.next_sequence;
+
+        for sender in &mut self.senders {
+            let from_seq = match sender.state {
+                ReplicaState::CatchingUp { from_sequence } => from_sequence,
+                _ => continue,
+            };
+
+            if from_seq >= master_seq {
+                // Already caught up
+                sender.state = ReplicaState::Live;
+                continue;
+            }
+
+            let ops = ops_from_seq(from_seq);
+            if ops.is_empty() {
+                // Redo log entries were reclaimed; can't catch up this way.
+                // The replica stays in CatchingUp state for a full resync.
+                continue;
+            }
+
+            // Send in batches
+            let mut ok = true;
+            for chunk in ops.chunks(batch_size) {
+                let batch = ReplicaBatch {
+                    first_sequence: from_seq, // approximate
+                    ops: chunk.to_vec(),
+                };
+                if let Err(_e) = sender.transport.send_batch(&batch) {
+                    sender.state = ReplicaState::Down;
+                    ok = false;
+                    break;
+                }
+                match sender.transport.recv_ack(timeout) {
+                    Ok(ReplicaAck::Ok { through_sequence }) => {
+                        sender.last_acked = through_sequence;
+                    }
+                    _ => {
+                        sender.state = ReplicaState::Down;
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+
+            if ok {
+                sender.state = ReplicaState::Live;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -574,6 +658,7 @@ mod tests {
             metadata_bytes: vec![0x01; 64],
             utxo_hashes: vec![[0xAA; 32]; 5],
             cold_data: Some(vec![0xCC; 20]),
+            is_external: false,
         }];
         mgr.replicate_batch(&ops).unwrap();
 
@@ -745,5 +830,44 @@ mod tests {
         // RF=2: need 1 replica ACK (majority of 2 = 1 + master)
         let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0 }];
         mgr.replicate_batch(&ops).unwrap();
+    }
+
+    #[test]
+    fn catch_up_transitions_to_live() {
+        let (mt, rt) = InMemoryTransport::pair();
+        let _handle = spawn_auto_ack_replica(rt);
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig::default(),
+            vec![Box::new(mt)],
+        );
+
+        // Send 5 ops normally
+        for i in 0..5 {
+            let ops = vec![ReplicaOp::Freeze { tx_key: key(i), offset: 0 }];
+            mgr.replicate_batch(&ops).unwrap();
+        }
+        assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
+        assert_eq!(mgr.sender(0).last_acked(), 5);
+
+        // Simulate disconnect: force the replica to Down state
+        mgr.senders[0].state = ReplicaState::Down;
+
+        // "Send" 5 more ops by advancing the master sequence without
+        // actually sending to the downed replica
+        mgr.next_sequence += 5; // master advanced to seq 11
+
+        // Simulate reconnect: the transport is still connected
+        mgr.check_reconnected();
+        assert!(matches!(mgr.sender(0).state(), ReplicaState::CatchingUp { from_sequence: 6 }));
+
+        // Run catch-up with mock ops
+        mgr.run_catchup(|from_seq| {
+            (from_seq..11)
+                .map(|i| ReplicaOp::Freeze { tx_key: key(i as u8), offset: 0 })
+                .collect()
+        }).unwrap();
+
+        assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
     }
 }

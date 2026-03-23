@@ -227,9 +227,9 @@ func encodeMarkLongestChainBatch(buf []byte, params MarkLongestChainParams, txid
 // ---------------------------------------------------------------------------
 
 // encodeGetBatch appends a GetBatch request payload to buf.
-func encodeGetBatch(buf []byte, fieldMask uint16, txids []TxID) []byte {
+func encodeGetBatch(buf []byte, fieldMask uint32, txids []TxID) []byte {
 	buf = appendU32(buf, uint32(len(txids)))
-	buf = appendU16(buf, fieldMask)
+	buf = appendU32(buf, fieldMask)
 	for i := range txids {
 		buf = append(buf, txids[i][:]...)
 	}
@@ -272,6 +272,57 @@ func encodePreserveTransactions(buf []byte, blockHeight uint32, txids []TxID) []
 // encodeProcessExpired appends a ProcessExpiredPreservations request payload to buf.
 func encodeProcessExpired(buf []byte, currentHeight uint32) []byte {
 	return appendU32(buf, currentHeight)
+}
+
+// ---------------------------------------------------------------------------
+// Streaming blob upload
+// ---------------------------------------------------------------------------
+
+// encodeStreamChunk encodes an OP_STREAM_CHUNK payload.
+// Format: [txid:32][offset:8 LE][chunk_data_len:4 LE][chunk_data]
+func encodeStreamChunk(buf []byte, txid TxID, offset uint64, data []byte) []byte {
+	buf = append(buf, txid[:]...)
+	buf = appendU64(buf, offset)
+	buf = appendU32(buf, uint32(len(data)))
+	buf = append(buf, data...)
+	return buf
+}
+
+// encodeStreamEnd encodes an OP_STREAM_END payload.
+// Format: [txid:32][total_size:8 LE]
+func encodeStreamEnd(buf []byte, txid TxID, totalSize uint64) []byte {
+	buf = append(buf, txid[:]...)
+	buf = appendU64(buf, totalSize)
+	return buf
+}
+
+// encodeColdData encodes a CreateItem's TxData into the cold_data wire format.
+// Format: [inputs_len:4][inputs][outputs_len:4][outputs][inpoints_len:4][inpoints]
+// Returns nil if the TxData has no content.
+func encodeColdData(item *CreateItem) []byte {
+	hasTxData := len(item.TxData.Inputs) > 0 || len(item.TxData.Outputs) > 0 || len(item.TxData.Inpoints) > 0
+	if !hasTxData {
+		return nil
+	}
+	coldLen := 4 + len(item.TxData.Inputs) + 4 + len(item.TxData.Outputs) + 4 + len(item.TxData.Inpoints)
+	buf := make([]byte, 0, coldLen)
+	buf = appendU32(buf, uint32(len(item.TxData.Inputs)))
+	buf = append(buf, item.TxData.Inputs...)
+	buf = appendU32(buf, uint32(len(item.TxData.Outputs)))
+	buf = append(buf, item.TxData.Outputs...)
+	buf = appendU32(buf, uint32(len(item.TxData.Inpoints)))
+	buf = append(buf, item.TxData.Inpoints...)
+	return buf
+}
+
+// coldDataSize returns the wire size of a CreateItem's cold_data section.
+// Returns 0 if the TxData has no content.
+func coldDataSize(item *CreateItem) int {
+	hasTxData := len(item.TxData.Inputs) > 0 || len(item.TxData.Outputs) > 0 || len(item.TxData.Inpoints) > 0
+	if !hasTxData {
+		return 0
+	}
+	return 4 + len(item.TxData.Inputs) + 4 + len(item.TxData.Outputs) + 4 + len(item.TxData.Inpoints)
 }
 
 // ===========================================================================
@@ -504,33 +555,190 @@ func decodeProcessExpiredResponse(data []byte) (uint32, uint32, error) {
 // GetBatch data field parsers
 // ---------------------------------------------------------------------------
 
+// MetadataAllSize is the byte size when ALL metadata fields (bits 0-18) are requested.
+const MetadataAllSize = 148
+
+// ExternalRefSize is the byte size of the ExternalRef section (FieldExternalRef, bit 16).
+const ExternalRefSize = 65
+
 // DecodeTxMetadata parses the metadata section from a GetResult.Data field.
-func DecodeTxMetadata(data []byte) (*TxMetadata, error) {
-	if len(data) < 81 {
-		return nil, fmt.Errorf("tx metadata: need 81 bytes, have %d", len(data))
+// Only fields whose bits are set in fieldMask are present in the data.
+// Returns the parsed metadata, the number of bytes consumed, and any error.
+func DecodeTxMetadata(fieldMask uint32, data []byte) (*TxMetadata, int, error) {
+	md := &TxMetadata{}
+	pos := 0
+
+	if fieldMask&FieldTxVersion != 0 {
+		if pos+4 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at TxVersion")
+		}
+		md.TxVersion = getU32(data[pos : pos+4])
+		pos += 4
 	}
-	return &TxMetadata{
-		TxVersion:      getU32(data[0:4]),
-		Locktime:       getU32(data[4:8]),
-		Fee:            getU64(data[8:16]),
-		SizeInBytes:    getU64(data[16:24]),
-		ExtendedSize:   getU64(data[24:32]),
-		Flags:          data[32],
-		SpendingHeight: getU32(data[33:37]),
-		CreatedAt:      getU64(data[37:45]),
-		SpentUtxos:     getU32(data[45:49]),
-		PrunedUtxos:    getU32(data[49:53]),
-		UtxoCount:      getU32(data[53:57]),
-		Generation:     getU32(data[57:61]),
-		UpdatedAt:      getU64(data[61:69]),
-		UnminedSince:   getU32(data[69:73]),
-		DeleteAtHeight: getU32(data[73:77]),
-		PreserveUntil:  getU32(data[77:81]),
-	}, nil
+	if fieldMask&FieldLocktime != 0 {
+		if pos+4 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at Locktime")
+		}
+		md.Locktime = getU32(data[pos : pos+4])
+		pos += 4
+	}
+	if fieldMask&FieldFee != 0 {
+		if pos+8 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at Fee")
+		}
+		md.Fee = getU64(data[pos : pos+8])
+		pos += 8
+	}
+	if fieldMask&FieldSizeInBytes != 0 {
+		if pos+8 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at SizeInBytes")
+		}
+		md.SizeInBytes = getU64(data[pos : pos+8])
+		pos += 8
+	}
+	if fieldMask&FieldExtendedSize != 0 {
+		if pos+8 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at ExtendedSize")
+		}
+		md.ExtendedSize = getU64(data[pos : pos+8])
+		pos += 8
+	}
+	if fieldMask&FieldFlags != 0 {
+		if pos+1 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at Flags")
+		}
+		md.Flags = data[pos]
+		pos++
+	}
+	if fieldMask&FieldSpendingHeight != 0 {
+		if pos+4 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at SpendingHeight")
+		}
+		md.SpendingHeight = getU32(data[pos : pos+4])
+		pos += 4
+	}
+	if fieldMask&FieldCreatedAt != 0 {
+		if pos+8 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at CreatedAt")
+		}
+		md.CreatedAt = getU64(data[pos : pos+8])
+		pos += 8
+	}
+	if fieldMask&FieldSpentUtxos != 0 {
+		if pos+4 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at SpentUtxos")
+		}
+		md.SpentUtxos = getU32(data[pos : pos+4])
+		pos += 4
+	}
+	if fieldMask&FieldPrunedUtxos != 0 {
+		if pos+4 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at PrunedUtxos")
+		}
+		md.PrunedUtxos = getU32(data[pos : pos+4])
+		pos += 4
+	}
+	if fieldMask&FieldUtxoCount != 0 {
+		if pos+4 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at UtxoCount")
+		}
+		md.UtxoCount = getU32(data[pos : pos+4])
+		pos += 4
+	}
+	if fieldMask&FieldGeneration != 0 {
+		if pos+4 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at Generation")
+		}
+		md.Generation = getU32(data[pos : pos+4])
+		pos += 4
+	}
+	if fieldMask&FieldUpdatedAt != 0 {
+		if pos+8 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at UpdatedAt")
+		}
+		md.UpdatedAt = getU64(data[pos : pos+8])
+		pos += 8
+	}
+	if fieldMask&FieldUnminedSince != 0 {
+		if pos+4 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at UnminedSince")
+		}
+		md.UnminedSince = getU32(data[pos : pos+4])
+		pos += 4
+	}
+	if fieldMask&FieldDeleteAtHeight != 0 {
+		if pos+4 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at DeleteAtHeight")
+		}
+		md.DeleteAtHeight = getU32(data[pos : pos+4])
+		pos += 4
+	}
+	if fieldMask&FieldPreserveUntil != 0 {
+		if pos+4 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at PreserveUntil")
+		}
+		md.PreserveUntil = getU32(data[pos : pos+4])
+		pos += 4
+	}
+	if fieldMask&FieldExternalRef != 0 {
+		if pos+ExternalRefSize > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at ExternalRef")
+		}
+		md.ExternalRef.StoreType = data[pos]
+		copy(md.ExternalRef.ContentHash[:], data[pos+1:pos+33])
+		md.ExternalRef.TotalSize = getU64(data[pos+33 : pos+41])
+		md.ExternalRef.InputCount = getU32(data[pos+41 : pos+45])
+		md.ExternalRef.OutputCount = getU32(data[pos+45 : pos+49])
+		md.ExternalRef.InputsOffset = getU64(data[pos+49 : pos+57])
+		md.ExternalRef.OutputsOffset = getU64(data[pos+57 : pos+65])
+		pos += ExternalRefSize
+	}
+	if fieldMask&FieldReassignCount != 0 {
+		if pos+1 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at ReassignCount")
+		}
+		md.ReassignCount = data[pos]
+		pos++
+	}
+	if fieldMask&FieldBlockEntryCount != 0 {
+		if pos+1 > len(data) {
+			return nil, 0, fmt.Errorf("tx metadata: truncated at BlockEntryCount")
+		}
+		md.BlockEntryCount = data[pos]
+		pos++
+	}
+
+	return md, pos, nil
 }
 
-// MetadataSize is the byte size of the serialized metadata section.
-const MetadataSize = 81
+// RawMetadataSize is the byte size of the full on-disk metadata struct (FIELD_RAW_METADATA).
+const RawMetadataSize = 256
+
+// DecodeTxMetadataRaw parses the full 256-byte on-disk metadata struct returned
+// by FIELD_RAW_METADATA. The raw bytes are preserved for inspection, and key
+// internal fields are parsed into convenience accessors. For debugging only.
+func DecodeTxMetadataRaw(data []byte) (*TxMetadataRaw, error) {
+	if len(data) < RawMetadataSize {
+		return nil, fmt.Errorf("raw metadata: need %d bytes, have %d", RawMetadataSize, len(data))
+	}
+	raw := &TxMetadataRaw{
+		Magic:                     getU32(data[0:4]),
+		SchemaVersion:             getU32(data[4:8]),
+		RecordSize:                getU32(data[8:12]),
+		UtxoCount:                 getU32(data[12:16]),
+		Flags:                     data[80],
+		SpentUtxos:                getU32(data[93:97]),
+		BlockEntryCount:           data[113],
+		BlockOverflowOffset:       getU64(data[150:158]),
+		ReassignmentOffset:        getU64(data[158:166]),
+		ReassignmentCount:         data[166],
+		ConflictingChildrenCount:  data[244],
+		ConflictingChildrenOffset: getU64(data[245:253]),
+	}
+	copy(raw.Bytes[:], data[:RawMetadataSize])
+	copy(raw.TxID[:], data[16:48])
+	return raw, nil
+}
 
 // DecodeUtxoSlots parses the UTXO slots section from a GetResult.Data field.
 func DecodeUtxoSlots(data []byte) ([]UtxoSlot, error) {

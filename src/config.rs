@@ -23,6 +23,10 @@ pub struct ServerConfig {
     /// Size of the redo log region in bytes.
     pub redo_log_size: u64,
 
+    /// Path for the redo log file. If not set, derived from the first device
+    /// path by appending `.redo`.
+    pub redo_log_path: Option<PathBuf>,
+
     /// Path for the index snapshot file.
     pub index_snapshot_path: PathBuf,
 
@@ -64,6 +68,13 @@ pub struct ServerConfig {
 
     /// SWIM suspicion timeout in milliseconds.
     pub swim_suspicion_timeout_ms: u64,
+
+    /// Directory for external blob storage (large transaction cold data).
+    pub blobstore_path: String,
+
+    /// Path for persisted cluster state (peak cluster size for quorum safety).
+    /// If not set, derived from the first device path by appending `.cluster`.
+    pub cluster_state_path: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -74,6 +85,7 @@ impl Default for ServerConfig {
             device_size: 1024 * 1024 * 1024, // 1 GiB
             device_alignment: 4096,
             redo_log_size: 64 * 1024 * 1024, // 64 MiB
+            redo_log_path: None,
             index_snapshot_path: PathBuf::from("teraslab-index.snap"),
             expected_records: 100_000,
             lock_stripes: 65536,
@@ -87,6 +99,8 @@ impl Default for ServerConfig {
             replication_factor: 1,
             swim_probe_interval_ms: 200,
             swim_suspicion_timeout_ms: 5000,
+            blobstore_path: "/blobstore".to_string(),
+            cluster_state_path: None,
         }
     }
 }
@@ -95,6 +109,32 @@ impl ServerConfig {
     /// Whether clustering is enabled (node_id > 0).
     pub fn is_clustered(&self) -> bool {
         self.node_id > 0
+    }
+
+    /// Resolve the redo log file path. Uses `redo_log_path` if explicitly set,
+    /// otherwise derives it from the first device path by appending `.redo`.
+    pub fn resolved_redo_log_path(&self) -> PathBuf {
+        match &self.redo_log_path {
+            Some(p) => p.clone(),
+            None => {
+                let mut p = self.device_paths[0].clone().into_os_string();
+                p.push(".redo");
+                PathBuf::from(p)
+            }
+        }
+    }
+
+    /// Resolve the cluster state file path. Uses `cluster_state_path` if set,
+    /// otherwise derives from the first device path by appending `.cluster`.
+    pub fn resolved_cluster_state_path(&self) -> PathBuf {
+        match &self.cluster_state_path {
+            Some(p) => p.clone(),
+            None => {
+                let mut p = self.device_paths[0].clone().into_os_string();
+                p.push(".cluster");
+                PathBuf::from(p)
+            }
+        }
     }
 }
 

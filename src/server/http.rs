@@ -3,6 +3,8 @@
 //! Runs on a separate port from the binary wire protocol. Uses `axum`
 //! for routing. Does not block or slow the binary protocol path.
 
+use crate::cluster::coordinator::RunningCluster;
+use crate::cluster::shards::NUM_SHARDS;
 use crate::index::TxKey;
 use crate::metrics::ThreadMetrics;
 use crate::ops::engine::Engine;
@@ -31,6 +33,8 @@ pub struct HttpState {
     pub ready: Arc<AtomicBool>,
     /// Runtime log level.
     pub log_level: Arc<AtomicU8>,
+    /// Cluster coordinator (None in single-node mode).
+    pub cluster: Option<Arc<RunningCluster>>,
 }
 
 /// Start the HTTP observability server on the given address.
@@ -52,6 +56,8 @@ pub fn start_http_server(
             .route("/health/live", get(handle_health_live))
             .route("/health/ready", get(handle_health_ready))
             .route("/status", get(handle_status))
+            .route("/admin/quiesce", put(handle_admin_quiesce))
+            .route("/admin/migration_status", get(handle_admin_migration_status))
             .route("/debug/index", get(handle_debug_index))
             .route("/debug/freelist", get(handle_debug_freelist))
             .route("/debug/redo", get(handle_debug_redo))
@@ -144,7 +150,51 @@ async fn handle_health_ready(State(state): State<Arc<HttpState>>) -> impl IntoRe
 
 async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
     let m = state.metrics;
+
+    let cluster_info = if let Some(ref cluster) = state.cluster {
+        let table = cluster.shard_table();
+        let table_guard = table.read().unwrap();
+        let self_id = cluster.self_id();
+        let mut master_count: u32 = 0;
+        let mut replica_count: u32 = 0;
+        for shard in 0..NUM_SHARDS as u16 {
+            let assignment = table_guard.assignment(shard);
+            if assignment.master == self_id {
+                master_count += 1;
+            }
+            if assignment.replicas.contains(&self_id) {
+                replica_count += 1;
+            }
+        }
+        let cluster_size = cluster.alive_node_count();
+        drop(table_guard);
+
+        serde_json::json!({
+            "node_id": self_id.0,
+            "cluster_size": cluster_size,
+            "shard_table_version": cluster.shard_table_version(),
+            "master_shard_count": master_count,
+            "replica_shard_count": replica_count,
+            "active_migrations": cluster.active_migrations(),
+        })
+    } else {
+        serde_json::json!({
+            "node_id": 0,
+            "cluster_size": 1,
+            "shard_table_version": 0,
+            "master_shard_count": 0,
+            "replica_shard_count": 0,
+            "active_migrations": 0,
+        })
+    };
+
     let status = serde_json::json!({
+        "node_id": cluster_info["node_id"],
+        "cluster_size": cluster_info["cluster_size"],
+        "shard_table_version": cluster_info["shard_table_version"],
+        "master_shard_count": cluster_info["master_shard_count"],
+        "replica_shard_count": cluster_info["replica_shard_count"],
+        "active_migrations": cluster_info["active_migrations"],
         "records": {
             "total": state.engine.index_len(),
             "dah_index": state.engine.dah_index().len(),
@@ -165,6 +215,53 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
         [("content-type", "application/json")],
         status.to_string(),
     )
+}
+
+// ---------------------------------------------------------------------------
+// /admin/* endpoints
+// ---------------------------------------------------------------------------
+
+/// Trigger graceful shard drain (quiesce). All master shards migrate away
+/// from this node so it can be safely stopped.
+async fn handle_admin_quiesce(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    match state.cluster {
+        Some(ref cluster) => {
+            cluster.quiesce();
+            (StatusCode::OK, "quiesce initiated".to_string())
+        }
+        None => (StatusCode::BAD_REQUEST, "not in cluster mode".to_string()),
+    }
+}
+
+/// Return the current migration status as JSON.
+async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    match state.cluster {
+        Some(ref cluster) => {
+            let migrations = cluster.migration_status();
+            let body = serde_json::json!({
+                "active_count": migrations.len(),
+                "migrations": migrations.iter().map(|m| {
+                    serde_json::json!({
+                        "shard": m.shard,
+                        "from_node": m.from_node.0,
+                        "to_node": m.to_node.0,
+                        "state": format!("{:?}", m.state),
+                        "migrated_records": m.migrated_records,
+                        "total_records": m.total_records,
+                        "bytes_sent": m.bytes_sent,
+                    })
+                }).collect::<Vec<_>>(),
+            });
+            (
+                StatusCode::OK,
+                body.to_string(),
+            )
+        }
+        None => (
+            StatusCode::OK,
+            serde_json::json!({"active_count": 0, "migrations": []}).to_string(),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------

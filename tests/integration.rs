@@ -81,6 +81,7 @@ fn create_tx(engine: &Engine, n: u32, utxo_count: usize) -> TxKey {
         frozen: false,
         conflicting: false,
         locked: false,
+        parent_txids: vec![],
     };
     engine.create(&req).unwrap();
     TxKey { txid: tx_id }
@@ -475,7 +476,7 @@ fn preserve_until_blocks_pruning() {
         inputs: None, outputs: None, inpoints: None, is_external: false,
         created_at: 1710000000000, block_height: 1000,
         mined_block_infos: vec![MinedBlockInfo { block_id: 1, block_height: 900, subtree_idx: 0 }],
-        frozen: false, conflicting: false, locked: false,
+        frozen: false, conflicting: false, locked: false, parent_txids: vec![],
     };
     let key = TxKey { txid: req.tx_id };
     engine.create(&req).unwrap();
@@ -629,7 +630,7 @@ fn dah_set_and_cleared() {
         inputs: None, outputs: None, inpoints: None, is_external: false,
         created_at: 1710000000000, block_height: 1000,
         mined_block_infos: vec![MinedBlockInfo { block_id: 1, block_height: 900, subtree_idx: 0 }],
-        frozen: false, conflicting: false, locked: false,
+        frozen: false, conflicting: false, locked: false, parent_txids: vec![],
     };
     let key = TxKey { txid: req.tx_id };
     engine.create(&req).unwrap();
@@ -689,7 +690,7 @@ fn coinbase_maturity() {
         inputs: None, outputs: None, inpoints: None, is_external: false,
         created_at: 1710000000000, block_height: 1000,
         mined_block_infos: vec![MinedBlockInfo { block_id: 1, block_height: 1000, subtree_idx: 0 }],
-        frozen: false, conflicting: false, locked: false,
+        frozen: false, conflicting: false, locked: false, parent_txids: vec![],
     };
     let key = TxKey { txid: tx_id };
     engine.create(&req).unwrap();
@@ -744,7 +745,7 @@ fn cold_data_survives_mutations() {
         outputs: Some(vec![0xBE, 0xEF]),
         inpoints: None, is_external: false,
         created_at: 1710000000000, block_height: 1000,
-        mined_block_infos: vec![], frozen: false, conflicting: false, locked: false,
+        mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
     };
     let key = TxKey { txid: tx_id };
     engine.create(&req).unwrap();

@@ -1,6 +1,17 @@
 .idea/
-
+_plans/
 
 # Added by cargo
-
 /target
+
+# Client build artifacts
+/client/rust/target
+/client/rust/Cargo.lock
+
+# Test client build artifacts
+/teraslab-tests/client/target
+/teraslab-tests/client/Cargo.lock
+
+# Test results and logs
+/teraslab-tests/results/*
+!/teraslab-tests/results/.gitkeep

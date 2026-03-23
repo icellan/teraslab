@@ -15,6 +15,10 @@ type TxRecord struct {
 	// Metadata is non-nil when FieldMetadata was requested and the record exists.
 	Metadata *TxMetadata
 
+	// RawMetadata is non-nil when FieldRawMetadata was requested.
+	// Contains the full 256-byte on-disk struct for debugging.
+	RawMetadata *TxMetadataRaw
+
 	// Slots contains one entry per UTXO output.  Non-nil when FieldUtxoSlots
 	// was requested and the record exists.
 	Slots []UtxoSlot
@@ -36,14 +40,14 @@ type TxRecord struct {
 // GetRecordBatch is a high-level wrapper around GetBatch that decodes the raw
 // wire response into structured TxRecord values.  The returned slice is
 // positionally aligned with the input txids slice.
-func (c *Client) GetRecordBatch(ctx context.Context, fieldMask uint16, txids []TxID) ([]TxRecord, error) {
-	raw, err := c.GetBatch(ctx, fieldMask, txids)
+func (c *Client) GetRecordBatch(ctx context.Context, fieldMask uint32, txids []TxID) ([]TxRecord, error) {
+	batch, err := c.GetBatch(ctx, fieldMask, txids)
 	if err != nil {
 		return nil, err
 	}
 
-	records := make([]TxRecord, len(raw))
-	for i, r := range raw {
+	records := make([]TxRecord, batch.Len())
+	for i, r := range batch.Items {
 		if r.Status != 0 {
 			continue
 		}
@@ -58,22 +62,32 @@ func (c *Client) GetRecordBatch(ctx context.Context, fieldMask uint16, txids []T
 
 // decodeRecord parses the concatenated field sections in a single GetResult.Data
 // blob according to the field mask that was used in the request.  The sections
-// appear in a fixed order: metadata, utxo_slots, cold_data, block_entries —
-// but only sections whose bit is set in fieldMask are present.
-func decodeRecord(fieldMask uint16, data []byte) (TxRecord, error) {
+// appear in a fixed order: raw_metadata or metadata fields, utxo_slots,
+// cold_data, block_entries, conflicting_children — but only sections whose
+// bit is set in fieldMask are present.
+func decodeRecord(fieldMask uint32, data []byte) (TxRecord, error) {
 	rec := TxRecord{Found: true}
 	pos := 0
 
-	if fieldMask&FieldMetadata != 0 {
-		if pos+MetadataSize > len(data) {
-			return rec, fmt.Errorf("metadata section truncated: need %d, have %d", MetadataSize, len(data)-pos)
+	if fieldMask&FieldRawMetadata != 0 {
+		// Raw metadata takes precedence over individual metadata fields.
+		if pos+RawMetadataSize > len(data) {
+			return rec, fmt.Errorf("raw metadata section truncated: need %d, have %d", RawMetadataSize, len(data)-pos)
 		}
-		md, err := DecodeTxMetadata(data[pos:])
+		raw, err := DecodeTxMetadataRaw(data[pos:])
+		if err != nil {
+			return rec, err
+		}
+		rec.RawMetadata = raw
+		pos += RawMetadataSize
+	} else if metaMask := fieldMask & FieldAllMetadata; metaMask != 0 {
+		// Any metadata fields requested (bits 0-18).
+		md, n, err := DecodeTxMetadata(metaMask, data[pos:])
 		if err != nil {
 			return rec, err
 		}
 		rec.Metadata = md
-		pos += MetadataSize
+		pos += n
 	}
 
 	if fieldMask&FieldUtxoSlots != 0 {

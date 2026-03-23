@@ -1,16 +1,16 @@
-# BSV UTXO Store: Rust Replacement for Aerospike — Specification Briefing
+# BSV UTXO Store: Purpose-Built Rust Implementation — Specification Briefing
 
 > **Note:** This document is the design session briefing that served as input for the full specification. The complete, code-validated OpenSpec is in [BSV_UTXO_STORE_SPEC.md](./BSV_UTXO_STORE_SPEC.md). Where the two documents differ, the OpenSpec takes precedence — it reflects the actual codebase analysis and subsequent refinements (69-byte slots, PRUNED status, flags bitfield, eliminated fields, block entry overflow, secondary indexes, etc.).
 
 ## Project context
 
-This document captures the full analysis from a multi-turn design session for building a purpose-built Rust database server to replace Aerospike as the UTXO store for BSV Teranode. The goal is a dramatically faster and more efficient system by exploiting the known, fixed workload patterns of the UTXO store.
+This document captures the full analysis from a multi-turn design session for building a purpose-built Rust database server as the UTXO store for BSV Teranode, replacing the original general-purpose database backend. The goal is a dramatically faster and more efficient system by exploiting the known, fixed workload patterns of the UTXO store.
 
-The current implementation uses a forked Aerospike server (`bsv-blockchain/aerospike-server`, branch `master`, module `modules/mod-teranode`) with Lua UDFs for atomic record mutations. The Go client code lives in `bsv-blockchain/teranode` — the UTXO store interface, field definitions, and Go-side expression operations are in that repo.
+The original implementation uses a forked general-purpose database server (branch `master`, module `modules/mod-teranode`) with Lua UDFs for atomic record mutations. The Go client code lives in `bsv-blockchain/teranode` — the UTXO store interface, field definitions, and Go-side expression operations are in that repo.
 
 ### Scale targets
 
-- Sustained throughput: 3+ million Aerospike operations/sec (demonstrated in production trials)
+- Sustained throughput: 3+ million operations/sec (demonstrated in production trials with the original backend)
 - Latency: sub-10ms p99
 - Dataset: billions of UTXO records
 - Largest single transaction seen on the network: 320 MB
@@ -19,11 +19,11 @@ The current implementation uses a forked Aerospike server (`bsv-blockchain/aeros
 
 ---
 
-## Current Aerospike architecture (what we're replacing)
+## Original architecture (what we're replacing)
 
-### Why Aerospike is fast (and where it isn't fast enough)
+### Why the original system is fast (and where it isn't fast enough)
 
-Aerospike's performance comes from six interlocked design decisions:
+The existing system's performance comes from six interlocked design decisions:
 
 1. **Raw block device access** — bypasses the filesystem entirely, opens NVMe devices with `O_DIRECT`, treats SSDs as a flat array of write-blocks (`wblocks`).
 
@@ -37,19 +37,19 @@ Aerospike's performance comes from six interlocked design decisions:
 
 6. **Dedicated thread pools** — service threads handle clients, `run_write` threads flush SWBs, defrag threads run independently. Write path is fully async from the service thread's perspective.
 
-### Why Aerospike is suboptimal for this specific workload
+### Why the original system is suboptimal for this specific workload
 
 The copy-on-write model is the core mismatch:
 
-- **`spend` (the hottest operation)** flips a status and writes 36 bytes of spending data into a UTXO entry. But because the UTXO entry grows from 32 to 68 bytes, Aerospike must copy-on-write the ENTIRE record (all UTXOs, all metadata, everything) to a new SWB position. For a tx with 1000 outputs, spending output #1 copies all 1000 UTXOs + metadata.
+- **`spend` (the hottest operation)** flips a status and writes 36 bytes of spending data into a UTXO entry. But because the UTXO entry grows from 32 to 68 bytes, the existing system must copy-on-write the ENTIRE record (all UTXOs, all metadata, everything) to a new SWB position. For a tx with 1000 outputs, spending output #1 copies all 1000 UTXOs + metadata.
 
 - **`setMined`** appends one integer to `blockIDs` and touches a few flags. Still rewrites the entire record including all UTXO data.
 
-- **Lua UDF overhead** — every mutation runs through the Lua interpreter: record deserialization into Lua tables, byte-by-byte hash comparison in interpreted Lua (not native `memcmp`), Lua object allocation for every response map, full record serialization back on `aerospike:update(rec)`.
+- **Lua UDF overhead** — every mutation runs through the Lua interpreter: record deserialization into Lua tables, byte-by-byte hash comparison in interpreted Lua (not native `memcmp`), Lua object allocation for every response map, full record serialization back on update.
 
 - **Three parallel lists** — `blockIDs`, `blockHeights`, `subtreeIdxs` are maintained as three separate lists that must be kept in sync. Linear scan for removal. Fragile.
 
-- **Multi-record pagination** — large transactions are split across multiple Aerospike records (master + extras). The `spentExtraRecs` counter drifts under load (there's explicit clamping at lines 1172-1181 of the Lua code to paper over the race). The entire master/child coordination machinery adds complexity.
+- **Multi-record pagination** — large transactions are split across multiple records (master + extras). The `spentExtraRecs` counter drifts under load (there's explicit clamping at lines 1172-1181 of the Lua code to paper over the race). The entire master/child coordination machinery adds complexity.
 
 ---
 
@@ -57,7 +57,7 @@ The copy-on-write model is the core mismatch:
 
 ### Core principle: in-place mutation on raw device
 
-Since we control the record format and know the layout at compile time, we can do something Aerospike fundamentally cannot: true in-place mutation. The `spend` path becomes a single `pwrite` of 68 bytes at a known offset instead of a full record copy-on-write.
+Since we control the record format and know the layout at compile time, we can do something the previous design fundamentally cannot: true in-place mutation. The `spend` path becomes a single `pwrite` of 68 bytes at a known offset instead of a full record copy-on-write.
 
 ### Record layout
 
@@ -131,7 +131,7 @@ The current design puts everything in one record. The Rust version separates the
 
 ### No multi-record pagination needed
 
-With fixed-size 68-byte slots on raw device, there's no Aerospike record size limit. A tx with 10,000 outputs = 680 KB of contiguous pre-allocated space. The entire master/child/extra-recs machinery disappears, along with the counter-drift bug.
+With fixed-size 68-byte slots on raw device, there's no record size limit imposed by the storage engine. A tx with 10,000 outputs = 680 KB of contiguous pre-allocated space. The entire master/child/extra-recs machinery disappears, along with the counter-drift bug.
 
 ---
 
@@ -259,7 +259,7 @@ Pure point lookups by outpoint hash (txid, or txid+vout depending on key scheme)
 
 ## Concurrency: per-transaction locks (not Lua VM)
 
-The Lua UDF provided atomicity via Aerospike's per-record write lock. Replace with:
+The Lua UDF provided atomicity via the original system's per-record write lock. Replace with:
 
 - Sharded lock table: array of `parking_lot::Mutex<()>`, ~65536 stripes
 - Hash tx key to lock stripe, acquire, do read-validate-write, release
@@ -305,7 +305,7 @@ enum ReplicaOp {
 }
 ```
 
-### Advantages over Aerospike's full-record replication:
+### Advantages over full-record replication:
 
 - `spend` replication = ~40 bytes vs hundreds of bytes (full record)
 - All operations are idempotent — simplifies recovery (re-send and replay)
@@ -337,7 +337,7 @@ enum ReplicaOp {
 ### Cluster membership
 
 - Heartbeat protocol (TCP mesh)
-- For AP mode: simple membership agreement + deterministic partition map (like Aerospike's approach, without the Paxos complexity)
+- For AP mode: simple membership agreement + deterministic partition map (without Paxos complexity)
 - For SC mode (if needed later): consider Raft via `openraft` crate, but note RF=3 requirement
 
 ---
@@ -361,13 +361,13 @@ UTXOs from the same transaction share a txid. When that tx is later spent, many 
 - At creation: allocate N contiguous slots for N outputs
 - Index maps `(txid, vout)` to base_slot + offset
 - "Spend all outputs of tx X" becomes one `pwritev` covering contiguous range
-- Aerospike can't do this because it doesn't understand the data model
+- A general-purpose database can't do this because it doesn't understand the data model
 
 ---
 
 ## Expected performance improvements
 
-| Metric | Current (Aerospike) | Expected (Rust) | Reason |
+| Metric | Current (Legacy) | Expected (Rust) | Reason |
 |--------|-------------------|-----------------|--------|
 | Write throughput/node | Baseline | 3-5x higher | Eliminate copy-on-write + defrag |
 | Write latency p50 | Baseline | Similar | Both dominated by single pwrite |
@@ -407,9 +407,9 @@ Run continuously in CI.
 The following files in `bsv-blockchain/teranode` are critical for understanding the workload:
 
 ### UTXO store interface and field definitions
-- `internal/utxostore/` — the Go interface that calls into Aerospike
+- `internal/utxostore/` — the Go interface that calls into the UTXO store backend
 - `internal/utxostore/fields/` — field name constants and bin definitions
-- `internal/utxostore/aerospike/` — Aerospike-specific client implementation
+- `internal/utxostore/legacy/` — legacy database-specific client implementation
 - Look for: `create.go`, `spend.go`, `spend_expressions.go`, `set_mined.go`, `set_mined_expressions.go`, `longest_chain.go`, `conflicting.go`
 
 ### Transaction creation flow
@@ -418,12 +418,12 @@ The following files in `bsv-blockchain/teranode` are critical for understanding 
 - The `createLock` mechanism and the `creating` flag
 
 ### Expression-based operations (alternative to Lua)
-- `spend_expressions.go` — Aerospike expressions for spend (parallel path to Lua)
+- `spend_expressions.go` — database expressions for spend (parallel path to Lua)
 - `set_mined_expressions.go` — expressions for setMined
-- These show what Aerospike operations are used when Lua is not available
+- These show what database operations are used when Lua is not available
 
 ### Configuration and tuning
-- `settings.conf` — Aerospike connection strings, policies, timeouts, batch sizes
+- `settings.conf` — database connection strings, policies, timeouts, batch sizes
 - Look for: `utxoBatchSize`, `maxMinedRoutines`, connection pool sizing
 
 ### Block validation and mining

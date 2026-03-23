@@ -13,7 +13,7 @@ Phases 1-10 must be complete with all tests passing.
 - `specs/BSV_UTXO_STORE_SPEC.md` §2.3 (Record Layout on NVMe)
 - `specs/BSV_UTXO_STORE_SPEC.md` §2.6 (External Reference Structure)
 - `specs/BSV_UTXO_STORE_SPEC.md` §4.3-4.4 (Tiered Storage and Creation Pipeline)
-- Current Aerospike implementation uses `external` boolean flag and `externalStore=file://` path
+- The original implementation uses an `external` boolean flag and `externalStore=file://` path
 
 ## Record layout recap
 

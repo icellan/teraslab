@@ -11,6 +11,8 @@ pub enum MigrationState {
     WaitingForAck,
     /// Target confirmed, migration is complete.
     Complete,
+    /// Migration failed after all retries; kept for visibility and retry.
+    Failed,
 }
 
 /// Progress of a single shard migration.
@@ -63,23 +65,43 @@ impl MigrationProgress {
 /// Manages active migrations for this node.
 pub struct MigrationManager {
     active: Vec<MigrationProgress>,
+    /// Shards that this node expects to receive data for (inbound migrations).
+    inbound_shards: Vec<u16>,
 }
 
 impl MigrationManager {
     /// Create a new migration manager with no active migrations.
     pub fn new() -> Self {
-        Self { active: Vec::new() }
+        Self {
+            active: Vec::new(),
+            inbound_shards: Vec::new(),
+        }
     }
 
-    /// Start migrations from a list of tasks.
+    /// Start migrations from a list of tasks, tracking both outbound and inbound.
     ///
-    /// Only tasks where this node is the source (`from_node`) are tracked.
+    /// Outbound tasks (this node is source) are fully tracked with progress.
+    /// Inbound tasks (this node is target) are tracked by shard ID so the
+    /// read path can wait for data to arrive before returning NotFound.
     pub fn start_outbound(&mut self, tasks: &[MigrationTask], self_id: NodeId) {
         for task in tasks {
             if task.from_node == self_id {
                 self.active.push(MigrationProgress::from_task(task));
             }
+            if task.to_node == self_id {
+                self.inbound_shards.push(task.shard);
+            }
         }
+    }
+
+    /// Mark an inbound shard as received (data has arrived).
+    pub fn mark_inbound_complete(&mut self, shard: u16) {
+        self.inbound_shards.retain(|&s| s != shard);
+    }
+
+    /// Check if this node is expecting inbound data for the given shard.
+    pub fn has_pending_inbound(&self, shard: u16) -> bool {
+        self.inbound_shards.contains(&shard)
     }
 
     /// Mark records as migrated for a shard.
@@ -104,9 +126,32 @@ impl MigrationManager {
         }
     }
 
-    /// Remove completed migrations.
+    /// Mark a migration as failed after all retries exhausted.
+    ///
+    /// Failed migrations are retained in the active list for visibility
+    /// and potential retry. They are NOT removed by `cleanup_completed()`.
+    pub fn mark_failed(&mut self, shard: u16) {
+        if let Some(p) = self.active.iter_mut().find(|p| p.shard == shard) {
+            p.state = MigrationState::Failed;
+        }
+    }
+
+    /// Number of failed migrations.
+    pub fn failed_count(&self) -> usize {
+        self.active.iter().filter(|p| p.state == MigrationState::Failed).count()
+    }
+
+    /// Remove completed migrations (but NOT failed ones).
+    ///
+    /// When all outbound migrations are complete (none active, none failed),
+    /// also clears the inbound shard tracking — if we've finished sending
+    /// data to all targets, the cluster has fully rebalanced and any
+    /// pending inbound data should have arrived as well.
     pub fn cleanup_completed(&mut self) {
         self.active.retain(|p| !p.is_complete());
+        if self.active.is_empty() {
+            self.inbound_shards.clear();
+        }
     }
 
     /// Check if a shard is currently being migrated outbound.
@@ -176,5 +221,40 @@ mod tests {
         let task = MigrationTask { shard: 0, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
         let progress = MigrationProgress::from_task(&task);
         assert_eq!(progress.fraction_complete(), 1.0); // 0 total → 100%
+    }
+
+    #[test]
+    fn failed_migration_not_cleaned_up() {
+        let mut mgr = MigrationManager::new();
+        let task = MigrationTask { shard: 3, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        mgr.start_outbound(&[task], NodeId(1));
+
+        mgr.mark_failed(3);
+        assert_eq!(mgr.active_migrations()[0].state, MigrationState::Failed);
+
+        // cleanup_completed should NOT remove failed migrations
+        mgr.cleanup_completed();
+        assert_eq!(mgr.active_count(), 1);
+        assert_eq!(mgr.failed_count(), 1);
+        assert_eq!(mgr.active_migrations()[0].state, MigrationState::Failed);
+    }
+
+    #[test]
+    fn waiting_for_ack_transitions_correctly() {
+        let mut mgr = MigrationManager::new();
+        let task = MigrationTask { shard: 7, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        mgr.start_outbound(&[task], NodeId(1));
+
+        assert_eq!(mgr.active_migrations()[0].state, MigrationState::Streaming);
+
+        mgr.mark_waiting_for_ack(7);
+        assert_eq!(mgr.active_migrations()[0].state, MigrationState::WaitingForAck);
+
+        mgr.mark_complete(7);
+        assert_eq!(mgr.active_migrations()[0].state, MigrationState::Complete);
+        assert!(mgr.active_migrations()[0].is_complete());
+
+        mgr.cleanup_completed();
+        assert_eq!(mgr.active_count(), 0);
     }
 }

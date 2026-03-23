@@ -121,9 +121,11 @@ fn make_create_item(txid: [u8; 32], utxo_count: u32, tx_n: u32) -> WireCreateIte
         flags: 0,
         utxo_hashes: (0..utxo_count).map(|v| test_utxo_hash(tx_n, v)).collect(),
         cold_data: vec![],
+        block_height: 0,
         mined_block_id: None,
         mined_block_height: None,
         mined_subtree_idx: None,
+        parent_txids: vec![],
     }
 }
 
@@ -169,7 +171,7 @@ fn create_10_then_get_batch_all() {
 
     // GetBatch all 10 with METADATA
     let txids: Vec<[u8; 32]> = (0..10u32).map(|i| test_txid(200 + i)).collect();
-    let get_payload = encode_get_batch(FieldMask::METADATA, &txids);
+    let get_payload = encode_get_batch(FieldMask::ALL_METADATA, &txids);
     let resp = send_request(&mut stream, &RequestFrame {
         request_id: 101,
         op_code: OP_GET_BATCH,
@@ -291,7 +293,7 @@ fn create_spend_across_multiple_txids_then_get() {
     let txids: Vec<[u8; 32]> = (0..3u32).map(|i| test_txid(300 + i)).collect();
     let resp = send_request(&mut stream, &RequestFrame {
         request_id: 302, op_code: OP_GET_BATCH, flags: 0,
-        payload: encode_get_batch(FieldMask::METADATA | FieldMask::UTXO_SLOTS, &txids),
+        payload: encode_get_batch(FieldMask::ALL_METADATA | FieldMask::UTXO_SLOTS, &txids),
     });
     assert_eq!(resp.status, STATUS_OK);
     let results = decode_get_response(&resp.payload).unwrap();
@@ -388,7 +390,7 @@ fn create_set_mined_mark_longest_chain() {
     // GetBatch to verify unmined_since was updated
     let resp = send_request(&mut stream, &RequestFrame {
         request_id: 403, op_code: OP_GET_BATCH, flags: 0,
-        payload: encode_get_batch(FieldMask::METADATA, &[txid]),
+        payload: encode_get_batch(FieldMask::ALL_METADATA, &[txid]),
     });
     assert_eq!(resp.status, STATUS_OK);
     let results = decode_get_response(&resp.payload).unwrap();
@@ -521,7 +523,7 @@ fn create_set_conflicting() {
     // GetBatch to verify flag
     let resp = send_request(&mut stream, &RequestFrame {
         request_id: 602, op_code: OP_GET_BATCH, flags: 0,
-        payload: encode_get_batch(FieldMask::METADATA, &[txid]),
+        payload: encode_get_batch(FieldMask::ALL_METADATA, &[txid]),
     });
     assert_eq!(resp.status, STATUS_OK);
     let results = decode_get_response(&resp.payload).unwrap();
@@ -553,7 +555,7 @@ fn create_set_locked() {
     // GetBatch to verify locked flag
     let resp = send_request(&mut stream, &RequestFrame {
         request_id: 702, op_code: OP_GET_BATCH, flags: 0,
-        payload: encode_get_batch(FieldMask::METADATA, &[txid]),
+        payload: encode_get_batch(FieldMask::ALL_METADATA, &[txid]),
     });
     let results = decode_get_response(&resp.payload).unwrap();
     let flags = results[0].data[32];
@@ -582,7 +584,7 @@ fn create_preserve_until_get() {
     // GetBatch to verify preserve_until field
     let resp = send_request(&mut stream, &RequestFrame {
         request_id: 802, op_code: OP_GET_BATCH, flags: 0,
-        payload: encode_get_batch(FieldMask::METADATA, &[txid]),
+        payload: encode_get_batch(FieldMask::ALL_METADATA, &[txid]),
     });
     let results = decode_get_response(&resp.payload).unwrap();
     assert_eq!(results[0].status, 0);

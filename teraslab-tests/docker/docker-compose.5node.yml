@@ -1,0 +1,43 @@
+# Overlay for 5-node cluster. Use with:
+#   docker compose -f docker-compose.3node.yml -f docker-compose.5node.yml up
+
+volumes:
+  node4-data:
+  node5-data:
+
+services:
+  node4:
+    image: teraslab:test
+    container_name: teraslab-node4
+    hostname: node4
+    networks:
+      teraslab-net:
+        ipv4_address: 172.30.0.14
+    volumes:
+      - node4-data:/data
+      - shared-blobstore:/blobstore
+      - ./config/node4.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13303:3300"
+      - "19103:9100"
+    cap_add:
+      - NET_ADMIN
+    restart: "no"
+
+  node5:
+    image: teraslab:test
+    container_name: teraslab-node5
+    hostname: node5
+    networks:
+      teraslab-net:
+        ipv4_address: 172.30.0.15
+    volumes:
+      - node5-data:/data
+      - shared-blobstore:/blobstore
+      - ./config/node5.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13304:3300"
+      - "19104:9100"
+    cap_add:
+      - NET_ADMIN
+    restart: "no"

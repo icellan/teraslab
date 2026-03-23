@@ -10,16 +10,25 @@
 //! 7. Start TCP server
 //! 8. On shutdown: snapshot index, sync device
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use teraslab::allocator::SlotAllocator;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, DirectDevice};
 use teraslab::index::{DahIndex, Index, UnminedIndex};
 use teraslab::locks::StripedLocks;
+use teraslab::metrics::ThreadMetrics;
 use teraslab::ops::engine::Engine;
+use teraslab::redo::RedoLog;
+use teraslab::server::http::{HttpState, start_http_server};
 use teraslab::server::Server;
+use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
+
+/// Global metrics counters for the server binary.
+static SERVER_METRICS: ThreadMetrics = ThreadMetrics::new();
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -77,7 +86,7 @@ fn main() {
 
     // 3. Load or rebuild index
     let snap_path = &config.index_snapshot_path;
-    let (index, dah_index, unmined_index) = if snap_path.exists() {
+    let (mut index, dah_index, unmined_index) = if snap_path.exists() {
         match Index::restore_all(snap_path) {
             Ok((idx, dah, unmined, flags)) => {
                 eprintln!("  index restored from snapshot ({} entries)", idx.len());
@@ -110,16 +119,82 @@ fn main() {
     eprintln!("  DAH index: {} entries", dah_index.len());
     eprintln!("  unmined index: {} entries", unmined_index.len());
 
+    // 3b. Open redo log device (separate file) and run recovery
+    let redo_log_path = config.resolved_redo_log_path();
+    let redo_log_device: Arc<dyn BlockDevice> = match DirectDevice::open(
+        &redo_log_path,
+        config.redo_log_size,
+        config.device_alignment,
+    ) {
+        Ok(d) => {
+            eprintln!("  redo log device opened: {}", redo_log_path.display());
+            Arc::new(d)
+        }
+        Err(e) => {
+            eprintln!("  redo log device open failed: {e}, creating fresh");
+            match DirectDevice::open(
+                &redo_log_path,
+                config.redo_log_size,
+                config.device_alignment,
+            ) {
+                Ok(d) => Arc::new(d),
+                Err(e2) => {
+                    eprintln!("  redo log device create failed: {e2}, proceeding without redo log");
+                    // Proceed without redo log — it's an enhancement, not a hard requirement
+                    // for startup to succeed.
+                    Arc::new(teraslab::device::MemoryDevice::new(config.redo_log_size, config.device_alignment)
+                        .expect("failed to create fallback redo log device"))
+                }
+            }
+        }
+    };
+
+    let redo_log = match RedoLog::open(redo_log_device.clone(), 0, config.redo_log_size) {
+        Ok(log) => {
+            eprintln!("  redo log opened (size {} MiB)", config.redo_log_size / (1024 * 1024));
+            Some(log)
+        }
+        Err(e) => {
+            eprintln!("  redo log open failed: {e}, proceeding without redo log");
+            None
+        }
+    };
+
+    // Run recovery if we have a redo log, while index is still mutable
+    if let Some(ref redo) = redo_log {
+        match teraslab::recovery::recover(&*device, redo, &mut index) {
+            Ok(stats) => {
+                eprintln!("  recovery: {} replayed, {} skipped, {} failed",
+                    stats.entries_replayed, stats.entries_skipped, stats.entries_failed);
+            }
+            Err(e) => {
+                eprintln!("  recovery failed: {e}");
+            }
+        }
+    }
+
+    // Wrap redo log in Arc<Mutex> for shared access from dispatch threads
+    let redo_log: Option<Arc<Mutex<RedoLog>>> = redo_log.map(|log| Arc::new(Mutex::new(log)));
+
     // 4. Create engine
     let locks = StripedLocks::new(config.lock_stripes);
-    let engine = Arc::new(Engine::new(
+    let mut engine = Engine::new(
         device.clone(),
         index,
         allocator,
         locks,
         dah_index,
         unmined_index,
-    ));
+    );
+
+    // 4b. Initialize blobstore from config and attach to engine
+    let blob_store: Arc<dyn BlobStore> = Arc::new(
+        FileBlobStore::new(Path::new(&config.blobstore_path), 2),
+    );
+    engine.set_blob_store(blob_store.clone());
+    eprintln!("  blobstore: {}", config.blobstore_path);
+
+    let engine = Arc::new(engine);
 
     // 5. Start cluster if configured
     let cluster = if config.is_clustered() {
@@ -128,8 +203,10 @@ fn main() {
 
         let self_addr: std::net::SocketAddr = config.listen_addr.parse()
             .expect("invalid listen_addr");
+        // Use the same IP as listen_addr for SWIM bind so the advertised
+        // SWIM address is reachable from other nodes (important in Docker).
         let swim_bind: std::net::SocketAddr =
-            format!("0.0.0.0:{}", config.swim_port).parse().unwrap();
+            format!("{}:{}", self_addr.ip(), config.swim_port).parse().unwrap();
         let seed_addrs: Vec<std::net::SocketAddr> = config.seed_nodes.iter()
             .filter_map(|s| s.parse().ok())
             .collect();
@@ -144,8 +221,13 @@ fn main() {
             suspicion_timeout: std::time::Duration::from_millis(config.swim_suspicion_timeout_ms),
         };
 
-        let coordinator = ClusterCoordinator::new(cluster_config);
-        let running = coordinator.start(engine.clone());
+        let cluster_state_path = config.resolved_cluster_state_path();
+        let initial_peak = teraslab::cluster::coordinator::load_peak_cluster_size(&cluster_state_path);
+        if initial_peak > 1 {
+            eprintln!("  cluster: restored peak cluster size = {initial_peak} (quorum requires {})", (initial_peak / 2) + 1);
+        }
+        let coordinator = ClusterCoordinator::new(cluster_config, initial_peak);
+        let running = coordinator.start(engine.clone(), Some(cluster_state_path));
         eprintln!("  cluster: node {} started with RF={}", config.node_id, config.replication_factor);
         Some(Arc::new(running))
     } else {
@@ -153,11 +235,28 @@ fn main() {
         None
     };
 
-    // 6. Setup server
+    // 6. Start HTTP observability server
+    let http_state = Arc::new(HttpState {
+        engine: engine.clone(),
+        metrics: &SERVER_METRICS,
+        ready: Arc::new(AtomicBool::new(true)),
+        log_level: Arc::new(AtomicU8::new(2)), // INFO
+        cluster: cluster.clone(),
+    });
+    let http_addr = config.http_listen_addr.clone();
+    std::thread::spawn(move || {
+        start_http_server(http_addr, http_state);
+    });
+
+    // 7. Setup TCP server
     let mut server = Server::new(engine.clone(), config.clone());
     if let Some(ref c) = cluster {
         server = server.with_cluster(c.clone());
     }
+    if let Some(ref rl) = redo_log {
+        server = server.with_redo_log(rl.clone());
+    }
+    server = server.with_blob_store(blob_store);
     let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_clone = shutdown_flag.clone();
     ctrlc_handler(move || {

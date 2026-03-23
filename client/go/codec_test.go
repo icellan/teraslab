@@ -301,16 +301,16 @@ func TestGetBatch4096Items(t *testing.T) {
 		txids[i][1] = byte(i >> 8)
 	}
 	encoded := encodeGetBatch(nil, FieldAll, txids)
-	if len(encoded) != 6+4096*32 {
-		t.Fatalf("encoded length = %d, want %d", len(encoded), 6+4096*32)
+	if len(encoded) != 8+4096*32 {
+		t.Fatalf("encoded length = %d, want %d", len(encoded), 8+4096*32)
 	}
 	count := getU32(encoded[0:4])
-	mask := getU16(encoded[4:6])
+	mask := getU32(encoded[4:8])
 	if count != 4096 {
 		t.Errorf("count = %d, want 4096", count)
 	}
 	if mask != FieldAll {
-		t.Errorf("mask = %d, want %d", mask, FieldAll)
+		t.Errorf("mask = 0x%08X, want 0x%08X", mask, FieldAll)
 	}
 }
 
@@ -676,5 +676,191 @@ func TestProcessExpiredResponseDecode(t *testing.T) {
 	}
 	if failed != 3 {
 		t.Errorf("failed = %d, want 3", failed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Stream chunk / end encode
+// ---------------------------------------------------------------------------
+
+func TestEncodeStreamChunkLayout(t *testing.T) {
+	txid := testTxID(0xAA)
+	data := []byte{0x01, 0x02, 0x03, 0x04, 0x05}
+	offset := uint64(4 * 1024 * 1024)
+
+	encoded := encodeStreamChunk(nil, txid, offset, data)
+
+	// Expected: txid(32) + offset(8) + chunk_data_len(4) + data(5) = 49
+	if len(encoded) != 32+8+4+5 {
+		t.Fatalf("encoded length = %d, want %d", len(encoded), 49)
+	}
+
+	// Verify txid.
+	var gotTxID TxID
+	copy(gotTxID[:], encoded[0:32])
+	if gotTxID != txid {
+		t.Errorf("txid mismatch")
+	}
+
+	// Verify offset.
+	gotOffset := getU64(encoded[32:40])
+	if gotOffset != offset {
+		t.Errorf("offset = %d, want %d", gotOffset, offset)
+	}
+
+	// Verify data length.
+	gotDataLen := getU32(encoded[40:44])
+	if gotDataLen != 5 {
+		t.Errorf("data_len = %d, want 5", gotDataLen)
+	}
+
+	// Verify data.
+	if !bytes.Equal(encoded[44:49], data) {
+		t.Errorf("data mismatch: got %x, want %x", encoded[44:49], data)
+	}
+}
+
+func TestEncodeStreamChunkLargePayload(t *testing.T) {
+	txid := testTxID(1)
+	data := make([]byte, BlobChunkSize)
+	for i := range data {
+		data[i] = byte(i & 0xFF)
+	}
+
+	encoded := encodeStreamChunk(nil, txid, 0, data)
+
+	expectedLen := 32 + 8 + 4 + BlobChunkSize
+	if len(encoded) != expectedLen {
+		t.Fatalf("encoded length = %d, want %d", len(encoded), expectedLen)
+	}
+
+	gotDataLen := getU32(encoded[40:44])
+	if gotDataLen != uint32(BlobChunkSize) {
+		t.Errorf("data_len = %d, want %d", gotDataLen, BlobChunkSize)
+	}
+
+	if !bytes.Equal(encoded[44:], data) {
+		t.Error("data mismatch in large payload")
+	}
+}
+
+func TestEncodeStreamEndLayout(t *testing.T) {
+	txid := testTxID(0xBB)
+	totalSize := uint64(10 * 1024 * 1024)
+
+	encoded := encodeStreamEnd(nil, txid, totalSize)
+
+	// Expected: txid(32) + total_size(8) = 40
+	if len(encoded) != 40 {
+		t.Fatalf("encoded length = %d, want 40", len(encoded))
+	}
+
+	var gotTxID TxID
+	copy(gotTxID[:], encoded[0:32])
+	if gotTxID != txid {
+		t.Errorf("txid mismatch")
+	}
+
+	gotTotal := getU64(encoded[32:40])
+	if gotTotal != totalSize {
+		t.Errorf("total_size = %d, want %d", gotTotal, totalSize)
+	}
+}
+
+func TestEncodeStreamChunkAppendsToBuffer(t *testing.T) {
+	// Verify that encodeStreamChunk appends to the provided buffer
+	// rather than replacing it.
+	prefix := []byte{0xFF, 0xFE}
+	data := []byte{0x01, 0x02}
+	encoded := encodeStreamChunk(prefix, testTxID(1), 0, data)
+
+	if encoded[0] != 0xFF || encoded[1] != 0xFE {
+		t.Error("prefix bytes were overwritten")
+	}
+	if len(encoded) != 2+32+8+4+2 {
+		t.Fatalf("total length = %d, want %d", len(encoded), 2+32+8+4+2)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cold data helpers
+// ---------------------------------------------------------------------------
+
+func TestEncodeColdDataWithContent(t *testing.T) {
+	item := CreateItem{
+		TxData: TxData{
+			Inputs:   []byte{0xDE, 0xAD},
+			Outputs:  []byte{0xBE, 0xEF, 0x01},
+			Inpoints: []byte{0xCA, 0xFE},
+		},
+	}
+	cold := encodeColdData(&item)
+	if cold == nil {
+		t.Fatal("expected non-nil cold data")
+	}
+
+	// Format: [inputs_len:4][inputs:2][outputs_len:4][outputs:3][inpoints_len:4][inpoints:2] = 19
+	if len(cold) != 4+2+4+3+4+2 {
+		t.Fatalf("cold data length = %d, want %d", len(cold), 19)
+	}
+
+	pos := 0
+	inputsLen := getU32(cold[pos : pos+4])
+	pos += 4
+	if inputsLen != 2 {
+		t.Errorf("inputs_len = %d, want 2", inputsLen)
+	}
+	if !bytes.Equal(cold[pos:pos+2], []byte{0xDE, 0xAD}) {
+		t.Error("inputs mismatch")
+	}
+	pos += 2
+
+	outputsLen := getU32(cold[pos : pos+4])
+	pos += 4
+	if outputsLen != 3 {
+		t.Errorf("outputs_len = %d, want 3", outputsLen)
+	}
+	if !bytes.Equal(cold[pos:pos+3], []byte{0xBE, 0xEF, 0x01}) {
+		t.Error("outputs mismatch")
+	}
+	pos += 3
+
+	inpointsLen := getU32(cold[pos : pos+4])
+	pos += 4
+	if inpointsLen != 2 {
+		t.Errorf("inpoints_len = %d, want 2", inpointsLen)
+	}
+	if !bytes.Equal(cold[pos:pos+2], []byte{0xCA, 0xFE}) {
+		t.Error("inpoints mismatch")
+	}
+}
+
+func TestEncodeColdDataEmpty(t *testing.T) {
+	item := CreateItem{}
+	cold := encodeColdData(&item)
+	if cold != nil {
+		t.Errorf("expected nil cold data for empty TxData, got %d bytes", len(cold))
+	}
+}
+
+func TestColdDataSizeCalculation(t *testing.T) {
+	item := CreateItem{
+		TxData: TxData{
+			Inputs:   make([]byte, 100),
+			Outputs:  make([]byte, 200),
+			Inpoints: make([]byte, 50),
+		},
+	}
+	got := coldDataSize(&item)
+	want := 4 + 100 + 4 + 200 + 4 + 50
+	if got != want {
+		t.Errorf("coldDataSize = %d, want %d", got, want)
+	}
+}
+
+func TestColdDataSizeEmpty(t *testing.T) {
+	item := CreateItem{}
+	if coldDataSize(&item) != 0 {
+		t.Errorf("coldDataSize for empty item = %d, want 0", coldDataSize(&item))
 	}
 }

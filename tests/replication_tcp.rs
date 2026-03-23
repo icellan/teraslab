@@ -118,6 +118,7 @@ fn create_record_on_engine(engine: &Engine, txid: [u8; 32], utxo_count: u32) {
         frozen: false,
         conflicting: false,
         locked: false,
+        parent_txids: vec![],
     };
     engine.create(&req).unwrap();
 }
@@ -247,6 +248,7 @@ fn tcp_replicate_create_and_spend_lifecycle() {
             metadata_bytes: vec![],
             utxo_hashes: hashes,
             cold_data: None,
+            is_external: false,
         }],
     };
     let ack = send_replica_batch_tcp(replica_port, &create_batch);

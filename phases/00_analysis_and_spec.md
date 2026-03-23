@@ -2,7 +2,7 @@
 
 ## Goal
 
-The formal specification (`BSV_UTXO_STORE_SPEC.md`) and crate recommendations (`BSV_UTXO_STORE_RUST_CRATES.md`) already exist and have been refined. Before implementation begins, validate them against the actual Teranode and Aerospike source code to catch any gaps, stale assumptions, or missing operations.
+The formal specification (`BSV_UTXO_STORE_SPEC.md`) and crate recommendations (`BSV_UTXO_STORE_RUST_CRATES.md`) already exist and have been refined. Before implementation begins, validate them against the actual Teranode source code and the original UTXO store implementation to catch any gaps, stale assumptions, or missing operations.
 
 NO implementation code is written in this phase — only analysis and spec amendments.
 
@@ -19,11 +19,10 @@ Read these documents in order:
 3. `BSV_UTXO_STORE_RUST_CRATES.md` — crate recommendations (already refined)
 4. `specs/teranode.lua` — the current Lua UDF
 
-Clone both repositories:
+Clone the repository:
 
 ```bash
 git clone https://github.com/bsv-blockchain/teranode.git repos/teranode
-git clone https://github.com/bsv-blockchain/aerospike-server.git repos/aerospike-server
 ```
 
 ## What to validate
@@ -54,7 +53,7 @@ If any field is missing, document it and flag it.
 
 #### C. Key structure confirmation
 
-- [ ] How are Aerospike record keys constructed? (txid only? txid + index?)
+- [ ] How are record keys constructed in the original implementation? (txid only? txid + index?)
 - [ ] What is `utxoBatchSize` and its default?
 - [ ] Does the spec correctly describe the key scheme for TeraSlab?
 
@@ -89,17 +88,17 @@ Find the pruner package:
 
 From `settings.conf` and Go config code:
 - [ ] Extract `utxoBatchSize` default
-- [ ] Extract Aerospike namespace config (replication factor, storage settings)
+- [ ] Extract namespace config (replication factor, storage settings)
 - [ ] Extract connection pool sizes, timeouts, retry policies
 - [ ] Confirm spec's configuration section covers these
 
-### In `repos/aerospike-server`
+### Lua UDF comparison
 
-#### G. Lua UDF comparison
+#### G. Lua UDF verification
 
-- [ ] Compare `modules/mod-teranode/teranode.lua` against `specs/teranode.lua` — note any differences
+- [ ] Compare the Lua UDF source against `specs/teranode.lua` — note any differences
 - [ ] Are there additional Lua files beyond `teranode.lua`?
-- [ ] Are there any C extensions or custom Aerospike modifications?
+- [ ] Are there any C extensions or custom modifications?
 
 ### Cross-reference with phase files
 
@@ -118,7 +117,7 @@ Produce a validation report as `SPEC_VALIDATION_REPORT.md` in the project root:
 # Spec Validation Report
 
 ## Date: [date]
-## Repos analyzed: teranode@[commit], aerospike-server@[commit]
+## Repos analyzed: teranode@[commit]
 
 ## Findings
 

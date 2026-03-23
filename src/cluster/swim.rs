@@ -185,7 +185,15 @@ impl SwimRunner {
             if should_suspect
                 && let Some(pending) = self.pending_probe.take()
             {
-                let events = self.membership.lock().unwrap().mark_suspect(pending.target);
+                let mut mem = self.membership.lock().unwrap();
+                // Use the member's current incarnation for local suspicion.
+                // This is not a gossipped suspicion — it's our own probe
+                // failure, so we always know the current incarnation.
+                let inc = mem.member_info(&pending.target)
+                    .map(|i| i.incarnation)
+                    .unwrap_or(0);
+                let events = mem.mark_suspect(pending.target, inc);
+                drop(mem);
                 for event in events {
                     let _ = event_tx.send(event);
                 }
@@ -203,18 +211,23 @@ impl SwimRunner {
                 }
             }
 
-            // Retry seed JOINs periodically until we have peers.
-            // Handles the case where the initial JOIN was lost (seed not
-            // yet bound, UDP dropped, etc.). Once we have peers, no need
-            // to keep contacting seeds.
+            // Periodically retry seed JOINs to rediscover nodes after
+            // partitions heal or when the cluster is degraded. Without this,
+            // nodes that were marked dead during a partition can never rejoin
+            // because the SWIM probe cycle doesn't re-seed.
             if !self.config.seed_nodes.is_empty()
-                && self.peer_addrs.lock().unwrap().is_empty()
-                && last_seed_retry.elapsed() >= probe_interval * 2
+                && last_seed_retry.elapsed() >= probe_interval * 10
             {
-                for seed in &self.config.seed_nodes {
-                    let updates = self.collect_member_updates();
-                    let msg = self.encode_message(MSG_JOIN, &updates);
-                    let _ = socket.send_to(&msg, seed);
+                let alive_count = self.membership.lock().unwrap().alive_members().len();
+                let total_known = self.peer_addrs.lock().unwrap().len();
+                // Retry seeds if we have fewer alive members than known peers
+                // (some nodes are dead/suspect) or if we have no peers at all.
+                if alive_count < total_known + 1 || total_known == 0 {
+                    for seed in &self.config.seed_nodes {
+                        let updates = self.collect_member_updates();
+                        let msg = self.encode_message(MSG_JOIN, &updates);
+                        let _ = socket.send_to(&msg, seed);
+                    }
                 }
                 last_seed_retry = Instant::now();
             }
@@ -231,7 +244,8 @@ impl SwimRunner {
         from_addr: SocketAddr,
         socket: &UdpSocket,
     ) -> Vec<ClusterEvent> {
-        if data.len() < 11 {
+        // Minimum header: msg_type(1) + sender_id(8) + incarnation(8) + addr_len(2) = 19
+        if data.len() < 19 {
             return vec![];
         }
 
@@ -319,8 +333,8 @@ impl SwimRunner {
                     let mut mem = self.membership.lock().unwrap();
                     let evts = match state {
                         0 => mem.mark_alive(nid, tcp_addr, inc),
-                        1 => mem.mark_suspect(nid),
-                        2 => mem.mark_dead(nid),
+                        1 => mem.mark_suspect(nid, inc),
+                        2 => mem.mark_dead(nid, inc),
                         _ => vec![],
                     };
                     events.extend(evts);
@@ -433,19 +447,31 @@ impl SwimRunner {
     /// If there is already a pending probe (awaiting ACK or indirect results),
     /// we skip starting a new one to avoid resetting the suspicion timer.
     fn send_probe(&mut self, socket: &UdpSocket) {
+        use crate::cluster::membership::NodeState;
+
         // Don't start a new probe if one is already in flight.
         // The existing probe's timeout will handle failure detection.
         if self.pending_probe.is_some() {
             return;
         }
 
+        // Filter out dead nodes — probing them wastes the probe budget.
+        // Dead nodes can rejoin via seed retry (runs every 10 probe intervals).
+        let membership = self.membership.lock().unwrap();
         let peers: Vec<(NodeId, SocketAddr)> = self
             .peer_addrs
             .lock()
             .unwrap()
             .iter()
+            .filter(|&(&id, _)| {
+                membership
+                    .member_info(&id)
+                    .map(|info| info.state != NodeState::Dead)
+                    .unwrap_or(true) // probe unknown nodes
+            })
             .map(|(&id, &addr)| (id, addr))
             .collect();
+        drop(membership);
 
         if peers.is_empty() {
             return;
@@ -493,14 +519,24 @@ impl SwimRunner {
             p.indirect_sent = true;
         }
 
+        // Filter out the suspect itself and dead nodes — dead peers
+        // cannot relay probes on our behalf.
+        let membership = self.membership.lock().unwrap();
         let peers: Vec<(NodeId, SocketAddr)> = self
             .peer_addrs
             .lock()
             .unwrap()
             .iter()
-            .filter(|&(&id, _)| id != suspect_id)
+            .filter(|&(&id, _)| {
+                id != suspect_id
+                    && membership
+                        .member_info(&id)
+                        .map(|info| info.state != crate::cluster::membership::NodeState::Dead)
+                        .unwrap_or(true)
+            })
             .map(|(&id, &addr)| (id, addr))
             .collect();
+        drop(membership);
 
         if peers.is_empty() {
             return;
@@ -558,32 +594,54 @@ impl SwimRunner {
     }
 
     fn collect_member_updates(&self) -> Vec<u8> {
+        use crate::cluster::membership::NodeState;
+
         let membership = self.membership.lock().unwrap();
         let peers = self.peer_addrs.lock().unwrap();
         let swim_addrs = self.swim_peer_addrs.lock().unwrap();
 
-        let alive = membership.alive_members();
         let mut buf = Vec::new();
         let mut entries: Vec<(NodeId, u8, u64, String, String)> = Vec::new();
 
-        for &node in alive.iter().take(20) {
-            let state: u8 = 0; // Alive
-            let incarnation = if node == self.config.self_id {
-                self.incarnation
-            } else if let Some(info) = membership.member_info(&node) {
-                info.incarnation
-            } else {
-                self.incarnation
+        // Always include self as alive.
+        entries.push((
+            self.config.self_id,
+            0, // Alive
+            self.incarnation,
+            self.config.self_addr.to_string(),
+            self.config.bind_addr.to_string(),
+        ));
+
+        // Collect all known members with their actual state.
+        // Prioritize suspect/dead entries — they carry convergence-critical
+        // failure information that other nodes need to learn quickly.
+        let all_states = membership.all_member_states();
+        let mut suspect_dead: Vec<_> = all_states.iter()
+            .filter(|(_, st, _, _)| *st != NodeState::Alive)
+            .collect();
+        let mut alive: Vec<_> = all_states.iter()
+            .filter(|(_, st, _, _)| *st == NodeState::Alive)
+            .collect();
+        // Stable ordering within each group
+        suspect_dead.sort_by_key(|(id, _, _, _)| *id);
+        alive.sort_by_key(|(id, _, _, _)| *id);
+
+        for &&(node, state, incarnation, _addr) in suspect_dead.iter().chain(alive.iter()) {
+            if entries.len() >= 20 {
+                break;
+            }
+            let state_byte: u8 = match state {
+                NodeState::Alive => 0,
+                NodeState::Suspect => 1,
+                NodeState::Dead => 2,
             };
-            let (tcp_str, swim_str) = if node == self.config.self_id {
-                (self.config.self_addr.to_string(), self.config.bind_addr.to_string())
-            } else if let Some(&tcp) = peers.get(&node) {
+            let (tcp_str, swim_str) = if let Some(&tcp) = peers.get(&node) {
                 let swim = swim_addrs.get(&node).copied().unwrap_or(tcp);
                 (tcp.to_string(), swim.to_string())
             } else {
                 continue;
             };
-            entries.push((node, state, incarnation, tcp_str, swim_str));
+            entries.push((node, state_byte, incarnation, tcp_str, swim_str));
         }
 
         let count = entries.len().min(20) as u16;

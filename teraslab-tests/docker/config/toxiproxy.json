@@ -1,0 +1,32 @@
+[
+  {
+    "name": "node1_client",
+    "listen": "0.0.0.0:23300",
+    "upstream": "172.30.0.11:3300",
+    "enabled": true
+  },
+  {
+    "name": "node2_client",
+    "listen": "0.0.0.0:23301",
+    "upstream": "172.30.0.12:3300",
+    "enabled": true
+  },
+  {
+    "name": "node3_client",
+    "listen": "0.0.0.0:23302",
+    "upstream": "172.30.0.13:3300",
+    "enabled": true
+  },
+  {
+    "name": "node4_client",
+    "listen": "0.0.0.0:23303",
+    "upstream": "172.30.0.14:3300",
+    "enabled": true
+  },
+  {
+    "name": "node5_client",
+    "listen": "0.0.0.0:23304",
+    "upstream": "172.30.0.15:3300",
+    "enabled": true
+  }
+]

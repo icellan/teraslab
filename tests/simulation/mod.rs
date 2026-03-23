@@ -303,6 +303,7 @@ impl Simulation {
                             frozen: false,
                             conflicting: false,
                             locked: false,
+                            parent_txids: vec![],
                         };
                         if engine.create(&req).is_ok() {
                             reference.insert(*txid, (*utxo_count, 0, hashes));
@@ -358,6 +359,7 @@ impl Simulation {
                     frozen: false,
                     conflicting: false,
                     locked: false,
+                    parent_txids: vec![],
                 };
 
                 if engine.create(&req).is_ok() {

@@ -1,0 +1,96 @@
+networks:
+  ts13-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.43.0.0/24
+
+volumes:
+  ts13-node1-data:
+  ts13-node2-data:
+  ts13-node3-data:
+  ts13-node4-data:
+  ts13-node5-data:
+  ts13-blobstore:
+
+x-teraslab-common: &teraslab-common
+  image: teraslab:test
+  restart: "no"
+  cap_add:
+    - NET_ADMIN
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+
+services:
+  node1:
+    <<: *teraslab-common
+    container_name: ts13-node1
+    hostname: node1
+    networks:
+      ts13-net:
+        ipv4_address: 172.43.0.11
+    volumes:
+      - ts13-node1-data:/data
+      - ts13-blobstore:/blobstore
+      - /Users/siggioskarsson/gitcheckout/teraslab/teraslab-tests/client/../docker/config/ts13-node1.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13130:3300"
+      - "19130:9100"
+  node2:
+    <<: *teraslab-common
+    container_name: ts13-node2
+    hostname: node2
+    networks:
+      ts13-net:
+        ipv4_address: 172.43.0.12
+    volumes:
+      - ts13-node2-data:/data
+      - ts13-blobstore:/blobstore
+      - /Users/siggioskarsson/gitcheckout/teraslab/teraslab-tests/client/../docker/config/ts13-node2.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13131:3300"
+      - "19131:9100"
+  node3:
+    <<: *teraslab-common
+    container_name: ts13-node3
+    hostname: node3
+    networks:
+      ts13-net:
+        ipv4_address: 172.43.0.13
+    volumes:
+      - ts13-node3-data:/data
+      - ts13-blobstore:/blobstore
+      - /Users/siggioskarsson/gitcheckout/teraslab/teraslab-tests/client/../docker/config/ts13-node3.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13132:3300"
+      - "19132:9100"
+  node4:
+    <<: *teraslab-common
+    container_name: ts13-node4
+    hostname: node4
+    networks:
+      ts13-net:
+        ipv4_address: 172.43.0.14
+    volumes:
+      - ts13-node4-data:/data
+      - ts13-blobstore:/blobstore
+      - /Users/siggioskarsson/gitcheckout/teraslab/teraslab-tests/client/../docker/config/ts13-node4.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13133:3300"
+      - "19133:9100"
+  node5:
+    <<: *teraslab-common
+    container_name: ts13-node5
+    hostname: node5
+    networks:
+      ts13-net:
+        ipv4_address: 172.43.0.15
+    volumes:
+      - ts13-node5-data:/data
+      - ts13-blobstore:/blobstore
+      - /Users/siggioskarsson/gitcheckout/teraslab/teraslab-tests/client/../docker/config/ts13-node5.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13134:3300"
+      - "19134:9100"

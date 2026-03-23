@@ -434,7 +434,8 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             tx_key,
             metadata_bytes,
             utxo_hashes,
-            cold_data: _,
+            cold_data,
+            is_external,
         } => {
             // Build a CreateRequest using metadata from the master.
             // The metadata_bytes contains: tx_version(4) + locktime(4) + fee(8) +
@@ -475,7 +476,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 inputs: None,
                 outputs: None,
                 inpoints: None,
-                is_external: false,
+                is_external: *is_external,
                 created_at,
                 block_height: 0,
                 mined_block_infos: vec![],
@@ -485,7 +486,17 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 parent_txids: vec![],
             };
             match engine.create(&create_req) {
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    // Store cold data in the blobstore if provided.
+                    if let Some(data) = cold_data
+                        && !data.is_empty()
+                        && let Some(bs) = engine.blob_store()
+                        && let Err(e) = bs.put(&tx_key.txid, data)
+                    {
+                        eprintln!("replication: failed to store cold data for {:?}: {e}", tx_key);
+                    }
+                    Ok(())
+                }
                 Err(CreateError::DuplicateTxId) => Ok(()), // idempotent
                 Err(e) => Err(format!("create: {e}")),
             }
@@ -636,6 +647,7 @@ mod tests {
             metadata_bytes: vec![0; 64],
             utxo_hashes: hashes,
             cold_data: None,
+            is_external: false,
         };
         apply_op(&engine, &op).unwrap();
 
@@ -655,6 +667,7 @@ mod tests {
             metadata_bytes: vec![],
             utxo_hashes: hashes.clone(),
             cold_data: None,
+            is_external: false,
         };
         apply_op(&engine, &op).unwrap();
         apply_op(&engine, &op).unwrap(); // duplicate — should be ok

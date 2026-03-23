@@ -1,0 +1,68 @@
+networks:
+  teraslab-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  shared-blobstore:
+
+x-teraslab-common: &teraslab-common
+  image: teraslab:test
+  restart: "no"
+  cap_add:
+    - NET_ADMIN
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+
+services:
+  node1:
+    <<: *teraslab-common
+    container_name: teraslab-node1
+    hostname: node1
+    networks:
+      teraslab-net:
+        ipv4_address: 172.30.0.11
+    volumes:
+      - node1-data:/data
+      - shared-blobstore:/blobstore
+      - ./config/node1.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13300:3300"
+      - "19100:9100"
+
+  node2:
+    <<: *teraslab-common
+    container_name: teraslab-node2
+    hostname: node2
+    networks:
+      teraslab-net:
+        ipv4_address: 172.30.0.12
+    volumes:
+      - node2-data:/data
+      - shared-blobstore:/blobstore
+      - ./config/node2.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13301:3300"
+      - "19101:9100"
+
+  node3:
+    <<: *teraslab-common
+    container_name: teraslab-node3
+    hostname: node3
+    networks:
+      teraslab-net:
+        ipv4_address: 172.30.0.13
+    volumes:
+      - node3-data:/data
+      - shared-blobstore:/blobstore
+      - ./config/node3.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13302:3300"
+      - "19102:9100"

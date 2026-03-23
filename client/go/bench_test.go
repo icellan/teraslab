@@ -68,7 +68,7 @@ func BenchmarkEncodeGetBatch4096(b *testing.B) {
 	txids := make([]TxID, 4096)
 	b.ReportAllocs()
 	for b.Loop() {
-		buf := getBuf(6 + len(txids)*32)
+		buf := getBuf(8 + len(txids)*32)
 		buf = encodeGetBatch(buf, FieldAll, txids)
 		putBuf(buf)
 	}

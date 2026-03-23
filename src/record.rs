@@ -184,7 +184,7 @@ impl Eq for UtxoSlot {}
 
 /// A single block entry combining block_id, block_height, and subtree_idx.
 ///
-/// Replaces the three parallel lists from the Aerospike/Lua design.
+/// Replaces the three parallel lists from the original Lua design.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockEntry {
@@ -285,7 +285,7 @@ impl Eq for ExternalRef {}
 bitflags! {
     /// Packed bitfield for transaction boolean flags (1 byte).
     ///
-    /// Replaces 5 separate fields from the Aerospike design.
+    /// Replaces 5 separate fields from the original design.
     /// The `CREATING` flag is eliminated — it only existed for multi-record
     /// 2-phase commit which is unnecessary with single-record atomic writes.
     #[repr(transparent)]
@@ -866,5 +866,353 @@ mod tests {
             TxMetadata::record_size_for(1000),
             METADATA_SIZE as u64 + 1000 * UTXO_SLOT_SIZE as u64
         );
+    }
+
+    // -- Edge case and boundary condition tests --
+
+    #[test]
+    fn utxo_slot_all_zero_hash_round_trip() {
+        let hash = [0u8; 32];
+        let slot = UtxoSlot::new_unspent(hash);
+
+        let mut buf = [0u8; UTXO_SLOT_SIZE];
+        slot.to_bytes(&mut buf);
+        let restored = UtxoSlot::from_bytes(&buf);
+
+        assert_eq!(restored.hash, [0u8; 32]);
+        assert_eq!(restored.status, UTXO_UNSPENT);
+        assert_eq!(restored.spending_data, [0u8; 36]);
+        assert_eq!(slot, restored);
+    }
+
+    #[test]
+    fn utxo_slot_all_ff_hash_round_trip() {
+        let hash = [0xFFu8; 32];
+        let slot = UtxoSlot::new_unspent(hash);
+
+        let mut buf = [0u8; UTXO_SLOT_SIZE];
+        slot.to_bytes(&mut buf);
+        let restored = UtxoSlot::from_bytes(&buf);
+
+        assert_eq!(restored.hash, [0xFFu8; 32]);
+        assert_eq!(restored.status, UTXO_UNSPENT);
+        assert_eq!(restored.spending_data, [0u8; 36]);
+        assert_eq!(slot, restored);
+    }
+
+    #[test]
+    fn block_entry_u32_max_round_trip() {
+        let entry = BlockEntry {
+            block_id: u32::MAX,
+            block_height: u32::MAX,
+            subtree_idx: u32::MAX,
+        };
+        let mut buf = [0u8; BLOCK_ENTRY_SIZE];
+        entry.to_bytes(&mut buf);
+        let restored = BlockEntry::from_bytes(&buf);
+
+        assert_eq!({ restored.block_id }, u32::MAX);
+        assert_eq!({ restored.block_height }, u32::MAX);
+        assert_eq!({ restored.subtree_idx }, u32::MAX);
+        assert_eq!(entry, restored);
+    }
+
+    #[test]
+    fn metadata_block_entry_count_zero_ignores_inline() {
+        let mut meta = TxMetadata::new(5);
+        meta.block_entry_count = 0;
+        // Write garbage into inline entries — should be irrelevant when count is 0
+        meta.block_entries_inline[0] = BlockEntry {
+            block_id: 999,
+            block_height: 888,
+            subtree_idx: 777,
+        };
+        meta.block_entries_inline[1] = BlockEntry {
+            block_id: 111,
+            block_height: 222,
+            subtree_idx: 333,
+        };
+
+        let mut buf = vec![0u8; METADATA_SIZE];
+        meta.to_bytes(&mut buf);
+        let restored = TxMetadata::from_bytes(&buf);
+
+        // The count must be 0, meaning a consumer should not read any inline entries.
+        assert_eq!(restored.block_entry_count, 0);
+        // The inline bytes still survive the round-trip (raw memcpy), but they
+        // are logically meaningless because count is 0.
+        assert_eq!(meta, restored);
+    }
+
+    #[test]
+    fn metadata_block_entry_count_3_inline_round_trip() {
+        let mut meta = TxMetadata::new(10);
+        meta.block_entry_count = INLINE_BLOCK_ENTRIES as u8;
+        meta.block_entries_inline[0] = BlockEntry {
+            block_id: 1000,
+            block_height: 500_000,
+            subtree_idx: 7,
+        };
+        meta.block_entries_inline[1] = BlockEntry {
+            block_id: 2000,
+            block_height: 500_001,
+            subtree_idx: 14,
+        };
+        meta.block_entries_inline[2] = BlockEntry {
+            block_id: 3000,
+            block_height: 500_002,
+            subtree_idx: 21,
+        };
+
+        let mut buf = vec![0u8; METADATA_SIZE];
+        meta.to_bytes(&mut buf);
+        let restored = TxMetadata::from_bytes(&buf);
+
+        assert_eq!(restored.block_entry_count, 3);
+        for i in 0..INLINE_BLOCK_ENTRIES {
+            assert_eq!(
+                { restored.block_entries_inline[i].block_id },
+                { meta.block_entries_inline[i].block_id }
+            );
+            assert_eq!(
+                { restored.block_entries_inline[i].block_height },
+                { meta.block_entries_inline[i].block_height }
+            );
+            assert_eq!(
+                { restored.block_entries_inline[i].subtree_idx },
+                { meta.block_entries_inline[i].subtree_idx }
+            );
+        }
+        assert_eq!(meta, restored);
+    }
+
+    #[test]
+    fn metadata_magic_validation_corrupted() {
+        let meta = TxMetadata::new(10);
+        let mut buf = vec![0u8; METADATA_SIZE];
+        meta.to_bytes(&mut buf);
+
+        // Corrupt the first 4 bytes (magic field)
+        buf[0] = 0x00;
+        buf[1] = 0x00;
+        buf[2] = 0x00;
+        buf[3] = 0x00;
+
+        let restored = TxMetadata::from_bytes(&buf);
+        assert_ne!({ restored.magic }, METADATA_MAGIC);
+        assert_eq!({ restored.magic }, 0x0000_0000);
+    }
+
+    #[test]
+    fn metadata_all_fields_max_values_round_trip() {
+        // Build manually to avoid overflow in TxMetadata::new() when utxo_count is u32::MAX
+        let mut meta = TxMetadata::new(0);
+        meta.magic = METADATA_MAGIC;
+        meta.schema_version = u32::MAX;
+        meta.record_size = u32::MAX;
+        meta.utxo_count = u32::MAX;
+        meta.tx_id = [0xFFu8; 32];
+        meta.tx_version = u32::MAX;
+        meta.locktime = u32::MAX;
+        meta.fee = u64::MAX;
+        meta.size_in_bytes = u64::MAX;
+        meta.extended_size = u64::MAX;
+        meta.flags = TxFlags::from_bits_truncate(0xFF);
+        meta.spending_height = u32::MAX;
+        meta.created_at = u64::MAX;
+        meta.spent_utxos = u32::MAX;
+        meta.pruned_utxos = u32::MAX;
+        meta.generation = u32::MAX;
+        meta.updated_at = u64::MAX;
+        meta.block_entry_count = u8::MAX;
+        meta.block_entries_inline = [BlockEntry {
+            block_id: u32::MAX,
+            block_height: u32::MAX,
+            subtree_idx: u32::MAX,
+        }; INLINE_BLOCK_ENTRIES];
+        meta.block_overflow_offset = u64::MAX;
+        meta.reassignment_offset = u64::MAX;
+        meta.reassignment_count = u8::MAX;
+        meta.unmined_since = u32::MAX;
+        meta.delete_at_height = u32::MAX;
+        meta.preserve_until = u32::MAX;
+        meta.external_ref = ExternalRef {
+            store_type: u8::MAX,
+            content_hash: [0xFFu8; 32],
+            total_size: u64::MAX,
+            input_count: u32::MAX,
+            output_count: u32::MAX,
+            inputs_offset: u64::MAX,
+            outputs_offset: u64::MAX,
+        };
+        meta.conflicting_children_count = u8::MAX;
+        meta.conflicting_children_offset = u64::MAX;
+
+        let mut buf = vec![0u8; METADATA_SIZE];
+        meta.to_bytes(&mut buf);
+        let restored = TxMetadata::from_bytes(&buf);
+
+        assert_eq!({ restored.magic }, METADATA_MAGIC);
+        assert_eq!({ restored.schema_version }, u32::MAX);
+        assert_eq!({ restored.record_size }, u32::MAX);
+        assert_eq!({ restored.utxo_count }, u32::MAX);
+        assert_eq!(restored.tx_id, [0xFFu8; 32]);
+        assert_eq!({ restored.tx_version }, u32::MAX);
+        assert_eq!({ restored.locktime }, u32::MAX);
+        assert_eq!({ restored.fee }, u64::MAX);
+        assert_eq!({ restored.size_in_bytes }, u64::MAX);
+        assert_eq!({ restored.extended_size }, u64::MAX);
+        assert_eq!({ restored.spending_height }, u32::MAX);
+        assert_eq!({ restored.created_at }, u64::MAX);
+        assert_eq!({ restored.spent_utxos }, u32::MAX);
+        assert_eq!({ restored.pruned_utxos }, u32::MAX);
+        assert_eq!({ restored.generation }, u32::MAX);
+        assert_eq!({ restored.updated_at }, u64::MAX);
+        assert_eq!(restored.block_entry_count, u8::MAX);
+        assert_eq!({ restored.block_overflow_offset }, u64::MAX);
+        assert_eq!({ restored.reassignment_offset }, u64::MAX);
+        assert_eq!(restored.reassignment_count, u8::MAX);
+        assert_eq!({ restored.unmined_since }, u32::MAX);
+        assert_eq!({ restored.delete_at_height }, u32::MAX);
+        assert_eq!({ restored.preserve_until }, u32::MAX);
+        assert_eq!(restored.conflicting_children_count, u8::MAX);
+        assert_eq!({ restored.conflicting_children_offset }, u64::MAX);
+        assert_eq!(meta, restored);
+    }
+
+    #[test]
+    fn external_ref_round_trip_through_metadata() {
+        let ext = ExternalRef {
+            store_type: 1,
+            content_hash: {
+                let mut h = [0u8; 32];
+                h[0] = 0xDE;
+                h[15] = 0xAD;
+                h[31] = 0xBE;
+                h
+            },
+            total_size: 10_000_000,
+            input_count: 500,
+            output_count: 1200,
+            inputs_offset: 64,
+            outputs_offset: 32768,
+        };
+
+        let mut meta = TxMetadata::new(5);
+        meta.flags = TxFlags::EXTERNAL;
+        meta.external_ref = ext;
+
+        let mut buf = vec![0u8; METADATA_SIZE];
+        meta.to_bytes(&mut buf);
+        let restored = TxMetadata::from_bytes(&buf);
+
+        let rext = restored.external_ref;
+        assert_eq!(rext.store_type, 1);
+        assert_eq!(rext.content_hash[0], 0xDE);
+        assert_eq!(rext.content_hash[15], 0xAD);
+        assert_eq!(rext.content_hash[31], 0xBE);
+        assert_eq!({ rext.total_size }, 10_000_000);
+        assert_eq!({ rext.input_count }, 500);
+        assert_eq!({ rext.output_count }, 1200);
+        assert_eq!({ rext.inputs_offset }, 64);
+        assert_eq!({ rext.outputs_offset }, 32768);
+        assert_eq!(ext, rext);
+    }
+
+    #[test]
+    fn external_ref_zeroed_all_bytes() {
+        let ext = ExternalRef::zeroed();
+        assert_eq!(ext.store_type, 0);
+        assert_eq!(ext.content_hash, [0u8; 32]);
+        assert_eq!({ ext.total_size }, 0);
+        assert_eq!({ ext.input_count }, 0);
+        assert_eq!({ ext.output_count }, 0);
+        assert_eq!({ ext.inputs_offset }, 0);
+        assert_eq!({ ext.outputs_offset }, 0);
+
+        // Verify the raw byte representation is all zeros
+        let size = std::mem::size_of::<ExternalRef>();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&ext as *const ExternalRef).cast::<u8>(),
+                size,
+            )
+        };
+        assert!(bytes.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn tx_flags_all_combinations_round_trip() {
+        let all_flags = [
+            TxFlags::IS_COINBASE,
+            TxFlags::CONFLICTING,
+            TxFlags::LOCKED,
+            TxFlags::EXTERNAL,
+            TxFlags::LAST_SPENT_ALL,
+        ];
+
+        // Iterate every combination of 5 flags (2^5 = 32 combinations)
+        for mask in 0u8..32 {
+            let mut flags = TxFlags::empty();
+            for (i, &flag) in all_flags.iter().enumerate() {
+                if mask & (1 << i) != 0 {
+                    flags |= flag;
+                }
+            }
+
+            let mut meta = TxMetadata::new(1);
+            meta.flags = flags;
+
+            let mut buf = vec![0u8; METADATA_SIZE];
+            meta.to_bytes(&mut buf);
+            let restored = TxMetadata::from_bytes(&buf);
+
+            assert_eq!(
+                restored.flags, flags,
+                "Flag combination mask={mask:#010b} did not survive round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn utxo_slot_frozen_has_all_ff_spending_data() {
+        let hash = [0x77u8; 32];
+        let slot = UtxoSlot::new_frozen(hash);
+
+        assert_eq!(slot.status, UTXO_FROZEN);
+        for (i, &byte) in slot.spending_data.iter().enumerate() {
+            assert_eq!(
+                byte, 0xFF,
+                "spending_data[{i}] should be 0xFF for frozen slot, got {byte:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn utxo_slot_spent_round_trip_preserves_spending_data() {
+        let hash = [0x55u8; 32];
+        // Build a specific 36-byte spending_data: txid(32) + vin(4)
+        let mut sd = [0u8; 36];
+        for (i, byte) in sd.iter_mut().enumerate().take(32) {
+            *byte = (i as u8).wrapping_mul(7).wrapping_add(0x13);
+        }
+        sd[32..36].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+
+        let slot = UtxoSlot::new_spent(hash, sd);
+
+        let mut buf = [0u8; UTXO_SLOT_SIZE];
+        slot.to_bytes(&mut buf);
+        let restored = UtxoSlot::from_bytes(&buf);
+
+        assert_eq!(restored.status, UTXO_SPENT);
+        assert_eq!(restored.hash, hash);
+        for i in 0..36 {
+            assert_eq!(
+                restored.spending_data[i], sd[i],
+                "spending_data[{i}] mismatch: expected {:#04x}, got {:#04x}",
+                sd[i], restored.spending_data[i]
+            );
+        }
+        assert_eq!(slot, restored);
     }
 }

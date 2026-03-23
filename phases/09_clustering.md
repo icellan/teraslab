@@ -11,14 +11,14 @@ Phases 1-8 must be complete with all tests passing.
 ## Reference
 
 - `specs/BSV_UTXO_STORE_SPEC.md` §9 (Cluster Management) — 4096 shards, 12-bit hash
-- Aerospike uses 4096 partitions with Paxos-based gossip. TeraSlab uses simpler deterministic hash-based sharding since the workload doesn't need the complexity.
+- TeraSlab uses deterministic hash-based sharding since the workload doesn't need the complexity of Paxos-based gossip.
 
 ## What to build
 
 ### 9.1 Shard table — `src/cluster/shards.rs`
 
 ```rust
-pub const NUM_SHARDS: usize = 4096;  // Match Aerospike for familiarity
+pub const NUM_SHARDS: usize = 4096;
 
 pub struct ShardTable {
     /// For each shard: which node is the master, which nodes are replicas
@@ -77,7 +77,7 @@ impl ShardTable {
 
     /// Compute which shard a key belongs to.
     pub fn shard_for_key(key: &TxKey) -> u16 {
-        // Use first 12 bits of txid (matching Aerospike's RIPEMD-160 → 12-bit partition)
+        // Use first 12 bits of txid for 4096-shard partitioning
         let h = u16::from_le_bytes([key.txid[0], key.txid[1]]);
         h & 0x0FFF  // 12 bits = 4096 shards
     }
@@ -109,7 +109,7 @@ The shard table is computed deterministically from two inputs: the sorted list o
 3. Because the function is pure — same inputs always produce the same output — every node arrives at the identical shard table without any coordination, voting, or leader election.
 4. The `version` field is derived deterministically (e.g., hash of the sorted member list) so nodes can compare shard table versions to detect staleness.
 
-This is strictly simpler than Aerospike's Paxos-based partition assignment and eliminates an entire class of split-brain bugs.
+This is strictly simpler than Paxos-based partition assignment and eliminates an entire class of split-brain bugs.
 
 ### 9.2 SWIM membership protocol — `src/cluster/swim.rs`
 

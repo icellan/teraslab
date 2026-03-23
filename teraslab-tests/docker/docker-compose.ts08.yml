@@ -1,0 +1,66 @@
+networks:
+  ts08-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.38.0.0/24
+
+volumes:
+  ts08-node1-data:
+  ts08-node2-data:
+  ts08-node3-data:
+  ts08-blobstore:
+
+x-teraslab-common: &teraslab-common
+  image: teraslab:test
+  restart: "no"
+  cap_add:
+    - NET_ADMIN
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+
+services:
+  node1:
+    <<: *teraslab-common
+    container_name: ts08-node1
+    hostname: node1
+    networks:
+      ts08-net:
+        ipv4_address: 172.38.0.11
+    volumes:
+      - ts08-node1-data:/data
+      - ts08-blobstore:/blobstore
+      - /Users/siggioskarsson/gitcheckout/teraslab/teraslab-tests/client/../docker/config/ts08-node1.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13080:3300"
+      - "19080:9100"
+  node2:
+    <<: *teraslab-common
+    container_name: ts08-node2
+    hostname: node2
+    networks:
+      ts08-net:
+        ipv4_address: 172.38.0.12
+    volumes:
+      - ts08-node2-data:/data
+      - ts08-blobstore:/blobstore
+      - /Users/siggioskarsson/gitcheckout/teraslab/teraslab-tests/client/../docker/config/ts08-node2.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13081:3300"
+      - "19081:9100"
+  node3:
+    <<: *teraslab-common
+    container_name: ts08-node3
+    hostname: node3
+    networks:
+      ts08-net:
+        ipv4_address: 172.38.0.13
+    volumes:
+      - ts08-node3-data:/data
+      - ts08-blobstore:/blobstore
+      - /Users/siggioskarsson/gitcheckout/teraslab/teraslab-tests/client/../docker/config/ts08-node3.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13082:3300"
+      - "19082:9100"

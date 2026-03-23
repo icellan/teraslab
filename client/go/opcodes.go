@@ -39,6 +39,23 @@ const (
 	OpPing            uint16 = 102
 )
 
+// Streaming blob upload opcodes.
+const (
+	OpStreamChunk uint16 = 200
+	OpStreamEnd   uint16 = 201
+)
+
+// Blob upload thresholds.
+const (
+	// BlobUploadThreshold is the cold_data size (in bytes) above which
+	// CreateBatch will pre-upload the data via chunked streaming instead
+	// of inlining it in the batch payload.
+	BlobUploadThreshold = 1024 * 1024 // 1 MiB
+
+	// BlobChunkSize is the maximum payload size per OP_STREAM_CHUNK request.
+	BlobChunkSize = 4 * 1024 * 1024 // 4 MiB
+)
+
 // Response status codes.
 const (
 	StatusOK           uint8 = 0
@@ -68,14 +85,41 @@ const (
 	ErrCodeInternal        uint16 = 255
 )
 
-// Field mask bits for GetBatch requests.
+// Field mask bits for GetBatch requests. Each bit selects a single field.
 const (
-	FieldMetadata     uint16 = 0x0001
-	FieldUtxoSlots    uint16 = 0x0002
-	FieldColdData     uint16 = 0x0004
-	FieldBlockEntries          uint16 = 0x0008
-	FieldConflictingChildren uint16 = 0x0010
-	FieldAll                 uint16 = 0x001F
+	FieldTxVersion           uint32 = 1 << 0
+	FieldLocktime            uint32 = 1 << 1
+	FieldFee                 uint32 = 1 << 2
+	FieldSizeInBytes         uint32 = 1 << 3
+	FieldExtendedSize        uint32 = 1 << 4
+	FieldFlags               uint32 = 1 << 5
+	FieldSpendingHeight      uint32 = 1 << 6
+	FieldCreatedAt           uint32 = 1 << 7
+	FieldSpentUtxos          uint32 = 1 << 8
+	FieldPrunedUtxos         uint32 = 1 << 9
+	FieldUtxoCount           uint32 = 1 << 10
+	FieldGeneration          uint32 = 1 << 11
+	FieldUpdatedAt           uint32 = 1 << 12
+	FieldUnminedSince        uint32 = 1 << 13
+	FieldDeleteAtHeight      uint32 = 1 << 14
+	FieldPreserveUntil       uint32 = 1 << 15
+	FieldExternalRef         uint32 = 1 << 16
+	FieldReassignCount       uint32 = 1 << 17
+	FieldBlockEntryCount     uint32 = 1 << 18
+	FieldUtxoSlots           uint32 = 1 << 19
+	FieldColdData            uint32 = 1 << 20
+	FieldBlockEntries        uint32 = 1 << 21
+	FieldConflictingChildren uint32 = 1 << 22
+	// FieldRawMetadata returns the full 256-byte on-disk metadata struct
+	// as-is, including internal fields (magic, schema_version, device
+	// offsets, padding). For debugging only. Takes precedence over
+	// individual metadata field bits if set.
+	FieldRawMetadata uint32 = 1 << 23
+
+	// FieldAllMetadata selects all metadata fields (bits 0-18).
+	FieldAllMetadata uint32 = 0x0007_FFFF
+	// FieldAll includes all client-facing fields (bits 0-22, excludes FieldRawMetadata).
+	FieldAll uint32 = 0x007F_FFFF
 )
 
 // UTXO slot status values.
@@ -84,6 +128,14 @@ const (
 	SlotSpent   uint8 = 0x01
 	SlotPruned  uint8 = 0x02
 	SlotFrozen  uint8 = 0xFF
+)
+
+// Record flag bits.
+const (
+	// FlagExternalBlob indicates that cold_data was pre-uploaded to the
+	// blobstore via OP_STREAM_CHUNK / OP_STREAM_END and should not be
+	// inlined in the CreateBatch payload.
+	FlagExternalBlob uint8 = 0x08
 )
 
 // Signal values returned by spend/setMined operations.

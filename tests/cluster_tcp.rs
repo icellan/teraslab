@@ -64,8 +64,8 @@ fn create_node(
         suspicion_timeout: Duration::from_secs(2),
     };
 
-    let coordinator = ClusterCoordinator::new(cluster_config);
-    let running = Arc::new(coordinator.start(engine.clone()));
+    let coordinator = ClusterCoordinator::new(cluster_config, 1);
+    let running = Arc::new(coordinator.start(engine.clone(), None));
 
     let config = ServerConfig {
         listen_addr: format!("127.0.0.1:{tcp_port}"),
@@ -236,9 +236,11 @@ fn make_wire_create_item(txid: [u8; 32], utxo_hashes: &[[u8; 32]]) -> WireCreate
         flags: 0,
         utxo_hashes: utxo_hashes.to_vec(),
         cold_data: vec![],
+        block_height: 0,
         mined_block_id: None,
         mined_block_height: None,
         mined_subtree_idx: None,
+        parent_txids: vec![],
     }
 }
 

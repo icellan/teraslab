@@ -18,6 +18,7 @@ use crate::ops::signal::Signal;
 use crate::ops::spend::*;
 use crate::ops::unspend::*;
 use crate::record::*;
+use crate::storage::blobstore::BlobStore;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -33,6 +34,7 @@ pub struct Engine {
     locks: StripedLocks,
     dah_index: parking_lot::Mutex<DahIndex>,
     unmined_index: parking_lot::Mutex<UnminedIndex>,
+    blob_store: Option<Arc<dyn BlobStore>>,
 }
 
 impl Engine {
@@ -52,7 +54,18 @@ impl Engine {
             locks,
             dah_index: parking_lot::Mutex::new(dah_index),
             unmined_index: parking_lot::Mutex::new(unmined_index),
+            blob_store: None,
         }
+    }
+
+    /// Set the blobstore for external cold data storage.
+    pub fn set_blob_store(&mut self, store: Arc<dyn BlobStore>) {
+        self.blob_store = Some(store);
+    }
+
+    /// Get a reference to the blobstore, if configured.
+    pub fn blob_store(&self) -> Option<&dyn BlobStore> {
+        self.blob_store.as_deref()
     }
 
     /// Register a transaction in the index (for test setup).
@@ -745,7 +758,13 @@ impl Engine {
         }
 
         // Calculate cold data size
-        let cold_data = build_cold_data(&req.inputs, &req.outputs, &req.inpoints);
+        let cold_data = if req.is_external && req.inputs.is_none() {
+            // Cold data was pre-uploaded to blobstore via OP_STREAM_CHUNK.
+            // Write only metadata + UTXO slots; cold_data is read from blobstore on demand.
+            vec![]
+        } else {
+            build_cold_data(&req.inputs, &req.outputs, &req.inpoints)
+        };
         let cold_size = cold_data.len();
 
         // Calculate total record size
@@ -786,6 +805,19 @@ impl Engine {
             flags |= TxFlags::LOCKED;
         }
         meta.flags = flags;
+
+        // Populate ExternalRef for externally-stored cold data.
+        if req.is_external {
+            meta.external_ref = ExternalRef {
+                store_type: 1, // local_file blobstore
+                content_hash: req.tx_id,
+                total_size: req.size_in_bytes,
+                input_count: 0,
+                output_count: 0,
+                inputs_offset: 0,
+                outputs_offset: 0,
+            };
+        }
 
         // Set unmined_since
         if req.mined_block_infos.is_empty() {
@@ -910,7 +942,11 @@ impl Engine {
         Ok(())
     }
 
-    /// Read cold data from a record (for testing).
+    /// Read cold data from a record.
+    ///
+    /// If cold data is stored inline on the device, reads it directly.
+    /// If the record has the EXTERNAL flag and no inline cold data, falls
+    /// back to the blobstore keyed by txid.
     pub fn read_cold_data(&self, key: &TxKey) -> Result<Vec<u8>, SpendError> {
         let entry = self
             .index
@@ -918,23 +954,40 @@ impl Engine {
             .lookup(key)
             .ok_or(SpendError::TxNotFound)?;
 
-        if entry.cold_offset == 0 || entry.cold_size == 0 {
-            return Ok(Vec::new());
+        // If cold data is stored inline on device, read it directly.
+        if entry.cold_offset != 0 && entry.cold_size != 0 {
+            let align = self.device.alignment();
+            let aligned_base = entry.cold_offset / align as u64 * align as u64;
+            let intra = (entry.cold_offset - aligned_base) as usize;
+            let read_len = (intra + entry.cold_size as usize).div_ceil(align) * align;
+
+            let mut buf = crate::device::AlignedBuf::new(read_len, align);
+            self.device
+                .pread(&mut buf, aligned_base)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("{e}"),
+                })?;
+
+            return Ok(buf[intra..intra + entry.cold_size as usize].to_vec());
         }
 
-        let align = self.device.alignment();
-        let aligned_base = entry.cold_offset / align as u64 * align as u64;
-        let intra = (entry.cold_offset - aligned_base) as usize;
-        let read_len = (intra + entry.cold_size as usize).div_ceil(align) * align;
+        // Check if cold data is in external blobstore.
+        if entry.flags & TxFlags::EXTERNAL.bits() != 0 {
+            if let Some(ref blob_store) = self.blob_store {
+                match blob_store.get(&key.txid) {
+                    Ok(Some(data)) => return Ok(data),
+                    Ok(None) => return Err(SpendError::TxNotFound),
+                    Err(e) => {
+                        return Err(SpendError::StorageError {
+                            detail: format!("blobstore read: {e}"),
+                        })
+                    }
+                }
+            }
+        }
 
-        let mut buf = crate::device::AlignedBuf::new(read_len, align);
-        self.device
-            .pread(&mut buf, aligned_base)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("{e}"),
-            })?;
-
-        Ok(buf[intra..intra + entry.cold_size as usize].to_vec())
+        // No cold data (neither inline nor external).
+        Ok(vec![])
     }
 
     // -----------------------------------------------------------------------
@@ -5930,5 +5983,464 @@ mod tests {
         let meta = engine.read_metadata(&key).unwrap();
         // spent_utxos tracks everything in a single record — no extra_recs needed
         assert_eq!({ meta.spent_utxos }, 5);
+    }
+
+    // ===================================================================
+    // Coverage gap tests
+    // ===================================================================
+
+    // -- set_mined gaps --
+
+    #[test]
+    fn set_mined_duplicate_block_entry_idempotent() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        let req = SetMinedRequest {
+            tx_key: h.key,
+            block_id: 42,
+            block_height: 800_000,
+            subtree_idx: 7,
+            current_block_height: 800_000,
+            block_height_retention: 288,
+            on_longest_chain: true,
+            unset_mined: false,
+        };
+
+        h.engine.set_mined(&req).unwrap();
+        let meta_after_first = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!(meta_after_first.block_entry_count, 1);
+
+        // Call set_mined again with same block_id — should be idempotent
+        h.engine.set_mined(&req).unwrap();
+        let meta_after_second = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!(meta_after_second.block_entry_count, 1); // NOT double-counted
+        assert_eq!({ meta_after_second.block_entries_inline[0].block_id }, 42);
+    }
+
+    #[test]
+    fn set_mined_clears_locked_flag() {
+        let engine = create_engine();
+        let req = make_create_req(200, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        // Set locked
+        engine
+            .set_locked(&SetLockedRequest {
+                tx_key: key,
+                value: true,
+            })
+            .unwrap();
+        let meta = engine.read_metadata(&key).unwrap();
+        assert!(meta.flags.contains(TxFlags::LOCKED));
+
+        // set_mined should clear LOCKED
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 1,
+                block_height: 100,
+                subtree_idx: 0,
+                current_block_height: 100,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert!(
+            !meta.flags.contains(TxFlags::LOCKED),
+            "LOCKED flag should be cleared after set_mined"
+        );
+    }
+
+    #[test]
+    fn set_mined_clears_creating_flag() {
+        // The CREATING flag does not exist in TeraSlab (it was eliminated
+        // because TeraSlab uses single-record design). Verify that the
+        // only flags that exist are the 5 defined bits, and set_mined
+        // does not leave any stray bits set.
+        let engine = create_engine();
+        let mut req = make_create_req(201, 5);
+        req.locked = true;
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        // Verify LOCKED is set before mining
+        let meta_before = engine.read_metadata(&key).unwrap();
+        assert!(meta_before.flags.contains(TxFlags::LOCKED));
+
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 1,
+                block_height: 100,
+                subtree_idx: 0,
+                current_block_height: 100,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+
+        let meta_after = engine.read_metadata(&key).unwrap();
+        // LOCKED should be cleared — no stray flags remain from any
+        // "creating" concept (which doesn't exist in this codebase)
+        assert!(!meta_after.flags.contains(TxFlags::LOCKED));
+        // Only known flags should be set
+        let known_mask = TxFlags::IS_COINBASE
+            | TxFlags::CONFLICTING
+            | TxFlags::LOCKED
+            | TxFlags::EXTERNAL
+            | TxFlags::LAST_SPENT_ALL;
+        let stray = TxFlags::from_bits_truncate(meta_after.flags.bits() & !known_mask.bits());
+        assert!(
+            stray.is_empty(),
+            "stray flag bits found: {:#010b}",
+            stray.bits()
+        );
+    }
+
+    #[test]
+    fn unset_mined_sets_unmined_since() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        // Add a block
+        h.engine
+            .set_mined(&SetMinedRequest {
+                tx_key: h.key,
+                block_id: 1,
+                block_height: 100,
+                subtree_idx: 0,
+                current_block_height: 100,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!({ meta.unmined_since }, 0); // On chain
+
+        // Unmine the last block at current_block_height=750
+        h.engine
+            .set_mined(&SetMinedRequest {
+                tx_key: h.key,
+                block_id: 1,
+                block_height: 100,
+                subtree_idx: 0,
+                current_block_height: 750,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: true,
+            })
+            .unwrap();
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        // unmined_since should be set to the provided current_block_height, not 0
+        assert_eq!(
+            { meta.unmined_since },
+            750,
+            "unmined_since should equal current_block_height after unmining last block"
+        );
+    }
+
+    #[test]
+    fn set_mined_does_not_modify_utxo_slots_with_mixed_state() {
+        let engine = create_engine();
+        let req = make_create_req(202, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        // Spend 2 of the 5 UTXOs
+        for i in [1u32, 3] {
+            let mut sd = [0u8; 36];
+            sd[0] = i as u8;
+            sd[32..36].copy_from_slice(&1u32.to_le_bytes());
+            engine
+                .spend(&SpendRequest {
+                    tx_key: key,
+                    offset: i,
+                    utxo_hash: req.utxo_hashes[i as usize],
+                    spending_data: sd,
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                })
+                .unwrap();
+        }
+
+        // Read all 5 slots before set_mined
+        let slots_before: Vec<UtxoSlot> = (0..5u32)
+            .map(|i| engine.read_slot(&key, i).unwrap())
+            .collect();
+
+        // Verify pre-conditions: slots 1 and 3 are spent, rest unspent
+        assert!(slots_before[0].is_unspent());
+        assert!(slots_before[1].is_spent());
+        assert!(slots_before[2].is_unspent());
+        assert!(slots_before[3].is_spent());
+        assert!(slots_before[4].is_unspent());
+
+        // set_mined
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 42,
+                block_height: 1000,
+                subtree_idx: 0,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+
+        // Read all 5 slots after set_mined — must be identical
+        for i in 0..5u32 {
+            let slot_after = engine.read_slot(&key, i).unwrap();
+            assert_eq!(
+                slots_before[i as usize], slot_after,
+                "slot {i} was modified by set_mined"
+            );
+        }
+    }
+
+    // -- delete gaps --
+
+    #[test]
+    fn delete_with_cold_data_frees_space() {
+        let engine = create_engine();
+        let mut req = make_create_req(210, 5);
+        req.inputs = Some(vec![0x01; 100]);
+        req.outputs = Some(vec![0x02; 200]);
+        let key = req.tx_key();
+        let resp = engine.create(&req).unwrap();
+        let record_offset = resp.record_offset;
+
+        // Verify cold data exists
+        let entry = engine.lookup(&key).unwrap();
+        assert_ne!(entry.cold_offset, 0);
+        assert!(entry.cold_size > 0);
+
+        // Delete
+        engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+
+        // Verify lookup returns None
+        assert!(engine.lookup(&key).is_none());
+
+        // Verify freed space is reusable: create a new record and confirm
+        // it reuses the same offset (allocator hands out freed space first)
+        let req2 = make_create_req(211, 5);
+        let resp2 = engine.create(&req2).unwrap();
+        assert_eq!(
+            resp2.record_offset, record_offset,
+            "freed space should be reused by allocator"
+        );
+    }
+
+    // -- Concurrency tests --
+
+    #[test]
+    fn concurrent_100_threads_spend_different_utxos() {
+        let engine = create_engine();
+        let req = make_create_req(220, 100);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        std::thread::scope(|s| {
+            for i in 0..100u32 {
+                let engine = &engine;
+                let utxo_hash = req.utxo_hashes[i as usize];
+                s.spawn(move || {
+                    let mut sd = [0u8; 36];
+                    sd[0] = (i & 0xFF) as u8;
+                    sd[1] = ((i >> 8) & 0xFF) as u8;
+                    sd[32..36].copy_from_slice(&1u32.to_le_bytes());
+                    engine
+                        .spend(&SpendRequest {
+                            tx_key: key,
+                            offset: i,
+                            utxo_hash,
+                            spending_data: sd,
+                            ignore_conflicting: false,
+                            ignore_locked: false,
+                            current_block_height: 1000,
+                            block_height_retention: 288,
+                        })
+                        .unwrap();
+                });
+            }
+        });
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!(
+            { meta.spent_utxos },
+            100,
+            "all 100 UTXOs should be spent"
+        );
+
+        // Verify all slots are actually spent
+        for i in 0..100u32 {
+            let slot = engine.read_slot(&key, i).unwrap();
+            assert!(slot.is_spent(), "slot {i} should be spent");
+        }
+    }
+
+    #[test]
+    fn concurrent_100_threads_spend_same_utxo_same_data() {
+        let engine = create_engine();
+        let req = make_create_req(221, 1);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let utxo_hash = req.utxo_hashes[0];
+        let mut sd = [0u8; 36];
+        sd[0] = 0xAB;
+        sd[32..36].copy_from_slice(&1u32.to_le_bytes());
+
+        std::thread::scope(|s| {
+            for _ in 0..100 {
+                let engine = &engine;
+                s.spawn(move || {
+                    // All threads use identical spending_data — should be idempotent
+                    engine
+                        .spend(&SpendRequest {
+                            tx_key: key,
+                            offset: 0,
+                            utxo_hash,
+                            spending_data: sd,
+                            ignore_conflicting: false,
+                            ignore_locked: false,
+                            current_block_height: 1000,
+                            block_height_retention: 288,
+                        })
+                        .unwrap(); // All should succeed (idempotent)
+                });
+            }
+        });
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!(
+            { meta.spent_utxos },
+            1,
+            "counter should be 1 (idempotent — not incremented 100 times)"
+        );
+    }
+
+    #[test]
+    fn concurrent_100_threads_spend_same_utxo_different_data() {
+        let engine = create_engine();
+        let req = make_create_req(222, 1);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let utxo_hash = req.utxo_hashes[0];
+
+        let results: Vec<Result<_, _>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..100u8)
+                .map(|i| {
+                    let engine = &engine;
+                    s.spawn(move || {
+                        let mut sd = [0u8; 36];
+                        sd[0] = i;
+                        sd[32..36].copy_from_slice(&1u32.to_le_bytes());
+                        engine.spend(&SpendRequest {
+                            tx_key: key,
+                            offset: 0,
+                            utxo_hash,
+                            spending_data: sd,
+                            ignore_conflicting: false,
+                            ignore_locked: false,
+                            current_block_height: 1000,
+                            block_height_retention: 288,
+                        })
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let mut successes = 0u32;
+        let mut already_spent = 0u32;
+        for result in &results {
+            match result {
+                Ok(_) => successes += 1,
+                Err(SpendError::AlreadySpent { .. }) => already_spent += 1,
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+
+        assert_eq!(successes, 1, "exactly one thread should succeed");
+        assert_eq!(already_spent, 99, "99 threads should get AlreadySpent");
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.spent_utxos }, 1);
+    }
+
+    #[test]
+    fn concurrent_create_duplicate_txid() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone());
+        let index = Index::new(1000).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        // All 10 threads try to create the same txid
+        let create_req = make_create_req(230, 5);
+
+        let results: Vec<Result<_, _>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..10)
+                .map(|_| {
+                    let engine = &engine;
+                    let req = create_req.clone();
+                    s.spawn(move || engine.create(&req))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let mut successes = 0u32;
+        let mut duplicates = 0u32;
+        for result in &results {
+            match result {
+                Ok(_) => successes += 1,
+                Err(CreateError::DuplicateTxId) => duplicates += 1,
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+
+        // At least one thread must succeed
+        assert!(
+            successes >= 1,
+            "at least one thread should succeed creating the txid"
+        );
+        // Some threads should observe the duplicate
+        assert!(
+            duplicates > 0,
+            "at least some threads should get DuplicateTxId"
+        );
+        assert_eq!(
+            successes + duplicates,
+            10,
+            "all threads should either succeed or get DuplicateTxId"
+        );
+
+        // After all threads complete, exactly one record should exist in the index
+        let key = create_req.tx_key();
+        let entry = engine.lookup(&key);
+        assert!(
+            entry.is_some(),
+            "the txid should exist in the index after concurrent creates"
+        );
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.utxo_count }, 5);
     }
 }

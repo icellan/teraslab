@@ -89,6 +89,7 @@ pub enum ReplicaOp {
         metadata_bytes: Vec<u8>,
         utxo_hashes: Vec<[u8; 32]>,
         cold_data: Option<Vec<u8>>,
+        is_external: bool,
     },
     Delete {
         tx_key: TxKey,
@@ -163,7 +164,7 @@ impl ReplicaOp {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&block_height.to_le_bytes());
             }
-            ReplicaOp::Create { tx_key, metadata_bytes, utxo_hashes, cold_data } => {
+            ReplicaOp::Create { tx_key, metadata_bytes, utxo_hashes, cold_data, is_external } => {
                 buf.push(OP_CREATE);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&(metadata_bytes.len() as u32).to_le_bytes());
@@ -179,6 +180,7 @@ impl ReplicaOp {
                     }
                     None => buf.extend_from_slice(&0u32.to_le_bytes()),
                 }
+                buf.push(if *is_external { 1 } else { 0 });
             }
             ReplicaOp::Delete { tx_key } => {
                 buf.push(OP_DELETE);
@@ -290,7 +292,17 @@ impl ReplicaOp {
                 } else {
                     None
                 };
-                Ok((ReplicaOp::Create { tx_key: key, metadata_bytes, utxo_hashes, cold_data }, 1 + pos))
+                // Backward-compatible: if there is a byte remaining, read
+                // is_external; otherwise default to false so old replication
+                // streams still work.
+                let is_external = if pos < rest.len() {
+                    let v = rest[pos] != 0;
+                    pos += 1;
+                    v
+                } else {
+                    false
+                };
+                Ok((ReplicaOp::Create { tx_key: key, metadata_bytes, utxo_hashes, cold_data, is_external }, 1 + pos))
             }
             OP_DELETE => {
                 need(rest, 32)?;
@@ -500,6 +512,7 @@ mod tests {
                 metadata_bytes: vec![0x42; 100],
                 utxo_hashes: vec![[0xAA; 32], [0xBB; 32]],
                 cold_data: Some(vec![0xDD; 50]),
+                is_external: false,
             },
             ReplicaOp::Delete { tx_key: key(12) },
             ReplicaOp::PruneSlot { tx_key: key(13), offset: 99 },
@@ -521,6 +534,7 @@ mod tests {
             metadata_bytes: vec![0; 256],
             utxo_hashes: hashes.clone(),
             cold_data: None,
+            is_external: false,
         };
         let bytes = op.serialize();
         let (decoded, _) = ReplicaOp::deserialize(&bytes).unwrap();

@@ -5,7 +5,7 @@
 - **Minimum**: 1x NVMe SSD, 1 TB, 500K+ random 4K read IOPS
 - **Recommended**: Samsung PM9A3, Intel P5800X, or equivalent datacenter NVMe
 - **Endurance**: 1+ DWPD (Drive Writes Per Day) — TeraSlab's sub-block
-  write coalescing significantly reduces write amplification vs Aerospike
+  write coalescing significantly reduces write amplification vs the previous design
 - **Queue depth**: Devices with high QD performance benefit from io_uring batching
 
 ## Memory

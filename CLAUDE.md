@@ -2,7 +2,7 @@
 
 ## Project overview
 
-TeraSlab is a purpose-built Rust database server that serves as a new UTXO store backend for BSV Teranode (alongside the existing Aerospike option). It exploits fixed, known workload patterns to target 10M+ ops/sec sustained throughput, 10-50x less SSD wear, and dramatically better tail latency than Aerospike.
+TeraSlab is a purpose-built Rust database server that serves as the UTXO store backend for BSV Teranode. It exploits fixed, known workload patterns to target 10M+ ops/sec sustained throughput, 10-50x less SSD wear, and dramatically better tail latency than general-purpose databases.
 
 Read `specs/SPEC_BRIEFING.md` for the full architecture analysis and rationale. Read `specs/teranode.lua` for the current Lua UDF implementation being replaced.
 
@@ -115,7 +115,7 @@ Start here. Read `phases/00_analysis_and_spec.md`. The formal specification and 
 - `BSV_UTXO_STORE_SPEC.md` — the formal specification (already refined)
 - `BSV_UTXO_STORE_RUST_CRATES.md` — recommended Rust crates (already refined)
 
-Phase 0 validates these existing documents against the actual Teranode and Aerospike source repos. Clone the repos, trace the Go code, and produce a `SPEC_VALIDATION_REPORT.md` flagging any gaps, discrepancies, or missing operations. If amendments to the spec or phase files are needed, list them explicitly in the report for review before implementation begins.
+Phase 0 validates these existing documents against the actual Teranode source repos. Clone the repos, trace the Go code, and produce a `SPEC_VALIDATION_REPORT.md` flagging any gaps, discrepancies, or missing operations. If amendments to the spec or phase files are needed, list them explicitly in the report for review before implementation begins.
 
 ### Phase 1+ (implementation)
 

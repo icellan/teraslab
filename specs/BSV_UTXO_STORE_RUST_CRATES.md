@@ -81,11 +81,11 @@ Use `hashbrown` for prototyping and testing. The actual production index should 
 | Crate | Version | Notes | Recommendation |
 |-------|---------|-------|---------------|
 | **`sha2`** | 0.10+ | SHA-256 implementation. Pure Rust with hardware acceleration. | **Primary** — for content hashing |
-| **`ripemd`** | 0.1+ | RIPEMD-160 implementation. | For any RIPEMD-160 needs (Aerospike digest compat) |
+| **`ripemd`** | 0.1+ | RIPEMD-160 implementation. | For any RIPEMD-160 needs (legacy digest compat) |
 | `ring` | 0.17+ | Crypto library with SHA-256. C/ASM backend. | Alternative if maximum SHA-256 perf needed |
 | `crc32fast` | 1.x | Hardware-accelerated CRC32. | **Essential** — for redo log and protocol checksums |
 
-**Recommendation**: Use **`sha2`** for SHA-256 (content addressing of blobs), **`ripemd`** if RIPEMD-160 compatibility is needed (Aerospike uses RIPEMD-160 for key digests), and **`crc32fast`** for protocol/redo checksums.
+**Recommendation**: Use **`sha2`** for SHA-256 (content addressing of blobs), **`ripemd`** if RIPEMD-160 compatibility is needed (the previous implementation used RIPEMD-160 for key digests), and **`crc32fast`** for protocol/redo checksums.
 
 **Note**: The BSV txid is already a double-SHA-256 hash computed by the Go client. The Rust store doesn't need to recompute it — it's passed as a 32-byte key.
 
@@ -224,7 +224,7 @@ struct ThreadMetrics {
 | **`aws-sdk-s3`** | 1.x | Official AWS S3 SDK. | For S3-compatible blob storage |
 | `opendal` | 0.50+ | Unified storage access (S3, FS, HTTP, etc.). | **Recommended** — single API for all blob backends |
 | `reqwest` | 0.12+ | HTTP client. | For HTTP-based blob storage |
-| `moka` | 0.12+ | Concurrent cache with TTL. | For external tx cache (replacing Aerospike's in-memory cache) |
+| `moka` | 0.12+ | Concurrent cache with TTL. | For external tx cache (replacing the legacy in-memory cache) |
 
 **Recommendation**: Use **`opendal`** for blob storage abstraction (supports S3, MinIO, local filesystem, HTTP out of the box). Use **`moka`** for the 10-second TTL cache that replaces the Go `externalTxCache`.
 

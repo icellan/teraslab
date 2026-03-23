@@ -82,6 +82,7 @@ pub fn stress_random_operations() {
             frozen: false,
             conflicting: false,
             locked: false,
+            parent_txids: vec![],
         };
         engine.create(&req).unwrap();
     }
@@ -197,6 +198,7 @@ pub fn stress_device_fill_and_churn() {
             frozen: false,
             conflicting: false,
             locked: false,
+            parent_txids: vec![],
         };
         match engine.create(&req) {
             Ok(_) => created_ids.push(i),
@@ -239,6 +241,7 @@ pub fn stress_device_fill_and_churn() {
             frozen: false,
             conflicting: false,
             locked: false,
+            parent_txids: vec![],
         };
         match engine.create(&req) {
             Ok(_) => rechurned += 1,

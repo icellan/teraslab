@@ -1,0 +1,20 @@
+# Toxiproxy overlay for application-level fault injection.
+# Use with: docker compose -f docker-compose.3node.yml -f docker-compose.toxiproxy.yml up
+#
+# Note: Toxiproxy only proxies TCP. SWIM (UDP) fault injection
+# requires iptables/tc netem via the shell scripts.
+
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: teraslab-toxiproxy
+    hostname: toxiproxy
+    networks:
+      teraslab-net:
+        ipv4_address: 172.30.0.100
+    ports:
+      - "8474:8474"
+    volumes:
+      - ./config/toxiproxy.json:/config/toxiproxy.json:ro
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    restart: "no"

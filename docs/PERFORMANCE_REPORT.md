@@ -42,7 +42,7 @@ Run `cargo test --test e2e_workload -- --nocapture perf_` to see numbers.
 ## Memory Per Record
 
 - Raw index entry: 58 bytes (32-byte key + 26-byte TxIndexEntry)
-- Under the 64-byte Aerospike baseline target
+- Under the 64-byte baseline target
 - Hash table overhead amortized across entries
 
 ## Design Targets (from SPEC_BRIEFING.md)

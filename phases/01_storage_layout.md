@@ -82,7 +82,7 @@ bitflags! {
 }
 ```
 
-This replaces the separate `is_coinbase`, `conflicting`, `locked`, `external`, and `last_spent_state` fields. The `creating` flag from the Aerospike design is eliminated — it only existed for multi-record 2-phase commit, which is unnecessary with single-record atomic writes.
+This replaces the separate `is_coinbase`, `conflicting`, `locked`, `external`, and `last_spent_state` fields. The `creating` flag from the previous design is eliminated — it only existed for multi-record 2-phase commit, which is unnecessary with single-record atomic writes.
 
 #### TxMetadata
 
@@ -140,7 +140,7 @@ Calculate `METADATA_PADDING` so that `size_of::<TxMetadata>()` rounds up to the 
 
 **Metadata is placed first** in the record at a fixed compile-time size. This eliminates the need for a separate record header — metadata IS the header. UTXO slot offsets are deterministic: `METADATA_SIZE + vout * 69`. This saves one `pread` on every hot-path operation.
 
-**Fields eliminated from the Aerospike design:**
+**Fields eliminated from the previous design:**
 - `record_utxos` — redundant; the all-spent check uses `utxo_count`
 - `total_utxos` — redundant; same as `utxo_count`
 - `creating` — no multi-record 2-phase commit

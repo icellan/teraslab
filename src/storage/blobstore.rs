@@ -4,7 +4,9 @@
 //! keyed by txid. The file-based implementation uses a directory tree
 //! organized by hash prefix.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -20,6 +22,23 @@ pub type Result<T> = std::result::Result<T, BlobError>;
 /// Format a 32-byte key as a hex string.
 fn hex_key(key: &[u8; 32]) -> String {
     key.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Trait for streaming large blob writes in chunks.
+///
+/// Created by [`BlobStore::begin_stream`]. The caller appends data via
+/// [`write_chunk`] and finalizes with [`finish`]. If the stream is dropped
+/// without finishing, [`abort`] cleans up any partial data.
+pub trait BlobStreamWriter: Send {
+    /// Append a chunk of data to the stream.
+    fn write_chunk(&mut self, data: &[u8]) -> Result<()>;
+
+    /// Finalize the stream, making the blob available for reads.
+    /// Returns the total number of bytes written.
+    fn finish(self: Box<Self>) -> Result<u64>;
+
+    /// Abort the stream and clean up any partial data.
+    fn abort(self: Box<Self>) -> Result<()>;
 }
 
 /// Trait for external blob storage.
@@ -44,6 +63,13 @@ pub trait BlobStore: Send + Sync {
     /// Returns the number of bytes written, or `BlobError::NotFound` if the
     /// blob does not exist.
     fn stream_to(&self, key: &[u8; 32], writer: &mut dyn std::io::Write) -> Result<u64>;
+
+    /// Begin a streaming write for a blob keyed by txid.
+    ///
+    /// Returns a writer that accumulates chunks. Call [`BlobStreamWriter::finish`]
+    /// to finalize. If the stream is abandoned, call [`BlobStreamWriter::abort`]
+    /// or drop the writer (which will NOT clean up — always call abort explicitly).
+    fn begin_stream(&self, key: &[u8; 32]) -> Result<Box<dyn BlobStreamWriter>>;
 }
 
 /// File-based blob store organized by hash prefix directories.
@@ -78,6 +104,35 @@ impl FileBlobStore {
             }
         }
         path.join(&hex)
+    }
+}
+
+/// Streaming writer that appends chunks to a temporary file,
+/// then atomically renames to the final blob path on finish.
+struct FileStreamWriter {
+    temp_path: PathBuf,
+    final_path: PathBuf,
+    file: std::fs::File,
+    bytes_written: u64,
+}
+
+impl BlobStreamWriter for FileStreamWriter {
+    fn write_chunk(&mut self, data: &[u8]) -> Result<()> {
+        self.file.write_all(data)?;
+        self.bytes_written += data.len() as u64;
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> Result<u64> {
+        self.file.sync_all()?;
+        std::fs::rename(&self.temp_path, &self.final_path)?;
+        Ok(self.bytes_written)
+    }
+
+    fn abort(self: Box<Self>) -> Result<()> {
+        drop(self.file);
+        let _ = std::fs::remove_file(&self.temp_path);
+        Ok(())
     }
 }
 
@@ -144,18 +199,35 @@ impl BlobStore for FileBlobStore {
         let bytes_written = std::io::copy(&mut reader, writer)?;
         Ok(bytes_written)
     }
+
+    fn begin_stream(&self, key: &[u8; 32]) -> Result<Box<dyn BlobStreamWriter>> {
+        let final_path = self.blob_path(key);
+        let mut temp_path = final_path.as_os_str().to_os_string();
+        temp_path.push(".tmp");
+        let temp_path = PathBuf::from(temp_path);
+        if let Some(parent) = final_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::File::create(&temp_path)?;
+        Ok(Box::new(FileStreamWriter {
+            temp_path,
+            final_path,
+            file,
+            bytes_written: 0,
+        }))
+    }
 }
 
 /// In-memory blob store for testing.
 pub struct MemoryBlobStore {
-    blobs: parking_lot::Mutex<std::collections::HashMap<[u8; 32], Vec<u8>>>,
+    blobs: Arc<parking_lot::Mutex<std::collections::HashMap<[u8; 32], Vec<u8>>>>,
 }
 
 impl MemoryBlobStore {
     /// Create a new empty in-memory blob store.
     pub fn new() -> Self {
         Self {
-            blobs: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            blobs: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -210,6 +282,40 @@ impl BlobStore for MemoryBlobStore {
             }
             None => Err(BlobError::NotFound { key: hex_key(key) }),
         }
+    }
+
+    fn begin_stream(&self, key: &[u8; 32]) -> Result<Box<dyn BlobStreamWriter>> {
+        Ok(Box::new(MemoryStreamWriter {
+            key: *key,
+            buffer: Vec::new(),
+            store: Arc::clone(&self.blobs),
+        }))
+    }
+}
+
+/// Streaming writer for [`MemoryBlobStore`] that accumulates chunks in memory,
+/// then inserts the complete blob into the shared map on finish.
+struct MemoryStreamWriter {
+    key: [u8; 32],
+    buffer: Vec<u8>,
+    store: Arc<parking_lot::Mutex<std::collections::HashMap<[u8; 32], Vec<u8>>>>,
+}
+
+impl BlobStreamWriter for MemoryStreamWriter {
+    fn write_chunk(&mut self, data: &[u8]) -> Result<()> {
+        self.buffer.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> Result<u64> {
+        let len = self.buffer.len() as u64;
+        self.store.lock().insert(self.key, self.buffer);
+        Ok(len)
+    }
+
+    fn abort(self: Box<Self>) -> Result<()> {
+        // Nothing to clean up for the in-memory store; buffer is dropped.
+        Ok(())
     }
 }
 
@@ -369,5 +475,71 @@ mod tests {
         store.put(&test_key(3), b"abcdefgh").unwrap();
         let range = store.get_range(&test_key(3), 2, 3).unwrap().unwrap();
         assert_eq!(range, b"cde");
+    }
+
+    // -- Streaming write tests --
+
+    #[test]
+    fn file_stream_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileBlobStore::new(dir.path(), 2);
+        let key = test_key(20);
+        let mut writer = store.begin_stream(&key).unwrap();
+        writer.write_chunk(b"hello ").unwrap();
+        writer.write_chunk(b"world").unwrap();
+        let total = writer.finish().unwrap();
+        assert_eq!(total, 11);
+        let data = store.get(&key).unwrap().unwrap();
+        assert_eq!(data, b"hello world");
+    }
+
+    #[test]
+    fn file_stream_abort_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileBlobStore::new(dir.path(), 2);
+        let key = test_key(21);
+        let mut writer = store.begin_stream(&key).unwrap();
+        writer.write_chunk(b"partial data").unwrap();
+        writer.abort().unwrap();
+        assert!(store.get(&key).unwrap().is_none());
+    }
+
+    #[test]
+    fn file_stream_large_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileBlobStore::new(dir.path(), 2);
+        let key = test_key(22);
+        let chunk = vec![0x42u8; 4 * 1024 * 1024]; // 4 MiB chunk
+        let mut writer = store.begin_stream(&key).unwrap();
+        for _ in 0..5 {
+            writer.write_chunk(&chunk).unwrap(); // 20 MiB total
+        }
+        let total = writer.finish().unwrap();
+        assert_eq!(total, 20 * 1024 * 1024);
+        let data = store.get(&key).unwrap().unwrap();
+        assert_eq!(data.len(), 20 * 1024 * 1024);
+    }
+
+    #[test]
+    fn memory_stream_write() {
+        let store = MemoryBlobStore::new();
+        let key = test_key(23);
+        let mut writer = store.begin_stream(&key).unwrap();
+        writer.write_chunk(b"chunk1").unwrap();
+        writer.write_chunk(b"chunk2").unwrap();
+        let total = writer.finish().unwrap();
+        assert_eq!(total, 12);
+        let data = store.get(&key).unwrap().unwrap();
+        assert_eq!(data, b"chunk1chunk2");
+    }
+
+    #[test]
+    fn memory_stream_abort() {
+        let store = MemoryBlobStore::new();
+        let key = test_key(24);
+        let mut writer = store.begin_stream(&key).unwrap();
+        writer.write_chunk(b"data").unwrap();
+        writer.abort().unwrap();
+        assert!(store.get(&key).unwrap().is_none());
     }
 }

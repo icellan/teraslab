@@ -43,6 +43,7 @@ fn start_test_http_server() -> (u16, Arc<HttpState>) {
         metrics: &TEST_METRICS,
         ready,
         log_level,
+        cluster: None,
     });
 
     let addr = format!("127.0.0.1:{port}");
@@ -248,6 +249,7 @@ fn debug_records_returns_json_for_existing_record() {
         frozen: false,
         conflicting: false,
         locked: false,
+        parent_txids: vec![],
     };
     state.engine.create(&req).unwrap();
 

@@ -11,7 +11,7 @@ Phase 1 must be complete with all tests passing.
 ## Reference
 
 - `specs/BSV_UTXO_STORE_SPEC.md` §5 (Index) — including §5.5 (secondary indexes for pruner)
-- The Aerospike primary index uses 64 bytes per entry in red-black tree sprigs. Our index should use ~24-32 bytes per entry in a flat hash table — no tree traversal, no pointer chasing.
+- The original implementation's primary index uses 64 bytes per entry in red-black tree sprigs. Our index should use ~24-32 bytes per entry in a flat hash table — no tree traversal, no pointer chasing.
 
 **Note**: This phase covers the primary hash index only. The secondary indexes for pruner queries (DAH index, Unmined index per spec §5.5) should also be built in this phase — they are lightweight B-tree/sorted structures maintained in memory alongside the primary index.
 

@@ -97,6 +97,7 @@ impl StateVerifier {
                     frozen: false,
                     conflicting: false,
                     locked: false,
+                    parent_txids: vec![],
                 };
 
                 engine.create(&req).map_err(|e| format!("create failed: {e}"))?;

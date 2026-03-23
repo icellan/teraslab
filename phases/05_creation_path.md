@@ -117,7 +117,7 @@ The cold data is written once during creation and never modified.
 
 ### 5.5 No creating flag
 
-The `creating` flag from the Aerospike design is eliminated. It only existed to block spending during multi-record 2-phase commit (master + child records). Since TeraSlab writes the entire record atomically in one operation, there is no window where a partially-created record could be spent. The record either exists in the index (fully created) or doesn't.
+The `creating` flag from the previous design is eliminated. It only existed to block spending during multi-record 2-phase commit (master + child records). Since TeraSlab writes the entire record atomically in one operation, there is no window where a partially-created record could be spent. The record either exists in the index (fully created) or doesn't.
 
 ## Acceptance criteria
 
@@ -194,5 +194,5 @@ The `creating` flag from the Aerospike design is eliminated. It only existed to 
 ## NOT in this phase
 
 - No external blob store writing (Phase 11)
-- No lock records (this was an Aerospike-specific mechanism that may not be needed)
+- No lock records (this was a mechanism from the previous design that may not be needed)
 - No read/query path (that's part of Phase 10 wire protocol)
