@@ -87,7 +87,12 @@ items := []teraslab.CreateItem{
         IsCoinbase:   false,
         CreatedAt:    uint64(time.Now().UnixMilli()),
         UtxoHashes:   []teraslab.UtxoHash{utxoHash0, utxoHash1},
-        ColdData:     rawTxBytes,        // optional: full tx inputs/outputs
+        TxData: teraslab.TxData{         // optional: transaction inputs/outputs/inpoints
+            Inputs:   inputBytes,
+            Outputs:  outputBytes,
+            Inpoints: inpointBytes,
+        },
+        BlockHeight:      800000,        // current block height (sets unmined_since)
         MinedBlockID:     &blockID,      // optional: set if already mined
         MinedBlockHeight: &blockHeight,
         MinedSubtreeIdx:  &subtreeIdx,
@@ -271,29 +276,21 @@ data per item which can be parsed with the `DecodeTxMetadata`, `DecodeUtxoSlots`
 `DecodeBlockEntries` helpers.
 
 ```go
-results, err := client.GetBatch(ctx, teraslab.FieldAll, []teraslab.TxID{txid})
+// Use GetRecordBatch for automatic decoding based on field mask.
+records, err := client.GetRecordBatch(ctx, teraslab.FieldAllMetadata|teraslab.FieldUtxoSlots, []teraslab.TxID{txid})
 if err != nil {
     log.Fatal(err)
 }
 
-for _, r := range results {
-    if r.Status != 0 {
+for _, rec := range records {
+    if !rec.Found {
         fmt.Println("not found")
         continue
     }
 
-    meta, err := teraslab.DecodeTxMetadata(r.Data)
-    if err != nil {
-        log.Fatal(err)
-    }
-    fmt.Printf("fee=%d utxo_count=%d spent=%d\n", meta.Fee, meta.UtxoCount, meta.SpentUtxos)
+    fmt.Printf("fee=%d utxo_count=%d spent=%d\n", rec.Metadata.Fee, rec.Metadata.UtxoCount, rec.Metadata.SpentUtxos)
 
-    // Parse UTXO slots (starts after metadata section).
-    slots, err := teraslab.DecodeUtxoSlots(r.Data[teraslab.MetadataSize:])
-    if err != nil {
-        log.Fatal(err)
-    }
-    for i, slot := range slots {
+    for i, slot := range rec.Slots {
         switch slot.Status {
         case teraslab.SlotUnspent:
             fmt.Printf("  vout %d: unspent\n", i)
@@ -306,21 +303,51 @@ for _, r := range results {
 }
 ```
 
-To fetch only metadata (lighter response):
+To fetch only fee and utxo count (zero-alloc access, no TxMetadata struct allocated):
 
 ```go
-results, err := client.GetBatch(ctx, teraslab.FieldMetadata, []teraslab.TxID{txid})
+batch, err := client.GetBatch(ctx, teraslab.FieldFee|teraslab.FieldUtxoCount, []teraslab.TxID{txid})
+fee, _ := batch.Fee(0)           // reads directly from wire bytes
+count, _ := batch.UtxoCount(0)   // zero allocation
+```
+
+Full decode when you need the struct:
+
+```go
+batch, err := client.GetBatch(ctx, teraslab.FieldAllMetadata, txids)
+meta, _, _ := batch.DecodeMetadata(0)  // allocates TxMetadata
 ```
 
 Available field masks (combine with `|`):
 
 | Constant | Bit | Description |
 |----------|-----|-------------|
-| `FieldMetadata` | `0x01` | Transaction metadata (fee, flags, counts, timestamps) |
-| `FieldUtxoSlots` | `0x02` | UTXO slot data (hash, status, spending data) |
-| `FieldColdData` | `0x04` | Full transaction inputs/outputs |
-| `FieldBlockEntries` | `0x08` | Block entries (block ID, height, subtree index) |
-| `FieldAll` | `0x0F` | All fields |
+| `FieldTxVersion` | `1 << 0` | Transaction version |
+| `FieldLocktime` | `1 << 1` | Transaction locktime |
+| `FieldFee` | `1 << 2` | Transaction fee |
+| `FieldSizeInBytes` | `1 << 3` | Transaction size in bytes |
+| `FieldExtendedSize` | `1 << 4` | Extended transaction size |
+| `FieldFlags` | `1 << 5` | Transaction flags |
+| `FieldSpendingHeight` | `1 << 6` | Spending height |
+| `FieldCreatedAt` | `1 << 7` | Creation timestamp |
+| `FieldSpentUtxos` | `1 << 8` | Spent UTXO count |
+| `FieldPrunedUtxos` | `1 << 9` | Pruned UTXO count |
+| `FieldUtxoCount` | `1 << 10` | Total UTXO count |
+| `FieldGeneration` | `1 << 11` | Record generation number |
+| `FieldUpdatedAt` | `1 << 12` | Last updated timestamp |
+| `FieldUnminedSince` | `1 << 13` | Block height since unmined |
+| `FieldDeleteAtHeight` | `1 << 14` | Delete-at block height |
+| `FieldPreserveUntil` | `1 << 15` | Preserve-until block height |
+| `FieldExternalRef` | `1 << 16` | External storage reference |
+| `FieldReassignCount` | `1 << 17` | Reassignment count |
+| `FieldBlockEntryCount` | `1 << 18` | Block entry count |
+| `FieldUtxoSlots` | `1 << 19` | UTXO slot data (hash, status, spending data) |
+| `FieldColdData` | `1 << 20` | Full transaction inputs/outputs |
+| `FieldBlockEntries` | `1 << 21` | Block entries (block ID, height, subtree index) |
+| `FieldConflictingChildren` | `1 << 22` | Conflicting child transaction IDs |
+| `FieldRawMetadata` | `1 << 23` | Full 256-byte on-disk metadata (debugging only) |
+| `FieldAllMetadata` | `0x0007_FFFF` | All metadata fields (bits 0-18) |
+| `FieldAll` | `0x007F_FFFF` | All client-facing fields (bits 0-22) |
 
 ### Get spend status
 
