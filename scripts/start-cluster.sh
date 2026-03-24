@@ -1,77 +1,93 @@
 #!/usr/bin/env bash
 #
-# Start a 3-node TeraSlab cluster with replication factor 2.
+# Start a 3-node TeraSlab cluster with replication factor 2 in Docker.
 #
 # Usage:
-#   ./scripts/start-cluster.sh              # defaults: data in ./data/cluster/
-#   ./scripts/start-cluster.sh /tmp/ts      # custom data directory
+#   ./scripts/start-cluster.sh                          # use ghcr.io/icellan/teraslab:latest
+#   TERASLAB_IMAGE=teraslab-server:latest ./scripts/start-cluster.sh  # use local image
 #
-# Ports per node:
-#   Node 1: wire 3300, SWIM 3301, HTTP 9100
-#   Node 2: wire 3310, SWIM 3311, HTTP 9110
-#   Node 3: wire 3320, SWIM 3321, HTTP 9120
+# Host ports per node:
+#   Node 1: wire 3300, HTTP 9100
+#   Node 2: wire 3310, HTTP 9110
+#   Node 3: wire 3320, HTTP 9120
 #
-# Stop with Ctrl-C (sends SIGINT to all nodes).
-# Data is preserved between restarts.
+# Data is persisted in Docker volumes (teraslab-node1-data, etc.).
+# Stop with:   ./scripts/start-cluster.sh stop
+# Remove all:  docker rm -f teraslab-node1 teraslab-node2 teraslab-node3
+#              docker volume rm teraslab-node{1,2,3}-data teraslab-node{1,2,3}-blobstore
+#              docker network rm teraslab-cluster
 
 set -euo pipefail
 
-DATA_DIR="${1:-./data/cluster}"
+IMAGE="${TERASLAB_IMAGE:-ghcr.io/icellan/teraslab:latest}"
+NETWORK="teraslab-cluster"
 
-PIDS=()
-
-cleanup() {
-    echo ""
+stop_cluster() {
     echo "Stopping cluster..."
-    for pid in "${PIDS[@]}"; do
-        kill "$pid" 2>/dev/null || true
-    done
-    wait 2>/dev/null
+    docker rm -f teraslab-node1 teraslab-node2 teraslab-node3 2>/dev/null || true
     echo "All nodes stopped."
 }
-trap cleanup EXIT INT TERM
+
+if [ "${1:-}" = "stop" ]; then
+    stop_cluster
+    exit 0
+fi
+
+# Clean up any previous run
+stop_cluster
+
+# Create network for inter-node communication
+docker network create "$NETWORK" 2>/dev/null || true
 
 start_node() {
     local id=$1
     local wire_port=$2
-    local swim_port=$3
-    local http_port=$4
-    local dir="$DATA_DIR/node$id"
+    local http_port=$3
+    local name="teraslab-node$id"
 
-    mkdir -p "$dir/blobstore"
-
-    local config="$dir/node.toml"
-    cat > "$config" <<EOF
-listen_addr          = "127.0.0.1:$wire_port"
-http_listen_addr     = "127.0.0.1:$http_port"
-device_paths         = ["$dir/teraslab.dat"]
-device_size          = 1073741824  # 1 GiB
-index_snapshot_path  = "$dir/index.snap"
-blobstore_path       = "$dir/blobstore"
+    # Generate config with container-internal addresses
+    local config
+    config=$(cat <<EOF
+listen_addr          = "0.0.0.0:3300"
+http_listen_addr     = "0.0.0.0:9100"
+device_paths         = ["/data/teraslab.dat"]
+device_size          = 1073741824
+index_snapshot_path  = "/data/index.snap"
+blobstore_path       = "/blobstore"
 
 node_id              = $id
-swim_port            = $swim_port
-seed_nodes           = ["127.0.0.1:3301", "127.0.0.1:3311", "127.0.0.1:3321"]
+swim_port            = 3301
+seed_nodes           = ["teraslab-node1:3301", "teraslab-node2:3301", "teraslab-node3:3301"]
 replication_factor   = 2
 cluster_secret       = "dev-cluster-secret"
 EOF
+)
 
-    echo "  Node $id: wire=:$wire_port  swim=:$swim_port  http=:$http_port  dir=$dir"
-    cargo run --release --bin teraslab-server -- --config "$config" &
-    PIDS+=($!)
+    echo "  Node $id ($name): wire=localhost:$wire_port  http=localhost:$http_port"
+
+    docker run -d \
+        --name "$name" \
+        --network "$NETWORK" \
+        -p "$wire_port:3300" \
+        -p "$http_port:9100" \
+        -v "$name-data:/data" \
+        -v "$name-blobstore:/blobstore" \
+        "$IMAGE" \
+        sh -c "echo '$config' > /etc/teraslab/node.toml && exec teraslab-server --config /etc/teraslab/node.toml" \
+        > /dev/null
 }
 
 echo "Starting 3-node TeraSlab cluster (replication_factor=2)..."
+echo "  Image: $IMAGE"
 echo ""
 
-start_node 1 3300 3301 9100
-start_node 2 3310 3311 9110
-start_node 3 3320 3321 9120
+start_node 1 3300 9100
+start_node 2 3310 9110
+start_node 3 3320 9120
 
 echo ""
-echo "Cluster starting. Waiting for health checks..."
+echo "Waiting for health checks..."
 
-# Wait for all nodes to be healthy
 for port in 9100 9110 9120; do
     for i in $(seq 1 30); do
         if curl -sf "http://127.0.0.1:$port/health/live" > /dev/null 2>&1; then
@@ -90,6 +106,4 @@ echo "Cluster ready."
 echo "  Connect to any node: localhost:3300, localhost:3310, localhost:3320"
 echo "  Health endpoints:    localhost:9100, localhost:9110, localhost:9120"
 echo ""
-echo "Press Ctrl-C to stop all nodes."
-
-wait
+echo "Stop with: ./scripts/start-cluster.sh stop"
