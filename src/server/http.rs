@@ -173,6 +173,7 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
             "node_id": self_id.0,
             "cluster_size": cluster_size,
             "shard_table_version": cluster.shard_table_version(),
+            "topology_term": cluster.committed_topology_term(),
             "master_shard_count": master_count,
             "replica_shard_count": replica_count,
             "active_migrations": cluster.active_migrations(),
@@ -238,8 +239,12 @@ async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> i
     match state.cluster {
         Some(ref cluster) => {
             let migrations = cluster.migration_status();
+            let inbound = cluster.inbound_pending_count();
+            let fenced = cluster.fenced_shard_count();
             let body = serde_json::json!({
                 "active_count": migrations.len(),
+                "inbound_pending": inbound,
+                "fenced_shards": fenced,
                 "migrations": migrations.iter().map(|m| {
                     serde_json::json!({
                         "shard": m.shard,

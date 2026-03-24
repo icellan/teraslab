@@ -209,6 +209,7 @@ fn tcp_replicate_spend() {
             tx_key: key,
             offset: 0,
             spending_data: sd,
+            master_generation: 0,
         }],
     };
     let ack = send_replica_batch_tcp(replica_port, &batch);
@@ -285,6 +286,7 @@ fn tcp_replicate_create_and_spend_lifecycle() {
             tx_key: key,
             offset: 0,
             spending_data: sd,
+            master_generation: 0,
         }],
     };
     let ack = send_replica_batch_tcp(replica_port, &spend_batch);
@@ -338,6 +340,7 @@ fn tcp_replicate_batch_50_ops() {
             tx_key: key,
             offset: 0,
             spending_data: sd,
+            master_generation: 0,
         });
     }
 
@@ -437,10 +440,12 @@ fn tcp_replicate_mixed_ops() {
                 tx_key: key_from_txid(txid_spend),
                 offset: 0,
                 spending_data: sd,
+                master_generation: 0,
             },
             ReplicaOp::Freeze {
                 tx_key: key_from_txid(txid_freeze),
                 offset: 1,
+                master_generation: 0,
             },
             ReplicaOp::SetMined {
                 tx_key: key_from_txid(txid_mined),
@@ -448,6 +453,7 @@ fn tcp_replicate_mixed_ops() {
                 block_height: 1000,
                 subtree_idx: 0,
                 on_longest_chain: true,
+                master_generation: 0,
             },
         ],
     };
@@ -519,6 +525,7 @@ fn tcp_catchup_missed_ops() {
             tx_key: key,
             offset: 0,
             spending_data: sd,
+            master_generation: 0,
         });
     }
 
@@ -640,6 +647,7 @@ fn tcp_concurrent_replicate_and_client() {
                 tx_key: key,
                 offset: 0,
                 spending_data: sd,
+                master_generation: 0,
             });
         }
 
@@ -703,6 +711,7 @@ fn tcp_replica_timeout() {
         ops: vec![ReplicaOp::Freeze {
             tx_key: key_from_txid(test_txid(999)),
             offset: 0,
+            master_generation: 0,
         }],
     };
     transport.send_batch(&batch).unwrap();
@@ -757,6 +766,7 @@ fn tcp_consistency_verification() {
             tx_key: key,
             offset: 0,
             spending_data: sd,
+            master_generation: 0,
         });
     }
 
@@ -775,6 +785,7 @@ fn tcp_consistency_verification() {
         ops.push(ReplicaOp::Freeze {
             tx_key: key,
             offset: 1,
+            master_generation: 0,
         });
     }
 
@@ -800,6 +811,7 @@ fn tcp_consistency_verification() {
             block_height: 1000 + i,
             subtree_idx: 0,
             on_longest_chain: true,
+            master_generation: 0,
         });
     }
 
@@ -816,6 +828,7 @@ fn tcp_consistency_verification() {
         ops.push(ReplicaOp::SetLocked {
             tx_key: key,
             value: true,
+            master_generation: 0,
         });
     }
 

@@ -35,6 +35,9 @@ pub struct Engine {
     dah_index: parking_lot::Mutex<DahIndex>,
     unmined_index: parking_lot::Mutex<UnminedIndex>,
     blob_store: Option<Arc<dyn BlobStore>>,
+    /// Per-shard record counts for O(1) migration verification.
+    /// Updated atomically on create/delete. Indexed by shard number.
+    shard_counts: Vec<std::sync::atomic::AtomicU64>,
 }
 
 impl Engine {
@@ -47,6 +50,14 @@ impl Engine {
         dah_index: DahIndex,
         unmined_index: UnminedIndex,
     ) -> Self {
+        let shard_counts: Vec<std::sync::atomic::AtomicU64> = (0..4096)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
+        // Initialize shard counts from the existing index.
+        for (key, _) in index.iter() {
+            let shard = crate::cluster::shards::ShardTable::shard_for_key(&key) as usize;
+            shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Self {
             device,
             index: parking_lot::RwLock::new(index),
@@ -55,6 +66,7 @@ impl Engine {
             dah_index: parking_lot::Mutex::new(dah_index),
             unmined_index: parking_lot::Mutex::new(unmined_index),
             blob_store: None,
+            shard_counts,
         }
     }
 
@@ -66,6 +78,23 @@ impl Engine {
     /// Get a reference to the blobstore, if configured.
     pub fn blob_store(&self) -> Option<&dyn BlobStore> {
         self.blob_store.as_deref()
+    }
+
+    /// Get the record count for a shard (O(1), lock-free).
+    pub fn shard_record_count(&self, shard: u16) -> u64 {
+        self.shard_counts[shard as usize].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Increment the shard record count (called after successful create).
+    fn increment_shard_count(&self, key: &TxKey) {
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(key) as usize;
+        self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Decrement the shard record count (called after successful delete).
+    fn decrement_shard_count(&self, key: &TxKey) {
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(key) as usize;
+        self.shard_counts[shard].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Register a transaction in the index (for test setup).
@@ -89,6 +118,56 @@ impl Engine {
     /// a read lock briefly and collects all keys into a Vec.
     pub fn all_keys(&self) -> Vec<TxKey> {
         self.index.read().iter().map(|(k, _)| k).collect()
+    }
+
+    /// Return keys belonging to a specific shard.
+    ///
+    /// More efficient than `all_keys()` followed by filtering when only
+    /// a subset of shards is needed. Acquires the index read lock once
+    /// and filters inline, avoiding a full clone + filter pass.
+    pub fn keys_for_shard(&self, shard: u16) -> Vec<TxKey> {
+        self.index.read().iter()
+            .filter_map(|(k, _)| {
+                if crate::cluster::shards::ShardTable::shard_for_key(&k) == shard {
+                    Some(k)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Group all keys by shard in a single index scan.
+    ///
+    /// Returns a HashMap from shard number to Vec of keys. This is O(N)
+    /// where N is the total number of index entries, compared to O(N * S)
+    /// if calling `keys_for_shard` for each shard S.
+    pub fn keys_by_shard(&self) -> std::collections::HashMap<u16, Vec<TxKey>> {
+        let mut result: std::collections::HashMap<u16, Vec<TxKey>> = std::collections::HashMap::new();
+        for (k, _) in self.index.read().iter() {
+            let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+            result.entry(shard).or_default().push(k);
+        }
+        result
+    }
+
+    /// Group keys by shard, but only for a specified set of shards.
+    ///
+    /// More memory-efficient than `keys_by_shard()` when only a subset
+    /// of shards need migration (common case: only outbound shards).
+    /// Keys belonging to shards NOT in the filter are skipped entirely.
+    pub fn keys_by_shard_filtered(
+        &self,
+        shard_filter: &std::collections::HashSet<u16>,
+    ) -> std::collections::HashMap<u16, Vec<TxKey>> {
+        let mut result: std::collections::HashMap<u16, Vec<TxKey>> = std::collections::HashMap::new();
+        for (k, _) in self.index.read().iter() {
+            let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+            if shard_filter.contains(&shard) {
+                result.entry(shard).or_default().push(k);
+            }
+        }
+        result
     }
 
     /// Execute a batch of spends on a single transaction.
@@ -144,6 +223,7 @@ impl Engine {
                 block_ids,
                 errors: HashMap::new(),
                 spent_count: 0,
+                generation: { metadata.generation },
             });
         }
 
@@ -311,6 +391,7 @@ impl Engine {
             block_ids,
             errors,
             spent_count,
+            generation: { metadata.generation },
         })
     }
 
@@ -384,7 +465,7 @@ impl Engine {
         match slot.status {
             UTXO_UNSPENT => {
                 // Already unspent — no-op, no counter change, no generation bump
-                return Ok(UnspendResponse { signal: Signal::None });
+                return Ok(UnspendResponse { signal: Signal::None, generation: { metadata.generation } });
             }
             UTXO_SPENT => {
                 // Check if frozen (spending_data all 0xFF)
@@ -450,7 +531,7 @@ impl Engine {
             }
         }
 
-        Ok(UnspendResponse { signal })
+        Ok(UnspendResponse { signal, generation: { metadata.generation } })
     }
 
     /// Set or unset the mined state of a transaction.
@@ -660,6 +741,7 @@ impl Engine {
         Ok(SetMinedResponse {
             signal,
             block_ids,
+            generation: { metadata.generation },
         })
     }
 
@@ -732,7 +814,7 @@ impl Engine {
             }
         }
 
-        Ok(MarkOnLongestChainResponse { signal })
+        Ok(MarkOnLongestChainResponse { signal, generation: { metadata.generation } })
     }
 
     // -----------------------------------------------------------------------
@@ -883,6 +965,7 @@ impl Engine {
             }
         }
 
+        self.increment_shard_count(&TxKey { txid: req.tx_id });
         Ok(CreateResponse {
             record_offset,
             utxo_count,
@@ -972,16 +1055,16 @@ impl Engine {
         }
 
         // Check if cold data is in external blobstore.
-        if entry.flags & TxFlags::EXTERNAL.bits() != 0 {
-            if let Some(ref blob_store) = self.blob_store {
-                match blob_store.get(&key.txid) {
-                    Ok(Some(data)) => return Ok(data),
-                    Ok(None) => return Err(SpendError::TxNotFound),
-                    Err(e) => {
-                        return Err(SpendError::StorageError {
-                            detail: format!("blobstore read: {e}"),
-                        })
-                    }
+        if entry.flags & TxFlags::EXTERNAL.bits() != 0
+            && let Some(ref blob_store) = self.blob_store
+        {
+            match blob_store.get(&key.txid) {
+                Ok(Some(data)) => return Ok(data),
+                Ok(None) => return Err(SpendError::TxNotFound),
+                Err(e) => {
+                    return Err(SpendError::StorageError {
+                        detail: format!("blobstore read: {e}"),
+                    })
                 }
             }
         }
@@ -997,7 +1080,7 @@ impl Engine {
     /// Freeze a UTXO (set status to FROZEN, spending_data all 0xFF).
     ///
     /// Does NOT modify metadata counters — frozen does not count as "spent".
-    pub fn freeze(&self, req: &FreezeRequest) -> Result<(), SpendError> {
+    pub fn freeze(&self, req: &FreezeRequest) -> Result<u32, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
@@ -1032,11 +1115,12 @@ impl Engine {
         let frozen = UtxoSlot::new_frozen(req.utxo_hash);
         io::write_utxo_slot(&*self.device, ro, req.offset, &frozen)
             .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
-        Ok(())
+        let generation = { meta.generation };
+        Ok(generation)
     }
 
     /// Unfreeze a UTXO (set status to UNSPENT, spending_data zeroed).
-    pub fn unfreeze(&self, req: &UnfreezeRequest) -> Result<(), SpendError> {
+    pub fn unfreeze(&self, req: &UnfreezeRequest) -> Result<u32, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
@@ -1059,11 +1143,12 @@ impl Engine {
         let unspent = UtxoSlot::new_unspent(req.utxo_hash);
         io::write_utxo_slot(&*self.device, ro, req.offset, &unspent)
             .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
-        Ok(())
+        let generation = { meta.generation };
+        Ok(generation)
     }
 
     /// Reassign a frozen UTXO to a new hash with a spendable-after cooldown.
-    pub fn reassign(&self, req: &ReassignRequest) -> Result<(), SpendError> {
+    pub fn reassign(&self, req: &ReassignRequest) -> Result<u32, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
@@ -1098,7 +1183,8 @@ impl Engine {
         io::write_metadata(&*self.device, ro, &meta)
             .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
 
-        Ok(())
+        let generation = { meta.generation };
+        Ok(generation)
     }
 
     /// Append a child txid to a parent record's conflicting-children list.
@@ -1140,7 +1226,7 @@ impl Engine {
         }
 
         // Dedup
-        if children.iter().any(|c| *c == child_txid) {
+        if children.contains(&child_txid) {
             return Ok(());
         }
         children.push(child_txid);
@@ -1268,11 +1354,11 @@ impl Engine {
             }
         }
 
-        Ok(SetConflictingResponse { signal })
+        Ok(SetConflictingResponse { signal, generation: { meta.generation } })
     }
 
     /// Set or clear the locked flag on a transaction.
-    pub fn set_locked(&self, req: &SetLockedRequest) -> Result<(), SpendError> {
+    pub fn set_locked(&self, req: &SetLockedRequest) -> Result<u32, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
@@ -1304,7 +1390,8 @@ impl Engine {
             if new_dah != 0 { dah.insert(new_dah, req.tx_key); }
         }
 
-        Ok(())
+        let generation = { meta.generation };
+        Ok(generation)
     }
 
     /// Preserve a record until a specific block height.
@@ -1340,7 +1427,7 @@ impl Engine {
         } else {
             Signal::None
         };
-        Ok(PreserveUntilResponse { signal })
+        Ok(PreserveUntilResponse { signal, generation: { meta.generation } })
     }
 
     /// Delete a transaction record.
@@ -1373,6 +1460,7 @@ impl Engine {
         self.dah_index.lock().remove(&req.tx_key);
         self.unmined_index.lock().remove(&req.tx_key);
 
+        self.decrement_shard_count(&req.tx_key);
         Ok(())
     }
 
@@ -6442,5 +6530,35 @@ mod tests {
         );
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.utxo_count }, 5);
+    }
+
+    #[test]
+    fn keys_for_shard_filters_correctly() {
+        let h = TestHarness::new(2, TxFlags::empty());
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&h.key);
+
+        // The key should appear in its own shard.
+        let shard_keys = h.engine.keys_for_shard(shard);
+        assert_eq!(shard_keys.len(), 1);
+        assert_eq!(shard_keys[0], h.key);
+
+        // A different shard should be empty (unless hash collision, but
+        // with a single key this is guaranteed for at least one other shard).
+        let other_shard = if shard == 0 { 1 } else { 0 };
+        let other_keys = h.engine.keys_for_shard(other_shard);
+        assert!(other_keys.is_empty());
+    }
+
+    #[test]
+    fn keys_by_shard_groups_all_keys() {
+        let h = TestHarness::new(2, TxFlags::empty());
+        let by_shard = h.engine.keys_by_shard();
+
+        // With one key, exactly one shard should have one entry.
+        let total: usize = by_shard.values().map(|v| v.len()).sum();
+        assert_eq!(total, 1);
+
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&h.key);
+        assert_eq!(by_shard.get(&shard).unwrap().len(), 1);
     }
 }

@@ -80,6 +80,10 @@ pub enum ReplicaState {
     CatchingUp { from_sequence: u64 },
     /// Replica is disconnected.
     Down,
+    /// Redo entries needed for catch-up have been reclaimed (circular log
+    /// wrapped). A full shard resync is required before this replica can
+    /// return to Live.
+    NeedsResync,
 }
 
 /// Manages a single replica's transport and state.
@@ -136,6 +140,26 @@ impl ReplicationManager {
             senders,
             config,
             next_sequence: 1,
+        }
+    }
+
+    /// Create a manager with sequence state recovered from the redo log.
+    ///
+    /// `initial_sequence` should be `redo_log.current_sequence()` so that
+    /// replication sequence numbers are contiguous with the durable log.
+    pub fn with_initial_sequence(
+        config: ReplicationConfig,
+        transports: Vec<Box<dyn ReplicaTransport>>,
+        initial_sequence: u64,
+    ) -> Self {
+        let senders = transports
+            .into_iter()
+            .map(ReplicaSender::new)
+            .collect();
+        Self {
+            senders,
+            config,
+            next_sequence: initial_sequence.max(1),
         }
     }
 
@@ -308,7 +332,9 @@ impl ReplicationManager {
             let ops = ops_from_seq(from_seq);
             if ops.is_empty() {
                 // Redo log entries were reclaimed; can't catch up this way.
-                // The replica stays in CatchingUp state for a full resync.
+                // Transition to NeedsResync so the caller knows a full
+                // shard copy is required.
+                sender.state = ReplicaState::NeedsResync;
                 continue;
             }
 
@@ -439,7 +465,7 @@ mod tests {
             vec![Box::new(master_t)],
         );
 
-        let ops = vec![ReplicaOp::Spend { tx_key: key(1), offset: 0, spending_data: [0xAB; 36] }];
+        let ops = vec![ReplicaOp::Spend { tx_key: key(1), offset: 0, spending_data: [0xAB; 36], master_generation: 0 }];
         mgr.replicate_batch(&ops).unwrap();
 
         drop(mgr); // Close channels
@@ -459,7 +485,7 @@ mod tests {
         );
 
         let ops: Vec<ReplicaOp> = (0..50u8)
-            .map(|i| ReplicaOp::Spend { tx_key: key(i), offset: i as u32, spending_data: [i; 36] })
+            .map(|i| ReplicaOp::Spend { tx_key: key(i), offset: i as u32, spending_data: [i; 36], master_generation: 0 })
             .collect();
         mgr.replicate_batch(&ops).unwrap();
 
@@ -481,7 +507,7 @@ mod tests {
             vec![Box::new(mt1), Box::new(mt2)],
         );
 
-        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0 }];
+        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
         mgr.replicate_batch(&ops).unwrap();
 
         drop(mgr);
@@ -508,7 +534,7 @@ mod tests {
             vec![Box::new(mt1), Box::new(mt2)],
         );
 
-        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0 }];
+        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
         let result = mgr.replicate_batch(&ops);
         assert!(result.is_err());
     }
@@ -529,7 +555,7 @@ mod tests {
         );
 
         // WriteMajority with RF=3: need 1 replica ACK (master + 1 = majority of 3)
-        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0 }];
+        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
         mgr.replicate_batch(&ops).unwrap();
     }
 
@@ -547,7 +573,7 @@ mod tests {
             vec![Box::new(mt1), Box::new(mt2)],
         );
 
-        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0 }];
+        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
         assert!(mgr.replicate_batch(&ops).is_err());
     }
 
@@ -561,10 +587,10 @@ mod tests {
             vec![Box::new(mt)],
         );
 
-        mgr.replicate_batch(&[ReplicaOp::Freeze { tx_key: key(1), offset: 0 }]).unwrap();
+        mgr.replicate_batch(&[ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }]).unwrap();
         mgr.replicate_batch(&[
-            ReplicaOp::Freeze { tx_key: key(2), offset: 1 },
-            ReplicaOp::Freeze { tx_key: key(3), offset: 2 },
+            ReplicaOp::Freeze { tx_key: key(2), offset: 1, master_generation: 0 },
+            ReplicaOp::Freeze { tx_key: key(3), offset: 2, master_generation: 0 },
         ]).unwrap();
 
         drop(mgr);
@@ -586,8 +612,8 @@ mod tests {
         );
 
         let ops = vec![
-            ReplicaOp::Spend { tx_key: key(1), offset: 0, spending_data: [0x11; 36] },
-            ReplicaOp::SetMined { tx_key: key(2), block_id: 1, block_height: 100, subtree_idx: 0, on_longest_chain: true },
+            ReplicaOp::Spend { tx_key: key(1), offset: 0, spending_data: [0x11; 36], master_generation: 0 },
+            ReplicaOp::SetMined { tx_key: key(2), block_id: 1, block_height: 100, subtree_idx: 0, on_longest_chain: true, master_generation: 0 },
             ReplicaOp::PruneSlot { tx_key: key(3), offset: 5 },
         ];
         mgr.replicate_batch(&ops).unwrap();
@@ -696,8 +722,8 @@ mod tests {
         );
 
         let ops = vec![
-            ReplicaOp::Freeze { tx_key: key(1), offset: 3 },
-            ReplicaOp::Unfreeze { tx_key: key(1), offset: 3 },
+            ReplicaOp::Freeze { tx_key: key(1), offset: 3, master_generation: 0 },
+            ReplicaOp::Unfreeze { tx_key: key(1), offset: 3, master_generation: 0 },
         ];
         mgr.replicate_batch(&ops).unwrap();
 
@@ -722,6 +748,7 @@ mod tests {
             new_hash: [0xBB; 32],
             block_height: 1000,
             spendable_after: 100,
+            master_generation: 0,
         }];
         mgr.replicate_batch(&ops).unwrap();
 
@@ -741,9 +768,9 @@ mod tests {
         );
 
         let ops = vec![
-            ReplicaOp::SetConflicting { tx_key: key(1), value: true, current_block_height: 1000, retention: 288 },
-            ReplicaOp::SetLocked { tx_key: key(2), value: true },
-            ReplicaOp::PreserveUntil { tx_key: key(3), block_height: 5000 },
+            ReplicaOp::SetConflicting { tx_key: key(1), value: true, current_block_height: 1000, retention: 288, master_generation: 0 },
+            ReplicaOp::SetLocked { tx_key: key(2), value: true, master_generation: 0 },
+            ReplicaOp::PreserveUntil { tx_key: key(3), block_height: 5000, master_generation: 0 },
         ];
         mgr.replicate_batch(&ops).unwrap();
 
@@ -777,7 +804,7 @@ mod tests {
         );
 
         let ops: Vec<ReplicaOp> = (0..10u8)
-            .map(|i| ReplicaOp::Freeze { tx_key: key(i), offset: i as u32 })
+            .map(|i| ReplicaOp::Freeze { tx_key: key(i), offset: i as u32, master_generation: 0 })
             .collect();
         mgr.replicate_batch(&ops).unwrap();
 
@@ -799,7 +826,7 @@ mod tests {
         );
 
         let ops = vec![ReplicaOp::Spend {
-            tx_key: key(1), offset: 0, spending_data: [0xAB; 36],
+            tx_key: key(1), offset: 0, spending_data: [0xAB; 36], master_generation: 0,
         }];
         // Send same ops twice
         mgr.replicate_batch(&ops).unwrap();
@@ -828,7 +855,7 @@ mod tests {
         );
 
         // RF=2: need 1 replica ACK (majority of 2 = 1 + master)
-        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0 }];
+        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
         mgr.replicate_batch(&ops).unwrap();
     }
 
@@ -844,7 +871,7 @@ mod tests {
 
         // Send 5 ops normally
         for i in 0..5 {
-            let ops = vec![ReplicaOp::Freeze { tx_key: key(i), offset: 0 }];
+            let ops = vec![ReplicaOp::Freeze { tx_key: key(i), offset: 0, master_generation: 0 }];
             mgr.replicate_batch(&ops).unwrap();
         }
         assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
@@ -864,10 +891,34 @@ mod tests {
         // Run catch-up with mock ops
         mgr.run_catchup(|from_seq| {
             (from_seq..11)
-                .map(|i| ReplicaOp::Freeze { tx_key: key(i as u8), offset: 0 })
+                .map(|i| ReplicaOp::Freeze { tx_key: key(i as u8), offset: 0, master_generation: 0 })
                 .collect()
         }).unwrap();
 
         assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
+    }
+
+    #[test]
+    fn catchup_transitions_to_needs_resync_when_redo_reclaimed() {
+        let (master_tx, _replica_rx) = InMemoryTransport::pair();
+        let (_tx2, replica_side) = InMemoryTransport::pair();
+
+        let config = ReplicationConfig::default();
+        let mut mgr = ReplicationManager::new(config, vec![Box::new(master_tx)]);
+
+        // Replicate some ops to advance the sequence
+        let ops: Vec<ReplicaOp> = (0..5)
+            .map(|i| ReplicaOp::Freeze { tx_key: key(i), offset: 0, master_generation: 0 })
+            .collect();
+
+        // Manually set up the scenario: replica is catching up
+        mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 1 };
+        mgr.next_sequence = 10;
+
+        // Run catch-up with an empty result (simulating reclaimed redo)
+        mgr.run_catchup(|_from_seq| Vec::new()).unwrap();
+
+        // Should transition to NeedsResync, not stay in CatchingUp
+        assert_eq!(*mgr.sender(0).state(), ReplicaState::NeedsResync);
     }
 }

@@ -75,6 +75,53 @@ pub struct ServerConfig {
     /// Path for persisted cluster state (peak cluster size for quorum safety).
     /// If not set, derived from the first device path by appending `.cluster`.
     pub cluster_state_path: Option<PathBuf>,
+
+    /// Shared secret for cluster authentication (HMAC-SHA256).
+    ///
+    /// When set, all SWIM messages and inter-node TCP connections are
+    /// authenticated. Peers that cannot produce a valid HMAC are rejected.
+    /// All nodes in the cluster must use the same secret.
+    pub cluster_secret: Option<String>,
+
+    /// Maximum concurrent migration threads per topology change.
+    /// Prevents resource exhaustion during rapid churn. Default: 16.
+    pub max_migration_threads: usize,
+
+    // -- Replication durability settings --
+
+    /// Replication acknowledgment policy.
+    ///
+    /// - `"auto"` (default): WriteAll for RF=2, WriteMajority for RF>=3,
+    ///   best_effort for RF=1.
+    /// - `"write_all"`: Wait for ALL replicas to ACK before client success.
+    /// - `"write_majority"`: Wait for floor(RF/2)+1 copies (including master).
+    /// - `"best_effort"`: Log replication failures but don't fail the client.
+    pub ack_policy: String,
+
+    /// Timeout in milliseconds for each replication batch ACK. Default: 3000.
+    pub replication_timeout_ms: u64,
+
+    /// Behavior when the replication ACK policy cannot be satisfied.
+    ///
+    /// - `"reject"` (default): Fail the mutation with ERR_REPLICATION_FAILED.
+    /// - `"best_effort"`: Log the failure but succeed the client request.
+    pub replication_degraded_mode: String,
+
+    // -- Migration performance settings --
+
+    /// Number of parallel TCP connections per migration target.
+    /// More connections = higher throughput for large migrations.
+    /// Default: 4.
+    pub migration_pool_size: usize,
+
+    /// Number of records per baseline streaming batch during migration.
+    /// Larger batches reduce round-trip overhead but increase memory per batch.
+    /// Default: 100.
+    pub migration_batch_size: usize,
+
+    /// Interval in seconds between replica lag checks. Default: 30.
+    /// Set to 0 to disable lag monitoring.
+    pub replica_lag_check_interval_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -101,6 +148,14 @@ impl Default for ServerConfig {
             swim_suspicion_timeout_ms: 5000,
             blobstore_path: "/blobstore".to_string(),
             cluster_state_path: None,
+            cluster_secret: None,
+            max_migration_threads: 16,
+            ack_policy: "auto".to_string(),
+            replication_timeout_ms: 3000,
+            replication_degraded_mode: "reject".to_string(),
+            migration_pool_size: 4,
+            migration_batch_size: 100,
+            replica_lag_check_interval_secs: 30,
         }
     }
 }
@@ -135,6 +190,31 @@ impl ServerConfig {
                 PathBuf::from(p)
             }
         }
+    }
+
+    /// Resolve the replication ACK policy based on config and replication factor.
+    ///
+    /// Returns `None` when replication is best-effort (RF=1 or explicit "best_effort").
+    /// Returns the appropriate `AckPolicy` otherwise.
+    pub fn resolved_ack_policy(&self) -> Option<crate::replication::manager::AckPolicy> {
+        use crate::replication::manager::AckPolicy;
+        match self.ack_policy.as_str() {
+            "write_all" => Some(AckPolicy::WriteAll),
+            "write_majority" => Some(AckPolicy::WriteMajority),
+            "best_effort" => None,
+            _ => {
+                match self.replication_factor {
+                    0 | 1 => None,
+                    2 => Some(AckPolicy::WriteAll),
+                    _ => Some(AckPolicy::WriteMajority),
+                }
+            }
+        }
+    }
+
+    /// Whether replication failures should be tolerated (best_effort mode).
+    pub fn is_replication_best_effort(&self) -> bool {
+        self.replication_degraded_mode == "best_effort"
     }
 }
 

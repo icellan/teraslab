@@ -62,14 +62,19 @@ fn create_node(
         replication_factor: 2,
         probe_interval: Duration::from_millis(100),
         suspicion_timeout: Duration::from_secs(2),
+        cluster_secret: None,
+        max_migration_threads: 16,
+        topology_propose_timeout: Duration::from_millis(300),
+        migration_pool_size: 4,
+        migration_batch_size: 100,
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);
-    let running = Arc::new(coordinator.start(engine.clone(), None));
+    let running = Arc::new(coordinator.start(engine.clone(), None, None, None, true));
 
     let config = ServerConfig {
         listen_addr: format!("127.0.0.1:{tcp_port}"),
-        max_connections: 10,
+        max_connections: 64,
         max_batch_size: 4096,
         node_id,
         ..Default::default()
@@ -314,19 +319,19 @@ fn three_node_cluster_all_shards_assigned() {
 
 #[test]
 fn add_fourth_node_rebalance_triggers() {
-    // Start 3-node cluster
-    let node1 = create_node(111, 13410, 13411, &[]);
-    let node2 = create_node(112, 13412, 13413, &[13411]);
-    let node3 = create_node(113, 13414, 13415, &[13411]);
+    // Start 3-node cluster (using ports well-separated from other tests)
+    let node1 = create_node(111, 13710, 13711, &[]);
+    let node2 = create_node(112, 13712, 13713, &[13711]);
+    let node3 = create_node(113, 13714, 13715, &[13711]);
 
-    std::thread::sleep(Duration::from_secs(3));
+    std::thread::sleep(Duration::from_secs(4));
     let v_before = node1.cluster.shard_table_version();
 
     // Add 4th node
-    let node4 = create_node(114, 13416, 13417, &[13411]);
+    let node4 = create_node(114, 13716, 13717, &[13711]);
 
-    // Wait for rebalance
-    std::thread::sleep(Duration::from_secs(3));
+    // Wait for SWIM discovery + rebalance
+    std::thread::sleep(Duration::from_secs(5));
 
     let v_after = node1.cluster.shard_table_version();
 

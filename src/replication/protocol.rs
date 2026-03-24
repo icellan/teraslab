@@ -33,16 +33,25 @@ const OP_DELETE: u8 = 12;
 const OP_PRUNE_SLOT: u8 = 13;
 
 /// A single replication operation sent from master to replica.
+/// A mutation operation to be replicated from master to replica.
+///
+/// Every mutation variant carries `master_generation` — the record's
+/// generation counter on the master AFTER the mutation was applied.
+/// The replica uses this to:
+/// - Set the generation to the master's value instead of auto-incrementing
+/// - Detect stale/out-of-order ops (master_generation <= local generation)
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReplicaOp {
     Spend {
         tx_key: TxKey,
         offset: u32,
         spending_data: [u8; 36],
+        master_generation: u32,
     },
     Unspend {
         tx_key: TxKey,
         offset: u32,
+        master_generation: u32,
     },
     SetMined {
         tx_key: TxKey,
@@ -50,18 +59,22 @@ pub enum ReplicaOp {
         block_height: u32,
         subtree_idx: u32,
         on_longest_chain: bool,
+        master_generation: u32,
     },
     UnsetMined {
         tx_key: TxKey,
         block_id: u32,
+        master_generation: u32,
     },
     Freeze {
         tx_key: TxKey,
         offset: u32,
+        master_generation: u32,
     },
     Unfreeze {
         tx_key: TxKey,
         offset: u32,
+        master_generation: u32,
     },
     Reassign {
         tx_key: TxKey,
@@ -69,20 +82,24 @@ pub enum ReplicaOp {
         new_hash: [u8; 32],
         block_height: u32,
         spendable_after: u32,
+        master_generation: u32,
     },
     SetConflicting {
         tx_key: TxKey,
         value: bool,
         current_block_height: u32,
         retention: u32,
+        master_generation: u32,
     },
     SetLocked {
         tx_key: TxKey,
         value: bool,
+        master_generation: u32,
     },
     PreserveUntil {
         tx_key: TxKey,
         block_height: u32,
+        master_generation: u32,
     },
     Create {
         tx_key: TxKey,
@@ -101,68 +118,122 @@ pub enum ReplicaOp {
 }
 
 impl ReplicaOp {
+    /// Extract the transaction key from any op variant.
+    pub fn tx_key(&self) -> TxKey {
+        match self {
+            Self::Spend { tx_key, .. }
+            | Self::Unspend { tx_key, .. }
+            | Self::SetMined { tx_key, .. }
+            | Self::UnsetMined { tx_key, .. }
+            | Self::Freeze { tx_key, .. }
+            | Self::Unfreeze { tx_key, .. }
+            | Self::Reassign { tx_key, .. }
+            | Self::SetConflicting { tx_key, .. }
+            | Self::SetLocked { tx_key, .. }
+            | Self::PreserveUntil { tx_key, .. }
+            | Self::Create { tx_key, .. }
+            | Self::Delete { tx_key, .. }
+            | Self::PruneSlot { tx_key, .. } => *tx_key,
+        }
+    }
+
+    /// Extract the master generation from a mutation op, if present.
+    ///
+    /// Create, Delete, and PruneSlot don't carry generation because
+    /// Create sets it via metadata_bytes and Delete/PruneSlot remove data.
+    pub fn master_generation(&self) -> Option<u32> {
+        match self {
+            Self::Spend { master_generation, .. }
+            | Self::Unspend { master_generation, .. }
+            | Self::SetMined { master_generation, .. }
+            | Self::UnsetMined { master_generation, .. }
+            | Self::Freeze { master_generation, .. }
+            | Self::Unfreeze { master_generation, .. }
+            | Self::Reassign { master_generation, .. }
+            | Self::SetConflicting { master_generation, .. }
+            | Self::SetLocked { master_generation, .. }
+            | Self::PreserveUntil { master_generation, .. } => Some(*master_generation),
+            Self::Create { .. } | Self::Delete { .. } | Self::PruneSlot { .. } => None,
+        }
+    }
+}
+
+impl ReplicaOp {
     /// Serialize this op to bytes. Returns the serialized form.
+    ///
+    /// Mutation ops append `master_generation` (4 bytes LE) after all
+    /// other fields. Create/Delete/PruneSlot do not carry generation.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(80);
         match self {
-            ReplicaOp::Spend { tx_key, offset, spending_data } => {
+            ReplicaOp::Spend { tx_key, offset, spending_data, master_generation } => {
                 buf.push(OP_SPEND);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
                 buf.extend_from_slice(spending_data);
+                buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::Unspend { tx_key, offset } => {
+            ReplicaOp::Unspend { tx_key, offset, master_generation } => {
                 buf.push(OP_UNSPEND);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
+                buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::SetMined { tx_key, block_id, block_height, subtree_idx, on_longest_chain } => {
+            ReplicaOp::SetMined { tx_key, block_id, block_height, subtree_idx, on_longest_chain, master_generation } => {
                 buf.push(OP_SET_MINED);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&block_id.to_le_bytes());
                 buf.extend_from_slice(&block_height.to_le_bytes());
                 buf.extend_from_slice(&subtree_idx.to_le_bytes());
                 buf.push(u8::from(*on_longest_chain));
+                buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::UnsetMined { tx_key, block_id } => {
+            ReplicaOp::UnsetMined { tx_key, block_id, master_generation } => {
                 buf.push(OP_UNSET_MINED);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&block_id.to_le_bytes());
+                buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::Freeze { tx_key, offset } => {
+            ReplicaOp::Freeze { tx_key, offset, master_generation } => {
                 buf.push(OP_FREEZE);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
+                buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::Unfreeze { tx_key, offset } => {
+            ReplicaOp::Unfreeze { tx_key, offset, master_generation } => {
                 buf.push(OP_UNFREEZE);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
+                buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::Reassign { tx_key, offset, new_hash, block_height, spendable_after } => {
+            ReplicaOp::Reassign { tx_key, offset, new_hash, block_height, spendable_after, master_generation } => {
                 buf.push(OP_REASSIGN);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
                 buf.extend_from_slice(new_hash);
                 buf.extend_from_slice(&block_height.to_le_bytes());
                 buf.extend_from_slice(&spendable_after.to_le_bytes());
+                buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::SetConflicting { tx_key, value, current_block_height, retention } => {
+            ReplicaOp::SetConflicting { tx_key, value, current_block_height, retention, master_generation } => {
                 buf.push(OP_SET_CONFLICTING);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.push(u8::from(*value));
                 buf.extend_from_slice(&current_block_height.to_le_bytes());
                 buf.extend_from_slice(&retention.to_le_bytes());
+                buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::SetLocked { tx_key, value } => {
+            ReplicaOp::SetLocked { tx_key, value, master_generation } => {
                 buf.push(OP_SET_LOCKED);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.push(u8::from(*value));
+                buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::PreserveUntil { tx_key, block_height } => {
+            ReplicaOp::PreserveUntil { tx_key, block_height, master_generation } => {
                 buf.push(OP_PRESERVE_UNTIL);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&block_height.to_le_bytes());
+                buf.extend_from_slice(&master_generation.to_le_bytes());
             }
             ReplicaOp::Create { tx_key, metadata_bytes, utxo_hashes, cold_data, is_external } => {
                 buf.push(OP_CREATE);
@@ -205,62 +276,84 @@ impl ReplicaOp {
 
         match op_type {
             OP_SPEND => {
-                need(rest, 72)?; // 32 + 4 + 36
+                need(rest, 76)?; // 32 + 4 + 36 + 4(gen)
                 let key = read_key(rest);
                 let offset = u32::from_le_bytes(rest[32..36].try_into().unwrap());
                 let mut sd = [0u8; 36];
                 sd.copy_from_slice(&rest[36..72]);
-                Ok((ReplicaOp::Spend { tx_key: key, offset, spending_data: sd }, 73))
+                let master_generation = r_u32(rest, 72);
+                Ok((ReplicaOp::Spend { tx_key: key, offset, spending_data: sd, master_generation }, 77))
             }
             OP_UNSPEND => {
-                need(rest, 36)?;
-                Ok((ReplicaOp::Unspend { tx_key: read_key(rest), offset: r_u32(rest, 32) }, 37))
+                need(rest, 40)?; // 32 + 4 + 4(gen)
+                Ok((ReplicaOp::Unspend {
+                    tx_key: read_key(rest), offset: r_u32(rest, 32),
+                    master_generation: r_u32(rest, 36),
+                }, 41))
             }
             OP_SET_MINED => {
-                need(rest, 45)?;
+                need(rest, 49)?; // 32 + 4 + 4 + 4 + 1 + 4(gen)
                 Ok((ReplicaOp::SetMined {
                     tx_key: read_key(rest),
                     block_id: r_u32(rest, 32),
                     block_height: r_u32(rest, 36),
                     subtree_idx: r_u32(rest, 40),
                     on_longest_chain: rest[44] != 0,
-                }, 46))
+                    master_generation: r_u32(rest, 45),
+                }, 50))
             }
             OP_UNSET_MINED => {
-                need(rest, 36)?;
-                Ok((ReplicaOp::UnsetMined { tx_key: read_key(rest), block_id: r_u32(rest, 32) }, 37))
+                need(rest, 40)?; // 32 + 4 + 4(gen)
+                Ok((ReplicaOp::UnsetMined {
+                    tx_key: read_key(rest), block_id: r_u32(rest, 32),
+                    master_generation: r_u32(rest, 36),
+                }, 41))
             }
             OP_FREEZE => {
-                need(rest, 36)?;
-                Ok((ReplicaOp::Freeze { tx_key: read_key(rest), offset: r_u32(rest, 32) }, 37))
+                need(rest, 40)?; // 32 + 4 + 4(gen)
+                Ok((ReplicaOp::Freeze {
+                    tx_key: read_key(rest), offset: r_u32(rest, 32),
+                    master_generation: r_u32(rest, 36),
+                }, 41))
             }
             OP_UNFREEZE => {
-                need(rest, 36)?;
-                Ok((ReplicaOp::Unfreeze { tx_key: read_key(rest), offset: r_u32(rest, 32) }, 37))
+                need(rest, 40)?; // 32 + 4 + 4(gen)
+                Ok((ReplicaOp::Unfreeze {
+                    tx_key: read_key(rest), offset: r_u32(rest, 32),
+                    master_generation: r_u32(rest, 36),
+                }, 41))
             }
             OP_REASSIGN => {
-                need(rest, 76)?;
+                need(rest, 80)?; // 32 + 4 + 32 + 4 + 4 + 4(gen)
                 let mut nh = [0u8; 32];
                 nh.copy_from_slice(&rest[36..68]);
                 Ok((ReplicaOp::Reassign {
                     tx_key: read_key(rest), offset: r_u32(rest, 32),
                     new_hash: nh, block_height: r_u32(rest, 68), spendable_after: r_u32(rest, 72),
-                }, 77))
+                    master_generation: r_u32(rest, 76),
+                }, 81))
             }
             OP_SET_CONFLICTING => {
-                need(rest, 41)?;
+                need(rest, 45)?; // 32 + 1 + 4 + 4 + 4(gen)
                 Ok((ReplicaOp::SetConflicting {
                     tx_key: read_key(rest), value: rest[32] != 0,
                     current_block_height: r_u32(rest, 33), retention: r_u32(rest, 37),
-                }, 42))
+                    master_generation: r_u32(rest, 41),
+                }, 46))
             }
             OP_SET_LOCKED => {
-                need(rest, 33)?;
-                Ok((ReplicaOp::SetLocked { tx_key: read_key(rest), value: rest[32] != 0 }, 34))
+                need(rest, 37)?; // 32 + 1 + 4(gen)
+                Ok((ReplicaOp::SetLocked {
+                    tx_key: read_key(rest), value: rest[32] != 0,
+                    master_generation: r_u32(rest, 33),
+                }, 38))
             }
             OP_PRESERVE_UNTIL => {
-                need(rest, 36)?;
-                Ok((ReplicaOp::PreserveUntil { tx_key: read_key(rest), block_height: r_u32(rest, 32) }, 37))
+                need(rest, 40)?; // 32 + 4 + 4(gen)
+                Ok((ReplicaOp::PreserveUntil {
+                    tx_key: read_key(rest), block_height: r_u32(rest, 32),
+                    master_generation: r_u32(rest, 36),
+                }, 41))
             }
             OP_CREATE => {
                 need(rest, 36)?; // key + meta_len
@@ -477,7 +570,7 @@ mod tests {
 
     #[test]
     fn spend_round_trip() {
-        let op = ReplicaOp::Spend { tx_key: key(1), offset: 5, spending_data: [0xAB; 36] };
+        let op = ReplicaOp::Spend { tx_key: key(1), offset: 5, spending_data: [0xAB; 36], master_generation: 0 };
         let bytes = op.serialize();
         assert!(bytes.len() < 80, "spend serialized to {} bytes", bytes.len());
         let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
@@ -497,16 +590,16 @@ mod tests {
     #[test]
     fn all_variants_round_trip() {
         let ops = vec![
-            ReplicaOp::Spend { tx_key: key(1), offset: 0, spending_data: [0x11; 36] },
-            ReplicaOp::Unspend { tx_key: key(2), offset: 1 },
-            ReplicaOp::SetMined { tx_key: key(3), block_id: 100, block_height: 800000, subtree_idx: 7, on_longest_chain: true },
-            ReplicaOp::UnsetMined { tx_key: key(4), block_id: 200 },
-            ReplicaOp::Freeze { tx_key: key(5), offset: 3 },
-            ReplicaOp::Unfreeze { tx_key: key(6), offset: 4 },
-            ReplicaOp::Reassign { tx_key: key(7), offset: 5, new_hash: [0xCC; 32], block_height: 1000, spendable_after: 100 },
-            ReplicaOp::SetConflicting { tx_key: key(8), value: true, current_block_height: 500, retention: 288 },
-            ReplicaOp::SetLocked { tx_key: key(9), value: false },
-            ReplicaOp::PreserveUntil { tx_key: key(10), block_height: 5000 },
+            ReplicaOp::Spend { tx_key: key(1), offset: 0, spending_data: [0x11; 36], master_generation: 0 },
+            ReplicaOp::Unspend { tx_key: key(2), offset: 1, master_generation: 0 },
+            ReplicaOp::SetMined { tx_key: key(3), block_id: 100, block_height: 800000, subtree_idx: 7, on_longest_chain: true, master_generation: 0 },
+            ReplicaOp::UnsetMined { tx_key: key(4), block_id: 200, master_generation: 0 },
+            ReplicaOp::Freeze { tx_key: key(5), offset: 3, master_generation: 0 },
+            ReplicaOp::Unfreeze { tx_key: key(6), offset: 4, master_generation: 0 },
+            ReplicaOp::Reassign { tx_key: key(7), offset: 5, new_hash: [0xCC; 32], block_height: 1000, spendable_after: 100, master_generation: 0 },
+            ReplicaOp::SetConflicting { tx_key: key(8), value: true, current_block_height: 500, retention: 288, master_generation: 0 },
+            ReplicaOp::SetLocked { tx_key: key(9), value: false, master_generation: 0 },
+            ReplicaOp::PreserveUntil { tx_key: key(10), block_height: 5000, master_generation: 0 },
             ReplicaOp::Create {
                 tx_key: key(11),
                 metadata_bytes: vec![0x42; 100],
@@ -546,8 +639,8 @@ mod tests {
         let batch = ReplicaBatch {
             first_sequence: 100,
             ops: vec![
-                ReplicaOp::Spend { tx_key: key(1), offset: 0, spending_data: [0x11; 36] },
-                ReplicaOp::Freeze { tx_key: key(2), offset: 1 },
+                ReplicaOp::Spend { tx_key: key(1), offset: 0, spending_data: [0x11; 36], master_generation: 0 },
+                ReplicaOp::Freeze { tx_key: key(2), offset: 1, master_generation: 0 },
                 ReplicaOp::PruneSlot { tx_key: key(3), offset: 2 },
             ],
         };
@@ -560,7 +653,7 @@ mod tests {
     #[test]
     fn batch_100_ops_round_trip() {
         let ops: Vec<ReplicaOp> = (0..100u8)
-            .map(|i| ReplicaOp::Spend { tx_key: key(i), offset: i as u32, spending_data: [i; 36] })
+            .map(|i| ReplicaOp::Spend { tx_key: key(i), offset: i as u32, spending_data: [i; 36], master_generation: 0 })
             .collect();
         let batch = ReplicaBatch { first_sequence: 1000, ops };
         let bytes = batch.serialize();

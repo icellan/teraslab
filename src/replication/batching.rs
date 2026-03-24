@@ -64,8 +64,8 @@ mod tests {
         let mut acc = ReplicaBatchAccumulator::new(100);
         assert!(acc.is_empty());
 
-        acc.push(ReplicaOp::Freeze { tx_key: key(1), offset: 0 });
-        acc.push(ReplicaOp::Freeze { tx_key: key(2), offset: 1 });
+        acc.push(ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 });
+        acc.push(ReplicaOp::Freeze { tx_key: key(2), offset: 1, master_generation: 0 });
         assert_eq!(acc.len(), 2);
         assert!(!acc.is_empty());
 
@@ -78,11 +78,11 @@ mod tests {
     #[test]
     fn should_flush_at_threshold() {
         let mut acc = ReplicaBatchAccumulator::new(3);
-        acc.push(ReplicaOp::Freeze { tx_key: key(1), offset: 0 });
-        acc.push(ReplicaOp::Freeze { tx_key: key(2), offset: 1 });
+        acc.push(ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 });
+        acc.push(ReplicaOp::Freeze { tx_key: key(2), offset: 1, master_generation: 0 });
         assert!(!acc.should_flush());
 
-        acc.push(ReplicaOp::Freeze { tx_key: key(3), offset: 2 });
+        acc.push(ReplicaOp::Freeze { tx_key: key(3), offset: 2, master_generation: 0 });
         assert!(acc.should_flush());
     }
 

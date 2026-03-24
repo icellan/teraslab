@@ -24,4 +24,6 @@ pub struct MarkOnLongestChainRequest {
 pub struct MarkOnLongestChainResponse {
     /// Signal from deleteAtHeight evaluation.
     pub signal: Signal,
+    /// Record generation after mutation.
+    pub generation: u32,
 }

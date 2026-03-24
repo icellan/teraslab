@@ -28,11 +28,22 @@ use std::sync::Arc;
 ///
 /// Multiple master connections can be handled concurrently; each gets
 /// its own handler thread.
+///
+/// When an `ack_state_path` is configured, the highest applied sequence
+/// is persisted to disk periodically so the master can resume streaming
+/// from the correct position after a replica restart.
 pub struct ReplicationReceiver {
     engine: Arc<Engine>,
     last_applied_sequence: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
+    /// Path for persisting the last-applied sequence. None in test setups.
+    ack_state_path: Option<std::path::PathBuf>,
+    /// Counter for amortized persistence (flush every N batches).
+    batches_since_flush: Arc<std::sync::atomic::AtomicU32>,
 }
+
+/// Number of batches between forced persistence of last_applied_sequence.
+const PERSIST_EVERY_N_BATCHES: u32 = 100;
 
 impl ReplicationReceiver {
     /// Create a new receiver backed by the given engine.
@@ -41,6 +52,42 @@ impl ReplicationReceiver {
             engine,
             last_applied_sequence: Arc::new(AtomicU64::new(0)),
             running: Arc::new(AtomicBool::new(true)),
+            ack_state_path: None,
+            batches_since_flush: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }
+    }
+
+    /// Create a receiver with persistent ACK state.
+    ///
+    /// Loads the last-applied sequence from disk if the file exists,
+    /// allowing the master to resume streaming from where the replica
+    /// left off after a restart.
+    pub fn with_ack_state(engine: Arc<Engine>, path: std::path::PathBuf) -> Self {
+        let initial_seq = Self::load_sequence(&path).unwrap_or(0);
+        Self {
+            engine,
+            last_applied_sequence: Arc::new(AtomicU64::new(initial_seq)),
+            running: Arc::new(AtomicBool::new(true)),
+            ack_state_path: Some(path),
+            batches_since_flush: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }
+    }
+
+    /// Load the persisted sequence from disk. Format: `[sequence:8 LE]`.
+    fn load_sequence(path: &std::path::Path) -> Option<u64> {
+        let data = std::fs::read(path).ok()?;
+        if data.len() >= 8 {
+            Some(u64::from_le_bytes(data[0..8].try_into().unwrap()))
+        } else {
+            None
+        }
+    }
+
+    /// Persist the current last-applied sequence to disk.
+    fn persist_sequence(path: &std::path::Path, seq: u64) {
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, seq.to_le_bytes()).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
         }
     }
 
@@ -59,6 +106,8 @@ impl ReplicationReceiver {
         let engine = self.engine.clone();
         let running = self.running.clone();
         let last_applied = self.last_applied_sequence.clone();
+        let ack_state_path = self.ack_state_path.clone();
+        let batches_counter = self.batches_since_flush.clone();
 
         std::thread::spawn(move || {
             while running.load(Ordering::Relaxed) {
@@ -67,8 +116,10 @@ impl ReplicationReceiver {
                         let eng = engine.clone();
                         let run = running.clone();
                         let la = last_applied.clone();
+                        let asp = ack_state_path.clone();
+                        let bc = batches_counter.clone();
                         std::thread::spawn(move || {
-                            handle_connection(&eng, stream, &run, &la);
+                            handle_connection(&eng, stream, &run, &la, asp.as_deref(), &bc);
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -91,8 +142,17 @@ impl ReplicationReceiver {
     }
 
     /// Signal the receiver to stop accepting new connections.
+    ///
+    /// Persists the final last-applied sequence to disk before returning.
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
+        // Final flush to ensure we don't lose the latest sequence.
+        if let Some(ref path) = self.ack_state_path {
+            let seq = self.last_applied_sequence.load(Ordering::Relaxed);
+            if seq > 0 {
+                Self::persist_sequence(path, seq);
+            }
+        }
     }
 }
 
@@ -106,6 +166,8 @@ fn handle_connection(
     mut stream: TcpStream,
     running: &AtomicBool,
     last_applied: &AtomicU64,
+    ack_state_path: Option<&std::path::Path>,
+    batches_counter: &std::sync::atomic::AtomicU32,
 ) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
@@ -149,7 +211,19 @@ fn handle_connection(
         };
 
         let response = if request.op_code == OP_REPLICA_BATCH {
-            handle_replica_batch(&request, engine, last_applied)
+            let resp = handle_replica_batch(&request, engine, last_applied);
+            // Periodically persist the last-applied sequence to disk.
+            if let Some(path) = ack_state_path {
+                let count = batches_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                if count >= PERSIST_EVERY_N_BATCHES {
+                    batches_counter.store(0, Ordering::Relaxed);
+                    let seq = last_applied.load(Ordering::Relaxed);
+                    if seq > 0 {
+                        ReplicationReceiver::persist_sequence(path, seq);
+                    }
+                }
+            }
+            resp
         } else {
             // Unknown opcode for replication receiver
             ResponseFrame {
@@ -237,6 +311,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             tx_key,
             offset,
             spending_data,
+            ..
         } => {
             // Read the slot to get the UTXO hash
             let hash = match engine.read_slot(tx_key, *offset) {
@@ -267,7 +342,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 Err(e) => Err(format!("spend: {e}")),
             }
         }
-        ReplicaOp::Unspend { tx_key, offset } => {
+        ReplicaOp::Unspend { tx_key, offset, .. } => {
             let hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
                 Err(_) => return Ok(()),
@@ -292,6 +367,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             block_height,
             subtree_idx,
             on_longest_chain,
+            ..
         } => {
             let req = SetMinedRequest {
                 tx_key: *tx_key,
@@ -309,7 +385,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 Err(e) => Err(format!("set_mined: {e}")),
             }
         }
-        ReplicaOp::UnsetMined { tx_key, block_id } => {
+        ReplicaOp::UnsetMined { tx_key, block_id, .. } => {
             let req = SetMinedRequest {
                 tx_key: *tx_key,
                 block_id: *block_id,
@@ -326,7 +402,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 Err(e) => Err(format!("unset_mined: {e}")),
             }
         }
-        ReplicaOp::Freeze { tx_key, offset } => {
+        ReplicaOp::Freeze { tx_key, offset, .. } => {
             let hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
                 Err(_) => return Ok(()),
@@ -337,14 +413,14 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 utxo_hash: hash,
             };
             match engine.freeze(&req) {
-                Ok(()) => Ok(()),
+                Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::AlreadyFrozen { .. }) => Ok(()),
                 Err(crate::ops::error::SpendError::AlreadySpent { .. }) => Ok(()),
                 Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
                 Err(e) => Err(format!("freeze: {e}")),
             }
         }
-        ReplicaOp::Unfreeze { tx_key, offset } => {
+        ReplicaOp::Unfreeze { tx_key, offset, .. } => {
             let hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
                 Err(_) => return Ok(()),
@@ -355,7 +431,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 utxo_hash: hash,
             };
             match engine.unfreeze(&req) {
-                Ok(()) => Ok(()),
+                Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::NotFrozen { .. }) => Ok(()),
                 Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
                 Err(e) => Err(format!("unfreeze: {e}")),
@@ -367,6 +443,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             new_hash,
             block_height,
             spendable_after,
+            ..
         } => {
             let old_hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
@@ -381,7 +458,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 spendable_after: *spendable_after,
             };
             match engine.reassign(&req) {
-                Ok(()) => Ok(()),
+                Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::NotFrozen { .. }) => Ok(()),
                 Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
                 Err(e) => Err(format!("reassign: {e}")),
@@ -392,6 +469,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             value,
             current_block_height,
             retention,
+            ..
         } => {
             let req = SetConflictingRequest {
                 tx_key: *tx_key,
@@ -405,13 +483,13 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 Err(e) => Err(format!("set_conflicting: {e}")),
             }
         }
-        ReplicaOp::SetLocked { tx_key, value } => {
+        ReplicaOp::SetLocked { tx_key, value, .. } => {
             let req = SetLockedRequest {
                 tx_key: *tx_key,
                 value: *value,
             };
             match engine.set_locked(&req) {
-                Ok(()) => Ok(()),
+                Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
                 Err(e) => Err(format!("set_locked: {e}")),
             }
@@ -419,6 +497,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
         ReplicaOp::PreserveUntil {
             tx_key,
             block_height,
+            ..
         } => {
             let req = PreserveUntilRequest {
                 tx_key: *tx_key,
@@ -486,18 +565,42 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 parent_txids: vec![],
             };
             match engine.create(&create_req) {
-                Ok(_) => {
+                Ok(_) | Err(CreateError::DuplicateTxId) => {
+                    // Apply extended lifecycle metadata if present.
+                    // Layout after the core 46 bytes: generation(4) +
+                    // updated_at(8) + unmined_since(4) + delete_at_height(4) +
+                    // preserve_until(4) = 24 bytes (total 70).
+                    if metadata_bytes.len() >= 70
+                        && let Ok(mut meta) = engine.read_metadata(tx_key)
+                    {
+                        let m = metadata_bytes.as_slice();
+                        meta.generation = u32::from_le_bytes(m[46..50].try_into().unwrap());
+                        meta.updated_at = u64::from_le_bytes(m[50..58].try_into().unwrap());
+                        meta.unmined_since = u32::from_le_bytes(m[58..62].try_into().unwrap());
+                        meta.delete_at_height = u32::from_le_bytes(m[62..66].try_into().unwrap());
+                        meta.preserve_until = u32::from_le_bytes(m[66..70].try_into().unwrap());
+                        if let Some(entry) = engine.lookup(tx_key) {
+                            let _ = crate::io::write_metadata(
+                                engine.device(),
+                                entry.record_offset,
+                                &meta,
+                            );
+                        }
+                    }
+
                     // Store cold data in the blobstore if provided.
+                    // Blob persistence is part of the durability contract:
+                    // failing to store cold data must fail the ACK so the
+                    // master knows this replica is not a complete copy.
                     if let Some(data) = cold_data
                         && !data.is_empty()
                         && let Some(bs) = engine.blob_store()
                         && let Err(e) = bs.put(&tx_key.txid, data)
                     {
-                        eprintln!("replication: failed to store cold data for {:?}: {e}", tx_key);
+                        return Err(format!("cold data write failed for {:?}: {e}", tx_key));
                     }
                     Ok(())
                 }
-                Err(CreateError::DuplicateTxId) => Ok(()), // idempotent
                 Err(e) => Err(format!("create: {e}")),
             }
         }
@@ -530,7 +633,27 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 .map_err(|e| format!("prune_slot: {e}"))?;
             Ok(())
         }
+    }?;
+
+    // After applying the mutation, sync the record's generation counter
+    // to the master's value. The engine auto-increments generation on
+    // every mutation, but the replica must use the master's generation
+    // so both sides agree. We only update if the master's generation
+    // is newer (higher), which also guards against stale replays.
+    if let Some(master_gen) = op.master_generation() {
+        let tx_key = op.tx_key();
+        if let Ok(mut meta) = engine.read_metadata(&tx_key)
+            && let Some(entry) = engine.lookup(&tx_key)
+        {
+            let local_gen = { meta.generation };
+            if master_gen > local_gen {
+                meta.generation = master_gen;
+                let _ = crate::io::write_metadata(engine.device(), entry.record_offset, &meta);
+            }
+        }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -609,6 +732,7 @@ mod tests {
             tx_key: k,
             offset: 0,
             spending_data: [0xAB; 36],
+            master_generation: 0,
         };
         apply_op(&engine, &op).unwrap();
 
@@ -627,6 +751,7 @@ mod tests {
             tx_key: k,
             offset: 0,
             spending_data: [0xAB; 36],
+            master_generation: 0,
         };
         apply_op(&engine, &op).unwrap();
         // Apply again — should not error
@@ -684,6 +809,7 @@ mod tests {
             &ReplicaOp::Freeze {
                 tx_key: k,
                 offset: 1,
+                master_generation: 0,
             },
         )
         .unwrap();
@@ -695,6 +821,7 @@ mod tests {
             &ReplicaOp::Unfreeze {
                 tx_key: k,
                 offset: 1,
+                master_generation: 0,
             },
         )
         .unwrap();
@@ -726,6 +853,7 @@ mod tests {
                 block_height: 1000,
                 subtree_idx: 0,
                 on_longest_chain: true,
+                master_generation: 0,
             },
         )
         .unwrap();
@@ -745,6 +873,7 @@ mod tests {
                 tx_key: k,
                 offset: 0,
                 spending_data: [0; 36],
+                master_generation: 0,
             },
         )
         .unwrap();
@@ -754,6 +883,7 @@ mod tests {
             &ReplicaOp::Freeze {
                 tx_key: k,
                 offset: 0,
+                master_generation: 0,
             },
         )
         .unwrap();

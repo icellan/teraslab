@@ -36,23 +36,62 @@ use std::sync::atomic::AtomicU64;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-/// Global connection pool for replication TCP connections.
+/// Lock-free replication sequence counter. Assigns monotonically
+/// increasing positions to replication batches without contention.
+/// Initialized from the redo log on startup.
+static REPL_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Per-replica connection pool and ACK tracking. Only locked for
+/// connection management, not for sequence assignment.
+struct ReplicationPool {
+    connections: HashMap<SocketAddr, TcpReplicaTransport>,
+    /// Per-replica last-ACKed sequence (in-memory, for fast lookup).
+    last_acked: HashMap<SocketAddr, u64>,
+}
+
+static REPL_POOL: LazyLock<Mutex<ReplicationPool>> = LazyLock::new(|| {
+    Mutex::new(ReplicationPool {
+        connections: HashMap::new(),
+        last_acked: HashMap::new(),
+    })
+});
+
+/// Persistent replication ACK tracker. Initialized during server startup
+/// via `init_ack_tracker()`. Records per-replica durable ACK sequences
+/// to disk so that after a master restart, catch-up streaming can resume
+/// from the correct position.
+static ACK_TRACKER: std::sync::OnceLock<crate::replication::durable::AckTracker> =
+    std::sync::OnceLock::new();
+
+/// Initialize the persistent ACK tracker.
 ///
-/// Maps each replica's `SocketAddr` to a persistent `TcpReplicaTransport`.
-/// Connections are reused across dispatches to avoid the overhead of opening
-/// a new TCP connection per batch. When a connection fails, it is discarded
-/// and a fresh one is created on the next attempt.
-static REPL_POOL: LazyLock<Mutex<HashMap<SocketAddr, TcpReplicaTransport>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Must be called once during server startup before any replication occurs.
+/// The `path` should be alongside the cluster state file (e.g., `<device>.repl-ack`).
+pub fn init_ack_tracker(path: std::path::PathBuf) {
+    let tracker = crate::replication::durable::AckTracker::new(path);
+    let _ = ACK_TRACKER.set(tracker);
+}
+
+/// Initialize the replication sequence counter from the redo log.
+///
+/// Must be called once during server startup, after the redo log is
+/// opened and recovery is complete, so that replication sequence numbers
+/// are contiguous with the durable commit log.
+pub fn init_replication_sequence(initial_sequence: u64) {
+    REPL_SEQUENCE.store(initial_sequence.max(1), std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Dispatch a request frame to the appropriate Engine method.
 ///
 /// If `cluster` is Some, shard ownership is checked for key-based operations.
 /// Requests for keys not owned by this node get a Redirect response.
 ///
-/// If `redo_log` is Some, successful mutations are logged for crash recovery.
-/// Redo log writes are best-effort: failures are logged but do not fail the
-/// client request (the data has already been applied to the engine).
+/// Mutation path (durability contract):
+/// 1. Engine applies the mutation (durable via O_DIRECT).
+/// 2. Redo log records the mutation and fsyncs (mandatory — failure fails
+///    the client request).
+/// 3. Replication sends to replicas with durable sequence numbers.
+/// 4. Client response is sent.
 pub(crate) fn handle_request(
     request: &RequestFrame,
     engine: &Engine,
@@ -63,10 +102,10 @@ pub(crate) fn handle_request(
     blob_store: Option<&dyn BlobStore>,
 ) -> ResponseFrame {
     // Reject mutations when the cluster lacks quorum to prevent split-brain.
-    if is_mutation_opcode(request.op_code) {
-        if let Some(err_resp) = check_quorum(cluster, request.request_id) {
-            return err_resp;
-        }
+    if is_mutation_opcode(request.op_code)
+        && let Some(err_resp) = check_quorum(cluster, request.request_id)
+    {
+        return err_resp;
     }
 
     match request.op_code {
@@ -110,35 +149,154 @@ pub(crate) fn handle_request(
             thread_local! {
                 static DISPATCH_LAST_APPLIED: AtomicU64 = const { AtomicU64::new(0) };
             }
-            let resp = DISPATCH_LAST_APPLIED.with(|la| {
-                handle_replica_batch(request, engine, la)
-            });
-
-            // After processing a replica batch, mark any inbound shards as
-            // received so the read path stops waiting for migration data.
-            if resp.status == STATUS_OK {
-                if let Some(cluster) = cluster {
-                    // Parse the batch to find which shards were included.
-                    // The request_id is set to the shard number during migration.
-                    cluster.mark_inbound_complete(request.request_id as u16);
-                }
+            // During migration, flags bit FLAG_MIGRATION_BATCH is set
+            // and request_id carries the shard number. Register this
+            // shard as actively receiving inbound migration data so
+            // the read/write path knows to wait for completion.
+            // Normal replication batches do NOT set this flag.
+            if request.flags & FLAG_MIGRATION_BATCH != 0
+                && let Some(cluster) = cluster
+            {
+                cluster.mark_inbound_active(request.request_id as u16);
             }
-
-            resp
+            DISPATCH_LAST_APPLIED.with(|la| {
+                handle_replica_batch(request, engine, la)
+            })
+            // NOTE: We do NOT mark inbound shards as complete here.
+            // Only the OP_MIGRATION_COMPLETE handshake clears the
+            // pending-inbound flag, after verifying the data arrived.
         }
         OP_MIGRATION_COMPLETE => {
             // Migration-complete handshake: the source has finished
             // streaming all batches for a shard and wants confirmation
             // that we received the data. The request_id carries the shard.
-            // We simply acknowledge — the data was already applied via
-            // OP_REPLICA_BATCH handlers above.
-            if let Some(cluster) = cluster {
-                cluster.mark_inbound_complete(request.request_id as u16);
+            //
+            // Payload format:
+            //   [record_count:8]                 — expected records (0 = empty shard)
+            //   [fence_sequence:8] (optional)    — redo fence sequence for audit
+            //   [topology_epoch:8] (optional)    — reject stale migrations
+            let shard = request.request_id as u16;
+
+            let expected_records = if request.payload.len() >= 8 {
+                u64::from_le_bytes(request.payload[..8].try_into().unwrap())
+            } else {
+                0
+            };
+            let _fence_sequence = if request.payload.len() >= 16 {
+                u64::from_le_bytes(request.payload[8..16].try_into().unwrap())
+            } else {
+                0
+            };
+            let migration_epoch = if request.payload.len() >= 24 {
+                u64::from_le_bytes(request.payload[16..24].try_into().unwrap())
+            } else {
+                0
+            };
+
+            // Reject stale migrations from a previous topology epoch.
+            if migration_epoch > 0
+                && let Some(cluster) = cluster
+            {
+                let current_epoch = cluster.topology_epoch();
+                if migration_epoch < current_epoch {
+                    return error_response(
+                        request.request_id,
+                        ERR_MIGRATION_IN_PROGRESS,
+                        &format!("stale migration epoch {migration_epoch} < current {current_epoch}"),
+                    );
+                }
             }
-            ResponseFrame {
-                request_id: request.request_id,
-                status: STATUS_OK,
-                payload: Vec::new(),
+
+            // Verify the actual record count matches expected exactly
+            // using the O(1) per-shard counter. Use exact match (==)
+            // instead of >=  to catch missing deletes and stale records.
+            let actual = engine.shard_record_count(shard);
+            let verified = if expected_records == 0 {
+                true // empty shard, no data expected
+            } else {
+                actual == expected_records
+            };
+
+            if verified {
+                if let Some(cluster) = cluster {
+                    cluster.mark_inbound_complete(shard);
+                }
+                ResponseFrame {
+                    request_id: request.request_id,
+                    status: STATUS_OK,
+                    payload: Vec::new(),
+                }
+            } else {
+                error_response(
+                    request.request_id,
+                    ERR_MIGRATION_IN_PROGRESS,
+                    &format!("shard {shard} record count mismatch: expected {expected_records}, got {actual}"),
+                )
+            }
+        }
+        OP_TOPOLOGY_PROPOSE => {
+            // Topology authority: another node is proposing a new term.
+            // Validate and vote.
+            let cluster = match cluster {
+                Some(c) => c,
+                None => return error_response(request.request_id, ERR_INTERNAL, "not clustered"),
+            };
+            match crate::cluster::topology::TopologyTerm::deserialize(&request.payload) {
+                Some(propose) => {
+                    let vote = cluster.topology_authority().handle_propose(&propose);
+                    ResponseFrame {
+                        request_id: request.request_id,
+                        status: STATUS_OK,
+                        payload: vote.serialize(),
+                    }
+                }
+                None => error_response(request.request_id, ERR_INTERNAL, "malformed topology propose"),
+            }
+        }
+        OP_TOPOLOGY_VOTE => {
+            // Topology authority: a peer voted on our proposal.
+            // Check if quorum is reached — if so, broadcast commit.
+            // The commit broadcast is handled by the coordinator event loop,
+            // not here. We just return OK with any resulting commit.
+            let cluster = match cluster {
+                Some(c) => c,
+                None => return error_response(request.request_id, ERR_INTERNAL, "not clustered"),
+            };
+            match crate::cluster::topology::TopologyVote::deserialize(&request.payload) {
+                Some(vote) => {
+                    let commit = cluster.topology_authority().handle_vote(&vote);
+                    let payload = match commit {
+                        Some(c) => c.serialize(),
+                        None => Vec::new(),
+                    };
+                    ResponseFrame {
+                        request_id: request.request_id,
+                        status: STATUS_OK,
+                        payload,
+                    }
+                }
+                None => error_response(request.request_id, ERR_INTERNAL, "malformed topology vote"),
+            }
+        }
+        OP_TOPOLOGY_COMMIT => {
+            // Topology authority: a proposer achieved quorum and is committing.
+            // Activate the shard table with the committed members.
+            let cluster = match cluster {
+                Some(c) => c,
+                None => return error_response(request.request_id, ERR_INTERNAL, "not clustered"),
+            };
+            match crate::cluster::topology::TopologyCommit::deserialize(&request.payload) {
+                Some(commit) => {
+                    if let Some(term) = cluster.topology_authority().handle_commit(&commit) {
+                        eprintln!("cluster: topology term {term} committed with {} members", commit.members.len());
+                    }
+                    ResponseFrame {
+                        request_id: request.request_id,
+                        status: STATUS_OK,
+                        payload: Vec::new(),
+                    }
+                }
+                None => error_response(request.request_id, ERR_INTERNAL, "malformed topology commit"),
             }
         }
         _ => error_response(request.request_id, ERR_INTERNAL, "unknown opcode"),
@@ -149,51 +307,63 @@ pub(crate) fn handle_request(
 // Redo log helper
 // ---------------------------------------------------------------------------
 
-/// Append redo ops to the log and flush. Best-effort: errors are logged
-/// to stderr but do not propagate. The data is already on the device via
-/// the engine, so redo logging failures only affect crash recovery coverage.
-fn write_redo_ops(redo_log: Option<&Mutex<RedoLog>>, ops: &[RedoOp]) {
+/// Append redo ops to the log and flush.
+///
+/// Returns the sequence number of the last appended entry on success.
+/// Returns an error string if the redo log write or flush fails — the
+/// caller must fail the client request to maintain the durability
+/// contract (every acknowledged mutation has a redo log entry).
+///
+/// When no redo log is configured (single-node test setups), returns
+/// `Ok(0)` — the engine writes are still durable via O_DIRECT but
+/// there is no crash recovery journal.
+fn write_redo_ops(redo_log: Option<&Mutex<RedoLog>>, ops: &[RedoOp]) -> std::result::Result<u64, String> {
     let redo = match redo_log {
         Some(r) => r,
-        None => return,
+        None => return Ok(0),
     };
+    if ops.is_empty() {
+        return Ok(0);
+    }
     let mut log = redo.lock();
+    let mut last_seq = 0;
     for op in ops {
-        if let Err(e) = log.append(op.clone()) {
-            eprintln!("redo log append error: {e}");
-            return;
-        }
+        last_seq = log.append(op.clone())
+            .map_err(|e| format!("redo log append: {e}"))?;
     }
-    if let Err(e) = log.flush() {
-        eprintln!("redo log flush error: {e}");
-    }
+    log.flush()
+        .map_err(|e| format!("redo log flush: {e}"))?;
+    Ok(last_seq)
 }
 
 // ---------------------------------------------------------------------------
 // Replication helper
 // ---------------------------------------------------------------------------
 
-/// Send replication operations to replica nodes for the given key.
+/// Send replication operations to replica nodes for the given keys.
 ///
-/// For each replica node that owns a copy of the key's shard, the batch is
-/// sent synchronously on the current dispatch thread using a persistent TCP
-/// connection from the global pool. Replication failures are logged but do
-/// not affect the client response — the replica will catch up from the redo
-/// log or via anti-entropy.
+/// Assigns durable sequence numbers from the global replication state,
+/// groups ops by target replica, and sends synchronously on the current
+/// dispatch thread. The dispatch thread is dedicated to this client
+/// connection, so blocking here is acceptable.
 ///
-/// Synchronous sending ensures data exists on replicas before the client
-/// gets the ACK, which is required for RF=2 durability. The dispatch thread
-/// is dedicated to this client connection, so blocking here is acceptable.
+/// When ACK policy enforcement is enabled (RF >= 2 with a non-best_effort
+/// policy), replication failures are returned as errors so the caller can
+/// fail the client request. In best-effort mode, failures are logged only.
+///
+/// Returns `Ok(())` when either no replication is needed or the ACK policy
+/// is satisfied. Returns `Err(message)` when the required number of
+/// replica ACKs was not received.
 fn replicate_all_ops(
     cluster: Option<&RunningCluster>,
     ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)>,
-) {
+) -> std::result::Result<(), String> {
     let cluster = match cluster {
         Some(c) => c,
-        None => return,
+        None => return Ok(()),
     };
     if ops_by_key.is_empty() {
-        return;
+        return Ok(());
     }
 
     // Group all ops by target replica address
@@ -212,64 +382,108 @@ fn replicate_all_ops(
     }
     drop(table_guard);
 
-    // Send one batch per replica node synchronously using persistent connections.
+    if by_addr.is_empty() {
+        return Ok(()); // No replicas configured or no replica addresses known.
+    }
+
+    let total_targets = by_addr.len();
+    let mut ack_count: usize = 0;
+    let mut last_error: Option<String> = None;
+
+    // Assign durable sequence numbers and send to each replica.
     for (addr, ops) in by_addr {
         if ops.is_empty() {
+            ack_count += 1;
             continue;
         }
+        // Lock-free sequence assignment via atomic fetch_add.
+        let first_seq = REPL_SEQUENCE.fetch_add(
+            ops.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let batch = ReplicaBatch {
-            first_sequence: 0,
+            first_sequence: first_seq,
             ops,
         };
-        if let Err(e) = send_replica_batch_to(addr, &batch) {
-            eprintln!("replication to {addr} failed: {e}");
+        match send_replica_batch_to(addr, &batch) {
+            Ok(()) => {
+                ack_count += 1;
+            }
+            Err(e) => {
+                eprintln!("replication to {addr} failed: {e}");
+                last_error = Some(e);
+            }
         }
+    }
+
+    // Check ACK policy. The policy is read from the cluster's replication
+    // config. The master (local node) always counts as one copy.
+    let ack_policy = cluster.ack_policy();
+    let best_effort = cluster.is_replication_best_effort();
+    let required = match ack_policy {
+        Some(crate::replication::manager::AckPolicy::WriteAll) => total_targets,
+        Some(crate::replication::manager::AckPolicy::WriteMajority) => {
+            // For majority: need floor(RF/2)+1 total copies. Master is 1,
+            // so need floor(RF/2) replica ACKs. But we count per-target
+            // here, so: total_targets / 2 + (if total_targets is even { 0 } else { 1 })
+            // Simplified: ceil(total_targets / 2)
+            total_targets.div_ceil(2)
+        }
+        None => 0, // best-effort: no minimum
+    };
+
+    if ack_count < required && !best_effort {
+        Err(format!(
+            "replication: {ack_count}/{total_targets} replicas ACKed, need {required}: {}",
+            last_error.unwrap_or_default()
+        ))
+    } else {
+        Ok(())
     }
 }
 
 /// Send a `ReplicaBatch` to a replica node via TCP using the wire protocol.
 ///
-/// Reuses a persistent connection from the global `REPL_POOL`. If no cached
-/// connection exists or the cached connection has failed, a fresh TCP
-/// connection is established. On success the connection is returned to the
-/// pool for future reuse.
+/// Reuses a persistent connection from the global replication state. If no
+/// cached connection exists or the cached one has failed, a fresh TCP
+/// connection is established. On success, updates the per-replica
+/// `last_acked` sequence and returns the connection to the pool.
 fn send_replica_batch_to(
     addr: SocketAddr,
     batch: &ReplicaBatch,
 ) -> std::result::Result<(), String> {
-    // Take an existing connection from the pool (if any).
-    // We remove it so other threads don't try to use it concurrently,
-    // and we drop the lock before doing any I/O.
-    let existing = REPL_POOL.lock().remove(&addr);
+    // Take an existing connection from the pool. Lock is held only
+    // for the HashMap remove, not during I/O.
+    let existing = REPL_POOL.lock().connections.remove(&addr);
 
     let mut transport = match existing {
         Some(t) if t.is_connected() => t,
         _ => {
-            // No cached connection or the cached one is dead — create a fresh one.
             TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5))
                 .map_err(|e| format!("connect: {e}"))?
         }
     };
 
-    // Attempt to send the batch and receive acknowledgment.
     if let Err(e) = transport.send_batch(batch) {
-        // Connection broke during send — discard it and do NOT return to pool.
         return Err(format!("send: {e}"));
     }
 
-    match transport.recv_ack(Duration::from_secs(10)) {
-        Ok(ReplicaAck::Ok { .. }) => {
-            // Success — return connection to the pool for reuse.
-            REPL_POOL.lock().insert(addr, transport);
+    match transport.recv_ack(Duration::from_secs(3)) {
+        Ok(ReplicaAck::Ok { through_sequence }) => {
+            let mut pool = REPL_POOL.lock();
+            pool.connections.insert(addr, transport);
+            pool.last_acked.insert(addr, through_sequence);
+            // Persist the ACK sequence for crash-safe catch-up.
+            if let Some(tracker) = ACK_TRACKER.get() {
+                tracker.record_ack(addr, through_sequence);
+            }
             Ok(())
         }
         Ok(ReplicaAck::Error { message, .. }) => {
-            // Application-level error — connection is still usable.
-            REPL_POOL.lock().insert(addr, transport);
+            REPL_POOL.lock().connections.insert(addr, transport);
             Err(format!("replica error: {message}"))
         }
         Err(e) => {
-            // Transport-level error — discard the broken connection.
             Err(format!("recv_ack: {e}"))
         }
     }
@@ -357,6 +571,17 @@ fn check_shard_ownership(
         // data, reject mutations so clients retry after migration completes.
         // Reads are handled separately with a wait loop.
         if !allow_if_migrating && cluster.has_pending_inbound(&key) {
+            let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+            eprintln!("dispatch: write rejected shard {shard} — pending inbound migration");
+            return Some(BatchItemError {
+                item_index,
+                error_code: ERR_MIGRATION_IN_PROGRESS,
+                error_data: Vec::new(),
+            });
+        }
+        if !allow_if_migrating && cluster.is_shard_write_fenced(&key) {
+            let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+            eprintln!("dispatch: write rejected shard {shard} — write-fenced (delta streaming)");
             return Some(BatchItemError {
                 item_index,
                 error_code: ERR_MIGRATION_IN_PROGRESS,
@@ -459,18 +684,23 @@ fn handle_spend_batch(
                 let key = TxKey { txid: *txid };
                 let mut key_repl_ops = Vec::new();
 
+                // Use the generation from the mutation result — avoids
+                // an extra device read per mutation.
+                let mgen = resp.generation;
+
                 for &(i, item) in group {
                     if !error_indices.contains(&(i as u32)) {
                         redo_ops.push(RedoOp::Spend {
                             tx_key: key,
                             offset: item.vout,
                             spending_data: item.spending_data,
-                            new_spent_count: 0, // Precise count not tracked per-item here
+                            new_spent_count: 0,
                         });
                         key_repl_ops.push(ReplicaOp::Spend {
                             tx_key: key,
                             offset: item.vout,
                             spending_data: item.spending_data,
+                            master_generation: mgen,
                         });
                     }
                 }
@@ -492,8 +722,12 @@ fn handle_spend_batch(
         }
     }
 
-    write_redo_ops(redo_log, &redo_ops);
-    replicate_all_ops(cluster, repl_ops_by_key);
+    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
+        return error_response(req.request_id, ERR_INTERNAL, &e);
+    }
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+    }
 
     if errors.is_empty() {
         ResponseFrame {
@@ -548,7 +782,7 @@ fn handle_unspend_batch(
             block_height_retention: params.block_height_retention,
         });
         match result {
-            Ok(_) => {
+            Ok(resp) => {
                 redo_ops.push(RedoOp::Unspend {
                     tx_key: key,
                     offset: item.vout,
@@ -557,6 +791,7 @@ fn handle_unspend_batch(
                 repl_ops_by_key.push((key, vec![ReplicaOp::Unspend {
                     tx_key: key,
                     offset: item.vout,
+                    master_generation: resp.generation,
                 }]));
             }
             Err(err) => {
@@ -565,8 +800,12 @@ fn handle_unspend_batch(
         }
     }
 
-    write_redo_ops(redo_log, &redo_ops);
-    replicate_all_ops(cluster, repl_ops_by_key);
+    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
+        return error_response(req.request_id, ERR_INTERNAL, &e);
+    }
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+    }
 
     batch_response(req.request_id, &errors)
 }
@@ -611,7 +850,7 @@ fn handle_set_mined_batch(
             unset_mined: params.unset_mined,
         });
         match result {
-            Ok(_) => {
+            Ok(resp) => {
                 redo_ops.push(RedoOp::SetMined {
                     tx_key: key,
                     block_id: params.block_id,
@@ -619,10 +858,12 @@ fn handle_set_mined_batch(
                     subtree_idx: params.subtree_idx,
                     unset: params.unset_mined,
                 });
+                let mgen = resp.generation;
                 if params.unset_mined {
                     repl_ops_by_key.push((key, vec![ReplicaOp::UnsetMined {
                         tx_key: key,
                         block_id: params.block_id,
+                        master_generation: mgen,
                     }]));
                 } else {
                     repl_ops_by_key.push((key, vec![ReplicaOp::SetMined {
@@ -631,6 +872,7 @@ fn handle_set_mined_batch(
                         block_height: params.block_height,
                         subtree_idx: params.subtree_idx,
                         on_longest_chain: params.on_longest_chain,
+                        master_generation: mgen,
                     }]));
                 }
             }
@@ -640,8 +882,12 @@ fn handle_set_mined_batch(
         }
     }
 
-    write_redo_ops(redo_log, &redo_ops);
-    replicate_all_ops(cluster, repl_ops_by_key);
+    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
+        return error_response(req.request_id, ERR_INTERNAL, &e);
+    }
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+    }
 
     batch_response(req.request_id, &errors)
 }
@@ -652,6 +898,7 @@ fn handle_set_mined_batch(
 
 /// Parse the wire cold_data blob into separate inputs/outputs/inpoints fields.
 /// Wire format: [inputs_len:4 LE][inputs][outputs_len:4 LE][outputs][inpoints_len:4 LE][inpoints]
+#[allow(clippy::type_complexity)]
 fn parse_cold_data_fields(cold_data: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) {
     if cold_data.len() < 12 {
         return (None, None, None);
@@ -712,26 +959,26 @@ fn handle_create_batch(
 
         // Check whether this item uses an externally-uploaded blob.
         let is_ext = item.flags & FLAG_EXTERNAL_BLOB != 0;
-        if is_ext {
-            if let Some(bs) = blob_store {
-                match bs.exists(&item.txid) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        errors.push(BatchItemError {
-                            item_index: i as u32,
-                            error_code: ERR_BLOB_NOT_FOUND,
-                            error_data: vec![],
-                        });
-                        continue;
-                    }
-                    Err(_) => {
-                        errors.push(BatchItemError {
-                            item_index: i as u32,
-                            error_code: ERR_INTERNAL,
-                            error_data: vec![],
-                        });
-                        continue;
-                    }
+        if is_ext
+            && let Some(bs) = blob_store
+        {
+            match bs.exists(&item.txid) {
+                Ok(true) => {}
+                Ok(false) => {
+                    errors.push(BatchItemError {
+                        item_index: i as u32,
+                        error_code: ERR_BLOB_NOT_FOUND,
+                        error_data: vec![],
+                    });
+                    continue;
+                }
+                Err(_) => {
+                    errors.push(BatchItemError {
+                        item_index: i as u32,
+                        error_code: ERR_INTERNAL,
+                        error_data: vec![],
+                    });
+                    continue;
                 }
             }
         }
@@ -828,8 +1075,12 @@ fn handle_create_batch(
         }
     }
 
-    write_redo_ops(redo_log, &redo_ops);
-    replicate_all_ops(cluster, repl_ops_by_key);
+    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
+        return error_response(req.request_id, ERR_INTERNAL, &e);
+    }
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+    }
 
     batch_response(req.request_id, &errors)
 }
@@ -867,11 +1118,12 @@ fn handle_freeze_batch(
             offset: item.vout,
             utxo_hash: item.utxo_hash,
         }) {
-            Ok(()) => {
+            Ok(mgen) => {
                 redo_ops.push(RedoOp::Freeze { tx_key: key, offset: item.vout });
                 repl_ops_by_key.push((key, vec![ReplicaOp::Freeze {
                     tx_key: key,
                     offset: item.vout,
+                    master_generation: mgen,
                 }]));
             }
             Err(err) => {
@@ -880,8 +1132,12 @@ fn handle_freeze_batch(
         }
     }
 
-    write_redo_ops(redo_log, &redo_ops);
-    replicate_all_ops(cluster, repl_ops_by_key);
+    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
+        return error_response(req.request_id, ERR_INTERNAL, &e);
+    }
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+    }
 
     batch_response(req.request_id, &errors)
 }
@@ -915,11 +1171,12 @@ fn handle_unfreeze_batch(
             offset: item.vout,
             utxo_hash: item.utxo_hash,
         }) {
-            Ok(()) => {
+            Ok(mgen) => {
                 redo_ops.push(RedoOp::Unfreeze { tx_key: key, offset: item.vout });
                 repl_ops_by_key.push((key, vec![ReplicaOp::Unfreeze {
                     tx_key: key,
                     offset: item.vout,
+                    master_generation: mgen,
                 }]));
             }
             Err(err) => {
@@ -928,8 +1185,12 @@ fn handle_unfreeze_batch(
         }
     }
 
-    write_redo_ops(redo_log, &redo_ops);
-    replicate_all_ops(cluster, repl_ops_by_key);
+    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
+        return error_response(req.request_id, ERR_INTERNAL, &e);
+    }
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+    }
 
     batch_response(req.request_id, &errors)
 }
@@ -966,7 +1227,7 @@ fn handle_reassign_batch(
             block_height: params.block_height,
             spendable_after: params.spendable_after,
         }) {
-            Ok(()) => {
+            Ok(mgen) => {
                 redo_ops.push(RedoOp::Reassign {
                     tx_key: key,
                     offset: item.vout,
@@ -980,6 +1241,7 @@ fn handle_reassign_batch(
                     new_hash: item.new_utxo_hash,
                     block_height: params.block_height,
                     spendable_after: params.spendable_after,
+                    master_generation: mgen,
                 }]));
             }
             Err(err) => {
@@ -988,8 +1250,12 @@ fn handle_reassign_batch(
         }
     }
 
-    write_redo_ops(redo_log, &redo_ops);
-    replicate_all_ops(cluster, repl_ops_by_key);
+    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
+        return error_response(req.request_id, ERR_INTERNAL, &e);
+    }
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+    }
 
     batch_response(req.request_id, &errors)
 }
@@ -1028,7 +1294,7 @@ fn handle_set_conflicting_batch(
             current_block_height: cbh,
             block_height_retention: bhr,
         }) {
-            Ok(_) => {
+            Ok(resp) => {
                 redo_ops.push(RedoOp::SetConflicting {
                     tx_key: key,
                     value,
@@ -1040,6 +1306,7 @@ fn handle_set_conflicting_batch(
                     value,
                     current_block_height: cbh,
                     retention: bhr,
+                    master_generation: resp.generation,
                 }]));
             }
             Err(err) => {
@@ -1048,8 +1315,12 @@ fn handle_set_conflicting_batch(
         }
     }
 
-    write_redo_ops(redo_log, &redo_ops);
-    replicate_all_ops(cluster, repl_ops_by_key);
+    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
+        return error_response(req.request_id, ERR_INTERNAL, &e);
+    }
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+    }
 
     batch_response(req.request_id, &errors)
 }
@@ -1084,11 +1355,12 @@ fn handle_set_locked_batch(
             tx_key: key,
             value,
         }) {
-            Ok(()) => {
+            Ok(mgen) => {
                 redo_ops.push(RedoOp::SetLocked { tx_key: key, value });
                 repl_ops_by_key.push((key, vec![ReplicaOp::SetLocked {
                     tx_key: key,
                     value,
+                    master_generation: mgen,
                 }]));
             }
             Err(err) => {
@@ -1097,8 +1369,12 @@ fn handle_set_locked_batch(
         }
     }
 
-    write_redo_ops(redo_log, &redo_ops);
-    replicate_all_ops(cluster, repl_ops_by_key);
+    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
+        return error_response(req.request_id, ERR_INTERNAL, &e);
+    }
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+    }
 
     batch_response(req.request_id, &errors)
 }
@@ -1133,7 +1409,7 @@ fn handle_preserve_until_batch(
             tx_key: key,
             block_height: height,
         }) {
-            Ok(_) => {
+            Ok(resp) => {
                 redo_ops.push(RedoOp::PreserveUntil {
                     tx_key: key,
                     block_height: height,
@@ -1141,6 +1417,7 @@ fn handle_preserve_until_batch(
                 repl_ops_by_key.push((key, vec![ReplicaOp::PreserveUntil {
                     tx_key: key,
                     block_height: height,
+                    master_generation: resp.generation,
                 }]));
             }
             Err(err) => {
@@ -1149,8 +1426,12 @@ fn handle_preserve_until_batch(
         }
     }
 
-    write_redo_ops(redo_log, &redo_ops);
-    replicate_all_ops(cluster, repl_ops_by_key);
+    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
+        return error_response(req.request_id, ERR_INTERNAL, &e);
+    }
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+    }
 
     batch_response(req.request_id, &errors)
 }
@@ -1200,8 +1481,12 @@ fn handle_delete_batch(
         }
     }
 
-    write_redo_ops(redo_log, &redo_ops);
-    replicate_all_ops(cluster, repl_ops_by_key);
+    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
+        return error_response(req.request_id, ERR_INTERNAL, &e);
+    }
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+    }
 
     batch_response(req.request_id, &errors)
 }
@@ -1255,7 +1540,9 @@ fn handle_mark_longest_chain_batch(
         }
     }
 
-    write_redo_ops(redo_log, &redo_ops);
+    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
+        return error_response(req.request_id, ERR_INTERNAL, &e);
+    }
 
     batch_response(req.request_id, &errors)
 }
@@ -1291,7 +1578,25 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
             if !is_master && !is_migrating_out {
                 // Not master — check if we have it locally before rejecting.
                 if engine.read_metadata(&key).is_err() {
-                    results.push(WireGetResult { status: 1, data: vec![] });
+                    // Redirect to the master so the client retries there
+                    // instead of treating the record as permanently absent.
+                    let route = cluster.route(&key);
+                    let redirect_status = match route {
+                        crate::cluster::shards::RouteDecision::RedirectTo { node, .. } => {
+                            match cluster.node_addr(&node) {
+                                Some(addr) => {
+                                    let addr_bytes = addr.to_string().into_bytes();
+                                    let mut data = Vec::with_capacity(2 + addr_bytes.len());
+                                    data.extend_from_slice(&(ERR_REDIRECT as u8).to_le_bytes());
+                                    data.extend_from_slice(&addr_bytes);
+                                    data
+                                }
+                                None => vec![ERR_REDIRECT as u8],
+                            }
+                        }
+                        _ => vec![ERR_REDIRECT as u8],
+                    };
+                    results.push(WireGetResult { status: ERR_REDIRECT as u8, data: redirect_status });
                     continue;
                 }
                 // We have it locally — serve it despite not being master.
@@ -1300,18 +1605,22 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
             // If we're master but don't have the data, and there's a pending
             // inbound migration for this shard, wait briefly for it to arrive.
             if is_master && engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key) {
+                let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+                eprintln!("dispatch: read waiting for shard {shard} inbound migration");
                 let mut found = false;
-                for _ in 0..50 { // up to 5 seconds (50 * 100ms)
+                for tick in 0..10 { // up to 1 second (10 * 100ms)
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     if engine.read_metadata(&key).is_ok() {
                         found = true;
                         break;
                     }
                     if !cluster.has_pending_inbound(&key) {
-                        break; // migration finished but data didn't include this record
+                        eprintln!("dispatch: shard {shard} inbound cleared after {tick}00ms (no data)");
+                        break;
                     }
                 }
                 if !found {
+                    eprintln!("dispatch: read shard {shard} migration-in-progress after 1s wait");
                     // Return migration-in-progress instead of NotFound so
                     // clients know to retry rather than treating the record
                     // as permanently absent.
@@ -1485,7 +1794,7 @@ fn handle_preserve_transactions(
             tx_key: key,
             block_height: height,
         }) {
-            Ok(_) => {
+            Ok(resp) => {
                 redo_ops.push(RedoOp::PreserveUntil {
                     tx_key: key,
                     block_height: height,
@@ -1493,6 +1802,7 @@ fn handle_preserve_transactions(
                 repl_ops_by_key.push((key, vec![ReplicaOp::PreserveUntil {
                     tx_key: key,
                     block_height: height,
+                    master_generation: resp.generation,
                 }]));
             }
             Err(err) => {
@@ -1501,8 +1811,12 @@ fn handle_preserve_transactions(
         }
     }
 
-    write_redo_ops(redo_log, &redo_ops);
-    replicate_all_ops(cluster, repl_ops_by_key);
+    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
+        return error_response(req.request_id, ERR_INTERNAL, &e);
+    }
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+    }
 
     batch_response(req.request_id, &errors)
 }
@@ -1543,7 +1857,9 @@ fn handle_process_expired(
         }
     }
 
-    write_redo_ops(redo_log, &redo_ops);
+    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
+        return error_response(req.request_id, ERR_INTERNAL, &e);
+    }
 
     let mut payload = Vec::with_capacity(8);
     payload.extend_from_slice(&deleted.to_le_bytes());
@@ -1684,10 +2000,11 @@ fn handle_stream_chunk(
     };
 
     // Get or create the stream session for this txid.
-    if !conn_state.streams.contains_key(&chunk.txid) {
+    use std::collections::hash_map::Entry;
+    if let Entry::Vacant(entry) = conn_state.streams.entry(chunk.txid) {
         match blob_store.begin_stream(&chunk.txid) {
             Ok(writer) => {
-                conn_state.streams.insert(chunk.txid, super::ActiveStream {
+                entry.insert(super::ActiveStream {
                     writer,
                     bytes_received: 0,
                 });

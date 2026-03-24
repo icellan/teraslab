@@ -9,10 +9,14 @@ use crate::index::TxKey;
 use crate::ops::engine::Engine;
 use crate::protocol::frame::{RequestFrame, ResponseFrame};
 use crate::protocol::opcodes::*;
+use crate::redo::RedoLog;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
+// MigrationManager uses std::sync::Mutex; redo log uses parking_lot::Mutex.
+use std::sync::Mutex;
+type ParkingMutex<T> = parking_lot::Mutex<T>;
 use std::time::Duration;
 
 /// Cluster coordinator configuration.
@@ -25,18 +29,39 @@ pub struct ClusterConfig {
     pub replication_factor: u8,
     pub probe_interval: Duration,
     pub suspicion_timeout: Duration,
+    /// Shared secret for HMAC authentication of SWIM and inter-node traffic.
+    pub cluster_secret: Option<Vec<u8>>,
+    /// Maximum concurrent migration threads per topology change.
+    pub max_migration_threads: usize,
+    /// Timeout for topology proposal (how long non-proposer waits).
+    /// Default: 3x probe_interval.
+    pub topology_propose_timeout: Duration,
+    /// Number of parallel TCP connections per migration target. Default: 4.
+    pub migration_pool_size: usize,
+    /// Records per baseline streaming batch during migration. Default: 100.
+    pub migration_batch_size: usize,
 }
 
 /// The cluster coordinator. Manages membership, shard table, and migrations.
 pub struct ClusterCoordinator {
     self_id: NodeId,
-    shard_table: Arc<RwLock<ShardTable>>,
+    pub shard_table: Arc<RwLock<ShardTable>>,
     swim: Option<SwimRunner>,
     migration: Arc<Mutex<MigrationManager>>,
     replication_factor: u8,
     node_addrs: Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
     shutdown: Arc<AtomicBool>,
     initial_peak: usize,
+    max_migration_threads: usize,
+    /// Monotonic topology epoch counter. Incremented on every membership
+    /// change. Used as the shard table version / fencing token.
+    pub topology_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Topology authority for quorum-committed term management.
+    pub topology_authority: Arc<crate::cluster::topology::TopologyAuthority>,
+    /// Parallel connections per migration target.
+    migration_pool_size: usize,
+    /// Records per baseline streaming batch.
+    migration_batch_size: usize,
 }
 
 impl ClusterCoordinator {
@@ -53,9 +78,10 @@ impl ClusterCoordinator {
             self_id: config.self_id,
             self_addr: config.self_addr,
             bind_addr: config.swim_bind,
-            seed_nodes: config.seed_nodes,
+            seed_nodes: config.seed_nodes.clone(),
             probe_interval: config.probe_interval,
             suspicion_timeout: config.suspicion_timeout,
+            cluster_secret: config.cluster_secret.clone(),
         });
 
         let mut addrs = std::collections::HashMap::new();
@@ -70,6 +96,14 @@ impl ClusterCoordinator {
             node_addrs: Arc::new(RwLock::new(addrs)),
             shutdown: Arc::new(AtomicBool::new(false)),
             initial_peak,
+            max_migration_threads: config.max_migration_threads,
+            topology_epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            topology_authority: Arc::new(crate::cluster::topology::TopologyAuthority::new(
+                config.self_id,
+                config.topology_propose_timeout,
+            )),
+            migration_pool_size: config.migration_pool_size.max(1),
+            migration_batch_size: config.migration_batch_size.max(1),
         }
     }
 
@@ -77,7 +111,14 @@ impl ClusterCoordinator {
     ///
     /// `cluster_state_path` is where the peak cluster size is persisted
     /// for quorum safety across restarts. Pass `None` for test setups.
-    pub fn start(mut self, engine: Arc<Engine>, cluster_state_path: Option<std::path::PathBuf>) -> RunningCluster {
+    pub fn start(
+        mut self,
+        engine: Arc<Engine>,
+        cluster_state_path: Option<std::path::PathBuf>,
+        redo_log: Option<Arc<ParkingMutex<RedoLog>>>,
+        repl_ack_policy: Option<crate::replication::manager::AckPolicy>,
+        repl_best_effort: bool,
+    ) -> RunningCluster {
         let swim = self.swim.take().expect("swim already started");
         let (swim_shutdown, swim_handle, event_rx) = swim.start();
 
@@ -89,6 +130,19 @@ impl ClusterCoordinator {
         let shutdown = self.shutdown.clone();
         let peak_size = Arc::new(std::sync::atomic::AtomicUsize::new(self.initial_peak));
         let peak_size_event = peak_size.clone();
+        let max_migration_threads = self.max_migration_threads;
+        let topology_epoch = self.topology_epoch.clone();
+        let migration_pool_size = self.migration_pool_size;
+        let migration_batch_size = self.migration_batch_size;
+        let topology_epoch_for_cluster = topology_epoch.clone();
+        let redo_for_events = redo_log;
+
+        // Derive inbound state path before cluster_state_path is moved into the closure.
+        let inbound_state_path = cluster_state_path.as_ref().map(|p| {
+            let mut s = p.as_os_str().to_os_string();
+            s.push(".inbound");
+            std::path::PathBuf::from(s)
+        });
 
         // Event processing thread
         let event_handle = std::thread::spawn(move || {
@@ -96,24 +150,37 @@ impl ClusterCoordinator {
                 match event_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(event) => {
                         // Update peak cluster size on membership changes and
-                        // persist to disk so a restarted node remembers its
-                        // quorum requirement.
+                        // Update peak cluster size on membership changes.
                         if let ClusterEvent::MembershipChanged(members) = &event {
                             let current = members.len();
-                            let prev = peak_size_event.fetch_max(current, Ordering::Relaxed);
-                            if current > prev && let Some(ref path) = cluster_state_path {
-                                persist_peak_cluster_size(path, current as u64);
-                            }
+                            peak_size_event.fetch_max(current, Ordering::Relaxed);
                         }
+                        // Run the handler (which increments topology_epoch
+                        // for MembershipChanged events).
                         Self::handle_event(
                             &event,
                             self_id,
                             rf,
+                            max_migration_threads,
                             &shard_table,
                             &migration,
                             &node_addrs,
                             &engine,
+                            &redo_for_events,
+                            &topology_epoch,
+                            migration_pool_size,
+                            migration_batch_size,
                         );
+                        // Persist AFTER handle_event so the epoch is
+                        // already incremented. This ensures a restarted
+                        // node loads an epoch >= the latest shard table.
+                        if matches!(&event, ClusterEvent::MembershipChanged(_))
+                            && let Some(ref path) = cluster_state_path
+                        {
+                            let peak = peak_size_event.load(Ordering::Relaxed) as u64;
+                            let epoch = topology_epoch.load(Ordering::Relaxed);
+                            persist_cluster_state(path, peak, epoch);
+                        }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -129,34 +196,79 @@ impl ClusterCoordinator {
             swim_shutdown,
             shutdown: self.shutdown.clone(),
             peak_size,
+            topology_epoch: topology_epoch_for_cluster,
+            repl_ack_policy,
+            repl_best_effort,
+            topology_authority: self.topology_authority.clone(),
+            inbound_state_path,
             _swim_handle: swim_handle,
             _event_handle: event_handle,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_event(
         event: &ClusterEvent,
         self_id: NodeId,
         rf: u8,
+        _max_migration_threads: usize,
         shard_table: &Arc<RwLock<ShardTable>>,
         migration: &Arc<Mutex<MigrationManager>>,
         node_addrs: &Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
         engine: &Arc<Engine>,
+        redo_for_events: &Option<Arc<ParkingMutex<RedoLog>>>,
+        topology_epoch: &Arc<std::sync::atomic::AtomicU64>,
+        migration_pool_size: usize,
+        migration_batch_size: usize,
     ) {
         match event {
             ClusterEvent::NodeJoined(node, addr) => {
                 eprintln!("cluster: node {:?} joined at {addr}", node);
                 node_addrs.write().unwrap().insert(*node, *addr);
+
+                // Retry any previously failed migrations — the newly
+                // joined node may be the target that was unavailable.
+                let retry_tasks = migration.lock().unwrap().take_failed_tasks();
+                if !retry_tasks.is_empty() {
+                    eprintln!("cluster: retrying {} failed migration(s)", retry_tasks.len());
+                    // Group retries by target and use batched migration.
+                    let mut by_target: std::collections::HashMap<NodeId, Vec<MigrationTask>> =
+                        std::collections::HashMap::new();
+                    for t in retry_tasks {
+                        by_target.entry(t.to_node).or_default().push(t);
+                    }
+                    let epoch = topology_epoch.load(Ordering::Relaxed);
+                    for (target_node, tasks) in by_target {
+                        let target_addr = node_addrs.read().unwrap().get(&target_node).copied();
+                        let migration_ref = migration.clone();
+                        // Only snapshot keys for the shards being retried.
+                        let retry_shards: std::collections::HashSet<u16> = tasks.iter()
+                            .map(|t| t.shard).collect();
+                        let keys_map = engine.keys_by_shard_filtered(&retry_shards);
+                        let all_keys: Vec<TxKey> = keys_map.values()
+                            .flat_map(|v| v.iter().copied()).collect();
+                        let eng = engine.clone();
+                        let redo = redo_for_events.clone();
+                        let st = shard_table.clone();
+                        std::thread::spawn(move || {
+                            run_migration_batch(tasks, target_addr, &all_keys, &eng, &migration_ref, &st, &redo, epoch, migration_pool_size, migration_batch_size);
+                        });
+                    }
+                }
             }
             ClusterEvent::NodeLeft(node) => {
                 eprintln!("cluster: node {:?} left", node);
                 node_addrs.write().unwrap().remove(node);
             }
             ClusterEvent::MembershipChanged(members) => {
-                eprintln!("cluster: membership changed to {} nodes: {members:?}", members.len());
+                // Increment the monotonic topology epoch. This ensures
+                // every shard table has a strictly increasing version,
+                // making stale ownership views detectable.
+                let epoch = topology_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!("cluster: membership changed to {} nodes (epoch {epoch}): {members:?}", members.len());
 
                 let old_table = shard_table.read().unwrap();
-                let new_table = ShardTable::compute(members, rf);
+                let new_table = ShardTable::compute_with_epoch(members, rf, epoch);
                 let plan = ShardTable::migration_plan(&old_table, &new_table);
                 let replica_plan = ShardTable::replica_migration_plan(&old_table, &new_table);
                 drop(old_table);
@@ -183,69 +295,122 @@ impl ClusterCoordinator {
                         plan.len(), replica_plan.len(), outbound_tasks.len(), master_out, replica_out, inbound
                     );
 
-                    // CRITICAL: Take the shard table write lock, snapshot records,
-                    // then swap the table — all under the same lock. This ensures
-                    // no concurrent writes sneak in between the snapshot and the
-                    // table swap. The write lock blocks dispatch's read of the
-                    // shard table (check_shard_ownership), so in-flight writes
-                    // that started before the lock will complete before we
-                    // snapshot, and new writes will see the new table.
-                    let pre_swap_keys;
+                    // Record the redo log sequence at snapshot time.
+                    // Any mutations with sequence > snapshot_seq happened
+                    // after the snapshot and must be streamed as deltas.
+                    let snapshot_seq: u64 = redo_for_events
+                        .as_ref()
+                        .map(|rl| rl.lock().current_sequence())
+                        .unwrap_or(0);
+
+                    // Two-phase topology activation: begin handoff but do
+                    // NOT make new owners authoritative yet. The old master
+                    // continues serving each shard until its handoff commits.
+                    //
+                    // Snapshot only outbound shards' keys (not the full index).
+                    // This avoids materializing millions of keys into memory
+                    // when only a fraction of shards are migrating.
+                    let outbound_shard_set: std::collections::HashSet<u16> = outbound_tasks.iter()
+                        .map(|t| t.shard)
+                        .collect();
+                    let pre_swap_keys_by_shard;
                     {
                         let mut table = shard_table.write().unwrap();
-                        // Brief pause to let any in-flight writes that already
-                        // acquired the shard table read lock finish executing.
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        pre_swap_keys = engine.all_keys();
-                        *table = new_table;
+                        pre_swap_keys_by_shard = engine.keys_by_shard_filtered(&outbound_shard_set);
+                        table.begin_handoff(&new_table);
+                    }
+                    // Flatten for the existing run_migration_batch API.
+                    let pre_swap_keys: Vec<TxKey> = pre_swap_keys_by_shard.values()
+                        .flat_map(|v| v.iter().copied())
+                        .collect();
+
+                    // Compute which shards actually have records so we
+                    // only register inbound for those. Empty shards need
+                    // no data transfer and should not block reads/writes.
+                    // Uses the O(1) per-shard atomic counters rather than
+                    // iterating all keys.
+                    let populated_shards: std::collections::HashSet<u16> = (0..NUM_SHARDS as u16)
+                        .filter(|&s| engine.shard_record_count(s) > 0)
+                        .collect();
+
+                    {
+                        let mut mgr = migration.lock().unwrap();
+                        mgr.start_outbound(&all_tasks, self_id, &populated_shards);
+                        // Record the snapshot sequence on all outbound tasks.
+                        for t in all_tasks.iter().filter(|t| t.from_node == self_id) {
+                            mgr.set_snapshot_sequence(t, snapshot_seq);
+                        }
                     }
 
-                    migration.lock().unwrap().start_outbound(&all_tasks, self_id);
+                    // Group outbound tasks by target node. One thread per
+                    // target streams ALL shards for that target on a single
+                    // TCP connection. This is orders of magnitude faster than
+                    // the old per-shard threading model (e.g. 2 connections
+                    // for a 3-node cluster instead of 2700).
+                    let master_tasks: Vec<MigrationTask> = outbound_tasks.iter()
+                        .filter(|t| t.is_master).cloned().collect();
+                    let replica_tasks: Vec<MigrationTask> = outbound_tasks.iter()
+                        .filter(|t| !t.is_master).cloned().collect();
 
-                    // Spawn background threads for each outbound migration
-                    // (both master and replica) using the pre-swap key snapshot.
-                    for task in outbound_tasks {
-                        let target_addr = node_addrs.read().unwrap().get(&task.to_node).copied();
+                    // Group masters by target node.
+                    let mut masters_by_target: std::collections::HashMap<NodeId, Vec<MigrationTask>> =
+                        std::collections::HashMap::new();
+                    for t in master_tasks {
+                        masters_by_target.entry(t.to_node).or_default().push(t);
+                    }
+
+                    let mut master_handles = Vec::new();
+                    for (target_node, tasks) in masters_by_target {
+                        let target_addr = node_addrs.read().unwrap().get(&target_node).copied();
                         let migration_ref = migration.clone();
                         let all_keys = pre_swap_keys.clone();
                         let eng = engine.clone();
+                        let redo = redo_for_events.clone();
+                        let st = shard_table.clone();
+
+                        let h = std::thread::spawn(move || {
+                            run_migration_batch(tasks, target_addr, &all_keys, &eng, &migration_ref, &st, &redo, epoch, migration_pool_size, migration_batch_size);
+                        });
+                        master_handles.push(h);
+                    }
+
+                    // Replica backfills: wait for masters, then group by target.
+                    if !replica_tasks.is_empty() {
+                        let migration_for_replica = migration.clone();
+                        let node_addrs_for_replica = node_addrs.clone();
+                        let keys_for_replica = pre_swap_keys.clone();
+                        let engine_for_replica = engine.clone();
+                        let redo_for_replica = redo_for_events.clone();
+                        let shard_table_for_replica = shard_table.clone();
 
                         std::thread::spawn(move || {
-                            let mut ok = false;
-                            // Retry migration up to 3 times on failure
-                            for attempt in 0..3 {
-                                match target_addr {
-                                    Some(addr) => {
-                                        match migrate_shard(&task, addr, &all_keys, &eng) {
-                                            Ok(()) => { ok = true; break; }
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "cluster: migration of shard {} to {:?} attempt {} failed: {e}",
-                                                    task.shard, task.to_node, attempt + 1,
-                                                );
-                                                if attempt < 2 {
-                                                    std::thread::sleep(std::time::Duration::from_secs(2));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    None => {
-                                        eprintln!(
-                                            "cluster: no address for target node {:?}, cannot migrate shard {}",
-                                            task.to_node, task.shard
-                                        );
-                                        break;
-                                    }
-                                }
+                            for h in master_handles {
+                                let _ = h.join();
                             }
-                            let mut mgr = migration_ref.lock().unwrap();
-                            if ok {
-                                mgr.mark_complete(task.shard);
-                            } else {
-                                eprintln!("cluster: shard {} migration FAILED after retries", task.shard);
-                                mgr.mark_failed(task.shard);
+
+                            let mut replicas_by_target: std::collections::HashMap<NodeId, Vec<MigrationTask>> =
+                                std::collections::HashMap::new();
+                            for t in replica_tasks {
+                                replicas_by_target.entry(t.to_node).or_default().push(t);
                             }
-                            mgr.cleanup_completed();
+
+                            let st_for_replica = shard_table_for_replica.clone();
+                            let mut handles = Vec::new();
+                            for (target_node, tasks) in replicas_by_target {
+                                let target_addr = node_addrs_for_replica.read().unwrap().get(&target_node).copied();
+                                let migration_ref = migration_for_replica.clone();
+                                let all_keys = keys_for_replica.clone();
+                                let eng = engine_for_replica.clone();
+                                let redo = redo_for_replica.clone();
+                                let st = st_for_replica.clone();
+
+                                handles.push(std::thread::spawn(move || {
+                                    run_migration_batch(tasks, target_addr, &all_keys, &eng, &migration_ref, &st, &redo, epoch, migration_pool_size, migration_batch_size);
+                                }));
+                            }
+                            for h in handles {
+                                let _ = h.join();
+                            }
                         });
                     }
                 }
@@ -257,37 +422,1004 @@ impl ClusterCoordinator {
     }
 }
 
+/// Run a single migration task with the fenced handoff lifecycle.
+///
+/// 1. Stream baseline records from the key snapshot (Streaming state)
+/// 2. Fence writes for this shard on the source (Fenced state)
+/// 3. Stream redo log deltas from snapshot_sequence to fence_sequence
+/// 4. Send OP_MIGRATION_COMPLETE and wait for target confirmation
+/// 5. Mark complete or failed
+///
+/// Retries up to 3 times on failure. On final failure, the fence is
+/// lifted and the shard continues serving on the old master.
+/// Migrate all shards destined for one target node on a single TCP connection.
+///
+/// Opens one connection, then for each shard:
+/// 1. Streams baseline records
+/// 2. Fences source writes
+/// 3. Streams redo deltas
+/// 4. Sends OP_MIGRATION_COMPLETE
+///
+/// This is orders of magnitude faster than per-shard connections:
+/// a 3-node cluster migrating 1300 shards uses 1 connection instead of 1300.
+#[allow(clippy::too_many_arguments)]
+fn run_migration_batch(
+    tasks: Vec<MigrationTask>,
+    target_addr: Option<SocketAddr>,
+    all_keys: &[TxKey],
+    engine: &Engine,
+    migration: &Arc<Mutex<MigrationManager>>,
+    shard_table: &Arc<RwLock<ShardTable>>,
+    redo_log: &Option<Arc<ParkingMutex<RedoLog>>>,
+    topology_epoch: u64,
+    pool_size: usize,
+    batch_size: usize,
+) {
+    let addr = match target_addr {
+        Some(a) => a,
+        None => {
+            eprintln!("cluster: no address for target, cannot migrate {} shards", tasks.len());
+            let mut mgr = migration.lock().unwrap();
+            for task in &tasks {
+                mgr.mark_failed(task);
+            }
+            mgr.cleanup_completed();
+            drop(mgr);
+            // Rollback shard table so old masters remain authoritative.
+            let mut table = shard_table.write().unwrap();
+            for task in &tasks {
+                table.rollback_shard(task.shard);
+            }
+            return;
+        }
+    };
+
+    let completed = std::sync::atomic::AtomicU32::new(0);
+    let failed = std::sync::atomic::AtomicU32::new(0);
+
+    // Pre-group keys by shard ONCE. Without this, each shard does an
+    // O(N) scan of all keys, making total cost O(shards × keys).
+    // With pre-grouping, total cost is O(keys) for the grouping +
+    // O(shard_keys) per shard for the actual migration.
+    let mut keys_by_shard: std::collections::HashMap<u16, Vec<&TxKey>> =
+        std::collections::HashMap::new();
+    for key in all_keys {
+        let shard = ShardTable::shard_for_key(key);
+        keys_by_shard.entry(shard).or_default().push(key);
+    }
+
+    // Separate empty shards from shards with data using the pre-grouped
+    // map (O(1) per shard instead of O(all_keys) per shard).
+    let mut empty_tasks: Vec<MigrationTask> = Vec::new();
+    let mut data_tasks: Vec<MigrationTask> = Vec::new();
+    for task in &tasks {
+        if keys_by_shard.contains_key(&task.shard) {
+            data_tasks.push((*task).clone());
+        } else {
+            empty_tasks.push((*task).clone());
+        }
+    }
+
+    // Empty shards: fence writes, then re-verify emptiness before
+    // committing. A record could have been created between the
+    // pre_swap_keys snapshot and now, so we must block writes and
+    // re-check. If the shard is no longer empty, promote it to the
+    // data path for full migration.
+    if !empty_tasks.is_empty() {
+        let mut promoted = Vec::new();
+        {
+            let mut mgr = migration.lock().unwrap();
+            let mut table = shard_table.write().unwrap();
+            for task in &empty_tasks {
+                mgr.fence_shard(task.shard);
+                let count = engine.shard_record_count(task.shard);
+                if count == 0 {
+                    mgr.mark_complete(task);
+                    table.commit_shard(task.shard);
+                    completed.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // Records appeared between snapshot and fence.
+                    // Must go through full migration path.
+                    mgr.unfence_shard(task.shard);
+                    promoted.push(task.clone());
+                }
+            }
+        }
+        let instant_count = empty_tasks.len() - promoted.len();
+        if instant_count > 0 {
+            eprintln!("cluster: {} empty shards to {} committed instantly", instant_count, addr);
+        }
+        // Promoted shards are not in keys_by_shard since they were empty
+        // at snapshot time. The baseline will see zero keys for them, but
+        // the Create redo entries (now included in delta streaming per 1A)
+        // will transmit the newly created records during the delta phase.
+        // This is correct: the records were created after the snapshot, so
+        // they belong in the delta, not the baseline.
+        data_tasks.extend(promoted);
+    }
+
+    let total = data_tasks.len();
+    if total == 0 {
+        migration.lock().unwrap().cleanup_completed();
+        let c = completed.load(Ordering::Relaxed);
+        let f = failed.load(Ordering::Relaxed);
+        eprintln!("cluster: batch migration to {}: {} completed, {} failed", addr, c, f);
+        return;
+    }
+
+    // Split data tasks across a pool of parallel connections.
+    // More connections = more throughput for large migrations.
+    let pool_size = pool_size.max(1);
+    let chunk_size = total.div_ceil(pool_size);
+
+    let total_keys: usize = data_tasks.iter()
+        .map(|t| keys_by_shard.get(&t.shard).map(|v| v.len()).unwrap_or(0))
+        .sum();
+    eprintln!(
+        "cluster: migrating {} data shards ({} records) to {} across {} connections (batch_size={})",
+        total, total_keys, addr, pool_size.min(total), batch_size,
+    );
+
+    let completed = Arc::new(std::sync::atomic::AtomicU32::new(
+        completed.load(Ordering::Relaxed),
+    ));
+    let failed = Arc::new(std::sync::atomic::AtomicU32::new(
+        failed.load(Ordering::Relaxed),
+    ));
+
+    let migration_start = std::time::Instant::now();
+    let keys_ref = &keys_by_shard;
+    // Scale TCP timeouts based on batch size: base 5s + 50ms per record,
+    // capped at 60s. Large batches with cold data blobs need more time.
+    let timeout_ms = (5000 + batch_size as u64 * 50).min(60_000);
+    let tcp_timeout = Duration::from_millis(timeout_ms);
+
+    std::thread::scope(|scope| {
+        for chunk in data_tasks.chunks(chunk_size) {
+            let completed = completed.clone();
+            let failed = failed.clone();
+            let migration = migration.clone();
+
+            scope.spawn(move || {
+                // Exponential backoff delays for connection retries.
+                const CONNECT_RETRY_DELAYS_MS: [u64; 3] = [10, 50, 200];
+
+                let mut stream = None;
+                for (attempt, &delay_ms) in CONNECT_RETRY_DELAYS_MS.iter().enumerate() {
+                    match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+                        Ok(s) => {
+                            let _ = s.set_read_timeout(Some(tcp_timeout));
+                            let _ = s.set_write_timeout(Some(tcp_timeout));
+                            stream = Some(s);
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "cluster: connect to {} attempt {} failed: {e}",
+                                addr, attempt + 1,
+                            );
+                            if attempt < 2 {
+                                std::thread::sleep(Duration::from_millis(delay_ms));
+                            }
+                        }
+                    }
+                }
+
+                let mut stream = match stream {
+                    Some(s) => s,
+                    None => {
+                        eprintln!("cluster: connect to {} failed after retries", addr);
+                        let mut mgr = migration.lock().unwrap();
+                        for task in chunk {
+                            mgr.mark_failed(task);
+                            failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        drop(mgr);
+                        let mut table = shard_table.write().unwrap();
+                        for task in chunk {
+                            table.rollback_shard(task.shard);
+                        }
+                        return;
+                    }
+                };
+
+                for task in chunk {
+                    migrate_single_shard(task, keys_ref, engine, &migration, shard_table, redo_log, &mut stream, addr, &completed, &failed, topology_epoch, batch_size);
+                }
+            });
+        }
+    });
+
+    let c = completed.load(Ordering::Relaxed);
+    let f = failed.load(Ordering::Relaxed);
+    let elapsed = migration_start.elapsed();
+
+    migration.lock().unwrap().cleanup_completed();
+    let rate = if elapsed.as_secs_f64() > 0.0 {
+        total_keys as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    eprintln!(
+        "cluster: batch migration to {}: {} completed, {} failed in {:.1}s ({:.0} records/s)",
+        addr, c, f, elapsed.as_secs_f64(), rate,
+    );
+}
+
+/// Migrate a single shard: baseline → fence → deltas → complete handshake.
+///
+/// Checks the shard table version before fencing and before the complete
+/// handshake. If the topology has changed (epoch advanced), the migration
+/// is aborted early — the new topology's coordinator will re-plan.
+#[allow(clippy::too_many_arguments)]
+fn migrate_single_shard(
+    task: &MigrationTask,
+    keys_by_shard: &std::collections::HashMap<u16, Vec<&TxKey>>,
+    engine: &Engine,
+    migration: &Arc<Mutex<MigrationManager>>,
+    shard_table: &Arc<RwLock<ShardTable>>,
+    redo_log: &Option<Arc<ParkingMutex<RedoLog>>>,
+    stream: &mut TcpStream,
+    addr: SocketAddr,
+    completed: &Arc<std::sync::atomic::AtomicU32>,
+    failed: &Arc<std::sync::atomic::AtomicU32>,
+    topology_epoch: u64,
+    batch_size: usize,
+) {
+    let empty_vec = Vec::new();
+    let shard_keys = keys_by_shard.get(&task.shard).unwrap_or(&empty_vec);
+
+    // Phase 1: baseline
+    if let Err(e) = stream_shard_baseline(task, shard_keys, engine, stream, batch_size) {
+        eprintln!("cluster: shard {} baseline failed: {e}", task.shard);
+        migration.lock().unwrap().mark_failed(task);
+        shard_table.write().unwrap().rollback_shard(task.shard);
+        failed.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    // Epoch check: if topology changed since this migration started, abort
+    // early. The new topology's migration plan supersedes this one.
+    {
+        let current_version = shard_table.read().unwrap().version;
+        if current_version != topology_epoch {
+            eprintln!(
+                "cluster: shard {} migration aborted — topology epoch advanced ({} → {})",
+                task.shard, topology_epoch, current_version,
+            );
+            migration.lock().unwrap().mark_failed(task);
+            shard_table.write().unwrap().rollback_shard(task.shard);
+            failed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+
+    // Phase 2: fence
+    let snapshot_seq;
+    let fence_seq;
+    {
+        let mut mgr = migration.lock().unwrap();
+        snapshot_seq = mgr.find_task_mut(task)
+            .map(|p| p.snapshot_sequence).unwrap_or(0);
+        fence_seq = redo_log.as_ref()
+            .map(|rl| rl.lock().current_sequence()).unwrap_or(0);
+        mgr.mark_fenced(task, fence_seq);
+    }
+
+    // Phase 3: deltas
+    if snapshot_seq > 0
+        && fence_seq > snapshot_seq
+        && let Some(rl) = redo_log
+        && let Ok(entries) = rl.lock().read_from_sequence(snapshot_seq)
+    {
+        let delta_ops: Vec<_> = entries.iter()
+            .filter(|e| e.sequence < fence_seq)
+            .filter_map(|e| redo_entry_to_replica_op(e, task.shard, engine))
+            .collect();
+        if !delta_ops.is_empty()
+            && let Err(e) = send_delta_ops(stream, task.shard, &delta_ops)
+        {
+            eprintln!("cluster: shard {} delta failed: {e}", task.shard);
+            migration.lock().unwrap().mark_failed(task);
+            shard_table.write().unwrap().rollback_shard(task.shard);
+            failed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+
+    // Epoch check before final handshake: last chance to detect stale migration.
+    {
+        let current_version = shard_table.read().unwrap().version;
+        if current_version != topology_epoch {
+            eprintln!(
+                "cluster: shard {} migration aborted before complete — topology epoch advanced ({} → {})",
+                task.shard, topology_epoch, current_version,
+            );
+            migration.lock().unwrap().mark_failed(task);
+            shard_table.write().unwrap().rollback_shard(task.shard);
+            failed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+
+    // Phase 4: complete handshake
+    if let Err(e) = send_migration_complete(addr, task.shard, shard_keys.len() as u64, fence_seq, topology_epoch, Some(stream)) {
+        eprintln!("cluster: shard {} complete handshake failed: {e}", task.shard);
+        migration.lock().unwrap().mark_failed(task);
+        shard_table.write().unwrap().rollback_shard(task.shard);
+        failed.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    migration.lock().unwrap().mark_complete(task);
+    // Two-phase activation: commit this shard so routing switches
+    // from the old master to the new master.
+    shard_table.write().unwrap().commit_shard(task.shard);
+    completed.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Stream baseline records for one shard on an existing TCP connection.
+fn stream_shard_baseline(
+    task: &MigrationTask,
+    shard_keys: &[&TxKey],
+    engine: &Engine,
+    stream: &mut TcpStream,
+    batch_size: usize,
+) -> std::result::Result<(), String> {
+    use crate::replication::protocol::{ReplicaAck, ReplicaBatch, ReplicaOp};
+    use crate::record::{UTXO_SPENT, UTXO_FROZEN};
+
+    let batch_size = batch_size.max(1);
+    for chunk in shard_keys.chunks(batch_size) {
+        let mut ops = Vec::with_capacity(chunk.len() * 2);
+        for key in chunk {
+            let meta = match engine.read_metadata(key) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let utxo_count = meta.utxo_count;
+            let mut utxo_hashes = Vec::with_capacity(utxo_count as usize);
+            let mut slots = Vec::with_capacity(utxo_count as usize);
+            for v in 0..utxo_count {
+                match engine.read_slot(key, v) {
+                    Ok(slot) => {
+                        utxo_hashes.push(slot.hash);
+                        slots.push(slot);
+                    }
+                    Err(_) => {
+                        utxo_hashes.push([0u8; 32]);
+                        slots.push(crate::record::UtxoSlot::new_unspent([0u8; 32]));
+                    }
+                }
+            }
+
+            // Serialize metadata (70 bytes with extended fields).
+            let mut meta_buf = Vec::with_capacity(70);
+            meta_buf.extend_from_slice(&meta.tx_version.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.locktime.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.fee.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.size_in_bytes.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.extended_size.to_le_bytes());
+            meta_buf.push(meta.flags.bits());
+            meta_buf.extend_from_slice(&meta.spending_height.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.created_at.to_le_bytes());
+            meta_buf.push(0); // wire flags
+            meta_buf.extend_from_slice(&meta.generation.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.updated_at.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.unmined_since.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.delete_at_height.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.preserve_until.to_le_bytes());
+
+            let cold_data = if meta.flags.contains(crate::record::TxFlags::EXTERNAL) {
+                engine.blob_store().and_then(|bs| bs.get(&key.txid).ok().flatten())
+            } else {
+                None
+            };
+
+            ops.push(ReplicaOp::Create {
+                tx_key: **key,
+                metadata_bytes: meta_buf,
+                utxo_hashes,
+                cold_data,
+                is_external: meta.flags.contains(crate::record::TxFlags::EXTERNAL),
+            });
+
+            let tx_key = **key;
+            let record_gen = { meta.generation };
+            for (v, slot) in slots.iter().enumerate() {
+                if slot.status == UTXO_SPENT {
+                    ops.push(ReplicaOp::Spend {
+                        tx_key, offset: v as u32, spending_data: slot.spending_data,
+                        master_generation: record_gen,
+                    });
+                } else if slot.status == UTXO_FROZEN {
+                    ops.push(ReplicaOp::Freeze {
+                        tx_key, offset: v as u32, master_generation: record_gen,
+                    });
+                }
+            }
+
+            for i in 0..meta.block_entry_count as usize {
+                if i < crate::record::INLINE_BLOCK_ENTRIES {
+                    let be = &meta.block_entries_inline[i];
+                    if be.block_id != 0 || be.block_height != 0 {
+                        ops.push(ReplicaOp::SetMined {
+                            tx_key, block_id: be.block_id, block_height: be.block_height,
+                            subtree_idx: be.subtree_idx, on_longest_chain: true,
+                            master_generation: record_gen,
+                        });
+                    }
+                }
+            }
+
+            if meta.flags.contains(crate::record::TxFlags::CONFLICTING) {
+                ops.push(ReplicaOp::SetConflicting {
+                    tx_key, value: true, current_block_height: 0, retention: 0,
+                    master_generation: record_gen,
+                });
+            }
+            if meta.flags.contains(crate::record::TxFlags::LOCKED) {
+                ops.push(ReplicaOp::SetLocked {
+                    tx_key, value: true, master_generation: record_gen,
+                });
+            }
+        }
+
+        if ops.is_empty() {
+            continue;
+        }
+
+        let batch = ReplicaBatch { first_sequence: 0, ops };
+        let request = RequestFrame {
+            request_id: task.shard as u64,
+            op_code: OP_REPLICA_BATCH,
+            flags: FLAG_MIGRATION_BATCH,
+            payload: batch.serialize(),
+        };
+
+        stream.write_all(&request.encode())
+            .map_err(|e| format!("write baseline batch: {e}"))?;
+
+        // Read and validate response.
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf)
+            .map_err(|e| format!("read response length: {e}"))?;
+        let total_length = u32::from_le_bytes(len_buf) as usize;
+        let mut body = vec![0u8; total_length];
+        stream.read_exact(&mut body)
+            .map_err(|e| format!("read response body: {e}"))?;
+
+        let mut full = Vec::with_capacity(4 + total_length);
+        full.extend_from_slice(&len_buf);
+        full.extend_from_slice(&body);
+        let (response, _) = ResponseFrame::decode(&full)
+            .map_err(|e| format!("decode response: {e}"))?;
+
+        if response.status != STATUS_OK {
+            return Err(format!("batch failed with status {}", response.status));
+        }
+
+        if !response.payload.is_empty() {
+            match ReplicaAck::deserialize(&response.payload) {
+                Ok(ReplicaAck::Error { failed_sequence, message }) => {
+                    return Err(format!("replica error at seq {failed_sequence}: {message}"));
+                }
+                Ok(ReplicaAck::Ok { .. }) => {}
+                Err(e) => {
+                    return Err(format!("failed to parse replica ack: {e}"));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Run a single migration task through the full fenced handoff lifecycle.
+///
+/// 1. Stream baseline records to target (Streaming)
+/// 2. Fence source writes for this shard (Fenced)
+/// 3. Stream redo log deltas from snapshot to fence point
+/// 4. Send OP_MIGRATION_COMPLETE with record count
+/// 5. Wait for target ACK (verifies data receipt)
+/// 6. Mark complete (unfences source)
+///
+/// Retries up to 3 times with exponential backoff. On final failure the
+/// shard table is rolled back so the old master remains authoritative
+/// and the write fence is lifted.
+#[allow(dead_code)]
+fn run_migration_task(
+    task: MigrationTask,
+    target_addr: Option<SocketAddr>,
+    all_keys: &[TxKey],
+    engine: &Engine,
+    migration: &Arc<Mutex<MigrationManager>>,
+    shard_table: &Arc<RwLock<ShardTable>>,
+    redo_log: &Option<Arc<ParkingMutex<RedoLog>>>,
+) {
+    // Exponential backoff delays: 10ms, 50ms, 200ms.
+    const RETRY_DELAYS_MS: [u64; 3] = [10, 50, 200];
+
+    let mut ok = false;
+    for (attempt, &delay_ms) in RETRY_DELAYS_MS.iter().enumerate() {
+        let addr = match target_addr {
+            Some(a) => a,
+            None => {
+                eprintln!(
+                    "cluster: no address for target node {:?}, cannot migrate shard {}",
+                    task.to_node, task.shard
+                );
+                break;
+            }
+        };
+
+        // Phase 1: stream baseline records. Returns the open TCP stream
+        // so phases 2-4 reuse it (avoids 2 extra TCP connections per shard).
+        let (baseline_count, mut stream) = match migrate_shard(&task, addr, all_keys, engine) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "cluster: shard {} baseline to {:?} attempt {} failed: {e}",
+                    task.shard, task.to_node, attempt + 1,
+                );
+                if attempt < 2 {
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                }
+                continue;
+            }
+        };
+
+        // Phase 2: fence writes on this shard
+        let snapshot_seq;
+        let fence_seq;
+        {
+            let mut mgr = migration.lock().unwrap();
+            snapshot_seq = mgr.find_task_mut(&task)
+                .map(|p| p.snapshot_sequence)
+                .unwrap_or(0);
+            fence_seq = redo_log.as_ref()
+                .map(|rl| rl.lock().current_sequence())
+                .unwrap_or(0);
+            mgr.mark_fenced(&task, fence_seq);
+        }
+
+        // Phase 3: stream deltas on the same connection
+        let mut delta_failed = false;
+        if snapshot_seq > 0 && fence_seq > snapshot_seq
+            && let Some(rl) = redo_log
+            && let Ok(entries) = rl.lock().read_from_sequence(snapshot_seq)
+        {
+            let delta_ops: Vec<_> = entries.iter()
+                .filter(|e| e.sequence < fence_seq)
+                .filter_map(|e| redo_entry_to_replica_op(e, task.shard, engine))
+                .collect();
+            if !delta_ops.is_empty()
+                && let Some(ref mut s) = stream
+            {
+                eprintln!(
+                    "cluster: shard {} streaming {} delta ops (seq {}..{})",
+                    task.shard, delta_ops.len(), snapshot_seq, fence_seq
+                );
+                if let Err(e) = send_delta_ops(s, task.shard, &delta_ops) {
+                    eprintln!("cluster: shard {} delta streaming failed: {e}", task.shard);
+                    delta_failed = true;
+                }
+            }
+        }
+        if delta_failed {
+            if attempt < 2 {
+                migration.lock().unwrap().unfence_shard(task.shard);
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+            continue;
+        }
+
+        // Phase 4: send OP_MIGRATION_COMPLETE on the same connection
+        if let Err(e) = send_migration_complete(addr, task.shard, baseline_count as u64, fence_seq, 0, stream.as_mut()) {
+            eprintln!("cluster: shard {} migration-complete handshake failed: {e}", task.shard);
+            if attempt < 2 {
+                migration.lock().unwrap().unfence_shard(task.shard);
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+            continue;
+        }
+
+        ok = true;
+        break;
+    }
+
+    let mut mgr = migration.lock().unwrap();
+    if ok {
+        mgr.mark_complete(&task);
+    } else {
+        eprintln!("cluster: shard {} migration FAILED after retries — rolling back", task.shard);
+        mgr.mark_failed(&task);
+        drop(mgr);
+        // Rollback shard table so old master remains authoritative.
+        shard_table.write().unwrap().rollback_shard(task.shard);
+        let mut mgr = migration.lock().unwrap();
+        mgr.cleanup_completed();
+        return;
+    }
+    mgr.cleanup_completed();
+}
+
+/// Send the OP_MIGRATION_COMPLETE handshake on an existing or new stream.
+///
+/// The payload includes the expected record count, fence sequence, and
+/// topology epoch so the target can perform a stronger verification than
+/// a simple count check.
+///
+/// If `stream` is Some, reuses it (avoids a new TCP connection).
+/// Otherwise opens a fresh connection.
+fn send_migration_complete(
+    target_addr: SocketAddr,
+    shard: u16,
+    record_count: u64,
+    fence_sequence: u64,
+    topology_epoch: u64,
+    stream: Option<&mut TcpStream>,
+) -> std::result::Result<(), String> {
+    // Use existing stream or create new one.
+    let mut owned;
+    let s: &mut TcpStream = match stream {
+        Some(s) => s,
+        None => {
+            owned = TcpStream::connect_timeout(
+                &target_addr, Duration::from_secs(3),
+            ).map_err(|e| format!("connect: {e}"))?;
+            owned.set_read_timeout(Some(Duration::from_secs(5)))
+                .map_err(|e| format!("set read timeout: {e}"))?;
+            &mut owned
+        }
+    };
+
+    // Payload: [record_count:8][fence_sequence:8][topology_epoch:8]
+    let mut payload = Vec::with_capacity(24);
+    payload.extend_from_slice(&record_count.to_le_bytes());
+    payload.extend_from_slice(&fence_sequence.to_le_bytes());
+    payload.extend_from_slice(&topology_epoch.to_le_bytes());
+
+    let request = RequestFrame {
+        request_id: shard as u64,
+        op_code: OP_MIGRATION_COMPLETE,
+        flags: 0,
+        payload,
+    };
+    s.write_all(&request.encode())
+        .map_err(|e| format!("write: {e}"))?;
+
+    let mut len_buf = [0u8; 4];
+    s.read_exact(&mut len_buf)
+        .map_err(|e| format!("read response length: {e}"))?;
+    let total_length = u32::from_le_bytes(len_buf) as usize;
+    let mut body = vec![0u8; total_length];
+    s.read_exact(&mut body)
+        .map_err(|e| format!("read response body: {e}"))?;
+
+    let mut full = Vec::with_capacity(4 + total_length);
+    full.extend_from_slice(&len_buf);
+    full.extend_from_slice(&body);
+    let (response, _) = ResponseFrame::decode(&full)
+        .map_err(|e| format!("decode response: {e}"))?;
+
+    if response.status != STATUS_OK {
+        return Err(format!("target rejected: status {}", response.status));
+    }
+    Ok(())
+}
+
+/// Convert a redo log entry to a ReplicaOp if it belongs to the given shard.
+///
+/// Returns None for entries belonging to other shards, or for non-replicatable
+/// ops like Checkpoint and MarkOnLongestChain. Create and Delete ops are
+/// converted so that records created or deleted after the baseline snapshot
+/// are captured in the delta phase.
+pub fn redo_entry_to_replica_op(
+    entry: &crate::redo::RedoEntry,
+    shard: u16,
+    engine: &Engine,
+) -> Option<crate::replication::protocol::ReplicaOp> {
+    use crate::redo::RedoOp;
+    use crate::replication::protocol::ReplicaOp;
+
+    // Helper: read current generation for a key.
+    let gen_for = |k: &TxKey| -> u32 {
+        engine.read_metadata(k).map(|m| { m.generation }).unwrap_or(0)
+    };
+
+    match &entry.op {
+        RedoOp::Spend { tx_key, offset, spending_data, .. } => {
+            if ShardTable::shard_for_key(tx_key) != shard { return None; }
+            Some(ReplicaOp::Spend {
+                tx_key: *tx_key, offset: *offset, spending_data: *spending_data,
+                master_generation: gen_for(tx_key),
+            })
+        }
+        RedoOp::Unspend { tx_key, offset, .. } => {
+            if ShardTable::shard_for_key(tx_key) != shard { return None; }
+            Some(ReplicaOp::Unspend {
+                tx_key: *tx_key, offset: *offset,
+                master_generation: gen_for(tx_key),
+            })
+        }
+        RedoOp::SetMined { tx_key, block_id, block_height, subtree_idx, unset } => {
+            if ShardTable::shard_for_key(tx_key) != shard { return None; }
+            if *unset {
+                Some(ReplicaOp::UnsetMined {
+                    tx_key: *tx_key, block_id: *block_id,
+                    master_generation: gen_for(tx_key),
+                })
+            } else {
+                Some(ReplicaOp::SetMined {
+                    tx_key: *tx_key, block_id: *block_id, block_height: *block_height,
+                    subtree_idx: *subtree_idx, on_longest_chain: true,
+                    master_generation: gen_for(tx_key),
+                })
+            }
+        }
+        RedoOp::Freeze { tx_key, offset } => {
+            if ShardTable::shard_for_key(tx_key) != shard { return None; }
+            Some(ReplicaOp::Freeze {
+                tx_key: *tx_key, offset: *offset,
+                master_generation: gen_for(tx_key),
+            })
+        }
+        RedoOp::Unfreeze { tx_key, offset } => {
+            if ShardTable::shard_for_key(tx_key) != shard { return None; }
+            Some(ReplicaOp::Unfreeze {
+                tx_key: *tx_key, offset: *offset,
+                master_generation: gen_for(tx_key),
+            })
+        }
+        RedoOp::Reassign { tx_key, offset, new_hash, block_height, spendable_after } => {
+            if ShardTable::shard_for_key(tx_key) != shard { return None; }
+            Some(ReplicaOp::Reassign {
+                tx_key: *tx_key, offset: *offset, new_hash: *new_hash,
+                block_height: *block_height, spendable_after: *spendable_after,
+                master_generation: gen_for(tx_key),
+            })
+        }
+        RedoOp::SetConflicting { tx_key, value, current_block_height, block_height_retention } => {
+            if ShardTable::shard_for_key(tx_key) != shard { return None; }
+            Some(ReplicaOp::SetConflicting {
+                tx_key: *tx_key, value: *value,
+                current_block_height: *current_block_height,
+                retention: *block_height_retention,
+                master_generation: gen_for(tx_key),
+            })
+        }
+        RedoOp::SetLocked { tx_key, value } => {
+            if ShardTable::shard_for_key(tx_key) != shard { return None; }
+            Some(ReplicaOp::SetLocked {
+                tx_key: *tx_key, value: *value,
+                master_generation: gen_for(tx_key),
+            })
+        }
+        RedoOp::PreserveUntil { tx_key, block_height } => {
+            if ShardTable::shard_for_key(tx_key) != shard { return None; }
+            Some(ReplicaOp::PreserveUntil {
+                tx_key: *tx_key, block_height: *block_height,
+                master_generation: gen_for(tx_key),
+            })
+        }
+        RedoOp::PruneSlot { tx_key, offset } => {
+            if ShardTable::shard_for_key(tx_key) != shard { return None; }
+            Some(ReplicaOp::PruneSlot { tx_key: *tx_key, offset: *offset })
+        }
+        RedoOp::Create { tx_key, .. } => {
+            // A record created after the baseline snapshot must be sent as a
+            // delta, otherwise the target never receives it. We read the full
+            // current record state from the engine (metadata, UTXOs, cold data)
+            // and emit a ReplicaOp::Create. Any subsequent mutations (Spend,
+            // SetMined, etc.) within the delta range have their own redo
+            // entries which are already converted above, and applying them
+            // twice on the target is harmless (all ops are idempotent).
+            if ShardTable::shard_for_key(tx_key) != shard { return None; }
+            let meta = match engine.read_metadata(tx_key) {
+                Ok(m) => m,
+                Err(_) => return None, // record may have been deleted since
+            };
+
+            let utxo_count = meta.utxo_count;
+            let mut utxo_hashes = Vec::with_capacity(utxo_count as usize);
+            for v in 0..utxo_count {
+                match engine.read_slot(tx_key, v) {
+                    Ok(slot) => utxo_hashes.push(slot.hash),
+                    Err(_) => utxo_hashes.push([0u8; 32]),
+                }
+            }
+
+            // Serialize metadata in the same format as stream_shard_baseline.
+            let mut meta_buf = Vec::with_capacity(70);
+            meta_buf.extend_from_slice(&meta.tx_version.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.locktime.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.fee.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.size_in_bytes.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.extended_size.to_le_bytes());
+            meta_buf.push(meta.flags.bits());
+            meta_buf.extend_from_slice(&meta.spending_height.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.created_at.to_le_bytes());
+            meta_buf.push(0); // wire flags
+            meta_buf.extend_from_slice(&meta.generation.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.updated_at.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.unmined_since.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.delete_at_height.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.preserve_until.to_le_bytes());
+
+            let cold_data = if meta.flags.contains(crate::record::TxFlags::EXTERNAL) {
+                engine.blob_store().and_then(|bs| bs.get(&tx_key.txid).ok().flatten())
+            } else {
+                None
+            };
+
+            Some(ReplicaOp::Create {
+                tx_key: *tx_key,
+                metadata_bytes: meta_buf,
+                utxo_hashes,
+                cold_data,
+                is_external: meta.flags.contains(crate::record::TxFlags::EXTERNAL),
+            })
+        }
+        RedoOp::Delete { tx_key, .. } => {
+            // A delete after the baseline snapshot must be forwarded so the
+            // target removes the record. Without this, deleted records would
+            // be resurrected on the target.
+            if ShardTable::shard_for_key(tx_key) != shard { return None; }
+            Some(ReplicaOp::Delete { tx_key: *tx_key })
+        }
+        // Checkpoint is a no-op. MarkOnLongestChain is a secondary index
+        // operation that gets rebuilt.
+        RedoOp::Checkpoint | RedoOp::MarkOnLongestChain { .. } => None,
+    }
+}
+
+/// Send delta ReplicaOps to the target on an existing stream and validate ACK.
+fn send_delta_ops(
+    stream: &mut TcpStream,
+    shard: u16,
+    ops: &[crate::replication::protocol::ReplicaOp],
+) -> std::result::Result<(), String> {
+    use crate::replication::protocol::{ReplicaAck, ReplicaBatch};
+
+    let batch = ReplicaBatch {
+        first_sequence: 0,
+        ops: ops.to_vec(),
+    };
+    let request = RequestFrame {
+        request_id: shard as u64,
+        op_code: OP_REPLICA_BATCH,
+        flags: FLAG_MIGRATION_BATCH,
+        payload: batch.serialize(),
+    };
+    stream.write_all(&request.encode())
+        .map_err(|e| format!("write delta batch: {e}"))?;
+
+    // Read and validate response — same contract as baseline migration.
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)
+        .map_err(|e| format!("read delta response length: {e}"))?;
+    let total_length = u32::from_le_bytes(len_buf) as usize;
+    let mut body = vec![0u8; total_length];
+    stream.read_exact(&mut body)
+        .map_err(|e| format!("read delta response body: {e}"))?;
+
+    let mut full = Vec::with_capacity(4 + total_length);
+    full.extend_from_slice(&len_buf);
+    full.extend_from_slice(&body);
+    let (response, _) = ResponseFrame::decode(&full)
+        .map_err(|e| format!("decode delta response: {e}"))?;
+
+    if response.status != STATUS_OK {
+        return Err(format!("delta batch rejected: status {}", response.status));
+    }
+
+    // Validate ReplicaAck payload
+    if !response.payload.is_empty() {
+        match ReplicaAck::deserialize(&response.payload) {
+            Ok(ReplicaAck::Error { failed_sequence, message }) => {
+                return Err(format!(
+                    "delta apply error at seq {failed_sequence}: {message}"
+                ));
+            }
+            Ok(ReplicaAck::Ok { .. }) => {}
+            Err(e) => {
+                return Err(format!("failed to parse delta ack: {e}"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Persist the peak cluster size to disk (atomic write: temp file + rename).
 ///
 /// Best-effort: errors are logged but do not propagate. The cluster will
 /// still function correctly but a restart may lose the quorum guarantee.
-fn persist_peak_cluster_size(path: &std::path::Path, peak: u64) {
+/// Persist the cluster state (peak size + topology epoch) to disk.
+///
+/// File format: `[peak:8 LE][epoch:8 LE]`.
+/// Best-effort: errors are logged but do not propagate.
+fn persist_cluster_state(path: &std::path::Path, peak: u64, epoch: u64) {
     use std::io::Write as _;
     let tmp = path.with_extension("cluster.tmp");
     let result = (|| -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(&peak.to_le_bytes())?;
+        f.write_all(&epoch.to_le_bytes())?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)?;
         Ok(())
     })();
     if let Err(e) = result {
-        eprintln!("cluster: failed to persist peak cluster size: {e}");
+        eprintln!("cluster: failed to persist cluster state: {e}");
     }
 }
 
-/// Load the persisted peak cluster size from disk.
-///
-/// Returns the persisted value, or 1 if the file does not exist or is
-/// corrupted.
-pub fn load_peak_cluster_size(path: &std::path::Path) -> usize {
+/// Persist the full topology state (new format with committed members).
+#[allow(dead_code)]
+fn persist_topology_state(
+    path: &std::path::Path,
+    state: &crate::cluster::topology::PersistedTopologyState,
+) {
+    use std::io::Write as _;
+    let tmp = path.with_extension("cluster.tmp");
+    let data = state.serialize();
+    let result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&data)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        eprintln!("cluster: failed to persist topology state: {e}");
+    }
+}
+
+/// Load the full topology state from disk (backward-compatible).
+pub fn load_topology_state(path: &std::path::Path) -> crate::cluster::topology::PersistedTopologyState {
     match std::fs::read(path) {
+        Ok(data) => crate::cluster::topology::PersistedTopologyState::deserialize(&data),
+        _ => crate::cluster::topology::PersistedTopologyState {
+            peak_cluster_size: 1,
+            committed_term: 0,
+            committed_members: Vec::new(),
+            voted_term: 0,
+        },
+    }
+}
+
+/// Backward-compatible alias for callers that only persist peak.
+#[allow(dead_code)]
+fn persist_peak_cluster_size(path: &std::path::Path, peak: u64) {
+    persist_cluster_state(path, peak, 0);
+}
+
+/// Load the persisted cluster state from disk.
+///
+/// Returns `(peak_cluster_size, topology_epoch)`.
+/// Falls back to (1, 0) if the file doesn't exist or is corrupted.
+/// Backward-compatible: reads 8-byte files as peak-only (epoch=0).
+pub fn load_cluster_state(path: &std::path::Path) -> (usize, u64) {
+    match std::fs::read(path) {
+        Ok(data) if data.len() >= 16 => {
+            let peak = u64::from_le_bytes(data[..8].try_into().unwrap_or([0; 8]));
+            let epoch = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
+            ((peak as usize).max(1), epoch)
+        }
         Ok(data) if data.len() >= 8 => {
             let peak = u64::from_le_bytes(data[..8].try_into().unwrap_or([0; 8]));
-            (peak as usize).max(1)
+            ((peak as usize).max(1), 0)
         }
-        _ => 1,
+        _ => (1, 0),
     }
+}
+
+/// Load the persisted peak cluster size from disk (backward-compat wrapper).
+pub fn load_peak_cluster_size(path: &std::path::Path) -> usize {
+    load_cluster_state(path).0
 }
 
 /// Migrate all records belonging to a shard to the target node.
@@ -295,12 +1427,25 @@ pub fn load_peak_cluster_size(path: &std::path::Path) -> usize {
 /// Reads full record data from the local engine and sends it to the target
 /// via `OP_REPLICA_BATCH` frames so the target receives complete records
 /// (not dummy placeholders).
+/// Stream baseline records for a shard to the target node.
+///
+/// Returns the number of records streamed. Does NOT send
+/// `OP_MIGRATION_COMPLETE` — that is handled by `run_migration_task`
+/// after delta streaming completes.
+/// Stream baseline records for a shard to the target node.
+///
+/// Returns `(record_count, tcp_stream)`. The stream is kept open so the
+/// caller can reuse it for delta streaming and the completion handshake,
+/// avoiding 3 separate TCP connections per shard.
+///
+/// For empty shards, returns `(0, None)` — no connection needed.
+#[allow(dead_code)]
 fn migrate_shard(
     task: &MigrationTask,
     target_addr: SocketAddr,
     all_keys: &[TxKey],
     engine: &Engine,
-) -> Result<(), String> {
+) -> std::result::Result<(usize, Option<TcpStream>), String> {
     // Filter keys belonging to this shard
     let shard_keys: Vec<&TxKey> = all_keys.iter()
         .filter(|k| ShardTable::shard_for_key(k) == task.shard)
@@ -308,7 +1453,7 @@ fn migrate_shard(
 
     if shard_keys.is_empty() {
         eprintln!("cluster: shard {} has no records to migrate", task.shard);
-        return Ok(());
+        return Ok((0, None));
     }
 
     eprintln!(
@@ -319,13 +1464,13 @@ fn migrate_shard(
     // Connect to target node
     let mut stream = TcpStream::connect_timeout(
         &target_addr,
-        Duration::from_secs(10),
+        Duration::from_secs(3),
     ).map_err(|e| format!("connect to {target_addr}: {e}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| format!("set read timeout: {e}"))?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(30)))
+        .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| format!("set write timeout: {e}"))?;
 
     // Build ReplicaOps for each record: Create + Spend/Freeze/SetMined as needed.
@@ -360,8 +1505,14 @@ fn migrate_shard(
                 }
             }
 
-            // Serialize metadata for the replica
-            let mut meta_buf = Vec::with_capacity(46);
+            // Serialize metadata for the replica.
+            // Layout: tx_version(4) + locktime(4) + fee(8) + size_in_bytes(8) +
+            //   extended_size(8) + flags(1) + spending_height(4) + created_at(8) +
+            //   wire_flags(1) + generation(4) + updated_at(8) + unmined_since(4) +
+            //   delete_at_height(4) + preserve_until(4) = 70 bytes
+            // The receiver parses the first 46 bytes for the core fields and
+            // uses remaining bytes for lifecycle/counter state if present.
+            let mut meta_buf = Vec::with_capacity(70);
             meta_buf.extend_from_slice(&meta.tx_version.to_le_bytes());
             meta_buf.extend_from_slice(&meta.locktime.to_le_bytes());
             meta_buf.extend_from_slice(&meta.fee.to_le_bytes());
@@ -370,7 +1521,13 @@ fn migrate_shard(
             meta_buf.push(meta.flags.bits());
             meta_buf.extend_from_slice(&meta.spending_height.to_le_bytes());
             meta_buf.extend_from_slice(&meta.created_at.to_le_bytes());
-            meta_buf.push(0); // flags byte for create
+            meta_buf.push(0); // wire flags byte for create
+            // Extended metadata for full failover state:
+            meta_buf.extend_from_slice(&meta.generation.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.updated_at.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.unmined_since.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.delete_at_height.to_le_bytes());
+            meta_buf.extend_from_slice(&meta.preserve_until.to_le_bytes());
 
             // Include cold data from the blobstore if the record has external
             // data. Without this, replicas/migration targets lose the blob.
@@ -389,19 +1546,24 @@ fn migrate_shard(
                 is_external: meta.flags.contains(crate::record::TxFlags::EXTERNAL),
             });
 
-            // Replay spent/frozen slot state so the replica matches the master
+            // Replay spent/frozen slot state so the replica matches the master.
+            // Use the master's generation for all replay ops so the replica
+            // ends up with the same generation counter.
             let tx_key = **key;
+            let record_gen = { meta.generation };
             for (v, slot) in slots.iter().enumerate() {
                 if slot.status == UTXO_SPENT {
                     ops.push(ReplicaOp::Spend {
                         tx_key,
                         offset: v as u32,
                         spending_data: slot.spending_data,
+                        master_generation: record_gen,
                     });
                 } else if slot.status == UTXO_FROZEN {
                     ops.push(ReplicaOp::Freeze {
                         tx_key,
                         offset: v as u32,
+                        master_generation: record_gen,
                     });
                 }
             }
@@ -417,6 +1579,7 @@ fn migrate_shard(
                             block_height: be.block_height,
                             subtree_idx: be.subtree_idx,
                             on_longest_chain: true,
+                            master_generation: record_gen,
                         });
                     }
                 }
@@ -429,12 +1592,14 @@ fn migrate_shard(
                     value: true,
                     current_block_height: 0,
                     retention: 0,
+                    master_generation: record_gen,
                 });
             }
             if meta.flags.contains(crate::record::TxFlags::LOCKED) {
                 ops.push(ReplicaOp::SetLocked {
                     tx_key,
                     value: true,
+                    master_generation: record_gen,
                 });
             }
         }
@@ -448,11 +1613,12 @@ fn migrate_shard(
             ops,
         };
 
-        // Send as OP_REPLICA_BATCH so the target receives full record data
+        // Send as OP_REPLICA_BATCH with FLAG_MIGRATION_BATCH so the
+        // target registers the shard as receiving inbound migration data.
         let request = RequestFrame {
             request_id: task.shard as u64,
             op_code: OP_REPLICA_BATCH,
-            flags: 0,
+            flags: FLAG_MIGRATION_BATCH,
             payload: batch.serialize(),
         };
 
@@ -484,47 +1650,34 @@ fn migrate_shard(
                 response.status
             ));
         }
+
+        // The receiver always returns STATUS_OK and encodes the real
+        // result in the ReplicaAck payload.  A deserialization or
+        // apply_op failure produces ReplicaAck::Error, which we must
+        // detect — otherwise we'd mark the migration as successful
+        // when the target silently rejected the data.
+        use crate::replication::protocol::ReplicaAck;
+        if !response.payload.is_empty() {
+            match ReplicaAck::deserialize(&response.payload) {
+                Ok(ReplicaAck::Error { failed_sequence, message }) => {
+                    return Err(format!(
+                        "migration batch: replica reported error at seq {failed_sequence}: {message}"
+                    ));
+                }
+                Ok(ReplicaAck::Ok { .. }) => {} // success
+                Err(e) => {
+                    return Err(format!("migration batch: failed to parse replica ack: {e}"));
+                }
+            }
+        }
     }
 
-    // Send migration-complete handshake so the target can verify it
-    // has the data before we consider the migration finished.
-    let complete_request = RequestFrame {
-        request_id: task.shard as u64,
-        op_code: OP_MIGRATION_COMPLETE,
-        flags: 0,
-        payload: Vec::new(),
-    };
-    let complete_bytes = complete_request.encode();
-    stream
-        .write_all(&complete_bytes)
-        .map_err(|e| format!("write migration complete: {e}"))?;
+    // NOTE: OP_MIGRATION_COMPLETE is NOT sent here. It is sent by
+    // run_migration_task() AFTER delta streaming completes, so the
+    // target does not clear pending-inbound before all data arrives.
 
-    // Read the acknowledgment
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .map_err(|e| format!("read migration complete response length: {e}"))?;
-    let total_length = u32::from_le_bytes(len_buf) as usize;
-    let mut body = vec![0u8; total_length];
-    stream
-        .read_exact(&mut body)
-        .map_err(|e| format!("read migration complete response body: {e}"))?;
-
-    let mut full = Vec::with_capacity(4 + total_length);
-    full.extend_from_slice(&len_buf);
-    full.extend_from_slice(&body);
-    let (response, _) = ResponseFrame::decode(&full)
-        .map_err(|e| format!("decode migration complete response: {e}"))?;
-
-    if response.status != STATUS_OK {
-        return Err(format!(
-            "migration complete handshake failed with status {}",
-            response.status
-        ));
-    }
-
-    eprintln!("cluster: shard {} migration complete ({} records)", task.shard, shard_keys.len());
-    Ok(())
+    eprintln!("cluster: shard {} baseline streamed ({} records)", task.shard, shard_keys.len());
+    Ok((shard_keys.len(), Some(stream)))
 }
 
 /// Encode a batch of TxKeys as a CreateBatch payload for migration.
@@ -533,6 +1686,7 @@ fn migrate_shard(
 /// node's `decode_create_batch` can parse it. Each record is created with
 /// a single dummy UTXO slot — the actual record data will be synchronized
 /// via replication.
+#[allow(dead_code)]
 fn encode_migration_create_batch(keys: &[&TxKey]) -> Vec<u8> {
     use crate::protocol::codec::{WireCreateItem, encode_create_batch};
 
@@ -569,6 +1723,18 @@ pub struct RunningCluster {
     shutdown: Arc<AtomicBool>,
     /// Highest observed cluster size (for quorum calculations).
     peak_size: Arc<std::sync::atomic::AtomicUsize>,
+    /// Monotonic topology epoch for ownership fencing.
+    topology_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Resolved ACK policy for replication durability enforcement.
+    repl_ack_policy: Option<crate::replication::manager::AckPolicy>,
+    /// Whether replication failures are tolerated (best_effort degraded mode).
+    repl_best_effort: bool,
+    /// Topology authority for quorum-committed term management.
+    topology_authority: Arc<crate::cluster::topology::TopologyAuthority>,
+    /// Path for persisting inbound migration state across restarts.
+    /// When set, every inbound state change is durably flushed so a
+    /// crashed target knows which shards were mid-migration on recovery.
+    inbound_state_path: Option<std::path::PathBuf>,
     _swim_handle: std::thread::JoinHandle<()>,
     _event_handle: std::thread::JoinHandle<()>,
 }
@@ -623,9 +1789,39 @@ impl RunningCluster {
         self.migration.lock().unwrap().has_pending_inbound(shard)
     }
 
+    /// Check if writes are fenced for the given key's shard.
+    ///
+    /// Returns true when this node is the source of an outbound migration
+    /// and the shard has entered the Fenced state (baseline complete,
+    /// streaming deltas). Writes are rejected; reads continue.
+    pub fn is_shard_write_fenced(&self, key: &TxKey) -> bool {
+        let shard = ShardTable::shard_for_key(key);
+        self.migration.lock().unwrap().is_shard_fenced(shard)
+    }
+
     /// Mark an inbound shard migration as complete (data has arrived).
+    ///
+    /// Persists the updated inbound state to disk so a crash after
+    /// completion doesn't resurrect stale pending-inbound entries.
     pub fn mark_inbound_complete(&self, shard: u16) {
-        self.migration.lock().unwrap().mark_inbound_complete(shard);
+        let mgr = &mut self.migration.lock().unwrap();
+        mgr.mark_inbound_complete(shard);
+        if let Some(ref path) = self.inbound_state_path {
+            crate::cluster::migration::persist_inbound_state(path, mgr);
+        }
+    }
+
+    /// Register a shard as actively receiving inbound migration data.
+    ///
+    /// Called when the first `OP_REPLICA_BATCH` for this shard arrives
+    /// so the read/write path knows to wait for migration completion.
+    /// Persists to disk so a crash mid-migration blocks the shard on restart.
+    pub fn mark_inbound_active(&self, shard: u16) {
+        let mgr = &mut self.migration.lock().unwrap();
+        mgr.mark_inbound_active(shard);
+        if let Some(ref path) = self.inbound_state_path {
+            crate::cluster::migration::persist_inbound_state(path, mgr);
+        }
     }
 
     /// Get the address of a node.
@@ -682,6 +1878,39 @@ impl RunningCluster {
         self.peak_size.load(Ordering::Relaxed)
     }
 
+    /// Current monotonic topology epoch.
+    ///
+    /// Every membership change increments this counter. Used as a
+    /// fencing token for ownership validation.
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Resolved replication ACK policy. None means best-effort (no enforcement).
+    pub fn ack_policy(&self) -> Option<crate::replication::manager::AckPolicy> {
+        self.repl_ack_policy
+    }
+
+    /// Whether replication failures should be tolerated (best_effort degraded mode).
+    pub fn is_replication_best_effort(&self) -> bool {
+        self.repl_best_effort
+    }
+
+    /// Access the topology authority for handling propose/vote/commit messages.
+    pub fn topology_authority(&self) -> &crate::cluster::topology::TopologyAuthority {
+        &self.topology_authority
+    }
+
+    /// Committed topology term number.
+    pub fn committed_topology_term(&self) -> u64 {
+        self.topology_authority.committed_term()
+    }
+
+    /// Members of the committed topology term.
+    pub fn committed_topology_members(&self) -> Vec<NodeId> {
+        self.topology_authority.committed_members()
+    }
+
     /// Trigger graceful shard drain (quiesce).
     ///
     /// Recomputes the shard table as if this node has left the cluster,
@@ -718,7 +1947,8 @@ impl RunningCluster {
                 "cluster: quiesce initiated — {} outbound migrations",
                 outbound.len()
             );
-            self.migration.lock().unwrap().start_outbound(&plan, self.self_id);
+            let all_shards: std::collections::HashSet<u16> = (0..4096).collect();
+            self.migration.lock().unwrap().start_outbound(&plan, self.self_id, &all_shards);
             // Note: the actual migration threads are spawned by the coordinator's
             // event loop. Here we just update the shard table and record the plan.
             // For immediate migration, we'd need to access the engine.
@@ -728,6 +1958,36 @@ impl RunningCluster {
     /// Get a snapshot of active migration progress.
     pub fn migration_status(&self) -> Vec<crate::cluster::migration::MigrationProgress> {
         self.migration.lock().unwrap().active_migrations().to_vec()
+    }
+
+    /// Number of shards pending inbound migration data.
+    pub fn inbound_pending_count(&self) -> usize {
+        self.migration.lock().unwrap().inbound_count()
+    }
+
+    /// Number of shards with write fences active.
+    pub fn fenced_shard_count(&self) -> usize {
+        self.migration.lock().unwrap().fenced_count()
+    }
+
+    /// Restore inbound migration state from a previous run.
+    ///
+    /// Call during startup BEFORE accepting client requests. Shards
+    /// that were mid-migration when the node crashed will remain blocked
+    /// until the source node re-initiates migration or a topology change
+    /// supersedes them.
+    pub fn restore_inbound_state(&self) {
+        if let Some(ref path) = self.inbound_state_path {
+            let data = crate::cluster::migration::load_inbound_state(path);
+            if !data.is_empty() {
+                let mut mgr = self.migration.lock().unwrap();
+                mgr.restore_inbound(&data);
+                let count = mgr.inbound_count();
+                if count > 0 {
+                    eprintln!("cluster: restored {} pending inbound migration(s) from disk", count);
+                }
+            }
+        }
     }
 
     /// Shut down the cluster.

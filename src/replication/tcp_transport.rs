@@ -184,6 +184,7 @@ mod tests {
             ops: vec![ReplicaOp::Freeze {
                 tx_key: key(1),
                 offset: 0,
+                master_generation: 0,
             }],
         };
 
@@ -254,6 +255,7 @@ mod tests {
             ops: vec![ReplicaOp::Freeze {
                 tx_key: key(1),
                 offset: 0,
+                master_generation: 0,
             }],
         };
         transport.send_batch(&batch).unwrap();

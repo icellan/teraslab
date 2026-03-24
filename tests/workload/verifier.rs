@@ -319,7 +319,7 @@ impl StateVerifier {
                 };
 
                 match engine.freeze(&req) {
-                    Ok(()) => {
+                    Ok(_) => {
                         if let Some(rec) = self.records.get_mut(tx_key) {
                             let slot = &mut rec.slots[*offset as usize];
                             slot.status = UTXO_FROZEN;
@@ -345,7 +345,7 @@ impl StateVerifier {
                 };
 
                 match engine.unfreeze(&req) {
-                    Ok(()) => {
+                    Ok(_) => {
                         if let Some(rec) = self.records.get_mut(tx_key) {
                             let slot = &mut rec.slots[*offset as usize];
                             slot.status = UTXO_UNSPENT;

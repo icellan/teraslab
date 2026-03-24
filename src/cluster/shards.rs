@@ -35,14 +35,44 @@ pub struct MigrationTask {
     pub is_master: bool,
 }
 
+/// Per-shard handoff state for two-phase topology activation.
+///
+/// Each shard transitions independently: the old assignment stays
+/// authoritative for serving until the target has durably received
+/// all data and the handoff is committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardHandoff {
+    /// Shard is serving from the current (old) assignment.
+    /// This is the state before any migration starts, or if no
+    /// ownership change is needed for this shard.
+    ServingCurrent,
+    /// Handoff in progress — old owner still serves reads/writes.
+    /// The target is receiving data but is NOT yet authoritative.
+    Copying,
+    /// Target has all data; waiting for commit confirmation.
+    /// Old owner still serves to avoid gaps.
+    CommitReady,
+    /// Handoff committed — new assignment is authoritative.
+    /// The shard is now served from the new assignment.
+    ServingNew,
+}
+
 /// The shard table: maps each shard to its master and replicas.
 ///
-/// Computed deterministically from a sorted member list so every node
-/// in the cluster arrives at the identical assignment independently.
+/// Supports two-phase topology activation: when a membership change
+/// computes a new assignment, each shard transitions individually
+/// from the old assignment to the new one. Routing uses the old
+/// assignment until a shard's handoff reaches `ServingNew`.
 #[derive(Clone)]
 pub struct ShardTable {
     assignments: Vec<ShardAssignment>,
-    /// Incremented on every topology change.
+    /// Previous assignments (before the current topology change).
+    /// Used for routing shards that haven't completed handoff yet.
+    prev_assignments: Option<Vec<ShardAssignment>>,
+    /// Per-shard handoff state. When `None`, all shards use `assignments`
+    /// directly (no handoff in progress).
+    handoff_state: Option<Vec<ShardHandoff>>,
+    /// Monotonic topology epoch. Incremented on every membership change.
     pub version: u64,
     /// Replication factor used to compute this table.
     rf: u8,
@@ -61,7 +91,12 @@ impl ShardTable {
     /// # Panics
     ///
     /// Panics if `members` is empty.
-    pub fn compute(members: &[NodeId], replication_factor: u8) -> Self {
+    /// Compute a shard table with an explicit monotonic epoch.
+    ///
+    /// `epoch` must be strictly greater than the previous table's epoch.
+    /// Each topology change increments the epoch so ownership transitions
+    /// are totally ordered and stale views can be detected.
+    pub fn compute_with_epoch(members: &[NodeId], replication_factor: u8, epoch: u64) -> Self {
         assert!(!members.is_empty(), "cannot compute shard table with 0 members");
         let n = members.len();
         let mut assignments = Vec::with_capacity(NUM_SHARDS);
@@ -71,7 +106,7 @@ impl ShardTable {
             let mut replicas = Vec::new();
             for r in 1..replication_factor as usize {
                 if r >= n {
-                    break; // Not enough distinct nodes
+                    break;
                 }
                 let replica = members[(shard + r) % n];
                 if replica != master {
@@ -81,17 +116,128 @@ impl ShardTable {
             assignments.push(ShardAssignment { master, replicas });
         }
 
-        // Version derived from member list hash for consistency detection
+        ShardTable {
+            assignments,
+            prev_assignments: None,
+            handoff_state: None,
+            version: epoch,
+            rf: replication_factor,
+        }
+    }
+
+    /// Begin a two-phase topology activation.
+    ///
+    /// Saves the current assignments as `prev_assignments` and installs
+    /// the new assignments. Shards whose master changed start in `Copying`;
+    /// unchanged shards go directly to `ServingNew`.
+    pub fn begin_handoff(&mut self, new_table: &ShardTable) {
+        let mut handoff = vec![ShardHandoff::ServingNew; NUM_SHARDS];
+        for (shard, h_state) in handoff.iter_mut().enumerate() {
+            let old_master = self.assignments[shard].master;
+            let new_master = new_table.assignments[shard].master;
+            if old_master != new_master {
+                *h_state = ShardHandoff::Copying;
+            }
+        }
+        self.prev_assignments = Some(self.assignments.clone());
+        self.assignments = new_table.assignments.clone();
+        self.handoff_state = Some(handoff);
+        self.version = new_table.version;
+    }
+
+    /// Commit the handoff for a single shard — it now serves from the
+    /// new assignment.
+    pub fn commit_shard(&mut self, shard: u16) {
+        if let Some(ref mut hs) = self.handoff_state {
+            hs[shard as usize] = ShardHandoff::ServingNew;
+            // If all shards are now ServingNew, clear the handoff state.
+            if hs.iter().all(|s| *s == ShardHandoff::ServingNew) {
+                self.prev_assignments = None;
+                self.handoff_state = None;
+            }
+        }
+    }
+
+    /// Mark a shard as ready to commit (target has all data).
+    pub fn mark_commit_ready(&mut self, shard: u16) {
+        if let Some(ref mut hs) = self.handoff_state
+            && hs[shard as usize] == ShardHandoff::Copying
+        {
+            hs[shard as usize] = ShardHandoff::CommitReady;
+        }
+    }
+
+    /// Get the effective assignment for a shard, considering handoff state.
+    ///
+    /// During two-phase activation, shards that haven't completed handoff
+    /// use the previous (old) assignment. This ensures the old master
+    /// remains authoritative until the target has all data.
+    pub fn effective_assignment(&self, shard: u16) -> &ShardAssignment {
+        match (&self.handoff_state, &self.prev_assignments) {
+            (Some(hs), Some(prev)) => {
+                match hs[shard as usize] {
+                    ShardHandoff::ServingCurrent | ShardHandoff::Copying | ShardHandoff::CommitReady => {
+                        &prev[shard as usize]
+                    }
+                    ShardHandoff::ServingNew => {
+                        &self.assignments[shard as usize]
+                    }
+                }
+            }
+            _ => &self.assignments[shard as usize],
+        }
+    }
+
+    /// Get the handoff state for a shard.
+    pub fn shard_handoff_state(&self, shard: u16) -> ShardHandoff {
+        match &self.handoff_state {
+            Some(hs) => hs[shard as usize],
+            None => ShardHandoff::ServingNew,
+        }
+    }
+
+    /// Rollback a shard's handoff — revert to the old (previous) assignment.
+    ///
+    /// Used when a migration fails: the old master must remain authoritative
+    /// for this shard instead of the new (unreachable) target. Without this,
+    /// lifting the write fence while the shard table points to the new master
+    /// creates a window where no node serves the shard.
+    ///
+    /// After rollback the shard is `ServingNew` with the old assignment
+    /// restored, so routing sends traffic back to the original master.
+    pub fn rollback_shard(&mut self, shard: u16) {
+        let old_assignment = match &self.prev_assignments {
+            Some(prev) => prev[shard as usize].clone(),
+            None => return, // No handoff in progress.
+        };
+        self.assignments[shard as usize] = old_assignment;
+        if let Some(hs) = &mut self.handoff_state {
+            hs[shard as usize] = ShardHandoff::ServingNew;
+            if hs.iter().all(|s| *s == ShardHandoff::ServingNew) {
+                self.prev_assignments = None;
+                self.handoff_state = None;
+            }
+        }
+    }
+
+    /// Number of shards still in handoff (not yet ServingNew).
+    pub fn pending_handoff_count(&self) -> usize {
+        match &self.handoff_state {
+            Some(hs) => hs.iter().filter(|s| **s != ShardHandoff::ServingNew).count(),
+            None => 0,
+        }
+    }
+
+    /// Compute a shard table with a hash-based version (legacy).
+    ///
+    /// Prefer `compute_with_epoch` in production; this exists for
+    /// backward compatibility in tests and bootstrap paths.
+    pub fn compute(members: &[NodeId], replication_factor: u8) -> Self {
         let mut version_hash: u64 = 0;
         for (i, m) in members.iter().enumerate() {
             version_hash = version_hash.wrapping_add(m.0.wrapping_mul(i as u64 + 1));
         }
-
-        ShardTable {
-            assignments,
-            version: version_hash,
-            rf: replication_factor,
-        }
+        Self::compute_with_epoch(members, replication_factor, version_hash)
     }
 
     /// The replication factor used to compute this table.
@@ -118,7 +264,19 @@ impl ShardTable {
     }
 
     /// Get the assignment for a specific shard.
+    /// Get the assignment for a shard.
+    ///
+    /// During two-phase activation, returns the **effective** assignment:
+    /// old master for shards still in handoff, new master for committed
+    /// shards. This ensures routing stays with the old owner until the
+    /// target has all data.
     pub fn assignment(&self, shard: u16) -> &ShardAssignment {
+        self.effective_assignment(shard)
+    }
+
+    /// Get the target (new) assignment for a shard, regardless of handoff state.
+    /// Used by migration code to know where data should go.
+    pub fn target_assignment(&self, shard: u16) -> &ShardAssignment {
         &self.assignments[shard as usize]
     }
 
@@ -496,5 +654,67 @@ mod tests {
         }
         assert!(found_local, "should find at least one local key");
         assert!(found_remote, "should find at least one remote key");
+    }
+
+    #[test]
+    fn rollback_shard_restores_old_master() {
+        let old_members = nodes(&[1, 2, 3]);
+        let new_members = nodes(&[1, 2, 3, 4]);
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+
+        // Find a shard that changes master between old and new.
+        let mut changed_shard = None;
+        for shard in 0..NUM_SHARDS as u16 {
+            let old_master = table.assignment(shard).master;
+            let new_master = new_table.target_assignment(shard).master;
+            if old_master != new_master {
+                changed_shard = Some((shard, old_master, new_master));
+                break;
+            }
+        }
+        let (shard, old_master, new_master) = changed_shard.expect("should have at least one changed shard");
+
+        // Begin handoff — old master still serves during handoff.
+        table.begin_handoff(&new_table);
+        assert_eq!(table.effective_assignment(shard).master, old_master);
+        assert_eq!(table.shard_handoff_state(shard), ShardHandoff::Copying);
+
+        // Rollback — old master is restored as the canonical assignment.
+        table.rollback_shard(shard);
+        assert_eq!(table.assignment(shard).master, old_master);
+        assert_eq!(table.shard_handoff_state(shard), ShardHandoff::ServingNew);
+        // The target assignment is now also the old master (reverted).
+        assert_eq!(table.target_assignment(shard).master, old_master);
+    }
+
+    #[test]
+    fn rollback_clears_handoff_when_all_done() {
+        let old_members = nodes(&[1, 2]);
+        let new_members = nodes(&[1, 2, 3]);
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+
+        table.begin_handoff(&new_table);
+        let pending_before = table.pending_handoff_count();
+        assert!(pending_before > 0);
+
+        // Commit all shards that changed, or rollback — either way clears handoff.
+        for shard in 0..NUM_SHARDS as u16 {
+            if table.shard_handoff_state(shard) != ShardHandoff::ServingNew {
+                table.rollback_shard(shard);
+            }
+        }
+        assert_eq!(table.pending_handoff_count(), 0);
+    }
+
+    #[test]
+    fn rollback_noop_without_handoff() {
+        let members = nodes(&[1, 2, 3]);
+        let mut table = ShardTable::compute(&members, 2);
+        let original_master = table.assignment(0).master;
+        // Rollback without active handoff is a no-op.
+        table.rollback_shard(0);
+        assert_eq!(table.assignment(0).master, original_master);
     }
 }

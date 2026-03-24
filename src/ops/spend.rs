@@ -47,6 +47,8 @@ pub struct SpendMultiResponse {
     pub errors: HashMap<u32, SpendError>,
     /// Number of UTXOs actually spent in this batch (not counting idempotent re-spends).
     pub spent_count: u32,
+    /// Record generation after this mutation (for replication).
+    pub generation: u32,
 }
 
 /// Request for a single spend (convenience wrapper around spendMulti).

@@ -34,4 +34,6 @@ pub struct SetMinedResponse {
     pub signal: Signal,
     /// Current block IDs after this operation.
     pub block_ids: Vec<u32>,
+    /// Record generation after mutation.
+    pub generation: u32,
 }

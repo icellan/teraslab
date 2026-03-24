@@ -56,6 +56,8 @@ pub struct SetConflictingRequest {
 #[derive(Debug, Clone)]
 pub struct SetConflictingResponse {
     pub signal: Signal,
+    /// Record generation after mutation.
+    pub generation: u32,
 }
 
 // -- SetLocked --
@@ -80,6 +82,8 @@ pub struct PreserveUntilRequest {
 #[derive(Debug, Clone)]
 pub struct PreserveUntilResponse {
     pub signal: Signal,
+    /// Record generation after mutation.
+    pub generation: u32,
 }
 
 // -- Delete --

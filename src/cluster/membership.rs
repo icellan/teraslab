@@ -231,6 +231,27 @@ impl Membership {
             .map(|(&id, info)| (id, info.state, info.incarnation, info.addr))
             .collect()
     }
+
+    /// Remove dead nodes that have been in the Dead state for longer than
+    /// `max_age`. This prevents unbounded memory growth from accumulated
+    /// dead nodes across many cluster restart cycles.
+    ///
+    /// Returns the IDs of removed nodes so the caller can clean up
+    /// associated state (e.g., peer address maps).
+    pub fn forget_dead_older_than(&mut self, max_age: Duration) -> Vec<NodeId> {
+        let now = Instant::now();
+        let to_remove: Vec<NodeId> = self.members.iter()
+            .filter(|(_, info)| {
+                info.state == NodeState::Dead
+                    && now.duration_since(info.state_changed_at) >= max_age
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in &to_remove {
+            self.members.remove(id);
+        }
+        to_remove
+    }
 }
 
 #[cfg(test)]
@@ -412,5 +433,41 @@ mod tests {
         assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive);
         assert_eq!(m.member_info(&NodeId(2)).unwrap().incarnation, 6);
         assert!(events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))));
+    }
+
+    #[test]
+    fn forget_dead_removes_old_dead_nodes() {
+        let mut m = Membership::new(NodeId(1), Duration::from_millis(10));
+        m.mark_alive(NodeId(2), addr(3001), 1);
+        m.mark_alive(NodeId(3), addr(3002), 1);
+
+        // Kill node 2.
+        m.mark_dead(NodeId(2), 1);
+        assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Dead);
+
+        // Immediately, the dead node should NOT be forgotten (too young).
+        let forgotten = m.forget_dead_older_than(Duration::from_secs(3600));
+        assert!(forgotten.is_empty());
+        assert!(m.member_info(&NodeId(2)).is_some());
+
+        // With zero max_age, dead nodes are immediately eligible.
+        let forgotten = m.forget_dead_older_than(Duration::ZERO);
+        assert_eq!(forgotten, vec![NodeId(2)]);
+        assert!(m.member_info(&NodeId(2)).is_none());
+        // Alive node 3 is unaffected.
+        assert!(m.member_info(&NodeId(3)).is_some());
+    }
+
+    #[test]
+    fn forget_dead_ignores_alive_and_suspect() {
+        let mut m = Membership::new(NodeId(1), Duration::from_millis(10));
+        m.mark_alive(NodeId(2), addr(3001), 1);
+        m.mark_alive(NodeId(3), addr(3002), 1);
+        m.mark_suspect(NodeId(3), 1);
+
+        // Even with zero max_age, alive and suspect nodes survive.
+        let forgotten = m.forget_dead_older_than(Duration::ZERO);
+        assert!(forgotten.is_empty());
+        assert_eq!(m.total_members(), 3); // self + 2 peers
     }
 }

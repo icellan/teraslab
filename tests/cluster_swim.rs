@@ -84,6 +84,7 @@ fn start_swim_with_config(
         seed_nodes: seed_addrs,
         probe_interval,
         suspicion_timeout,
+        cluster_secret: None,
     });
     let (shutdown, handle, rx) = runner.start();
     SwimNode { shutdown, handle: Some(handle), rx }
@@ -345,12 +346,14 @@ fn network_load_per_node_constant() {
         seed_nodes: vec![],
         probe_interval: Duration::from_millis(100),
         suspicion_timeout: Duration::from_millis(500),
+        cluster_secret: None,
     };
     let config_20 = SwimConfig {
         self_id: NodeId(80), self_addr: tcp_addr(15201), bind_addr: swim_addr(15200),
         seed_nodes: vec![],
         probe_interval: Duration::from_millis(100),
         suspicion_timeout: Duration::from_millis(500),
+        cluster_secret: None,
     };
 
     assert_eq!(config_3.probe_interval, config_20.probe_interval);

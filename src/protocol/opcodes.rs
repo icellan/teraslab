@@ -44,6 +44,14 @@ pub const OP_MIGRATION_COMPLETE: u16 = 242;
 // Cluster (inter-node)
 pub const OP_HEARTBEAT: u16 = 250;
 
+// Topology authority (inter-node)
+/// Propose a new topology term to peers.
+pub const OP_TOPOLOGY_PROPOSE: u16 = 251;
+/// Vote on a proposed topology term.
+pub const OP_TOPOLOGY_VOTE: u16 = 252;
+/// Commit a quorum-achieved topology term.
+pub const OP_TOPOLOGY_COMMIT: u16 = 253;
+
 // Compatibility
 pub const OP_INCREMENT_SPENT_EXTRA_RECS: u16 = 255;
 
@@ -67,6 +75,11 @@ pub const ERR_NO_QUORUM: u16 = 15;
 
 /// Shard data is being migrated; client should retry after a brief delay.
 pub const ERR_MIGRATION_IN_PROGRESS: u16 = 19;
+
+/// Required replication ACKs were not received within the timeout.
+/// The mutation was applied locally and recorded in the redo log, but
+/// the durability contract (RF copies) was not satisfied.
+pub const ERR_REPLICATION_FAILED: u16 = 20;
 
 // Streaming errors
 /// Blob stream not found for the given txid on this connection.
@@ -95,6 +108,12 @@ pub const FLAG_EXTERNAL_BLOB: u8 = 0x08;
 /// Used by test clients for replication verification — reading the same
 /// record from both master and replica for byte-for-byte comparison.
 pub const FLAG_LOCAL_READ: u16 = 0x0001;
+
+/// Request flag on `OP_REPLICA_BATCH`: indicates this batch is part of a
+/// shard migration (not normal replication). When set, `request_id`
+/// carries the shard number and the receiver registers the shard as
+/// actively receiving inbound migration data.
+pub const FLAG_MIGRATION_BATCH: u16 = 0x0002;
 
 /// Maximum frame payload size (512 MiB).
 ///

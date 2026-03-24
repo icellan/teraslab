@@ -173,6 +173,14 @@ fn main() {
         }
     }
 
+    // Initialize replication sequence from the redo log so replica
+    // sequence numbers are contiguous with the durable commit log.
+    if let Some(ref log) = redo_log {
+        let seq = log.current_sequence();
+        teraslab::server::dispatch::init_replication_sequence(seq);
+        eprintln!("  replication: sequence initialized at {seq}");
+    }
+
     // Wrap redo log in Arc<Mutex> for shared access from dispatch threads
     let redo_log: Option<Arc<Mutex<RedoLog>>> = redo_log.map(|log| Arc::new(Mutex::new(log)));
 
@@ -211,23 +219,123 @@ fn main() {
             .filter_map(|s| s.parse().ok())
             .collect();
 
+        let probe_interval = std::time::Duration::from_millis(config.swim_probe_interval_ms);
         let cluster_config = ClusterConfig {
             self_id: NodeId(config.node_id),
             self_addr,
             swim_bind,
             seed_nodes: seed_addrs,
             replication_factor: config.replication_factor,
-            probe_interval: std::time::Duration::from_millis(config.swim_probe_interval_ms),
+            probe_interval,
             suspicion_timeout: std::time::Duration::from_millis(config.swim_suspicion_timeout_ms),
+            cluster_secret: config.cluster_secret.as_ref().map(|s| s.as_bytes().to_vec()),
+            max_migration_threads: config.max_migration_threads,
+            topology_propose_timeout: probe_interval * 3,
+            migration_pool_size: config.migration_pool_size,
+            migration_batch_size: config.migration_batch_size,
         };
 
         let cluster_state_path = config.resolved_cluster_state_path();
-        let initial_peak = teraslab::cluster::coordinator::load_peak_cluster_size(&cluster_state_path);
+        // Load topology state (backward-compatible with old format).
+        let topo_state = teraslab::cluster::coordinator::load_topology_state(&cluster_state_path);
+        let initial_peak = topo_state.peak_cluster_size as usize;
+        let initial_epoch = topo_state.committed_term;
         if initial_peak > 1 {
-            eprintln!("  cluster: restored peak cluster size = {initial_peak} (quorum requires {})", (initial_peak / 2) + 1);
+            eprintln!("  cluster: restored peak={initial_peak} term={initial_epoch} (quorum requires {})", (initial_peak / 2) + 1);
         }
         let coordinator = ClusterCoordinator::new(cluster_config, initial_peak);
-        let running = coordinator.start(engine.clone(), Some(cluster_state_path));
+        // Restore topology state so new terms/epochs are strictly higher.
+        coordinator.topology_epoch.store(initial_epoch, std::sync::atomic::Ordering::Relaxed);
+        coordinator.topology_authority.restore(&topo_state);
+        if initial_epoch > 0 {
+            coordinator.shard_table.write().unwrap().version = initial_epoch;
+        }
+        let running = coordinator.start(
+            engine.clone(),
+            Some(cluster_state_path),
+            redo_log.clone(),
+            config.resolved_ack_policy(),
+            config.is_replication_best_effort(),
+        );
+        // Restore inbound migration state from a previous run so shards
+        // that were mid-migration remain blocked until re-migration.
+        running.restore_inbound_state();
+        // Initialize persistent ACK tracker alongside the cluster state file.
+        let ack_path = {
+            let mut p = config.resolved_cluster_state_path().into_os_string();
+            p.push(".repl-ack");
+            std::path::PathBuf::from(p)
+        };
+        teraslab::server::dispatch::init_ack_tracker(ack_path.clone());
+
+        // Spawn background catch-up for replicas that are behind.
+        // Reads persisted last_acked per replica and streams missing redo
+        // entries. This runs asynchronously so it doesn't block startup.
+        if config.replication_factor > 1 {
+            let redo_for_catchup = redo_log.clone();
+            let engine_for_catchup = engine.clone();
+            std::thread::spawn(move || {
+                let tracker = teraslab::replication::durable::AckTracker::new(ack_path);
+                let all_acked = tracker.all_acked();
+                if all_acked.is_empty() {
+                    return; // No known replicas yet
+                }
+
+                let current_seq = redo_for_catchup.as_ref()
+                    .map(|rl| rl.lock().current_sequence())
+                    .unwrap_or(0);
+
+                for (addr, last_acked) in &all_acked {
+                    if *last_acked >= current_seq {
+                        continue; // Already caught up
+                    }
+                    let lag = current_seq - last_acked;
+                    eprintln!("  catchup: replica {addr} is {lag} ops behind, starting catch-up from seq {}", last_acked + 1);
+
+                    let redo_ref = redo_for_catchup.clone();
+                    let eng_ref = engine_for_catchup.clone();
+
+                    let result = teraslab::replication::durable::run_catchup_for_replica(
+                        addr,
+                        last_acked + 1,
+                        current_seq,
+                        1000,
+                        &|from_seq| {
+                            let rl = match redo_ref.as_ref() {
+                                Some(rl) => rl,
+                                None => return Vec::new(),
+                            };
+                            let entries = match rl.lock().read_from_sequence(from_seq) {
+                                Ok(e) => e,
+                                Err(_) => return Vec::new(),
+                            };
+                            // Convert redo entries to ReplicaOps. Each entry's shard
+                            // is derived from its tx_key. The replica applies all
+                            // ops idempotently, gracefully skipping unknown records.
+                            entries.iter()
+                                .filter_map(|e| {
+                                    let tx_key = e.op.tx_key()?;
+                                    let shard = teraslab::cluster::shards::ShardTable::shard_for_key(tx_key);
+                                    teraslab::cluster::coordinator::redo_entry_to_replica_op(e, shard, &eng_ref)
+                                })
+                                .collect()
+                        },
+                    );
+
+                    match result {
+                        Ok(through) => {
+                            eprintln!("  catchup: replica {addr} caught up to seq {through}");
+                            tracker.record_ack(*addr, through);
+                            tracker.flush();
+                        }
+                        Err(e) => {
+                            eprintln!("  catchup: replica {addr} catch-up failed: {e}");
+                        }
+                    }
+                }
+            });
+        }
+
         eprintln!("  cluster: node {} started with RF={}", config.node_id, config.replication_factor);
         Some(Arc::new(running))
     } else {

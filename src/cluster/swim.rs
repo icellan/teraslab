@@ -33,6 +33,10 @@ pub struct SwimConfig {
     pub seed_nodes: Vec<SocketAddr>,
     pub probe_interval: Duration,
     pub suspicion_timeout: Duration,
+    /// Shared secret for HMAC-SHA256 message authentication.
+    /// When set, outgoing messages are signed and incoming messages
+    /// without a valid signature are silently dropped.
+    pub cluster_secret: Option<Vec<u8>>,
 }
 
 /// State of a pending direct probe awaiting an ACK.
@@ -230,6 +234,21 @@ impl SwimRunner {
                     }
                 }
                 last_seed_retry = Instant::now();
+
+                // Garbage-collect dead nodes older than 1 hour to prevent
+                // unbounded memory growth. Also clean up their address entries
+                // so gossip stops including them.
+                let forgotten = self.membership.lock().unwrap()
+                    .forget_dead_older_than(Duration::from_secs(3600));
+                if !forgotten.is_empty() {
+                    let mut peers = self.peer_addrs.lock().unwrap();
+                    let mut swim = self.swim_peer_addrs.lock().unwrap();
+                    for id in &forgotten {
+                        peers.remove(id);
+                        swim.remove(id);
+                    }
+                    eprintln!("SWIM: garbage-collected {} dead node(s)", forgotten.len());
+                }
             }
 
             std::thread::sleep(Duration::from_millis(10));
@@ -244,6 +263,16 @@ impl SwimRunner {
         from_addr: SocketAddr,
         socket: &UdpSocket,
     ) -> Vec<ClusterEvent> {
+        // If a cluster secret is configured, verify HMAC before parsing.
+        let data = if let Some(ref secret) = self.config.cluster_secret {
+            match crate::cluster::auth::verify(secret, data) {
+                Ok(payload) => payload,
+                Err(_) => return vec![], // silently drop unauthenticated messages
+            }
+        } else {
+            data
+        };
+
         // Minimum header: msg_type(1) + sender_id(8) + incarnation(8) + addr_len(2) = 19
         if data.len() < 19 {
             return vec![];
@@ -583,13 +612,18 @@ impl SwimRunner {
         let addr_str = self.config.self_addr.to_string();
         let addr_bytes = addr_str.as_bytes();
 
-        let mut buf = Vec::with_capacity(19 + addr_bytes.len() + piggybacked_updates.len());
+        let mut buf = Vec::with_capacity(19 + addr_bytes.len() + piggybacked_updates.len() + 32);
         buf.push(msg_type);
         buf.extend_from_slice(&self.config.self_id.0.to_le_bytes());
         buf.extend_from_slice(&self.incarnation.to_le_bytes());
         buf.extend_from_slice(&(addr_bytes.len() as u16).to_le_bytes());
         buf.extend_from_slice(addr_bytes);
         buf.extend_from_slice(piggybacked_updates);
+
+        // If a cluster secret is configured, append HMAC-SHA256 tag.
+        if let Some(ref secret) = self.config.cluster_secret {
+            buf = crate::cluster::auth::sign(secret, &buf);
+        }
         buf
     }
 

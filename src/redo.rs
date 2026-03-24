@@ -148,6 +148,28 @@ impl RedoOp {
         }
     }
 
+    /// Extract the tx_key from the operation, if it has one.
+    ///
+    /// Returns `None` for `Checkpoint` which has no associated key.
+    pub fn tx_key(&self) -> Option<&TxKey> {
+        match self {
+            RedoOp::Spend { tx_key, .. }
+            | RedoOp::Unspend { tx_key, .. }
+            | RedoOp::SetMined { tx_key, .. }
+            | RedoOp::Freeze { tx_key, .. }
+            | RedoOp::Unfreeze { tx_key, .. }
+            | RedoOp::Reassign { tx_key, .. }
+            | RedoOp::PruneSlot { tx_key, .. }
+            | RedoOp::Create { tx_key, .. }
+            | RedoOp::Delete { tx_key, .. }
+            | RedoOp::SetConflicting { tx_key, .. }
+            | RedoOp::SetLocked { tx_key, .. }
+            | RedoOp::PreserveUntil { tx_key, .. }
+            | RedoOp::MarkOnLongestChain { tx_key, .. } => Some(tx_key),
+            RedoOp::Checkpoint => None,
+        }
+    }
+
     /// Serialize op-specific data (without type byte, sequence, or length).
     fn serialize_data(&self, buf: &mut Vec<u8>) {
         match self {

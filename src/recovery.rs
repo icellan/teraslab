@@ -1,8 +1,20 @@
 //! Crash recovery by replaying redo log entries.
 //!
+//! ## Durability Contract
+//!
+//! TeraSlab uses a durable-engine-first model: engine writes go to the
+//! block device via O_DIRECT (immediately durable), then a mandatory
+//! redo log entry is fsynced before the client is acknowledged.
+//!
+//! On crash, the engine's UTXO slot bytes are already correct on disk.
+//! Recovery replays redo entries after the last checkpoint to fix up
+//! derived metadata (counters like `spent_utxos`, secondary index
+//! entries) that depend on read-modify-write sequences which may have
+//! been interrupted mid-flight.
+//!
 //! All operations are idempotent: replaying an already-applied operation
-//! is harmless. Recovery reads entries after the last checkpoint and
-//! re-executes each one against the current on-disk state.
+//! is harmless. Each replay checks the current on-disk state before
+//! writing to avoid double-application.
 
 use crate::device::BlockDevice;
 use crate::index::{Index, TxIndexEntry, TxKey};

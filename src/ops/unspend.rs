@@ -26,4 +26,6 @@ pub struct UnspendRequest {
 pub struct UnspendResponse {
     /// Signal from deleteAtHeight evaluation.
     pub signal: Signal,
+    /// Record generation after mutation (0 for no-op early returns).
+    pub generation: u32,
 }
