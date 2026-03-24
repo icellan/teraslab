@@ -1,0 +1,66 @@
+networks:
+  ts17-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.47.0.0/24
+
+volumes:
+  ts17-node1-data:
+  ts17-node2-data:
+  ts17-node3-data:
+  ts17-blobstore:
+
+x-teraslab-common: &teraslab-common
+  image: teraslab:test
+  restart: "no"
+  cap_add:
+    - NET_ADMIN
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+
+services:
+  node1:
+    <<: *teraslab-common
+    container_name: ts17-node1
+    hostname: node1
+    networks:
+      ts17-net:
+        ipv4_address: 172.47.0.11
+    volumes:
+      - ts17-node1-data:/data
+      - ts17-blobstore:/blobstore
+      - ./config/ts17-node1.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13170:3300"
+      - "19170:9100"
+  node2:
+    <<: *teraslab-common
+    container_name: ts17-node2
+    hostname: node2
+    networks:
+      ts17-net:
+        ipv4_address: 172.47.0.12
+    volumes:
+      - ts17-node2-data:/data
+      - ts17-blobstore:/blobstore
+      - ./config/ts17-node2.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13171:3300"
+      - "19171:9100"
+  node3:
+    <<: *teraslab-common
+    container_name: ts17-node3
+    hostname: node3
+    networks:
+      ts17-net:
+        ipv4_address: 172.47.0.13
+    volumes:
+      - ts17-node3-data:/data
+      - ts17-blobstore:/blobstore
+      - ./config/ts17-node3.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13172:3300"
+      - "19172:9100"

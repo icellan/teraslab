@@ -21,9 +21,9 @@ done
 # Select scenarios based on tier
 case "$TIER" in
     pr)      SCENARIOS=(01 02 03) ;;
-    nightly) SCENARIOS=(01 02 03 04 05 06 07 08 09 10 11) ;;
-    weekly)  SCENARIOS=(01 02 03 04 05 06 07 08 09 10 11 12 13 14 15) ;;
-    release) SCENARIOS=(01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16) ;;
+    nightly) SCENARIOS=(01 02 03 04 05 06 07 08 09 10 11 17) ;;
+    weekly)  SCENARIOS=(01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 17) ;;
+    release) SCENARIOS=(01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17) ;;
     *) echo "Unknown tier: $TIER (use pr, nightly, weekly, release)"; exit 1 ;;
 esac
 
@@ -50,6 +50,7 @@ declare -A NAMES=(
     [14]="Split-Brain Prevention"
     [15]="Crash Recovery"
     [16]="CHAOS"
+    [17]="Failure Recovery Hardening"
 )
 
 # Timeouts per scenario (seconds)
@@ -57,7 +58,7 @@ declare -A TIMEOUTS=(
     [01]=120 [02]=300 [03]=300 [04]=300 [05]=300
     [06]=300 [07]=300 [08]=600 [09]=300 [10]=900
     [11]=300 [12]=300 [13]=300 [14]=300 [15]=600
-    [16]=2400
+    [16]=2400 [17]=600
 )
 
 echo "============================================"
