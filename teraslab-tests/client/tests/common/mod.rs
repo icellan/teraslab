@@ -195,6 +195,7 @@ pub async fn wait_specific_migrations_complete(
     let start = std::time::Instant::now();
     loop {
         let mut all_idle = true;
+        let mut total_masters: u64 = 0;
         for &n in node_nums {
             let port = docker.http_port(n);
             let url = format!("http://127.0.0.1:{port}/admin/migration_status");
@@ -207,13 +208,21 @@ pub async fn wait_specific_migrations_complete(
                     }
                 }
             }
+            let status_url = format!("http://127.0.0.1:{port}/status");
+            if let Ok(resp) = reqwest::get(&status_url).await {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(m) = json["master_shard_count"].as_u64() {
+                        total_masters += m;
+                    }
+                }
+            }
         }
-        if all_idle {
+        if all_idle && total_masters == 4096 {
             return Ok(());
         }
         if start.elapsed() >= timeout {
             return Err(ClientError::Connection(
-                format!("migrations still active on specific nodes after {timeout:?}"),
+                format!("migrations still active on specific nodes after {timeout:?} [masters={total_masters}/4096]"),
             ));
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -285,7 +294,9 @@ pub async fn start_3node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Cli
     let mut docker = docker_3node(scenario_id);
     docker.compose_up().await?;
     wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    // Wait for initial shard migrations to settle before creating the client.
+    // This prevents stale routing errors from the initial topology convergence.
+    wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
     let client = create_client(&docker, 3).await?;
     client.refresh_routing().await?;
     Ok((docker, client))

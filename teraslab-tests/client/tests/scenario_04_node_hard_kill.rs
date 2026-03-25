@@ -123,9 +123,9 @@ async fn run_scenario() -> Result<(), ClientError> {
         })?;
     eprintln!("[4.1] OK -- both surviving nodes report cluster_size=2");
 
-    // Wait for migrations/rebalance to complete after node2's death
-    common::wait_migrations_complete(&docker, 2, Duration::from_secs(60)).await
-        .unwrap_or_else(|e| eprintln!("[4.1] migration wait warning: {e}"));
+    // Wait for migrations to complete on the surviving nodes only.
+    // Node 2 is dead, so we can't query it — use wait_specific_migrations_complete.
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(120)).await?;
     // Refresh client routing to use the new shard assignments
     client.refresh_routing().await?;
     // Allow additional settling time for replication catchup
