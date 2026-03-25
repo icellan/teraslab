@@ -37,6 +37,13 @@ pub struct SwimConfig {
     /// When set, outgoing messages are signed and incoming messages
     /// without a valid signature are silently dropped.
     pub cluster_secret: Option<Vec<u8>>,
+    /// Persisted incarnation from the previous run.
+    /// The SWIM runner will start from `persisted_incarnation + 1`.
+    pub persisted_incarnation: u64,
+    /// Shared reference to the topology authority's committed term.
+    /// Piggybacked on gossip messages so lagging nodes can detect
+    /// they're behind and trigger a catch-up.
+    pub committed_term: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// State of a pending direct probe awaiting an ACK.
@@ -79,20 +86,23 @@ impl SwimRunner {
             config.self_id,
             config.suspicion_timeout,
         )));
+        let incarnation = config.persisted_incarnation + 1;
         Self {
             config,
             membership,
             peer_addrs: Arc::new(Mutex::new(HashMap::new())),
             swim_peer_addrs: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
-            incarnation: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            incarnation,
             pending_probe: None,
             probe_round_robin: 0,
             ping_req_forwarding: HashMap::new(),
         }
+    }
+
+    /// Get the current SWIM incarnation counter.
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
     }
 
     /// Get a reference to the membership state.
@@ -251,7 +261,7 @@ impl SwimRunner {
                 }
             }
 
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(1));
         }
 
         Ok(())
@@ -315,11 +325,12 @@ impl SwimRunner {
         // Wire format per entry:
         // [node_id:8][state:1][incarnation:8][tcp_addr_len:2][tcp_addr:N][swim_addr_len:2][swim_addr:M]
         let updates_offset = 19 + addr_len;
+        let mut pos = updates_offset;
         if data.len() > updates_offset + 2 {
             let update_count =
                 u16::from_le_bytes(data[updates_offset..updates_offset + 2].try_into().unwrap())
                     as usize;
-            let mut pos = updates_offset + 2;
+            pos = updates_offset + 2;
             for _ in 0..update_count {
                 if pos + 19 > data.len() {
                     break;
@@ -368,6 +379,17 @@ impl SwimRunner {
                     };
                     events.extend(evts);
                 }
+            }
+        }
+
+        // Parse piggybacked committed topology term (appended after updates).
+        // If the remote node has a higher committed term, emit TopologyStale
+        // so the coordinator can request the committed topology for catch-up.
+        if data.len() >= pos + 8 {
+            let remote_committed = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            let local_committed = self.config.committed_term.load(std::sync::atomic::Ordering::Relaxed);
+            if remote_committed > local_committed {
+                events.push(ClusterEvent::TopologyStale(remote_committed));
             }
         }
 
@@ -612,13 +634,19 @@ impl SwimRunner {
         let addr_str = self.config.self_addr.to_string();
         let addr_bytes = addr_str.as_bytes();
 
-        let mut buf = Vec::with_capacity(19 + addr_bytes.len() + piggybacked_updates.len() + 32);
+        let mut buf = Vec::with_capacity(19 + addr_bytes.len() + piggybacked_updates.len() + 8 + 32);
         buf.push(msg_type);
         buf.extend_from_slice(&self.config.self_id.0.to_le_bytes());
         buf.extend_from_slice(&self.incarnation.to_le_bytes());
         buf.extend_from_slice(&(addr_bytes.len() as u16).to_le_bytes());
         buf.extend_from_slice(addr_bytes);
         buf.extend_from_slice(piggybacked_updates);
+
+        // Append committed topology term for catch-up detection.
+        // Receivers compare this against their local committed term
+        // and emit TopologyStale if they are behind.
+        let ct = self.config.committed_term.load(std::sync::atomic::Ordering::Relaxed);
+        buf.extend_from_slice(&ct.to_le_bytes());
 
         // If a cluster secret is configured, append HMAC-SHA256 tag.
         if let Some(ref secret) = self.config.cluster_secret {

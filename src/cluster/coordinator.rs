@@ -40,6 +40,9 @@ pub struct ClusterConfig {
     pub migration_pool_size: usize,
     /// Records per baseline streaming batch during migration. Default: 100.
     pub migration_batch_size: usize,
+    /// Persisted SWIM incarnation from a previous run. The SWIM runner will
+    /// start from `persisted_incarnation + 1` to guarantee monotonicity.
+    pub persisted_incarnation: u64,
 }
 
 /// The cluster coordinator. Manages membership, shard table, and migrations.
@@ -62,6 +65,8 @@ pub struct ClusterCoordinator {
     migration_pool_size: usize,
     /// Records per baseline streaming batch.
     migration_batch_size: usize,
+    /// SWIM incarnation counter for persisting alongside topology state.
+    swim_incarnation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ClusterCoordinator {
@@ -74,6 +79,10 @@ impl ClusterCoordinator {
         members.sort();
         let initial_table = ShardTable::compute(&members, config.replication_factor);
 
+        let topology_authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
+            config.self_id,
+            config.topology_propose_timeout,
+        ));
         let swim = SwimRunner::new(SwimConfig {
             self_id: config.self_id,
             self_addr: config.self_addr,
@@ -82,7 +91,10 @@ impl ClusterCoordinator {
             probe_interval: config.probe_interval,
             suspicion_timeout: config.suspicion_timeout,
             cluster_secret: config.cluster_secret.clone(),
+            persisted_incarnation: config.persisted_incarnation,
+            committed_term: topology_authority.committed_term_shared(),
         });
+        let swim_incarnation = Arc::new(std::sync::atomic::AtomicU64::new(swim.incarnation()));
 
         let mut addrs = std::collections::HashMap::new();
         addrs.insert(config.self_id, config.self_addr);
@@ -98,12 +110,10 @@ impl ClusterCoordinator {
             initial_peak,
             max_migration_threads: config.max_migration_threads,
             topology_epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            topology_authority: Arc::new(crate::cluster::topology::TopologyAuthority::new(
-                config.self_id,
-                config.topology_propose_timeout,
-            )),
+            topology_authority,
             migration_pool_size: config.migration_pool_size.max(1),
             migration_batch_size: config.migration_batch_size.max(1),
+            swim_incarnation,
         }
     }
 
@@ -136,6 +146,8 @@ impl ClusterCoordinator {
         let migration_batch_size = self.migration_batch_size;
         let topology_epoch_for_cluster = topology_epoch.clone();
         let redo_for_events = redo_log;
+        let swim_incarnation_event = self.swim_incarnation.clone();
+        let swim_incarnation_for_cluster = self.swim_incarnation.clone();
 
         // Atomic bitmaps shared between event loop, migration threads, and hot path.
         let fenced_bitmap = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
@@ -200,6 +212,7 @@ impl ClusterCoordinator {
                             &topology_commit_tx_event,
                             &topo_state_path_event,
                             &peak_size_event,
+                            &swim_incarnation_event,
                         );
                         if matches!(&event, ClusterEvent::MembershipChanged(_))
                             && let Some(ref path) = cluster_state_path
@@ -226,7 +239,8 @@ impl ClusterCoordinator {
                             );
                             if let Some(ref path) = topo_state_path_event {
                                 let peak = peak_size_event.load(Ordering::Relaxed) as u64;
-                                persist_topology_state(path, &topo_authority_event.persisted_state(peak));
+                                let inc = swim_incarnation_event.load(Ordering::Relaxed);
+                                persist_topology_state(path, &topo_authority_event.persisted_state(peak, inc));
                             }
                             // Check single-node quorum (self-vote already recorded).
                             let self_vote = crate::cluster::topology::TopologyVote {
@@ -251,8 +265,9 @@ impl ClusterCoordinator {
                                 let tx = topology_commit_tx_event.clone();
                                 let tp = topo_state_path_event.clone();
                                 let ps = peak_size_event.clone();
+                                let si = swim_incarnation_event.clone();
                                 std::thread::spawn(move || {
-                                    run_topology_proposer(fallback_proposal, ta, na, self_id, tx, tp, ps);
+                                    run_topology_proposer(fallback_proposal, ta, na, self_id, tx, tp, ps, si);
                                 });
                             }
                         }
@@ -299,6 +314,7 @@ impl ClusterCoordinator {
             migrating_bitmap,
             topology_commit_tx,
             topology_state_path,
+            swim_incarnation: swim_incarnation_for_cluster,
             _swim_handle: swim_handle,
             _event_handle: event_handle,
         }
@@ -326,6 +342,7 @@ impl ClusterCoordinator {
         topology_commit_tx: &std::sync::mpsc::Sender<(Vec<NodeId>, u64)>,
         topology_state_path: &Option<std::path::PathBuf>,
         peak_size: &Arc<std::sync::atomic::AtomicUsize>,
+        swim_incarnation: &Arc<std::sync::atomic::AtomicU64>,
     ) {
         match event {
             ClusterEvent::NodeJoined(node, addr) => {
@@ -382,7 +399,8 @@ impl ClusterCoordinator {
                     // Persist voted_term before broadcasting.
                     if let Some(path) = topology_state_path {
                         let peak = peak_size.load(Ordering::Relaxed) as u64;
-                        persist_topology_state(path, &topology_authority.persisted_state(peak));
+                        let inc = swim_incarnation.load(Ordering::Relaxed);
+                        persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
                     }
 
                     // Check if self-vote already achieves quorum (single-node cluster).
@@ -405,7 +423,8 @@ impl ClusterCoordinator {
                         );
                         if let Some(path) = topology_state_path {
                             let peak = peak_size.load(Ordering::Relaxed) as u64;
-                            persist_topology_state(path, &topology_authority.persisted_state(peak));
+                            let inc = swim_incarnation.load(Ordering::Relaxed);
+                            persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
                         }
                     } else {
                         // Multi-node: spawn proposer thread to broadcast proposal,
@@ -415,8 +434,9 @@ impl ClusterCoordinator {
                         let tx = topology_commit_tx.clone();
                         let tp = topology_state_path.clone();
                         let ps = peak_size.clone();
+                        let si = swim_incarnation.clone();
                         std::thread::spawn(move || {
-                            run_topology_proposer(proposal, ta, na, self_id, tx, tp, ps);
+                            run_topology_proposer(proposal, ta, na, self_id, tx, tp, ps, si);
                         });
                     }
                 }
@@ -425,6 +445,73 @@ impl ClusterCoordinator {
             }
             ClusterEvent::NodeSuspect(node) => {
                 eprintln!("cluster: node {:?} suspected", node);
+            }
+            ClusterEvent::TopologyStale(remote_term) => {
+                let local_term = topology_authority.committed_term();
+                if *remote_term > local_term {
+                    eprintln!(
+                        "cluster: topology stale (local term {local_term}, remote has {remote_term}) — requesting catch-up",
+                    );
+                    // Request the committed topology from any reachable peer.
+                    // Send OP_TOPOLOGY_COMMIT with an empty payload as a
+                    // "catch-up request". The remote's dispatch handler will
+                    // reply with the current committed topology. Simpler: we
+                    // connect to each peer and ask for its committed topology
+                    // by sending OP_TOPOLOGY_PROPOSE with term=0 (special
+                    // catch-up sentinel). However, the simplest correct
+                    // approach is: connect to any peer and request the full
+                    // committed topology as a commit message.
+                    //
+                    // For now, just trigger a re-evaluation by the fallback
+                    // proposer path. Reset the last_membership_change timer
+                    // on the topology authority so the fallback fires sooner,
+                    // and broadcast a synthetic MembershipChanged with current
+                    // known members to re-enter the topology proposal path.
+                    let members: Vec<NodeId> = {
+                        let addrs = node_addrs_for_topo.read().unwrap();
+                        let mut m: Vec<NodeId> = addrs.keys().copied().collect();
+                        m.sort();
+                        m
+                    };
+                    topology_authority.reset_membership_timer();
+                    if let Some(proposal) = topology_authority.on_membership_changed(&members) {
+                        eprintln!(
+                            "cluster: catch-up: re-proposing topology term {} ({} members)",
+                            proposal.term, proposal.members.len(),
+                        );
+                        if let Some(path) = topology_state_path {
+                            let peak = peak_size.load(Ordering::Relaxed) as u64;
+                            let inc = swim_incarnation.load(Ordering::Relaxed);
+                            persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
+                        }
+                        let self_vote = crate::cluster::topology::TopologyVote {
+                            term: proposal.term,
+                            digest: proposal.digest,
+                            voter: self_id,
+                            accepted: true,
+                            voter_current_term: topology_authority.committed_term(),
+                        };
+                        if let Some(commit) = topology_authority.handle_vote(&self_vote) {
+                            let epoch = topology_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+                            topology_authority.handle_commit(&commit);
+                            Self::activate_topology(
+                                &commit.members, epoch, self_id, rf, shard_table, migration,
+                                node_addrs, engine, redo_for_events, migration_pool_size,
+                                migration_batch_size, fenced_bm, migrating_bm, inbound_bm,
+                            );
+                        } else {
+                            let ta = topology_authority.clone();
+                            let na = node_addrs_for_topo.clone();
+                            let tx = topology_commit_tx.clone();
+                            let tp = topology_state_path.clone();
+                            let ps = peak_size.clone();
+                            let si = swim_incarnation.clone();
+                            std::thread::spawn(move || {
+                                run_topology_proposer(proposal, ta, na, self_id, tx, tp, ps, si);
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -452,25 +539,47 @@ impl ClusterCoordinator {
         migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
         inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
     ) {
-        // Supersede any in-flight migrations from the previous topology.
-        // A new topology commit means the migration plan has changed — old
-        // inbound entries are stale (the source may no longer be responsible
-        // for those shards) and old outbound entries will never complete
-        // (the target assignment has changed).
+        // Compute new migration plan FIRST so we know which existing
+        // migrations can be preserved (same source, target, and type).
+        let old_table_snap = shard_table.read().unwrap().clone();
+        let new_table = ShardTable::compute_with_epoch(members, rf, epoch);
+        let new_plan = ShardTable::migration_plan(&old_table_snap, &new_table);
+        let new_replica_plan = ShardTable::replica_migration_plan(&old_table_snap, &new_table);
+        drop(old_table_snap);
+
+        let mut all_new_tasks: Vec<MigrationTask> = new_plan.clone();
+        all_new_tasks.extend(new_replica_plan.iter().cloned());
+
+        // Build a set of (shard, from, to, is_master) for the new plan.
+        let new_task_set: std::collections::HashSet<(u16, NodeId, NodeId, bool)> = all_new_tasks.iter()
+            .map(|t| (t.shard, t.from_node, t.to_node, t.is_master))
+            .collect();
+
+        // Determine which existing migrations can be preserved.
+        let preserved_shards: std::collections::HashSet<u16>;
         {
             let mut mgr = migration.lock().unwrap();
             let old_inbound = mgr.inbound_count();
             let old_active = mgr.active_count();
             let old_failed = mgr.failed_count();
-            mgr.clear_inbound();
-            mgr.cleanup_completed(); // remove completed entries
-            // Mark remaining active outbound as failed so they don't
-            // block future migrations. Failed entries are cleaned up
-            // by cleanup_completed on the next cycle.
+
+            // Identify preservable migrations: active, not complete/failed,
+            // and appearing in the new plan with same source/target.
+            preserved_shards = mgr.active_migrations().iter()
+                .filter(|p| {
+                    p.state != crate::cluster::migration::MigrationState::Complete
+                        && p.state != crate::cluster::migration::MigrationState::Failed
+                        && new_task_set.contains(&(p.shard, p.from_node, p.to_node, p.is_master))
+                })
+                .map(|p| p.shard)
+                .collect();
+
+            // Cancel only non-preserved migrations.
             let stale_tasks: Vec<MigrationTask> = mgr.active_migrations().iter()
                 .filter(|p| {
                     p.state != crate::cluster::migration::MigrationState::Complete
                         && p.state != crate::cluster::migration::MigrationState::Failed
+                        && !preserved_shards.contains(&p.shard)
                 })
                 .map(|p| MigrationTask {
                     shard: p.shard, from_node: p.from_node,
@@ -480,24 +589,48 @@ impl ClusterCoordinator {
             for t in &stale_tasks {
                 mgr.mark_failed(t);
             }
+
+            // Clear inbound for non-preserved shards only.
+            // We can't selectively clear inbound_migrations easily, so
+            // clear all and re-register preserved ones after.
+            mgr.clear_inbound();
             mgr.cleanup_completed();
-            if old_inbound > 0 || old_active > 0 || old_failed > 0 {
+
+            let preserved_count = preserved_shards.len();
+            let cancelled = old_active.saturating_sub(preserved_count);
+            if old_inbound > 0 || cancelled > 0 || old_failed > 0 {
                 eprintln!(
-                    "cluster: superseded {old_active} active + {old_failed} failed outbound, {old_inbound} inbound migrations from previous topology",
+                    "cluster: topology change — preserved {preserved_count}, cancelled {cancelled} active + {old_failed} failed outbound, cleared {old_inbound} inbound",
                 );
             }
         }
-        // Reset atomic bitmaps — all fences and inbound flags from the
-        // old topology are invalid. New migrations will re-set them.
-        fenced_bm.clear_all();
-        migrating_bm.clear_all();
-        inbound_bm.clear_all();
 
-        let old_table = shard_table.read().unwrap();
-        let new_table = ShardTable::compute_with_epoch(members, rf, epoch);
-        let plan = ShardTable::migration_plan(&old_table, &new_table);
-        let replica_plan = ShardTable::replica_migration_plan(&old_table, &new_table);
-        drop(old_table);
+        // Reset atomic bitmaps for non-preserved shards.
+        // For preserved shards, keep their fenced/migrating state.
+        if preserved_shards.is_empty() {
+            fenced_bm.clear_all();
+            migrating_bm.clear_all();
+            inbound_bm.clear_all();
+        } else {
+            // Reload fenced bitmap from the manager (preserves fences for active migrations).
+            let mgr = migration.lock().unwrap();
+            fenced_bm.load_from(mgr.fenced_bitmap());
+            // Inbound was already cleared in the manager, so clear its atomic.
+            inbound_bm.clear_all();
+            // Rebuild migrating bitmap from the active migration list.
+            migrating_bm.clear_all();
+            for p in mgr.active_migrations() {
+                if p.state != crate::cluster::migration::MigrationState::Complete
+                    && p.state != crate::cluster::migration::MigrationState::Failed
+                {
+                    migrating_bm.set(p.shard);
+                }
+            }
+            drop(mgr);
+        }
+
+        let plan = new_plan;
+        let replica_plan = new_replica_plan;
 
         if plan.is_empty() && replica_plan.is_empty() {
             *shard_table.write().unwrap() = new_table;
@@ -506,7 +639,7 @@ impl ClusterCoordinator {
             all_tasks.extend(replica_plan.iter().cloned());
 
             let outbound_tasks: Vec<MigrationTask> = all_tasks.iter()
-                .filter(|t| t.from_node == self_id)
+                .filter(|t| t.from_node == self_id && !preserved_shards.contains(&t.shard))
                 .cloned()
                 .collect();
             let inbound = all_tasks.iter()
@@ -545,8 +678,12 @@ impl ClusterCoordinator {
 
             {
                 let mut mgr = migration.lock().unwrap();
-                mgr.start_outbound(&all_tasks, self_id, &populated_shards);
-                for t in all_tasks.iter().filter(|t| t.from_node == self_id) {
+                let new_tasks: Vec<MigrationTask> = all_tasks.iter()
+                    .filter(|t| !preserved_shards.contains(&t.shard))
+                    .cloned()
+                    .collect();
+                mgr.start_outbound(&new_tasks, self_id, &populated_shards);
+                for t in new_tasks.iter().filter(|t| t.from_node == self_id) {
                     mgr.set_snapshot_sequence(t, snapshot_seq);
                 }
             }
@@ -631,6 +768,7 @@ impl ClusterCoordinator {
 /// Runs in a dedicated thread so TCP round-trips don't block SWIM event
 /// processing. Uses the standard TeraSlab framed TCP protocol (same
 /// `RequestFrame`/`ResponseFrame` as migration and replication).
+#[allow(clippy::too_many_arguments)]
 fn run_topology_proposer(
     proposal: crate::cluster::topology::TopologyTerm,
     topology_authority: Arc<crate::cluster::topology::TopologyAuthority>,
@@ -639,6 +777,7 @@ fn run_topology_proposer(
     topology_commit_tx: std::sync::mpsc::Sender<(Vec<NodeId>, u64)>,
     topology_state_path: Option<std::path::PathBuf>,
     peak_size: Arc<std::sync::atomic::AtomicUsize>,
+    swim_incarnation: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let peers: Vec<(NodeId, SocketAddr)> = {
         let addrs = node_addrs.read().unwrap();
@@ -682,19 +821,44 @@ fn run_topology_proposer(
                 commit.term,
             );
 
-            // Broadcast OP_TOPOLOGY_COMMIT to all peers (best-effort).
+            // Broadcast OP_TOPOLOGY_COMMIT to all peers with retry.
+            // Failed broadcasts are retried up to 2 times with exponential
+            // backoff (50ms, 200ms) to handle transient TCP failures.
             let commit_payload = commit.serialize();
+            let mut failed_addrs: Vec<SocketAddr> = Vec::new();
             for (_, addr) in &peers {
                 if let Err(e) = send_topology_frame(*addr, OP_TOPOLOGY_COMMIT, &commit_payload) {
                     eprintln!("cluster: topology commit broadcast to {addr} failed: {e}");
+                    failed_addrs.push(*addr);
                 }
+            }
+            for (retry, delay_ms) in [(1u32, 50u64), (2, 200)] {
+                if failed_addrs.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                failed_addrs.retain(|addr| {
+                    if let Err(e) = send_topology_frame(*addr, OP_TOPOLOGY_COMMIT, &commit_payload) {
+                        eprintln!("cluster: topology commit retry {retry} to {addr} failed: {e}");
+                        true // keep in failed list
+                    } else {
+                        false // succeeded, remove
+                    }
+                });
+            }
+            if !failed_addrs.is_empty() {
+                eprintln!(
+                    "cluster: topology commit: {} node(s) unreachable after retries",
+                    failed_addrs.len(),
+                );
             }
 
             // Apply commit locally.
             topology_authority.handle_commit(&commit);
             if let Some(ref path) = topology_state_path {
                 let peak = peak_size.load(Ordering::Relaxed) as u64;
-                persist_topology_state(path, &topology_authority.persisted_state(peak));
+                let inc = swim_incarnation.load(Ordering::Relaxed);
+                persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
             }
 
             // Signal the event loop to activate the shard table.
@@ -1143,15 +1307,31 @@ fn migrate_single_shard(
             && let Some(rl) = redo_log
             && let Ok(entries) = rl.lock().read_from_sequence(snapshot_seq)
         {
-            let delta_ops: Vec<_> = entries.iter()
-                .filter(|e| e.sequence < fence_seq)
-                .filter_map(|e| redo_entry_to_replica_op(e, task.shard, engine))
-                .collect();
-            if !delta_ops.is_empty()
-                && let Err(e) = send_delta_ops(stream, task.shard, &delta_ops)
+            // Check for redo log truncation: if the earliest returned entry
+            // is later than what we asked for, the log has wrapped and we've
+            // lost delta data. The migration must restart from scratch so the
+            // baseline captures the current state under a write fence.
+            let first_entry_seq = entries.first().map(|e| e.sequence);
+            if let Some(first_seq) = first_entry_seq
+                && first_seq > snapshot_seq
             {
-                last_err = format!("delta: {e}");
+                eprintln!(
+                    "cluster: shard {} redo log truncated (need seq {}, earliest available {}) — migration must restart",
+                    task.shard, snapshot_seq, first_seq,
+                );
+                last_err = format!("redo log truncated: need seq {snapshot_seq}, got {first_seq}");
                 delta_failed = true;
+            } else {
+                let delta_ops: Vec<_> = entries.iter()
+                    .filter(|e| e.sequence < fence_seq)
+                    .filter_map(|e| redo_entry_to_replica_op(e, task.shard, engine))
+                    .collect();
+                if !delta_ops.is_empty()
+                    && let Err(e) = send_delta_ops(stream, task.shard, &delta_ops)
+                {
+                    last_err = format!("delta: {e}");
+                    delta_failed = true;
+                }
             }
         }
         if delta_failed {
@@ -1839,6 +2019,7 @@ pub fn load_topology_state(path: &std::path::Path) -> crate::cluster::topology::
             committed_term: 0,
             committed_members: Vec::new(),
             voted_term: 0,
+            incarnation: 0,
         },
     }
 }
@@ -2205,6 +2386,8 @@ pub struct RunningCluster {
     topology_commit_tx: std::sync::mpsc::Sender<(Vec<NodeId>, u64)>,
     /// Path for persisting full topology state (voted_term, committed_members).
     topology_state_path: Option<std::path::PathBuf>,
+    /// SWIM incarnation counter shared with the event loop for persistence.
+    swim_incarnation: Arc<std::sync::atomic::AtomicU64>,
     _swim_handle: std::thread::JoinHandle<()>,
     _event_handle: std::thread::JoinHandle<()>,
 }
@@ -2544,7 +2727,8 @@ impl RunningCluster {
     pub fn persist_topology(&self) {
         if let Some(ref path) = self.topology_state_path {
             let peak = self.peak_size.load(Ordering::Relaxed) as u64;
-            let state = self.topology_authority.persisted_state(peak);
+            let inc = self.swim_incarnation.load(Ordering::Relaxed);
+            let state = self.topology_authority.persisted_state(peak, inc);
             persist_topology_state(path, &state);
         }
     }

@@ -188,14 +188,18 @@ pub struct PersistedTopologyState {
     pub committed_members: Vec<NodeId>,
     /// Highest term this node voted for (prevents double-voting).
     pub voted_term: u64,
+    /// Monotonic SWIM incarnation counter for this node.
+    /// Persisted so that after restart the node always has a higher
+    /// incarnation than any previously gossiped value.
+    pub incarnation: u64,
 }
 
 impl PersistedTopologyState {
     /// Serialize to bytes.
     ///
-    /// Format: `[peak:8][committed_term:8][voted_term:8][member_count:4][member_ids:8 * count]`
+    /// Format: `[peak:8][committed_term:8][voted_term:8][member_count:4][member_ids:8*N][incarnation:8]`
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(28 + self.committed_members.len() * 8);
+        let mut buf = Vec::with_capacity(36 + self.committed_members.len() * 8);
         buf.extend_from_slice(&self.peak_cluster_size.to_le_bytes());
         buf.extend_from_slice(&self.committed_term.to_le_bytes());
         buf.extend_from_slice(&self.voted_term.to_le_bytes());
@@ -203,12 +207,14 @@ impl PersistedTopologyState {
         for m in &self.committed_members {
             buf.extend_from_slice(&m.0.to_le_bytes());
         }
+        buf.extend_from_slice(&self.incarnation.to_le_bytes());
         buf
     }
 
     /// Deserialize from bytes.
     ///
-    /// Backward compatible with the old 16-byte `[peak:8][epoch:8]` format.
+    /// Backward compatible with the old 16-byte `[peak:8][epoch:8]` format
+    /// and the pre-incarnation format without the trailing incarnation field.
     pub fn deserialize(data: &[u8]) -> Self {
         if data.len() >= 28 {
             let peak = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0; 8]));
@@ -222,7 +228,15 @@ impl PersistedTopologyState {
                     members.push(NodeId(u64::from_le_bytes(data[off..off+8].try_into().unwrap_or([0; 8]))));
                 }
             }
-            Self { peak_cluster_size: peak.max(1), committed_term, committed_members: members, voted_term }
+            // Incarnation lives after the member list. If there aren't
+            // enough bytes (old format without incarnation), default to 0.
+            let incarnation_off = 28 + count * 8;
+            let incarnation = if incarnation_off + 8 <= data.len() {
+                u64::from_le_bytes(data[incarnation_off..incarnation_off + 8].try_into().unwrap_or([0; 8]))
+            } else {
+                0
+            };
+            Self { peak_cluster_size: peak.max(1), committed_term, committed_members: members, voted_term, incarnation }
         } else if data.len() >= 16 {
             // Old format: [peak:8][epoch:8]
             let peak = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0; 8]));
@@ -232,6 +246,7 @@ impl PersistedTopologyState {
                 committed_term: epoch,
                 committed_members: Vec::new(),
                 voted_term: epoch,
+                incarnation: 0,
             }
         } else if data.len() >= 8 {
             // Oldest format: [peak:8] only
@@ -241,9 +256,10 @@ impl PersistedTopologyState {
                 committed_term: 0,
                 committed_members: Vec::new(),
                 voted_term: 0,
+                incarnation: 0,
             }
         } else {
-            Self { peak_cluster_size: 1, committed_term: 0, committed_members: Vec::new(), voted_term: 0 }
+            Self { peak_cluster_size: 1, committed_term: 0, committed_members: Vec::new(), voted_term: 0, incarnation: 0 }
         }
     }
 }
@@ -265,8 +281,10 @@ struct PendingProposal {
 /// Thread-safe: all mutable state is behind a Mutex.
 pub struct TopologyAuthority {
     self_id: NodeId,
-    /// Highest committed term.
-    committed_term: AtomicU64,
+    /// Highest committed term. Wrapped in `Arc` so SWIM gossip can share
+    /// a reference and piggyback the value on probe messages for catch-up
+    /// detection without polling.
+    committed_term: Arc<AtomicU64>,
     /// Members of the committed term.
     committed_members: Arc<RwLock<Vec<NodeId>>>,
     /// Highest term this node voted for (persisted before responding).
@@ -284,13 +302,22 @@ impl TopologyAuthority {
     pub fn new(self_id: NodeId, propose_timeout: Duration) -> Self {
         Self {
             self_id,
-            committed_term: AtomicU64::new(0),
+            committed_term: Arc::new(AtomicU64::new(0)),
             committed_members: Arc::new(RwLock::new(Vec::new())),
             voted_term: AtomicU64::new(0),
             pending_proposal: Mutex::new(None),
             propose_timeout,
             last_membership_change: Mutex::new(Instant::now()),
         }
+    }
+
+    /// Get a shared reference to the committed term atomic.
+    ///
+    /// Used by SWIM gossip to piggyback the committed term on probe
+    /// messages so that lagging nodes can detect they are behind and
+    /// trigger a topology catch-up without an extra polling mechanism.
+    pub fn committed_term_shared(&self) -> Arc<AtomicU64> {
+        self.committed_term.clone()
     }
 
     /// Restore from persisted state on startup.
@@ -310,13 +337,26 @@ impl TopologyAuthority {
         self.committed_members.read().unwrap().clone()
     }
 
+    /// Reset the membership-change timer to `now`.
+    ///
+    /// Called when a `TopologyStale` event is detected so the fallback
+    /// proposer path fires sooner (on the very next timeout check) rather
+    /// than waiting for the original membership-change timer to expire.
+    pub fn reset_membership_timer(&self) {
+        *self.last_membership_change.lock().unwrap() = Instant::now();
+    }
+
     /// Current persisted state for saving to disk.
-    pub fn persisted_state(&self, peak: u64) -> PersistedTopologyState {
+    ///
+    /// `incarnation` is the SWIM incarnation counter to persist so that
+    /// after restart the node can resume with a strictly higher value.
+    pub fn persisted_state(&self, peak: u64, incarnation: u64) -> PersistedTopologyState {
         PersistedTopologyState {
             peak_cluster_size: peak,
             committed_term: self.committed_term.load(Ordering::Relaxed),
             committed_members: self.committed_members.read().unwrap().clone(),
             voted_term: self.voted_term.load(Ordering::Relaxed),
+            incarnation,
         }
     }
 
@@ -648,6 +688,7 @@ mod tests {
             committed_term: 42,
             committed_members: members(&[1, 2, 3]),
             voted_term: 43,
+            incarnation: 99,
         };
         let data = state.serialize();
         let restored = PersistedTopologyState::deserialize(&data);
@@ -656,6 +697,7 @@ mod tests {
         assert_eq!(restored.voted_term, 43);
         assert_eq!(restored.committed_members.len(), 3);
         assert_eq!(restored.committed_members[0], NodeId(1));
+        assert_eq!(restored.incarnation, 99);
     }
 
     #[test]
@@ -669,6 +711,7 @@ mod tests {
         assert_eq!(restored.committed_term, 7);
         assert_eq!(restored.voted_term, 7);
         assert!(restored.committed_members.is_empty());
+        assert_eq!(restored.incarnation, 0);
     }
 
     #[test]

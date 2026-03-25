@@ -103,6 +103,8 @@ pub struct ThreadMetrics {
     pub freezes_attempted: PaddedCounter,
     /// Total delete operations attempted.
     pub deletes_attempted: PaddedCounter,
+    /// Writes ACKed to client without full replication (best_effort degraded).
+    pub replication_degraded_acks: PaddedCounter,
 }
 
 impl Default for ThreadMetrics {
@@ -134,6 +136,7 @@ impl ThreadMetrics {
             gets_succeeded: PaddedCounter::new(),
             freezes_attempted: PaddedCounter::new(),
             deletes_attempted: PaddedCounter::new(),
+            replication_degraded_acks: PaddedCounter::new(),
         }
     }
 }

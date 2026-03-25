@@ -466,35 +466,40 @@ fn replicate_all_ops(
         return Ok(()); // No replicas configured or no replica addresses known.
     }
 
-    let total_targets = by_addr.len();
+    // Send to all replica targets in parallel. Each thread gets its own
+    // TCP connection via the global REPL_POOL, so there's no contention.
+    let results: Vec<std::result::Result<(), String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = by_addr.into_iter().map(|(addr, ops)| {
+            scope.spawn(move || {
+                if ops.is_empty() {
+                    return Ok(());
+                }
+                let first_seq = REPL_SEQUENCE.fetch_add(
+                    ops.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                let batch = ReplicaBatch {
+                    first_sequence: first_seq,
+                    ops,
+                };
+                send_replica_batch_to(addr, &batch)
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("thread panicked".to_string()))).collect()
+    });
+
     let mut ack_count: usize = 0;
     let mut last_error: Option<String> = None;
-
-    // Assign durable sequence numbers and send to each replica.
-    for (addr, ops) in by_addr {
-        if ops.is_empty() {
-            ack_count += 1;
-            continue;
-        }
-        // Lock-free sequence assignment via atomic fetch_add.
-        let first_seq = REPL_SEQUENCE.fetch_add(
-            ops.len() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        let batch = ReplicaBatch {
-            first_sequence: first_seq,
-            ops,
-        };
-        match send_replica_batch_to(addr, &batch) {
-            Ok(()) => {
-                ack_count += 1;
-            }
+    for result in &results {
+        match result {
+            Ok(()) => { ack_count += 1; }
             Err(e) => {
-                eprintln!("replication to {addr} failed: {e}");
-                last_error = Some(e);
+                eprintln!("replication to replica failed: {e}");
+                last_error = Some(e.clone());
             }
         }
     }
+    let total_targets = results.len();
 
     // Check ACK policy. The policy is read from the cluster's replication
     // config. The master (local node) always counts as one copy.
@@ -518,6 +523,15 @@ fn replicate_all_ops(
             last_error.unwrap_or_default()
         ))
     } else {
+        if ack_count < total_targets {
+            // Acked to client despite incomplete replication (best_effort mode).
+            if let Some(metrics) = DISPATCH_METRICS.get() {
+                metrics.replication_degraded_acks.inc();
+            }
+            eprintln!(
+                "replication: degraded ack — {ack_count}/{total_targets} replicas succeeded (best_effort)",
+            );
+        }
         Ok(())
     }
 }

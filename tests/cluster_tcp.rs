@@ -67,6 +67,7 @@ fn create_node(
         topology_propose_timeout: Duration::from_millis(300),
         migration_pool_size: 4,
         migration_batch_size: 100,
+        persisted_incarnation: 0,
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);

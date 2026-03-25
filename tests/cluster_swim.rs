@@ -85,6 +85,8 @@ fn start_swim_with_config(
         probe_interval,
         suspicion_timeout,
         cluster_secret: None,
+        persisted_incarnation: 0,
+        committed_term: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
     let (shutdown, handle, rx) = runner.start();
     SwimNode { shutdown, handle: Some(handle), rx }
@@ -347,6 +349,8 @@ fn network_load_per_node_constant() {
         probe_interval: Duration::from_millis(100),
         suspicion_timeout: Duration::from_millis(500),
         cluster_secret: None,
+        persisted_incarnation: 0,
+        committed_term: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     let config_20 = SwimConfig {
         self_id: NodeId(80), self_addr: tcp_addr(15201), bind_addr: swim_addr(15200),
@@ -354,6 +358,8 @@ fn network_load_per_node_constant() {
         probe_interval: Duration::from_millis(100),
         suspicion_timeout: Duration::from_millis(500),
         cluster_secret: None,
+        persisted_incarnation: 0,
+        committed_term: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     assert_eq!(config_3.probe_interval, config_20.probe_interval);

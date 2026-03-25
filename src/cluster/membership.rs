@@ -31,6 +31,9 @@ pub enum ClusterEvent {
     NodeLeft(NodeId),
     /// The alive member list changed (sorted).
     MembershipChanged(Vec<NodeId>),
+    /// A remote node has a higher committed topology term than ours.
+    /// The coordinator should request the committed topology to catch up.
+    TopologyStale(u64),
 }
 
 /// Information about a cluster member.
@@ -55,6 +58,7 @@ pub struct Membership {
     self_id: NodeId,
     members: HashMap<NodeId, MemberInfo>,
     suspicion_timeout: Duration,
+    cached_alive: Vec<NodeId>,
 }
 
 impl Membership {
@@ -64,7 +68,19 @@ impl Membership {
             self_id,
             members: HashMap::new(),
             suspicion_timeout,
+            cached_alive: vec![self_id],
         }
+    }
+
+    /// Recompute the cached sorted list of alive members (including self).
+    fn rebuild_alive_cache(&mut self) {
+        let mut members: Vec<NodeId> = self.members.iter()
+            .filter(|(_, info)| info.state == NodeState::Alive)
+            .map(|(&id, _)| id)
+            .collect();
+        members.push(self.self_id);
+        members.sort();
+        self.cached_alive = members;
     }
 
     /// Register a node as alive. Returns events if membership changed.
@@ -101,12 +117,13 @@ impl Membership {
                     info.addr = addr;
                     info.state_changed_at = Instant::now();
 
-                    if was_dead {
-                        events.push(ClusterEvent::NodeJoined(node, addr));
-                        events.push(ClusterEvent::MembershipChanged(self.alive_members()));
-                    } else if was_suspect {
-                        // Suspect→Alive is a refutation — the node proved it is
-                        // alive. Emit MembershipChanged so routing recomputes.
+                    if was_dead || was_suspect {
+                        self.rebuild_alive_cache();
+                        if was_dead {
+                            events.push(ClusterEvent::NodeJoined(node, addr));
+                        }
+                        // Both Dead→Alive and Suspect→Alive emit MembershipChanged
+                        // so routing recomputes.
                         events.push(ClusterEvent::MembershipChanged(self.alive_members()));
                     }
                 }
@@ -118,6 +135,7 @@ impl Membership {
                     incarnation,
                     state_changed_at: Instant::now(),
                 });
+                self.rebuild_alive_cache();
                 events.push(ClusterEvent::NodeJoined(node, addr));
                 events.push(ClusterEvent::MembershipChanged(self.alive_members()));
             }
@@ -140,6 +158,7 @@ impl Membership {
         {
             info.state = NodeState::Suspect;
             info.state_changed_at = Instant::now();
+            self.rebuild_alive_cache();
             events.push(ClusterEvent::NodeSuspect(node));
         }
 
@@ -160,6 +179,7 @@ impl Membership {
         {
             info.state = NodeState::Dead;
             info.state_changed_at = Instant::now();
+            self.rebuild_alive_cache();
             events.push(ClusterEvent::NodeLeft(node));
             events.push(ClusterEvent::MembershipChanged(self.alive_members()));
         }
@@ -191,14 +211,12 @@ impl Membership {
     }
 
     /// Get the sorted list of alive members (including self).
+    ///
+    /// Returns a clone of the internally cached list. The cache is rebuilt
+    /// whenever membership state changes, so this is O(n) only in the clone
+    /// cost, not in filtering/sorting.
     pub fn alive_members(&self) -> Vec<NodeId> {
-        let mut members: Vec<NodeId> = self.members.iter()
-            .filter(|(_, info)| info.state == NodeState::Alive)
-            .map(|(&id, _)| id)
-            .collect();
-        members.push(self.self_id);
-        members.sort();
-        members
+        self.cached_alive.clone()
     }
 
     /// Number of known members (all states).
@@ -208,7 +226,7 @@ impl Membership {
 
     /// Number of alive members (including self).
     pub fn alive_count(&self) -> usize {
-        self.alive_members().len()
+        self.cached_alive.len()
     }
 
     /// Get info about a specific member.
@@ -249,6 +267,9 @@ impl Membership {
             .collect();
         for id in &to_remove {
             self.members.remove(id);
+        }
+        if !to_remove.is_empty() {
+            self.rebuild_alive_cache();
         }
         to_remove
     }

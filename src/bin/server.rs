@@ -225,6 +225,13 @@ fn main() {
             .collect();
 
         let probe_interval = std::time::Duration::from_millis(config.swim_probe_interval_ms);
+
+        let cluster_state_path = config.resolved_cluster_state_path();
+        // Load topology state (backward-compatible with old format).
+        let topo_state = teraslab::cluster::coordinator::load_topology_state(&cluster_state_path);
+        let initial_peak = topo_state.peak_cluster_size as usize;
+        let initial_epoch = topo_state.committed_term;
+
         let cluster_config = ClusterConfig {
             self_id: NodeId(config.node_id),
             self_addr,
@@ -238,13 +245,8 @@ fn main() {
             topology_propose_timeout: probe_interval * 3,
             migration_pool_size: config.migration_pool_size,
             migration_batch_size: config.migration_batch_size,
+            persisted_incarnation: topo_state.incarnation,
         };
-
-        let cluster_state_path = config.resolved_cluster_state_path();
-        // Load topology state (backward-compatible with old format).
-        let topo_state = teraslab::cluster::coordinator::load_topology_state(&cluster_state_path);
-        let initial_peak = topo_state.peak_cluster_size as usize;
-        let initial_epoch = topo_state.committed_term;
         if initial_peak > 1 {
             eprintln!("  cluster: restored peak={initial_peak} term={initial_epoch} (quorum requires {})", (initial_peak / 2) + 1);
         }
