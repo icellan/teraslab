@@ -338,11 +338,13 @@ impl ReplicationManager {
                 continue;
             }
 
-            // Send in batches
+            // Send in batches, advancing the sequence cursor per chunk
+            // so the replica's last_applied reflects the correct position.
             let mut ok = true;
+            let mut chunk_seq = from_seq;
             for chunk in ops.chunks(batch_size) {
                 let batch = ReplicaBatch {
-                    first_sequence: from_seq, // approximate
+                    first_sequence: chunk_seq,
                     ops: chunk.to_vec(),
                 };
                 if let Err(_e) = sender.transport.send_batch(&batch) {
@@ -360,6 +362,7 @@ impl ReplicationManager {
                         break;
                     }
                 }
+                chunk_seq += chunk.len() as u64;
             }
 
             if ok {
@@ -920,5 +923,56 @@ mod tests {
 
         // Should transition to NeedsResync, not stay in CatchingUp
         assert_eq!(*mgr.sender(0).state(), ReplicaState::NeedsResync);
+    }
+
+    #[test]
+    fn catchup_chunked_batches_have_correct_first_sequence() {
+        // Regression test: when catch-up ops are sent in multiple chunks,
+        // each chunk must have the correct first_sequence. The old code
+        // used the starting from_seq for all chunks, which caused the
+        // replica to record incorrect last_applied values.
+        let (master_t, replica_t) = InMemoryTransport::pair();
+        let handle = spawn_auto_ack_replica(replica_t);
+
+        let config = ReplicationConfig {
+            catchup_batch_size: 2, // Force chunking at 2 ops per batch
+            ..Default::default()
+        };
+        let mut mgr = ReplicationManager::new(config, vec![Box::new(master_t)]);
+
+        // Set up catching-up state starting from sequence 100
+        mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 100 };
+        mgr.next_sequence = 105;
+
+        // Provide 5 ops → should be sent in 3 chunks (2+2+1)
+        let result = mgr.run_catchup(|from_seq| {
+            assert_eq!(from_seq, 100);
+            (0..5)
+                .map(|i| ReplicaOp::Freeze {
+                    tx_key: key(i),
+                    offset: 0,
+                    master_generation: 0,
+                })
+                .collect()
+        });
+        assert!(result.is_ok());
+        assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
+
+        drop(mgr);
+        let received = handle.join().unwrap();
+        assert_eq!(received.len(), 3, "5 ops at batch_size=2 should produce 3 batches");
+
+        // Verify each chunk has the correct first_sequence
+        assert_eq!(received[0].first_sequence, 100);
+        assert_eq!(received[0].ops.len(), 2);
+        assert_eq!(received[0].last_sequence(), 101);
+
+        assert_eq!(received[1].first_sequence, 102);
+        assert_eq!(received[1].ops.len(), 2);
+        assert_eq!(received[1].last_sequence(), 103);
+
+        assert_eq!(received[2].first_sequence, 104);
+        assert_eq!(received[2].ops.len(), 1);
+        assert_eq!(received[2].last_sequence(), 104);
     }
 }

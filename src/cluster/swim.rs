@@ -187,8 +187,9 @@ impl SwimRunner {
         let mut recv_buf = [0u8; MAX_MSG_SIZE];
 
         while !self.shutdown.load(Ordering::Relaxed) {
-            // Receive incoming messages
-            loop {
+            // Receive incoming messages (bounded drain to prevent
+            // probe-timer starvation under message bursts).
+            for _ in 0..64 {
                 match socket.recv_from(&mut recv_buf) {
                     Ok((len, from_addr)) => {
                         let events = self.handle_message(&recv_buf[..len], from_addr, &socket);

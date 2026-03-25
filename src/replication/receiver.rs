@@ -282,7 +282,11 @@ pub fn handle_replica_batch(
     }
 
     let through = batch.last_sequence();
-    last_applied.store(through, Ordering::Relaxed);
+    // Use fetch_max to ensure monotonic advancement. Multiple master
+    // connections may call handle_replica_batch concurrently; a plain
+    // store() could move last_applied backward if batches complete out
+    // of sequence order.
+    last_applied.fetch_max(through, Ordering::Relaxed);
 
     let ack = ReplicaAck::Ok {
         through_sequence: through,
@@ -1206,5 +1210,129 @@ mod tests {
         assert_eq!(restored_gen, 10);
         assert_eq!(restored_dah, 500);
         assert_eq!(restored_pu, 700);
+    }
+
+    #[test]
+    fn last_applied_monotonic_under_concurrent_batches() {
+        // Regression test: multiple concurrent handler threads calling
+        // handle_replica_batch must not regress last_applied. The old
+        // code used store() which could overwrite a higher value with
+        // a lower one if batch completion order differs from sequence
+        // order. The fix uses fetch_max() for monotonic advancement.
+        let engine = make_engine();
+        let last_applied = Arc::new(AtomicU64::new(0));
+
+        // Create two records so ops succeed
+        create_record(&engine, key(200), 2);
+        create_record(&engine, key(201), 2);
+
+        // Batch A: sequence range 10..12 (higher)
+        let batch_a = ReplicaBatch {
+            first_sequence: 10,
+            ops: vec![
+                ReplicaOp::Spend {
+                    tx_key: key(200),
+                    offset: 0,
+                    spending_data: [0xAA; 36],
+                    master_generation: 1,
+                },
+                ReplicaOp::Spend {
+                    tx_key: key(200),
+                    offset: 1,
+                    spending_data: [0xBB; 36],
+                    master_generation: 1,
+                },
+            ],
+        };
+
+        // Batch B: sequence range 5..6 (lower)
+        let batch_b = ReplicaBatch {
+            first_sequence: 5,
+            ops: vec![
+                ReplicaOp::Spend {
+                    tx_key: key(201),
+                    offset: 0,
+                    spending_data: [0xCC; 36],
+                    master_generation: 1,
+                },
+            ],
+        };
+
+        // Simulate: batch A completes first, then batch B completes.
+        // With store(), last_applied would go 11 → 5 (regression).
+        // With fetch_max(), it stays at 11.
+        let req_a = RequestFrame {
+            op_code: OP_REPLICA_BATCH,
+            request_id: 1,
+            flags: 0,
+            payload: batch_a.serialize(),
+        };
+        let req_b = RequestFrame {
+            op_code: OP_REPLICA_BATCH,
+            request_id: 2,
+            flags: 0,
+            payload: batch_b.serialize(),
+        };
+
+        let resp_a = handle_replica_batch(&req_a, &engine, &last_applied);
+        assert_eq!(resp_a.status, STATUS_OK);
+        assert_eq!(last_applied.load(Ordering::Relaxed), 11);
+
+        let resp_b = handle_replica_batch(&req_b, &engine, &last_applied);
+        assert_eq!(resp_b.status, STATUS_OK);
+        // Key assertion: last_applied must NOT regress from 11 to 5.
+        assert_eq!(
+            last_applied.load(Ordering::Relaxed),
+            11,
+            "last_applied must be monotonic — fetch_max should keep it at 11, not regress to 5"
+        );
+    }
+
+    #[test]
+    fn last_applied_advances_when_higher() {
+        // Complementary test: verify fetch_max does advance when the
+        // new value is genuinely higher.
+        let engine = make_engine();
+        let last_applied = Arc::new(AtomicU64::new(0));
+        create_record(&engine, key(210), 2);
+        create_record(&engine, key(211), 2);
+
+        // First batch: seq 1..2
+        let batch_1 = ReplicaBatch {
+            first_sequence: 1,
+            ops: vec![ReplicaOp::Spend {
+                tx_key: key(210),
+                offset: 0,
+                spending_data: [0xDD; 36],
+                master_generation: 1,
+            }],
+        };
+        let req_1 = RequestFrame {
+            op_code: OP_REPLICA_BATCH,
+            request_id: 1,
+            flags: 0,
+            payload: batch_1.serialize(),
+        };
+        handle_replica_batch(&req_1, &engine, &last_applied);
+        assert_eq!(last_applied.load(Ordering::Relaxed), 1);
+
+        // Second batch: seq 10..11
+        let batch_2 = ReplicaBatch {
+            first_sequence: 10,
+            ops: vec![ReplicaOp::Spend {
+                tx_key: key(211),
+                offset: 0,
+                spending_data: [0xEE; 36],
+                master_generation: 1,
+            }],
+        };
+        let req_2 = RequestFrame {
+            op_code: OP_REPLICA_BATCH,
+            request_id: 2,
+            flags: 0,
+            payload: batch_2.serialize(),
+        };
+        handle_replica_batch(&req_2, &engine, &last_applied);
+        assert_eq!(last_applied.load(Ordering::Relaxed), 10);
     }
 }
