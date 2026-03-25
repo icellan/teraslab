@@ -734,7 +734,22 @@ impl ClusterCoordinator {
             {
                 let mut table = shard_table.write().unwrap();
                 pre_swap_keys_by_shard = engine.keys_by_shard_filtered(&outbound_shard_set);
-                table.begin_handoff_with(&new_table, |s| engine.shard_record_count(s) > 0);
+                // Snapshot old masters before the handoff swaps assignments.
+                let alive_addrs = node_addrs.read().unwrap();
+                let old_masters: Vec<NodeId> = (0..crate::cluster::shards::NUM_SHARDS as u16)
+                    .map(|s| table.effective_assignment(s).master)
+                    .collect();
+                // Only enter Copying state for shards that have data AND whose old
+                // master is still alive. If the old master is dead, there's no point
+                // waiting for migration — commit the new assignment immediately.
+                table.begin_handoff_with(&new_table, |s| {
+                    if engine.shard_record_count(s) == 0 {
+                        return false;
+                    }
+                    let old_master = old_masters[s as usize];
+                    alive_addrs.contains_key(&old_master) || old_master == self_id
+                });
+                drop(alive_addrs);
             }
             let pre_swap_keys: Arc<Vec<TxKey>> = Arc::new(
                 pre_swap_keys_by_shard.values()
