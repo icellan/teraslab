@@ -347,7 +347,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 spending_data: *spending_data,
                 ignore_conflicting: true,
                 ignore_locked: true,
-                current_block_height: 0,
+                // Use u32::MAX to bypass spendable_height cooldown check.
+                // The master already validated the block height constraint;
+                // the replica just applies the mutation.
+                current_block_height: u32::MAX,
                 block_height_retention: 0,
             };
             match engine.spend(&req) {

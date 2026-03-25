@@ -100,9 +100,19 @@ for NUM in "${SCENARIOS[@]}"; do
         ./scripts/collect_logs.sh "$RESULTS_DIR/${TEST_NAME}_diag"
     fi
 
-    # Clean up between scenarios
+    # Clean up between scenarios — remove all per-scenario Docker resources.
+    # The per-test teardown handles its own compose project, but stale containers,
+    # networks, or volumes from a crashed/timed-out test can leak.
     docker compose -f docker/docker-compose.3node.yml down -v 2>/dev/null || true
-    docker compose -f docker/docker-compose.3node.yml -f docker/docker-compose.5node.yml down -v 2>/dev/null || true
+    docker compose -f docker/docker-compose.5node.yml down -v 2>/dev/null || true
+    for sid in $(seq -w 1 17); do
+        compose_file="docker/docker-compose.ts${sid}.yml"
+        if [ -f "$compose_file" ]; then
+            docker compose -f "$compose_file" down -v 2>/dev/null || true
+        fi
+    done
+    # Force-remove any lingering scenario containers not caught by compose down.
+    docker ps -aq --filter "name=ts[0-9][0-9]-node" 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
 done
 
 echo ""
