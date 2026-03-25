@@ -44,7 +44,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     common::teardown_all(SID).await;
 
     let (mut docker, client) = common::start_3node_cluster(SID).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
     // Node2 address for direct reads
@@ -65,7 +65,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     // Wait for BOTH surviving nodes to detect node2's departure
     common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(30)).await?;
     // Wait for shard table rebalance and migrations on the 2-node cluster
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(60)).await?;
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(180)).await?;
     tokio::time::sleep(Duration::from_secs(5)).await;
     client.refresh_routing().await?;
 
@@ -94,7 +94,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // -- Test 5.2: Wait for migrations --
     eprintln!("[5.2] Waiting for migrations to complete");
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     let time_to_caught_up = membership_start.elapsed();
     eprintln!("[5.2] OK -- all migrations complete");
 

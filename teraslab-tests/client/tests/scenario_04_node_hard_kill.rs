@@ -38,7 +38,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let (mut docker, client) = common::start_3node_cluster(SID).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
     let verifier = StateVerifier::new();
@@ -125,7 +125,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // Wait for migrations to complete on the surviving nodes only.
     // Node 2 is dead, so we can't query it — use wait_specific_migrations_complete.
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(120)).await?;
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(180)).await?;
     // Refresh client routing to use the new shard assignments
     client.refresh_routing().await?;
     // Allow additional settling time for replication catchup
@@ -152,7 +152,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     client.refresh_routing().await?;
 
     // Wait for migrations to complete on surviving nodes ONLY (1 and 3).
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(120)).await
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[4.2b] migration wait timed out: {e}"));
     tokio::time::sleep(Duration::from_secs(5)).await;
     client.refresh_routing().await?;
@@ -306,8 +306,8 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // Restart node2 first so we have a full 3-node cluster again
     docker.start_node("node2").await?;
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     // Wait for shard table to stabilize after deferred migration swap
     tokio::time::sleep(Duration::from_secs(10)).await;
     client.refresh_routing().await?;

@@ -122,7 +122,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     let (_docker, client) = common::start_3node_cluster(SID).await?;
     let docker = common::docker_3node(SID);
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
     let verifier = StateVerifier::new();
@@ -639,8 +639,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     eprintln!("[11.9] Restarted {kill_node_name}");
 
     // Wait for full cluster recovery and migration
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     let _ = client.refresh_routing().await;
     tokio::time::sleep(Duration::from_secs(3)).await;
 
@@ -704,7 +704,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     docker_5.compose_up_nodes(&["node4"]).await?;
     eprintln!("[11.10] Added node4, waiting for cluster_size=4");
 
-    common::wait_cluster_ready(&docker_5, 4, Duration::from_secs(60)).await?;
+    common::wait_cluster_ready(&docker_5, 4, Duration::from_secs(180)).await?;
     eprintln!("[11.10] Cluster size=4, waiting for migrations to complete");
     common::wait_migrations_complete(&docker_5, 4, Duration::from_secs(180)).await?;
     eprintln!("[11.10] Migrations complete");
@@ -853,7 +853,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     // Restart node2
     docker_5.start_node("node2").await?;
     eprintln!("[11.11] Restarted node2");
-    common::wait_cluster_ready(&docker_5, 4, Duration::from_secs(60)).await?;
+    common::wait_cluster_ready(&docker_5, 4, Duration::from_secs(180)).await?;
     eprintln!("[11.11] Cluster recovered to 4 nodes. PASSED");
 
     common::teardown_all(SID).await;

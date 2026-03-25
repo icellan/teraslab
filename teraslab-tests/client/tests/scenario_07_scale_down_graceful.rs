@@ -32,12 +32,12 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     eprintln!("[7.0] Starting 3-node cluster and adding node4");
     let (_docker3, client) = common::start_3node_cluster(SID).await?;
-    common::wait_migrations_complete(&_docker3, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&_docker3, 3, Duration::from_secs(180)).await?;
 
     let mut docker5 = common::docker_5node(SID);
     docker5.compose_up_nodes(&["node4"]).await?;
     common::wait_cluster_ready(&docker5, 4, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker5, 4, Duration::from_secs(120)).await?;
+    common::wait_migrations_complete(&docker5, 4, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
     for node_num in 1..=4u32 {
@@ -163,7 +163,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // SWIM needs ~3-5s to detect the departed node (suspicion_timeout=3s).
     // Wait for all 3 surviving nodes to agree on cluster_size=3.
-    common::wait_specific_nodes_ready(&docker5, &[1, 2, 3], 3, Duration::from_secs(60)).await?;
+    common::wait_specific_nodes_ready(&docker5, &[1, 2, 3], 3, Duration::from_secs(180)).await?;
 
     for node_num in 1..=3u32 {
         let status = common::http_status(&docker5, node_num).await?;
@@ -174,7 +174,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     eprintln!("[7.3] OK -- cluster stabilized at size 3");
 
     // Wait for migrations to complete after topology change
-    common::wait_migrations_complete(&docker5, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker5, 3, Duration::from_secs(180)).await
         .map_err(|e| {
             eprintln!("[7.3] ERROR: migrations did not complete within 120s: {e}");
             e

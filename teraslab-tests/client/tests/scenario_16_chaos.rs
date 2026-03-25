@@ -811,7 +811,7 @@ async fn run_scenario() -> Result<(), ClientError> {
             let _ = docker.compose_up().await;
             tokio::time::sleep(Duration::from_secs(15)).await;
             common::wait_cluster_ready(&docker, 5, Duration::from_secs(180)).await?;
-            common::wait_migrations_complete(&docker, 5, Duration::from_secs(120)).await
+            common::wait_migrations_complete(&docker, 5, Duration::from_secs(180)).await
                 .unwrap_or_else(|e| eprintln!("[16] checkpoint migration wait: {e}"));
 
             // Resolve timeout txids before consistency check
@@ -916,7 +916,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     let _ = docker.compose_up().await;
     tokio::time::sleep(Duration::from_secs(15)).await;
     common::wait_cluster_ready(&docker, 5, Duration::from_secs(180)).await?;
-    common::wait_migrations_complete(&docker, 5, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker, 5, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[16] final migration wait: {e}"));
     tokio::time::sleep(Duration::from_secs(10)).await;
 

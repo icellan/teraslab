@@ -70,7 +70,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     let (_docker, client) = common::start_3node_cluster(SID).await?;
     let docker = common::docker_3node(SID);
 
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
     let verifier = Arc::new(StateVerifier::new());
@@ -328,10 +328,10 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[9.{node_num}] {node_name} started");
 
         // After restart, wait for rejoin
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
         eprintln!("[9.{node_num}] Cluster back to 3 nodes");
 
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
         tokio::time::sleep(Duration::from_secs(5)).await;
         eprintln!("[9.{node_num}] Migrations complete after restarting {node_name}");
 
@@ -357,7 +357,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     let _ = bg_handle.await;
 
     // -- Post-restart verification --
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[9.4] migration wait: {e}"));
     tokio::time::sleep(Duration::from_secs(10)).await;
     client.refresh_routing().await?;

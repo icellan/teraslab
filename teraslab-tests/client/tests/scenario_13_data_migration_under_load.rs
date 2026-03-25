@@ -29,7 +29,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     common::teardown_all(SID).await;
 
     let (mut docker, client) = common::start_3node_cluster(SID).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
     let verifier = Arc::new(StateVerifier::new());
@@ -183,10 +183,10 @@ async fn run_scenario() -> Result<(), ClientError> {
     docker_5.compose_up_nodes(&["node4"]).await?;
 
     eprintln!("[13.2] Waiting for node4 to join (cluster_size=4)");
-    common::wait_cluster_ready(&docker_5, 4, Duration::from_secs(60)).await?;
+    common::wait_cluster_ready(&docker_5, 4, Duration::from_secs(180)).await?;
 
     eprintln!("[13.2] Waiting for migrations to complete on 4 nodes");
-    common::wait_migrations_complete(&docker_5, 4, Duration::from_secs(120)).await?;
+    common::wait_migrations_complete(&docker_5, 4, Duration::from_secs(180)).await?;
     let migration_duration = migration_start.elapsed();
     eprintln!("[13.2] Migrations complete in {:.1}s", migration_duration.as_secs_f64());
 

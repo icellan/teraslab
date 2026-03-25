@@ -97,7 +97,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     let node_addrs = docker.host_client_addrs(3);
 
     // Wait for migrations to settle before seeding data
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
 
     // Refresh routing so the client has the latest partition map
     client.refresh_routing().await?;

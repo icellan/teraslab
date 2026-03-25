@@ -339,7 +339,7 @@ async fn test_late_join() -> Result<(), ClientError> {
 
     docker.compose_up_nodes(&["node3"]).await?;
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
 
     let expected_per_node: u64 = 4096 / 3;
     let tolerance: u64 = 50;

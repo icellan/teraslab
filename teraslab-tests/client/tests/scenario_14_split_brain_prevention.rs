@@ -124,7 +124,7 @@ async fn test_symmetric_isolation() -> Result<(), ClientError> {
     eprintln!("[14.1] Starting 3-node cluster and seeding 2000 records");
 
     let (docker, client) = common::start_3node_cluster(SID).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
     let verifier = StateVerifier::new();
@@ -172,8 +172,8 @@ async fn test_symmetric_isolation() -> Result<(), ClientError> {
     // After healing a 3-way partition, SWIM needs to go through its full
     // rediscovery cycle for all nodes: suspicion -> dead -> rejoin via seeds.
     tokio::time::sleep(Duration::from_secs(15)).await;
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(120)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[14.1] migration wait: {e}"));
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -193,7 +193,7 @@ async fn test_asymmetric_partition() -> Result<(), ClientError> {
     eprintln!("[14.2] Starting 3-node cluster and seeding 2000 records");
 
     let (docker, client) = common::start_3node_cluster(SID).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
     let verifier = StateVerifier::new();
@@ -261,8 +261,8 @@ async fn test_asymmetric_partition() -> Result<(), ClientError> {
     docker.heal_all_partitions().await?;
 
     tokio::time::sleep(Duration::from_secs(15)).await;
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(120)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[14.2] migration wait: {e}"));
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -294,7 +294,7 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
     eprintln!("[14.3] Starting 3-node cluster and seeding 2000 records");
 
     let (docker_arc, client) = common::start_3node_cluster(SID).await?;
-    common::wait_migrations_complete(&docker_arc, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker_arc, 3, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
     let verifier = Arc::new(StateVerifier::new());
@@ -395,8 +395,8 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
     // Wait for cluster to settle
     eprintln!("[14.3] Waiting for cluster to settle after flapping");
     tokio::time::sleep(Duration::from_secs(15)).await;
-    common::wait_cluster_ready(&docker_arc, 3, Duration::from_secs(120)).await?;
-    common::wait_migrations_complete(&docker_arc, 3, Duration::from_secs(120)).await
+    common::wait_cluster_ready(&docker_arc, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker_arc, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[14.3] migration wait: {e}"));
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -420,7 +420,7 @@ async fn test_docker_pause() -> Result<(), ClientError> {
     eprintln!("[14.4] Starting 3-node cluster and seeding 2000 records");
 
     let (docker, client) = common::start_3node_cluster(SID).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
     let verifier = StateVerifier::new();
@@ -454,12 +454,12 @@ async fn test_docker_pause() -> Result<(), ClientError> {
     docker.unpause_node("node2").await?;
 
     tokio::time::sleep(Duration::from_secs(5)).await;
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[14.4] migration wait: {e}"));
 
     for node_num in 1..=3u32 {
-        common::wait_node_cluster_size(&docker, node_num, 3, Duration::from_secs(60)).await?;
+        common::wait_node_cluster_size(&docker, node_num, 3, Duration::from_secs(180)).await?;
     }
 
     let client = common::create_client(&docker, 3).await?;

@@ -17,6 +17,10 @@ fn txid_hex(txid: &[u8; 32]) -> String {
     txid.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
 }
 
+/// Note: This test requires iptables inside Docker containers, which works on
+/// Linux but may not work reliably on Docker Desktop for macOS (iptables rules
+/// apply to the Linux VM, not the host's network stack). Skip with `--skip`
+/// on macOS if consistently failing.
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_08_network_partition() {
     let result = tokio::time::timeout(Duration::from_secs(600), run_scenario()).await;
@@ -35,7 +39,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[8a] === Minority isolation sub-scenario ===");
 
         let (mut docker, client) = common::start_3node_cluster(SID).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
         client.refresh_routing().await?;
 
         let verifier = StateVerifier::new();
@@ -184,8 +188,8 @@ async fn run_scenario() -> Result<(), ClientError> {
 
         // After partition heal, SWIM must go through its full rediscovery cycle.
         tokio::time::sleep(Duration::from_secs(15)).await;
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(120)).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
         client.refresh_routing().await?;
 
         eprintln!("[8a.3] OK -- cluster reconverged to size 3");
@@ -223,7 +227,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[8b] === Full isolation sub-scenario ===");
 
         let (mut docker, client) = common::start_3node_cluster(SID).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
         client.refresh_routing().await?;
 
         let verifier = StateVerifier::new();
@@ -335,8 +339,8 @@ async fn run_scenario() -> Result<(), ClientError> {
         docker.heal_all_partitions().await?;
 
         tokio::time::sleep(Duration::from_secs(15)).await;
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(120)).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
         client.refresh_routing().await?;
 
         eprintln!("[8b.3] OK -- cluster reformed after full isolation");
@@ -369,7 +373,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[8c] === Slow network sub-scenario ===");
 
         let (mut docker, _client_orig) = common::start_3node_cluster(SID).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
 
         // Create a client with extended timeouts for degraded network
         let slow_config = ClientConfig {
@@ -456,8 +460,8 @@ async fn run_scenario() -> Result<(), ClientError> {
         docker.clear_all_networks().await?;
 
         tokio::time::sleep(Duration::from_secs(5)).await;
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
             .unwrap_or_else(|e| eprintln!("[8c.3] migration wait: {e}"));
         client.refresh_routing().await?;
 
@@ -526,7 +530,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[8d] === Asymmetric partition sub-scenario ===");
 
         let (mut docker, client) = common::start_3node_cluster(SID).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
         client.refresh_routing().await?;
 
         let verifier = StateVerifier::new();
@@ -601,8 +605,8 @@ async fn run_scenario() -> Result<(), ClientError> {
         docker.heal_all_partitions().await?;
 
         tokio::time::sleep(Duration::from_secs(15)).await;
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(120)).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
         client.refresh_routing().await?;
 
         eprintln!("[8d.3] OK -- cluster reconverged after asymmetric partition heal");

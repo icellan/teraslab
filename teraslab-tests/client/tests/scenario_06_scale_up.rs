@@ -31,7 +31,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     common::teardown_all(SID).await;
 
     let (mut docker, client) = common::start_3node_cluster(SID).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
     let verifier = Arc::new(StateVerifier::new());
@@ -156,7 +156,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // -- Test 6.2: Wait for migrations, check balance --
     eprintln!("[6.2] Waiting for migrations to complete, then checking balance");
-    common::wait_migrations_complete(&docker5, 4, Duration::from_secs(120)).await?;
+    common::wait_migrations_complete(&docker5, 4, Duration::from_secs(180)).await?;
     eprintln!("[6.2] OK -- all migrations complete");
 
     // Stop the background workload

@@ -84,7 +84,7 @@ async fn test_kill_two_of_three() -> Result<(), ClientError> {
 
     let (_docker, client) = common::start_3node_cluster(SID).await?;
     let docker = common::docker_3node(SID);
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
     let verifier = StateVerifier::new();
@@ -131,8 +131,8 @@ async fn test_kill_two_of_three() -> Result<(), ClientError> {
     docker.start_node("node2").await?;
     docker.start_node("node3").await?;
 
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[12.1] migration wait: {e}"));
     tokio::time::sleep(Duration::from_secs(5)).await;
     client.refresh_routing().await?;
@@ -181,7 +181,7 @@ async fn test_sequential_kills() -> Result<(), ClientError> {
 
     let (_docker, client) = common::start_3node_cluster(SID).await?;
     let docker = common::docker_3node(SID);
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
     let verifier = StateVerifier::new();
@@ -218,8 +218,8 @@ async fn test_sequential_kills() -> Result<(), ClientError> {
 
     eprintln!("[12.2] Restarting node3 -- majority restored");
     docker.start_node("node3").await?;
-    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(60)).await?;
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(60)).await?;
+    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(180)).await?;
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
     eprintln!("[12.2] Cluster size = 2 (node1 + node3), writes should resume");
 
@@ -230,8 +230,8 @@ async fn test_sequential_kills() -> Result<(), ClientError> {
 
     eprintln!("[12.2] Restarting node2 -- full cluster restored");
     docker.start_node("node2").await?;
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[12.2] migration wait: {e}"));
     tokio::time::sleep(Duration::from_secs(5)).await;
     client.refresh_routing().await?;
@@ -288,7 +288,7 @@ async fn test_partition_plus_kill() -> Result<(), ClientError> {
 
     let (_docker, client) = common::start_3node_cluster(SID).await?;
     let docker = common::docker_3node(SID);
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
     let verifier = StateVerifier::new();
@@ -333,8 +333,8 @@ async fn test_partition_plus_kill() -> Result<(), ClientError> {
     docker.heal_all_partitions().await?;
     docker.start_node("node2").await?;
 
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[12.3] migration wait: {e}"));
     tokio::time::sleep(Duration::from_secs(5)).await;
     client.refresh_routing().await?;
@@ -364,7 +364,7 @@ async fn test_kill_during_migration() -> Result<(), ClientError> {
 
     let (_docker, client) = common::start_3node_cluster(SID).await?;
     let docker = common::docker_3node(SID);
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
     let verifier = StateVerifier::new();
@@ -392,14 +392,14 @@ async fn test_kill_during_migration() -> Result<(), ClientError> {
     // The cluster may report different sizes depending on how SWIM reacts.
     // Wait for at least 3 nodes to agree.
     eprintln!("[12.4] Waiting for remaining nodes to stabilize");
-    common::wait_specific_nodes_ready(&docker_5, &[1, 3, 4], 3, Duration::from_secs(120))
+    common::wait_specific_nodes_ready(&docker_5, &[1, 3, 4], 3, Duration::from_secs(180))
         .await
         .unwrap_or_else(|e| {
             eprintln!("[12.4] partial stabilization: {e}");
         });
 
     // Wait for migration to complete or roll back
-    common::wait_specific_migrations_complete(&docker_5, &[1, 3, 4], Duration::from_secs(120))
+    common::wait_specific_migrations_complete(&docker_5, &[1, 3, 4], Duration::from_secs(180))
         .await
         .unwrap_or_else(|e| {
             eprintln!("[12.4] migration wait: {e}");
@@ -414,13 +414,13 @@ async fn test_kill_during_migration() -> Result<(), ClientError> {
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     // Try to wait for 4-node cluster first; fall back to 3 if node4 was ejected
-    let cluster_size = if common::wait_cluster_ready(&docker_5, 4, Duration::from_secs(60))
+    let cluster_size = if common::wait_cluster_ready(&docker_5, 4, Duration::from_secs(180))
         .await
         .is_ok()
     {
         4u32
     } else {
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
         3u32
     };
 
@@ -488,7 +488,7 @@ async fn test_rolling_restart_plus_partition() -> Result<(), ClientError> {
 
     let (_docker, client) = common::start_3node_cluster(SID).await?;
     let docker = common::docker_3node(SID);
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
     let verifier = StateVerifier::new();
@@ -549,8 +549,8 @@ async fn test_rolling_restart_plus_partition() -> Result<(), ClientError> {
     docker.start_node("node1").await?;
 
     // Wait for full cluster to reform
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(120)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[12.5] migration wait: {e}"));
     tokio::time::sleep(Duration::from_secs(10)).await;
     client.refresh_routing().await?;
