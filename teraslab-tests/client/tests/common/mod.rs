@@ -388,6 +388,15 @@ pub async fn seed_records(
             match client.create_batch(&items).await {
                 Ok(_) => { created = true; break; }
                 Err(ClientError::Server { code, .. }) if code == 15 && attempt < 4 => {
+                    // NO_QUORUM: SWIM instability, retry after refresh.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let _ = client.refresh_routing().await;
+                }
+                Err(ClientError::Partial(ref pe)) if attempt < 4
+                    && pe.errors.iter().all(|e| e.code == 14 || e.code == 19) =>
+                {
+                    // All errors are REDIRECT (14) or MIGRATION_IN_PROGRESS (19).
+                    // Retry after routing refresh — the cluster is still converging.
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     let _ = client.refresh_routing().await;
                 }
