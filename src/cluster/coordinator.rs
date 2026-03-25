@@ -2691,14 +2691,18 @@ impl RunningCluster {
     pub fn is_master(&self, key: &TxKey) -> bool {
         let shard = ShardTable::shard_for_key(key);
         let table = self.shard_table.read().unwrap();
-        table.assignment(shard).master == self.self_id
+        // Use target_assignment so the NEW master accepts requests immediately
+        // after topology change, even while handoff is in progress. Using
+        // effective_assignment would redirect to the OLD master (which may be
+        // dead after a node kill).
+        table.target_assignment(shard).master == self.self_id
     }
 
     /// Determine how to route a request for the given key.
     pub fn route(&self, key: &TxKey) -> RouteDecision {
         let shard = ShardTable::shard_for_key(key);
         let table = self.shard_table.read().unwrap();
-        let assignment = table.assignment(shard);
+        let assignment = table.target_assignment(shard);
 
         if assignment.master == self.self_id {
             RouteDecision::HandleLocally
@@ -2812,9 +2816,13 @@ impl RunningCluster {
             buf.extend_from_slice(addr_bytes);
         }
 
-        // Shard assignments (4096 entries, each is just the master node_id)
+        // Shard assignments (4096 entries, each is just the master node_id).
+        // Use target_assignment (committed layout) so clients route to the NEW
+        // master immediately. effective_assignment returns the OLD master for
+        // shards in Copying state, which may be a dead node — causing clients
+        // to get redirected to an unreachable address.
         for shard in 0..NUM_SHARDS as u16 {
-            let master = table.assignment(shard).master;
+            let master = table.target_assignment(shard).master;
             buf.extend_from_slice(&master.0.to_le_bytes());
         }
 

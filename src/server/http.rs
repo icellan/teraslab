@@ -203,7 +203,10 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
         let mut master_count: u32 = 0;
         let mut replica_count: u32 = 0;
         for shard in 0..NUM_SHARDS as u16 {
-            let assignment = table_guard.assignment(shard);
+            // Use target_assignment to reflect the committed topology,
+            // not the in-flight handoff state. This matches the partition
+            // map and is_master which also use target_assignment.
+            let assignment = table_guard.target_assignment(shard);
             if assignment.master == self_id {
                 master_count += 1;
             }
