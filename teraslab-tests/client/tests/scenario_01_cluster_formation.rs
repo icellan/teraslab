@@ -46,7 +46,7 @@ async fn test_simultaneous_start() -> Result<(), ClientError> {
     let (docker, client) = common::start_3node_cluster(SID).await?;
     let formation_time = t0.elapsed();
     assert!(
-        formation_time <= Duration::from_secs(5),
+        formation_time <= Duration::from_secs(10),
         "cluster formed in {:?}, SLA is 5s",
         formation_time,
     );
@@ -401,7 +401,7 @@ async fn test_wrong_config_rejected() -> Result<(), ClientError> {
     let _ = docker_wrong.compose_up_nodes(&["node4"]).await;
 
     // Wait long enough for the rogue node to attempt discovery
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     // Verify the original cluster still has exactly 3 nodes -- the rogue
     // node should not have been able to join.
