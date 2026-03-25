@@ -352,6 +352,10 @@ fn main() {
 
     // 6. Start HTTP observability server
     let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let http_port: u16 = config.http_listen_addr
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or(9100);
     let http_state = Arc::new(HttpState {
         engine: engine.clone(),
         metrics: &SERVER_METRICS,
@@ -361,6 +365,7 @@ fn main() {
         cluster: cluster.clone(),
         redo_log: redo_log.clone(),
         active_connections: active_connections.clone(),
+        http_port,
     });
     let http_addr = config.http_listen_addr.clone();
     std::thread::spawn(move || {

@@ -263,9 +263,16 @@
         if (ws) { ws.close(); ws = null; }
     }
 
-    function computeRates() {
-        const cur = store.topSnapshot;
-        const prev = store.prevSnapshot;
+    // Toggle between aggregate and per-node views
+    let topViewMode = 'aggregate'; // 'aggregate' or 'pernode'
+
+    // Extract the aggregate data from a response (handles both formats)
+    function getAggregate(resp) {
+        if (!resp) return null;
+        return resp.aggregate || resp;
+    }
+
+    function computeRatesFrom(cur, prev) {
         if (!cur || !prev) return null;
         const dt = (cur.timestamp_ms - prev.timestamp_ms) / 1000;
         if (dt <= 0) return null;
@@ -277,52 +284,95 @@
             set_mined: rate('set_mined_attempted'),
             gets: rate('gets_attempted'),
             unspends: rate('unspends_attempted'),
-            spend_errors: rate('spends_failed'),
-            create_errors: ((cur.counters.creates_attempted||0) - (cur.counters.creates_succeeded||0)) -
-                           ((prev.counters.creates_attempted||0) - (prev.counters.creates_succeeded||0)),
         };
     }
 
-    function renderTop() {
-        const snap = store.topSnapshot;
-        const rates = computeRates();
-        const dot = '<span class="live-dot ' + (store.wsConnected ? 'connected' : 'disconnected') + '"></span>';
-
-        if (!snap) {
-            return '<div class="live-header"><div>' + dot + (store.wsConnected ? 'Connected' : 'Connecting...') + '</div></div>' +
-                   '<div class="card">Waiting for data...</div>';
-        }
-
+    function renderOpsTable(snap, rates) {
         const c = snap.counters;
         const lat = snap.latency || {};
-
-        function opRow(name, attemptedKey, successKey, errKey, latKey) {
-            const r = rates ? Math.round(rates[name.toLowerCase().replace(' ', '_')] || 0) : 0;
+        function opRow(name, attemptedKey, successKey, latKey) {
+            const rateKey = name.toLowerCase().replace(' ', '_');
+            const r = rates ? Math.round(rates[rateKey] || 0) : 0;
             return '<tr><td>' + name + '</td><td>' + fmt(r) + '</td><td>' + fmt(c[attemptedKey]) +
                    '</td><td>' + fmt((c[attemptedKey]||0) - (c[successKey]||0)) +
                    '</td><td>' + fmtNs(lat[latKey]?.p50_ns) + '</td><td>' + fmtNs(lat[latKey]?.p99_ns) + '</td></tr>';
         }
-
-        return '<div class="live-header"><div>' + dot + (store.wsConnected ? 'Live' : 'Disconnected') +
-            ' &mdash; ' + snap.connections + ' connections</div></div>' +
-            '<div class="card"><h2>Operations</h2><table>' +
+        return '<table>' +
             '<tr><th>Operation</th><th>Ops/sec</th><th>Total</th><th>Errors</th><th>p50</th><th>p99</th></tr>' +
-            opRow('Spends', 'spends_attempted', 'spends_succeeded', 'spends_failed', 'spend') +
-            opRow('Spend Multi', 'spend_multi_batches', 'spend_multi_batches', 'spend_multi_batches', 'spend_multi') +
-            opRow('Creates', 'creates_attempted', 'creates_succeeded', 'creates_attempted', 'spend') +
-            opRow('Set Mined', 'set_mined_attempted', 'set_mined_succeeded', 'set_mined_attempted', 'spend') +
-            opRow('Gets', 'gets_attempted', 'gets_succeeded', 'gets_attempted', 'spend') +
-            opRow('Unspends', 'unspends_attempted', 'unspends_succeeded', 'unspends_failed', 'unspend') +
-            '</table></div>' +
+            opRow('Spends', 'spends_attempted', 'spends_succeeded', 'spend') +
+            opRow('Spend Multi', 'spend_multi_batches', 'spend_multi_batches', 'spend_multi') +
+            opRow('Creates', 'creates_attempted', 'creates_succeeded', 'spend') +
+            opRow('Set Mined', 'set_mined_attempted', 'set_mined_succeeded', 'spend') +
+            opRow('Gets', 'gets_attempted', 'gets_succeeded', 'spend') +
+            opRow('Unspends', 'unspends_attempted', 'unspends_succeeded', 'unspend') +
+            '</table>';
+    }
+
+    function renderPerNodeTable(nodes, prevNodes) {
+        if (!nodes || nodes.length <= 1) return '<p style="color:var(--text-muted)">Single node — no per-node breakdown</p>';
+        let html = '<table><tr><th>Node</th><th>Spends/s</th><th>Creates/s</th><th>Gets/s</th><th>Records</th><th>Storage</th><th>Conns</th></tr>';
+        for (const node of nodes) {
+            const prev = (prevNodes || []).find(function(p) { return p.node_id === node.node_id; });
+            const dt = prev ? (node.timestamp_ms - prev.timestamp_ms) / 1000 : 0;
+            function nr(key) {
+                if (!prev || dt <= 0) return 0;
+                return Math.round(((node.counters[key]||0) - (prev.counters[key]||0)) / dt);
+            }
+            html += '<tr><td>node ' + node.node_id + '</td><td>' + fmt(nr('spends_attempted')) +
+                '</td><td>' + fmt(nr('creates_attempted')) + '</td><td>' + fmt(nr('gets_attempted')) +
+                '</td><td>' + fmt(node.index?.entries) + '</td><td>' + pct(node.storage?.utilization) +
+                '</td><td>' + (node.connections || 0) + '</td></tr>';
+        }
+        return html + '</table>';
+    }
+
+    function renderTop() {
+        const resp = store.topSnapshot;
+        const prevResp = store.prevSnapshot;
+        const dot = '<span class="live-dot ' + (store.wsConnected ? 'connected' : 'disconnected') + '"></span>';
+
+        if (!resp) {
+            return '<div class="live-header"><div>' + dot + (store.wsConnected ? 'Connected' : 'Connecting...') + '</div></div>' +
+                   '<div class="card">Waiting for data...</div>';
+        }
+
+        const agg = getAggregate(resp);
+        const prevAgg = getAggregate(prevResp);
+        const nodeCount = agg.node_count || 1;
+        const viewLabel = topViewMode === 'aggregate'
+            ? 'Cluster (' + nodeCount + ' nodes)'
+            : 'Per-Node (' + nodeCount + ' nodes)';
+        const toggleBtn = '<button onclick="window._toggleTopView()" style="margin-left:1rem;padding:0.25rem 0.75rem;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.8rem">' +
+            (topViewMode === 'aggregate' ? 'Show Per-Node' : 'Show Aggregate') + '</button>';
+
+        let header = '<div class="live-header"><div>' + dot + (store.wsConnected ? 'Live' : 'Disconnected') +
+            ' &mdash; ' + viewLabel + ' &mdash; ' + (agg.connections || 0) + ' connections' + toggleBtn + '</div></div>';
+
+        let opsHtml;
+        if (topViewMode === 'aggregate') {
+            const rates = computeRatesFrom(agg, prevAgg);
+            opsHtml = '<div class="card"><h2>Operations (Cluster Aggregate)</h2>' + renderOpsTable(agg, rates) + '</div>';
+        } else {
+            const nodes = resp.nodes || [agg];
+            const prevNodes = prevResp ? (prevResp.nodes || [getAggregate(prevResp)]) : [];
+            opsHtml = '<div class="card"><h2>Per-Node Breakdown</h2>' + renderPerNodeTable(nodes, prevNodes) + '</div>';
+        }
+
+        return header + opsHtml +
             '<div class="grid">' +
-                '<div class="card"><h2>Index</h2><div class="stat"><div class="stat-value">' + fmt(snap.index?.entries) +
-                '</div><div class="stat-label">LF: ' + pct(snap.index?.load_factor) + ' &middot; Memory: ' + fmtBytes(snap.index?.memory_bytes) + '</div></div></div>' +
-                '<div class="card"><h2>Storage</h2>' + bar(snap.storage?.utilization || 0,
-                    fmtBytes(snap.storage?.used_bytes) + ' / ' + fmtBytes(snap.storage?.total_bytes) + ' (' + pct(snap.storage?.utilization) + ')') + '</div>' +
-                '<div class="card"><h2>Redo Log</h2>' + bar(snap.redo?.utilization || 0,
-                    'Seq: ' + fmt(snap.redo?.current_sequence) + ' (' + pct(snap.redo?.utilization) + ')') + '</div>' +
+                '<div class="card"><h2>Index</h2><div class="stat"><div class="stat-value">' + fmt(agg.index?.entries) +
+                '</div><div class="stat-label">LF: ' + pct(agg.index?.load_factor) + ' &middot; Memory: ' + fmtBytes(agg.index?.memory_bytes) + '</div></div></div>' +
+                '<div class="card"><h2>Storage</h2>' + bar(agg.storage?.utilization || 0,
+                    fmtBytes(agg.storage?.used_bytes) + ' / ' + fmtBytes(agg.storage?.total_bytes) + ' (' + pct(agg.storage?.utilization) + ')') + '</div>' +
+                '<div class="card"><h2>Redo Log</h2>' + bar(agg.redo?.utilization || 0,
+                    'Seq: ' + fmt(agg.redo?.current_sequence) + ' (' + pct(agg.redo?.utilization) + ')') + '</div>' +
             '</div>';
     }
+
+    window._toggleTopView = function() {
+        topViewMode = topViewMode === 'aggregate' ? 'pernode' : 'aggregate';
+        renderCurrentPage();
+    };
 
     // ---------------------------------------------------------------------------
     // Router

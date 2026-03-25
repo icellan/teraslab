@@ -48,6 +48,7 @@ fn start_test_http_server() -> (u16, Arc<HttpState>) {
         cluster: None,
         redo_log: None,
         active_connections: Arc::new(AtomicUsize::new(0)),
+        http_port: 0,
     });
 
     let addr = format!("127.0.0.1:{port}");

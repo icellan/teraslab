@@ -626,68 +626,82 @@ fn cmd_bench(http: &HttpClient, data_addr: &str, json: bool, operation: &str, co
 // Top command — ratatui terminal UI
 // ---------------------------------------------------------------------------
 
+/// View mode for the top command.
+#[derive(Clone, Copy, PartialEq)]
+enum TopView {
+    /// Aggregate cluster-wide totals.
+    Aggregate,
+    /// Per-node breakdown.
+    PerNode,
+}
+
 fn cmd_top(http: &HttpClient) -> Result<(), CliError> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind};
     use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
     use crossterm::ExecutableCommand;
     use ratatui::prelude::*;
 
-    // Enter raw mode
     terminal::enable_raw_mode().map_err(|e| CliError::Other(format!("terminal: {e}")))?;
     let mut stdout = std::io::stdout();
     stdout.execute(EnterAlternateScreen).map_err(|e| CliError::Other(format!("terminal: {e}")))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| CliError::Other(format!("terminal: {e}")))?;
 
-    let mut prev_snapshot: Option<serde_json::Value> = None;
+    let mut prev_response: Option<serde_json::Value> = None;
     let mut error_msg: Option<String>;
+    let mut view = TopView::Aggregate;
 
     loop {
-        // Fetch snapshot
-        let snapshot = match http.get_json("/admin/top") {
-            Ok(s) => {
-                error_msg = None;
-                Some(s)
-            }
-            Err(e) => {
-                error_msg = Some(format!("Connection lost: {e}"));
-                None
-            }
+        // Fetch cluster-wide snapshot
+        let response = match http.get_json("/admin/top") {
+            Ok(s) => { error_msg = None; Some(s) }
+            Err(e) => { error_msg = Some(format!("Connection lost: {e}")); None }
         };
 
-        // Compute rates
-        let rates = compute_rates(prev_snapshot.as_ref(), snapshot.as_ref());
-
-        // Render
         terminal.draw(|frame| {
-            draw_top(frame, snapshot.as_ref(), &rates, error_msg.as_deref());
+            draw_top(frame, response.as_ref(), prev_response.as_ref(), error_msg.as_deref(), view);
         }).map_err(|e| CliError::Other(format!("render: {e}")))?;
 
-        if snapshot.is_some() {
-            prev_snapshot = snapshot;
+        if response.is_some() {
+            prev_response = response;
         }
 
-        // Poll for 'q' key with 1s timeout
+        // Poll for keys with 1s timeout
         if event::poll(Duration::from_secs(1)).unwrap_or(false)
             && let Ok(Event::Key(key)) = event::read()
             && key.kind == KeyEventKind::Press
-            && key.code == KeyCode::Char('q')
         {
-            break;
+            match key.code {
+                KeyCode::Char('q') => break,
+                KeyCode::Char('v') | KeyCode::Tab => {
+                    view = match view {
+                        TopView::Aggregate => TopView::PerNode,
+                        TopView::PerNode => TopView::Aggregate,
+                    };
+                }
+                _ => {}
+            }
         }
     }
 
-    // Restore terminal
     terminal::disable_raw_mode().ok();
     std::io::stdout().execute(LeaveAlternateScreen).ok();
     Ok(())
 }
 
-/// Compute per-second rates from two consecutive snapshots.
-fn compute_rates(prev: Option<&serde_json::Value>, cur: Option<&serde_json::Value>) -> Vec<(String, u64, u64, u64, String, String)> {
-    let (Some(prev), Some(cur)) = (prev, cur) else {
-        return Vec::new();
-    };
+/// Extract the viewable data snapshot from a response.
+/// The response may be `{ "aggregate": {...}, "nodes": [...] }` (cluster)
+/// or a flat snapshot (single node / ?local=true).
+fn get_view_data(response: &serde_json::Value) -> &serde_json::Value {
+    if response.get("aggregate").is_some() {
+        &response["aggregate"]
+    } else {
+        response
+    }
+}
+
+/// Compute per-second rates from two consecutive snapshots of the same shape.
+fn compute_rates(prev: &serde_json::Value, cur: &serde_json::Value) -> Vec<(String, u64, u64, u64, String, String)> {
     let dt_ms = as_u64(&cur["timestamp_ms"]).saturating_sub(as_u64(&prev["timestamp_ms"]));
     if dt_ms == 0 { return Vec::new(); }
     let dt = dt_ms as f64 / 1000.0;
@@ -723,12 +737,13 @@ fn compute_rates(prev: Option<&serde_json::Value>, cur: Option<&serde_json::Valu
     ]
 }
 
-/// Render the top TUI.
+/// Render the top TUI with aggregate or per-node view.
 fn draw_top(
     frame: &mut ratatui::Frame,
-    snapshot: Option<&serde_json::Value>,
-    rates: &[(String, u64, u64, u64, String, String)],
+    response: Option<&serde_json::Value>,
+    prev_response: Option<&serde_json::Value>,
     error: Option<&str>,
+    view: TopView,
 ) {
     use ratatui::prelude::*;
     use ratatui::widgets::*;
@@ -746,12 +761,20 @@ fn draw_top(
         .split(area);
 
     // Header
-    let header_text = if let Some(snap) = snapshot {
+    let header_text = if let Some(resp) = response {
+        let agg = get_view_data(resp);
+        let node_count = agg.get("node_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1);
+        let view_label = match view {
+            TopView::Aggregate => format!("CLUSTER ({node_count} nodes)"),
+            TopView::PerNode => format!("PER-NODE ({node_count} nodes)"),
+        };
         format!(
-            " TeraSlab Top  |  {} connections  |  {} records  |  ready: {}",
-            as_u64(&snap["connections"]),
-            fmt_num(as_u64(&snap["index"]["entries"])),
-            snap["ready"],
+            " TeraSlab Top [{view_label}]  |  {} connections  |  {} records  |  ready: {}",
+            as_u64(&agg["connections"]),
+            fmt_num(as_u64(&agg["index"]["entries"])),
+            agg["ready"],
         )
     } else if let Some(err) = error {
         format!(" TeraSlab Top  |  {err}")
@@ -764,62 +787,171 @@ fn draw_top(
         .block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, chunks[0]);
 
-    // Operations table
+    match view {
+        TopView::Aggregate => {
+            // Show aggregate rates and stats
+            let rates = if let (Some(cur), Some(prev)) = (response, prev_response) {
+                compute_rates(get_view_data(cur), get_view_data(prev))
+            } else {
+                Vec::new()
+            };
+            render_ops_table(frame, chunks[1], &rates, " Operations (Cluster Aggregate) ");
+            if let Some(resp) = response {
+                render_system_stats(frame, chunks[2], get_view_data(resp));
+            } else {
+                render_waiting(frame, chunks[2]);
+            }
+        }
+        TopView::PerNode => {
+            // Show per-node breakdown
+            if let Some(resp) = response {
+                let nodes = resp.get("nodes").and_then(|n| n.as_array());
+                if let Some(nodes) = nodes {
+                    render_per_node_table(frame, chunks[1], nodes, prev_response);
+                } else {
+                    // No nodes array — single node, show as aggregate
+                    let rates = if let Some(prev) = prev_response {
+                        compute_rates(get_view_data(resp), get_view_data(prev))
+                    } else {
+                        Vec::new()
+                    };
+                    render_ops_table(frame, chunks[1], &rates, " Operations (Single Node) ");
+                }
+                render_system_stats(frame, chunks[2], get_view_data(resp));
+            } else {
+                render_waiting(frame, chunks[1]);
+                render_waiting(frame, chunks[2]);
+            }
+        }
+    }
+
+    // Footer
+    let footer = Paragraph::new(" 'q' quit  |  'v'/Tab toggle aggregate/per-node")
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(footer, chunks[3]);
+}
+
+fn render_ops_table(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, rates: &[(String, u64, u64, u64, String, String)], title: &str) {
+    use ratatui::prelude::*;
+    use ratatui::widgets::*;
+
     let header_row = Row::new(vec!["Operation", "Ops/sec", "Total", "Errors", "p50", "p99"])
         .style(Style::default().add_modifier(Modifier::BOLD));
     let rows: Vec<Row> = rates.iter().map(|(name, rate, total, errors, p50, p99)| {
         Row::new(vec![
-            name.clone(),
-            fmt_num(*rate),
-            fmt_num(*total),
-            errors.to_string(),
-            p50.clone(),
-            p99.clone(),
+            name.clone(), fmt_num(*rate), fmt_num(*total),
+            errors.to_string(), p50.clone(), p99.clone(),
         ])
     }).collect();
 
     let table = ratatui::widgets::Table::new(
         rows,
         [
-            Constraint::Length(14),
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(10),
+            Constraint::Length(14), Constraint::Length(12), Constraint::Length(10),
+            Constraint::Length(10), Constraint::Length(10), Constraint::Length(10),
         ],
     )
     .header(header_row)
-    .block(Block::default().title(" Operations ").borders(Borders::ALL));
-    frame.render_widget(table, chunks[1]);
+    .block(Block::default().title(title).borders(Borders::ALL));
+    frame.render_widget(table, area);
+}
 
-    // System stats
-    let stats_text = if let Some(snap) = snapshot {
-        format!(
-            " Index: {} entries  LF: {}  Memory: {}  |  Storage: {} / {} ({})  Free regions: {}  |  Redo: {} seq: {}",
-            fmt_num(as_u64(&snap["index"]["entries"])),
-            fmt_pct(as_f64(&snap["index"]["load_factor"])),
-            fmt_bytes(as_u64(&snap["index"]["memory_bytes"])),
-            fmt_bytes(as_u64(&snap["storage"]["used_bytes"])),
-            fmt_bytes(as_u64(&snap["storage"]["total_bytes"])),
-            fmt_pct(as_f64(&snap["storage"]["utilization"])),
-            as_u64(&snap["storage"]["free_regions"]),
-            fmt_pct(as_f64(&snap["redo"]["utilization"])),
-            fmt_num(as_u64(&snap["redo"]["current_sequence"])),
-        )
-    } else {
-        " Waiting for data...".to_string()
-    };
+fn render_per_node_table(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    nodes: &[serde_json::Value],
+    prev_response: Option<&serde_json::Value>,
+) {
+    use ratatui::prelude::*;
+    use ratatui::widgets::*;
 
+    let header_row = Row::new(vec![
+        "Node", "Spends/s", "Creates/s", "Gets/s", "Records", "Storage", "Conns",
+    ]).style(Style::default().add_modifier(Modifier::BOLD));
+
+    let prev_nodes: Vec<&serde_json::Value> = prev_response
+        .and_then(|r| r.get("nodes"))
+        .and_then(|n| n.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+
+    let rows: Vec<Row> = nodes.iter().map(|node| {
+        let node_id = as_u64(&node["node_id"]);
+        // Find matching previous node for rate calculation
+        let prev_node = prev_nodes.iter().find(|p| as_u64(&p["node_id"]) == node_id);
+        let dt_ms = prev_node
+            .map(|p| as_u64(&node["timestamp_ms"]).saturating_sub(as_u64(&p["timestamp_ms"])))
+            .unwrap_or(0);
+        let dt = if dt_ms > 0 { dt_ms as f64 / 1000.0 } else { 1.0 };
+
+        let spend_rate = prev_node.map(|p| {
+            let c = as_u64(&node["counters"]["spends_attempted"]);
+            let prev = as_u64(&p["counters"]["spends_attempted"]);
+            (c.saturating_sub(prev) as f64 / dt) as u64
+        }).unwrap_or(0);
+
+        let create_rate = prev_node.map(|p| {
+            let c = as_u64(&node["counters"]["creates_attempted"]);
+            let prev = as_u64(&p["counters"]["creates_attempted"]);
+            (c.saturating_sub(prev) as f64 / dt) as u64
+        }).unwrap_or(0);
+
+        let get_rate = prev_node.map(|p| {
+            let c = as_u64(&node["counters"]["gets_attempted"]);
+            let prev = as_u64(&p["counters"]["gets_attempted"]);
+            (c.saturating_sub(prev) as f64 / dt) as u64
+        }).unwrap_or(0);
+
+        Row::new(vec![
+            format!("node {node_id}"),
+            fmt_num(spend_rate),
+            fmt_num(create_rate),
+            fmt_num(get_rate),
+            fmt_num(as_u64(&node["index"]["entries"])),
+            fmt_pct(as_f64(&node["storage"]["utilization"])),
+            as_u64(&node["connections"]).to_string(),
+        ])
+    }).collect();
+
+    let table = ratatui::widgets::Table::new(
+        rows,
+        [
+            Constraint::Length(10), Constraint::Length(12), Constraint::Length(12),
+            Constraint::Length(10), Constraint::Length(10), Constraint::Length(10),
+            Constraint::Length(6),
+        ],
+    )
+    .header(header_row)
+    .block(Block::default().title(" Per-Node Breakdown ").borders(Borders::ALL));
+    frame.render_widget(table, area);
+}
+
+fn render_system_stats(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, snap: &serde_json::Value) {
+    use ratatui::widgets::*;
+
+    let stats_text = format!(
+        " Index: {} entries  LF: {}  Memory: {}  |  Storage: {} / {} ({})  Free regions: {}  |  Redo: {} seq: {}",
+        fmt_num(as_u64(&snap["index"]["entries"])),
+        fmt_pct(as_f64(&snap["index"]["load_factor"])),
+        fmt_bytes(as_u64(&snap["index"]["memory_bytes"])),
+        fmt_bytes(as_u64(&snap["storage"]["used_bytes"])),
+        fmt_bytes(as_u64(&snap["storage"]["total_bytes"])),
+        fmt_pct(as_f64(&snap["storage"]["utilization"])),
+        as_u64(&snap["storage"]["free_regions"]),
+        fmt_pct(as_f64(&snap["redo"]["utilization"])),
+        fmt_num(as_u64(&snap["redo"]["current_sequence"])),
+    );
     let stats = Paragraph::new(stats_text)
         .block(Block::default().title(" System ").borders(Borders::ALL))
         .wrap(Wrap { trim: true });
-    frame.render_widget(stats, chunks[2]);
+    frame.render_widget(stats, area);
+}
 
-    // Footer
-    let footer = Paragraph::new(" Press 'q' to quit")
-        .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(footer, chunks[3]);
+fn render_waiting(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    use ratatui::widgets::*;
+    let p = Paragraph::new(" Waiting for data...")
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(p, area);
 }
 
 // ---------------------------------------------------------------------------

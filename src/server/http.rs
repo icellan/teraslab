@@ -10,7 +10,7 @@ use crate::metrics::{ThreadHistograms, ThreadMetrics};
 use crate::ops::engine::Engine;
 use crate::redo::RedoLog;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, put};
@@ -18,7 +18,7 @@ use axum::Router;
 use rust_embed::Embed;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Log levels for the runtime log level endpoint.
 const LOG_LEVEL_ERROR: u8 = 0;
@@ -50,6 +50,8 @@ pub struct HttpState {
     pub redo_log: Option<Arc<parking_lot::Mutex<RedoLog>>>,
     /// Active TCP connection count (shared with the Server struct).
     pub active_connections: Arc<AtomicUsize>,
+    /// HTTP port used by this node (for deriving other nodes' HTTP addresses).
+    pub http_port: u16,
 }
 
 /// Start the HTTP observability server on the given address.
@@ -437,13 +439,16 @@ async fn handle_admin_drain(
 // /admin/top — full metrics snapshot for real-time monitoring
 // ---------------------------------------------------------------------------
 
-/// Build a full metrics snapshot as JSON. Used by both the /admin/top
-/// endpoint and the WebSocket push loop.
-fn build_top_snapshot(state: &HttpState) -> serde_json::Value {
+/// Build this node's local metrics snapshot as JSON.
+fn build_local_top_snapshot(state: &HttpState) -> serde_json::Value {
     let m = state.metrics;
     let h = state.histograms;
     let index_stats = state.engine.index_stats();
     let alloc_stats = state.engine.allocator_stats();
+
+    let node_id = state.cluster.as_ref()
+        .map(|c| c.self_id().0)
+        .unwrap_or(0);
 
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -472,6 +477,7 @@ fn build_top_snapshot(state: &HttpState) -> serde_json::Value {
     };
 
     serde_json::json!({
+        "node_id": node_id,
         "timestamp_ms": timestamp_ms,
         "counters": {
             "spends_attempted": m.spends_attempted.get(),
@@ -527,10 +533,183 @@ fn histogram_json(h: &crate::metrics::LatencyHistogram) -> serde_json::Value {
     })
 }
 
-/// Return a point-in-time metrics snapshot for the `top` monitor.
-async fn handle_admin_top(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
-    let body = build_top_snapshot(&state);
-    json_response(body)
+/// Build a cluster-wide top snapshot by fetching from all nodes in parallel.
+///
+/// Returns the local snapshot plus remote node snapshots, with an aggregate.
+/// Remote nodes are queried with `?local=true` to prevent recursive fan-out.
+/// If a remote node doesn't respond within 2 seconds, it is omitted.
+async fn build_cluster_top_snapshot(state: &HttpState) -> serde_json::Value {
+    let local = build_local_top_snapshot(state);
+    let mut all_nodes = vec![local.clone()];
+
+    // Fan out to remote nodes (if clustered)
+    if let Some(ref cluster) = state.cluster {
+        let self_id = cluster.self_id();
+        let addrs = cluster.node_addresses();
+        let http_port = state.http_port;
+
+        let mut handles = Vec::new();
+        for (&node_id, &addr) in &addrs {
+            if node_id == self_id {
+                continue; // Skip self — already have local snapshot
+            }
+            let url = format!("http://{}:{}/admin/top?local=true", addr.ip(), http_port);
+            handles.push(tokio::spawn(async move {
+                let client = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .ok()?;
+                let resp = client.get(&url).send().await.ok()?;
+                if !resp.status().is_success() { return None; }
+                resp.json::<serde_json::Value>().await.ok()
+            }));
+        }
+
+        for handle in handles {
+            if let Ok(Some(snapshot)) = handle.await {
+                all_nodes.push(snapshot);
+            }
+        }
+    }
+
+    // Build aggregate by summing counters, index entries, storage, connections
+    let aggregate = aggregate_snapshots(&all_nodes);
+
+    serde_json::json!({
+        "aggregate": aggregate,
+        "nodes": all_nodes,
+    })
+}
+
+/// Sum counters and system stats across all node snapshots.
+fn aggregate_snapshots(nodes: &[serde_json::Value]) -> serde_json::Value {
+    let timestamp_ms = nodes.iter()
+        .filter_map(|n| n["timestamp_ms"].as_u64())
+        .max()
+        .unwrap_or(0);
+
+    let counter_keys = [
+        "spends_attempted", "spends_succeeded", "spends_idempotent", "spends_failed",
+        "unspends_attempted", "unspends_succeeded", "unspends_noop", "unspends_failed",
+        "spend_multi_batches",
+        "creates_attempted", "creates_succeeded",
+        "set_mined_attempted", "set_mined_succeeded",
+        "gets_attempted", "gets_succeeded",
+        "freezes_attempted", "deletes_attempted",
+    ];
+
+    let mut counters = serde_json::Map::new();
+    for key in &counter_keys {
+        let sum: u64 = nodes.iter()
+            .filter_map(|n| n["counters"][*key].as_u64())
+            .sum();
+        counters.insert(key.to_string(), serde_json::json!(sum));
+    }
+
+    // Latency: take the max of p99/p95, weighted mean for p50/mean
+    let latency_keys = ["spend", "spend_multi", "unspend", "lock_wait"];
+    let mut latency = serde_json::Map::new();
+    for lk in &latency_keys {
+        let total_count: u64 = nodes.iter()
+            .filter_map(|n| n["latency"][*lk]["count"].as_u64())
+            .sum();
+        let weighted_mean: u64 = if total_count > 0 {
+            let sum: u64 = nodes.iter()
+                .map(|n| {
+                    let c = n["latency"][*lk]["count"].as_u64().unwrap_or(0);
+                    let m = n["latency"][*lk]["mean_ns"].as_u64().unwrap_or(0);
+                    c * m
+                })
+                .sum();
+            sum / total_count
+        } else { 0 };
+        let max_p50: u64 = nodes.iter()
+            .filter_map(|n| n["latency"][*lk]["p50_ns"].as_u64())
+            .max().unwrap_or(0);
+        let max_p95: u64 = nodes.iter()
+            .filter_map(|n| n["latency"][*lk]["p95_ns"].as_u64())
+            .max().unwrap_or(0);
+        let max_p99: u64 = nodes.iter()
+            .filter_map(|n| n["latency"][*lk]["p99_ns"].as_u64())
+            .max().unwrap_or(0);
+        latency.insert(lk.to_string(), serde_json::json!({
+            "count": total_count,
+            "mean_ns": weighted_mean,
+            "p50_ns": max_p50,
+            "p95_ns": max_p95,
+            "p99_ns": max_p99,
+        }));
+    }
+
+    // Index: sum entries/capacity/memory, weighted avg load factor
+    let index_entries: u64 = nodes.iter().filter_map(|n| n["index"]["entries"].as_u64()).sum();
+    let index_capacity: u64 = nodes.iter().filter_map(|n| n["index"]["capacity"].as_u64()).sum();
+    let index_memory: u64 = nodes.iter().filter_map(|n| n["index"]["memory_bytes"].as_u64()).sum();
+    let index_lf = if index_capacity > 0 { index_entries as f64 / index_capacity as f64 } else { 0.0 };
+
+    // Storage: sum used/total, compute aggregate utilization
+    let storage_used: u64 = nodes.iter().filter_map(|n| n["storage"]["used_bytes"].as_u64()).sum();
+    let storage_total: u64 = nodes.iter().filter_map(|n| n["storage"]["total_bytes"].as_u64()).sum();
+    let storage_util = if storage_total > 0 { storage_used as f64 / storage_total as f64 } else { 0.0 };
+    let storage_free_regions: u64 = nodes.iter().filter_map(|n| n["storage"]["free_regions"].as_u64()).sum();
+
+    // Redo: sum
+    let redo_seq: u64 = nodes.iter().filter_map(|n| n["redo"]["current_sequence"].as_u64()).sum();
+    let redo_avail: u64 = nodes.iter().filter_map(|n| n["redo"]["available_space"].as_u64()).sum();
+    let redo_pos: u64 = nodes.iter().filter_map(|n| n["redo"]["write_position"].as_u64()).sum();
+    let redo_total = redo_pos + redo_avail;
+    let redo_util = if redo_total > 0 { redo_pos as f64 / redo_total as f64 } else { 0.0 };
+
+    let connections: u64 = nodes.iter().filter_map(|n| n["connections"].as_u64()).sum();
+    let all_ready = nodes.iter().all(|n| n["ready"].as_bool().unwrap_or(false));
+
+    serde_json::json!({
+        "timestamp_ms": timestamp_ms,
+        "node_count": nodes.len(),
+        "counters": counters,
+        "latency": latency,
+        "index": {
+            "entries": index_entries,
+            "capacity": index_capacity,
+            "load_factor": index_lf,
+            "memory_bytes": index_memory,
+        },
+        "storage": {
+            "used_bytes": storage_used,
+            "total_bytes": storage_total,
+            "utilization": storage_util,
+            "free_regions": storage_free_regions,
+        },
+        "redo": {
+            "current_sequence": redo_seq,
+            "write_position": redo_pos,
+            "available_space": redo_avail,
+            "utilization": redo_util,
+        },
+        "connections": connections,
+        "ready": all_ready,
+    })
+}
+
+/// Query parameter for /admin/top.
+#[derive(serde::Deserialize)]
+struct TopQuery {
+    /// When true, return only this node's local snapshot (no fan-out).
+    #[serde(default)]
+    local: bool,
+}
+
+/// Return a metrics snapshot. Without `?local=true`, fans out to all
+/// cluster nodes and returns an aggregate + per-node breakdown.
+async fn handle_admin_top(
+    State(state): State<Arc<HttpState>>,
+    Query(query): Query<TopQuery>,
+) -> impl IntoResponse {
+    if query.local || state.cluster.is_none() {
+        json_response(build_local_top_snapshot(&state))
+    } else {
+        json_response(build_cluster_top_snapshot(&state).await)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -545,19 +724,28 @@ async fn handle_ws_top(
     ws.on_upgrade(move |socket| ws_top_loop(socket, state))
 }
 
-/// WebSocket loop: send a JSON metrics snapshot every second.
+/// WebSocket loop: send cluster-wide JSON metrics snapshot every second.
 async fn ws_top_loop(mut socket: WebSocket, state: Arc<HttpState>) {
     loop {
-        let snapshot = build_top_snapshot(&state);
+        let snapshot = if state.cluster.is_some() {
+            build_cluster_top_snapshot(&state).await
+        } else {
+            // Single-node: wrap local snapshot in the same envelope
+            let local = build_local_top_snapshot(&state);
+            serde_json::json!({
+                "aggregate": local,
+                "nodes": [local],
+            })
+        };
         let msg = Message::Text(snapshot.to_string().into());
         if socket.send(msg).await.is_err() {
             break; // Client disconnected
         }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
         // Drain any incoming messages (pings, close frames)
         while let Ok(Some(_)) = tokio::time::timeout(
-            std::time::Duration::from_millis(1),
+            Duration::from_millis(1),
             socket.recv(),
         ).await {
             // Just consume; we don't process client messages
