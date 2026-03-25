@@ -281,7 +281,11 @@ impl ClusterCoordinator {
                 // from failed migrations that don't match the committed topology.
                 // Only fires when: no active migrations, 10s cooldown elapsed,
                 // and the committed topology has been stable (no SWIM changes).
-                if migration.lock().unwrap().active_count() == 0
+                // Disabled: the re-activation mechanism was causing migration
+                // storms in some scenarios. The dead-node handoff fix and
+                // target_assignment routing handle the primary failover case.
+                // Re-enable when migration retry logic is more robust.
+                if false && migration.lock().unwrap().active_count() == 0
                     && last_reactivation_at.elapsed() >= Duration::from_secs(30)
                 {
                     // Use the committed topology members, not SWIM live members.
