@@ -184,6 +184,19 @@ client.delete_batch(txids).await?;
 client.refresh_routing().await?;
 ```
 
+## Signal Constants
+
+Mutation operations return per-item signals indicating state transitions:
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `SIGNAL_NONE` | 0 | No state transition |
+| `SIGNAL_ALL_SPENT` | 1 | All UTXOs in this transaction are now spent |
+| `SIGNAL_NOT_ALL_SPENT` | 2 | Not all UTXOs are spent (e.g. after unspend) |
+| `SIGNAL_DELETE_AT_HEIGHT_SET` | 3 | Transaction queued for pruning at a block height |
+| `SIGNAL_DELETE_AT_HEIGHT_UNSET` | 4 | Transaction removed from pruning queue |
+| `SIGNAL_PRESERVE` | 5 | Transaction marked for preservation |
+
 ## Error Handling
 
 ```rust
@@ -193,7 +206,10 @@ pub enum ClientError {
     NotFound,                               // Record not found
     Redirect(String),                       // Shard on another node
     Partial(PartialError),                  // Mixed success/failure
-    Decode(String),                         // Response decode failure
+    Protocol(String),                       // Response decode failure
+    Timeout,                                // Request timed out
+    NoPartitionMap,                         // No partition map available (cluster mode)
+    PoolClosed,                             // Connection pool has been closed
 }
 ```
 
@@ -209,6 +225,16 @@ match client.spend_batch(params, items).await {
     Err(e) => panic!("{}", e),
     Ok(result) => { /* all items succeeded */ }
 }
+```
+
+## Additional APIs
+
+```rust
+// Manually refresh the cluster partition map
+client.refresh_routing().await?;
+
+// Upload a large blob before create_batch (done automatically for cold_data > 1 MiB)
+client.upload_blob(&cold_data).await?;
 ```
 
 ## Cluster Routing

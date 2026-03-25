@@ -456,6 +456,19 @@ if err != nil {
 }
 ```
 
+### Signal constants
+
+Mutation operations return per-item signals indicating state transitions:
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `SignalNone` | 0 | No state transition |
+| `SignalAllSpent` | 1 | All UTXOs in this transaction are now spent |
+| `SignalNotAllSpent` | 2 | Not all UTXOs are spent (e.g. after unspend) |
+| `SignalDeleteAtHeightSet` | 3 | Transaction queued for pruning at a block height |
+| `SignalDeleteAtHeightUnset` | 4 | Transaction removed from pruning queue |
+| `SignalPreserve` | 5 | Transaction marked for preservation |
+
 ### Error codes
 
 | Constant | Code | Description |

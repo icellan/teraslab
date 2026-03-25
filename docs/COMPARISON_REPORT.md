@@ -9,7 +9,7 @@
 | Index | In-memory hash (sprigs) | mmap'd hash table with hugepage support |
 | Write path | Log-structured (requires defrag) | Direct-placement with freelist (no defrag) |
 | UTXO logic | Lua UDF on server | Native Rust implementation |
-| Spend I/O | Read full record → Lua → write full record | Read slot (69B) → validate → write slot (69B) |
+| Spend I/O | Read full record → Lua → write full record | Read slot (69B) → validate → write 37B slot status + 256B metadata |
 | Replication | Built-in (complex) | Operation-based, purpose-built |
 | Tiered storage | None (all inline) | Inline / separate NVMe / external blob |
 
@@ -22,16 +22,16 @@ The original implementation writes the entire record on every mutation
 transaction with 100 UTXOs:
 
 - **Original**: ~7.5 KB written per spend (full record rewrite)
-- **TeraSlab**: ~69 bytes written per spend (single slot update) + ~256 bytes metadata
+- **TeraSlab**: ~37 bytes written per UTXO slot (status + spending data) + 256 bytes metadata
 
 **Reduction: ~10-30x less SSD wear per spend operation.**
 
 ### Memory Per Record
 
 - **Original**: 64 bytes per record (in-memory index)
-- **TeraSlab**: 58 bytes per record (TxKey + TxIndexEntry)
+- **TeraSlab**: 72 bytes per hash table bucket (1 occupied + 2 probe_distance + 32 txid + 8 fingerprint + 27 TxIndexEntry + padding). The core index entry (TxIndexEntry) is 27 bytes; the full bucket including Robin Hood metadata and key is 72 bytes.
 
-**TeraSlab meets the <64 byte target.**
+**TeraSlab uses ~72 bytes per bucket including all overhead.** At load factor 0.5 (recommended), effective memory per record is ~144 bytes counting empty buckets. Actual resident memory depends on load factor.
 
 ### Latency
 

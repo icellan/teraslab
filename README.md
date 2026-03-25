@@ -6,15 +6,15 @@ TeraSlab exploits the fixed, known workload patterns of UTXO storage to achieve 
 
 ## Key design
 
-A UTXO spend only changes one 69-byte slot. TeraSlab pre-allocates slots at full size during creation and mutates them in place with a single `pwrite` call, eliminating copy-on-write overhead entirely.
+TeraSlab pre-allocates UTXO slots at full size during creation and mutates them in place. A spend writes 37 bytes per slot (1-byte status + 36-byte spending data) plus a metadata update, eliminating copy-on-write overhead entirely.
 
 | Property | Value |
 |----------|-------|
-| Spend write size | 69 bytes (in-place) |
+| Spend write size | 37 bytes per UTXO slot (status + spending data) + metadata update |
 | p99.9 latency | Low (no copy-on-write, no defrag spikes) |
 | Replication bandwidth | ~120 MB/s (operation-based, not full-record) |
-| SSD wear per spend | 69 bytes (vs full record in copy-on-write designs) |
-| Memory per record | ~16 bytes (index entry) |
+| SSD wear per spend | 37 bytes per slot + ~256 bytes metadata (vs full record in copy-on-write designs) |
+| Memory per record | 72 bytes (hash table bucket including key, fingerprint, overhead) |
 
 ## Building
 
@@ -22,7 +22,7 @@ A UTXO spend only changes one 69-byte slot. TeraSlab pre-allocates slots at full
 cargo build --release
 ```
 
-The binary is at `target/release/teraslab-server`.
+The binaries are at `target/release/teraslab-server` and `target/release/teraslab-cli`.
 
 ### Requirements
 
@@ -112,6 +112,18 @@ seed_nodes = []                       # e.g. ["10.0.0.2:3301", "10.0.0.3:3301"]
 replication_factor = 1                # 1 = no replication, 2 = master + 1 replica
 swim_probe_interval_ms = 200          # SWIM heartbeat interval
 swim_suspicion_timeout_ms = 5000      # Time before suspect node is declared dead
+cluster_secret = ""                   # Shared secret for HMAC-SHA256 cluster auth (optional)
+max_migration_threads = 16            # Max concurrent migration threads per topology change
+
+# --- Replication durability ---
+ack_policy = "auto"                   # "auto", "write_all", "write_majority", or "best_effort"
+replication_timeout_ms = 3000         # Timeout for each replication batch ACK
+replication_degraded_mode = "reject"  # "reject" or "best_effort" when ack policy fails
+
+# --- Migration performance ---
+migration_pool_size = 4               # Parallel TCP connections per migration target
+migration_batch_size = 100            # Records per baseline streaming batch
+replica_lag_check_interval_secs = 30  # Interval between replica lag checks (0 to disable)
 ```
 
 ### Cluster deployment (3 nodes, RF=2)
@@ -223,6 +235,13 @@ All operations are batch-oriented. Single-item operations are batches of size 1.
 | 31 | `PreserveTransactions` | Prevent pruning of parent transactions |
 | 32 | `ProcessExpiredPreservations` | Delete expired preserved transactions |
 
+**Streaming (large cold data upload):**
+
+| Opcode | Name | Description |
+|--------|------|-------------|
+| 200 | `StreamChunk` | Upload a chunk of blob data for a pending create |
+| 201 | `StreamEnd` | Finalize a blob upload |
+
 **Admin:**
 
 | Opcode | Name | Description |
@@ -238,17 +257,25 @@ All operations are batch-oriented. Single-item operations are batches of size 1.
 | 0 | `OK` | Success |
 | 1 | `TX_NOT_FOUND` | Transaction does not exist |
 | 2 | `UTXO_HASH_MISMATCH` | Provided hash doesn't match stored hash |
-| 3 | `ALREADY_SPENT` | UTXO is already spent |
+| 3 | `ALREADY_SPENT` | UTXO is already spent (error data: 36-byte existing spending data) |
 | 4 | `ALREADY_FROZEN` | UTXO is already frozen |
+| 5 | `UTXO_NOT_FROZEN` | Expected frozen UTXO but it is not frozen |
+| 6 | `INVALID_SPEND` | Spending data targets a deleted/pruned UTXO |
 | 7 | `FROZEN` | Cannot spend a frozen UTXO |
 | 8 | `CONFLICTING` | Transaction is marked conflicting |
 | 9 | `LOCKED` | Transaction is locked |
-| 10 | `COINBASE_IMMATURE` | Coinbase UTXO not yet spendable |
+| 10 | `COINBASE_IMMATURE` | Coinbase UTXO not yet spendable (error data: 4-byte required height) |
 | 11 | `VOUT_OUT_OF_RANGE` | UTXO index exceeds slot count |
 | 12 | `ALREADY_EXISTS` | Duplicate transaction creation |
+| 13 | `FROZEN_UNTIL` | Reassignment cooldown not met |
 | 14 | `REDIRECT` | Shard owned by another node (payload contains target address) |
 | 15 | `NO_QUORUM` | Cluster quorum not met, mutations rejected |
+| 16 | `STREAM_NOT_FOUND` | Blob stream not found for this txid on this connection |
+| 17 | `BLOB_NOT_FOUND` | Blob not found in blobstore (EXTERNAL_BLOB flag set but no upload) |
+| 18 | `STREAM_OFFSET_MISMATCH` | Chunk offset does not match expected stream position |
 | 19 | `MIGRATION_IN_PROGRESS` | Shard being migrated, retry shortly |
+| 20 | `REPLICATION_FAILED` | Required replication ACKs not received within timeout |
+| 255 | `INTERNAL` | Unexpected server error |
 
 ## HTTP observability
 
@@ -294,15 +321,54 @@ curl http://localhost:9100/debug/log-level
 curl -X PUT http://localhost:9100/debug/log-level -d 'DEBUG'
 ```
 
-### Cluster admin
+### Status overview
+
+```bash
+# Cluster health overview (JSON)
+curl http://localhost:9100/status
+```
+
+### Admin endpoints
 
 ```bash
 # Shard migration status
 curl http://localhost:9100/admin/migration_status
 
+# List all cluster nodes with shard counts
+curl http://localhost:9100/admin/nodes
+
+# Memory breakdown
+curl http://localhost:9100/admin/memory
+
+# Record inventory summary
+curl http://localhost:9100/admin/records
+
+# Replication configuration and status
+curl http://localhost:9100/admin/replication
+
+# Full metrics snapshot (like Unix top)
+curl http://localhost:9100/admin/top
+
 # Drain shards from this node (graceful shutdown prep)
 curl -X PUT http://localhost:9100/admin/quiesce
+
+# Drain a specific node by ID
+curl -X PUT http://localhost:9100/admin/drain/2
+
+# Trigger cluster rebalance
+curl -X PUT http://localhost:9100/admin/rebalance
 ```
+
+### WebSocket
+
+```bash
+# Real-time metrics push (updates every second)
+wscat -c ws://localhost:9100/ws/top
+```
+
+### Web UI
+
+An embedded admin dashboard is served at `http://localhost:9100/ui/`. It provides a real-time view of node status, shard distribution, and key metrics.
 
 ## Client libraries
 
@@ -390,12 +456,12 @@ When the shard table changes (node join/leave), data migrates automatically:
 Each transaction occupies a contiguous region on the block device:
 
 ```
-[TxMetadata: ~200 bytes][UtxoSlot 0: 69 bytes][UtxoSlot 1: 69 bytes]...[UtxoSlot N-1: 69 bytes]
+[TxMetadata: 256 bytes][UtxoSlot 0: 69 bytes][UtxoSlot 1: 69 bytes]...[UtxoSlot N-1: 69 bytes]
 ```
 
-**TxMetadata** contains: txid, version, locktime, fee, size, flags (frozen, conflicting, locked, external, coinbase), block entries (up to 4 inline), spending height, creation timestamp, and counters.
+**TxMetadata** (256 bytes, padded for alignment) contains: txid, version, locktime, fee, size, extended size, flags (conflicting, locked, external, coinbase, last_spent_all), block entries (up to 3 inline, overflow stored separately), spending height, creation timestamp, generation counter, update timestamp, unmined_since, delete_at_height, preserve_until, reassignment tracking, external storage reference, and conflicting children tracking.
 
-**UtxoSlot** (69 bytes each): 32-byte hash, 1-byte status (unspent/spent/frozen/pruned), 36-byte spending data (spending txid + vout). Slots are pre-allocated at full size during creation. A spend writes only the status byte and spending data in place.
+**UtxoSlot** (69 bytes each): 32-byte hash, 1-byte status (unspent/spent/frozen/pruned), 36-byte spending data (spending txid + vout). Slots are pre-allocated at full size during creation. A spend writes the 37-byte status+spending region in place, plus updates the 256-byte metadata (generation, counters, timestamps).
 
 ### Tiered storage
 
@@ -411,32 +477,67 @@ A write-ahead redo log records all mutations. On crash recovery:
 
 The redo log is a fixed-size circular buffer on a separate device file.
 
+## Admin CLI
+
+The `teraslab-cli` binary provides operator commands that consume the HTTP observability endpoints and binary wire protocol. Supports both table-formatted and JSON output.
+
+```bash
+./target/release/teraslab-cli --addr localhost:9100 <command>
+```
+
+Available commands:
+
+| Command | Description |
+|---------|-------------|
+| `status` | Cluster health overview |
+| `nodes` | List cluster nodes with shard counts |
+| `shards` | Shard distribution details |
+| `storage` | Storage utilization |
+| `memory` | Memory breakdown |
+| `records` | Record inventory summary |
+| `record <txid>` | Inspect a specific record by txid |
+| `index` | Index statistics (load factor, capacity) |
+| `replication` | Replication configuration and status |
+| `redo` | Redo log position and utilization |
+| `rebalance` | Trigger cluster rebalance |
+| `drain <node_id>` | Drain shards from a node |
+| `log-level [LEVEL]` | Get or set runtime log level |
+| `bench` | Run a quick benchmark against the server |
+| `healthcheck` | Health check (exit code 0 on success) |
+| `top` | Live metrics dashboard (TUI, updates each second) |
+
 ## Project structure
 
 ```
 teraslab/
 ├── src/
 │   ├── bin/server.rs         Server binary entry point
+│   ├── bin/cli.rs            Admin CLI binary
 │   ├── config.rs             Configuration (TOML)
-│   ├── device.rs             Block device abstraction
-│   ├── record.rs             On-disk record types
-│   ├── allocator.rs          Slot allocator
-│   ├── index/                Primary + secondary indexes
+│   ├── device.rs             Block device abstraction (MemoryDevice, DirectDevice)
+│   ├── device_io/            I/O backends (sync fallback, io_uring stub)
+│   ├── record.rs             On-disk record types (TxMetadata, UtxoSlot)
+│   ├── allocator.rs          Freelist-based slot allocator
+│   ├── index/                Primary hash table + DAH and unmined secondary indexes
 │   ├── locks.rs              Striped per-transaction locking
-│   ├── redo.rs               Write-ahead redo log
+│   ├── redo.rs               Write-ahead redo log (circular buffer)
 │   ├── recovery.rs           Crash recovery replay
 │   ├── io.rs                 Aligned I/O utilities
-│   ├── metrics.rs            Operation counters
-│   ├── ops/                  All UTXO operations (spend, create, etc.)
+│   ├── metrics.rs            Operation counters and latency histograms
+│   ├── ops/                  All UTXO operations (spend, create, delete_eval, etc.)
 │   ├── protocol/             Wire protocol (frames, codecs, opcodes)
-│   ├── server/               TCP server, dispatch, HTTP, streaming
-│   ├── cluster/              SWIM membership, sharding, migration
-│   ├── replication/          Master-replica replication
-│   └── storage/              Blob store for cold data
+│   ├── server/               TCP server, dispatch, HTTP observability, WebSocket
+│   ├── cluster/              SWIM membership, sharding, migration, topology authority
+│   ├── replication/          Master-replica replication with durable sequencing
+│   └── storage/              Tiered storage (inline, separate NVMe, external blob)
 ├── client/
 │   ├── go/                   Go client library
 │   └── rust/                 Rust client library (async, Tokio)
+├── ui/                       Embedded web dashboard (HTML/CSS/JS)
 ├── tests/                    Integration, stress, simulation tests
+├── benches/                  Criterion benchmarks
+├── teraslab-tests/           Docker-based cluster integration tests
+├── scripts/                  Helper scripts (start-single, start-cluster)
 ├── specs/                    Architecture specs and Teranode Lua reference
 └── phases/                   Build phase specifications (00-13)
 ```

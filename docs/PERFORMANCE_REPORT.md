@@ -41,9 +41,9 @@ Run `cargo test --test e2e_workload -- --nocapture perf_` to see numbers.
 
 ## Memory Per Record
 
-- Raw index entry: 58 bytes (32-byte key + 26-byte TxIndexEntry)
-- Under the 64-byte baseline target
-- Hash table overhead amortized across entries
+- Hash table bucket: 72 bytes (1 occupied + 2 probe_distance + 32 txid + 8 fingerprint + 27 TxIndexEntry + padding)
+- Core index entry (TxIndexEntry): 27 bytes (device_id, record_offset, utxo_count, cold_offset, cold_size, flags)
+- Hash table uses Robin Hood open addressing; at load factor 0.5, total allocated is ~144 bytes per record including empty buckets
 
 ## Design Targets (from SPEC_BRIEFING.md)
 
@@ -57,7 +57,7 @@ These targets assume production hardware (NVMe SSD, O_DIRECT, io_uring):
 | SpendMulti (batch 10) | > 200K batches/sec | Requires NVMe benchmark |
 | SetMined throughput | > 500K ops/sec | Requires NVMe benchmark |
 | Create (10 UTXOs) | > 100K ops/sec | Requires NVMe benchmark |
-| Memory per record | < 64 bytes | PASS (58 bytes) |
+| Memory per record | < 64 bytes | 72 bytes per bucket (see notes) |
 | SSD write amplification | < 10x | Requires NVMe measurement |
 
 ## Correctness Validation

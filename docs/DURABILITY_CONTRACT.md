@@ -115,12 +115,24 @@ the previous hash-based version which could collide.
 
 ### Persisted Cluster State
 
-File format: `[peak_cluster_size:8 LE][topology_epoch:8 LE]`.
+File format:
+```
+[peak_cluster_size:8 LE]
+[committed_term:8 LE]
+[voted_term:8 LE]
+[member_count:4 LE]
+[member_ids:8*N LE]     (N = member_count)
+[incarnation:8 LE]
+```
 
 Persisted on every membership change. On restart:
 - Peak cluster size restores the quorum requirement
-- Topology epoch restores the ordering baseline so new epochs are
-  strictly higher than any the node has seen
+- Committed term restores the topology ordering baseline so new terms
+  are strictly higher than any the node has seen
+- Voted term prevents double-voting in the same term after restart
+- Member list restores the last committed membership view
+- Incarnation counter ensures SWIM refutation numbers are monotonic
+  across restarts (loaded value + 1)
 
 ### Ownership Safety Properties
 

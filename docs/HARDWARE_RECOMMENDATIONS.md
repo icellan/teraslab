@@ -10,12 +10,12 @@
 
 ## Memory
 
-- **Index**: ~58 bytes per record in the primary hash table
-- **For 100M records**: ~5.8 GB index memory
-- **For 1B records**: ~58 GB index memory
-- **Hugepages**: Enable 2 MB hugepages for the hash table mmap to reduce TLB misses
+- **Index**: 72 bytes per hash table bucket (Robin Hood open-addressing). At load factor 0.5 (recommended), allocate capacity = 2x expected records.
+- **For 100M records**: ~14.4 GB allocated (200M buckets x 72 bytes), ~7.2 GB occupied
+- **For 1B records**: ~144 GB allocated (2B buckets x 72 bytes), ~72 GB occupied
+- **Hugepages**: Enable 2 MB hugepages for the hash table mmap to reduce TLB misses (Linux only)
   - `echo 4096 > /proc/sys/vm/nr_hugepages` for ~8 GB of hugepage-backed index
-- **Total system RAM**: Index size + 2 GB for OS/buffers + 1 GB per replication connection
+- **Total system RAM**: Index allocation + 2 GB for OS/buffers + 1 GB per replication connection
 
 ## CPU
 
