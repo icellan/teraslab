@@ -289,8 +289,16 @@ async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> i
             let migrations = cluster.migration_status();
             let inbound = cluster.inbound_pending_count();
             let fenced = cluster.fenced_shard_count();
+            let active_count = migrations.iter().filter(|m| {
+                m.state != crate::cluster::migration::MigrationState::Complete
+                    && m.state != crate::cluster::migration::MigrationState::Failed
+            }).count();
+            let failed_count = migrations.iter().filter(|m| {
+                m.state == crate::cluster::migration::MigrationState::Failed
+            }).count();
             let body = serde_json::json!({
-                "active_count": migrations.len(),
+                "active_count": active_count,
+                "failed_count": failed_count,
                 "inbound_pending": inbound,
                 "fenced_shards": fenced,
                 "migrations": migrations.iter().map(|m| {

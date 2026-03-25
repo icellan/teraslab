@@ -184,7 +184,6 @@ impl ClusterCoordinator {
 
         // Event processing thread
         let event_handle = std::thread::spawn(move || {
-            let mut last_reactivation_epoch: u64 = 0;
             let mut last_reactivation_at = std::time::Instant::now();
             while !shutdown.load(Ordering::Relaxed) {
                 match event_rx.recv_timeout(Duration::from_millis(100)) {
@@ -279,14 +278,13 @@ impl ClusterCoordinator {
 
                 // Re-activate topology if the shard table has rolled-back shards
                 // from failed migrations that don't match the committed topology.
-                // Only fires when: no active migrations, 10s cooldown elapsed,
-                // and the committed topology has been stable (no SWIM changes).
-                // Disabled: the re-activation mechanism was causing migration
-                // storms in some scenarios. The dead-node handoff fix and
-                // target_assignment routing handle the primary failover case.
-                // Re-enable when migration retry logic is more robust.
-                if false && migration.lock().unwrap().active_count() == 0
-                    && last_reactivation_at.elapsed() >= Duration::from_secs(30)
+                // Only fires when: no active migrations, cooldown elapsed, and
+                // the committed topology has been stable (no SWIM changes).
+                // 15s cooldown balances fast recovery against migration storms:
+                // short enough for Docker test scenarios, long enough to let a
+                // topology change fully settle before retrying.
+                if migration.lock().unwrap().active_count() == 0
+                    && last_reactivation_at.elapsed() >= Duration::from_secs(15)
                 {
                     // Use the committed topology members, not SWIM live members.
                     // This avoids false mismatches during topology transitions.
@@ -507,32 +505,60 @@ impl ClusterCoordinator {
                             .map(|(_, &addr)| addr)
                             .collect()
                     };
-                    let caught_up = false;
+                    let mut caught_up = false;
                     for peer_addr in &peers {
-                        // Request the peer's committed topology by sending a
-                        // OP_TOPOLOGY_PROPOSE with term=0. The peer's dispatch
-                        // handler will reply normally (rejecting term 0) but
-                        // including its voter_current_term. Instead, we send
-                        // OP_TOPOLOGY_COMMIT with empty payload as a catch-up
-                        // request. The peer echoes its committed topology.
-                        //
-                        // Simpler approach: just ask the peer to replay its
-                        // last commit. We repurpose the propose frame with
-                        // term=0 as a catch-up sentinel — the remote returns
-                        // its committed state in the vote response, which
-                        // includes voter_current_term. We then use that to
-                        // know the remote's term but still need the members.
-                        //
-                        // Most direct: fetch via OP_GET_PARTITION_MAP which
-                        // returns the full routing info including members.
-                        // Then construct a synthetic commit.
-                        if let Ok(payload) = send_topology_frame(*peer_addr, OP_TOPOLOGY_PROPOSE, &crate::cluster::topology::TopologyTerm::new(0, vec![], NodeId(0)).serialize())
-                            && let Some(vote) = crate::cluster::topology::TopologyVote::deserialize(&payload)
+                        // Fetch the peer's committed topology via
+                        // OP_GET_PARTITION_MAP, which returns the full routing
+                        // info including all node addresses and the shard table
+                        // version. We extract the member list from the routing
+                        // info and construct a synthetic commit to apply locally.
+                        if let Ok(payload) = send_topology_frame(*peer_addr, OP_GET_PARTITION_MAP, &[])
+                            && let Some(routing) = crate::cluster::routing::RoutingInfo::decode(&payload)
                         {
-                            eprintln!(
-                                "cluster: catch-up: peer {} has term {}, we have {local_term}",
-                                peer_addr, vote.voter_current_term,
-                            );
+                            // Build member list from the routing info nodes.
+                            let mut remote_members: Vec<NodeId> = routing.nodes.iter()
+                                .filter(|n| n.is_alive)
+                                .map(|n| n.id)
+                                .collect();
+                            remote_members.sort();
+                            if remote_members.len() <= 1 {
+                                continue; // Peer is single-node, skip
+                            }
+
+                            // Construct and apply a synthetic commit so
+                            // our topology authority advances without a
+                            // full voting round. Use the remote's term
+                            // (remote_term from the SWIM gossip) as the
+                            // commit term — it's the value we know the
+                            // remote has committed.
+                            let commit_term = *remote_term;
+                            let synthetic = crate::cluster::topology::TopologyCommit {
+                                term: commit_term,
+                                proposer: remote_members[0], // deterministic proposer
+                                members: remote_members.clone(),
+                                digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                                    commit_term, &remote_members,
+                                ),
+                            };
+                            if let Some(applied_term) = topology_authority.handle_commit(&synthetic) {
+                                eprintln!(
+                                    "cluster: catch-up: applied term {} from peer {} ({} members)",
+                                    applied_term, peer_addr, remote_members.len(),
+                                );
+                                if let Some(path) = topology_state_path {
+                                    let peak = peak_size.load(Ordering::Relaxed) as u64;
+                                    let inc = swim_incarnation.load(Ordering::Relaxed);
+                                    persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
+                                }
+                                let epoch = topology_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+                                Self::activate_topology(
+                                    &remote_members, epoch, self_id, rf, shard_table, migration,
+                                    node_addrs, engine, redo_for_events, migration_pool_size,
+                                    migration_batch_size, fenced_bm, migrating_bm, inbound_bm,
+                                );
+                                caught_up = true;
+                                break;
+                            }
                         }
                     }
 
@@ -1010,6 +1036,7 @@ fn send_topology_frame(
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| format!("set timeout: {e}"))?;
+    crate::replication::tcp_transport::configure_tcp_keepalive(&stream);
 
     let request = RequestFrame {
         request_id: 0,
@@ -1285,6 +1312,7 @@ fn run_migration_batch(
                         Ok(s) => {
                             let _ = s.set_read_timeout(Some(tcp_timeout));
                             let _ = s.set_write_timeout(Some(tcp_timeout));
+                            crate::replication::tcp_transport::configure_tcp_keepalive(&s);
                             stream = Some(s);
                             break;
                         }
@@ -1307,6 +1335,7 @@ fn run_migration_batch(
                             Ok(s) => {
                                 let _ = s.set_read_timeout(Some(tcp_timeout));
                                 let _ = s.set_write_timeout(Some(tcp_timeout));
+                                crate::replication::tcp_transport::configure_tcp_keepalive(&s);
                                 return Some(s);
                             }
                             Err(_) => {
@@ -1340,8 +1369,12 @@ fn run_migration_batch(
                 };
 
                 let mut consecutive_failures: u32 = 0;
-                for task in chunk {
+                let mut task_idx = 0;
+                while task_idx < chunk.len() {
+                    let task = &chunk[task_idx];
                     let ok = migrate_single_shard(task, keys_ref, &engine, &migration, shard_table, redo_log, &mut stream, addr, &completed, &failed, topology_epoch, batch_size, &fenced_bm, &migrating_bm);
+
+                    task_idx += 1;
 
                     if ok {
                         consecutive_failures = 0;
@@ -1354,11 +1387,21 @@ fn run_migration_batch(
                             consecutive_failures = 0;
                         } else if consecutive_failures >= 3 {
                             // Can't reconnect after 3 consecutive failures — give up.
-                            eprintln!("cluster: aborting migration batch to {} — cannot reconnect", addr);
+                            // Mark all remaining unattempted tasks as Failed and
+                            // rollback their shards. These tasks were registered via
+                            // start_outbound() before the thread pool started, so
+                            // they're in the active list as Preparing/Streaming.
+                            eprintln!("cluster: aborting migration batch to {} — cannot reconnect ({} remaining)", addr, chunk.len() - task_idx);
                             let mut mgr = migration.lock().unwrap();
-                            // Remaining tasks in this chunk haven't been attempted
-                            // so they're not in the migration manager yet — they'll
-                            // be picked up by the re-activation loop.
+                            let mut table = shard_table.write().unwrap();
+                            for remaining in &chunk[task_idx..] {
+                                mgr.mark_failed(remaining);
+                                fenced_bm.clear(remaining.shard);
+                                migrating_bm.clear(remaining.shard);
+                                table.rollback_shard(remaining.shard);
+                                failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            drop(table);
                             drop(mgr);
                             break;
                         }
@@ -1977,6 +2020,7 @@ fn send_migration_complete(
             ).map_err(|e| format!("connect: {e}"))?;
             owned.set_read_timeout(Some(Duration::from_secs(5)))
                 .map_err(|e| format!("set read timeout: {e}"))?;
+            crate::replication::tcp_transport::configure_tcp_keepalive(&owned);
             &mut owned
         }
     };
@@ -2393,6 +2437,7 @@ fn migrate_shard(
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| format!("set write timeout: {e}"))?;
+    crate::replication::tcp_transport::configure_tcp_keepalive(&stream);
 
     // Build ReplicaOps for each record: Create + Spend/Freeze/SetMined as needed.
     // This ensures the replica receives the full record state, not just the

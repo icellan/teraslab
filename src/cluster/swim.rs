@@ -528,9 +528,13 @@ impl SwimRunner {
             return;
         }
 
-        // Filter out dead nodes — probing them wastes the probe budget.
+        // Filter to non-dead nodes that have a known SWIM (UDP) address.
         // Dead nodes can rejoin via seed retry (runs every 10 probe intervals).
+        // Nodes discovered via gossip but never contacted directly have no
+        // swim address yet — including them wastes the probe slot because
+        // we can't send a UDP packet without a destination.
         let membership = self.membership.lock().unwrap();
+        let swim_addrs = self.swim_peer_addrs.lock().unwrap();
         let peers: Vec<(NodeId, SocketAddr)> = self
             .peer_addrs
             .lock()
@@ -542,8 +546,10 @@ impl SwimRunner {
                     .map(|info| info.state != NodeState::Dead)
                     .unwrap_or(true) // probe unknown nodes
             })
-            .map(|(&id, &addr)| (id, addr))
+            .filter(|&(&id, _)| swim_addrs.contains_key(&id))
+            .map(|(&id, _)| (id, *swim_addrs.get(&id).unwrap()))
             .collect();
+        drop(swim_addrs);
         drop(membership);
 
         if peers.is_empty() {
@@ -553,29 +559,17 @@ impl SwimRunner {
         // Round-robin selection of the peer to probe
         let idx = self.probe_round_robin % peers.len();
         self.probe_round_robin = self.probe_round_robin.wrapping_add(1);
-        let (target_id, _target_tcp_addr) = peers[idx];
+        let (target_id, target_swim_addr) = peers[idx];
 
         let updates = self.collect_member_updates();
         let msg = self.encode_message(MSG_PING, &updates);
 
-        // Use the target's actual SWIM (UDP) address. If we don't know it
-        // (node discovered via gossip but never contacted directly), skip
-        // this probe — a future gossip round will populate the swim address.
-        let swim_addr = self
-            .swim_peer_addrs
-            .lock()
-            .unwrap()
-            .get(&target_id)
-            .copied();
-
-        if let Some(addr) = swim_addr {
-            let _ = socket.send_to(&msg, addr);
-            self.pending_probe = Some(PendingProbe {
-                target: target_id,
-                started: Instant::now(),
-                indirect_sent: false,
-            });
-        }
+        let _ = socket.send_to(&msg, target_swim_addr);
+        self.pending_probe = Some(PendingProbe {
+            target: target_id,
+            started: Instant::now(),
+            indirect_sent: false,
+        });
     }
 
     /// Send indirect PING_REQ probes to K other peers, asking them to probe

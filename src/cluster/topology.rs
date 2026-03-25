@@ -812,4 +812,83 @@ mod tests {
         let t2 = auth.on_membership_changed(&members(&[1, 2])).unwrap();
         assert_eq!(t2.term, 2);
     }
+
+    // -- Catch-up via synthetic commit --
+
+    #[test]
+    fn catchup_via_synthetic_commit() {
+        // Simulate a lagging node (term=0) catching up to term=5
+        // by receiving a synthetic commit from a peer.
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        assert_eq!(auth.committed_term(), 0);
+
+        // Construct a synthetic commit as if fetched from a peer
+        let remote_members = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: remote_members.clone(),
+            digest: TopologyTerm::compute_digest(5, &remote_members),
+        };
+        let result = auth.handle_commit(&commit);
+        assert_eq!(result, Some(5));
+        assert_eq!(auth.committed_term(), 5);
+        assert_eq!(auth.committed_members(), remote_members);
+    }
+
+    #[test]
+    fn catchup_rejects_stale_synthetic_commit() {
+        // A node already at term=10 must reject a synthetic commit for term=5.
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        auth.committed_term.store(10, Ordering::Relaxed);
+
+        let remote_members = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: remote_members.clone(),
+            digest: TopologyTerm::compute_digest(5, &remote_members),
+        };
+        let result = auth.handle_commit(&commit);
+        assert!(result.is_none());
+        assert_eq!(auth.committed_term(), 10); // unchanged
+    }
+
+    #[test]
+    fn catchup_rejects_bad_digest_synthetic_commit() {
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+
+        let commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: members(&[1, 2, 3]),
+            digest: [0xFF; 32], // corrupt
+        };
+        assert!(auth.handle_commit(&commit).is_none());
+        assert_eq!(auth.committed_term(), 0); // unchanged
+    }
+
+    #[test]
+    fn catchup_advances_and_then_normal_proposal_works() {
+        // After catching up via synthetic commit, normal proposal flow
+        // should still work with higher term numbers.
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+
+        // Catch up to term 5
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            digest: TopologyTerm::compute_digest(5, &mems),
+        };
+        auth.handle_commit(&commit);
+        assert_eq!(auth.committed_term(), 5);
+
+        // Now a normal membership change should produce term 6
+        let new_mems = members(&[1, 2]);
+        let proposal = auth.on_membership_changed(&new_mems);
+        assert!(proposal.is_some());
+        assert_eq!(proposal.unwrap().term, 6);
+    }
 }

@@ -14,6 +14,62 @@ use std::time::Duration;
 
 use super::manager::ReplicaTransport;
 
+/// Configure TCP keepalive on a stream for fast broken-connection detection.
+///
+/// After a container SIGKILL the peer's TCP connection is silently broken.
+/// Without keepalive the surviving node doesn't know until the next read
+/// timeout fires (seconds to minutes). Keepalive probes detect the dead
+/// connection within a few seconds.
+///
+/// Settings: idle=5s, interval=1s, count=3 → dead peer detected in ~8s.
+pub fn configure_tcp_keepalive(stream: &TcpStream) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+        unsafe {
+            // Enable keepalive
+            let enable: libc::c_int = 1;
+            libc::setsockopt(
+                fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE,
+                &enable as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+
+            // Time before first keepalive probe (seconds)
+            let idle: libc::c_int = 5;
+            #[cfg(target_os = "macos")]
+            libc::setsockopt(
+                fd, libc::IPPROTO_TCP, libc::TCP_KEEPALIVE,
+                &idle as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            #[cfg(target_os = "linux")]
+            libc::setsockopt(
+                fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,
+                &idle as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+
+            // Interval between keepalive probes (seconds)
+            let interval: libc::c_int = 1;
+            libc::setsockopt(
+                fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL,
+                &interval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+
+            // Number of failed probes before declaring dead
+            let count: libc::c_int = 3;
+            libc::setsockopt(
+                fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,
+                &count as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+}
+
 /// TCP-based transport for replication.
 ///
 /// Sends `ReplicaBatch` as wire-protocol `RequestFrame`s with opcode
@@ -27,7 +83,9 @@ pub struct TcpReplicaTransport {
 impl TcpReplicaTransport {
     /// Connect to a replica at the given address with a timeout.
     ///
-    /// Sets both read and write timeouts on the resulting stream.
+    /// Sets read/write timeouts and enables TCP keepalive so broken
+    /// connections (e.g. after container SIGKILL) are detected quickly
+    /// instead of waiting for the OS default keepalive timeout (minutes).
     pub fn connect(addr: &str, timeout: Duration) -> Result<Self, ReplicationError> {
         let sock_addr: std::net::SocketAddr = addr
             .parse()
@@ -40,6 +98,7 @@ impl TcpReplicaTransport {
         stream
             .set_read_timeout(Some(timeout))
             .map_err(|e| ReplicationError::Transport(format!("set read timeout: {e}")))?;
+        configure_tcp_keepalive(&stream);
         Ok(Self {
             stream,
             request_id: 0,
@@ -289,5 +348,45 @@ mod tests {
     fn connect_to_invalid_addr_returns_error() {
         let result = TcpReplicaTransport::connect("not_a_valid_address", Duration::from_secs(1));
         assert!(matches!(result, Err(ReplicationError::Transport(_))));
+    }
+
+    #[test]
+    fn tcp_keepalive_configured_on_connect() {
+        // Verify that connect() configures TCP keepalive without error.
+        // We can't easily inspect the socket options portably, but we can
+        // verify the connection succeeds and the keepalive function doesn't
+        // panic or error.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+
+        // connect() now calls configure_tcp_keepalive internally
+        let transport =
+            TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5)).unwrap();
+        assert!(transport.is_connected());
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn configure_keepalive_on_raw_stream() {
+        // Verify configure_tcp_keepalive works on a plain TcpStream.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        // Must not panic
+        super::configure_tcp_keepalive(&stream);
+
+        handle.join().unwrap();
     }
 }

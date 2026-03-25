@@ -389,10 +389,9 @@ impl MigrationManager {
 
     /// Mark a migration as failed after all retries exhausted.
     ///
-    /// Failed migrations are retained in the active list for visibility
-    /// and potential retry. They are NOT removed by `cleanup_completed()`.
     /// The write fence is lifted so the shard can continue serving on
-    /// the old master.
+    /// the old master. Failed migrations are removed from the active list
+    /// by the next call to `cleanup_completed()`.
     pub fn mark_failed(&mut self, task: &MigrationTask) {
         if let Some(p) = self.find_task_mut(task) {
             p.state = MigrationState::Failed;
@@ -446,15 +445,21 @@ impl MigrationManager {
         })
     }
 
-    /// Remove completed migrations (but NOT failed ones).
+    /// Remove completed and failed migrations from the active list.
     ///
-    /// Outbound migrations in the Complete state are removed from the active
-    /// list. Inbound migrations marked as completed are also removed.
+    /// Outbound migrations in the Complete or Failed state are removed.
+    /// Failed migrations have already had their shards rolled back, fences
+    /// lifted, and bitmaps cleared — removing them just frees the tracking
+    /// entry so `active_count()` and the HTTP status endpoint stay accurate.
+    ///
+    /// Inbound migrations marked as completed are also removed.
     /// Inbound and outbound tracking are independent — completing outbound
     /// work does NOT clear pending inbound migrations (which may still be
     /// receiving data from other nodes).
     pub fn cleanup_completed(&mut self) {
-        self.active.retain(|p| !p.is_complete());
+        self.active.retain(|p| {
+            !p.is_complete() && p.state != MigrationState::Failed
+        });
         self.inbound_migrations.retain(|m| !m.completed);
         // Rebuild inbound bitmap from remaining entries.
         self.inbound_bitmap.clear_all();
@@ -773,19 +778,21 @@ mod tests {
     }
 
     #[test]
-    fn failed_migration_not_cleaned_up() {
+    fn failed_migration_cleaned_up_by_cleanup() {
         let mut mgr = MigrationManager::new();
         let task = MigrationTask { shard: 3, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
         mgr.start_outbound(&[task.clone()], NodeId(1), &std::collections::HashSet::new());
 
         mgr.mark_failed(&task);
         assert_eq!(mgr.active_migrations()[0].state, MigrationState::Failed);
-
-        // cleanup_completed should NOT remove failed migrations
-        mgr.cleanup_completed();
         assert_eq!(mgr.active_count(), 0); // active_count excludes Failed
         assert_eq!(mgr.failed_count(), 1); // but failed_count tracks them
-        assert_eq!(mgr.active_migrations()[0].state, MigrationState::Failed);
+
+        // cleanup_completed removes both Complete and Failed migrations.
+        mgr.cleanup_completed();
+        assert_eq!(mgr.active_count(), 0);
+        assert_eq!(mgr.failed_count(), 0);
+        assert!(mgr.active_migrations().is_empty());
     }
 
     #[test]
@@ -1074,5 +1081,131 @@ mod tests {
 
         mgr.restore_outbound(&[0, 0, 0, 0]); // count = 0
         assert_eq!(mgr.active_count(), 0);
+    }
+
+    // ---------- Bug fix regression tests ----------
+
+    /// Verify that cleanup_completed removes Failed migrations, preventing
+    /// them from accumulating indefinitely in the active list.
+    /// Regression: Failed migrations previously stayed forever because
+    /// cleanup_completed only removed Complete entries.
+    #[test]
+    fn cleanup_removes_failed_migrations() {
+        let mut mgr = MigrationManager::new();
+        let t1 = MigrationTask { shard: 1, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        let t2 = MigrationTask { shard: 2, from_node: NodeId(1), to_node: NodeId(3), is_master: true };
+        let t3 = MigrationTask { shard: 3, from_node: NodeId(1), to_node: NodeId(4), is_master: true };
+        mgr.start_outbound(&[t1.clone(), t2.clone(), t3.clone()], NodeId(1), &std::collections::HashSet::new());
+
+        mgr.mark_complete(&t1);
+        mgr.mark_failed(&t2);
+        // t3 still Preparing
+
+        assert_eq!(mgr.active_count(), 1); // only t3
+        assert_eq!(mgr.failed_count(), 1); // t2
+        assert_eq!(mgr.active_migrations().len(), 3); // all tracked
+
+        mgr.cleanup_completed();
+
+        // After cleanup: only t3 (Preparing) remains
+        assert_eq!(mgr.active_migrations().len(), 1);
+        assert_eq!(mgr.active_migrations()[0].shard, 3);
+        assert_eq!(mgr.active_count(), 1);
+        assert_eq!(mgr.failed_count(), 0);
+    }
+
+    /// Verify that multiple Failed migrations are all cleaned up, not just the first.
+    #[test]
+    fn cleanup_removes_all_failed_migrations() {
+        let mut mgr = MigrationManager::new();
+        let tasks: Vec<MigrationTask> = (0..5).map(|i| {
+            MigrationTask { shard: i, from_node: NodeId(1), to_node: NodeId(2), is_master: true }
+        }).collect();
+        mgr.start_outbound(&tasks, NodeId(1), &std::collections::HashSet::new());
+
+        for t in &tasks {
+            mgr.mark_failed(t);
+        }
+        assert_eq!(mgr.failed_count(), 5);
+        assert_eq!(mgr.active_count(), 0);
+
+        mgr.cleanup_completed();
+
+        assert!(mgr.active_migrations().is_empty());
+        assert_eq!(mgr.failed_count(), 0);
+        assert_eq!(mgr.active_count(), 0);
+    }
+
+    /// Verify that active_count correctly excludes Failed and Complete,
+    /// matching what the HTTP endpoint should report.
+    #[test]
+    fn active_count_matches_http_expectation() {
+        let mut mgr = MigrationManager::new();
+        let t1 = MigrationTask { shard: 1, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        let t2 = MigrationTask { shard: 2, from_node: NodeId(1), to_node: NodeId(3), is_master: true };
+        let t3 = MigrationTask { shard: 3, from_node: NodeId(1), to_node: NodeId(4), is_master: true };
+        let t4 = MigrationTask { shard: 4, from_node: NodeId(1), to_node: NodeId(5), is_master: true };
+        mgr.start_outbound(&[t1.clone(), t2.clone(), t3.clone(), t4.clone()], NodeId(1), &std::collections::HashSet::new());
+
+        mgr.mark_complete(&t1);
+        mgr.mark_failed(&t2);
+        mgr.set_snapshot_sequence(&t3, 100); // Streaming
+        // t4 still Preparing
+
+        // active_count should only count Preparing + Streaming + Fenced
+        assert_eq!(mgr.active_count(), 2); // t3 (Streaming) + t4 (Preparing)
+        // The HTTP endpoint should report the same
+        let all = mgr.active_migrations();
+        let http_active = all.iter().filter(|m| {
+            m.state != MigrationState::Complete && m.state != MigrationState::Failed
+        }).count();
+        assert_eq!(http_active, mgr.active_count());
+    }
+
+    /// Verify that take_failed_tasks works correctly before cleanup runs.
+    /// This is the retry path used on NodeJoined events.
+    #[test]
+    fn take_failed_tasks_before_cleanup() {
+        let mut mgr = MigrationManager::new();
+        let t1 = MigrationTask { shard: 1, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        let t2 = MigrationTask { shard: 2, from_node: NodeId(1), to_node: NodeId(3), is_master: true };
+        mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &std::collections::HashSet::new());
+
+        mgr.mark_failed(&t1);
+        mgr.mark_failed(&t2);
+
+        // take_failed_tasks should return the tasks and reset them to Streaming.
+        let retries = mgr.take_failed_tasks();
+        assert_eq!(retries.len(), 2);
+        assert_eq!(mgr.failed_count(), 0);
+        assert_eq!(mgr.active_count(), 2); // now Streaming again
+    }
+
+    /// Verify that mark_failed lifts the write fence.
+    #[test]
+    fn mark_failed_lifts_fence() {
+        let mut mgr = MigrationManager::new();
+        let t = MigrationTask { shard: 42, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        mgr.start_outbound(&[t.clone()], NodeId(1), &std::collections::HashSet::new());
+
+        mgr.mark_fenced(&t, 100);
+        assert!(mgr.is_shard_fenced(42));
+
+        mgr.mark_failed(&t);
+        assert!(!mgr.is_shard_fenced(42));
+        assert_eq!(mgr.active_migrations()[0].state, MigrationState::Failed);
+    }
+
+    /// Verify that is_migrating_shard excludes Failed migrations.
+    /// A failed migration should NOT block new migrations for the same shard.
+    #[test]
+    fn is_migrating_shard_excludes_failed() {
+        let mut mgr = MigrationManager::new();
+        let t = MigrationTask { shard: 7, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        mgr.start_outbound(&[t.clone()], NodeId(1), &std::collections::HashSet::new());
+
+        assert!(mgr.is_migrating_shard(7));
+        mgr.mark_failed(&t);
+        assert!(!mgr.is_migrating_shard(7));
     }
 }
