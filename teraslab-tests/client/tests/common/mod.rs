@@ -311,8 +311,10 @@ pub async fn start_3node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Cli
     docker.compose_up().await?;
     wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
     // Wait for initial shard migrations to settle before creating the client.
-    // This prevents stale routing errors from the initial topology convergence.
     wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
+    // Allow extra settle time for topology re-activation cycles to complete.
+    // Without this, the client may fetch a partition map mid-transition.
+    tokio::time::sleep(Duration::from_secs(5)).await;
     let client = create_client(&docker, 3).await?;
     client.refresh_routing().await?;
     Ok((docker, client))

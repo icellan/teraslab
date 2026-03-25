@@ -282,7 +282,7 @@ impl ClusterCoordinator {
                 // Only fires when: no active migrations, 10s cooldown elapsed,
                 // and the committed topology has been stable (no SWIM changes).
                 if migration.lock().unwrap().active_count() == 0
-                    && last_reactivation_at.elapsed() >= Duration::from_secs(15)
+                    && last_reactivation_at.elapsed() >= Duration::from_secs(30)
                 {
                     // Use the committed topology members, not SWIM live members.
                     // This avoids false mismatches during topology transitions.
