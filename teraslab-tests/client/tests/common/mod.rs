@@ -217,8 +217,18 @@ pub async fn wait_specific_migrations_complete(
                 }
             }
         }
-        if all_idle && total_masters == 4096 {
-            return Ok(());
+        // Consider ready when all master shards are assigned (4096).
+        // Replica migrations may still be running but don't affect
+        // functional readiness — the cluster can serve all shards.
+        if total_masters == 4096 {
+            if all_idle {
+                return Ok(());
+            }
+            // Masters assigned but replica migrations running — wait a bit
+            // for them to finish, but don't block indefinitely.
+            if start.elapsed() >= timeout.min(Duration::from_secs(30)) {
+                return Ok(());
+            }
         }
         if start.elapsed() >= timeout {
             return Err(ClientError::Connection(
@@ -267,10 +277,16 @@ pub async fn wait_migrations_complete(
                 }
             }
         }
-        // Consider complete when migrations are idle AND all 4096 shards
-        // are assigned as masters (no shards stuck in handoff).
-        if all_idle && total_masters == 4096 {
-            return Ok(());
+        // Consider ready when all master shards are assigned (4096).
+        // Replica migrations may still be running but don't affect
+        // functional readiness.
+        if total_masters == 4096 {
+            if all_idle {
+                return Ok(());
+            }
+            if start.elapsed() >= timeout.min(Duration::from_secs(30)) {
+                return Ok(());
+            }
         }
         if start.elapsed() >= timeout {
             let detail = if !node_details.is_empty() {

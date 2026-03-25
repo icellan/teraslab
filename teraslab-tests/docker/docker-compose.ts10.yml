@@ -9,6 +9,8 @@ volumes:
   ts10-node1-data:
   ts10-node2-data:
   ts10-node3-data:
+  ts10-node4-data:
+  ts10-node5-data:
   ts10-blobstore:
 
 x-teraslab-common: &teraslab-common
@@ -64,3 +66,31 @@ services:
     ports:
       - "13102:3300"
       - "19102:9100"
+  node4:
+    <<: *teraslab-common
+    container_name: ts10-node4
+    hostname: node4
+    networks:
+      ts10-net:
+        ipv4_address: 172.40.0.14
+    volumes:
+      - ts10-node4-data:/data
+      - ts10-blobstore:/blobstore
+      - /Users/siggioskarsson/gitcheckout/teraslab/teraslab-tests/client/../docker/config/ts10-node4.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13103:3300"
+      - "19103:9100"
+  node5:
+    <<: *teraslab-common
+    container_name: ts10-node5
+    hostname: node5
+    networks:
+      ts10-net:
+        ipv4_address: 172.40.0.15
+    volumes:
+      - ts10-node5-data:/data
+      - ts10-blobstore:/blobstore
+      - /Users/siggioskarsson/gitcheckout/teraslab/teraslab-tests/client/../docker/config/ts10-node5.toml:/etc/teraslab/node.toml:ro
+    ports:
+      - "13104:3300"
+      - "19104:9100"
