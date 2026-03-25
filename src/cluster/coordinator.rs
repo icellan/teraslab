@@ -736,8 +736,12 @@ impl ClusterCoordinator {
                 pre_swap_keys_by_shard = engine.keys_by_shard_filtered(&outbound_shard_set);
                 // Snapshot old masters before the handoff swaps assignments.
                 let alive_addrs = node_addrs.read().unwrap();
+                // Use target_assignment (committed layout), not effective_assignment
+                // (which may reflect old assignments from a prior handoff still
+                // in Copying state). We want the intended master, not the
+                // in-flight handoff master.
                 let old_masters: Vec<NodeId> = (0..crate::cluster::shards::NUM_SHARDS as u16)
-                    .map(|s| table.effective_assignment(s).master)
+                    .map(|s| table.target_assignment(s).master)
                     .collect();
                 // Only enter Copying state for shards that have data AND whose old
                 // master is still alive. If the old master is dead, there's no point
