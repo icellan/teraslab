@@ -72,14 +72,14 @@ impl RoutingInfo {
             buf.push(if node.is_alive { 1 } else { 0 });
         }
 
-        // Shard assignments: 4096 × 8 bytes
-        for shard in 0..NUM_SHARDS as u16 {
-            let master = self
-                .shard_assignments
-                .iter()
-                .find(|(s, _)| *s == shard)
-                .map(|(_, n)| *n)
-                .unwrap_or(NodeId(0));
+        // Build O(1) lookup from the shard assignments, then encode
+        // all 4096 shards as 8-byte master NodeIds. This replaces the
+        // previous O(n) .find() per shard which was O(4096²) total.
+        let mut shard_masters = [NodeId(0); NUM_SHARDS];
+        for &(shard, master) in &self.shard_assignments {
+            shard_masters[shard as usize] = master;
+        }
+        for master in &shard_masters {
             buf.extend_from_slice(&master.0.to_le_bytes());
         }
 

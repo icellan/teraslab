@@ -60,7 +60,7 @@ impl PaddedCounter {
     }
 }
 
-/// Thread-safe metrics for spend-path operations.
+/// Thread-safe metrics for all operation types.
 ///
 /// All counters use `Relaxed` ordering for minimal overhead (~1ns per increment).
 /// Counters are cache-line padded to prevent false sharing between cores.
@@ -87,6 +87,22 @@ pub struct ThreadMetrics {
     pub dah_inserts: PaddedCounter,
     /// DAH index removals.
     pub dah_removes: PaddedCounter,
+    /// Total create operations attempted.
+    pub creates_attempted: PaddedCounter,
+    /// Create operations that succeeded.
+    pub creates_succeeded: PaddedCounter,
+    /// Total setMined operations attempted.
+    pub set_mined_attempted: PaddedCounter,
+    /// setMined operations that succeeded.
+    pub set_mined_succeeded: PaddedCounter,
+    /// Total get operations attempted.
+    pub gets_attempted: PaddedCounter,
+    /// Get operations that succeeded.
+    pub gets_succeeded: PaddedCounter,
+    /// Total freeze operations attempted.
+    pub freezes_attempted: PaddedCounter,
+    /// Total delete operations attempted.
+    pub deletes_attempted: PaddedCounter,
 }
 
 impl Default for ThreadMetrics {
@@ -110,6 +126,14 @@ impl ThreadMetrics {
             spend_multi_batches: PaddedCounter::new(),
             dah_inserts: PaddedCounter::new(),
             dah_removes: PaddedCounter::new(),
+            creates_attempted: PaddedCounter::new(),
+            creates_succeeded: PaddedCounter::new(),
+            set_mined_attempted: PaddedCounter::new(),
+            set_mined_succeeded: PaddedCounter::new(),
+            gets_attempted: PaddedCounter::new(),
+            gets_succeeded: PaddedCounter::new(),
+            freezes_attempted: PaddedCounter::new(),
+            deletes_attempted: PaddedCounter::new(),
         }
     }
 }

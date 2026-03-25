@@ -62,6 +62,35 @@ struct FreeRegion {
 }
 
 // ---------------------------------------------------------------------------
+// AllocatorStats
+// ---------------------------------------------------------------------------
+
+/// Summary statistics for the device space allocator.
+///
+/// Returned by [`SlotAllocator::stats`] for observability endpoints.
+#[derive(Debug, Clone)]
+pub struct AllocatorStats {
+    /// Start of the data region on device (bytes).
+    pub data_region_start: u64,
+    /// Current high-water mark — all allocations are below this offset.
+    pub next_offset: u64,
+    /// Total device size in bytes.
+    pub device_size: u64,
+    /// Device I/O alignment in bytes.
+    pub alignment: usize,
+    /// Number of free regions in the freelist.
+    pub free_region_count: usize,
+    /// Total free bytes across all freelist regions.
+    pub total_free_bytes: u64,
+    /// Size of the largest contiguous free region in bytes.
+    pub largest_free_region: u64,
+    /// Bytes used by allocated data (high-water minus data start minus free).
+    pub used_bytes: u64,
+    /// Device utilization as a fraction (0.0–1.0).
+    pub utilization: f64,
+}
+
+// ---------------------------------------------------------------------------
 // SlotAllocator
 // ---------------------------------------------------------------------------
 
@@ -317,6 +346,40 @@ impl SlotAllocator {
     /// Device alignment in bytes.
     pub fn device_alignment(&self) -> usize {
         self.alignment
+    }
+
+    /// Compute a snapshot of allocator statistics for observability.
+    ///
+    /// Iterates the freelist once to compute totals. The allocator must
+    /// be locked by the caller (it takes `&self`).
+    pub fn stats(&self) -> AllocatorStats {
+        let mut total_free: u64 = 0;
+        let mut largest: u64 = 0;
+        for region in &self.freelist {
+            total_free += region.size;
+            if region.size > largest {
+                largest = region.size;
+            }
+        }
+        let data_capacity = self.device_size.saturating_sub(self.data_region_start);
+        let high_water = self.next_offset.saturating_sub(self.data_region_start);
+        let used = high_water.saturating_sub(total_free);
+        let utilization = if data_capacity > 0 {
+            used as f64 / data_capacity as f64
+        } else {
+            0.0
+        };
+        AllocatorStats {
+            data_region_start: self.data_region_start,
+            next_offset: self.next_offset,
+            device_size: self.device_size,
+            alignment: self.alignment,
+            free_region_count: self.freelist.len(),
+            total_free_bytes: total_free,
+            largest_free_region: largest,
+            used_bytes: used,
+            utilization,
+        }
     }
 }
 

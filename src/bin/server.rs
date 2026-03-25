@@ -20,7 +20,7 @@ use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, DirectDevice};
 use teraslab::index::{DahIndex, Index, UnminedIndex};
 use teraslab::locks::StripedLocks;
-use teraslab::metrics::ThreadMetrics;
+use teraslab::metrics::{ThreadHistograms, ThreadMetrics};
 use teraslab::ops::engine::Engine;
 use teraslab::redo::RedoLog;
 use teraslab::server::http::{HttpState, start_http_server};
@@ -29,6 +29,9 @@ use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
 
 /// Global metrics counters for the server binary.
 static SERVER_METRICS: ThreadMetrics = ThreadMetrics::new();
+
+/// Global latency histograms for the server binary.
+static SERVER_HISTOGRAMS: ThreadHistograms = ThreadHistograms::new();
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -49,6 +52,8 @@ fn main() {
         eprintln!("No config file specified, using defaults");
         ServerConfig::default()
     };
+
+    teraslab::server::dispatch::init_dispatch_metrics(&SERVER_METRICS);
 
     eprintln!("TeraSlab server starting...");
     eprintln!("  listen: {}", config.listen_addr);
@@ -344,12 +349,16 @@ fn main() {
     };
 
     // 6. Start HTTP observability server
+    let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let http_state = Arc::new(HttpState {
         engine: engine.clone(),
         metrics: &SERVER_METRICS,
+        histograms: &SERVER_HISTOGRAMS,
         ready: Arc::new(AtomicBool::new(true)),
         log_level: Arc::new(AtomicU8::new(2)), // INFO
         cluster: cluster.clone(),
+        redo_log: redo_log.clone(),
+        active_connections: active_connections.clone(),
     });
     let http_addr = config.http_listen_addr.clone();
     std::thread::spawn(move || {
@@ -357,7 +366,8 @@ fn main() {
     });
 
     // 7. Setup TCP server
-    let mut server = Server::new(engine.clone(), config.clone());
+    let mut server = Server::new(engine.clone(), config.clone())
+        .with_active_connections(active_connections);
     if let Some(ref c) = cluster {
         server = server.with_cluster(c.clone());
     }

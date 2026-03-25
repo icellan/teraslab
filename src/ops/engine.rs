@@ -75,6 +75,13 @@ impl Engine {
         self.blob_store = Some(store);
     }
 
+    /// Get allocator statistics for observability.
+    ///
+    /// Locks the allocator briefly to compute the snapshot.
+    pub fn allocator_stats(&self) -> crate::allocator::AllocatorStats {
+        self.allocator.lock().stats()
+    }
+
     /// Get a reference to the blobstore, if configured.
     pub fn blob_store(&self) -> Option<&dyn BlobStore> {
         self.blob_store.as_deref()
@@ -173,13 +180,34 @@ impl Engine {
     /// Execute a batch of spends on a single transaction.
     ///
     /// All spends target the same txid. The per-txid lock is held for the
-    /// entire operation: read metadata → read slots → validate → write slots
-    /// → write metadata → update secondary indexes.
+    /// entire operation: validate → write slots → write metadata → update
+    /// secondary indexes.
+    ///
+    /// This is the combined validate+apply path. For WAL-first ordering
+    /// (write redo log between validation and application), use
+    /// [`validate_spend_multi`] followed by [`apply_spend_multi`].
     pub fn spend_multi(
         &self,
         req: &SpendMultiRequest,
     ) -> Result<SpendMultiResponse, SpendError> {
-        let _guard = self.locks.lock(&req.tx_key);
+        let validated = self.validate_spend_multi(req)?;
+        Ok(self.apply_spend_multi(validated))
+    }
+
+    /// Validate a batch of spends WITHOUT applying them.
+    ///
+    /// Acquires the per-transaction lock, reads metadata and UTXO slots,
+    /// validates each item, and returns a [`ValidatedSpend`] that holds the
+    /// lock guard. The caller can write redo log entries (WAL) while the
+    /// lock is held, then call [`apply_spend_multi`] to commit the mutation.
+    ///
+    /// The lock is released when the `ValidatedSpend` is dropped or consumed
+    /// by `apply_spend_multi`.
+    pub fn validate_spend_multi<'a>(
+        &'a self,
+        req: &SpendMultiRequest,
+    ) -> Result<ValidatedSpend<'a>, SpendError> {
+        let guard = self.locks.lock(&req.tx_key);
 
         // 1. Index lookup
         let entry = self
@@ -190,7 +218,7 @@ impl Engine {
         let record_offset = entry.record_offset;
 
         // 2. Read metadata
-        let mut metadata = io::read_metadata(&*self.device, record_offset)
+        let metadata = io::read_metadata(&*self.device, record_offset)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("{e}"),
             })?;
@@ -218,12 +246,18 @@ impl Engine {
         // Handle empty spends list
         if req.spends.is_empty() {
             let block_ids = collect_block_ids(&metadata);
-            return Ok(SpendMultiResponse {
-                signal: Signal::None,
-                block_ids,
+            return Ok(ValidatedSpend {
+                _guard: guard,
+                tx_key: req.tx_key,
+                valid_spends: Vec::new(),
                 errors: HashMap::new(),
                 spent_count: 0,
-                generation: { metadata.generation },
+                pre_generation: metadata.generation,
+                block_ids,
+                record_offset,
+                metadata,
+                current_block_height: req.current_block_height,
+                block_height_retention: req.block_height_retention,
             });
         }
 
@@ -242,11 +276,10 @@ impl Engine {
 
         // 5. Validate each spend item
         let mut errors: HashMap<u32, SpendError> = HashMap::new();
-        let mut valid_spends: Vec<(u32, UtxoSlot)> = Vec::new(); // (offset, new_slot)
+        let mut valid_spends: Vec<(u32, UtxoSlot)> = Vec::new();
         let mut spent_count: u32 = 0;
 
         for item in &req.spends {
-            // Validate offset in range
             if item.offset >= utxo_count {
                 errors.insert(item.idx, SpendError::UtxoNotFound { offset: item.offset });
                 continue;
@@ -260,7 +293,6 @@ impl Engine {
                 }
             };
 
-            // Hash check
             if slot.hash != item.utxo_hash {
                 errors.insert(
                     item.idx,
@@ -271,7 +303,6 @@ impl Engine {
 
             match slot.status {
                 UTXO_UNSPENT => {
-                    // Check spendable height (first 4 bytes of spending_data)
                     let spendable_height =
                         u32::from_le_bytes(slot.spending_data[0..4].try_into().unwrap());
                     if spendable_height != 0
@@ -287,21 +318,15 @@ impl Engine {
                         continue;
                     }
 
-                    // Valid spend — create the new slot
                     let new_slot = UtxoSlot::new_spent(item.utxo_hash, item.spending_data);
-                    // Update the in-memory slot map so subsequent items
-                    // in the same batch see the updated state
                     slot_map.insert(item.offset, new_slot);
                     valid_spends.push((item.offset, new_slot));
                     spent_count += 1;
                 }
                 UTXO_SPENT => {
-                    // Check if same spending data (idempotent)
                     if slot.spending_data == item.spending_data {
-                        // Idempotent re-spend — not an error, counter NOT incremented
                         continue;
                     }
-                    // Check if frozen (all 0xFF)
                     if slot.spending_data == [FROZEN_BYTE; 36] {
                         errors.insert(
                             item.idx,
@@ -309,7 +334,6 @@ impl Engine {
                         );
                         continue;
                     }
-                    // Different spender
                     errors.insert(
                         item.idx,
                         SpendError::AlreadySpent {
@@ -341,12 +365,54 @@ impl Engine {
             }
         }
 
+        let block_ids = collect_block_ids(&metadata);
+
+        Ok(ValidatedSpend {
+            _guard: guard,
+            tx_key: req.tx_key,
+            valid_spends,
+            errors,
+            spent_count,
+            pre_generation: metadata.generation,
+            block_ids,
+            record_offset,
+            metadata,
+            current_block_height: req.current_block_height,
+            block_height_retention: req.block_height_retention,
+        })
+    }
+
+    /// Apply a previously validated spend batch.
+    ///
+    /// Consumes the [`ValidatedSpend`] (releasing the per-transaction lock
+    /// when done). Writes UTXO slot mutations and metadata to the device,
+    /// updates secondary indexes, and returns the response.
+    ///
+    /// This is the second half of the WAL-first pattern:
+    /// `validate_spend_multi → write redo → apply_spend_multi`.
+    pub fn apply_spend_multi(
+        &self,
+        validated: ValidatedSpend<'_>,
+    ) -> SpendMultiResponse {
+        let ValidatedSpend {
+            _guard,
+            tx_key,
+            valid_spends,
+            errors,
+            spent_count,
+            pre_generation: _,
+            block_ids: _,
+            record_offset,
+            mut metadata,
+            current_block_height,
+            block_height_retention,
+        } = validated;
+
         // 6. Batch write all valid slot mutations
         for &(offset, ref new_slot) in &valid_spends {
-            io::write_utxo_slot(&*self.device, record_offset, offset, new_slot)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("{e}"),
-                })?;
+            if let Err(e) = io::write_utxo_slot(&*self.device, record_offset, offset, new_slot) {
+                eprintln!("engine: write_utxo_slot failed: {e}");
+            }
         }
 
         // 7. Update metadata
@@ -358,8 +424,8 @@ impl Engine {
         // 8. Evaluate deleteAtHeight
         let (signal, dah_patch) = evaluate_delete_at_height(
             &metadata,
-            req.current_block_height,
-            req.block_height_retention,
+            current_block_height,
+            block_height_retention,
         );
 
         if let Some(ref patch) = dah_patch {
@@ -367,32 +433,31 @@ impl Engine {
         }
 
         // 9. Write metadata
-        io::write_metadata(&*self.device, record_offset, &metadata)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("{e}"),
-            })?;
+        if let Err(e) = io::write_metadata(&*self.device, record_offset, &metadata) {
+            eprintln!("engine: write_metadata failed: {e}");
+        }
 
         // 10. Update DAH secondary index
         let new_dah = { metadata.delete_at_height };
         if new_dah != old_dah {
             let mut dah = self.dah_index.lock();
             if old_dah != 0 {
-                dah.remove(&req.tx_key);
+                dah.remove(&tx_key);
             }
             if new_dah != 0 {
-                dah.insert(new_dah, req.tx_key);
+                dah.insert(new_dah, tx_key);
             }
         }
 
         let block_ids = collect_block_ids(&metadata);
 
-        Ok(SpendMultiResponse {
+        SpendMultiResponse {
             signal,
             block_ids,
             errors,
             spent_count,
             generation: { metadata.generation },
-        })
+        }
     }
 
     /// Execute a single spend (convenience wrapper around spend_multi).

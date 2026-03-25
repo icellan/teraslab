@@ -2,8 +2,10 @@
 //!
 //! Implements all validation logic from `teranode.lua` lines 284–466.
 
+use crate::index::TxKey;
 use crate::ops::error::SpendError;
 use crate::ops::signal::Signal;
+use crate::record::{TxMetadata, UtxoSlot};
 use std::collections::HashMap;
 
 /// A single spend item within a spendMulti batch.
@@ -98,4 +100,38 @@ impl SpendRequest {
             block_height_retention: self.block_height_retention,
         }
     }
+}
+
+/// Result of spend validation, holding the per-record lock.
+///
+/// Produced by `Engine::validate_spend_multi()`. The lock guard prevents
+/// other mutations on this record until `Engine::apply_spend_multi()`
+/// consumes this struct and releases the lock. This enables the caller
+/// to write redo log entries (WAL) between validation and application.
+pub struct ValidatedSpend<'a> {
+    /// RAII lock guard — holds the per-transaction stripe lock.
+    /// Dropped when `apply_spend_multi()` consumes this struct.
+    pub(crate) _guard: parking_lot::MutexGuard<'a, ()>,
+    /// Transaction key being spent.
+    pub tx_key: TxKey,
+    /// Validated spend operations: (slot_offset, new_slot_state).
+    /// Only items that passed all validation checks.
+    pub(crate) valid_spends: Vec<(u32, UtxoSlot)>,
+    /// Per-item errors from validation (idx → error).
+    pub errors: HashMap<u32, SpendError>,
+    /// Number of UTXOs that will actually change state (not counting idempotent re-spends).
+    pub spent_count: u32,
+    /// Record generation BEFORE this mutation. The post-mutation generation
+    /// will be `pre_generation.wrapping_add(1)`.
+    pub pre_generation: u32,
+    /// Block IDs currently on the record.
+    pub block_ids: Vec<u32>,
+    /// Record offset on the block device (needed for apply).
+    pub(crate) record_offset: u64,
+    /// Metadata read during validation (needed for apply).
+    pub(crate) metadata: TxMetadata,
+    /// Request params needed during apply (DAH evaluation).
+    pub(crate) current_block_height: u32,
+    /// Block height retention for DAH.
+    pub(crate) block_height_retention: u32,
 }

@@ -1,6 +1,139 @@
 //! Data migration tracking for shard rebalancing.
 
-use crate::cluster::shards::{MigrationTask, NodeId};
+use crate::cluster::shards::{MigrationTask, NodeId, NUM_SHARDS};
+
+// ---------------------------------------------------------------------------
+// ShardBitmap — O(1) per-shard flag storage
+// ---------------------------------------------------------------------------
+
+/// Fixed-size bitmap for 4096 shards. Each shard maps to one bit:
+/// `word = shard / 64`, `bit = shard % 64`.
+///
+/// All operations are O(1). Memory footprint: 512 bytes.
+#[derive(Clone, Debug)]
+pub struct ShardBitmap {
+    words: [u64; Self::WORDS],
+}
+
+impl ShardBitmap {
+    const WORDS: usize = NUM_SHARDS / 64; // 64
+
+    /// Create an empty bitmap (all bits clear).
+    pub const fn new() -> Self {
+        Self { words: [0u64; Self::WORDS] }
+    }
+
+    /// Set the bit for `shard`.
+    pub fn set(&mut self, shard: u16) {
+        let (w, b) = Self::pos(shard);
+        self.words[w] |= 1u64 << b;
+    }
+
+    /// Clear the bit for `shard`.
+    pub fn clear(&mut self, shard: u16) {
+        let (w, b) = Self::pos(shard);
+        self.words[w] &= !(1u64 << b);
+    }
+
+    /// Test whether `shard` is set.
+    pub fn test(&self, shard: u16) -> bool {
+        let (w, b) = Self::pos(shard);
+        (self.words[w] >> b) & 1 == 1
+    }
+
+    /// Clear all bits.
+    pub fn clear_all(&mut self) {
+        self.words = [0u64; Self::WORDS];
+    }
+
+    /// Number of set bits.
+    pub fn count(&self) -> usize {
+        self.words.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    fn pos(shard: u16) -> (usize, u32) {
+        ((shard as usize) / 64, (shard as u32) % 64)
+    }
+}
+
+impl Default for ShardBitmap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AtomicShardBitmap — lock-free per-shard flags for the hot path
+// ---------------------------------------------------------------------------
+
+/// Atomic version of [`ShardBitmap`] for use on the request hot path.
+///
+/// Read operations (`test`) are a single `AtomicU64::load` + bit test,
+/// giving O(1) with zero contention. Write operations (`set`/`clear`)
+/// use `fetch_or`/`fetch_and` (also lock-free).
+///
+/// The bitmap is maintained as a shadow of the authoritative state inside
+/// `MigrationManager`. Mutation methods on `RunningCluster` update both
+/// the manager (under its Mutex) and the atomic bitmap.
+pub struct AtomicShardBitmap {
+    words: [std::sync::atomic::AtomicU64; Self::WORDS],
+}
+
+impl AtomicShardBitmap {
+    const WORDS: usize = NUM_SHARDS / 64; // 64
+
+    /// Create an empty atomic bitmap.
+    pub fn new() -> Self {
+        Self {
+            words: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Set the bit for `shard` (lock-free).
+    pub fn set(&self, shard: u16) {
+        let (w, b) = Self::pos(shard);
+        self.words[w].fetch_or(1u64 << b, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Clear the bit for `shard` (lock-free).
+    pub fn clear(&self, shard: u16) {
+        let (w, b) = Self::pos(shard);
+        self.words[w].fetch_and(!(1u64 << b), std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test whether `shard` is set (lock-free, no contention).
+    pub fn test(&self, shard: u16) -> bool {
+        let (w, b) = Self::pos(shard);
+        (self.words[w].load(std::sync::atomic::Ordering::Acquire) >> b) & 1 == 1
+    }
+
+    /// Clear all bits.
+    pub fn clear_all(&self) {
+        for w in &self.words {
+            w.store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Bulk-copy from a [`ShardBitmap`] snapshot.
+    ///
+    /// Used to synchronize the atomic bitmap after a batch update
+    /// to the MigrationManager (e.g., after `cleanup_completed`).
+    pub fn load_from(&self, bitmap: &ShardBitmap) {
+        for (i, w) in self.words.iter().enumerate() {
+            w.store(bitmap.words[i], std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn pos(shard: u16) -> (usize, u32) {
+        ((shard as usize) / 64, (shard as u32) % 64)
+    }
+}
+
+impl Default for AtomicShardBitmap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// State of an active shard migration.
 ///
@@ -110,10 +243,14 @@ pub struct MigrationManager {
     /// this node expects to receive data for, with its source node.
     /// Entries are only removed when explicitly marked completed.
     inbound_migrations: Vec<InboundMigration>,
+    /// O(1) bitmap shadow of `inbound_migrations` for fast `has_pending_inbound`.
+    /// Kept in sync: set when an entry is added, cleared when all entries for
+    /// that shard are completed.
+    inbound_bitmap: ShardBitmap,
     /// Shards where writes are fenced on this node (source is migrating out).
     /// Dispatch rejects mutations for these shards with ERR_MIGRATION_IN_PROGRESS.
     /// Reads continue to be served locally during the fence.
-    fenced_shards: Vec<u16>,
+    fenced_shards: ShardBitmap,
 }
 
 impl MigrationManager {
@@ -122,7 +259,8 @@ impl MigrationManager {
         Self {
             active: Vec::new(),
             inbound_migrations: Vec::new(),
-            fenced_shards: Vec::new(),
+            inbound_bitmap: ShardBitmap::new(),
+            fenced_shards: ShardBitmap::new(),
         }
     }
 
@@ -153,6 +291,7 @@ impl MigrationManager {
                     from_node: task.from_node,
                     completed: false,
                 });
+                self.inbound_bitmap.set(task.shard);
             }
         }
     }
@@ -170,6 +309,7 @@ impl MigrationManager {
                 from_node: NodeId(0),
                 completed: false,
             });
+            self.inbound_bitmap.set(shard);
         }
     }
 
@@ -183,29 +323,35 @@ impl MigrationManager {
         {
             m.completed = true;
         }
+        // Clear bitmap bit only if no more pending entries for this shard.
+        if !self.inbound_migrations.iter().any(|m| m.shard == shard && !m.completed) {
+            self.inbound_bitmap.clear(shard);
+        }
     }
 
     /// Check if this node is expecting inbound data for the given shard.
+    ///
+    /// O(1) via bitmap lookup (no linear scan of inbound_migrations).
     pub fn has_pending_inbound(&self, shard: u16) -> bool {
-        self.inbound_migrations.iter().any(|m| m.shard == shard && !m.completed)
+        self.inbound_bitmap.test(shard)
     }
 
     /// Fence a shard on the source node — writes for this shard will be
     /// rejected with ERR_MIGRATION_IN_PROGRESS. Reads continue locally.
     pub fn fence_shard(&mut self, shard: u16) {
-        if !self.fenced_shards.contains(&shard) {
-            self.fenced_shards.push(shard);
-        }
+        self.fenced_shards.set(shard);
     }
 
     /// Remove the write fence for a shard (migration completed or failed).
     pub fn unfence_shard(&mut self, shard: u16) {
-        self.fenced_shards.retain(|&s| s != shard);
+        self.fenced_shards.clear(shard);
     }
 
     /// Check if writes are fenced for the given shard on this node.
+    ///
+    /// O(1) via bitmap lookup.
     pub fn is_shard_fenced(&self, shard: u16) -> bool {
-        self.fenced_shards.contains(&shard)
+        self.fenced_shards.test(shard)
     }
 
     /// Transition a migration to the Fenced state and record the fence sequence.
@@ -310,6 +456,11 @@ impl MigrationManager {
     pub fn cleanup_completed(&mut self) {
         self.active.retain(|p| !p.is_complete());
         self.inbound_migrations.retain(|m| !m.completed);
+        // Rebuild inbound bitmap from remaining entries.
+        self.inbound_bitmap.clear_all();
+        for m in &self.inbound_migrations {
+            self.inbound_bitmap.set(m.shard);
+        }
     }
 
     /// Check if a shard is currently being migrated outbound.
@@ -338,7 +489,17 @@ impl MigrationManager {
 
     /// Number of shards with active write fences.
     pub fn fenced_count(&self) -> usize {
-        self.fenced_shards.len()
+        self.fenced_shards.count()
+    }
+
+    /// Read-only access to the fenced-shards bitmap.
+    pub fn fenced_bitmap(&self) -> &ShardBitmap {
+        &self.fenced_shards
+    }
+
+    /// Read-only access to the inbound-migration bitmap.
+    pub fn inbound_bitmap(&self) -> &ShardBitmap {
+        &self.inbound_bitmap
     }
 
     /// Serialize pending (non-completed) inbound migrations to bytes.
@@ -385,6 +546,7 @@ impl MigrationManager {
                     from_node,
                     completed: false,
                 });
+                self.inbound_bitmap.set(shard);
             }
         }
     }
@@ -393,6 +555,82 @@ impl MigrationManager {
     /// supersedes any in-flight migrations).
     pub fn clear_inbound(&mut self) {
         self.inbound_migrations.clear();
+        self.inbound_bitmap.clear_all();
+    }
+
+    /// Serialize active outbound migration state to bytes.
+    ///
+    /// Format: `[count:4][ shard:2 + from_node:8 + to_node:8 + is_master:1
+    ///   + state:1 + snapshot_seq:8 + fence_seq:8 ] × count`
+    ///
+    /// Per-entry size: 36 bytes. Only non-complete, non-failed entries
+    /// are persisted — on restart these indicate migrations that were
+    /// interrupted and may need to be re-initiated.
+    pub fn serialize_outbound(&self) -> Vec<u8> {
+        let active: Vec<_> = self.active.iter()
+            .filter(|p| !p.is_complete() && p.state != MigrationState::Failed)
+            .collect();
+        let mut buf = Vec::with_capacity(4 + active.len() * 36);
+        buf.extend_from_slice(&(active.len() as u32).to_le_bytes());
+        for p in &active {
+            buf.extend_from_slice(&p.shard.to_le_bytes());
+            buf.extend_from_slice(&p.from_node.0.to_le_bytes());
+            buf.extend_from_slice(&p.to_node.0.to_le_bytes());
+            buf.push(if p.is_master { 1 } else { 0 });
+            let state_byte: u8 = match p.state {
+                MigrationState::Preparing => 0,
+                MigrationState::Streaming => 1,
+                MigrationState::Fenced => 2,
+                MigrationState::Complete => 3,
+                MigrationState::Failed => 4,
+            };
+            buf.push(state_byte);
+            buf.extend_from_slice(&p.snapshot_sequence.to_le_bytes());
+            buf.extend_from_slice(&p.fence_sequence.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Restore outbound migration state from bytes produced by `serialize_outbound`.
+    ///
+    /// Restored entries start in the state they were serialized with.
+    /// The coordinator can inspect these on startup to decide whether
+    /// to resume, abort, or re-plan each migration.
+    pub fn restore_outbound(&mut self, data: &[u8]) {
+        if data.len() < 4 {
+            return;
+        }
+        let count = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4])) as usize;
+        let mut pos = 4;
+        for _ in 0..count {
+            if pos + 36 > data.len() {
+                break;
+            }
+            let shard = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap_or([0; 2]));
+            let from_node = NodeId(u64::from_le_bytes(data[pos + 2..pos + 10].try_into().unwrap_or([0; 8])));
+            let to_node = NodeId(u64::from_le_bytes(data[pos + 10..pos + 18].try_into().unwrap_or([0; 8])));
+            let is_master = data[pos + 18] != 0;
+            let state = match data[pos + 19] {
+                0 => MigrationState::Preparing,
+                1 => MigrationState::Streaming,
+                2 => MigrationState::Fenced,
+                3 => MigrationState::Complete,
+                _ => MigrationState::Failed,
+            };
+            let snapshot_sequence = u64::from_le_bytes(data[pos + 20..pos + 28].try_into().unwrap_or([0; 8]));
+            let fence_sequence = u64::from_le_bytes(data[pos + 28..pos + 36].try_into().unwrap_or([0; 8]));
+            pos += 36;
+
+            let task = MigrationTask { shard, from_node, to_node, is_master };
+            // Only add if not already tracked.
+            if self.find_task_mut(&task).is_none() {
+                let mut progress = MigrationProgress::from_task(&task);
+                progress.state = state;
+                progress.snapshot_sequence = snapshot_sequence;
+                progress.fence_sequence = fence_sequence;
+                self.active.push(progress);
+            }
+        }
     }
 }
 
@@ -423,6 +661,34 @@ pub fn load_inbound_state(path: &std::path::Path) -> Vec<u8> {
     std::fs::read(path).unwrap_or_default()
 }
 
+/// Persist outbound migration state to disk (atomic write via temp + rename).
+///
+/// Best-effort: errors are logged but do not propagate. On restart the
+/// node can inspect persisted outbound state to determine which
+/// migrations were in-flight and need re-planning.
+pub fn persist_outbound_state(path: &std::path::Path, mgr: &MigrationManager) {
+    let data = mgr.serialize_outbound();
+    let tmp = path.with_extension("outbound.tmp");
+    let result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut f, &data)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        eprintln!("cluster: failed to persist outbound migration state: {e}");
+    }
+}
+
+/// Load outbound migration state from disk.
+///
+/// Returns the raw bytes for `MigrationManager::restore_outbound()`.
+/// Returns an empty Vec if the file doesn't exist or is corrupted.
+pub fn load_outbound_state(path: &std::path::Path) -> Vec<u8> {
+    std::fs::read(path).unwrap_or_default()
+}
+
 impl Default for MigrationManager {
     fn default() -> Self {
         Self::new()
@@ -432,6 +698,33 @@ impl Default for MigrationManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shard_bitmap_set_clear_test() {
+        let mut bm = ShardBitmap::new();
+        assert!(!bm.test(0));
+        assert!(!bm.test(4095));
+        assert_eq!(bm.count(), 0);
+
+        bm.set(0);
+        bm.set(63);
+        bm.set(64);
+        bm.set(4095);
+        assert!(bm.test(0));
+        assert!(bm.test(63));
+        assert!(bm.test(64));
+        assert!(bm.test(4095));
+        assert!(!bm.test(1));
+        assert_eq!(bm.count(), 4);
+
+        bm.clear(63);
+        assert!(!bm.test(63));
+        assert_eq!(bm.count(), 3);
+
+        bm.clear_all();
+        assert_eq!(bm.count(), 0);
+        assert!(!bm.test(0));
+    }
 
     #[test]
     fn start_outbound_filters_by_self() {
@@ -705,5 +998,81 @@ mod tests {
         assert_eq!(mgr.inbound_count(), 0);
         assert!(!mgr.has_pending_inbound(10));
         assert!(!mgr.has_pending_inbound(20));
+    }
+
+    #[test]
+    fn serialize_restore_outbound_round_trip() {
+        let mut mgr = MigrationManager::new();
+        let t1 = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        let t2 = MigrationTask { shard: 10, from_node: NodeId(1), to_node: NodeId(3), is_master: false };
+        mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &std::collections::HashSet::new());
+
+        // Advance t1 to Streaming with a snapshot sequence.
+        mgr.set_snapshot_sequence(&t1, 42);
+        assert_eq!(mgr.active_migrations()[0].state, MigrationState::Streaming);
+
+        let data = mgr.serialize_outbound();
+        let mut restored = MigrationManager::new();
+        restored.restore_outbound(&data);
+
+        // Both tasks should be restored.
+        assert_eq!(restored.active_count(), 2);
+        let p1 = restored.active_migrations().iter()
+            .find(|p| p.shard == 5).expect("shard 5 restored");
+        assert_eq!(p1.state, MigrationState::Streaming);
+        assert_eq!(p1.snapshot_sequence, 42);
+        assert!(p1.is_master);
+        let p2 = restored.active_migrations().iter()
+            .find(|p| p.shard == 10).expect("shard 10 restored");
+        assert!(!p2.is_master);
+    }
+
+    #[test]
+    fn serialize_outbound_skips_complete_and_failed() {
+        let mut mgr = MigrationManager::new();
+        let t1 = MigrationTask { shard: 1, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        let t2 = MigrationTask { shard: 2, from_node: NodeId(1), to_node: NodeId(3), is_master: true };
+        let t3 = MigrationTask { shard: 3, from_node: NodeId(1), to_node: NodeId(4), is_master: true };
+        mgr.start_outbound(&[t1.clone(), t2.clone(), t3.clone()], NodeId(1), &std::collections::HashSet::new());
+
+        mgr.mark_complete(&t1);
+        mgr.mark_failed(&t2);
+
+        let data = mgr.serialize_outbound();
+        let mut restored = MigrationManager::new();
+        restored.restore_outbound(&data);
+
+        // Only t3 (Preparing) should be restored.
+        assert_eq!(restored.active_count(), 1);
+        assert_eq!(restored.active_migrations()[0].shard, 3);
+    }
+
+    #[test]
+    fn persist_and_load_outbound_state() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("outbound.state");
+
+        let mut mgr = MigrationManager::new();
+        let t = MigrationTask { shard: 42, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        mgr.start_outbound(&[t.clone()], NodeId(1), &std::collections::HashSet::new());
+        mgr.set_snapshot_sequence(&t, 100);
+
+        super::persist_outbound_state(&path, &mgr);
+
+        let data = super::load_outbound_state(&path);
+        let mut restored = MigrationManager::new();
+        restored.restore_outbound(&data);
+        assert_eq!(restored.active_count(), 1);
+        assert_eq!(restored.active_migrations()[0].snapshot_sequence, 100);
+    }
+
+    #[test]
+    fn restore_outbound_empty_data() {
+        let mut mgr = MigrationManager::new();
+        mgr.restore_outbound(&[]);
+        assert_eq!(mgr.active_count(), 0);
+
+        mgr.restore_outbound(&[0, 0, 0, 0]); // count = 0
+        assert_eq!(mgr.active_count(), 0);
     }
 }

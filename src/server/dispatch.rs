@@ -63,6 +63,12 @@ static REPL_POOL: LazyLock<Mutex<ReplicationPool>> = LazyLock::new(|| {
 static ACK_TRACKER: std::sync::OnceLock<crate::replication::durable::AckTracker> =
     std::sync::OnceLock::new();
 
+/// Global metrics reference. Initialized during server startup via
+/// `init_dispatch_metrics()`. Used to increment operation counters
+/// without threading metrics through every handler function.
+static DISPATCH_METRICS: std::sync::OnceLock<&'static crate::metrics::ThreadMetrics> =
+    std::sync::OnceLock::new();
+
 /// Initialize the persistent ACK tracker.
 ///
 /// Must be called once during server startup before any replication occurs.
@@ -70,6 +76,13 @@ static ACK_TRACKER: std::sync::OnceLock<crate::replication::durable::AckTracker>
 pub fn init_ack_tracker(path: std::path::PathBuf) {
     let tracker = crate::replication::durable::AckTracker::new(path);
     let _ = ACK_TRACKER.set(tracker);
+}
+
+/// Initialize the dispatch metrics reference.
+///
+/// Must be called once during server startup before any requests are processed.
+pub fn init_dispatch_metrics(metrics: &'static crate::metrics::ThreadMetrics) {
+    let _ = DISPATCH_METRICS.set(metrics);
 }
 
 /// Initialize the replication sequence counter from the redo log.
@@ -108,7 +121,19 @@ pub(crate) fn handle_request(
         return err_resp;
     }
 
-    match request.op_code {
+    // Increment operation counters (best-effort — no-op if metrics not initialized).
+    if let Some(m) = DISPATCH_METRICS.get() {
+        match request.op_code {
+            OP_CREATE_BATCH => m.creates_attempted.inc(),
+            OP_SET_MINED_BATCH => m.set_mined_attempted.inc(),
+            OP_GET_BATCH | OP_GET_SPEND_BATCH => m.gets_attempted.inc(),
+            OP_FREEZE_BATCH => m.freezes_attempted.inc(),
+            OP_DELETE_BATCH => m.deletes_attempted.inc(),
+            _ => {}
+        }
+    }
+
+    let response = match request.op_code {
         OP_SPEND_BATCH => handle_spend_batch(request, engine, max_batch_size, cluster, redo_log),
         OP_UNSPEND_BATCH => handle_unspend_batch(request, engine, max_batch_size, cluster, redo_log),
         OP_SET_MINED_BATCH => handle_set_mined_batch(request, engine, max_batch_size, cluster, redo_log),
@@ -175,6 +200,7 @@ pub(crate) fn handle_request(
             //   [record_count:8]                 — expected records (0 = empty shard)
             //   [fence_sequence:8] (optional)    — redo fence sequence for audit
             //   [topology_epoch:8] (optional)    — reject stale migrations
+            //   [manifest_hash:32] (optional)    — XOR-hash of (txid, generation) pairs
             let shard = request.request_id as u16;
 
             let expected_records = if request.payload.len() >= 8 {
@@ -192,6 +218,14 @@ pub(crate) fn handle_request(
             } else {
                 0
             };
+            let source_manifest: Option<[u8; 32]> = if request.payload.len() >= 56 {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&request.payload[24..56]);
+                // All-zeros = no manifest (legacy source or empty shard).
+                if h == [0u8; 32] { None } else { Some(h) }
+            } else {
+                None
+            };
 
             // Reject stale migrations from a previous topology epoch.
             if migration_epoch > 0
@@ -208,35 +242,58 @@ pub(crate) fn handle_request(
             }
 
             // Verify the actual record count matches expected exactly
-            // using the O(1) per-shard counter. Use exact match (==)
-            // instead of >=  to catch missing deletes and stale records.
+            // using the O(1) per-shard counter.
             let actual = engine.shard_record_count(shard);
-            let verified = if expected_records == 0 {
+            let count_ok = if expected_records == 0 {
                 true // empty shard, no data expected
             } else {
                 actual == expected_records
             };
 
-            if verified {
-                if let Some(cluster) = cluster {
-                    cluster.mark_inbound_complete(shard);
-                }
-                ResponseFrame {
-                    request_id: request.request_id,
-                    status: STATUS_OK,
-                    payload: Vec::new(),
-                }
-            } else {
-                error_response(
+            if !count_ok {
+                return error_response(
                     request.request_id,
                     ERR_MIGRATION_IN_PROGRESS,
                     &format!("shard {shard} record count mismatch: expected {expected_records}, got {actual}"),
-                )
+                );
+            }
+
+            // Verify manifest hash (content fingerprint) if provided.
+            // Computes the same XOR-hash over all (txid, generation) pairs
+            // for this shard on the target and compares with the source's hash.
+            if let Some(expected_hash) = source_manifest {
+                let mut local_manifest = crate::cluster::coordinator::ManifestHasher::new();
+                for key in engine.keys_for_shard(shard) {
+                    if let Ok(meta) = engine.read_metadata(&key) {
+                        local_manifest.fold(&key.txid, meta.generation);
+                    }
+                }
+                let local_hash = local_manifest.finalize();
+                if local_hash != expected_hash {
+                    return error_response(
+                        request.request_id,
+                        ERR_MIGRATION_IN_PROGRESS,
+                        &format!(
+                            "shard {shard} manifest hash mismatch (count matched at {actual} records but content differs)",
+                        ),
+                    );
+                }
+            }
+
+            if let Some(cluster) = cluster {
+                cluster.mark_inbound_complete(shard);
+            }
+            ResponseFrame {
+                request_id: request.request_id,
+                status: STATUS_OK,
+                payload: Vec::new(),
             }
         }
         OP_TOPOLOGY_PROPOSE => {
             // Topology authority: another node is proposing a new term.
-            // Validate and vote.
+            // Validate and vote. Persist voted_term BEFORE returning
+            // the vote — safety requirement to prevent double-voting
+            // after a crash.
             let cluster = match cluster {
                 Some(c) => c,
                 None => return error_response(request.request_id, ERR_INTERNAL, "not clustered"),
@@ -244,6 +301,9 @@ pub(crate) fn handle_request(
             match crate::cluster::topology::TopologyTerm::deserialize(&request.payload) {
                 Some(propose) => {
                     let vote = cluster.topology_authority().handle_propose(&propose);
+                    if vote.accepted {
+                        cluster.persist_topology();
+                    }
                     ResponseFrame {
                         request_id: request.request_id,
                         status: STATUS_OK,
@@ -287,8 +347,14 @@ pub(crate) fn handle_request(
             };
             match crate::cluster::topology::TopologyCommit::deserialize(&request.payload) {
                 Some(commit) => {
+                    let members = commit.members.clone();
                     if let Some(term) = cluster.topology_authority().handle_commit(&commit) {
-                        eprintln!("cluster: topology term {term} committed with {} members", commit.members.len());
+                        eprintln!("cluster: topology term {term} committed with {} members", members.len());
+                        // Signal the coordinator event loop to activate the
+                        // shard table with the committed member list.
+                        cluster.signal_topology_committed(members, term);
+                        // Persist topology state so voted_term survives restarts.
+                        cluster.persist_topology();
                     }
                     ResponseFrame {
                         request_id: request.request_id,
@@ -300,7 +366,21 @@ pub(crate) fn handle_request(
             }
         }
         _ => error_response(request.request_id, ERR_INTERNAL, "unknown opcode"),
+    };
+
+    // Increment success counters based on response status.
+    if response.status == STATUS_OK
+        && let Some(m) = DISPATCH_METRICS.get()
+    {
+        match request.op_code {
+            OP_CREATE_BATCH => m.creates_succeeded.inc(),
+            OP_SET_MINED_BATCH => m.set_mined_succeeded.inc(),
+            OP_GET_BATCH | OP_GET_SPEND_BATCH => m.gets_succeeded.inc(),
+            _ => {}
+        }
     }
+
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -639,13 +719,15 @@ fn handle_spend_batch(
     }
 
     let mut errors: Vec<BatchItemError> = Vec::new();
-    let mut redo_ops: Vec<RedoOp> = Vec::new();
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
 
+    // WAL-first ordering: for each txid group we validate under lock,
+    // write redo ops to the WAL (fsync), THEN apply the mutation.
+    // This guarantees that if the process crashes after the engine
+    // mutation, the redo log already has the entry and replicas will
+    // see it during catch-up streaming.
     for (txid, group) in &by_txid {
-        // Check shard ownership for the first item in the group (all share the same txid)
         if let Some(redirect_err) = check_shard_ownership(txid, group[0].0 as u32, cluster, false) {
-            // All items in this group get redirect errors
             for &(i, _) in group {
                 errors.push(BatchItemError {
                     item_index: i as u32,
@@ -675,56 +757,70 @@ fn handle_spend_batch(
             block_height_retention: params.block_height_retention,
         };
 
-        match engine.spend_multi(&multi_req) {
-            Ok(resp) => {
-                // Collect successful items for redo/replication
-                let error_indices: std::collections::HashSet<u32> =
-                    resp.errors.keys().copied().collect();
-
-                let key = TxKey { txid: *txid };
-                let mut key_repl_ops = Vec::new();
-
-                // Use the generation from the mutation result — avoids
-                // an extra device read per mutation.
-                let mgen = resp.generation;
-
-                for &(i, item) in group {
-                    if !error_indices.contains(&(i as u32)) {
-                        redo_ops.push(RedoOp::Spend {
-                            tx_key: key,
-                            offset: item.vout,
-                            spending_data: item.spending_data,
-                            new_spent_count: 0,
-                        });
-                        key_repl_ops.push(ReplicaOp::Spend {
-                            tx_key: key,
-                            offset: item.vout,
-                            spending_data: item.spending_data,
-                            master_generation: mgen,
-                        });
-                    }
-                }
-
-                if !key_repl_ops.is_empty() {
-                    repl_ops_by_key.push((key, key_repl_ops));
-                }
-
-                for (idx, err) in resp.errors {
-                    errors.push(spend_error_to_batch_error(idx, &err));
-                }
-            }
+        // Phase 1: Validate under lock (no disk writes yet).
+        let validated = match engine.validate_spend_multi(&multi_req) {
+            Ok(v) => v,
             Err(err) => {
-                // Record-level error applies to all items in this group
                 for &(i, _) in group {
                     errors.push(spend_error_to_batch_error(i as u32, &err));
                 }
+                continue;
+            }
+        };
+
+        // Phase 2: Build redo ops for validated items BEFORE mutation.
+        // The post-mutation generation is pre_generation + 1.
+        let error_indices: std::collections::HashSet<u32> =
+            validated.errors.keys().copied().collect();
+        let key = TxKey { txid: *txid };
+        let post_generation = validated.pre_generation.wrapping_add(1);
+
+        let mut redo_ops: Vec<RedoOp> = Vec::new();
+        let mut key_repl_ops: Vec<ReplicaOp> = Vec::new();
+        for &(i, item) in group {
+            if !error_indices.contains(&(i as u32)) {
+                redo_ops.push(RedoOp::Spend {
+                    tx_key: key,
+                    offset: item.vout,
+                    spending_data: item.spending_data,
+                    new_spent_count: 0,
+                });
+                key_repl_ops.push(ReplicaOp::Spend {
+                    tx_key: key,
+                    offset: item.vout,
+                    spending_data: item.spending_data,
+                    master_generation: post_generation,
+                });
             }
         }
+
+        // Phase 3: Write redo BEFORE engine mutation (WAL-first).
+        // Lock is still held via ValidatedSpend, so no concurrent
+        // mutation can interleave.
+        if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
+            // Redo failure: don't apply, return error.
+            // ValidatedSpend drops here, releasing the lock.
+            return error_response(req.request_id, ERR_INTERNAL, &e);
+        }
+
+        // Phase 4: Apply the mutation (still under lock).
+        // ValidatedSpend is consumed, lock released after write.
+        let validation_errors = validated.errors.clone();
+        let resp = engine.apply_spend_multi(validated);
+
+        if !key_repl_ops.is_empty() {
+            repl_ops_by_key.push((key, key_repl_ops));
+        }
+
+        for (idx, err) in validation_errors {
+            errors.push(spend_error_to_batch_error(idx, &err));
+        }
+
+        // Use signal/block_ids from resp if needed in the future.
+        let _ = resp.signal;
     }
 
-    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
-        return error_response(req.request_id, ERR_INTERNAL, &e);
-    }
+    // Phase 5: Replicate (redo already fsynced, engine already applied).
     if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
         return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
     }

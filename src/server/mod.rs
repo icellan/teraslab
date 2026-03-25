@@ -88,6 +88,16 @@ impl Server {
         self
     }
 
+    /// Share an external active connection counter with the server.
+    ///
+    /// The counter is incremented on accept and decremented on disconnect.
+    /// This allows other subsystems (like the HTTP server) to observe the
+    /// current connection count.
+    pub fn with_active_connections(mut self, counter: Arc<AtomicUsize>) -> Self {
+        self.active_connections = counter;
+        self
+    }
+
     /// Set the blob store for external cold data storage.
     pub fn with_blob_store(mut self, store: Arc<dyn BlobStore>) -> Self {
         self.blob_store = Some(store);

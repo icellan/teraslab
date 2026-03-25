@@ -4,18 +4,19 @@
 
 use std::io::{Read, Write as IoWrite};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
 use teraslab::index::{DahIndex, Index, UnminedIndex};
 use teraslab::locks::StripedLocks;
-use teraslab::metrics::ThreadMetrics;
+use teraslab::metrics::{ThreadHistograms, ThreadMetrics};
 use teraslab::ops::engine::Engine;
 use teraslab::server::http::{start_http_server, HttpState};
 
 static TEST_METRICS: ThreadMetrics = ThreadMetrics::new();
+static TEST_HISTOGRAMS: ThreadHistograms = ThreadHistograms::new();
 
 fn start_test_http_server() -> (u16, Arc<HttpState>) {
     let dev: Arc<dyn BlockDevice> =
@@ -41,9 +42,12 @@ fn start_test_http_server() -> (u16, Arc<HttpState>) {
     let state = Arc::new(HttpState {
         engine,
         metrics: &TEST_METRICS,
+        histograms: &TEST_HISTOGRAMS,
         ready,
         log_level,
         cluster: None,
+        redo_log: None,
+        active_connections: Arc::new(AtomicUsize::new(0)),
     });
 
     let addr = format!("127.0.0.1:{port}");
@@ -274,4 +278,173 @@ fn metrics_scrape_does_not_block() {
     }
     let elapsed = start.elapsed();
     assert!(elapsed.as_secs() < 5, "metrics scrapes took too long: {elapsed:?}");
+}
+
+#[test]
+fn metrics_includes_new_operation_counters() {
+    let (port, _state) = start_test_http_server();
+    let (_, _, body) = http_get(port, "/metrics");
+
+    assert!(body.contains("teraslab_creates_attempted_total"));
+    assert!(body.contains("teraslab_creates_succeeded_total"));
+    assert!(body.contains("teraslab_set_mined_attempted_total"));
+    assert!(body.contains("teraslab_gets_attempted_total"));
+    assert!(body.contains("teraslab_freezes_attempted_total"));
+    assert!(body.contains("teraslab_deletes_attempted_total"));
+    assert!(body.contains("teraslab_active_connections"));
+}
+
+#[test]
+fn freelist_returns_real_stats() {
+    let (port, _state) = start_test_http_server();
+    let (status, _, body) = http_get(port, "/debug/freelist");
+    assert_eq!(status, 200);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    // Should have real numeric fields, not a stub
+    assert!(parsed["device_size"].is_number());
+    assert!(parsed["used_bytes"].is_number());
+    assert!(parsed["utilization"].is_number());
+    assert!(parsed["free_region_count"].is_number());
+    assert!(parsed["alignment"].is_number());
+
+    // Device size should match the 16 MB test device
+    assert_eq!(parsed["device_size"].as_u64().unwrap(), 16 * 1024 * 1024);
+}
+
+#[test]
+fn redo_endpoint_returns_not_available_without_redo_log() {
+    let (port, _state) = start_test_http_server();
+    let (status, _, body) = http_get(port, "/debug/redo");
+    assert_eq!(status, 200);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    // No redo log configured in test → should report not available
+    assert_eq!(parsed["available"], false);
+}
+
+#[test]
+fn admin_nodes_returns_json_array() {
+    let (port, _state) = start_test_http_server();
+    let (status, content_type, body) = http_get(port, "/admin/nodes");
+    assert_eq!(status, 200);
+    assert!(content_type.contains("application/json"));
+
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(parsed["nodes"].is_array());
+    // Single-node mode: should have exactly 1 node
+    assert_eq!(parsed["nodes"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn admin_memory_returns_json() {
+    let (port, _state) = start_test_http_server();
+    let (status, _, body) = http_get(port, "/admin/memory");
+    assert_eq!(status, 200);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(parsed["index_bytes"].is_number());
+    assert!(parsed["index_entries"].is_number());
+}
+
+#[test]
+fn admin_records_returns_json() {
+    let (port, _state) = start_test_http_server();
+    let (status, _, body) = http_get(port, "/admin/records");
+    assert_eq!(status, 200);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(parsed["total_records"].is_number());
+    assert!(parsed["dah_index_count"].is_number());
+    assert!(parsed["unmined_count"].is_number());
+}
+
+#[test]
+fn admin_replication_returns_json() {
+    let (port, _state) = start_test_http_server();
+    let (status, _, body) = http_get(port, "/admin/replication");
+    assert_eq!(status, 200);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    // Single-node mode: replication disabled
+    assert_eq!(parsed["enabled"], false);
+}
+
+#[test]
+fn admin_top_returns_full_snapshot() {
+    let (port, _state) = start_test_http_server();
+    let (status, _, body) = http_get(port, "/admin/top");
+    assert_eq!(status, 200);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    assert!(parsed["timestamp_ms"].is_number());
+    assert!(parsed["counters"]["spends_attempted"].is_number());
+    assert!(parsed["counters"]["creates_attempted"].is_number());
+    assert!(parsed["latency"]["spend"]["count"].is_number());
+    assert!(parsed["latency"]["spend"]["p50_ns"].is_number());
+    assert!(parsed["latency"]["spend"]["p99_ns"].is_number());
+    assert!(parsed["index"]["entries"].is_number());
+    assert!(parsed["index"]["load_factor"].is_number());
+    assert!(parsed["storage"]["used_bytes"].is_number());
+    assert!(parsed["storage"]["utilization"].is_number());
+    assert!(parsed["connections"].is_number());
+    assert!(parsed["ready"].is_boolean());
+}
+
+#[test]
+fn ui_root_returns_html() {
+    let (port, _state) = start_test_http_server();
+    let (status, content_type, body) = http_get(port, "/ui/");
+    assert_eq!(status, 200);
+    assert!(content_type.contains("text/html"), "expected text/html, got {content_type}");
+    assert!(body.contains("TeraSlab"), "HTML should contain TeraSlab title");
+    assert!(body.contains("<script"), "HTML should include script tag");
+}
+
+#[test]
+fn ui_static_css_embedded() {
+    let (port, _state) = start_test_http_server();
+    let (status, content_type, body) = http_get(port, "/ui/style.css");
+    assert_eq!(status, 200);
+    assert!(content_type.contains("text/css"), "expected text/css, got {content_type}");
+    assert!(body.contains("--bg:"), "CSS should contain custom properties");
+}
+
+#[test]
+fn ui_static_js_embedded() {
+    let (port, _state) = start_test_http_server();
+    let (status, content_type, body) = http_get(port, "/ui/app.js");
+    assert_eq!(status, 200);
+    assert!(content_type.contains("javascript"), "expected javascript, got {content_type}");
+    assert!(body.contains("TeraSlab"), "JS should contain TeraSlab references");
+}
+
+#[test]
+fn ui_spa_fallback_returns_index() {
+    let (port, _state) = start_test_http_server();
+    // Non-existent path under /ui/ should return index.html (SPA fallback)
+    let (status, content_type, body) = http_get(port, "/ui/nonexistent/path");
+    assert_eq!(status, 200);
+    assert!(content_type.contains("text/html"));
+    assert!(body.contains("TeraSlab"));
+}
+
+#[test]
+fn admin_rebalance_without_cluster_returns_error() {
+    let (port, _state) = start_test_http_server();
+    let (status, _) = http_put(port, "/admin/rebalance", "");
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn admin_drain_without_cluster_returns_error() {
+    let (port, _state) = start_test_http_server();
+    let (status, _) = http_put(port, "/admin/drain/1", "");
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn debug_record_nonexistent_returns_404() {
+    let (port, _state) = start_test_http_server();
+    let txid_hex = "0000000000000000000000000000000000000000000000000000000000000000";
+    let (status, _, body) = http_get(port, &format!("/debug/records/{txid_hex}"));
+    assert_eq!(status, 404);
+    assert!(body.contains("not found"));
 }

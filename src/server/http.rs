@@ -1,4 +1,4 @@
-//! HTTP observability server (metrics, health, debug endpoints).
+//! HTTP observability server (metrics, health, debug, admin, WebSocket, Web UI).
 //!
 //! Runs on a separate port from the binary wire protocol. Uses `axum`
 //! for routing. Does not block or slow the binary protocol path.
@@ -6,15 +6,19 @@
 use crate::cluster::coordinator::RunningCluster;
 use crate::cluster::shards::NUM_SHARDS;
 use crate::index::TxKey;
-use crate::metrics::ThreadMetrics;
+use crate::metrics::{ThreadHistograms, ThreadMetrics};
 use crate::ops::engine::Engine;
+use crate::redo::RedoLog;
+use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, put};
 use axum::Router;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use rust_embed::Embed;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Log levels for the runtime log level endpoint.
 const LOG_LEVEL_ERROR: u8 = 0;
@@ -23,18 +27,29 @@ const LOG_LEVEL_INFO: u8 = 2;
 const LOG_LEVEL_DEBUG: u8 = 3;
 const LOG_LEVEL_TRACE: u8 = 4;
 
+/// Embedded static files for the admin Web UI.
+#[derive(Embed)]
+#[folder = "ui/"]
+struct UiAssets;
+
 /// Shared state for the HTTP server.
 pub struct HttpState {
     /// Reference to the engine for data queries.
     pub engine: Arc<Engine>,
     /// Global metrics counters.
     pub metrics: &'static ThreadMetrics,
+    /// Global latency histograms.
+    pub histograms: &'static ThreadHistograms,
     /// Whether the index has been fully loaded (ready check).
     pub ready: Arc<AtomicBool>,
     /// Runtime log level.
     pub log_level: Arc<AtomicU8>,
     /// Cluster coordinator (None in single-node mode).
     pub cluster: Option<Arc<RunningCluster>>,
+    /// Redo log for status queries (None if not available).
+    pub redo_log: Option<Arc<parking_lot::Mutex<RedoLog>>>,
+    /// Active TCP connection count (shared with the Server struct).
+    pub active_connections: Arc<AtomicUsize>,
 }
 
 /// Start the HTTP observability server on the given address.
@@ -52,18 +67,33 @@ pub fn start_http_server(
 
     rt.block_on(async move {
         let app = Router::new()
+            // Metrics & health
             .route("/metrics", get(handle_metrics))
             .route("/health/live", get(handle_health_live))
             .route("/health/ready", get(handle_health_ready))
             .route("/status", get(handle_status))
+            // Admin
             .route("/admin/quiesce", put(handle_admin_quiesce))
             .route("/admin/migration_status", get(handle_admin_migration_status))
+            .route("/admin/nodes", get(handle_admin_nodes))
+            .route("/admin/memory", get(handle_admin_memory))
+            .route("/admin/records", get(handle_admin_records))
+            .route("/admin/replication", get(handle_admin_replication))
+            .route("/admin/rebalance", put(handle_admin_rebalance))
+            .route("/admin/drain/{node_id}", put(handle_admin_drain))
+            .route("/admin/top", get(handle_admin_top))
+            // Debug
             .route("/debug/index", get(handle_debug_index))
             .route("/debug/freelist", get(handle_debug_freelist))
             .route("/debug/redo", get(handle_debug_redo))
             .route("/debug/log-level", put(handle_set_log_level))
             .route("/debug/log-level", get(handle_get_log_level))
             .route("/debug/records/{txid}", get(handle_debug_record))
+            // WebSocket
+            .route("/ws/top", get(handle_ws_top))
+            // Web UI
+            .route("/ui/", get(handle_ui_root))
+            .route("/ui/{*path}", get(handle_ui))
             .with_state(state);
 
         let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
@@ -90,7 +120,7 @@ async fn handle_metrics(State(state): State<Arc<HttpState>>) -> impl IntoRespons
     let m = state.metrics;
     let mut out = String::with_capacity(4096);
 
-    // Counters
+    // Spend counters
     prom_counter(&mut out, "teraslab_spends_attempted_total", m.spends_attempted.get());
     prom_counter(&mut out, "teraslab_spends_succeeded_total", m.spends_succeeded.get());
     prom_counter(&mut out, "teraslab_spends_idempotent_total", m.spends_idempotent.get());
@@ -103,11 +133,24 @@ async fn handle_metrics(State(state): State<Arc<HttpState>>) -> impl IntoRespons
     prom_counter(&mut out, "teraslab_dah_inserts_total", m.dah_inserts.get());
     prom_counter(&mut out, "teraslab_dah_removes_total", m.dah_removes.get());
 
+    // New operation counters
+    prom_counter(&mut out, "teraslab_creates_attempted_total", m.creates_attempted.get());
+    prom_counter(&mut out, "teraslab_creates_succeeded_total", m.creates_succeeded.get());
+    prom_counter(&mut out, "teraslab_set_mined_attempted_total", m.set_mined_attempted.get());
+    prom_counter(&mut out, "teraslab_set_mined_succeeded_total", m.set_mined_succeeded.get());
+    prom_counter(&mut out, "teraslab_gets_attempted_total", m.gets_attempted.get());
+    prom_counter(&mut out, "teraslab_gets_succeeded_total", m.gets_succeeded.get());
+    prom_counter(&mut out, "teraslab_freezes_attempted_total", m.freezes_attempted.get());
+    prom_counter(&mut out, "teraslab_deletes_attempted_total", m.deletes_attempted.get());
+
     // Index gauges
     let index_entries = state.engine.index_len();
     prom_gauge(&mut out, "teraslab_index_entries", index_entries as u64);
     prom_gauge(&mut out, "teraslab_dah_index_entries", state.engine.dah_index().len() as u64);
     prom_gauge(&mut out, "teraslab_unmined_index_entries", state.engine.unmined_index().len() as u64);
+
+    // Connection gauge
+    prom_gauge(&mut out, "teraslab_active_connections", state.active_connections.load(Ordering::Relaxed) as u64);
 
     (
         StatusCode::OK,
@@ -269,6 +312,259 @@ async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> i
     }
 }
 
+/// List all nodes in the cluster with state and shard counts.
+async fn handle_admin_nodes(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let body = if let Some(ref cluster) = state.cluster {
+        let addrs = cluster.node_addresses();
+        let table = cluster.shard_table();
+        let table_guard = table.read().unwrap();
+
+        let mut nodes = Vec::new();
+        for (&node_id, &addr) in &addrs {
+            let mut master_count: u32 = 0;
+            let mut replica_count: u32 = 0;
+            for shard in 0..NUM_SHARDS as u16 {
+                let assignment = table_guard.assignment(shard);
+                if assignment.master == node_id {
+                    master_count += 1;
+                }
+                if assignment.replicas.contains(&node_id) {
+                    replica_count += 1;
+                }
+            }
+            nodes.push(serde_json::json!({
+                "node_id": node_id.0,
+                "address": addr.to_string(),
+                "state": "alive",
+                "master_shards": master_count,
+                "replica_shards": replica_count,
+            }));
+        }
+        drop(table_guard);
+        serde_json::json!({ "nodes": nodes })
+    } else {
+        serde_json::json!({
+            "nodes": [{
+                "node_id": 0,
+                "address": "local",
+                "state": "alive",
+                "master_shards": 0,
+                "replica_shards": 0,
+            }]
+        })
+    };
+
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        body.to_string(),
+    )
+}
+
+/// Memory breakdown.
+async fn handle_admin_memory(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let index_stats = state.engine.index_stats();
+    let body = serde_json::json!({
+        "index_bytes": index_stats.memory_bytes,
+        "index_entries": index_stats.entry_count,
+        "dah_index_entries": state.engine.dah_index().len(),
+        "unmined_index_entries": state.engine.unmined_index().len(),
+        "estimated_total_bytes": index_stats.memory_bytes,
+    });
+    json_response(body)
+}
+
+/// Record inventory summary.
+async fn handle_admin_records(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let body = serde_json::json!({
+        "total_records": state.engine.index_len(),
+        "dah_index_count": state.engine.dah_index().len(),
+        "unmined_count": state.engine.unmined_index().len(),
+    });
+    json_response(body)
+}
+
+/// Replication configuration and status.
+async fn handle_admin_replication(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let body = if let Some(ref cluster) = state.cluster {
+        serde_json::json!({
+            "enabled": true,
+            "topology_term": cluster.committed_topology_term(),
+            "topology_epoch": cluster.topology_epoch(),
+            "peak_cluster_size": cluster.peak_cluster_size(),
+            "ack_policy": format!("{:?}", cluster.ack_policy()),
+            "best_effort": cluster.is_replication_best_effort(),
+        })
+    } else {
+        serde_json::json!({ "enabled": false })
+    };
+    json_response(body)
+}
+
+/// Trigger cluster rebalance (quiesce current node).
+async fn handle_admin_rebalance(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    match state.cluster {
+        Some(ref cluster) => {
+            cluster.quiesce();
+            (StatusCode::OK, "rebalance initiated".to_string())
+        }
+        None => (StatusCode::BAD_REQUEST, "not in cluster mode".to_string()),
+    }
+}
+
+/// Drain a specific node by ID.
+async fn handle_admin_drain(
+    State(state): State<Arc<HttpState>>,
+    Path(node_id): Path<u64>,
+) -> impl IntoResponse {
+    match state.cluster {
+        Some(ref cluster) => {
+            if cluster.self_id().0 == node_id {
+                cluster.quiesce();
+                (StatusCode::OK, format!("drain initiated for node {node_id}"))
+            } else {
+                (StatusCode::BAD_REQUEST, format!(
+                    "can only drain local node ({}), use --addr to target node {node_id} directly",
+                    cluster.self_id().0
+                ))
+            }
+        }
+        None => (StatusCode::BAD_REQUEST, "not in cluster mode".to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /admin/top — full metrics snapshot for real-time monitoring
+// ---------------------------------------------------------------------------
+
+/// Build a full metrics snapshot as JSON. Used by both the /admin/top
+/// endpoint and the WebSocket push loop.
+fn build_top_snapshot(state: &HttpState) -> serde_json::Value {
+    let m = state.metrics;
+    let h = state.histograms;
+    let index_stats = state.engine.index_stats();
+    let alloc_stats = state.engine.allocator_stats();
+
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let redo = if let Some(ref rl) = state.redo_log {
+        let log = rl.lock();
+        let avail = log.available_space();
+        let pos = log.write_position();
+        let total = pos + avail;
+        let utilization = if total > 0 { pos as f64 / total as f64 } else { 0.0 };
+        serde_json::json!({
+            "current_sequence": log.current_sequence(),
+            "write_position": pos,
+            "available_space": avail,
+            "utilization": utilization,
+        })
+    } else {
+        serde_json::json!({
+            "current_sequence": 0,
+            "write_position": 0,
+            "available_space": 0,
+            "utilization": 0.0,
+        })
+    };
+
+    serde_json::json!({
+        "timestamp_ms": timestamp_ms,
+        "counters": {
+            "spends_attempted": m.spends_attempted.get(),
+            "spends_succeeded": m.spends_succeeded.get(),
+            "spends_idempotent": m.spends_idempotent.get(),
+            "spends_failed": m.spends_failed.get(),
+            "unspends_attempted": m.unspends_attempted.get(),
+            "unspends_succeeded": m.unspends_succeeded.get(),
+            "unspends_noop": m.unspends_noop.get(),
+            "unspends_failed": m.unspends_failed.get(),
+            "spend_multi_batches": m.spend_multi_batches.get(),
+            "creates_attempted": m.creates_attempted.get(),
+            "creates_succeeded": m.creates_succeeded.get(),
+            "set_mined_attempted": m.set_mined_attempted.get(),
+            "set_mined_succeeded": m.set_mined_succeeded.get(),
+            "gets_attempted": m.gets_attempted.get(),
+            "gets_succeeded": m.gets_succeeded.get(),
+            "freezes_attempted": m.freezes_attempted.get(),
+            "deletes_attempted": m.deletes_attempted.get(),
+        },
+        "latency": {
+            "spend": histogram_json(&h.spend_latency),
+            "spend_multi": histogram_json(&h.spend_multi_latency),
+            "unspend": histogram_json(&h.unspend_latency),
+            "lock_wait": histogram_json(&h.lock_wait),
+        },
+        "index": {
+            "entries": index_stats.entry_count,
+            "capacity": index_stats.capacity,
+            "load_factor": index_stats.load_factor,
+            "memory_bytes": index_stats.memory_bytes,
+        },
+        "storage": {
+            "used_bytes": alloc_stats.used_bytes,
+            "total_bytes": alloc_stats.device_size,
+            "utilization": alloc_stats.utilization,
+            "free_regions": alloc_stats.free_region_count,
+        },
+        "redo": redo,
+        "connections": state.active_connections.load(Ordering::Relaxed),
+        "ready": state.ready.load(Ordering::Relaxed),
+    })
+}
+
+/// Convert a `LatencyHistogram` to JSON with percentiles.
+fn histogram_json(h: &crate::metrics::LatencyHistogram) -> serde_json::Value {
+    serde_json::json!({
+        "count": h.count(),
+        "mean_ns": h.mean_ns(),
+        "p50_ns": h.percentile_ns(0.50),
+        "p95_ns": h.percentile_ns(0.95),
+        "p99_ns": h.percentile_ns(0.99),
+    })
+}
+
+/// Return a point-in-time metrics snapshot for the `top` monitor.
+async fn handle_admin_top(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let body = build_top_snapshot(&state);
+    json_response(body)
+}
+
+// ---------------------------------------------------------------------------
+// /ws/top — WebSocket push of metrics every second
+// ---------------------------------------------------------------------------
+
+/// Upgrade to WebSocket and push metrics snapshots every second.
+async fn handle_ws_top(
+    ws: axum::extract::WebSocketUpgrade,
+    State(state): State<Arc<HttpState>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| ws_top_loop(socket, state))
+}
+
+/// WebSocket loop: send a JSON metrics snapshot every second.
+async fn ws_top_loop(mut socket: WebSocket, state: Arc<HttpState>) {
+    loop {
+        let snapshot = build_top_snapshot(&state);
+        let msg = Message::Text(snapshot.to_string().into());
+        if socket.send(msg).await.is_err() {
+            break; // Client disconnected
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // Drain any incoming messages (pings, close frames)
+        while let Ok(Some(_)) = tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            socket.recv(),
+        ).await {
+            // Just consume; we don't process client messages
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // /debug/* endpoints
 // ---------------------------------------------------------------------------
@@ -290,26 +586,43 @@ async fn handle_debug_index(State(state): State<Arc<HttpState>>) -> impl IntoRes
     )
 }
 
-async fn handle_debug_freelist(State(_state): State<Arc<HttpState>>) -> impl IntoResponse {
+/// Real allocator/freelist statistics.
+async fn handle_debug_freelist(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let stats = state.engine.allocator_stats();
     let body = serde_json::json!({
-        "info": "freelist debug endpoint",
+        "data_region_start": stats.data_region_start,
+        "next_offset": stats.next_offset,
+        "device_size": stats.device_size,
+        "alignment": stats.alignment,
+        "free_region_count": stats.free_region_count,
+        "total_free_bytes": stats.total_free_bytes,
+        "largest_free_region": stats.largest_free_region,
+        "used_bytes": stats.used_bytes,
+        "utilization": stats.utilization,
     });
-    (
-        StatusCode::OK,
-        [("content-type", "application/json")],
-        body.to_string(),
-    )
+    json_response(body)
 }
 
-async fn handle_debug_redo(State(_state): State<Arc<HttpState>>) -> impl IntoResponse {
-    let body = serde_json::json!({
-        "info": "redo log debug endpoint",
-    });
-    (
-        StatusCode::OK,
-        [("content-type", "application/json")],
-        body.to_string(),
-    )
+/// Real redo log statistics.
+async fn handle_debug_redo(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let body = if let Some(ref rl) = state.redo_log {
+        let log = rl.lock();
+        let avail = log.available_space();
+        let pos = log.write_position();
+        let total = pos + avail;
+        let utilization = if total > 0 { pos as f64 / total as f64 } else { 0.0 };
+        serde_json::json!({
+            "available": true,
+            "current_sequence": log.current_sequence(),
+            "write_position": pos,
+            "available_space": avail,
+            "log_size": total,
+            "utilization": utilization,
+        })
+    } else {
+        serde_json::json!({ "available": false })
+    };
+    json_response(body)
 }
 
 async fn handle_set_log_level(
@@ -386,6 +699,62 @@ async fn handle_debug_record(
         }
         Err(_) => (StatusCode::NOT_FOUND, "tx not found".to_string()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// /ui/* — embedded static Web UI
+// ---------------------------------------------------------------------------
+
+/// Serve the root UI page.
+async fn handle_ui_root() -> impl IntoResponse {
+    serve_embedded_file("index.html")
+}
+
+/// Serve embedded static files with SPA fallback.
+async fn handle_ui(Path(path): Path<String>) -> impl IntoResponse {
+    serve_embedded_file(&path)
+}
+
+/// Serve a file from the embedded `UiAssets`, falling back to `index.html`
+/// for client-side routing (SPA).
+fn serve_embedded_file(path: &str) -> (StatusCode, [(axum::http::HeaderName, String); 1], Vec<u8>) {
+    let (data, mime) = match UiAssets::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path)
+                .first_or_octet_stream()
+                .to_string();
+            (content.data.to_vec(), mime)
+        }
+        None => {
+            // SPA fallback: serve index.html for unrecognized paths
+            match UiAssets::get("index.html") {
+                Some(content) => (content.data.to_vec(), "text/html".to_string()),
+                None => return (
+                    StatusCode::NOT_FOUND,
+                    [(axum::http::header::CONTENT_TYPE, "text/plain".to_string())],
+                    b"UI not found".to_vec(),
+                ),
+            }
+        }
+    };
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, mime)],
+        data,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Convenience wrapper for JSON responses.
+fn json_response(body: serde_json::Value) -> (StatusCode, [(axum::http::HeaderName, &'static str); 1], String) {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
 }
 
 fn parse_hex_txid(hex: &str) -> Option<[u8; 32]> {
