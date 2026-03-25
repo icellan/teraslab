@@ -36,25 +36,20 @@ use std::sync::atomic::AtomicU64;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-/// Lock-free replication sequence counter. Assigns monotonically
-/// increasing positions to replication batches without contention.
-/// Initialized from the redo log on startup.
-static REPL_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// Per-replica connection pool and ACK tracking. Only locked for
-/// connection management, not for sequence assignment.
-struct ReplicationPool {
-    connections: HashMap<SocketAddr, TcpReplicaTransport>,
-    /// Per-replica last-ACKed sequence (in-memory, for fast lookup).
-    last_acked: HashMap<SocketAddr, u64>,
+/// Per-address replication connection slot. Each replica address gets its
+/// own independent mutex, so concurrent sends to different replicas never
+/// contend on a single lock. At millions of ops/sec with RF=3, this
+/// eliminates the serialization point that a single global pool creates.
+struct PerAddrSlot {
+    connection: Option<TcpReplicaTransport>,
+    last_acked: u64,
 }
 
-static REPL_POOL: LazyLock<Mutex<ReplicationPool>> = LazyLock::new(|| {
-    Mutex::new(ReplicationPool {
-        connections: HashMap::new(),
-        last_acked: HashMap::new(),
-    })
-});
+/// Per-address connection pool. The outer HashMap is locked briefly for
+/// lookup/insert only. Each address has its own `Arc<Mutex<PerAddrSlot>>`,
+/// so concurrent sends to different replicas proceed without contention.
+static REPL_POOL: LazyLock<Mutex<HashMap<SocketAddr, std::sync::Arc<Mutex<PerAddrSlot>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Persistent replication ACK tracker. Initialized during server startup
 /// via `init_ack_tracker()`. Records per-replica durable ACK sequences
@@ -85,14 +80,6 @@ pub fn init_dispatch_metrics(metrics: &'static crate::metrics::ThreadMetrics) {
     let _ = DISPATCH_METRICS.set(metrics);
 }
 
-/// Initialize the replication sequence counter from the redo log.
-///
-/// Must be called once during server startup, after the redo log is
-/// opened and recovery is complete, so that replication sequence numbers
-/// are contiguous with the durable commit log.
-pub fn init_replication_sequence(initial_sequence: u64) {
-    REPL_SEQUENCE.store(initial_sequence.max(1), std::sync::atomic::Ordering::Relaxed);
-}
 
 /// Dispatch a request frame to the appropriate Engine method.
 ///
@@ -227,12 +214,14 @@ pub(crate) fn handle_request(
                 None
             };
 
-            // Reject stale migrations from a previous topology epoch.
+            // Reject migrations from very stale topology epochs.
+            // Allow 2 epochs of slack to accommodate re-activation cycles
+            // where the epoch advances while migrations are in flight.
             if migration_epoch > 0
                 && let Some(cluster) = cluster
             {
                 let current_epoch = cluster.topology_epoch();
-                if migration_epoch < current_epoch {
+                if current_epoch > migration_epoch + 2 {
                     return error_response(
                         request.request_id,
                         ERR_MIGRATION_IN_PROGRESS,
@@ -244,10 +233,12 @@ pub(crate) fn handle_request(
             // Verify the actual record count matches expected exactly
             // using the O(1) per-shard counter.
             let actual = engine.shard_record_count(shard);
+            // Target may already hold replica copies for this shard, so
+            // actual count can exceed expected. Accept if >= expected.
             let count_ok = if expected_records == 0 {
                 true // empty shard, no data expected
             } else {
-                actual == expected_records
+                actual >= expected_records
             };
 
             if !count_ok {
@@ -259,9 +250,11 @@ pub(crate) fn handle_request(
             }
 
             // Verify manifest hash (content fingerprint) if provided.
-            // Computes the same XOR-hash over all (txid, generation) pairs
-            // for this shard on the target and compares with the source's hash.
-            if let Some(expected_hash) = source_manifest {
+            // Skip when the target has more records than expected (pre-existing
+            // replica data makes the hash incomparable).
+            if let Some(expected_hash) = source_manifest
+                && actual == expected_records
+            {
                 let mut local_manifest = crate::cluster::coordinator::ManifestHasher::new();
                 for key in engine.keys_for_shard(shard) {
                     if let Ok(meta) = engine.read_metadata(&key) {
@@ -397,23 +390,29 @@ pub(crate) fn handle_request(
 /// When no redo log is configured (single-node test setups), returns
 /// `Ok(0)` — the engine writes are still durable via O_DIRECT but
 /// there is no crash recovery journal.
-fn write_redo_ops(redo_log: Option<&Mutex<RedoLog>>, ops: &[RedoOp]) -> std::result::Result<u64, String> {
+/// Write redo operations to the WAL and flush.
+///
+/// Returns `(first_seq, last_seq)` — the redo sequence range assigned to the
+/// appended entries. These are the authoritative sequence numbers used by
+/// replica catch-up and ACK tracking.
+fn write_redo_ops(redo_log: Option<&Mutex<RedoLog>>, ops: &[RedoOp]) -> std::result::Result<(u64, u64), String> {
     let redo = match redo_log {
         Some(r) => r,
-        None => return Ok(0),
+        None => return Ok((0, 0)),
     };
     if ops.is_empty() {
-        return Ok(0);
+        return Ok((0, 0));
     }
     let mut log = redo.lock();
-    let mut last_seq = 0;
+    let first_seq = log.current_sequence();
+    let mut last_seq = first_seq;
     for op in ops {
         last_seq = log.append(op.clone())
             .map_err(|e| format!("redo log append: {e}"))?;
     }
     log.flush()
         .map_err(|e| format!("redo log flush: {e}"))?;
-    Ok(last_seq)
+    Ok((first_seq, last_seq))
 }
 
 // ---------------------------------------------------------------------------
@@ -422,10 +421,9 @@ fn write_redo_ops(redo_log: Option<&Mutex<RedoLog>>, ops: &[RedoOp]) -> std::res
 
 /// Send replication operations to replica nodes for the given keys.
 ///
-/// Assigns durable sequence numbers from the global replication state,
-/// groups ops by target replica, and sends synchronously on the current
-/// dispatch thread. The dispatch thread is dedicated to this client
-/// connection, so blocking here is acceptable.
+/// Uses the redo sequence range from `write_redo_ops()` to tag batches so
+/// that replica ACK tracking and catch-up use the same sequence space as
+/// the durable redo log.
 ///
 /// When ACK policy enforcement is enabled (RF >= 2 with a non-best_effort
 /// policy), replication failures are returned as errors so the caller can
@@ -437,6 +435,7 @@ fn write_redo_ops(redo_log: Option<&Mutex<RedoLog>>, ops: &[RedoOp]) -> std::res
 fn replicate_all_ops(
     cluster: Option<&RunningCluster>,
     ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)>,
+    redo_seq_range: (u64, u64),
 ) -> std::result::Result<(), String> {
     let cluster = match cluster {
         Some(c) => c,
@@ -474,12 +473,8 @@ fn replicate_all_ops(
                 if ops.is_empty() {
                     return Ok(());
                 }
-                let first_seq = REPL_SEQUENCE.fetch_add(
-                    ops.len() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
                 let batch = ReplicaBatch {
-                    first_sequence: first_seq,
+                    first_sequence: redo_seq_range.0,
                     ops,
                 };
                 send_replica_batch_to(addr, &batch)
@@ -538,19 +533,28 @@ fn replicate_all_ops(
 
 /// Send a `ReplicaBatch` to a replica node via TCP using the wire protocol.
 ///
-/// Reuses a persistent connection from the global replication state. If no
-/// cached connection exists or the cached one has failed, a fresh TCP
-/// connection is established. On success, updates the per-replica
-/// `last_acked` sequence and returns the connection to the pool.
+/// Reuses a persistent connection from the per-address pool. If no cached
+/// connection exists or the cached one has failed, a fresh TCP connection
+/// is established. The per-address mutex ensures that concurrent sends to
+/// the SAME replica are serialized (correct: TCP is ordered), while sends
+/// to DIFFERENT replicas proceed in parallel without contention.
 fn send_replica_batch_to(
     addr: SocketAddr,
     batch: &ReplicaBatch,
 ) -> std::result::Result<(), String> {
-    // Take an existing connection from the pool. Lock is held only
-    // for the HashMap remove, not during I/O.
-    let existing = REPL_POOL.lock().connections.remove(&addr);
+    // Get or create the per-address slot. The outer pool lock is held
+    // only for the HashMap lookup/insert, not during I/O.
+    let slot = {
+        let mut pool = REPL_POOL.lock();
+        pool.entry(addr).or_insert_with(|| {
+            std::sync::Arc::new(Mutex::new(PerAddrSlot { connection: None, last_acked: 0 }))
+        }).clone()
+    };
 
-    let mut transport = match existing {
+    // Lock only this address's slot. Other addresses are uncontended.
+    let mut slot_guard = slot.lock();
+
+    let mut transport = match slot_guard.connection.take() {
         Some(t) if t.is_connected() => t,
         _ => {
             TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5))
@@ -564,9 +568,8 @@ fn send_replica_batch_to(
 
     match transport.recv_ack(Duration::from_secs(3)) {
         Ok(ReplicaAck::Ok { through_sequence }) => {
-            let mut pool = REPL_POOL.lock();
-            pool.connections.insert(addr, transport);
-            pool.last_acked.insert(addr, through_sequence);
+            slot_guard.connection = Some(transport);
+            slot_guard.last_acked = through_sequence;
             // Persist the ACK sequence for crash-safe catch-up.
             if let Some(tracker) = ACK_TRACKER.get() {
                 tracker.record_ack(addr, through_sequence);
@@ -574,7 +577,7 @@ fn send_replica_batch_to(
             Ok(())
         }
         Ok(ReplicaAck::Error { message, .. }) => {
-            REPL_POOL.lock().connections.insert(addr, transport);
+            slot_guard.connection = Some(transport);
             Err(format!("replica error: {message}"))
         }
         Err(e) => {
@@ -734,6 +737,7 @@ fn handle_spend_batch(
 
     let mut errors: Vec<BatchItemError> = Vec::new();
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    let mut spend_redo_range: (u64, u64) = (0, 0);
 
     // WAL-first ordering: for each txid group we validate under lock,
     // write redo ops to the WAL (fsync), THEN apply the mutation.
@@ -811,10 +815,19 @@ fn handle_spend_batch(
         // Phase 3: Write redo BEFORE engine mutation (WAL-first).
         // Lock is still held via ValidatedSpend, so no concurrent
         // mutation can interleave.
-        if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
-            // Redo failure: don't apply, return error.
-            // ValidatedSpend drops here, releasing the lock.
-            return error_response(req.request_id, ERR_INTERNAL, &e);
+        match write_redo_ops(redo_log, &redo_ops) {
+            Ok(range) => {
+                if spend_redo_range.0 == 0 && spend_redo_range.1 == 0 {
+                    spend_redo_range = range;
+                } else if range.1 > 0 {
+                    spend_redo_range.1 = range.1; // Extend the end
+                }
+            }
+            Err(e) => {
+                // Redo failure: don't apply, return error.
+                // ValidatedSpend drops here, releasing the lock.
+                return error_response(req.request_id, ERR_INTERNAL, &e);
+            }
         }
 
         // Phase 4: Apply the mutation (still under lock).
@@ -835,7 +848,7 @@ fn handle_spend_batch(
     }
 
     // Phase 5: Replicate (redo already fsynced, engine already applied).
-    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key, spend_redo_range) {
         return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
     }
 
@@ -859,6 +872,15 @@ fn handle_spend_batch(
 // Unspend
 // ---------------------------------------------------------------------------
 
+// NOTE ON WAL ORDERING: Unlike `handle_spend_batch` which holds the
+// per-txid lock across redo write + engine mutation (because spend uses
+// validate-then-apply), the handlers below (unspend, set_mined, freeze,
+// etc.) write redo ops BEFORE acquiring the engine lock. This is safe
+// because ALL redo operations in these paths are idempotent — replaying
+// a redo entry that was already applied is a no-op due to generation
+// guards and slot-state checks. If a non-idempotent redo op is ever
+// added to these paths, this pattern must be restructured to match
+// the spend path's WAL-first-under-lock discipline.
 fn handle_unspend_batch(
     req: &RequestFrame,
     engine: &Engine,
@@ -876,44 +898,55 @@ fn handle_unspend_batch(
 
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
-    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
 
+    // Phase 1: Validate ownership and build redo ops from request parameters.
+    struct ValidUnspend<'a> { idx: usize, key: TxKey, item: &'a WireSlotItem }
+    let mut valid_items: Vec<ValidUnspend> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
         let key = TxKey { txid: item.txid };
-        let result = engine.unspend(&UnspendRequest {
+        redo_ops.push(RedoOp::Unspend {
             tx_key: key,
             offset: item.vout,
-            utxo_hash: item.utxo_hash,
+            new_spent_count: 0,
+        });
+        valid_items.push(ValidUnspend { idx: i, key, item });
+    }
+
+    // Phase 2: WAL-first — write redo before engine mutation.
+    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+        Ok(range) => range,
+        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+    };
+
+    // Phase 3: Apply engine mutations and build repl ops.
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    for v in &valid_items {
+        match engine.unspend(&UnspendRequest {
+            tx_key: v.key,
+            offset: v.item.vout,
+            utxo_hash: v.item.utxo_hash,
             current_block_height: params.current_block_height,
             block_height_retention: params.block_height_retention,
-        });
-        match result {
+        }) {
             Ok(resp) => {
-                redo_ops.push(RedoOp::Unspend {
-                    tx_key: key,
-                    offset: item.vout,
-                    new_spent_count: 0,
-                });
-                repl_ops_by_key.push((key, vec![ReplicaOp::Unspend {
-                    tx_key: key,
-                    offset: item.vout,
+                repl_ops_by_key.push((v.key, vec![ReplicaOp::Unspend {
+                    tx_key: v.key,
+                    offset: v.item.vout,
                     master_generation: resp.generation,
                 }]));
             }
             Err(err) => {
-                errors.push(spend_error_to_batch_error(i as u32, &err));
+                errors.push(spend_error_to_batch_error(v.idx as u32, &err));
             }
         }
     }
 
-    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
-        return error_response(req.request_id, ERR_INTERNAL, &e);
-    }
-    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+    // Phase 4: Replicate.
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key, redo_range) {
         return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
     }
 
@@ -941,16 +974,37 @@ fn handle_set_mined_batch(
 
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
-    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
 
+    // Phase 1: Validate ownership and build redo ops from request params.
+    struct ValidSetMined { idx: usize, key: TxKey }
+    let mut valid_items: Vec<ValidSetMined> = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
         let key = TxKey { txid: *txid };
-        let result = engine.set_mined(&SetMinedRequest {
+        redo_ops.push(RedoOp::SetMined {
             tx_key: key,
+            block_id: params.block_id,
+            block_height: params.block_height,
+            subtree_idx: params.subtree_idx,
+            unset: params.unset_mined,
+        });
+        valid_items.push(ValidSetMined { idx: i, key });
+    }
+
+    // Phase 2: WAL-first — write redo before engine mutation.
+    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+        Ok(range) => range,
+        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+    };
+
+    // Phase 3: Apply engine mutations and build repl ops from engine results.
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    for v in &valid_items {
+        match engine.set_mined(&SetMinedRequest {
+            tx_key: v.key,
             block_id: params.block_id,
             block_height: params.block_height,
             subtree_idx: params.subtree_idx,
@@ -958,26 +1012,18 @@ fn handle_set_mined_batch(
             block_height_retention: params.block_height_retention,
             on_longest_chain: params.on_longest_chain,
             unset_mined: params.unset_mined,
-        });
-        match result {
+        }) {
             Ok(resp) => {
-                redo_ops.push(RedoOp::SetMined {
-                    tx_key: key,
-                    block_id: params.block_id,
-                    block_height: params.block_height,
-                    subtree_idx: params.subtree_idx,
-                    unset: params.unset_mined,
-                });
                 let mgen = resp.generation;
                 if params.unset_mined {
-                    repl_ops_by_key.push((key, vec![ReplicaOp::UnsetMined {
-                        tx_key: key,
+                    repl_ops_by_key.push((v.key, vec![ReplicaOp::UnsetMined {
+                        tx_key: v.key,
                         block_id: params.block_id,
                         master_generation: mgen,
                     }]));
                 } else {
-                    repl_ops_by_key.push((key, vec![ReplicaOp::SetMined {
-                        tx_key: key,
+                    repl_ops_by_key.push((v.key, vec![ReplicaOp::SetMined {
+                        tx_key: v.key,
                         block_id: params.block_id,
                         block_height: params.block_height,
                         subtree_idx: params.subtree_idx,
@@ -987,15 +1033,13 @@ fn handle_set_mined_batch(
                 }
             }
             Err(err) => {
-                errors.push(spend_error_to_batch_error(i as u32, &err));
+                errors.push(spend_error_to_batch_error(v.idx as u32, &err));
             }
         }
     }
 
-    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
-        return error_response(req.request_id, ERR_INTERNAL, &e);
-    }
-    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+    // Phase 4: Replicate.
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key, redo_range) {
         return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
     }
 
@@ -1146,10 +1190,19 @@ fn handle_create_batch(
                         utxo_count: item.utxo_hashes.len() as u32,
                     });
                 }
-                // Serialize metadata for the replica: tx_version(4) + locktime(4) +
-                // fee(8) + size_in_bytes(8) + extended_size(8) + is_coinbase(1) +
-                // spending_height(4) + created_at(8) + flags(1) = 46 bytes.
-                let mut meta_buf = Vec::with_capacity(46);
+                // Serialize full metadata for the replica so a promoted replica
+                // has the authoritative record state. Layout:
+                //   Bytes  0-45: Core — tx_version(4) + locktime(4) + fee(8) +
+                //                size_in_bytes(8) + extended_size(8) + is_coinbase(1) +
+                //                spending_height(4) + created_at(8) + flags(1) = 46 bytes
+                //   Bytes 46-69: Lifecycle — generation(4) + updated_at(8) +
+                //                unmined_since(4) + delete_at_height(4) +
+                //                preserve_until(4) = 24 bytes
+                //   Bytes 70+:   Extended — block_height(4) + block_count(1) +
+                //                [block_id(4)+block_height(4)+subtree_idx(4)]*N +
+                //                parent_txid_count(2) + parent_txids(32*N)
+                let mut meta_buf = Vec::with_capacity(128);
+                // Core 46 bytes
                 meta_buf.extend_from_slice(&item.tx_version.to_le_bytes());
                 meta_buf.extend_from_slice(&item.locktime.to_le_bytes());
                 meta_buf.extend_from_slice(&item.fee.to_le_bytes());
@@ -1159,6 +1212,34 @@ fn handle_create_batch(
                 meta_buf.extend_from_slice(&item.spending_height.to_le_bytes());
                 meta_buf.extend_from_slice(&item.created_at.to_le_bytes());
                 meta_buf.push(item.flags);
+                // Lifecycle 24 bytes — read back the just-created record to
+                // capture the authoritative generation and timestamps.
+                let (r_gen, r_upd, r_ums, r_dah, r_pu) =
+                    if let Ok(meta) = engine.read_metadata(&key) {
+                        ({ meta.generation }, { meta.updated_at },
+                         { meta.unmined_since }, { meta.delete_at_height },
+                         { meta.preserve_until })
+                    } else {
+                        (0u32, 0u64, 0u32, 0u32, 0u32)
+                    };
+                meta_buf.extend_from_slice(&r_gen.to_le_bytes());
+                meta_buf.extend_from_slice(&r_upd.to_le_bytes());
+                meta_buf.extend_from_slice(&r_ums.to_le_bytes());
+                meta_buf.extend_from_slice(&r_dah.to_le_bytes());
+                meta_buf.extend_from_slice(&r_pu.to_le_bytes());
+                // Extended: block_height + mined_block_infos + parent_txids
+                meta_buf.extend_from_slice(&item.block_height.to_le_bytes());
+                let block_infos = &create_req.mined_block_infos;
+                meta_buf.push(block_infos.len() as u8);
+                for info in block_infos {
+                    meta_buf.extend_from_slice(&info.block_id.to_le_bytes());
+                    meta_buf.extend_from_slice(&info.block_height.to_le_bytes());
+                    meta_buf.extend_from_slice(&info.subtree_idx.to_le_bytes());
+                }
+                meta_buf.extend_from_slice(&(item.parent_txids.len() as u16).to_le_bytes());
+                for ptx in &item.parent_txids {
+                    meta_buf.extend_from_slice(ptx);
+                }
 
                 repl_ops_by_key.push((key, vec![ReplicaOp::Create {
                     tx_key: key,
@@ -1185,10 +1266,11 @@ fn handle_create_batch(
         }
     }
 
-    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
-        return error_response(req.request_id, ERR_INTERNAL, &e);
-    }
-    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+        Ok(range) => range,
+        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+    };
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key, redo_range) {
         return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
     }
 
@@ -1215,37 +1297,49 @@ fn handle_freeze_batch(
     }
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
-    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
 
+    // Phase 1: Validate ownership and build redo ops from request params.
+    struct ValidFreeze<'a> { idx: usize, key: TxKey, item: &'a WireSlotItem }
+    let mut valid_items: Vec<ValidFreeze> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
         let key = TxKey { txid: item.txid };
+        redo_ops.push(RedoOp::Freeze { tx_key: key, offset: item.vout });
+        valid_items.push(ValidFreeze { idx: i, key, item });
+    }
+
+    // Phase 2: WAL-first — write redo before engine mutation.
+    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+        Ok(range) => range,
+        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+    };
+
+    // Phase 3: Apply engine mutations and build repl ops from engine results.
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    for v in &valid_items {
         match engine.freeze(&FreezeRequest {
-            tx_key: key,
-            offset: item.vout,
-            utxo_hash: item.utxo_hash,
+            tx_key: v.key,
+            offset: v.item.vout,
+            utxo_hash: v.item.utxo_hash,
         }) {
             Ok(mgen) => {
-                redo_ops.push(RedoOp::Freeze { tx_key: key, offset: item.vout });
-                repl_ops_by_key.push((key, vec![ReplicaOp::Freeze {
-                    tx_key: key,
-                    offset: item.vout,
+                repl_ops_by_key.push((v.key, vec![ReplicaOp::Freeze {
+                    tx_key: v.key,
+                    offset: v.item.vout,
                     master_generation: mgen,
                 }]));
             }
             Err(err) => {
-                errors.push(spend_error_to_batch_error(i as u32, &err));
+                errors.push(spend_error_to_batch_error(v.idx as u32, &err));
             }
         }
     }
 
-    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
-        return error_response(req.request_id, ERR_INTERNAL, &e);
-    }
-    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+    // Phase 4: Replicate.
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key, redo_range) {
         return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
     }
 
@@ -1268,37 +1362,49 @@ fn handle_unfreeze_batch(
     }
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
-    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
 
+    // Phase 1: Validate ownership and build redo ops from request params.
+    struct ValidUnfreeze<'a> { idx: usize, key: TxKey, item: &'a WireSlotItem }
+    let mut valid_items: Vec<ValidUnfreeze> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
         let key = TxKey { txid: item.txid };
+        redo_ops.push(RedoOp::Unfreeze { tx_key: key, offset: item.vout });
+        valid_items.push(ValidUnfreeze { idx: i, key, item });
+    }
+
+    // Phase 2: WAL-first — write redo before engine mutation.
+    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+        Ok(range) => range,
+        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+    };
+
+    // Phase 3: Apply engine mutations and build repl ops from engine results.
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    for v in &valid_items {
         match engine.unfreeze(&UnfreezeRequest {
-            tx_key: key,
-            offset: item.vout,
-            utxo_hash: item.utxo_hash,
+            tx_key: v.key,
+            offset: v.item.vout,
+            utxo_hash: v.item.utxo_hash,
         }) {
             Ok(mgen) => {
-                redo_ops.push(RedoOp::Unfreeze { tx_key: key, offset: item.vout });
-                repl_ops_by_key.push((key, vec![ReplicaOp::Unfreeze {
-                    tx_key: key,
-                    offset: item.vout,
+                repl_ops_by_key.push((v.key, vec![ReplicaOp::Unfreeze {
+                    tx_key: v.key,
+                    offset: v.item.vout,
                     master_generation: mgen,
                 }]));
             }
             Err(err) => {
-                errors.push(spend_error_to_batch_error(i as u32, &err));
+                errors.push(spend_error_to_batch_error(v.idx as u32, &err));
             }
         }
     }
 
-    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
-        return error_response(req.request_id, ERR_INTERNAL, &e);
-    }
-    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+    // Phase 4: Replicate.
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key, redo_range) {
         return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
     }
 
@@ -1321,49 +1427,61 @@ fn handle_reassign_batch(
     }
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
-    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
 
+    // Phase 1: Validate ownership and build redo ops from request params.
+    struct ValidReassign<'a> { idx: usize, key: TxKey, item: &'a WireReassignItem }
+    let mut valid_items: Vec<ValidReassign> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
         let key = TxKey { txid: item.txid };
-        match engine.reassign(&ReassignRequest {
+        redo_ops.push(RedoOp::Reassign {
             tx_key: key,
             offset: item.vout,
-            utxo_hash: item.utxo_hash,
-            new_utxo_hash: item.new_utxo_hash,
+            new_hash: item.new_utxo_hash,
+            block_height: params.block_height,
+            spendable_after: params.spendable_after,
+        });
+        valid_items.push(ValidReassign { idx: i, key, item });
+    }
+
+    // Phase 2: WAL-first — write redo before engine mutation.
+    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+        Ok(range) => range,
+        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+    };
+
+    // Phase 3: Apply engine mutations and build repl ops from engine results.
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    for v in &valid_items {
+        match engine.reassign(&ReassignRequest {
+            tx_key: v.key,
+            offset: v.item.vout,
+            utxo_hash: v.item.utxo_hash,
+            new_utxo_hash: v.item.new_utxo_hash,
             block_height: params.block_height,
             spendable_after: params.spendable_after,
         }) {
             Ok(mgen) => {
-                redo_ops.push(RedoOp::Reassign {
-                    tx_key: key,
-                    offset: item.vout,
-                    new_hash: item.new_utxo_hash,
-                    block_height: params.block_height,
-                    spendable_after: params.spendable_after,
-                });
-                repl_ops_by_key.push((key, vec![ReplicaOp::Reassign {
-                    tx_key: key,
-                    offset: item.vout,
-                    new_hash: item.new_utxo_hash,
+                repl_ops_by_key.push((v.key, vec![ReplicaOp::Reassign {
+                    tx_key: v.key,
+                    offset: v.item.vout,
+                    new_hash: v.item.new_utxo_hash,
                     block_height: params.block_height,
                     spendable_after: params.spendable_after,
                     master_generation: mgen,
                 }]));
             }
             Err(err) => {
-                errors.push(spend_error_to_batch_error(i as u32, &err));
+                errors.push(spend_error_to_batch_error(v.idx as u32, &err));
             }
         }
     }
 
-    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
-        return error_response(req.request_id, ERR_INTERNAL, &e);
-    }
-    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+    // Phase 4: Replicate.
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key, redo_range) {
         return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
     }
 
@@ -1390,29 +1508,43 @@ fn handle_set_conflicting_batch(
 
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
-    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
 
+    // Phase 1: Validate ownership and build redo ops from request params.
+    struct ValidSetConflicting { idx: usize, key: TxKey }
+    let mut valid_items: Vec<ValidSetConflicting> = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
         let key = TxKey { txid: *txid };
-        match engine.set_conflicting(&SetConflictingRequest {
+        redo_ops.push(RedoOp::SetConflicting {
             tx_key: key,
+            value,
+            current_block_height: cbh,
+            block_height_retention: bhr,
+        });
+        valid_items.push(ValidSetConflicting { idx: i, key });
+    }
+
+    // Phase 2: WAL-first — write redo before engine mutation.
+    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+        Ok(range) => range,
+        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+    };
+
+    // Phase 3: Apply engine mutations and build repl ops from engine results.
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    for v in &valid_items {
+        match engine.set_conflicting(&SetConflictingRequest {
+            tx_key: v.key,
             value,
             current_block_height: cbh,
             block_height_retention: bhr,
         }) {
             Ok(resp) => {
-                redo_ops.push(RedoOp::SetConflicting {
-                    tx_key: key,
-                    value,
-                    current_block_height: cbh,
-                    block_height_retention: bhr,
-                });
-                repl_ops_by_key.push((key, vec![ReplicaOp::SetConflicting {
-                    tx_key: key,
+                repl_ops_by_key.push((v.key, vec![ReplicaOp::SetConflicting {
+                    tx_key: v.key,
                     value,
                     current_block_height: cbh,
                     retention: bhr,
@@ -1420,15 +1552,13 @@ fn handle_set_conflicting_batch(
                 }]));
             }
             Err(err) => {
-                errors.push(spend_error_to_batch_error(i as u32, &err));
+                errors.push(spend_error_to_batch_error(v.idx as u32, &err));
             }
         }
     }
 
-    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
-        return error_response(req.request_id, ERR_INTERNAL, &e);
-    }
-    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+    // Phase 4: Replicate.
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key, redo_range) {
         return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
     }
 
@@ -1453,36 +1583,48 @@ fn handle_set_locked_batch(
 
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
-    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
 
+    // Phase 1: Validate ownership and build redo ops from request params.
+    struct ValidSetLocked { idx: usize, key: TxKey }
+    let mut valid_items: Vec<ValidSetLocked> = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
         let key = TxKey { txid: *txid };
+        redo_ops.push(RedoOp::SetLocked { tx_key: key, value });
+        valid_items.push(ValidSetLocked { idx: i, key });
+    }
+
+    // Phase 2: WAL-first — write redo before engine mutation.
+    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+        Ok(range) => range,
+        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+    };
+
+    // Phase 3: Apply engine mutations and build repl ops from engine results.
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    for v in &valid_items {
         match engine.set_locked(&SetLockedRequest {
-            tx_key: key,
+            tx_key: v.key,
             value,
         }) {
             Ok(mgen) => {
-                redo_ops.push(RedoOp::SetLocked { tx_key: key, value });
-                repl_ops_by_key.push((key, vec![ReplicaOp::SetLocked {
-                    tx_key: key,
+                repl_ops_by_key.push((v.key, vec![ReplicaOp::SetLocked {
+                    tx_key: v.key,
                     value,
                     master_generation: mgen,
                 }]));
             }
             Err(err) => {
-                errors.push(spend_error_to_batch_error(i as u32, &err));
+                errors.push(spend_error_to_batch_error(v.idx as u32, &err));
             }
         }
     }
 
-    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
-        return error_response(req.request_id, ERR_INTERNAL, &e);
-    }
-    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+    // Phase 4: Replicate.
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key, redo_range) {
         return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
     }
 
@@ -1507,39 +1649,51 @@ fn handle_preserve_until_batch(
 
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
-    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
 
+    // Phase 1: Validate ownership and build redo ops from request params.
+    struct ValidPreserve { idx: usize, key: TxKey }
+    let mut valid_items: Vec<ValidPreserve> = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
         let key = TxKey { txid: *txid };
-        match engine.preserve_until(&PreserveUntilRequest {
+        redo_ops.push(RedoOp::PreserveUntil {
             tx_key: key,
+            block_height: height,
+        });
+        valid_items.push(ValidPreserve { idx: i, key });
+    }
+
+    // Phase 2: WAL-first — write redo before engine mutation.
+    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+        Ok(range) => range,
+        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+    };
+
+    // Phase 3: Apply engine mutations and build repl ops from engine results.
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    for v in &valid_items {
+        match engine.preserve_until(&PreserveUntilRequest {
+            tx_key: v.key,
             block_height: height,
         }) {
             Ok(resp) => {
-                redo_ops.push(RedoOp::PreserveUntil {
-                    tx_key: key,
-                    block_height: height,
-                });
-                repl_ops_by_key.push((key, vec![ReplicaOp::PreserveUntil {
-                    tx_key: key,
+                repl_ops_by_key.push((v.key, vec![ReplicaOp::PreserveUntil {
+                    tx_key: v.key,
                     block_height: height,
                     master_generation: resp.generation,
                 }]));
             }
             Err(err) => {
-                errors.push(spend_error_to_batch_error(i as u32, &err));
+                errors.push(spend_error_to_batch_error(v.idx as u32, &err));
             }
         }
     }
 
-    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
-        return error_response(req.request_id, ERR_INTERNAL, &e);
-    }
-    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+    // Phase 4: Replicate.
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key, redo_range) {
         return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
     }
 
@@ -1562,39 +1716,47 @@ fn handle_delete_batch(
     }
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
-    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
 
+    // Phase 1: Validate ownership, lookup record_offset (read-only), build redo ops.
+    // The lookup doesn't mutate anything so it's safe before the redo write.
+    struct ValidDelete { idx: usize, key: TxKey }
+    let mut valid_items: Vec<ValidDelete> = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
         let key = TxKey { txid: *txid };
-        // Look up the record offset before deletion for the redo log
-        let entry_info = engine.lookup(&key);
-        match engine.delete(&DeleteRequest { tx_key: key }) {
+        let record_offset = engine.lookup(&key).map(|e| e.record_offset).unwrap_or(0);
+        redo_ops.push(RedoOp::Delete {
+            tx_key: key,
+            record_offset,
+            record_size: 0, // Size not tracked in index; use 0
+        });
+        valid_items.push(ValidDelete { idx: i, key });
+    }
+
+    // Phase 2: WAL-first — write redo before engine mutation.
+    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+        Ok(range) => range,
+        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+    };
+
+    // Phase 3: Apply engine mutations and build repl ops.
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    for v in &valid_items {
+        match engine.delete(&DeleteRequest { tx_key: v.key }) {
             Ok(()) => {
-                let (record_offset, record_size) = match entry_info {
-                    Some(e) => (e.record_offset, 0u64), // Size not tracked in index; use 0
-                    None => (0, 0),
-                };
-                redo_ops.push(RedoOp::Delete {
-                    tx_key: key,
-                    record_offset,
-                    record_size,
-                });
-                repl_ops_by_key.push((key, vec![ReplicaOp::Delete { tx_key: key }]));
+                repl_ops_by_key.push((v.key, vec![ReplicaOp::Delete { tx_key: v.key }]));
             }
             Err(err) => {
-                errors.push(spend_error_to_batch_error(i as u32, &err));
+                errors.push(spend_error_to_batch_error(v.idx as u32, &err));
             }
         }
     }
 
-    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
-        return error_response(req.request_id, ERR_INTERNAL, &e);
-    }
-    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+    // Phase 4: Replicate.
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key, redo_range) {
         return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
     }
 
@@ -1921,10 +2083,11 @@ fn handle_preserve_transactions(
         }
     }
 
-    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
-        return error_response(req.request_id, ERR_INTERNAL, &e);
-    }
-    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key) {
+    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+        Ok(range) => range,
+        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+    };
+    if let Err(e) = replicate_all_ops(cluster, repl_ops_by_key, redo_range) {
         return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
     }
 

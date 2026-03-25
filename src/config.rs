@@ -10,6 +10,11 @@ pub struct ServerConfig {
     /// TCP listen address for the binary wire protocol.
     pub listen_addr: String,
 
+    /// Address to advertise to other cluster nodes. If not set, defaults to
+    /// `listen_addr`. Set this when `listen_addr` uses `0.0.0.0` (e.g. in
+    /// Docker containers) so other nodes can reach this node by its actual IP.
+    pub advertise_addr: Option<String>,
+
     /// Device file paths for data storage.
     /// Each path is a file that will be created if it doesn't exist.
     pub device_paths: Vec<PathBuf>,
@@ -105,6 +110,20 @@ pub struct ServerConfig {
     ///
     /// - `"reject"` (default): Fail the mutation with ERR_REPLICATION_FAILED.
     /// - `"best_effort"`: Log the failure but succeed the client request.
+    ///
+    /// # WARNING — DATA LOSS RISK
+    ///
+    /// Setting this to `"best_effort"` means that acknowledged writes can be
+    /// **permanently lost** if the master node crashes before replicas catch up.
+    /// In best-effort mode, the client receives STATUS_OK even when zero
+    /// replicas have confirmed the write. If the master then dies, those writes
+    /// exist only on the dead master's device and are irrecoverable.
+    ///
+    /// Only use `"best_effort"` when availability is more important than
+    /// durability — e.g., for idempotent workloads where the client can
+    /// safely retry, or during planned maintenance windows. For production
+    /// deployments where every acknowledged write must survive a single node
+    /// failure, keep the default `"reject"`.
     pub replication_degraded_mode: String,
 
     // -- Migration performance settings --
@@ -128,6 +147,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:3300".to_string(),
+            advertise_addr: None,
             device_paths: vec![PathBuf::from("teraslab-data.dat")],
             device_size: 1024 * 1024 * 1024, // 1 GiB
             device_alignment: 4096,

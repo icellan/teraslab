@@ -371,6 +371,18 @@ impl TopologyAuthority {
             return None;
         }
 
+        // Skip if the committed membership is already identical.
+        // This prevents redundant proposals when SWIM fires membership
+        // events that don't actually change the member set.
+        {
+            let committed_members = self.committed_members.read().unwrap();
+            if committed_members.len() == members.len()
+                && committed_members.iter().zip(members.iter()).all(|(a, b)| a == b)
+            {
+                return None;
+            }
+        }
+
         // Deterministic proposer: lowest NodeId (members are sorted).
         let proposer = members[0];
         if proposer != self.self_id {
@@ -408,10 +420,31 @@ impl TopologyAuthority {
         let committed = self.committed_term.load(Ordering::Relaxed);
         let voted = self.voted_term.load(Ordering::Relaxed);
 
-        // Validate: term must be strictly higher than anything we've committed or voted for.
-        let accepted = propose.term > committed
+        let valid_digest = propose.digest == TopologyTerm::compute_digest(propose.term, &propose.members);
+
+        // Accept if the term is strictly higher than anything we've seen.
+        let mut accepted = propose.term > committed
             && propose.term > voted
-            && propose.digest == TopologyTerm::compute_digest(propose.term, &propose.members);
+            && valid_digest;
+
+        // Cluster formation recovery: when multiple nodes start simultaneously,
+        // each commits a single-node term independently. A later proposal with
+        // more members that's at or above our term should be accepted so the
+        // cluster can converge. This is safe because the proposer has a larger
+        // member set (which subsumes ours). Only applies when we haven't voted
+        // for anything beyond our committed term (voted <= committed), so it
+        // cannot override a genuine stale-vote rejection.
+        if !accepted && valid_digest && propose.members.len() > 1 {
+            let committed_members = self.committed_members.read().unwrap();
+            let our_cluster_is_single_node = committed_members.len() <= 1;
+            let proposal_subsumes_us = propose.members.contains(&self.self_id);
+            let no_outstanding_vote = voted <= committed;
+            if our_cluster_is_single_node && proposal_subsumes_us
+                && propose.term >= committed && no_outstanding_vote
+            {
+                accepted = true;
+            }
+        }
 
         if accepted {
             // Record vote (must be persisted by caller before sending).
@@ -496,6 +529,16 @@ impl TopologyAuthority {
     pub fn check_timeout(&self, members: &[NodeId]) -> Option<TopologyTerm> {
         if members.is_empty() || members[0] == self.self_id {
             return None; // We are already the deterministic proposer
+        }
+
+        // Skip if the committed membership is already identical.
+        {
+            let committed_members = self.committed_members.read().unwrap();
+            if committed_members.len() == members.len()
+                && committed_members.iter().zip(members.iter()).all(|(a, b)| a == b)
+            {
+                return None;
+            }
         }
 
         let elapsed = self.last_membership_change.lock().unwrap().elapsed();

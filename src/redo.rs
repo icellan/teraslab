@@ -560,6 +560,18 @@ impl RedoLog {
         self.next_sequence
     }
 
+    /// The sequence number of the earliest available entry in the log.
+    ///
+    /// Returns `Ok(Some(seq))` if the log contains at least one entry,
+    /// `Ok(None)` if the log is empty. Used by replication catch-up to
+    /// detect redo log truncation: if the earliest entry is beyond a
+    /// replica's last-acked position, the log has wrapped and the
+    /// replica needs a full resync instead of incremental catch-up.
+    pub fn earliest_sequence(&self) -> Result<Option<u64>> {
+        let all = self.scan_all()?;
+        Ok(all.first().map(|e| e.sequence))
+    }
+
     /// Advance the checkpoint, allowing entries before it to be reclaimed.
     pub fn advance_checkpoint(&mut self, up_to_sequence: u64) -> Result<()> {
         if up_to_sequence > self.checkpoint_seq {

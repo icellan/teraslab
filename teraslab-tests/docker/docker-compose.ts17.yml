@@ -32,7 +32,7 @@ services:
     volumes:
       - ts17-node1-data:/data
       - ts17-blobstore:/blobstore
-      - ./config/ts17-node1.toml:/etc/teraslab/node.toml:ro
+      - /Users/siggioskarsson/gitcheckout/teraslab/teraslab-tests/client/../docker/config/ts17-node1.toml:/etc/teraslab/node.toml:ro
     ports:
       - "13170:3300"
       - "19170:9100"
@@ -46,7 +46,7 @@ services:
     volumes:
       - ts17-node2-data:/data
       - ts17-blobstore:/blobstore
-      - ./config/ts17-node2.toml:/etc/teraslab/node.toml:ro
+      - /Users/siggioskarsson/gitcheckout/teraslab/teraslab-tests/client/../docker/config/ts17-node2.toml:/etc/teraslab/node.toml:ro
     ports:
       - "13171:3300"
       - "19171:9100"
@@ -60,7 +60,7 @@ services:
     volumes:
       - ts17-node3-data:/data
       - ts17-blobstore:/blobstore
-      - ./config/ts17-node3.toml:/etc/teraslab/node.toml:ro
+      - /Users/siggioskarsson/gitcheckout/teraslab/teraslab-tests/client/../docker/config/ts17-node3.toml:/etc/teraslab/node.toml:ro
     ports:
       - "13172:3300"
       - "19172:9100"

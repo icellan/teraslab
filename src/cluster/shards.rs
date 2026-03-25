@@ -131,18 +131,37 @@ impl ShardTable {
     /// the new assignments. Shards whose master changed start in `Copying`;
     /// unchanged shards go directly to `ServingNew`.
     pub fn begin_handoff(&mut self, new_table: &ShardTable) {
+        self.begin_handoff_with(new_table, |_| true);
+    }
+
+    /// Like [`begin_handoff`](Self::begin_handoff), but with a callback that
+    /// indicates whether each shard has data on this node. Empty shards skip
+    /// the Copying state entirely, avoiding handoff stalls on fresh or
+    /// sparsely populated clusters where there is nothing to migrate.
+    pub fn begin_handoff_with(
+        &mut self,
+        new_table: &ShardTable,
+        shard_has_data: impl Fn(u16) -> bool,
+    ) {
         let mut handoff = vec![ShardHandoff::ServingNew; NUM_SHARDS];
         for (shard, h_state) in handoff.iter_mut().enumerate() {
             let old_master = self.assignments[shard].master;
             let new_master = new_table.assignments[shard].master;
-            if old_master != new_master {
+            if old_master != new_master && shard_has_data(shard as u16) {
                 *h_state = ShardHandoff::Copying;
             }
         }
+        let all_serving = handoff.iter().all(|s| *s == ShardHandoff::ServingNew);
         self.prev_assignments = Some(self.assignments.clone());
         self.assignments = new_table.assignments.clone();
         self.handoff_state = Some(handoff);
         self.version = new_table.version;
+
+        // If no shards need copying, clear handoff state immediately.
+        if all_serving {
+            self.prev_assignments = None;
+            self.handoff_state = None;
+        }
     }
 
     /// Commit the handoff for a single shard — it now serves from the
@@ -287,6 +306,20 @@ impl ShardTable {
             *counts.entry(a.master).or_insert(0) += 1;
         }
         counts
+    }
+
+    /// Return all shard numbers where `node` is master or replica in the
+    /// current (target) assignments. Used by orphan cleanup to determine
+    /// which records this node should keep after migrations complete.
+    pub fn shards_owned_by(&self, node: NodeId) -> std::collections::HashSet<u16> {
+        let mut owned = std::collections::HashSet::new();
+        for shard in 0..NUM_SHARDS as u16 {
+            let a = &self.assignments[shard as usize];
+            if a.master == node || a.replicas.contains(&node) {
+                owned.insert(shard);
+            }
+        }
+        owned
     }
 
     /// Compute which shards need to migrate between an old and new table.
@@ -716,5 +749,37 @@ mod tests {
         // Rollback without active handoff is a no-op.
         table.rollback_shard(0);
         assert_eq!(table.assignment(0).master, original_master);
+    }
+
+    #[test]
+    fn shards_owned_by_includes_master_and_replica() {
+        let members = nodes(&[1, 2, 3]);
+        let table = ShardTable::compute_with_epoch(&members, 2, 1);
+
+        let owned1 = table.shards_owned_by(NodeId(1));
+        let owned2 = table.shards_owned_by(NodeId(2));
+        let owned3 = table.shards_owned_by(NodeId(3));
+
+        // With 3 nodes and RF=2, each node owns ~2/3 of all shards
+        // (master for ~1/3, replica for ~1/3).
+        assert!(owned1.len() > 2700 && owned1.len() < 2740);
+        assert!(owned2.len() > 2700 && owned2.len() < 2740);
+        assert!(owned3.len() > 2700 && owned3.len() < 2740);
+
+        // Every shard should be owned by exactly 2 nodes (RF=2).
+        for shard in 0..NUM_SHARDS as u16 {
+            let count = [&owned1, &owned2, &owned3].iter()
+                .filter(|s| s.contains(&shard))
+                .count();
+            assert_eq!(count, 2, "shard {shard} owned by {count} nodes, expected 2");
+        }
+    }
+
+    #[test]
+    fn shards_owned_by_excludes_non_member() {
+        let members = nodes(&[1, 2, 3]);
+        let table = ShardTable::compute_with_epoch(&members, 2, 1);
+        let owned = table.shards_owned_by(NodeId(99));
+        assert!(owned.is_empty());
     }
 }

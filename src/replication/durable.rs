@@ -167,6 +167,29 @@ use crate::replication::manager::ReplicaTransport;
 use crate::replication::protocol::{ReplicaBatch, ReplicaOp};
 use crate::replication::tcp_transport::TcpReplicaTransport;
 
+/// Check whether the redo log has been truncated past a requested sequence.
+///
+/// Returns `Ok(())` if the entries start at or before `requested_seq`,
+/// meaning no gap exists. Returns `Err(msg)` if the earliest available
+/// entry is beyond the requested sequence — the circular redo log has
+/// wrapped and the caller must fall back to a full resync.
+///
+/// Used by both the replication catch-up path and migration delta streaming
+/// to detect log truncation consistently.
+pub fn check_redo_truncation(
+    first_entry_seq: Option<u64>,
+    requested_seq: u64,
+) -> std::result::Result<(), String> {
+    if let Some(first_seq) = first_entry_seq
+        && first_seq > requested_seq
+    {
+        return Err(format!(
+            "redo log truncated: need seq {requested_seq}, earliest available {first_seq}; full resync required"
+        ));
+    }
+    Ok(())
+}
+
 /// Run catch-up replication for a single replica, streaming redo-derived
 /// ops from `from_seq` to the current master sequence.
 ///
@@ -176,16 +199,27 @@ use crate::replication::tcp_transport::TcpReplicaTransport;
 /// The `ops_from_seq` callback should read redo entries starting at the
 /// given sequence and convert them to `ReplicaOp`s. It returns an empty
 /// vec when the entries have been reclaimed (circular redo log wrapped).
+///
+/// The `first_available_seq` callback returns the sequence number of the
+/// earliest available redo entry, or `None` if the log is empty. Used to
+/// detect redo log truncation: if the earliest entry is beyond `from_seq`,
+/// the log has wrapped and a full resync is required instead.
 pub fn run_catchup_for_replica(
     addr: &std::net::SocketAddr,
     from_seq: u64,
     current_seq: u64,
     batch_size: usize,
     ops_from_seq: &dyn Fn(u64) -> Vec<ReplicaOp>,
+    first_available_seq: Option<u64>,
 ) -> std::result::Result<u64, String> {
     if from_seq >= current_seq {
         return Ok(from_seq); // already caught up
     }
+
+    // Detect redo log truncation before attempting to stream.
+    // If the circular redo log has wrapped past `from_seq`, the entries
+    // we need are gone and the replica needs a full resync.
+    check_redo_truncation(first_available_seq, from_seq)?;
 
     let ops = ops_from_seq(from_seq);
     if ops.is_empty() {

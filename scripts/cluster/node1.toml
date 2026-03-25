@@ -1,0 +1,15 @@
+listen_addr          = "0.0.0.0:3300"
+advertise_addr       = "127.0.0.1:3300"
+http_listen_addr     = "0.0.0.0:9100"
+device_paths         = ["/data/teraslab.dat"]
+device_size          = 1073741824
+index_snapshot_path  = "/data/index.snap"
+blobstore_path       = "/blobstore"
+
+node_id              = 1
+swim_port            = 3301
+seed_nodes           = ["127.0.0.1:3311", "127.0.0.1:3321"]
+replication_factor   = 2
+cluster_secret       = "dev-cluster-secret"
+swim_probe_interval_ms = 500
+swim_suspicion_timeout_ms = 15000

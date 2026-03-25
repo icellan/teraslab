@@ -306,6 +306,25 @@ pub fn handle_replica_batch(
 /// not-found records), or `Err(message)` if the operation fails in a
 /// way that should abort the batch.
 pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), String> {
+    // Pre-apply generation guard: reject stale ops BEFORE mutating state.
+    // An op is stale if its master_generation is strictly less than the
+    // record's current generation — a newer mutation has already been applied.
+    // Equal-generation replays are allowed through since all mutation ops
+    // are idempotent and the generation sync at the end is a no-op.
+    // Ops without master_generation (Create, Delete, PruneSlot) skip this
+    // check; they rely on idempotency in their match arms instead.
+    if let Some(master_gen) = op.master_generation() {
+        let tx_key = op.tx_key();
+        if let Ok(meta) = engine.read_metadata(&tx_key) {
+            let local_gen = { meta.generation };
+            if master_gen < local_gen {
+                return Ok(()); // Stale op — already superseded by a newer mutation
+            }
+        }
+        // If read_metadata fails (TxNotFound), the record may not exist yet
+        // or was deleted. Let the match arm handle it gracefully.
+    }
+
     match op {
         ReplicaOp::Spend {
             tx_key,
@@ -542,6 +561,48 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                         .as_millis() as u64)
                 };
 
+            // Extract frozen/conflicting/locked from the wire flags byte
+            // at offset 45 (locked=0x01, conflicting=0x02, frozen=0x04).
+            let (frozen, conflicting, locked) = if metadata_bytes.len() >= 46 {
+                let wire_flags = metadata_bytes[45];
+                (wire_flags & 0x04 != 0, wire_flags & 0x02 != 0, wire_flags & 0x01 != 0)
+            } else {
+                (false, false, false)
+            };
+
+            // Parse extended fields at offset 70+: block_height(4) +
+            // block_count(1) + [block_id(4)+block_height(4)+subtree_idx(4)]*N +
+            // parent_txid_count(2) + parent_txids(32*N).
+            let mut block_height = 0u32;
+            let mut mined_block_infos = Vec::new();
+            let mut parent_txids: Vec<[u8; 32]> = Vec::new();
+            if metadata_bytes.len() >= 75 {
+                let m = metadata_bytes.as_slice();
+                block_height = u32::from_le_bytes(m[70..74].try_into().unwrap());
+                let block_count = m[74] as usize;
+                let mut pos = 75;
+                for _ in 0..block_count {
+                    if pos + 12 > m.len() { break; }
+                    mined_block_infos.push(crate::ops::create::MinedBlockInfo {
+                        block_id: u32::from_le_bytes(m[pos..pos + 4].try_into().unwrap()),
+                        block_height: u32::from_le_bytes(m[pos + 4..pos + 8].try_into().unwrap()),
+                        subtree_idx: u32::from_le_bytes(m[pos + 8..pos + 12].try_into().unwrap()),
+                    });
+                    pos += 12;
+                }
+                if pos + 2 <= m.len() {
+                    let ptx_count = u16::from_le_bytes(m[pos..pos + 2].try_into().unwrap()) as usize;
+                    pos += 2;
+                    for _ in 0..ptx_count {
+                        if pos + 32 > m.len() { break; }
+                        let mut ptx = [0u8; 32];
+                        ptx.copy_from_slice(&m[pos..pos + 32]);
+                        parent_txids.push(ptx);
+                        pos += 32;
+                    }
+                }
+            }
+
             let create_req = CreateRequest {
                 tx_id: tx_key.txid,
                 tx_version,
@@ -557,12 +618,12 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 inpoints: None,
                 is_external: *is_external,
                 created_at,
-                block_height: 0,
-                mined_block_infos: vec![],
-                frozen: false,
-                conflicting: false,
-                locked: false,
-                parent_txids: vec![],
+                block_height,
+                mined_block_infos,
+                frozen,
+                conflicting,
+                locked,
+                parent_txids,
             };
             match engine.create(&create_req) {
                 Ok(_) | Err(CreateError::DuplicateTxId) => {
@@ -638,18 +699,16 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
     // After applying the mutation, sync the record's generation counter
     // to the master's value. The engine auto-increments generation on
     // every mutation, but the replica must use the master's generation
-    // so both sides agree. We only update if the master's generation
-    // is newer (higher), which also guards against stale replays.
+    // so both sides agree. The pre-apply guard above already rejected
+    // stale ops (master_gen <= local_gen), so here we unconditionally
+    // set the generation to the master's value.
     if let Some(master_gen) = op.master_generation() {
         let tx_key = op.tx_key();
         if let Ok(mut meta) = engine.read_metadata(&tx_key)
             && let Some(entry) = engine.lookup(&tx_key)
         {
-            let local_gen = { meta.generation };
-            if master_gen > local_gen {
-                meta.generation = master_gen;
-                let _ = crate::io::write_metadata(engine.device(), entry.record_offset, &meta);
-            }
+            meta.generation = master_gen;
+            let _ = crate::io::write_metadata(engine.device(), entry.record_offset, &meta);
         }
     }
 
@@ -887,5 +946,262 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn apply_stale_spend_skipped() {
+        let engine = make_engine();
+        let k = key(100);
+        create_record(&engine, k, 3);
+
+        // Apply a spend with master_generation=2 to advance the record's gen.
+        let op1 = ReplicaOp::Spend {
+            tx_key: k,
+            offset: 0,
+            spending_data: [0xAA; 36],
+            master_generation: 2,
+        };
+        apply_op(&engine, &op1).unwrap();
+        let cur_gen = { engine.read_metadata(&k).unwrap().generation };
+        assert_eq!(cur_gen, 2);
+
+        // Now send a stale spend (master_gen=1 <= local_gen=2) on slot 1.
+        // The pre-apply guard should skip it entirely.
+        let op2 = ReplicaOp::Spend {
+            tx_key: k,
+            offset: 1,
+            spending_data: [0xBB; 36],
+            master_generation: 1,
+        };
+        apply_op(&engine, &op2).unwrap();
+        // Slot 1 should still be UNSPENT because the stale op was rejected.
+        let slot = engine.read_slot(&k, 1).unwrap();
+        assert_eq!(slot.status, UTXO_UNSPENT);
+    }
+
+    #[test]
+    fn apply_fresh_spend_applies() {
+        let engine = make_engine();
+        let k = key(101);
+        create_record(&engine, k, 3);
+
+        // Fresh op: master_gen=1 > local_gen=0.
+        let op = ReplicaOp::Spend {
+            tx_key: k,
+            offset: 0,
+            spending_data: [0xCC; 36],
+            master_generation: 1,
+        };
+        apply_op(&engine, &op).unwrap();
+
+        let slot = engine.read_slot(&k, 0).unwrap();
+        assert_eq!(slot.status, UTXO_SPENT);
+        let cur_gen = { engine.read_metadata(&k).unwrap().generation };
+        assert_eq!(cur_gen, 1);
+    }
+
+    #[test]
+    fn apply_equal_generation_idempotent() {
+        // Equal-generation replays are allowed through because all ops are
+        // idempotent. The guard only rejects strictly-lower generations.
+        let engine = make_engine();
+        let k = key(102);
+        create_record(&engine, k, 3);
+
+        // Advance to gen=2 with a freeze.
+        let op1 = ReplicaOp::Freeze {
+            tx_key: k,
+            offset: 0,
+            master_generation: 2,
+        };
+        apply_op(&engine, &op1).unwrap();
+        let cur_gen = { engine.read_metadata(&k).unwrap().generation };
+        assert_eq!(cur_gen, 2);
+
+        // Replay the same freeze (master_gen=2 == local_gen=2) — allowed,
+        // handled idempotently by the engine (AlreadyFrozen → Ok(())).
+        apply_op(&engine, &op1).unwrap();
+        let slot = engine.read_slot(&k, 0).unwrap();
+        assert_eq!(slot.status, UTXO_FROZEN);
+    }
+
+    #[test]
+    fn apply_stale_freeze_skipped() {
+        let engine = make_engine();
+        let k = key(103);
+        create_record(&engine, k, 3);
+
+        // Advance to gen=5 via a spend.
+        let op1 = ReplicaOp::Spend {
+            tx_key: k,
+            offset: 0,
+            spending_data: [0xEE; 36],
+            master_generation: 5,
+        };
+        apply_op(&engine, &op1).unwrap();
+
+        // Stale freeze (gen=3 <= 5) on slot 1 should be rejected.
+        let op2 = ReplicaOp::Freeze {
+            tx_key: k,
+            offset: 1,
+            master_generation: 3,
+        };
+        apply_op(&engine, &op2).unwrap();
+        let slot = engine.read_slot(&k, 1).unwrap();
+        assert_eq!(slot.status, UTXO_UNSPENT);
+    }
+
+    /// Build a full metadata buffer matching the extended wire format used by
+    /// the live create path: core(46) + lifecycle(24) + extended fields.
+    fn build_full_metadata(
+        tx_version: u32,
+        is_coinbase: bool,
+        wire_flags: u8,
+        generation: u32,
+        block_height: u32,
+        block_infos: &[(u32, u32, u32)],   // (block_id, block_height, subtree_idx)
+        parent_txids: &[[u8; 32]],
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(128);
+        // Core 46 bytes
+        buf.extend_from_slice(&tx_version.to_le_bytes()); // tx_version
+        buf.extend_from_slice(&0u32.to_le_bytes());       // locktime
+        buf.extend_from_slice(&0u64.to_le_bytes());       // fee
+        buf.extend_from_slice(&0u64.to_le_bytes());       // size_in_bytes
+        buf.extend_from_slice(&0u64.to_le_bytes());       // extended_size
+        buf.push(if is_coinbase { 1 } else { 0 });        // is_coinbase
+        buf.extend_from_slice(&0u32.to_le_bytes());       // spending_height
+        buf.extend_from_slice(&0u64.to_le_bytes());       // created_at
+        buf.push(wire_flags);                              // flags
+        // Lifecycle 24 bytes
+        buf.extend_from_slice(&generation.to_le_bytes());  // generation
+        buf.extend_from_slice(&0u64.to_le_bytes());        // updated_at
+        buf.extend_from_slice(&0u32.to_le_bytes());        // unmined_since
+        buf.extend_from_slice(&0u32.to_le_bytes());        // delete_at_height
+        buf.extend_from_slice(&0u32.to_le_bytes());        // preserve_until
+        // Extended: block_height + block_infos + parent_txids
+        buf.extend_from_slice(&block_height.to_le_bytes());
+        buf.push(block_infos.len() as u8);
+        for (bid, bht, bsi) in block_infos {
+            buf.extend_from_slice(&bid.to_le_bytes());
+            buf.extend_from_slice(&bht.to_le_bytes());
+            buf.extend_from_slice(&bsi.to_le_bytes());
+        }
+        buf.extend_from_slice(&(parent_txids.len() as u16).to_le_bytes());
+        for ptx in parent_txids {
+            buf.extend_from_slice(ptx);
+        }
+        buf
+    }
+
+    #[test]
+    fn create_replication_full_state() {
+        let engine = make_engine();
+        let k = key(110);
+        let hashes = vec![[0xAA; 32]; 3];
+
+        // Build metadata with mined_block_info, frozen flag, and parent_txids.
+        let parent = [0xBBu8; 32];
+        let meta_bytes = build_full_metadata(
+            2,           // tx_version
+            false,       // is_coinbase
+            0x04,        // frozen=0x04
+            5,           // generation
+            1000,        // block_height
+            &[(42, 1000, 7)],  // one block entry
+            &[parent],         // one parent_txid
+        );
+
+        let op = ReplicaOp::Create {
+            tx_key: k,
+            metadata_bytes: meta_bytes,
+            utxo_hashes: hashes,
+            cold_data: None,
+            is_external: false,
+        };
+        apply_op(&engine, &op).unwrap();
+
+        // Verify the record was created.
+        let slot = engine.read_slot(&k, 0).unwrap();
+        // Frozen flag should have been applied via CreateRequest.frozen = true
+        assert_eq!(slot.status, UTXO_FROZEN);
+
+        // Verify lifecycle metadata was applied.
+        let meta = engine.read_metadata(&k).unwrap();
+        let restored_gen = { meta.generation };
+        assert_eq!(restored_gen, 5);
+
+        // Verify block entry was applied.
+        let block_count = { meta.block_entry_count };
+        assert_eq!(block_count, 1);
+        let be_id = { meta.block_entries_inline[0].block_id };
+        assert_eq!(be_id, 42);
+    }
+
+    #[test]
+    fn create_replication_46byte_compat() {
+        // Old-format 46-byte payload should still work with defaults.
+        let engine = make_engine();
+        let k = key(111);
+        let hashes = vec![[0xCC; 32]; 2];
+
+        let mut meta_bytes = Vec::with_capacity(46);
+        meta_bytes.extend_from_slice(&1u32.to_le_bytes()); // tx_version
+        meta_bytes.extend_from_slice(&0u32.to_le_bytes()); // locktime
+        meta_bytes.extend_from_slice(&100u64.to_le_bytes()); // fee
+        meta_bytes.extend_from_slice(&200u64.to_le_bytes()); // size_in_bytes
+        meta_bytes.extend_from_slice(&0u64.to_le_bytes()); // extended_size
+        meta_bytes.push(0); // is_coinbase
+        meta_bytes.extend_from_slice(&0u32.to_le_bytes()); // spending_height
+        meta_bytes.extend_from_slice(&0u64.to_le_bytes()); // created_at
+        meta_bytes.push(0); // flags
+
+        let op = ReplicaOp::Create {
+            tx_key: k,
+            metadata_bytes: meta_bytes,
+            utxo_hashes: hashes,
+            cold_data: None,
+            is_external: false,
+        };
+        apply_op(&engine, &op).unwrap();
+
+        let slot = engine.read_slot(&k, 0).unwrap();
+        assert_eq!(slot.status, UTXO_UNSPENT);
+        let meta = engine.read_metadata(&k).unwrap();
+        let block_count = { meta.block_entry_count };
+        assert_eq!(block_count, 0); // No block entries in 46-byte format
+    }
+
+    #[test]
+    fn create_replication_lifecycle_fields() {
+        let engine = make_engine();
+        let k = key(112);
+        let hashes = vec![[0xDD; 32]; 1];
+
+        let mut meta_bytes = build_full_metadata(
+            1, false, 0, 10, 0, &[], &[],
+        );
+        // Patch lifecycle fields: set delete_at_height=500 and preserve_until=700
+        // Offsets: generation(46-49), updated_at(50-57), unmined_since(58-61),
+        //          delete_at_height(62-65), preserve_until(66-69)
+        meta_bytes[62..66].copy_from_slice(&500u32.to_le_bytes());
+        meta_bytes[66..70].copy_from_slice(&700u32.to_le_bytes());
+
+        let op = ReplicaOp::Create {
+            tx_key: k,
+            metadata_bytes: meta_bytes,
+            utxo_hashes: hashes,
+            cold_data: None,
+            is_external: false,
+        };
+        apply_op(&engine, &op).unwrap();
+
+        let meta = engine.read_metadata(&k).unwrap();
+        let restored_gen = { meta.generation };
+        let restored_dah = { meta.delete_at_height };
+        let restored_pu = { meta.preserve_until };
+        assert_eq!(restored_gen, 10);
+        assert_eq!(restored_dah, 500);
+        assert_eq!(restored_pu, 700);
     }
 }

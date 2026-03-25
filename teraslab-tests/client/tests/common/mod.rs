@@ -91,6 +91,7 @@ pub async fn wait_cluster_ready(docker: &DockerHelpers, node_count: u32, timeout
     let start = std::time::Instant::now();
     loop {
         let mut ready = 0u32;
+        let mut versions: Vec<u64> = Vec::new();
         for i in 1..=node_count {
             let port = docker.http_port(i);
             let url = format!("http://127.0.0.1:{port}/status");
@@ -99,17 +100,26 @@ pub async fn wait_cluster_ready(docker: &DockerHelpers, node_count: u32, timeout
                     if let Some(size) = json["cluster_size"].as_u64() {
                         if size == node_count as u64 {
                             ready += 1;
+                            if let Some(v) = json["shard_table_version"].as_u64() {
+                                versions.push(v);
+                            }
                         }
                     }
                 }
             }
         }
-        if ready == node_count {
+        // All nodes must report correct cluster size AND agree on the
+        // shard table version (topology term). This ensures the cluster
+        // has fully converged before tests begin.
+        if ready == node_count
+            && versions.len() == node_count as usize
+            && versions.iter().all(|&v| v > 0 && v == versions[0])
+        {
             return Ok(());
         }
         if start.elapsed() >= timeout {
             return Err(ClientError::Connection(
-                format!("{ready}/{node_count} nodes ready after {timeout:?}"),
+                format!("{ready}/{node_count} nodes ready (versions: {versions:?}) after {timeout:?}"),
             ));
         }
         tokio::time::sleep(Duration::from_millis(500)).await;

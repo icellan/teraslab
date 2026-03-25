@@ -12,10 +12,11 @@ ARG CACHE_BUST=1
 # Copy everything needed for compilation.
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+COPY ui/ ui/
 COPY benches/ benches/
 COPY tests/ tests/
 
-RUN cargo build --release --bin teraslab-server
+RUN cargo build --release --bin teraslab-server --bin teraslab-cli
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -28,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/teraslab-server /usr/local/bin/teraslab-server
+COPY --from=builder /build/target/release/teraslab-cli /usr/local/bin/teraslab-cli
 RUN mkdir -p /etc/teraslab /data /blobstore
 
 VOLUME ["/data", "/blobstore"]

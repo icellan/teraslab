@@ -27,6 +27,17 @@ use teraslab::server::http::{HttpState, start_http_server};
 use teraslab::server::Server;
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
 
+/// Detect the first non-loopback IPv4 address on this host.
+/// Used when `listen_addr` is `0.0.0.0` and no `advertise_addr` is configured,
+/// so the node can advertise a reachable IP to cluster peers.
+fn detect_local_ip() -> Option<std::net::IpAddr> {
+    // Connect a UDP socket to a public IP to discover our default route address.
+    // No traffic is sent — this just causes the OS to select the outgoing interface.
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:53").ok()?;
+    socket.local_addr().ok().map(|a| a.ip())
+}
+
 /// Global metrics counters for the server binary.
 static SERVER_METRICS: ThreadMetrics = ThreadMetrics::new();
 
@@ -178,14 +189,6 @@ fn main() {
         }
     }
 
-    // Initialize replication sequence from the redo log so replica
-    // sequence numbers are contiguous with the durable commit log.
-    if let Some(ref log) = redo_log {
-        let seq = log.current_sequence();
-        teraslab::server::dispatch::init_replication_sequence(seq);
-        eprintln!("  replication: sequence initialized at {seq}");
-    }
-
     // Wrap redo log in Arc<Mutex> for shared access from dispatch threads
     let redo_log: Option<Arc<Mutex<RedoLog>>> = redo_log.map(|log| Arc::new(Mutex::new(log)));
 
@@ -214,14 +217,29 @@ fn main() {
         use teraslab::cluster::coordinator::{ClusterConfig, ClusterCoordinator};
         use teraslab::cluster::shards::NodeId;
 
-        let self_addr: std::net::SocketAddr = config.listen_addr.parse()
+        let bind_addr: std::net::SocketAddr = config.listen_addr.parse()
             .expect("invalid listen_addr");
-        // Use the same IP as listen_addr for SWIM bind so the advertised
-        // SWIM address is reachable from other nodes (important in Docker).
+        // Determine the address to advertise to other nodes.
+        // If advertise_addr is set, use it. Otherwise, if listen_addr uses
+        // 0.0.0.0 (common in Docker), auto-detect a non-loopback IP.
+        let self_addr: std::net::SocketAddr = if let Some(ref adv) = config.advertise_addr {
+            adv.parse().expect("invalid advertise_addr")
+        } else if bind_addr.ip().is_unspecified() {
+            let ip = detect_local_ip().unwrap_or(bind_addr.ip());
+            std::net::SocketAddr::new(ip, bind_addr.port())
+        } else {
+            bind_addr
+        };
         let swim_bind: std::net::SocketAddr =
-            format!("{}:{}", self_addr.ip(), config.swim_port).parse().unwrap();
+            format!("{}:{}", bind_addr.ip(), config.swim_port).parse().unwrap();
         let seed_addrs: Vec<std::net::SocketAddr> = config.seed_nodes.iter()
-            .filter_map(|s| s.parse().ok())
+            .filter_map(|s| {
+                // Try direct parse first (IP:port), then fall back to DNS resolution.
+                s.parse().ok().or_else(|| {
+                    use std::net::ToSocketAddrs;
+                    s.to_socket_addrs().ok().and_then(|mut addrs| addrs.next())
+                })
+            })
             .collect();
 
         let probe_interval = std::time::Duration::from_millis(config.swim_probe_interval_ms);
@@ -264,9 +282,10 @@ fn main() {
             config.resolved_ack_policy(),
             config.is_replication_best_effort(),
         );
-        // Restore inbound migration state from a previous run so shards
-        // that were mid-migration remain blocked until re-migration.
+        // Restore migration state from a previous run so shards that were
+        // mid-migration remain blocked (inbound) or tracked (outbound).
         running.restore_inbound_state();
+        running.restore_outbound_state();
         // Initialize persistent ACK tracker alongside the cluster state file.
         let ack_path = {
             let mut p = config.resolved_cluster_state_path().into_os_string();
@@ -302,6 +321,14 @@ fn main() {
                     let redo_ref = redo_for_catchup.clone();
                     let eng_ref = engine_for_catchup.clone();
 
+                    // Determine the earliest available redo sequence for
+                    // truncation detection. If the redo log has wrapped past
+                    // the replica's last-acked position, catch-up is impossible
+                    // and the replica needs a full resync.
+                    let first_avail_seq = redo_ref.as_ref().and_then(|rl| {
+                        rl.lock().earliest_sequence().ok().flatten()
+                    });
+
                     let result = teraslab::replication::durable::run_catchup_for_replica(
                         addr,
                         last_acked + 1,
@@ -327,6 +354,7 @@ fn main() {
                                 })
                                 .collect()
                         },
+                        first_avail_seq,
                     );
 
                     match result {

@@ -3,8 +3,13 @@ name = "teraslab-client"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "teraslab-loadgen"
+path = "src/bin/loadgen.rs"
+
 [dependencies]
 teraslab = { path = "../.." }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "io-util", "sync"] }
 parking_lot = "0.12"
 thiserror = "2"
+clap = { version = "4", features = ["derive"] }

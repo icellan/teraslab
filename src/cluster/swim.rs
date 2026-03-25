@@ -154,6 +154,23 @@ impl SwimRunner {
         socket
             .set_nonblocking(true)
             .map_err(|e| format!("set_nonblocking: {e}"))?;
+        // Increase receive buffer to avoid dropping ACKs when many
+        // self-looped or gossip packets arrive simultaneously.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = socket.as_raw_fd();
+            let size: libc::c_int = 1024 * 1024; // 1 MiB
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &size as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
 
         eprintln!("SWIM listening on {}", self.config.bind_addr);
 
@@ -292,6 +309,11 @@ impl SwimRunner {
         let sender_id = NodeId(u64::from_le_bytes(data[1..9].try_into().unwrap()));
         let sender_incarnation = u64::from_le_bytes(data[9..17].try_into().unwrap());
         let addr_len = u16::from_le_bytes(data[17..19].try_into().unwrap()) as usize;
+
+        // Ignore our own messages (UDP loopback on Docker bridge networks).
+        if sender_id == self.config.self_id {
+            return vec![];
+        }
 
         if data.len() < 19 + addr_len {
             return vec![];

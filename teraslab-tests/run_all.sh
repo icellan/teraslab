@@ -32,34 +32,26 @@ if [ -n "$SINGLE" ]; then
     SCENARIOS=("$SINGLE")
 fi
 
-# Scenario names for logging
-declare -A NAMES=(
-    [01]="Cluster Formation"
-    [02]="Basic Operations"
-    [03]="Replication Correctness"
-    [04]="Node Hard Kill"
-    [05]="Node Recovery"
-    [06]="Scale Up"
-    [07]="Scale Down"
-    [08]="Network Partitions"
-    [09]="Rolling Restart"
-    [10]="Sustained Load"
-    [11]="Large Transactions"
-    [12]="Concurrent Failures"
-    [13]="Migration Under Load"
-    [14]="Split-Brain Prevention"
-    [15]="Crash Recovery"
-    [16]="CHAOS"
-    [17]="Failure Recovery Hardening"
-)
-
-# Timeouts per scenario (seconds)
-declare -A TIMEOUTS=(
-    [01]=120 [02]=300 [03]=300 [04]=300 [05]=300
-    [06]=300 [07]=300 [08]=600 [09]=300 [10]=900
-    [11]=300 [12]=300 [13]=300 [14]=300 [15]=600
-    [16]=2400 [17]=600
-)
+# Scenario name and timeout lookup (avoids bash octal issues with 08/09 keys).
+scenario_name() {
+    case "$1" in
+        01) echo "Cluster Formation" ;;      02) echo "Basic Operations" ;;
+        03) echo "Replication Correctness" ;; 04) echo "Node Hard Kill" ;;
+        05) echo "Node Recovery" ;;           06) echo "Scale Up" ;;
+        07) echo "Scale Down" ;;              08) echo "Network Partitions" ;;
+        09) echo "Rolling Restart" ;;         10) echo "Sustained Load" ;;
+        11) echo "Large Transactions" ;;      12) echo "Concurrent Failures" ;;
+        13) echo "Migration Under Load" ;;    14) echo "Split-Brain Prevention" ;;
+        15) echo "Crash Recovery" ;;          16) echo "CHAOS" ;;
+        17) echo "Failure Recovery Hardening" ;; *) echo "Scenario $1" ;;
+    esac
+}
+scenario_timeout() {
+    case "$1" in
+        01) echo 120 ;;  10) echo 900 ;;  08|15) echo 600 ;;
+        16) echo 2400 ;; 17) echo 600 ;;  *) echo 300 ;;
+    esac
+}
 
 echo "============================================"
 echo "TeraSlab Docker Cluster Test Suite"
@@ -70,7 +62,8 @@ echo "============================================"
 # Build Docker image
 echo ""
 echo "Building Docker image..."
-docker build -t teraslab:test -f docker/Dockerfile ../.. 2>&1 | tail -5
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+docker build -t teraslab:test -f "$SCRIPT_DIR/docker/Dockerfile" "$PROJECT_ROOT" 2>&1 | tail -5
 
 # Build test client
 echo ""
@@ -81,8 +74,8 @@ PASS=0
 FAIL=0
 
 for NUM in "${SCENARIOS[@]}"; do
-    NAME="${NAMES[$NUM]:-Scenario $NUM}"
-    TIMEOUT="${TIMEOUTS[$NUM]:-300}"
+    NAME="$(scenario_name "$NUM")"
+    TIMEOUT="$(scenario_timeout "$NUM")"
     TEST="scenario_${NUM}_*"
 
     echo ""
@@ -95,7 +88,9 @@ for NUM in "${SCENARIOS[@]}"; do
         continue
     fi
 
-    if timeout "$TIMEOUT" cargo test --manifest-path client/Cargo.toml \
+    TIMEOUT_CMD="timeout"
+    command -v timeout >/dev/null 2>&1 || TIMEOUT_CMD="gtimeout"
+    if $TIMEOUT_CMD "$TIMEOUT" cargo test --manifest-path client/Cargo.toml \
         --release --test "$TEST_NAME" -- --nocapture > "$RESULTS_DIR/${TEST_NAME}.log" 2>&1; then
         echo "  PASS"
         PASS=$((PASS + 1))
