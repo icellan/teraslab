@@ -67,78 +67,93 @@ impl std::fmt::Debug for TxKey {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TxIndexEntry {
     /// Which device this record lives on (for multi-device setups).
-    pub device_id: u16,
+    pub device_id: u8,
     /// Byte offset on that device to the start of TxMetadata.
     pub record_offset: u64,
     /// Number of UTXO slots in this record.
     pub utxo_count: u32,
-    /// Byte offset to inline cold data (0 if none/external).
-    pub cold_offset: u64,
-    /// Size of inline cold data in bytes (0 if none/external).
-    pub cold_size: u32,
-    /// Bit flags (has_external_ref, etc.).
-    pub flags: u8,
+    /// Number of entries in the block (cached from metadata).
+    pub block_entry_count: u8,
+    /// Transaction-level flags (cached from metadata).
+    pub tx_flags: u8,
+    /// Number of spent UTXOs (cached from TxMetadata).
+    pub spent_utxos: u32,
+    /// Delete-at-height or preserve-until value (discriminated by HAS_PRESERVE_UNTIL bit in tx_flags).
+    pub dah_or_preserve: u32,
+    /// Unmined-since timestamp (cached from TxMetadata).
+    pub unmined_since: u32,
+    /// Generation counter (cached from TxMetadata).
+    pub generation: u32,
 }
 
 // ---------------------------------------------------------------------------
 // Bucket
 // ---------------------------------------------------------------------------
 
-const BUCKET_EMPTY: u8 = 0;
-const BUCKET_OCCUPIED: u8 = 1;
-#[allow(dead_code)]
-const BUCKET_TOMBSTONE: u8 = 2;
+/// Sentinel value for `probe_distance` indicating an empty bucket.
+/// Valid probe distances are 0–254; 0xFF means the bucket is empty.
+const BUCKET_EMPTY_SENTINEL: u8 = 0xFF;
 
-/// Entry size: 1 + 2 + 32 + 8 + 2 + 8 + 4 + 8 + 4 + 1 = 70, pad to 8-byte boundary.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Bucket {
-    occupied: u8,
-    probe_distance: u16,
-    txid: [u8; 32],
-    fingerprint: u64,
-    device_id: u16,
-    record_offset: u64,
-    utxo_count: u32,
-    cold_offset: u64,
-    cold_size: u32,
-    flags: u8,
-    _pad: [u8; BUCKET_PAD],
+/// Maximum storable probe distance.  Any entry whose true Robin Hood
+/// displacement exceeds this is stored with probe_distance = 254.
+/// This disables Robin Hood early-termination for those (rare) entries.
+const MAX_STORED_PROBE: u16 = (BUCKET_EMPTY_SENTINEL - 1) as u16;
+
+/// Cap a probe distance for storage in a bucket's `probe_distance` field.
+#[inline(always)]
+fn cap_probe(dist: u16) -> u8 {
+    dist.min(MAX_STORED_PROBE) as u8
 }
 
-const BUCKET_RAW_SIZE: usize = 1 + 2 + 32 + 8 + 2 + 8 + 4 + 8 + 4 + 1;
-const BUCKET_PAD: usize = if BUCKET_RAW_SIZE.is_multiple_of(8) {
-    0
-} else {
-    8 - (BUCKET_RAW_SIZE % 8)
-};
+/// One bucket in the Robin Hood hash table: exactly 64 bytes (one cache line).
+///
+/// The `probe_distance` field serves double duty: values 0–254 indicate an
+/// occupied bucket whose Robin Hood probe distance is that value; the value
+/// 0xFF ([`BUCKET_EMPTY_SENTINEL`]) means the bucket is empty.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct Bucket {
+    probe_distance: u8,
+    txid: [u8; 32],
+    device_id: u8,
+    record_offset: u64,
+    utxo_count: u32,
+    block_entry_count: u8,
+    tx_flags: u8,
+    spent_utxos: u32,
+    dah_or_preserve: u32,
+    unmined_since: u32,
+    generation: u32,
+}
 
 /// Actual size of one bucket in bytes.
 pub const BUCKET_SIZE: usize = std::mem::size_of::<Bucket>();
 
+const _: () = assert!(BUCKET_SIZE == 64, "Bucket must be exactly 64 bytes (1 cache line)");
+
 impl Bucket {
     fn empty() -> Self {
         Self {
-            occupied: BUCKET_EMPTY,
-            probe_distance: 0,
+            probe_distance: BUCKET_EMPTY_SENTINEL,
             txid: [0; 32],
-            fingerprint: 0,
             device_id: 0,
             record_offset: 0,
             utxo_count: 0,
-            cold_offset: 0,
-            cold_size: 0,
-            flags: 0,
-            _pad: [0; BUCKET_PAD],
+            block_entry_count: 0,
+            tx_flags: 0,
+            spent_utxos: 0,
+            dah_or_preserve: 0,
+            unmined_since: 0,
+            generation: 0,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.occupied == BUCKET_EMPTY
+        self.probe_distance == BUCKET_EMPTY_SENTINEL
     }
 
     fn is_occupied(&self) -> bool {
-        self.occupied == BUCKET_OCCUPIED
+        self.probe_distance != BUCKET_EMPTY_SENTINEL
     }
 
     fn entry(&self) -> TxIndexEntry {
@@ -146,23 +161,27 @@ impl Bucket {
             device_id: self.device_id,
             record_offset: self.record_offset,
             utxo_count: self.utxo_count,
-            cold_offset: self.cold_offset,
-            cold_size: self.cold_size,
-            flags: self.flags,
+            block_entry_count: self.block_entry_count,
+            tx_flags: self.tx_flags,
+            spent_utxos: self.spent_utxos,
+            dah_or_preserve: self.dah_or_preserve,
+            unmined_since: self.unmined_since,
+            generation: self.generation,
         }
     }
 
-    fn set_entry(&mut self, key: &TxKey, entry: &TxIndexEntry, probe_dist: u16) {
-        self.occupied = BUCKET_OCCUPIED;
+    fn set_entry(&mut self, key: &TxKey, entry: &TxIndexEntry, probe_dist: u8) {
         self.probe_distance = probe_dist;
         self.txid = key.txid;
-        self.fingerprint = fingerprint(key);
         self.device_id = entry.device_id;
         self.record_offset = entry.record_offset;
         self.utxo_count = entry.utxo_count;
-        self.cold_offset = entry.cold_offset;
-        self.cold_size = entry.cold_size;
-        self.flags = entry.flags;
+        self.block_entry_count = entry.block_entry_count;
+        self.tx_flags = entry.tx_flags;
+        self.spent_utxos = entry.spent_utxos;
+        self.dah_or_preserve = entry.dah_or_preserve;
+        self.unmined_since = entry.unmined_since;
+        self.generation = entry.generation;
     }
 }
 
@@ -176,9 +195,11 @@ fn bucket_index(key: &TxKey, mask: usize) -> usize {
     (h as usize) & mask
 }
 
-/// Compute the fingerprint from a TxKey. Uses bytes 8–16 of txid.
-fn fingerprint(key: &TxKey) -> u64 {
-    u64::from_le_bytes(key.txid[8..16].try_into().unwrap())
+/// Derive the fingerprint from a txid. Uses bytes 8–15 (same region that
+/// was previously stored redundantly in each bucket).
+#[inline(always)]
+fn txid_fingerprint(txid: &[u8; 32]) -> u64 {
+    u64::from_le_bytes(txid[8..16].try_into().unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +263,6 @@ fn alloc_mmap_buckets(
         )));
     }
 
-    // MAP_ANONYMOUS returns zeroed memory, so all buckets start as BUCKET_EMPTY.
     Ok((ptr.cast::<Bucket>(), byte_len, false))
 }
 
@@ -312,6 +332,17 @@ impl HashTable {
     pub fn new(initial_capacity: usize) -> Result<Self> {
         let capacity = initial_capacity.next_power_of_two().max(16);
         let (ptr, mmap_len, hugepage) = alloc_mmap_buckets(capacity)?;
+
+        // mmap returns zeroed memory, but our empty sentinel is 0xFF (not 0x00).
+        // Initialize every bucket's probe_distance byte to BUCKET_EMPTY_SENTINEL.
+        // Safety: ptr is valid for `capacity` buckets.
+        unsafe {
+            // Set the entire region to 0xFF first (making all bytes 0xFF),
+            // then we're done: probe_distance = 0xFF means empty, and the
+            // remaining fields will be overwritten on insert anyway.
+            std::ptr::write_bytes(ptr as *mut u8, BUCKET_EMPTY_SENTINEL, mmap_len);
+        }
+
         Ok(Self {
             ptr,
             capacity,
@@ -341,7 +372,7 @@ impl HashTable {
 
     /// Look up a transaction by key, returning the entry by value. O(1) expected.
     pub fn get_entry(&self, key: &TxKey) -> Option<TxIndexEntry> {
-        let fp = fingerprint(key);
+        let fp = txid_fingerprint(&key.txid);
         let mut idx = bucket_index(key, self.mask);
         let mut dist: u16 = 0;
 
@@ -351,11 +382,14 @@ impl HashTable {
                 return None;
             }
             if bucket.is_occupied() {
-                if dist > bucket.probe_distance {
-                    // Robin Hood invariant: the key cannot be further.
+                // Robin Hood early termination is only safe when the stored
+                // probe_distance is not capped (< MAX_STORED_PROBE).
+                if (bucket.probe_distance as u16) < MAX_STORED_PROBE
+                    && dist > bucket.probe_distance as u16
+                {
                     return None;
                 }
-                if bucket.fingerprint == fp && bucket.txid == key.txid {
+                if txid_fingerprint(&bucket.txid) == fp && bucket.txid == key.txid {
                     return Some(bucket.entry());
                 }
             }
@@ -374,7 +408,7 @@ impl HashTable {
         entry: TxIndexEntry,
     ) -> Result<Option<TxIndexEntry>> {
         // Check for update of existing key first.
-        let fp = fingerprint(&key);
+        let fp = txid_fingerprint(&key.txid);
         {
             let mut idx = bucket_index(&key, self.mask);
             let mut dist: u16 = 0;
@@ -384,12 +418,14 @@ impl HashTable {
                     break;
                 }
                 if bucket.is_occupied() {
-                    if dist > bucket.probe_distance {
+                    if (bucket.probe_distance as u16) < MAX_STORED_PROBE
+                        && dist > bucket.probe_distance as u16
+                    {
                         break;
                     }
-                    if bucket.fingerprint == fp && bucket.txid == key.txid {
+                    if txid_fingerprint(&bucket.txid) == fp && bucket.txid == key.txid {
                         let old = bucket.entry();
-                        self.bucket_mut(idx).set_entry(&key, &entry, dist);
+                        self.bucket_mut(idx).set_entry(&key, &entry, cap_probe(dist));
                         return Ok(Some(old));
                     }
                 }
@@ -411,7 +447,7 @@ impl HashTable {
             let bucket = self.bucket(idx);
             if bucket.is_empty() {
                 self.bucket_mut(idx)
-                    .set_entry(&cur_key, &cur_entry, dist);
+                    .set_entry(&cur_key, &cur_entry, cap_probe(dist));
                 self.count += 1;
                 if dist as usize > self.max_probe {
                     self.max_probe = dist as usize;
@@ -420,15 +456,15 @@ impl HashTable {
             }
 
             // Robin Hood: if our displacement is greater, swap.
-            if bucket.is_occupied() && dist > bucket.probe_distance {
+            if bucket.is_occupied() && dist > bucket.probe_distance as u16 {
                 let displaced_key = TxKey {
                     txid: bucket.txid,
                 };
                 let displaced_entry = bucket.entry();
-                let displaced_dist = bucket.probe_distance;
+                let displaced_dist: u16 = bucket.probe_distance as u16;
 
                 self.bucket_mut(idx)
-                    .set_entry(&cur_key, &cur_entry, dist);
+                    .set_entry(&cur_key, &cur_entry, cap_probe(dist));
 
                 cur_key = displaced_key;
                 cur_entry = displaced_entry;
@@ -451,7 +487,7 @@ impl HashTable {
     ///
     /// Uses backward-shift deletion for better probe-chain performance.
     pub fn remove(&mut self, key: &TxKey) -> Option<TxIndexEntry> {
-        let fp = fingerprint(key);
+        let fp = txid_fingerprint(&key.txid);
         let mut idx = bucket_index(key, self.mask);
         let mut dist: u16 = 0;
 
@@ -462,10 +498,12 @@ impl HashTable {
                 return None;
             }
             if bucket.is_occupied() {
-                if dist > bucket.probe_distance {
+                if (bucket.probe_distance as u16) < MAX_STORED_PROBE
+                    && dist > bucket.probe_distance as u16
+                {
                     return None;
                 }
-                if bucket.fingerprint == fp && bucket.txid == key.txid {
+                if txid_fingerprint(&bucket.txid) == fp && bucket.txid == key.txid {
                     break; // Found at idx
                 }
             }
@@ -493,7 +531,11 @@ impl HashTable {
             let shifted = *self.bucket(next_idx);
             let b = self.bucket_mut(empty_idx);
             *b = shifted;
-            b.probe_distance -= 1;
+            // Only decrement if probe_distance is below the cap; capped entries
+            // may still have true distance > MAX_STORED_PROBE after the shift.
+            if b.probe_distance < MAX_STORED_PROBE as u8 {
+                b.probe_distance -= 1;
+            }
             empty_idx = next_idx;
         }
         *self.bucket_mut(empty_idx) = Bucket::empty();
@@ -534,6 +576,55 @@ impl HashTable {
     /// Whether hugepages are backing this table.
     pub fn hugepage_enabled(&self) -> bool {
         self.hugepage
+    }
+
+    /// Update the cached fields for an existing entry.
+    ///
+    /// Returns `true` if the entry was found and updated, `false` if not found.
+    /// This is a targeted update — only the specified fields are written,
+    /// the rest of the bucket is untouched.
+    pub fn update_cached_fields(
+        &mut self,
+        key: &TxKey,
+        tx_flags: u8,
+        block_entry_count: u8,
+        spent_utxos: u32,
+        dah_or_preserve: u32,
+        unmined_since: u32,
+        generation: u32,
+    ) -> bool {
+        let fp = txid_fingerprint(&key.txid);
+        let mut idx = bucket_index(key, self.mask);
+        let mut dist: u16 = 0;
+
+        loop {
+            let bucket = self.bucket(idx);
+            if bucket.is_empty() {
+                return false;
+            }
+            if bucket.is_occupied() {
+                if (bucket.probe_distance as u16) < MAX_STORED_PROBE
+                    && dist > bucket.probe_distance as u16
+                {
+                    return false;
+                }
+                if txid_fingerprint(&bucket.txid) == fp && bucket.txid == key.txid {
+                    let b = self.bucket_mut(idx);
+                    b.tx_flags = tx_flags;
+                    b.block_entry_count = block_entry_count;
+                    b.spent_utxos = spent_utxos;
+                    b.dah_or_preserve = dah_or_preserve;
+                    b.unmined_since = unmined_since;
+                    b.generation = generation;
+                    return true;
+                }
+            }
+            idx = (idx + 1) & self.mask;
+            dist += 1;
+            if dist as usize >= self.capacity {
+                return false;
+            }
+        }
     }
 
     /// Resize the table to at least `new_capacity` buckets.
@@ -627,9 +718,12 @@ mod tests {
             device_id: 0,
             record_offset: offset,
             utxo_count: 10,
-            cold_offset: 0,
-            cold_size: 0,
-            flags: 0,
+            block_entry_count: 0,
+            tx_flags: 0,
+            spent_utxos: 0,
+            dah_or_preserve: 0,
+            unmined_since: 0,
+            generation: 0,
         }
     }
 
@@ -751,7 +845,7 @@ mod tests {
             bucket_index(&k2, 1023),
             "keys should collide"
         );
-        assert_ne!(fingerprint(&k1), fingerprint(&k2));
+        assert_ne!(txid_fingerprint(&k1.txid), txid_fingerprint(&k2.txid));
 
         let e1 = make_entry(1000);
         let e2 = make_entry(2000);

@@ -519,6 +519,23 @@ impl FieldMask {
     pub fn has(self, flag: u32) -> bool {
         self.0 & flag != 0
     }
+
+    /// Bitmask of fields that can be served entirely from the primary index
+    /// cache without reading metadata from device memory.
+    pub const INDEX_CACHED: u32 =
+        Self::FLAGS
+        | Self::SPENT_UTXOS
+        | Self::UTXO_COUNT
+        | Self::UNMINED_SINCE
+        | Self::DELETE_AT_HEIGHT
+        | Self::PRESERVE_UNTIL
+        | Self::BLOCK_ENTRY_COUNT;
+
+    /// Returns `true` if ALL requested fields can be served from the index
+    /// cache, meaning no device metadata read is needed.
+    pub fn fully_cached(self) -> bool {
+        self.0 != 0 && (self.0 & !Self::INDEX_CACHED) == 0
+    }
 }
 
 /// Encode a GetBatch request payload.

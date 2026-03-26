@@ -60,7 +60,7 @@ const UNMINED_SECTION_MAGIC: [u8; 4] = *b"UNMI";
 const SECONDARY_VERSION: u32 = 1;
 
 // Per-entry sizes in the snapshot file
-const PRIMARY_ENTRY_SIZE: usize = 32 + 2 + 8 + 4 + 8 + 4 + 1; // TxKey + TxIndexEntry = 59
+const PRIMARY_ENTRY_SIZE: usize = 32 + 1 + 8 + 4 + 1 + 1 + 4 + 4 + 4 + 4; // TxKey + TxIndexEntry = 63
 const SECONDARY_ENTRY_SIZE: usize = 4 + 32; // height + txid = 36
 
 // ---------------------------------------------------------------------------
@@ -140,6 +140,22 @@ impl Index {
     /// Remove a transaction from the index (on deletion/pruning).
     pub fn unregister(&mut self, key: &TxKey) -> Option<TxIndexEntry> {
         self.table.remove(key)
+    }
+
+    /// Update the cached fields in the bucket for `key`.
+    /// Returns `true` if the key was found and updated.
+    pub fn update_cached_fields(
+        &mut self,
+        key: &TxKey,
+        tx_flags: u8,
+        block_entry_count: u8,
+        spent_utxos: u32,
+        dah_or_preserve: u32,
+        unmined_since: u32,
+        generation: u32,
+    ) -> bool {
+        self.table
+            .update_cached_fields(key, tx_flags, block_entry_count, spent_utxos, dah_or_preserve, unmined_since, generation)
     }
 
     /// Number of entries in the primary index.
@@ -319,9 +335,12 @@ impl Index {
                 device_id: 0,
                 record_offset: offset,
                 utxo_count: { meta.utxo_count },
-                cold_offset: 0,
-                cold_size: 0,
-                flags: meta.flags.bits(),
+                block_entry_count: meta.block_entry_count,
+                tx_flags: meta.flags.bits(),
+                spent_utxos: meta.spent_utxos,
+                dah_or_preserve: 0,
+                unmined_since: 0,
+                generation: 0,
             };
             index.register(key, entry)?;
 
@@ -406,12 +425,15 @@ impl Index {
 
         for (key, entry) in self.table.iter() {
             buf.extend_from_slice(&key.txid);
-            buf.extend_from_slice(&entry.device_id.to_le_bytes());
+            buf.push(entry.device_id);
             buf.extend_from_slice(&entry.record_offset.to_le_bytes());
             buf.extend_from_slice(&entry.utxo_count.to_le_bytes());
-            buf.extend_from_slice(&entry.cold_offset.to_le_bytes());
-            buf.extend_from_slice(&entry.cold_size.to_le_bytes());
-            buf.push(entry.flags);
+            buf.push(entry.block_entry_count);
+            buf.push(entry.tx_flags);
+            buf.extend_from_slice(&entry.spent_utxos.to_le_bytes());
+            buf.extend_from_slice(&entry.dah_or_preserve.to_le_bytes());
+            buf.extend_from_slice(&entry.unmined_since.to_le_bytes());
+            buf.extend_from_slice(&entry.generation.to_le_bytes());
         }
 
         let checksum = crc32fast::hash(&buf);
@@ -473,22 +495,27 @@ impl Index {
             let key = TxKey { txid };
 
             let entry = TxIndexEntry {
-                device_id: u16::from_le_bytes(
-                    data[base + 32..base + 34].try_into().unwrap(),
-                ),
+                device_id: data[base + 32],
                 record_offset: u64::from_le_bytes(
-                    data[base + 34..base + 42].try_into().unwrap(),
+                    data[base + 33..base + 41].try_into().unwrap(),
                 ),
                 utxo_count: u32::from_le_bytes(
-                    data[base + 42..base + 46].try_into().unwrap(),
+                    data[base + 41..base + 45].try_into().unwrap(),
                 ),
-                cold_offset: u64::from_le_bytes(
-                    data[base + 46..base + 54].try_into().unwrap(),
+                block_entry_count: data[base + 45],
+                tx_flags: data[base + 46],
+                spent_utxos: u32::from_le_bytes(
+                    data[base + 47..base + 51].try_into().unwrap(),
                 ),
-                cold_size: u32::from_le_bytes(
-                    data[base + 54..base + 58].try_into().unwrap(),
+                dah_or_preserve: u32::from_le_bytes(
+                    data[base + 51..base + 55].try_into().unwrap(),
                 ),
-                flags: data[base + 58],
+                unmined_since: u32::from_le_bytes(
+                    data[base + 55..base + 59].try_into().unwrap(),
+                ),
+                generation: u32::from_le_bytes(
+                    data[base + 59..base + 63].try_into().unwrap(),
+                ),
             };
             index.register(key, entry)?;
         }
@@ -604,9 +631,12 @@ mod tests {
             device_id: 0,
             record_offset: offset,
             utxo_count: 10,
-            cold_offset: 0,
-            cold_size: 0,
-            flags: 0,
+            block_entry_count: 0,
+            tx_flags: 0,
+            spent_utxos: 0,
+            dah_or_preserve: 0,
+            unmined_since: 0,
+            generation: 0,
         }
     }
 

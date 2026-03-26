@@ -313,9 +313,12 @@ fn replay_create(
         device_id: 0,
         record_offset,
         utxo_count,
-        cold_offset: 0,
-        cold_size: 0,
-        flags: 0,
+        block_entry_count: 0,
+        tx_flags: 0,
+        spent_utxos: 0,
+        dah_or_preserve: 0,
+        unmined_since: 0,
+        generation: 0,
     };
     match index.register(*tx_key, entry) {
         Ok(()) => ReplayResult::Applied,
@@ -514,7 +517,9 @@ mod tests {
 
             self.index.register(key, TxIndexEntry {
                 device_id: 0, record_offset: offset, utxo_count,
-                cold_offset: 0, cold_size: 0, flags: 0,
+                block_entry_count: 0, tx_flags: 0,
+                spent_utxos: 0, dah_or_preserve: 0, unmined_since: 0,
+                generation: 0,
             }).unwrap();
 
             key

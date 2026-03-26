@@ -147,6 +147,121 @@ pub fn evaluate_delete_at_height(
     (Signal::None, None)
 }
 
+/// Evaluate `deleteAtHeight` from cached index fields — no metadata read needed.
+///
+/// Same logic as [`evaluate_delete_at_height`] but takes individual cached values
+/// from `TxIndexEntry` instead of a `&TxMetadata` reference.
+///
+/// The `has_preserve_until` flag indicates whether `dah_or_preserve` holds
+/// `preserve_until` (true) or `delete_at_height` (false).
+pub fn evaluate_dah_cached(
+    tx_flags: TxFlags,
+    spent_utxos: u32,
+    utxo_count: u32,
+    block_entry_count: u8,
+    unmined_since: u32,
+    has_preserve_until: bool,
+    dah_or_preserve: u32,
+    current_block_height: u32,
+    block_height_retention: u32,
+) -> (Signal, Option<DahPatch>) {
+    if block_height_retention == 0 {
+        return (Signal::None, None);
+    }
+
+    if has_preserve_until {
+        return (Signal::None, None);
+    }
+
+    let existing_dah = dah_or_preserve; // it's delete_at_height when !has_preserve_until
+    let new_dah = current_block_height.saturating_add(block_height_retention);
+    let is_external = tx_flags.contains(TxFlags::EXTERNAL);
+
+    // Handle conflicting transactions
+    if tx_flags.contains(TxFlags::CONFLICTING) {
+        if existing_dah == 0 {
+            let signal = if is_external {
+                Signal::DeleteAtHeightSet
+            } else {
+                Signal::None
+            };
+            return (
+                signal,
+                Some(DahPatch {
+                    new_delete_at_height: new_dah,
+                    last_spent_all: tx_flags.contains(TxFlags::LAST_SPENT_ALL),
+                }),
+            );
+        }
+        return (Signal::None, None);
+    }
+
+    let all_spent = spent_utxos == utxo_count;
+    let has_blocks = block_entry_count > 0;
+    let on_longest_chain = unmined_since == 0;
+    let was_all_spent = tx_flags.contains(TxFlags::LAST_SPENT_ALL);
+
+    if all_spent && has_blocks && on_longest_chain {
+        if existing_dah == 0 || existing_dah < new_dah {
+            let signal = if is_external {
+                Signal::DeleteAtHeightSet
+            } else {
+                Signal::None
+            };
+            let last_all = if !was_all_spent { true } else { was_all_spent };
+            return (
+                signal,
+                Some(DahPatch {
+                    new_delete_at_height: new_dah,
+                    last_spent_all: last_all,
+                }),
+            );
+        }
+        if !was_all_spent {
+            return (
+                Signal::None,
+                Some(DahPatch {
+                    new_delete_at_height: existing_dah,
+                    last_spent_all: true,
+                }),
+            );
+        }
+        return (Signal::None, None);
+    }
+
+    if existing_dah != 0 {
+        let signal = if is_external {
+            Signal::DeleteAtHeightUnset
+        } else {
+            Signal::None
+        };
+        return (
+            signal,
+            Some(DahPatch {
+                new_delete_at_height: 0,
+                last_spent_all: false,
+            }),
+        );
+    }
+
+    if all_spent != was_all_spent {
+        let signal = if all_spent {
+            Signal::AllSpent
+        } else {
+            Signal::NotAllSpent
+        };
+        return (
+            signal,
+            Some(DahPatch {
+                new_delete_at_height: 0,
+                last_spent_all: all_spent,
+            }),
+        );
+    }
+
+    (Signal::None, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

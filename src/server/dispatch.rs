@@ -13,7 +13,7 @@ use crate::cluster::shards::ShardTable;
 use crate::index::TxKey;
 use crate::ops::create::*;
 use crate::ops::engine::Engine;
-use crate::record::METADATA_SIZE;
+use crate::record::{METADATA_SIZE, TxFlags};
 use crate::ops::error::SpendError;
 use crate::ops::mark_longest_chain::*;
 use crate::ops::remaining::*;
@@ -1901,6 +1901,36 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
                 }
             }
         }
+        // Fast path: if ALL requested fields are cached in the primary index,
+        // serve directly without reading device metadata (zero I/O).
+        if field_mask.fully_cached() {
+            if let Some(entry) = engine.lookup_cached(&key) {
+                let mut data = Vec::new();
+                let has_preserve = entry.tx_flags & TxFlags::HAS_PRESERVE_UNTIL.bits() != 0;
+                // Strip the index-only HAS_PRESERVE_UNTIL bit before returning flags
+                let wire_flags = entry.tx_flags & !TxFlags::HAS_PRESERVE_UNTIL.bits();
+                if field_mask.has(FieldMask::FLAGS)              { data.push(wire_flags); }
+                if field_mask.has(FieldMask::SPENT_UTXOS)       { data.extend_from_slice(&entry.spent_utxos.to_le_bytes()); }
+                if field_mask.has(FieldMask::UTXO_COUNT)        { data.extend_from_slice(&entry.utxo_count.to_le_bytes()); }
+                if field_mask.has(FieldMask::UNMINED_SINCE)      { data.extend_from_slice(&entry.unmined_since.to_le_bytes()); }
+                if field_mask.has(FieldMask::DELETE_AT_HEIGHT)  {
+                    let dah = if has_preserve { 0u32 } else { entry.dah_or_preserve };
+                    data.extend_from_slice(&dah.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::PRESERVE_UNTIL)    {
+                    let pu = if has_preserve { entry.dah_or_preserve } else { 0u32 };
+                    data.extend_from_slice(&pu.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::BLOCK_ENTRY_COUNT)  { data.push(entry.block_entry_count); }
+                results.push(WireGetResult { status: STATUS_OK, data });
+                continue;
+            }
+            // Not in index — fall through to TxNotFound below
+            results.push(WireGetResult { status: ERR_TX_NOT_FOUND as u8, data: vec![] });
+            continue;
+        }
+
+        // Slow path: read full metadata from device for non-cached fields.
         match engine.read_metadata(&key) {
             Ok(meta) => {
                 let mut data = Vec::new();

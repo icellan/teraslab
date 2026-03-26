@@ -165,6 +165,34 @@ impl Engine {
         }
     }
 
+    /// Update the cached fields in the primary index entry after a mutation.
+    /// Acquires a brief write lock on the index.
+    ///
+    /// Encodes `preserve_until` / `delete_at_height` into the shared
+    /// `dah_or_preserve` field with the `HAS_PRESERVE_UNTIL` discriminant bit.
+    #[inline]
+    fn sync_index_cache(&self, key: &TxKey, metadata: &TxMetadata) {
+        let preserve = { metadata.preserve_until };
+        let dah = { metadata.delete_at_height };
+        let has_preserve = preserve != 0;
+        let dah_or_preserve = if has_preserve { preserve } else { dah };
+        let mut tf = metadata.flags.bits();
+        if has_preserve {
+            tf |= TxFlags::HAS_PRESERVE_UNTIL.bits();
+        } else {
+            tf &= !TxFlags::HAS_PRESERVE_UNTIL.bits();
+        }
+        self.index.write().update_cached_fields(
+            key,
+            tf,
+            metadata.block_entry_count,
+            { metadata.spent_utxos },
+            dah_or_preserve,
+            { metadata.unmined_since },
+            { metadata.generation },
+        );
+    }
+
     /// Register a transaction in the index (for test setup).
     pub fn register(&self, key: TxKey, entry: TxIndexEntry) -> Result<(), SpendError> {
         self.index
@@ -479,10 +507,14 @@ impl Engine {
             apply_dah_patch(&mut metadata, patch);
         }
 
-        // 9. Write metadata (zero-alloc when direct)
-        if let Err(e) = self.write_metadata_fast(record_offset, &metadata) {
+        // 9. Write metadata (targeted spend footer when direct, full otherwise)
+        if !self.device_ptr.is_null() {
+            unsafe { io::write_spend_footer_direct(self.device_ptr, record_offset, &metadata) };
+        } else if let Err(e) = self.write_metadata_fast(record_offset, &metadata) {
             eprintln!("engine: write_metadata failed: {e}");
         }
+
+        self.sync_index_cache(&tx_key, &metadata);
 
         // 10. Update DAH secondary index
         let new_dah = { metadata.delete_at_height };
@@ -616,8 +648,14 @@ impl Engine {
             apply_dah_patch(&mut metadata, patch);
         }
 
-        // 8. Write metadata
-        self.write_metadata_fast(record_offset, &metadata)?;
+        // 8. Write metadata (targeted spend footer when direct, full otherwise)
+        if !self.device_ptr.is_null() {
+            unsafe { io::write_spend_footer_direct(self.device_ptr, record_offset, &metadata) };
+        } else {
+            self.write_metadata_fast(record_offset, &metadata)?;
+        }
+
+        self.sync_index_cache(&req.tx_key, &metadata);
 
         // 9. Update DAH secondary index
         let new_dah = { metadata.delete_at_height };
@@ -648,6 +686,116 @@ impl Engine {
             .lookup(&req.tx_key)
             .ok_or(SpendError::TxNotFound)?;
         let record_offset = entry.record_offset;
+
+        // ---------------------------------------------------------------
+        // FAST PATH: first-ever setMined (count == 0), write-only.
+        //
+        // When no block entries exist yet, we can skip the metadata read
+        // entirely: no duplicates to check, no existing block_ids to
+        // return, DAH evaluation runs from cached index fields.
+        // ---------------------------------------------------------------
+        let cached_count = entry.block_entry_count;
+        if !req.unset_mined
+            && cached_count == 0
+            && !self.device_ptr.is_null()
+        {
+            let new_count = cached_count + 1;
+            let new_entry = BlockEntry {
+                block_id: req.block_id,
+                block_height: req.block_height,
+                subtree_idx: req.subtree_idx,
+            };
+
+            // Compute new field values from cached state
+            let mut tf = TxFlags::from_bits_truncate(entry.tx_flags);
+            tf.remove(TxFlags::LOCKED); // setMined clears LOCKED
+            let new_unmined = if req.on_longest_chain { 0u32 } else { entry.unmined_since };
+            let old_unmined = entry.unmined_since;
+            let has_preserve = tf.contains(TxFlags::HAS_PRESERVE_UNTIL);
+            let old_dah = if has_preserve { 0 } else { entry.dah_or_preserve };
+
+            // DAH evaluation from cached fields
+            let (signal, dah_patch) = crate::ops::delete_eval::evaluate_dah_cached(
+                tf,
+                entry.spent_utxos,
+                entry.utxo_count,
+                new_count,
+                new_unmined,
+                has_preserve,
+                entry.dah_or_preserve,
+                req.current_block_height,
+                req.block_height_retention,
+            );
+            let mut new_dah = old_dah;
+            if let Some(ref patch) = dah_patch {
+                tf.set(TxFlags::LAST_SPENT_ALL, patch.last_spent_all);
+                new_dah = patch.new_delete_at_height;
+            }
+
+            // Generation is now cached in the index — zero device reads needed.
+            let generation = entry.generation.wrapping_add(1);
+            let updated_at = now_millis();
+
+            // Targeted writes — block entry + mined footer fields
+            unsafe {
+                io::write_block_entry_direct(
+                    self.device_ptr,
+                    record_offset,
+                    new_count,
+                    cached_count as usize,
+                    &new_entry,
+                );
+                // Build a minimal TxMetadata-shaped struct for the footer writer.
+                // We only need the fields that the footer writer reads.
+                let mut meta_stub = std::mem::zeroed::<TxMetadata>();
+                meta_stub.flags = tf;
+                meta_stub.generation = generation;
+                meta_stub.updated_at = updated_at;
+                meta_stub.delete_at_height = new_dah;
+                meta_stub.unmined_since = new_unmined;
+                io::write_mined_footer_direct(self.device_ptr, record_offset, &meta_stub);
+                // Also write flags byte (mined footer writes it, but ensure LOCKED cleared)
+            }
+
+            // Sync all cached fields to index
+            let dah_or_preserve = if has_preserve { entry.dah_or_preserve } else { new_dah };
+            let mut sync_tf = tf;
+            if has_preserve {
+                sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
+            }
+            self.index.write().update_cached_fields(
+                &req.tx_key,
+                sync_tf.bits(),
+                new_count,
+                entry.spent_utxos,
+                dah_or_preserve,
+                new_unmined,
+                generation,
+            );
+
+            // Update secondary indexes
+            if new_dah != old_dah {
+                let mut dah_idx = self.dah_index.lock();
+                if old_dah != 0 { dah_idx.remove(&req.tx_key); }
+                if new_dah != 0 { dah_idx.insert(new_dah, req.tx_key); }
+            }
+            if new_unmined != old_unmined {
+                let mut unmined_idx = self.unmined_index.lock();
+                if old_unmined != 0 { unmined_idx.remove(&req.tx_key); }
+                if new_unmined != 0 { unmined_idx.insert(new_unmined, req.tx_key); }
+            }
+
+            return Ok(SetMinedResponse {
+                signal,
+                block_ids: vec![req.block_id],
+                generation,
+            });
+        }
+
+        // ---------------------------------------------------------------
+        // SLOW PATH: unset_mined, overflow (count >= 3), or no direct ptr.
+        // Full metadata read + write.
+        // ---------------------------------------------------------------
 
         // 2. Read metadata
         let mut metadata = self.read_metadata_fast(record_offset)?;
@@ -723,7 +871,7 @@ impl Engine {
                 }
             }
         } else {
-            // Add block entry — check for duplicate
+            // Add block entry (slow path — overflow or no direct ptr)
             let count = metadata.block_entry_count as usize;
             let inline_count = count.min(INLINE_BLOCK_ENTRIES);
             let mut exists = false;
@@ -735,7 +883,6 @@ impl Engine {
                 }
             }
 
-            // Check overflow entries for duplicate
             if !exists && count > INLINE_BLOCK_ENTRIES {
                 let overflow =
                     read_overflow_entries(&*self.device, &metadata)
@@ -755,7 +902,6 @@ impl Engine {
                         subtree_idx: req.subtree_idx,
                     };
                 } else {
-                    // Overflow: read existing overflow entries, append, write back
                     let mut overflow =
                         read_overflow_entries(&*self.device, &metadata)
                             .map_err(|e| SpendError::StorageError {
@@ -807,30 +953,23 @@ impl Engine {
             apply_dah_patch(&mut metadata, patch);
         }
 
-        // Write metadata
+        // Write full metadata (slow path)
         self.write_metadata_fast(record_offset, &metadata)?;
+        self.sync_index_cache(&req.tx_key, &metadata);
 
         // Update secondary indexes
         let new_dah = { metadata.delete_at_height };
         if new_dah != old_dah {
             let mut dah = self.dah_index.lock();
-            if old_dah != 0 {
-                dah.remove(&req.tx_key);
-            }
-            if new_dah != 0 {
-                dah.insert(new_dah, req.tx_key);
-            }
+            if old_dah != 0 { dah.remove(&req.tx_key); }
+            if new_dah != 0 { dah.insert(new_dah, req.tx_key); }
         }
 
         let new_unmined = { metadata.unmined_since };
         if new_unmined != old_unmined {
             let mut unmined = self.unmined_index.lock();
-            if old_unmined != 0 {
-                unmined.remove(&req.tx_key);
-            }
-            if new_unmined != 0 {
-                unmined.insert(new_unmined, req.tx_key);
-            }
+            if old_unmined != 0 { unmined.remove(&req.tx_key); }
+            if new_unmined != 0 { unmined.insert(new_unmined, req.tx_key); }
         }
 
         let block_ids = if (metadata.block_entry_count as usize) <= INLINE_BLOCK_ENTRIES {
@@ -889,7 +1028,14 @@ impl Engine {
             apply_dah_patch(&mut metadata, patch);
         }
 
-        self.write_metadata_fast(record_offset, &metadata)?;
+        // Targeted mined footer when direct, full write otherwise
+        if !self.device_ptr.is_null() {
+            unsafe { io::write_mined_footer_direct(self.device_ptr, record_offset, &metadata) };
+        } else {
+            self.write_metadata_fast(record_offset, &metadata)?;
+        }
+
+        self.sync_index_cache(&req.tx_key, &metadata);
 
         // Update secondary indexes
         let new_dah = { metadata.delete_at_height };
@@ -1032,18 +1178,16 @@ impl Engine {
         self.write_full_record_with_cold(record_offset, &meta, &slots, &cold_data)?;
 
         // Register in index
-        let cold_offset = if cold_size > 0 {
-            record_offset + base_size
-        } else {
-            0
-        };
         let index_entry = TxIndexEntry {
             device_id: 0,
             record_offset,
             utxo_count,
-            cold_offset,
-            cold_size: cold_size as u32,
-            flags: flags.bits(),
+            block_entry_count: meta.block_entry_count,
+            tx_flags: flags.bits(),
+            spent_utxos: { meta.spent_utxos },
+            dah_or_preserve: { meta.delete_at_height },
+            unmined_since: { meta.unmined_since },
+            generation: 0,
         };
         self.index
             .write()
@@ -1137,25 +1281,8 @@ impl Engine {
             .lookup(key)
             .ok_or(SpendError::TxNotFound)?;
 
-        // If cold data is stored inline on device, read it directly.
-        if entry.cold_offset != 0 && entry.cold_size != 0 {
-            let align = self.device.alignment();
-            let aligned_base = entry.cold_offset / align as u64 * align as u64;
-            let intra = (entry.cold_offset - aligned_base) as usize;
-            let read_len = (intra + entry.cold_size as usize).div_ceil(align) * align;
-
-            let mut buf = crate::device::AlignedBuf::new(read_len, align);
-            self.device
-                .pread(&mut buf, aligned_base)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("{e}"),
-                })?;
-
-            return Ok(buf[intra..intra + entry.cold_size as usize].to_vec());
-        }
-
         // Check if cold data is in external blobstore.
-        if entry.flags & TxFlags::EXTERNAL.bits() != 0
+        if entry.tx_flags & TxFlags::EXTERNAL.bits() != 0
             && let Some(ref blob_store) = self.blob_store
         {
             match blob_store.get(&key.txid) {
@@ -1169,8 +1296,28 @@ impl Engine {
             }
         }
 
-        // No cold data (neither inline nor external).
-        Ok(vec![])
+        // Read metadata to determine record_size, then compute inline cold offset.
+        let meta = self.read_metadata_fast(entry.record_offset)?;
+        let cold_intra = crate::storage::manager::StorageManager::inline_cold_offset(entry.utxo_count);
+        let cold_size = (meta.record_size as u64).saturating_sub(cold_intra);
+        if cold_size == 0 {
+            return Ok(vec![]);
+        }
+
+        let cold_offset = entry.record_offset + cold_intra;
+        let align = self.device.alignment();
+        let aligned_base = cold_offset / align as u64 * align as u64;
+        let intra = (cold_offset - aligned_base) as usize;
+        let read_len = (intra + cold_size as usize).div_ceil(align) * align;
+
+        let mut buf = crate::device::AlignedBuf::new(read_len, align);
+        self.device
+            .pread(&mut buf, aligned_base)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("{e}"),
+            })?;
+
+        Ok(buf[intra..intra + cold_size as usize].to_vec())
     }
 
     // -----------------------------------------------------------------------
@@ -1272,6 +1419,8 @@ impl Engine {
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = now_millis();
         self.write_metadata_fast(ro, &meta)?;
+
+        self.sync_index_cache(&req.tx_key, &meta);
 
         let generation = { meta.generation };
         Ok(generation)
@@ -1395,6 +1544,65 @@ impl Engine {
         let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
+        // Fast path: DAH evaluation from cached fields, no metadata read.
+        if !self.device_ptr.is_null() {
+            let mut tf = TxFlags::from_bits_truncate(entry.tx_flags);
+            let has_preserve = tf.contains(TxFlags::HAS_PRESERVE_UNTIL);
+            let old_dah = if has_preserve { 0 } else { entry.dah_or_preserve };
+
+            if req.value {
+                tf.insert(TxFlags::CONFLICTING);
+            } else {
+                tf.remove(TxFlags::CONFLICTING);
+            }
+
+            let (signal, dah_patch) = crate::ops::delete_eval::evaluate_dah_cached(
+                tf, entry.spent_utxos, entry.utxo_count,
+                entry.block_entry_count, entry.unmined_since,
+                has_preserve, entry.dah_or_preserve,
+                req.current_block_height, req.block_height_retention,
+            );
+            let mut new_dah = old_dah;
+            if let Some(ref patch) = dah_patch {
+                tf.set(TxFlags::LAST_SPENT_ALL, patch.last_spent_all);
+                new_dah = patch.new_delete_at_height;
+            }
+
+            // Generation is cached in the index — zero device reads.
+            let generation = entry.generation.wrapping_add(1);
+            let updated_at = now_millis();
+
+            // Targeted write
+            unsafe {
+                let mut meta_stub = std::mem::zeroed::<TxMetadata>();
+                meta_stub.flags = tf;
+                meta_stub.generation = generation;
+                meta_stub.updated_at = updated_at;
+                meta_stub.delete_at_height = new_dah;
+                io::write_mutation_footer_direct(self.device_ptr, ro, &meta_stub);
+            }
+
+            // Sync index cache
+            let dah_or_preserve = if has_preserve { entry.dah_or_preserve } else { new_dah };
+            let mut sync_tf = tf;
+            if has_preserve { sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL); }
+            self.index.write().update_cached_fields(
+                &req.tx_key, sync_tf.bits(), entry.block_entry_count,
+                entry.spent_utxos, dah_or_preserve, entry.unmined_since,
+                generation,
+            );
+
+            // Update DAH secondary index
+            if new_dah != old_dah {
+                let mut dah = self.dah_index.lock();
+                if old_dah != 0 { dah.remove(&req.tx_key); }
+                if new_dah != 0 { dah.insert(new_dah, req.tx_key); }
+            }
+
+            return Ok(SetConflictingResponse { signal, generation });
+        }
+
+        // Slow path: no direct pointer
         let mut meta = self.read_metadata_fast(ro)?;
         let old_dah = { meta.delete_at_height };
 
@@ -1417,6 +1625,7 @@ impl Engine {
         }
 
         self.write_metadata_fast(ro, &meta)?;
+        self.sync_index_cache(&req.tx_key, &meta);
 
         let new_dah = { meta.delete_at_height };
         if new_dah != old_dah {
@@ -1448,15 +1657,62 @@ impl Engine {
         let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
+        // Fast path: all needed state is in the index cache + 4-byte generation read.
+        if !self.device_ptr.is_null() {
+            let mut tf = TxFlags::from_bits_truncate(entry.tx_flags);
+            let has_preserve = tf.contains(TxFlags::HAS_PRESERVE_UNTIL);
+            let old_dah = if has_preserve { 0 } else { entry.dah_or_preserve };
+
+            let new_dah;
+            if req.value {
+                tf.insert(TxFlags::LOCKED);
+                new_dah = 0; // Locking clears deleteAtHeight
+            } else {
+                tf.remove(TxFlags::LOCKED);
+                new_dah = old_dah; // Unlocking doesn't change DAH
+            }
+
+            // Generation is cached in the index — zero device reads.
+            let generation = entry.generation.wrapping_add(1);
+            let updated_at = now_millis();
+
+            // Targeted write
+            unsafe {
+                let mut meta_stub = std::mem::zeroed::<TxMetadata>();
+                meta_stub.flags = tf;
+                meta_stub.generation = generation;
+                meta_stub.updated_at = updated_at;
+                meta_stub.delete_at_height = new_dah;
+                io::write_mutation_footer_direct(self.device_ptr, ro, &meta_stub);
+            }
+
+            // Sync index cache
+            let dah_or_preserve = if has_preserve { entry.dah_or_preserve } else { new_dah };
+            let mut sync_tf = tf;
+            if has_preserve { sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL); }
+            self.index.write().update_cached_fields(
+                &req.tx_key, sync_tf.bits(), entry.block_entry_count,
+                entry.spent_utxos, dah_or_preserve, entry.unmined_since,
+                generation,
+            );
+
+            // Update DAH secondary index
+            if new_dah != old_dah {
+                let mut dah = self.dah_index.lock();
+                if old_dah != 0 { dah.remove(&req.tx_key); }
+                if new_dah != 0 { dah.insert(new_dah, req.tx_key); }
+            }
+
+            return Ok(generation);
+        }
+
+        // Slow path: no direct pointer
         let mut meta = self.read_metadata_fast(ro)?;
         let old_dah = { meta.delete_at_height };
 
         if req.value {
             meta.flags |= TxFlags::LOCKED;
-            // Locking clears deleteAtHeight
-            if old_dah != 0 {
-                meta.delete_at_height = 0;
-            }
+            if old_dah != 0 { meta.delete_at_height = 0; }
         } else {
             meta.flags -= meta.flags & TxFlags::LOCKED;
         }
@@ -1465,6 +1721,7 @@ impl Engine {
         meta.updated_at = now_millis();
 
         self.write_metadata_fast(ro, &meta)?;
+        self.sync_index_cache(&req.tx_key, &meta);
 
         let new_dah = { meta.delete_at_height };
         if new_dah != old_dah {
@@ -1473,8 +1730,7 @@ impl Engine {
             if new_dah != 0 { dah.insert(new_dah, req.tx_key); }
         }
 
-        let generation = { meta.generation };
-        Ok(generation)
+        Ok({ meta.generation })
     }
 
     /// Preserve a record until a specific block height.
@@ -1586,6 +1842,19 @@ impl Engine {
             .lookup(key)
             .ok_or(SpendError::TxNotFound)?;
         self.read_metadata_fast(entry.record_offset)
+    }
+
+    /// Look up a transaction's cached index fields without reading device memory.
+    ///
+    /// Returns the `TxIndexEntry` directly from the primary index. Fields like
+    /// `tx_flags`, `spent_utxos`, `utxo_count`, `block_entry_count`,
+    /// `dah_or_preserve`, and `unmined_since` are cached and updated on every
+    /// mutation via `sync_index_cache`.
+    ///
+    /// Use this for GET requests where the field mask only covers cached fields
+    /// (see [`FieldMask::fully_cached`]).
+    pub fn lookup_cached(&self, key: &TxKey) -> Option<TxIndexEntry> {
+        self.index.read().lookup(key)
     }
 
     /// Read a UTXO slot (for testing).
@@ -1872,13 +2141,23 @@ mod tests {
 
             io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
 
+            let preserve = { meta.preserve_until };
+            let dah = { meta.delete_at_height };
+            let has_preserve = preserve != 0;
+            let mut ie_flags = meta.flags.bits();
+            if has_preserve {
+                ie_flags |= TxFlags::HAS_PRESERVE_UNTIL.bits();
+            }
             let ie = TxIndexEntry {
                 device_id: 0,
                 record_offset: offset,
                 utxo_count,
-                cold_offset: 0,
-                cold_size: 0,
-                flags: flags.bits(),
+                block_entry_count: meta.block_entry_count,
+                tx_flags: ie_flags,
+                spent_utxos: { meta.spent_utxos },
+                dah_or_preserve: if has_preserve { preserve } else { dah },
+                unmined_since: { meta.unmined_since },
+                generation: 0,
             };
             index.register(key, ie).unwrap();
 
@@ -2716,9 +2995,12 @@ mod tests {
                 device_id: 0,
                 record_offset: offset,
                 utxo_count: 10,
-                cold_offset: 0,
-                cold_size: 0,
-                flags: 0,
+                block_entry_count: 0,
+                tx_flags: 0,
+                spent_utxos: 0,
+                dah_or_preserve: 0,
+                unmined_since: 0,
+                generation: 0,
             }).unwrap();
         }
 
@@ -3524,9 +3806,12 @@ mod tests {
                         device_id: 0,
                         record_offset: offset,
                         utxo_count: 1,
-                        cold_offset: 0,
-                        cold_size: 0,
-                        flags: 0,
+                        block_entry_count: 0,
+                        tx_flags: 0,
+                        spent_utxos: 0,
+                        dah_or_preserve: 0,
+                        unmined_since: 0,
+                        generation: 0,
                     },
                 )
                 .unwrap();
@@ -3641,9 +3926,12 @@ mod tests {
                         device_id: 0,
                         record_offset: offset,
                         utxo_count: 1,
-                        cold_offset: 0,
-                        cold_size: 0,
-                        flags: 0,
+                        block_entry_count: 0,
+                        tx_flags: 0,
+                        spent_utxos: 0,
+                        dah_or_preserve: 0,
+                        unmined_since: 0,
+                        generation: 0,
                     },
                 )
                 .unwrap();
@@ -5071,12 +5359,11 @@ mod tests {
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
-        let entry = engine.lookup(&key).unwrap();
-        assert_ne!(entry.cold_offset, 0);
-        assert!(entry.cold_size > 0);
+        let _entry = engine.lookup(&key).unwrap();
 
-        // Read back cold data and verify
+        // Read back cold data and verify it was stored
         let cold = engine.read_cold_data(&key).unwrap();
+        assert!(!cold.is_empty(), "cold data should be present");
         // Format: [inputs_len:4][inputs][outputs_len:4][outputs][inpoints_len:4][inpoints]
         assert_eq!(u32::from_le_bytes(cold[0..4].try_into().unwrap()), 4); // inputs len
         assert_eq!(&cold[4..8], &[0x01, 0x02, 0x03, 0x04]);
@@ -5091,9 +5378,10 @@ mod tests {
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
-        let entry = engine.lookup(&key).unwrap();
-        assert_eq!(entry.cold_offset, 0);
-        assert_eq!(entry.cold_size, 0);
+        let _entry = engine.lookup(&key).unwrap();
+        // Without cold data, read_cold_data should return empty
+        let cold = engine.read_cold_data(&key).unwrap();
+        assert!(cold.is_empty(), "cold data should be empty when not provided");
     }
 
     #[test]
@@ -6379,9 +6667,9 @@ mod tests {
         let record_offset = resp.record_offset;
 
         // Verify cold data exists
-        let entry = engine.lookup(&key).unwrap();
-        assert_ne!(entry.cold_offset, 0);
-        assert!(entry.cold_size > 0);
+        let _entry = engine.lookup(&key).unwrap();
+        let cold = engine.read_cold_data(&key).unwrap();
+        assert!(!cold.is_empty(), "cold data should be present");
 
         // Delete
         engine.delete(&DeleteRequest { tx_key: key }).unwrap();

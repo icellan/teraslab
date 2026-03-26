@@ -12,10 +12,157 @@
 //!   the device does not expose direct memory access.
 
 use crate::device::{AlignedBuf, BlockDevice, DeviceError};
-use crate::record::{TxMetadata, UtxoSlot, METADATA_SIZE, UTXO_SLOT_SIZE};
+use crate::record::{BlockEntry, TxMetadata, UtxoSlot, BLOCK_ENTRY_SIZE, METADATA_SIZE, UTXO_SLOT_SIZE};
 
 /// Result type for I/O helper operations.
 pub type Result<T> = std::result::Result<T, DeviceError>;
+
+// ===========================================================================
+// TxMetadata byte-offset constants (repr(C, packed), 256 bytes)
+// ===========================================================================
+
+/// Byte offset of `flags` (u8) within TxMetadata.
+pub const META_OFF_FLAGS: usize = 80;
+/// Byte offset of `spent_utxos` (u32 LE) within TxMetadata.
+pub const META_OFF_SPENT_UTXOS: usize = 93;
+/// Byte offset of `generation` (u32 LE) within TxMetadata.
+pub const META_OFF_GENERATION: usize = 101;
+/// Byte offset of `updated_at` (u64 LE) within TxMetadata.
+pub const META_OFF_UPDATED_AT: usize = 105;
+/// Byte offset of `block_entry_count` (u8) within TxMetadata.
+pub const META_OFF_BLOCK_ENTRY_COUNT: usize = 113;
+/// Byte offset of `block_entries_inline` ([BlockEntry; 3]) within TxMetadata.
+pub const META_OFF_BLOCK_ENTRIES: usize = 114;
+/// Byte offset of `unmined_since` (u32 LE) within TxMetadata.
+pub const META_OFF_UNMINED_SINCE: usize = 167;
+/// Byte offset of `delete_at_height` (u32 LE) within TxMetadata.
+pub const META_OFF_DELETE_AT_HEIGHT: usize = 171;
+/// Byte offset of `preserve_until` (u32 LE) within TxMetadata.
+pub const META_OFF_PRESERVE_UNTIL: usize = 175;
+
+// Compile-time verification of offsets against the actual struct layout.
+const _: () = assert!(std::mem::offset_of!(TxMetadata, flags) == META_OFF_FLAGS);
+const _: () = assert!(std::mem::offset_of!(TxMetadata, spent_utxos) == META_OFF_SPENT_UTXOS);
+const _: () = assert!(std::mem::offset_of!(TxMetadata, generation) == META_OFF_GENERATION);
+const _: () = assert!(std::mem::offset_of!(TxMetadata, updated_at) == META_OFF_UPDATED_AT);
+const _: () = assert!(std::mem::offset_of!(TxMetadata, block_entry_count) == META_OFF_BLOCK_ENTRY_COUNT);
+const _: () = assert!(std::mem::offset_of!(TxMetadata, block_entries_inline) == META_OFF_BLOCK_ENTRIES);
+const _: () = assert!(std::mem::offset_of!(TxMetadata, unmined_since) == META_OFF_UNMINED_SINCE);
+const _: () = assert!(std::mem::offset_of!(TxMetadata, delete_at_height) == META_OFF_DELETE_AT_HEIGHT);
+const _: () = assert!(std::mem::offset_of!(TxMetadata, preserve_until) == META_OFF_PRESERVE_UNTIL);
+
+// ===========================================================================
+// Targeted metadata field writes — write only changed bytes
+// ===========================================================================
+
+/// Write the common mutation footer: flags + generation + updated_at + delete_at_height.
+///
+/// Every mutation bumps generation and updated_at, and may change flags or
+/// delete_at_height via DAH evaluation. This writes 17 bytes at 4 offsets.
+///
+/// # Safety
+///
+/// `base_ptr` must be valid for `record_offset + METADATA_SIZE` bytes.
+/// Caller must hold the per-transaction stripe lock.
+#[inline]
+pub unsafe fn write_mutation_footer_direct(
+    base_ptr: *mut u8,
+    record_offset: u64,
+    meta: &TxMetadata,
+) {
+    unsafe {
+        let p = base_ptr.add(record_offset as usize);
+        // flags (1 byte)
+        p.add(META_OFF_FLAGS).write(meta.flags.bits());
+        // generation (4 bytes LE)
+        std::ptr::copy_nonoverlapping(
+            meta.generation.to_le_bytes().as_ptr(),
+            p.add(META_OFF_GENERATION),
+            4,
+        );
+        // updated_at (8 bytes LE)
+        std::ptr::copy_nonoverlapping(
+            meta.updated_at.to_le_bytes().as_ptr(),
+            p.add(META_OFF_UPDATED_AT),
+            8,
+        );
+        // delete_at_height (4 bytes LE)
+        std::ptr::copy_nonoverlapping(
+            meta.delete_at_height.to_le_bytes().as_ptr(),
+            p.add(META_OFF_DELETE_AT_HEIGHT),
+            4,
+        );
+    }
+}
+
+/// Write mutation footer + spent_utxos (for spend/unspend). 21 bytes at 5 offsets.
+///
+/// # Safety
+///
+/// Same as [`write_mutation_footer_direct`].
+#[inline]
+pub unsafe fn write_spend_footer_direct(
+    base_ptr: *mut u8,
+    record_offset: u64,
+    meta: &TxMetadata,
+) {
+    unsafe {
+        write_mutation_footer_direct(base_ptr, record_offset, meta);
+        let p = base_ptr.add(record_offset as usize);
+        std::ptr::copy_nonoverlapping(
+            meta.spent_utxos.to_le_bytes().as_ptr(),
+            p.add(META_OFF_SPENT_UTXOS),
+            4,
+        );
+    }
+}
+
+/// Write mutation footer + unmined_since (for set_mined, mark_on_longest_chain). 21 bytes.
+///
+/// # Safety
+///
+/// Same as [`write_mutation_footer_direct`].
+#[inline]
+pub unsafe fn write_mined_footer_direct(
+    base_ptr: *mut u8,
+    record_offset: u64,
+    meta: &TxMetadata,
+) {
+    unsafe {
+        write_mutation_footer_direct(base_ptr, record_offset, meta);
+        let p = base_ptr.add(record_offset as usize);
+        std::ptr::copy_nonoverlapping(
+            meta.unmined_since.to_le_bytes().as_ptr(),
+            p.add(META_OFF_UNMINED_SINCE),
+            4,
+        );
+    }
+}
+
+/// Write block_entry_count + one inline BlockEntry (for setMined inline add). 13 bytes.
+///
+/// # Safety
+///
+/// Same as [`write_mutation_footer_direct`]. `inline_index` must be < 3.
+#[inline]
+pub unsafe fn write_block_entry_direct(
+    base_ptr: *mut u8,
+    record_offset: u64,
+    count: u8,
+    inline_index: usize,
+    entry: &BlockEntry,
+) {
+    unsafe {
+        let p = base_ptr.add(record_offset as usize);
+        // block_entry_count (1 byte)
+        p.add(META_OFF_BLOCK_ENTRY_COUNT).write(count);
+        // BlockEntry at inline_index (12 bytes)
+        let entry_offset = META_OFF_BLOCK_ENTRIES + inline_index * BLOCK_ENTRY_SIZE;
+        let mut buf = [0u8; BLOCK_ENTRY_SIZE];
+        entry.to_bytes(&mut buf);
+        std::ptr::copy_nonoverlapping(buf.as_ptr(), p.add(entry_offset), BLOCK_ENTRY_SIZE);
+    }
+}
 
 // ===========================================================================
 // Direct memory access path — zero allocations

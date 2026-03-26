@@ -301,6 +301,10 @@ bitflags! {
         const EXTERNAL       = 0b0000_1000;
         /// Bit 4 — mutable, tracks last all-spent signaling state.
         const LAST_SPENT_ALL = 0b0001_0000;
+        /// Bit 5 — index-only flag (not persisted to device metadata).
+        /// When set in `TxIndexEntry.tx_flags`, the `dah_or_preserve` field
+        /// holds `preserve_until` instead of `delete_at_height`.
+        const HAS_PRESERVE_UNTIL = 0b0010_0000;
     }
 }
 

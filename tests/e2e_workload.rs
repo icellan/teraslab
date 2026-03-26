@@ -736,7 +736,7 @@ fn perf_memory_per_record() {
     }
 
     let stats = engine.index_stats();
-    // TxIndexEntry: device_id(2) + record_offset(8) + utxo_count(4) + cold_offset(8) + cold_size(4) = 26 bytes
+    // TxIndexEntry: device_id(1) + record_offset(8) + utxo_count(4) + flags(2) + spent_utxos(4) + dah_or_preserve(4) + unmined_since(4) + generation(4) = 31 bytes
     // TxKey: 32 bytes
     // Total per-entry: 58 bytes + hash table overhead
     // Amortized overhead = capacity * bucket_size / entry_count
