@@ -185,6 +185,7 @@ impl ClusterCoordinator {
         // Event processing thread
         let event_handle = std::thread::spawn(move || {
             let mut last_reactivation_at = std::time::Instant::now();
+            let mut last_activation_at = std::time::Instant::now();
             while !shutdown.load(Ordering::Relaxed) {
                 match event_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(event) => {
@@ -215,6 +216,10 @@ impl ClusterCoordinator {
                             &peak_size_event,
                             &swim_incarnation_event,
                         );
+                        // Track last activation for settle-time guard.
+                        // handle_event may call activate_topology for
+                        // MembershipChanged or TopologyStale events.
+                        last_activation_at = std::time::Instant::now();
                         if matches!(&event, ClusterEvent::MembershipChanged(_))
                             && let Some(ref path) = cluster_state_path
                         {
@@ -258,6 +263,7 @@ impl ClusterCoordinator {
                                     &node_addrs, &engine, &redo_for_events, migration_pool_size,
                                     migration_batch_size, &fenced_bm_event, &migrating_bm_event, &inbound_bm_event,
                                 );
+                                last_activation_at = std::time::Instant::now();
                                 topo_authority_event.handle_commit(&commit);
                             } else {
                                 // Multi-node: spawn proposer thread.
@@ -285,6 +291,7 @@ impl ClusterCoordinator {
                 // topology change fully settle before retrying.
                 if migration.lock().unwrap().active_count() == 0
                     && last_reactivation_at.elapsed() >= Duration::from_secs(15)
+                    && last_activation_at.elapsed() >= Duration::from_secs(30)
                 {
                     // Use the committed topology members, not SWIM live members.
                     // This avoids false mismatches during topology transitions.
@@ -307,6 +314,7 @@ impl ClusterCoordinator {
                                 mismatched,
                             );
                             last_reactivation_at = std::time::Instant::now();
+                            last_activation_at = std::time::Instant::now();
                             Self::activate_topology(
                                 &committed_members, epoch, self_id, rf, &shard_table, &migration,
                                 &node_addrs, &engine, &redo_for_events, migration_pool_size,
@@ -325,6 +333,7 @@ impl ClusterCoordinator {
                         &node_addrs, &engine, &redo_for_events, migration_pool_size,
                         migration_batch_size, &fenced_bm_event, &migrating_bm_event, &inbound_bm_event,
                     );
+                    last_activation_at = std::time::Instant::now();
                     if let Some(ref path) = cluster_state_path {
                         let peak = peak_size_event.load(Ordering::Relaxed) as u64;
                         persist_cluster_state(path, peak, epoch);
@@ -416,8 +425,9 @@ impl ClusterCoordinator {
                         let st = shard_table.clone();
                         let fb = fenced_bm.clone();
                         let mb = migrating_bm.clone();
+                        let ib = inbound_bm.clone();
                         std::thread::spawn(move || {
-                            run_migration_batch(tasks, target_addr, &all_keys, eng, &migration_ref, &st, &redo, epoch, migration_pool_size, migration_batch_size, fb, mb, self_id);
+                            run_migration_batch(tasks, target_addr, &all_keys, eng, &migration_ref, &st, &redo, epoch, migration_pool_size, migration_batch_size, fb, mb, ib, self_id);
                         });
                     }
                 }
@@ -515,11 +525,22 @@ impl ClusterCoordinator {
                         if let Ok(payload) = send_topology_frame(*peer_addr, OP_GET_PARTITION_MAP, &[])
                             && let Some(routing) = crate::cluster::routing::RoutingInfo::decode(&payload)
                         {
-                            // Build member list from the routing info nodes.
-                            let mut remote_members: Vec<NodeId> = routing.nodes.iter()
-                                .filter(|n| n.is_alive)
-                                .map(|n| n.id)
-                                .collect();
+                            // Use the committed_members from the routing info
+                            // (appended by encode_partition_map). These are the
+                            // EXACT members that were committed with the remote
+                            // term, so the digest will match. Fall back to
+                            // SWIM-alive nodes if committed_members is empty
+                            // (older server without the extension).
+                            let mut remote_members = if !routing.committed_members.is_empty() {
+                                routing.committed_members.clone()
+                            } else {
+                                let mut m: Vec<NodeId> = routing.nodes.iter()
+                                    .filter(|n| n.is_alive)
+                                    .map(|n| n.id)
+                                    .collect();
+                                m.sort();
+                                m
+                            };
                             remote_members.sort();
                             if remote_members.len() <= 1 {
                                 continue; // Peer is single-node, skip
@@ -828,9 +849,10 @@ impl ClusterCoordinator {
                 let st = shard_table.clone();
                 let fb = fenced_bm.clone();
                 let mb = migrating_bm.clone();
+                let ib = inbound_bm.clone();
 
                 let h = std::thread::spawn(move || {
-                    run_migration_batch(tasks, target_addr, &all_keys, eng, &migration_ref, &st, &redo, epoch, migration_pool_size, migration_batch_size, fb, mb, self_id);
+                    run_migration_batch(tasks, target_addr, &all_keys, eng, &migration_ref, &st, &redo, epoch, migration_pool_size, migration_batch_size, fb, mb, ib, self_id);
                 });
                 master_handles.push(h);
             }
@@ -844,6 +866,7 @@ impl ClusterCoordinator {
                 let shard_table_for_replica = shard_table.clone();
                 let fb_replica = fenced_bm.clone();
                 let mb_replica = migrating_bm.clone();
+                let ib_replica = inbound_bm.clone();
 
                 std::thread::spawn(move || {
                     for h in master_handles {
@@ -867,9 +890,10 @@ impl ClusterCoordinator {
                         let st = st_for_replica.clone();
                         let fb = fb_replica.clone();
                         let mb = mb_replica.clone();
+                        let ib = ib_replica.clone();
 
                         handles.push(std::thread::spawn(move || {
-                            run_migration_batch(tasks, target_addr, &all_keys, eng, &migration_ref, &st, &redo, epoch, migration_pool_size, migration_batch_size, fb, mb, self_id);
+                            run_migration_batch(tasks, target_addr, &all_keys, eng, &migration_ref, &st, &redo, epoch, migration_pool_size, migration_batch_size, fb, mb, ib, self_id);
                         }));
                     }
                     for h in handles {
@@ -1160,6 +1184,7 @@ fn run_migration_batch(
     batch_size: usize,
     fenced_bm: Arc<crate::cluster::migration::AtomicShardBitmap>,
     migrating_bm: Arc<crate::cluster::migration::AtomicShardBitmap>,
+    inbound_bm: Arc<crate::cluster::migration::AtomicShardBitmap>,
     self_id: NodeId,
 ) {
     let addr = match target_addr {
@@ -1436,9 +1461,21 @@ fn run_migration_batch(
         run_orphan_cleanup(self_id, &cleanup_engine, &cleanup_st, &cleanup_mig, topology_epoch);
     });
 
-    // If any migrations failed, shards were rolled back to the old assignment.
-    // Signal the coordinator to re-attempt by bumping the membership timer so
-    // the fallback proposer fires on the next timeout poll.
+    // Clear stale inbound migrations. If this node has pending inbound
+    // shards but there are no active outbound migrations left (all finished
+    // or failed), those inbound shards will never receive data. Clear them
+    // so writes aren't blocked indefinitely.
+    {
+        let mut mgr = migration.lock().unwrap();
+        if mgr.active_count() == 0 && mgr.inbound_count() > 0 {
+            let stale = mgr.inbound_count();
+            mgr.clear_inbound();
+            inbound_bm.clear_all();
+            eprintln!("cluster: cleared {stale} stale inbound migration(s) — no active outbound migrations remain");
+        }
+        drop(mgr);
+    }
+
     if f > 0 {
         eprintln!("cluster: {} migration(s) failed — will re-attempt on next topology cycle", f);
     }
@@ -1545,7 +1582,7 @@ fn migrate_single_shard(
     addr: SocketAddr,
     completed: &Arc<std::sync::atomic::AtomicU32>,
     failed: &Arc<std::sync::atomic::AtomicU32>,
-    topology_epoch: u64,
+    _topology_epoch: u64,
     batch_size: usize,
     fenced_bm: &crate::cluster::migration::AtomicShardBitmap,
     migrating_bm: &crate::cluster::migration::AtomicShardBitmap,
@@ -1565,7 +1602,7 @@ fn migrate_single_shard(
     };
 
     // Retry loop: up to 3 attempts with exponential backoff for transient
-    // TCP failures. Epoch changes are non-retryable (abort immediately).
+    // TCP failures. Handoff state resets are non-retryable (abort immediately).
     const RETRY_DELAYS_MS: [u64; 3] = [0, 50, 200];
     let mut last_err = String::new();
 
@@ -1593,14 +1630,17 @@ fn migrate_single_shard(
             }
         };
 
-        // Epoch check: non-retryable. The new topology's coordinator will re-plan.
+        // Handoff state check: if the shard has already been committed or
+        // rolled back (ServingNew), abort — a newer topology has superseded
+        // this migration.  But if the shard is still in Copying/CommitReady,
+        // the migration is still valid even if the epoch was bumped by a
+        // re-activation, so continue.
         {
-            let current_version = shard_table.read().unwrap().version;
-            if current_version != topology_epoch {
-                eprintln!(
-                    "cluster: shard {} migration aborted — topology epoch advanced ({} → {})",
-                    task.shard, topology_epoch, current_version,
-                );
+            let table = shard_table.read().unwrap();
+            let handoff = table.shard_handoff_state(task.shard);
+            if handoff == ShardHandoff::ServingNew {
+                eprintln!("cluster: shard {} migration aborted — shard already committed/rolled back", task.shard);
+                drop(table);
                 fail_shard(migration, shard_table, failed);
                 return false;
             }
@@ -1655,14 +1695,15 @@ fn migrate_single_shard(
             return false;
         }
 
-        // Epoch check before final handshake: non-retryable.
+        // Handoff state check before final handshake: if the shard was
+        // committed or rolled back by a newer topology, abort.  Otherwise
+        // continue — the migration is still valid.
         {
-            let current_version = shard_table.read().unwrap().version;
-            if current_version != topology_epoch {
-                eprintln!(
-                    "cluster: shard {} migration aborted before complete — topology epoch advanced ({} → {})",
-                    task.shard, topology_epoch, current_version,
-                );
+            let table = shard_table.read().unwrap();
+            let handoff = table.shard_handoff_state(task.shard);
+            if handoff == ShardHandoff::ServingNew {
+                eprintln!("cluster: shard {} migration aborted before complete — shard already committed/rolled back", task.shard);
+                drop(table);
                 fail_shard(migration, shard_table, failed);
                 return false;
             }
@@ -2875,12 +2916,32 @@ impl RunningCluster {
             buf.extend_from_slice(&master.0.to_le_bytes());
         }
 
+        // Append committed topology members for catch-up. This is backward
+        // compatible: clients that don't understand the extra data just ignore
+        // it. The catch-up code uses these members to construct a synthetic
+        // commit with the correct digest (matching the original committed term).
+        let committed = self.topology_authority.committed_members();
+        buf.extend_from_slice(&(committed.len() as u32).to_le_bytes());
+        for m in &committed {
+            buf.extend_from_slice(&m.0.to_le_bytes());
+        }
+
         buf
     }
 
-    /// Number of alive nodes in the cluster (based on known addresses).
+    /// Number of alive nodes in the cluster.
+    ///
+    /// Uses the committed topology members when a topology has been
+    /// committed (non-empty member list). Falls back to the SWIM-derived
+    /// `node_addrs` length during initial single-node startup before any
+    /// topology has been committed.
     pub fn alive_node_count(&self) -> usize {
-        self.node_addrs.read().unwrap().len()
+        let committed = self.topology_authority.committed_members();
+        if committed.is_empty() {
+            self.node_addrs.read().unwrap().len()
+        } else {
+            committed.len()
+        }
     }
 
     /// Snapshot of all known node addresses keyed by node ID.
@@ -3091,7 +3152,13 @@ impl RunningCluster {
     }
 
     /// Shut down the cluster.
+    ///
+    /// Persists the current topology state to disk before stopping so
+    /// that on restart the node resumes with the correct committed term
+    /// and voted term. Without this, topology changes received between
+    /// the last event-driven persist and shutdown would be lost.
     pub fn shutdown(&self) {
+        self.persist_topology();
         self.shutdown.store(true, Ordering::Relaxed);
         self.swim_shutdown.store(true, Ordering::Relaxed);
     }

@@ -925,6 +925,298 @@ mod tests {
         assert_eq!(*mgr.sender(0).state(), ReplicaState::NeedsResync);
     }
 
+    // -----------------------------------------------------------------------
+    // Part 3.2: Replica slow but not dead
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn slow_replica_succeeds_within_timeout() {
+        // Replica takes 200ms but timeout is 5s → should succeed
+        let (mt, rt) = InMemoryTransport::pair();
+
+        let handle = std::thread::spawn(move || {
+            let batch = rt.recv_batch(Duration::from_secs(5)).unwrap();
+            std::thread::sleep(Duration::from_millis(200)); // slow but alive
+            let ack = ReplicaAck::Ok { through_sequence: batch.last_sequence() };
+            rt.send_ack(&ack).unwrap();
+        });
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig {
+                replication_timeout: Duration::from_secs(5),
+                ..Default::default()
+            },
+            vec![Box::new(mt)],
+        );
+
+        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        let result = mgr.replicate_batch(&ops);
+        assert!(result.is_ok(), "slow replica within timeout should succeed");
+
+        handle.join().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 3.3: Replica timeout
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn replica_timeout_returns_error() {
+        // Replica takes 500ms, timeout is 100ms → should fail
+        let (mt, rt) = InMemoryTransport::pair();
+
+        let _handle = std::thread::spawn(move || {
+            if let Ok(batch) = rt.recv_batch(Duration::from_secs(5)) {
+                std::thread::sleep(Duration::from_millis(500)); // too slow
+                let ack = ReplicaAck::Ok { through_sequence: batch.last_sequence() };
+                let _ = rt.send_ack(&ack);
+            }
+        });
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteAll,
+                replication_timeout: Duration::from_millis(100),
+                ..Default::default()
+            },
+            vec![Box::new(mt)],
+        );
+
+        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        let result = mgr.replicate_batch(&ops);
+        assert!(result.is_err(), "replica timeout should return error");
+
+        // Replica should be marked Down
+        assert_eq!(*mgr.sender(0).state(), ReplicaState::Down);
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 3.5: Sequence numbers and initial sequence
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn initial_sequence_syncs_with_redo_log() {
+        let (mt, rt) = InMemoryTransport::pair();
+        let handle = spawn_auto_ack_replica(rt);
+
+        // Start replication from sequence 100 (simulating redo log state)
+        let mut mgr = ReplicationManager::with_initial_sequence(
+            ReplicationConfig::default(),
+            vec![Box::new(mt)],
+            100,
+        );
+
+        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        mgr.replicate_batch(&ops).unwrap();
+
+        drop(mgr);
+        let received = handle.join().unwrap();
+        assert_eq!(received[0].first_sequence, 100, "should start from redo log sequence");
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 3.6: Master crashes → Down state handling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn down_replica_excluded_from_replication() {
+        let (mt1, rt1) = InMemoryTransport::pair();
+        let (mt2, _rt2) = InMemoryTransport::pair(); // Drop replica side
+        let _h1 = spawn_auto_ack_replica(rt1);
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteMajority,
+                replication_timeout: Duration::from_millis(100),
+                ..Default::default()
+            },
+            vec![Box::new(mt1), Box::new(mt2)],
+        );
+
+        // First batch: one replica fails
+        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        mgr.replicate_batch(&ops).unwrap(); // succeeds with majority
+
+        // Second batch: down replica excluded, live replica handles it
+        let ops2 = vec![ReplicaOp::Freeze { tx_key: key(2), offset: 0, master_generation: 0 }];
+        let result = mgr.replicate_batch(&ops2);
+        // With WriteMajority RF=3, need 1 ACK. 1 live replica → should succeed.
+        assert!(result.is_ok(), "should succeed with 1 live replica and WriteMajority");
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 3.9: Replication ordering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn operations_arrive_in_order() {
+        let (mt, rt) = InMemoryTransport::pair();
+        let handle = spawn_auto_ack_replica(rt);
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig::default(),
+            vec![Box::new(mt)],
+        );
+
+        // Send 100 operations in rapid succession
+        for i in 0..100u8 {
+            let ops = vec![ReplicaOp::Freeze { tx_key: key(i), offset: i as u32, master_generation: 0 }];
+            mgr.replicate_batch(&ops).unwrap();
+        }
+
+        drop(mgr);
+        let received = handle.join().unwrap();
+        assert_eq!(received.len(), 100);
+
+        // Verify ordering: first_sequence must increase monotonically
+        for i in 1..received.len() {
+            assert!(received[i].first_sequence > received[i-1].first_sequence,
+                "batch {i} sequence {} should be > batch {} sequence {}",
+                received[i].first_sequence, i-1, received[i-1].first_sequence);
+        }
+
+        // Verify each batch has the expected key
+        for (i, batch) in received.iter().enumerate() {
+            match &batch.ops[0] {
+                ReplicaOp::Freeze { tx_key, offset, .. } => {
+                    assert_eq!(tx_key.txid[0], i as u8);
+                    assert_eq!(*offset, i as u32);
+                }
+                _ => panic!("unexpected op type"),
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 3.11: Catchup protocol
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn catchup_idempotent_restart() {
+        // If catch-up is interrupted and restarted, no double-application.
+        let (mt, rt) = InMemoryTransport::pair();
+        let handle = spawn_auto_ack_replica(rt);
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig {
+                catchup_batch_size: 5,
+                ..Default::default()
+            },
+            vec![Box::new(mt)],
+        );
+
+        mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 1 };
+        mgr.next_sequence = 11;
+
+        // First catchup: succeeds, transitions to Live
+        mgr.run_catchup(|from_seq| {
+            (from_seq..11).map(|i| ReplicaOp::Freeze {
+                tx_key: key(i as u8), offset: 0, master_generation: 0,
+            }).collect()
+        }).unwrap();
+        assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
+
+        // Simulate: replica goes down and comes back
+        mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: mgr.sender(0).last_acked() + 1 };
+        mgr.next_sequence = 11; // same sequence
+
+        // Second catchup from last acked: should be a no-op (already caught up)
+        mgr.run_catchup(|from_seq| {
+            if from_seq >= 11 { return Vec::new(); }
+            (from_seq..11).map(|i| ReplicaOp::Freeze {
+                tx_key: key(i as u8), offset: 0, master_generation: 0,
+            }).collect()
+        }).unwrap();
+        assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
+
+        drop(mgr);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn catchup_progress_tracked_via_last_acked() {
+        let (mt, rt) = InMemoryTransport::pair();
+        let handle = spawn_auto_ack_replica(rt);
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig {
+                catchup_batch_size: 3,
+                ..Default::default()
+            },
+            vec![Box::new(mt)],
+        );
+
+        mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 50 };
+        mgr.next_sequence = 60;
+
+        mgr.run_catchup(|from_seq| {
+            (from_seq..60).map(|i| ReplicaOp::Freeze {
+                tx_key: key(i as u8), offset: 0, master_generation: 0,
+            }).collect()
+        }).unwrap();
+
+        // After catchup: last_acked should be at the end of the range
+        assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
+        assert!(mgr.sender(0).last_acked() >= 59,
+            "last_acked should be >= 59 after catching up to seq 60");
+
+        drop(mgr);
+        let _ = handle.join();
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 3.12: Connection management
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_reconnected_transitions_down_to_catchup() {
+        let (mt, _rt) = InMemoryTransport::pair();
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig::default(),
+            vec![Box::new(mt)],
+        );
+
+        // Simulate: replica was sending, got to seq 50, then went down
+        mgr.senders[0].last_acked = 50;
+        mgr.senders[0].state = ReplicaState::Down;
+
+        // InMemoryTransport always reports connected
+        mgr.check_reconnected();
+        assert_eq!(*mgr.sender(0).state(),
+            ReplicaState::CatchingUp { from_sequence: 51 },
+            "should transition to CatchingUp from last_acked + 1");
+    }
+
+    #[test]
+    fn lag_calculation() {
+        let (mt, _rt) = InMemoryTransport::pair();
+        let mgr = ReplicationManager::new(
+            ReplicationConfig::default(),
+            vec![Box::new(mt)],
+        );
+        // last_acked = 0, master seq = 1
+        assert_eq!(mgr.sender(0).lag(100), 100);
+        assert_eq!(mgr.sender(0).lag(0), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 3: RF=1 (no replicas) — edge case
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn zero_replicas_always_succeeds() {
+        // With no replicas, replication should be a no-op success
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig::default(),
+            vec![], // no replicas
+        );
+
+        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        // WriteAll with 0 replicas: 0 required ACKs → should succeed
+        mgr.replicate_batch(&ops).unwrap();
+    }
+
     #[test]
     fn catchup_chunked_batches_have_correct_first_sequence() {
         // Regression test: when catch-up ops are sent in multiple chunks,

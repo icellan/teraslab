@@ -1196,6 +1196,125 @@ mod tests {
         assert_eq!(mgr.active_migrations()[0].state, MigrationState::Failed);
     }
 
+    // -----------------------------------------------------------------------
+    // Part 4: Migration edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fence_and_complete_lifecycle() {
+        let mut mgr = MigrationManager::new();
+        let task = MigrationTask { shard: 42, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        mgr.start_outbound(&[task.clone()], NodeId(1), &std::collections::HashSet::new());
+
+        // Full lifecycle: Preparing → Streaming → Fenced → Complete
+        mgr.set_snapshot_sequence(&task, 100);
+        assert_eq!(mgr.active_migrations()[0].state, MigrationState::Streaming);
+        assert_eq!(mgr.active_migrations()[0].snapshot_sequence, 100);
+
+        mgr.mark_fenced(&task, 200);
+        assert_eq!(mgr.active_migrations()[0].state, MigrationState::Fenced);
+        assert_eq!(mgr.active_migrations()[0].fence_sequence, 200);
+        assert!(mgr.is_shard_fenced(42));
+
+        mgr.mark_complete(&task);
+        assert!(!mgr.is_shard_fenced(42), "fence should be lifted on complete");
+        assert!(mgr.active_migrations()[0].is_complete());
+    }
+
+    #[test]
+    fn inbound_bitmap_consistency_after_cleanup() {
+        let mut mgr = MigrationManager::new();
+
+        // Register several inbound migrations
+        mgr.mark_inbound_active(10);
+        mgr.mark_inbound_active(20);
+        mgr.mark_inbound_active(30);
+
+        // Complete one
+        mgr.mark_inbound_complete(20);
+
+        // Cleanup
+        mgr.cleanup_completed();
+
+        // Bitmap should accurately reflect remaining state
+        assert!(mgr.has_pending_inbound(10));
+        assert!(!mgr.has_pending_inbound(20), "completed shard should be cleared");
+        assert!(mgr.has_pending_inbound(30));
+        assert_eq!(mgr.inbound_count(), 2);
+    }
+
+    #[test]
+    fn failed_migration_retry_resets_progress() {
+        let mut mgr = MigrationManager::new();
+        let task = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        mgr.start_outbound(&[task.clone()], NodeId(1), &std::collections::HashSet::new());
+
+        mgr.set_snapshot_sequence(&task, 100);
+        mgr.record_progress(&task, 500, 500_000);
+        mgr.mark_failed(&task);
+
+        // Retry should reset progress
+        let retried = mgr.retry_failed(&task);
+        assert!(retried);
+        let p = mgr.find_task_mut(&task).unwrap();
+        assert_eq!(p.state, MigrationState::Streaming);
+        assert_eq!(p.migrated_records, 0);
+        assert_eq!(p.bytes_sent, 0);
+    }
+
+    #[test]
+    fn atomic_shard_bitmap_concurrent_ops() {
+        let bitmap = AtomicShardBitmap::new();
+
+        // Set from multiple threads
+        let bitmap_ref = &bitmap;
+        std::thread::scope(|s| {
+            for shard in 0..100u16 {
+                s.spawn(move || {
+                    bitmap_ref.set(shard);
+                });
+            }
+        });
+
+        // All 100 should be set
+        for shard in 0..100u16 {
+            assert!(bitmap.test(shard), "shard {shard} should be set");
+        }
+        for shard in 100..NUM_SHARDS as u16 {
+            assert!(!bitmap.test(shard), "shard {shard} should not be set");
+        }
+
+        // Clear from multiple threads
+        std::thread::scope(|s| {
+            for shard in 0..100u16 {
+                s.spawn(move || {
+                    bitmap_ref.clear(shard);
+                });
+            }
+        });
+
+        for shard in 0..NUM_SHARDS as u16 {
+            assert!(!bitmap.test(shard));
+        }
+    }
+
+    #[test]
+    fn load_from_bitmap_snapshot() {
+        let mut source = ShardBitmap::new();
+        source.set(0);
+        source.set(42);
+        source.set(4095);
+
+        let atomic = AtomicShardBitmap::new();
+        atomic.load_from(&source);
+
+        assert!(atomic.test(0));
+        assert!(atomic.test(42));
+        assert!(atomic.test(4095));
+        assert!(!atomic.test(1));
+        assert!(!atomic.test(100));
+    }
+
     /// Verify that is_migrating_shard excludes Failed migrations.
     /// A failed migration should NOT block new migrations for the same shard.
     #[test]

@@ -19,6 +19,11 @@ pub struct RoutingInfo {
     pub nodes: Vec<NodeInfo>,
     /// Shard-to-master mapping: `shard_assignments[shard] = master NodeId`.
     pub shard_assignments: Vec<(u16, NodeId)>,
+    /// Members of the committed topology term (sorted by NodeId).
+    /// Used by the topology catch-up mechanism to construct synthetic
+    /// commits with the correct digest. Empty if not present in the wire
+    /// format (backward compatibility with older servers).
+    pub committed_members: Vec<NodeId>,
 }
 
 /// Information about a single cluster node.
@@ -47,6 +52,7 @@ impl RoutingInfo {
             shard_table_version,
             nodes,
             shard_assignments: assignments,
+            committed_members: Vec::new(),
         }
     }
 
@@ -127,10 +133,28 @@ impl RoutingInfo {
             assignments.push((shard, master));
         }
 
+        // Parse optional committed_members appended after shard assignments.
+        // Backward compatible: if not present, committed_members is empty.
+        let mut committed_members = Vec::new();
+        if pos + 4 <= data.len() {
+            let cm_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
+            pos += 4;
+            for _ in 0..cm_count {
+                if pos + 8 > data.len() {
+                    break;
+                }
+                committed_members.push(NodeId(u64::from_le_bytes(
+                    data[pos..pos + 8].try_into().unwrap_or([0; 8]),
+                )));
+                pos += 8;
+            }
+        }
+
         Some(Self {
             shard_table_version: version,
             nodes,
             shard_assignments: assignments,
+            committed_members,
         })
     }
 }
@@ -180,6 +204,53 @@ mod tests {
     }
 
     #[test]
+    fn routing_info_committed_members_backward_compat() {
+        // RoutingInfo encoded WITHOUT committed_members (old server)
+        // should decode with empty committed_members.
+        let info = RoutingInfo::new(
+            42,
+            vec![NodeInfo {
+                id: NodeId(1),
+                addr: "127.0.0.1:3000".parse().unwrap(),
+                is_alive: true,
+            }],
+            (0..NUM_SHARDS as u16).map(|s| (s, NodeId(1))).collect(),
+        );
+        let encoded = info.encode();
+        let decoded = RoutingInfo::decode(&encoded).unwrap();
+        assert!(decoded.committed_members.is_empty(),
+            "old format should have empty committed_members");
+    }
+
+    #[test]
+    fn routing_info_committed_members_present() {
+        // Simulate a partition map payload that includes committed_members
+        // appended after the shard assignments.
+        let info = RoutingInfo::new(
+            5,
+            vec![
+                NodeInfo { id: NodeId(1), addr: "127.0.0.1:3000".parse().unwrap(), is_alive: true },
+                NodeInfo { id: NodeId(2), addr: "127.0.0.1:3001".parse().unwrap(), is_alive: true },
+                NodeInfo { id: NodeId(3), addr: "127.0.0.1:3002".parse().unwrap(), is_alive: false },
+            ],
+            (0..NUM_SHARDS as u16).map(|s| (s, NodeId(1))).collect(),
+        );
+        let mut encoded = info.encode();
+
+        // Append committed_members [NodeId(1), NodeId(3)] — different from
+        // the alive nodes — to simulate the scenario where the committed
+        // topology has a different member set than SWIM's current view.
+        encoded.extend_from_slice(&2u32.to_le_bytes()); // count = 2
+        encoded.extend_from_slice(&1u64.to_le_bytes()); // NodeId(1)
+        encoded.extend_from_slice(&3u64.to_le_bytes()); // NodeId(3)
+
+        let decoded = RoutingInfo::decode(&encoded).unwrap();
+        assert_eq!(decoded.committed_members.len(), 2);
+        assert_eq!(decoded.committed_members[0], NodeId(1));
+        assert_eq!(decoded.committed_members[1], NodeId(3));
+    }
+
+    #[test]
     fn routing_info_single_node() {
         let info = RoutingInfo::new(
             1,
@@ -201,5 +272,94 @@ mod tests {
         for (shard, master) in &decoded.shard_assignments {
             assert_eq!(*master, NodeId(100), "shard {shard} should map to node 100");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 5.1: Stale routing — version in response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn routing_info_preserves_version_through_encode_decode() {
+        for version in [0, 1, 42, u64::MAX] {
+            let info = RoutingInfo::new(
+                version,
+                vec![NodeInfo {
+                    id: NodeId(1),
+                    addr: "127.0.0.1:3000".parse().unwrap(),
+                    is_alive: true,
+                }],
+                (0..NUM_SHARDS as u16).map(|s| (s, NodeId(1))).collect(),
+            );
+            let decoded = RoutingInfo::decode(&info.encode()).unwrap();
+            assert_eq!(decoded.shard_table_version, version);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 5: All 4096 shards present in decoded routing info
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decoded_routing_info_covers_all_shards() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 5);
+        let assignments: Vec<(u16, NodeId)> = (0..NUM_SHARDS as u16)
+            .map(|s| (s, table.target_assignment(s).master))
+            .collect();
+        let nodes = members.iter().map(|&id| NodeInfo {
+            id,
+            addr: format!("127.0.0.1:{}", 3000 + id.0).parse().unwrap(),
+            is_alive: true,
+        }).collect();
+
+        let info = RoutingInfo::new(5, nodes, assignments);
+        let decoded = RoutingInfo::decode(&info.encode()).unwrap();
+
+        assert_eq!(decoded.shard_assignments.len(), NUM_SHARDS);
+        for (shard, master) in &decoded.shard_assignments {
+            assert!(members.contains(master),
+                "shard {shard} has master {master:?} not in member list");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 5: Routing info with many nodes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn routing_info_10_nodes_round_trip() {
+        let nodes: Vec<NodeInfo> = (1..=10u64).map(|id| NodeInfo {
+            id: NodeId(id),
+            addr: format!("127.0.0.1:{}", 3000 + id).parse().unwrap(),
+            is_alive: id % 3 != 0, // some dead
+        }).collect();
+        let assignments: Vec<(u16, NodeId)> = (0..NUM_SHARDS as u16)
+            .map(|s| (s, NodeId((s as u64 % 10) + 1)))
+            .collect();
+
+        let info = RoutingInfo::new(42, nodes, assignments);
+        let decoded = RoutingInfo::decode(&info.encode()).unwrap();
+
+        assert_eq!(decoded.shard_table_version, 42);
+        assert_eq!(decoded.nodes.len(), 10);
+        // Check alive flags
+        for node in &decoded.nodes {
+            assert_eq!(node.is_alive, node.id.0 % 3 != 0);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 5: Malformed routing info handled gracefully
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn routing_info_decode_too_short_for_shards() {
+        // Valid header but not enough bytes for 4096 shard entries
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u64.to_le_bytes()); // version
+        data.extend_from_slice(&0u32.to_le_bytes()); // 0 nodes
+        // Only a few shard bytes instead of 4096 * 8
+        data.extend_from_slice(&[0u8; 16]);
+        assert!(RoutingInfo::decode(&data).is_none());
     }
 }

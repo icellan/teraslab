@@ -789,6 +789,48 @@ impl Client {
             return Self::handle_mutation_response(&resp);
         }
 
+        let encode_sub_arc = Arc::new(encode_sub);
+
+        // Retry once on transient errors (dead node / replication failure)
+        // after routing refresh.
+        for attempt in 0..2u32 {
+            let result = self.send_item_batch_cluster_inner(
+                op_code, items, &get_txid, &encode_sub_arc,
+            ).await;
+            match &result {
+                Err(ClientError::Connection(msg)) if attempt == 0 => {
+                    eprintln!("client: retry after connection error: {msg}");
+                    continue;
+                }
+                Err(ClientError::Partial(pe)) if attempt == 0
+                    && pe.errors.len() == items.len() =>
+                {
+                    eprintln!("client: retry after all-items-failed partial error");
+                    let _ = self.refresh_routing().await;
+                    continue;
+                }
+                Err(ClientError::Server { code, .. }) if attempt == 0 && *code == 15 => {
+                    let _ = self.refresh_routing().await;
+                    continue;
+                }
+                _ => return result,
+            }
+        }
+        unreachable!()
+    }
+
+    /// Inner implementation of cluster batch send. Separated so the outer
+    /// function can retry on connection errors after routing refresh.
+    async fn send_item_batch_cluster_inner<T>(
+        &self,
+        op_code: u16,
+        items: &[T],
+        get_txid: &(impl Fn(&T) -> &TxID),
+        encode_sub: &Arc<impl Fn(&[T], &[usize]) -> Vec<u8> + Send + Sync + 'static>,
+    ) -> Result<BatchResult, ClientError>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
         let cluster = self.cluster.as_ref().unwrap();
 
         // Group by target pool.
@@ -820,12 +862,11 @@ impl Client {
 
         // Multiple nodes — send in parallel.
         let items_arc = Arc::new(items.to_vec());
-        let encode_sub_arc = Arc::new(encode_sub);
         let mut handles = Vec::with_capacity(groups.len());
 
         for (_, (pool, idx_map)) in groups {
             let items_ref = Arc::clone(&items_arc);
-            let encoder = Arc::clone(&encode_sub_arc);
+            let encoder = Arc::clone(encode_sub);
 
             handles.push(tokio::spawn(async move {
                 let payload = encoder(&items_ref, &idx_map);
@@ -840,26 +881,38 @@ impl Client {
 
         let mut all_errors: Vec<BatchItemError> = Vec::new();
         let mut got_no_quorum = false;
+        let mut had_connection_error = false;
         for handle in handles {
-            let (result, idx_map) = handle
+            let join_result = handle
                 .await
-                .map_err(|e| ClientError::Connection(format!("join: {e}")))?
-                ?;
-            match result {
-                Ok(_) => {}
-                Err(ClientError::Partial(pe)) => {
-                    all_errors.extend(remap_batch_errors(pe.errors, &idx_map));
+                .map_err(|e| ClientError::Connection(format!("join: {e}")))?;
+            match join_result {
+                Ok((result, idx_map)) => {
+                    match result {
+                        Ok(_) => {}
+                        Err(ClientError::Partial(pe)) => {
+                            all_errors.extend(remap_batch_errors(pe.errors, &idx_map));
+                        }
+                        Err(ClientError::Server { code, ref message }) if code == 15 || message.contains("no quorum") => {
+                            got_no_quorum = true;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
-                Err(ClientError::Server { code, ref message }) if code == 15 || message.contains("no quorum") => {
-                    got_no_quorum = true;
+                Err(ClientError::Connection(_)) => {
+                    had_connection_error = true;
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        // If any sub-batch got "no quorum", refresh routing and let the caller retry.
-        // The transient quorum loss during SWIM failure detection typically resolves
-        // within a few seconds.
+        if had_connection_error {
+            let _ = self.refresh_routing().await;
+            return Err(ClientError::Connection(
+                "sub-batch to unreachable node (routing refreshed)".to_string(),
+            ));
+        }
+
         if got_no_quorum {
             let _ = self.refresh_routing().await;
             return Err(ClientError::Server {
@@ -1176,6 +1229,26 @@ impl Client {
         field_mask: u32,
         txids: &[TxID],
     ) -> Result<GetBatchResult, ClientError> {
+        // Retry once on connection error (dead node) after routing refresh.
+        for attempt in 0..2u32 {
+            match self.get_batch_inner(field_mask, txids).await {
+                Ok(result) => return Ok(result),
+                Err(ClientError::Connection(ref msg)) if attempt == 0 => {
+                    eprintln!("client: get_batch retry after connection error: {msg}");
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!()
+    }
+
+    /// Inner get_batch implementation. Separated for retry on connection errors.
+    async fn get_batch_inner(
+        &self,
+        field_mask: u32,
+        txids: &[TxID],
+    ) -> Result<GetBatchResult, ClientError> {
         let groups = self.group_txids(txids);
 
         // Single node or no cluster — send directly.
@@ -1234,18 +1307,32 @@ impl Client {
             }));
         }
 
-        // Reassemble results in original order.
         let mut merged: Vec<Option<GetResult>> = (0..total).map(|_| None).collect();
+        let mut had_connection_error = false;
         for handle in handles {
-            let (results, idx_map) = handle
+            let join_result = handle
                 .await
-                .map_err(|e| ClientError::Connection(format!("join: {e}")))?
-                ?;
-            for (sub_idx, result) in results.into_iter().enumerate() {
-                if sub_idx < idx_map.len() {
-                    merged[idx_map[sub_idx]] = Some(result);
+                .map_err(|e| ClientError::Connection(format!("join: {e}")))?;
+            match join_result {
+                Ok((results, idx_map)) => {
+                    for (sub_idx, result) in results.into_iter().enumerate() {
+                        if sub_idx < idx_map.len() {
+                            merged[idx_map[sub_idx]] = Some(result);
+                        }
+                    }
                 }
+                Err(ClientError::Connection(_)) => {
+                    had_connection_error = true;
+                }
+                Err(e) => return Err(e),
             }
+        }
+
+        if had_connection_error {
+            let _ = self.refresh_routing().await;
+            return Err(ClientError::Connection(
+                "sub-batch to unreachable node (routing refreshed)".to_string(),
+            ));
         }
 
         let items = merged

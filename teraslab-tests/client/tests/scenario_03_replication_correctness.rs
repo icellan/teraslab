@@ -108,11 +108,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     let txids = common::seed_records(&client, &verifier, 2000, 10).await?;
     assert_eq!(txids.len(), 2000, "expected 2000 seeded records");
 
-    // Allow a window for async replication to propagate. 5 seconds is used
-    // rather than a polling-based wait because there is no server API to
-    // query replication lag directly. This is a conservative fixed delay;
-    // a proper replication-complete signal would require a new API endpoint.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Wait for redo log sequences to converge (replication settled).
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
 
     // ==========================================================================
     // Test 3.1: Post-seed replication verification -- check ALL 2000 records
@@ -213,9 +210,8 @@ async fn run_scenario() -> Result<(), ClientError> {
             spent_txids.push(txid);
         }
 
-        // Allow replication propagation. Fixed 5s delay because there is no
-        // server API to poll for replication completion on individual records.
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Wait for redo log sequences to converge (replication settled).
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
 
         // Check ALL 500 affected records
         let mut mismatches = 0u32;
@@ -282,8 +278,8 @@ async fn run_scenario() -> Result<(), ClientError> {
             mined_txids.push(txid);
         }
 
-        // Fixed 5s delay for replication propagation (no replication-complete API).
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Wait for redo log sequences to converge (replication settled).
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
 
         // Check ALL 300 affected records
         let mut mismatches = 0u32;
@@ -380,8 +376,8 @@ async fn run_scenario() -> Result<(), ClientError> {
             verifier.record_unfreeze(txid, 0);
         }
 
-        // Fixed 5s delay for replication propagation (no replication-complete API).
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Wait for redo log sequences to converge (replication settled).
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
 
         // Verify replication on all affected records
         let mut mismatches = 0u32;
@@ -423,8 +419,8 @@ async fn run_scenario() -> Result<(), ClientError> {
             deleted_txids.push(txid);
         }
 
-        // Fixed 5s delay for replication propagation (no replication-complete API).
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Wait for redo log sequences to converge (replication settled).
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
 
         let mut replication_failures = 0u32;
 
@@ -557,8 +553,8 @@ async fn run_scenario() -> Result<(), ClientError> {
             }
         }
 
-        // Allow replication propagation
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Wait for redo log sequences to converge (replication settled).
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
         // Verify counter incremented exactly once on both nodes
         let (holders, _) = find_holders(&client, &node_addrs, &idempotent_txid).await?;

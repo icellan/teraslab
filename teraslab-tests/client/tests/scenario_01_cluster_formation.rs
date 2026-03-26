@@ -258,6 +258,7 @@ async fn test_staggered_start() -> Result<(), ClientError> {
     docker.compose_up_nodes(&["node3"]).await?;
 
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
 
     let mut versions = Vec::with_capacity(3);
     for node_num in 1..=3u32 {
@@ -318,6 +319,7 @@ async fn test_late_join() -> Result<(), ClientError> {
 
     docker.compose_up_nodes(&["node1", "node2"]).await?;
     common::wait_cluster_ready(&docker, 2, Duration::from_secs(30)).await?;
+    common::wait_migrations_complete(&docker, 2, Duration::from_secs(60)).await?;
 
     let mut total_master_shards_2node: u64 = 0;
     for node_num in 1..=2u32 {

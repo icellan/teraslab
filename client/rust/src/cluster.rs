@@ -357,6 +357,67 @@ impl Cluster {
                 }
             }
 
+            // Log partition map details for debugging.
+            let unique_masters: std::collections::HashSet<u64> =
+                pm.assignments.iter().copied().collect();
+            eprintln!("client: refreshed partition map: version={}, nodes={}, unique_masters={:?}",
+                pm.version, pm.nodes.len(), unique_masters);
+
+            *self.part_map.write() = Some(pm);
+            return Ok(());
+        }
+
+        // All known pools failed — fall back to seed nodes.
+        // This handles the case where all cached pools point to dead nodes
+        // but the surviving nodes are reachable via the original seeds.
+        for seed in &self.config.seeds {
+            let pool = ConnPool::new(seed.clone(), self.config.pool_config.clone());
+            let conn = match pool.get().await {
+                Ok(c) => c,
+                Err(e) => {
+                    pool.close().await;
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            let resp = match conn
+                .round_trip(OP_GET_PARTITION_MAP, 0, Vec::new())
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    pool.close().await;
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            if resp.status != STATUS_OK {
+                pool.close().await;
+                continue;
+            }
+            let pm = match decode_partition_map(&resp.payload) {
+                Ok(pm) => pm,
+                Err(e) => {
+                    pool.close().await;
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            {
+                let mut pools_map = self.pools.write();
+                let mut atn = self.addr_to_node.write();
+                for node in &pm.nodes {
+                    let resolved = self.config.resolve_addr(&node.addr).to_string();
+                    pools_map.entry(node.id).or_insert_with(|| {
+                        Arc::new(ConnPool::new(
+                            resolved,
+                            self.config.pool_config.clone(),
+                        ))
+                    });
+                    atn.insert(node.addr.clone(), node.id);
+                }
+            }
+            pool.close().await;
             *self.part_map.write() = Some(pm);
             return Ok(());
         }

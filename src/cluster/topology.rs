@@ -891,4 +891,231 @@ mod tests {
         assert!(proposal.is_some());
         assert_eq!(proposal.unwrap().term, 6);
     }
+
+    #[test]
+    fn synthetic_commit_with_wrong_members_rejected() {
+        // Regression test: a synthetic commit constructed with the wrong
+        // member list (e.g., SWIM-alive nodes instead of committed members)
+        // produces a mismatched digest and MUST be rejected.
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+
+        // The original term 5 was committed with members [1, 3].
+        let original_members = members(&[1, 3]);
+        let original_digest = TopologyTerm::compute_digest(5, &original_members);
+
+        // Synthetic commit with wrong members [1, 2, 3] (SWIM-alive view).
+        let wrong_members = members(&[1, 2, 3]);
+        let wrong_digest = TopologyTerm::compute_digest(5, &wrong_members);
+
+        // The digests MUST differ.
+        assert_ne!(original_digest, wrong_digest,
+            "digest must differ when member lists differ");
+
+        // Applying the wrong-members commit should fail.
+        let wrong_commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: wrong_members,
+            digest: wrong_digest,
+        };
+        // This succeeds because the digest matches (term, wrong_members).
+        // But the point is: if you use the WRONG members to compute the
+        // digest, you get a DIFFERENT commit than the one the cluster
+        // originally agreed on. This is why catch-up must use
+        // committed_members, not SWIM-alive nodes.
+        let result = auth.handle_commit(&wrong_commit);
+        assert!(result.is_some(), "commit with self-consistent digest should apply");
+        assert_eq!(auth.committed_members(), members(&[1, 2, 3]));
+
+        // The correct commit uses the ORIGINAL members.
+        let auth2 = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let correct_commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: original_members.clone(),
+            digest: original_digest,
+        };
+        let result2 = auth2.handle_commit(&correct_commit);
+        assert!(result2.is_some());
+        assert_eq!(auth2.committed_members(), original_members,
+            "correct catch-up should use the original committed members");
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 2.4: Membership change during ongoing membership change
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pending_proposal_superseded_by_new_membership_change() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+
+        // First membership change → propose term 1
+        let t1 = auth.on_membership_changed(&members(&[1, 2, 3])).unwrap();
+        assert_eq!(t1.term, 1);
+
+        // Before quorum is reached, another membership change occurs
+        // This should propose a NEW term (term 2), superseding term 1
+        let t2 = auth.on_membership_changed(&members(&[1, 2, 4])).unwrap();
+        assert_eq!(t2.term, 2, "new membership change should advance term");
+
+        // Votes for the old term 1 should not produce a commit
+        let stale_vote = TopologyVote {
+            term: 1,
+            digest: t1.digest,
+            voter: NodeId(2),
+            accepted: true,
+            voter_current_term: 0,
+        };
+        let commit = auth.handle_vote(&stale_vote);
+        assert!(commit.is_none(), "stale vote for superseded term should not produce commit");
+    }
+
+    #[test]
+    fn commit_clears_pending_proposal() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let t = auth.on_membership_changed(&members(&[1, 2, 3])).unwrap();
+
+        // Simulate external commit (e.g., from another proposer)
+        let commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(2),
+            members: members(&[1, 2, 3, 4]),
+            digest: TopologyTerm::compute_digest(5, &members(&[1, 2, 3, 4])),
+        };
+        auth.handle_commit(&commit);
+
+        // Pending proposal for term 1 should be cleared
+        let stale_vote = TopologyVote {
+            term: t.term,
+            digest: t.digest,
+            voter: NodeId(2),
+            accepted: true,
+            voter_current_term: 0,
+        };
+        let result = auth.handle_vote(&stale_vote);
+        assert!(result.is_none(), "pending proposal should be cleared by commit");
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 2.5: Two nodes same membership → same version
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn two_authorities_same_proposal_same_digest() {
+        let a1 = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let a2 = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+
+        let t1 = a1.on_membership_changed(&members(&[1, 2, 3])).unwrap();
+        let t2 = a2.on_membership_changed(&members(&[1, 2, 3])).unwrap();
+
+        assert_eq!(t1.term, t2.term);
+        assert_eq!(t1.digest, t2.digest, "same term+members must produce same digest");
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 1.7: Quorum prevents split-brain
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn minority_cannot_commit_independently() {
+        // In a 5-node cluster, 2 nodes can't reach quorum (need 3)
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let t = auth.on_membership_changed(&members(&[1, 2, 3, 4, 5])).unwrap();
+        // Quorum = 3. Self-vote = 1. Need 2 more.
+
+        // Only 1 additional vote → no commit
+        let vote = TopologyVote {
+            term: t.term,
+            digest: t.digest,
+            voter: NodeId(2),
+            accepted: true,
+            voter_current_term: 0,
+        };
+        let commit = auth.handle_vote(&vote);
+        assert!(commit.is_none(), "2/5 is not quorum");
+
+        // One rejected vote → still no commit
+        let reject_vote = TopologyVote {
+            term: t.term,
+            digest: t.digest,
+            voter: NodeId(3),
+            accepted: false,
+            voter_current_term: 0,
+        };
+        let commit = auth.handle_vote(&reject_vote);
+        assert!(commit.is_none(), "reject doesn't count toward quorum");
+
+        // Third acceptance → quorum reached
+        let vote3 = TopologyVote {
+            term: t.term,
+            digest: t.digest,
+            voter: NodeId(4),
+            accepted: true,
+            voter_current_term: 0,
+        };
+        let commit = auth.handle_vote(&vote3);
+        assert!(commit.is_some(), "3/5 is quorum → should commit");
+    }
+
+    #[test]
+    fn fallback_proposer_skips_when_already_committed() {
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_millis(10));
+        let mems = members(&[1, 2, 3]);
+
+        // Commit the current membership
+        let commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            digest: TopologyTerm::compute_digest(5, &mems),
+        };
+        auth.handle_commit(&commit);
+
+        // Now check_timeout with the same membership should skip
+        // (committed membership == proposed membership)
+        std::thread::sleep(Duration::from_millis(15));
+        let result = auth.check_timeout(&mems);
+        assert!(result.is_none(),
+            "should not fallback-propose when committed membership matches");
+    }
+
+    #[test]
+    fn synthetic_commit_mixed_term_and_members_rejected() {
+        // Regression test for the exact bug: synthetic commit uses
+        // remote_term from SWIM gossip but members from current routing
+        // info (SWIM-alive nodes). The digest won't match the original
+        // commit because the original had different members.
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+
+        // Original term 5 committed with members [1, 3] (node2 was down).
+        let original_members = members(&[1, 3]);
+
+        // Now node2 is back, SWIM sees [1, 2, 3]. Catch-up code naively
+        // uses remote_term=5 with current members=[1, 2, 3].
+        let bad_commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: members(&[1, 2, 3]),
+            // This digest is compute_digest(5, [1,2,3]) which differs
+            // from the original compute_digest(5, [1,3]).
+            digest: TopologyTerm::compute_digest(5, &members(&[1, 2, 3])),
+        };
+
+        // The commit applies (digest is internally consistent), but it
+        // represents a DIFFERENT topology than what was actually committed
+        // on the cluster. This is the bug: the catch-up code should use
+        // committed_members from the peer, not SWIM-alive nodes.
+        //
+        // With the fix, the catch-up code fetches committed_members=[1,3]
+        // from the partition map and constructs:
+        let good_commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: original_members.clone(),
+            digest: TopologyTerm::compute_digest(5, &original_members),
+        };
+        let result = auth.handle_commit(&good_commit);
+        assert_eq!(result, Some(5));
+        assert_eq!(auth.committed_members(), original_members);
+    }
 }

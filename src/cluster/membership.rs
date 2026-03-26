@@ -491,4 +491,192 @@ mod tests {
         assert!(forgotten.is_empty());
         assert_eq!(m.total_members(), 3); // self + 2 peers
     }
+
+    // -----------------------------------------------------------------------
+    // Part 1.2: Death event fires exactly once
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn death_event_fires_exactly_once() {
+        let mut m = Membership::new(NodeId(1), Duration::from_millis(10));
+        m.mark_alive(NodeId(2), addr(3001), 1);
+        m.mark_alive(NodeId(3), addr(3002), 1);
+
+        // Kill node 3 — first time should emit NodeLeft
+        let events = m.mark_dead(NodeId(3), 1);
+        let left_count = events.iter().filter(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(3)))).count();
+        assert_eq!(left_count, 1, "NodeLeft should fire exactly once");
+
+        // Second mark_dead with same incarnation should NOT emit again
+        let events2 = m.mark_dead(NodeId(3), 1);
+        let left_count2 = events2.iter().filter(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(3)))).count();
+        assert_eq!(left_count2, 0, "repeated mark_dead should not fire NodeLeft again");
+
+        // Node 2 should still be alive and unaffected
+        assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive);
+        assert_eq!(m.alive_count(), 2); // self + node 2
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 1.3: Rejoin timing and events
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dead_node_rejoin_emits_joined_and_membership_changed() {
+        let mut m = Membership::new(NodeId(1), Duration::from_millis(10));
+        m.mark_alive(NodeId(2), addr(3001), 1);
+        m.mark_dead(NodeId(2), 1);
+
+        // Rejoin with same incarnation (Dead→Alive same-inc is allowed)
+        let events = m.mark_alive(NodeId(2), addr(3001), 1);
+        assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(2), _))),
+            "should emit NodeJoined on rejoin from Dead");
+        assert!(events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
+            "should emit MembershipChanged on rejoin from Dead");
+        assert_eq!(m.alive_count(), 2);
+    }
+
+    #[test]
+    fn suspect_rejoin_emits_membership_changed_but_not_joined() {
+        let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
+        m.mark_alive(NodeId(2), addr(3001), 1);
+        m.mark_suspect(NodeId(2), 1);
+
+        // Revive with same incarnation (Suspect→Alive same-inc is allowed)
+        let events = m.mark_alive(NodeId(2), addr(3001), 1);
+        // Suspect→Alive should NOT emit NodeJoined (node never fully left)
+        assert!(!events.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
+            "Suspect→Alive should not emit NodeJoined");
+        // But it should emit MembershipChanged (alive list changed)
+        assert!(events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
+            "Suspect→Alive should emit MembershipChanged");
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 1.4: Simultaneous start / fresh state
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fresh_membership_does_not_expire_unknown_nodes() {
+        // On fresh start with no prior state, expire_suspects should be no-op.
+        let mut m = Membership::new(NodeId(1), Duration::from_millis(10));
+        // No peers known yet — expire should not crash or declare anyone dead
+        let events = m.expire_suspects();
+        assert!(events.is_empty(), "no suspects to expire on fresh start");
+        assert_eq!(m.alive_count(), 1); // just self
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 1.6: Flapping node (rapid alive/dead cycles)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn flapping_node_no_zombie_state() {
+        let mut m = Membership::new(NodeId(1), Duration::from_millis(10));
+        m.mark_alive(NodeId(2), addr(3001), 1);
+
+        // Simulate flapping: dead → alive → dead → alive in rapid succession
+        for incarnation in 1..=20u64 {
+            m.mark_dead(NodeId(2), incarnation);
+            let state = m.member_info(&NodeId(2)).unwrap().state;
+            assert_eq!(state, NodeState::Dead, "inc {incarnation}: should be dead");
+            assert!(!m.alive_members().contains(&NodeId(2)));
+
+            m.mark_alive(NodeId(2), addr(3001), incarnation + 1);
+            let state = m.member_info(&NodeId(2)).unwrap().state;
+            assert_eq!(state, NodeState::Alive, "inc {}: should be alive", incarnation + 1);
+            assert!(m.alive_members().contains(&NodeId(2)));
+        }
+
+        // After flapping, final state should be consistent
+        let alive = m.alive_members();
+        assert_eq!(alive.len(), 2);
+        assert!(alive.contains(&NodeId(1)));
+        assert!(alive.contains(&NodeId(2)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 1.9: Message corruption / self-message rejection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn self_message_ignored() {
+        let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
+        // Receiving a heartbeat from our own NodeId should be no-op
+        let events = m.mark_alive(NodeId(1), addr(3000), 100);
+        assert!(events.is_empty());
+        assert_eq!(m.alive_count(), 1); // just self
+        assert!(m.member_info(&NodeId(1)).is_none()); // self not tracked in members
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 1: Additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn alive_list_sorted_after_every_mutation() {
+        let mut m = Membership::new(NodeId(5), Duration::from_secs(5));
+        m.mark_alive(NodeId(3), addr(3001), 1);
+        m.mark_alive(NodeId(1), addr(3002), 1);
+        m.mark_alive(NodeId(7), addr(3003), 1);
+        m.mark_alive(NodeId(2), addr(3004), 1);
+
+        let alive = m.alive_members();
+        assert_eq!(alive, vec![NodeId(1), NodeId(2), NodeId(3), NodeId(5), NodeId(7)]);
+
+        // Remove one and check sort is maintained
+        m.mark_dead(NodeId(3), 1);
+        let alive = m.alive_members();
+        assert_eq!(alive, vec![NodeId(1), NodeId(2), NodeId(5), NodeId(7)]);
+    }
+
+    #[test]
+    fn mark_dead_on_unknown_node_no_op() {
+        let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
+        // Marking an unknown node dead should be a no-op
+        let events = m.mark_dead(NodeId(99), 1);
+        assert!(events.is_empty());
+        assert_eq!(m.alive_count(), 1);
+    }
+
+    #[test]
+    fn mark_suspect_on_unknown_node_no_op() {
+        let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
+        let events = m.mark_suspect(NodeId(99), 1);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn expire_suspects_only_after_timeout() {
+        let mut m = Membership::new(NodeId(1), Duration::from_secs(10));
+        m.mark_alive(NodeId(2), addr(3001), 1);
+        m.mark_suspect(NodeId(2), 1);
+
+        // Immediately: should NOT expire (timeout is 10 seconds)
+        let events = m.expire_suspects();
+        assert!(events.is_empty(), "should not expire before timeout");
+        assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Suspect);
+    }
+
+    #[test]
+    fn stale_alive_with_lower_incarnation_ignored() {
+        let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
+        m.mark_alive(NodeId(2), addr(3001), 10);
+
+        // Stale alive with lower incarnation: no state change
+        let events = m.mark_alive(NodeId(2), addr(3001), 5);
+        assert!(events.is_empty());
+        assert_eq!(m.member_info(&NodeId(2)).unwrap().incarnation, 10);
+    }
+
+    #[test]
+    fn same_incarnation_alive_on_alive_is_noop() {
+        let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
+        m.mark_alive(NodeId(2), addr(3001), 5);
+
+        // Same incarnation alive on already-alive node: no event
+        let events = m.mark_alive(NodeId(2), addr(3001), 5);
+        assert!(events.is_empty(), "same-inc alive on alive should be noop");
+        assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive);
+    }
 }

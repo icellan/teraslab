@@ -403,7 +403,7 @@ async fn handle_admin_replication(State(state): State<Arc<HttpState>>) -> impl I
         serde_json::json!({
             "enabled": true,
             "topology_term": cluster.committed_topology_term(),
-            "topology_epoch": cluster.topology_epoch(),
+            "topology_epoch": cluster.committed_topology_term(),
             "peak_cluster_size": cluster.peak_cluster_size(),
             "ack_policy": format!("{:?}", cluster.ack_policy()),
             "best_effort": cluster.is_replication_best_effort(),

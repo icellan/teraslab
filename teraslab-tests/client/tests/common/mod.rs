@@ -122,7 +122,7 @@ pub async fn wait_cluster_ready(docker: &DockerHelpers, node_count: u32, timeout
                 format!("{ready}/{node_count} nodes ready (versions: {versions:?}) after {timeout:?}"),
             ));
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -151,7 +151,7 @@ pub async fn wait_node_cluster_size(
                 format!("node {node_num}: cluster_size != {expected_size} after {timeout:?}"),
             ));
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -182,7 +182,7 @@ pub async fn wait_specific_nodes_ready(
                 format!("{ready}/{} specific nodes ready after {timeout:?}", node_nums.len()),
             ));
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -217,15 +217,10 @@ pub async fn wait_specific_migrations_complete(
                 }
             }
         }
-        // Consider ready when all master shards are assigned (4096).
-        // Replica migrations may still be running but don't affect
-        // functional readiness — the cluster can serve all shards.
         if total_masters == 4096 {
             if all_idle {
                 return Ok(());
             }
-            // Masters assigned but replica migrations running — wait a bit
-            // for them to finish, but don't block indefinitely.
             if start.elapsed() >= timeout.min(Duration::from_secs(30)) {
                 return Ok(());
             }
@@ -235,7 +230,7 @@ pub async fn wait_specific_migrations_complete(
                 format!("migrations still active on specific nodes after {timeout:?} [masters={total_masters}/4096]"),
             ));
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -255,7 +250,6 @@ pub async fn wait_migrations_complete(
         let mut node_details = Vec::new();
         for i in 1..=node_count {
             let port = docker.http_port(i);
-            // Check migration status
             let url = format!("http://127.0.0.1:{port}/admin/migration_status");
             if let Ok(resp) = reqwest::get(&url).await {
                 if let Ok(json) = resp.json::<serde_json::Value>().await {
@@ -267,7 +261,6 @@ pub async fn wait_migrations_complete(
                     }
                 }
             }
-            // Also check master shard count
             let status_url = format!("http://127.0.0.1:{port}/status");
             if let Ok(resp) = reqwest::get(&status_url).await {
                 if let Ok(json) = resp.json::<serde_json::Value>().await {
@@ -277,9 +270,6 @@ pub async fn wait_migrations_complete(
                 }
             }
         }
-        // Consider ready when all master shards are assigned (4096).
-        // Replica migrations may still be running but don't affect
-        // functional readiness.
         if total_masters == 4096 {
             if all_idle {
                 return Ok(());
@@ -298,7 +288,96 @@ pub async fn wait_migrations_complete(
                 format!("migrations still active after {timeout:?}{detail}"),
             ));
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Wait for replication to propagate.
+///
+/// Polls `/debug/redo` on each reachable node and waits until redo
+/// sequences stabilize (stop changing between polls). This detects when
+/// all in-flight replication has completed without requiring sequences
+/// to be equal across nodes (each node has an independent redo log).
+pub async fn wait_replication_settled(
+    docker: &DockerHelpers,
+    node_count: u32,
+    timeout: Duration,
+) -> Result<(), ClientError> {
+    let start = std::time::Instant::now();
+    let mut prev_seqs: Vec<u64> = Vec::new();
+    let mut stable_polls = 0u32;
+
+    loop {
+        let mut seqs = Vec::new();
+        for i in 1..=node_count {
+            let port = docker.http_port(i);
+            let url = format!("http://127.0.0.1:{port}/debug/redo");
+            if let Ok(resp) = reqwest::get(&url).await {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(seq) = json["current_sequence"].as_u64() {
+                        seqs.push(seq);
+                    }
+                }
+            }
+        }
+
+        // Settled when sequences haven't changed for 2 consecutive polls.
+        if seqs.len() == prev_seqs.len() && seqs == prev_seqs {
+            stable_polls += 1;
+            if stable_polls >= 2 {
+                return Ok(());
+            }
+        } else {
+            stable_polls = 0;
+        }
+        prev_seqs = seqs;
+
+        if start.elapsed() >= timeout {
+            return Ok(()); // Best-effort: don't fail the test over lag.
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Wait for replication to settle on specific nodes only (e.g., surviving
+/// nodes after a kill).
+pub async fn wait_specific_replication_settled(
+    docker: &DockerHelpers,
+    node_nums: &[u32],
+    timeout: Duration,
+) -> Result<(), ClientError> {
+    let start = std::time::Instant::now();
+    let mut prev_seqs: Vec<u64> = Vec::new();
+    let mut stable_polls = 0u32;
+
+    loop {
+        let mut seqs = Vec::new();
+        for &n in node_nums {
+            let port = docker.http_port(n);
+            let url = format!("http://127.0.0.1:{port}/debug/redo");
+            if let Ok(resp) = reqwest::get(&url).await {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(seq) = json["current_sequence"].as_u64() {
+                        seqs.push(seq);
+                    }
+                }
+            }
+        }
+
+        if seqs.len() == prev_seqs.len() && seqs == prev_seqs {
+            stable_polls += 1;
+            if stable_polls >= 2 {
+                return Ok(());
+            }
+        } else {
+            stable_polls = 0;
+        }
+        prev_seqs = seqs;
+
+        if start.elapsed() >= timeout {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -310,11 +389,7 @@ pub async fn start_3node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Cli
     let mut docker = docker_3node(scenario_id);
     docker.compose_up().await?;
     wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    // Wait for initial shard migrations to settle before creating the client.
     wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
-    // Allow extra settle time for topology re-activation cycles to complete.
-    // Without this, the client may fetch a partition map mid-transition.
-    tokio::time::sleep(Duration::from_secs(5)).await;
     let client = create_client(&docker, 3).await?;
     client.refresh_routing().await?;
     Ok((docker, client))
@@ -384,25 +459,47 @@ pub async fn seed_records(
 
         // Only record in verifier AFTER the create succeeds, to avoid
         // phantom records when the create fails (e.g., during degradation).
-        // Retry on transient "no quorum" errors from SWIM instability.
+        // Retry on transient errors from SWIM instability or dead nodes.
         let mut created = false;
         for attempt in 0..5 {
             match client.create_batch(&items).await {
                 Ok(_) => { created = true; break; }
                 Err(ClientError::Server { code, .. }) if code == 15 && attempt < 4 => {
                     // NO_QUORUM: SWIM instability, retry after refresh.
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let _ = client.refresh_routing().await;
+                }
+                Err(ClientError::Connection(_)) if attempt < 4 => {
+                    // Connection refused / dead node — refresh routing and retry.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     let _ = client.refresh_routing().await;
                 }
                 Err(ClientError::Partial(ref pe)) if attempt < 4
-                    && pe.errors.iter().all(|e| e.code == 14 || e.code == 19) =>
+                    && pe.errors.len() == items.len() =>
                 {
-                    // All errors are REDIRECT (14) or MIGRATION_IN_PROGRESS (19).
-                    // Retry after routing refresh — the cluster is still converging.
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    // All items failed — cluster-wide transient issue
+                    // (redirect, migration, replication, or dead node).
+                    // Log error codes for diagnostics, then retry.
+                    if attempt == 0 {
+                        let codes: Vec<u16> = pe.errors.iter().map(|e| e.code).collect();
+                        let unique: std::collections::HashSet<u16> = codes.iter().copied().collect();
+                        eprintln!("seed_records: all {} items failed (codes: {:?}), retrying...",
+                            items.len(), unique);
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     let _ = client.refresh_routing().await;
                 }
-                Err(e) => return Err(e),
+                Err(ClientError::Partial(ref pe)) if attempt < 4
+                    && pe.errors.iter().all(|e| e.code == 14 || e.code == 19 || e.code == 20) =>
+                {
+                    // All errors are retryable codes.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let _ = client.refresh_routing().await;
+                }
+                Err(e) => {
+                    eprintln!("seed_records: unhandled error on attempt {attempt}: {e}");
+                    return Err(e);
+                }
             }
         }
         if !created {
@@ -432,8 +529,6 @@ pub async fn teardown(docker: &mut DockerHelpers) {
     }
 
     // Wait for Docker to fully release network ports and resources.
-    // Without sufficient delay, port conflicts and stale state from
-    // previous runs cause the next cluster to fail on startup.
     tokio::time::sleep(Duration::from_secs(3)).await;
 }
 
@@ -487,7 +582,7 @@ pub async fn verify_consistency(
         eprintln!("verify_consistency: {} records NotFound on first pass, retrying after routing refresh...",
             not_found_txids.len());
         let _ = client.refresh_routing().await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         let _ = client.refresh_routing().await;
 
         for chunk in not_found_txids.chunks(100) {

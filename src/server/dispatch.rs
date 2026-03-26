@@ -452,7 +452,11 @@ fn replicate_all_ops(
 
     for (key, ops) in &ops_by_key {
         let shard = ShardTable::shard_for_key(key);
-        let assignment = table_guard.assignment(shard);
+        // Use target_assignment (new topology) rather than effective_assignment
+        // (old topology during handoff). Replication must go to nodes in the
+        // NEW member list — the old assignment may reference dead nodes whose
+        // departure triggered the topology change.
+        let assignment = table_guard.target_assignment(shard);
         for replica_id in &assignment.replicas {
             if let Some(addr) = cluster.node_addr(replica_id) {
                 by_addr.entry(addr).or_default().extend(ops.clone());

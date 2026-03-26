@@ -56,9 +56,9 @@ async fn run_scenario() -> Result<(), ClientError> {
     let initial_txids = common::seed_records(&client, &verifier, 5000, 10).await?;
     assert_eq!(initial_txids.len(), 5000, "expected 5000 seeded records");
 
-    // Allow time for replication of all 5000 records before killing node2
-    eprintln!("[5.0] Waiting 10s for replication to propagate...");
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    // Wait for redo sequences to converge before killing node2
+    eprintln!("[5.0] Waiting for replication to settle...");
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
 
     eprintln!("[5.0] Killing node2");
     docker.kill_node("node2").await?;
@@ -66,7 +66,6 @@ async fn run_scenario() -> Result<(), ClientError> {
     common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(30)).await?;
     // Wait for shard table rebalance and migrations on the 2-node cluster
     common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(180)).await?;
-    tokio::time::sleep(Duration::from_secs(5)).await;
     client.refresh_routing().await?;
 
     eprintln!("[5.0] Creating 500 additional records while node2 is down");
@@ -172,9 +171,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     // each shard and compare raw bytes. That level of verification is not yet
     // implemented in the test client.
     eprintln!("[5.5] Full consistency check via verify_consistency()");
-    // Create a FRESH client after all migrations to get the latest partition map.
-    // The old client's cached routing may be stale.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Wait for replication to settle after migrations, then create a fresh client.
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
     let fresh_client = common::create_client(&docker, 3).await?;
     let mismatches = common::verify_consistency(&fresh_client, &verifier).await?;
     assert!(mismatches.is_empty(),

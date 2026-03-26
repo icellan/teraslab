@@ -97,9 +97,9 @@ async fn run_scenario() -> Result<(), ClientError> {
         }
     }
 
-    // Allow replication propagation for all 5000 creates + 2000 spends + 1000 setMined
-    eprintln!("[4.0] Waiting 10s for replication to propagate...");
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    // Wait for redo sequences to converge across all 3 nodes.
+    eprintln!("[4.0] Waiting for replication to settle...");
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
 
     // Log pre-kill state
     for n in 1..=3u32 {
@@ -128,8 +128,6 @@ async fn run_scenario() -> Result<(), ClientError> {
     common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(180)).await?;
     // Refresh client routing to use the new shard assignments
     client.refresh_routing().await?;
-    // Allow additional settling time for replication catchup
-    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // ==========================================================================
     // Test 4.2: Master shard count sums to 4096 (replica promotion)
@@ -154,7 +152,6 @@ async fn run_scenario() -> Result<(), ClientError> {
     // Wait for migrations to complete on surviving nodes ONLY (1 and 3).
     common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[4.2b] migration wait timed out: {e}"));
-    tokio::time::sleep(Duration::from_secs(5)).await;
     client.refresh_routing().await?;
 
     // ==========================================================================
@@ -308,8 +305,6 @@ async fn run_scenario() -> Result<(), ClientError> {
     docker.start_node("node2").await?;
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
-    // Wait for shard table to stabilize after deferred migration swap
-    tokio::time::sleep(Duration::from_secs(10)).await;
     client.refresh_routing().await?;
 
     // Create a separate verifier for this sub-test
@@ -330,8 +325,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     }
     assert_eq!(bg_txids.len(), 500);
 
-    // Allow replication
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for replication to settle
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     let total_ops = Arc::new(AtomicU32::new(0));
     let failed_ops = Arc::new(AtomicU32::new(0));
