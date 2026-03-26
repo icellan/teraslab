@@ -1666,17 +1666,27 @@ fn migrate_single_shard(
             }
         }
 
-        // Phase 2: fence
+        // Phase 2: fence writes, then drain in-flight writes, then capture
+        // the redo sequence as the delta boundary. See the detailed comment
+        // in run_migration_task for the correctness argument.
         let snapshot_seq;
         let fence_seq;
         {
             let mut mgr = migration.lock().unwrap();
             snapshot_seq = mgr.find_task_mut(task)
                 .map(|p| p.snapshot_sequence).unwrap_or(0);
-            fence_seq = redo_log.as_ref()
-                .map(|rl| rl.lock().current_sequence()).unwrap_or(0);
-            mgr.mark_fenced(task, fence_seq);
+            mgr.fence_shard(task.shard);
             fenced_bm.set(task.shard);
+            drop(mgr);
+        }
+        {
+            fence_seq = redo_log.as_ref()
+                .map(|rl| {
+                    let guard = rl.lock();
+                    guard.current_sequence()
+                }).unwrap_or(0);
+            let mut mgr = migration.lock().unwrap();
+            mgr.mark_fenced(task, fence_seq);
         }
 
         // Phase 3: deltas
@@ -1978,7 +1988,16 @@ fn run_migration_task(
             }
         };
 
-        // Phase 2: fence writes on this shard
+        // Phase 2: fence writes on this shard.
+        //
+        // Correctness: the fence must be activated BEFORE capturing the redo
+        // sequence. Otherwise a write can slip through between the sequence
+        // capture and the fence activation, and its redo entry won't be
+        // included in the delta stream (sequence > fence_seq but write was
+        // pre-fence). The fix: fence first, then drain in-flight writes by
+        // acquiring the redo lock (any write that passed the fence check is
+        // either holding the redo lock or has already released it), then
+        // read current_sequence as the fence boundary.
         let snapshot_seq;
         let fence_seq;
         {
@@ -1986,9 +2005,22 @@ fn run_migration_task(
             snapshot_seq = mgr.find_task_mut(&task)
                 .map(|p| p.snapshot_sequence)
                 .unwrap_or(0);
+            // Activate the fence — all new writes for this shard are rejected
+            // from this point forward.
+            mgr.fence_shard(task.shard);
+            drop(mgr);
+        }
+        // Drain in-flight writes: acquire and release the redo lock to ensure
+        // any write that started before the fence has committed its redo entry.
+        {
             fence_seq = redo_log.as_ref()
-                .map(|rl| rl.lock().current_sequence())
+                .map(|rl| {
+                    let guard = rl.lock();
+                    guard.current_sequence()
+                })
                 .unwrap_or(0);
+            // Record the fence boundary in the migration progress.
+            let mut mgr = migration.lock().unwrap();
             mgr.mark_fenced(&task, fence_seq);
         }
 
