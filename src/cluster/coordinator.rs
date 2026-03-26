@@ -282,15 +282,16 @@ impl ClusterCoordinator {
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
 
-                // Clear stale inbound migrations. Run cleanup_completed to
-                // remove finished outbound entries, then clear all inbound
-                // state when no outbound work is active. Inbound entries are
-                // re-registered by start_outbound if new migrations are planned,
-                // so clearing them aggressively is safe.
+                // Clear stale inbound migrations every poll cycle. Inbound
+                // entries block writes and must be cleared promptly. Even
+                // with active outbound migrations, inbound entries from
+                // PREVIOUS migration rounds may be stale. Re-registration
+                // happens in start_outbound which only runs on topology
+                // commits, not on every poll.
                 {
                     let mut mgr = migration.lock().unwrap();
                     mgr.cleanup_completed();
-                    if mgr.active_count() == 0 && mgr.inbound_count() > 0 {
+                    if mgr.inbound_count() > 0 && mgr.active_count() == 0 {
                         mgr.clear_inbound();
                         inbound_bm_event.clear_all();
                     }
