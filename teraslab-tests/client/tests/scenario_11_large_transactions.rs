@@ -802,8 +802,9 @@ async fn run_scenario() -> Result<(), ClientError> {
         if read_num == 4 {
             eprintln!("[11.11] Killing node2 midway through reads");
             docker_5.kill_node("node2").await?;
-            // Brief pause for cluster to notice
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Wait for surviving nodes to detect the kill and complete migrations
+            common::wait_specific_nodes_ready(&docker_5, &[1, 3, 4], 3, Duration::from_secs(30)).await?;
+            common::wait_specific_migrations_complete(&docker_5, &[1, 3, 4], Duration::from_secs(60)).await?;
             let _ = client_4.refresh_routing().await;
         }
 

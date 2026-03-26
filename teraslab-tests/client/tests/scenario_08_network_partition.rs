@@ -48,18 +48,20 @@ async fn run_scenario() -> Result<(), ClientError> {
         let initial_txids = common::seed_records(&client, &verifier, 1000, 10).await?;
         assert_eq!(initial_txids.len(), 1000);
 
-        // Allow extra time for replication to propagate to all replicas.
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // Wait for replication to settle before partitioning.
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
 
         eprintln!("[8a.1] Partitioning node3 from node1 and node2");
         docker.partition_node("node3", &["node1", "node2"]).await?;
 
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Wait for SWIM to detect the partition and topology to commit.
+        // With probe_interval=150ms and suspicion_timeout=3000ms, detection
+        // takes ~4-6s. Poll instead of sleeping a fixed duration.
+        common::wait_specific_nodes_ready(&docker, &[1, 2], 2, Duration::from_secs(30)).await?;
 
         let status_n1 = common::http_status(&docker, 1).await?;
         let cluster_size_n1 = status_n1["cluster_size"].as_u64().unwrap_or(0);
         eprintln!("[8a.1] node1 reports cluster_size={cluster_size_n1}");
-        // The minority partition should result in exactly 2 nodes in the majority side.
         assert!(cluster_size_n1 == 2,
             "Test 8a.1: node1 reports cluster_size={cluster_size_n1}, expected exactly 2 \
              (majority partition of node1+node2 with node3 isolated)");
@@ -176,6 +178,10 @@ async fn run_scenario() -> Result<(), ClientError> {
         assert!(node3_write_rejected,
             "node3 should reject writes during minority partition");
 
+        // Wait for migrations between surviving nodes to settle before writing.
+        common::wait_specific_migrations_complete(&docker, &[1, 2], Duration::from_secs(60)).await?;
+        client.refresh_routing().await?;
+
         eprintln!("[8a.2] Creating 200 records while node3 is isolated");
         let partition_txids = common::seed_records(&client, &verifier, 200, 10).await?;
         assert_eq!(partition_txids.len(), 200);
@@ -236,8 +242,8 @@ async fn run_scenario() -> Result<(), ClientError> {
         let pre_partition_txids = common::seed_records(&client, &verifier, 1000, 10).await?;
         assert_eq!(pre_partition_txids.len(), 1000);
 
-        // Allow replication to propagate
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // Wait for replication to settle.
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
 
         eprintln!("[8b.1] Partitioning ALL 3 nodes from each other");
         // node1 isolated from node2 and node3
@@ -245,7 +251,10 @@ async fn run_scenario() -> Result<(), ClientError> {
         // node2 isolated from node3 (already isolated from node1 by the above)
         docker.partition_node("node2", &["node3"]).await?;
 
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Wait for SWIM to detect full isolation. Each node sees all peers as dead.
+        // Poll node1 until it reports cluster_size=1 (only itself).
+        common::wait_node_cluster_size(&docker, 1, 1, Duration::from_secs(30)).await
+            .unwrap_or_else(|e| eprintln!("[8b.1] node1 did not reach cluster_size=1: {e}"));
 
         // All writes should fail on all nodes when fully isolated
         eprintln!("[8b.2] Verifying all writes fail on all nodes");
@@ -393,8 +402,8 @@ async fn run_scenario() -> Result<(), ClientError> {
         let baseline_txids = common::seed_records(&client, &verifier, 1000, 10).await?;
         assert_eq!(baseline_txids.len(), 1000);
 
-        // Allow extra time for replication to propagate to all replicas.
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // Wait for replication to settle.
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
 
         eprintln!("[8c.1] Applying slow_network (200ms, 5%% loss) to all nodes");
         docker.slow_network("node1", 200, 5.0).await?;
@@ -539,8 +548,8 @@ async fn run_scenario() -> Result<(), ClientError> {
         let initial_txids = common::seed_records(&client, &verifier, 1000, 10).await?;
         assert_eq!(initial_txids.len(), 1000);
 
-        // Allow replication to propagate
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // Wait for replication to settle.
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
 
         // Asymmetric partition: node1 <-> node3 broken, but node1 <-> node2 and node2 <-> node3 ok
         eprintln!("[8d.1] Creating asymmetric partition: node1 <-> node3 broken");

@@ -282,6 +282,21 @@ impl ClusterCoordinator {
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
 
+                // Periodically clear stale inbound migrations that block writes.
+                // Inbound state is set when a migration is planned but may never
+                // be cleared if the source fails or retries exhaust. Check every
+                // poll cycle: if no outbound migrations are active and there are
+                // pending inbound entries, clear them.
+                {
+                    let mut mgr = migration.lock().unwrap();
+                    if mgr.active_count() == 0 && mgr.inbound_count() > 0 {
+                        let stale = mgr.inbound_count();
+                        mgr.clear_inbound();
+                        inbound_bm_event.clear_all();
+                        eprintln!("cluster: coordinator cleared {stale} stale inbound migration(s)");
+                    }
+                }
+
                 // Re-activate topology if the shard table has rolled-back shards
                 // from failed migrations that don't match the committed topology.
                 // Only fires when: no active migrations, cooldown elapsed, and
@@ -545,14 +560,20 @@ impl ClusterCoordinator {
                             if remote_members.len() <= 1 {
                                 continue; // Peer is single-node, skip
                             }
+                            // Skip if the partition map's term isn't higher
+                            // than ours — the peer may not have advanced yet.
+                            if routing.shard_table_version <= local_term {
+                                continue;
+                            }
 
-                            // Construct and apply a synthetic commit so
-                            // our topology authority advances without a
-                            // full voting round. Use the remote's term
-                            // (remote_term from the SWIM gossip) as the
-                            // commit term — it's the value we know the
-                            // remote has committed.
-                            let commit_term = *remote_term;
+                            // Construct and apply a synthetic commit.
+                            // Use the partition map's version (which equals
+                            // the peer's committed_term at the time the map
+                            // was built) rather than the SWIM gossip value.
+                            // The SWIM value may have advanced beyond the
+                            // partition map's snapshot, causing a digest
+                            // mismatch if we mix the two.
+                            let commit_term = routing.shard_table_version;
                             let synthetic = crate::cluster::topology::TopologyCommit {
                                 term: commit_term,
                                 proposer: remote_members[0], // deterministic proposer
@@ -2904,6 +2925,7 @@ impl RunningCluster {
             let addr_bytes = addr_str.as_bytes();
             buf.extend_from_slice(&(addr_bytes.len() as u16).to_le_bytes());
             buf.extend_from_slice(addr_bytes);
+            buf.push(1); // is_alive — required by RoutingInfo::decode format
         }
 
         // Shard assignments (4096 entries, each is just the master node_id).

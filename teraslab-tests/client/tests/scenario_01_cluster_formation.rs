@@ -342,6 +342,9 @@ async fn test_late_join() -> Result<(), ClientError> {
     docker.compose_up_nodes(&["node3"]).await?;
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+    // Allow shard handoff to complete (Copying → ServingNew transition
+    // after migration data arrives).
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     let expected_per_node: u64 = 4096 / 3;
     let tolerance: u64 = 50;

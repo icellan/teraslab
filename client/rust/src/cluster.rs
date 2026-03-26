@@ -487,6 +487,10 @@ pub(crate) fn decode_partition_map(data: &[u8]) -> Result<PartitionMap, ClientEr
         }
         let addr = String::from_utf8_lossy(&data[pos..pos + addr_len]).to_string();
         pos += addr_len;
+        // Skip is_alive byte (part of RoutingInfo wire format).
+        if pos < data.len() {
+            pos += 1;
+        }
         nodes.push(NodeInfo { id: node_id, addr });
     }
 
