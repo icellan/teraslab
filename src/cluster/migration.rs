@@ -280,12 +280,10 @@ impl MigrationManager {
             if task.from_node == self_id {
                 self.active.push(MigrationProgress::from_task(task));
             }
-            // Register inbound for shards that DON'T have data on this node.
-            // If the shard is already populated locally (via replication or
-            // prior migration), no inbound transfer is needed and writes
-            // should not be blocked. Only empty shards need to wait for data.
+            // Register inbound for shards that have data on the source node.
+            // Empty shards complete instantly with no data transfer.
             if task.to_node == self_id
-                && !populated_shards.contains(&task.shard)
+                && populated_shards.contains(&task.shard)
                 && !self.inbound_migrations.iter().any(|m| m.shard == task.shard && m.from_node == task.from_node)
             {
                 self.inbound_migrations.push(InboundMigration {
@@ -847,9 +845,8 @@ mod tests {
         let outbound = MigrationTask { shard: 10, from_node: NodeId(1), to_node: NodeId(3), is_master: true };
         let inbound = MigrationTask { shard: 5, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
 
-        // populated_shards = shards that already have data on THIS node.
-        // Shard 5 is NOT in populated — this node needs to receive it.
-        let populated = std::collections::HashSet::new();
+        let mut populated = std::collections::HashSet::new();
+        populated.insert(5);
         mgr.start_outbound(&[outbound.clone(), inbound.clone()], NodeId(1), &populated);
 
         // Node 1 has one outbound task and one inbound migration.
@@ -895,8 +892,8 @@ mod tests {
         let t1 = MigrationTask { shard: 5, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
         let t2 = MigrationTask { shard: 5, from_node: NodeId(3), to_node: NodeId(1), is_master: false };
 
-        // Shard 5 not in populated — this node needs to receive it.
-        let populated = std::collections::HashSet::new();
+        let mut populated = std::collections::HashSet::new();
+        populated.insert(5);
         mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &populated);
 
         // Two inbound entries for the same shard from different sources.
@@ -918,8 +915,8 @@ mod tests {
         let mut mgr = MigrationManager::new();
         mgr.mark_inbound_active(10);
         let t = MigrationTask { shard: 20, from_node: NodeId(5), to_node: NodeId(1), is_master: true };
-        // Shard 20 not in populated — this node needs to receive it.
-        let populated = std::collections::HashSet::new();
+        let mut populated = std::collections::HashSet::new();
+        populated.insert(20);
         mgr.start_outbound(&[t], NodeId(1), &populated);
 
         // Mark shard 10's migration complete — should NOT be serialized.

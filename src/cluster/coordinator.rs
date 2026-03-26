@@ -186,6 +186,7 @@ impl ClusterCoordinator {
         let event_handle = std::thread::spawn(move || {
             let mut last_reactivation_at = std::time::Instant::now();
             let mut last_activation_at = std::time::Instant::now();
+            let mut last_inbound_clear = std::time::Instant::now();
             while !shutdown.load(Ordering::Relaxed) {
                 match event_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(event) => {
@@ -282,18 +283,21 @@ impl ClusterCoordinator {
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
 
-                // Clear stale inbound migrations every poll cycle. Inbound
-                // entries block writes and must be cleared promptly. Even
-                // with active outbound migrations, inbound entries from
-                // PREVIOUS migration rounds may be stale. Re-registration
-                // happens in start_outbound which only runs on topology
-                // commits, not on every poll.
+                // Periodically clear ALL inbound migrations. Inbound entries
+                // block writes; stale entries from failed/retried migrations
+                // can persist indefinitely if active_count never reaches 0.
+                // Clearing every 5s is safe: start_outbound re-registers
+                // inbound on the next activate_topology for shards that
+                // genuinely need data transfer.
                 {
                     let mut mgr = migration.lock().unwrap();
                     mgr.cleanup_completed();
-                    if mgr.inbound_count() > 0 && mgr.active_count() == 0 {
+                    if mgr.inbound_count() > 0
+                        && last_inbound_clear.elapsed() >= Duration::from_secs(5)
+                    {
                         mgr.clear_inbound();
                         inbound_bm_event.clear_all();
+                        last_inbound_clear = std::time::Instant::now();
                     }
                 }
 
