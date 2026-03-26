@@ -1,15 +1,110 @@
 //! Read/write helpers for TeraSlab records on block devices.
 //!
-//! These functions handle the read-modify-write pattern needed for sub-block
-//! writes with `O_DIRECT`. When the data to write is smaller than the device's
-//! minimum I/O size, the containing aligned block is read, modified in memory,
-//! and written back.
+//! Two paths:
+//!
+//! - **Direct path** (`_direct` functions): Zero-allocation access through a raw
+//!   pointer. Used when the device supports [`BlockDevice::as_raw_ptr`] (e.g.,
+//!   `MemoryDevice`, future mmap'd `DirectDevice`). No alignment overhead, no
+//!   `AlignedBuf`, no `RwLock`.
+//!
+//! - **Block I/O path** (original functions): Read-modify-write through
+//!   `pread`/`pwrite` with `AlignedBuf` for `O_DIRECT` compatibility. Used when
+//!   the device does not expose direct memory access.
 
 use crate::device::{AlignedBuf, BlockDevice, DeviceError};
 use crate::record::{TxMetadata, UtxoSlot, METADATA_SIZE, UTXO_SLOT_SIZE};
 
 /// Result type for I/O helper operations.
 pub type Result<T> = std::result::Result<T, DeviceError>;
+
+// ===========================================================================
+// Direct memory access path — zero allocations
+// ===========================================================================
+
+/// Read [`TxMetadata`] directly from a memory-mapped device region.
+///
+/// Zero-copy: interprets the bytes in place and returns a bitwise copy.
+/// No `AlignedBuf` allocation, no `RwLock`, no syscalls.
+///
+/// # Safety
+///
+/// `base_ptr` must be valid for at least `record_offset + METADATA_SIZE` bytes.
+/// Caller must hold the per-transaction stripe lock.
+#[inline]
+pub unsafe fn read_metadata_direct(base_ptr: *const u8, record_offset: u64) -> TxMetadata {
+    unsafe {
+        let src = base_ptr.add(record_offset as usize);
+        let bytes = std::slice::from_raw_parts(src, METADATA_SIZE);
+        TxMetadata::from_bytes(bytes)
+    }
+}
+
+/// Write [`TxMetadata`] directly to a memory-mapped device region.
+///
+/// Zero-copy serialization: writes the metadata bytes directly to the
+/// target address. No `AlignedBuf`, no read-modify-write.
+///
+/// # Safety
+///
+/// `base_ptr` must be valid for at least `record_offset + METADATA_SIZE` bytes.
+/// Caller must hold the per-transaction stripe lock.
+#[inline]
+pub unsafe fn write_metadata_direct(base_ptr: *mut u8, record_offset: u64, metadata: &TxMetadata) {
+    unsafe {
+        let dst = base_ptr.add(record_offset as usize);
+        let dst_slice = std::slice::from_raw_parts_mut(dst, METADATA_SIZE);
+        let mut buf = [0u8; METADATA_SIZE];
+        metadata.to_bytes(&mut buf);
+        dst_slice.copy_from_slice(&buf);
+    }
+}
+
+/// Read a single [`UtxoSlot`] directly from a memory-mapped device region.
+///
+/// # Safety
+///
+/// `base_ptr` must be valid for at least `record_offset + METADATA_SIZE +
+/// (slot_index + 1) * UTXO_SLOT_SIZE` bytes. Caller must hold the stripe lock.
+#[inline]
+pub unsafe fn read_utxo_slot_direct(
+    base_ptr: *const u8,
+    record_offset: u64,
+    slot_index: u32,
+) -> UtxoSlot {
+    unsafe {
+        let slot_offset = record_offset + TxMetadata::utxo_slot_offset(slot_index);
+        let src = base_ptr.add(slot_offset as usize);
+        let bytes = std::slice::from_raw_parts(src, UTXO_SLOT_SIZE);
+        UtxoSlot::from_bytes(bytes)
+    }
+}
+
+/// Write a single [`UtxoSlot`] directly to a memory-mapped device region.
+///
+/// # Safety
+///
+/// `base_ptr` must be valid for at least `record_offset + METADATA_SIZE +
+/// (slot_index + 1) * UTXO_SLOT_SIZE` bytes. Caller must hold the stripe lock.
+#[inline]
+pub unsafe fn write_utxo_slot_direct(
+    base_ptr: *mut u8,
+    record_offset: u64,
+    slot_index: u32,
+    slot: &UtxoSlot,
+) {
+    unsafe {
+        let slot_offset = record_offset + TxMetadata::utxo_slot_offset(slot_index);
+        let dst = base_ptr.add(slot_offset as usize);
+        let dst_slice = std::slice::from_raw_parts_mut(dst, UTXO_SLOT_SIZE);
+        let mut buf = [0u8; UTXO_SLOT_SIZE];
+        slot.to_bytes(&mut buf);
+        dst_slice.copy_from_slice(&buf);
+    }
+}
+
+// ===========================================================================
+// Block I/O path — for O_DIRECT devices without memory mapping
+// ===========================================================================
 
 /// Read the [`TxMetadata`] header of a record at `record_offset`.
 ///

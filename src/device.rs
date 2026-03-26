@@ -67,6 +67,21 @@ pub trait BlockDevice: Send + Sync {
 
     /// Sync all pending writes to stable storage.
     fn sync(&self) -> Result<()>;
+
+    /// Return a raw pointer to the device's memory region, if supported.
+    ///
+    /// Memory-backed devices (MemoryDevice, mmap'd files) can expose their
+    /// underlying memory for zero-copy reads and writes. This bypasses
+    /// alignment requirements, AlignedBuf allocation, and RwLock overhead.
+    ///
+    /// # Safety contract
+    ///
+    /// The returned pointer is valid for `self.size()` bytes for the lifetime
+    /// of the device. Callers must ensure proper synchronization (e.g., the
+    /// Engine's stripe locks protect per-record access).
+    fn as_raw_ptr(&self) -> Option<*mut u8> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,15 +169,26 @@ impl Drop for AlignedBuf {
 // MemoryDevice
 // ---------------------------------------------------------------------------
 
-/// In-memory block device for testing.
+/// In-memory block device for testing and benchmarking.
 ///
 /// Enforces the same alignment constraints as [`DirectDevice`] so tests
-/// catch alignment bugs. This is NOT a stub — it validates alignment on
-/// every read and write.
+/// catch alignment bugs via `pread`/`pwrite`. Also exposes a stable raw
+/// pointer via [`as_raw_ptr`](BlockDevice::as_raw_ptr) for zero-copy
+/// access on the Engine hot path.
 pub struct MemoryDevice {
     data: std::sync::RwLock<Vec<u8>>,
+    /// Stable pointer into the Vec's heap allocation. Valid for the lifetime
+    /// of this device because the Vec is never resized after construction.
+    raw_ptr: *mut u8,
+    raw_len: usize,
     alignment: usize,
 }
+
+// Safety: MemoryDevice owns its allocation exclusively. The raw_ptr points
+// into the Vec's heap buffer which is stable (never resized). Concurrent
+// access through raw_ptr is the caller's responsibility (Engine stripe locks).
+unsafe impl Send for MemoryDevice {}
+unsafe impl Sync for MemoryDevice {}
 
 impl MemoryDevice {
     /// Create a new in-memory device of `size` bytes with the given alignment.
@@ -174,8 +200,13 @@ impl MemoryDevice {
         if size == 0 {
             return Err(DeviceError::ZeroSize);
         }
+        let mut data = vec![0u8; size as usize];
+        let raw_ptr = data.as_mut_ptr();
+        let raw_len = data.len();
         Ok(Self {
-            data: std::sync::RwLock::new(vec![0u8; size as usize]),
+            data: std::sync::RwLock::new(data),
+            raw_ptr,
+            raw_len,
             alignment,
         })
     }
@@ -239,11 +270,15 @@ impl BlockDevice for MemoryDevice {
     }
 
     fn size(&self) -> u64 {
-        self.data.read().unwrap().len() as u64
+        self.raw_len as u64
     }
 
     fn sync(&self) -> Result<()> {
         Ok(())
+    }
+
+    fn as_raw_ptr(&self) -> Option<*mut u8> {
+        Some(self.raw_ptr)
     }
 }
 

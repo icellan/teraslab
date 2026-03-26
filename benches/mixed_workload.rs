@@ -82,6 +82,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                parent_txids: vec![],
             };
             engine.create(&req).unwrap();
             created_txs.push((TxKey { txid: tx_id }, i));
@@ -114,6 +115,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
                     frozen: false,
                     conflicting: false,
                     locked: false,
+                    parent_txids: vec![],
                 };
                 let _ = engine.create(&req);
                 created_txs.push((TxKey { txid: tx_id }, next_tx));

@@ -30,19 +30,23 @@ fn make_utxo_hash(tx_n: u32, vout: u32) -> [u8; 32] {
     h
 }
 
-fn create_engine() -> Arc<Engine> {
+fn create_engine_sized(device_mb: u64, index_capacity: usize) -> Arc<Engine> {
     let dev: Arc<dyn BlockDevice> =
-        Arc::new(MemoryDevice::new(512 * 1024 * 1024, 4096).unwrap());
+        Arc::new(MemoryDevice::new(device_mb * 1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone());
-    let index = Index::new(200_000).unwrap();
+    let index = Index::new(index_capacity).unwrap();
     Arc::new(Engine::new(
         dev,
         index,
         alloc,
-        StripedLocks::new(1024),
+        StripedLocks::new(65536),
         DahIndex::new(),
         UnminedIndex::new(),
     ))
+}
+
+fn create_engine() -> Arc<Engine> {
+    create_engine_sized(512, 200_000)
 }
 
 fn setup_engine_with_txs(count: u32, utxos_per_tx: u32) -> Arc<Engine> {
@@ -71,6 +75,7 @@ fn setup_engine_with_txs(count: u32, utxos_per_tx: u32) -> Arc<Engine> {
             frozen: false,
             conflicting: false,
             locked: false,
+            parent_txids: vec![],
         };
         engine.create(&req).unwrap();
     }
@@ -176,6 +181,9 @@ fn bench_set_mined(c: &mut Criterion) {
     let mut group = c.benchmark_group("set_mined");
     group.throughput(Throughput::Elements(1));
 
+    // Use the standard engine. setMined wrapping is okay — it exercises the
+    // realistic path where txs accumulate 1-3 inline block entries. Overflow
+    // (>3 entries) adds device I/O cost but is rare in production.
     let engine = setup_engine_with_txs(50_000, 5);
     let mut tx_idx = 0u32;
     let mut block_id = 1u32;
@@ -203,6 +211,93 @@ fn bench_set_mined(c: &mut Criterion) {
             }
         })
     });
+
+    // Separate benchmark: setMined on fresh txs only (no wrapping, no overflow).
+    // Each iteration creates a fresh tx, then mines it once.
+    group.bench_function("set_mined_first_pass", |b| {
+        let fresh_engine = create_engine();
+        let mut fresh_idx = 0u32;
+        b.iter(|| {
+            // Create a tx then immediately setMined it — pure first-pass.
+            let tx_id = make_tx_id(fresh_idx + 1_000_000);
+            let req = CreateRequest {
+                tx_id,
+                tx_version: 1, locktime: 0, fee: 500, size_in_bytes: 250,
+                extended_size: 0, is_coinbase: false, spending_height: 0,
+                utxo_hashes: vec![make_utxo_hash(fresh_idx, 0)],
+                inputs: None, outputs: None, inpoints: None,
+                is_external: false, created_at: 1710000000000,
+                block_height: 1000, mined_block_infos: vec![],
+                frozen: false, conflicting: false, locked: false,
+                parent_txids: vec![],
+            };
+            let _ = fresh_engine.create(&req);
+
+            let key = TxKey { txid: tx_id };
+            let _ = fresh_engine.set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: fresh_idx + 1,
+                block_height: 2000,
+                subtree_idx: 0,
+                current_block_height: 2000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            });
+            fresh_idx += 1;
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_spend_threaded(c: &mut Criterion) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let mut group = c.benchmark_group("spend_threaded");
+
+    for num_threads in [2, 4, 8] {
+        let txs_per_thread = 10_000u32;
+        let total = txs_per_thread * num_threads as u32;
+        let engine = setup_engine_with_txs(total, 10);
+
+        group.throughput(Throughput::Elements(num_threads as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(num_threads),
+            &num_threads,
+            |b, &threads| {
+                let counters: Vec<AtomicU32> = (0..threads).map(|_| AtomicU32::new(0)).collect();
+                b.iter(|| {
+                    std::thread::scope(|s| {
+                        for t in 0..threads {
+                            let eng = &engine;
+                            let ctr = &counters[t];
+                            let offset = t as u32 * txs_per_thread;
+                            s.spawn(move || {
+                                let i = ctr.fetch_add(1, Ordering::Relaxed);
+                                let tx_idx = offset + (i % txs_per_thread);
+                                let key = TxKey { txid: make_tx_id(tx_idx) };
+                                let slot = i % 10;
+                                let mut sd = [0u8; 36];
+                                sd[0..4].copy_from_slice(&(tx_idx + 10000).to_le_bytes());
+                                sd[32..36].copy_from_slice(&slot.to_le_bytes());
+                                let _ = eng.spend(&SpendRequest {
+                                    tx_key: key,
+                                    offset: slot,
+                                    utxo_hash: make_utxo_hash(tx_idx, slot),
+                                    spending_data: sd,
+                                    ignore_conflicting: false,
+                                    ignore_locked: false,
+                                    current_block_height: 2000,
+                                    block_height_retention: 288,
+                                });
+                            });
+                        }
+                    });
+                })
+            },
+        );
+    }
 
     group.finish();
 }
@@ -243,6 +338,7 @@ fn bench_create(c: &mut Criterion) {
                         frozen: false,
                         conflicting: false,
                         locked: false,
+                        parent_txids: vec![],
                     };
                     let _ = engine.create(&req);
                     tx_idx += 1;
@@ -284,5 +380,6 @@ criterion_group!(
     bench_set_mined,
     bench_create,
     bench_read,
+    bench_spend_threaded,
 );
 criterion_main!(benches);

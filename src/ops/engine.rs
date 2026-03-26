@@ -29,6 +29,10 @@ use std::sync::Arc;
 /// while operations on the same transaction are serialized.
 pub struct Engine {
     device: Arc<dyn BlockDevice>,
+    /// Raw pointer to device memory for zero-copy I/O on the hot path.
+    /// `null_mut()` when the device does not support direct access (falls
+    /// back to `pread`/`pwrite` with `AlignedBuf`).
+    device_ptr: *mut u8,
     index: parking_lot::RwLock<Index>,
     allocator: parking_lot::Mutex<SlotAllocator>,
     locks: StripedLocks,
@@ -40,6 +44,11 @@ pub struct Engine {
     shard_counts: Vec<std::sync::atomic::AtomicU64>,
 }
 
+// Safety: Engine's device_ptr points into an Arc'd device that outlives
+// the Engine. All access through device_ptr is guarded by stripe locks.
+unsafe impl Send for Engine {}
+unsafe impl Sync for Engine {}
+
 impl Engine {
     /// Create a new engine with the given components.
     pub fn new(
@@ -50,6 +59,7 @@ impl Engine {
         dah_index: DahIndex,
         unmined_index: UnminedIndex,
     ) -> Self {
+        let device_ptr = device.as_raw_ptr().unwrap_or(std::ptr::null_mut());
         let shard_counts: Vec<std::sync::atomic::AtomicU64> = (0..4096)
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
@@ -60,6 +70,7 @@ impl Engine {
         }
         Self {
             device,
+            device_ptr,
             index: parking_lot::RwLock::new(index),
             allocator: parking_lot::Mutex::new(allocator),
             locks,
@@ -102,6 +113,56 @@ impl Engine {
     fn decrement_shard_count(&self, key: &TxKey) {
         let shard = crate::cluster::shards::ShardTable::shard_for_key(key) as usize;
         self.shard_counts[shard].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fast-path I/O helpers: direct memory when available, pread/pwrite fallback
+    // -----------------------------------------------------------------------
+
+    /// Read metadata from device, using direct memory access when available.
+    #[inline(always)]
+    fn read_metadata_fast(&self, record_offset: u64) -> std::result::Result<TxMetadata, SpendError> {
+        if !self.device_ptr.is_null() {
+            Ok(unsafe { io::read_metadata_direct(self.device_ptr, record_offset) })
+        } else {
+            io::read_metadata(&*self.device, record_offset)
+                .map_err(|e| SpendError::StorageError { detail: format!("{e}") })
+        }
+    }
+
+    /// Write metadata to device, using direct memory access when available.
+    #[inline(always)]
+    fn write_metadata_fast(&self, record_offset: u64, metadata: &TxMetadata) -> std::result::Result<(), SpendError> {
+        if !self.device_ptr.is_null() {
+            unsafe { io::write_metadata_direct(self.device_ptr, record_offset, metadata) };
+            Ok(())
+        } else {
+            io::write_metadata(&*self.device, record_offset, metadata)
+                .map_err(|e| SpendError::StorageError { detail: format!("{e}") })
+        }
+    }
+
+    /// Read a UTXO slot, using direct memory access when available.
+    #[inline(always)]
+    fn read_slot_fast(&self, record_offset: u64, slot_index: u32) -> std::result::Result<UtxoSlot, SpendError> {
+        if !self.device_ptr.is_null() {
+            Ok(unsafe { io::read_utxo_slot_direct(self.device_ptr, record_offset, slot_index) })
+        } else {
+            io::read_utxo_slot(&*self.device, record_offset, slot_index)
+                .map_err(|e| SpendError::StorageError { detail: format!("{e}") })
+        }
+    }
+
+    /// Write a UTXO slot, using direct memory access when available.
+    #[inline(always)]
+    fn write_slot_fast(&self, record_offset: u64, slot_index: u32, slot: &UtxoSlot) -> std::result::Result<(), SpendError> {
+        if !self.device_ptr.is_null() {
+            unsafe { io::write_utxo_slot_direct(self.device_ptr, record_offset, slot_index, slot) };
+            Ok(())
+        } else {
+            io::write_utxo_slot(&*self.device, record_offset, slot_index, slot)
+                .map_err(|e| SpendError::StorageError { detail: format!("{e}") })
+        }
     }
 
     /// Register a transaction in the index (for test setup).
@@ -217,11 +278,8 @@ impl Engine {
             .ok_or(SpendError::TxNotFound)?;
         let record_offset = entry.record_offset;
 
-        // 2. Read metadata
-        let metadata = io::read_metadata(&*self.device, record_offset)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("{e}"),
-            })?;
+        // 2. Read metadata (zero-alloc when device supports direct access)
+        let metadata = self.read_metadata_fast(record_offset)?;
 
         // 3. Record-level validation
         if metadata.flags.contains(TxFlags::CONFLICTING) && !req.ignore_conflicting {
@@ -261,22 +319,12 @@ impl Engine {
             });
         }
 
-        // 4. Batch read all requested UTXO slots
-        let slot_indices: Vec<u32> = req.spends.iter().map(|s| s.offset).collect();
-        let mut slot_map: HashMap<u32, UtxoSlot> = HashMap::new();
-        for &si in &slot_indices {
-            if si < utxo_count {
-                let slot = io::read_utxo_slot(&*self.device, record_offset, si)
-                    .map_err(|e| SpendError::StorageError {
-                        detail: format!("{e}"),
-                    })?;
-                slot_map.insert(si, slot);
-            }
-        }
-
-        // 5. Validate each spend item
+        // 4+5. Read each slot inline and validate immediately.
+        // No intermediate HashMap. For duplicate vouts in the same batch, we
+        // check valid_spends to find the already-spent state (since device
+        // writes haven't happened yet during validation).
         let mut errors: HashMap<u32, SpendError> = HashMap::new();
-        let mut valid_spends: Vec<(u32, UtxoSlot)> = Vec::new();
+        let mut valid_spends: Vec<(u32, UtxoSlot)> = Vec::with_capacity(req.spends.len());
         let mut spent_count: u32 = 0;
 
         for item in &req.spends {
@@ -285,12 +333,12 @@ impl Engine {
                 continue;
             }
 
-            let slot = match slot_map.get(&item.offset) {
-                Some(s) => *s,
-                None => {
-                    errors.insert(item.idx, SpendError::UtxoNotFound { offset: item.offset });
-                    continue;
-                }
+            // Check if this vout was already spent earlier in this batch.
+            // This handles duplicate offsets without a HashMap lookup table.
+            let slot = if let Some((_, prev)) = valid_spends.iter().rev().find(|(off, _)| *off == item.offset) {
+                *prev
+            } else {
+                self.read_slot_fast(record_offset, item.offset)?
             };
 
             if slot.hash != item.utxo_hash {
@@ -319,7 +367,6 @@ impl Engine {
                     }
 
                     let new_slot = UtxoSlot::new_spent(item.utxo_hash, item.spending_data);
-                    slot_map.insert(item.offset, new_slot);
                     valid_spends.push((item.offset, new_slot));
                     spent_count += 1;
                 }
@@ -408,9 +455,9 @@ impl Engine {
             block_height_retention,
         } = validated;
 
-        // 6. Batch write all valid slot mutations
+        // 6. Batch write all valid slot mutations (zero-alloc when direct)
         for &(offset, ref new_slot) in &valid_spends {
-            if let Err(e) = io::write_utxo_slot(&*self.device, record_offset, offset, new_slot) {
+            if let Err(e) = self.write_slot_fast(record_offset, offset, new_slot) {
                 eprintln!("engine: write_utxo_slot failed: {e}");
             }
         }
@@ -432,8 +479,8 @@ impl Engine {
             apply_dah_patch(&mut metadata, patch);
         }
 
-        // 9. Write metadata
-        if let Err(e) = io::write_metadata(&*self.device, record_offset, &metadata) {
+        // 9. Write metadata (zero-alloc when direct)
+        if let Err(e) = self.write_metadata_fast(record_offset, &metadata) {
             eprintln!("engine: write_metadata failed: {e}");
         }
 
@@ -505,10 +552,7 @@ impl Engine {
         let record_offset = entry.record_offset;
 
         // 2. Read metadata
-        let mut metadata = io::read_metadata(&*self.device, record_offset)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("{e}"),
-            })?;
+        let mut metadata = self.read_metadata_fast(record_offset)?;
 
         let utxo_count = { metadata.utxo_count };
         if req.offset >= utxo_count {
@@ -516,10 +560,7 @@ impl Engine {
         }
 
         // 3. Read the specific slot
-        let slot = io::read_utxo_slot(&*self.device, record_offset, req.offset)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("{e}"),
-            })?;
+        let slot = self.read_slot_fast(record_offset, req.offset)?;
 
         // 4. Validate hash
         if slot.hash != req.utxo_hash {
@@ -539,10 +580,7 @@ impl Engine {
                 }
                 // Valid unspend
                 let new_slot = UtxoSlot::new_unspent(req.utxo_hash);
-                io::write_utxo_slot(&*self.device, record_offset, req.offset, &new_slot)
-                    .map_err(|e| SpendError::StorageError {
-                        detail: format!("{e}"),
-                    })?;
+                self.write_slot_fast(record_offset, req.offset, &new_slot)?;
 
                 let current = { metadata.spent_utxos };
                 if current > 0 {
@@ -579,10 +617,7 @@ impl Engine {
         }
 
         // 8. Write metadata
-        io::write_metadata(&*self.device, record_offset, &metadata)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("{e}"),
-            })?;
+        self.write_metadata_fast(record_offset, &metadata)?;
 
         // 9. Update DAH secondary index
         let new_dah = { metadata.delete_at_height };
@@ -615,8 +650,7 @@ impl Engine {
         let record_offset = entry.record_offset;
 
         // 2. Read metadata
-        let mut metadata = io::read_metadata(&*self.device, record_offset)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let mut metadata = self.read_metadata_fast(record_offset)?;
 
         let old_unmined = { metadata.unmined_since };
         let old_dah = { metadata.delete_at_height };
@@ -774,8 +808,7 @@ impl Engine {
         }
 
         // Write metadata
-        io::write_metadata(&*self.device, record_offset, &metadata)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        self.write_metadata_fast(record_offset, &metadata)?;
 
         // Update secondary indexes
         let new_dah = { metadata.delete_at_height };
@@ -800,8 +833,12 @@ impl Engine {
             }
         }
 
-        let block_ids = collect_all_block_ids(&*self.device, &metadata)
-            .unwrap_or_else(|_| collect_block_ids(&metadata));
+        let block_ids = if (metadata.block_entry_count as usize) <= INLINE_BLOCK_ENTRIES {
+            collect_block_ids(&metadata)
+        } else {
+            collect_all_block_ids(&*self.device, &metadata)
+                .unwrap_or_else(|_| collect_block_ids(&metadata))
+        };
 
         Ok(SetMinedResponse {
             signal,
@@ -827,8 +864,7 @@ impl Engine {
             .ok_or(SpendError::TxNotFound)?;
         let record_offset = entry.record_offset;
 
-        let mut metadata = io::read_metadata(&*self.device, record_offset)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let mut metadata = self.read_metadata_fast(record_offset)?;
 
         let old_unmined = { metadata.unmined_since };
         let old_dah = { metadata.delete_at_height };
@@ -853,8 +889,7 @@ impl Engine {
             apply_dah_patch(&mut metadata, patch);
         }
 
-        io::write_metadata(&*self.device, record_offset, &metadata)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        self.write_metadata_fast(record_offset, &metadata)?;
 
         // Update secondary indexes
         let new_dah = { metadata.delete_at_height };
@@ -1150,14 +1185,12 @@ impl Engine {
         let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
-        let meta = io::read_metadata(&*self.device, ro)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let meta = self.read_metadata_fast(ro)?;
         if req.offset >= { meta.utxo_count } {
             return Err(SpendError::UtxoNotFound { offset: req.offset });
         }
 
-        let slot = io::read_utxo_slot(&*self.device, ro, req.offset)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let slot = self.read_slot_fast(ro, req.offset)?;
         if slot.hash != req.utxo_hash {
             return Err(SpendError::UtxoHashMismatch { offset: req.offset });
         }
@@ -1178,8 +1211,7 @@ impl Engine {
         }
 
         let frozen = UtxoSlot::new_frozen(req.utxo_hash);
-        io::write_utxo_slot(&*self.device, ro, req.offset, &frozen)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        self.write_slot_fast(ro, req.offset, &frozen)?;
         let generation = { meta.generation };
         Ok(generation)
     }
@@ -1190,14 +1222,12 @@ impl Engine {
         let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
-        let meta = io::read_metadata(&*self.device, ro)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let meta = self.read_metadata_fast(ro)?;
         if req.offset >= { meta.utxo_count } {
             return Err(SpendError::UtxoNotFound { offset: req.offset });
         }
 
-        let slot = io::read_utxo_slot(&*self.device, ro, req.offset)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let slot = self.read_slot_fast(ro, req.offset)?;
         if slot.hash != req.utxo_hash {
             return Err(SpendError::UtxoHashMismatch { offset: req.offset });
         }
@@ -1206,8 +1236,7 @@ impl Engine {
         }
 
         let unspent = UtxoSlot::new_unspent(req.utxo_hash);
-        io::write_utxo_slot(&*self.device, ro, req.offset, &unspent)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        self.write_slot_fast(ro, req.offset, &unspent)?;
         let generation = { meta.generation };
         Ok(generation)
     }
@@ -1218,14 +1247,12 @@ impl Engine {
         let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
-        let mut meta = io::read_metadata(&*self.device, ro)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let mut meta = self.read_metadata_fast(ro)?;
         if req.offset >= { meta.utxo_count } {
             return Err(SpendError::UtxoNotFound { offset: req.offset });
         }
 
-        let slot = io::read_utxo_slot(&*self.device, ro, req.offset)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let slot = self.read_slot_fast(ro, req.offset)?;
         if slot.hash != req.utxo_hash {
             return Err(SpendError::UtxoHashMismatch { offset: req.offset });
         }
@@ -1238,15 +1265,13 @@ impl Engine {
         let mut new_slot = UtxoSlot::new_unspent(req.new_utxo_hash);
         new_slot.spending_data[0..4].copy_from_slice(&spendable_height.to_le_bytes());
 
-        io::write_utxo_slot(&*self.device, ro, req.offset, &new_slot)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        self.write_slot_fast(ro, req.offset, &new_slot)?;
 
         // Update metadata (generation, updated_at, reassignment_count)
         meta.reassignment_count = meta.reassignment_count.saturating_add(1);
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = now_millis();
-        io::write_metadata(&*self.device, ro, &meta)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        self.write_metadata_fast(ro, &meta)?;
 
         let generation = { meta.generation };
         Ok(generation)
@@ -1266,8 +1291,7 @@ impl Engine {
             None => return Ok(()),
         };
         let ro = entry.record_offset;
-        let mut meta = io::read_metadata(&*self.device, ro)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let mut meta = self.read_metadata_fast(ro)?;
 
         let count = { meta.conflicting_children_count } as usize;
         let offset = { meta.conflicting_children_offset };
@@ -1324,8 +1348,7 @@ impl Engine {
         meta.conflicting_children_offset = new_offset;
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = now_millis();
-        io::write_metadata(&*self.device, ro, &meta)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        self.write_metadata_fast(ro, &meta)?;
 
         Ok(())
     }
@@ -1337,8 +1360,7 @@ impl Engine {
     ) -> Result<Vec<[u8; 32]>, SpendError> {
         let entry = self.index.read().lookup(key).ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
-        let meta = io::read_metadata(&*self.device, ro)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let meta = self.read_metadata_fast(ro)?;
 
         let count = { meta.conflicting_children_count } as usize;
         let offset = { meta.conflicting_children_offset };
@@ -1373,8 +1395,7 @@ impl Engine {
         let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
-        let mut meta = io::read_metadata(&*self.device, ro)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let mut meta = self.read_metadata_fast(ro)?;
         let old_dah = { meta.delete_at_height };
 
         if req.value {
@@ -1395,8 +1416,7 @@ impl Engine {
             apply_dah_patch(&mut meta, patch);
         }
 
-        io::write_metadata(&*self.device, ro, &meta)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        self.write_metadata_fast(ro, &meta)?;
 
         let new_dah = { meta.delete_at_height };
         if new_dah != old_dah {
@@ -1428,8 +1448,7 @@ impl Engine {
         let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
-        let mut meta = io::read_metadata(&*self.device, ro)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let mut meta = self.read_metadata_fast(ro)?;
         let old_dah = { meta.delete_at_height };
 
         if req.value {
@@ -1445,8 +1464,7 @@ impl Engine {
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = now_millis();
 
-        io::write_metadata(&*self.device, ro, &meta)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        self.write_metadata_fast(ro, &meta)?;
 
         let new_dah = { meta.delete_at_height };
         if new_dah != old_dah {
@@ -1471,8 +1489,7 @@ impl Engine {
         let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
-        let mut meta = io::read_metadata(&*self.device, ro)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let mut meta = self.read_metadata_fast(ro)?;
         let old_dah = { meta.delete_at_height };
 
         meta.delete_at_height = 0;
@@ -1480,8 +1497,7 @@ impl Engine {
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = now_millis();
 
-        io::write_metadata(&*self.device, ro, &meta)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        self.write_metadata_fast(ro, &meta)?;
 
         if old_dah != 0 {
             self.dah_index.lock().remove(&req.tx_key);
@@ -1507,8 +1523,7 @@ impl Engine {
         };
 
         let record_size = {
-            let meta = io::read_metadata(&*self.device, entry.record_offset)
-                .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+            let meta = self.read_metadata_fast(entry.record_offset)?;
             ({ meta.record_size }) as u64
         };
 
@@ -1534,14 +1549,12 @@ impl Engine {
         let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
-        let meta = io::read_metadata(&*self.device, ro)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let meta = self.read_metadata_fast(ro)?;
         if req.offset >= { meta.utxo_count } {
             return Err(SpendError::UtxoNotFound { offset: req.offset });
         }
 
-        let slot = io::read_utxo_slot(&*self.device, ro, req.offset)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        let slot = self.read_slot_fast(ro, req.offset)?;
         if slot.hash != req.utxo_hash {
             return Err(SpendError::UtxoHashMismatch { offset: req.offset });
         }
@@ -1572,10 +1585,7 @@ impl Engine {
             .read()
             .lookup(key)
             .ok_or(SpendError::TxNotFound)?;
-        io::read_metadata(&*self.device, entry.record_offset)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("{e}"),
-            })
+        self.read_metadata_fast(entry.record_offset)
     }
 
     /// Read a UTXO slot (for testing).
@@ -1585,10 +1595,7 @@ impl Engine {
             .read()
             .lookup(key)
             .ok_or(SpendError::TxNotFound)?;
-        io::read_utxo_slot(&*self.device, entry.record_offset, offset)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("{e}"),
-            })
+        self.read_slot_fast(entry.record_offset, offset)
     }
 
     /// Get the DAH index (for testing).
