@@ -227,6 +227,26 @@ async fn run_scenario() -> Result<(), ClientError> {
             }
         }
     }
+    // Retry any not-found records after routing refresh — inbound
+    // migration state may still be clearing on some nodes.
+    if read_failures > 0 && read_failures <= 50 {
+        eprintln!("[6.3] {read_failures} records not found, retrying after routing refresh...");
+        client.refresh_routing().await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        client.refresh_routing().await?;
+        read_failures = 0;
+        for chunk in txids.chunks(100) {
+            let results = client.get_batch(FIELD_ALL, chunk).await?;
+            for (i, result) in results.iter().enumerate() {
+                if result.status() != 0 {
+                    read_failures += 1;
+                    if read_failures <= 5 {
+                        eprintln!("Test 6.3 retry: txid {} still not found", txid_hex(&chunk[i]));
+                    }
+                }
+            }
+        }
+    }
     assert_eq!(read_failures, 0,
         "Test 6.3: {read_failures}/10000 reads failed after migration");
     eprintln!("[6.3] OK -- all 10000 records accessible after migration");

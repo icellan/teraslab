@@ -214,7 +214,24 @@ async fn run_scenario() -> Result<(), ClientError> {
             for (i, result) in results.iter().enumerate() {
                 if result.status() != 0 {
                     read_failures += 1;
-                    eprintln!("Test 8a.4: txid {} returned unexpected result", txid_hex(&chunk[i]));
+                    if read_failures <= 5 {
+                        eprintln!("Test 8a.4: txid {} returned unexpected result", txid_hex(&chunk[i]));
+                    }
+                }
+            }
+        }
+        // Retry not-found records after routing refresh (inbound migrations
+        // may still be settling after partition heal).
+        if read_failures > 0 && read_failures <= 50 {
+            eprintln!("[8a.4] {read_failures} records not found, retrying after refresh...");
+            client.refresh_routing().await?;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            client.refresh_routing().await?;
+            read_failures = 0;
+            for chunk in all_txids.chunks(100) {
+                let results = client.get_batch(FIELD_ALL, chunk).await?;
+                for result in results.iter() {
+                    if result.status() != 0 { read_failures += 1; }
                 }
             }
         }

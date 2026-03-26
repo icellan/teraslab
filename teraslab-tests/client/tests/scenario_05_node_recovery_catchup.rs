@@ -101,6 +101,28 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // -- Test 5.3: Verify balanced distribution --
     eprintln!("[5.3] Checking shard distribution balance");
+    // Wait for shard rebalance to fully propagate after node rejoin.
+    {
+        let start = std::time::Instant::now();
+        loop {
+            let mut min_masters = u64::MAX;
+            for n in 1..=3u32 {
+                if let Ok(s) = common::http_status(&docker, n).await {
+                    let mc = s["master_shard_count"].as_u64().unwrap_or(0);
+                    min_masters = min_masters.min(mc);
+                }
+            }
+            if min_masters > 1000 {
+                break;
+            }
+            if start.elapsed() >= Duration::from_secs(30) {
+                eprintln!("[5.3] WARNING: min_masters={min_masters} after 30s");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     let expected_per_node: u64 = 4096 / 3;
     let tolerance_pct: u64 = 10;
     let tolerance = expected_per_node * tolerance_pct / 100;

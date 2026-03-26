@@ -31,6 +31,7 @@ const OP_PRESERVE_UNTIL: u8 = 10;
 const OP_CREATE: u8 = 11;
 const OP_DELETE: u8 = 12;
 const OP_PRUNE_SLOT: u8 = 13;
+const OP_MARK_LONGEST_CHAIN: u8 = 14;
 
 /// A single replication operation sent from master to replica.
 /// A mutation operation to be replicated from master to replica.
