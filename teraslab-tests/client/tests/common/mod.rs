@@ -206,6 +206,9 @@ pub async fn wait_specific_migrations_complete(
                             all_idle = false;
                         }
                     }
+                    // Note: inbound_pending is NOT checked here. It may
+                    // remain non-zero during retry cycles. The 30s timeout
+                    // fallback (line below) handles this case.
                 }
             }
             let status_url = format!("http://127.0.0.1:{port}/status");
@@ -259,6 +262,9 @@ pub async fn wait_migrations_complete(
                             node_details.push(format!("node{i}:mig={count}"));
                         }
                     }
+                    // Note: inbound_pending is NOT checked here. It may
+                    // remain non-zero during retry cycles. The 30s timeout
+                    // fallback (line below) handles this case.
                 }
             }
             let status_url = format!("http://127.0.0.1:{port}/status");

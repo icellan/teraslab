@@ -259,6 +259,30 @@ async fn test_staggered_start() -> Result<(), ClientError> {
 
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    // Wait for shard rebalance to fully propagate to all nodes.
+    // After topology commit and migration, each node's target_assignment
+    // should reflect the 3-node layout. Poll until shard distribution
+    // is balanced (each node masters > 1000 shards).
+    {
+        let start = std::time::Instant::now();
+        loop {
+            let mut min_masters = u64::MAX;
+            for n in 1..=3u32 {
+                if let Ok(s) = common::http_status(&docker, n).await {
+                    let mc = s["master_shard_count"].as_u64().unwrap_or(0);
+                    min_masters = min_masters.min(mc);
+                }
+            }
+            if min_masters > 1000 {
+                break;
+            }
+            if start.elapsed() >= Duration::from_secs(30) {
+                eprintln!("[1.8] WARNING: min_masters={min_masters} after 30s, proceeding anyway");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
 
     let mut versions = Vec::with_capacity(3);
     for node_num in 1..=3u32 {
@@ -342,9 +366,26 @@ async fn test_late_join() -> Result<(), ClientError> {
     docker.compose_up_nodes(&["node3"]).await?;
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
-    // Allow shard handoff to complete (Copying → ServingNew transition
-    // after migration data arrives).
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for shard rebalance to fully propagate.
+    {
+        let start = std::time::Instant::now();
+        loop {
+            let mut min_masters = u64::MAX;
+            for n in 1..=3u32 {
+                if let Ok(s) = common::http_status(&docker, n).await {
+                    let mc = s["master_shard_count"].as_u64().unwrap_or(0);
+                    min_masters = min_masters.min(mc);
+                }
+            }
+            if min_masters > 1000 {
+                break;
+            }
+            if start.elapsed() >= Duration::from_secs(30) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
 
     let expected_per_node: u64 = 4096 / 3;
     let tolerance: u64 = 50;
