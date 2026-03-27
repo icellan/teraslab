@@ -1144,4 +1144,166 @@ mod tests {
         assert_eq!(result, Some(5));
         assert_eq!(auth.committed_members(), original_members);
     }
+
+    // -----------------------------------------------------------------------
+    // Deep edge cases: state machine interactions
+    // -----------------------------------------------------------------------
+
+    /// handle_commit does NOT advance voted_term. After catching up via
+    /// handle_commit, the gap between voted_term and committed_term must
+    /// not allow re-voting for a term between the two.
+    #[test]
+    fn handle_commit_leaves_voted_term_unchanged() {
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+
+        // Vote for term 3
+        let p = TopologyTerm::new(3, members(&[1, 2, 3]), NodeId(1));
+        let v = auth.handle_propose(&p);
+        assert!(v.accepted);
+        assert_eq!(auth.voted_term.load(Ordering::Relaxed), 3);
+
+        // Catch up to term 10 via commit
+        let mems = members(&[1, 2, 3, 4]);
+        let commit = TopologyCommit {
+            term: 10,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            digest: TopologyTerm::compute_digest(10, &mems),
+        };
+        auth.handle_commit(&commit);
+        assert_eq!(auth.committed_term(), 10);
+        // voted_term is still 3 — handle_commit doesn't update it
+        assert_eq!(auth.voted_term.load(Ordering::Relaxed), 3);
+
+        // Proposal for term 8: > voted(3) but NOT > committed(10) → reject
+        let p2 = TopologyTerm::new(8, members(&[1, 2, 3]), NodeId(1));
+        let v2 = auth.handle_propose(&p2);
+        assert!(!v2.accepted, "term 8 < committed_term 10 → must reject");
+    }
+
+    /// on_membership_changed computes new_term as max(committed, voted) + 1.
+    /// If voted_term > committed_term (voted for a term that wasn't committed),
+    /// the next proposal skips past the voted term.
+    #[test]
+    fn on_membership_changed_skips_past_voted_term() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+
+        // Propose and self-vote for term 1
+        let t1 = auth.on_membership_changed(&members(&[1, 2, 3])).unwrap();
+        assert_eq!(t1.term, 1);
+        // voted_term = 1, committed_term = 0
+
+        // Proposal for term 2 arrives from another node — we vote for it
+        // (simulating a concurrent proposer). But for this test, we'll
+        // artificially advance voted_term.
+        auth.voted_term.store(5, Ordering::Relaxed);
+
+        // Now on_membership_changed should produce term 6 (max(0, 5) + 1)
+        let t2 = auth.on_membership_changed(&members(&[1, 2])).unwrap();
+        assert_eq!(t2.term, 6, "should skip past voted_term=5");
+    }
+
+    /// check_timeout twice: each call proposes a new term and overwrites
+    /// the pending proposal. Votes for the first term are ignored.
+    #[test]
+    fn check_timeout_overwrite_pending() {
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_millis(1));
+        let mems = members(&[1, 2, 3]);
+
+        // Commit a different membership so check_timeout fires.
+        let old_mems = members(&[1, 2]);
+        auth.handle_commit(&TopologyCommit {
+            term: 1,
+            proposer: NodeId(1),
+            members: old_mems.clone(),
+            digest: TopologyTerm::compute_digest(1, &old_mems),
+        });
+
+        std::thread::sleep(Duration::from_millis(5));
+
+        let t1 = auth.check_timeout(&mems).unwrap();
+        let t2 = auth.check_timeout(&mems).unwrap();
+        assert!(t2.term > t1.term, "second timeout should advance term");
+
+        // Vote for t1 should not match pending (which is now t2)
+        let v1 = TopologyVote {
+            term: t1.term,
+            digest: t1.digest,
+            voter: NodeId(1),
+            accepted: true,
+            voter_current_term: 0,
+        };
+        assert!(auth.handle_vote(&v1).is_none());
+
+        // Vote for t2 should match
+        let v2 = TopologyVote {
+            term: t2.term,
+            digest: t2.digest,
+            voter: NodeId(1),
+            accepted: true,
+            voter_current_term: 0,
+        };
+        assert!(auth.handle_vote(&v2).is_some());
+    }
+
+    /// Verify that deserialize rejects truncated data at various boundaries.
+    #[test]
+    fn topology_term_deserialize_truncation_boundaries() {
+        let term = TopologyTerm::new(42, members(&[1, 2, 3]), NodeId(1));
+        let data = term.serialize();
+
+        // Truncate at various points — all should return None.
+        for len in [0, 1, 8, 15, 19, 20, 27, 28] {
+            if len < data.len() {
+                assert!(TopologyTerm::deserialize(&data[..len]).is_none(),
+                    "truncation at {len} bytes should fail");
+            }
+        }
+
+        // Full data should succeed
+        assert!(TopologyTerm::deserialize(&data).is_some());
+    }
+
+    /// Persisted state with zero peak_cluster_size: should be clamped to 1.
+    #[test]
+    fn persisted_state_zero_peak_clamped() {
+        let state = PersistedTopologyState {
+            peak_cluster_size: 0,
+            committed_term: 1,
+            committed_members: members(&[1]),
+            voted_term: 1,
+            incarnation: 0,
+        };
+        let data = state.serialize();
+        let restored = PersistedTopologyState::deserialize(&data);
+        assert_eq!(restored.peak_cluster_size, 1,
+            "zero peak should be clamped to 1");
+    }
+
+    /// handle_propose: cluster formation recovery with proposal term EQUAL
+    /// to committed term (not just greater). This is the boundary condition.
+    #[test]
+    fn formation_recovery_equal_term_accepted() {
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+
+        // Single-node commit at term 1
+        let single = members(&[2]);
+        auth.handle_commit(&TopologyCommit {
+            term: 1,
+            proposer: NodeId(2),
+            members: single.clone(),
+            digest: TopologyTerm::compute_digest(1, &single),
+        });
+
+        // Proposal at term 1 (equal, not greater) with multi-node members.
+        // Formation recovery: our_cluster_is_single_node=true, proposal subsumes
+        // us, no outstanding vote (voted=0 after commit? Let's check...).
+        // Actually after commit, voted_term is still 0 (handle_commit doesn't
+        // update it), and committed_term = 1. no_outstanding_vote = (voted <= committed)
+        // = (0 <= 1) = true. propose.term >= committed = (1 >= 1) = true.
+        let proposal = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1));
+        let v = auth.handle_propose(&proposal);
+        assert!(v.accepted,
+            "formation recovery should accept equal-term multi-node proposal");
+    }
 }

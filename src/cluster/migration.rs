@@ -1327,4 +1327,193 @@ mod tests {
         mgr.mark_failed(&t);
         assert!(!mgr.is_migrating_shard(7));
     }
+
+    // -----------------------------------------------------------------------
+    // Deep edge cases: fence bitmap single-bit-per-shard limitation
+    // -----------------------------------------------------------------------
+
+    /// Two tasks for the same shard both fenced: completing one unfences
+    /// the shard even though the other is still in the Fenced state.
+    /// This documents the current limitation: the fenced_shards bitmap
+    /// has one bit per shard, not one bit per (shard, task).
+    #[test]
+    fn two_fenced_tasks_same_shard_complete_one_unfences() {
+        let mut mgr = MigrationManager::new();
+        let t1 = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        let t2 = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(3), is_master: false };
+        mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &std::collections::HashSet::new());
+
+        mgr.mark_fenced(&t1, 100);
+        mgr.mark_fenced(&t2, 200);
+        assert!(mgr.is_shard_fenced(5));
+
+        // Complete t1 → shard 5 unfenced, even though t2 is still Fenced.
+        mgr.mark_complete(&t1);
+        assert!(!mgr.is_shard_fenced(5),
+            "bitmap is per-shard: completing one task unfences");
+
+        // t2 is still tracked as Fenced in its progress entry.
+        let t2_progress = mgr.active_migrations().iter()
+            .find(|p| p.to_node == NodeId(3))
+            .expect("t2 should still be active");
+        assert_eq!(t2_progress.state, MigrationState::Fenced);
+    }
+
+    /// mark_complete and mark_failed always call unfence_shard regardless
+    /// of whether find_task_mut found the task. This means calling
+    /// mark_complete on a task that was already cleaned up still unfences.
+    #[test]
+    fn mark_complete_unfences_even_when_task_not_found() {
+        let mut mgr = MigrationManager::new();
+
+        // Fence a shard manually without registering a task.
+        mgr.fence_shard(99);
+        assert!(mgr.is_shard_fenced(99));
+
+        // mark_complete with a non-existent task → find_task_mut returns None,
+        // but unfence_shard(99) still runs.
+        let phantom = MigrationTask { shard: 99, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        mgr.mark_complete(&phantom);
+        assert!(!mgr.is_shard_fenced(99));
+    }
+
+    /// mark_failed also unfences even when the task isn't found.
+    #[test]
+    fn mark_failed_unfences_even_when_task_not_found() {
+        let mut mgr = MigrationManager::new();
+        mgr.fence_shard(42);
+        assert!(mgr.is_shard_fenced(42));
+
+        let phantom = MigrationTask { shard: 42, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        mgr.mark_failed(&phantom);
+        assert!(!mgr.is_shard_fenced(42));
+    }
+
+    // -----------------------------------------------------------------------
+    // Deep edge cases: inbound tracking precision
+    // -----------------------------------------------------------------------
+
+    /// Inbound tracking with multiple sources for the same shard: each
+    /// source must be independently completable.
+    #[test]
+    fn inbound_multiple_sources_independent_completion() {
+        let mut mgr = MigrationManager::new();
+        let t1 = MigrationTask { shard: 10, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
+        let t2 = MigrationTask { shard: 10, from_node: NodeId(3), to_node: NodeId(1), is_master: false };
+
+        let mut pop = std::collections::HashSet::new();
+        pop.insert(10);
+        mgr.start_outbound(&[t1, t2], NodeId(1), &pop);
+
+        // Two inbound entries for shard 10.
+        assert_eq!(mgr.inbound_count(), 2);
+        assert!(mgr.has_pending_inbound(10));
+
+        // Complete one source.
+        mgr.mark_inbound_complete(10);
+        assert_eq!(mgr.inbound_count(), 1);
+        assert!(mgr.has_pending_inbound(10), "shard still has one pending source");
+
+        // Complete the second source.
+        mgr.mark_inbound_complete(10);
+        assert_eq!(mgr.inbound_count(), 0);
+        assert!(!mgr.has_pending_inbound(10));
+    }
+
+    /// start_outbound skips inbound registration for empty shards.
+    #[test]
+    fn start_outbound_skips_empty_shards_for_inbound() {
+        let mut mgr = MigrationManager::new();
+        let t1 = MigrationTask { shard: 10, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
+        let t2 = MigrationTask { shard: 20, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
+
+        // Only shard 10 is populated.
+        let mut pop = std::collections::HashSet::new();
+        pop.insert(10);
+        mgr.start_outbound(&[t1, t2], NodeId(1), &pop);
+
+        // Only shard 10 should be registered as inbound.
+        assert!(mgr.has_pending_inbound(10));
+        assert!(!mgr.has_pending_inbound(20), "empty shard 20 should not be inbound");
+        assert_eq!(mgr.inbound_count(), 1);
+    }
+
+    /// Outbound serialize/restore round-trip preserves Streaming state
+    /// with the correct snapshot_sequence, and skips Fenced tasks (which
+    /// ARE serialized — this verifies both are preserved).
+    #[test]
+    fn outbound_serialize_preserves_all_active_states() {
+        let mut mgr = MigrationManager::new();
+        let t1 = MigrationTask { shard: 1, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        let t2 = MigrationTask { shard: 2, from_node: NodeId(1), to_node: NodeId(3), is_master: true };
+        let t3 = MigrationTask { shard: 3, from_node: NodeId(1), to_node: NodeId(4), is_master: false };
+        mgr.start_outbound(&[t1.clone(), t2.clone(), t3.clone()], NodeId(1), &std::collections::HashSet::new());
+
+        mgr.set_snapshot_sequence(&t1, 100); // Streaming
+        mgr.mark_fenced(&t2, 200); // Fenced
+        // t3 stays Preparing
+
+        let data = mgr.serialize_outbound();
+        let mut restored = MigrationManager::new();
+        restored.restore_outbound(&data);
+
+        assert_eq!(restored.active_count(), 3);
+        let r1 = restored.active_migrations().iter().find(|p| p.shard == 1).unwrap();
+        assert_eq!(r1.state, MigrationState::Streaming);
+        assert_eq!(r1.snapshot_sequence, 100);
+
+        let r2 = restored.active_migrations().iter().find(|p| p.shard == 2).unwrap();
+        assert_eq!(r2.state, MigrationState::Fenced);
+        assert_eq!(r2.fence_sequence, 200);
+
+        let r3 = restored.active_migrations().iter().find(|p| p.shard == 3).unwrap();
+        assert_eq!(r3.state, MigrationState::Preparing);
+        assert!(!r3.is_master);
+    }
+
+    /// clear_inbound followed by start_outbound: new inbound registrations
+    /// should work correctly after a full clear.
+    #[test]
+    fn clear_inbound_then_reregister() {
+        let mut mgr = MigrationManager::new();
+        mgr.mark_inbound_active(10);
+        mgr.mark_inbound_active(20);
+        assert_eq!(mgr.inbound_count(), 2);
+
+        mgr.clear_inbound();
+        assert_eq!(mgr.inbound_count(), 0);
+        assert!(!mgr.has_pending_inbound(10));
+        assert!(!mgr.has_pending_inbound(20));
+
+        // Re-register via start_outbound.
+        let t = MigrationTask { shard: 10, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
+        let mut pop = std::collections::HashSet::new();
+        pop.insert(10);
+        mgr.start_outbound(&[t], NodeId(1), &pop);
+        assert_eq!(mgr.inbound_count(), 1);
+        assert!(mgr.has_pending_inbound(10));
+    }
+
+    /// AtomicShardBitmap: load_from must completely overwrite the previous
+    /// state, not OR with it.
+    #[test]
+    fn atomic_bitmap_load_from_overwrites() {
+        let atomic = AtomicShardBitmap::new();
+        atomic.set(0);
+        atomic.set(100);
+        atomic.set(4095);
+
+        // Create a source bitmap with different bits.
+        let mut source = ShardBitmap::new();
+        source.set(50);
+        source.set(200);
+
+        // load_from should replace, not merge.
+        atomic.load_from(&source);
+        assert!(!atomic.test(0), "old bit 0 should be cleared");
+        assert!(!atomic.test(100), "old bit 100 should be cleared");
+        assert!(!atomic.test(4095), "old bit 4095 should be cleared");
+        assert!(atomic.test(50), "new bit 50 should be set");
+        assert!(atomic.test(200), "new bit 200 should be set");
+    }
 }

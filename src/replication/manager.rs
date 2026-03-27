@@ -1267,4 +1267,177 @@ mod tests {
         assert_eq!(received[2].ops.len(), 1);
         assert_eq!(received[2].last_sequence(), 104);
     }
+
+    // -----------------------------------------------------------------------
+    // Deep edge cases: catch-up state machine
+    // -----------------------------------------------------------------------
+
+    /// Replica already caught up (from_seq >= master_seq): transitions
+    /// directly to Live without sending anything.
+    #[test]
+    fn catchup_already_caught_up_transitions_to_live() {
+        let (mt, _rt) = InMemoryTransport::pair();
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig::default(),
+            vec![Box::new(mt)],
+        );
+
+        mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 100 };
+        mgr.senders[0].last_acked = 99;
+        mgr.next_sequence = 100; // from_seq(100) >= master(100)
+
+        mgr.run_catchup(|_| {
+            panic!("should not be called when already caught up");
+        }).unwrap();
+
+        assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
+    }
+
+    /// Catch-up batch_size=1: each op sent individually. Verify all are
+    /// applied with correct first_sequence values.
+    #[test]
+    fn catchup_batch_size_1_each_op_individual() {
+        let (mt, rt) = InMemoryTransport::pair();
+        let handle = spawn_auto_ack_replica(rt);
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig {
+                catchup_batch_size: 1,
+                ..Default::default()
+            },
+            vec![Box::new(mt)],
+        );
+
+        mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 50 };
+        mgr.next_sequence = 53;
+
+        mgr.run_catchup(|from_seq| {
+            assert_eq!(from_seq, 50);
+            (0..3).map(|i| ReplicaOp::Freeze {
+                tx_key: key(i), offset: 0, master_generation: 0,
+            }).collect()
+        }).unwrap();
+
+        assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
+
+        drop(mgr);
+        let received = handle.join().unwrap();
+        assert_eq!(received.len(), 3, "3 ops at batch_size=1 = 3 batches");
+        assert_eq!(received[0].first_sequence, 50);
+        assert_eq!(received[1].first_sequence, 51);
+        assert_eq!(received[2].first_sequence, 52);
+    }
+
+    /// Catch-up transport failure mid-stream: replica should be marked Down.
+    #[test]
+    fn catchup_transport_failure_marks_down() {
+        let (mt, _rt) = InMemoryTransport::pair(); // drop replica side → send fails
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig {
+                catchup_batch_size: 5,
+                replication_timeout: Duration::from_millis(100),
+                ..Default::default()
+            },
+            vec![Box::new(mt)],
+        );
+
+        mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 1 };
+        mgr.next_sequence = 10;
+
+        mgr.run_catchup(|_| {
+            (0..9).map(|i| ReplicaOp::Freeze {
+                tx_key: key(i as u8), offset: 0, master_generation: 0,
+            }).collect()
+        }).unwrap();
+
+        assert_eq!(*mgr.sender(0).state(), ReplicaState::Down,
+            "transport failure during catchup should mark Down");
+    }
+
+    /// check_reconnected on a NeedsResync replica: should stay NeedsResync
+    /// (reconnection alone isn't enough to resume — full resync needed).
+    #[test]
+    fn check_reconnected_does_not_clear_needs_resync() {
+        let (mt, _rt) = InMemoryTransport::pair();
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig::default(),
+            vec![Box::new(mt)],
+        );
+
+        mgr.senders[0].state = ReplicaState::NeedsResync;
+        mgr.check_reconnected();
+        // NeedsResync is not Down, so check_reconnected should not touch it.
+        assert_eq!(*mgr.sender(0).state(), ReplicaState::NeedsResync);
+    }
+
+    /// WriteMajority RF=5 (4 replicas): verify required_ack_count is exactly 2
+    /// (majority of 5 = 3 copies; master counts as 1; need 2 replica ACKs).
+    #[test]
+    fn required_ack_count_rf5_write_majority() {
+        let mgr = ReplicationManager::new(
+            ReplicationConfig { ack_policy: AckPolicy::WriteMajority, ..Default::default() },
+            vec![
+                Box::new(InMemoryTransport::pair().0),
+                Box::new(InMemoryTransport::pair().0),
+                Box::new(InMemoryTransport::pair().0),
+                Box::new(InMemoryTransport::pair().0),
+            ],
+        );
+        // RF=5: majority = 5/2+1 = 3. Master counts as 1. Need 2 ACKs.
+        assert_eq!(mgr.required_ack_count(), 2);
+    }
+
+    /// WriteAll RF=5: required_ack_count should be 4 (all replicas).
+    #[test]
+    fn required_ack_count_rf5_write_all() {
+        let mgr = ReplicationManager::new(
+            ReplicationConfig { ack_policy: AckPolicy::WriteAll, ..Default::default() },
+            vec![
+                Box::new(InMemoryTransport::pair().0),
+                Box::new(InMemoryTransport::pair().0),
+                Box::new(InMemoryTransport::pair().0),
+                Box::new(InMemoryTransport::pair().0),
+            ],
+        );
+        assert_eq!(mgr.required_ack_count(), 4);
+    }
+
+    /// with_initial_sequence(0) clamps to 1.
+    #[test]
+    fn with_initial_sequence_zero_clamps() {
+        let mgr = ReplicationManager::with_initial_sequence(
+            ReplicationConfig::default(),
+            vec![],
+            0,
+        );
+        assert_eq!(mgr.current_sequence(), 1);
+    }
+
+    /// Replica sends an error ACK: sender should be marked Down and the
+    /// error propagated.
+    #[test]
+    fn replica_error_ack_marks_sender_down() {
+        let (mt, rt) = InMemoryTransport::pair();
+
+        let _handle = std::thread::spawn(move || {
+            if let Ok(batch) = rt.recv_batch(Duration::from_secs(1)) {
+                let ack = ReplicaAck::Error {
+                    failed_sequence: batch.first_sequence,
+                    message: "test error".into(),
+                };
+                let _ = rt.send_ack(&ack);
+            }
+        });
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig::default(),
+            vec![Box::new(mt)],
+        );
+
+        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        let result = mgr.replicate_batch(&ops);
+        assert!(result.is_err());
+        assert_eq!(*mgr.sender(0).state(), ReplicaState::Down);
+    }
 }
