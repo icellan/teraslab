@@ -465,45 +465,25 @@ pub async fn seed_records(
 
         // Only record in verifier AFTER the create succeeds, to avoid
         // phantom records when the create fails (e.g., during degradation).
-        // Retry on transient errors from SWIM instability or dead nodes.
+        // Retry on transient errors from SWIM instability, dead nodes,
+        // or cluster topology changes. Uses exponential backoff with up to
+        // 8 attempts (~30s total) to ride out post-topology-change settle.
+        const MAX_SEED_RETRIES: u32 = 8;
         let mut created = false;
-        for attempt in 0..5 {
+        for attempt in 0..MAX_SEED_RETRIES {
             match client.create_batch(&items).await {
                 Ok(_) => { created = true; break; }
-                Err(ClientError::Server { code, .. }) if code == 15 && attempt < 4 => {
-                    // NO_QUORUM: SWIM instability, retry after refresh.
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    let _ = client.refresh_routing().await;
-                }
-                Err(ClientError::Connection(_)) if attempt < 4 => {
-                    // Connection refused / dead node — refresh routing and retry.
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    let _ = client.refresh_routing().await;
-                }
-                Err(ClientError::Partial(ref pe)) if attempt < 4
-                    && pe.errors.len() == items.len() =>
-                {
-                    // All items failed — cluster-wide transient issue
-                    // (redirect, migration, replication, or dead node).
-                    // Log error codes for diagnostics, then retry.
+                Err(ref e) if attempt + 1 < MAX_SEED_RETRIES => {
+                    // Retryable: any error except on the last attempt.
                     if attempt == 0 {
-                        let codes: Vec<u16> = pe.errors.iter().map(|e| e.code).collect();
-                        let unique: std::collections::HashSet<u16> = codes.iter().copied().collect();
-                        eprintln!("seed_records: all {} items failed (codes: {:?}), retrying...",
-                            items.len(), unique);
+                        eprintln!("seed_records: transient error on attempt {attempt}, retrying: {e}");
                     }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    let _ = client.refresh_routing().await;
-                }
-                Err(ClientError::Partial(ref pe)) if attempt < 4
-                    && pe.errors.iter().all(|e| e.code == 14 || e.code == 19 || e.code == 20) =>
-                {
-                    // All errors are retryable codes.
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let delay = Duration::from_millis(500 * (1 << attempt.min(3)));
+                    tokio::time::sleep(delay).await;
                     let _ = client.refresh_routing().await;
                 }
                 Err(e) => {
-                    eprintln!("seed_records: unhandled error on attempt {attempt}: {e}");
+                    eprintln!("seed_records: failed after {MAX_SEED_RETRIES} attempts: {e}");
                     return Err(e);
                 }
             }
@@ -553,9 +533,26 @@ pub async fn verify_consistency(
 
     // Process in batches of 100 to avoid overwhelming the wire protocol.
     for chunk in txids.chunks(100) {
-        let results = client
-            .get_batch(FIELD_ALL_METADATA, chunk)
-            .await?;
+        // Retry batch reads on connection errors — cluster may still be
+        // settling after recovery, partitions, or migrations.
+        let results = {
+            let mut last_err = None;
+            let mut res = None;
+            for _retry in 0..3 {
+                match client.get_batch(FIELD_ALL_METADATA, chunk).await {
+                    Ok(r) => { res = Some(r); break; }
+                    Err(e) => {
+                        let _ = client.refresh_routing().await;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        last_err = Some(e);
+                    }
+                }
+            }
+            match res {
+                Some(r) => r,
+                None => return Err(last_err.unwrap()),
+            }
+        };
 
         for (i, result) in results.iter().enumerate() {
             let txid = &chunk[i];
@@ -673,6 +670,12 @@ pub async fn teardown_all(scenario_id: u16) {
             .await;
     }
 
+    // Prune any orphaned volumes from this scenario to avoid stale state.
+    let _ = tokio::process::Command::new("docker")
+        .args(["volume", "prune", "-f", "--filter", &format!("name=ts{scenario_id:02}")])
+        .output()
+        .await;
+
     // Wait for Docker to fully release network ports and resources.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
 }

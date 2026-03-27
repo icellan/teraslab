@@ -712,6 +712,32 @@ mod tests {
     }
 
     #[test]
+    fn handle_commit_rejects_same_term() {
+        // Regression: duplicate commit for the same term must be rejected.
+        // This prevents double-mastered shards when two commit signals
+        // arrive close together (e.g., deterministic + fallback proposer).
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            digest: TopologyTerm::compute_digest(5, &mems),
+        };
+
+        // First commit succeeds
+        let result1 = auth.handle_commit(&commit);
+        assert_eq!(result1, Some(5));
+        assert_eq!(auth.committed_term(), 5);
+
+        // Second commit with same term is rejected
+        let result2 = auth.handle_commit(&commit);
+        assert!(result2.is_none(), "duplicate commit for same term should be rejected");
+        // Term should still be 5 — not advanced
+        assert_eq!(auth.committed_term(), 5);
+    }
+
+    #[test]
     fn handle_commit_rejects_bad_digest() {
         let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
         let mems = members(&[1, 2, 3]);

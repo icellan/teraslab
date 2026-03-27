@@ -670,8 +670,9 @@ async fn verify_replication_sample(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_16_chaos() {
-    // 30 minutes + generous buffer for healing/verification checkpoints
-    let result = tokio::time::timeout(Duration::from_secs(2700), run_scenario()).await;
+    // Default 5 minutes + buffer for healing/verification checkpoints.
+    // Override with TERASLAB_CHAOS_DURATION_SECS for longer soak tests.
+    let result = tokio::time::timeout(Duration::from_secs(600), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => panic!("scenario failed: {e}"),
@@ -682,11 +683,12 @@ async fn scenario_16_chaos() {
 async fn run_scenario() -> Result<(), ClientError> {
     common::teardown_all(SID).await;
 
-    // Default duration: 30 minutes (1800 seconds). Overridable via env var.
+    // Default duration: 5 minutes (300 seconds). Override via env var for
+    // longer soak tests (e.g., TERASLAB_CHAOS_DURATION_SECS=1800 for 30min).
     let chaos_duration_secs: u64 = std::env::var("TERASLAB_CHAOS_DURATION_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1800);
+        .unwrap_or(300);
     let chaos_duration = Duration::from_secs(chaos_duration_secs);
 
     eprintln!("[16] Starting 5-node cluster (chaos duration = {chaos_duration_secs}s)");

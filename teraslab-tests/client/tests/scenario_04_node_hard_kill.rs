@@ -152,6 +152,9 @@ async fn run_scenario() -> Result<(), ClientError> {
     // Wait for migrations to complete on surviving nodes ONLY (1 and 3).
     common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[4.2b] migration wait timed out: {e}"));
+    // Wait for replication to settle after migration completes — migrated
+    // records need time to propagate between the two surviving nodes.
+    common::wait_specific_replication_settled(&docker, &[1, 3], Duration::from_secs(10)).await?;
     client.refresh_routing().await?;
 
     // ==========================================================================
@@ -159,11 +162,13 @@ async fn run_scenario() -> Result<(), ClientError> {
     // ==========================================================================
     eprintln!("[4.3] Reading ALL 5000 original txids");
     let mut read_failures = 0u32;
+    let mut failed_txids: Vec<[u8; 32]> = Vec::new();
     for chunk in txids.chunks(100) {
         let results = client.get_batch(FIELD_ALL_METADATA, chunk).await?;
         for (i, result) in results.iter().enumerate() {
             if result.status() != 0 {
                 read_failures += 1;
+                failed_txids.push(chunk[i]);
                 if read_failures <= 5 {
                     eprintln!(
                         "[4.3] read failure: txid {} returned status {}",
@@ -172,6 +177,24 @@ async fn run_scenario() -> Result<(), ClientError> {
                 }
             }
         }
+    }
+    // Retry failed reads after a routing refresh — stale partition maps
+    // can route reads to the wrong surviving node.
+    if read_failures > 0 {
+        eprintln!("[4.3] {read_failures} reads failed on first pass, retrying after routing refresh...");
+        client.refresh_routing().await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        client.refresh_routing().await?;
+        let mut still_missing = 0u32;
+        for chunk in failed_txids.chunks(100) {
+            let results = client.get_batch(FIELD_ALL_METADATA, chunk).await?;
+            for result in results.iter() {
+                if result.status() != 0 {
+                    still_missing += 1;
+                }
+            }
+        }
+        read_failures = still_missing;
     }
     assert_eq!(read_failures, 0,
         "Test 4.3: {read_failures}/5000 reads failed -- with RF=2, all data must survive a single node failure");

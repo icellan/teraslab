@@ -154,6 +154,7 @@ pub fn evaluate_delete_at_height(
 ///
 /// The `has_preserve_until` flag indicates whether `dah_or_preserve` holds
 /// `preserve_until` (true) or `delete_at_height` (false).
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_dah_cached(
     tx_flags: TxFlags,
     spent_utxos: u32,

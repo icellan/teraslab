@@ -144,6 +144,7 @@ impl Index {
 
     /// Update the cached fields in the bucket for `key`.
     /// Returns `true` if the key was found and updated.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_cached_fields(
         &mut self,
         key: &TxKey,

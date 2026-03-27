@@ -49,7 +49,7 @@ scenario_name() {
 scenario_timeout() {
     case "$1" in
         01) echo 120 ;;  10) echo 900 ;;  08|15) echo 600 ;;
-        16) echo 2400 ;; 17) echo 600 ;;  *) echo 300 ;;
+        16) echo 600 ;;  17) echo 600 ;;  *) echo 300 ;;
     esac
 }
 

@@ -93,6 +93,14 @@ impl Engine {
         self.allocator.lock().stats()
     }
 
+    /// Get a reference to the allocator mutex.
+    ///
+    /// Used by the dispatch layer to free pre-allocated space when a redo
+    /// flush fails after [`pre_allocate_create`] succeeded.
+    pub fn allocator(&self) -> &parking_lot::Mutex<SlotAllocator> {
+        &self.allocator
+    }
+
     /// Get a reference to the blobstore, if configured.
     pub fn blob_store(&self) -> Option<&dyn BlobStore> {
         self.blob_store.as_deref()
@@ -186,10 +194,10 @@ impl Engine {
             key,
             tf,
             metadata.block_entry_count,
-            { metadata.spent_utxos },
+            metadata.spent_utxos,
             dah_or_preserve,
-            { metadata.unmined_since },
-            { metadata.generation },
+            metadata.unmined_since,
+            metadata.generation,
         );
     }
 
@@ -1216,6 +1224,169 @@ impl Engine {
         })
     }
 
+    /// Pre-allocate space for a create operation without writing any data.
+    ///
+    /// Validates the request, computes the record size, and allocates device
+    /// space. Returns `(record_offset, utxo_count)` on success. The caller
+    /// must subsequently call [`create_at_offset`] with the same request and
+    /// the returned `record_offset` to finalize the create.
+    ///
+    /// If the caller decides not to finalize (e.g., redo flush fails), it
+    /// must free the allocated space via `self.allocator.lock().free(offset, size)`.
+    pub fn pre_allocate_create(&self, req: &CreateRequest) -> Result<(u64, u32), CreateError> {
+        let utxo_count = req.utxo_hashes.len() as u32;
+        if utxo_count == 0 {
+            return Err(CreateError::InvalidUtxoCount);
+        }
+
+        let key = req.tx_key();
+
+        // Check for duplicate txid
+        if self.index.read().lookup(&key).is_some() {
+            return Err(CreateError::DuplicateTxId);
+        }
+
+        // Compute cold data size to determine total record size
+        let cold_data = if req.is_external && req.inputs.is_none() {
+            vec![]
+        } else {
+            build_cold_data(&req.inputs, &req.outputs, &req.inpoints)
+        };
+        let cold_size = cold_data.len();
+
+        let base_size = TxMetadata::record_size_for(utxo_count);
+        let total_size = base_size + cold_size as u64;
+
+        let record_offset = self
+            .allocator
+            .lock()
+            .allocate(total_size)
+            .map_err(|_| CreateError::DeviceFull)?;
+
+        Ok((record_offset, utxo_count))
+    }
+
+    /// Create a transaction record at a pre-allocated device offset.
+    ///
+    /// Same as [`create`] but skips allocation — the caller provides the
+    /// `record_offset` obtained from [`pre_allocate_create`]. Used by the
+    /// WAL-first write path where the redo entry must be fsynced before
+    /// the engine mutation.
+    pub fn create_at_offset(&self, req: &CreateRequest, record_offset: u64) -> Result<CreateResponse, CreateError> {
+        let utxo_count = req.utxo_hashes.len() as u32;
+        if utxo_count == 0 {
+            return Err(CreateError::InvalidUtxoCount);
+        }
+
+        let key = req.tx_key();
+
+        // Duplicate check — another thread may have created it between
+        // pre_allocate and now.
+        if self.index.read().lookup(&key).is_some() {
+            return Err(CreateError::DuplicateTxId);
+        }
+
+        // Build cold data
+        let cold_data = if req.is_external && req.inputs.is_none() {
+            vec![]
+        } else {
+            build_cold_data(&req.inputs, &req.outputs, &req.inpoints)
+        };
+
+        // Build metadata
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = req.tx_id;
+        meta.tx_version = req.tx_version;
+        meta.locktime = req.locktime;
+        meta.fee = req.fee;
+        meta.size_in_bytes = req.size_in_bytes;
+        meta.extended_size = req.extended_size;
+        meta.spending_height = req.spending_height;
+        meta.created_at = req.created_at;
+        let base_size = TxMetadata::record_size_for(utxo_count);
+        meta.record_size = (base_size + cold_data.len() as u64) as u32;
+
+        let mut flags = TxFlags::empty();
+        if req.is_coinbase { flags |= TxFlags::IS_COINBASE; }
+        if req.is_external { flags |= TxFlags::EXTERNAL; }
+        if req.conflicting { flags |= TxFlags::CONFLICTING; }
+        if req.locked { flags |= TxFlags::LOCKED; }
+        meta.flags = flags;
+
+        if req.is_external {
+            meta.external_ref = ExternalRef {
+                store_type: 1,
+                content_hash: req.tx_id,
+                total_size: req.size_in_bytes,
+                input_count: 0,
+                output_count: 0,
+                inputs_offset: 0,
+                outputs_offset: 0,
+            };
+        }
+
+        if req.mined_block_infos.is_empty() {
+            meta.unmined_since = req.block_height;
+        } else {
+            meta.unmined_since = 0;
+            let entries = req.block_entries();
+            let inline_count = entries.len().min(INLINE_BLOCK_ENTRIES);
+            for (i, entry) in entries.iter().take(inline_count).enumerate() {
+                meta.block_entries_inline[i] = *entry;
+            }
+            meta.block_entry_count = entries.len() as u8;
+        }
+
+        let slots: Vec<UtxoSlot> = req
+            .utxo_hashes
+            .iter()
+            .map(|hash| {
+                if req.frozen {
+                    UtxoSlot::new_frozen(*hash)
+                } else {
+                    UtxoSlot::new_unspent(*hash)
+                }
+            })
+            .collect();
+
+        self.write_full_record_with_cold(record_offset, &meta, &slots, &cold_data)?;
+
+        let index_entry = TxIndexEntry {
+            device_id: 0,
+            record_offset,
+            utxo_count,
+            block_entry_count: meta.block_entry_count,
+            tx_flags: flags.bits(),
+            spent_utxos: { meta.spent_utxos },
+            dah_or_preserve: { meta.delete_at_height },
+            unmined_since: { meta.unmined_since },
+            generation: 0,
+        };
+        self.index
+            .write()
+            .register(key, index_entry)
+            .map_err(|e| CreateError::StorageError {
+                detail: format!("{e}"),
+            })?;
+
+        if meta.unmined_since != 0 {
+            self.unmined_index.lock().insert(meta.unmined_since, key);
+        }
+
+        if req.conflicting {
+            for parent_txid in &req.parent_txids {
+                let parent_key = TxKey { txid: *parent_txid };
+                let _ = self.append_conflicting_child(&parent_key, req.tx_id);
+            }
+        }
+
+        self.increment_shard_count(&TxKey { txid: req.tx_id });
+        Ok(CreateResponse {
+            record_offset,
+            utxo_count,
+        })
+    }
+
     /// Create multiple transaction records in a batch.
     ///
     /// Each creation is independent — a failure in one does not affect others.
@@ -1663,14 +1834,13 @@ impl Engine {
             let has_preserve = tf.contains(TxFlags::HAS_PRESERVE_UNTIL);
             let old_dah = if has_preserve { 0 } else { entry.dah_or_preserve };
 
-            let new_dah;
-            if req.value {
+            let new_dah = if req.value {
                 tf.insert(TxFlags::LOCKED);
-                new_dah = 0; // Locking clears deleteAtHeight
+                0 // Locking clears deleteAtHeight
             } else {
                 tf.remove(TxFlags::LOCKED);
-                new_dah = old_dah; // Unlocking doesn't change DAH
-            }
+                old_dah // Unlocking doesn't change DAH
+            };
 
             // Generation is cached in the index — zero device reads.
             let generation = entry.generation.wrapping_add(1);
@@ -1730,7 +1900,7 @@ impl Engine {
             if new_dah != 0 { dah.insert(new_dah, req.tx_key); }
         }
 
-        Ok({ meta.generation })
+        Ok(meta.generation)
     }
 
     /// Preserve a record until a specific block height.
@@ -1941,7 +2111,10 @@ fn extract_parent_txids_from_cold_data(cold_bytes: &[u8]) -> Vec<[u8; 32]> {
 /// Build inline cold data from optional inputs/outputs/inpoints.
 ///
 /// Format: `[inputs_len:4 LE][inputs][outputs_len:4 LE][outputs][inpoints_len:4 LE][inpoints]`
-fn build_cold_data(
+/// Build the on-disk cold data blob from optional input/output/inpoint fields.
+///
+/// Public so the dispatch layer can compute record sizes for pre-allocation.
+pub fn build_cold_data(
     inputs: &Option<Vec<u8>>,
     outputs: &Option<Vec<u8>>,
     inpoints: &Option<Vec<u8>>,

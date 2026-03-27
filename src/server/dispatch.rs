@@ -12,7 +12,7 @@ use crate::cluster::coordinator::RunningCluster;
 use crate::cluster::shards::ShardTable;
 use crate::index::TxKey;
 use crate::ops::create::*;
-use crate::ops::engine::Engine;
+use crate::ops::engine::{Engine, build_cold_data};
 use crate::record::{METADATA_SIZE, TxFlags};
 use crate::ops::error::SpendError;
 use crate::ops::mark_longest_chain::*;
@@ -789,7 +789,15 @@ fn send_replica_batch_to(
     };
 
     if let Err(e) = transport.send_batch(batch) {
-        return Err(format!("send: {e}"));
+        // Connection may be stale (broken by partition, killed node, etc.).
+        // Drop the broken transport and reconnect once before giving up.
+        drop(transport);
+        let mut retry_transport = TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5))
+            .map_err(|e2| format!("send: {e}; reconnect: {e2}"))?;
+        if let Err(e2) = retry_transport.send_batch(batch) {
+            return Err(format!("send after reconnect: {e2}"));
+        }
+        transport = retry_transport;
     }
 
     match transport.recv_ack(Duration::from_secs(3)) {
@@ -1332,7 +1340,14 @@ fn handle_create_batch(
 
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
-    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+
+    // Phase 1: Validate ownership, check blobs, pre-allocate space, build redo ops.
+    struct ValidCreate {
+        idx: usize,
+        create_req: CreateRequest,
+        record_offset: u64,
+    }
+    let mut valid_items: Vec<ValidCreate> = Vec::new();
 
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
@@ -1376,9 +1391,6 @@ fn handle_create_batch(
             vec![]
         };
 
-        // Parse cold_data into inputs/outputs/inpoints for the engine.
-        // For external blobs, cold_data is not stored inline — the engine
-        // record just has the is_external flag so reads fetch from blobstore.
         let (inputs, outputs, inpoints) = if is_ext {
             (None, None, None)
         } else {
@@ -1408,28 +1420,64 @@ fn handle_create_batch(
             parent_txids: item.parent_txids.clone(),
         };
 
-        match engine.create(&create_req) {
+        // Pre-allocate space to get record_offset for the redo entry.
+        match engine.pre_allocate_create(&create_req) {
+            Ok((record_offset, utxo_count)) => {
+                let key = TxKey { txid: item.txid };
+                redo_ops.push(RedoOp::Create {
+                    tx_key: key,
+                    record_offset,
+                    utxo_count,
+                });
+                valid_items.push(ValidCreate { idx: i, create_req, record_offset });
+            }
+            Err(CreateError::DuplicateTxId) => {
+                errors.push(BatchItemError {
+                    item_index: i as u32,
+                    error_code: ERR_ALREADY_EXISTS,
+                    error_data: vec![],
+                });
+            }
+            Err(_) => {
+                errors.push(BatchItemError {
+                    item_index: i as u32,
+                    error_code: ERR_INTERNAL,
+                    error_data: vec![],
+                });
+            }
+        }
+    }
+
+    // Phase 2: WAL-first — write redo before engine mutation.
+    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+        Ok(range) => range,
+        Err(e) => {
+            // Redo failed: free all pre-allocated space.
+            for v in &valid_items {
+                let utxo_count = v.create_req.utxo_hashes.len() as u32;
+                let base_size = crate::record::TxMetadata::record_size_for(utxo_count);
+                let cold_len = if v.create_req.is_external && v.create_req.inputs.is_none() {
+                    0u64
+                } else {
+                    build_cold_data(
+                        &v.create_req.inputs, &v.create_req.outputs, &v.create_req.inpoints,
+                    ).len() as u64
+                };
+                let _ = engine.allocator().lock().free(v.record_offset, base_size + cold_len);
+            }
+            return error_response(req.request_id, ERR_INTERNAL, &e);
+        }
+    };
+
+    // Phase 3: Apply engine mutations at pre-allocated offsets.
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    for v in &valid_items {
+        let item = &items[v.idx];
+        match engine.create_at_offset(&v.create_req, v.record_offset) {
             Ok(_) => {
                 let key = TxKey { txid: item.txid };
-                // Look up the just-created record to get its offset for the redo log
-                if let Some(entry) = engine.lookup(&key) {
-                    redo_ops.push(RedoOp::Create {
-                        tx_key: key,
-                        record_offset: entry.record_offset,
-                        utxo_count: item.utxo_hashes.len() as u32,
-                    });
-                }
                 // Serialize full metadata for the replica so a promoted replica
-                // has the authoritative record state. Layout:
-                //   Bytes  0-45: Core — tx_version(4) + locktime(4) + fee(8) +
-                //                size_in_bytes(8) + extended_size(8) + is_coinbase(1) +
-                //                spending_height(4) + created_at(8) + flags(1) = 46 bytes
-                //   Bytes 46-69: Lifecycle — generation(4) + updated_at(8) +
-                //                unmined_since(4) + delete_at_height(4) +
-                //                preserve_until(4) = 24 bytes
-                //   Bytes 70+:   Extended — block_height(4) + block_count(1) +
-                //                [block_id(4)+block_height(4)+subtree_idx(4)]*N +
-                //                parent_txid_count(2) + parent_txids(32*N)
+                // has the authoritative record state.
                 let mut meta_buf = Vec::with_capacity(128);
                 // Core 46 bytes
                 meta_buf.extend_from_slice(&item.tx_version.to_le_bytes());
@@ -1441,8 +1489,7 @@ fn handle_create_batch(
                 meta_buf.extend_from_slice(&item.spending_height.to_le_bytes());
                 meta_buf.extend_from_slice(&item.created_at.to_le_bytes());
                 meta_buf.push(item.flags);
-                // Lifecycle 24 bytes — read back the just-created record to
-                // capture the authoritative generation and timestamps.
+                // Lifecycle 24 bytes
                 let (r_gen, r_upd, r_ums, r_dah, r_pu) =
                     if let Ok(meta) = engine.read_metadata(&key) {
                         ({ meta.generation }, { meta.updated_at },
@@ -1458,7 +1505,7 @@ fn handle_create_batch(
                 meta_buf.extend_from_slice(&r_pu.to_le_bytes());
                 // Extended: block_height + mined_block_infos + parent_txids
                 meta_buf.extend_from_slice(&item.block_height.to_le_bytes());
-                let block_infos = &create_req.mined_block_infos;
+                let block_infos = &v.create_req.mined_block_infos;
                 meta_buf.push(block_infos.len() as u8);
                 for info in block_infos {
                     meta_buf.extend_from_slice(&info.block_id.to_le_bytes());
@@ -1480,14 +1527,14 @@ fn handle_create_batch(
             }
             Err(CreateError::DuplicateTxId) => {
                 errors.push(BatchItemError {
-                    item_index: i as u32,
+                    item_index: v.idx as u32,
                     error_code: ERR_ALREADY_EXISTS,
                     error_data: vec![],
                 });
             }
             Err(_) => {
                 errors.push(BatchItemError {
-                    item_index: i as u32,
+                    item_index: v.idx as u32,
                     error_code: ERR_INTERNAL,
                     error_data: vec![],
                 });
@@ -1495,10 +1542,7 @@ fn handle_create_batch(
         }
     }
 
-    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
-        Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
-    };
+    // Phase 4: Replicate.
     if let Err(e) = replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
         compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
         return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
@@ -2120,36 +2164,45 @@ fn handle_mark_longest_chain_batch(
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
+    // Phase 1: Validate ownership and build redo ops from request params.
+    struct ValidMark { idx: usize, key: TxKey }
+    let mut valid_items: Vec<ValidMark> = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
         let key = TxKey { txid: *txid };
-        match engine.mark_on_longest_chain(&MarkOnLongestChainRequest {
+        redo_ops.push(RedoOp::MarkOnLongestChain {
             tx_key: key,
+            on_longest_chain,
+            current_block_height: cbh,
+            block_height_retention: bhr,
+        });
+        valid_items.push(ValidMark { idx: i, key });
+    }
+
+    // Phase 2: WAL-first — write redo before engine mutation.
+    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
+        return error_response(req.request_id, ERR_INTERNAL, &e);
+    }
+
+    // Phase 3: Apply engine mutations.
+    for v in &valid_items {
+        match engine.mark_on_longest_chain(&MarkOnLongestChainRequest {
+            tx_key: v.key,
             on_longest_chain,
             current_block_height: cbh,
             block_height_retention: bhr,
         }) {
             Ok(_) => {
-                redo_ops.push(RedoOp::MarkOnLongestChain {
-                    tx_key: key,
-                    on_longest_chain,
-                    current_block_height: cbh,
-                    block_height_retention: bhr,
-                });
                 // MarkOnLongestChain is metadata-only; no dedicated ReplicaOp
                 // needed — the SetMined replication already covers block tracking.
             }
             Err(err) => {
-                errors.push(spend_error_to_batch_error(i as u32, &err));
+                errors.push(spend_error_to_batch_error(v.idx as u32, &err));
             }
         }
-    }
-
-    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
-        return error_response(req.request_id, ERR_INTERNAL, &e);
     }
 
     batch_response(req.request_id, &errors)
@@ -2420,39 +2473,50 @@ fn handle_preserve_transactions(
 
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
-    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
 
+    // Phase 1: Validate ownership and build redo ops from request params.
+    struct ValidPreserveTx { idx: usize, key: TxKey }
+    let mut valid_items: Vec<ValidPreserveTx> = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
         let key = TxKey { txid: *txid };
-        match engine.preserve_until(&PreserveUntilRequest {
+        redo_ops.push(RedoOp::PreserveUntil {
             tx_key: key,
+            block_height: height,
+        });
+        valid_items.push(ValidPreserveTx { idx: i, key });
+    }
+
+    // Phase 2: WAL-first — write redo before engine mutation.
+    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+        Ok(range) => range,
+        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+    };
+
+    // Phase 3: Apply engine mutations and build repl ops from engine results.
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    for v in &valid_items {
+        match engine.preserve_until(&PreserveUntilRequest {
+            tx_key: v.key,
             block_height: height,
         }) {
             Ok(resp) => {
-                redo_ops.push(RedoOp::PreserveUntil {
-                    tx_key: key,
-                    block_height: height,
-                });
-                repl_ops_by_key.push((key, vec![ReplicaOp::PreserveUntil {
-                    tx_key: key,
+                repl_ops_by_key.push((v.key, vec![ReplicaOp::PreserveUntil {
+                    tx_key: v.key,
                     block_height: height,
                     master_generation: resp.generation,
                 }]));
             }
             Err(err) => {
-                errors.push(spend_error_to_batch_error(i as u32, &err));
+                errors.push(spend_error_to_batch_error(v.idx as u32, &err));
             }
         }
     }
 
-    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
-        Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
-    };
+    // Phase 4: Replicate.
     if let Err(e) = replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
         compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
         return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
@@ -2474,31 +2538,33 @@ fn handle_process_expired(
 
     // Query DAH index for transactions due for deletion
     let keys = engine.dah_index().range_query(current_height);
-    let mut deleted = 0u32;
-    let mut failed = 0u32;
-    let mut redo_ops: Vec<RedoOp> = Vec::new();
 
+    // Phase 1: Lookup record offsets (read-only) and build redo ops.
+    let mut redo_ops: Vec<RedoOp> = Vec::new();
+    let mut valid_keys: Vec<TxKey> = Vec::new();
     for key in &keys {
-        let entry_info = engine.lookup(key);
-        match engine.delete(&DeleteRequest { tx_key: *key }) {
-            Ok(()) => {
-                deleted += 1;
-                let (record_offset, record_size) = match entry_info {
-                    Some(e) => (e.record_offset, 0u64),
-                    None => (0, 0),
-                };
-                redo_ops.push(RedoOp::Delete {
-                    tx_key: *key,
-                    record_offset,
-                    record_size,
-                });
-            }
-            Err(_) => failed += 1,
-        }
+        let record_offset = engine.lookup(key).map(|e| e.record_offset).unwrap_or(0);
+        redo_ops.push(RedoOp::Delete {
+            tx_key: *key,
+            record_offset,
+            record_size: 0,
+        });
+        valid_keys.push(*key);
     }
 
+    // Phase 2: WAL-first — write redo before engine mutation.
     if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
         return error_response(req.request_id, ERR_INTERNAL, &e);
+    }
+
+    // Phase 3: Apply engine mutations.
+    let mut deleted = 0u32;
+    let mut failed = 0u32;
+    for key in &valid_keys {
+        match engine.delete(&DeleteRequest { tx_key: *key }) {
+            Ok(()) => deleted += 1,
+            Err(_) => failed += 1,
+        }
     }
 
     let mut payload = Vec::with_capacity(8);
@@ -3428,5 +3494,313 @@ mod tests {
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
         assert_eq!(code, ERR_INTERNAL);
         assert!(msg.contains("batch too large"), "expected 'batch too large' in: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // WAL-first regression tests — redo fsynced before engine mutation
+    // -----------------------------------------------------------------------
+
+    /// Test harness with redo log support for crash-recovery testing.
+    struct RedoDispatchHarness {
+        engine: Engine,
+        redo_log: Arc<Mutex<crate::redo::RedoLog>>,
+        data_dev: Arc<MemoryDevice>,
+        redo_dev: Arc<MemoryDevice>,
+    }
+
+    impl RedoDispatchHarness {
+        fn new() -> Self {
+            let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+            let redo_dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+            let alloc = SlotAllocator::new(data_dev.clone());
+            let index = Index::new(10000).unwrap();
+            let locks = StripedLocks::new(1024);
+            let dah = DahIndex::new();
+            let unmined = UnminedIndex::new();
+            let engine = Engine::new(
+                data_dev.clone() as Arc<dyn BlockDevice>,
+                index,
+                alloc,
+                locks,
+                dah,
+                unmined,
+            );
+            let redo_log = crate::redo::RedoLog::open(
+                redo_dev.clone() as Arc<dyn BlockDevice>,
+                0,
+                4 * 1024 * 1024,
+            )
+            .unwrap();
+            Self {
+                engine,
+                redo_log: Arc::new(Mutex::new(redo_log)),
+                data_dev,
+                redo_dev,
+            }
+        }
+
+        /// Dispatch a request through the full handler with redo log attached.
+        fn request(&self, op_code: u16, payload: Vec<u8>) -> ResponseFrame {
+            let req = RequestFrame {
+                request_id: 1,
+                op_code,
+                flags: 0,
+                payload,
+            };
+            let mut conn_state = crate::server::ConnectionState::new();
+            handle_request(
+                &req,
+                &self.engine,
+                8192,
+                None,
+                Some(&self.redo_log),
+                &mut conn_state,
+                None,
+            )
+        }
+
+        /// Create a transaction and return the response.
+        fn create_tx(&self, txid: [u8; 32], utxo_count: u32) -> ResponseFrame {
+            let hashes: Vec<[u8; 32]> = (0..utxo_count)
+                .map(|i| {
+                    let mut h = [0u8; 32];
+                    h[0] = (i & 0xFF) as u8;
+                    h[1] = ((i >> 8) & 0xFF) as u8;
+                    h
+                })
+                .collect();
+            let item = WireCreateItem {
+                txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 250,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1700000000000,
+                flags: 0,
+                utxo_hashes: hashes,
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            };
+            let payload = encode_create_batch(&[item]);
+            self.request(OP_CREATE_BATCH, payload)
+        }
+
+        /// Simulate crash: drop engine and redo log, rebuild from devices.
+        /// Returns a new harness with recovered state.
+        fn crash_and_recover(self) -> Self {
+            // Drop the engine and redo log — simulates SIGKILL.
+            // The MemoryDevice data survives (it's Arc'd).
+            let data_dev = self.data_dev.clone();
+            let redo_dev = self.redo_dev.clone();
+            drop(self);
+
+            // Reopen redo log from device
+            let redo_log = crate::redo::RedoLog::open(
+                redo_dev.clone() as Arc<dyn BlockDevice>,
+                0,
+                4 * 1024 * 1024,
+            )
+            .unwrap();
+
+            // Create fresh index + allocator
+            let alloc = SlotAllocator::new(data_dev.clone());
+            let mut index = Index::new(10000).unwrap();
+
+            // Run recovery to rebuild index from redo log
+            let stats = crate::recovery::recover(
+                &*data_dev as &dyn BlockDevice,
+                &redo_log,
+                &mut index,
+            )
+            .unwrap();
+            eprintln!(
+                "recovery: {} replayed, {} skipped, {} failed",
+                stats.entries_replayed, stats.entries_skipped, stats.entries_failed
+            );
+
+            let engine = Engine::new(
+                data_dev.clone() as Arc<dyn BlockDevice>,
+                index,
+                alloc,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+                UnminedIndex::new(),
+            );
+
+            Self {
+                engine,
+                redo_log: Arc::new(Mutex::new(redo_log)),
+                data_dev,
+                redo_dev,
+            }
+        }
+    }
+
+    #[test]
+    fn acked_creates_survive_crash() {
+        let h = RedoDispatchHarness::new();
+
+        // Create 50 records, collecting ACK'd txids
+        let mut acked_keys = Vec::new();
+        for i in 0..50u8 {
+            let mut txid = [0u8; 32];
+            txid[0] = i;
+            txid[31] = i.wrapping_mul(7);
+            let resp = h.create_tx(txid, 3);
+            if resp.status == STATUS_OK {
+                acked_keys.push(TxKey { txid });
+            }
+        }
+        assert!(
+            !acked_keys.is_empty(),
+            "should have ACK'd at least one create"
+        );
+
+        // CRASH and recover
+        let h2 = h.crash_and_recover();
+
+        // Every ACK'd key must be in the recovered index
+        let mut missing = Vec::new();
+        for key in &acked_keys {
+            if h2.engine.lookup(key).is_none() {
+                missing.push(key);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "ACKed creates lost after crash: {}/{} missing",
+            missing.len(),
+            acked_keys.len()
+        );
+    }
+
+    #[test]
+    fn acked_spends_survive_crash() {
+        let h = RedoDispatchHarness::new();
+
+        // Create 20 records
+        let mut txids = Vec::new();
+        for i in 0..20u8 {
+            let mut txid = [0u8; 32];
+            txid[0] = i;
+            txid[31] = i.wrapping_mul(7);
+            let resp = h.create_tx(txid, 3);
+            assert_eq!(resp.status, STATUS_OK, "create {i} failed");
+            txids.push(txid);
+        }
+
+        // Spend slot 0 on the first 10 records
+        let mut acked_spends = Vec::new();
+        for txid in txids.iter().take(10) {
+            let key = TxKey { txid: *txid };
+            let hash = h.engine.read_slot(&key, 0).unwrap().hash;
+            let spend_item = WireSpendItem {
+                txid: *txid,
+                vout: 0,
+                utxo_hash: hash,
+                spending_data: [0xAB; 36],
+            };
+            let params = SpendBatchParams {
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            };
+            let payload = encode_spend_batch(&params, &[spend_item]);
+            let resp = h.request(OP_SPEND_BATCH, payload);
+            if resp.status == STATUS_OK {
+                acked_spends.push(key);
+            }
+        }
+        assert!(
+            !acked_spends.is_empty(),
+            "should have ACK'd at least one spend"
+        );
+
+        // CRASH and recover
+        let h2 = h.crash_and_recover();
+
+        // Verify spent slots are still spent after recovery
+        let mut lost = 0;
+        for key in &acked_spends {
+            match h2.engine.read_slot(key, 0) {
+                Ok(slot) => {
+                    if !slot.is_spent() {
+                        lost += 1;
+                    }
+                }
+                Err(_) => lost += 1,
+            }
+        }
+        assert_eq!(
+            lost, 0,
+            "ACKed spends lost after crash: {}/{} not spent",
+            lost,
+            acked_spends.len()
+        );
+    }
+
+    #[test]
+    fn acked_mark_longest_chain_survives_crash() {
+        let h = RedoDispatchHarness::new();
+
+        // Create 10 records and set_mined on them
+        let mut txids = Vec::new();
+        for i in 0..10u8 {
+            let mut txid = [0u8; 32];
+            txid[0] = i;
+            txid[31] = i.wrapping_mul(7);
+            let resp = h.create_tx(txid, 2);
+            assert_eq!(resp.status, STATUS_OK);
+            txids.push(txid);
+        }
+
+        // set_mined on all
+        let set_mined_params = SetMinedBatchParams {
+            block_id: 42,
+            block_height: 1000,
+            subtree_idx: 5,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let payload = encode_set_mined_batch(&set_mined_params, &txids);
+        let resp = h.request(OP_SET_MINED_BATCH, payload);
+        assert_eq!(resp.status, STATUS_OK);
+
+        // mark_on_longest_chain = false (unmined) on first 5
+        let shared = {
+            let mut s = Vec::with_capacity(9);
+            s.push(0u8); // on_longest_chain = false
+            s.extend_from_slice(&2000u32.to_le_bytes()); // current_block_height
+            s.extend_from_slice(&288u32.to_le_bytes()); // block_height_retention
+            s
+        };
+        let payload_bytes = encode_txid_batch(&txids[..5], &shared);
+        let resp = h.request(OP_MARK_LONGEST_CHAIN_BATCH, payload_bytes);
+        assert_eq!(resp.status, STATUS_OK);
+
+        // CRASH and recover
+        let h2 = h.crash_and_recover();
+
+        // The first 5 should have unmined_since = 2000 after recovery
+        for txid in txids.iter().take(5) {
+            let key = TxKey { txid: *txid };
+            let meta = h2.engine.read_metadata(&key).unwrap();
+            assert_eq!(
+                { meta.unmined_since },
+                2000,
+                "mark_longest_chain not recovered for txid[0]={:02x}",
+                txid[0]
+            );
+        }
     }
 }

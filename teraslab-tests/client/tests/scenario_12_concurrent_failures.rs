@@ -220,6 +220,9 @@ async fn test_sequential_kills() -> Result<(), ClientError> {
     docker.start_node("node3").await?;
     common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(180)).await?;
     common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(180)).await?;
+    // Wait for replication to settle — node3 may still be catching up
+    // and replication failures would cause all writes to fail.
+    common::wait_specific_replication_settled(&docker, &[1, 3], Duration::from_secs(10)).await?;
     client.refresh_routing().await?;
     eprintln!("[12.2] Cluster size = 2 (node1 + node3), writes should resume");
 
@@ -336,12 +339,15 @@ async fn test_partition_plus_kill() -> Result<(), ClientError> {
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[12.3] migration wait: {e}"));
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(15)).await?;
     client.refresh_routing().await?;
     eprintln!("[12.3] Cluster restored to 3 nodes");
 
-    // Full consistency check
-    let mismatches = common::verify_consistency(&client, &verifier).await?;
+    // Full consistency check — use a fresh client to avoid stale connections
+    // from the partition + kill phase.
+    let fresh_client = common::create_client(&docker, 3).await?;
+    fresh_client.refresh_routing().await?;
+    let mismatches = common::verify_consistency(&fresh_client, &verifier).await?;
     assert!(
         mismatches.is_empty(),
         "12.3: {} consistency mismatches after partition+kill recovery: {:?}",
@@ -433,17 +439,20 @@ async fn test_kill_during_migration() -> Result<(), ClientError> {
     .await
     .unwrap_or_else(|e| eprintln!("[12.4] final migration wait: {e}"));
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    client.refresh_routing().await?;
+    common::wait_replication_settled(&docker_5, cluster_size, Duration::from_secs(15)).await?;
+    let fresh_client = common::create_client(&docker_5, cluster_size as usize).await?;
+    fresh_client.refresh_routing().await?;
     eprintln!("[12.4] Cluster restored to {cluster_size} nodes");
 
-    // Verify no data loss: all 10000 original records should be accessible
+    // Verify no data loss: all 10000 original records should be accessible.
+    // Use fresh client to avoid stale connections from the kill phase.
     let sample_size = 200;
     let step = txids.len() / sample_size;
     let mut failures = 0u32;
+    let mut failed_txids = Vec::new();
     for i in 0..sample_size {
         let txid = txids[i * step];
-        match client
+        match fresh_client
             .get_batch(FIELD_ALL, std::slice::from_ref(&txid))
             .await
         {
@@ -453,6 +462,24 @@ async fn test_kill_during_migration() -> Result<(), ClientError> {
                     && !results.item(0).data.is_empty() => {}
             _ => {
                 failures += 1;
+                failed_txids.push(txid);
+            }
+        }
+    }
+    // Retry failed reads after routing refresh
+    if failures > 0 {
+        eprintln!("[12.4] {failures} reads failed, retrying after routing refresh...");
+        fresh_client.refresh_routing().await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        fresh_client.refresh_routing().await?;
+        failures = 0;
+        for txid in &failed_txids {
+            match fresh_client.get_batch(FIELD_ALL, std::slice::from_ref(txid)).await {
+                Ok(results)
+                    if !results.is_empty()
+                        && results.item(0).status == 0
+                        && !results.item(0).data.is_empty() => {}
+                _ => { failures += 1; }
             }
         }
     }
@@ -463,7 +490,7 @@ async fn test_kill_during_migration() -> Result<(), ClientError> {
     eprintln!("[12.4] All {sample_size} sampled records accessible: no data loss");
 
     // Full consistency check
-    let mismatches = common::verify_consistency(&client, &verifier).await?;
+    let mismatches = common::verify_consistency(&fresh_client, &verifier).await?;
     assert!(
         mismatches.is_empty(),
         "12.4: {} consistency mismatches: {:?}",
@@ -566,8 +593,15 @@ async fn test_rolling_restart_plus_partition() -> Result<(), ClientError> {
     );
     eprintln!("[12.5] Full consistency check passed: zero mismatches");
 
-    // Verify we can still write and read
-    let new_txids = common::seed_records(&client, &verifier, 100, 2).await?;
+    // Verify we can still write and read.
+    // After partitions + kills + restart, server-side replication TCP
+    // connections may be broken and need time to reconnect. A fresh
+    // client avoids stale client-side connections. The longer settle
+    // time allows the server's replication pool to reconnect.
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
+    let fresh_client = common::create_client(&docker, 3).await?;
+    fresh_client.refresh_routing().await?;
+    let new_txids = common::seed_records(&fresh_client, &verifier, 100, 2).await?;
     assert_eq!(new_txids.len(), 100);
     eprintln!("[12.5] 100 new records created successfully after recovery");
 

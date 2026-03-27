@@ -187,6 +187,11 @@ impl ClusterCoordinator {
             let mut last_reactivation_at = std::time::Instant::now();
             let mut last_activation_at = std::time::Instant::now();
             let mut last_inbound_clear = std::time::Instant::now();
+            // Track the last topology term that was activated to prevent
+            // duplicate activations when the same commit signal arrives
+            // through multiple channels (e.g., deterministic proposer
+            // commit + fallback proposer timeout firing simultaneously).
+            let mut last_activated_term: u64 = 0;
             while !shutdown.load(Ordering::Relaxed) {
                 match event_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(event) => {
@@ -258,13 +263,22 @@ impl ClusterCoordinator {
                                 voter_current_term: topo_authority_event.committed_term(),
                             };
                             if let Some(commit) = topo_authority_event.handle_vote(&self_vote) {
-                                let epoch = topology_epoch.fetch_add(1, Ordering::Relaxed) + 1;
-                                Self::activate_topology(
-                                    &commit.members, epoch, self_id, rf, &shard_table, &migration,
-                                    &node_addrs, &engine, &redo_for_events, migration_pool_size,
-                                    migration_batch_size, &fenced_bm_event, &migrating_bm_event, &inbound_bm_event,
-                                );
-                                last_activation_at = std::time::Instant::now();
+                                if commit.term <= last_activated_term {
+                                    eprintln!(
+                                        "cluster: skipping duplicate self-vote activation for term {} \
+                                         (already activated at term {last_activated_term})",
+                                        commit.term,
+                                    );
+                                } else {
+                                    last_activated_term = commit.term;
+                                    let epoch = topology_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+                                    Self::activate_topology(
+                                        &commit.members, epoch, self_id, rf, &shard_table, &migration,
+                                        &node_addrs, &engine, &redo_for_events, migration_pool_size,
+                                        migration_batch_size, &fenced_bm_event, &migrating_bm_event, &inbound_bm_event,
+                                    );
+                                    last_activation_at = std::time::Instant::now();
+                                }
                                 topo_authority_event.handle_commit(&commit);
                             } else {
                                 // Multi-node: spawn proposer thread.
@@ -345,6 +359,18 @@ impl ClusterCoordinator {
 
                 // Poll topology commit signals from dispatch or proposer threads.
                 while let Ok((members, term)) = topology_commit_rx.try_recv() {
+                    // Guard: skip if this term was already activated. This
+                    // prevents double activation when two commit signals for
+                    // the same term arrive close together (e.g., deterministic
+                    // proposer commit + fallback proposer timeout).
+                    if term <= last_activated_term {
+                        eprintln!(
+                            "cluster: skipping duplicate topology commit for term {term} \
+                             (already activated at term {last_activated_term})"
+                        );
+                        continue;
+                    }
+                    last_activated_term = term;
                     let epoch = topology_epoch.fetch_add(1, Ordering::Relaxed) + 1;
                     eprintln!("cluster: activating topology from commit signal (term {term}, epoch {epoch})");
                     Self::activate_topology(
@@ -1671,19 +1697,28 @@ fn migrate_single_shard(
             }
         }
 
-        // Phase 2: fence writes, then drain in-flight writes, then capture
-        // the redo sequence as the delta boundary. See the detailed comment
-        // in run_migration_task for the correctness argument.
+        // Phase 2: Fence writes BEFORE capturing the redo sequence.
+        // This guarantees no write can slip through between the sequence
+        // capture and the fence. Any write that arrives between the
+        // baseline snapshot and the fence is captured in the delta stream.
         let snapshot_seq;
         let fence_seq;
         {
             let mut mgr = migration.lock().unwrap();
             snapshot_seq = mgr.find_task_mut(task)
-                .map(|p| p.snapshot_sequence).unwrap_or(0);
+                .map(|p| p.snapshot_sequence).unwrap_or(0)
+                // If snapshot_sequence was never set (e.g., quiesce path),
+                // default to 1 so delta streaming covers all redo entries
+                // between baseline and fence. Without this, writes between
+                // the key capture and the fence are silently lost.
+                .max(1);
             mgr.fence_shard(task.shard);
             fenced_bm.set(task.shard);
             drop(mgr);
         }
+        // Drain in-flight writes: acquire and release the redo lock to
+        // ensure any write that started before the fence has committed its
+        // redo entry.
         {
             fence_seq = redo_log.as_ref()
                 .map(|rl| {
@@ -1694,14 +1729,17 @@ fn migrate_single_shard(
             mgr.mark_fenced(task, fence_seq);
         }
 
-        // Phase 3: deltas
+        // Phase 3: Stream deltas (writes between baseline snapshot and fence).
+        // For quiesce migrations where snapshot_seq was not set (== 0),
+        // there's no delta window: the baseline already captured all keys
+        // that existed at activation time, and any writes between activation
+        // and fence are captured here if snapshot_seq > 0.
         let mut delta_failed = false;
         if snapshot_seq > 0
             && fence_seq > snapshot_seq
             && let Some(rl) = redo_log
             && let Ok(entries) = rl.lock().read_from_sequence(snapshot_seq)
         {
-            // Check for redo log truncation using the shared helper.
             let first_entry_seq = entries.first().map(|e| e.sequence);
             if let Err(trunc_err) = crate::replication::durable::check_redo_truncation(first_entry_seq, snapshot_seq) {
                 eprintln!(
@@ -1977,8 +2015,7 @@ fn run_migration_task(
             }
         };
 
-        // Phase 1: stream baseline records. Returns the open TCP stream
-        // so phases 2-4 reuse it (avoids 2 extra TCP connections per shard).
+        // Phase 1: stream baseline records.
         let (baseline_count, mut stream) = match migrate_shard(&task, addr, all_keys, engine) {
             Ok(r) => r,
             Err(e) => {
@@ -1993,30 +2030,22 @@ fn run_migration_task(
             }
         };
 
-        // Phase 2: fence writes on this shard.
-        //
-        // Correctness: the fence must be activated BEFORE capturing the redo
-        // sequence. Otherwise a write can slip through between the sequence
-        // capture and the fence activation, and its redo entry won't be
-        // included in the delta stream (sequence > fence_seq but write was
-        // pre-fence). The fix: fence first, then drain in-flight writes by
-        // acquiring the redo lock (any write that passed the fence check is
-        // either holding the redo lock or has already released it), then
-        // read current_sequence as the fence boundary.
+        // Phase 2: fence writes, then drain in-flight writes, then capture
+        // the redo sequence as the delta boundary.
         let snapshot_seq;
         let fence_seq;
         {
             let mut mgr = migration.lock().unwrap();
             snapshot_seq = mgr.find_task_mut(&task)
                 .map(|p| p.snapshot_sequence)
-                .unwrap_or(0);
-            // Activate the fence — all new writes for this shard are rejected
-            // from this point forward.
+                .unwrap_or(0)
+                // If snapshot_sequence was never set (e.g., quiesce path),
+                // default to 1 so delta streaming covers all redo entries
+                // between baseline and fence.
+                .max(1);
             mgr.fence_shard(task.shard);
             drop(mgr);
         }
-        // Drain in-flight writes: acquire and release the redo lock to ensure
-        // any write that started before the fence has committed its redo entry.
         {
             fence_seq = redo_log.as_ref()
                 .map(|rl| {
@@ -2024,7 +2053,6 @@ fn run_migration_task(
                     guard.current_sequence()
                 })
                 .unwrap_or(0);
-            // Record the fence boundary in the migration progress.
             let mut mgr = migration.lock().unwrap();
             mgr.mark_fenced(&task, fence_seq);
         }

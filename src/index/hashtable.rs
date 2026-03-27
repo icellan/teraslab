@@ -583,6 +583,7 @@ impl HashTable {
     /// Returns `true` if the entry was found and updated, `false` if not found.
     /// This is a targeted update — only the specified fields are written,
     /// the rest of the bucket is untouched.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_cached_fields(
         &mut self,
         key: &TxKey,

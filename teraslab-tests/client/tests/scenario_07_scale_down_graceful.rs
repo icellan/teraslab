@@ -232,13 +232,13 @@ async fn run_scenario() -> Result<(), ClientError> {
             }
         }
     }
-    // Retry after routing refresh — inbound migrations may still be settling.
+    // Retry after routing refresh — inbound migrations and replication
+    // may still be settling after the quiesce drain.
     if read_failures > 0 {
-        eprintln!("[7.4] {read_failures} records not found, retrying after refresh...");
+        eprintln!("[7.4] {read_failures} records not found, retrying after settle...");
+        common::wait_specific_replication_settled(&docker5, &[1, 2, 3], Duration::from_secs(10)).await?;
         client.refresh_routing().await?;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        common::wait_migrations_complete(&docker5, 3, Duration::from_secs(60)).await
-            .unwrap_or_else(|e| eprintln!("[7.4] migration wait: {e}"));
+        tokio::time::sleep(Duration::from_secs(2)).await;
         client.refresh_routing().await?;
         read_failures = 0;
         for chunk in txids.chunks(100) {
