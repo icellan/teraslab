@@ -93,11 +93,28 @@ fn main() {
     let allocator = match SlotAllocator::recover(device.clone()) {
         Ok(alloc) => {
             eprintln!("  allocator recovered from device header");
+            let device_uuid_hex = alloc.device_uuid_hex();
+            eprintln!("  device UUID: {device_uuid_hex}");
+
+            if let Some(ref expected) = config.device_uuid {
+                if expected != &device_uuid_hex {
+                    eprintln!("FATAL: device UUID mismatch!");
+                    eprintln!("  config expects: {expected}");
+                    eprintln!("  device contains: {device_uuid_hex}");
+                    eprintln!("  This likely means the device path points to the wrong device.");
+                    std::process::exit(1);
+                }
+                eprintln!("  device UUID verified");
+            }
+
             alloc
         }
         Err(_) => {
+            let fresh = SlotAllocator::new(device.clone());
+            let device_uuid_hex = fresh.device_uuid_hex();
             eprintln!("  allocator: fresh (no persisted state found)");
-            SlotAllocator::new(device.clone())
+            eprintln!("  device UUID: {device_uuid_hex}  (copy to config to enable UUID verification)");
+            fresh
         }
     };
 
