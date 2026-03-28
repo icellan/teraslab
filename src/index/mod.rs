@@ -4,12 +4,20 @@
 //! - [`DahIndex`]: secondary index for `delete_at_height` pruner queries
 //! - [`UnminedIndex`]: secondary index for `unmined_since` pruner queries
 
+pub mod backend;
 pub mod dah_index;
 pub mod hashtable;
+pub mod migration;
+pub mod redb_dah;
+pub mod redb_primary;
+pub mod redb_unmined;
+pub mod secondary_backend;
 pub mod unmined_index;
 
+pub use backend::PrimaryBackend;
 pub use dah_index::DahIndex;
 pub use hashtable::{TxIndexEntry, TxKey};
+pub use secondary_backend::{DahBackend, UnminedBackend};
 pub use unmined_index::UnminedIndex;
 
 use crate::allocator::SlotAllocator;
@@ -172,7 +180,7 @@ impl Index {
     /// Iterate over all `(TxKey, TxIndexEntry)` pairs in the primary index.
     ///
     /// Used for migration scanning and index snapshots.
-    pub fn iter(&self) -> impl Iterator<Item = (TxKey, TxIndexEntry)> + '_ {
+    pub fn iter(&self) -> hashtable::HashTableIter<'_> {
         self.table.iter()
     }
 

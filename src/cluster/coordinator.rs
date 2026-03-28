@@ -1029,7 +1029,7 @@ fn run_migration_tasks_with_global_limit(
     });
 }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     fn obsolete_handle_event_duplicate(
         event: &ClusterEvent,
         self_id: NodeId,
@@ -1307,7 +1307,7 @@ fn run_migration_tasks_with_global_limit(
     /// Called from the event loop when a MembershipChanged fires.
     /// Extracted as a separate function so it can also be invoked from
     /// a topology commit signal when the quorum protocol is active.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     fn obsolete_activate_topology_duplicate(
         members: &[NodeId],
         epoch: u64,
@@ -2489,7 +2489,7 @@ fn stream_shard_baseline(
     stream: &mut TcpStream,
     batch_size: usize,
 ) -> std::result::Result<ManifestHasher, String> {
-    use crate::replication::protocol::{ReplicaAck, ReplicaBatch, ReplicaOp};
+    use crate::replication::protocol::{ReplicaBatch, ReplicaOp};
     use crate::record::{UTXO_SPENT, UTXO_FROZEN};
 
     let batch_size = batch_size.max(1);

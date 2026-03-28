@@ -3,6 +3,104 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+// ---------------------------------------------------------------------------
+// Index backend configuration
+// ---------------------------------------------------------------------------
+
+/// Index backend mode.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum IndexBackendMode {
+    /// In-memory Robin Hood hash table (default, fastest).
+    #[default]
+    Memory,
+    /// On-disk B+ tree via redb (low-RAM deployments).
+    Redb,
+}
+
+impl<'de> Deserialize<'de> for IndexBackendMode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "memory" | "" => Ok(Self::Memory),
+            "redb" => Ok(Self::Redb),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown index backend: {other:?} (expected \"memory\" or \"redb\")"
+            ))),
+        }
+    }
+}
+
+/// Configuration for the index subsystem.
+///
+/// Controls which backend is used for the primary and secondary indexes.
+/// When `backend` is `"memory"` (default), the existing in-memory Robin Hood
+/// hash table is used. When `"redb"`, a crash-durable B+ tree backed by redb
+/// is used instead, trading throughput for dramatically lower RAM requirements.
+///
+/// The redb backend uses three separate database files: one for the primary
+/// index (`redb_path`), one for the DAH secondary index (`redb_dah_path`),
+/// and one for the unmined secondary index (`redb_unmined_path`).
+///
+/// # Example (TOML)
+///
+/// ```toml
+/// [index]
+/// backend = "redb"
+/// redb_path = "/data/teraslab-index.redb"
+/// redb_dah_path = "/data/teraslab-dah.redb"
+/// redb_unmined_path = "/data/teraslab-unmined.redb"
+/// redb_cache_size = 268435456
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct IndexConfig {
+    /// Backend mode: `"memory"` (default) or `"redb"`.
+    pub backend: IndexBackendMode,
+
+    /// Path for the redb primary index database file.
+    /// Only used when `backend = "redb"`.
+    pub redb_path: PathBuf,
+
+    /// Path for the redb DAH secondary index database.
+    /// Only used when `backend = "redb"`.
+    pub redb_dah_path: PathBuf,
+
+    /// Path for the redb unmined secondary index database.
+    /// Only used when `backend = "redb"`.
+    pub redb_unmined_path: PathBuf,
+
+    /// redb page cache size in bytes. Default: 256 MiB.
+    /// Only applies to the redb backend.
+    pub redb_cache_size: usize,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            backend: IndexBackendMode::Memory,
+            redb_path: PathBuf::from("teraslab-index.redb"),
+            redb_dah_path: PathBuf::from("teraslab-dah.redb"),
+            redb_unmined_path: PathBuf::from("teraslab-unmined.redb"),
+            redb_cache_size: 256 * 1024 * 1024, // 256 MiB
+        }
+    }
+}
+
+impl IndexConfig {
+    /// Whether the in-memory backend is selected.
+    pub fn is_memory(&self) -> bool {
+        self.backend == IndexBackendMode::Memory
+    }
+
+    /// Whether the redb on-disk backend is selected.
+    pub fn is_redb(&self) -> bool {
+        self.backend == IndexBackendMode::Redb
+    }
+}
+
 /// TeraSlab server configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -141,6 +239,12 @@ pub struct ServerConfig {
     /// Interval in seconds between replica lag checks. Default: 30.
     /// Set to 0 to disable lag monitoring.
     pub replica_lag_check_interval_secs: u64,
+
+    // -- Index backend settings --
+
+    /// Index backend configuration. Controls whether the primary and secondary
+    /// indexes use in-memory hash tables or on-disk redb B+ trees.
+    pub index: IndexConfig,
 }
 
 impl Default for ServerConfig {
@@ -176,6 +280,7 @@ impl Default for ServerConfig {
             migration_pool_size: 4,
             migration_batch_size: 100,
             replica_lag_check_interval_secs: 30,
+            index: IndexConfig::default(),
         }
     }
 }
@@ -245,5 +350,82 @@ impl ServerConfig {
             .map_err(|e| format!("failed to read config file: {e}"))?;
         toml::from_str(&content)
             .map_err(|e| format!("failed to parse config: {e}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_index_config_is_memory() {
+        let cfg = IndexConfig::default();
+        assert_eq!(cfg.backend, IndexBackendMode::Memory);
+        assert!(cfg.is_memory());
+        assert!(!cfg.is_redb());
+    }
+
+    #[test]
+    fn parse_index_backend_memory() {
+        let toml_str = r#"
+[index]
+backend = "memory"
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.index.is_memory());
+    }
+
+    #[test]
+    fn parse_index_backend_redb() {
+        let toml_str = r#"
+[index]
+backend = "redb"
+redb_path = "/data/primary.redb"
+redb_dah_path = "/data/dah.redb"
+redb_unmined_path = "/data/unmined.redb"
+redb_cache_size = 536870912
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.index.is_redb());
+        assert_eq!(cfg.index.redb_path, PathBuf::from("/data/primary.redb"));
+        assert_eq!(cfg.index.redb_dah_path, PathBuf::from("/data/dah.redb"));
+        assert_eq!(cfg.index.redb_unmined_path, PathBuf::from("/data/unmined.redb"));
+        assert_eq!(cfg.index.redb_cache_size, 536870912);
+    }
+
+    #[test]
+    fn parse_no_index_section_defaults_to_memory() {
+        let toml_str = r#"
+listen_addr = "0.0.0.0:3300"
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.index.is_memory());
+        assert_eq!(cfg.index.redb_cache_size, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_unknown_backend_is_error() {
+        let toml_str = r#"
+[index]
+backend = "rocksdb"
+"#;
+        let result: std::result::Result<ServerConfig, _> = toml::from_str(toml_str);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unknown index backend"), "error was: {err}");
+    }
+
+    #[test]
+    fn parse_empty_backend_defaults_to_memory() {
+        let toml_str = r#"
+[index]
+backend = ""
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.index.is_memory());
     }
 }

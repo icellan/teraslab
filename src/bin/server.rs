@@ -18,7 +18,8 @@ use parking_lot::Mutex;
 use teraslab::allocator::SlotAllocator;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, DirectDevice};
-use teraslab::index::{DahIndex, Index, UnminedIndex};
+use teraslab::config::IndexBackendMode;
+use teraslab::index::{DahBackend, DahIndex, PrimaryBackend, UnminedBackend, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{ThreadHistograms, ThreadMetrics};
 use teraslab::ops::engine::Engine;
@@ -100,35 +101,108 @@ fn main() {
         }
     };
 
-    // 3. Load or rebuild index
-    let snap_path = &config.index_snapshot_path;
-    let (mut index, dah_index, unmined_index) = if snap_path.exists() {
-        match Index::restore_all(snap_path) {
-            Ok((idx, dah, unmined, flags)) => {
-                eprintln!("  index restored from snapshot ({} entries)", idx.len());
-                let dah = if flags.dah_needs_rebuild {
-                    eprintln!("  DAH index needs rebuild (snapshot corrupt)");
-                    rebuild_dah(&*device, &allocator)
-                } else {
-                    dah
-                };
-                let unmined = if flags.unmined_needs_rebuild {
-                    eprintln!("  unmined index needs rebuild (snapshot corrupt)");
-                    rebuild_unmined(&*device, &allocator)
-                } else {
-                    unmined
-                };
-                (idx, dah, unmined)
-            }
-            Err(e) => {
-                eprintln!("  index snapshot corrupt ({e}), rebuilding from device...");
+    // 3. Load or rebuild index (backend selected by config)
+    eprintln!("  index backend: {}", if config.index.is_redb() { "redb" } else { "memory" });
+
+    let (mut index, dah_index, unmined_index): (PrimaryBackend, DahBackend, UnminedBackend) =
+        if config.index.backend == IndexBackendMode::Redb {
+            // ReDB on-disk backend
+            let primary = match PrimaryBackend::restore_redb(&config.index) {
+                Ok(idx) => {
+                    eprintln!("  redb primary index opened ({} entries)", idx.len());
+                    idx
+                }
+                Err(_) => {
+                    eprintln!("  redb primary index not found, rebuilding from device...");
+                    match PrimaryBackend::rebuild_redb(&config.index, &*device, &allocator) {
+                        Ok(idx) => idx,
+                        Err(e) => {
+                            eprintln!("  redb rebuild failed: {e}, removing stale file and creating empty");
+                            let _ = std::fs::remove_file(&config.index.redb_path);
+                            PrimaryBackend::new_on_disk(&config.index).unwrap()
+                        }
+                    }
+                }
+            };
+            let dah = match teraslab::index::redb_dah::RedbDahIndex::open(
+                &config.index.redb_dah_path,
+                config.index.redb_cache_size,
+            ) {
+                Ok(idx) => DahBackend::OnDisk(idx),
+                Err(e) => {
+                    eprintln!("  redb DAH index error: {e}, removing corrupt file and retrying");
+                    let _ = std::fs::remove_file(&config.index.redb_dah_path);
+                    match teraslab::index::redb_dah::RedbDahIndex::open(
+                        &config.index.redb_dah_path,
+                        config.index.redb_cache_size,
+                    ) {
+                        Ok(idx) => {
+                            eprintln!("  redb DAH index: fresh database created");
+                            DahBackend::OnDisk(idx)
+                        }
+                        Err(e2) => {
+                            eprintln!("  redb DAH index: fresh creation also failed: {e2}, falling back to in-memory");
+                            DahBackend::new_in_memory()
+                        }
+                    }
+                }
+            };
+            let unmined = match teraslab::index::redb_unmined::RedbUnminedIndex::open(
+                &config.index.redb_unmined_path,
+                config.index.redb_cache_size,
+            ) {
+                Ok(idx) => UnminedBackend::OnDisk(idx),
+                Err(e) => {
+                    eprintln!("  redb unmined index error: {e}, removing corrupt file and retrying");
+                    let _ = std::fs::remove_file(&config.index.redb_unmined_path);
+                    match teraslab::index::redb_unmined::RedbUnminedIndex::open(
+                        &config.index.redb_unmined_path,
+                        config.index.redb_cache_size,
+                    ) {
+                        Ok(idx) => {
+                            eprintln!("  redb unmined index: fresh database created");
+                            UnminedBackend::OnDisk(idx)
+                        }
+                        Err(e2) => {
+                            eprintln!("  redb unmined index: fresh creation also failed: {e2}, falling back to in-memory");
+                            UnminedBackend::new_in_memory()
+                        }
+                    }
+                }
+            };
+            (primary, dah, unmined)
+        } else {
+            // In-memory backend (default)
+            let snap_path = &config.index_snapshot_path;
+            let (idx, dah, unmined) = if snap_path.exists() {
+                match PrimaryBackend::restore_all(snap_path) {
+                    Ok((idx, dah, unmined, flags)) => {
+                        eprintln!("  index restored from snapshot ({} entries)", idx.len());
+                        let dah = if flags.dah_needs_rebuild {
+                            eprintln!("  DAH index needs rebuild (snapshot corrupt)");
+                            rebuild_dah(&*device, &allocator)
+                        } else {
+                            dah
+                        };
+                        let unmined = if flags.unmined_needs_rebuild {
+                            eprintln!("  unmined index needs rebuild (snapshot corrupt)");
+                            rebuild_unmined(&*device, &allocator)
+                        } else {
+                            unmined
+                        };
+                        (idx, dah, unmined)
+                    }
+                    Err(e) => {
+                        eprintln!("  index snapshot corrupt ({e}), rebuilding from device...");
+                        rebuild_all(&*device, &allocator)
+                    }
+                }
+            } else {
+                eprintln!("  no index snapshot found, rebuilding from device...");
                 rebuild_all(&*device, &allocator)
-            }
-        }
-    } else {
-        eprintln!("  no index snapshot found, rebuilding from device...");
-        rebuild_all(&*device, &allocator)
-    };
+            };
+            (idx, DahBackend::from(dah), UnminedBackend::from(unmined))
+        };
 
     eprintln!("  index: {} entries, load factor {:.1}%",
         index.len(), index.stats().load_factor * 100.0);
@@ -470,15 +544,15 @@ impl ServerWithShutdown {
     }
 }
 
-fn rebuild_all(device: &dyn BlockDevice, allocator: &SlotAllocator) -> (Index, DahIndex, UnminedIndex) {
-    let index = match Index::rebuild(device, allocator) {
+fn rebuild_all(device: &dyn BlockDevice, allocator: &SlotAllocator) -> (PrimaryBackend, DahIndex, UnminedIndex) {
+    let index = match PrimaryBackend::rebuild(device, allocator) {
         Ok(idx) => idx,
         Err(e) => {
             eprintln!("  index rebuild failed: {e}, starting empty");
-            Index::new(1000).unwrap()
+            PrimaryBackend::new_in_memory(1000).unwrap()
         }
     };
-    let (dah, unmined) = match Index::rebuild_secondary(device, allocator) {
+    let (dah, unmined) = match PrimaryBackend::rebuild_secondary(device, allocator) {
         Ok((d, u)) => (d, u),
         Err(e) => {
             eprintln!("  secondary index rebuild failed: {e}, starting empty");
@@ -489,14 +563,14 @@ fn rebuild_all(device: &dyn BlockDevice, allocator: &SlotAllocator) -> (Index, D
 }
 
 fn rebuild_dah(device: &dyn BlockDevice, allocator: &SlotAllocator) -> DahIndex {
-    match Index::rebuild_secondary(device, allocator) {
+    match PrimaryBackend::rebuild_secondary(device, allocator) {
         Ok((dah, _)) => dah,
         Err(_) => DahIndex::new(),
     }
 }
 
 fn rebuild_unmined(device: &dyn BlockDevice, allocator: &SlotAllocator) -> UnminedIndex {
-    match Index::rebuild_secondary(device, allocator) {
+    match PrimaryBackend::rebuild_secondary(device, allocator) {
         Ok((_, unmined)) => unmined,
         Err(_) => UnminedIndex::new(),
     }

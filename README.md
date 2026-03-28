@@ -14,7 +14,7 @@ TeraSlab pre-allocates UTXO slots at full size during creation and mutates them 
 | p99.9 latency | Low (no copy-on-write, no defrag spikes) |
 | Replication bandwidth | ~120 MB/s (operation-based, not full-record) |
 | SSD wear per spend | 37 bytes per slot + ~256 bytes metadata (vs full record in copy-on-write designs) |
-| Memory per record | 72 bytes (hash table bucket including key, fingerprint, overhead) |
+| Memory per record | 72 bytes in-memory (hash table bucket) or ~0 with on-disk redb backend |
 
 ## Building
 
@@ -54,7 +54,7 @@ This starts TeraSlab with all defaults:
 - **TCP wire protocol** on `0.0.0.0:3300`
 - **HTTP observability** on `0.0.0.0:9100`
 - Data file: `teraslab-data.dat` (1 GiB, created if missing)
-- Index snapshot: `teraslab-index.snap`
+- Index: in-memory (snapshot: `teraslab-index.snap`). See [Index backends](#index-backends) for the on-disk alternative.
 - Single-node mode (no clustering)
 
 ### Configuration file
@@ -73,6 +73,23 @@ device_paths = ["/dev/nvme0n1p1"]
 device_size = 107374182400  # 100 GiB
 expected_records = 50000000
 ```
+
+#### Low-RAM deployment with on-disk index
+
+```toml
+listen_addr = "0.0.0.0:3300"
+device_paths = ["/dev/nvme0n1p1"]
+device_size = 107374182400  # 100 GiB
+
+[index]
+backend = "redb"
+redb_path = "/data/teraslab-index.redb"
+redb_dah_path = "/data/teraslab-dah.redb"
+redb_unmined_path = "/data/teraslab-unmined.redb"
+redb_cache_size = 268435456  # 256 MiB
+```
+
+This uses the redb on-disk index, keeping RAM usage under 512 MiB regardless of record count. See [Index backends](#index-backends) for details on tradeoffs.
 
 #### Full configuration reference
 
@@ -95,6 +112,14 @@ redo_log_path = "teraslab-data.dat.redo"  # Optional explicit redo log path
 # --- Index ---
 index_snapshot_path = "teraslab-index.snap"
 expected_records = 100000             # Hint for initial hash table sizing
+
+# --- Index backend (optional, defaults to in-memory) ---
+[index]
+backend = "memory"                        # "memory" (default) or "redb"
+redb_path = "teraslab-index.redb"         # Primary index redb file
+redb_dah_path = "teraslab-dah.redb"       # DAH secondary index redb file
+redb_unmined_path = "teraslab-unmined.redb" # Unmined secondary index redb file
+redb_cache_size = 268435456               # redb page cache in bytes (256 MiB default)
 
 # --- Concurrency ---
 lock_stripes = 65536                  # Per-transaction lock stripes (power of 2)
@@ -477,6 +502,80 @@ A write-ahead redo log records all mutations. On crash recovery:
 
 The redo log is a fixed-size circular buffer on a separate device file.
 
+## Index backends
+
+TeraSlab supports two index backends for the primary index and secondary indexes (DAH, unmined). The backend is selected at startup via configuration and cannot be changed at runtime.
+
+### In-memory (default)
+
+The default backend stores the index in a Robin Hood hash table backed by anonymous `mmap`. This is the fastest option, delivering the full 10M+ ops/sec throughput target. It requires approximately **72 bytes per record** of RAM. For 100M records, this means ~7.2 GB of RAM for the index alone.
+
+On clean shutdown the index is snapshotted to `index_snapshot_path` and restored on next startup. On crash, the index is rebuilt from the device scan + redo log replay.
+
+No configuration is needed — this is the default.
+
+### On-disk via redb
+
+The `redb` backend stores all three indexes (primary, DAH, unmined) in [redb](https://github.com/cberner/redb) B+ tree database files on disk. This trades throughput for dramatically lower RAM requirements — the index memory footprint drops to the redb page cache size (default 256 MiB) regardless of record count.
+
+Use this backend when:
+- The host has limited RAM (e.g., <16 GB) but fast NVMe storage
+- You are running many TeraSlab instances on the same host
+- You need crash-durable indexes without snapshot/rebuild cycles
+
+#### Configuration
+
+```toml
+[index]
+backend = "redb"
+redb_path = "/data/teraslab-index.redb"
+redb_dah_path = "/data/teraslab-dah.redb"
+redb_unmined_path = "/data/teraslab-unmined.redb"
+redb_cache_size = 268435456  # 256 MiB (default)
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `backend` | `"memory"` | `"memory"` or `"redb"` |
+| `redb_path` | `teraslab-index.redb` | Primary index database file |
+| `redb_dah_path` | `teraslab-dah.redb` | DAH (delete-at-height) secondary index file |
+| `redb_unmined_path` | `teraslab-unmined.redb` | Unmined secondary index file |
+| `redb_cache_size` | `268435456` (256 MiB) | Page cache size in bytes. Larger cache = more data kept in RAM = faster reads |
+
+#### Tradeoffs
+
+| | In-memory | redb |
+|--|-----------|------|
+| **Throughput** | 10M+ ops/sec | ~100K-500K ops/sec (I/O bound) |
+| **RAM per 10M records** | ~720 MB | ~256 MB (page cache only) |
+| **Crash recovery** | Rebuild from device + redo replay | Instant (already on disk) |
+| **Startup time** | Seconds (snapshot restore) to minutes (full rebuild) | Instant (open existing files) |
+| **Snapshot needed** | Yes (`index_snapshot_path`) | No (crash-durable by default) |
+| **SSD write overhead** | None (index is in RAM) | B+ tree writes per mutation |
+
+#### Error recovery
+
+If a redb database file is corrupt on startup, the server will:
+1. Delete the corrupt file
+2. Attempt to create a fresh empty database at the same path
+3. If that also fails, fall back to the in-memory backend for that index
+
+The primary index will be rebuilt from a device scan if the redb file is missing or cannot be opened. The secondary indexes (DAH, unmined) start empty and are repopulated as operations arrive.
+
+#### Migration between backends
+
+Use `teraslab-cli` to export and import index data between backends:
+
+```bash
+# Export current index (any backend) to a portable snapshot
+teraslab-cli export-index --output /tmp/index-export.snap
+
+# Import into a redb-configured instance
+teraslab-cli import-index --input /tmp/index-export.snap
+```
+
+The export format is the same binary snapshot format used for in-memory index persistence, making it backend-agnostic.
+
 ## Admin CLI
 
 The `teraslab-cli` binary provides operator commands that consume the HTTP observability endpoints and binary wire protocol. Supports both table-formatted and JSON output.
@@ -518,7 +617,7 @@ teraslab/
 │   ├── device_io/            I/O backends (sync fallback, io_uring stub)
 │   ├── record.rs             On-disk record types (TxMetadata, UtxoSlot)
 │   ├── allocator.rs          Freelist-based slot allocator
-│   ├── index/                Primary hash table + DAH and unmined secondary indexes
+│   ├── index/                Primary + secondary indexes (in-memory and redb on-disk backends)
 │   ├── locks.rs              Striped per-transaction locking
 │   ├── redo.rs               Write-ahead redo log (circular buffer)
 │   ├── recovery.rs           Crash recovery replay

@@ -5,7 +5,7 @@
 
 use crate::allocator::SlotAllocator;
 use crate::device::{AlignedBuf, BlockDevice};
-use crate::index::{DahIndex, Index, TxIndexEntry, TxKey, UnminedIndex};
+use crate::index::{DahBackend, PrimaryBackend, TxIndexEntry, TxKey, UnminedBackend};
 use crate::io;
 use crate::locks::StripedLocks;
 use crate::ops::create::*;
@@ -33,11 +33,11 @@ pub struct Engine {
     /// `null_mut()` when the device does not support direct access (falls
     /// back to `pread`/`pwrite` with `AlignedBuf`).
     device_ptr: *mut u8,
-    index: parking_lot::RwLock<Index>,
+    index: parking_lot::RwLock<PrimaryBackend>,
     allocator: parking_lot::Mutex<SlotAllocator>,
     locks: StripedLocks,
-    dah_index: parking_lot::Mutex<DahIndex>,
-    unmined_index: parking_lot::Mutex<UnminedIndex>,
+    dah_index: parking_lot::Mutex<DahBackend>,
+    unmined_index: parking_lot::Mutex<UnminedBackend>,
     blob_store: Option<Arc<dyn BlobStore>>,
     /// Per-shard record counts for O(1) migration verification.
     /// Updated atomically on create/delete. Indexed by shard number.
@@ -53,13 +53,14 @@ impl Engine {
     /// Create a new engine with the given components.
     pub fn new(
         device: Arc<dyn BlockDevice>,
-        index: Index,
+        index: impl Into<PrimaryBackend>,
         allocator: SlotAllocator,
         locks: StripedLocks,
-        dah_index: DahIndex,
-        unmined_index: UnminedIndex,
+        dah_index: impl Into<DahBackend>,
+        unmined_index: impl Into<UnminedBackend>,
     ) -> Self {
         let device_ptr = device.as_raw_ptr().unwrap_or(std::ptr::null_mut());
+        let index = index.into();
         let shard_counts: Vec<std::sync::atomic::AtomicU64> = (0..4096)
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
@@ -74,8 +75,8 @@ impl Engine {
             index: parking_lot::RwLock::new(index),
             allocator: parking_lot::Mutex::new(allocator),
             locks,
-            dah_index: parking_lot::Mutex::new(dah_index),
-            unmined_index: parking_lot::Mutex::new(unmined_index),
+            dah_index: parking_lot::Mutex::new(dah_index.into()),
+            unmined_index: parking_lot::Mutex::new(unmined_index.into()),
             blob_store: None,
             shard_counts,
         }
@@ -2000,7 +2001,7 @@ impl Engine {
     }
 
     /// Get the unmined index (for testing).
-    pub fn unmined_index(&self) -> parking_lot::MutexGuard<'_, UnminedIndex> {
+    pub fn unmined_index(&self) -> parking_lot::MutexGuard<'_, UnminedBackend> {
         self.unmined_index.lock()
     }
 
@@ -2038,7 +2039,7 @@ impl Engine {
     }
 
     /// Get the DAH index (for testing).
-    pub fn dah_index(&self) -> parking_lot::MutexGuard<'_, DahIndex> {
+    pub fn dah_index(&self) -> parking_lot::MutexGuard<'_, DahBackend> {
         self.dah_index.lock()
     }
 
@@ -2266,6 +2267,7 @@ mod tests {
     use super::*;
     use crate::allocator::SlotAllocator;
     use crate::device::MemoryDevice;
+    use crate::index::{DahIndex, Index, UnminedIndex};
     use std::sync::Arc;
 
     /// Build a test engine with a pre-created record.

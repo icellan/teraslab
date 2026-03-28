@@ -3611,7 +3611,7 @@ mod tests {
 
             // Create fresh index + allocator
             let alloc = SlotAllocator::new(data_dev.clone());
-            let mut index = Index::new(10000).unwrap();
+            let mut index: crate::index::PrimaryBackend = Index::new(10000).unwrap().into();
 
             // Run recovery to rebuild index from redo log
             let stats = crate::recovery::recover(

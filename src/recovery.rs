@@ -17,7 +17,7 @@
 //! writing to avoid double-application.
 
 use crate::device::BlockDevice;
-use crate::index::{Index, TxIndexEntry, TxKey};
+use crate::index::{PrimaryBackend, TxIndexEntry, TxKey};
 use crate::io;
 use crate::record::*;
 use crate::redo::{RedoEntry, RedoLog, RedoOp};
@@ -57,7 +57,7 @@ pub struct RecoveryStats {
 pub fn recover(
     device: &dyn BlockDevice,
     redo_log: &RedoLog,
-    index: &mut Index,
+    index: &mut PrimaryBackend,
 ) -> Result<RecoveryStats, RecoveryError> {
     let entries = redo_log.recover()?;
     let mut stats = RecoveryStats::default();
@@ -81,7 +81,7 @@ enum ReplayResult {
 
 fn replay_entry(
     device: &dyn BlockDevice,
-    index: &mut Index,
+    index: &mut PrimaryBackend,
     entry: &RedoEntry,
 ) -> ReplayResult {
     match &entry.op {
@@ -117,7 +117,7 @@ fn replay_entry(
 
 fn replay_spend(
     device: &dyn BlockDevice,
-    index: &Index,
+    index: &PrimaryBackend,
     tx_key: &TxKey,
     offset: u32,
     spending_data: &[u8; 36],
@@ -155,7 +155,7 @@ fn replay_spend(
 
 fn replay_unspend(
     device: &dyn BlockDevice,
-    index: &Index,
+    index: &PrimaryBackend,
     tx_key: &TxKey,
     offset: u32,
     new_spent_count: u32,
@@ -189,7 +189,7 @@ fn replay_unspend(
 
 fn replay_set_mined(
     device: &dyn BlockDevice,
-    index: &Index,
+    index: &PrimaryBackend,
     tx_key: &TxKey,
     block_id: u32,
     block_height: u32,
@@ -246,7 +246,7 @@ fn replay_set_mined(
 
 fn replay_freeze(
     device: &dyn BlockDevice,
-    index: &Index,
+    index: &PrimaryBackend,
     tx_key: &TxKey,
     offset: u32,
 ) -> ReplayResult {
@@ -273,7 +273,7 @@ fn replay_freeze(
 
 fn replay_unfreeze(
     device: &dyn BlockDevice,
-    index: &Index,
+    index: &PrimaryBackend,
     tx_key: &TxKey,
     offset: u32,
 ) -> ReplayResult {
@@ -299,7 +299,7 @@ fn replay_unfreeze(
 }
 
 fn replay_create(
-    index: &mut Index,
+    index: &mut PrimaryBackend,
     tx_key: &TxKey,
     record_offset: u64,
     utxo_count: u32,
@@ -327,7 +327,7 @@ fn replay_create(
 }
 
 fn replay_delete(
-    index: &mut Index,
+    index: &mut PrimaryBackend,
     tx_key: &TxKey,
 ) -> ReplayResult {
     match index.unregister(tx_key) {
@@ -338,7 +338,7 @@ fn replay_delete(
 
 fn replay_metadata_op(
     device: &dyn BlockDevice,
-    index: &Index,
+    index: &PrimaryBackend,
     entry: &RedoEntry,
 ) -> ReplayResult {
     match &entry.op {
@@ -481,7 +481,7 @@ mod tests {
     struct RecoveryTestHarness {
         data_dev: Arc<MemoryDevice>,
         redo_dev: Arc<MemoryDevice>,
-        index: Index,
+        index: PrimaryBackend,
         alloc: SlotAllocator,
     }
 
@@ -490,7 +490,7 @@ mod tests {
             let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
             let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
             let alloc = SlotAllocator::new(data_dev.clone());
-            let index = Index::new(1000).unwrap();
+            let index = PrimaryBackend::new_in_memory(1000).unwrap();
             Self { data_dev, redo_dev, index, alloc }
         }
 
