@@ -26,6 +26,7 @@ impl RedbDahIndex {
     ///
     /// TeraSlab's redo log provides crash recovery, so per-operation fsync
     /// is unnecessary. See [`RedbPrimary::begin_write`] for rationale.
+    #[allow(clippy::result_large_err)] // redb::TransactionError is external; we cannot shrink it
     fn begin_write(&self) -> Result<redb::WriteTransaction, redb::TransactionError> {
         let mut txn = self.db.begin_write()?;
         txn.set_durability(redb::Durability::Eventual);
