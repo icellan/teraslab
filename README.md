@@ -79,7 +79,7 @@ expected_records = 50000000
 
 ```toml
 listen_addr = "0.0.0.0:3300"
-device_paths = ["/dev/nvme0n1p1"]
+device_paths = ["/dev/disk/by-id/nvme-Samsung_990_PRO_S73WNJ0X123456-part1"]
 device_size = 107374182400  # 100 GiB
 
 [index]
@@ -165,7 +165,7 @@ node_id = 1
 swim_port = 3301
 seed_nodes = ["10.0.0.2:3301", "10.0.0.3:3301"]
 replication_factor = 2
-device_paths = ["/dev/nvme0n1p1"]
+device_paths = ["/dev/disk/by-id/nvme-Samsung_990_PRO_S73WNJ0X000001-part1"]
 device_size = 107374182400
 ```
 
@@ -176,7 +176,7 @@ node_id = 2
 swim_port = 3301
 seed_nodes = ["10.0.0.1:3301", "10.0.0.3:3301"]
 replication_factor = 2
-device_paths = ["/dev/nvme0n1p1"]
+device_paths = ["/dev/disk/by-id/nvme-Samsung_990_PRO_S73WNJ0X000002-part1"]
 device_size = 107374182400
 ```
 
@@ -187,7 +187,7 @@ node_id = 3
 swim_port = 3301
 seed_nodes = ["10.0.0.1:3301", "10.0.0.2:3301"]
 replication_factor = 2
-device_paths = ["/dev/nvme0n1p1"]
+device_paths = ["/dev/disk/by-id/nvme-Samsung_990_PRO_S73WNJ0X000003-part1"]
 device_size = 107374182400
 ```
 
