@@ -4,6 +4,7 @@
 //! Tests 12.3-12.5: Combined partition + kill, migration + kill,
 //!   rolling restart + partition scenarios.
 
+#[allow(dead_code)]
 mod common;
 
 use std::time::Duration;
@@ -13,6 +14,14 @@ use teraslab_test_client::types::*;
 
 use rand::Rng;
 
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
+
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 12;
 
@@ -21,29 +30,55 @@ async fn scenario_12_concurrent_failures() {
     let result = tokio::time::timeout(Duration::from_secs(600), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("scenario failed: {e}"),
-        Err(_) => panic!("scenario timed out after 600s"),
+        Ok(Err(e)) => {
+            common::teardown_all(SID).await;
+            panic!("scenario failed: {e}");
+        }
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario timed out after 600s");
+        }
     }
 }
 
 async fn run_scenario() -> Result<(), ClientError> {
-    common::teardown_all(SID).await;
+    let t0 = std::time::Instant::now();
 
+    tlog!(t0, "teardown_all (pre-clean)");
+    common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
+
+    tlog!(t0, "test_kill_two_of_three");
     test_kill_two_of_three().await?;
+    tlog!(t0, "teardown_all (after 12.1)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
+    tlog!(t0, "test_sequential_kills");
     test_sequential_kills().await?;
+    tlog!(t0, "teardown_all (after 12.2)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
+    tlog!(t0, "test_partition_plus_kill");
     test_partition_plus_kill().await?;
+    tlog!(t0, "teardown_all (after 12.3)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
+    tlog!(t0, "test_kill_during_migration");
     test_kill_during_migration().await?;
+    tlog!(t0, "teardown_all (after 12.4)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
+    tlog!(t0, "test_rolling_restart_plus_partition");
     test_rolling_restart_plus_partition().await?;
+    tlog!(t0, "teardown_all (after 12.5)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
+    tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
 }
 
@@ -92,7 +127,7 @@ async fn test_kill_two_of_three() -> Result<(), ClientError> {
     let txids = common::seed_records(&client, &verifier, 5000, 4).await?;
     assert_eq!(txids.len(), 5000);
     // Allow replication to propagate AND ensure all nodes have fully converged
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // Verify all 3 nodes report cluster_size=3
     for node_num in 1..=3u32 {
@@ -103,7 +138,7 @@ async fn test_kill_two_of_three() -> Result<(), ClientError> {
     docker.kill_node("node2").await?;
     docker.kill_node("node3").await?;
     // Wait for SWIM failure detection on node1
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     eprintln!("[12.1] Attempting create with only 1 of 3 nodes alive");
     let test_item = make_test_create_item();
@@ -134,7 +169,7 @@ async fn test_kill_two_of_three() -> Result<(), ClientError> {
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[12.1] migration wait: {e}"));
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
     client.refresh_routing().await?;
     eprintln!("[12.1] Cluster restored to 3 nodes");
 
@@ -188,7 +223,7 @@ async fn test_sequential_kills() -> Result<(), ClientError> {
 
     let txids = common::seed_records(&client, &verifier, 5000, 4).await?;
     assert_eq!(txids.len(), 5000);
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     eprintln!("[12.2] Killing node2");
     docker.kill_node("node2").await?;
@@ -236,7 +271,7 @@ async fn test_sequential_kills() -> Result<(), ClientError> {
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[12.2] migration wait: {e}"));
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
     client.refresh_routing().await?;
     eprintln!("[12.2] Full 3-node cluster restored");
 
@@ -298,7 +333,7 @@ async fn test_partition_plus_kill() -> Result<(), ClientError> {
 
     let txids = common::seed_records(&client, &verifier, 5000, 4).await?;
     assert_eq!(txids.len(), 5000);
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // Ensure all nodes see cluster_size=3
     for node_num in 1..=3u32 {
@@ -314,7 +349,7 @@ async fn test_partition_plus_kill() -> Result<(), ClientError> {
     // Wait for failure detection. node1 is now alone:
     //   - node2 is dead
     //   - node3 is partitioned (unreachable)
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
     eprintln!("[12.3] node1 is alone (node2 dead, node3 partitioned)");
 
     // Writes should fail on node1 (no quorum: 1 out of 3)
@@ -378,7 +413,7 @@ async fn test_kill_during_migration() -> Result<(), ClientError> {
     eprintln!("[12.4] Seeding 10000 records on 3-node cluster");
     let txids = common::seed_records(&client, &verifier, 10000, 4).await?;
     assert_eq!(txids.len(), 10000);
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // Add node4 to trigger migration
     eprintln!("[12.4] Adding node4 to trigger migration");
@@ -392,7 +427,7 @@ async fn test_kill_during_migration() -> Result<(), ClientError> {
     // Kill node2 during migration
     eprintln!("[12.4] Killing node2 during migration");
     docker.kill_node("node2").await?;
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Wait for the remaining nodes to stabilize. We now have nodes 1, 3, 4.
     // The cluster may report different sizes depending on how SWIM reacts.
@@ -499,7 +534,6 @@ async fn test_kill_during_migration() -> Result<(), ClientError> {
     );
     eprintln!("[12.4] Full consistency check passed: zero mismatches");
 
-    let _ = docker_5.compose_down().await;
     eprintln!("[12.4] PASSED");
 
     Ok(())
@@ -522,7 +556,7 @@ async fn test_rolling_restart_plus_partition() -> Result<(), ClientError> {
 
     let txids = common::seed_records(&client, &verifier, 5000, 4).await?;
     assert_eq!(txids.len(), 5000);
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // Ensure all nodes see cluster_size=3
     for node_num in 1..=3u32 {
@@ -565,7 +599,7 @@ async fn test_rolling_restart_plus_partition() -> Result<(), ClientError> {
     //   - node1: stopped
     //   - node2: partitioned from node3
     //   - node3: partitioned from node2
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
     eprintln!("[12.5] All three nodes impaired");
 
     // Step 3: Heal partition and restart node1
@@ -579,7 +613,7 @@ async fn test_rolling_restart_plus_partition() -> Result<(), ClientError> {
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[12.5] migration wait: {e}"));
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
     client.refresh_routing().await?;
     eprintln!("[12.5] Cluster restored to 3 nodes");
 

@@ -763,9 +763,9 @@ fn migration_complete_on_unknown_task_still_unfences() {
         "mark_complete should unfence even for unknown tasks");
 }
 
-/// Two tasks for the same shard: fencing both, then completing one unfences
-/// the shard even though the other is still fenced. This documents the
-/// current behavior (single bit per shard in the bitmap).
+/// Two tasks for the same shard: fencing both, then completing one keeps the
+/// shard fenced because the other task is still in the Fenced state. The
+/// shard only unfences once all fenced tasks for it are complete/failed.
 #[test]
 fn migration_two_tasks_same_shard_fence_interaction() {
     let mut mgr = MigrationManager::new();
@@ -778,18 +778,21 @@ fn migration_two_tasks_same_shard_fence_interaction() {
     mgr.mark_fenced(&t2, 200);
     assert!(mgr.is_shard_fenced(5));
 
-    // Complete t1 → unfences shard 5, even though t2 is still Fenced.
+    // Complete t1 → shard 5 STAYS fenced because t2 is still Fenced.
     mgr.mark_complete(&t1);
-    // This documents the current behavior: the fence is lifted.
-    // The bitmap uses one bit per shard, not per task.
-    assert!(!mgr.is_shard_fenced(5),
-        "completing one task unfences the shard (bitmap is per-shard, not per-task)");
+    assert!(mgr.is_shard_fenced(5),
+        "shard should remain fenced while another task is in Fenced state");
 
     // t2 is still in Fenced state in the task list.
     let t2_state = mgr.active_migrations().iter()
         .find(|p| p.to_node == NodeId(3))
         .map(|p| p.state.clone());
     assert_eq!(t2_state, Some(teraslab::cluster::migration::MigrationState::Fenced));
+
+    // Complete t2 → NOW the shard is unfenced.
+    mgr.mark_complete(&t2);
+    assert!(!mgr.is_shard_fenced(5),
+        "shard should unfence once all fenced tasks are done");
 }
 
 /// After cleanup_completed, the inbound bitmap must be rebuilt to exclude

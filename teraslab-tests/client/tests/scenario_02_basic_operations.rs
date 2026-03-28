@@ -6,12 +6,21 @@
 //! verifies full correctness using the in-memory [`StateVerifier`] and
 //! field-level read-back.
 
+#[allow(dead_code)]
 mod common;
 
 use std::time::Duration;
 use teraslab_test_client::ClientError;
 use teraslab_test_client::verifier::{StateVerifier, parse_metadata_fields};
 use teraslab_test_client::types::*;
+
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
 
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 2;
@@ -25,9 +34,12 @@ fn txid_hex(txid: &[u8; 32]) -> String {
 async fn scenario_02_basic_operations() {
     // -- Setup --
     let timeout_guard = tokio::time::timeout(Duration::from_secs(300), async {
+        let t0 = std::time::Instant::now();
+        tlog!(t0, "teardown_all (pre-clean)...");
         common::teardown_all(SID).await;
+        tlog!(t0, "teardown_all done");
 
-        let (mut docker, client) = common::start_3node_cluster(SID).await
+        let (docker, client) = common::start_3node_cluster(SID).await
             .expect("failed to start 3-node cluster");
 
         let verifier = StateVerifier::new();
@@ -35,6 +47,7 @@ async fn scenario_02_basic_operations() {
         // ==================================================================
         // Test 2.1 -- Create 1000 txs (10 UTXOs each) + read back ALL fields
         // ==================================================================
+        tlog!(t0, "test 2.1 start");
         eprintln!("[2.1] Create 1000 txs with 10 UTXOs each, then read back and verify all fields");
 
         let txids = common::seed_records(&client, &verifier, 1000, 10).await
@@ -90,10 +103,12 @@ async fn scenario_02_basic_operations() {
         }
 
         eprintln!("[2.1] OK -- created and verified all fields on 1000 records");
+        tlog!(t0, "test 2.1 done");
 
         // ==================================================================
         // Test 2.2 -- Spend vout=0 on 500 txids, assert success, verify counter
         // ==================================================================
+        tlog!(t0, "test 2.2 start");
         eprintln!("[2.2] Spend vout=0 on 500 txids");
 
         let spend_txids: Vec<[u8; 32]> = txids[..500].to_vec();
@@ -156,10 +171,12 @@ async fn scenario_02_basic_operations() {
         }
 
         eprintln!("[2.2] OK -- spent vout=0 on 500 txids, verified counter");
+        tlog!(t0, "test 2.2 done");
 
         // ==================================================================
         // Test 2.3 -- SpendMulti: 5 UTXOs on same tx, verify counter +5
         // ==================================================================
+        tlog!(t0, "test 2.3 start");
         eprintln!("[2.3] Spend vouts 0-4 on a single tx (multi-vout spend)");
 
         let multi_txid = txids[500];
@@ -203,10 +220,12 @@ async fn scenario_02_basic_operations() {
         );
 
         eprintln!("[2.3] OK -- spent vouts 0-4 on txid {}, counter={}", txid_hex(&multi_txid), post_meta.spent_utxos);
+        tlog!(t0, "test 2.3 done");
 
         // ==================================================================
         // Test 2.4 -- Unspend a spent UTXO, verify slot cleared + counter decremented
         // ==================================================================
+        tlog!(t0, "test 2.4 start");
         eprintln!("[2.4] Unspend a previously spent UTXO");
 
         let unspend_txid = spend_txids[0];
@@ -249,10 +268,12 @@ async fn scenario_02_basic_operations() {
         );
 
         eprintln!("[2.4] OK -- unspend succeeded, counter decremented to 0");
+        tlog!(t0, "test 2.4 done");
 
         // ==================================================================
         // Test 2.5 -- SetMined on 200 txs, verify block entries present
         // ==================================================================
+        tlog!(t0, "test 2.5 start");
         eprintln!("[2.5] SetMined on 200 txids");
 
         let mined_txids: Vec<[u8; 32]> = txids[..200].to_vec();
@@ -295,10 +316,12 @@ async fn scenario_02_basic_operations() {
         }
 
         eprintln!("[2.5] OK -- set_mined on 200 txids, block entries confirmed");
+        tlog!(t0, "test 2.5 done");
 
         // ==================================================================
         // Test 2.6 -- UnsetMined on 50 txs, verify block entry removed + unmined_since set
         // ==================================================================
+        tlog!(t0, "test 2.6 start");
         eprintln!("[2.6] UnsetMined on 50 txids");
 
         let unset_mined_txids: Vec<[u8; 32]> = mined_txids[..50].to_vec();
@@ -346,10 +369,12 @@ async fn scenario_02_basic_operations() {
         }
 
         eprintln!("[2.6] OK -- unset_mined on 50 txids, block entries removed, unmined_since set");
+        tlog!(t0, "test 2.6 done");
 
         // ==================================================================
         // Test 2.7 -- Freeze -> spend (FROZEN) -> unfreeze -> spend (success)
         // ==================================================================
+        tlog!(t0, "test 2.7 start");
         eprintln!("[2.7] Full freeze lifecycle: freeze -> spend fails FROZEN -> unfreeze -> spend succeeds");
 
         let freeze_txids = common::seed_records(&client, &verifier, 1, 5).await
@@ -426,10 +451,12 @@ async fn scenario_02_basic_operations() {
         verifier.record_spend(freeze_txid, 0);
 
         eprintln!("[2.7] OK -- freeze lifecycle passed: freeze -> FROZEN error -> unfreeze -> spend OK");
+        tlog!(t0, "test 2.7 done");
 
         // ==================================================================
         // Test 2.8 -- Reassign frozen UTXO with spendableAfter
         // ==================================================================
+        tlog!(t0, "test 2.8 start");
         eprintln!("[2.8] Reassign frozen UTXO with spendableAfter");
 
         let reassign_txids = common::seed_records(&client, &verifier, 1, 3).await
@@ -527,11 +554,13 @@ async fn scenario_02_basic_operations() {
         verifier.record_spend(reassign_txid, 0);
 
         eprintln!("[2.8] OK -- reassign with spendableAfter succeeded, spend-before-height rejected, spend-at-height accepted");
+        tlog!(t0, "test 2.8 done");
 
         // ==================================================================
         // Test 2.9 -- SetConflicting on 100 txs, spend without flag fails,
         //             with flag succeeds
         // ==================================================================
+        tlog!(t0, "test 2.9 start");
         eprintln!("[2.9] SetConflicting on 100 txs");
 
         let conflicting_txids: Vec<[u8; 32]> = txids[700..800].to_vec();
@@ -600,11 +629,13 @@ async fn scenario_02_basic_operations() {
         verifier.record_spend(conflict_test_txid, 1);
 
         eprintln!("[2.9] OK -- SetConflicting: spend without flag failed, with flag succeeded");
+        tlog!(t0, "test 2.9 done");
 
         // ==================================================================
         // Test 2.10 -- SetLocked on 50 txs, spend without flag fails,
         //              setMined clears locked
         // ==================================================================
+        tlog!(t0, "test 2.10 start");
         eprintln!("[2.10] SetLocked on 50 txs");
 
         let locked_txids: Vec<[u8; 32]> = txids[800..850].to_vec();
@@ -672,10 +703,12 @@ async fn scenario_02_basic_operations() {
         );
 
         eprintln!("[2.10] OK -- SetLocked: spend without flag failed, setMined cleared locked");
+        tlog!(t0, "test 2.10 done");
 
         // ==================================================================
         // Test 2.11 -- PreserveUntil on 20 txs
         // ==================================================================
+        tlog!(t0, "test 2.11 start");
         eprintln!("[2.11] PreserveUntil on 20 txs");
 
         let preserve_txids: Vec<[u8; 32]> = txids[850..870].to_vec();
@@ -701,10 +734,12 @@ async fn scenario_02_basic_operations() {
         }
 
         eprintln!("[2.11] OK -- preserve_until set on 20 txs");
+        tlog!(t0, "test 2.11 done");
 
         // ==================================================================
         // Test 2.12 -- Delete 100 txids, verify NotFound specifically
         // ==================================================================
+        tlog!(t0, "test 2.12 start");
         eprintln!("[2.12] Delete 100 txids and verify NotFound on read-back");
 
         let delete_txids: Vec<[u8; 32]> = txids[900..1000].to_vec();
@@ -744,10 +779,12 @@ async fn scenario_02_basic_operations() {
         }
 
         eprintln!("[2.12] OK -- deleted 100 txids and confirmed NotFound");
+        tlog!(t0, "test 2.12 done");
 
         // ==================================================================
         // Test 2.13 -- Coinbase tx with spending_height, test below and at height
         // ==================================================================
+        tlog!(t0, "test 2.13 start");
         eprintln!("[2.13] Coinbase tx with spending_height maturity check");
 
         let mut coinbase_txid = [0u8; 32];
@@ -823,10 +860,12 @@ async fn scenario_02_basic_operations() {
         verifier.record_spend(coinbase_txid, 0);
 
         eprintln!("[2.13] OK -- coinbase maturity: immature spend failed, mature spend succeeded");
+        tlog!(t0, "test 2.13 done");
 
         // ==================================================================
         // Test 2.14 -- Batch create 100 txs, verify all readable
         // ==================================================================
+        tlog!(t0, "test 2.14 start");
         eprintln!("[2.14] Batch create 100 txs");
 
         let batch_create_txids = common::seed_records(&client, &verifier, 100, 5).await
@@ -845,10 +884,12 @@ async fn scenario_02_basic_operations() {
         }
 
         eprintln!("[2.14] OK -- batch created 100 txs, all readable");
+        tlog!(t0, "test 2.14 done");
 
         // ==================================================================
         // Test 2.15 -- Batch get 200 txs, verify all returned correctly
         // ==================================================================
+        tlog!(t0, "test 2.15 start");
         eprintln!("[2.15] Batch get 200 txs");
 
         // Use the first 200 non-deleted txids from the verifier
@@ -901,10 +942,12 @@ async fn scenario_02_basic_operations() {
         assert_eq!(all_found, 200, "Test 2.15: should have found all 200 records");
 
         eprintln!("[2.15] OK -- batch get returned all 200 txs correctly");
+        tlog!(t0, "test 2.15 done");
 
         // ==================================================================
         // Test 2.16 -- Full consistency check using verify_consistency()
         // ==================================================================
+        tlog!(t0, "test 2.16 start");
         eprintln!("[2.16] Full consistency check against state verifier");
 
         let mismatches = common::verify_consistency(&client, &verifier).await
@@ -926,15 +969,22 @@ async fn scenario_02_basic_operations() {
         );
 
         eprintln!("[2.16] OK -- full consistency check passed: zero mismatches");
+        tlog!(t0, "test 2.16 done");
 
         // -- Teardown --
-        let _ = docker.compose_down().await;
+        tlog!(t0, "teardown_all (final)...");
+        common::teardown_all(SID).await;
+        tlog!(t0, "teardown_all done");
 
         eprintln!("[scenario_02] All sub-tests passed");
+        tlog!(t0, "=== SCENARIO COMPLETE ===");
     });
 
     match timeout_guard.await {
         Ok(()) => {}
-        Err(_) => panic!("scenario_02_basic_operations timed out after 300s"),
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario_02_basic_operations timed out after 300s");
+        }
     }
 }

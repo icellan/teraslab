@@ -10,6 +10,7 @@
 //! Orphaned blob detection is not implemented because it requires
 //! blobstore filesystem access from inside Docker containers.
 
+#[allow(dead_code)]
 mod common;
 
 use std::collections::HashSet;
@@ -26,6 +27,14 @@ use teraslab_test_client::types::*;
 
 use teraslab::protocol::codec::encode_get_batch;
 use teraslab::protocol::opcodes::{FLAG_LOCAL_READ, OP_GET_BATCH, STATUS_OK};
+
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
 
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 16;
@@ -443,11 +452,13 @@ async fn run_workload_tick(
                             verifier.record_spend(txid, 0);
                             metrics_spends_ok.fetch_add(1, Ordering::Relaxed);
                         } else {
+                            ws.timeout_txids.lock().push((txid, "spend".to_string()));
                             metrics_spends_err.fetch_add(1, Ordering::Relaxed);
                             metrics_total_errors.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     _ => {
+                        ws.timeout_txids.lock().push((txid, "spend".to_string()));
                         metrics_spends_err.fetch_add(1, Ordering::Relaxed);
                         metrics_total_errors.fetch_add(1, Ordering::Relaxed);
                     }
@@ -477,6 +488,7 @@ async fn run_workload_tick(
                         metrics_set_mined_ok.fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(Err(_)) => {
+                        ws.timeout_txids.lock().push((txid, "set_mined".to_string()));
                         metrics_set_mined_err.fetch_add(1, Ordering::Relaxed);
                         metrics_total_errors.fetch_add(1, Ordering::Relaxed);
                     }
@@ -508,6 +520,7 @@ async fn run_workload_tick(
                         metrics_deletes_ok.fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(Err(_)) => {
+                        ws.timeout_txids.lock().push((txid, "delete".to_string()));
                         metrics_deletes_err.fetch_add(1, Ordering::Relaxed);
                         metrics_total_errors.fetch_add(1, Ordering::Relaxed);
                     }
@@ -537,52 +550,79 @@ async fn resolve_timeouts(
     ws: &ChaosWorkloadState,
 ) {
     let timeout_list: Vec<([u8; 32], String)> = ws.timeout_txids.lock().drain(..).collect();
+    let mut unresolved: Vec<([u8; 32], String)> = Vec::new();
     for (txid, op_type) in &timeout_list {
-        if let Ok(results) = check_client.get_batch(FIELD_ALL_METADATA, std::slice::from_ref(txid)).await {
-            if !results.is_empty() && results.item(0).status == 0 {
-                // The record exists on the cluster
-                match op_type.as_str() {
-                    "create" => {
-                        if verifier.get_record(txid).is_none() {
-                            let mut dummy_hash = [0u8; 32];
-                            dummy_hash[0] = 0xEE;
-                            verifier.record_create(*txid, 1, vec![dummy_hash]);
-                            ws.confirmed_txids.lock().push((*txid, vec![dummy_hash]));
+        let mut resolved = false;
+        for attempt in 0..3 {
+            match check_client.get_batch(FIELD_ALL_METADATA, std::slice::from_ref(txid)).await {
+                Ok(results) if !results.is_empty() && results.item(0).status == 0 => {
+                    match op_type.as_str() {
+                        "create" => {
+                            if verifier.get_record(txid).is_none() {
+                                let mut dummy_hash = [0u8; 32];
+                                dummy_hash[0] = 0xEE;
+                                verifier.record_create(*txid, 1, vec![dummy_hash]);
+                                ws.confirmed_txids.lock().push((*txid, vec![dummy_hash]));
+                            }
+                            resolved = true;
                         }
-                    }
-                    "set_mined" => {
-                        // Check if block_entry_count > 0 (offset 147 in FIELD_ALL_METADATA)
-                        let data = &results.item(0).data;
-                        if let Some((_spent, is_mined, _conflicting, _locked)) = parse_metadata_fields(data) {
-                            if is_mined {
-                                verifier.record_set_mined(*txid);
+                        "spend" => {
+                            let data = &results.item(0).data;
+                            if let Some((spent, _is_mined, _conflicting, _locked)) = parse_metadata_fields(data) {
+                                if spent > 0 {
+                                    verifier.record_spend(*txid, 0);
+                                }
+                                resolved = true;
                             }
                         }
+                        "set_mined" => {
+                            let data = &results.item(0).data;
+                            if let Some((_spent, is_mined, _conflicting, _locked)) = parse_metadata_fields(data) {
+                                if is_mined {
+                                    verifier.record_set_mined(*txid);
+                                }
+                                resolved = true;
+                            }
+                        }
+                        "delete" => {
+                            resolved = true;
+                        }
+                        _ => {
+                            resolved = true;
+                        }
                     }
-                    "delete" => {
-                        // Record exists despite delete timeout -- do not mark as deleted.
-                        // The delete was not applied.
-                    }
-                    _ => {}
                 }
-            } else {
-                // Record NOT found on cluster
-                match op_type.as_str() {
-                    "delete" => {
-                        // The delete was applied -- record it
-                        verifier.record_delete(*txid);
-                        ws.deleted_txids.lock().insert(*txid);
+                Ok(results) if !results.is_empty() => {
+                    match op_type.as_str() {
+                        "delete" => {
+                            verifier.record_delete(*txid);
+                            ws.deleted_txids.lock().insert(*txid);
+                            resolved = true;
+                        }
+                        "create" => {
+                            resolved = true;
+                        }
+                        _ => {}
                     }
-                    "create" => {
-                        // Create was not applied -- nothing to do
-                    }
-                    "set_mined" => {
-                        // Record not found (possibly deleted by another op) -- nothing to do
-                    }
-                    _ => {}
                 }
+                _ => {}
+            }
+
+            if resolved {
+                break;
+            }
+            if attempt < 2 {
+                let _ = check_client.refresh_routing().await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
+
+        if !resolved {
+            unresolved.push((*txid, op_type.clone()));
+        }
+    }
+    if !unresolved.is_empty() {
+        ws.timeout_txids.lock().extend(unresolved);
     }
 }
 
@@ -675,13 +715,23 @@ async fn scenario_16_chaos() {
     let result = tokio::time::timeout(Duration::from_secs(600), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("scenario failed: {e}"),
-        Err(_) => panic!("scenario timed out after 2700s"),
+        Ok(Err(e)) => {
+            common::teardown_all(SID).await;
+            panic!("scenario failed: {e}");
+        }
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario timed out after 2700s");
+        }
     }
 }
 
 async fn run_scenario() -> Result<(), ClientError> {
+    let t0 = std::time::Instant::now();
+
+    tlog!(t0, "teardown_all (initial)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all (initial) done");
 
     // Default duration: 5 minutes (300 seconds). Override via env var for
     // longer soak tests (e.g., TERASLAB_CHAOS_DURATION_SECS=1800 for 30min).
@@ -704,7 +754,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     assert_eq!(seed_txids.len(), 5000);
 
     // Allow extra time for replication to propagate to all 5 replicas.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 5, Duration::from_secs(10)).await?;
 
     // Initial consistency check
     let mismatches = common::verify_consistency(&client, &verifier).await?;
@@ -811,10 +861,11 @@ async fn run_scenario() -> Result<(), ClientError> {
 
             // Ensure all nodes are running after healing
             let _ = docker.compose_up().await;
-            tokio::time::sleep(Duration::from_secs(15)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
             common::wait_cluster_ready(&docker, 5, Duration::from_secs(180)).await?;
             common::wait_migrations_complete(&docker, 5, Duration::from_secs(180)).await
                 .unwrap_or_else(|e| eprintln!("[16] checkpoint migration wait: {e}"));
+            common::wait_replication_settled(&docker, 5, Duration::from_secs(10)).await?;
 
             // Resolve timeout txids before consistency check
             {
@@ -916,11 +967,11 @@ async fn run_scenario() -> Result<(), ClientError> {
     // After chaos healing, nodes need extended time to rediscover each other
     tokio::time::sleep(Duration::from_secs(5)).await;
     let _ = docker.compose_up().await;
-    tokio::time::sleep(Duration::from_secs(15)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
     common::wait_cluster_ready(&docker, 5, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker, 5, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[16] final migration wait: {e}"));
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 5, Duration::from_secs(10)).await?;
 
     // Resolve any remaining timeout txids
     {
@@ -972,7 +1023,10 @@ async fn run_scenario() -> Result<(), ClientError> {
          - Final consistency mismatches: 0\n\
          - PASS");
 
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
+    tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
 }

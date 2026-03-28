@@ -1,5 +1,6 @@
 //! Scenario 14 -- Split-brain prevention.
 
+#[allow(dead_code)]
 mod common;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,6 +12,14 @@ use teraslab_test_client::types::*;
 
 use parking_lot::Mutex;
 use rand::{Rng, SeedableRng};
+
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
 
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 14;
@@ -96,26 +105,53 @@ async fn scenario_14_split_brain_prevention() {
     let result = tokio::time::timeout(Duration::from_secs(600), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("scenario failed: {e}"),
-        Err(_) => panic!("scenario timed out after 600s"),
+        Ok(Err(e)) => {
+            common::teardown_all(SID).await;
+            panic!("scenario failed: {e}");
+        }
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario timed out after 600s");
+        }
     }
 }
 
 async fn run_scenario() -> Result<(), ClientError> {
-    common::teardown_all(SID).await;
+    let t0 = std::time::Instant::now();
 
+    tlog!(t0, "teardown_all (initial)");
+    common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all (initial) done");
+
+    tlog!(t0, "test_symmetric_isolation");
     test_symmetric_isolation().await?;
+    tlog!(t0, "test_symmetric_isolation done");
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
+    tlog!(t0, "test_asymmetric_partition");
     test_asymmetric_partition().await?;
+    tlog!(t0, "test_asymmetric_partition done");
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
+    tlog!(t0, "test_flapping_partition");
     test_flapping_partition().await?;
+    tlog!(t0, "test_flapping_partition done");
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
+    tlog!(t0, "test_docker_pause");
     test_docker_pause().await?;
+    tlog!(t0, "test_docker_pause done");
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
+    tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
 }
 
@@ -132,7 +168,7 @@ async fn test_symmetric_isolation() -> Result<(), ClientError> {
     assert_eq!(txids.len(), 2000);
 
     // Allow extra time for replication to propagate to all replicas.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     let pre_partition_readable = verify_sample_readable(&client, &txids, 50).await?;
     assert_eq!(pre_partition_readable, 50);
@@ -171,11 +207,11 @@ async fn test_symmetric_isolation() -> Result<(), ClientError> {
 
     // After healing a 3-way partition, SWIM needs to go through its full
     // rediscovery cycle for all nodes: suspicion -> dead -> rejoin via seeds.
-    tokio::time::sleep(Duration::from_secs(15)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[14.1] migration wait: {e}"));
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
     let client = common::create_client(&docker, 3).await?;
 
@@ -201,7 +237,7 @@ async fn test_asymmetric_partition() -> Result<(), ClientError> {
     assert_eq!(txids.len(), 2000);
 
     // Allow extra time for replication to propagate to all replicas.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     eprintln!("[14.2] Creating asymmetric partition: node1<->node3 broken, node1<->node2 ok, node2<->node3 ok");
     // Only break the connection between node1 and node3
@@ -260,11 +296,11 @@ async fn test_asymmetric_partition() -> Result<(), ClientError> {
     eprintln!("[14.2] Healing partition");
     docker.heal_all_partitions().await?;
 
-    tokio::time::sleep(Duration::from_secs(15)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[14.2] migration wait: {e}"));
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
     let client = common::create_client(&docker, 3).await?;
     client.refresh_routing().await?;
@@ -300,7 +336,7 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
     let verifier = Arc::new(StateVerifier::new());
     let txids = common::seed_records(&client, &verifier, 2000, 5).await?;
     assert_eq!(txids.len(), 2000);
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker_arc, 3, Duration::from_secs(10)).await?;
 
     // Start a background workload
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -394,11 +430,11 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
 
     // Wait for cluster to settle
     eprintln!("[14.3] Waiting for cluster to settle after flapping");
-    tokio::time::sleep(Duration::from_secs(15)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
     common::wait_cluster_ready(&docker_arc, 3, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker_arc, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[14.3] migration wait: {e}"));
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_replication_settled(&docker_arc, 3, Duration::from_secs(5)).await?;
 
     // Full consistency check
     let client = common::create_client(&docker_arc, 3).await?;
@@ -428,7 +464,7 @@ async fn test_docker_pause() -> Result<(), ClientError> {
     assert_eq!(txids.len(), 2000);
 
     // Allow extra time for replication to propagate to all replicas.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     let pre_pause_readable = verify_sample_readable(&client, &txids, 50).await?;
     assert_eq!(pre_pause_readable, 50);

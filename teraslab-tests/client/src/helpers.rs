@@ -75,6 +75,11 @@ impl DockerHelpers {
         self.scenario_id
     }
 
+    /// Returns the number of nodes in this cluster.
+    pub fn node_count(&self) -> u32 {
+        self.node_count
+    }
+
     /// Returns the host-mapped client port for a given node number (1-based).
     ///
     /// Formula: `13000 + scenario_id * 10 + (node_num - 1)`

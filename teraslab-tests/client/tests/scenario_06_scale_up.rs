@@ -1,5 +1,6 @@
 //! Scenario 06 -- Horizontal scale-up from 3 to 4 nodes.
 
+#[allow(dead_code)]
 mod common;
 
 use std::sync::Arc;
@@ -8,6 +9,14 @@ use teraslab_test_client::ClientError;
 use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::reporter::MetricsReporter;
 use teraslab_test_client::types::*;
+
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
 
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 6;
@@ -22,15 +31,25 @@ async fn scenario_06_scale_up() {
     let result = tokio::time::timeout(Duration::from_secs(300), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("scenario failed: {e}"),
-        Err(_) => panic!("scenario timed out after 300s"),
+        Ok(Err(e)) => {
+            common::teardown_all(SID).await;
+            panic!("scenario failed: {e}");
+        }
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario timed out after 300s");
+        }
     }
 }
 
 async fn run_scenario() -> Result<(), ClientError> {
-    common::teardown_all(SID).await;
+    let t0 = std::time::Instant::now();
 
-    let (mut docker, client) = common::start_3node_cluster(SID).await?;
+    tlog!(t0, "teardown_all (pre-clean)");
+    common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
+
+    let (docker, client) = common::start_3node_cluster(SID).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     client.refresh_routing().await?;
 
@@ -52,6 +71,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     }
 
     // -- Test 6.1: Start node4 --
+    tlog!(t0, "test 6.1: start node4");
     eprintln!("[6.1] Starting node4 via 5-node compose overlay");
     let mut docker5 = common::docker_5node(SID);
     docker5.compose_up_nodes(&["node4"]).await?;
@@ -67,6 +87,8 @@ async fn run_scenario() -> Result<(), ClientError> {
             "Test 6.1: node {node_num} reports cluster_size={cluster_size}, expected 4");
     }
     eprintln!("[6.1] OK -- all 4 nodes report cluster_size=4");
+
+    tlog!(t0, "test 6.1: done");
 
     // -- Test 6.5: Background workload DURING migration at ~300 ops/sec --
     // Start the background workload BEFORE waiting for migration to complete.
@@ -155,6 +177,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     });
 
     // -- Test 6.2: Wait for migrations, check balance --
+    tlog!(t0, "test 6.2: wait for migrations");
     eprintln!("[6.2] Waiting for migrations to complete, then checking balance");
     common::wait_migrations_complete(&docker5, 4, Duration::from_secs(180)).await?;
     eprintln!("[6.2] OK -- all migrations complete");
@@ -214,7 +237,10 @@ async fn run_scenario() -> Result<(), ClientError> {
     assert_eq!(total_masters, 4096);
     eprintln!("[6.2] OK -- balanced distribution confirmed (~1024 per node)");
 
+    tlog!(t0, "test 6.2: done");
+
     // -- Test 6.3: Read ALL 10000 original records --
+    tlog!(t0, "test 6.3: read all records");
     eprintln!("[6.3] Reading ALL 10000 original records");
     let mut read_failures = 0u32;
 
@@ -251,7 +277,10 @@ async fn run_scenario() -> Result<(), ClientError> {
         "Test 6.3: {read_failures}/10000 reads failed after migration");
     eprintln!("[6.3] OK -- all 10000 records accessible after migration");
 
+    tlog!(t0, "test 6.3: done");
+
     // -- Test 6.4: Explicit no-duplication check --
+    tlog!(t0, "test 6.4: no-duplication check");
     eprintln!("[6.4] Checking for duplicate records and data loss");
     let mut seen_txids = std::collections::HashSet::new();
     let mut duplicate_count = 0u32;
@@ -280,7 +309,10 @@ async fn run_scenario() -> Result<(), ClientError> {
         "Test 6.4: {missing_count} records missing after scale-up (data loss or duplication issue)");
     eprintln!("[6.4] OK -- no data loss or duplication detected");
 
+    tlog!(t0, "test 6.4: done");
+
     // -- Test 6.6: Source nodes freed space for migrated shards --
+    tlog!(t0, "test 6.6: source nodes freed shards");
     eprintln!("[6.6] Checking that source nodes have fewer shards after migration");
     for (node_num, pre_count) in &pre_scaleup_shard_counts {
         let status = common::http_status(&docker5, *node_num).await?;
@@ -292,7 +324,10 @@ async fn run_scenario() -> Result<(), ClientError> {
     }
     eprintln!("[6.6] OK -- all source nodes have fewer master shards after migration");
 
+    tlog!(t0, "test 6.6: done");
+
     // -- Test 6.7: Full consistency + replication check --
+    tlog!(t0, "test 6.7: consistency check");
     eprintln!("[6.7] Running full consistency check via verify_consistency()");
     let mismatches = common::verify_consistency(&client, &verifier).await?;
     assert!(mismatches.is_empty(),
@@ -301,9 +336,14 @@ async fn run_scenario() -> Result<(), ClientError> {
         mismatches.iter().take(5).collect::<Vec<_>>());
     eprintln!("[6.7] OK -- full consistency check passed, zero mismatches");
 
-    let _ = docker5.compose_down().await;
-    let _ = docker.compose_down().await;
+    tlog!(t0, "test 6.7: done");
+
+    tlog!(t0, "teardown_all (cleanup)");
+    common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
+
     eprintln!("[scenario_06] All sub-tests passed");
+    tlog!(t0, "=== SCENARIO COMPLETE ===");
 
     Ok(())
 }

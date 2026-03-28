@@ -5,6 +5,7 @@
 //! a background workload during kill has bounded failure rate with no
 //! data corruption.
 
+#[allow(dead_code)]
 mod common;
 
 use std::sync::Arc;
@@ -13,6 +14,14 @@ use std::time::Duration;
 use teraslab_test_client::ClientError;
 use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::types::*;
+
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
 
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 4;
@@ -27,15 +36,22 @@ async fn scenario_04_node_hard_kill() {
     let result = tokio::time::timeout(Duration::from_secs(300), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("scenario failed: {e}"),
-        Err(_) => panic!("scenario timed out after 300s"),
+        Ok(Err(e)) => {
+            common::teardown_all(SID).await;
+            panic!("scenario failed: {e}");
+        }
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario timed out after 300s");
+        }
     }
 }
 
 async fn run_scenario() -> Result<(), ClientError> {
+    let t0 = std::time::Instant::now();
+    tlog!(t0, "teardown_all (pre-clean)...");
     common::teardown_all(SID).await;
-    // Allow Docker cleanup to fully complete before starting fresh containers.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tlog!(t0, "teardown_all done");
 
     let (mut docker, client) = common::start_3node_cluster(SID).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
@@ -46,6 +62,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     // ==========================================================================
     // Setup: Seed 5000 records, 2000 spends, 1000 setMined
     // ==========================================================================
+    tlog!(t0, "test 4.0 (setup) start");
     eprintln!("[4.0] Seeding 5000 records with 10 UTXOs each");
     let txids = common::seed_records(&client, &verifier, 5000, 10).await?;
     assert_eq!(txids.len(), 5000, "expected 5000 seeded records");
@@ -109,9 +126,12 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[4.0] node{n}: {records} records, {masters} master shards");
     }
 
+    tlog!(t0, "test 4.0 (setup) done");
+
     // ==========================================================================
     // Test 4.1: Kill node2 with SIGKILL
     // ==========================================================================
+    tlog!(t0, "test 4.1 start");
     eprintln!("[4.1] Killing node2 (SIGKILL)");
     docker.kill_node("node2").await?;
 
@@ -122,6 +142,7 @@ async fn run_scenario() -> Result<(), ClientError> {
             e
         })?;
     eprintln!("[4.1] OK -- both surviving nodes report cluster_size=2");
+    tlog!(t0, "test 4.1 done");
 
     // Wait for migrations to complete on the surviving nodes only.
     // Node 2 is dead, so we can't query it — use wait_specific_migrations_complete.
@@ -132,6 +153,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     // ==========================================================================
     // Test 4.2: Master shard count sums to 4096 (replica promotion)
     // ==========================================================================
+    tlog!(t0, "test 4.2 start");
     eprintln!("[4.2] Verifying master shard coverage on surviving nodes");
     let status_n1 = common::http_status(&docker, 1).await?;
     let status_n3 = common::http_status(&docker, 3).await?;
@@ -146,6 +168,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         "Test 4.2: master shard sum across node1 ({master_n1}) + node3 ({master_n3}) \
          is {total_masters}, expected 4096");
     eprintln!("[4.2] OK -- node1={master_n1}, node3={master_n3}, total={total_masters}");
+    tlog!(t0, "test 4.2 done");
 
     client.refresh_routing().await?;
 
@@ -160,6 +183,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     // ==========================================================================
     // Test 4.3: Read ALL 5000 txids -- all must be accessible
     // ==========================================================================
+    tlog!(t0, "test 4.3 start");
     eprintln!("[4.3] Reading ALL 5000 original txids");
     let mut read_failures = 0u32;
     let mut failed_txids: Vec<[u8; 32]> = Vec::new();
@@ -199,18 +223,22 @@ async fn run_scenario() -> Result<(), ClientError> {
     assert_eq!(read_failures, 0,
         "Test 4.3: {read_failures}/5000 reads failed -- with RF=2, all data must survive a single node failure");
     eprintln!("[4.3] OK -- all 5000 reads succeeded");
+    tlog!(t0, "test 4.3 done");
 
     // ==========================================================================
     // Test 4.4: Create 500 new txs
     // ==========================================================================
+    tlog!(t0, "test 4.4 start");
     eprintln!("[4.4] Creating 500 new records on 2-node cluster");
     let new_txids = common::seed_records(&client, &verifier, 500, 10).await?;
     assert_eq!(new_txids.len(), 500);
     eprintln!("[4.4] OK -- created 500 new records");
+    tlog!(t0, "test 4.4 done");
 
     // ==========================================================================
     // Test 4.5: Spend 200 UTXOs (including on ex-node2 shards)
     // ==========================================================================
+    tlog!(t0, "test 4.5 start");
     eprintln!("[4.5] Spending 200 UTXOs on 2-node cluster (including ex-node2 shards)");
 
     // Use records starting from index 2000 which haven't been spent yet
@@ -256,10 +284,12 @@ async fn run_scenario() -> Result<(), ClientError> {
     assert_eq!(spend_errors, 0,
         "Test 4.5: {spend_errors}/200 spends failed on 2-node cluster");
     eprintln!("[4.5] OK -- all 200 spends succeeded on 2-node cluster");
+    tlog!(t0, "test 4.5 done");
 
     // ==========================================================================
     // Test 4.6: SetMined on 100 records
     // ==========================================================================
+    tlog!(t0, "test 4.6 start");
     eprintln!("[4.6] SetMined on 100 records on 2-node cluster");
     let mined_after_kill: Vec<[u8; 32]> = txids[3000..3100].to_vec();
     let mined_params = SetMinedBatchParams {
@@ -288,10 +318,12 @@ async fn run_scenario() -> Result<(), ClientError> {
     }
 
     eprintln!("[4.6] OK -- SetMined on 100 records succeeded");
+    tlog!(t0, "test 4.6 done");
 
     // ==========================================================================
     // Test 4.7: Full consistency check using verify_consistency()
     // ==========================================================================
+    tlog!(t0, "test 4.7 start");
     eprintln!("[4.7] Full consistency check for all 5500 records");
     {
         let mismatches = common::verify_consistency(&client, &verifier).await?;
@@ -317,11 +349,13 @@ async fn run_scenario() -> Result<(), ClientError> {
         }
     }
     eprintln!("[4.7] OK -- full consistency check passed: zero mismatches");
+    tlog!(t0, "test 4.7 done");
 
     // ==========================================================================
     // Test 4.8: Background workload during kill -- spawn ops at ~200 ops/sec,
     //           kill node2 after 5s, verify <5% failure rate and atomicity
     // ==========================================================================
+    tlog!(t0, "test 4.8 start");
     eprintln!("[4.8] Background workload during kill");
 
     // Restart node2 first so we have a full 3-node cluster again
@@ -540,9 +574,13 @@ async fn run_scenario() -> Result<(), ClientError> {
     }
 
     eprintln!("[4.8] OK -- background workload: <5% failure, zero data corruption");
+    tlog!(t0, "test 4.8 done");
 
-    let _ = docker.compose_down().await;
+    tlog!(t0, "teardown_all (final)...");
+    common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
     eprintln!("[scenario_04] All sub-tests passed");
 
+    tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
 }

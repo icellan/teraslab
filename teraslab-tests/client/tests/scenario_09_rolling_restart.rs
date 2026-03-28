@@ -7,6 +7,7 @@
 //! mismatches. Zero write/read failures throughout. Report p99 latency per
 //! restart phase.
 
+#[allow(dead_code)]
 mod common;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,6 +21,14 @@ use teraslab_test_client::types::*;
 use parking_lot::Mutex;
 use rand::{Rng, SeedableRng};
 
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
+
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 9;
 
@@ -28,8 +37,14 @@ async fn scenario_09_rolling_restart() {
     let result = tokio::time::timeout(Duration::from_secs(600), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("scenario failed: {e}"),
-        Err(_) => panic!("scenario timed out after 600s"),
+        Ok(Err(e)) => {
+            common::teardown_all(SID).await;
+            panic!("scenario failed: {e}");
+        }
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario timed out after 600s");
+        }
     }
 }
 
@@ -65,7 +80,11 @@ impl BgMetrics {
 }
 
 async fn run_scenario() -> Result<(), ClientError> {
+    let t0 = std::time::Instant::now();
+
+    tlog!(t0, "teardown_all (pre-clean)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     let (_docker, client) = common::start_3node_cluster(SID).await?;
     let docker = common::docker_3node(SID);
@@ -79,8 +98,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     let txids = common::seed_records(&client, &verifier, 5000, 4).await?;
     assert_eq!(txids.len(), 5000, "expected 5000 seeded txids");
 
-    // Allow replication to propagate.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    // Wait for replication to propagate.
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // -- Start background workload at ~200 ops/sec --
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -257,6 +276,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     for node_num in 1u32..=3 {
         let node_name = format!("node{node_num}");
+        tlog!(t0, "test 9.{}: rolling restart for {}", node_num, node_name);
         eprintln!("[9.{node_num}] Beginning rolling restart for {node_name}");
 
         // Snapshot error counts before this phase
@@ -337,7 +357,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[9.{node_num}] Cluster back to 3 nodes");
 
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
         eprintln!("[9.{node_num}] Migrations complete after restarting {node_name}");
 
         client.refresh_routing().await?;
@@ -355,6 +375,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         }
         phase_p99s.push((node_num, max_p99));
         eprintln!("[9.{node_num}] Phase p99 latency (max across op types): {max_p99:?}");
+        tlog!(t0, "test 9.{}: done", node_num);
     }
 
     // -- Stop background workload --
@@ -362,9 +383,10 @@ async fn run_scenario() -> Result<(), ClientError> {
     let _ = bg_handle.await;
 
     // -- Post-restart verification --
+    tlog!(t0, "post-restart verification");
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[9.4] migration wait: {e}"));
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
     client.refresh_routing().await?;
 
     // Log total transient errors. These are NOT data loss — writes that failed
@@ -427,8 +449,12 @@ async fn run_scenario() -> Result<(), ClientError> {
     assert_eq!(total_master_shards, 4096);
     eprintln!("[9.6] Total master shards = 4096 -- correct");
 
+    tlog!(t0, "teardown_all (cleanup)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
+
     eprintln!("[scenario_09] All sub-tests passed");
+    tlog!(t0, "=== SCENARIO COMPLETE ===");
 
     Ok(())
 }

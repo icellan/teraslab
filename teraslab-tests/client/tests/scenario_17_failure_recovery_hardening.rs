@@ -10,6 +10,7 @@
 //! - 17.4: Full consistency after cascading failures during rebalance
 //! - 17.5: Writes during migration recovery — no silent data loss
 
+#[allow(dead_code)]
 mod common;
 
 use std::sync::Arc;
@@ -18,6 +19,14 @@ use std::time::Duration;
 use teraslab_test_client::{Client, ClientConfig, ClientError, PoolConfig};
 use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::types::*;
+
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
 
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 17;
@@ -32,34 +41,65 @@ async fn scenario_17_failure_recovery_hardening() {
     let result = tokio::time::timeout(Duration::from_secs(600), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("scenario failed: {e}"),
-        Err(_) => panic!("scenario timed out after 600s"),
+        Ok(Err(e)) => {
+            common::teardown_all(SID).await;
+            panic!("scenario failed: {e}");
+        }
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario timed out after 600s");
+        }
     }
 }
 
 async fn run_scenario() -> Result<(), ClientError> {
+    let t0 = std::time::Instant::now();
+
+    tlog!(t0, "teardown_all (initial)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all (initial) done");
 
     // 17.1: Kill target during migration — old master must resume
+    tlog!(t0, "test_migration_rollback_on_target_kill");
     test_migration_rollback_on_target_kill().await?;
+    tlog!(t0, "test_migration_rollback_on_target_kill done");
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     // 17.2: Crash target mid-migration, restart — shard blocked until re-migration
+    tlog!(t0, "test_inbound_state_survives_restart");
     test_inbound_state_survives_restart().await?;
+    tlog!(t0, "test_inbound_state_survives_restart done");
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     // 17.3: Repeated kill/restart during active migrations
+    tlog!(t0, "test_repeated_kills_during_migration");
     test_repeated_kills_during_migration().await?;
+    tlog!(t0, "test_repeated_kills_during_migration done");
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     // 17.4: Full consistency after cascading failures during rebalance
+    tlog!(t0, "test_cascading_failure_during_rebalance");
     test_cascading_failure_during_rebalance().await?;
+    tlog!(t0, "test_cascading_failure_during_rebalance done");
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     // 17.5: Writes during migration recovery window
+    tlog!(t0, "test_writes_during_migration_recovery");
     test_writes_during_migration_recovery().await?;
+    tlog!(t0, "test_writes_during_migration_recovery done");
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
+    tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
 }
 
@@ -83,7 +123,7 @@ async fn test_migration_rollback_on_target_kill() -> Result<(), ClientError> {
     assert_eq!(txids.len(), 3000);
 
     // Allow replication to propagate fully.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // Kill node3 — triggers migration of node3's master shards to node1/node2.
     eprintln!("[17.1] Killing node3 to trigger shard migration");
@@ -107,7 +147,7 @@ async fn test_migration_rollback_on_target_kill() -> Result<(), ClientError> {
     common::wait_specific_nodes_ready(&docker, &[1, 2], 2, Duration::from_secs(180)).await?;
     common::wait_specific_migrations_complete(&docker, &[1, 2], Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[17.1] migration wait: {e}"));
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_specific_replication_settled(&docker, &[1, 2], Duration::from_secs(10)).await?;
 
     let client = common::create_client(&docker, 2).await?;
     client.refresh_routing().await?;
@@ -149,7 +189,7 @@ async fn test_migration_rollback_on_target_kill() -> Result<(), ClientError> {
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[17.1] final migration: {e}"));
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
     let client = common::create_client(&docker, 3).await?;
     client.refresh_routing().await?;
@@ -182,7 +222,7 @@ async fn test_inbound_state_survives_restart() -> Result<(), ClientError> {
 
     let txids = common::seed_records(&client, &verifier, 2000, 5).await?;
     assert_eq!(txids.len(), 2000);
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // Kill node2 to trigger migration of its shards.
     eprintln!("[17.2] Killing node2 to trigger migration");
@@ -211,7 +251,7 @@ async fn test_inbound_state_survives_restart() -> Result<(), ClientError> {
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[17.2] migration wait: {e}"));
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     let client = common::create_client(&docker, 3).await?;
     client.refresh_routing().await?;
@@ -247,7 +287,7 @@ async fn test_repeated_kills_during_migration() -> Result<(), ClientError> {
     eprintln!("[17.3] Seeding 1000 baseline records");
     let baseline_txids = common::seed_records(&client, &verifier, 1000, 5).await?;
     assert_eq!(baseline_txids.len(), 1000);
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // Rotate kills: kill node N, verify data on survivors, restart node N.
     let kill_order = ["node3", "node1", "node2"];
@@ -300,7 +340,7 @@ async fn test_repeated_kills_during_migration() -> Result<(), ClientError> {
         common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
             .unwrap_or_else(|e| eprintln!("[17.3] recovery round {}: {e}", round + 1));
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
     }
 
     // Final consistency check — baseline + 3*200 = 1600 records.
@@ -346,7 +386,7 @@ async fn test_cascading_failure_during_rebalance() -> Result<(), ClientError> {
 
     let txids = common::seed_records(&client, &verifier, 2000, 5).await?;
     assert_eq!(txids.len(), 2000);
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // Kill node1 — triggers rebalance.
     eprintln!("[17.4] Killing node1 — migration to node2/node3 begins");
@@ -374,7 +414,7 @@ async fn test_cascading_failure_during_rebalance() -> Result<(), ClientError> {
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[17.4] final migration: {e}"));
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     let client = common::create_client(&docker, 3).await?;
     client.refresh_routing().await?;
@@ -410,7 +450,7 @@ async fn test_writes_during_migration_recovery() -> Result<(), ClientError> {
 
     let txids = common::seed_records(&client, &verifier, 1000, 5).await?;
     assert_eq!(txids.len(), 1000);
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // Kill node2 — triggers migration.
     eprintln!("[17.5] Killing node2 to trigger migration");
@@ -494,7 +534,7 @@ async fn test_writes_during_migration_recovery() -> Result<(), ClientError> {
         "Test 17.5: {spend_errors}/200 spends failed during migration window"
     );
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_specific_replication_settled(&docker, &[1, 3], Duration::from_secs(5)).await?;
 
     // Restart node2 for full recovery.
     eprintln!("[17.5] Restarting node2 for full recovery");
@@ -502,7 +542,7 @@ async fn test_writes_during_migration_recovery() -> Result<(), ClientError> {
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[17.5] final migration: {e}"));
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     let client = common::create_client(&docker, 3).await?;
     client.refresh_routing().await?;

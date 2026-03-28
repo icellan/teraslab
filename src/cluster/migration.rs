@@ -228,12 +228,16 @@ impl MigrationProgress {
 /// This replaces the previous `Vec<u16>` inbound tracking which was too
 /// coarse — clearing all inbound state when outbound work finished could
 /// remove protection for shards still receiving data from other nodes.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 struct InboundMigration {
     shard: u16,
     from_node: NodeId,
     /// True once `OP_MIGRATION_COMPLETE` confirmed data arrived.
     completed: bool,
+    /// When this entry was created. Used for staleness-based cleanup:
+    /// entries older than a threshold are removed to prevent indefinite
+    /// write-blocking from abandoned migrations.
+    created_at: std::time::Instant,
 }
 
 /// Manages active migrations for this node.
@@ -290,6 +294,7 @@ impl MigrationManager {
                     shard: task.shard,
                     from_node: task.from_node,
                     completed: false,
+                    created_at: std::time::Instant::now(),
                 });
                 self.inbound_bitmap.set(task.shard);
             }
@@ -308,6 +313,7 @@ impl MigrationManager {
                 shard,
                 from_node: NodeId(0),
                 completed: false,
+                created_at: std::time::Instant::now(),
             });
             self.inbound_bitmap.set(shard);
         }
@@ -380,23 +386,43 @@ impl MigrationManager {
     }
 
     /// Mark a migration as complete and remove the write fence.
+    ///
+    /// The fence is only lifted if no other active migration task for
+    /// this shard is still in the Fenced state. This prevents premature
+    /// unfencing when multiple tasks target the same shard (e.g., master
+    /// migration + replica backfill).
     pub fn mark_complete(&mut self, task: &MigrationTask) {
         if let Some(p) = self.find_task_mut(task) {
             p.state = MigrationState::Complete;
         }
-        self.unfence_shard(task.shard);
+        if !self.has_other_fenced_task(task.shard, task) {
+            self.unfence_shard(task.shard);
+        }
     }
 
     /// Mark a migration as failed after all retries exhausted.
     ///
     /// The write fence is lifted so the shard can continue serving on
-    /// the old master. Failed migrations are removed from the active list
-    /// by the next call to `cleanup_completed()`.
+    /// the old master, unless another task for the same shard is still
+    /// in the Fenced state. Failed migrations are removed from the
+    /// active list by the next call to `cleanup_completed()`.
     pub fn mark_failed(&mut self, task: &MigrationTask) {
         if let Some(p) = self.find_task_mut(task) {
             p.state = MigrationState::Failed;
         }
-        self.unfence_shard(task.shard);
+        if !self.has_other_fenced_task(task.shard, task) {
+            self.unfence_shard(task.shard);
+        }
+    }
+
+    /// Check if any active migration task for the given shard (other than
+    /// the specified task) is still in the Fenced state.
+    fn has_other_fenced_task(&self, shard: u16, exclude: &MigrationTask) -> bool {
+        self.active.iter().any(|p| {
+            p.shard == shard
+                && p.state == MigrationState::Fenced
+                && !(p.from_node == exclude.from_node && p.to_node == exclude.to_node)
+        })
     }
 
     /// Number of failed migrations.
@@ -457,9 +483,31 @@ impl MigrationManager {
     /// work does NOT clear pending inbound migrations (which may still be
     /// receiving data from other nodes).
     pub fn cleanup_completed(&mut self) {
+        // Collect shards that had fenced tasks being removed, so we can
+        // unfence them if no remaining active task is still fenced.
+        let mut maybe_unfence: Vec<u16> = Vec::new();
+        for p in &self.active {
+            if (p.is_complete() || p.state == MigrationState::Failed)
+                && self.fenced_shards.test(p.shard)
+            {
+                maybe_unfence.push(p.shard);
+            }
+        }
+
         self.active.retain(|p| {
             !p.is_complete() && p.state != MigrationState::Failed
         });
+
+        // Unfence shards that no longer have any fenced task.
+        for shard in maybe_unfence {
+            let still_fenced = self.active.iter().any(|p| {
+                p.shard == shard && p.state == MigrationState::Fenced
+            });
+            if !still_fenced {
+                self.unfence_shard(shard);
+            }
+        }
+
         self.inbound_migrations.retain(|m| !m.completed);
         // Rebuild inbound bitmap from remaining entries.
         self.inbound_bitmap.clear_all();
@@ -550,6 +598,7 @@ impl MigrationManager {
                     shard,
                     from_node,
                     completed: false,
+                    created_at: std::time::Instant::now(),
                 });
                 self.inbound_bitmap.set(shard);
             }
@@ -561,6 +610,32 @@ impl MigrationManager {
     pub fn clear_inbound(&mut self) {
         self.inbound_migrations.clear();
         self.inbound_bitmap.clear_all();
+    }
+
+    /// Remove inbound migrations older than `max_age`.
+    ///
+    /// Unlike [`clear_inbound`] which removes everything, this only evicts
+    /// entries that have been pending longer than the threshold. This
+    /// prevents indefinite write-blocking from abandoned migrations while
+    /// preserving protection for shards still actively receiving data.
+    ///
+    /// Returns the number of entries removed.
+    pub fn clear_stale_inbound(&mut self, max_age: std::time::Duration) -> usize {
+        let before = self.inbound_migrations.len();
+        self.inbound_migrations.retain(|m| {
+            !m.completed && m.created_at.elapsed() < max_age
+        });
+        let removed = before - self.inbound_migrations.len();
+        if removed > 0 {
+            // Rebuild bitmap from surviving entries.
+            self.inbound_bitmap.clear_all();
+            for m in &self.inbound_migrations {
+                if !m.completed {
+                    self.inbound_bitmap.set(m.shard);
+                }
+            }
+        }
+        removed
     }
 
     /// Serialize active outbound migration state to bytes.
@@ -703,6 +778,7 @@ impl Default for MigrationManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn shard_bitmap_set_clear_test() {
@@ -1329,15 +1405,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Deep edge cases: fence bitmap single-bit-per-shard limitation
+    // Fence bitmap: conditional unfencing with multiple tasks per shard
     // -----------------------------------------------------------------------
 
-    /// Two tasks for the same shard both fenced: completing one unfences
-    /// the shard even though the other is still in the Fenced state.
-    /// This documents the current limitation: the fenced_shards bitmap
-    /// has one bit per shard, not one bit per (shard, task).
+    /// Two tasks for the same shard both fenced: completing one keeps the
+    /// shard fenced because the other task is still in the Fenced state.
+    /// The shard only unfences once ALL fenced tasks are complete/failed.
     #[test]
-    fn two_fenced_tasks_same_shard_complete_one_unfences() {
+    fn two_fenced_tasks_same_shard_complete_one_keeps_fence() {
         let mut mgr = MigrationManager::new();
         let t1 = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
         let t2 = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(3), is_master: false };
@@ -1347,16 +1422,21 @@ mod tests {
         mgr.mark_fenced(&t2, 200);
         assert!(mgr.is_shard_fenced(5));
 
-        // Complete t1 → shard 5 unfenced, even though t2 is still Fenced.
+        // Complete t1 → shard 5 STAYS fenced because t2 is still Fenced.
         mgr.mark_complete(&t1);
-        assert!(!mgr.is_shard_fenced(5),
-            "bitmap is per-shard: completing one task unfences");
+        assert!(mgr.is_shard_fenced(5),
+            "shard should remain fenced while another task is in Fenced state");
 
         // t2 is still tracked as Fenced in its progress entry.
         let t2_progress = mgr.active_migrations().iter()
             .find(|p| p.to_node == NodeId(3))
             .expect("t2 should still be active");
         assert_eq!(t2_progress.state, MigrationState::Fenced);
+
+        // Complete t2 → NOW the shard is unfenced.
+        mgr.mark_complete(&t2);
+        assert!(!mgr.is_shard_fenced(5),
+            "shard should unfence once all fenced tasks are done");
     }
 
     /// mark_complete and mark_failed always call unfence_shard regardless
@@ -1515,5 +1595,169 @@ mod tests {
         assert!(!atomic.test(4095), "old bit 4095 should be cleared");
         assert!(atomic.test(50), "new bit 50 should be set");
         assert!(atomic.test(200), "new bit 200 should be set");
+    }
+
+    // -----------------------------------------------------------------------
+    // Staleness-based inbound clear
+    // -----------------------------------------------------------------------
+
+    /// Fresh inbound entries survive a staleness clear with a long timeout.
+    #[test]
+    fn clear_stale_inbound_preserves_recent() {
+        let mut mgr = MigrationManager::new();
+        mgr.mark_inbound_active(10);
+        mgr.mark_inbound_active(20);
+
+        // Both are fresh — 30s timeout should keep them.
+        let removed = mgr.clear_stale_inbound(Duration::from_secs(30));
+        assert_eq!(removed, 0);
+        assert!(mgr.has_pending_inbound(10));
+        assert!(mgr.has_pending_inbound(20));
+        assert_eq!(mgr.inbound_count(), 2);
+    }
+
+    /// All entries are removed when max_age is zero (everything is stale).
+    #[test]
+    fn clear_stale_inbound_removes_old() {
+        let mut mgr = MigrationManager::new();
+        mgr.mark_inbound_active(10);
+        mgr.mark_inbound_active(20);
+
+        // Duration::ZERO means everything is stale.
+        let removed = mgr.clear_stale_inbound(Duration::ZERO);
+        assert_eq!(removed, 2);
+        assert!(!mgr.has_pending_inbound(10));
+        assert!(!mgr.has_pending_inbound(20));
+        assert_eq!(mgr.inbound_count(), 0);
+    }
+
+    /// Completed entries are also cleared by staleness sweep (retain
+    /// condition requires !completed AND young enough).
+    #[test]
+    fn clear_stale_inbound_removes_completed() {
+        let mut mgr = MigrationManager::new();
+        mgr.mark_inbound_active(10);
+        mgr.mark_inbound_active(20);
+        mgr.mark_inbound_complete(10);
+
+        // Even with a long timeout, completed entries are removed.
+        let removed = mgr.clear_stale_inbound(Duration::from_secs(3600));
+        assert_eq!(removed, 1);
+        assert!(!mgr.has_pending_inbound(10));
+        assert!(mgr.has_pending_inbound(20));
+    }
+
+    /// Bitmap is correctly rebuilt after partial staleness clear.
+    #[test]
+    fn clear_stale_inbound_bitmap_consistency() {
+        let mut mgr = MigrationManager::new();
+        mgr.mark_inbound_active(10);
+        mgr.mark_inbound_active(20);
+        mgr.mark_inbound_active(30);
+
+        // Remove shard 10 by completing it, then clear stale.
+        mgr.mark_inbound_complete(10);
+        let removed = mgr.clear_stale_inbound(Duration::from_secs(3600));
+        assert_eq!(removed, 1); // shard 10 (completed)
+
+        // Remaining: shards 20 and 30.
+        assert!(!mgr.has_pending_inbound(10));
+        assert!(mgr.has_pending_inbound(20));
+        assert!(mgr.has_pending_inbound(30));
+        assert_eq!(mgr.inbound_count(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // cleanup_completed must unfence shards with no remaining fenced tasks
+    // -----------------------------------------------------------------------
+
+    /// Two fenced tasks for the same shard, both completed. After
+    /// cleanup_completed removes them, the shard must be unfenced.
+    /// Without the fix, the shard stays permanently fenced because
+    /// mark_complete on task A defers unfencing (task B is still Fenced),
+    /// then mark_complete on task B also defers (task A is now Complete,
+    /// not Fenced — so has_other_fenced_task returns false and unfences).
+    /// But if cleanup_completed runs between the two mark_complete calls,
+    /// it removes task A before task B is completed, leaving task B's
+    /// mark_complete to correctly unfence. The dangerous case is when
+    /// both are completed before cleanup runs: cleanup removes both,
+    /// and no one unfences.
+    #[test]
+    fn cleanup_completed_unfences_shard_with_no_remaining_fenced_tasks() {
+        let mut mgr = MigrationManager::new();
+        let t1 = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        let t2 = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(3), is_master: false };
+        mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &std::collections::HashSet::new());
+
+        mgr.mark_fenced(&t1, 100);
+        mgr.mark_fenced(&t2, 200);
+        assert!(mgr.is_shard_fenced(5));
+
+        // Complete both tasks. mark_complete on t1 keeps the fence (t2 still
+        // Fenced). mark_complete on t2 unfences (no other Fenced task).
+        mgr.mark_complete(&t1);
+        mgr.mark_complete(&t2);
+        assert!(!mgr.is_shard_fenced(5), "both completed, should be unfenced");
+
+        // Re-fence for the dangerous scenario: both completed, then cleanup.
+        mgr.fence_shard(5);
+        // Simulate: re-add two completed tasks.
+        mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &std::collections::HashSet::new());
+        mgr.mark_fenced(&t1, 100);
+        mgr.mark_fenced(&t2, 200);
+        mgr.mark_complete(&t1);
+        mgr.mark_complete(&t2);
+
+        // Now fence shard 5 again manually to simulate the bug scenario
+        // where unfencing didn't happen.
+        mgr.fence_shard(5);
+        // Call cleanup — it should unfence shard 5 since all tasks are
+        // Complete (none remaining in Fenced state).
+        mgr.cleanup_completed();
+        assert!(!mgr.is_shard_fenced(5),
+            "cleanup_completed must unfence shards with no remaining fenced tasks");
+    }
+
+    // -----------------------------------------------------------------------
+    // Inbound entries must be clearable even when outbound task fails
+    // -----------------------------------------------------------------------
+
+    /// Simulates the scenario where a shard has both a master (empty) and
+    /// replica migration task. The empty master task completes instantly,
+    /// which commits the shard. The replica task then fails because the
+    /// shard is already committed. The inbound entry (registered when
+    /// migration data arrived) must be cleared by mark_inbound_complete
+    /// even though the outbound task failed — otherwise writes to that
+    /// shard are blocked indefinitely.
+    #[test]
+    fn inbound_cleared_when_migration_aborted_for_committed_shard() {
+        let mut mgr = MigrationManager::new();
+        let master_task = MigrationTask {
+            shard: 42, from_node: NodeId(1), to_node: NodeId(3), is_master: true,
+        };
+        let replica_task = MigrationTask {
+            shard: 42, from_node: NodeId(1), to_node: NodeId(3), is_master: false,
+        };
+        mgr.start_outbound(
+            &[master_task.clone(), replica_task.clone()],
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+
+        // Simulate: empty master completes instantly.
+        mgr.mark_complete(&master_task);
+
+        // Simulate: replica migration sent data, receiver registered inbound.
+        mgr.mark_inbound_active(42);
+        assert!(mgr.has_pending_inbound(42), "inbound should be active after data arrived");
+
+        // Simulate: replica task fails because shard is already committed.
+        // The coordinator should call mark_inbound_complete BEFORE mark_failed.
+        mgr.mark_inbound_complete(42);
+        mgr.mark_failed(&replica_task);
+
+        // Inbound must be cleared — writes should not be blocked.
+        assert!(!mgr.has_pending_inbound(42),
+            "inbound must be cleared when migration aborts for committed shard");
     }
 }

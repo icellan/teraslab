@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod common;
 
 use std::time::Duration;
@@ -6,36 +7,71 @@ use teraslab_test_client::ClientError;
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 1;
 
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_01_cluster_formation() {
     let result = tokio::time::timeout(Duration::from_secs(120), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("scenario failed: {e}"),
-        Err(_) => panic!("scenario timed out after 120s"),
+        Ok(Err(e)) => {
+            common::teardown_all(SID).await;
+            panic!("scenario failed: {e}");
+        }
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario timed out after 120s");
+        }
     }
 }
 
 async fn run_scenario() -> Result<(), ClientError> {
+    let t0 = std::time::Instant::now();
+
     // Ensure clean state
+    tlog!(t0, ">>> teardown_all (initial cleanup)");
     common::teardown_all(SID).await;
+    tlog!(t0, "<<< teardown_all done");
 
     // === Tests 1.1 - 1.7: Simultaneous start ===
+    tlog!(t0, ">>> test_simultaneous_start");
     test_simultaneous_start().await?;
+    tlog!(t0, "<<< test_simultaneous_start done");
+    tlog!(t0, ">>> teardown_all (after simultaneous)");
     common::teardown_all(SID).await;
+    tlog!(t0, "<<< teardown_all done");
 
     // === Test 1.8: Staggered start ===
+    tlog!(t0, ">>> test_staggered_start");
     test_staggered_start().await?;
+    tlog!(t0, "<<< test_staggered_start done");
+    tlog!(t0, ">>> teardown_all (after staggered)");
     common::teardown_all(SID).await;
+    tlog!(t0, "<<< teardown_all done");
 
     // === Test 1.9: Late join ===
+    tlog!(t0, ">>> test_late_join");
     test_late_join().await?;
+    tlog!(t0, "<<< test_late_join done");
+    tlog!(t0, ">>> teardown_all (after late_join)");
     common::teardown_all(SID).await;
+    tlog!(t0, "<<< teardown_all done");
 
     // === Test 1.10: Wrong cluster config rejected ===
+    tlog!(t0, ">>> test_wrong_config_rejected");
     test_wrong_config_rejected().await?;
+    tlog!(t0, "<<< test_wrong_config_rejected done");
+    tlog!(t0, ">>> teardown_all (final cleanup)");
     common::teardown_all(SID).await;
+    tlog!(t0, "<<< teardown_all done");
 
+    tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
 }
 
@@ -43,8 +79,10 @@ async fn run_scenario() -> Result<(), ClientError> {
 /// cluster formation, shard table consistency, and balanced shard distribution.
 async fn test_simultaneous_start() -> Result<(), ClientError> {
     let t0 = std::time::Instant::now();
+    tlog!(t0, "  [simul] start_3node_cluster...");
     let (docker, client) = common::start_3node_cluster(SID).await?;
     let formation_time = t0.elapsed();
+    tlog!(t0, "  [simul] cluster ready in {:.1}s", formation_time.as_secs_f64());
     assert!(
         formation_time <= Duration::from_secs(10),
         "cluster formed in {:?}, SLA is 5s",
@@ -247,18 +285,30 @@ async fn test_simultaneous_start() -> Result<(), ClientError> {
 
 /// Test 1.8: Staggered start
 async fn test_staggered_start() -> Result<(), ClientError> {
+    let t0 = std::time::Instant::now();
     let mut docker = common::docker_3node(SID);
 
+    tlog!(t0, "  [stag] compose_up node1...");
     docker.compose_up_nodes(&["node1"]).await?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    common::wait_node_healthy(&docker, 1, Duration::from_secs(10)).await?;
+    tlog!(t0, "  [stag] node1 healthy");
 
+    tlog!(t0, "  [stag] compose_up node2...");
     docker.compose_up_nodes(&["node2"]).await?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    common::wait_node_healthy(&docker, 2, Duration::from_secs(10)).await?;
+    tlog!(t0, "  [stag] node2 healthy");
 
+    tlog!(t0, "  [stag] compose_up node3...");
     docker.compose_up_nodes(&["node3"]).await?;
+    common::wait_node_healthy(&docker, 3, Duration::from_secs(10)).await?;
+    tlog!(t0, "  [stag] node3 healthy");
 
+    tlog!(t0, "  [stag] wait_cluster_ready...");
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
+    tlog!(t0, "  [stag] cluster ready");
+    tlog!(t0, "  [stag] wait_migrations_complete...");
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    tlog!(t0, "  [stag] migrations done");
     // Wait for shard rebalance to fully propagate to all nodes.
     // After topology commit and migration, each node's target_assignment
     // should reflect the 3-node layout. Poll until shard distribution
@@ -339,11 +389,18 @@ async fn test_staggered_start() -> Result<(), ClientError> {
 
 /// Test 1.9: Late join
 async fn test_late_join() -> Result<(), ClientError> {
+    let t0 = std::time::Instant::now();
     let mut docker = common::docker_3node(SID);
 
+    tlog!(t0, "  [late] compose_up node1+node2...");
     docker.compose_up_nodes(&["node1", "node2"]).await?;
+    tlog!(t0, "  [late] nodes up");
+    tlog!(t0, "  [late] wait_cluster_ready (2 nodes)...");
     common::wait_cluster_ready(&docker, 2, Duration::from_secs(30)).await?;
+    tlog!(t0, "  [late] cluster ready");
+    tlog!(t0, "  [late] wait_migrations_complete (2 nodes)...");
     common::wait_migrations_complete(&docker, 2, Duration::from_secs(60)).await?;
+    tlog!(t0, "  [late] migrations done");
 
     let mut total_master_shards_2node: u64 = 0;
     for node_num in 1..=2u32 {
@@ -363,10 +420,17 @@ async fn test_late_join() -> Result<(), ClientError> {
         "Test 1.9: with 2 nodes, total master shards is {total_master_shards_2node}, expected 4096"
     );
 
+    tlog!(t0, "  [late] compose_up node3...");
     docker.compose_up_nodes(&["node3"]).await?;
+    tlog!(t0, "  [late] node3 up");
+    tlog!(t0, "  [late] wait_cluster_ready (3 nodes)...");
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
+    tlog!(t0, "  [late] cluster ready");
+    tlog!(t0, "  [late] wait_migrations_complete (3 nodes, 180s timeout)...");
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+    tlog!(t0, "  [late] migrations done");
     // Wait for shard rebalance to fully propagate.
+    tlog!(t0, "  [late] wait for rebalance...");
     {
         let start = std::time::Instant::now();
         loop {
@@ -427,7 +491,10 @@ async fn test_late_join() -> Result<(), ClientError> {
 /// node that cannot reach the correct seed nodes. The existing cluster
 /// should remain at 3 nodes.
 async fn test_wrong_config_rejected() -> Result<(), ClientError> {
+    let t0 = std::time::Instant::now();
+    tlog!(t0, "  [wrong] start_3node_cluster...");
     let (docker, _client) = common::start_3node_cluster(SID).await?;
+    tlog!(t0, "  [wrong] cluster ready");
 
     // Verify we start with a healthy 3-node cluster.
     for node_num in 1..=3u32 {
@@ -444,10 +511,14 @@ async fn test_wrong_config_rejected() -> Result<(), ClientError> {
     // a wrong cluster configuration. It should not be able to join.
     let wrong_sid: u16 = 99;
     let mut docker_wrong = common::docker_5node(wrong_sid);
+    tlog!(t0, "  [wrong] compose_up rogue node4...");
     let _ = docker_wrong.compose_up_nodes(&["node4"]).await;
+    tlog!(t0, "  [wrong] rogue node up, waiting for discovery attempt...");
 
-    // Wait long enough for the rogue node to attempt discovery
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    // Wait long enough for the rogue node to attempt discovery.
+    // SWIM probe interval is 150ms, so 3s covers ~20 probe cycles.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    tlog!(t0, "  [wrong] wait done");
 
     // Verify the original cluster still has exactly 3 nodes -- the rogue
     // node should not have been able to join.
@@ -461,8 +532,8 @@ async fn test_wrong_config_rejected() -> Result<(), ClientError> {
         );
     }
 
-    // Clean up the rogue node
-    let _ = docker_wrong.compose_down().await;
+    // Clean up the rogue scenario's resources (container, volumes, network).
+    common::teardown_all(wrong_sid).await;
 
     eprintln!("[1.10] OK -- wrong-config node did not join the cluster");
     Ok(())

@@ -1,6 +1,12 @@
 //! Shared setup/teardown for Docker cluster test scenarios.
 
 use std::time::Duration;
+
+/// Returns true when `TERASLAB_TEST_TIMING=1` is set, enabling detailed
+/// timing logs on stderr for every major phase of the test.
+pub fn timing_enabled() -> bool {
+    std::env::var("TERASLAB_TEST_TIMING").map_or(false, |v| v == "1")
+}
 use teraslab_test_client::{Client, ClientConfig, ClientError, PoolConfig};
 use teraslab_test_client::helpers::DockerHelpers;
 use teraslab_test_client::verifier::{Mismatch, StateVerifier, parse_metadata_fields};
@@ -250,6 +256,7 @@ pub async fn wait_migrations_complete(
     loop {
         let mut all_idle = true;
         let mut total_masters: u64 = 0;
+        let mut total_pending_handoffs: u64 = 0;
         let mut node_details = Vec::new();
         for i in 1..=node_count {
             let port = docker.http_port(i);
@@ -273,22 +280,23 @@ pub async fn wait_migrations_complete(
                     if let Some(m) = json["master_shard_count"].as_u64() {
                         total_masters += m;
                     }
+                    if let Some(h) = json["pending_handoff_shards"].as_u64() {
+                        total_pending_handoffs += h;
+                        if h > 0 {
+                            node_details.push(format!("node{i}:handoff={h}"));
+                        }
+                    }
                 }
             }
         }
-        if total_masters == 4096 {
-            if all_idle {
-                return Ok(());
-            }
-            if start.elapsed() >= timeout.min(Duration::from_secs(30)) {
-                return Ok(());
-            }
+        if total_masters == 4096 && total_pending_handoffs == 0 && all_idle {
+            return Ok(());
         }
         if start.elapsed() >= timeout {
             let detail = if !node_details.is_empty() {
                 format!(" [{}]", node_details.join(", "))
             } else {
-                format!(" [masters={total_masters}/4096]")
+                format!(" [masters={total_masters}/4096, handoffs={total_pending_handoffs}]")
             };
             return Err(ClientError::Connection(
                 format!("migrations still active after {timeout:?}{detail}"),
@@ -468,15 +476,49 @@ pub async fn seed_records(
         // Retry on transient errors from SWIM instability, dead nodes,
         // or cluster topology changes. Uses exponential backoff with up to
         // 8 attempts (~30s total) to ride out post-topology-change settle.
+        //
+        // On partial success, only retry the failed items (not items that
+        // already succeeded — re-sending those would cause ERR_ALREADY_EXISTS).
         const MAX_SEED_RETRIES: u32 = 8;
-        let mut created = false;
+        let mut remaining_items = items;
+        let mut remaining_meta = batch_meta;
+        let mut succeeded_meta: Vec<([u8; 32], Vec<[u8; 32]>)> = Vec::new();
+
         for attempt in 0..MAX_SEED_RETRIES {
-            match client.create_batch(&items).await {
-                Ok(_) => { created = true; break; }
+            match client.create_batch(&remaining_items).await {
+                Ok(_) => {
+                    // All remaining items succeeded.
+                    succeeded_meta.extend(remaining_meta.drain(..));
+                    remaining_items.clear();
+                    break;
+                }
                 Err(ref e) if attempt + 1 < MAX_SEED_RETRIES => {
-                    // Retryable: any error except on the last attempt.
+                    // On partial error, extract which items failed and only
+                    // retry those. Items not in the error list succeeded.
+                    if let ClientError::Partial(pe) = e {
+                        let failed_indices: std::collections::HashSet<usize> =
+                            pe.errors.iter().map(|e| e.item_index as usize).collect();
+                        let mut retry_items = Vec::new();
+                        let mut retry_meta = Vec::new();
+                        for (i, (item, meta)) in remaining_items.drain(..)
+                            .zip(remaining_meta.drain(..)).enumerate()
+                        {
+                            if failed_indices.contains(&i) {
+                                retry_items.push(item);
+                                retry_meta.push(meta);
+                            } else {
+                                succeeded_meta.push(meta);
+                            }
+                        }
+                        remaining_items = retry_items;
+                        remaining_meta = retry_meta;
+                    }
+                    if remaining_items.is_empty() {
+                        break;
+                    }
                     if attempt == 0 {
-                        eprintln!("seed_records: transient error on attempt {attempt}, retrying: {e}");
+                        eprintln!("seed_records: transient error on attempt {attempt}, \
+                            retrying {} items: {e}", remaining_items.len());
                     }
                     let delay = Duration::from_millis(500 * (1 << attempt.min(3)));
                     tokio::time::sleep(delay).await;
@@ -488,10 +530,12 @@ pub async fn seed_records(
                 }
             }
         }
-        if !created {
-            return Err(ClientError::Connection("create_batch failed after retries".to_string()));
+        if !remaining_items.is_empty() {
+            return Err(ClientError::Connection(
+                format!("create_batch: {} items still failing after retries", remaining_items.len())
+            ));
         }
-        for (txid, utxo_hashes) in batch_meta {
+        for (txid, utxo_hashes) in succeeded_meta {
             verifier.record_create(txid, utxos_per_tx, utxo_hashes);
             txids.push(txid);
         }
@@ -502,20 +546,8 @@ pub async fn seed_records(
 
 /// Tear down the Docker cluster for a specific scenario and wait for cleanup.
 pub async fn teardown(docker: &mut DockerHelpers) {
-    let _ = docker.compose_down().await;
-
-    // Force-remove any lingering containers for this scenario
-    let sid = docker.scenario_id();
-    for i in 1..=5 {
-        let name = format!("ts{sid:02}-node{i}");
-        let _ = tokio::process::Command::new("docker")
-            .args(["rm", "-f", &name])
-            .output()
-            .await;
-    }
-
-    // Wait for Docker to fully release network ports and resources.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    force_cleanup(docker.scenario_id()).await;
+    wait_ports_free(docker.http_port(1), docker.scenario_id(), docker.node_count()).await;
 }
 
 /// Full consistency check: read every non-deleted record from the cluster and
@@ -656,26 +688,128 @@ pub async fn verify_consistency(
 
 /// Tear down both 3-node and 5-node clusters for a specific scenario.
 pub async fn teardown_all(scenario_id: u16) {
-    let mut d3 = docker_3node(scenario_id);
-    let _ = d3.compose_down().await;
-    let mut d5 = docker_5node(scenario_id);
-    let _ = d5.compose_down().await;
+    force_cleanup(scenario_id).await;
+    let first_http_port = 19000 + scenario_id * 10;
+    wait_ports_free(first_http_port, scenario_id, 5).await;
+}
 
-    // Force-remove any lingering containers for this scenario
-    for i in 1..=5 {
-        let name = format!("ts{scenario_id:02}-node{i}");
-        let _ = tokio::process::Command::new("docker")
-            .args(["rm", "-f", &name])
-            .output()
-            .await;
+/// Force-remove all Docker resources (containers, volumes, networks) for a
+/// scenario using direct docker commands. Much faster than `compose_down`
+/// because it skips compose file generation and runs a single bulk removal.
+async fn force_cleanup(scenario_id: u16) {
+    let sid = format!("ts{scenario_id:02}");
+
+    // 1. Force-remove all containers for this scenario in one shot.
+    let container_filter = format!("name={sid}-node");
+    if let Ok(out) = tokio::process::Command::new("docker")
+        .args(["ps", "-aq", "--filter", &container_filter])
+        .output()
+        .await
+    {
+        let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+        if !ids.is_empty() {
+            let mut args = vec!["rm".to_string(), "-f".to_string()];
+            args.extend(ids);
+            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            let _ = tokio::process::Command::new("docker")
+                .args(&arg_refs)
+                .output()
+                .await;
+        }
     }
 
-    // Prune any orphaned volumes from this scenario to avoid stale state.
-    let _ = tokio::process::Command::new("docker")
-        .args(["volume", "prune", "-f", "--filter", &format!("name=ts{scenario_id:02}")])
-        .output()
-        .await;
+    // 2. Remove volumes and networks in parallel (safe now that containers are gone).
+    let sid2 = sid.clone();
+    let vol_handle = tokio::spawn(async move {
+        let filter = format!("name={sid2}");
+        if let Ok(out) = tokio::process::Command::new("docker")
+            .args(["volume", "ls", "-q", "--filter", &filter])
+            .output()
+            .await
+        {
+            let vols: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+            if !vols.is_empty() {
+                let mut args = vec!["volume".to_string(), "rm".to_string()];
+                args.extend(vols);
+                let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                let _ = tokio::process::Command::new("docker")
+                    .args(&arg_refs)
+                    .output()
+                    .await;
+            }
+        }
+    });
 
-    // Wait for Docker to fully release network ports and resources.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    let net_handle = tokio::spawn(async move {
+        let filter = format!("name={sid}");
+        if let Ok(out) = tokio::process::Command::new("docker")
+            .args(["network", "ls", "-q", "--filter", &filter])
+            .output()
+            .await
+        {
+            let nets: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+            if !nets.is_empty() {
+                let mut args = vec!["network".to_string(), "rm".to_string()];
+                args.extend(nets);
+                let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                let _ = tokio::process::Command::new("docker")
+                    .args(&arg_refs)
+                    .output()
+                    .await;
+            }
+        }
+    });
+
+    let _ = vol_handle.await;
+    let _ = net_handle.await;
+}
+
+/// Wait until a single node's HTTP health endpoint responds.
+/// Polls `GET /health/live` every 100ms, returns as soon as it gets a 200,
+/// or after `timeout` elapses.
+pub async fn wait_node_healthy(docker: &DockerHelpers, node_num: u32, timeout: Duration) -> Result<(), ClientError> {
+    let port = docker.http_port(node_num);
+    let url = format!("http://127.0.0.1:{port}/health/live");
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(resp) = reqwest::get(&url).await {
+            if resp.status().is_success() {
+                return Ok(());
+            }
+        }
+        if start.elapsed() >= timeout {
+            return Err(ClientError::Connection(
+                format!("node {node_num} not healthy after {timeout:?}"),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Poll until all HTTP ports for a scenario are free (connection refused).
+/// Returns immediately once no port accepts connections, or after 2s at most.
+async fn wait_ports_free(first_http_port: u16, _scenario_id: u16, node_count: u32) {
+    let ports: Vec<u16> = (0..node_count).map(|i| first_http_port + i as u16).collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let all_free = ports.iter().all(|&p| {
+            std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], p)),
+                Duration::from_millis(50),
+            ).is_err()
+        });
+        if all_free || std::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

@@ -198,7 +198,7 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
 
     let cluster_info = if let Some(ref cluster) = state.cluster {
         let table = cluster.shard_table();
-        let table_guard = table.read().unwrap();
+        let table_guard = table.read();
         let self_id = cluster.self_id();
         let mut master_count: u32 = 0;
         let mut replica_count: u32 = 0;
@@ -214,6 +214,7 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
                 replica_count += 1;
             }
         }
+        let pending_handoff_shards = table_guard.pending_handoff_count();
         let cluster_size = cluster.alive_node_count();
         drop(table_guard);
 
@@ -224,6 +225,7 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
             "topology_term": cluster.committed_topology_term(),
             "master_shard_count": master_count,
             "replica_shard_count": replica_count,
+            "pending_handoff_shards": pending_handoff_shards,
             "active_migrations": cluster.active_migrations(),
         })
     } else {
@@ -233,6 +235,7 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
             "shard_table_version": 0,
             "master_shard_count": 0,
             "replica_shard_count": 0,
+            "pending_handoff_shards": 0,
             "active_migrations": 0,
         })
     };
@@ -243,6 +246,7 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
         "shard_table_version": cluster_info["shard_table_version"],
         "master_shard_count": cluster_info["master_shard_count"],
         "replica_shard_count": cluster_info["replica_shard_count"],
+        "pending_handoff_shards": cluster_info["pending_handoff_shards"],
         "active_migrations": cluster_info["active_migrations"],
         "records": {
             "total": state.engine.index_len(),
@@ -330,7 +334,7 @@ async fn handle_admin_nodes(State(state): State<Arc<HttpState>>) -> impl IntoRes
     let body = if let Some(ref cluster) = state.cluster {
         let addrs = cluster.node_addresses();
         let table = cluster.shard_table();
-        let table_guard = table.read().unwrap();
+        let table_guard = table.read();
 
         let mut nodes = Vec::new();
         for (&node_id, &addr) in &addrs {

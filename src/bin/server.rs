@@ -273,7 +273,7 @@ fn main() {
         coordinator.topology_epoch.store(initial_epoch, std::sync::atomic::Ordering::Relaxed);
         coordinator.topology_authority.restore(&topo_state);
         if initial_epoch > 0 {
-            coordinator.shard_table.write().unwrap().version = initial_epoch;
+            coordinator.shard_table.write().version = initial_epoch;
         }
         let running = coordinator.start(
             engine.clone(),

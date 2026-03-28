@@ -1,5 +1,6 @@
 //! Scenario 15 -- Crash recovery correctness.
 
+#[allow(dead_code)]
 mod common;
 
 use std::sync::Arc;
@@ -7,6 +8,14 @@ use std::time::Duration;
 use teraslab_test_client::{Client, ClientConfig, ClientError, PoolConfig};
 use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::types::*;
+
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
 
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 15;
@@ -100,42 +109,81 @@ async fn scenario_15_crash_recovery_correctness() {
     let result = tokio::time::timeout(Duration::from_secs(900), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("scenario failed: {e}"),
-        Err(_) => panic!("scenario timed out after 900s"),
+        Ok(Err(e)) => {
+            common::teardown_all(SID).await;
+            panic!("scenario failed: {e}");
+        }
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario timed out after 900s");
+        }
     }
 }
 
 async fn run_scenario() -> Result<(), ClientError> {
+    let t0 = std::time::Instant::now();
+
+    tlog!(t0, "teardown_all (initial)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all (initial) done");
 
     // 15.1: Basic crash recovery
+    tlog!(t0, "test_basic_crash_recovery");
     test_basic_crash_recovery().await?;
+    tlog!(t0, "test_basic_crash_recovery done");
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     // 15.2 + 15.3: Kill during writes, repeated 10 times
+    tlog!(t0, "test_kill_during_writes");
     test_kill_during_writes().await?;
+    tlog!(t0, "test_kill_during_writes done");
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     // 15.4: SIGKILL during spendMulti batch
+    tlog!(t0, "test_kill_during_spend_multi");
     test_kill_during_spend_multi().await?;
+    tlog!(t0, "test_kill_during_spend_multi done");
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     // 15.5: SIGKILL during setMined
+    tlog!(t0, "test_kill_during_set_mined");
     test_kill_during_set_mined().await?;
+    tlog!(t0, "test_kill_during_set_mined done");
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     // 15.6: SIGKILL during create
+    tlog!(t0, "test_kill_during_create");
     test_kill_during_create().await?;
+    tlog!(t0, "test_kill_during_create done");
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     // 15.7: Kill all 3 simultaneously
+    tlog!(t0, "test_kill_all_simultaneously");
     test_kill_all_simultaneously().await?;
+    tlog!(t0, "test_kill_all_simultaneously done");
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     // 15.8: Cascading recovery
+    tlog!(t0, "test_cascading_recovery");
     test_cascading_recovery().await?;
+    tlog!(t0, "test_cascading_recovery done");
+    tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
+    tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
 }
 
@@ -153,7 +201,7 @@ async fn test_basic_crash_recovery() -> Result<(), ClientError> {
     assert_eq!(txids.len(), 1000);
 
     // Allow extra time for replication to propagate to all replicas.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     eprintln!("[15.1] Killing node1 with SIGKILL");
     docker.kill_node("node1").await?;
@@ -167,7 +215,7 @@ async fn test_basic_crash_recovery() -> Result<(), ClientError> {
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[15.1] migration wait: {e}"));
     // Extra settling time for redo log replay and migration data transfer.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     let client = common::create_client(&docker, 3).await?;
     client.refresh_routing().await?;
@@ -177,7 +225,7 @@ async fn test_basic_crash_recovery() -> Result<(), ClientError> {
     let readable = verify_sample(&client, &txids, txids.len(), "15.1").await?;
     if readable < total {
         eprintln!("[15.1] First read pass: {readable}/{total} -- waiting for more migration settling");
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
         client.refresh_routing().await?;
         let readable = verify_sample(&client, &txids, txids.len(), "15.1 retry").await?;
         assert_eq!(readable, total,
@@ -203,7 +251,7 @@ async fn test_kill_during_writes() -> Result<(), ClientError> {
         let baseline_txids = common::seed_records(&client, &verifier, 200, 3).await?;
         assert_eq!(baseline_txids.len(), 200);
         // Allow replication to propagate before killing.
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
         let mut confirmed_txids: Vec<[u8; 32]> = baseline_txids.clone();
         let mut attempted = 0u32;
@@ -241,7 +289,7 @@ async fn test_kill_during_writes() -> Result<(), ClientError> {
         common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
             .unwrap_or_else(|e| eprintln!("[15.2/15.3] migration wait: {e}"));
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
         let client = common::create_client(&docker, 3).await?;
         client.refresh_routing().await?;
@@ -275,7 +323,7 @@ async fn test_kill_during_spend_multi() -> Result<(), ClientError> {
     // Create records with multiple UTXOs so we can do a spendMulti
     let txids = common::seed_records(&client, &verifier, 500, 5).await?;
     assert_eq!(txids.len(), 500);
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // Prepare a large batch of spends targeting multiple UTXOs on the same txids
     // We'll send these, then kill node1 mid-flight
@@ -327,7 +375,7 @@ async fn test_kill_during_spend_multi() -> Result<(), ClientError> {
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[15.4] migration wait: {e}"));
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     let client = common::create_client(&docker, 3).await?;
     client.refresh_routing().await?;
@@ -373,7 +421,7 @@ async fn test_kill_during_set_mined() -> Result<(), ClientError> {
 
     let txids = common::seed_records(&client, &verifier, 500, 3).await?;
     assert_eq!(txids.len(), 500);
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // Prepare a setMined batch
     let target_txids: Vec<[u8; 32]> = txids[0..100].to_vec();
@@ -417,7 +465,7 @@ async fn test_kill_during_set_mined() -> Result<(), ClientError> {
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[15.5] migration wait: {e}"));
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     let client = common::create_client(&docker, 3).await?;
     client.refresh_routing().await?;
@@ -532,7 +580,7 @@ async fn test_kill_during_create() -> Result<(), ClientError> {
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[15.6] migration wait: {e}"));
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     let client = common::create_client(&docker, 3).await?;
     client.refresh_routing().await?;
@@ -596,7 +644,7 @@ async fn test_kill_all_simultaneously() -> Result<(), ClientError> {
     assert_eq!(txids.len(), 500);
 
     // Allow extra time for replication to propagate to all replicas.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     eprintln!("[15.7] Killing all 3 nodes with SIGKILL");
     docker.kill_node("node1").await?;
@@ -614,7 +662,7 @@ async fn test_kill_all_simultaneously() -> Result<(), ClientError> {
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[15.7] migration wait: {e}"));
     // Extra settling time for redo log replay after all-node crash.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     let client = common::create_client(&docker, 3).await?;
     client.refresh_routing().await?;
@@ -624,7 +672,7 @@ async fn test_kill_all_simultaneously() -> Result<(), ClientError> {
     let readable = verify_sample(&client, &txids, txids.len(), "15.7").await?;
     if readable < total {
         eprintln!("[15.7] First read pass: {readable}/{total} -- waiting for more migration settling");
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
         client.refresh_routing().await?;
         let readable = verify_sample(&client, &txids, txids.len(), "15.7 retry").await?;
         assert_eq!(readable, total,
@@ -651,7 +699,7 @@ async fn test_cascading_recovery() -> Result<(), ClientError> {
     assert_eq!(initial_txids.len(), 500);
 
     // Allow extra time for replication to propagate to all replicas.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     eprintln!("[15.8] Killing node1");
     docker.kill_node("node1").await?;
@@ -662,7 +710,7 @@ async fn test_cascading_recovery() -> Result<(), ClientError> {
     // Wait for the 2-node topology to stabilize and migrations to finish.
     common::wait_specific_migrations_complete(&docker, &[2, 3], Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[15.8] migration wait (after node1 kill) warning: {e}"));
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_specific_replication_settled(&docker, &[2, 3], Duration::from_secs(5)).await?;
 
     eprintln!("[15.8] Creating 500 more records on surviving nodes");
     let node2_port = docker.client_port(2);
@@ -684,7 +732,7 @@ async fn test_cascading_recovery() -> Result<(), ClientError> {
     let additional_txids = common::seed_records(&client_2node, &verifier, 500, 5).await?;
     assert_eq!(additional_txids.len(), 500);
     // Allow replication to propagate between node2 and node3.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_specific_replication_settled(&docker, &[2, 3], Duration::from_secs(5)).await?;
 
     eprintln!("[15.8] Killing node2");
     docker.kill_node("node2").await?;
@@ -699,7 +747,7 @@ async fn test_cascading_recovery() -> Result<(), ClientError> {
     common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[15.8] migration wait (2-node) warning: {e}"));
     // Extra settling time for node3 -> node1 data transfer.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_specific_replication_settled(&docker, &[1, 3], Duration::from_secs(5)).await?;
 
     eprintln!("[15.8] Restarting node2");
     docker.start_node("node2").await?;
@@ -708,7 +756,7 @@ async fn test_cascading_recovery() -> Result<(), ClientError> {
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
         .unwrap_or_else(|e| eprintln!("[15.8] final migration wait warning: {e}"));
     // Allow additional time for all data to settle after 3-node migration.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     let client = common::create_client(&docker, 3).await?;
     client.refresh_routing().await?;
@@ -722,7 +770,7 @@ async fn test_cascading_recovery() -> Result<(), ClientError> {
     let readable = verify_sample(&client, &all_txids, total, "15.8").await?;
     if readable < total as u32 {
         eprintln!("[15.8] First read pass: {readable}/{total} -- waiting for more migration settling");
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
         client.refresh_routing().await?;
         let readable = verify_sample(&client, &all_txids, total, "15.8 retry").await?;
         assert_eq!(readable, total as u32,

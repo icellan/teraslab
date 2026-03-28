@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod common;
 
 use std::time::Duration;
@@ -7,6 +8,14 @@ use teraslab_test_client::types::*;
 
 use teraslab::protocol::codec::encode_get_batch;
 use teraslab::protocol::opcodes::{FLAG_LOCAL_READ, OP_GET_BATCH, STATUS_OK};
+
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
 
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 3;
@@ -82,14 +91,23 @@ async fn scenario_03_replication_correctness() {
         tokio::time::timeout(Duration::from_secs(300), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("scenario failed: {e}"),
-        Err(_) => panic!("scenario timed out after 300s"),
+        Ok(Err(e)) => {
+            common::teardown_all(SID).await;
+            panic!("scenario failed: {e}");
+        }
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario timed out after 300s");
+        }
     }
 }
 
 async fn run_scenario() -> Result<(), ClientError> {
+    let t0 = std::time::Instant::now();
     // Ensure clean state
+    tlog!(t0, "teardown_all (pre-clean)...");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     let (docker, client) = common::start_3node_cluster(SID).await?;
 
@@ -114,6 +132,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     // ==========================================================================
     // Test 3.1: Post-seed replication verification -- check ALL 2000 records
     // ==========================================================================
+    tlog!(t0, "test 3.1 start");
     eprintln!("[3.1] Verifying replication for ALL 2000 records");
     {
         let mut mismatches = 0u32;
@@ -156,10 +175,12 @@ async fn run_scenario() -> Result<(), ClientError> {
         );
     }
     eprintln!("[3.1] OK -- all 2000 records replicated correctly");
+    tlog!(t0, "test 3.1 done");
 
     // ==========================================================================
     // Test 3.2: 500 spends replicated -- check ALL 500 affected records
     // ==========================================================================
+    tlog!(t0, "test 3.2 start");
     eprintln!("[3.2] Spending 500 UTXOs and verifying replication on ALL affected records");
     {
         let spend_count = 500;
@@ -250,10 +271,12 @@ async fn run_scenario() -> Result<(), ClientError> {
         );
     }
     eprintln!("[3.2] OK -- all 500 spend records replicated correctly");
+    tlog!(t0, "test 3.2 done");
 
     // ==========================================================================
     // Test 3.3: 300 SetMined replicated -- check ALL 300 affected records
     // ==========================================================================
+    tlog!(t0, "test 3.3 start");
     eprintln!("[3.3] SetMined on 300 records and verifying replication on ALL");
     {
         let mined_count = 300;
@@ -311,10 +334,12 @@ async fn run_scenario() -> Result<(), ClientError> {
         );
     }
     eprintln!("[3.3] OK -- all 300 set_mined records replicated correctly");
+    tlog!(t0, "test 3.3 done");
 
     // ==========================================================================
     // Test 3.4: 50 freeze, 20 unfreeze, 10 reassign -- re-verify replication
     // ==========================================================================
+    tlog!(t0, "test 3.4 start");
     eprintln!("[3.4] Freeze 50, unfreeze 20, reassign 10 -- verify replication");
     {
         let freeze_start = 1000;
@@ -400,10 +425,12 @@ async fn run_scenario() -> Result<(), ClientError> {
         );
     }
     eprintln!("[3.4] OK -- freeze/unfreeze/reassign replicated correctly");
+    tlog!(t0, "test 3.4 done");
 
     // ==========================================================================
     // Test 3.5: 100 deletes replicated -- verified deleted from both master AND replica
     // ==========================================================================
+    tlog!(t0, "test 3.5 start");
     eprintln!("[3.5] Deleting 100 records and verifying deleted from both nodes");
     {
         let delete_count = 100;
@@ -443,11 +470,13 @@ async fn run_scenario() -> Result<(), ClientError> {
         );
     }
     eprintln!("[3.5] OK -- all 100 deletes replicated correctly");
+    tlog!(t0, "test 3.5 done");
 
     // ==========================================================================
     // Test 3.6: Per-shard key listing -- verify keys exist on master + replica
     //           but NOT on the third (non-holder) node
     // ==========================================================================
+    tlog!(t0, "test 3.6 start");
     eprintln!("[3.6] Per-shard key listing: verify keys on master+replica, not third node");
     {
         // Sample 200 records to check key placement
@@ -498,11 +527,13 @@ async fn run_scenario() -> Result<(), ClientError> {
         );
     }
     eprintln!("[3.6] OK -- keys exist on exactly master+replica, not third node");
+    tlog!(t0, "test 3.6 done");
 
     // ==========================================================================
     // Test 3.7: Idempotent spend -- send same spend twice, counter increments once
     //           on both nodes
     // ==========================================================================
+    tlog!(t0, "test 3.7 start");
     eprintln!("[3.7] Idempotent spend: same spend twice, counter increments once");
     {
         // Pick a record that hasn't been spent yet
@@ -581,6 +612,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         }
     }
     eprintln!("[3.7] OK -- idempotent spend: counter incremented once on both nodes");
+    tlog!(t0, "test 3.7 done");
 
     // ==========================================================================
     // Test 3.8: Full replication check using verify_consistency()
@@ -593,6 +625,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     // node and compares payloads (similar to what tests 3.1-3.5 do for
     // individual operations). That is a larger change left for future work.
     // ==========================================================================
+    tlog!(t0, "test 3.8 start");
     eprintln!("[3.8] Full consistency check using verify_consistency()");
     {
         let mismatches = common::verify_consistency(&client, &verifier).await?;
@@ -613,9 +646,13 @@ async fn run_scenario() -> Result<(), ClientError> {
         );
     }
     eprintln!("[3.8] OK -- full consistency check passed: zero mismatches");
+    tlog!(t0, "test 3.8 done");
 
     // Teardown
+    tlog!(t0, "teardown_all (final)...");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
+    tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
 }

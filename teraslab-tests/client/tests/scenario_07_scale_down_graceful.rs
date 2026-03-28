@@ -1,5 +1,6 @@
 //! Scenario 07 -- Graceful scale-down from 4 nodes to 3 via quiesce + drain.
 
+#[allow(dead_code)]
 mod common;
 
 use std::sync::Arc;
@@ -8,6 +9,14 @@ use teraslab_test_client::ClientError;
 use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::reporter::MetricsReporter;
 use teraslab_test_client::types::*;
+
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
 
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 7;
@@ -22,13 +31,23 @@ async fn scenario_07_scale_down_graceful() {
     let result = tokio::time::timeout(Duration::from_secs(300), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("scenario failed: {e}"),
-        Err(_) => panic!("scenario timed out after 300s"),
+        Ok(Err(e)) => {
+            common::teardown_all(SID).await;
+            panic!("scenario failed: {e}");
+        }
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario timed out after 300s");
+        }
     }
 }
 
 async fn run_scenario() -> Result<(), ClientError> {
+    let t0 = std::time::Instant::now();
+
+    tlog!(t0, "teardown_all (pre-clean)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     eprintln!("[7.0] Starting 3-node cluster and adding node4");
     let (_docker3, client) = common::start_3node_cluster(SID).await?;
@@ -52,9 +71,9 @@ async fn run_scenario() -> Result<(), ClientError> {
     let txids = common::seed_records(&client, &verifier, 5000, 10).await?;
     assert_eq!(txids.len(), 5000, "expected 5000 seeded records");
 
-    // Allow extra time for replication of all 5000 records to propagate
+    // Wait for replication of all 5000 records to propagate
     // to all 4 replica nodes via background TCP connections.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    common::wait_replication_settled(&docker5, 4, Duration::from_secs(10)).await?;
 
     // -- Test 7.6: Start background workload DURING drain --
     // Start this BEFORE quiesce so it runs throughout the drain process.
@@ -120,11 +139,15 @@ async fn run_scenario() -> Result<(), ClientError> {
     });
 
     // -- Test 7.1: Trigger quiesce on node4 --
+    tlog!(t0, "test 7.1: trigger quiesce on node4");
     eprintln!("[7.1] Triggering quiesce on node4");
     common::http_quiesce(&docker5, 4).await?;
     eprintln!("[7.1] OK -- quiesce request accepted");
 
+    tlog!(t0, "test 7.1: done");
+
     // -- Test 7.2: Wait for node4 to drain --
+    tlog!(t0, "test 7.2: wait for node4 drain");
     eprintln!("[7.2] Polling node4 until master_shard_count reaches 0");
     let drain_timeout = Duration::from_secs(120);
     let drain_start = std::time::Instant::now();
@@ -157,7 +180,10 @@ async fn run_scenario() -> Result<(), ClientError> {
     assert!(node4_drained, "Test 7.2: node4 did not drain all master shards within {drain_timeout:?}");
     eprintln!("[7.2] OK -- node4 fully drained");
 
+    tlog!(t0, "test 7.2: done");
+
     // -- Test 7.3: Stop node4, wait for cluster_size=3 --
+    tlog!(t0, "test 7.3: stop node4, wait for cluster_size=3");
     eprintln!("[7.3] Stopping node4");
     let _ = docker5.stop_node("node4").await;
 
@@ -179,7 +205,7 @@ async fn run_scenario() -> Result<(), ClientError> {
             eprintln!("[7.3] ERROR: migrations did not complete within 120s: {e}");
             e
         })?;
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_replication_settled(&docker5, 3, Duration::from_secs(5)).await?;
     client.refresh_routing().await?;
 
     // Stop background workload now that drain is complete
@@ -217,7 +243,10 @@ async fn run_scenario() -> Result<(), ClientError> {
     }
     assert_eq!(total_masters, 4096);
 
+    tlog!(t0, "test 7.3: done");
+
     // -- Test 7.4: Read ALL records --
+    tlog!(t0, "test 7.4: read all records");
     eprintln!("[7.4] Reading ALL {} records", txids.len());
     let mut read_failures = 0u32;
 
@@ -252,7 +281,10 @@ async fn run_scenario() -> Result<(), ClientError> {
         "Test 7.4: {read_failures}/{} reads failed after drain", txids.len());
     eprintln!("[7.4] OK -- all {} records accessible, zero loss", txids.len());
 
+    tlog!(t0, "test 7.4: done");
+
     // -- Test 7.5: Full consistency check via verify_consistency() --
+    tlog!(t0, "test 7.5: consistency check");
     eprintln!("[7.5] Running full consistency check via verify_consistency()");
     let mismatches = common::verify_consistency(&client, &verifier).await?;
     assert!(mismatches.is_empty(),
@@ -261,8 +293,14 @@ async fn run_scenario() -> Result<(), ClientError> {
         mismatches.iter().take(5).collect::<Vec<_>>());
     eprintln!("[7.5] OK -- full consistency check passed, zero mismatches");
 
-    let _ = docker5.compose_down().await;
+    tlog!(t0, "test 7.5: done");
+
+    tlog!(t0, "teardown_all (cleanup)");
+    common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
+
     eprintln!("[scenario_07] All sub-tests passed");
+    tlog!(t0, "=== SCENARIO COMPLETE ===");
 
     Ok(())
 }

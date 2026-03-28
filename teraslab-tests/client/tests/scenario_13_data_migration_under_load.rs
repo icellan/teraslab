@@ -1,5 +1,6 @@
 //! Scenario 13 -- Data migration under load (3-node -> 4-node scale-out).
 
+#[allow(dead_code)]
 mod common;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,6 +13,14 @@ use teraslab_test_client::types::*;
 use parking_lot::Mutex;
 use rand::{Rng, SeedableRng};
 
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
+
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 13;
 
@@ -20,13 +29,23 @@ async fn scenario_13_data_migration_under_load() {
     let result = tokio::time::timeout(Duration::from_secs(600), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("scenario failed: {e}"),
-        Err(_) => panic!("scenario timed out after 600s"),
+        Ok(Err(e)) => {
+            common::teardown_all(SID).await;
+            panic!("scenario failed: {e}");
+        }
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario timed out after 600s");
+        }
     }
 }
 
 async fn run_scenario() -> Result<(), ClientError> {
+    let t0 = std::time::Instant::now();
+
+    tlog!(t0, "teardown_all (pre-clean)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     let (mut docker, client) = common::start_3node_cluster(SID).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
@@ -375,9 +394,12 @@ async fn run_scenario() -> Result<(), ClientError> {
     eprintln!("  Reads: {reads_ok} ok, {reads_err} err");
     eprintln!("  Spends: {spends_ok} ok, {spends_err} err");
 
-    let _ = docker_5.compose_down().await;
-    let _ = docker.compose_down().await;
+    tlog!(t0, "teardown_all (cleanup)");
+    common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
+
     eprintln!("[scenario_13] All sub-tests passed");
 
+    tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
 }

@@ -1,5 +1,6 @@
 //! Scenario 08 -- Network partition and degraded-network resilience.
 
+#[allow(dead_code)]
 mod common;
 
 use std::sync::Arc;
@@ -8,6 +9,14 @@ use teraslab_test_client::{Client, ClientConfig, ClientError, PoolConfig};
 use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::reporter::MetricsReporter;
 use teraslab_test_client::types::*;
+
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
 
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 8;
@@ -26,16 +35,27 @@ async fn scenario_08_network_partition() {
     let result = tokio::time::timeout(Duration::from_secs(600), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("scenario failed: {e}"),
-        Err(_) => panic!("scenario timed out after 600s"),
+        Ok(Err(e)) => {
+            common::teardown_all(SID).await;
+            panic!("scenario failed: {e}");
+        }
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario timed out after 600s");
+        }
     }
 }
 
 async fn run_scenario() -> Result<(), ClientError> {
+    let t0 = std::time::Instant::now();
+
+    tlog!(t0, "teardown_all (pre-clean)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     // == Test 8a -- Minority isolation ==
     {
+        tlog!(t0, "test 8a: minority isolation");
         eprintln!("[8a] === Minority isolation sub-scenario ===");
 
         let (mut docker, client) = common::start_3node_cluster(SID).await?;
@@ -193,7 +213,8 @@ async fn run_scenario() -> Result<(), ClientError> {
         docker.heal_partition("node2").await?;
 
         // After partition heal, SWIM must go through its full rediscovery cycle.
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        // SWIM suspicion timeout is 3s, so 5s is sufficient.
+        tokio::time::sleep(Duration::from_secs(5)).await;
         common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
         client.refresh_routing().await?;
@@ -241,12 +262,14 @@ async fn run_scenario() -> Result<(), ClientError> {
 
         let _ = docker.compose_down().await;
         eprintln!("[8a] === Minority isolation sub-scenario complete ===");
+        tlog!(t0, "test 8a: done");
     }
 
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // == Test 8b -- Full isolation ==
     {
+        tlog!(t0, "test 8b: full isolation");
         eprintln!("[8b] === Full isolation sub-scenario ===");
 
         let (mut docker, client) = common::start_3node_cluster(SID).await?;
@@ -364,7 +387,8 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[8b.3] Healing all partitions");
         docker.heal_all_partitions().await?;
 
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        // SWIM suspicion timeout is 3s, so 5s is sufficient for rediscovery.
+        tokio::time::sleep(Duration::from_secs(5)).await;
         common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
         client.refresh_routing().await?;
@@ -390,12 +414,14 @@ async fn run_scenario() -> Result<(), ClientError> {
 
         let _ = docker.compose_down().await;
         eprintln!("[8b] === Full isolation sub-scenario complete ===");
+        tlog!(t0, "test 8b: done");
     }
 
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // == Test 8c -- Slow network ==
     {
+        tlog!(t0, "test 8c: slow network");
         eprintln!("[8c] === Slow network sub-scenario ===");
 
         let (mut docker, _client_orig) = common::start_3node_cluster(SID).await?;
@@ -503,8 +529,8 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[8c.4] OK -- all 3 nodes still in cluster after clearing degradation");
 
         eprintln!("[8c.5] Verifying records written during degradation");
-        // Wait extra for deferred shard table swaps to complete, then use a fresh client
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Wait for deferred shard table swaps to complete, then use a fresh client
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
         let fresh_client = common::create_client(&docker, 3).await?;
         let mut verify_failures = 0u32;
 
@@ -547,15 +573,17 @@ async fn run_scenario() -> Result<(), ClientError> {
 
         let _ = docker.compose_down().await;
         eprintln!("[8c] === Slow network sub-scenario complete ===");
+        tlog!(t0, "test 8c: done");
     }
 
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // == Test 8d -- Asymmetric partition ==
     {
+        tlog!(t0, "test 8d: asymmetric partition");
         eprintln!("[8d] === Asymmetric partition sub-scenario ===");
 
-        let (mut docker, client) = common::start_3node_cluster(SID).await?;
+        let (docker, client) = common::start_3node_cluster(SID).await?;
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
         client.refresh_routing().await?;
 
@@ -630,7 +658,8 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[8d.3] Healing asymmetric partition");
         docker.heal_all_partitions().await?;
 
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        // SWIM suspicion timeout is 3s, so 5s is sufficient for rediscovery.
+        tokio::time::sleep(Duration::from_secs(5)).await;
         common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
         client.refresh_routing().await?;
@@ -669,10 +698,15 @@ async fn run_scenario() -> Result<(), ClientError> {
             "Test 8d.4: {read_failures}/{} records not accessible after heal", all_txids.len());
         eprintln!("[8d.4] OK -- all {} records accessible after asymmetric partition heal", all_txids.len());
 
-        let _ = docker.compose_down().await;
         eprintln!("[8d] === Asymmetric partition sub-scenario complete ===");
+        tlog!(t0, "test 8d: done");
     }
 
+    tlog!(t0, "teardown_all (cleanup)");
+    common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
+
     eprintln!("[scenario_08] All sub-tests passed");
+    tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
 }

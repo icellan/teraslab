@@ -5,6 +5,7 @@
 //! checks, delete cleanup, concurrent large tx creation, and non-blocking
 //! behavior for small tx operations.
 
+#[allow(dead_code)]
 mod common;
 
 use std::time::{Duration, Instant};
@@ -18,6 +19,14 @@ use teraslab::protocol::opcodes::{FLAG_LOCAL_READ, OP_GET_BATCH, STATUS_OK};
 
 use rand::Rng;
 
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
+
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 11;
 
@@ -26,8 +35,14 @@ async fn scenario_11_large_transactions() {
     let result = tokio::time::timeout(Duration::from_secs(600), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("scenario failed: {e}"),
-        Err(_) => panic!("scenario timed out after 600s"),
+        Ok(Err(e)) => {
+            common::teardown_all(SID).await;
+            panic!("scenario failed: {e}");
+        }
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario timed out after 600s");
+        }
     }
 }
 
@@ -118,7 +133,11 @@ fn payload_data_len(payload: &[u8]) -> usize {
 }
 
 async fn run_scenario() -> Result<(), ClientError> {
+    let t0 = std::time::Instant::now();
+
+    tlog!(t0, "teardown_all (pre-clean)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     let (_docker, client) = common::start_3node_cluster(SID).await?;
     let docker = common::docker_3node(SID);
@@ -322,7 +341,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     eprintln!("[11.5] Verifying replication of all size tiers");
 
     // Wait for replication to propagate
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // Verify all records are accessible (implying replicas are up to date)
     for (label, txid) in [
@@ -392,7 +411,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     client.create_batch(&[del_vlarge_item]).await?;
 
     // Allow replication to propagate
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // Delete all four
     let del_txids = [del_small_txid, del_medium_txid, del_large_txid, del_vlarge_txid];
@@ -402,7 +421,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     }
 
     // Allow deletion to propagate
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // Verify all are deleted
     for (label, txid) in [
@@ -543,7 +562,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     eprintln!("[11.9] Created 5MiB blob transaction");
 
     // Wait for replication to propagate
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // Read from all 3 nodes directly using FLAG_LOCAL_READ
     let node_addrs = docker.host_client_addrs(3);
@@ -577,8 +596,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     common::wait_specific_migrations_complete(
         &docker, &surviving_nodes, Duration::from_secs(60),
     ).await?;
-    let _ = client.refresh_routing().await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    common::wait_specific_replication_settled(&docker, &surviving_nodes, Duration::from_secs(5)).await?;
     let _ = client.refresh_routing().await;
 
     // Read the record using the normal routed client — should succeed via
@@ -641,8 +659,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     // Wait for full cluster recovery and migration
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
     let _ = client.refresh_routing().await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Verify the blob is accessible after full recovery via routed read.
     // After rebalancing, the new shard master should have the EXTERNAL flag
@@ -650,8 +668,6 @@ async fn run_scenario() -> Result<(), ClientError> {
     // blobstore. The record is always accessible (metadata), but cold_data
     // availability depends on the EXTERNAL flag being correctly propagated
     // during shard migration.
-    let _ = client.refresh_routing().await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
     let _ = client.refresh_routing().await;
     let results = client
         .get_batch(FIELD_ALL, std::slice::from_ref(&blob_txid))
@@ -697,7 +713,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     }
 
     // Wait for replication to propagate
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
 
     // Add a 4th node — triggers shard migration
     let mut docker_5 = common::docker_5node(SID);
@@ -806,7 +822,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     eprintln!("[11.11] Created 50MiB transaction for concurrent read/kill test");
 
     // Wait for replication
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    common::wait_replication_settled(&docker_5, 4, Duration::from_secs(10)).await?;
 
     // Read it in a loop: 10 reads total. Kill node2 after the 3rd read.
     let mut successful_reads = 0u32;
@@ -871,8 +887,12 @@ async fn run_scenario() -> Result<(), ClientError> {
     common::wait_cluster_ready(&docker_5, 4, Duration::from_secs(180)).await?;
     eprintln!("[11.11] Cluster recovered to 4 nodes. PASSED");
 
+    tlog!(t0, "teardown_all (cleanup)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
+
     eprintln!("[scenario_11] All sub-tests passed");
 
+    tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
 }

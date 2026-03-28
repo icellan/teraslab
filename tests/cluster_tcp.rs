@@ -134,8 +134,8 @@ fn two_nodes_discover_each_other() {
     std::thread::sleep(Duration::from_secs(2));
 
     // Both nodes should see each other
-    let members1 = node1.cluster.shard_table().read().unwrap().version;
-    let members2 = node2.cluster.shard_table().read().unwrap().version;
+    let members1 = node1.cluster.shard_table().read().version;
+    let members2 = node2.cluster.shard_table().read().version;
 
     // Shard table versions should be non-zero (computed from member list)
     // They may not be identical yet if timing is tight, but they should exist
@@ -304,7 +304,7 @@ fn three_node_cluster_all_shards_assigned() {
 
     // Verify the shard table covers all 4096 shards with valid masters
     let table = node1.cluster.shard_table();
-    let table_ref = table.read().unwrap();
+    let table_ref = table.read();
     for shard in 0..NUM_SHARDS as u16 {
         let assignment = table_ref.assignment(shard);
         assert!(
@@ -344,7 +344,7 @@ fn add_fourth_node_rebalance_triggers() {
 
     // Verify the 4th node has some shards assigned
     let table = node1.cluster.shard_table();
-    let table_ref = table.read().unwrap();
+    let table_ref = table.read();
     let counts = table_ref.shard_counts();
     if let Some(&count) = counts.get(&NodeId(114)) {
         assert!(count > 0, "node 4 should have some shards");
@@ -372,7 +372,7 @@ fn remove_node_rebalance_triggers() {
 
     // Check that node1's shard table no longer has node 123 as master
     let table = node1.cluster.shard_table();
-    let table_ref = table.read().unwrap();
+    let table_ref = table.read();
     let counts = table_ref.shard_counts();
 
     // Node 123 should not be a master for any shards (it's dead)
@@ -511,7 +511,7 @@ fn migrate_shard_with_records_to_new_node() {
 
     // Verify that node2 now owns some shards
     let table2 = node2.cluster.shard_table();
-    let counts = table2.read().unwrap().shard_counts();
+    let counts = table2.read().shard_counts();
     let n2_shards = counts.get(&NodeId(152)).copied().unwrap_or(0);
     eprintln!("node 152 owns {n2_shards} shards after rebalance");
 
@@ -1103,7 +1103,7 @@ fn kill_node_detection_affected_shards() {
 
     // Count shards owned by node 3 before killing it
     let table = node1.cluster.shard_table();
-    let counts_before = table.read().unwrap().shard_counts();
+    let counts_before = table.read().shard_counts();
     let n3_shards_before = counts_before.get(&NodeId(263)).copied().unwrap_or(0);
     eprintln!("node 263 owns {n3_shards_before} shards before kill");
 
@@ -1115,7 +1115,7 @@ fn kill_node_detection_affected_shards() {
 
     // Node 1 should have rebalanced
     let table_after = node1.cluster.shard_table();
-    let counts_after = table_after.read().unwrap().shard_counts();
+    let counts_after = table_after.read().shard_counts();
     let n3_shards_after = counts_after.get(&NodeId(263)).copied().unwrap_or(0);
     eprintln!("node 263 owns {n3_shards_after} shards after kill");
 

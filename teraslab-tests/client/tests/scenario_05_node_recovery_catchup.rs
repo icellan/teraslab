@@ -1,5 +1,6 @@
 //! Scenario 05 -- Node recovery and data catch-up after hard kill.
 
+#[allow(dead_code)]
 mod common;
 
 use std::sync::Arc;
@@ -11,6 +12,14 @@ use teraslab_test_client::reporter::MetricsReporter;
 
 use teraslab::protocol::codec::encode_get_batch;
 use teraslab::protocol::opcodes::{FLAG_LOCAL_READ, OP_GET_BATCH, STATUS_OK};
+
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
 
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 5;
@@ -35,13 +44,22 @@ async fn scenario_05_node_recovery_catchup() {
     let result = tokio::time::timeout(Duration::from_secs(300), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("scenario failed: {e}"),
-        Err(_) => panic!("scenario timed out after 300s"),
+        Ok(Err(e)) => {
+            common::teardown_all(SID).await;
+            panic!("scenario failed: {e}");
+        }
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario timed out after 300s");
+        }
     }
 }
 
 async fn run_scenario() -> Result<(), ClientError> {
+    let t0 = std::time::Instant::now();
+    tlog!(t0, "teardown_all (pre-clean)...");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     let (mut docker, client) = common::start_3node_cluster(SID).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
@@ -79,6 +97,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         .collect();
 
     // -- Test 5.1: Restart node2 --
+    tlog!(t0, "test 5.1 start");
     eprintln!("[5.1] Starting node2");
     let membership_start = std::time::Instant::now();
     docker.start_node("node2").await?;
@@ -90,16 +109,20 @@ async fn run_scenario() -> Result<(), ClientError> {
         })?;
     let time_to_membership = membership_start.elapsed();
     eprintln!("[5.1] OK -- all 3 nodes report cluster_size=3");
+    tlog!(t0, "test 5.1 done");
 
     // -- Test 5.2: Wait for migrations --
+    tlog!(t0, "test 5.2 start");
     eprintln!("[5.2] Waiting for migrations to complete");
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
     let time_to_caught_up = membership_start.elapsed();
     eprintln!("[5.2] OK -- all migrations complete");
+    tlog!(t0, "test 5.2 done");
 
     client.refresh_routing().await?;
 
     // -- Test 5.3: Verify balanced distribution --
+    tlog!(t0, "test 5.3 start");
     eprintln!("[5.3] Checking shard distribution balance");
     // Wait for shard rebalance to fully propagate after node rejoin.
     {
@@ -146,9 +169,11 @@ async fn run_scenario() -> Result<(), ClientError> {
     }
     assert_eq!(total_masters, 4096);
     eprintln!("[5.3] OK -- balanced distribution confirmed");
+    tlog!(t0, "test 5.3 done");
 
     // -- Test 5.4: Read ALL records from node2 directly --
     // Every record that node2 is master or replica for must be accessible.
+    tlog!(t0, "test 5.4 start");
     eprintln!("[5.4] Reading ALL {} records directly from node2 via FLAG_LOCAL_READ", all_txids.len());
     let mut accessible_count = 0u32;
     let mut inaccessible_count = 0u32;
@@ -185,6 +210,7 @@ async fn run_scenario() -> Result<(), ClientError> {
          expected at least ~20% (with RF=2 and 3 nodes, node2 should hold ~2/3 of shards)");
     eprintln!("[5.4] OK -- {accessible_count}/{total_checked} records accessible on node2 locally \
               ({inaccessible_count} not on this node, which is expected for shards it doesn't own)");
+    tlog!(t0, "test 5.4 done");
 
     // -- Test 5.5: Master/replica byte comparison for ALL records --
     // NOTE: This uses verify_consistency() which performs routed reads through the
@@ -192,6 +218,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     // verify_replication would read directly from both the master and replica for
     // each shard and compare raw bytes. That level of verification is not yet
     // implemented in the test client.
+    tlog!(t0, "test 5.5 start");
     eprintln!("[5.5] Full consistency check via verify_consistency()");
     // Wait for replication to settle after migrations, then create a fresh client.
     common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
@@ -202,8 +229,10 @@ async fn run_scenario() -> Result<(), ClientError> {
         mismatches.len(),
         mismatches.iter().take(5).collect::<Vec<_>>());
     eprintln!("[5.5] OK -- full consistency check passed, zero mismatches");
+    tlog!(t0, "test 5.5 done");
 
     // -- Test 5.6: No duplicate records --
+    tlog!(t0, "test 5.6 start");
     eprintln!("[5.6] Checking for duplicate records");
     let mut seen_txids = std::collections::HashSet::new();
     let all_verifier_txids = verifier.non_deleted_txids();
@@ -234,8 +263,10 @@ async fn run_scenario() -> Result<(), ClientError> {
     assert_eq!(cluster_duplicates, 0,
         "Test 5.6: {cluster_duplicates} records missing from cluster (possible duplication/loss issue)");
     eprintln!("[5.6] OK -- no duplicate records found");
+    tlog!(t0, "test 5.6 done");
 
     // -- Test 5.7: Measure time-to-membership and time-to-fully-caught-up --
+    tlog!(t0, "test 5.7 start");
     eprintln!("[5.7] Recovery timing measurements:");
     eprintln!("[5.7]   Time to membership (cluster_size=3): {:?}", time_to_membership);
     eprintln!("[5.7]   Time to fully caught up (migrations complete): {:?}", time_to_caught_up);
@@ -244,8 +275,10 @@ async fn run_scenario() -> Result<(), ClientError> {
     assert!(time_to_caught_up <= Duration::from_secs(60),
         "Test 5.7: time to fully caught up was {:?}, expected <= 60s", time_to_caught_up);
     eprintln!("[5.7] OK -- recovery timing within bounds");
+    tlog!(t0, "test 5.7 done");
 
     // -- Test 5.8: 30-second mixed workload with zero errors --
+    tlog!(t0, "test 5.8 start");
     eprintln!("[5.8] Running 30-second mixed workload after recovery");
     let reporter = Arc::new(MetricsReporter::new());
     let workload_duration = Duration::from_secs(30);
@@ -340,9 +373,13 @@ async fn run_scenario() -> Result<(), ClientError> {
         "Test 5.8: {error_rate:.1}% error rate ({total_errors}/{total_ops}) exceeds 5% threshold");
     eprintln!("[5.8] OK -- completed {total_ops} ops in 30s with zero errors");
     eprintln!("[5.8] {}", reporter.format_summary());
+    tlog!(t0, "test 5.8 done");
 
-    let _ = docker.compose_down().await;
+    tlog!(t0, "teardown_all (final)...");
+    common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
     eprintln!("[scenario_05] All sub-tests passed");
 
+    tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
 }

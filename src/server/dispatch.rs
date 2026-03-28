@@ -460,7 +460,7 @@ fn replicate_all_ops(
 
     // Group all ops by target replica address
     let table = cluster.shard_table();
-    let table_guard = table.read().unwrap();
+    let table_guard = table.read();
     let mut by_addr: HashMap<SocketAddr, Vec<ReplicaOp>> = HashMap::new();
 
     for (key, ops) in ops_by_key {

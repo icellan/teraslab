@@ -8,6 +8,7 @@
 //! Final assertions: zero mismatches at every checkpoint, throughput stable
 //! within 10%, RSS growth <20%, p99 latency stable within 2x.
 
+#[allow(dead_code)]
 mod common;
 
 use std::sync::atomic::Ordering;
@@ -26,26 +27,41 @@ use teraslab::protocol::opcodes::{FLAG_LOCAL_READ, OP_GET_BATCH, STATUS_OK};
 use parking_lot::Mutex;
 use rand::{Rng, SeedableRng};
 
+macro_rules! tlog {
+    ($t0:expr, $($arg:tt)*) => {
+        if common::timing_enabled() {
+            eprintln!("[{:6.1}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*));
+        }
+    };
+}
+
 /// Scenario ID for unique Docker ports and container names.
 const SID: u16 = 10;
 
-/// Total test duration: 10 minutes.
-const TOTAL_DURATION_SECS: u64 = 600;
+/// Total test duration: 60 seconds (high intensity).
+/// Override with `TERASLAB_SUSTAINED_DURATION_SECS` env var.
+const TOTAL_DURATION_SECS: u64 = 60;
 
-/// Checkpoint interval: 60 seconds.
-const CHECKPOINT_INTERVAL_SECS: u64 = 60;
+/// Checkpoint interval: 15 seconds.
+const CHECKPOINT_INTERVAL_SECS: u64 = 15;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_10_sustained_load() {
     let result = tokio::time::timeout(
-        Duration::from_secs(TOTAL_DURATION_SECS + 300),
+        Duration::from_secs(TOTAL_DURATION_SECS + 120),
         run_scenario(),
     )
     .await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("scenario failed: {e}"),
-        Err(_) => panic!("scenario timed out"),
+        Ok(Err(e)) => {
+            common::teardown_all(SID).await;
+            panic!("scenario failed: {e}");
+        }
+        Err(_) => {
+            common::teardown_all(SID).await;
+            panic!("scenario timed out");
+        }
     }
 }
 
@@ -69,7 +85,11 @@ struct Checkpoint {
 }
 
 async fn run_scenario() -> Result<(), ClientError> {
+    let t0 = std::time::Instant::now();
+
+    tlog!(t0, "teardown_all (pre-clean)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
 
     let (docker, client) = common::start_3node_cluster(SID).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
@@ -79,12 +99,12 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // Workload runner for pause/resume/stop signals
     let runner = Arc::new(WorkloadRunner::new(WorkloadConfig {
-        creates_per_sec: 500,
-        spends_per_sec: 2000,
-        set_mined_per_sec: 500,
-        reads_per_sec: 1000,
-        deletes_per_sec: 50,
-        freeze_per_sec: 10,
+        creates_per_sec: 5000,
+        spends_per_sec: 20000,
+        set_mined_per_sec: 5000,
+        reads_per_sec: 10000,
+        deletes_per_sec: 500,
+        freeze_per_sec: 100,
     }));
 
     let metrics = runner.metrics();
@@ -108,7 +128,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     let bg_handle = tokio::spawn(async move {
         let mut rng = rand::rngs::StdRng::from_entropy();
         // Execute in 100ms ticks.
-        // Per tick: 50 creates, 200 spends, 50 setMined, 100 reads, 5 deletes, 1 freeze+unfreeze
+        // Per tick: 500 creates, 2000 spends, 500 setMined, 1000 reads, 50 deletes, 10 freeze+unfreeze
         let tick = Duration::from_millis(100);
 
         loop {
@@ -125,15 +145,15 @@ async fn run_scenario() -> Result<(), ClientError> {
 
             let tick_start = Instant::now();
 
-            // -- Creates (50 per tick = 500/sec) --
+            // -- Creates (500 per tick = 5000/sec) --
             // ~1% of batches include one large transaction with 5MiB cold_data.
             {
-                let mut items = Vec::with_capacity(50);
-                let mut batch_info: Vec<([u8; 32], Vec<[u8; 32]>)> = Vec::with_capacity(50);
+                let mut items = Vec::with_capacity(500);
+                let mut batch_info: Vec<([u8; 32], Vec<[u8; 32]>)> = Vec::with_capacity(500);
 
                 let include_large_tx = rng.gen_range(0..100u32) == 0;
 
-                for item_idx in 0..50 {
+                for item_idx in 0..500 {
                     let mut txid = [0u8; 32];
                     rng.fill(&mut txid);
 
@@ -195,7 +215,7 @@ async fn run_scenario() -> Result<(), ClientError> {
                 }
             }
 
-            // -- Spends (200 per tick = 2000/sec, single-item batches) --
+            // -- Spends (2000 per tick = 20000/sec, single-item batches) --
             // Use single-item batches to get unambiguous per-spend success/failure.
             // Multi-item batches with cluster routing can produce ambiguous results
             // when items redirect to different nodes.
@@ -203,7 +223,7 @@ async fn run_scenario() -> Result<(), ClientError> {
                 let created_snapshot: Vec<([u8; 32], Vec<[u8; 32]>)> =
                     bg_created.lock().clone();
                 if !created_snapshot.is_empty() {
-                    for _ in 0..200 {
+                    for _ in 0..2000 {
                         let idx = rng.gen_range(0..created_snapshot.len());
                         let (txid, ref hashes) = created_snapshot[idx];
                         let vout = rng.gen_range(0..hashes.len() as u32);
@@ -259,13 +279,13 @@ async fn run_scenario() -> Result<(), ClientError> {
                 }
             }
 
-            // -- SetMined (50 per tick = 500/sec) --
+            // -- SetMined (500 per tick = 5000/sec) --
             {
                 let created_snapshot: Vec<([u8; 32], Vec<[u8; 32]>)> =
                     bg_created.lock().clone();
                 if !created_snapshot.is_empty() {
-                    let mut set_mined_txids: Vec<[u8; 32]> = Vec::with_capacity(50);
-                    for _ in 0..50 {
+                    let mut set_mined_txids: Vec<[u8; 32]> = Vec::with_capacity(500);
+                    for _ in 0..500 {
                         let idx = rng.gen_range(0..created_snapshot.len());
                         set_mined_txids.push(created_snapshot[idx].0);
                     }
@@ -286,8 +306,8 @@ async fn run_scenario() -> Result<(), ClientError> {
                             bg_reporter.record("set_mined", op_start.elapsed());
                             bg_metrics
                                 .set_mined_ok
-                                .fetch_add(50, Ordering::Relaxed);
-                            bg_metrics.total_ops.fetch_add(50, Ordering::Relaxed);
+                                .fetch_add(500, Ordering::Relaxed);
+                            bg_metrics.total_ops.fetch_add(500, Ordering::Relaxed);
                             for txid in &set_mined_txids {
                                 bg_verifier.record_set_mined(*txid);
                             }
@@ -296,17 +316,17 @@ async fn run_scenario() -> Result<(), ClientError> {
                         Err(_) => {
                             bg_metrics
                                 .set_mined_err
-                                .fetch_add(50, Ordering::Relaxed);
-                            bg_metrics.total_ops.fetch_add(50, Ordering::Relaxed);
-                            bg_metrics.total_errors.fetch_add(50, Ordering::Relaxed);
+                                .fetch_add(500, Ordering::Relaxed);
+                            bg_metrics.total_ops.fetch_add(500, Ordering::Relaxed);
+                            bg_metrics.total_errors.fetch_add(500, Ordering::Relaxed);
                             let _ = bg_client.refresh_routing().await;
                         }
                     }
                 }
             }
 
-            // -- Reads (100 per tick = 1000/sec, in batches of 20) --
-            for _ in 0..5 {
+            // -- Reads (1000 per tick = 10000/sec, in batches of 20) --
+            for _ in 0..50 {
                 let created_snapshot: Vec<([u8; 32], Vec<[u8; 32]>)> =
                     bg_created.lock().clone();
                 if created_snapshot.is_empty() {
@@ -339,14 +359,14 @@ async fn run_scenario() -> Result<(), ClientError> {
                 }
             }
 
-            // -- Deletes (5 per tick = 50/sec) --
+            // -- Deletes (50 per tick = 500/sec) --
             // Extract txids to delete while holding the lock, then drop it
             // before any `.await` to satisfy Send requirements.
             let delete_txids: Option<Vec<[u8; 32]>> = {
                 let mut created_locked = bg_created.lock();
                 if created_locked.len() > 100 {
-                    let mut txids = Vec::with_capacity(5);
-                    for _ in 0..5 {
+                    let mut txids = Vec::with_capacity(50);
+                    for _ in 0..50 {
                         let idx = rng.gen_range(0..created_locked.len());
                         let (txid, _) = created_locked.remove(idx);
                         txids.push(txid);
@@ -361,26 +381,27 @@ async fn run_scenario() -> Result<(), ClientError> {
                 match bg_client.delete_batch(&delete_txids).await {
                     Ok(_) => {
                         bg_reporter.record("delete", op_start.elapsed());
-                        bg_metrics.deletes_ok.fetch_add(5, Ordering::Relaxed);
-                        bg_metrics.total_ops.fetch_add(5, Ordering::Relaxed);
+                        bg_metrics.deletes_ok.fetch_add(50, Ordering::Relaxed);
+                        bg_metrics.total_ops.fetch_add(50, Ordering::Relaxed);
                         for txid in &delete_txids {
                             bg_verifier.record_delete(*txid);
                         }
                     }
                     Err(_) => {
-                        bg_metrics.deletes_err.fetch_add(5, Ordering::Relaxed);
-                        bg_metrics.total_ops.fetch_add(5, Ordering::Relaxed);
-                        bg_metrics.total_errors.fetch_add(5, Ordering::Relaxed);
+                        bg_metrics.deletes_err.fetch_add(50, Ordering::Relaxed);
+                        bg_metrics.total_ops.fetch_add(50, Ordering::Relaxed);
+                        bg_metrics.total_errors.fetch_add(50, Ordering::Relaxed);
                         let _ = bg_client.refresh_routing().await;
                     }
                 }
             }
 
-            // -- Freeze + Unfreeze (1 per tick = 10/sec total) --
-            {
+            // -- Freeze + Unfreeze (10 per tick = 100/sec total) --
+            for _ in 0..10 {
                 let created_snapshot: Vec<([u8; 32], Vec<[u8; 32]>)> =
                     bg_created.lock().clone();
-                if !created_snapshot.is_empty() {
+                if created_snapshot.is_empty() { break; }
+                {
                     let idx = rng.gen_range(0..created_snapshot.len());
                     let (txid, ref hashes) = created_snapshot[idx];
                     let vout = 0u32;
@@ -696,9 +717,13 @@ async fn run_scenario() -> Result<(), ClientError> {
         }
     }
 
+    tlog!(t0, "teardown_all (cleanup)");
     common::teardown_all(SID).await;
+    tlog!(t0, "teardown_all done");
+
     eprintln!("[scenario_10] All sub-tests passed");
 
+    tlog!(t0, "=== SCENARIO COMPLETE ===");
     Ok(())
 }
 
