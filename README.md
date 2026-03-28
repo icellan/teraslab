@@ -69,8 +69,9 @@ All settings have sensible defaults. Only specify what you want to override.
 
 ```toml
 listen_addr = "0.0.0.0:3300"
-device_paths = ["/dev/nvme0n1p1"]
-device_size = 107374182400  # 100 GiB
+# Use stable paths — /dev/nvme* numbers can change on reboot
+device_paths = ["/dev/disk/by-id/nvme-Samsung_990_PRO_S73WNJ0X123456-part1"]
+device_size = 107374182400  # 100 GiB (ignored for raw block devices; actual size is queried)
 expected_records = 50000000
 ```
 
@@ -101,8 +102,12 @@ max_connections = 1024              # Max concurrent TCP connections
 max_batch_size = 8192               # Max items per batch request
 
 # --- Storage ---
+# Both raw block devices and regular file paths are supported.
+# For block devices the actual kernel-reported size is always used and
+# device_size is ignored. For regular files, device_size is only used to
+# grow a new (or smaller) file — existing data is never truncated.
 device_paths = ["teraslab-data.dat"]  # Raw device or file path(s)
-device_size = 1073741824              # Bytes per device (used when creating new files)
+device_size = 1073741824              # Bytes per device (regular files only; block devices are auto-detected)
 device_alignment = 4096               # I/O alignment (4096 for NVMe/SSD)
 
 # --- Recovery ---
