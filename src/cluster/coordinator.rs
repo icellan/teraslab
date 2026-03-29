@@ -746,14 +746,6 @@ impl ClusterCoordinator {
         migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
         inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
     ) {
-        // Cancel any in-flight migration workers from the previous topology.
-        // Old workers check this token periodically and exit early.
-        {
-            let mut guard = MIGRATION_CANCEL.write().unwrap();
-            guard.store(true, Ordering::Release);
-            *guard = Arc::new(AtomicBool::new(false));
-        }
-
         // Compute new migration plan FIRST so we know which existing
         // migrations can be preserved (same source, target, and type).
         let old_table_snap = shard_table.read().clone();
@@ -801,6 +793,18 @@ impl ClusterCoordinator {
                     to_node: p.to_node, is_master: p.is_master,
                 })
                 .collect();
+
+            // Signal the cancellation token so in-flight worker threads
+            // for stale migrations exit early between shards. Only fires
+            // when there are actual stale tasks — re-activations of the
+            // same topology (e.g., retry after failed migrations) do NOT
+            // cancel, allowing workers to complete normally.
+            if !stale_tasks.is_empty() {
+                let mut guard = MIGRATION_CANCEL.write().unwrap();
+                guard.store(true, Ordering::Release);
+                *guard = Arc::new(AtomicBool::new(false));
+            }
+
             for t in &stale_tasks {
                 mgr.mark_failed(t);
             }
