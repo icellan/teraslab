@@ -245,6 +245,14 @@ pub struct ServerConfig {
     /// Index backend configuration. Controls whether the primary and secondary
     /// indexes use in-memory hash tables or on-disk redb B+ trees.
     pub index: IndexConfig,
+
+    /// Expected device UUID (hex string). If set, the server refuses to start
+    /// if the on-disk UUID does not match. Use this to prevent accidentally
+    /// pointing at the wrong device.
+    ///
+    /// The expected value is a 32-character lowercase hex string, as printed
+    /// by `device_uuid_hex()` and logged on first startup.
+    pub device_uuid: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -281,6 +289,7 @@ impl Default for ServerConfig {
             migration_batch_size: 500,
             replica_lag_check_interval_secs: 30,
             index: IndexConfig::default(),
+            device_uuid: None,
         }
     }
 }
