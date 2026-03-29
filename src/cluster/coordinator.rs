@@ -1804,6 +1804,17 @@ fn run_orphan_cleanup(
         return;
     }
 
+    // Guard: skip if any shards are still in a handoff state (Copying,
+    // CommitReady). Rolled-back shards from cancelled migrations revert
+    // to ServingCurrent — the local node is still the effective master.
+    // Deleting records for those shards would cause data loss.
+    {
+        let table = shard_table.read();
+        if table.pending_handoff_count() > 0 {
+            return;
+        }
+    }
+
     let owned_shards = shard_table.read().shards_owned_by(self_id);
 
     let mut orphaned_shards: Vec<u16> = Vec::new();
