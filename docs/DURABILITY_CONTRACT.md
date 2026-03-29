@@ -30,6 +30,108 @@ On restart, recovery replays all redo log entries after the last checkpoint:
 - **Redo replay fixes derived state** — counters (`spent_utxos`, `pruned_utxos`), secondary index entries (DAH, unmined), and any metadata fields that depend on read-modify-write sequences that may have been interrupted.
 - **Replay is idempotent** — each entry checks whether the mutation was already applied before re-applying.
 
+## Index Recovery on Startup
+
+The in-memory index (primary hash table + DAH and unmined secondary indexes)
+is a derived data structure — the block device is the source of truth.
+On clean shutdown the index is snapshotted to disk as an optimization. On
+startup, the system restores the index through three cascading layers:
+
+### Layer 1: Block device is always correct
+
+All UTXO slot and metadata writes go through `pwrite` on an `O_DIRECT`
+file descriptor. By the time a client receives an acknowledgment, the
+bytes are durable on the block device. After any crash, the on-disk UTXO
+slots and metadata headers reflect the last completed operation. The
+device is the ground truth — the index and redo log are derived from it.
+
+### Layer 2: Redo log bridges snapshot-to-present gap
+
+The redo log records every mutation between checkpoints. On recovery,
+entries after the last checkpoint are replayed to bring derived metadata
+(counters, secondary index entries, index registrations) up to date.
+All replays are idempotent — each entry reads the current device state
+before writing, skipping mutations that were already applied.
+
+### Layer 3: Snapshot is a startup optimization
+
+On clean shutdown, `Engine::snapshot_index()` writes the in-memory index
+to a single file using atomic temp-file + rename. This avoids an O(N)
+device scan on the next startup. The snapshot is never trusted as the
+sole source of truth — redo log replay always runs afterwards.
+
+### Startup Decision Tree
+
+```
+snapshot file exists?
+ ├─ yes → restore from snapshot, verify CRC32 per section
+ │         ├─ primary section corrupt?   → discard; full device scan
+ │         ├─ DAH section corrupt?       → rebuild DAH from device scan
+ │         │                               (also marks unmined for rebuild)
+ │         └─ unmined section corrupt?   → rebuild unmined from device scan
+ └─ no  → full device scan
+            (walk every aligned block, read metadata headers, register in index)
+
+then ALWAYS → replay redo log entries after last checkpoint
+              (idempotent; safe even if entries were already applied)
+```
+
+The `RestoreFlags` struct tracks which secondary indexes need rebuilding
+after a partial snapshot restore. If the DAH section is corrupt, file
+boundary tracking is considered unreliable and both secondaries are rebuilt.
+
+### Index Snapshot Format
+
+Written by `Index::snapshot_all()`, read by `Index::restore_all()`:
+
+```
+Primary section:
+  [magic "TSIX" (4)] [version (4)] [entry_count (8)] [capacity (8)]
+  [TxKey(32) + TxIndexEntry(31)] * entry_count
+  [CRC32 (4)]
+
+DAH section:
+  [magic "DAHI" (4)] [version (4)] [count (8)]
+  [height(4) + txid(32)] * count
+  [CRC32 (4)]
+
+Unmined section:
+  [magic "UNMI" (4)] [version (4)] [count (8)]
+  [unmined_since(4) + txid(32)] * count
+  [CRC32 (4)]
+```
+
+Atomicity: data is serialized to a `.tmp` file, fsynced, then renamed to
+the final path. If a crash occurs during snapshotting, the previous
+snapshot (or no snapshot) remains — the new file is never partially visible.
+
+### Device Scan Rebuild
+
+When no valid snapshot exists, `Index::rebuild()` scans the device:
+
+1. Walk every aligned block from `allocator.data_region_start()` to
+   `allocator.next_offset()`.
+2. Read the metadata header at each position; skip blocks with invalid
+   magic or I/O errors.
+3. For each valid record, register a `TxIndexEntry` in the hash table
+   with the on-device offset and cached metadata fields.
+4. Derived fields (`dah_or_preserve`, `unmined_since`, `generation`) are
+   zeroed — they are recovered by redo log replay in the next step.
+
+Secondary indexes are rebuilt by a separate `rebuild_secondary()` scan
+that extracts `delete_at_height` and `unmined_since` from metadata headers.
+
+### Crash Scenario Matrix
+
+| Scenario | Recovery path |
+|----------|---------------|
+| Clean shutdown | Restore snapshot (fast) + replay trailing redo entries |
+| Crash with recent snapshot | Restore snapshot + redo replay brings index current |
+| Crash during snapshotting | Old snapshot survives (atomic rename); redo replay covers gap |
+| Crash with no snapshot | Full device scan (slow at 50M+ records) + redo replay |
+| Crash with corrupted snapshot | Full device scan + redo replay |
+| Crash during redo replay | Replay is idempotent; restarts from last checkpoint on next boot |
+
 ### Sequence Numbering
 
 Each redo log entry receives a monotonically increasing sequence number assigned by `RedoLog::append()`. This sequence:
@@ -92,11 +194,12 @@ forward and replays them to the reconnected replica.
 
 ### Startup Recovery
 
-On server restart:
-1. Redo log is opened and recovery replays entries after the last checkpoint.
-2. `init_replication_sequence(redo_log.current_sequence())` sets the
+On server restart (see also "Index Recovery on Startup" above):
+1. Index is restored from snapshot or rebuilt from device scan.
+2. Redo log is opened and recovery replays entries after the last checkpoint.
+3. `init_replication_sequence(redo_log.current_sequence())` sets the
    replication counter so new batches continue from the correct position.
-3. Replica connections are re-established; catch-up runs automatically.
+4. Replica connections are re-established; catch-up runs automatically.
 
 ## Topology Epochs and Ownership Fencing
 
