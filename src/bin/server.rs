@@ -543,9 +543,7 @@ struct ServerWithShutdown {
     inner: Server,
     #[allow(dead_code)]
     shutdown: Arc<std::sync::atomic::AtomicBool>,
-    #[allow(dead_code)]
     engine: Arc<Engine>,
-    #[allow(dead_code)]
     snap_path: PathBuf,
     device: Arc<dyn BlockDevice>,
     #[allow(dead_code)]
@@ -563,6 +561,20 @@ impl ServerWithShutdown {
         }
 
         eprintln!("Persisting state...");
+
+        // Snapshot index to disk for fast restart
+        match self.engine.snapshot_index(&self.snap_path) {
+            Ok(()) => eprintln!("  index snapshot written to {}", self.snap_path.display()),
+            Err(e) => eprintln!("  index snapshot failed: {e}"),
+        }
+
+        // Persist allocator freelist
+        match self.engine.persist_allocator() {
+            Ok(()) => eprintln!("  allocator state persisted"),
+            Err(e) => eprintln!("  allocator persist failed: {e}"),
+        }
+
+        // Sync device
         if let Err(e) = self.device.sync() {
             eprintln!("  device sync error: {e}");
         } else {

@@ -2060,6 +2060,36 @@ impl Engine {
     pub fn device(&self) -> &dyn BlockDevice {
         &*self.device
     }
+
+    /// Snapshot the primary index and both secondary indexes to a file.
+    ///
+    /// Acquires read locks on the primary index and short-lived locks on the
+    /// secondary indexes, then writes a consistent snapshot to `path` via an
+    /// atomic rename. Called during graceful shutdown so the next startup can
+    /// restore from snapshot instead of scanning the device.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::index::IndexError`] on I/O failure or if the snapshot
+    /// directory is not writable.
+    pub fn snapshot_index(&self, path: &std::path::Path) -> crate::index::Result<()> {
+        let index = self.index.read();
+        let dah = self.dah_index.lock();
+        let unmined = self.unmined_index.lock();
+        index.snapshot_all(&dah, &unmined, path)
+    }
+
+    /// Persist the allocator's freelist and high-water mark to the device header.
+    ///
+    /// Called during graceful shutdown to avoid a full device scan on the next
+    /// startup. Acquires the allocator mutex briefly to serialize the freelist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::allocator::AllocatorError`] on device I/O failure.
+    pub fn persist_allocator(&self) -> crate::allocator::Result<()> {
+        self.allocator.lock().persist()
+    }
 }
 
 // ---------------------------------------------------------------------------

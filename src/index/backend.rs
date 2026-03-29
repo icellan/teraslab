@@ -8,6 +8,7 @@ use crate::config::IndexConfig;
 use crate::device::BlockDevice;
 use crate::index::hashtable::{TxIndexEntry, TxKey};
 use crate::index::redb_primary::RedbPrimary;
+use crate::index::secondary_backend::{DahBackend, UnminedBackend};
 use crate::index::{DahIndex, Index, IndexError, IndexStats, RestoreFlags, UnminedIndex};
 
 /// Primary index backend selection.
@@ -179,14 +180,28 @@ impl PrimaryBackend {
     }
 
     /// Snapshot primary index + both secondary indexes to a single file.
+    ///
+    /// Accepts the pluggable backend wrappers for the secondary indexes.
+    /// For the in-memory primary backend the secondary backends must be
+    /// `InMemory` variants; if they are `OnDisk` variants no secondary
+    /// data is written (redb is already durable so no snapshot is needed).
+    /// For the on-disk primary backend this is always a no-op.
     pub fn snapshot_all(
         &self,
-        dah: &DahIndex,
-        unmined: &UnminedIndex,
+        dah: &DahBackend,
+        unmined: &UnminedBackend,
         path: &std::path::Path,
     ) -> Result<(), IndexError> {
         match self {
-            Self::InMemory(idx) => idx.snapshot_all(dah, unmined, path),
+            Self::InMemory(idx) => {
+                match (dah, unmined) {
+                    (DahBackend::InMemory(d), UnminedBackend::InMemory(u)) => {
+                        idx.snapshot_all(d, u, path)
+                    }
+                    // Secondary indexes are on-disk (redb already durable) — skip snapshot.
+                    _ => Ok(()),
+                }
+            }
             Self::OnDisk(_) => Ok(()), // No-op: redb is already durable
         }
     }
@@ -586,8 +601,8 @@ mod tests {
         let mut backend = PrimaryBackend::new_on_disk(&config).unwrap();
         backend.register(make_key(1), make_entry(100)).unwrap();
 
-        let dah = DahIndex::new();
-        let unmined = UnminedIndex::new();
+        let dah = DahBackend::InMemory(DahIndex::new());
+        let unmined = UnminedBackend::InMemory(UnminedIndex::new());
         let snap_path = dir.path().join("all.snap");
         backend.snapshot_all(&dah, &unmined, &snap_path).unwrap();
         // No-op for OnDisk
@@ -763,12 +778,14 @@ mod tests {
             backend.register(make_key(i), make_entry(i * 100)).unwrap();
         }
 
-        let mut dah = DahIndex::new();
-        dah.insert(100, make_key(1));
-        dah.insert(200, make_key(2));
+        let mut dah_inner = DahIndex::new();
+        dah_inner.insert(100, make_key(1));
+        dah_inner.insert(200, make_key(2));
+        let dah = DahBackend::InMemory(dah_inner);
 
-        let mut unmined = UnminedIndex::new();
-        unmined.insert(300, make_key(3));
+        let mut unmined_inner = UnminedIndex::new();
+        unmined_inner.insert(300, make_key(3));
+        let unmined = UnminedBackend::InMemory(unmined_inner);
 
         // Snapshot all
         backend.snapshot_all(&dah, &unmined, &snap_path).unwrap();
