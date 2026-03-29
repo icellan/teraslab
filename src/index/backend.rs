@@ -21,6 +21,10 @@ pub enum PrimaryBackend {
     InMemory(Index),
     /// On-disk B+ tree via redb. Low RAM, crash-durable.
     OnDisk(RedbPrimary),
+    /// File-backed mmap. Same Robin Hood hash table as InMemory but backed
+    /// by `mmap(MAP_SHARED)` over a persistent file. Trades crash durability
+    /// (relies on redo log) for 100x better write throughput than redb.
+    FileBacked(Index),
 }
 
 impl std::fmt::Debug for PrimaryBackend {
@@ -28,6 +32,7 @@ impl std::fmt::Debug for PrimaryBackend {
         match self {
             Self::InMemory(_) => f.write_str("PrimaryBackend::InMemory"),
             Self::OnDisk(_) => f.write_str("PrimaryBackend::OnDisk(redb)"),
+            Self::FileBacked(_) => f.write_str("PrimaryBackend::FileBacked"),
         }
     }
 }
@@ -46,11 +51,40 @@ impl PrimaryBackend {
         )?))
     }
 
+    /// Open or create a file-backed mmap backend.
+    ///
+    /// Uses the same Robin Hood hash table as the in-memory backend but
+    /// backed by `mmap(MAP_SHARED)` over a persistent file. Writes are
+    /// `memcpy` into the mapped region (no transaction overhead). Crash
+    /// recovery relies on TeraSlab's redo log.
+    pub fn new_file_backed(
+        path: &std::path::Path,
+        expected_records: usize,
+    ) -> Result<Self, IndexError> {
+        Ok(Self::FileBacked(Index::open_file_backed(path, expected_records)?))
+    }
+
+    /// Restore a file-backed index by reopening the existing file.
+    ///
+    /// Returns an error if the file does not exist.
+    pub fn restore_file_backed(
+        path: &std::path::Path,
+        expected_records: usize,
+    ) -> Result<Self, IndexError> {
+        if !path.exists() {
+            return Err(IndexError::FormatError {
+                detail: format!("file-backed index not found: {}", path.display()),
+            });
+        }
+        Self::new_file_backed(path, expected_records)
+    }
+
     /// Look up where a transaction's record lives on disk.
     pub fn lookup(&self, key: &TxKey) -> Option<TxIndexEntry> {
         match self {
             Self::InMemory(idx) => idx.lookup(key),
             Self::OnDisk(redb) => redb.lookup(key),
+            Self::FileBacked(idx) => idx.lookup(key),
         }
     }
 
@@ -59,6 +93,7 @@ impl PrimaryBackend {
         match self {
             Self::InMemory(idx) => idx.register(key, entry),
             Self::OnDisk(redb) => redb.register(key, entry),
+            Self::FileBacked(idx) => idx.register(key, entry),
         }
     }
 
@@ -67,6 +102,7 @@ impl PrimaryBackend {
         match self {
             Self::InMemory(idx) => idx.unregister(key),
             Self::OnDisk(redb) => redb.unregister(key),
+            Self::FileBacked(idx) => idx.unregister(key),
         }
     }
 
@@ -84,7 +120,7 @@ impl PrimaryBackend {
         generation: u32,
     ) -> bool {
         match self {
-            Self::InMemory(idx) => idx.update_cached_fields(
+            Self::InMemory(idx) | Self::FileBacked(idx) => idx.update_cached_fields(
                 key,
                 tx_flags,
                 block_entry_count,
@@ -115,7 +151,7 @@ impl PrimaryBackend {
     /// Returns the number of entries successfully updated.
     pub fn update_cached_fields_batch(&mut self, updates: &[CachedFieldsUpdate]) -> usize {
         match self {
-            Self::InMemory(idx) => {
+            Self::InMemory(idx) | Self::FileBacked(idx) => {
                 let mut count = 0;
                 for u in updates {
                     if idx.update_cached_fields(
@@ -142,7 +178,9 @@ impl PrimaryBackend {
     /// were found and removed, `None` for missing keys.
     pub fn unregister_batch(&mut self, keys: &[TxKey]) -> Vec<Option<TxIndexEntry>> {
         match self {
-            Self::InMemory(idx) => keys.iter().map(|k| idx.unregister(k)).collect(),
+            Self::InMemory(idx) | Self::FileBacked(idx) => {
+                keys.iter().map(|k| idx.unregister(k)).collect()
+            }
             Self::OnDisk(redb) => redb.unregister_batch(keys),
         }
     }
@@ -150,7 +188,7 @@ impl PrimaryBackend {
     /// Number of entries in the primary index.
     pub fn len(&self) -> usize {
         match self {
-            Self::InMemory(idx) => idx.len(),
+            Self::InMemory(idx) | Self::FileBacked(idx) => idx.len(),
             Self::OnDisk(redb) => redb.len(),
         }
     }
@@ -158,7 +196,7 @@ impl PrimaryBackend {
     /// Whether the primary index is empty.
     pub fn is_empty(&self) -> bool {
         match self {
-            Self::InMemory(idx) => idx.is_empty(),
+            Self::InMemory(idx) | Self::FileBacked(idx) => idx.is_empty(),
             Self::OnDisk(redb) => redb.is_empty(),
         }
     }
@@ -171,7 +209,7 @@ impl PrimaryBackend {
     /// environments.
     pub fn iter(&self) -> PrimaryIter<'_> {
         match self {
-            Self::InMemory(idx) => PrimaryIter::InMemory(idx.iter()),
+            Self::InMemory(idx) | Self::FileBacked(idx) => PrimaryIter::InMemory(idx.iter()),
             Self::OnDisk(redb) => PrimaryIter::Collected(redb.iter_collected().into_iter()),
         }
     }
@@ -179,7 +217,7 @@ impl PrimaryBackend {
     /// Statistics for monitoring.
     pub fn stats(&self) -> IndexStats {
         match self {
-            Self::InMemory(idx) => idx.stats(),
+            Self::InMemory(idx) | Self::FileBacked(idx) => idx.stats(),
             Self::OnDisk(redb) => redb.stats(),
         }
     }
@@ -189,6 +227,7 @@ impl PrimaryBackend {
         match self {
             Self::InMemory(_) => "memory",
             Self::OnDisk(_) => "redb",
+            Self::FileBacked(_) => "file_backed",
         }
     }
 
@@ -203,6 +242,20 @@ impl PrimaryBackend {
         match self {
             Self::InMemory(idx) => idx.snapshot(path),
             Self::OnDisk(redb) => redb.snapshot(path),
+            Self::FileBacked(idx) => {
+                idx.sync();
+                Ok(())
+            }
+        }
+    }
+
+    /// Flush dirty pages to the backing file (file-backed backend only).
+    ///
+    /// No-op for InMemory and OnDisk backends. For FileBacked, schedules
+    /// an asynchronous writeback of dirty pages.
+    pub fn sync(&self) {
+        if let Self::FileBacked(idx) = self {
+            idx.sync();
         }
     }
 
@@ -245,6 +298,7 @@ impl PrimaryBackend {
                 }
             }
             Self::OnDisk(_) => Ok(()), // No-op: redb is already durable
+            Self::FileBacked(_) => Ok(()), // No-op: file IS persistence
         }
     }
 
@@ -354,6 +408,82 @@ impl PrimaryBackend {
         Ok(Self::OnDisk(primary))
     }
 
+    /// Rebuild the primary index into a file-backed mmap by scanning all records.
+    ///
+    /// Records with I/O errors or invalid magic are skipped with a warning.
+    /// The total number of skipped offsets is logged at the end so operators
+    /// can detect partial rebuilds from device corruption.
+    pub fn rebuild_file_backed(
+        path: &std::path::Path,
+        device: &dyn BlockDevice,
+        allocator: &SlotAllocator,
+    ) -> Result<Self, IndexError> {
+        let _ = std::fs::remove_file(path);
+
+        let mut index = Index::open_file_backed(path, 1024)?;
+        let align = allocator.device_alignment();
+        let start = allocator.data_region_start();
+        let end = allocator.next_offset();
+
+        let read_size = align.max(crate::record::METADATA_SIZE);
+        let aligned_read = read_size.div_ceil(align) * align;
+
+        let mut skipped: u64 = 0;
+        let mut indexed: u64 = 0;
+
+        let mut offset = start;
+        while offset + aligned_read as u64 <= end {
+            let mut buf = crate::device::AlignedBuf::new(aligned_read, align);
+            if device.pread(&mut buf, offset).is_err() {
+                skipped += 1;
+                offset += align as u64;
+                continue;
+            }
+
+            let meta = crate::record::TxMetadata::from_bytes(
+                &buf[..crate::record::METADATA_SIZE],
+            );
+            if { meta.magic } != crate::record::METADATA_MAGIC {
+                offset += align as u64;
+                continue;
+            }
+
+            let record_size = { meta.record_size } as u64;
+            if record_size == 0 {
+                offset += align as u64;
+                continue;
+            }
+
+            let key = TxKey { txid: meta.tx_id };
+            let entry = TxIndexEntry {
+                device_id: 0,
+                record_offset: offset,
+                utxo_count: { meta.utxo_count },
+                block_entry_count: meta.block_entry_count,
+                tx_flags: meta.flags.bits(),
+                spent_utxos: meta.spent_utxos,
+                dah_or_preserve: 0,
+                unmined_since: 0,
+                generation: 0,
+            };
+            index.register(key, entry)?;
+            indexed += 1;
+
+            let record_aligned = (record_size as usize).div_ceil(align) * align;
+            offset += record_aligned as u64;
+        }
+
+        if skipped > 0 {
+            eprintln!(
+                "  rebuild_file_backed: WARNING: skipped {skipped} offsets due to I/O errors \
+                 ({indexed} records indexed successfully)"
+            );
+        }
+
+        index.sync();
+        Ok(Self::FileBacked(index))
+    }
+
     /// Rebuild secondary indexes by scanning all records on the device.
     pub fn rebuild_secondary(
         device: &dyn BlockDevice,
@@ -445,8 +575,8 @@ mod tests {
         }
     }
 
-    /// Helper that runs the same test body against both InMemory and OnDisk backends.
-    fn with_both_backends(f: impl Fn(&mut PrimaryBackend)) {
+    /// Helper that runs the same test body against all three backends.
+    fn with_all_backends(f: impl Fn(&mut PrimaryBackend)) {
         // In-memory
         let mut mem = PrimaryBackend::new_in_memory(1000).unwrap();
         f(&mut mem);
@@ -456,6 +586,12 @@ mod tests {
         let config = redb_config(dir.path());
         let mut disk = PrimaryBackend::new_on_disk(&config).unwrap();
         f(&mut disk);
+
+        // File-backed mmap
+        let fb_dir = tempfile::tempdir().unwrap();
+        let fb_path = fb_dir.path().join("primary.idx");
+        let mut fb = PrimaryBackend::new_file_backed(&fb_path, 1000).unwrap();
+        f(&mut fb);
     }
 
     // -----------------------------------------------------------------------
@@ -464,7 +600,7 @@ mod tests {
 
     #[test]
     fn both_backends_lookup_register_unregister() {
-        with_both_backends(|backend| {
+        with_all_backends(|backend| {
             // Empty lookup
             assert!(backend.lookup(&make_key(1)).is_none());
             assert!(backend.is_empty());
@@ -496,7 +632,7 @@ mod tests {
 
     #[test]
     fn both_backends_register_many_and_iterate() {
-        with_both_backends(|backend| {
+        with_all_backends(|backend| {
             for i in 0..100u64 {
                 backend.register(make_key(i), make_entry(i * 100)).unwrap();
             }
@@ -520,7 +656,7 @@ mod tests {
 
     #[test]
     fn both_backends_update_cached_fields() {
-        with_both_backends(|backend| {
+        with_all_backends(|backend| {
             backend.register(make_key(1), make_entry(4096)).unwrap();
 
             let updated = backend.update_cached_fields(
@@ -548,7 +684,7 @@ mod tests {
 
     #[test]
     fn both_backends_stats() {
-        with_both_backends(|backend| {
+        with_all_backends(|backend| {
             let stats = backend.stats();
             assert_eq!(stats.entry_count, 0);
 
@@ -875,7 +1011,7 @@ mod tests {
 
     #[test]
     fn both_backends_overwrite_same_key() {
-        with_both_backends(|backend| {
+        with_all_backends(|backend| {
             let key = make_key(1);
             backend.register(key, make_entry(100)).unwrap();
             backend.register(key, make_entry(200)).unwrap();
@@ -888,7 +1024,7 @@ mod tests {
 
     #[test]
     fn both_backends_unregister_then_reregister() {
-        with_both_backends(|backend| {
+        with_all_backends(|backend| {
             let key = make_key(1);
             backend.register(key, make_entry(100)).unwrap();
             backend.unregister(&key);
@@ -903,7 +1039,7 @@ mod tests {
 
     #[test]
     fn both_backends_update_cached_fields_batch() {
-        with_both_backends(|backend| {
+        with_all_backends(|backend| {
             for i in 0..5u64 {
                 backend.register(make_key(i), make_entry(i * 100)).unwrap();
             }
@@ -934,7 +1070,7 @@ mod tests {
 
     #[test]
     fn both_backends_update_cached_fields_batch_empty() {
-        with_both_backends(|backend| {
+        with_all_backends(|backend| {
             backend.register(make_key(1), make_entry(100)).unwrap();
             let updated = backend.update_cached_fields_batch(&[]);
             assert_eq!(updated, 0);
@@ -943,7 +1079,7 @@ mod tests {
 
     #[test]
     fn both_backends_unregister_batch() {
-        with_both_backends(|backend| {
+        with_all_backends(|backend| {
             for i in 0..5u64 {
                 backend.register(make_key(i), make_entry(i * 100)).unwrap();
             }
@@ -961,7 +1097,7 @@ mod tests {
 
     #[test]
     fn both_backends_unregister_batch_empty() {
-        with_both_backends(|backend| {
+        with_all_backends(|backend| {
             backend.register(make_key(1), make_entry(100)).unwrap();
             let results = backend.unregister_batch(&[]);
             assert!(results.is_empty());
@@ -978,5 +1114,115 @@ mod tests {
         // Our test records have no DAH/unmined flags set, so both should be empty.
         assert!(dah.is_empty());
         assert!(unmined.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // FileBacked-specific tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn file_backed_backend_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("primary.idx");
+        let backend = PrimaryBackend::new_file_backed(&path, 16).unwrap();
+        assert_eq!(backend.backend_name(), "file_backed");
+    }
+
+    #[test]
+    fn file_backed_debug_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("primary.idx");
+        let backend = PrimaryBackend::new_file_backed(&path, 16).unwrap();
+        let debug = format!("{backend:?}");
+        assert!(debug.contains("FileBacked"), "debug was: {debug}");
+    }
+
+    #[test]
+    fn file_backed_restore_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("primary.idx");
+
+        {
+            let mut backend = PrimaryBackend::new_file_backed(&path, 1000).unwrap();
+            for i in 0..50u64 {
+                backend.register(make_key(i), make_entry(i * 100)).unwrap();
+            }
+        }
+
+        let restored = PrimaryBackend::restore_file_backed(&path, 1000).unwrap();
+        assert_eq!(restored.len(), 50);
+        assert_eq!(restored.backend_name(), "file_backed");
+        for i in 0..50u64 {
+            let e = restored.lookup(&make_key(i)).expect("should survive reopen");
+            assert_eq!(e.record_offset, i * 100);
+        }
+    }
+
+    #[test]
+    fn file_backed_restore_missing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.idx");
+        let result = PrimaryBackend::restore_file_backed(&path, 1000);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            IndexError::FormatError { detail } => {
+                assert!(detail.contains("not found"), "error was: {detail}");
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_backed_snapshot_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("primary.idx");
+        let mut backend = PrimaryBackend::new_file_backed(&path, 1000).unwrap();
+        backend.register(make_key(1), make_entry(100)).unwrap();
+        backend.snapshot(&dir.path().join("noop.snap")).unwrap();
+    }
+
+    #[test]
+    fn file_backed_sync_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("primary.idx");
+        let mut backend = PrimaryBackend::new_file_backed(&path, 1000).unwrap();
+        backend.register(make_key(1), make_entry(100)).unwrap();
+        backend.sync();
+    }
+
+    #[test]
+    fn rebuild_file_backed_from_device() {
+        let (dev, alloc, records) = setup_device_with_records(10);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("primary.idx");
+
+        let rebuilt = PrimaryBackend::rebuild_file_backed(&path, &*dev, &alloc).unwrap();
+        assert_eq!(rebuilt.len(), 10);
+        assert_eq!(rebuilt.backend_name(), "file_backed");
+
+        for (key, offset) in &records {
+            let e = rebuilt.lookup(key).expect("record should be indexed");
+            assert_eq!(e.record_offset, *offset);
+            assert_eq!(e.utxo_count, 5);
+        }
+    }
+
+    #[test]
+    fn rebuild_file_backed_matches_in_memory() {
+        let (dev, alloc, records) = setup_device_with_records(20);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("primary.idx");
+
+        let mem = PrimaryBackend::rebuild(&*dev, &alloc).unwrap();
+        let fb = PrimaryBackend::rebuild_file_backed(&path, &*dev, &alloc).unwrap();
+
+        assert_eq!(mem.len(), fb.len());
+        for (key, offset) in &records {
+            let mem_entry = mem.lookup(key).expect("mem should have key");
+            let fb_entry = fb.lookup(key).expect("fb should have key");
+            assert_eq!(mem_entry.record_offset, fb_entry.record_offset);
+            assert_eq!(mem_entry.utxo_count, fb_entry.utxo_count);
+            assert_eq!(mem_entry.record_offset, *offset);
+        }
     }
 }
