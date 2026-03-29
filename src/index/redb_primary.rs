@@ -171,6 +171,61 @@ impl RedbPrimary {
         result
     }
 
+    /// Remove multiple transactions from the index in a single write transaction.
+    ///
+    /// Returns a `Vec` parallel to the input: `Some(entry)` for keys that were
+    /// found and removed, `None` for missing keys.
+    ///
+    /// All removals that succeed are committed atomically. If the commit fails,
+    /// the entire batch is treated as failed and `vec![None; keys.len()]` is
+    /// returned.
+    pub fn unregister_batch(&mut self, keys: &[TxKey]) -> Vec<Option<TxIndexEntry>> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let txn = match self.begin_write() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("redb unregister_batch: begin_write failed: {e}");
+                return vec![None; keys.len()];
+            }
+        };
+        let mut results = Vec::with_capacity(keys.len());
+        let mut removed_count = 0usize;
+        {
+            let mut table = match txn.open_table(PRIMARY_TABLE) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("redb unregister_batch: open_table failed: {e}");
+                    return vec![None; keys.len()];
+                }
+            };
+            for key in keys {
+                match table.remove(key.txid) {
+                    Ok(Some(guard)) => {
+                        results.push(Some(deserialize_entry(&guard.value())));
+                        removed_count += 1;
+                    }
+                    Ok(None) => results.push(None),
+                    Err(e) => {
+                        eprintln!("redb unregister_batch: remove failed: {e}");
+                        results.push(None);
+                    }
+                }
+            }
+        }
+        if removed_count > 0 {
+            match txn.commit() {
+                Ok(()) => self.count -= removed_count,
+                Err(e) => {
+                    eprintln!("redb unregister_batch: commit failed: {e}");
+                    return vec![None; keys.len()];
+                }
+            }
+        }
+        results
+    }
+
     /// Update cached fields for an existing entry.
     ///
     /// Performs a read-modify-write within a single write transaction.
@@ -1112,5 +1167,70 @@ mod tests {
         assert_eq!(e.generation, 42);
         // Unchanged
         assert_eq!(e.record_offset, 100);
+    }
+
+    #[test]
+    fn unregister_batch_basic() {
+        let (_dir, mut primary) = open_temp();
+        for i in 0..5u64 {
+            primary.register(make_key(i), make_entry(i * 100)).unwrap();
+        }
+        assert_eq!(primary.len(), 5);
+
+        let keys: Vec<_> = (1..4u64).map(make_key).collect();
+        let results = primary.unregister_batch(&keys);
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].unwrap().record_offset, 100);
+        assert_eq!(results[1].unwrap().record_offset, 200);
+        assert_eq!(results[2].unwrap().record_offset, 300);
+        assert_eq!(primary.len(), 2);
+
+        // Remaining entries still present
+        assert!(primary.lookup(&make_key(0)).is_some());
+        assert!(primary.lookup(&make_key(4)).is_some());
+        // Removed entries gone
+        assert!(primary.lookup(&make_key(1)).is_none());
+        assert!(primary.lookup(&make_key(2)).is_none());
+        assert!(primary.lookup(&make_key(3)).is_none());
+    }
+
+    #[test]
+    fn unregister_batch_with_missing_keys() {
+        let (_dir, mut primary) = open_temp();
+        primary.register(make_key(1), make_entry(100)).unwrap();
+        primary.register(make_key(3), make_entry(300)).unwrap();
+
+        let keys = vec![make_key(1), make_key(2), make_key(3), make_key(4)];
+        let results = primary.unregister_batch(&keys);
+
+        assert_eq!(results.len(), 4);
+        assert!(results[0].is_some());
+        assert!(results[1].is_none());
+        assert!(results[2].is_some());
+        assert!(results[3].is_none());
+        assert_eq!(primary.len(), 0);
+    }
+
+    #[test]
+    fn unregister_batch_empty() {
+        let (_dir, mut primary) = open_temp();
+        primary.register(make_key(1), make_entry(100)).unwrap();
+        let results = primary.unregister_batch(&[]);
+        assert!(results.is_empty());
+        assert_eq!(primary.len(), 1);
+    }
+
+    #[test]
+    fn unregister_batch_all_missing() {
+        let (_dir, mut primary) = open_temp();
+        primary.register(make_key(1), make_entry(100)).unwrap();
+
+        let keys = vec![make_key(99), make_key(100)];
+        let results = primary.unregister_batch(&keys);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_none());
+        assert!(results[1].is_none());
+        assert_eq!(primary.len(), 1);
     }
 }
