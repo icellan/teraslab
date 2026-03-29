@@ -26,6 +26,25 @@ pub struct RedbPrimary {
     count: usize,
 }
 
+/// Batch update parameters for [`RedbPrimary::update_cached_fields_batch`].
+#[derive(Clone, Debug)]
+pub struct CachedFieldsUpdate {
+    /// The transaction key to update.
+    pub key: TxKey,
+    /// Transaction-level flags.
+    pub tx_flags: u8,
+    /// Number of entries in the block.
+    pub block_entry_count: u8,
+    /// Number of spent UTXOs.
+    pub spent_utxos: u32,
+    /// Delete-at-height or preserve-until value.
+    pub dah_or_preserve: u32,
+    /// Unmined-since timestamp.
+    pub unmined_since: u32,
+    /// Generation counter.
+    pub generation: u32,
+}
+
 impl RedbPrimary {
     /// Start a write transaction with eventual durability.
     ///
@@ -305,6 +324,57 @@ impl RedbPrimary {
         txn.commit().map_err(map_redb_commit_err)?;
         self.count += new_count;
         Ok(())
+    }
+
+    /// Update cached fields for multiple entries in a single write transaction.
+    ///
+    /// Performs a read-modify-write for each entry within one redb transaction,
+    /// amortizing the `begin_write() -> commit()` overhead across all updates.
+    /// Returns the number of entries successfully updated (missing keys are skipped).
+    ///
+    /// # Concurrency
+    ///
+    /// The caller MUST hold an exclusive lock around the `PrimaryBackend` before
+    /// calling this method, same as for individual `update_cached_fields` calls.
+    pub fn update_cached_fields_batch(&mut self, updates: &[CachedFieldsUpdate]) -> usize {
+        if updates.is_empty() {
+            return 0;
+        }
+        let txn = match self.begin_write() {
+            Ok(t) => t,
+            Err(_) => return 0,
+        };
+        let mut count = 0usize;
+        {
+            let mut table = match txn.open_table(PRIMARY_TABLE) {
+                Ok(t) => t,
+                Err(_) => return 0,
+            };
+            for update in updates {
+                let existing = match table.get(update.key.txid) {
+                    Ok(Some(guard)) => Some(deserialize_entry(&guard.value())),
+                    _ => None,
+                };
+                if let Some(mut entry) = existing {
+                    entry.tx_flags = update.tx_flags;
+                    entry.block_entry_count = update.block_entry_count;
+                    entry.spent_utxos = update.spent_utxos;
+                    entry.dah_or_preserve = update.dah_or_preserve;
+                    entry.unmined_since = update.unmined_since;
+                    entry.generation = update.generation;
+                    if table.insert(update.key.txid, serialize_entry(&entry)).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        if count > 0
+            && let Err(e) = txn.commit()
+        {
+            eprintln!("redb update_cached_fields_batch: commit failed: {e}");
+            return 0;
+        }
+        count
     }
 
     /// Snapshot is a no-op for redb (already crash-durable).
@@ -812,6 +882,186 @@ mod tests {
         assert_eq!(restored.dah_or_preserve, u32::MAX);
         assert_eq!(restored.unmined_since, u32::MAX);
         assert_eq!(restored.generation, u32::MAX);
+    }
+
+    #[test]
+    fn update_cached_fields_batch_basic() {
+        let (_dir, mut primary) = open_temp();
+        for i in 0..5u64 {
+            primary.register(make_key(i), make_entry(i * 100)).unwrap();
+        }
+
+        let updates: Vec<super::CachedFieldsUpdate> = (0..5u64)
+            .map(|i| super::CachedFieldsUpdate {
+                key: make_key(i),
+                tx_flags: 0xAA,
+                block_entry_count: (i as u8) + 1,
+                spent_utxos: (i as u32) * 10,
+                dah_or_preserve: 500,
+                unmined_since: 600,
+                generation: 42,
+            })
+            .collect();
+
+        let updated = primary.update_cached_fields_batch(&updates);
+        assert_eq!(updated, 5);
+
+        for i in 0..5u64 {
+            let e = primary.lookup(&make_key(i)).unwrap();
+            assert_eq!(e.tx_flags, 0xAA);
+            assert_eq!(e.block_entry_count, (i as u8) + 1);
+            assert_eq!(e.spent_utxos, (i as u32) * 10);
+            assert_eq!(e.dah_or_preserve, 500);
+            assert_eq!(e.unmined_since, 600);
+            assert_eq!(e.generation, 42);
+            // Unchanged fields
+            assert_eq!(e.record_offset, i * 100);
+            assert_eq!(e.utxo_count, 10);
+        }
+    }
+
+    #[test]
+    fn update_cached_fields_batch_with_missing_keys() {
+        let (_dir, mut primary) = open_temp();
+        primary.register(make_key(1), make_entry(100)).unwrap();
+        primary.register(make_key(3), make_entry(300)).unwrap();
+
+        let updates = vec![
+            super::CachedFieldsUpdate {
+                key: make_key(1),
+                tx_flags: 0xFF,
+                block_entry_count: 5,
+                spent_utxos: 8,
+                dah_or_preserve: 200,
+                unmined_since: 600,
+                generation: 99,
+            },
+            super::CachedFieldsUpdate {
+                key: make_key(2), // missing
+                tx_flags: 0xFF,
+                block_entry_count: 5,
+                spent_utxos: 8,
+                dah_or_preserve: 200,
+                unmined_since: 600,
+                generation: 99,
+            },
+            super::CachedFieldsUpdate {
+                key: make_key(3),
+                tx_flags: 0xBB,
+                block_entry_count: 7,
+                spent_utxos: 12,
+                dah_or_preserve: 300,
+                unmined_since: 700,
+                generation: 50,
+            },
+        ];
+
+        let updated = primary.update_cached_fields_batch(&updates);
+        assert_eq!(updated, 2);
+
+        let e1 = primary.lookup(&make_key(1)).unwrap();
+        assert_eq!(e1.tx_flags, 0xFF);
+        assert_eq!(e1.generation, 99);
+
+        assert!(primary.lookup(&make_key(2)).is_none());
+
+        let e3 = primary.lookup(&make_key(3)).unwrap();
+        assert_eq!(e3.tx_flags, 0xBB);
+        assert_eq!(e3.generation, 50);
+    }
+
+    #[test]
+    fn update_cached_fields_batch_empty() {
+        let (_dir, mut primary) = open_temp();
+        primary.register(make_key(1), make_entry(100)).unwrap();
+        let updated = primary.update_cached_fields_batch(&[]);
+        assert_eq!(updated, 0);
+        // Original entry unchanged
+        let e = primary.lookup(&make_key(1)).unwrap();
+        assert_eq!(e.record_offset, 100);
+    }
+
+    #[test]
+    fn update_cached_fields_batch_matches_individual() {
+        // Individual updates
+        let dir1 = tempfile::tempdir().unwrap();
+        let db_path1 = dir1.path().join("test1.redb");
+        let mut p1 = RedbPrimary::open(&db_path1, 64 * 1024 * 1024).unwrap();
+        for i in 0..10u64 {
+            p1.register(make_key(i), make_entry(i * 100)).unwrap();
+        }
+        for i in 0..10u64 {
+            p1.update_cached_fields(&make_key(i), 0xCC, 3, i as u32, 400, 500, 60);
+        }
+
+        // Batch update
+        let dir2 = tempfile::tempdir().unwrap();
+        let db_path2 = dir2.path().join("test2.redb");
+        let mut p2 = RedbPrimary::open(&db_path2, 64 * 1024 * 1024).unwrap();
+        for i in 0..10u64 {
+            p2.register(make_key(i), make_entry(i * 100)).unwrap();
+        }
+        let updates: Vec<super::CachedFieldsUpdate> = (0..10u64)
+            .map(|i| super::CachedFieldsUpdate {
+                key: make_key(i),
+                tx_flags: 0xCC,
+                block_entry_count: 3,
+                spent_utxos: i as u32,
+                dah_or_preserve: 400,
+                unmined_since: 500,
+                generation: 60,
+            })
+            .collect();
+        let updated = p2.update_cached_fields_batch(&updates);
+        assert_eq!(updated, 10);
+
+        // Both should produce identical results
+        for i in 0..10u64 {
+            let e1 = p1.lookup(&make_key(i)).unwrap();
+            let e2 = p2.lookup(&make_key(i)).unwrap();
+            assert_eq!(e1.tx_flags, e2.tx_flags);
+            assert_eq!(e1.block_entry_count, e2.block_entry_count);
+            assert_eq!(e1.spent_utxos, e2.spent_utxos);
+            assert_eq!(e1.dah_or_preserve, e2.dah_or_preserve);
+            assert_eq!(e1.unmined_since, e2.unmined_since);
+            assert_eq!(e1.generation, e2.generation);
+            assert_eq!(e1.record_offset, e2.record_offset);
+            assert_eq!(e1.utxo_count, e2.utxo_count);
+        }
+    }
+
+    #[test]
+    fn update_cached_fields_batch_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.redb");
+
+        {
+            let mut primary = RedbPrimary::open(&db_path, 64 * 1024 * 1024).unwrap();
+            for i in 0..3u64 {
+                primary.register(make_key(i), make_entry(i * 100)).unwrap();
+            }
+            let updates: Vec<super::CachedFieldsUpdate> = (0..3u64)
+                .map(|i| super::CachedFieldsUpdate {
+                    key: make_key(i),
+                    tx_flags: 0xDD,
+                    block_entry_count: 9,
+                    spent_utxos: 77,
+                    dah_or_preserve: 888,
+                    unmined_since: 999,
+                    generation: 44,
+                })
+                .collect();
+            primary.update_cached_fields_batch(&updates);
+        }
+
+        // Reopen and verify
+        let primary = RedbPrimary::open(&db_path, 64 * 1024 * 1024).unwrap();
+        for i in 0..3u64 {
+            let e = primary.lookup(&make_key(i)).unwrap();
+            assert_eq!(e.tx_flags, 0xDD);
+            assert_eq!(e.generation, 44);
+            assert_eq!(e.record_offset, i * 100);
+        }
     }
 
     #[test]
