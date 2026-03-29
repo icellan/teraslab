@@ -546,7 +546,6 @@ struct ServerWithShutdown {
     engine: Arc<Engine>,
     snap_path: PathBuf,
     device: Arc<dyn BlockDevice>,
-    #[allow(dead_code)]
     cluster: Option<Arc<teraslab::cluster::coordinator::RunningCluster>>,
 }
 

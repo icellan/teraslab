@@ -766,3 +766,43 @@ fn cold_data_survives_mutations() {
     let cold_after = engine.read_cold_data(&key).unwrap();
     assert_eq!(cold_before, cold_after);
 }
+
+// ---------------------------------------------------------------------------
+// Shutdown persistence
+// ---------------------------------------------------------------------------
+
+#[test]
+fn snapshot_index_and_persist_allocator_on_shutdown() {
+    let engine = create_engine();
+
+    // Create several transactions so the index and allocator have real state
+    for n in 1..=10u32 {
+        create_tx(&engine, n, 3);
+    }
+
+    // Snapshot index to a temp file
+    let dir = tempfile::tempdir().unwrap();
+    let snap_path = dir.path().join("index.snap");
+    engine.snapshot_index(&snap_path).unwrap();
+    assert!(snap_path.exists(), "snapshot file must be created");
+    assert!(
+        std::fs::metadata(&snap_path).unwrap().len() > 0,
+        "snapshot file must be non-empty"
+    );
+
+    // Persist allocator freelist to device header
+    engine.persist_allocator().unwrap();
+
+    // Verify index state is intact after snapshot — all 10 transactions still
+    // resolvable
+    for n in 1..=10u32 {
+        let key = TxKey { txid: make_tx_id(n) };
+        let req = GetSpendRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: make_utxo_hash(n, 0),
+        };
+        let resp = engine.get_spend(&req).unwrap();
+        assert_eq!(resp.status, 0x00, "UTXO should be unspent");
+    }
+}
