@@ -376,7 +376,7 @@ impl DirectDevice {
                 // Safety: fd is a valid open block device; dev_size is a
                 // properly-sized output variable for this ioctl.
                 let rc = unsafe {
-                    libc::ioctl(fd, 0x8008_1272_u64, &mut dev_size)
+                    libc::ioctl(fd, 0x8008_1272 as libc::c_ulong, &mut dev_size)
                 };
                 if rc != 0 {
                     return Err(DeviceError::Io(std::io::Error::last_os_error()));
@@ -394,20 +394,20 @@ impl DirectDevice {
                 // Safety: fd is a valid open block device; the output
                 // variables are correctly sized for the respective ioctls.
                 let rc = unsafe {
-                    libc::ioctl(fd, 0x4008_6419_u64, &mut block_count)
+                    libc::ioctl(fd, 0x4008_6419 as libc::c_ulong, &mut block_count)
                 };
                 if rc != 0 {
                     return Err(DeviceError::Io(std::io::Error::last_os_error()));
                 }
                 let rc = unsafe {
-                    libc::ioctl(fd, 0x4004_6418_u64, &mut block_size)
+                    libc::ioctl(fd, 0x4004_6418 as libc::c_ulong, &mut block_size)
                 };
                 if rc != 0 {
                     return Err(DeviceError::Io(std::io::Error::last_os_error()));
                 }
                 block_count * u64::from(block_size)
             }
-            #[cfg(not(any(target_os = "linux", target_os = "macos", not(unix))))]
+            #[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
             {
                 return Err(DeviceError::Io(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
