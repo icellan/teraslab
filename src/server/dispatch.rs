@@ -51,13 +51,29 @@ struct PerAddrSlot {
 static REPL_POOL: LazyLock<Mutex<HashMap<SocketAddr, std::sync::Arc<Mutex<PerAddrSlot>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Shared tokio runtime for async replication I/O. Uses a small thread pool
-/// (2 workers) dedicated to replication, keeping blocking I/O off the main
-/// server threads while reusing threads across replication calls instead of
-/// spawning new OS threads per `replicate_all_ops` invocation.
+/// Configurable worker thread count for the replication runtime.
+/// Set via [`init_repl_worker_threads`] before the runtime is first used.
+/// Defaults to 2 if not explicitly configured.
+static REPL_WORKER_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Configure the number of replication I/O worker threads.
+///
+/// Must be called during server startup before any replication occurs.
+/// If not called, defaults to 2 threads. At high throughput (10M+ ops/sec),
+/// consider setting this to `num_cpus / 4` or the replication factor,
+/// whichever is larger.
+pub fn init_repl_worker_threads(count: usize) {
+    let _ = REPL_WORKER_THREADS.set(count.max(1));
+}
+
+/// Shared tokio runtime for async replication I/O. Uses a configurable thread
+/// pool dedicated to replication, keeping blocking I/O off the main server
+/// threads while reusing threads across replication calls instead of spawning
+/// new OS threads per `replicate_all_ops` invocation.
 static REPL_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    let workers = REPL_WORKER_THREADS.get().copied().unwrap_or(2);
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(workers)
         .thread_name("repl-io")
         .enable_all()
         .build()
@@ -569,6 +585,27 @@ fn replicate_all_ops(
 /// This ensures the local node doesn't diverge from replicas: the client
 /// receives an error, and the local state is rolled back as if the write
 /// never happened.
+///
+/// # Crash safety: the double-fault gap
+///
+/// If the master crashes between the original redo write (durable) and
+/// this compensation function completing, crash recovery will replay the
+/// original mutation without compensation. The write becomes durable on
+/// the master even though no replica received it and the client got no
+/// response.
+///
+/// This is acceptable because:
+/// 1. The client received no response (connection dropped), so it
+///    doesn't know whether the write succeeded — it must handle
+///    ambiguity regardless.
+/// 2. Replica catch-up streaming will propagate the write to replicas
+///    once they reconnect, restoring the replication invariant.
+/// 3. Actual data loss requires a second fault: the master's disk
+///    failing before catch-up completes (double-fault scenario).
+///
+/// The alternative (writing a "pending replication" marker in the redo
+/// entry and checking it on recovery) would add per-write overhead to
+/// the hot path for a scenario that requires two independent failures.
 fn compensate_replication_failure(
     engine: &Engine,
     repl_ops: &[(TxKey, Vec<ReplicaOp>)],
