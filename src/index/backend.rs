@@ -572,6 +572,7 @@ mod tests {
             redb_dah_path: dir.join("dah.redb"),
             redb_unmined_path: dir.join("unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
+            ..IndexConfig::default()
         }
     }
 
@@ -747,6 +748,7 @@ mod tests {
             redb_dah_path: dir.path().join("dah.redb"),
             redb_unmined_path: dir.path().join("unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
+            ..IndexConfig::default()
         };
         let result = PrimaryBackend::restore_redb(&config);
         assert!(result.is_err());

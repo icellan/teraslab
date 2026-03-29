@@ -224,6 +224,7 @@ mod tests {
             redb_dah_path: dir.path().join("dah.redb"),
             redb_unmined_path: dir.path().join("unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
+            ..IndexConfig::default()
         };
         let (restored_primary, restored_dah, restored_unmined, import_stats) =
             import_index(&config, &snap_path).unwrap();
@@ -270,6 +271,7 @@ mod tests {
             redb_dah_path: dir.path().join("dah.redb"),
             redb_unmined_path: dir.path().join("unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
+            ..IndexConfig::default()
         };
         let mut primary = PrimaryBackend::new_on_disk(&config).unwrap();
         for i in 0..10u64 {
@@ -300,6 +302,7 @@ mod tests {
             redb_dah_path: dir.path().join("src_dah.redb"),
             redb_unmined_path: dir.path().join("src_unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
+            ..IndexConfig::default()
         };
 
         let mut primary = PrimaryBackend::new_on_disk(&src_config).unwrap();
@@ -338,6 +341,7 @@ mod tests {
             redb_dah_path: dir.path().join("dst_dah.redb"),
             redb_unmined_path: dir.path().join("dst_unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
+            ..IndexConfig::default()
         };
         let (restored_primary, restored_dah, restored_unmined, import_stats) =
             import_index(&dst_config, &snap_path).unwrap();

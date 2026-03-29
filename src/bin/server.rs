@@ -132,7 +132,11 @@ fn main() {
     };
 
     // 3. Load or rebuild index (backend selected by config)
-    eprintln!("  index backend: {}", if config.index.is_redb() { "redb" } else { "memory" });
+    eprintln!("  index backend: {}", match &config.index.backend {
+        IndexBackendMode::Memory => "memory",
+        IndexBackendMode::Redb => "redb",
+        IndexBackendMode::FileBacked => "file_backed",
+    });
 
     let (mut index, dah_index, unmined_index): (PrimaryBackend, DahBackend, UnminedBackend) =
         if config.index.backend == IndexBackendMode::Redb {
@@ -201,6 +205,46 @@ fn main() {
                 }
             };
             (primary, dah, unmined)
+        } else if config.index.backend == IndexBackendMode::FileBacked {
+            // File-backed mmap backend
+            let fb_path = &config.index.file_backed_path;
+            let primary = if fb_path.exists() {
+                match PrimaryBackend::restore_file_backed(fb_path, 1024) {
+                    Ok(idx) => {
+                        eprintln!("  file-backed index opened ({} entries)", idx.len());
+                        idx
+                    }
+                    Err(e) => {
+                        eprintln!("  file-backed index corrupt ({e}), rebuilding from device...");
+                        match PrimaryBackend::rebuild_file_backed(fb_path, &*device, &allocator) {
+                            Ok(idx) => idx,
+                            Err(e2) => {
+                                eprintln!("  file-backed rebuild failed: {e2}, removing stale file and creating empty");
+                                let _ = std::fs::remove_file(fb_path);
+                                PrimaryBackend::new_file_backed(fb_path, 1024).unwrap()
+                            }
+                        }
+                    }
+                }
+            } else {
+                eprintln!("  no file-backed index found, rebuilding from device...");
+                match PrimaryBackend::rebuild_file_backed(fb_path, &*device, &allocator) {
+                    Ok(idx) => idx,
+                    Err(e) => {
+                        eprintln!("  file-backed rebuild failed: {e}, creating empty");
+                        PrimaryBackend::new_file_backed(fb_path, 1024).unwrap()
+                    }
+                }
+            };
+            // File-backed mode: secondary indexes stay in-memory
+            let (dah, unmined) = match PrimaryBackend::rebuild_secondary(&*device, &allocator) {
+                Ok((d, u)) => (d, u),
+                Err(e) => {
+                    eprintln!("  secondary index rebuild failed: {e}, starting empty");
+                    (DahIndex::new(), UnminedIndex::new())
+                }
+            };
+            (primary, DahBackend::from(dah), UnminedBackend::from(unmined))
         } else {
             // In-memory backend (default)
             let snap_path = &config.index_snapshot_path;

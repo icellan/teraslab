@@ -15,6 +15,8 @@ pub enum IndexBackendMode {
     Memory,
     /// On-disk B+ tree via redb (low-RAM deployments).
     Redb,
+    /// File-backed mmap (persistent, relies on redo log for crash recovery).
+    FileBacked,
 }
 
 impl<'de> Deserialize<'de> for IndexBackendMode {
@@ -26,8 +28,9 @@ impl<'de> Deserialize<'de> for IndexBackendMode {
         match s.as_str() {
             "memory" | "" => Ok(Self::Memory),
             "redb" => Ok(Self::Redb),
+            "file_backed" => Ok(Self::FileBacked),
             other => Err(serde::de::Error::custom(format!(
-                "unknown index backend: {other:?} (expected \"memory\" or \"redb\")"
+                "unknown index backend: {other:?} (expected \"memory\", \"redb\", or \"file_backed\")"
             ))),
         }
     }
@@ -39,6 +42,9 @@ impl<'de> Deserialize<'de> for IndexBackendMode {
 /// When `backend` is `"memory"` (default), the existing in-memory Robin Hood
 /// hash table is used. When `"redb"`, a crash-durable B+ tree backed by redb
 /// is used instead, trading throughput for dramatically lower RAM requirements.
+/// When `"file_backed"`, a memory-mapped file is used for the primary index
+/// (persistent across restarts, relying on the redo log for crash recovery);
+/// secondary indexes remain in-memory.
 ///
 /// The redb backend uses three separate database files: one for the primary
 /// index (`redb_path`), one for the DAH secondary index (`redb_dah_path`),
@@ -57,7 +63,7 @@ impl<'de> Deserialize<'de> for IndexBackendMode {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct IndexConfig {
-    /// Backend mode: `"memory"` (default) or `"redb"`.
+    /// Backend mode: `"memory"` (default), `"redb"`, or `"file_backed"`.
     pub backend: IndexBackendMode,
 
     /// Path for the redb primary index database file.
@@ -75,6 +81,10 @@ pub struct IndexConfig {
     /// redb page cache size in bytes. Default: 256 MiB.
     /// Only applies to the redb backend.
     pub redb_cache_size: usize,
+
+    /// Path for the file-backed mmap primary index.
+    /// Only used when `backend = "file_backed"`.
+    pub file_backed_path: PathBuf,
 }
 
 impl Default for IndexConfig {
@@ -85,6 +95,7 @@ impl Default for IndexConfig {
             redb_dah_path: PathBuf::from("teraslab-dah.redb"),
             redb_unmined_path: PathBuf::from("teraslab-unmined.redb"),
             redb_cache_size: 256 * 1024 * 1024, // 256 MiB
+            file_backed_path: PathBuf::from("teraslab-index.dat"),
         }
     }
 }
@@ -98,6 +109,11 @@ impl IndexConfig {
     /// Whether the redb on-disk backend is selected.
     pub fn is_redb(&self) -> bool {
         self.backend == IndexBackendMode::Redb
+    }
+
+    /// Whether the file-backed mmap backend is selected.
+    pub fn is_file_backed(&self) -> bool {
+        self.backend == IndexBackendMode::FileBacked
     }
 }
 
@@ -457,5 +473,24 @@ backend = ""
 "#;
         let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.index.is_memory());
+    }
+
+    #[test]
+    fn file_backed_config() {
+        let cfg = IndexConfig {
+            backend: IndexBackendMode::FileBacked,
+            ..IndexConfig::default()
+        };
+        assert!(cfg.is_file_backed());
+        assert!(!cfg.is_memory());
+        assert!(!cfg.is_redb());
+        assert_eq!(cfg.file_backed_path, PathBuf::from("teraslab-index.dat"));
+    }
+
+    #[test]
+    fn deserialize_file_backed_backend() {
+        let toml_str = r#"backend = "file_backed""#;
+        let cfg: IndexConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.backend, IndexBackendMode::FileBacked);
     }
 }
