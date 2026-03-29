@@ -134,9 +134,9 @@ fn e2e_concurrent_10_threads_zero_mismatches() {
         engine.create(&CreateRequest {
             tx_id, tx_version: 1, locktime: 0, fee: 500, size_in_bytes: 250,
             extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes, inputs: None, outputs: None, inpoints: None,
+            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
             is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
         }).unwrap();
     }
 
@@ -260,9 +260,9 @@ fn realistic_block_reorg() {
         engine.create(&CreateRequest {
             tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
             size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes, inputs: None, outputs: None, inpoints: None,
+            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
             is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
         }).unwrap();
     }
 
@@ -334,12 +334,14 @@ fn realistic_large_transaction() {
 
     let tx_id = make_tx_id(1);
     let utxo_hashes: Vec<[u8; 32]> = (0..utxo_count).map(|v| make_utxo_hash(1, v)).collect();
+    let inputs_data = vec![0xDE; 5000];
+    let outputs_data = vec![0xBE; 5000];
     engine.create(&CreateRequest {
         tx_id, tx_version: 1, locktime: 0, fee: 500, size_in_bytes: 100_000,
-        extended_size: 0, is_coinbase: false, spending_height: 0, utxo_hashes,
-        inputs: Some(vec![0xDE; 5000]), outputs: Some(vec![0xBE; 5000]),
+        extended_size: 0, is_coinbase: false, spending_height: 0, utxo_hashes: &utxo_hashes,
+        inputs: Some(&inputs_data), outputs: Some(&outputs_data),
         inpoints: None, is_external: false, created_at: 1710000000000, block_height: 1000,
-        mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+        mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
     }).unwrap();
     let key = TxKey { txid: tx_id };
 
@@ -374,24 +376,28 @@ fn tiered_storage_mixed_workload() {
 
     for i in 0..small_count {
         let utxo_hashes: Vec<[u8; 32]> = (0..5u32).map(|v| make_utxo_hash(i, v)).collect();
+        let inp = vec![0xAA; 100];
+        let outp = vec![0xBB; 100];
         engine.create(&CreateRequest {
             tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
             size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes, inputs: Some(vec![0xAA; 100]), outputs: Some(vec![0xBB; 100]),
+            utxo_hashes: &utxo_hashes, inputs: Some(&inp), outputs: Some(&outp),
             inpoints: None, is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
         }).unwrap();
     }
     let offset = small_count;
     for i in 0..medium_count {
         let idx = offset + i;
         let utxo_hashes: Vec<[u8; 32]> = (0..50u32).map(|v| make_utxo_hash(idx, v)).collect();
+        let inp = vec![0xCC; 2000];
+        let outp = vec![0xDD; 2000];
         engine.create(&CreateRequest {
             tx_id: make_tx_id(idx), tx_version: 1, locktime: 0, fee: 5000,
             size_in_bytes: 10_000, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes, inputs: Some(vec![0xCC; 2000]), outputs: Some(vec![0xDD; 2000]),
+            utxo_hashes: &utxo_hashes, inputs: Some(&inp), outputs: Some(&outp),
             inpoints: None, is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
         }).unwrap();
     }
 
@@ -430,14 +436,18 @@ fn tiered_storage_mixed_workload() {
 fn tiered_storage_cold_data_read() {
     let engine = create_engine();
     let tx_id = make_tx_id(1);
+    let utxo_hashes = [make_utxo_hash(1, 0)];
+    let inputs_data = vec![0xDE; 4096];
+    let outputs_data = vec![0xBE; 4096];
+    let inpoints_data = vec![0xFE; 2048];
     engine.create(&CreateRequest {
         tx_id, tx_version: 1, locktime: 0, fee: 500, size_in_bytes: 10000,
         extended_size: 0, is_coinbase: false, spending_height: 0,
-        utxo_hashes: vec![make_utxo_hash(1, 0)],
-        inputs: Some(vec![0xDE; 4096]), outputs: Some(vec![0xBE; 4096]),
-        inpoints: Some(vec![0xFE; 2048]), is_external: false,
+        utxo_hashes: &utxo_hashes,
+        inputs: Some(&inputs_data), outputs: Some(&outputs_data),
+        inpoints: Some(&inpoints_data), is_external: false,
         created_at: 1710000000000, block_height: 1000,
-        mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+        mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
     }).unwrap();
     let key = TxKey { txid: tx_id };
 
@@ -566,9 +576,9 @@ fn stability_device_fill_and_churn() {
         match engine.create(&CreateRequest {
             tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
             size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes, inputs: None, outputs: None, inpoints: None,
+            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
             is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
         }) {
             Ok(_) => { keys.push(TxKey { txid: make_tx_id(i) }); created += 1; }
             Err(_) => break,
@@ -587,9 +597,9 @@ fn stability_device_fill_and_churn() {
         match engine.create(&CreateRequest {
             tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
             size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes, inputs: None, outputs: None, inpoints: None,
+            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
             is_external: false, created_at: 1710000000000, block_height: 2000,
-            mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
         }) {
             Ok(_) => new_created += 1,
             Err(_) => break,
@@ -613,9 +623,9 @@ fn perf_spend_throughput() {
         engine.create(&CreateRequest {
             tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
             size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes, inputs: None, outputs: None, inpoints: None,
+            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
             is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
         }).unwrap();
     }
 
@@ -650,9 +660,9 @@ fn perf_create_throughput() {
         engine.create(&CreateRequest {
             tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
             size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes, inputs: None, outputs: None, inpoints: None,
+            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
             is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
         }).unwrap();
     }
     let elapsed = start.elapsed();
@@ -669,9 +679,9 @@ fn perf_set_mined_throughput() {
         engine.create(&CreateRequest {
             tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
             size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes, inputs: None, outputs: None, inpoints: None,
+            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
             is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
         }).unwrap();
     }
     let start = std::time::Instant::now();
@@ -696,9 +706,9 @@ fn perf_spend_multi_throughput() {
         engine.create(&CreateRequest {
             tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
             size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes, inputs: None, outputs: None, inpoints: None,
+            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
             is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
         }).unwrap();
     }
     let start = std::time::Instant::now();
@@ -729,9 +739,9 @@ fn perf_memory_per_record() {
         engine.create(&CreateRequest {
             tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
             size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes, inputs: None, outputs: None, inpoints: None,
+            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
             is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
         }).unwrap();
     }
 
@@ -758,9 +768,9 @@ fn perf_read_throughput() {
         engine.create(&CreateRequest {
             tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
             size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes, inputs: None, outputs: None, inpoints: None,
+            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
             is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
         }).unwrap();
     }
     let start = std::time::Instant::now();
@@ -792,9 +802,9 @@ fn perf_concurrent_spend_throughput() {
             engine.create(&CreateRequest {
                 tx_id, tx_version: 1, locktime: 0, fee: 500,
                 size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-                utxo_hashes, inputs: None, outputs: None, inpoints: None,
+                utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
                 is_external: false, created_at: 1710000000000, block_height: 1000,
-                mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+                mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
             }).unwrap();
         }
 

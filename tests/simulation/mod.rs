@@ -292,18 +292,18 @@ impl Simulation {
                             extended_size: 0,
                             is_coinbase: false,
                             spending_height: 0,
-                            utxo_hashes: hashes.clone(),
+                            utxo_hashes: &hashes,
                             inputs: None,
                             outputs: None,
                             inpoints: None,
                             is_external: false,
                             created_at: self.clock.now_ms(),
                             block_height: current_block_height,
-                            mined_block_infos: vec![],
+                            mined_block_infos: &[],
                             frozen: false,
                             conflicting: false,
                             locked: false,
-                            parent_txids: vec![],
+                            parent_txids: &[],
                         };
                         if engine.create(&req).is_ok() {
                             reference.insert(*txid, (*utxo_count, 0, hashes));
@@ -348,18 +348,18 @@ impl Simulation {
                     extended_size: 0,
                     is_coinbase: false,
                     spending_height: 0,
-                    utxo_hashes: utxo_hashes.clone(),
+                    utxo_hashes: &utxo_hashes,
                     inputs: None,
                     outputs: None,
                     inpoints: None,
                     is_external: false,
                     created_at: self.clock.now_ms(),
                     block_height: current_block_height,
-                    mined_block_infos: vec![],
+                    mined_block_infos: &[],
                     frozen: false,
                     conflicting: false,
                     locked: false,
-                    parent_txids: vec![],
+                    parent_txids: &[],
                 };
 
                 if engine.create(&req).is_ok() {

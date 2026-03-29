@@ -70,18 +70,18 @@ fn create_tx(engine: &Engine, n: u32, utxo_count: usize) -> TxKey {
         extended_size: 0,
         is_coinbase: false,
         spending_height: 0,
-        utxo_hashes,
+        utxo_hashes: &utxo_hashes,
         inputs: None,
         outputs: None,
         inpoints: None,
         is_external: false,
         created_at: 1710000000000,
         block_height: 1000,
-        mined_block_infos: vec![],
+        mined_block_infos: &[],
         frozen: false,
         conflicting: false,
         locked: false,
-        parent_txids: vec![],
+        parent_txids: &[],
     };
     engine.create(&req).unwrap();
     TxKey { txid: tx_id }
@@ -468,15 +468,17 @@ fn locked_cleared_by_set_mined() {
 #[test]
 fn preserve_until_blocks_pruning() {
     let engine = create_engine();
+    let utxo_hashes = [make_utxo_hash(1, 0), make_utxo_hash(1, 1)];
+    let mined_infos = [MinedBlockInfo { block_id: 1, block_height: 900, subtree_idx: 0 }];
     let req = CreateRequest {
         tx_id: make_tx_id(1),
         tx_version: 1, locktime: 0, fee: 500, size_in_bytes: 250,
         extended_size: 0, is_coinbase: false, spending_height: 0,
-        utxo_hashes: vec![make_utxo_hash(1, 0), make_utxo_hash(1, 1)],
+        utxo_hashes: &utxo_hashes,
         inputs: None, outputs: None, inpoints: None, is_external: false,
         created_at: 1710000000000, block_height: 1000,
-        mined_block_infos: vec![MinedBlockInfo { block_id: 1, block_height: 900, subtree_idx: 0 }],
-        frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+        mined_block_infos: &mined_infos,
+        frozen: false, conflicting: false, locked: false, parent_txids: &[],
     };
     let key = TxKey { txid: req.tx_id };
     engine.create(&req).unwrap();
@@ -622,15 +624,17 @@ fn spend_multi_partial_errors() {
 fn dah_set_and_cleared() {
     let engine = create_engine();
 
+    let utxo_hashes = [make_utxo_hash(1, 0), make_utxo_hash(1, 1)];
+    let mined_infos = [MinedBlockInfo { block_id: 1, block_height: 900, subtree_idx: 0 }];
     let req = CreateRequest {
         tx_id: make_tx_id(1),
         tx_version: 1, locktime: 0, fee: 500, size_in_bytes: 250,
         extended_size: 0, is_coinbase: false, spending_height: 0,
-        utxo_hashes: vec![make_utxo_hash(1, 0), make_utxo_hash(1, 1)],
+        utxo_hashes: &utxo_hashes,
         inputs: None, outputs: None, inpoints: None, is_external: false,
         created_at: 1710000000000, block_height: 1000,
-        mined_block_infos: vec![MinedBlockInfo { block_id: 1, block_height: 900, subtree_idx: 0 }],
-        frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+        mined_block_infos: &mined_infos,
+        frozen: false, conflicting: false, locked: false, parent_txids: &[],
     };
     let key = TxKey { txid: req.tx_id };
     engine.create(&req).unwrap();
@@ -682,15 +686,17 @@ fn coinbase_maturity() {
     let engine = create_engine();
 
     let tx_id = make_tx_id(1);
+    let utxo_hashes = [make_utxo_hash(1, 0)];
+    let mined_infos = [MinedBlockInfo { block_id: 1, block_height: 1000, subtree_idx: 0 }];
     let req = CreateRequest {
         tx_id,
         tx_version: 1, locktime: 0, fee: 0, size_in_bytes: 100,
         extended_size: 0, is_coinbase: true, spending_height: 1100,
-        utxo_hashes: vec![make_utxo_hash(1, 0)],
+        utxo_hashes: &utxo_hashes,
         inputs: None, outputs: None, inpoints: None, is_external: false,
         created_at: 1710000000000, block_height: 1000,
-        mined_block_infos: vec![MinedBlockInfo { block_id: 1, block_height: 1000, subtree_idx: 0 }],
-        frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+        mined_block_infos: &mined_infos,
+        frozen: false, conflicting: false, locked: false, parent_txids: &[],
     };
     let key = TxKey { txid: tx_id };
     engine.create(&req).unwrap();
@@ -736,16 +742,19 @@ fn cold_data_survives_mutations() {
     let engine = create_engine();
 
     let tx_id = make_tx_id(1);
+    let utxo_hashes = [make_utxo_hash(1, 0), make_utxo_hash(1, 1)];
+    let inputs = [0xDE, 0xAD];
+    let outputs = [0xBE, 0xEF];
     let req = CreateRequest {
         tx_id,
         tx_version: 1, locktime: 0, fee: 500, size_in_bytes: 250,
         extended_size: 0, is_coinbase: false, spending_height: 0,
-        utxo_hashes: vec![make_utxo_hash(1, 0), make_utxo_hash(1, 1)],
-        inputs: Some(vec![0xDE, 0xAD]),
-        outputs: Some(vec![0xBE, 0xEF]),
+        utxo_hashes: &utxo_hashes,
+        inputs: Some(&inputs),
+        outputs: Some(&outputs),
         inpoints: None, is_external: false,
         created_at: 1710000000000, block_height: 1000,
-        mined_block_infos: vec![], frozen: false, conflicting: false, locked: false, parent_txids: vec![],
+        mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
     };
     let key = TxKey { txid: tx_id };
     engine.create(&req).unwrap();

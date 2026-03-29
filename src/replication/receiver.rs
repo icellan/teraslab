@@ -619,18 +619,18 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 extended_size,
                 is_coinbase,
                 spending_height,
-                utxo_hashes: utxo_hashes.clone(),
+                utxo_hashes,
                 inputs: None,
                 outputs: None,
                 inpoints: None,
                 is_external: *is_external,
                 created_at,
                 block_height,
-                mined_block_infos,
+                mined_block_infos: &mined_block_infos,
                 frozen,
                 conflicting,
                 locked,
-                parent_txids,
+                parent_txids: &parent_txids,
             };
             match engine.create(&create_req) {
                 Ok(_) | Err(CreateError::DuplicateTxId) => {
@@ -769,18 +769,18 @@ mod tests {
             extended_size: 0,
             is_coinbase: false,
             spending_height: 0,
-            utxo_hashes: hashes,
+            utxo_hashes: &hashes,
             inputs: None,
             outputs: None,
             inpoints: None,
             is_external: false,
             created_at: 0,
             block_height: 0,
-            mined_block_infos: vec![],
+            mined_block_infos: &[],
             frozen: false,
             conflicting: false,
             locked: false,
-            parent_txids: vec![],
+            parent_txids: &[],
         };
         engine.create(&req).unwrap();
     }

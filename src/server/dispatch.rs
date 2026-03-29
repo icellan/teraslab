@@ -17,7 +17,6 @@ use crate::record::{METADATA_SIZE, TxFlags};
 use crate::ops::error::SpendError;
 use crate::ops::mark_longest_chain::*;
 use crate::ops::remaining::*;
-use crate::ops::set_mined::*;
 use crate::ops::spend::*;
 use crate::ops::unspend::*;
 use crate::protocol::codec::*;
@@ -136,6 +135,10 @@ pub(crate) fn handle_request(
     {
         return err_resp;
     }
+
+    // Refresh the cached wall-clock time once per request so that all
+    // individual operations within the batch share the same timestamp.
+    engine.refresh_clock();
 
     // Increment operation counters (best-effort — no-op if metrics not initialized).
     if let Some(m) = DISPATCH_METRICS.get() {
@@ -1278,19 +1281,22 @@ fn handle_set_mined_batch(
         Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
     };
 
-    // Phase 3: Apply engine mutations and build repl ops from engine results.
+    // Phase 3: Apply engine mutations via batch API (params passed once by reference).
+    let engine_params = crate::ops::set_mined::SetMinedSharedParams {
+        block_id: params.block_id,
+        block_height: params.block_height,
+        subtree_idx: params.subtree_idx,
+        current_block_height: params.current_block_height,
+        block_height_retention: params.block_height_retention,
+        on_longest_chain: params.on_longest_chain,
+        unset_mined: params.unset_mined,
+    };
+    let keys: Vec<TxKey> = valid_items.iter().map(|v| v.key).collect();
+    let results = engine.set_mined_batch(&engine_params, &keys);
+
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
-    for v in &valid_items {
-        match engine.set_mined(&SetMinedRequest {
-            tx_key: v.key,
-            block_id: params.block_id,
-            block_height: params.block_height,
-            subtree_idx: params.subtree_idx,
-            current_block_height: params.current_block_height,
-            block_height_retention: params.block_height_retention,
-            on_longest_chain: params.on_longest_chain,
-            unset_mined: params.unset_mined,
-        }) {
+    for (v, result) in valid_items.iter().zip(results) {
+        match result {
             Ok(resp) => {
                 let mgen = resp.generation;
                 if params.unset_mined {
@@ -1332,7 +1338,7 @@ fn handle_set_mined_batch(
 /// Parse the wire cold_data blob into separate inputs/outputs/inpoints fields.
 /// Wire format: [inputs_len:4 LE][inputs][outputs_len:4 LE][outputs][inpoints_len:4 LE][inpoints]
 #[allow(clippy::type_complexity)]
-fn parse_cold_data_fields(cold_data: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) {
+fn parse_cold_data_fields(cold_data: &[u8]) -> (Option<&[u8]>, Option<&[u8]>, Option<&[u8]>) {
     if cold_data.len() < 12 {
         return (None, None, None);
     }
@@ -1341,27 +1347,29 @@ fn parse_cold_data_fields(cold_data: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>
     let il = u32::from_le_bytes(cold_data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
     if pos + il > cold_data.len() { return (None, None, None); }
-    let inputs = cold_data[pos..pos + il].to_vec();
+    let inputs = &cold_data[pos..pos + il];
     pos += il;
 
-    if pos + 4 > cold_data.len() { return (Some(inputs).filter(|v| !v.is_empty()), None, None); }
+    let inputs_opt = if inputs.is_empty() { None } else { Some(inputs) };
+
+    if pos + 4 > cold_data.len() { return (inputs_opt, None, None); }
     let ol = u32::from_le_bytes(cold_data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
-    if pos + ol > cold_data.len() { return (Some(inputs).filter(|v| !v.is_empty()), None, None); }
-    let outputs = cold_data[pos..pos + ol].to_vec();
+    if pos + ol > cold_data.len() { return (inputs_opt, None, None); }
+    let outputs = &cold_data[pos..pos + ol];
     pos += ol;
 
-    if pos + 4 > cold_data.len() { return (Some(inputs).filter(|v| !v.is_empty()), Some(outputs).filter(|v| !v.is_empty()), None); }
+    let outputs_opt = if outputs.is_empty() { None } else { Some(outputs) };
+
+    if pos + 4 > cold_data.len() { return (inputs_opt, outputs_opt, None); }
     let pl = u32::from_le_bytes(cold_data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
-    if pos + pl > cold_data.len() { return (Some(inputs).filter(|v| !v.is_empty()), Some(outputs).filter(|v| !v.is_empty()), None); }
-    let inpoints = cold_data[pos..pos + pl].to_vec();
+    if pos + pl > cold_data.len() { return (inputs_opt, outputs_opt, None); }
+    let inpoints = &cold_data[pos..pos + pl];
 
-    (
-        Some(inputs).filter(|v| !v.is_empty()),
-        Some(outputs).filter(|v| !v.is_empty()),
-        Some(inpoints).filter(|v| !v.is_empty()),
-    )
+    let inpoints_opt = if inpoints.is_empty() { None } else { Some(inpoints) };
+
+    (inputs_opt, outputs_opt, inpoints_opt)
 }
 
 fn handle_create_batch(
@@ -1383,10 +1391,26 @@ fn handle_create_batch(
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
+    // Pre-compute mined_block_infos for each item so CreateRequest can borrow them.
+    let mined_infos: Vec<Vec<crate::ops::create::MinedBlockInfo>> = items
+        .iter()
+        .map(|item| {
+            if let Some(block_id) = item.mined_block_id {
+                vec![crate::ops::create::MinedBlockInfo {
+                    block_id,
+                    block_height: item.mined_block_height.unwrap_or(0),
+                    subtree_idx: item.mined_subtree_idx.unwrap_or(0),
+                }]
+            } else {
+                vec![]
+            }
+        })
+        .collect();
+
     // Phase 1: Validate ownership, check blobs, pre-allocate space, build redo ops.
-    struct ValidCreate {
+    struct ValidCreate<'a> {
         idx: usize,
-        create_req: CreateRequest,
+        create_req: CreateRequest<'a>,
         record_offset: u64,
     }
     let mut valid_items: Vec<ValidCreate> = Vec::new();
@@ -1423,16 +1447,6 @@ fn handle_create_batch(
             }
         }
 
-        let mined_block_infos = if let Some(block_id) = item.mined_block_id {
-            vec![crate::ops::create::MinedBlockInfo {
-                block_id,
-                block_height: item.mined_block_height.unwrap_or(0),
-                subtree_idx: item.mined_subtree_idx.unwrap_or(0),
-            }]
-        } else {
-            vec![]
-        };
-
         let (inputs, outputs, inpoints) = if is_ext {
             (None, None, None)
         } else {
@@ -1448,18 +1462,18 @@ fn handle_create_batch(
             extended_size: item.extended_size,
             is_coinbase: item.is_coinbase,
             spending_height: item.spending_height,
-            utxo_hashes: item.utxo_hashes.clone(),
+            utxo_hashes: &item.utxo_hashes,
             inputs,
             outputs,
             inpoints,
             is_external: is_ext,
             created_at: item.created_at,
             block_height: item.block_height,
-            mined_block_infos,
+            mined_block_infos: &mined_infos[i],
             frozen: item.flags & 0x04 != 0,
             conflicting: item.flags & 0x02 != 0,
             locked: item.flags & 0x01 != 0,
-            parent_txids: item.parent_txids.clone(),
+            parent_txids: &item.parent_txids,
         };
 
         // Pre-allocate space to get record_offset for the redo entry.
@@ -1502,7 +1516,7 @@ fn handle_create_batch(
                     0u64
                 } else {
                     build_cold_data(
-                        &v.create_req.inputs, &v.create_req.outputs, &v.create_req.inpoints,
+                        v.create_req.inputs, v.create_req.outputs, v.create_req.inpoints,
                     ).len() as u64
                 };
                 let _ = engine.allocator().lock().free(v.record_offset, base_size + cold_len);
@@ -1547,7 +1561,7 @@ fn handle_create_batch(
                 meta_buf.extend_from_slice(&r_pu.to_le_bytes());
                 // Extended: block_height + mined_block_infos + parent_txids
                 meta_buf.extend_from_slice(&item.block_height.to_le_bytes());
-                let block_infos = &v.create_req.mined_block_infos;
+                let block_infos = v.create_req.mined_block_infos;
                 meta_buf.push(block_infos.len() as u8);
                 for info in block_infos {
                     meta_buf.extend_from_slice(&info.block_id.to_le_bytes());

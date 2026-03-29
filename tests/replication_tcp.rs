@@ -107,18 +107,18 @@ fn create_record_on_engine(engine: &Engine, txid: [u8; 32], utxo_count: u32) {
         extended_size: 0,
         is_coinbase: false,
         spending_height: 0,
-        utxo_hashes: hashes,
+        utxo_hashes: &hashes,
         inputs: None,
         outputs: None,
         inpoints: None,
         is_external: false,
         created_at: 0,
         block_height: 0,
-        mined_block_infos: vec![],
+        mined_block_infos: &[],
         frozen: false,
         conflicting: false,
         locked: false,
-        parent_txids: vec![],
+        parent_txids: &[],
     };
     engine.create(&req).unwrap();
 }

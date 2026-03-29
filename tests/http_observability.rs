@@ -234,6 +234,7 @@ fn debug_records_returns_json_for_existing_record() {
         t[0] = 0xAB; t[1] = 0xCD;
         t
     };
+    let utxo_hashes = [[1u8; 32]];
     let req = CreateRequest {
         tx_id: txid,
         tx_version: 2,
@@ -243,18 +244,18 @@ fn debug_records_returns_json_for_existing_record() {
         extended_size: 0,
         is_coinbase: false,
         spending_height: 0,
-        utxo_hashes: vec![[1u8; 32]],
+        utxo_hashes: &utxo_hashes,
         inputs: None,
         outputs: None,
         inpoints: None,
         is_external: false,
         created_at: 1700000000000,
         block_height: 0,
-        mined_block_infos: vec![],
+        mined_block_infos: &[],
         frozen: false,
         conflicting: false,
         locked: false,
-        parent_txids: vec![],
+        parent_txids: &[],
     };
     state.engine.create(&req).unwrap();
 

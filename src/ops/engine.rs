@@ -42,6 +42,12 @@ pub struct Engine {
     /// Per-shard record counts for O(1) migration verification.
     /// Updated atomically on create/delete. Indexed by shard number.
     shard_counts: Vec<std::sync::atomic::AtomicU64>,
+    /// Cached wall-clock time in milliseconds since Unix epoch.
+    ///
+    /// Avoids a `clock_gettime` syscall on every mutation. The dispatch
+    /// layer calls [`refresh_clock`] once per batch; individual operations
+    /// read the cached value via [`Self::now_millis`].
+    cached_millis: std::sync::atomic::AtomicU64,
 }
 
 // Safety: Engine's device_ptr points into an Arc'd device that outlives
@@ -79,7 +85,22 @@ impl Engine {
             unmined_index: parking_lot::Mutex::new(unmined_index.into()),
             blob_store: None,
             shard_counts,
+            cached_millis: std::sync::atomic::AtomicU64::new(sys_millis()),
         }
+    }
+
+    /// Refresh the cached wall-clock time from the system clock.
+    ///
+    /// Call this once per request batch in the dispatch layer so that all
+    /// operations within the batch share the same timestamp without
+    /// issuing individual `clock_gettime` syscalls.
+    pub fn refresh_clock(&self) {
+        self.cached_millis.store(sys_millis(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read the cached wall-clock time (milliseconds since Unix epoch).
+    fn now_millis(&self) -> u64 {
+        self.cached_millis.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Set the blobstore for external cold data storage.
@@ -340,7 +361,7 @@ impl Engine {
 
         // Handle empty spends list
         if req.spends.is_empty() {
-            let block_ids = collect_block_ids(&metadata);
+            let block_ids = collect_block_ids(&metadata).to_vec();
             return Ok(ValidatedSpend {
                 _guard: guard,
                 tx_key: req.tx_key,
@@ -449,7 +470,7 @@ impl Engine {
             }
         }
 
-        let block_ids = collect_block_ids(&metadata);
+        let block_ids = collect_block_ids(&metadata).to_vec();
 
         Ok(ValidatedSpend {
             _guard: guard,
@@ -485,7 +506,7 @@ impl Engine {
             errors,
             spent_count,
             pre_generation: _,
-            block_ids: _,
+            block_ids,
             record_offset,
             mut metadata,
             current_block_height,
@@ -503,7 +524,7 @@ impl Engine {
         let old_dah = { metadata.delete_at_height };
         metadata.spent_utxos = { metadata.spent_utxos }.wrapping_add(spent_count);
         metadata.generation = { metadata.generation }.wrapping_add(1);
-        metadata.updated_at = now_millis();
+        metadata.updated_at = self.now_millis();
 
         // 8. Evaluate deleteAtHeight
         let (signal, dah_patch) = evaluate_delete_at_height(
@@ -537,8 +558,8 @@ impl Engine {
             }
         }
 
-        let block_ids = collect_block_ids(&metadata);
-
+        // Reuse block_ids from validation — block entries don't change
+        // during spend (only spent_utxos, generation, updated_at, DAH).
         SpendMultiResponse {
             signal,
             block_ids,
@@ -548,32 +569,150 @@ impl Engine {
         }
     }
 
-    /// Execute a single spend (convenience wrapper around spend_multi).
+    /// Execute a single spend — zero-allocation fast path.
+    ///
+    /// Inlines the validate-and-apply logic for exactly one UTXO,
+    /// avoiding the `Vec` and `HashMap` allocations that `spend_multi` uses.
     pub fn spend(&self, req: &SpendRequest) -> Result<SpendResponse, SpendError> {
-        let multi_req = SpendMultiRequest {
-            tx_key: req.tx_key,
-            spends: vec![SpendItem {
-                offset: req.offset,
-                utxo_hash: req.utxo_hash,
-                spending_data: req.spending_data,
-                idx: 0,
-            }],
-            ignore_conflicting: req.ignore_conflicting,
-            ignore_locked: req.ignore_locked,
-            current_block_height: req.current_block_height,
-            block_height_retention: req.block_height_retention,
-        };
+        let _guard = self.locks.lock(&req.tx_key);
 
-        let resp = self.spend_multi(&multi_req)?;
+        // 1. Index lookup
+        let entry = self
+            .index
+            .read()
+            .lookup(&req.tx_key)
+            .ok_or(SpendError::TxNotFound)?;
+        let record_offset = entry.record_offset;
 
-        // If there's a per-item error for idx 0, return it
-        if let Some(err) = resp.errors.into_values().next() {
-            return Err(err);
+        // 2. Read metadata
+        let mut metadata = self.read_metadata_fast(record_offset)?;
+
+        // 3. Record-level validation
+        if metadata.flags.contains(TxFlags::CONFLICTING) && !req.ignore_conflicting {
+            return Err(SpendError::Conflicting);
+        }
+        if metadata.flags.contains(TxFlags::LOCKED) && !req.ignore_locked {
+            return Err(SpendError::Locked);
+        }
+        let spending_height = { metadata.spending_height };
+        if metadata.flags.contains(TxFlags::IS_COINBASE)
+            && spending_height > 0
+            && spending_height > req.current_block_height
+        {
+            return Err(SpendError::CoinbaseImmature {
+                spending_height,
+                current_height: req.current_block_height,
+            });
         }
 
+        let utxo_count = { metadata.utxo_count };
+        if req.offset >= utxo_count {
+            return Err(SpendError::UtxoNotFound { offset: req.offset });
+        }
+
+        // 4. Read and validate the UTXO slot
+        let slot = self.read_slot_fast(record_offset, req.offset)?;
+        if slot.hash != req.utxo_hash {
+            return Err(SpendError::UtxoHashMismatch { offset: req.offset });
+        }
+
+        match slot.status {
+            UTXO_UNSPENT => {
+                let spendable_height =
+                    u32::from_le_bytes(slot.spending_data[0..4].try_into().unwrap());
+                if spendable_height != 0
+                    && spendable_height >= req.current_block_height
+                {
+                    return Err(SpendError::FrozenUntil {
+                        offset: req.offset,
+                        spendable_at_height: spendable_height,
+                    });
+                }
+            }
+            UTXO_SPENT => {
+                if slot.spending_data == req.spending_data {
+                    // Idempotent re-spend — increment generation to match
+                    // spend_multi behavior, then return current state.
+                    metadata.generation = { metadata.generation }.wrapping_add(1);
+                    metadata.updated_at = self.now_millis();
+                    if !self.device_ptr.is_null() {
+                        unsafe { io::write_spend_footer_direct(self.device_ptr, record_offset, &metadata) };
+                    } else if let Err(e) = self.write_metadata_fast(record_offset, &metadata) {
+                        eprintln!("engine: write_metadata failed: {e}");
+                    }
+                    self.sync_index_cache(&req.tx_key, &metadata);
+                    let block_ids = collect_block_ids(&metadata).to_vec();
+                    return Ok(SpendResponse {
+                        signal: Signal::None,
+                        block_ids,
+                    });
+                }
+                if slot.spending_data == [FROZEN_BYTE; 36] {
+                    return Err(SpendError::Frozen { offset: req.offset });
+                }
+                return Err(SpendError::AlreadySpent {
+                    offset: req.offset,
+                    spending_data: slot.spending_data,
+                });
+            }
+            UTXO_PRUNED => return Err(SpendError::Pruned { offset: req.offset }),
+            UTXO_FROZEN => return Err(SpendError::Frozen { offset: req.offset }),
+            _ => {
+                return Err(SpendError::StorageError {
+                    detail: format!("unknown status byte: {:#04x}", slot.status),
+                });
+            }
+        }
+
+        // 5. Write the spent slot
+        let new_slot = UtxoSlot::new_spent(req.utxo_hash, req.spending_data);
+        if let Err(e) = self.write_slot_fast(record_offset, req.offset, &new_slot) {
+            eprintln!("engine: write_utxo_slot failed: {e}");
+        }
+
+        // 6. Update metadata
+        let old_dah = { metadata.delete_at_height };
+        metadata.spent_utxos = { metadata.spent_utxos }.wrapping_add(1);
+        metadata.generation = { metadata.generation }.wrapping_add(1);
+        metadata.updated_at = self.now_millis();
+
+        // 7. Evaluate deleteAtHeight
+        let (signal, dah_patch) = evaluate_delete_at_height(
+            &metadata,
+            req.current_block_height,
+            req.block_height_retention,
+        );
+
+        if let Some(ref patch) = dah_patch {
+            apply_dah_patch(&mut metadata, patch);
+        }
+
+        // 8. Write metadata
+        if !self.device_ptr.is_null() {
+            unsafe { io::write_spend_footer_direct(self.device_ptr, record_offset, &metadata) };
+        } else if let Err(e) = self.write_metadata_fast(record_offset, &metadata) {
+            eprintln!("engine: write_metadata failed: {e}");
+        }
+
+        self.sync_index_cache(&req.tx_key, &metadata);
+
+        // 9. Update DAH secondary index
+        let new_dah = { metadata.delete_at_height };
+        if new_dah != old_dah {
+            let mut dah = self.dah_index.lock();
+            if old_dah != 0 {
+                dah.remove(&req.tx_key);
+            }
+            if new_dah != 0 {
+                dah.insert(new_dah, req.tx_key);
+            }
+        }
+
+        let block_ids = collect_block_ids(&metadata).to_vec();
+
         Ok(SpendResponse {
-            signal: resp.signal,
-            block_ids: resp.block_ids,
+            signal,
+            block_ids,
         })
     }
 
@@ -644,7 +783,7 @@ impl Engine {
         // 6. Mutation bookkeeping
         let old_dah = { metadata.delete_at_height };
         metadata.generation = { metadata.generation }.wrapping_add(1);
-        metadata.updated_at = now_millis();
+        metadata.updated_at = self.now_millis();
 
         // 7. Evaluate deleteAtHeight
         let (signal, dah_patch) = evaluate_delete_at_height(
@@ -686,13 +825,34 @@ impl Engine {
     /// Adds or removes a block entry in the metadata. Only modifies the
     /// metadata region — UTXO slots are not touched.
     pub fn set_mined(&self, req: &SetMinedRequest) -> Result<SetMinedResponse, SpendError> {
-        let _guard = self.locks.lock(&req.tx_key);
+        let params = SetMinedSharedParams {
+            block_id: req.block_id,
+            block_height: req.block_height,
+            subtree_idx: req.subtree_idx,
+            current_block_height: req.current_block_height,
+            block_height_retention: req.block_height_retention,
+            on_longest_chain: req.on_longest_chain,
+            unset_mined: req.unset_mined,
+        };
+        self.set_mined_inner(&req.tx_key, &params)
+    }
+
+    /// Core set_mined logic, taking shared params by reference.
+    ///
+    /// Used by both [`set_mined`] (single request) and [`set_mined_batch`]
+    /// (batch with shared params). Acquires the per-transaction stripe lock.
+    fn set_mined_inner(
+        &self,
+        tx_key: &TxKey,
+        req: &SetMinedSharedParams,
+    ) -> Result<SetMinedResponse, SpendError> {
+        let _guard = self.locks.lock(tx_key);
 
         // 1. Index lookup
         let entry = self
             .index
             .read()
-            .lookup(&req.tx_key)
+            .lookup(tx_key)
             .ok_or(SpendError::TxNotFound)?;
         let record_offset = entry.record_offset;
 
@@ -743,7 +903,7 @@ impl Engine {
 
             // Generation is now cached in the index — zero device reads needed.
             let generation = entry.generation.wrapping_add(1);
-            let updated_at = now_millis();
+            let updated_at = self.now_millis();
 
             // Targeted writes — block entry + mined footer fields
             unsafe {
@@ -773,7 +933,7 @@ impl Engine {
                 sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
             }
             self.index.write().update_cached_fields(
-                &req.tx_key,
+                tx_key,
                 sync_tf.bits(),
                 new_count,
                 entry.spent_utxos,
@@ -785,13 +945,13 @@ impl Engine {
             // Update secondary indexes
             if new_dah != old_dah {
                 let mut dah_idx = self.dah_index.lock();
-                if old_dah != 0 { dah_idx.remove(&req.tx_key); }
-                if new_dah != 0 { dah_idx.insert(new_dah, req.tx_key); }
+                if old_dah != 0 { dah_idx.remove(tx_key); }
+                if new_dah != 0 { dah_idx.insert(new_dah, *tx_key); }
             }
             if new_unmined != old_unmined {
                 let mut unmined_idx = self.unmined_index.lock();
-                if old_unmined != 0 { unmined_idx.remove(&req.tx_key); }
-                if new_unmined != 0 { unmined_idx.insert(new_unmined, req.tx_key); }
+                if old_unmined != 0 { unmined_idx.remove(tx_key); }
+                if new_unmined != 0 { unmined_idx.insert(new_unmined, *tx_key); }
             }
 
             return Ok(SetMinedResponse {
@@ -950,7 +1110,7 @@ impl Engine {
 
         // Mutation bookkeeping
         metadata.generation = { metadata.generation }.wrapping_add(1);
-        metadata.updated_at = now_millis();
+        metadata.updated_at = self.now_millis();
 
         // Evaluate deleteAtHeight
         let (signal, dah_patch) = evaluate_delete_at_height(
@@ -964,28 +1124,28 @@ impl Engine {
 
         // Write full metadata (slow path)
         self.write_metadata_fast(record_offset, &metadata)?;
-        self.sync_index_cache(&req.tx_key, &metadata);
+        self.sync_index_cache(tx_key, &metadata);
 
         // Update secondary indexes
         let new_dah = { metadata.delete_at_height };
         if new_dah != old_dah {
             let mut dah = self.dah_index.lock();
-            if old_dah != 0 { dah.remove(&req.tx_key); }
-            if new_dah != 0 { dah.insert(new_dah, req.tx_key); }
+            if old_dah != 0 { dah.remove(tx_key); }
+            if new_dah != 0 { dah.insert(new_dah, *tx_key); }
         }
 
         let new_unmined = { metadata.unmined_since };
         if new_unmined != old_unmined {
             let mut unmined = self.unmined_index.lock();
-            if old_unmined != 0 { unmined.remove(&req.tx_key); }
-            if new_unmined != 0 { unmined.insert(new_unmined, req.tx_key); }
+            if old_unmined != 0 { unmined.remove(tx_key); }
+            if new_unmined != 0 { unmined.insert(new_unmined, *tx_key); }
         }
 
         let block_ids = if (metadata.block_entry_count as usize) <= INLINE_BLOCK_ENTRIES {
-            collect_block_ids(&metadata)
+            collect_block_ids(&metadata).to_vec()
         } else {
             collect_all_block_ids(&*self.device, &metadata)
-                .unwrap_or_else(|_| collect_block_ids(&metadata))
+                .unwrap_or_else(|_| collect_block_ids(&metadata).to_vec())
         };
 
         Ok(SetMinedResponse {
@@ -993,6 +1153,23 @@ impl Engine {
             block_ids,
             generation: { metadata.generation },
         })
+    }
+
+    /// Apply set_mined to a batch of transactions sharing the same params.
+    ///
+    /// This is the dispatch-layer entry point for `OP_SET_MINED_BATCH`.
+    /// Shared parameters are passed once by reference; only the `tx_key`
+    /// varies per item. This avoids copying 28 bytes of params per item.
+    ///
+    /// Returns one `Result` per key, in the same order as `keys`.
+    pub fn set_mined_batch(
+        &self,
+        params: &SetMinedSharedParams,
+        keys: &[TxKey],
+    ) -> Vec<Result<SetMinedResponse, SpendError>> {
+        keys.iter()
+            .map(|key| self.set_mined_inner(key, params))
+            .collect()
     }
 
     /// Mark a transaction as on or off the longest chain.
@@ -1025,7 +1202,7 @@ impl Engine {
 
         // Mutation bookkeeping
         metadata.generation = { metadata.generation }.wrapping_add(1);
-        metadata.updated_at = now_millis();
+        metadata.updated_at = self.now_millis();
 
         // Evaluate deleteAtHeight (longest chain status affects DAH)
         let (signal, dah_patch) = evaluate_delete_at_height(
@@ -1100,7 +1277,7 @@ impl Engine {
             // Write only metadata + UTXO slots; cold_data is read from blobstore on demand.
             vec![]
         } else {
-            build_cold_data(&req.inputs, &req.outputs, &req.inpoints)
+            build_cold_data(req.inputs, req.outputs, req.inpoints)
         };
         let cold_size = cold_data.len();
 
@@ -1212,7 +1389,7 @@ impl Engine {
 
         // Update parent records' conflicting-children lists
         if req.conflicting {
-            for parent_txid in &req.parent_txids {
+            for parent_txid in req.parent_txids {
                 let parent_key = TxKey { txid: *parent_txid };
                 let _ = self.append_conflicting_child(&parent_key, req.tx_id);
             }
@@ -1251,7 +1428,7 @@ impl Engine {
         let cold_data = if req.is_external && req.inputs.is_none() {
             vec![]
         } else {
-            build_cold_data(&req.inputs, &req.outputs, &req.inpoints)
+            build_cold_data(req.inputs, req.outputs, req.inpoints)
         };
         let cold_size = cold_data.len();
 
@@ -1291,7 +1468,7 @@ impl Engine {
         let cold_data = if req.is_external && req.inputs.is_none() {
             vec![]
         } else {
-            build_cold_data(&req.inputs, &req.outputs, &req.inpoints)
+            build_cold_data(req.inputs, req.outputs, req.inpoints)
         };
 
         // Build metadata
@@ -1375,7 +1552,7 @@ impl Engine {
         }
 
         if req.conflicting {
-            for parent_txid in &req.parent_txids {
+            for parent_txid in req.parent_txids {
                 let parent_key = TxKey { txid: *parent_txid };
                 let _ = self.append_conflicting_child(&parent_key, req.tx_id);
             }
@@ -1589,7 +1766,7 @@ impl Engine {
         // Update metadata (generation, updated_at, reassignment_count)
         meta.reassignment_count = meta.reassignment_count.saturating_add(1);
         meta.generation = { meta.generation }.wrapping_add(1);
-        meta.updated_at = now_millis();
+        meta.updated_at = self.now_millis();
         self.write_metadata_fast(ro, &meta)?;
 
         self.sync_index_cache(&req.tx_key, &meta);
@@ -1668,7 +1845,7 @@ impl Engine {
         meta.conflicting_children_count = children.len() as u8;
         meta.conflicting_children_offset = new_offset;
         meta.generation = { meta.generation }.wrapping_add(1);
-        meta.updated_at = now_millis();
+        meta.updated_at = self.now_millis();
         self.write_metadata_fast(ro, &meta)?;
 
         Ok(())
@@ -1742,7 +1919,7 @@ impl Engine {
 
             // Generation is cached in the index — zero device reads.
             let generation = entry.generation.wrapping_add(1);
-            let updated_at = now_millis();
+            let updated_at = self.now_millis();
 
             // Targeted write
             unsafe {
@@ -1785,7 +1962,7 @@ impl Engine {
         }
 
         meta.generation = { meta.generation }.wrapping_add(1);
-        meta.updated_at = now_millis();
+        meta.updated_at = self.now_millis();
 
         let (signal, dah_patch) = evaluate_delete_at_height(
             &meta,
@@ -1845,7 +2022,7 @@ impl Engine {
 
             // Generation is cached in the index — zero device reads.
             let generation = entry.generation.wrapping_add(1);
-            let updated_at = now_millis();
+            let updated_at = self.now_millis();
 
             // Targeted write
             unsafe {
@@ -1889,7 +2066,7 @@ impl Engine {
         }
 
         meta.generation = { meta.generation }.wrapping_add(1);
-        meta.updated_at = now_millis();
+        meta.updated_at = self.now_millis();
 
         self.write_metadata_fast(ro, &meta)?;
         self.sync_index_cache(&req.tx_key, &meta);
@@ -1922,7 +2099,7 @@ impl Engine {
         meta.delete_at_height = 0;
         meta.preserve_until = req.block_height;
         meta.generation = { meta.generation }.wrapping_add(1);
-        meta.updated_at = now_millis();
+        meta.updated_at = self.now_millis();
 
         self.write_metadata_fast(ro, &meta)?;
 
@@ -2146,13 +2323,13 @@ fn extract_parent_txids_from_cold_data(cold_bytes: &[u8]) -> Vec<[u8; 32]> {
 ///
 /// Public so the dispatch layer can compute record sizes for pre-allocation.
 pub fn build_cold_data(
-    inputs: &Option<Vec<u8>>,
-    outputs: &Option<Vec<u8>>,
-    inpoints: &Option<Vec<u8>>,
+    inputs: Option<&[u8]>,
+    outputs: Option<&[u8]>,
+    inpoints: Option<&[u8]>,
 ) -> Vec<u8> {
-    let inputs_data = inputs.as_deref().unwrap_or(&[]);
-    let outputs_data = outputs.as_deref().unwrap_or(&[]);
-    let inpoints_data = inpoints.as_deref().unwrap_or(&[]);
+    let inputs_data = inputs.unwrap_or(&[]);
+    let outputs_data = outputs.unwrap_or(&[]);
+    let inpoints_data = inpoints.unwrap_or(&[]);
 
     if inputs_data.is_empty() && outputs_data.is_empty() && inpoints_data.is_empty() {
         return Vec::new();
@@ -2178,13 +2355,27 @@ fn apply_dah_patch(metadata: &mut TxMetadata, patch: &DahPatch) {
     }
 }
 
-fn collect_block_ids(metadata: &TxMetadata) -> Vec<u32> {
+/// Inline block IDs stored on the stack (max `INLINE_BLOCK_ENTRIES`).
+struct InlineBlockIds {
+    ids: [u32; INLINE_BLOCK_ENTRIES],
+    len: u8,
+}
+
+impl InlineBlockIds {
+    /// Convert to a `Vec<u32>` for use in response types.
+    fn to_vec(&self) -> Vec<u32> {
+        self.ids[..self.len as usize].to_vec()
+    }
+}
+
+fn collect_block_ids(metadata: &TxMetadata) -> InlineBlockIds {
     let count = metadata.block_entry_count as usize;
     let inline = count.min(INLINE_BLOCK_ENTRIES);
-    metadata.block_entries_inline[..inline]
-        .iter()
-        .map(|e| { e.block_id })
-        .collect()
+    let mut ids = [0u32; INLINE_BLOCK_ENTRIES];
+    for (id_slot, entry) in ids.iter_mut().zip(metadata.block_entries_inline[..inline].iter()) {
+        *id_slot = entry.block_id;
+    }
+    InlineBlockIds { ids, len: inline as u8 }
 }
 
 /// Collect all block IDs including overflow entries read from device.
@@ -2281,7 +2472,11 @@ fn write_overflow_entries(
     Ok(())
 }
 
-fn now_millis() -> u64 {
+/// Get the current wall-clock time in milliseconds since Unix epoch.
+///
+/// Used by [`Engine::refresh_clock`] and test code. Production engine
+/// code reads the cached value via [`Engine::now_millis`] instead.
+fn sys_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -2672,9 +2867,9 @@ mod tests {
     #[test]
     fn spend_updated_at_set() {
         let h = TestHarness::new(10, TxFlags::empty());
-        let before = now_millis();
+        let before = sys_millis();
         h.engine.spend(&h.spend_req(0)).unwrap();
-        let after = now_millis();
+        let after = sys_millis();
 
         let meta = h.engine.read_metadata(&h.key).unwrap();
         let updated = { meta.updated_at };
@@ -3951,14 +4146,14 @@ mod tests {
         let h = TestHarness::new(10, TxFlags::empty());
 
         // Spend
-        let before = now_millis();
+        let before = sys_millis();
         h.engine.spend(&h.spend_req(0)).unwrap();
-        let after = now_millis();
+        let after = sys_millis();
         let meta = h.engine.read_metadata(&h.key).unwrap();
         assert!({ meta.updated_at } >= before && { meta.updated_at } <= after + 1);
 
         // Unspend
-        let before = now_millis();
+        let before = sys_millis();
         let req = UnspendRequest {
             tx_key: h.key,
             offset: 0,
@@ -3967,7 +4162,7 @@ mod tests {
             block_height_retention: 288,
         };
         h.engine.unspend(&req).unwrap();
-        let after = now_millis();
+        let after = sys_millis();
         let meta = h.engine.read_metadata(&h.key).unwrap();
         assert!({ meta.updated_at } >= before && { meta.updated_at } <= after + 1);
     }
@@ -4188,6 +4383,60 @@ mod tests {
     // ===================================================================
 
     // -- setMined correctness tests --
+
+    #[test]
+    fn set_mined_batch_applies_shared_params() {
+        let engine = create_engine();
+
+        // Create 3 txs.
+        let mut keys = Vec::new();
+        for n in 0..3u8 {
+            let (_, req) = make_create_req(n + 100, 2);
+            let key = req.tx_key();
+            engine.create(&req).unwrap();
+            keys.push(key);
+        }
+
+        let params = SetMinedSharedParams {
+            block_id: 42,
+            block_height: 800_000,
+            subtree_idx: 7,
+            current_block_height: 800_000,
+            block_height_retention: 288,
+            on_longest_chain: true,
+            unset_mined: false,
+        };
+
+        let results = engine.set_mined_batch(&params, &keys);
+        assert_eq!(results.len(), 3);
+        for (i, r) in results.iter().enumerate() {
+            let resp = r.as_ref().unwrap_or_else(|e| panic!("item {i} failed: {e}"));
+            assert!(resp.block_ids.contains(&42), "item {i} should have block_id 42");
+            assert!(resp.generation > 0, "item {i} should have incremented generation");
+        }
+
+        // Verify all three txs have the block entry.
+        for key in &keys {
+            let meta = engine.read_metadata(key).unwrap();
+            assert_eq!(meta.block_entry_count, 1);
+            assert_eq!({ meta.block_entries_inline[0].block_id }, 42);
+        }
+    }
+
+    #[test]
+    fn set_mined_batch_handles_missing_tx() {
+        let h = TestHarness::new(5, TxFlags::empty());
+        let missing_key = TxKey { txid: [0xFF; 32] };
+        let params = SetMinedSharedParams {
+            block_id: 1, block_height: 100, subtree_idx: 0,
+            current_block_height: 100, block_height_retention: 288,
+            on_longest_chain: true, unset_mined: false,
+        };
+
+        let results = h.engine.set_mined_batch(&params, &[h.key, missing_key]);
+        assert!(results[0].is_ok(), "existing tx should succeed");
+        assert!(results[1].is_err(), "missing tx should fail");
+    }
 
     #[test]
     fn set_mined_nonexistent_tx() {
@@ -5328,21 +5577,68 @@ mod tests {
     // Phase 5: Creation path tests
     // ===================================================================
 
-    fn make_create_req(n: u8, utxo_count: usize) -> CreateRequest {
+    /// Owned storage for CreateRequest test data.
+    struct OwnedCreateReq {
+        hashes: Vec<[u8; 32]>,
+        tx_id: [u8; 32],
+    }
+
+    impl OwnedCreateReq {
+        fn new(n: u8, utxo_count: usize) -> Self {
+            let mut tx_id = [0u8; 32];
+            tx_id[0] = n;
+            tx_id[8..16].copy_from_slice(&(n as u64 * 0x9E37).to_le_bytes());
+            tx_id[16] = n;
+            let hashes = (0..utxo_count)
+                .map(|i| { let mut h = [0u8; 32]; h[0] = i as u8; h[1] = (i >> 8) as u8; h })
+                .collect();
+            Self { hashes, tx_id }
+        }
+
+        fn req(&self) -> CreateRequest<'_> {
+            make_create_req_from(&self.tx_id, &self.hashes)
+        }
+    }
+
+    fn make_create_req(n: u8, utxo_count: usize) -> (Vec<[u8; 32]>, CreateRequest<'static>) {
+        // SAFETY: We leak the Vec to get a 'static lifetime for test convenience.
+        // This is fine in tests — the memory is small and the process exits after tests.
+        let hashes: Vec<[u8; 32]> = (0..utxo_count)
+            .map(|i| { let mut h = [0u8; 32]; h[0] = i as u8; h[1] = (i >> 8) as u8; h })
+            .collect();
+        let hashes_ref: &'static [[u8; 32]] = Box::leak(hashes.clone().into_boxed_slice());
         let mut tx_id = [0u8; 32];
         tx_id[0] = n;
         tx_id[8..16].copy_from_slice(&(n as u64 * 0x9E37).to_le_bytes());
         tx_id[16] = n;
-        let utxo_hashes: Vec<[u8; 32]> = (0..utxo_count)
-            .map(|i| {
-                let mut h = [0u8; 32];
-                h[0] = i as u8;
-                h[1] = (i >> 8) as u8;
-                h
-            })
-            .collect();
-        CreateRequest {
+        let req = CreateRequest {
             tx_id,
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: hashes_ref,
+            inputs: None,
+            outputs: None,
+            inpoints: None,
+            is_external: false,
+            created_at: 1710000000000,
+            block_height: 1000,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+            parent_txids: &[],
+        };
+        (hashes, req)
+    }
+
+    fn make_create_req_from<'a>(tx_id: &[u8; 32], utxo_hashes: &'a [[u8; 32]]) -> CreateRequest<'a> {
+        CreateRequest {
+            tx_id: *tx_id,
             tx_version: 1,
             locktime: 0,
             fee: 500,
@@ -5357,11 +5653,11 @@ mod tests {
             is_external: false,
             created_at: 1710000000000,
             block_height: 1000,
-            mined_block_infos: vec![],
+            mined_block_infos: &[],
             frozen: false,
             conflicting: false,
             locked: false,
-            parent_txids: vec![],
+            parent_txids: &[],
         }
     }
 
@@ -5383,7 +5679,7 @@ mod tests {
     #[test]
     fn create_single_utxo() {
         let engine = create_engine();
-        let req = make_create_req(1, 1);
+        let (_, req) = make_create_req(1, 1);
         let key = req.tx_key();
         let resp = engine.create(&req).unwrap();
 
@@ -5403,7 +5699,7 @@ mod tests {
     #[test]
     fn create_100_utxos() {
         let engine = create_engine();
-        let req = make_create_req(2, 100);
+        let (_, req) = make_create_req(2, 100);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -5420,7 +5716,7 @@ mod tests {
     #[test]
     fn create_10000_utxos() {
         let engine = create_engine();
-        let req = make_create_req(3, 10000);
+        let (_, req) = make_create_req(3, 10000);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -5437,7 +5733,7 @@ mod tests {
     #[test]
     fn create_metadata_fields_match() {
         let engine = create_engine();
-        let mut req = make_create_req(4, 5);
+        let (_, mut req) = make_create_req(4, 5);
         req.tx_version = 2;
         req.locktime = 500_000;
         req.fee = 1234;
@@ -5461,7 +5757,7 @@ mod tests {
     #[test]
     fn create_index_lookup() {
         let engine = create_engine();
-        let req = make_create_req(5, 10);
+        let (_, req) = make_create_req(5, 10);
         let key = req.tx_key();
         let resp = engine.create(&req).unwrap();
 
@@ -5473,7 +5769,7 @@ mod tests {
     #[test]
     fn create_then_spend() {
         let engine = create_engine();
-        let req = make_create_req(6, 5);
+        let (_, req) = make_create_req(6, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -5498,7 +5794,7 @@ mod tests {
     #[test]
     fn create_then_set_mined() {
         let engine = create_engine();
-        let req = make_create_req(7, 5);
+        let (_, req) = make_create_req(7, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -5525,7 +5821,7 @@ mod tests {
     #[test]
     fn create_duplicate_txid() {
         let engine = create_engine();
-        let req = make_create_req(8, 5);
+        let (_, req) = make_create_req(8, 5);
         engine.create(&req).unwrap();
 
         match engine.create(&req) {
@@ -5539,8 +5835,10 @@ mod tests {
     #[test]
     fn create_records_no_overlap() {
         let engine = create_engine();
-        let r1 = engine.create(&make_create_req(10, 5)).unwrap();
-        let r2 = engine.create(&make_create_req(11, 10)).unwrap();
+        let (_, req1) = make_create_req(10, 5);
+        let r1 = engine.create(&req1).unwrap();
+        let (_, req2) = make_create_req(11, 10);
+        let r2 = engine.create(&req2).unwrap();
 
         let size1 = TxMetadata::record_size_for(5);
         let size2 = TxMetadata::record_size_for(10);
@@ -5557,9 +5855,11 @@ mod tests {
     #[test]
     fn create_with_cold_data() {
         let engine = create_engine();
-        let mut req = make_create_req(20, 3);
-        req.inputs = Some(vec![0x01, 0x02, 0x03, 0x04]);
-        req.outputs = Some(vec![0x0A, 0x0B, 0x0C]);
+        let (_, mut req) = make_create_req(20, 3);
+        let inp = vec![0x01, 0x02, 0x03, 0x04];
+        let out = vec![0x0A, 0x0B, 0x0C];
+        req.inputs = Some(&inp);
+        req.outputs = Some(&out);
 
         let key = req.tx_key();
         engine.create(&req).unwrap();
@@ -5579,7 +5879,7 @@ mod tests {
     #[test]
     fn create_without_cold_data() {
         let engine = create_engine();
-        let req = make_create_req(21, 3);
+        let (_, req) = make_create_req(21, 3);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -5592,9 +5892,11 @@ mod tests {
     #[test]
     fn cold_data_not_modified_by_spend() {
         let engine = create_engine();
-        let mut req = make_create_req(22, 3);
-        req.inputs = Some(vec![0xDE, 0xAD]);
-        req.outputs = Some(vec![0xBE, 0xEF]);
+        let (_, mut req) = make_create_req(22, 3);
+        let inp = vec![0xDE, 0xAD];
+        let out = vec![0xBE, 0xEF];
+        req.inputs = Some(&inp);
+        req.outputs = Some(&out);
 
         let key = req.tx_key();
         engine.create(&req).unwrap();
@@ -5627,7 +5929,7 @@ mod tests {
     fn batch_create_10() {
         let engine = create_engine();
         let requests: Vec<CreateRequest> = (30..40u8)
-            .map(|n| make_create_req(n, 5))
+            .map(|n| make_create_req(n, 5).1)
             .collect();
         let results = engine.create_batch(&requests);
 
@@ -5641,7 +5943,7 @@ mod tests {
     fn batch_create_with_duplicate() {
         let engine = create_engine();
         let mut requests: Vec<CreateRequest> = (40..50u8)
-            .map(|n| make_create_req(n, 5))
+            .map(|n| make_create_req(n, 5).1)
             .collect();
         // Duplicate the 5th entry
         requests[5] = requests[4].clone();
@@ -5662,7 +5964,7 @@ mod tests {
     #[test]
     fn create_zero_utxos() {
         let engine = create_engine();
-        let req = make_create_req(50, 0);
+        let (_, req) = make_create_req(50, 0);
         match engine.create(&req) {
             Err(CreateError::InvalidUtxoCount) => {}
             other => panic!("expected InvalidUtxoCount, got {other:?}"),
@@ -5672,7 +5974,7 @@ mod tests {
     #[test]
     fn create_coinbase() {
         let engine = create_engine();
-        let mut req = make_create_req(51, 1);
+        let (_, mut req) = make_create_req(51, 1);
         req.is_coinbase = true;
         req.spending_height = 1100; // block_height + 100
 
@@ -5687,7 +5989,7 @@ mod tests {
     #[test]
     fn create_frozen() {
         let engine = create_engine();
-        let mut req = make_create_req(52, 3);
+        let (_, mut req) = make_create_req(52, 3);
         req.frozen = true;
 
         let key = req.tx_key();
@@ -5703,7 +6005,7 @@ mod tests {
     #[test]
     fn create_conflicting() {
         let engine = create_engine();
-        let mut req = make_create_req(53, 2);
+        let (_, mut req) = make_create_req(53, 2);
         req.conflicting = true;
 
         let key = req.tx_key();
@@ -5716,7 +6018,7 @@ mod tests {
     #[test]
     fn create_unmined() {
         let engine = create_engine();
-        let mut req = make_create_req(54, 2);
+        let (_, mut req) = make_create_req(54, 2);
         req.block_height = 800;
 
         let key = req.tx_key();
@@ -5734,12 +6036,13 @@ mod tests {
     #[test]
     fn create_with_mined_block_info() {
         let engine = create_engine();
-        let mut req = make_create_req(55, 2);
-        req.mined_block_infos = vec![MinedBlockInfo {
+        let (_, mut req) = make_create_req(55, 2);
+        let infos = vec![MinedBlockInfo {
             block_id: 42,
             block_height: 900,
             subtree_idx: 7,
         }];
+        req.mined_block_infos = &infos;
 
         let key = req.tx_key();
         engine.create(&req).unwrap();
@@ -5755,7 +6058,7 @@ mod tests {
     #[test]
     fn create_delete_recreate_same_txid() {
         let engine = create_engine();
-        let req = make_create_req(60, 5);
+        let (_, req) = make_create_req(60, 5);
         let key = req.tx_key();
 
         engine.create(&req).unwrap();
@@ -5773,7 +6076,7 @@ mod tests {
     #[test]
     fn create_record_at_aligned_offset() {
         let engine = create_engine();
-        let req = make_create_req(61, 5);
+        let (_, req) = make_create_req(61, 5);
         let resp = engine.create(&req).unwrap();
 
         // Record offset must be aligned to device alignment (4096)
@@ -5783,7 +6086,7 @@ mod tests {
     #[test]
     fn create_record_size_matches_expected() {
         let engine = create_engine();
-        let req = make_create_req(62, 7);
+        let (_, req) = make_create_req(62, 7);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -5795,9 +6098,11 @@ mod tests {
     #[test]
     fn create_record_size_with_cold_data() {
         let engine = create_engine();
-        let mut req = make_create_req(63, 3);
-        req.inputs = Some(vec![0x01; 10]);
-        req.outputs = Some(vec![0x02; 20]);
+        let (_, mut req) = make_create_req(63, 3);
+        let inp = vec![0x01; 10];
+        let out = vec![0x02; 20];
+        req.inputs = Some(&inp);
+        req.outputs = Some(&out);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -5829,7 +6134,7 @@ mod tests {
 
         // Request more records than can fit in the data region
         let requests: Vec<CreateRequest> = (0..50u8)
-            .map(|n| make_create_req(n + 100, 5)) // Each ~4KB
+            .map(|n| make_create_req(n + 100, 5).1) // Each ~4KB
             .collect();
 
         let results = engine.create_batch(&requests);
@@ -5848,7 +6153,7 @@ mod tests {
     #[test]
     fn create_non_coinbase_no_maturity_check() {
         let engine = create_engine();
-        let req = make_create_req(64, 3);
+        let (_, req) = make_create_req(64, 3);
         // spending_height = 0 (default for non-coinbase)
         assert_eq!(req.spending_height, 0);
         assert!(!req.is_coinbase);
@@ -5883,7 +6188,7 @@ mod tests {
     #[test]
     fn freeze_unspent() {
         let engine = create_engine();
-        let req = make_create_req(60, 5);
+        let (_, req) = make_create_req(60, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -5896,7 +6201,7 @@ mod tests {
     #[test]
     fn freeze_already_frozen() {
         let engine = create_engine();
-        let req = make_create_req(61, 5);
+        let (_, req) = make_create_req(61, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
@@ -5910,7 +6215,7 @@ mod tests {
     #[test]
     fn freeze_spent_utxo() {
         let engine = create_engine();
-        let req = make_create_req(62, 5);
+        let (_, req) = make_create_req(62, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         let mut sd = [0u8; 36]; sd[0] = 0xAB;
@@ -5938,7 +6243,7 @@ mod tests {
     #[test]
     fn freeze_hash_mismatch() {
         let engine = create_engine();
-        let req = make_create_req(63, 5);
+        let (_, req) = make_create_req(63, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -5951,7 +6256,7 @@ mod tests {
     #[test]
     fn freeze_does_not_change_counter() {
         let engine = create_engine();
-        let req = make_create_req(64, 5);
+        let (_, req) = make_create_req(64, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
@@ -5963,7 +6268,7 @@ mod tests {
     #[test]
     fn freeze_then_spend_returns_frozen() {
         let engine = create_engine();
-        let req = make_create_req(65, 5);
+        let (_, req) = make_create_req(65, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
@@ -5984,7 +6289,7 @@ mod tests {
     #[test]
     fn unfreeze_frozen() {
         let engine = create_engine();
-        let req = make_create_req(70, 5);
+        let (_, req) = make_create_req(70, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine.freeze(&FreezeRequest { tx_key: key, offset: 1, utxo_hash: req.utxo_hashes[1] }).unwrap();
@@ -5998,7 +6303,7 @@ mod tests {
     #[test]
     fn unfreeze_not_frozen() {
         let engine = create_engine();
-        let req = make_create_req(71, 5);
+        let (_, req) = make_create_req(71, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -6011,7 +6316,7 @@ mod tests {
     #[test]
     fn unfreeze_then_spend() {
         let engine = create_engine();
-        let req = make_create_req(72, 5);
+        let (_, req) = make_create_req(72, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
@@ -6031,7 +6336,7 @@ mod tests {
     #[test]
     fn reassign_frozen() {
         let engine = create_engine();
-        let req = make_create_req(80, 5);
+        let (_, req) = make_create_req(80, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
@@ -6052,7 +6357,7 @@ mod tests {
     #[test]
     fn reassign_not_frozen() {
         let engine = create_engine();
-        let req = make_create_req(81, 5);
+        let (_, req) = make_create_req(81, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -6068,7 +6373,7 @@ mod tests {
     #[test]
     fn reassign_hash_mismatch() {
         let engine = create_engine();
-        let req = make_create_req(82, 5);
+        let (_, req) = make_create_req(82, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
@@ -6085,7 +6390,7 @@ mod tests {
     #[test]
     fn reassign_not_spendable_until_cooldown() {
         let engine = create_engine();
-        let req = make_create_req(83, 5);
+        let (_, req) = make_create_req(83, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
@@ -6111,7 +6416,7 @@ mod tests {
     #[test]
     fn reassign_spendable_after_cooldown() {
         let engine = create_engine();
-        let req = make_create_req(84, 5);
+        let (_, req) = make_create_req(84, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
@@ -6135,7 +6440,7 @@ mod tests {
     #[test]
     fn reassign_old_hash_spend_fails() {
         let engine = create_engine();
-        let req = make_create_req(85, 5);
+        let (_, req) = make_create_req(85, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
@@ -6160,7 +6465,7 @@ mod tests {
     #[test]
     fn set_conflicting_true() {
         let engine = create_engine();
-        let req = make_create_req(90, 5);
+        let (_, req) = make_create_req(90, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -6176,7 +6481,7 @@ mod tests {
     #[test]
     fn set_conflicting_false() {
         let engine = create_engine();
-        let mut req = make_create_req(91, 5);
+        let (_, mut req) = make_create_req(91, 5);
         req.conflicting = true;
         let key = req.tx_key();
         engine.create(&req).unwrap();
@@ -6192,7 +6497,7 @@ mod tests {
     #[test]
     fn set_conflicting_blocks_spend() {
         let engine = create_engine();
-        let req = make_create_req(92, 5);
+        let (_, req) = make_create_req(92, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine.set_conflicting(&SetConflictingRequest {
@@ -6215,7 +6520,7 @@ mod tests {
     #[test]
     fn set_locked_true() {
         let engine = create_engine();
-        let req = make_create_req(100, 5);
+        let (_, req) = make_create_req(100, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine.set_locked(&SetLockedRequest { tx_key: key, value: true }).unwrap();
@@ -6227,7 +6532,7 @@ mod tests {
     #[test]
     fn set_locked_clears_dah() {
         let engine = create_engine();
-        let req = make_create_req(101, 5);
+        let (_, req) = make_create_req(101, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         // Set conflicting to get a DAH
@@ -6246,7 +6551,7 @@ mod tests {
     #[test]
     fn set_locked_false() {
         let engine = create_engine();
-        let mut req = make_create_req(102, 5);
+        let (_, mut req) = make_create_req(102, 5);
         req.locked = true;
         let key = req.tx_key();
         engine.create(&req).unwrap();
@@ -6259,7 +6564,7 @@ mod tests {
     #[test]
     fn locked_blocks_spend() {
         let engine = create_engine();
-        let req = make_create_req(103, 5);
+        let (_, req) = make_create_req(103, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine.set_locked(&SetLockedRequest { tx_key: key, value: true }).unwrap();
@@ -6280,7 +6585,7 @@ mod tests {
     #[test]
     fn preserve_until_stores_value() {
         let engine = create_engine();
-        let req = make_create_req(110, 5);
+        let (_, req) = make_create_req(110, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         // Set a DAH first
@@ -6298,8 +6603,9 @@ mod tests {
     #[test]
     fn preserve_until_blocks_dah_on_spend() {
         let engine = create_engine();
-        let mut req = make_create_req(111, 2);
-        req.mined_block_infos = vec![MinedBlockInfo { block_id: 1, block_height: 900, subtree_idx: 0 }];
+        let (_, mut req) = make_create_req(111, 2);
+        let infos = vec![MinedBlockInfo { block_id: 1, block_height: 900, subtree_idx: 0 }];
+        req.mined_block_infos = &infos;
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine.preserve_until(&PreserveUntilRequest { tx_key: key, block_height: 5000 }).unwrap();
@@ -6325,7 +6631,7 @@ mod tests {
     #[test]
     fn preserve_until_external_signals_preserve() {
         let engine = create_engine();
-        let mut req = make_create_req(112, 2);
+        let (_, mut req) = make_create_req(112, 2);
         req.is_external = true;
         let key = req.tx_key();
         engine.create(&req).unwrap();
@@ -6339,7 +6645,7 @@ mod tests {
     #[test]
     fn delete_existing() {
         let engine = create_engine();
-        let req = make_create_req(120, 5);
+        let (_, req) = make_create_req(120, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -6350,7 +6656,7 @@ mod tests {
     #[test]
     fn delete_then_lookup_none() {
         let engine = create_engine();
-        let req = make_create_req(121, 5);
+        let (_, req) = make_create_req(121, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine.delete(&DeleteRequest { tx_key: key }).unwrap();
@@ -6373,7 +6679,7 @@ mod tests {
     #[test]
     fn delete_frees_space_for_reuse() {
         let engine = create_engine();
-        let req1 = make_create_req(122, 100);
+        let (_, req1) = make_create_req(122, 100);
         let key1 = req1.tx_key();
         let resp1 = engine.create(&req1).unwrap();
         let offset1 = resp1.record_offset;
@@ -6381,7 +6687,7 @@ mod tests {
         engine.delete(&DeleteRequest { tx_key: key1 }).unwrap();
 
         // Create another record — should reuse the freed space
-        let req2 = make_create_req(123, 100);
+        let (_, req2) = make_create_req(123, 100);
         let resp2 = engine.create(&req2).unwrap();
         // Freed space should be reused (same offset)
         assert_eq!(resp2.record_offset, offset1);
@@ -6392,7 +6698,7 @@ mod tests {
     #[test]
     fn get_spend_unspent() {
         let engine = create_engine();
-        let mut req = make_create_req(130, 5);
+        let (_, mut req) = make_create_req(130, 5);
         req.locktime = 42_000;
         let key = req.tx_key();
         engine.create(&req).unwrap();
@@ -6408,7 +6714,7 @@ mod tests {
     #[test]
     fn get_spend_spent() {
         let engine = create_engine();
-        let req = make_create_req(131, 5);
+        let (_, req) = make_create_req(131, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         let mut sd = [0u8; 36]; sd[0] = 0xAB;
@@ -6428,7 +6734,7 @@ mod tests {
     #[test]
     fn get_spend_frozen() {
         let engine = create_engine();
-        let req = make_create_req(132, 5);
+        let (_, req) = make_create_req(132, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
@@ -6454,7 +6760,7 @@ mod tests {
     #[test]
     fn get_spend_hash_mismatch() {
         let engine = create_engine();
-        let req = make_create_req(133, 5);
+        let (_, req) = make_create_req(133, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -6469,7 +6775,7 @@ mod tests {
     #[test]
     fn get_spend_offset_out_of_range() {
         let engine = create_engine();
-        let req = make_create_req(134, 5);
+        let (_, req) = make_create_req(134, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -6484,7 +6790,7 @@ mod tests {
     #[test]
     fn get_spend_is_readonly() {
         let engine = create_engine();
-        let req = make_create_req(135, 5);
+        let (_, req) = make_create_req(135, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -6503,7 +6809,7 @@ mod tests {
     #[test]
     fn get_spend_pruned() {
         let engine = create_engine();
-        let req = make_create_req(136, 5);
+        let (_, req) = make_create_req(136, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -6542,7 +6848,7 @@ mod tests {
     #[test]
     fn set_conflicting_external_signals_dah_set() {
         let engine = create_engine();
-        let mut req = make_create_req(137, 5);
+        let (_, mut req) = make_create_req(137, 5);
         req.is_external = true;
         let key = req.tx_key();
         engine.create(&req).unwrap();
@@ -6562,7 +6868,7 @@ mod tests {
     #[test]
     fn concurrent_delete_and_spend() {
         let engine = create_engine();
-        let req = make_create_req(138, 5);
+        let (_, req) = make_create_req(138, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -6611,7 +6917,7 @@ mod tests {
         //
         // Verify that the engine has no spent_extra_recs state to corrupt:
         let engine = create_engine();
-        let req = make_create_req(139, 10);
+        let (_, req) = make_create_req(139, 10);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -6672,7 +6978,7 @@ mod tests {
     #[test]
     fn set_mined_clears_locked_flag() {
         let engine = create_engine();
-        let req = make_create_req(200, 5);
+        let (_, req) = make_create_req(200, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -6714,7 +7020,7 @@ mod tests {
         // only flags that exist are the 5 defined bits, and set_mined
         // does not leave any stray bits set.
         let engine = create_engine();
-        let mut req = make_create_req(201, 5);
+        let (_, mut req) = make_create_req(201, 5);
         req.locked = true;
         let key = req.tx_key();
         engine.create(&req).unwrap();
@@ -6800,7 +7106,7 @@ mod tests {
     #[test]
     fn set_mined_does_not_modify_utxo_slots_with_mixed_state() {
         let engine = create_engine();
-        let req = make_create_req(202, 5);
+        let (_, req) = make_create_req(202, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -6864,9 +7170,11 @@ mod tests {
     #[test]
     fn delete_with_cold_data_frees_space() {
         let engine = create_engine();
-        let mut req = make_create_req(210, 5);
-        req.inputs = Some(vec![0x01; 100]);
-        req.outputs = Some(vec![0x02; 200]);
+        let (_, mut req) = make_create_req(210, 5);
+        let inp = vec![0x01; 100];
+        let out = vec![0x02; 200];
+        req.inputs = Some(&inp);
+        req.outputs = Some(&out);
         let key = req.tx_key();
         let resp = engine.create(&req).unwrap();
         let record_offset = resp.record_offset;
@@ -6884,7 +7192,7 @@ mod tests {
 
         // Verify freed space is reusable: create a new record and confirm
         // it reuses the same offset (allocator hands out freed space first)
-        let req2 = make_create_req(211, 5);
+        let (_, req2) = make_create_req(211, 5);
         let resp2 = engine.create(&req2).unwrap();
         assert_eq!(
             resp2.record_offset, record_offset,
@@ -6897,7 +7205,7 @@ mod tests {
     #[test]
     fn concurrent_100_threads_spend_different_utxos() {
         let engine = create_engine();
-        let req = make_create_req(220, 100);
+        let (_, req) = make_create_req(220, 100);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -6943,7 +7251,7 @@ mod tests {
     #[test]
     fn concurrent_100_threads_spend_same_utxo_same_data() {
         let engine = create_engine();
-        let req = make_create_req(221, 1);
+        let (_, req) = make_create_req(221, 1);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -6984,7 +7292,7 @@ mod tests {
     #[test]
     fn concurrent_100_threads_spend_same_utxo_different_data() {
         let engine = create_engine();
-        let req = make_create_req(222, 1);
+        let (_, req) = make_create_req(222, 1);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -7047,14 +7355,14 @@ mod tests {
         ));
 
         // All 10 threads try to create the same txid
-        let create_req = make_create_req(230, 5);
+        let (_, create_req) = make_create_req(230, 5);
 
         let results: Vec<Result<_, _>> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..10)
                 .map(|_| {
                     let engine = &engine;
-                    let req = create_req.clone();
-                    s.spawn(move || engine.create(&req))
+                    let req = &create_req;
+                    s.spawn(move || engine.create(req))
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -7125,5 +7433,45 @@ mod tests {
 
         let shard = crate::cluster::shards::ShardTable::shard_for_key(&h.key);
         assert_eq!(by_shard.get(&shard).unwrap().len(), 1);
+    }
+
+    // -- Cached clock tests --
+
+    #[test]
+    fn cached_clock_initialized_on_construction() {
+        let h = TestHarness::new(2, TxFlags::empty());
+        let cached = h.engine.cached_millis.load(std::sync::atomic::Ordering::Relaxed);
+        // Should be close to current time (within 2 seconds).
+        let now = sys_millis();
+        assert!(cached > 0, "cached clock should be initialized");
+        assert!(now.abs_diff(cached) < 2000, "cached clock should be near current time");
+    }
+
+    #[test]
+    fn refresh_clock_updates_cached_value() {
+        let h = TestHarness::new(2, TxFlags::empty());
+        let before = h.engine.cached_millis.load(std::sync::atomic::Ordering::Relaxed);
+        // Sleep briefly so the clock advances.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        h.engine.refresh_clock();
+        let after = h.engine.cached_millis.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after >= before, "refresh_clock should advance cached time");
+    }
+
+    #[test]
+    fn mutations_use_cached_clock() {
+        let h = TestHarness::new(5, TxFlags::empty());
+        // Refresh the clock so cached value is current.
+        h.engine.refresh_clock();
+        let cached = h.engine.cached_millis.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Perform a mutation.
+        h.engine.spend(&h.spend_req(0)).unwrap();
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+
+        // The updated_at should equal the cached clock value exactly
+        // (since we refreshed just before and the method reads cached).
+        assert_eq!({ meta.updated_at }, cached,
+            "mutation should use the cached clock value");
     }
 }

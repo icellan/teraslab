@@ -64,18 +64,18 @@ fn setup_engine_with_txs(count: u32, utxos_per_tx: u32) -> Arc<Engine> {
             extended_size: 0,
             is_coinbase: false,
             spending_height: 0,
-            utxo_hashes,
+            utxo_hashes: &utxo_hashes,
             inputs: None,
             outputs: None,
             inpoints: None,
             is_external: false,
             created_at: 1710000000000,
             block_height: 1000,
-            mined_block_infos: vec![],
+            mined_block_infos: &[],
             frozen: false,
             conflicting: false,
             locked: false,
-            parent_txids: vec![],
+            parent_txids: &[],
         };
         engine.create(&req).unwrap();
     }
@@ -220,16 +220,17 @@ fn bench_set_mined(c: &mut Criterion) {
         b.iter(|| {
             // Create a tx then immediately setMined it — pure first-pass.
             let tx_id = make_tx_id(fresh_idx + 1_000_000);
+            let utxo_hashes = [make_utxo_hash(fresh_idx, 0)];
             let req = CreateRequest {
                 tx_id,
                 tx_version: 1, locktime: 0, fee: 500, size_in_bytes: 250,
                 extended_size: 0, is_coinbase: false, spending_height: 0,
-                utxo_hashes: vec![make_utxo_hash(fresh_idx, 0)],
+                utxo_hashes: &utxo_hashes,
                 inputs: None, outputs: None, inpoints: None,
                 is_external: false, created_at: 1710000000000,
-                block_height: 1000, mined_block_infos: vec![],
+                block_height: 1000, mined_block_infos: &[],
                 frozen: false, conflicting: false, locked: false,
-                parent_txids: vec![],
+                parent_txids: &[],
             };
             let _ = fresh_engine.create(&req);
 
@@ -327,18 +328,18 @@ fn bench_create(c: &mut Criterion) {
                         extended_size: 0,
                         is_coinbase: false,
                         spending_height: 0,
-                        utxo_hashes,
+                        utxo_hashes: &utxo_hashes,
                         inputs: None,
                         outputs: None,
                         inpoints: None,
                         is_external: false,
                         created_at: 1710000000000,
                         block_height: 1000,
-                        mined_block_infos: vec![],
+                        mined_block_infos: &[],
                         frozen: false,
                         conflicting: false,
                         locked: false,
-                        parent_txids: vec![],
+                        parent_txids: &[],
                     };
                     let _ = engine.create(&req);
                     tx_idx += 1;

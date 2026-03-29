@@ -39,8 +39,12 @@ pub struct MinedBlockInfo {
 }
 
 /// Request to create a new transaction record.
+///
+/// Uses borrowed slices for variable-length data to avoid heap allocations
+/// on the hot path. The caller owns the backing storage (typically a decoded
+/// wire-protocol buffer or a stack-allocated array).
 #[derive(Debug, Clone)]
-pub struct CreateRequest {
+pub struct CreateRequest<'a> {
     /// Transaction hash (32 bytes).
     pub tx_id: [u8; 32],
     /// Bitcoin transaction version.
@@ -58,13 +62,13 @@ pub struct CreateRequest {
     /// Coinbase maturity height (blockHeight + 100), 0 if not coinbase.
     pub spending_height: u32,
     /// UTXO hashes — one per output.
-    pub utxo_hashes: Vec<[u8; 32]>,
+    pub utxo_hashes: &'a [[u8; 32]],
     /// Raw input data (None if external or not available).
-    pub inputs: Option<Vec<u8>>,
+    pub inputs: Option<&'a [u8]>,
     /// Raw output data (None if external or not available).
-    pub outputs: Option<Vec<u8>>,
+    pub outputs: Option<&'a [u8]>,
     /// Raw inpoints data (None if not available).
-    pub inpoints: Option<Vec<u8>>,
+    pub inpoints: Option<&'a [u8]>,
     /// Whether inputs/outputs are stored externally (blob store).
     pub is_external: bool,
     /// Creation timestamp (milliseconds since epoch).
@@ -72,7 +76,7 @@ pub struct CreateRequest {
     /// Current block height (for unmined_since).
     pub block_height: u32,
     /// Pre-mined block info (empty = unmined).
-    pub mined_block_infos: Vec<MinedBlockInfo>,
+    pub mined_block_infos: &'a [MinedBlockInfo],
     /// Create all UTXOs in frozen state.
     pub frozen: bool,
     /// Create as conflicting.
@@ -80,10 +84,10 @@ pub struct CreateRequest {
     /// Create as locked.
     pub locked: bool,
     /// Parent txids for conflicting-children updates when conflicting=true.
-    pub parent_txids: Vec<[u8; 32]>,
+    pub parent_txids: &'a [[u8; 32]],
 }
 
-impl CreateRequest {
+impl CreateRequest<'_> {
     /// Build a [`TxKey`] from this request's tx_id.
     pub fn tx_key(&self) -> TxKey {
         TxKey { txid: self.tx_id }
@@ -113,9 +117,9 @@ pub struct CreateResponse {
 
 /// Request for a batch of record creations.
 #[derive(Debug, Clone)]
-pub struct BatchCreateRequest {
+pub struct BatchCreateRequest<'a> {
     /// Individual creation requests.
-    pub transactions: Vec<CreateRequest>,
+    pub transactions: Vec<CreateRequest<'a>>,
 }
 
 /// Response from a batch creation.

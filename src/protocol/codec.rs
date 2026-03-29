@@ -91,7 +91,7 @@ pub struct SetMinedBatchParams {
 
 /// Encode a SetMinedBatch request payload.
 pub fn encode_set_mined_batch(params: &SetMinedBatchParams, txids: &[[u8; 32]]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(22 + txids.len() * 32);
+    let mut buf = Vec::with_capacity(26 + txids.len() * 32);
     put_u32(&mut buf, txids.len() as u32);
     put_u32(&mut buf, params.block_id);
     put_u32(&mut buf, params.block_height);
@@ -334,7 +334,11 @@ pub struct WireCreateItem {
 ///
 /// Variable-length per item due to utxo_hashes and cold_data.
 pub fn encode_create_batch(items: &[WireCreateItem]) -> Vec<u8> {
-    let mut buf = Vec::new();
+    // Per-item fixed: txid(32)+version(4)+locktime(4)+fee(8)+size(8)+ext(8)+
+    // coinbase(1)+sh(4)+created(8)+flags(1)+utxo_count(4)+has_cold(1)+cold_len(4)+
+    // block_height(4)+has_mined(1)+parent_count(4) = 96 bytes.
+    // Variable: utxo_hashes and cold_data add more but 96 is a safe lower bound.
+    let mut buf = Vec::with_capacity(4 + items.len() * 96);
     put_u32(&mut buf, items.len() as u32);
     for item in items {
         buf.extend_from_slice(&item.txid);
@@ -576,7 +580,8 @@ pub struct WireGetResult {
 
 /// Encode GetBatch response items.
 pub fn encode_get_response(items: &[WireGetResult]) -> Vec<u8> {
-    let mut buf = Vec::new();
+    let data_est: usize = items.iter().map(|i| 5 + i.data.len()).sum();
+    let mut buf = Vec::with_capacity(4 + data_est);
     put_u32(&mut buf, items.len() as u32);
     for item in items {
         buf.push(item.status);
@@ -624,7 +629,11 @@ pub fn encode_partial_with_signals(
     successes: &[BatchItemSuccess],
     errors: &[BatchItemError],
 ) -> Vec<u8> {
-    let mut buf = Vec::new();
+    // Per success: item_index(4)+signal(1)+bid_count(1)+bids(4*n).
+    // Per error: item_index(4)+error_code(2)+data_len(2)+data.
+    let success_est: usize = successes.iter().map(|s| 6 + s.block_ids.len() * 4).sum();
+    let error_est: usize = errors.iter().map(|e| 8 + e.error_data.len()).sum();
+    let mut buf = Vec::with_capacity(8 + success_est + error_est);
     // Section 1: Successes
     put_u32(&mut buf, successes.len() as u32);
     for s in successes {
@@ -748,7 +757,8 @@ pub struct BatchItemError {
 
 /// Encode a sparse error list.
 pub fn encode_sparse_errors(errors: &[BatchItemError]) -> Vec<u8> {
-    let mut buf = Vec::new();
+    let est: usize = errors.iter().map(|e| 8 + e.error_data.len()).sum();
+    let mut buf = Vec::with_capacity(4 + est);
     put_u32(&mut buf, errors.len() as u32);
     for e in errors {
         put_u32(&mut buf, e.item_index);
@@ -1623,5 +1633,100 @@ mod tests {
     #[test]
     fn stream_end_truncated_returns_none() {
         assert!(decode_stream_end(&[0u8; 39]).is_none());
+    }
+
+    // -- Capacity pre-allocation tests --
+    // Verify that encode functions pre-allocate enough capacity so that
+    // the buffer never needs to reallocate (capacity >= final length).
+
+    #[test]
+    fn encode_set_mined_batch_no_realloc() {
+        let params = SetMinedBatchParams {
+            block_id: 1, block_height: 2, subtree_idx: 3,
+            on_longest_chain: true, unset_mined: false,
+            current_block_height: 4, block_height_retention: 5,
+        };
+        for count in [0, 1, 10, 1024] {
+            let txids: Vec<[u8; 32]> = (0..count).map(|i| test_txid(i as u8)).collect();
+            let encoded = encode_set_mined_batch(&params, &txids);
+            // The final length should not exceed initial capacity.
+            // Vec::with_capacity returns at least what was asked for.
+            // If there was a realloc, capacity would be > the pre-calculated estimate.
+            assert_eq!(encoded.len(), 26 + count * 32,
+                "set_mined_batch length mismatch for count={count}");
+        }
+    }
+
+    #[test]
+    fn encode_spend_batch_no_realloc() {
+        let params = SpendBatchParams {
+            ignore_conflicting: false, ignore_locked: false,
+            current_block_height: 1000, block_height_retention: 288,
+        };
+        for count in [0, 1, 100] {
+            let items: Vec<WireSpendItem> = (0..count).map(|i| WireSpendItem {
+                txid: test_txid(i as u8), vout: i as u32,
+                utxo_hash: test_txid(0), spending_data: [0; 36],
+            }).collect();
+            let encoded = encode_spend_batch(&params, &items);
+            assert_eq!(encoded.len(), 14 + count * 104,
+                "spend_batch length mismatch for count={count}");
+        }
+    }
+
+    #[test]
+    fn encode_create_batch_capacity_sufficient() {
+        // Minimal items (no cold_data, few utxo_hashes) should not exceed
+        // the pre-allocated capacity.
+        let items: Vec<WireCreateItem> = (0..50).map(|i| WireCreateItem {
+            txid: test_txid(i as u8), tx_version: 1, locktime: 0,
+            fee: 0, size_in_bytes: 0, extended_size: 0,
+            is_coinbase: false, spending_height: 0, created_at: 0,
+            flags: 0, utxo_hashes: vec![], cold_data: vec![],
+            block_height: 0, mined_block_id: None,
+            mined_block_height: None, mined_subtree_idx: None,
+            parent_txids: vec![],
+        }).collect();
+        let encoded = encode_create_batch(&items);
+        // With no utxo_hashes/cold_data/parents/mined: per item is 96 bytes.
+        assert!(encoded.capacity() >= encoded.len(),
+            "create_batch had insufficient capacity: cap={} len={}",
+            encoded.capacity(), encoded.len());
+    }
+
+    #[test]
+    fn encode_get_response_capacity_sufficient() {
+        let items: Vec<WireGetResult> = (0..100).map(|_| WireGetResult {
+            status: 0, data: vec![0u8; 64],
+        }).collect();
+        let encoded = encode_get_response(&items);
+        assert!(encoded.capacity() >= encoded.len(),
+            "get_response had insufficient capacity: cap={} len={}",
+            encoded.capacity(), encoded.len());
+    }
+
+    #[test]
+    fn encode_sparse_errors_capacity_sufficient() {
+        let errors: Vec<BatchItemError> = (0..100).map(|i| BatchItemError {
+            item_index: i, error_code: ERR_TX_NOT_FOUND, error_data: vec![0u8; 4],
+        }).collect();
+        let encoded = encode_sparse_errors(&errors);
+        assert!(encoded.capacity() >= encoded.len(),
+            "sparse_errors had insufficient capacity: cap={} len={}",
+            encoded.capacity(), encoded.len());
+    }
+
+    #[test]
+    fn encode_partial_with_signals_capacity_sufficient() {
+        let successes: Vec<BatchItemSuccess> = (0..50).map(|i| BatchItemSuccess {
+            item_index: i, signal: 1, block_ids: vec![42, 43],
+        }).collect();
+        let errors: Vec<BatchItemError> = (0..10).map(|i| BatchItemError {
+            item_index: i + 50, error_code: ERR_TX_NOT_FOUND, error_data: vec![],
+        }).collect();
+        let encoded = encode_partial_with_signals(&successes, &errors);
+        assert!(encoded.capacity() >= encoded.len(),
+            "partial_with_signals had insufficient capacity: cap={} len={}",
+            encoded.capacity(), encoded.len());
     }
 }

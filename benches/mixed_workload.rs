@@ -71,18 +71,18 @@ fn bench_mixed_workload(c: &mut Criterion) {
                 extended_size: 0,
                 is_coinbase: false,
                 spending_height: 0,
-                utxo_hashes,
+                utxo_hashes: &utxo_hashes,
                 inputs: None,
                 outputs: None,
                 inpoints: None,
                 is_external: false,
                 created_at: 1710000000000,
                 block_height: 1000,
-                mined_block_infos: vec![],
+                mined_block_infos: &[],
                 frozen: false,
                 conflicting: false,
                 locked: false,
-                parent_txids: vec![],
+                parent_txids: &[],
             };
             engine.create(&req).unwrap();
             created_txs.push((TxKey { txid: tx_id }, i));
@@ -104,18 +104,18 @@ fn bench_mixed_workload(c: &mut Criterion) {
                     extended_size: 0,
                     is_coinbase: false,
                     spending_height: 0,
-                    utxo_hashes,
+                    utxo_hashes: &utxo_hashes,
                     inputs: None,
                     outputs: None,
                     inpoints: None,
                     is_external: false,
                     created_at: 1710000000000,
                     block_height: 1000,
-                    mined_block_infos: vec![],
+                    mined_block_infos: &[],
                     frozen: false,
                     conflicting: false,
                     locked: false,
-                    parent_txids: vec![],
+                    parent_txids: &[],
                 };
                 let _ = engine.create(&req);
                 created_txs.push((TxKey { txid: tx_id }, next_tx));

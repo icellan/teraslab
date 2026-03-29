@@ -77,6 +77,15 @@ struct FreeRegion {
 }
 
 // ---------------------------------------------------------------------------
+// Hybrid freelist
+// ---------------------------------------------------------------------------
+
+/// Entry count at which the freelist promotes from Vec to BTree.
+const PROMOTE_THRESHOLD: usize = 64;
+/// Entry count at which the freelist demotes from BTree back to Vec.
+const DEMOTE_THRESHOLD: usize = 32;
+
+// ---------------------------------------------------------------------------
 // AllocatorStats
 // ---------------------------------------------------------------------------
 
@@ -109,13 +118,22 @@ pub struct AllocatorStats {
 // SlotAllocator
 // ---------------------------------------------------------------------------
 
-/// Manages device space allocation using a sorted freelist.
+/// Manages device space allocation using a hybrid freelist.
 ///
 /// Allocations are aligned to the device's minimum I/O alignment.
 /// Freed regions are coalesced with adjacent free regions.
+///
+/// Internally uses a hybrid freelist:
+/// - **Small** (≤64 entries): `Vec<FreeRegion>` sorted by offset — fast constant
+///   overhead for the common case of few free regions.
+/// - **Large** (>64 entries): dual `BTreeMap`/`BTreeSet` index — O(log n)
+///   best-fit and coalescing for heavily fragmented devices.
+///
+/// Automatic promotion at 64 entries; demotion back to Vec at 32 entries
+/// (hysteresis avoids thrashing near the boundary).
 pub struct SlotAllocator {
     device: Arc<dyn BlockDevice>,
-    freelist: Vec<FreeRegion>,
+    freelist: FreelistBackend,
     /// Next append point for new allocations (grows upward).
     next_offset: u64,
     data_region_start: u64,
@@ -126,13 +144,190 @@ pub struct SlotAllocator {
     device_id: [u8; 16],
 }
 
+/// Hybrid freelist backend: Vec for small, BTree for large.
+enum FreelistBackend {
+    /// Sorted by offset. Linear scan for best-fit, binary search for insert.
+    Small(Vec<FreeRegion>),
+    /// Dual-indexed: by_offset for coalescing, by_size for O(log n) best-fit.
+    Large {
+        by_offset: std::collections::BTreeMap<u64, u64>,
+        by_size: std::collections::BTreeSet<(u64, u64)>,
+    },
+}
+
+impl FreelistBackend {
+    fn new() -> Self {
+        Self::Small(Vec::new())
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Small(v) => v.len(),
+            Self::Large { by_offset, .. } => by_offset.len(),
+        }
+    }
+
+    /// Iterate (offset, size) pairs in offset order. Used for persist/stats.
+    fn iter_offset_order(&self) -> Box<dyn Iterator<Item = (u64, u64)> + '_> {
+        match self {
+            Self::Small(v) => Box::new(v.iter().map(|r| (r.offset, r.size))),
+            Self::Large { by_offset, .. } => Box::new(by_offset.iter().map(|(&o, &s)| (o, s))),
+        }
+    }
+
+    fn largest(&self) -> u64 {
+        match self {
+            Self::Small(v) => v.iter().map(|r| r.size).max().unwrap_or(0),
+            Self::Large { by_size, .. } => {
+                by_size.iter().next_back().map(|&(sz, _)| sz).unwrap_or(0)
+            }
+        }
+    }
+
+    /// Best-fit allocation. Returns `Some((offset, region_size))` or `None`.
+    fn best_fit(&mut self, aligned_size: u64) -> Option<(u64, u64)> {
+        match self {
+            Self::Small(v) => {
+                let mut best_idx: Option<usize> = None;
+                let mut best_waste: u64 = u64::MAX;
+                for (i, region) in v.iter().enumerate() {
+                    if region.size >= aligned_size {
+                        let waste = region.size - aligned_size;
+                        if waste < best_waste {
+                            best_waste = waste;
+                            best_idx = Some(i);
+                            if waste == 0 { break; }
+                        }
+                    }
+                }
+                let idx = best_idx?;
+                let region = v[idx];
+                if region.size == aligned_size {
+                    v.remove(idx);
+                } else {
+                    v[idx] = FreeRegion {
+                        offset: region.offset + aligned_size,
+                        size: region.size - aligned_size,
+                    };
+                }
+                Some((region.offset, region.size))
+            }
+            Self::Large { by_offset, by_size } => {
+                let &(region_size, region_offset) =
+                    by_size.range((aligned_size, 0)..).next()?;
+                by_size.remove(&(region_size, region_offset));
+                by_offset.remove(&region_offset);
+                if region_size > aligned_size {
+                    let rem_off = region_offset + aligned_size;
+                    let rem_sz = region_size - aligned_size;
+                    by_offset.insert(rem_off, rem_sz);
+                    by_size.insert((rem_sz, rem_off));
+                }
+                Some((region_offset, region_size))
+            }
+        }
+    }
+
+    /// Insert a free region (after coalescing). Does NOT coalesce — caller
+    /// must handle merges and call `remove` first.
+    fn insert(&mut self, offset: u64, size: u64) {
+        match self {
+            Self::Small(v) => {
+                let pos = v
+                    .binary_search_by_key(&offset, |r| r.offset)
+                    .unwrap_or_else(|p| p);
+                v.insert(pos, FreeRegion { offset, size });
+            }
+            Self::Large { by_offset, by_size } => {
+                by_offset.insert(offset, size);
+                by_size.insert((size, offset));
+            }
+        }
+    }
+
+    /// Remove a free region by offset. Returns `Some(size)` if found.
+    fn remove(&mut self, offset: u64) -> Option<u64> {
+        match self {
+            Self::Small(v) => {
+                let pos = v.binary_search_by_key(&offset, |r| r.offset).ok()?;
+                let region = v.remove(pos);
+                Some(region.size)
+            }
+            Self::Large { by_offset, by_size } => {
+                let size = by_offset.remove(&offset)?;
+                by_size.remove(&(size, offset));
+                Some(size)
+            }
+        }
+    }
+
+    /// Look up the next region at or after `boundary` (for forward coalesce).
+    fn next_from(&self, boundary: u64) -> Option<(u64, u64)> {
+        match self {
+            Self::Small(v) => {
+                let pos = v
+                    .binary_search_by_key(&boundary, |r| r.offset)
+                    .unwrap_or_else(|p| p);
+                v.get(pos).map(|r| (r.offset, r.size))
+            }
+            Self::Large { by_offset, .. } => {
+                by_offset.range(boundary..).next().map(|(&o, &s)| (o, s))
+            }
+        }
+    }
+
+    /// Look up the last region before `offset` (for backward coalesce).
+    fn prev_before(&self, offset: u64) -> Option<(u64, u64)> {
+        match self {
+            Self::Small(v) => {
+                let pos = v
+                    .binary_search_by_key(&offset, |r| r.offset)
+                    .unwrap_or_else(|p| p);
+                if pos > 0 {
+                    let r = &v[pos - 1];
+                    Some((r.offset, r.size))
+                } else {
+                    None
+                }
+            }
+            Self::Large { by_offset, .. } => {
+                by_offset.range(..offset).next_back().map(|(&o, &s)| (o, s))
+            }
+        }
+    }
+
+    /// Promote from Small → Large if above threshold.
+    fn maybe_promote(&mut self) {
+        if let Self::Small(v) = self
+            && v.len() > PROMOTE_THRESHOLD
+        {
+            let mut by_offset = std::collections::BTreeMap::new();
+            let mut by_size = std::collections::BTreeSet::new();
+            for r in v.drain(..) {
+                by_offset.insert(r.offset, r.size);
+                by_size.insert((r.size, r.offset));
+            }
+            *self = Self::Large { by_offset, by_size };
+        }
+    }
+
+    /// Demote from Large → Small if below threshold.
+    fn maybe_demote(&mut self) {
+        if let Self::Large { by_offset, .. } = self
+            && by_offset.len() < DEMOTE_THRESHOLD
+        {
+            let mut v: Vec<FreeRegion> = by_offset
+                .iter()
+                .map(|(&offset, &size)| FreeRegion { offset, size })
+                .collect();
+            v.sort_by_key(|r| r.offset);
+            *self = Self::Small(v);
+        }
+    }
+}
+
 impl SlotAllocator {
     /// Create a new allocator for the given device, starting fresh.
-    ///
-    /// The data region begins at `DATA_REGION_OFFSET`. Everything before
-    /// that is reserved for the device header. A fresh 128-bit device
-    /// identity is generated via `getrandom` and stored in the superblock
-    /// for identity verification on subsequent opens.
     pub fn new(device: Arc<dyn BlockDevice>) -> Result<Self> {
         let alignment = device.alignment();
         let device_size = device.size();
@@ -140,7 +335,7 @@ impl SlotAllocator {
         getrandom::getrandom(&mut device_id).map_err(AllocatorError::Getrandom)?;
         Ok(Self {
             device,
-            freelist: Vec::new(),
+            freelist: FreelistBackend::new(),
             next_offset: DATA_REGION_OFFSET,
             data_region_start: DATA_REGION_OFFSET,
             device_size,
@@ -156,51 +351,18 @@ impl SlotAllocator {
     pub fn allocate(&mut self, size: u64) -> Result<u64> {
         let aligned_size = self.align_up(size);
 
-        // Best-fit search on the freelist.
-        let mut best_idx: Option<usize> = None;
-        let mut best_waste: u64 = u64::MAX;
-        for (i, region) in self.freelist.iter().enumerate() {
-            if region.size >= aligned_size {
-                let waste = region.size - aligned_size;
-                if waste < best_waste {
-                    best_waste = waste;
-                    best_idx = Some(i);
-                    if waste == 0 {
-                        break; // Perfect fit
-                    }
-                }
-            }
-        }
-
-        if let Some(idx) = best_idx {
-            let region = self.freelist[idx];
-            let offset = region.offset;
-
-            if region.size == aligned_size {
-                // Exact fit — remove entirely.
-                self.freelist.remove(idx);
-            } else {
-                // Partial use — shrink the free region.
-                self.freelist[idx] = FreeRegion {
-                    offset: region.offset + aligned_size,
-                    size: region.size - aligned_size,
-                };
-            }
-            return Ok(offset);
+        if let Some((region_offset, _)) = self.freelist.best_fit(aligned_size) {
+            // best_fit already removed/split the region in the freelist.
+            self.freelist.maybe_demote();
+            return Ok(region_offset);
         }
 
         // No suitable free region — extend at the append point.
         let offset = self.next_offset;
         if offset + aligned_size > self.device_size {
-            let largest = self
-                .freelist
-                .iter()
-                .map(|r| r.size)
-                .max()
-                .unwrap_or(0);
             return Err(AllocatorError::DeviceFull {
                 requested: aligned_size,
-                largest_free: largest,
+                largest_free: self.freelist.largest(),
             });
         }
         self.next_offset = offset + aligned_size;
@@ -222,45 +384,29 @@ impl SlotAllocator {
             });
         }
 
-        // Insert in sorted order by offset.
-        let insert_pos = self
-            .freelist
-            .binary_search_by_key(&offset, |r| r.offset)
-            .unwrap_or_else(|pos| pos);
-
-        self.freelist.insert(
-            insert_pos,
-            FreeRegion {
-                offset,
-                size: aligned_size,
-            },
-        );
+        let mut final_offset = offset;
+        let mut final_size = aligned_size;
 
         // Merge with the next region if adjacent.
-        if insert_pos + 1 < self.freelist.len() {
-            let current = self.freelist[insert_pos];
-            let next = self.freelist[insert_pos + 1];
-            if current.offset + current.size == next.offset {
-                self.freelist[insert_pos] = FreeRegion {
-                    offset: current.offset,
-                    size: current.size + next.size,
-                };
-                self.freelist.remove(insert_pos + 1);
-            }
+        let next_boundary = offset + aligned_size;
+        if let Some((next_off, next_sz)) = self.freelist.next_from(next_boundary)
+            && next_off == next_boundary
+        {
+            self.freelist.remove(next_off);
+            final_size += next_sz;
         }
 
         // Merge with the previous region if adjacent.
-        if insert_pos > 0 {
-            let prev = self.freelist[insert_pos - 1];
-            let current = self.freelist[insert_pos];
-            if prev.offset + prev.size == current.offset {
-                self.freelist[insert_pos - 1] = FreeRegion {
-                    offset: prev.offset,
-                    size: prev.size + current.size,
-                };
-                self.freelist.remove(insert_pos);
-            }
+        if let Some((prev_off, prev_sz)) = self.freelist.prev_before(offset)
+            && prev_off + prev_sz == offset
+        {
+            self.freelist.remove(prev_off);
+            final_offset = prev_off;
+            final_size += prev_sz;
         }
+
+        self.freelist.insert(final_offset, final_size);
+        self.freelist.maybe_promote();
 
         Ok(())
     }
@@ -288,13 +434,11 @@ impl SlotAllocator {
         buf[16..24].copy_from_slice(&(count as u64).to_le_bytes());
         buf[24..40].copy_from_slice(&self.device_id);
         buf[40..44].copy_from_slice(&HEADER_VERSION.to_le_bytes());
-        // bytes 44..48: reserved padding (zeros)
 
-        for (i, region) in self.freelist.iter().take(count).enumerate() {
+        for (i, (offset, size)) in self.freelist.iter_offset_order().take(count).enumerate() {
             let base = FREELIST_OFFSET + i * 16;
-            buf[base..base + 8].copy_from_slice(&region.offset.to_le_bytes());
-            buf[base + 8..base + 16]
-                .copy_from_slice(&region.size.to_le_bytes());
+            buf[base..base + 8].copy_from_slice(&offset.to_le_bytes());
+            buf[base + 8..base + 16].copy_from_slice(&size.to_le_bytes());
         }
 
         self.device.pwrite(&buf, 0)?;
@@ -302,40 +446,26 @@ impl SlotAllocator {
     }
 
     /// Recover allocator state from the device header.
-    ///
-    /// Reads the persisted freelist, next_offset, and device identity from
-    /// offset 0. The header version at bytes 40..44 is validated — if it is
-    /// higher than the version this build understands, recovery fails with
-    /// [`AllocatorError::UnsupportedVersion`].
     pub fn recover(device: Arc<dyn BlockDevice>) -> Result<Self> {
         let alignment = device.alignment();
         let device_size = device.size();
 
-        // Read the fixed header (48 bytes minimum).
         let header_size = alignment.max(FREELIST_OFFSET);
         let mut header_buf = AlignedBuf::new(header_size, alignment);
         device.pread(&mut header_buf, 0)?;
 
-        let magic = u64::from_le_bytes(
-            header_buf[0..8].try_into().unwrap(),
-        );
+        let magic = u64::from_le_bytes(header_buf[0..8].try_into().unwrap());
         if magic != ALLOCATOR_MAGIC {
             return Err(AllocatorError::CorruptedHeader);
         }
 
-        let next_offset = u64::from_le_bytes(
-            header_buf[8..16].try_into().unwrap(),
-        );
-        let count = u64::from_le_bytes(
-            header_buf[16..24].try_into().unwrap(),
-        ) as usize;
+        let next_offset = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
+        let count = u64::from_le_bytes(header_buf[16..24].try_into().unwrap()) as usize;
 
         let mut device_id = [0u8; 16];
         device_id.copy_from_slice(&header_buf[24..40]);
 
-        let version = u32::from_le_bytes(
-            header_buf[40..44].try_into().unwrap(),
-        );
+        let version = u32::from_le_bytes(header_buf[40..44].try_into().unwrap());
         if version > HEADER_VERSION {
             return Err(AllocatorError::UnsupportedVersion(version));
         }
@@ -346,17 +476,14 @@ impl SlotAllocator {
         let mut buf = AlignedBuf::new(aligned_total, alignment);
         device.pread(&mut buf, 0)?;
 
-        let mut freelist = Vec::with_capacity(count);
+        let mut freelist = FreelistBackend::new();
         for i in 0..count {
             let base = FREELIST_OFFSET + i * 16;
-            let offset = u64::from_le_bytes(
-                buf[base..base + 8].try_into().unwrap(),
-            );
-            let size = u64::from_le_bytes(
-                buf[base + 8..base + 16].try_into().unwrap(),
-            );
-            freelist.push(FreeRegion { offset, size });
+            let offset = u64::from_le_bytes(buf[base..base + 8].try_into().unwrap());
+            let size = u64::from_le_bytes(buf[base + 8..base + 16].try_into().unwrap());
+            freelist.insert(offset, size);
         }
+        freelist.maybe_promote();
 
         Ok(Self {
             device,
@@ -382,37 +509,18 @@ impl SlotAllocator {
     }
 
     /// Start of the data region on device.
-    pub fn data_region_start(&self) -> u64 {
-        self.data_region_start
-    }
+    pub fn data_region_start(&self) -> u64 { self.data_region_start }
 
     /// Current high-water mark — all allocations are below this offset.
-    pub fn next_offset(&self) -> u64 {
-        self.next_offset
-    }
+    pub fn next_offset(&self) -> u64 { self.next_offset }
 
     /// Device alignment in bytes.
-    pub fn device_alignment(&self) -> usize {
-        self.alignment
-    }
+    pub fn device_alignment(&self) -> usize { self.alignment }
 
     /// The 128-bit device identity stored in the superblock.
-    ///
-    /// This value is generated by [`SlotAllocator::new`] and persisted in the
-    /// header at bytes 24..40. Use it to verify that a device path points to
-    /// the expected physical device before trusting its contents.
-    ///
-    /// Returns all zeros for devices recovered from a v1 header (pre-identity).
-    pub fn device_id(&self) -> [u8; 16] {
-        self.device_id
-    }
+    pub fn device_id(&self) -> [u8; 16] { self.device_id }
 
     /// The device identity formatted as a 32-character lowercase hex string.
-    ///
-    /// Example: `"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"`
-    ///
-    /// Use this value in the `device_id` field of `ServerConfig` to enable
-    /// identity verification on startup.
     pub fn device_id_hex(&self) -> String {
         self.device_id
             .iter()
@@ -424,17 +532,12 @@ impl SlotAllocator {
     }
 
     /// Compute a snapshot of allocator statistics for observability.
-    ///
-    /// Iterates the freelist once to compute totals. The allocator must
-    /// be locked by the caller (it takes `&self`).
     pub fn stats(&self) -> AllocatorStats {
         let mut total_free: u64 = 0;
         let mut largest: u64 = 0;
-        for region in &self.freelist {
-            total_free += region.size;
-            if region.size > largest {
-                largest = region.size;
-            }
+        for (_, size) in self.freelist.iter_offset_order() {
+            total_free += size;
+            if size > largest { largest = size; }
         }
         let data_capacity = self.device_size.saturating_sub(self.data_region_start);
         let high_water = self.next_offset.saturating_sub(self.data_region_start);
@@ -762,5 +865,131 @@ mod tests {
             next >= o2 + 8192 || next + 4096 <= o2,
             "allocation at {next} must not overlap with o2 at {o2}"
         );
+    }
+
+    #[test]
+    fn best_fit_picks_smallest_sufficient_region() {
+        let dev = test_device(64);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+
+        // Allocate three blocks, free them to create regions of different sizes.
+        let o1 = alloc.allocate(4096).unwrap();  // 4K
+        let _o2 = alloc.allocate(4096).unwrap(); // 4K (spacer, kept)
+        let o3 = alloc.allocate(8192).unwrap();  // 8K
+        let _o4 = alloc.allocate(4096).unwrap(); // 4K (spacer, kept)
+        let o5 = alloc.allocate(16384).unwrap(); // 16K
+
+        // Free them to create: 4K hole at o1, 8K hole at o3, 16K hole at o5.
+        alloc.free(o1, 4096).unwrap();
+        alloc.free(o3, 8192).unwrap();
+        alloc.free(o5, 16384).unwrap();
+        assert_eq!(alloc.free_region_count(), 3);
+
+        // Allocating 4K should pick o1 (exact fit), not o3 or o5.
+        let got = alloc.allocate(4096).unwrap();
+        assert_eq!(got, o1, "best-fit should pick the 4K region");
+        assert_eq!(alloc.free_region_count(), 2); // o3 and o5 remain
+
+        // Allocating 8K should pick o3 (exact fit).
+        let got = alloc.allocate(8192).unwrap();
+        assert_eq!(got, o3, "best-fit should pick the 8K region");
+    }
+
+    #[test]
+    fn freelist_consistent_after_many_operations() {
+        let dev = test_device(64);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+
+        // Allocate 100 regions, free even-indexed ones.
+        let mut offsets = Vec::new();
+        for _ in 0..100 {
+            offsets.push(alloc.allocate(4096).unwrap());
+        }
+        for i in (0..100).step_by(2) {
+            alloc.free(offsets[i], 4096).unwrap();
+        }
+
+        // Should have promoted to Large backend (50 free regions > 64 threshold).
+        // In any case, length should be consistent.
+        let count = alloc.free_region_count();
+        assert!(count > 0, "should have free regions");
+
+        // If Large backend, verify dual-index consistency.
+        if let FreelistBackend::Large { ref by_offset, ref by_size } = alloc.freelist {
+            assert_eq!(by_offset.len(), by_size.len(),
+                "dual indexes must stay in sync");
+            for (&off, &sz) in by_offset {
+                assert!(by_size.contains(&(sz, off)),
+                    "by_size missing entry ({sz}, {off})");
+            }
+        }
+
+        // Allocate everything back from the freelist.
+        let before_count = alloc.free_region_count();
+        for _ in 0..before_count {
+            alloc.allocate(4096).unwrap();
+        }
+        assert_eq!(alloc.free_region_count(), 0, "freelist should be empty");
+    }
+
+    #[test]
+    fn three_way_coalesce() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+
+        // Allocate three contiguous blocks.
+        let o1 = alloc.allocate(4096).unwrap();
+        let o2 = alloc.allocate(4096).unwrap();
+        let o3 = alloc.allocate(4096).unwrap();
+        assert_eq!(o2, o1 + 4096);
+        assert_eq!(o3, o2 + 4096);
+
+        // Free outer blocks first, then the middle.
+        alloc.free(o1, 4096).unwrap();
+        alloc.free(o3, 4096).unwrap();
+        assert_eq!(alloc.free_region_count(), 2);
+
+        // Freeing the middle should merge all three into one 12K region.
+        alloc.free(o2, 4096).unwrap();
+        assert_eq!(alloc.free_region_count(), 1);
+
+        // The merged region should be at o1 with size 12K.
+        let (off, sz) = alloc.freelist.iter_offset_order().next().unwrap();
+        assert_eq!(off, o1);
+        assert_eq!(sz, 12288);
+    }
+
+    #[test]
+    fn promote_demote_transitions() {
+        let dev = test_device(64);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+
+        // Start as Small.
+        assert!(matches!(alloc.freelist, FreelistBackend::Small(_)));
+
+        // Allocate many blocks, then free enough to trigger promotion.
+        let mut offsets = Vec::new();
+        for _ in 0..200 {
+            offsets.push(alloc.allocate(4096).unwrap());
+        }
+        // Free every other block to create 100 non-adjacent free regions.
+        for i in (0..200).step_by(2) {
+            alloc.free(offsets[i], 4096).unwrap();
+        }
+        // Should have promoted to Large (100 entries > 64 threshold).
+        assert!(matches!(alloc.freelist, FreelistBackend::Large { .. }),
+            "should promote to Large after 100 free regions");
+
+        // Allocate back most of the free regions to shrink below demote threshold.
+        for _ in 0..75 {
+            alloc.allocate(4096).unwrap();
+        }
+        // Should have demoted back to Small (25 entries < 32 threshold).
+        assert!(matches!(alloc.freelist, FreelistBackend::Small(_)),
+            "should demote to Small after allocating most free regions back");
+
+        // The remaining entries should still be correct.
+        let remaining = alloc.free_region_count();
+        assert!(remaining > 0 && remaining < DEMOTE_THRESHOLD);
     }
 }

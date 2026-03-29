@@ -37,3 +37,25 @@ pub struct SetMinedResponse {
     /// Record generation after mutation.
     pub generation: u32,
 }
+
+/// Shared parameters for a batch of setMined operations.
+///
+/// All items in the batch share these fields — only the `tx_key` varies
+/// per item. Passing this by reference avoids copying 28 bytes per item.
+#[derive(Debug, Clone)]
+pub struct SetMinedSharedParams {
+    /// Block ID to add or remove.
+    pub block_id: u32,
+    /// Block height.
+    pub block_height: u32,
+    /// Subtree index within the block.
+    pub subtree_idx: u32,
+    /// Current block height (for DAH evaluation).
+    pub current_block_height: u32,
+    /// Block height retention (for DAH evaluation).
+    pub block_height_retention: u32,
+    /// Whether this block is on the longest chain.
+    pub on_longest_chain: bool,
+    /// If true, remove this block entry instead of adding it.
+    pub unset_mined: bool,
+}

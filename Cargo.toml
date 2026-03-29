@@ -44,3 +44,23 @@ harness = false
 [[bench]]
 name = "mixed_workload"
 harness = false
+
+[[bench]]
+name = "index_ops"
+harness = false
+
+[[bench]]
+name = "allocator_ops"
+harness = false
+
+[[bench]]
+name = "codec_ops"
+harness = false
+
+[[bench]]
+name = "engine_remaining"
+harness = false
+
+[[bench]]
+name = "alloc_profile"
+harness = false
