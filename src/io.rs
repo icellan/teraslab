@@ -602,7 +602,7 @@ mod tests {
         // 1. Create allocator on MemoryDevice (64 MB to fit 1000-slot records)
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(dev.clone());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
 
         // 2. Allocate space for a record with 100 UTXO slots
         let record_size = TxMetadata::record_size_for(100);

@@ -2915,7 +2915,7 @@ mod tests {
         fn new() -> Self {
             let dev: Arc<dyn BlockDevice> =
                 Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-            let alloc = SlotAllocator::new(dev.clone());
+            let alloc = SlotAllocator::new(dev.clone()).unwrap();
             let index = Index::new(10000).unwrap();
             let locks = StripedLocks::new(1024);
             let dah = DahIndex::new();
@@ -3517,7 +3517,7 @@ mod tests {
         fn new() -> Self {
             let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
             let redo_dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
-            let alloc = SlotAllocator::new(data_dev.clone());
+            let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
             let index = Index::new(10000).unwrap();
             let locks = StripedLocks::new(1024);
             let dah = DahIndex::new();
@@ -3615,7 +3615,7 @@ mod tests {
             .unwrap();
 
             // Create fresh index + allocator
-            let alloc = SlotAllocator::new(data_dev.clone());
+            let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
             let mut index: crate::index::PrimaryBackend = Index::new(10000).unwrap().into();
 
             // Run recovery to rebuild index from redo log

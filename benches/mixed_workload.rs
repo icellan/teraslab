@@ -32,7 +32,7 @@ fn make_utxo_hash(tx_n: u32, vout: u32) -> [u8; 32] {
 fn create_engine() -> Arc<Engine> {
     let dev: Arc<dyn BlockDevice> =
         Arc::new(MemoryDevice::new(512 * 1024 * 1024, 4096).unwrap());
-    let alloc = SlotAllocator::new(dev.clone());
+    let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(200_000).unwrap();
     Arc::new(Engine::new(
         dev,

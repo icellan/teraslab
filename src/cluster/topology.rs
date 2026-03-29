@@ -450,7 +450,7 @@ impl TopologyAuthority {
             let our_cluster_is_single_node = committed > 0 && committed_members.len() <= 1;
             let proposal_subsumes_us = propose.members.contains(&self.self_id);
             if our_cluster_is_single_node && proposal_subsumes_us
-                && propose.term >= committed
+                && propose.term > voted
             {
                 accepted = true;
             }

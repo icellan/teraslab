@@ -733,7 +733,7 @@ mod tests {
     fn make_engine() -> Arc<Engine> {
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-        let alloc = SlotAllocator::new(dev.clone());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(10_000).unwrap();
         Arc::new(Engine::new(
             dev,

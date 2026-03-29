@@ -19,9 +19,16 @@ pub const DATA_REGION_OFFSET: u64 = 1024 * 1024; // 1 MiB reserved for header
 /// Magic number for the allocator header on device.
 const ALLOCATOR_MAGIC: u64 = 0x5445_5241_414C_4C43; // "TERAALLC"
 
+/// Current header version. Stored at bytes 40..44 so `recover()` can reject
+/// incompatible on-disk formats written by future builds.
+const HEADER_VERSION: u32 = 1;
+
+/// Byte offset where freelist entries begin in the header.
+const FREELIST_OFFSET: usize = 48;
+
 /// Maximum number of free regions that can be serialized to the device header.
 const MAX_PERSISTED_FREE_REGIONS: usize =
-    (DATA_REGION_OFFSET as usize - 48) / 16; // 48 bytes header (with UUID), 16 bytes per entry
+    (DATA_REGION_OFFSET as usize - FREELIST_OFFSET) / 16;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -45,6 +52,14 @@ pub enum AllocatorError {
     /// Attempted to free a region that is outside the data area.
     #[error("invalid free: offset {offset} + size {size} outside data region")]
     InvalidFree { offset: u64, size: u64 },
+
+    /// Failed to generate random bytes for device identity.
+    #[error("failed to generate device identity: {0}")]
+    Getrandom(getrandom::Error),
+
+    /// The on-disk header version is not supported by this build.
+    #[error("unsupported header version: {0}")]
+    UnsupportedVersion(u32),
 }
 
 /// Result type for allocator operations.
@@ -106,32 +121,32 @@ pub struct SlotAllocator {
     data_region_start: u64,
     device_size: u64,
     alignment: usize,
-    /// 128-bit device identity UUID, generated at format time and persisted in
+    /// 128-bit device identity, generated at format time and persisted in
     /// the superblock header at bytes 24..40.
-    device_uuid: [u8; 16],
+    device_id: [u8; 16],
 }
 
 impl SlotAllocator {
     /// Create a new allocator for the given device, starting fresh.
     ///
     /// The data region begins at `DATA_REGION_OFFSET`. Everything before
-    /// that is reserved for the device header. A fresh 128-bit UUID is
-    /// generated via `getrandom` and stored in the superblock for identity
-    /// verification on subsequent opens.
-    pub fn new(device: Arc<dyn BlockDevice>) -> Self {
+    /// that is reserved for the device header. A fresh 128-bit device
+    /// identity is generated via `getrandom` and stored in the superblock
+    /// for identity verification on subsequent opens.
+    pub fn new(device: Arc<dyn BlockDevice>) -> Result<Self> {
         let alignment = device.alignment();
         let device_size = device.size();
-        let mut device_uuid = [0u8; 16];
-        getrandom::getrandom(&mut device_uuid).expect("getrandom failed");
-        Self {
+        let mut device_id = [0u8; 16];
+        getrandom::getrandom(&mut device_id).map_err(AllocatorError::Getrandom)?;
+        Ok(Self {
             device,
             freelist: Vec::new(),
             next_offset: DATA_REGION_OFFSET,
             data_region_start: DATA_REGION_OFFSET,
             device_size,
             alignment,
-            device_uuid,
-        }
+            device_id,
+        })
     }
 
     /// Allocate a contiguous region of at least `size` bytes.
@@ -252,29 +267,31 @@ impl SlotAllocator {
 
     /// Persist the freelist and next_offset to the device header region.
     ///
-    /// The header is written at offset 0 with the format:
+    /// Header v1 layout:
     /// ```text
     /// Offset  Size  Field
     /// 0       8     Magic (TERAALLC)
     /// 8       8     next_offset
     /// 16      8     count (free region count)
-    /// 24      16    Device UUID (128-bit)
-    /// 40      8     padding (reserved, zeros)
+    /// 24      16    Device identity (128-bit random)
+    /// 40      4     Header version (little-endian u32, currently 1)
+    /// 44      4     padding (reserved, zeros)
     /// 48+     16*N  free region entries (offset:8, size:8)
     /// ```
     pub fn persist(&self) -> Result<()> {
         let count = self.freelist.len().min(MAX_PERSISTED_FREE_REGIONS);
-        let aligned_len = self.align_up(48 + (count as u64) * 16);
+        let aligned_len = self.align_up(FREELIST_OFFSET as u64 + (count as u64) * 16);
         let mut buf = AlignedBuf::new(aligned_len as usize, self.alignment);
 
         buf[0..8].copy_from_slice(&ALLOCATOR_MAGIC.to_le_bytes());
         buf[8..16].copy_from_slice(&self.next_offset.to_le_bytes());
         buf[16..24].copy_from_slice(&(count as u64).to_le_bytes());
-        buf[24..40].copy_from_slice(&self.device_uuid);
-        // bytes 40..48: reserved padding (zeros)
+        buf[24..40].copy_from_slice(&self.device_id);
+        buf[40..44].copy_from_slice(&HEADER_VERSION.to_le_bytes());
+        // bytes 44..48: reserved padding (zeros)
 
         for (i, region) in self.freelist.iter().take(count).enumerate() {
-            let base = 48 + i * 16;
+            let base = FREELIST_OFFSET + i * 16;
             buf[base..base + 8].copy_from_slice(&region.offset.to_le_bytes());
             buf[base + 8..base + 16]
                 .copy_from_slice(&region.size.to_le_bytes());
@@ -286,18 +303,16 @@ impl SlotAllocator {
 
     /// Recover allocator state from the device header.
     ///
-    /// Reads the persisted freelist, next_offset, and device UUID from offset 0.
-    /// The UUID is stored at bytes 24..40 of the header. For devices written with
-    /// an older header format (pre-UUID), the UUID bytes will be whatever was in
-    /// that region (typically zeros). The magic and freelist offsets at 0-24 are
-    /// unchanged, so old headers still parse correctly — only the UUID value will
-    /// be unreliable.
+    /// Reads the persisted freelist, next_offset, and device identity from
+    /// offset 0. The header version at bytes 40..44 is validated — if it is
+    /// higher than the version this build understands, recovery fails with
+    /// [`AllocatorError::UnsupportedVersion`].
     pub fn recover(device: Arc<dyn BlockDevice>) -> Result<Self> {
         let alignment = device.alignment();
         let device_size = device.size();
 
-        // Read header to get count first.
-        let header_size = alignment.max(48);
+        // Read the fixed header (48 bytes minimum).
+        let header_size = alignment.max(FREELIST_OFFSET);
         let mut header_buf = AlignedBuf::new(header_size, alignment);
         device.pread(&mut header_buf, 0)?;
 
@@ -315,18 +330,25 @@ impl SlotAllocator {
             header_buf[16..24].try_into().unwrap(),
         ) as usize;
 
-        let mut device_uuid = [0u8; 16];
-        device_uuid.copy_from_slice(&header_buf[24..40]);
+        let mut device_id = [0u8; 16];
+        device_id.copy_from_slice(&header_buf[24..40]);
+
+        let version = u32::from_le_bytes(
+            header_buf[40..44].try_into().unwrap(),
+        );
+        if version > HEADER_VERSION {
+            return Err(AllocatorError::UnsupportedVersion(version));
+        }
 
         // Read the full freelist.
-        let total_size = 48 + count * 16;
+        let total_size = FREELIST_OFFSET + count * 16;
         let aligned_total = total_size.div_ceil(alignment) * alignment;
         let mut buf = AlignedBuf::new(aligned_total, alignment);
         device.pread(&mut buf, 0)?;
 
         let mut freelist = Vec::with_capacity(count);
         for i in 0..count {
-            let base = 48 + i * 16;
+            let base = FREELIST_OFFSET + i * 16;
             let offset = u64::from_le_bytes(
                 buf[base..base + 8].try_into().unwrap(),
             );
@@ -343,7 +365,7 @@ impl SlotAllocator {
             data_region_start: DATA_REGION_OFFSET,
             device_size,
             alignment,
-            device_uuid,
+            device_id,
         })
     }
 
@@ -374,23 +396,25 @@ impl SlotAllocator {
         self.alignment
     }
 
-    /// The 128-bit device UUID stored in the superblock.
+    /// The 128-bit device identity stored in the superblock.
     ///
-    /// This UUID is generated by [`SlotAllocator::new`] and persisted in the
+    /// This value is generated by [`SlotAllocator::new`] and persisted in the
     /// header at bytes 24..40. Use it to verify that a device path points to
     /// the expected physical device before trusting its contents.
-    pub fn device_uuid(&self) -> [u8; 16] {
-        self.device_uuid
+    ///
+    /// Returns all zeros for devices recovered from a v1 header (pre-identity).
+    pub fn device_id(&self) -> [u8; 16] {
+        self.device_id
     }
 
-    /// The device UUID formatted as a 32-character lowercase hex string.
+    /// The device identity formatted as a 32-character lowercase hex string.
     ///
     /// Example: `"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"`
     ///
-    /// Use this value in the `device_uuid` field of `ServerConfig` to enable
-    /// UUID verification on startup.
-    pub fn device_uuid_hex(&self) -> String {
-        self.device_uuid
+    /// Use this value in the `device_id` field of `ServerConfig` to enable
+    /// identity verification on startup.
+    pub fn device_id_hex(&self) -> String {
+        self.device_id
             .iter()
             .fold(String::with_capacity(32), |mut s, b| {
                 use std::fmt::Write as _;
@@ -452,7 +476,7 @@ mod tests {
     #[test]
     fn allocate_returns_offset_in_data_region() {
         let dev = test_device(16);
-        let mut alloc = SlotAllocator::new(dev);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
         let offset = alloc.allocate(8192).unwrap();
         assert!(offset >= DATA_REGION_OFFSET);
     }
@@ -460,7 +484,7 @@ mod tests {
     #[test]
     fn allocate_returns_aligned_offset() {
         let dev = test_device(16);
-        let mut alloc = SlotAllocator::new(dev);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
         let offset = alloc.allocate(100).unwrap(); // Small, not aligned
         assert_eq!(offset % 4096, 0);
     }
@@ -468,7 +492,7 @@ mod tests {
     #[test]
     fn allocate_two_no_overlap() {
         let dev = test_device(16);
-        let mut alloc = SlotAllocator::new(dev);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
         let o1 = alloc.allocate(8192).unwrap();
         let o2 = alloc.allocate(8192).unwrap();
         assert_ne!(o1, o2);
@@ -479,7 +503,7 @@ mod tests {
     #[test]
     fn allocate_100_regions_no_overlap() {
         let dev = test_device(64);
-        let mut alloc = SlotAllocator::new(dev);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
         let mut allocations: Vec<(u64, u64)> = Vec::new();
 
         for i in 0..100 {
@@ -506,7 +530,7 @@ mod tests {
     #[test]
     fn free_and_reuse() {
         let dev = test_device(16);
-        let mut alloc = SlotAllocator::new(dev);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
         let o1 = alloc.allocate(4096).unwrap();
         alloc.free(o1, 4096).unwrap();
         let o2 = alloc.allocate(4096).unwrap();
@@ -516,7 +540,7 @@ mod tests {
     #[test]
     fn free_merges_adjacent() {
         let dev = test_device(16);
-        let mut alloc = SlotAllocator::new(dev);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
         let o1 = alloc.allocate(4096).unwrap();
         let o2 = alloc.allocate(4096).unwrap();
         assert_eq!(o2, o1 + 4096);
@@ -535,7 +559,7 @@ mod tests {
     #[test]
     fn free_smaller_reuse() {
         let dev = test_device(16);
-        let mut alloc = SlotAllocator::new(dev);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
 
         let o1 = alloc.allocate(8192).unwrap();
         alloc.free(o1, 8192).unwrap();
@@ -552,7 +576,7 @@ mod tests {
         let o1;
         let o2;
         {
-            let mut alloc = SlotAllocator::new(dev.clone());
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
             o1 = alloc.allocate(8192).unwrap();
             o2 = alloc.allocate(4096).unwrap();
             alloc.free(o1, 8192).unwrap();
@@ -577,7 +601,7 @@ mod tests {
         let dev = test_device(16);
         let o1;
         {
-            let mut alloc = SlotAllocator::new(dev.clone());
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
             o1 = alloc.allocate(4096).unwrap();
             alloc.persist().unwrap();
         }
@@ -592,7 +616,7 @@ mod tests {
     fn allocate_until_full() {
         // 2 MB device, 1 MB header → 1 MB data region → ~256 × 4096 blocks
         let dev = test_device(2);
-        let mut alloc = SlotAllocator::new(dev);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
 
         let mut count = 0;
         loop {
@@ -611,7 +635,7 @@ mod tests {
     #[test]
     fn fragment_allocate_free_pattern() {
         let dev = test_device(16);
-        let mut alloc = SlotAllocator::new(dev);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
 
         // Allocate A, B, C, D
         let a = alloc.allocate(4096).unwrap();
@@ -633,55 +657,92 @@ mod tests {
     }
 
     #[test]
-    fn uuid_generated_on_new() {
+    fn device_id_generated_on_new() {
         let dev = test_device(16);
-        let alloc = SlotAllocator::new(dev);
-        // A freshly generated UUID must not be all zeros.
-        assert_ne!(alloc.device_uuid(), [0u8; 16]);
+        let alloc = SlotAllocator::new(dev).unwrap();
+        // A freshly generated device identity must not be all zeros.
+        assert_ne!(alloc.device_id(), [0u8; 16]);
     }
 
     #[test]
-    fn uuid_persisted_and_recovered() {
+    fn device_id_persisted_and_recovered() {
         let dev = test_device(16);
-        let original_uuid;
+        let original_id;
         {
-            let alloc = SlotAllocator::new(dev.clone());
-            original_uuid = alloc.device_uuid();
+            let alloc = SlotAllocator::new(dev.clone()).unwrap();
+            original_id = alloc.device_id();
             alloc.persist().unwrap();
         }
         let recovered = SlotAllocator::recover(dev).unwrap();
-        assert_eq!(recovered.device_uuid(), original_uuid);
+        assert_eq!(recovered.device_id(), original_id);
     }
 
     #[test]
-    fn uuid_different_per_allocator() {
+    fn device_id_different_per_allocator() {
         let dev1 = test_device(16);
         let dev2 = test_device(16);
-        let alloc1 = SlotAllocator::new(dev1);
-        let alloc2 = SlotAllocator::new(dev2);
-        // Two independently created allocators must have different UUIDs.
-        assert_ne!(alloc1.device_uuid(), alloc2.device_uuid());
+        let alloc1 = SlotAllocator::new(dev1).unwrap();
+        let alloc2 = SlotAllocator::new(dev2).unwrap();
+        // Two independently created allocators must have different identities.
+        assert_ne!(alloc1.device_id(), alloc2.device_id());
     }
 
     #[test]
-    fn uuid_hex_format() {
+    fn device_id_hex_format() {
         let dev = test_device(16);
-        let alloc = SlotAllocator::new(dev);
-        let hex = alloc.device_uuid_hex();
-        assert_eq!(hex.len(), 32, "UUID hex must be exactly 32 characters");
+        let alloc = SlotAllocator::new(dev).unwrap();
+        let hex = alloc.device_id_hex();
+        assert_eq!(hex.len(), 32, "device ID hex must be exactly 32 characters");
         assert!(
             hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
-            "UUID hex must be lowercase hex digits, got: {hex}"
+            "device ID hex must be lowercase hex digits, got: {hex}"
         );
     }
 
     #[test]
-    fn header_v2_recover_reads_freelist() {
+    fn header_version_persisted_and_recovered() {
+        let dev = test_device(16);
+        {
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            alloc.allocate(4096).unwrap();
+            alloc.persist().unwrap();
+        }
+
+        // Read raw header and verify the version field at bytes 40..44.
+        let mut buf = crate::device::AlignedBuf::new(4096, 4096);
+        dev.pread(&mut buf, 0).unwrap();
+        let version = u32::from_le_bytes(buf[40..44].try_into().unwrap());
+        assert_eq!(version, HEADER_VERSION, "persisted header version must be {HEADER_VERSION}");
+    }
+
+    #[test]
+    fn recover_rejects_future_version() {
+        let dev = test_device(16);
+        {
+            let alloc = SlotAllocator::new(dev.clone()).unwrap();
+            alloc.persist().unwrap();
+        }
+
+        // Overwrite the version field with a future version (999).
+        let mut buf = crate::device::AlignedBuf::new(4096, 4096);
+        dev.pread(&mut buf, 0).unwrap();
+        buf[40..44].copy_from_slice(&999u32.to_le_bytes());
+        dev.pwrite(&buf, 0).unwrap();
+
+        match SlotAllocator::recover(dev) {
+            Err(AllocatorError::UnsupportedVersion(999)) => {}
+            Err(other) => panic!("expected UnsupportedVersion(999), got: {other}"),
+            Ok(_) => panic!("expected UnsupportedVersion(999), but recover succeeded"),
+        }
+    }
+
+    #[test]
+    fn recover_reads_freelist_at_correct_offset() {
         let dev = test_device(16);
         let o1;
         let o2;
         {
-            let mut alloc = SlotAllocator::new(dev.clone());
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
             o1 = alloc.allocate(4096).unwrap();
             o2 = alloc.allocate(8192).unwrap();
             // Free o1 so the freelist has one entry.

@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn submit_and_wait() {
         let (dev, blob, uploader) = setup();
-        let mut alloc = SlotAllocator::new(dev.clone());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
 
         let utxo_count = 2u32;
         let offset = alloc.allocate(TxMetadata::record_size_for(utxo_count)).unwrap();
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn is_complete_polling() {
         let (dev, _blob, uploader) = setup();
-        let mut alloc = SlotAllocator::new(dev.clone());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
 
         let utxo_count = 1u32;
         let offset = alloc.allocate(TxMetadata::record_size_for(utxo_count)).unwrap();
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn multiple_uploads() {
         let (dev, blob, uploader) = setup();
-        let mut alloc = SlotAllocator::new(dev.clone());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
 
         let mut handles = Vec::new();
         for i in 0..10u8 {
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn external_ref_pwrite_only_touches_metadata() {
         let (dev, _blob, uploader) = setup();
-        let mut alloc = SlotAllocator::new(dev.clone());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
 
         let utxo_count = 3u32;
         let offset = alloc.allocate(TxMetadata::record_size_for(utxo_count)).unwrap();

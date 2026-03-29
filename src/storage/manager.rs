@@ -321,7 +321,7 @@ mod tests {
 
     fn setup() -> (Arc<MemoryDevice>, StorageManager) {
         let dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-        let alloc = SlotAllocator::new(dev.clone());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let blob = Arc::new(MemoryBlobStore::new());
         let mgr = StorageManager::new(dev.clone(), alloc, blob);
         (dev, mgr)
