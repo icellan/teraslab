@@ -15,3 +15,9 @@ _plans/
 # Test results and logs
 /teraslab-tests/results/*
 !/teraslab-tests/results/.gitkeep
+
+# Generated Docker compose files and configs (runtime artifacts)
+/docker/
+
+# Coverage reports
+tarpaulin-report.json
