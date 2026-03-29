@@ -24,16 +24,6 @@ type ShardTableLock<T> = parking_lot::RwLock<T>;
 use std::sync::RwLock;
 use std::time::Duration;
 
-/// Cancellation token for in-flight migration worker threads.
-///
-/// When `activate_topology` starts a new migration batch it replaces the
-/// current token with a fresh one, signalling old workers to exit early.
-/// Workers clone the token at batch start and check it periodically between
-/// shard migrations — if set, they abort remaining shards without wasting
-/// network and CPU on a superseded topology.
-static MIGRATION_CANCEL: std::sync::LazyLock<std::sync::RwLock<Arc<AtomicBool>>> =
-    std::sync::LazyLock::new(|| std::sync::RwLock::new(Arc::new(AtomicBool::new(false))));
-
 /// Cluster coordinator configuration.
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
@@ -794,17 +784,6 @@ impl ClusterCoordinator {
                 })
                 .collect();
 
-            // Signal the cancellation token so in-flight worker threads
-            // for stale migrations exit early between shards. Only fires
-            // when there are actual stale tasks — re-activations of the
-            // same topology (e.g., retry after failed migrations) do NOT
-            // cancel, allowing workers to complete normally.
-            if !stale_tasks.is_empty() {
-                let mut guard = MIGRATION_CANCEL.write().unwrap();
-                guard.store(true, Ordering::Release);
-                *guard = Arc::new(AtomicBool::new(false));
-            }
-
             for t in &stale_tasks {
                 mgr.mark_failed(t);
             }
@@ -1414,10 +1393,6 @@ fn run_migration_batch(
         }
     };
 
-    // Snapshot the current cancellation token. If a new topology change
-    // fires while we're running, it sets this token and we exit early.
-    let cancel = MIGRATION_CANCEL.read().unwrap().clone();
-
     let completed = std::sync::atomic::AtomicU32::new(0);
     let failed = std::sync::atomic::AtomicU32::new(0);
 
@@ -1592,7 +1567,6 @@ fn run_migration_batch(
             let fenced_bm = fenced_bm.clone();
             let migrating_bm = migrating_bm.clone();
             let engine = engine.clone();
-            let cancel = cancel.clone();
 
             scope.spawn(move || {
                 // Exponential backoff delays for connection retries.
@@ -1665,22 +1639,6 @@ fn run_migration_batch(
                 let mut consecutive_failures: u32 = 0;
                 let mut task_idx = 0;
                 while task_idx < chunk.len() {
-                    // Check cancellation between shards.
-                    if cancel.load(Ordering::Acquire) {
-                        eprintln!("cluster: migration batch to {} cancelled — topology superseded ({} remaining)", addr, chunk.len() - task_idx);
-                        let mut mgr = migration.lock().unwrap();
-                        let mut table = shard_table.write();
-                        for remaining in &chunk[task_idx..] {
-                            mgr.mark_failed(remaining);
-                            if !mgr.is_shard_fenced(remaining.shard) {
-                                fenced_bm.clear(remaining.shard);
-                            }
-                            migrating_bm.clear(remaining.shard);
-                            table.rollback_shard(remaining.shard);
-                            failed.fetch_add(1, Ordering::Relaxed);
-                        }
-                        break;
-                    }
                     let task = &chunk[task_idx];
                     let ok = migrate_single_shard(task, keys_ref, &engine, &migration, shard_table, redo_log, &mut stream, addr, &completed, &failed, topology_epoch, batch_size, &fenced_bm, &migrating_bm);
 
@@ -3269,27 +3227,6 @@ mod tests {
             persist_failure_count() > before,
             "persist_failure_count should increment on failure",
         );
-    }
-
-    #[test]
-    fn migration_cancel_token_replaces_and_signals() {
-        // Simulate two topology activations: the second should cancel the first.
-        let token1 = MIGRATION_CANCEL.read().unwrap().clone();
-        assert!(!token1.load(Ordering::Acquire), "initial token should be false");
-
-        // Simulate activate_topology setting the old token and creating a new one.
-        {
-            let mut guard = MIGRATION_CANCEL.write().unwrap();
-            guard.store(true, Ordering::Release);
-            *guard = Arc::new(AtomicBool::new(false));
-        }
-
-        // The first token should now be cancelled.
-        assert!(token1.load(Ordering::Acquire), "old token should be set after replacement");
-
-        // The new token should be fresh.
-        let token2 = MIGRATION_CANCEL.read().unwrap().clone();
-        assert!(!token2.load(Ordering::Acquire), "new token should be false");
     }
 
     #[test]
