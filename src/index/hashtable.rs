@@ -278,6 +278,80 @@ unsafe fn dealloc_mmap_buckets(ptr: *mut Bucket, byte_len: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Backing
+// ---------------------------------------------------------------------------
+
+/// Tracks whether the hash table's memory is anonymous or file-backed.
+enum Backing {
+    /// Anonymous mmap (MAP_ANONYMOUS | MAP_PRIVATE). Default.
+    Anonymous,
+    /// File-backed mmap (MAP_SHARED). Persistent across restarts.
+    FileBacked {
+        /// File descriptor (kept open for msync/munmap).
+        fd: std::os::unix::io::RawFd,
+        /// Path to the backing file (for resize operations).
+        path: std::path::PathBuf,
+    },
+}
+
+/// Allocate a file-backed mmap region for `capacity` buckets.
+///
+/// Opens or creates the file at `path`, truncates to exact size, and maps
+/// it with `MAP_SHARED`. Sets `MADV_RANDOM` to disable readahead.
+///
+/// Returns `(pointer, mmap_byte_length, fd)`.
+fn alloc_file_backed_buckets(
+    path: &std::path::Path,
+    capacity: usize,
+) -> Result<(*mut Bucket, usize, std::os::unix::io::RawFd)> {
+    use std::os::unix::io::IntoRawFd;
+
+    let byte_len = capacity
+        .checked_mul(std::mem::size_of::<Bucket>())
+        .ok_or_else(|| HashTableError::AllocFailed("capacity overflow".into()))?;
+
+    if byte_len == 0 {
+        return Err(HashTableError::AllocFailed("zero-size allocation".into()));
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| HashTableError::AllocFailed(format!("open {}: {e}", path.display())))?;
+
+    file.set_len(byte_len as u64)
+        .map_err(|e| HashTableError::AllocFailed(format!("ftruncate: {e}")))?;
+
+    let fd = file.into_raw_fd();
+
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            byte_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+
+    if ptr == libc::MAP_FAILED {
+        unsafe { libc::close(fd) };
+        return Err(HashTableError::AllocFailed(format!(
+            "mmap MAP_SHARED({byte_len} bytes) failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    unsafe { libc::madvise(ptr, byte_len, libc::MADV_RANDOM) };
+
+    Ok((ptr.cast::<Bucket>(), byte_len, fd))
+}
+
+// ---------------------------------------------------------------------------
 // HashTable
 // ---------------------------------------------------------------------------
 
@@ -305,6 +379,8 @@ pub struct HashTable {
     hugepage: bool,
     /// Maximum probe distance observed so far.
     max_probe: usize,
+    /// Whether this table is anonymous or file-backed.
+    backing: Backing,
 }
 
 impl std::fmt::Debug for HashTable {
@@ -314,6 +390,10 @@ impl std::fmt::Debug for HashTable {
             .field("count", &self.count)
             .field("hugepage", &self.hugepage)
             .field("max_probe", &self.max_probe)
+            .field("backing", &match &self.backing {
+                Backing::Anonymous => "anonymous",
+                Backing::FileBacked { .. } => "file_backed",
+            })
             .finish()
     }
 }
@@ -351,7 +431,76 @@ impl HashTable {
             mmap_len,
             hugepage,
             max_probe: 0,
+            backing: Backing::Anonymous,
         })
+    }
+
+    /// Open or create a file-backed hash table at `path`.
+    ///
+    /// If the file exists and its size is `capacity * BUCKET_SIZE`, it is mapped
+    /// and scanned to recover `count` and `max_probe`. If the file does not exist
+    /// or its size doesn't match, a new file is created with all empty buckets.
+    ///
+    /// The capacity is rounded up to the next power of two (minimum 16).
+    pub fn open_file_backed(path: &std::path::Path, initial_capacity: usize) -> Result<Self> {
+        let capacity = initial_capacity.next_power_of_two().max(16);
+        let expected_size = capacity * std::mem::size_of::<Bucket>();
+
+        let file_exists = path.exists();
+        let file_matches = file_exists
+            && std::fs::metadata(path)
+                .map(|m| m.len() == expected_size as u64)
+                .unwrap_or(false);
+
+        let (ptr, mmap_len, fd) = alloc_file_backed_buckets(path, capacity)?;
+
+        if file_matches {
+            // Scan existing file to recover count and max_probe.
+            let mut count = 0usize;
+            let mut max_probe = 0usize;
+            for i in 0..capacity {
+                let bucket = unsafe { &*ptr.add(i) };
+                if bucket.is_occupied() {
+                    count += 1;
+                    if (bucket.probe_distance as usize) > max_probe {
+                        max_probe = bucket.probe_distance as usize;
+                    }
+                }
+            }
+            Ok(Self {
+                ptr,
+                capacity,
+                count,
+                mask: capacity - 1,
+                mmap_len,
+                hugepage: false,
+                max_probe,
+                backing: Backing::FileBacked {
+                    fd,
+                    path: path.to_path_buf(),
+                },
+            })
+        } else {
+            // Initialize all buckets to empty sentinel.
+            unsafe {
+                std::ptr::write_bytes(ptr as *mut u8, BUCKET_EMPTY_SENTINEL, mmap_len);
+            }
+            unsafe { libc::msync(ptr.cast(), mmap_len, libc::MS_SYNC) };
+
+            Ok(Self {
+                ptr,
+                capacity,
+                count: 0,
+                mask: capacity - 1,
+                mmap_len,
+                hugepage: false,
+                max_probe: 0,
+                backing: Backing::FileBacked {
+                    fd,
+                    path: path.to_path_buf(),
+                },
+            })
+        }
     }
 
     /// Safe accessor for bucket at `idx` (immutable).
@@ -628,19 +777,61 @@ impl HashTable {
         }
     }
 
+    /// Flush dirty pages to the backing file asynchronously.
+    ///
+    /// No-op for anonymous mmap. For file-backed tables, calls
+    /// `msync(MS_ASYNC)` to schedule a writeback without blocking.
+    pub fn sync(&self) {
+        if let Backing::FileBacked { .. } = &self.backing
+            && self.mmap_len > 0
+            && !self.ptr.is_null()
+        {
+            unsafe { libc::msync(self.ptr.cast(), self.mmap_len, libc::MS_ASYNC) };
+        }
+    }
+
+    /// Whether this table is backed by a persistent file.
+    pub fn is_file_backed(&self) -> bool {
+        matches!(self.backing, Backing::FileBacked { .. })
+    }
+
     /// Resize the table to at least `new_capacity` buckets.
     ///
-    /// Allocates a new mmap region, rehashes all occupied entries, and
-    /// releases the old mmap region.
+    /// For anonymous tables, allocates a new mmap region and rehashes.
+    /// For file-backed tables, creates a temporary file, rehashes into it,
+    /// then renames it over the original.
     pub fn resize(&mut self, new_capacity: usize) -> Result<()> {
         let new_cap = new_capacity.next_power_of_two().max(16);
-        let mut new_table = HashTable::new(new_cap)?;
+        let mut new_table = match &self.backing {
+            Backing::Anonymous => HashTable::new(new_cap)?,
+            Backing::FileBacked { path, .. } => {
+                let tmp_path = path.with_extension("tmp");
+                let _ = std::fs::remove_file(&tmp_path);
+                HashTable::open_file_backed(&tmp_path, new_cap)?
+            }
+        };
 
         for i in 0..self.capacity {
             let bucket = self.bucket(i);
             if bucket.is_occupied() {
                 let key = TxKey { txid: bucket.txid };
                 new_table.insert(key, bucket.entry())?;
+            }
+        }
+
+        if let (Backing::FileBacked { path: old_path, .. }, Backing::FileBacked { .. }) =
+            (&self.backing, &new_table.backing)
+        {
+            new_table.sync();
+            unsafe {
+                libc::msync(new_table.ptr.cast(), new_table.mmap_len, libc::MS_SYNC);
+            }
+            let tmp_path = old_path.with_extension("tmp");
+            std::fs::rename(&tmp_path, old_path).map_err(|e| {
+                HashTableError::AllocFailed(format!("rename during resize: {e}"))
+            })?;
+            if let Backing::FileBacked { path, .. } = &mut new_table.backing {
+                *path = old_path.clone();
             }
         }
 
@@ -661,9 +852,14 @@ impl HashTable {
 
 impl Drop for HashTable {
     fn drop(&mut self) {
-        if self.mmap_len > 0 {
-            // Safety: ptr was allocated by alloc_mmap_buckets with mmap_len bytes.
-            unsafe { dealloc_mmap_buckets(self.ptr, self.mmap_len) };
+        if self.mmap_len > 0 && !self.ptr.is_null() {
+            if let Backing::FileBacked { fd, .. } = &self.backing {
+                unsafe { libc::msync(self.ptr.cast(), self.mmap_len, libc::MS_SYNC) };
+                unsafe { dealloc_mmap_buckets(self.ptr, self.mmap_len) };
+                unsafe { libc::close(*fd) };
+            } else {
+                unsafe { dealloc_mmap_buckets(self.ptr, self.mmap_len) };
+            }
         }
     }
 }
@@ -1202,5 +1398,167 @@ mod tests {
         for (i, (_, e)) in collected.iter().enumerate() {
             assert_eq!(e.record_offset, i as u64);
         }
+    }
+
+    // -- File-backed tests --
+
+    #[test]
+    fn file_backed_create_insert_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.idx");
+        let mut t = HashTable::open_file_backed(&path, 64).unwrap();
+        assert!(t.is_file_backed());
+        assert_eq!(t.len(), 0);
+
+        let key = make_key(1);
+        let entry = make_entry(4096);
+        t.insert(key, entry).unwrap();
+        assert_eq!(t.len(), 1);
+
+        let got = t.get_entry(&key).unwrap();
+        assert_eq!(got, entry);
+    }
+
+    #[test]
+    fn file_backed_reopen_recovers_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.idx");
+
+        {
+            let mut t = HashTable::open_file_backed(&path, 64).unwrap();
+            for i in 0..20u64 {
+                t.insert(make_key(i), make_entry(i * 100)).unwrap();
+            }
+            assert_eq!(t.len(), 20);
+        }
+
+        let t = HashTable::open_file_backed(&path, 64).unwrap();
+        assert_eq!(t.len(), 20);
+        for i in 0..20u64 {
+            let e = t.get_entry(&make_key(i)).expect("should survive reopen");
+            assert_eq!(e.record_offset, i * 100);
+        }
+    }
+
+    #[test]
+    fn file_backed_sync_is_noop_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.idx");
+        let mut t = HashTable::open_file_backed(&path, 16).unwrap();
+        t.insert(make_key(1), make_entry(100)).unwrap();
+        t.sync();
+    }
+
+    #[test]
+    fn file_backed_remove_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.idx");
+        let mut t = HashTable::open_file_backed(&path, 64).unwrap();
+
+        for i in 0..10u64 {
+            t.insert(make_key(i), make_entry(i * 100)).unwrap();
+        }
+        assert_eq!(t.len(), 10);
+
+        let removed = t.remove(&make_key(5)).expect("should find entry");
+        assert_eq!(removed.record_offset, 500);
+        assert_eq!(t.len(), 9);
+        assert!(t.get_entry(&make_key(5)).is_none());
+    }
+
+    #[test]
+    fn file_backed_resize() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.idx");
+        let mut t = HashTable::open_file_backed(&path, 16).unwrap();
+        let initial_cap = t.capacity();
+
+        for i in 0..10u64 {
+            t.insert(make_key(i), make_entry(i * 100)).unwrap();
+        }
+
+        t.resize(initial_cap * 2).unwrap();
+        assert!(t.capacity() >= initial_cap * 2);
+        assert_eq!(t.len(), 10);
+
+        for i in 0..10u64 {
+            let e = t.get_entry(&make_key(i)).expect("entry should survive resize");
+            assert_eq!(e.record_offset, i * 100);
+        }
+
+        assert!(!dir.path().join("test.tmp").exists());
+    }
+
+    #[test]
+    fn file_backed_resize_then_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.idx");
+        let new_cap;
+
+        {
+            let mut t = HashTable::open_file_backed(&path, 16).unwrap();
+            for i in 0..10u64 {
+                t.insert(make_key(i), make_entry(i * 100)).unwrap();
+            }
+            t.resize(64).unwrap();
+            new_cap = t.capacity();
+        }
+
+        let t = HashTable::open_file_backed(&path, new_cap).unwrap();
+        assert_eq!(t.len(), 10);
+        for i in 0..10u64 {
+            let e = t.get_entry(&make_key(i)).expect("should survive resize + reopen");
+            assert_eq!(e.record_offset, i * 100);
+        }
+    }
+
+    #[test]
+    fn file_backed_update_cached_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.idx");
+        let mut t = HashTable::open_file_backed(&path, 32).unwrap();
+        let key = make_key(1);
+        t.insert(key, make_entry(4096)).unwrap();
+
+        let updated = t.update_cached_fields(&key, 0xFF, 5, 8, 200, 600, 99);
+        assert!(updated);
+
+        let e = t.get_entry(&key).unwrap();
+        assert_eq!(e.tx_flags, 0xFF);
+        assert_eq!(e.block_entry_count, 5);
+        assert_eq!(e.spent_utxos, 8);
+        assert_eq!(e.dah_or_preserve, 200);
+        assert_eq!(e.unmined_since, 600);
+        assert_eq!(e.generation, 99);
+        assert_eq!(e.record_offset, 4096);
+    }
+
+    #[test]
+    fn file_backed_matches_anonymous() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.idx");
+
+        let mut anon = HashTable::new(64).unwrap();
+        let mut fb = HashTable::open_file_backed(&path, 64).unwrap();
+
+        for i in 0..30u64 {
+            anon.insert(make_key(i), make_entry(i * 100)).unwrap();
+            fb.insert(make_key(i), make_entry(i * 100)).unwrap();
+        }
+
+        assert_eq!(anon.len(), fb.len());
+        for i in 0..30u64 {
+            let a = anon.get_entry(&make_key(i)).unwrap();
+            let f = fb.get_entry(&make_key(i)).unwrap();
+            assert_eq!(a, f, "mismatch at key {i}");
+        }
+    }
+
+    #[test]
+    fn anonymous_sync_is_noop() {
+        let mut t = HashTable::new(16).unwrap();
+        assert!(!t.is_file_backed());
+        t.insert(make_key(1), make_entry(100)).unwrap();
+        t.sync();
     }
 }
