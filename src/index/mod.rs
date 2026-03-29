@@ -129,6 +129,37 @@ impl Index {
         })
     }
 
+    /// Open or create a file-backed index at `path`.
+    ///
+    /// The hash table is pre-allocated to `expected_records / 0.7` buckets
+    /// (rounded to the next power of two) to keep the load factor below 70%.
+    /// If the file already exists with the correct size, entries are recovered
+    /// from the mapped file. Otherwise a fresh empty index is created.
+    pub fn open_file_backed(
+        path: &std::path::Path,
+        expected_records: usize,
+    ) -> Result<Self> {
+        let capacity = (expected_records as f64 / 0.7).ceil() as usize;
+        let table = HashTable::open_file_backed(path, capacity.max(16))?;
+        Ok(Self {
+            table,
+            resize_threshold: 0.7,
+        })
+    }
+
+    /// Flush dirty pages to the backing file (async).
+    ///
+    /// No-op for anonymous-mmap-backed indexes. For file-backed indexes,
+    /// schedules an asynchronous writeback of dirty pages.
+    pub fn sync(&self) {
+        self.table.sync();
+    }
+
+    /// Whether this index is backed by a persistent file.
+    pub fn is_file_backed(&self) -> bool {
+        self.table.is_file_backed()
+    }
+
     /// Look up where a transaction's record lives on disk.
     pub fn lookup(&self, key: &TxKey) -> Option<TxIndexEntry> {
         self.table.get_entry(key)
@@ -1075,5 +1106,61 @@ mod tests {
             let e = restored.lookup(&make_key(i)).expect("entry should exist");
             assert_eq!(e.record_offset, i * 100);
         }
+    }
+
+    // -- File-backed index tests --
+
+    #[test]
+    fn file_backed_index_create_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("primary.idx");
+
+        {
+            let mut idx = Index::open_file_backed(&path, 100).unwrap();
+            assert!(idx.is_file_backed());
+            for i in 0..50u64 {
+                let key = TxKey::from_bytes({
+                    let mut txid = [0u8; 32];
+                    txid[0..8].copy_from_slice(&i.to_le_bytes());
+                    txid[8..16].copy_from_slice(
+                        &(i.wrapping_mul(0x9E3779B97F4A7C15)).to_le_bytes(),
+                    );
+                    txid
+                });
+                let entry = TxIndexEntry {
+                    device_id: 0,
+                    record_offset: i * 100,
+                    utxo_count: 10,
+                    block_entry_count: 0,
+                    tx_flags: 0,
+                    spent_utxos: 0,
+                    dah_or_preserve: 0,
+                    unmined_since: 0,
+                    generation: 0,
+                };
+                idx.register(key, entry).unwrap();
+            }
+            assert_eq!(idx.len(), 50);
+            idx.sync();
+        }
+
+        let idx = Index::open_file_backed(&path, 100).unwrap();
+        assert_eq!(idx.len(), 50);
+    }
+
+    #[test]
+    fn file_backed_index_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("primary.idx");
+        let idx = Index::open_file_backed(&path, 100).unwrap();
+        let stats = idx.stats();
+        assert_eq!(stats.entry_count, 0);
+        assert!(!stats.hugepage_enabled);
+    }
+
+    #[test]
+    fn anonymous_index_is_not_file_backed() {
+        let idx = Index::new(16).unwrap();
+        assert!(!idx.is_file_backed());
     }
 }
