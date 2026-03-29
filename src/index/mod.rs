@@ -17,6 +17,7 @@ pub mod unmined_index;
 pub use backend::PrimaryBackend;
 pub use dah_index::DahIndex;
 pub use hashtable::{TxIndexEntry, TxKey};
+pub use redb_primary::CachedFieldsUpdate;
 pub use secondary_backend::{DahBackend, UnminedBackend};
 pub use unmined_index::UnminedIndex;
 

@@ -7,7 +7,7 @@ use crate::allocator::SlotAllocator;
 use crate::config::IndexConfig;
 use crate::device::BlockDevice;
 use crate::index::hashtable::{TxIndexEntry, TxKey};
-use crate::index::redb_primary::RedbPrimary;
+use crate::index::redb_primary::{CachedFieldsUpdate, RedbPrimary};
 use crate::index::secondary_backend::{DahBackend, UnminedBackend};
 use crate::index::{DahIndex, Index, IndexError, IndexStats, RestoreFlags, UnminedIndex};
 
@@ -102,6 +102,48 @@ impl PrimaryBackend {
                 unmined_since,
                 generation,
             ),
+        }
+    }
+
+    /// Update cached fields for multiple entries in a single transaction.
+    ///
+    /// For the redb backend, all updates are performed within one write
+    /// transaction, amortizing the `begin_write()/commit()` overhead.
+    /// For the in-memory backend, updates are applied individually (no
+    /// batching benefit for direct memory writes).
+    ///
+    /// Returns the number of entries successfully updated.
+    pub fn update_cached_fields_batch(&mut self, updates: &[CachedFieldsUpdate]) -> usize {
+        match self {
+            Self::InMemory(idx) => {
+                let mut count = 0;
+                for u in updates {
+                    if idx.update_cached_fields(
+                        &u.key,
+                        u.tx_flags,
+                        u.block_entry_count,
+                        u.spent_utxos,
+                        u.dah_or_preserve,
+                        u.unmined_since,
+                        u.generation,
+                    ) {
+                        count += 1;
+                    }
+                }
+                count
+            }
+            Self::OnDisk(redb) => redb.update_cached_fields_batch(updates),
+        }
+    }
+
+    /// Remove multiple transactions in a single transaction.
+    ///
+    /// Returns a `Vec` parallel to the input: `Some(entry)` for keys that
+    /// were found and removed, `None` for missing keys.
+    pub fn unregister_batch(&mut self, keys: &[TxKey]) -> Vec<Option<TxIndexEntry>> {
+        match self {
+            Self::InMemory(idx) => keys.iter().map(|k| idx.unregister(k)).collect(),
+            Self::OnDisk(redb) => redb.unregister_batch(keys),
         }
     }
 
@@ -856,6 +898,74 @@ mod tests {
             assert_eq!(backend.len(), 1);
             let e = backend.lookup(&key).unwrap();
             assert_eq!(e.record_offset, 999);
+        });
+    }
+
+    #[test]
+    fn both_backends_update_cached_fields_batch() {
+        with_both_backends(|backend| {
+            for i in 0..5u64 {
+                backend.register(make_key(i), make_entry(i * 100)).unwrap();
+            }
+
+            let updates: Vec<crate::index::CachedFieldsUpdate> = (0..5u64)
+                .map(|i| crate::index::CachedFieldsUpdate {
+                    key: make_key(i),
+                    tx_flags: 0xAA,
+                    block_entry_count: 3,
+                    spent_utxos: (i as u32) * 10,
+                    dah_or_preserve: 500,
+                    unmined_since: 600,
+                    generation: 42,
+                })
+                .collect();
+
+            let updated = backend.update_cached_fields_batch(&updates);
+            assert_eq!(updated, 5);
+
+            for i in 0..5u64 {
+                let e = backend.lookup(&make_key(i)).unwrap();
+                assert_eq!(e.tx_flags, 0xAA);
+                assert_eq!(e.generation, 42);
+                assert_eq!(e.record_offset, i * 100); // unchanged
+            }
+        });
+    }
+
+    #[test]
+    fn both_backends_update_cached_fields_batch_empty() {
+        with_both_backends(|backend| {
+            backend.register(make_key(1), make_entry(100)).unwrap();
+            let updated = backend.update_cached_fields_batch(&[]);
+            assert_eq!(updated, 0);
+        });
+    }
+
+    #[test]
+    fn both_backends_unregister_batch() {
+        with_both_backends(|backend| {
+            for i in 0..5u64 {
+                backend.register(make_key(i), make_entry(i * 100)).unwrap();
+            }
+
+            let keys: Vec<_> = vec![make_key(1), make_key(2), make_key(99)];
+            let results = backend.unregister_batch(&keys);
+
+            assert_eq!(results.len(), 3);
+            assert!(results[0].is_some());
+            assert!(results[1].is_some());
+            assert!(results[2].is_none());
+            assert_eq!(backend.len(), 3);
+        });
+    }
+
+    #[test]
+    fn both_backends_unregister_batch_empty() {
+        with_both_backends(|backend| {
+            backend.register(make_key(1), make_entry(100)).unwrap();
+            let results = backend.unregister_batch(&[]);
+            assert!(results.is_empty());
+            assert_eq!(backend.len(), 1);
         });
     }
 
