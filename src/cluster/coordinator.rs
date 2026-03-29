@@ -1560,29 +1560,31 @@ fn run_migration_batch(
     let tcp_timeout = Duration::from_millis(timeout_ms);
     let progress_done = Arc::new(AtomicBool::new(false));
 
-    std::thread::scope(|scope| {
-        // Periodic progress reporter: logs completion rate every 5 seconds
-        // during large migrations for operational visibility.
-        if total > 10 {
-            let completed_p = completed.clone();
-            let failed_p = failed.clone();
-            let done_p = progress_done.clone();
-            scope.spawn(move || {
-                while !done_p.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_secs(5));
-                    if done_p.load(Ordering::Relaxed) { break; }
-                    let c = completed_p.load(Ordering::Relaxed);
-                    let f = failed_p.load(Ordering::Relaxed);
-                    let elapsed = migration_start.elapsed().as_secs_f64();
-                    let rate = if elapsed > 0.0 { (c + f) as f64 / elapsed } else { 0.0 };
-                    eprintln!(
-                        "cluster: migration progress to {}: {c}/{total} completed, {f} failed ({:.1}s, {:.1} shards/s)",
-                        addr, elapsed, rate,
-                    );
-                }
-            });
-        }
+    // Periodic progress reporter: logs completion rate every 5 seconds
+    // during large migrations for operational visibility. Spawned as a
+    // detached thread (not inside thread::scope) so worker threads are
+    // not blocked waiting for the progress thread to exit.
+    if total > 10 {
+        let completed_p = completed.clone();
+        let failed_p = failed.clone();
+        let done_p = progress_done.clone();
+        std::thread::spawn(move || {
+            while !done_p.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(5));
+                if done_p.load(Ordering::Relaxed) { break; }
+                let c = completed_p.load(Ordering::Relaxed);
+                let f = failed_p.load(Ordering::Relaxed);
+                let elapsed = migration_start.elapsed().as_secs_f64();
+                let rate = if elapsed > 0.0 { (c + f) as f64 / elapsed } else { 0.0 };
+                eprintln!(
+                    "cluster: migration progress to {}: {c}/{total} completed, {f} failed ({:.1}s, {:.1} shards/s)",
+                    addr, elapsed, rate,
+                );
+            }
+        });
+    }
 
+    std::thread::scope(|scope| {
         for chunk in data_tasks.chunks(chunk_size) {
             let completed = completed.clone();
             let failed = failed.clone();
