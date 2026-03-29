@@ -237,7 +237,7 @@ impl ClusterCoordinator {
                             && let Some(ref path) = cluster_state_path
                         {
                             let peak = peak_size_event.load(Ordering::Relaxed) as u64;
-                            let epoch = topology_epoch.load(Ordering::Acquire);
+                            let epoch = topology_epoch.load(Ordering::Relaxed);
                             persist_cluster_state(path, peak, epoch);
                         }
                     }
@@ -278,7 +278,7 @@ impl ClusterCoordinator {
                                     );
                                 } else {
                                     last_activated_term = commit.term;
-                                    topology_epoch.store(commit.term, Ordering::Release);
+                                    topology_epoch.store(commit.term, Ordering::Relaxed);
                                     Self::activate_topology(
                                         &commit.members, commit.term, self_id, rf, &shard_table, &migration,
                                         &node_addrs, &engine, &redo_for_events, max_migration_threads,
@@ -359,7 +359,7 @@ impl ClusterCoordinator {
                             pending_handoffs,
                         ) {
                             let committed_term = topo_authority_event.committed_term();
-                            topology_epoch.store(committed_term, Ordering::Release);
+                            topology_epoch.store(committed_term, Ordering::Relaxed);
                             if startup_reactivation_due {
                                 startup_reactivation_event.store(false, Ordering::Release);
                                 eprintln!(
@@ -395,7 +395,7 @@ impl ClusterCoordinator {
                         continue;
                     }
                     last_activated_term = term;
-                    topology_epoch.store(term, Ordering::Release);
+                    topology_epoch.store(term, Ordering::Relaxed);
                     eprintln!("cluster: activating topology from commit signal (term {term}, epoch {term})");
                     Self::activate_topology(
                         &members, term, self_id, rf, &shard_table, &migration,
@@ -474,7 +474,7 @@ impl ClusterCoordinator {
                 let retry_tasks = migration.lock().unwrap().take_failed_tasks();
                 if !retry_tasks.is_empty() {
                     eprintln!("cluster: retrying {} failed migration(s)", retry_tasks.len());
-                    let epoch = topology_epoch.load(Ordering::Acquire);
+                    let epoch = topology_epoch.load(Ordering::Relaxed);
                     let retry_shards: std::collections::HashSet<u16> = retry_tasks.iter()
                         .map(|t| t.shard)
                         .collect();
@@ -541,7 +541,7 @@ impl ClusterCoordinator {
                     };
                     if let Some(commit) = topology_authority.handle_vote(&self_vote) {
                         // Single-node: quorum met immediately. Activate directly.
-                        topology_epoch.store(commit.term, Ordering::Release);
+                        topology_epoch.store(commit.term, Ordering::Relaxed);
                         eprintln!("cluster: single-node quorum — activating term {}", commit.term);
                         topology_authority.handle_commit(&commit);
                         Self::activate_topology(
@@ -653,7 +653,7 @@ impl ClusterCoordinator {
                                     let inc = swim_incarnation.load(Ordering::Relaxed);
                                     persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
                                 }
-                                topology_epoch.store(commit_term, Ordering::Release);
+                                topology_epoch.store(commit_term, Ordering::Relaxed);
                                 Self::activate_topology(
                                     &remote_members, commit_term, self_id, rf, shard_table, migration,
                                     node_addrs, engine, redo_for_events, max_migration_threads,
@@ -694,7 +694,7 @@ impl ClusterCoordinator {
                                 voter_current_term: topology_authority.committed_term(),
                             };
                             if let Some(commit) = topology_authority.handle_vote(&self_vote) {
-                                topology_epoch.store(commit.term, Ordering::Release);
+                                topology_epoch.store(commit.term, Ordering::Relaxed);
                                 topology_authority.handle_commit(&commit);
                                 Self::activate_topology(
                                     &commit.members, commit.term, self_id, rf, shard_table, migration,
@@ -2853,7 +2853,7 @@ impl RunningCluster {
     /// Every membership change increments this counter. Used as a
     /// fencing token for ownership validation.
     pub fn topology_epoch(&self) -> u64 {
-        self.topology_epoch.load(Ordering::Acquire)
+        self.topology_epoch.load(Ordering::Relaxed)
     }
 
     /// Resolved replication ACK policy. None means best-effort (no enforcement).
