@@ -322,8 +322,16 @@ fn alloc_file_backed_buckets(
         .open(path)
         .map_err(|e| HashTableError::AllocFailed(format!("open {}: {e}", path.display())))?;
 
-    file.set_len(byte_len as u64)
-        .map_err(|e| HashTableError::AllocFailed(format!("ftruncate: {e}")))?;
+    // Only set_len if the file isn't already the right size. This avoids
+    // truncating an existing file that was resized to a larger capacity.
+    let current_len = file
+        .metadata()
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if current_len != byte_len as u64 {
+        file.set_len(byte_len as u64)
+            .map_err(|e| HashTableError::AllocFailed(format!("ftruncate: {e}")))?;
+    }
 
     let fd = file.into_raw_fd();
 
@@ -437,24 +445,40 @@ impl HashTable {
 
     /// Open or create a file-backed hash table at `path`.
     ///
-    /// If the file exists and its size is `capacity * BUCKET_SIZE`, it is mapped
-    /// and scanned to recover `count` and `max_probe`. If the file does not exist
-    /// or its size doesn't match, a new file is created with all empty buckets.
+    /// If the file exists and its size is a valid power-of-two multiple of
+    /// `BUCKET_SIZE`, it is mapped at its existing capacity and scanned to
+    /// recover `count` and `max_probe`. The `initial_capacity` parameter is
+    /// only used when creating a new file.
     ///
     /// The capacity is rounded up to the next power of two (minimum 16).
     pub fn open_file_backed(path: &std::path::Path, initial_capacity: usize) -> Result<Self> {
-        let capacity = initial_capacity.next_power_of_two().max(16);
-        let expected_size = capacity * std::mem::size_of::<Bucket>();
+        let bucket_size = std::mem::size_of::<Bucket>();
 
-        let file_exists = path.exists();
-        let file_matches = file_exists
-            && std::fs::metadata(path)
-                .map(|m| m.len() == expected_size as u64)
-                .unwrap_or(false);
+        // If the file already exists with a valid bucket-array size, use that
+        // capacity instead of the caller's initial_capacity. This prevents
+        // truncating a file that auto-resized to a larger capacity.
+        let (capacity, is_existing) = if path.exists() {
+            if let Ok(meta) = std::fs::metadata(path) {
+                let file_len = meta.len() as usize;
+                if file_len >= bucket_size
+                    && file_len.is_multiple_of(bucket_size)
+                    && (file_len / bucket_size).is_power_of_two()
+                {
+                    (file_len / bucket_size, true)
+                } else {
+                    // File exists but has invalid size — treat as new.
+                    (initial_capacity.next_power_of_two().max(16), false)
+                }
+            } else {
+                (initial_capacity.next_power_of_two().max(16), false)
+            }
+        } else {
+            (initial_capacity.next_power_of_two().max(16), false)
+        };
 
         let (ptr, mmap_len, fd) = alloc_file_backed_buckets(path, capacity)?;
 
-        if file_matches {
+        if is_existing {
             // Scan existing file to recover count and max_probe.
             let mut count = 0usize;
             let mut max_probe = 0usize;
