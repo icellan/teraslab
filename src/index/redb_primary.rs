@@ -32,7 +32,7 @@ impl RedbPrimary {
     /// TeraSlab's redo log (WAL) provides crash recovery, so the redb index
     /// does not need per-operation fsync. `Durability::Eventual` lets redb
     /// batch fsyncs internally, which is 10-100x faster for small writes.
-    #[allow(clippy::result_large_err)] // redb::TransactionError is external; we cannot shrink it
+    #[allow(clippy::result_large_err)]
     fn begin_write(&self) -> Result<redb::WriteTransaction, redb::TransactionError> {
         let mut txn = self.db.begin_write()?;
         txn.set_durability(redb::Durability::Eventual);

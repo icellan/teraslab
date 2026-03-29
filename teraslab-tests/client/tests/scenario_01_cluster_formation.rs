@@ -304,10 +304,10 @@ async fn test_staggered_start() -> Result<(), ClientError> {
     tlog!(t0, "  [stag] node3 healthy");
 
     tlog!(t0, "  [stag] wait_cluster_ready...");
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
     tlog!(t0, "  [stag] cluster ready");
     tlog!(t0, "  [stag] wait_migrations_complete...");
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await?;
     tlog!(t0, "  [stag] migrations done");
     // Wait for shard rebalance to fully propagate to all nodes.
     // After topology commit and migration, each node's target_assignment
@@ -396,10 +396,10 @@ async fn test_late_join() -> Result<(), ClientError> {
     docker.compose_up_nodes(&["node1", "node2"]).await?;
     tlog!(t0, "  [late] nodes up");
     tlog!(t0, "  [late] wait_cluster_ready (2 nodes)...");
-    common::wait_cluster_ready(&docker, 2, Duration::from_secs(30)).await?;
+    common::wait_cluster_ready(&docker, 2, Duration::from_secs(15)).await?;
     tlog!(t0, "  [late] cluster ready");
     tlog!(t0, "  [late] wait_migrations_complete (2 nodes)...");
-    common::wait_migrations_complete(&docker, 2, Duration::from_secs(60)).await?;
+    common::wait_migrations_complete(&docker, 2, Duration::from_secs(15)).await?;
     tlog!(t0, "  [late] migrations done");
 
     let mut total_master_shards_2node: u64 = 0;
@@ -424,10 +424,10 @@ async fn test_late_join() -> Result<(), ClientError> {
     docker.compose_up_nodes(&["node3"]).await?;
     tlog!(t0, "  [late] node3 up");
     tlog!(t0, "  [late] wait_cluster_ready (3 nodes)...");
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
     tlog!(t0, "  [late] cluster ready");
     tlog!(t0, "  [late] wait_migrations_complete (3 nodes, 180s timeout)...");
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await?;
     tlog!(t0, "  [late] migrations done");
     // Wait for shard rebalance to fully propagate.
     tlog!(t0, "  [late] wait for rebalance...");
@@ -517,7 +517,7 @@ async fn test_wrong_config_rejected() -> Result<(), ClientError> {
 
     // Wait long enough for the rogue node to attempt discovery.
     // SWIM probe interval is 150ms, so 3s covers ~20 probe cycles.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     tlog!(t0, "  [wrong] wait done");
 
     // Verify the original cluster still has exactly 3 nodes -- the rogue

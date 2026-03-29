@@ -245,6 +245,14 @@ pub struct ServerConfig {
     /// Index backend configuration. Controls whether the primary and secondary
     /// indexes use in-memory hash tables or on-disk redb B+ trees.
     pub index: IndexConfig,
+
+    /// Expected device identity (hex string). If set, the server refuses to
+    /// start if the on-disk identity does not match. Use this to prevent
+    /// accidentally pointing at the wrong device.
+    ///
+    /// The expected value is a 32-character lowercase hex string, as printed
+    /// by `device_id_hex()` and logged on first startup.
+    pub device_id: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -277,10 +285,11 @@ impl Default for ServerConfig {
             ack_policy: "auto".to_string(),
             replication_timeout_ms: 3000,
             replication_degraded_mode: "reject".to_string(),
-            migration_pool_size: 4,
-            migration_batch_size: 100,
+            migration_pool_size: 32,
+            migration_batch_size: 500,
             replica_lag_check_interval_secs: 30,
             index: IndexConfig::default(),
+            device_id: None,
         }
     }
 }
@@ -340,6 +349,27 @@ impl ServerConfig {
     /// Whether replication failures should be tolerated (best_effort mode).
     pub fn is_replication_best_effort(&self) -> bool {
         self.replication_degraded_mode == "best_effort"
+    }
+
+    /// Validate the `device_id` config value, if set.
+    ///
+    /// Returns `Ok(())` if absent or a valid 32-char lowercase hex string.
+    /// Returns `Err` with a descriptive message otherwise.
+    pub fn validate_device_id(&self) -> std::result::Result<(), String> {
+        if let Some(ref id) = self.device_id {
+            if id.len() != 32 {
+                return Err(format!(
+                    "device_id must be exactly 32 hex characters, got {} characters",
+                    id.len()
+                ));
+            }
+            if !id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+                return Err(
+                    "device_id must contain only lowercase hex digits (0-9, a-f)".to_string()
+                );
+            }
+        }
+        Ok(())
     }
 }
 

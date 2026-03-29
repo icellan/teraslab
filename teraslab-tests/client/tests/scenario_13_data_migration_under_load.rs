@@ -48,7 +48,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     tlog!(t0, "teardown_all done");
 
     let (mut docker, client) = common::start_3node_cluster(SID).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await?;
     client.refresh_routing().await?;
 
     let verifier = Arc::new(StateVerifier::new());
@@ -57,7 +57,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     eprintln!("[13.0] Seeding 20000 records on 3-node cluster");
     let original_txids = common::seed_records(&client, &verifier, 20000, 4).await?;
     assert_eq!(original_txids.len(), 20000);
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     eprintln!("[13.0] Seeding complete");
 
     // -- 13.1: Start 500 ops/sec mixed background workload --
@@ -202,10 +202,10 @@ async fn run_scenario() -> Result<(), ClientError> {
     docker_5.compose_up_nodes(&["node4"]).await?;
 
     eprintln!("[13.2] Waiting for node4 to join (cluster_size=4)");
-    common::wait_cluster_ready(&docker_5, 4, Duration::from_secs(180)).await?;
+    common::wait_cluster_ready(&docker_5, 4, Duration::from_secs(15)).await?;
 
     eprintln!("[13.2] Waiting for migrations to complete on 4 nodes");
-    common::wait_migrations_complete(&docker_5, 4, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker_5, 4, Duration::from_secs(60)).await?;
     let migration_duration = migration_start.elapsed();
     eprintln!("[13.2] Migrations complete in {:.1}s", migration_duration.as_secs_f64());
 
@@ -259,28 +259,22 @@ async fn run_scenario() -> Result<(), ClientError> {
     let partition_map = fresh_client.get_partition_map().await?;
 
     let mut misrouted = 0u32;
+
+    // First pass: check shard assignments are valid (pure local computation)
     for txid in &background_txids {
-        // Compute the shard for this txid (first 2 bytes mod 4096)
         let shard = u16::from_le_bytes([txid[0], txid[1]]) % NUM_SHARDS as u16;
         let assigned_node_id = partition_map.assignments[shard as usize];
-
-        // Find the node's address
         let node_info = partition_map.nodes.iter().find(|n| n.id == assigned_node_id);
         if node_info.is_none() {
             eprintln!("[13.5] Shard {shard} assigned to unknown node_id {assigned_node_id}");
             misrouted += 1;
-            continue;
-        }
-
-        // Verify the record is readable via the cluster client (which routes
-        // to the correct node per the shard table)
-        match fresh_client.get_batch(FIELD_ALL_METADATA, std::slice::from_ref(txid)).await {
-            Ok(results) if !results.is_empty() && results.item(0).status == 0 => {}
-            _ => {
-                misrouted += 1;
-            }
         }
     }
+
+    // Second pass: batch-verify all records are readable via the cluster client
+    let (_, not_found) = common::count_accessible(&fresh_client, &background_txids).await?;
+    misrouted += not_found as u32;
+
     assert_eq!(misrouted, 0,
         "13.5: {misrouted} records created during migration are not on the correct node");
     eprintln!("[13.5] All {} background-created records routed correctly per new shard table",

@@ -82,6 +82,12 @@ pub trait BlockDevice: Send + Sync {
     fn as_raw_ptr(&self) -> Option<*mut u8> {
         None
     }
+
+    /// Returns `true` if the underlying file descriptor refers to a raw block
+    /// device (`S_IFBLK`), or `false` for regular files and in-memory devices.
+    fn is_block_device(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,21 +296,38 @@ impl BlockDevice for MemoryDevice {
 ///
 /// On Linux, opens with `O_DIRECT | O_RDWR` for zero-copy NVMe access.
 /// On macOS (development), uses standard file I/O with `F_NOCACHE`.
+///
+/// Raw block devices (`/dev/disk/by-id/…`, `/dev/nvme0n1`, etc.) are detected
+/// automatically. For block devices, `set_len` is never called (it would return
+/// `EINVAL`), and the actual device size is queried via `ioctl`. For regular
+/// files the requested `size` is used only to **grow** the file on creation; an
+/// existing file that is already larger than `size` is never shrunk.
 pub struct DirectDevice {
     file: std::fs::File,
     size: u64,
     alignment: usize,
+    is_block: bool,
 }
 
 impl DirectDevice {
-    /// Open or create a file-backed device at `path` with the given size.
+    /// Open or create a file-backed device at `path`.
     ///
-    /// The file is created if it doesn't exist and pre-allocated to `size` bytes.
+    /// `size` is the desired capacity in bytes, used only for regular files:
+    /// - If the file is new (size == 0) or smaller than `size`, it is grown to
+    ///   `size`.
+    /// - If the file already exists and is larger than `size`, it is left
+    ///   unchanged — the actual file size is used.
+    ///
+    /// For raw block devices (`S_IFBLK`), `size` is ignored; the kernel-reported
+    /// device size is queried via `ioctl` and stored instead. `set_len` is never
+    /// called on a block device.
+    ///
     /// `alignment` specifies the minimum I/O alignment (typically 4096).
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be opened or pre-allocated.
+    /// Returns [`DeviceError::Io`] if the file cannot be opened, the device size
+    /// cannot be queried, or pre-allocation fails.
     pub fn open(
         path: &std::path::Path,
         size: u64,
@@ -324,8 +347,83 @@ impl DirectDevice {
 
         let file = opts.open(path)?;
 
-        // Pre-allocate the file to the requested size.
-        file.set_len(size)?;
+        // Detect whether the path refers to a block device or a regular file.
+        #[cfg(unix)]
+        let is_block = {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            // Safety: fd is valid; stat_buf is fully written by fstat before
+            // being read.
+            let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::fstat(fd, &mut stat_buf) };
+            if rc != 0 {
+                return Err(DeviceError::Io(std::io::Error::last_os_error()));
+            }
+            (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFBLK
+        };
+        #[cfg(not(unix))]
+        let is_block = false;
+
+        let actual_size = if is_block {
+            // Query the true device capacity from the kernel; never call
+            // set_len on a block device (ftruncate returns EINVAL).
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::io::AsRawFd;
+                let fd = file.as_raw_fd();
+                let mut dev_size: u64 = 0;
+                // BLKGETSIZE64 = 0x80081272 — returns byte count as u64.
+                // Safety: fd is a valid open block device; dev_size is a
+                // properly-sized output variable for this ioctl.
+                let rc = unsafe {
+                    libc::ioctl(fd, 0x8008_1272 as libc::c_ulong, &mut dev_size)
+                };
+                if rc != 0 {
+                    return Err(DeviceError::Io(std::io::Error::last_os_error()));
+                }
+                dev_size
+            }
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::unix::io::AsRawFd;
+                let fd = file.as_raw_fd();
+                // DKIOCGETBLOCKCOUNT = 0x40086419  (returns u64 block count)
+                // DKIOCGETBLOCKSIZE  = 0x40046418  (returns u32 block size)
+                let mut block_count: u64 = 0;
+                let mut block_size: u32 = 0;
+                // Safety: fd is a valid open block device; the output
+                // variables are correctly sized for the respective ioctls.
+                let rc = unsafe {
+                    libc::ioctl(fd, 0x4008_6419 as libc::c_ulong, &mut block_count)
+                };
+                if rc != 0 {
+                    return Err(DeviceError::Io(std::io::Error::last_os_error()));
+                }
+                let rc = unsafe {
+                    libc::ioctl(fd, 0x4004_6418 as libc::c_ulong, &mut block_size)
+                };
+                if rc != 0 {
+                    return Err(DeviceError::Io(std::io::Error::last_os_error()));
+                }
+                block_count * u64::from(block_size)
+            }
+            #[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
+            {
+                return Err(DeviceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "block device size query not supported on this platform",
+                )));
+            }
+        } else {
+            // Regular file: only grow, never shrink.
+            let existing = file.metadata()?.len();
+            if existing < size {
+                file.set_len(size)?;
+                size
+            } else {
+                existing
+            }
+        };
 
         // On macOS, disable caching to approximate O_DIRECT behavior.
         #[cfg(target_os = "macos")]
@@ -339,8 +437,9 @@ impl DirectDevice {
 
         Ok(Self {
             file,
-            size,
+            size: actual_size,
             alignment,
+            is_block,
         })
     }
 
@@ -451,6 +550,10 @@ impl BlockDevice for DirectDevice {
     fn sync(&self) -> Result<()> {
         self.file.sync_all()?;
         Ok(())
+    }
+
+    fn is_block_device(&self) -> bool {
+        self.is_block
     }
 }
 
@@ -669,5 +772,75 @@ mod tests {
         let path = dir.path().join("test.dat");
         let dev = DirectDevice::open(&path, 4096, 4096).unwrap();
         dev.sync().unwrap();
+    }
+
+    #[test]
+    fn direct_device_is_not_block_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not_block.dat");
+        let dev = DirectDevice::open(&path, 4096, 4096).unwrap();
+        assert!(
+            !dev.is_block_device(),
+            "temp file must not be reported as a block device"
+        );
+    }
+
+    #[test]
+    fn direct_device_no_truncate_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.dat");
+
+        // Create a 65536-byte file.
+        {
+            let dev = DirectDevice::open(&path, 65536, 4096).unwrap();
+            assert_eq!(dev.size(), 65536);
+        }
+
+        // Reopen requesting only 4096 bytes — must NOT shrink the file.
+        let dev = DirectDevice::open(&path, 4096, 4096).unwrap();
+        assert_eq!(
+            dev.size(),
+            65536,
+            "existing file must not be truncated when smaller size is requested"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            65536,
+            "on-disk size must remain 65536"
+        );
+    }
+
+    #[test]
+    fn direct_device_grows_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grow.dat");
+
+        // Create a small file.
+        {
+            let dev = DirectDevice::open(&path, 4096, 4096).unwrap();
+            assert_eq!(dev.size(), 4096);
+        }
+
+        // Reopen requesting a larger size — file must grow.
+        let dev = DirectDevice::open(&path, 65536, 4096).unwrap();
+        assert_eq!(
+            dev.size(),
+            65536,
+            "file must be grown to the requested size"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            65536,
+            "on-disk size must be 65536 after growing"
+        );
+    }
+
+    #[test]
+    fn memory_device_is_not_block_device() {
+        let dev = MemoryDevice::new(4096, 4096).unwrap();
+        assert!(
+            !dev.is_block_device(),
+            "MemoryDevice must not be reported as a block device"
+        );
     }
 }

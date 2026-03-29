@@ -50,7 +50,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     tlog!(t0, "teardown_all done");
 
     let (docker, client) = common::start_3node_cluster(SID).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await?;
     client.refresh_routing().await?;
 
     let verifier = Arc::new(StateVerifier::new());
@@ -59,7 +59,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     let txids = common::seed_records(&client, &verifier, 10000, 10).await?;
     assert_eq!(txids.len(), 10000, "expected 10000 seeded records");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Record shard counts before scale-up for test 6.6
     let mut pre_scaleup_shard_counts: Vec<(u32, u64)> = Vec::new();
@@ -77,7 +77,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     docker5.compose_up_nodes(&["node4"]).await?;
 
     // Plan SLA is 5s; using 30s timeout as safety net
-    common::wait_cluster_ready(&docker5, 4, Duration::from_secs(30)).await?;
+    common::wait_cluster_ready(&docker5, 4, Duration::from_secs(15)).await?;
 
     for node_num in 1..=4u32 {
         let status = common::http_status(&docker5, node_num).await?;
@@ -179,7 +179,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     // -- Test 6.2: Wait for migrations, check balance --
     tlog!(t0, "test 6.2: wait for migrations");
     eprintln!("[6.2] Waiting for migrations to complete, then checking balance");
-    common::wait_migrations_complete(&docker5, 4, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker5, 4, Duration::from_secs(60)).await?;
     eprintln!("[6.2] OK -- all migrations complete");
 
     // Stop the background workload
@@ -258,7 +258,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     if read_failures > 0 && read_failures <= 50 {
         eprintln!("[6.3] {read_failures} records not found, retrying after routing refresh...");
         client.refresh_routing().await?;
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         client.refresh_routing().await?;
         read_failures = 0;
         for chunk in txids.chunks(100) {

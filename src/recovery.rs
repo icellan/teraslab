@@ -489,7 +489,7 @@ mod tests {
         fn new() -> Self {
             let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
             let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-            let alloc = SlotAllocator::new(data_dev.clone());
+            let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
             let index = PrimaryBackend::new_in_memory(1000).unwrap();
             Self { data_dev, redo_dev, index, alloc }
         }

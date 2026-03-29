@@ -825,7 +825,7 @@ impl Client {
         &self,
         op_code: u16,
         items: &[T],
-        get_txid: &(impl Fn(&T) -> &TxID),
+        get_txid: &impl Fn(&T) -> &TxID,
         encode_sub: &Arc<impl Fn(&[T], &[usize]) -> Vec<u8> + Send + Sync + 'static>,
     ) -> Result<BatchResult, ClientError>
     where

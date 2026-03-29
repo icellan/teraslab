@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn write_100_read_all() {
         let dev = test_device();
-        let mut alloc = SlotAllocator::new(dev.clone());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
         let size = 100 * INPUT_REF_SIZE as u64;
         let offset = alloc.allocate(size).unwrap();
 
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn input_refs_independent_of_cold_data() {
         let dev = test_device();
-        let mut alloc = SlotAllocator::new(dev.clone());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
 
         // Allocate space for cold data (simulating a record region)
         let cold_offset = alloc.allocate(4096).unwrap();

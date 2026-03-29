@@ -637,7 +637,7 @@ mod tests {
         record_count: usize,
     ) -> (Arc<MemoryDevice>, SlotAllocator, Vec<(TxKey, u64)>) {
         let dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(dev.clone());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
         let mut records = Vec::new();
 
         for i in 0..record_count {
@@ -689,7 +689,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = redb_config(dir.path());
         let dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
-        let alloc = SlotAllocator::new(dev.clone());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
 
         let rebuilt = PrimaryBackend::rebuild_redb(&config, &*dev, &alloc).unwrap();
         assert_eq!(rebuilt.len(), 0);

@@ -19,7 +19,7 @@ use teraslab::ops::spend::*;
 fn create_engine(size: u64) -> Arc<Engine> {
     let dev: Arc<dyn BlockDevice> =
         Arc::new(MemoryDevice::new(size, 4096).unwrap());
-    let alloc = SlotAllocator::new(dev.clone());
+    let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(200_000).unwrap();
     Arc::new(Engine::new(
         dev,

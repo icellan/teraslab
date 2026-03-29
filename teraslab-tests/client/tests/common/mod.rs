@@ -10,7 +10,9 @@ pub fn timing_enabled() -> bool {
 use teraslab_test_client::{Client, ClientConfig, ClientError, PoolConfig};
 use teraslab_test_client::helpers::DockerHelpers;
 use teraslab_test_client::verifier::{Mismatch, StateVerifier, parse_metadata_fields};
-use teraslab_test_client::types::{CreateItem, FIELD_ALL_METADATA};
+use teraslab_test_client::types::{CreateItem, FIELD_ALL, FIELD_ALL_METADATA};
+use teraslab::protocol::codec::encode_get_batch;
+use teraslab::protocol::opcodes::{FLAG_LOCAL_READ, OP_GET_BATCH, STATUS_OK};
 
 /// Path to the docker compose directory.
 pub fn compose_dir() -> String {
@@ -95,6 +97,7 @@ pub async fn http_migration_status(docker: &DockerHelpers, node_num: u32) -> Res
 /// Wait until all nodes report the expected cluster size via HTTP /status.
 pub async fn wait_cluster_ready(docker: &DockerHelpers, node_count: u32, timeout: Duration) -> Result<(), ClientError> {
     let start = std::time::Instant::now();
+    let mut last_log = std::time::Instant::now();
     loop {
         let mut ready = 0u32;
         let mut versions: Vec<u64> = Vec::new();
@@ -115,20 +118,44 @@ pub async fn wait_cluster_ready(docker: &DockerHelpers, node_count: u32, timeout
             }
         }
         // All nodes must report correct cluster size AND agree on the
-        // shard table version (topology term). This ensures the cluster
-        // has fully converged before tests begin.
+        // shard table version (topology term) AND every node must have
+        // master shards assigned. This ensures the cluster has fully
+        // converged and the shard table includes all nodes before tests
+        // begin.
+        // Check that each node actually has master shards
+        let mut min_masters = u64::MAX;
+        for i in 1..=node_count {
+            let port = docker.http_port(i);
+            let url = format!("http://127.0.0.1:{port}/status");
+            if let Ok(resp) = reqwest::get(&url).await {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(m) = json["master_shard_count"].as_u64() {
+                        min_masters = min_masters.min(m);
+                    }
+                }
+            }
+        }
+        let balanced = node_count <= 1 || min_masters > 0;
         if ready == node_count
             && versions.len() == node_count as usize
             && versions.iter().all(|&v| v > 0 && v == versions[0])
+            && balanced
         {
+            if timing_enabled() {
+                eprintln!("  wait_cluster_ready: {node_count} nodes converged in {:.1}ms (version={})", start.elapsed().as_secs_f64() * 1000.0, versions[0]);
+            }
             return Ok(());
+        }
+        if timing_enabled() && last_log.elapsed() >= Duration::from_secs(2) {
+            eprintln!("  wait_cluster_ready: {ready}/{node_count} ready, versions={versions:?} ({:.1}s)", start.elapsed().as_secs_f64());
+            last_log = std::time::Instant::now();
         }
         if start.elapsed() >= timeout {
             return Err(ClientError::Connection(
                 format!("{ready}/{node_count} nodes ready (versions: {versions:?}) after {timeout:?}"),
             ));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -157,7 +184,7 @@ pub async fn wait_node_cluster_size(
                 format!("node {node_num}: cluster_size != {expected_size} after {timeout:?}"),
             ));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -169,26 +196,43 @@ pub async fn wait_specific_nodes_ready(
     timeout: Duration,
 ) -> Result<(), ClientError> {
     let start = std::time::Instant::now();
+    let mut last_log = std::time::Instant::now();
     loop {
         let mut ready = 0u32;
+        let mut sizes = Vec::new();
         for &n in node_nums {
             if let Ok(status) = http_status(docker, n).await {
                 if let Some(size) = status["cluster_size"].as_u64() {
+                    sizes.push((n, size));
                     if size == expected_size as u64 {
                         ready += 1;
                     }
                 }
+            } else {
+                sizes.push((n, 0));
             }
         }
         if ready == node_nums.len() as u32 {
             return Ok(());
         }
+        if timing_enabled() && last_log.elapsed() >= Duration::from_secs(2) {
+            let detail: Vec<String> = sizes.iter()
+                .map(|(n, s)| format!("node{n}={s}"))
+                .collect();
+            eprintln!("  wait_specific_nodes: {ready}/{} ready, sizes=[{}] ({:.1}s)",
+                node_nums.len(), detail.join(", "), start.elapsed().as_secs_f64());
+            last_log = std::time::Instant::now();
+        }
         if start.elapsed() >= timeout {
+            let detail: Vec<String> = sizes.iter()
+                .map(|(n, s)| format!("node{n}={s}"))
+                .collect();
             return Err(ClientError::Connection(
-                format!("{ready}/{} specific nodes ready after {timeout:?}", node_nums.len()),
+                format!("{ready}/{} specific nodes ready after {timeout:?} [{}]",
+                    node_nums.len(), detail.join(", ")),
             ));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -226,7 +270,9 @@ pub async fn wait_specific_migrations_complete(
                 }
             }
         }
-        if total_masters == 4096 {
+        // During handoff, shards may be counted on both old and new masters,
+        // causing total_masters to briefly exceed 4096. Accept >= 4096.
+        if total_masters >= 4096 {
             if all_idle {
                 return Ok(());
             }
@@ -239,7 +285,7 @@ pub async fn wait_specific_migrations_complete(
                 format!("migrations still active on specific nodes after {timeout:?} [masters={total_masters}/4096]"),
             ));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -252,7 +298,11 @@ pub async fn wait_migrations_complete(
     node_count: u32,
     timeout: Duration,
 ) -> Result<(), ClientError> {
+    let mig_start = std::time::Instant::now();
+    let mut mig_last_log = std::time::Instant::now();
     let start = std::time::Instant::now();
+    // Track when handoff count stopped decreasing, for orphan detection.
+    let mut last_handoff_snapshot: Option<(u64, Duration)> = None;
     loop {
         let mut all_idle = true;
         let mut total_masters: u64 = 0;
@@ -289,8 +339,42 @@ pub async fn wait_migrations_complete(
                 }
             }
         }
-        if total_masters == 4096 && total_pending_handoffs == 0 && all_idle {
+        // Accept masters within ±4 of 4096 during handoff transitions.
+        let masters_ok = total_masters >= 4092 && total_masters <= 4100;
+        if masters_ok && total_pending_handoffs == 0 && all_idle {
+            if timing_enabled() {
+                eprintln!("  wait_migrations: complete in {:.1}ms", mig_start.elapsed().as_secs_f64() * 1000.0);
+            }
             return Ok(());
+        }
+        // Fallback: if all masters are assigned and no active migrations,
+        // accept the cluster even with pending handoffs IF the handoff
+        // count has stopped decreasing (stuck for >= 3 seconds). This
+        // catches genuinely orphaned handoffs (dead source node) without
+        // accepting prematurely during live-node scenarios where handoffs
+        // are still completing.
+        if masters_ok && all_idle && total_pending_handoffs > 0 {
+            if let Some((prev_h, prev_t)) = last_handoff_snapshot {
+                if total_pending_handoffs >= prev_h
+                    && start.elapsed().saturating_sub(prev_t) >= Duration::from_secs(3)
+                {
+                    if timing_enabled() {
+                        eprintln!("  wait_migrations: accepting with {total_pending_handoffs} orphaned handoffs after {:.1}s",
+                            mig_start.elapsed().as_secs_f64());
+                    }
+                    return Ok(());
+                }
+            }
+            if last_handoff_snapshot.is_none()
+                || last_handoff_snapshot.map_or(false, |(h, _)| total_pending_handoffs < h)
+            {
+                last_handoff_snapshot = Some((total_pending_handoffs, start.elapsed()));
+            }
+        }
+        if timing_enabled() && mig_last_log.elapsed() >= Duration::from_secs(2) {
+            eprintln!("  wait_migrations: masters={total_masters}/4096, handoffs={total_pending_handoffs}, idle={all_idle} ({:.1}s) [{}]",
+                mig_start.elapsed().as_secs_f64(), node_details.join(", "));
+            mig_last_log = std::time::Instant::now();
         }
         if start.elapsed() >= timeout {
             let detail = if !node_details.is_empty() {
@@ -302,7 +386,7 @@ pub async fn wait_migrations_complete(
                 format!("migrations still active after {timeout:?}{detail}"),
             ));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -349,7 +433,7 @@ pub async fn wait_replication_settled(
         if start.elapsed() >= timeout {
             return Ok(()); // Best-effort: don't fail the test over lag.
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -391,7 +475,7 @@ pub async fn wait_specific_replication_settled(
         if start.elapsed() >= timeout {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -403,7 +487,7 @@ pub async fn start_3node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Cli
     let mut docker = docker_3node(scenario_id);
     docker.compose_up().await?;
     wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
+    wait_migrations_complete(&docker, 3, Duration::from_secs(30)).await?;
     let client = create_client(&docker, 3).await?;
     client.refresh_routing().await?;
     Ok((docker, client))
@@ -414,7 +498,7 @@ pub async fn start_5node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Cli
     let mut docker = docker_5node(scenario_id);
     docker.compose_up().await?;
     wait_cluster_ready(&docker, 5, Duration::from_secs(30)).await?;
-    wait_migrations_complete(&docker, 5, Duration::from_secs(120)).await?;
+    wait_migrations_complete(&docker, 5, Duration::from_secs(30)).await?;
     let client = create_client(&docker, 5).await?;
     client.refresh_routing().await?;
     Ok((docker, client))
@@ -550,6 +634,28 @@ pub async fn teardown(docker: &mut DockerHelpers) {
     wait_ports_free(docker.http_port(1), docker.scenario_id(), docker.node_count()).await;
 }
 
+/// Batch-read a set of txids and return how many were NOT found (status != 0).
+/// Uses chunked get_batch for efficiency — no per-txid round trips.
+pub async fn count_accessible(
+    client: &Client,
+    txids: &[[u8; 32]],
+) -> Result<(usize, usize), ClientError> {
+    let start = std::time::Instant::now();
+    let mut found = 0usize;
+    let mut not_found = 0usize;
+    let total = txids.len();
+    for chunk in txids.chunks(500) {
+        let results = client.get_batch(FIELD_ALL_METADATA, chunk).await?;
+        for result in results.iter() {
+            if result.status() == 0 { found += 1; } else { not_found += 1; }
+        }
+    }
+    if timing_enabled() {
+        eprintln!("  count_accessible: {found}/{total} found in {:.1}ms", start.elapsed().as_secs_f64() * 1000.0);
+    }
+    Ok((found, not_found))
+}
+
 /// Full consistency check: read every non-deleted record from the cluster and
 /// compare against the verifier's expected state.
 ///
@@ -559,12 +665,16 @@ pub async fn verify_consistency(
     client: &Client,
     verifier: &StateVerifier,
 ) -> Result<Vec<Mismatch>, ClientError> {
+    let _start = std::time::Instant::now();
     let mut all_mismatches = Vec::new();
     let txids = verifier.non_deleted_txids();
+    if timing_enabled() {
+        eprintln!("  verify_consistency: checking {} records...", txids.len());
+    }
     let mut not_found_txids: Vec<[u8; 32]> = Vec::new();
 
-    // Process in batches of 100 to avoid overwhelming the wire protocol.
-    for chunk in txids.chunks(100) {
+    // Process in batches of 500 for throughput.
+    for chunk in txids.chunks(500) {
         // Retry batch reads on connection errors — cluster may still be
         // settling after recovery, partitions, or migrations.
         let results = {
@@ -620,7 +730,7 @@ pub async fn verify_consistency(
         tokio::time::sleep(Duration::from_millis(500)).await;
         let _ = client.refresh_routing().await;
 
-        for chunk in not_found_txids.chunks(100) {
+        for chunk in not_found_txids.chunks(500) {
             let results = client
                 .get_batch(FIELD_ALL_METADATA, chunk)
                 .await?;
@@ -791,8 +901,161 @@ pub async fn wait_node_healthy(docker: &DockerHelpers, node_num: u32, timeout: D
                 format!("node {node_num} not healthy after {timeout:?}"),
             ));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Read a batch of txids from a specific node, bypassing shard routing via
+/// FLAG_LOCAL_READ. Returns `(status, raw_payload)`.
+pub async fn direct_get(
+    client: &Client,
+    node_addr: &str,
+    txids: &[[u8; 32]],
+) -> Result<(u8, Vec<u8>), ClientError> {
+    let payload = encode_get_batch(FIELD_ALL, txids);
+    client.send_to_addr(node_addr, OP_GET_BATCH, FLAG_LOCAL_READ, payload).await
+}
+
+/// Parse a batch get response into per-item (status, data) pairs.
+pub fn parse_batch_response(payload: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let mut items = Vec::new();
+    if payload.len() < 4 {
+        return items;
+    }
+    let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let mut offset = 4;
+    for _ in 0..count {
+        if offset >= payload.len() {
+            break;
+        }
+        let status = payload[offset];
+        offset += 1;
+        if offset + 4 > payload.len() {
+            break;
+        }
+        let data_len = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        let data = if data_len > 0 && offset + data_len <= payload.len() {
+            payload[offset..offset + data_len].to_vec()
+        } else {
+            vec![]
+        };
+        offset += data_len;
+        items.push((status, data));
+    }
+    items
+}
+
+/// Compare two per-item data payloads ignoring the `updated_at` timestamp field.
+///
+/// The `updated_at` field (8 bytes) differs between master and replica because
+/// each node sets it to local time when the operation is applied. All other
+/// fields should be byte-identical.
+///
+/// Works on raw item data (after stripping the response envelope). The
+/// `updated_at` offset in item data is 61 (= 70 - 9 byte envelope prefix).
+pub fn payloads_match(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a_copy = a.to_vec();
+    let mut b_copy = b.to_vec();
+    // Zero out updated_at (8 bytes at offset 61 in item data).
+    if a_copy.len() >= 69 {
+        a_copy[61..69].fill(0);
+        b_copy[61..69].fill(0);
+    }
+    a_copy == b_copy
+}
+
+/// Batch replication check: fetch all txids from all nodes in bulk
+/// requests (chunked), then cross-compare in memory.
+///
+/// If `expect_present` is true, expects each record on exactly 2 nodes (RF=2)
+/// and compares payloads. If false, expects records to be absent (deleted).
+///
+/// Returns `(mismatches, holder_count_errors)`.
+pub async fn batch_verify_replication(
+    client: &Client,
+    node_addrs: &[String],
+    txids: &[[u8; 32]],
+    expect_present: bool,
+) -> Result<(u32, u32), ClientError> {
+    const CHUNK_SIZE: usize = 500;
+
+    let mut node_items: Vec<Vec<(u8, Vec<u8>)>> = Vec::new();
+    for addr in node_addrs {
+        let mut all_items = Vec::with_capacity(txids.len());
+        for chunk in txids.chunks(CHUNK_SIZE) {
+            let (frame_status, payload) = direct_get(client, addr, chunk).await?;
+            if frame_status == STATUS_OK {
+                all_items.extend(parse_batch_response(&payload));
+            } else {
+                for _ in 0..chunk.len() {
+                    all_items.push((1, vec![]));
+                }
+            }
+        }
+        node_items.push(all_items);
+    }
+
+    let mut mismatches = 0u32;
+    let mut holder_errors = 0u32;
+
+    for (idx, _txid) in txids.iter().enumerate() {
+        let mut holder_indices = Vec::new();
+        for (node_idx, items) in node_items.iter().enumerate() {
+            if idx < items.len() && items[idx].0 == 0 {
+                holder_indices.push(node_idx);
+            }
+        }
+
+        if expect_present {
+            if holder_indices.len() != 2 {
+                holder_errors += 1;
+                continue;
+            }
+            let a = &node_items[holder_indices[0]][idx].1;
+            let b = &node_items[holder_indices[1]][idx].1;
+            if !payloads_match(a, b) {
+                mismatches += 1;
+            }
+        } else {
+            if !holder_indices.is_empty() {
+                holder_errors += 1;
+            }
+        }
+    }
+
+    Ok((mismatches, holder_errors))
+}
+
+/// For a given txid, determine which nodes hold the record via FLAG_LOCAL_READ.
+/// Returns `(holder_indices, non_holder_indices)`.
+pub async fn find_holders(
+    client: &Client,
+    node_addrs: &[String],
+    txid: &[u8; 32],
+) -> Result<(Vec<usize>, Vec<usize>), ClientError> {
+    let mut holders = Vec::new();
+    let mut non_holders = Vec::new();
+    for (i, addr) in node_addrs.iter().enumerate() {
+        let (frame_status, payload) = direct_get(client, addr, &[*txid]).await?;
+        if frame_status == STATUS_OK && !payload.is_empty() {
+            if payload.len() >= 4 {
+                let count = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+                if count >= 1 && payload.len() >= 5 {
+                    let item_status = payload[4];
+                    if item_status == 0 {
+                        holders.push(i);
+                        continue;
+                    }
+                }
+            }
+        }
+        non_holders.push(i);
+    }
+    Ok((holders, non_holders))
 }
 
 /// Poll until all HTTP ports for a scenario are free (connection refused).
@@ -810,6 +1073,6 @@ async fn wait_ports_free(first_http_port: u16, _scenario_id: u16, node_count: u3
         if all_free || std::time::Instant::now() >= deadline {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

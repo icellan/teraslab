@@ -51,12 +51,12 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     eprintln!("[7.0] Starting 3-node cluster and adding node4");
     let (_docker3, client) = common::start_3node_cluster(SID).await?;
-    common::wait_migrations_complete(&_docker3, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&_docker3, 3, Duration::from_secs(15)).await?;
 
     let mut docker5 = common::docker_5node(SID);
     docker5.compose_up_nodes(&["node4"]).await?;
-    common::wait_cluster_ready(&docker5, 4, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker5, 4, Duration::from_secs(180)).await?;
+    common::wait_cluster_ready(&docker5, 4, Duration::from_secs(15)).await?;
+    common::wait_migrations_complete(&docker5, 4, Duration::from_secs(15)).await?;
     client.refresh_routing().await?;
 
     for node_num in 1..=4u32 {
@@ -174,7 +174,7 @@ async fn run_scenario() -> Result<(), ClientError> {
                 eprintln!("[7.2] WARNING: node4 http_status failed, still polling: {e}");
             }
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     assert!(node4_drained, "Test 7.2: node4 did not drain all master shards within {drain_timeout:?}");
@@ -182,14 +182,22 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     tlog!(t0, "test 7.2: done");
 
+    // Stop background workload before stopping node4 — the workload's
+    // purpose is to verify writes during drain, not during topology
+    // transition. Stopping it first avoids a retry storm that can
+    // overwhelm surviving nodes during SWIM failure detection.
+    workload_running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = bg_handle.await;
+
     // -- Test 7.3: Stop node4, wait for cluster_size=3 --
     tlog!(t0, "test 7.3: stop node4, wait for cluster_size=3");
-    eprintln!("[7.3] Stopping node4");
-    let _ = docker5.stop_node("node4").await;
+    eprintln!("[7.3] Force-removing node4 (releases Docker network interface)");
+    docker5.remove_node("node4").await?;
 
-    // SWIM needs ~3-5s to detect the departed node (suspicion_timeout=3s).
-    // Wait for all 3 surviving nodes to agree on cluster_size=3.
-    common::wait_specific_nodes_ready(&docker5, &[1, 2, 3], 3, Duration::from_secs(180)).await?;
+    // SWIM detects the departed node. Docker networking may delay UDP
+    // probe failure detection (silently dropped vs ICMP unreachable).
+    // Allow up to 30s for SWIM suspicion + topology proposal + commit.
+    common::wait_specific_nodes_ready(&docker5, &[1, 2, 3], 3, Duration::from_secs(30)).await?;
 
     for node_num in 1..=3u32 {
         let status = common::http_status(&docker5, node_num).await?;
@@ -199,18 +207,19 @@ async fn run_scenario() -> Result<(), ClientError> {
     }
     eprintln!("[7.3] OK -- cluster stabilized at size 3");
 
-    // Wait for migrations to complete after topology change
-    common::wait_migrations_complete(&docker5, 3, Duration::from_secs(180)).await
+    // Wait for migrations to complete after topology change. Scale-down
+    // migrations are heavier (data from departed node must be redistributed).
+    common::wait_migrations_complete(&docker5, 3, Duration::from_secs(60)).await
         .map_err(|e| {
-            eprintln!("[7.3] ERROR: migrations did not complete within 120s: {e}");
+            eprintln!("[7.3] ERROR: migrations did not complete: {e}");
             e
         })?;
+    // Extra settle after migration for any lagging handoff completions.
     common::wait_replication_settled(&docker5, 3, Duration::from_secs(5)).await?;
+    // Second migration wait: handoffs that were "orphaned" on first pass
+    // may have completed now.
+    common::wait_migrations_complete(&docker5, 3, Duration::from_secs(15)).await.ok();
     client.refresh_routing().await?;
-
-    // Stop background workload now that drain is complete
-    workload_running.store(false, std::sync::atomic::Ordering::Relaxed);
-    let _ = bg_handle.await;
 
     // Evaluate background workload results (test 7.6)
     let bg_write_errors = workload_write_errors.load(std::sync::atomic::Ordering::Relaxed);
@@ -230,7 +239,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     }
 
     // Wait for shard rebalance to fully settle after workload stops.
-    common::wait_migrations_complete(&docker5, 3, Duration::from_secs(60)).await
+    common::wait_migrations_complete(&docker5, 3, Duration::from_secs(15)).await
         .unwrap_or_else(|e| eprintln!("[7.3b] migration wait: {e}"));
     client.refresh_routing().await?;
 
@@ -267,7 +276,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[7.4] {read_failures} records not found, retrying after settle...");
         common::wait_specific_replication_settled(&docker5, &[1, 2, 3], Duration::from_secs(10)).await?;
         client.refresh_routing().await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         client.refresh_routing().await?;
         read_failures = 0;
         for chunk in txids.chunks(100) {

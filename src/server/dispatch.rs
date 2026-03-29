@@ -288,6 +288,11 @@ pub(crate) fn handle_request(
 
             if let Some(cluster) = cluster {
                 cluster.mark_inbound_complete(shard);
+                // Also commit the handoff so the shard transitions from
+                // Copying to ServingNew. Without this, shards whose
+                // migration was pre-filtered (data already in place)
+                // would stay stuck in Copying indefinitely.
+                cluster.shard_table().write().commit_shard(shard);
             }
             ResponseFrame {
                 request_id: request.request_id,
@@ -2910,7 +2915,7 @@ mod tests {
         fn new() -> Self {
             let dev: Arc<dyn BlockDevice> =
                 Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-            let alloc = SlotAllocator::new(dev.clone());
+            let alloc = SlotAllocator::new(dev.clone()).unwrap();
             let index = Index::new(10000).unwrap();
             let locks = StripedLocks::new(1024);
             let dah = DahIndex::new();
@@ -3512,7 +3517,7 @@ mod tests {
         fn new() -> Self {
             let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
             let redo_dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
-            let alloc = SlotAllocator::new(data_dev.clone());
+            let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
             let index = Index::new(10000).unwrap();
             let locks = StripedLocks::new(1024);
             let dah = DahIndex::new();
@@ -3610,7 +3615,7 @@ mod tests {
             .unwrap();
 
             // Create fresh index + allocator
-            let alloc = SlotAllocator::new(data_dev.clone());
+            let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
             let mut index: crate::index::PrimaryBackend = Index::new(10000).unwrap().into();
 
             // Run recovery to rebuild index from redo log

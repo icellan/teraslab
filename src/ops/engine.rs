@@ -2318,7 +2318,7 @@ mod tests {
         ) -> Self {
             let dev: Arc<dyn BlockDevice> =
                 Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-            let mut alloc = SlotAllocator::new(dev.clone());
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
             let mut index = Index::new(100).unwrap();
 
             let mut txid = [0u8; 32];
@@ -3170,7 +3170,7 @@ mod tests {
     fn concurrent_different_transactions() {
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(128 * 1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(dev.clone());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
         let mut index = Index::new(200).unwrap();
 
         let mut keys = Vec::new();
@@ -3978,7 +3978,7 @@ mod tests {
     fn two_txs_both_set_dah_different_heights() {
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(dev.clone());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
         let mut index = Index::new(200).unwrap();
 
         // Create two transactions
@@ -4098,7 +4098,7 @@ mod tests {
     fn dah_range_scan_returns_correct_set() {
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(dev.clone());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
         let mut index = Index::new(200).unwrap();
 
         // Create 5 transactions, each with 1 UTXO
@@ -5368,7 +5368,7 @@ mod tests {
     fn create_engine() -> Arc<Engine> {
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-        let alloc = SlotAllocator::new(dev.clone());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(1000).unwrap();
         Arc::new(Engine::new(
             dev,
@@ -5816,7 +5816,7 @@ mod tests {
         let total_size = 1024 * 1024 + data_blocks * 4096; // 1MiB header + 80KB data
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(total_size, 4096).unwrap());
-        let alloc = SlotAllocator::new(dev.clone());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(1000).unwrap();
         let engine = Arc::new(Engine::new(
             dev,
@@ -7035,7 +7035,7 @@ mod tests {
     fn concurrent_create_duplicate_txid() {
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-        let alloc = SlotAllocator::new(dev.clone());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(1000).unwrap();
         let engine = Arc::new(Engine::new(
             dev,

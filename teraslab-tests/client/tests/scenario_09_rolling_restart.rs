@@ -89,7 +89,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     let (_docker, client) = common::start_3node_cluster(SID).await?;
     let docker = common::docker_3node(SID);
 
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
     client.refresh_routing().await?;
 
     let verifier = Arc::new(StateVerifier::new());
@@ -99,7 +99,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     assert_eq!(txids.len(), 5000, "expected 5000 seeded txids");
 
     // Wait for replication to propagate.
-    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
     // -- Start background workload at ~200 ops/sec --
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -319,13 +319,13 @@ async fn run_scenario() -> Result<(), ClientError> {
         // Brief pause to let in-flight requests complete before stopping the node.
         // The background workload refreshes routing on each error, so the stale
         // routing entries will be corrected after a few failed attempts.
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Step 3: Stop the node
         docker.stop_node(&node_name).await?;
         eprintln!("[9.{node_num}] {node_name} stopped");
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Step 4: Assert zero failures during this step
         let write_err_after = bg_metrics.total_write_errors();
@@ -353,10 +353,10 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[9.{node_num}] {node_name} started");
 
         // After restart, wait for rejoin
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
         eprintln!("[9.{node_num}] Cluster back to 3 nodes");
 
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
         common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
         eprintln!("[9.{node_num}] Migrations complete after restarting {node_name}");
 
@@ -384,7 +384,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // -- Post-restart verification --
     tlog!(t0, "post-restart verification");
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await
         .unwrap_or_else(|e| eprintln!("[9.4] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
     client.refresh_routing().await?;

@@ -51,7 +51,7 @@ fn create_engine() -> Arc<Engine> {
 fn create_engine_with_size(size: u64) -> Arc<Engine> {
     let dev: Arc<dyn BlockDevice> =
         Arc::new(MemoryDevice::new(size, 4096).unwrap());
-    let alloc = SlotAllocator::new(dev.clone());
+    let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(200_000).unwrap();
     Arc::new(Engine::new(
         dev,

@@ -137,7 +137,7 @@ impl SimulatedNode {
     pub fn new(device_size: u64, block_size: u32) -> Self {
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(device_size, block_size as usize).unwrap());
-        let alloc = SlotAllocator::new(dev.clone());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(100_000).unwrap();
         let engine = Arc::new(Engine::new(
             dev.clone(),
@@ -177,7 +177,7 @@ impl SimulatedNode {
     /// For simulation, we create a fresh engine and re-scan.
     pub fn recover(&mut self) {
         let dev = self.device.clone();
-        let alloc = SlotAllocator::new(dev.clone());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(100_000).unwrap();
         let engine = Arc::new(Engine::new(
             dev,

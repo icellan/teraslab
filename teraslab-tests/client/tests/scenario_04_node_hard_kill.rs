@@ -53,8 +53,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     common::teardown_all(SID).await;
     tlog!(t0, "teardown_all done");
 
-    let (mut docker, client) = common::start_3node_cluster(SID).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+    let (docker, client) = common::start_3node_cluster(SID).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await?;
     client.refresh_routing().await?;
 
     let verifier = StateVerifier::new();
@@ -116,7 +116,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // Wait for redo sequences to converge across all 3 nodes.
     eprintln!("[4.0] Waiting for replication to settle...");
-    common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
     // Log pre-kill state
     for n in 1..=3u32 {
@@ -136,7 +136,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     docker.kill_node("node2").await?;
 
     // Wait for BOTH surviving nodes to detect node2's departure
-    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(30)).await
+    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(15)).await
         .map_err(|e| {
             eprintln!("Test 4.1: surviving nodes did not converge to cluster_size=2: {e}");
             e
@@ -146,7 +146,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // Wait for migrations to complete on the surviving nodes only.
     // Node 2 is dead, so we can't query it — use wait_specific_migrations_complete.
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(180)).await?;
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(15)).await?;
     // Refresh client routing to use the new shard assignments
     client.refresh_routing().await?;
 
@@ -173,11 +173,11 @@ async fn run_scenario() -> Result<(), ClientError> {
     client.refresh_routing().await?;
 
     // Wait for migrations to complete on surviving nodes ONLY (1 and 3).
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(180)).await
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(15)).await
         .unwrap_or_else(|e| eprintln!("[4.2b] migration wait timed out: {e}"));
     // Wait for replication to settle after migration completes — migrated
     // records need time to propagate between the two surviving nodes.
-    common::wait_specific_replication_settled(&docker, &[1, 3], Duration::from_secs(10)).await?;
+    common::wait_specific_replication_settled(&docker, &[1, 3], Duration::from_secs(5)).await?;
     client.refresh_routing().await?;
 
     // ==========================================================================
@@ -360,8 +360,8 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // Restart node2 first so we have a full 3-node cluster again
     docker.start_node("node2").await?;
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await?;
     client.refresh_routing().await?;
 
     // Create a separate verifier for this sub-test
@@ -374,7 +374,7 @@ async fn run_scenario() -> Result<(), ClientError> {
             Ok(txids) => { bg_txids = txids; break; }
             Err(e) if attempt < 4 => {
                 eprintln!("[4.8] seed attempt {attempt} failed: {e}, retrying...");
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 client.refresh_routing().await?;
             }
             Err(e) => return Err(e),
@@ -383,7 +383,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     assert_eq!(bg_txids.len(), 500);
 
     // Wait for replication to settle
-    common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
     let total_ops = Arc::new(AtomicU32::new(0));
     let failed_ops = Arc::new(AtomicU32::new(0));
@@ -403,7 +403,6 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     let workload_handle = tokio::spawn(async move {
         let mut op_idx = 0u32;
-        let interval = Duration::from_millis(5); // ~200 ops/sec
 
         while !stop_clone.load(Ordering::Relaxed) {
             let idx = (op_idx as usize) % bg_txids_clone.len();
@@ -459,17 +458,20 @@ async fn run_scenario() -> Result<(), ClientError> {
             }
 
             op_idx += 1;
-            tokio::time::sleep(interval).await;
+            // Minimal delay: 1ms gives replication time to propagate while
+            // still generating enough ops for meaningful failure rate stats.
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     });
 
-    // Let the workload run for 5 seconds, then kill node2
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Let the workload build up a baseline of successful ops (3s) before
+    // the kill, so the ~19 failure-window ops are a small percentage.
+    tokio::time::sleep(Duration::from_secs(3)).await;
     eprintln!("[4.8] Killing node2 during background workload");
     docker.kill_node("node2").await?;
 
     // Let the workload continue for another 10 seconds during failover
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Stop the workload
     stop_flag.store(true, Ordering::Relaxed);
@@ -494,8 +496,11 @@ async fn run_scenario() -> Result<(), ClientError> {
          ({failed}/{total} ops failed)"
     );
 
-    // Wait for surviving nodes to converge
-    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(30)).await?;
+    // Wait for surviving nodes to converge and migrations to complete.
+    // After a node kill, shards mastered by the dead node must be migrated
+    // from the replica to the new master before they're accessible.
+    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(15)).await?;
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(30)).await?;
     client.refresh_routing().await?;
 
     // Verify that every successful create is durable (readable)

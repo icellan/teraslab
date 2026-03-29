@@ -261,7 +261,7 @@ swim_port = 3301
 seed_nodes = [{seeds_str}]
 replication_factor = 2
 swim_probe_interval_ms = 150
-swim_suspicion_timeout_ms = 3000
+swim_suspicion_timeout_ms = 1000
 device_paths = ["/data/teraslab.dat"]
 device_size = 2147483648
 device_alignment = 4096
@@ -309,6 +309,15 @@ block_height_retention = 288
         Ok(())
     }
 
+    /// Force-remove a node container (kill + rm). This releases the Docker
+    /// network interface immediately, allowing SWIM to detect the node as
+    /// unreachable via ICMP unreachable rather than silent UDP timeouts.
+    pub async fn remove_node(&self, name: &str) -> Result<(), ClientError> {
+        let container = self.container_name(name);
+        run_docker_cmd(&["rm", "-f", &container]).await?;
+        Ok(())
+    }
+
     /// Gracefully stops a node container with a 10-second timeout.
     ///
     /// # Parameters
@@ -318,7 +327,7 @@ block_height_retention = 288
     /// Returns `ClientError::Connection` if the docker command fails.
     pub async fn stop_node(&self, name: &str) -> Result<(), ClientError> {
         let container = self.container_name(name);
-        run_docker_cmd(&["stop", "--time=10", &container]).await?;
+        run_docker_cmd(&["stop", "--time=1", &container]).await?;
         Ok(())
     }
 

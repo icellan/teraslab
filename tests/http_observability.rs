@@ -21,7 +21,7 @@ static TEST_HISTOGRAMS: ThreadHistograms = ThreadHistograms::new();
 fn start_test_http_server() -> (u16, Arc<HttpState>) {
     let dev: Arc<dyn BlockDevice> =
         Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
-    let alloc = SlotAllocator::new(dev.clone());
+    let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(1_000).unwrap();
     let engine = Arc::new(Engine::new(
         dev,
