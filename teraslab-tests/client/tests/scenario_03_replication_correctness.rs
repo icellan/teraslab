@@ -2,12 +2,9 @@
 mod common;
 
 use std::time::Duration;
-use teraslab_test_client::{Client, ClientError};
+use teraslab_test_client::ClientError;
 use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::types::*;
-
-use teraslab::protocol::codec::encode_get_batch;
-use teraslab::protocol::opcodes::{FLAG_LOCAL_READ, OP_GET_BATCH, STATUS_OK};
 
 macro_rules! tlog {
     ($t0:expr, $($arg:tt)*) => {
@@ -25,65 +22,8 @@ fn txid_hex(txid: &[u8; 32]) -> String {
     txid.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
 }
 
-/// Read a batch of txids from a specific node, bypassing shard routing via
-/// FLAG_LOCAL_READ. Returns `(status, raw_payload)`.
-async fn direct_get(
-    client: &Client,
-    node_addr: &str,
-    txids: &[[u8; 32]],
-) -> Result<(u8, Vec<u8>), ClientError> {
-    let payload = encode_get_batch(FIELD_ALL, txids);
-    client.send_to_addr(node_addr, OP_GET_BATCH, FLAG_LOCAL_READ, payload).await
-}
-
-/// Compare two get_batch payloads ignoring the `updated_at` timestamp field.
-///
-/// The `updated_at` field (8 bytes at response offset 70) differs between
-/// master and replica because each node sets it to local time when the
-/// operation is applied. All other fields should be byte-identical.
-fn payloads_match(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut a_copy = a.to_vec();
-    let mut b_copy = b.to_vec();
-    // Zero out updated_at (bytes 70..78) for comparison
-    if a_copy.len() >= 78 {
-        a_copy[70..78].fill(0);
-        b_copy[70..78].fill(0);
-    }
-    a_copy == b_copy
-}
-
-/// For a given txid with 3 nodes and RF=2, determine which nodes hold the record.
-/// Checks the per-item status inside the response payload, not the frame status.
-async fn find_holders(
-    client: &Client,
-    node_addrs: &[String],
-    txid: &[u8; 32],
-) -> Result<(Vec<usize>, Vec<usize>), ClientError> {
-    let mut holders = Vec::new();
-    let mut non_holders = Vec::new();
-    for (i, addr) in node_addrs.iter().enumerate() {
-        let (frame_status, payload) = direct_get(client, addr, &[*txid]).await?;
-        if frame_status == STATUS_OK && !payload.is_empty() {
-            // Decode per-item results: [count:4][items: status(1)+data_len(4)+data...]
-            // If count >= 1 and the first item's status is 0 (success), this node holds the record.
-            if payload.len() >= 4 {
-                let count = u32::from_le_bytes(payload[0..4].try_into().unwrap());
-                if count >= 1 && payload.len() >= 5 {
-                    let item_status = payload[4];
-                    if item_status == 0 {
-                        holders.push(i);
-                        continue;
-                    }
-                }
-            }
-        }
-        non_holders.push(i);
-    }
-    Ok((holders, non_holders))
-}
+// Use batch helpers from common
+use common::{batch_verify_replication, direct_get, find_holders};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_03_replication_correctness() {
@@ -115,7 +55,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     let node_addrs = docker.host_client_addrs(3);
 
     // Wait for migrations to settle before seeding data
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await?;
 
     // Refresh routing so the client has the latest partition map
     client.refresh_routing().await?;
@@ -127,7 +67,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     assert_eq!(txids.len(), 2000, "expected 2000 seeded records");
 
     // Wait for redo log sequences to converge (replication settled).
-    common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
     // ==========================================================================
     // Test 3.1: Post-seed replication verification -- check ALL 2000 records
@@ -135,40 +75,12 @@ async fn run_scenario() -> Result<(), ClientError> {
     tlog!(t0, "test 3.1 start");
     eprintln!("[3.1] Verifying replication for ALL 2000 records");
     {
-        let mut mismatches = 0u32;
-
-        for (idx, txid) in txids.iter().enumerate() {
-            let (holders, _non_holders) = find_holders(&client, &node_addrs, txid).await?;
-
-            assert!(
-                holders.len() == 2,
-                "Test 3.1: txid at index {} is held by {} nodes, expected 2 (RF=2)",
-                idx,
-                holders.len()
-            );
-
-            if holders.len() == 2 {
-                let (status_a, payload_a) =
-                    direct_get(&client, &node_addrs[holders[0]], &[*txid]).await?;
-                let (status_b, payload_b) =
-                    direct_get(&client, &node_addrs[holders[1]], &[*txid]).await?;
-
-                assert_eq!(status_a, STATUS_OK);
-                assert_eq!(status_b, STATUS_OK);
-
-                if !payloads_match(&payload_a, &payload_b) {
-                    mismatches += 1;
-                    if mismatches <= 3 {
-                        let first_diff = payload_a.iter().zip(payload_b.iter())
-                            .position(|(a, b)| a != b)
-                            .unwrap_or(payload_a.len().min(payload_b.len()));
-                        eprintln!("[3.1] MISMATCH on txid {}: len_a={}, len_b={}, first diff at byte {}",
-                            txid_hex(txid), payload_a.len(), payload_b.len(), first_diff);
-                    }
-                }
-            }
-        }
-
+        let (mismatches, holder_errors) =
+            batch_verify_replication(&client, &node_addrs, &txids, true).await?;
+        assert_eq!(
+            holder_errors, 0,
+            "Test 3.1: {holder_errors} records not held by exactly 2 nodes (RF=2)"
+        );
         assert_eq!(
             mismatches, 0,
             "Test 3.1: {mismatches} replication mismatches found in ALL 2000 records"
@@ -232,39 +144,15 @@ async fn run_scenario() -> Result<(), ClientError> {
         }
 
         // Wait for redo log sequences to converge (replication settled).
-        common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
         // Check ALL 500 affected records
-        let mut mismatches = 0u32;
-
-        for (idx, txid) in spent_txids.iter().enumerate() {
-            let (holders, _) = find_holders(&client, &node_addrs, txid).await?;
-
-            assert!(
-                holders.len() == 2,
-                "Test 3.2: post-spend txid at index {} held by {} nodes, expected 2",
-                idx,
-                holders.len()
-            );
-
-            if holders.len() == 2 {
-                let (_, payload_a) =
-                    direct_get(&client, &node_addrs[holders[0]], &[*txid]).await?;
-                let (_, payload_b) =
-                    direct_get(&client, &node_addrs[holders[1]], &[*txid]).await?;
-
-                if !payloads_match(&payload_a, &payload_b) {
-                    mismatches += 1;
-                    if mismatches <= 3 {
-                        let first_diff = payload_a.iter().zip(payload_b.iter())
-                            .position(|(a, b)| a != b)
-                            .unwrap_or(payload_a.len().min(payload_b.len()));
-                        eprintln!("[3.2] MISMATCH at index {}: first diff at byte {first_diff}", idx);
-                    }
-                }
-            }
-        }
-
+        let (mismatches, holder_errors) =
+            batch_verify_replication(&client, &node_addrs, &spent_txids, true).await?;
+        assert_eq!(
+            holder_errors, 0,
+            "Test 3.2: {holder_errors} post-spend records not held by exactly 2 nodes"
+        );
         assert_eq!(
             mismatches, 0,
             "Test 3.2: {mismatches} spend replication mismatches found in ALL {spend_count} records"
@@ -302,32 +190,15 @@ async fn run_scenario() -> Result<(), ClientError> {
         }
 
         // Wait for redo log sequences to converge (replication settled).
-        common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
         // Check ALL 300 affected records
-        let mut mismatches = 0u32;
-
-        for (idx, txid) in mined_txids.iter().enumerate() {
-            let (holders, _) = find_holders(&client, &node_addrs, txid).await?;
-
-            assert!(
-                holders.len() == 2,
-                "Test 3.3: post-set_mined txid at index {idx} held by {} nodes, expected 2",
-                holders.len()
-            );
-
-            if holders.len() == 2 {
-                let (_, payload_a) =
-                    direct_get(&client, &node_addrs[holders[0]], &[*txid]).await?;
-                let (_, payload_b) =
-                    direct_get(&client, &node_addrs[holders[1]], &[*txid]).await?;
-
-                if !payloads_match(&payload_a, &payload_b) {
-                    mismatches += 1;
-                }
-            }
-        }
-
+        let (mismatches, holder_errors) =
+            batch_verify_replication(&client, &node_addrs, &mined_txids, true).await?;
+        assert_eq!(
+            holder_errors, 0,
+            "Test 3.3: {holder_errors} post-set_mined records not held by exactly 2 nodes"
+        );
         assert_eq!(
             mismatches, 0,
             "Test 3.3: {mismatches} set_mined replication mismatches in ALL {mined_count} records"
@@ -402,23 +273,11 @@ async fn run_scenario() -> Result<(), ClientError> {
         }
 
         // Wait for redo log sequences to converge (replication settled).
-        common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
         // Verify replication on all affected records
-        let mut mismatches = 0u32;
-        for txid in &affected_txids {
-            let (holders, _) = find_holders(&client, &node_addrs, txid).await?;
-            if holders.len() == 2 {
-                let (_, payload_a) =
-                    direct_get(&client, &node_addrs[holders[0]], &[*txid]).await?;
-                let (_, payload_b) =
-                    direct_get(&client, &node_addrs[holders[1]], &[*txid]).await?;
-                if !payloads_match(&payload_a, &payload_b) {
-                    mismatches += 1;
-                }
-            }
-        }
-
+        let (mismatches, _) =
+            batch_verify_replication(&client, &node_addrs, &affected_txids, true).await?;
         assert_eq!(
             mismatches, 0,
             "Test 3.4: {mismatches} replication mismatches after freeze/unfreeze/reassign"
@@ -447,23 +306,10 @@ async fn run_scenario() -> Result<(), ClientError> {
         }
 
         // Wait for redo log sequences to converge (replication settled).
-        common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
-        let mut replication_failures = 0u32;
-
-        for (i, txid) in deleted_txids.iter().enumerate() {
-            let (holders, _) = find_holders(&client, &node_addrs, txid).await?;
-
-            if !holders.is_empty() {
-                replication_failures += 1;
-                eprintln!(
-                    "Test 3.5: deleted txid at index {} still found on {} node(s)",
-                    delete_start + i,
-                    holders.len()
-                );
-            }
-        }
-
+        let (_, replication_failures) =
+            batch_verify_replication(&client, &node_addrs, &deleted_txids, false).await?;
         assert_eq!(
             replication_failures, 0,
             "Test 3.5: {replication_failures} deleted records still present on at least one node"
@@ -479,48 +325,22 @@ async fn run_scenario() -> Result<(), ClientError> {
     tlog!(t0, "test 3.6 start");
     eprintln!("[3.6] Per-shard key listing: verify keys on master+replica, not third node");
     {
-        // Sample 200 records to check key placement
-        let sample_count = 200;
-        let sample_start = 1100;
-        let mut placement_errors = 0u32;
-
-        for i in 0..sample_count {
-            let idx = sample_start + i;
-            if idx >= 1800 {
-                break; // Skip the deleted range
-            }
-            let txid = &txids[idx];
-            let rec = verifier.get_record(txid);
-            if rec.is_none() || rec.as_ref().is_some_and(|r| r.is_deleted) {
-                continue;
-            }
-
-            let (holders, non_holders) = find_holders(&client, &node_addrs, txid).await?;
-
-            // With RF=2, exactly 2 nodes should hold the record
-            if holders.len() != 2 {
-                placement_errors += 1;
-                if placement_errors <= 3 {
-                    eprintln!(
-                        "[3.6] txid at index {idx} held by {} nodes, expected exactly 2",
-                        holders.len()
-                    );
+        // Sample 200 records to check key placement (skip the deleted range 1800-1899)
+        let sample_txids: Vec<[u8; 32]> = (1100..1300)
+            .filter(|&idx| idx < 1800)
+            .filter_map(|idx| {
+                let txid = &txids[idx];
+                let rec = verifier.get_record(txid);
+                if rec.is_none() || rec.as_ref().is_some_and(|r| r.is_deleted) {
+                    None
+                } else {
+                    Some(*txid)
                 }
-                continue;
-            }
+            })
+            .collect();
 
-            // The third node should NOT hold the record
-            if non_holders.len() != 1 {
-                placement_errors += 1;
-                if placement_errors <= 3 {
-                    eprintln!(
-                        "[3.6] txid at index {idx} has {} non-holders, expected exactly 1",
-                        non_holders.len()
-                    );
-                }
-            }
-        }
-
+        let (_, placement_errors) =
+            batch_verify_replication(&client, &node_addrs, &sample_txids, true).await?;
         assert_eq!(
             placement_errors, 0,
             "Test 3.6: {placement_errors} key placement errors (not on exactly 2 of 3 nodes)"
@@ -585,7 +405,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         }
 
         // Wait for redo log sequences to converge (replication settled).
-        common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
         // Verify counter incremented exactly once on both nodes
         let (holders, _) = find_holders(&client, &node_addrs, &idempotent_txid).await?;

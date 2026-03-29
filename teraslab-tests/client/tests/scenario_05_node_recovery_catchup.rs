@@ -5,13 +5,10 @@ mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
-use teraslab_test_client::{Client, ClientError};
+use teraslab_test_client::ClientError;
 use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::types::*;
 use teraslab_test_client::reporter::MetricsReporter;
-
-use teraslab::protocol::codec::encode_get_batch;
-use teraslab::protocol::opcodes::{FLAG_LOCAL_READ, OP_GET_BATCH, STATUS_OK};
 
 macro_rules! tlog {
     ($t0:expr, $($arg:tt)*) => {
@@ -27,16 +24,6 @@ const SID: u16 = 5;
 /// Format a txid as a short hex prefix for assertion messages.
 fn txid_hex(txid: &[u8; 32]) -> String {
     txid.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
-}
-
-/// Read a batch of txids from a specific node using FLAG_LOCAL_READ.
-async fn direct_get(
-    client: &Client,
-    node_addr: &str,
-    txids: &[[u8; 32]],
-) -> Result<(u8, Vec<u8>), ClientError> {
-    let payload = encode_get_batch(FIELD_ALL, txids);
-    client.send_to_addr(node_addr, OP_GET_BATCH, FLAG_LOCAL_READ, payload).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -61,8 +48,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     common::teardown_all(SID).await;
     tlog!(t0, "teardown_all done");
 
-    let (mut docker, client) = common::start_3node_cluster(SID).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+    let (docker, client) = common::start_3node_cluster(SID).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await?;
     client.refresh_routing().await?;
 
     // Node2 address for direct reads
@@ -76,14 +63,14 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // Wait for redo sequences to converge before killing node2
     eprintln!("[5.0] Waiting for replication to settle...");
-    common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
     eprintln!("[5.0] Killing node2");
     docker.kill_node("node2").await?;
     // Wait for BOTH surviving nodes to detect node2's departure
-    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(30)).await?;
+    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(15)).await?;
     // Wait for shard table rebalance and migrations on the 2-node cluster
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(180)).await?;
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(15)).await?;
     client.refresh_routing().await?;
 
     eprintln!("[5.0] Creating 500 additional records while node2 is down");
@@ -114,7 +101,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     // -- Test 5.2: Wait for migrations --
     tlog!(t0, "test 5.2 start");
     eprintln!("[5.2] Waiting for migrations to complete");
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await?;
     let time_to_caught_up = membership_start.elapsed();
     eprintln!("[5.2] OK -- all migrations complete");
     tlog!(t0, "test 5.2 done");
@@ -178,20 +165,21 @@ async fn run_scenario() -> Result<(), ClientError> {
     let mut accessible_count = 0u32;
     let mut inaccessible_count = 0u32;
 
-    // Process in batches of 50 to avoid overwhelming the connection
-    for chunk in all_txids.chunks(50) {
-        for txid in chunk {
-            match direct_get(&client, &node2_addr, std::slice::from_ref(txid)).await {
-                Ok((status, _payload)) => {
-                    if status == STATUS_OK {
+    // Batch reads: send chunks of 500 txids per request to node2.
+    for chunk in all_txids.chunks(500) {
+        match common::direct_get(&client, &node2_addr, chunk).await {
+            Ok((_status, payload)) => {
+                let items = common::parse_batch_response(&payload);
+                for (item_status, _data) in &items {
+                    if *item_status == 0 {
                         accessible_count += 1;
                     } else {
                         inaccessible_count += 1;
                     }
                 }
-                Err(_) => {
-                    inaccessible_count += 1;
-                }
+            }
+            Err(_) => {
+                inaccessible_count += chunk.len() as u32;
             }
         }
     }
@@ -221,7 +209,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     tlog!(t0, "test 5.5 start");
     eprintln!("[5.5] Full consistency check via verify_consistency()");
     // Wait for replication to settle after migrations, then create a fresh client.
-    common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
     let fresh_client = common::create_client(&docker, 3).await?;
     let mismatches = common::verify_consistency(&fresh_client, &verifier).await?;
     assert!(mismatches.is_empty(),

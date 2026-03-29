@@ -288,6 +288,11 @@ pub(crate) fn handle_request(
 
             if let Some(cluster) = cluster {
                 cluster.mark_inbound_complete(shard);
+                // Also commit the handoff so the shard transitions from
+                // Copying to ServingNew. Without this, shards whose
+                // migration was pre-filtered (data already in place)
+                // would stay stuck in Copying indefinitely.
+                cluster.shard_table().write().commit_shard(shard);
             }
             ResponseFrame {
                 request_id: request.request_id,

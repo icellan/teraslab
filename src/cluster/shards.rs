@@ -387,7 +387,10 @@ impl ShardTable {
                 }
                 // If no surviving replica, the data is lost (RF=2, both nodes dead)
             } else {
-                // Normal case: old master is alive, migrate from it
+                // Old master is alive — always generate a migration task.
+                // The full handoff (Copying + delta streaming) ensures that
+                // any in-flight writes on the old master during the topology
+                // change are captured and forwarded to the new master.
                 tasks.push(MigrationTask {
                     shard: shard as u16,
                     from_node: old_master,

@@ -92,7 +92,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     tlog!(t0, "teardown_all done");
 
     let (docker, client) = common::start_3node_cluster(SID).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await?;
     client.refresh_routing().await?;
 
     let verifier = Arc::new(StateVerifier::new());
@@ -462,7 +462,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     let mut next_checkpoint = checkpoint_interval;
 
     while start.elapsed() < total_duration {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
         if start.elapsed() >= next_checkpoint {
             let elapsed_secs = start.elapsed().as_secs();
@@ -472,7 +472,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
             // Pause workload
             runner.pause();
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
 
             // Run consistency check
             let mismatches = common::verify_consistency(&client, &verifier).await?;

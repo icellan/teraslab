@@ -427,20 +427,30 @@ impl TopologyAuthority {
             && propose.term > voted
             && valid_digest;
 
-        // Cluster formation recovery: when multiple nodes start simultaneously,
-        // each commits a single-node term independently. A later proposal with
-        // more members that's at or above our term should be accepted so the
-        // cluster can converge. This is safe because the proposer has a larger
-        // member set (which subsumes ours). Only applies when we haven't voted
-        // for anything beyond our committed term (voted <= committed), so it
-        // cannot override a genuine stale-vote rejection.
+        // Cluster formation recovery: when a node is in a single-node cluster
+        // (either from fresh start or after losing all peers), a multi-node
+        // proposal that includes this node should be accepted so the cluster
+        // can converge. This handles several scenarios:
+        //
+        // 1. Simultaneous start: each node commits single-node terms, then
+        //    discovers peers and needs to form a joint cluster.
+        //
+        // 2. Voted-but-not-committed: a node voted for a term that never
+        //    got committed (proposer crashed or network partition). The
+        //    outstanding vote should not permanently block convergence.
+        //
+        // 3. Sequential restarts: node3 restarts, commits single-node term,
+        //    then node1 proposes a 2-node term. Node3 must accept even if
+        //    the proposal term equals its voted term.
+        //
+        // Safety: the proposal must have more members (larger cluster) and
+        // must include this node, preventing acceptance of foreign proposals.
         if !accepted && valid_digest && propose.members.len() > 1 {
             let committed_members = self.committed_members.read().unwrap();
-            let our_cluster_is_single_node = committed_members.len() <= 1;
+            let our_cluster_is_single_node = committed > 0 && committed_members.len() <= 1;
             let proposal_subsumes_us = propose.members.contains(&self.self_id);
-            let no_outstanding_vote = voted <= committed;
             if our_cluster_is_single_node && proposal_subsumes_us
-                && propose.term >= committed && no_outstanding_vote
+                && propose.term >= committed
             {
                 accepted = true;
             }

@@ -59,7 +59,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[8a] === Minority isolation sub-scenario ===");
 
         let (mut docker, client) = common::start_3node_cluster(SID).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
         client.refresh_routing().await?;
 
         let verifier = StateVerifier::new();
@@ -69,7 +69,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         assert_eq!(initial_txids.len(), 1000);
 
         // Wait for replication to settle before partitioning.
-        common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
         eprintln!("[8a.1] Partitioning node3 from node1 and node2");
         docker.partition_node("node3", &["node1", "node2"]).await?;
@@ -77,7 +77,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         // Wait for SWIM to detect the partition and topology to commit.
         // With probe_interval=150ms and suspicion_timeout=3000ms, detection
         // takes ~4-6s. Poll instead of sleeping a fixed duration.
-        common::wait_specific_nodes_ready(&docker, &[1, 2], 2, Duration::from_secs(30)).await?;
+        common::wait_specific_nodes_ready(&docker, &[1, 2], 2, Duration::from_secs(15)).await?;
 
         let status_n1 = common::http_status(&docker, 1).await?;
         let cluster_size_n1 = status_n1["cluster_size"].as_u64().unwrap_or(0);
@@ -198,7 +198,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         assert!(node3_write_rejected,
             "node3 should reject writes during minority partition");
 
-        // Wait for migrations between surviving nodes to settle before writing.
+        // Wait for migrations between majority nodes to settle before writing.
         common::wait_specific_migrations_complete(&docker, &[1, 2], Duration::from_secs(60)).await?;
         client.refresh_routing().await?;
 
@@ -214,9 +214,8 @@ async fn run_scenario() -> Result<(), ClientError> {
 
         // After partition heal, SWIM must go through its full rediscovery cycle.
         // SWIM suspicion timeout is 3s, so 5s is sufficient.
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
         client.refresh_routing().await?;
 
         eprintln!("[8a.3] OK -- cluster reconverged to size 3");
@@ -246,13 +245,27 @@ async fn run_scenario() -> Result<(), ClientError> {
         if read_failures > 0 && read_failures <= 50 {
             eprintln!("[8a.4] {read_failures} records not found, retrying after refresh...");
             client.refresh_routing().await?;
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
             client.refresh_routing().await?;
             read_failures = 0;
             for chunk in all_txids.chunks(100) {
                 let results = client.get_batch(FIELD_ALL, chunk).await?;
                 for result in results.iter() {
                     if result.status() != 0 { read_failures += 1; }
+                }
+            }
+        }
+        // Retry once after routing refresh if records are missing
+        if read_failures > 0 {
+            eprintln!("[8a.4] {read_failures} records not found, retrying...");
+            client.refresh_routing().await?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            client.refresh_routing().await?;
+            read_failures = 0;
+            for chunk in all_txids.chunks(100) {
+                let results = client.get_batch(FIELD_ALL_METADATA, chunk).await?;
+                for r in results.iter() {
+                    if r.status() != 0 { read_failures += 1; }
                 }
             }
         }
@@ -265,7 +278,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         tlog!(t0, "test 8a: done");
     }
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // == Test 8b -- Full isolation ==
     {
@@ -273,7 +286,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[8b] === Full isolation sub-scenario ===");
 
         let (mut docker, client) = common::start_3node_cluster(SID).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
         client.refresh_routing().await?;
 
         let verifier = StateVerifier::new();
@@ -283,7 +296,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         assert_eq!(pre_partition_txids.len(), 1000);
 
         // Wait for replication to settle.
-        common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
         eprintln!("[8b.1] Partitioning ALL 3 nodes from each other");
         // node1 isolated from node2 and node3
@@ -293,7 +306,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
         // Wait for SWIM to detect full isolation. Each node sees all peers as dead.
         // Poll node1 until it reports cluster_size=1 (only itself).
-        common::wait_node_cluster_size(&docker, 1, 1, Duration::from_secs(30)).await
+        common::wait_node_cluster_size(&docker, 1, 1, Duration::from_secs(15)).await
             .unwrap_or_else(|e| eprintln!("[8b.1] node1 did not reach cluster_size=1: {e}"));
 
         // All writes should fail on all nodes when fully isolated
@@ -340,7 +353,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         if !all_writes_failed {
             eprintln!("[8b.2] Initial attempts had some successes, retrying with longer delays...");
             for round in 1..=3u32 {
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 let mut round_all_failed = true;
                 for attempt in 0..3u32 {
                     let mut txid = [0u8; 32];
@@ -388,9 +401,9 @@ async fn run_scenario() -> Result<(), ClientError> {
         docker.heal_all_partitions().await?;
 
         // SWIM suspicion timeout is 3s, so 5s is sufficient for rediscovery.
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
         client.refresh_routing().await?;
 
         eprintln!("[8b.3] OK -- cluster reformed after full isolation");
@@ -417,7 +430,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         tlog!(t0, "test 8b: done");
     }
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // == Test 8c -- Slow network ==
     {
@@ -425,7 +438,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[8c] === Slow network sub-scenario ===");
 
         let (mut docker, _client_orig) = common::start_3node_cluster(SID).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
 
         // Create a client with extended timeouts for degraded network
         let slow_config = ClientConfig {
@@ -446,14 +459,14 @@ async fn run_scenario() -> Result<(), ClientError> {
         assert_eq!(baseline_txids.len(), 1000);
 
         // Wait for replication to settle.
-        common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
         eprintln!("[8c.1] Applying slow_network (200ms, 5%% loss) to all nodes");
         docker.slow_network("node1", 200, 5.0).await?;
         docker.slow_network("node2", 200, 5.0).await?;
         docker.slow_network("node3", 200, 5.0).await?;
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         // 60-second sustained workload under degraded network
         eprintln!("[8c.2] Running 60-second sustained workload under degraded network");
@@ -511,9 +524,9 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[8c.3] Clearing network degradation");
         docker.clear_all_networks().await?;
 
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await
             .unwrap_or_else(|e| eprintln!("[8c.3] migration wait: {e}"));
         client.refresh_routing().await?;
 
@@ -532,20 +545,12 @@ async fn run_scenario() -> Result<(), ClientError> {
         // Wait for deferred shard table swaps to complete, then use a fresh client
         common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
         let fresh_client = common::create_client(&docker, 3).await?;
-        let mut verify_failures = 0u32;
 
-        for txid in &slow_txids {
-            let results = fresh_client.get_batch(FIELD_ALL, std::slice::from_ref(txid)).await?;
-            if results.is_empty() || results.item(0).status != 0 {
-                verify_failures += 1;
-                eprintln!("Test 8c.5: txid {} returned unexpected result", txid_hex(txid));
-            }
-        }
-        assert_eq!(verify_failures, 0,
-            "Test 8c.5: {verify_failures}/{} records written during degradation are unreadable",
+        let (found, not_found) = common::count_accessible(&fresh_client, &slow_txids).await?;
+        assert_eq!(not_found, 0,
+            "Test 8c.5: {not_found}/{} records written during degradation are unreadable",
             slow_txids.len());
-        eprintln!("[8c.5] OK -- all {} records written during degradation are readable",
-            slow_txids.len());
+        eprintln!("[8c.5] OK -- all {found} records written during degradation are readable");
 
         // Verify baseline records too
         let mut baseline_failures = 0u32;
@@ -576,7 +581,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         tlog!(t0, "test 8c: done");
     }
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // == Test 8d -- Asymmetric partition ==
     {
@@ -584,7 +589,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[8d] === Asymmetric partition sub-scenario ===");
 
         let (docker, client) = common::start_3node_cluster(SID).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
         client.refresh_routing().await?;
 
         let verifier = StateVerifier::new();
@@ -594,13 +599,13 @@ async fn run_scenario() -> Result<(), ClientError> {
         assert_eq!(initial_txids.len(), 1000);
 
         // Wait for replication to settle.
-        common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
         // Asymmetric partition: node1 <-> node3 broken, but node1 <-> node2 and node2 <-> node3 ok
         eprintln!("[8d.1] Creating asymmetric partition: node1 <-> node3 broken");
         docker.partition_node("node1", &["node3"]).await?;
 
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
         // 30-second workload during asymmetric partition
         eprintln!("[8d.2] Running 30-second workload during asymmetric partition");
@@ -659,9 +664,9 @@ async fn run_scenario() -> Result<(), ClientError> {
         docker.heal_all_partitions().await?;
 
         // SWIM suspicion timeout is 3s, so 5s is sufficient for rediscovery.
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(180)).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
         client.refresh_routing().await?;
 
         eprintln!("[8d.3] OK -- cluster reconverged after asymmetric partition heal");

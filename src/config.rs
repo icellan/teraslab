@@ -277,8 +277,8 @@ impl Default for ServerConfig {
             ack_policy: "auto".to_string(),
             replication_timeout_ms: 3000,
             replication_degraded_mode: "reject".to_string(),
-            migration_pool_size: 4,
-            migration_batch_size: 100,
+            migration_pool_size: 32,
+            migration_batch_size: 500,
             replica_lag_check_interval_secs: 30,
             index: IndexConfig::default(),
         }
