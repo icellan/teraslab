@@ -268,12 +268,12 @@ fn main() {
                     }
                     Err(e) => {
                         eprintln!("  index snapshot corrupt ({e}), rebuilding from device...");
-                        rebuild_all(&*device, &allocator)
+                        rebuild_all(&*device, &allocator, config.expected_records)
                     }
                 }
             } else {
                 eprintln!("  no index snapshot found, rebuilding from device...");
-                rebuild_all(&*device, &allocator)
+                rebuild_all(&*device, &allocator, config.expected_records)
             };
             (idx, DahBackend::from(dah), UnminedBackend::from(unmined))
         };
@@ -629,12 +629,12 @@ impl ServerWithShutdown {
     }
 }
 
-fn rebuild_all(device: &dyn BlockDevice, allocator: &SlotAllocator) -> (PrimaryBackend, DahIndex, UnminedIndex) {
+fn rebuild_all(device: &dyn BlockDevice, allocator: &SlotAllocator, expected_records: usize) -> (PrimaryBackend, DahIndex, UnminedIndex) {
     let index = match PrimaryBackend::rebuild(device, allocator) {
         Ok(idx) => idx,
         Err(e) => {
             eprintln!("  index rebuild failed: {e}, starting empty");
-            PrimaryBackend::new_in_memory(1000).unwrap()
+            PrimaryBackend::new_in_memory(expected_records).unwrap()
         }
     };
     let (dah, unmined) = match PrimaryBackend::rebuild_secondary(device, allocator) {

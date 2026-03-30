@@ -265,6 +265,11 @@ pub fn handle_replica_batch(
         }
     };
 
+    // Refresh the cached clock once per batch so replicated mutations
+    // record a current `updated_at` timestamp without issuing a
+    // `clock_gettime` syscall per individual operation.
+    engine.refresh_clock();
+
     let mut seq = batch.first_sequence;
     for op in &batch.ops {
         if let Err(msg) = apply_op(engine, op) {
@@ -310,11 +315,6 @@ pub fn handle_replica_batch(
 /// not-found records), or `Err(message)` if the operation fails in a
 /// way that should abort the batch.
 pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), String> {
-    // Refresh the cached clock so replicated mutations record a current
-    // `updated_at` timestamp. Without this, all replicated ops would use the
-    // stale value from the last dispatch-path write (or server startup).
-    engine.refresh_clock();
-
     // Pre-apply generation guard: reject stale ops BEFORE mutating state.
     // An op is stale if its master_generation is strictly less than the
     // record's current generation — a newer mutation has already been applied.
