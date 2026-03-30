@@ -179,6 +179,9 @@ impl RedbPrimary {
     /// All removals that succeed are committed atomically. If the commit fails,
     /// the entire batch is treated as failed and `vec![None; keys.len()]` is
     /// returned.
+    ///
+    /// When no keys are found (all-miss), the write transaction is aborted
+    /// early to avoid holding the redb write lock unnecessarily.
     pub fn unregister_batch(&mut self, keys: &[TxKey]) -> Vec<Option<TxIndexEntry>> {
         if keys.is_empty() {
             return Vec::new();
@@ -208,7 +211,7 @@ impl RedbPrimary {
                     }
                     Ok(None) => results.push(None),
                     Err(e) => {
-                        eprintln!("redb unregister_batch: remove failed: {e}");
+                        eprintln!("redb unregister_batch: remove failed for key: {e}");
                         results.push(None);
                     }
                 }
@@ -222,6 +225,10 @@ impl RedbPrimary {
                     return vec![None; keys.len()];
                 }
             }
+        } else {
+            // All keys were misses — abort the transaction early to release
+            // the write lock without performing a commit.
+            drop(txn);
         }
         results
     }

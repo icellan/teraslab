@@ -209,7 +209,7 @@ fn main() {
             // File-backed mmap backend
             let fb_path = &config.index.file_backed_path;
             let primary = if fb_path.exists() {
-                match PrimaryBackend::restore_file_backed(fb_path, 1024) {
+                match PrimaryBackend::restore_file_backed(fb_path, config.expected_records) {
                     Ok(idx) => {
                         eprintln!("  file-backed index opened ({} entries)", idx.len());
                         idx
@@ -221,7 +221,7 @@ fn main() {
                             Err(e2) => {
                                 eprintln!("  file-backed rebuild failed: {e2}, removing stale file and creating empty");
                                 let _ = std::fs::remove_file(fb_path);
-                                PrimaryBackend::new_file_backed(fb_path, 1024).unwrap()
+                                PrimaryBackend::new_file_backed(fb_path, config.expected_records).unwrap()
                             }
                         }
                     }
@@ -232,7 +232,7 @@ fn main() {
                     Ok(idx) => idx,
                     Err(e) => {
                         eprintln!("  file-backed rebuild failed: {e}, creating empty");
-                        PrimaryBackend::new_file_backed(fb_path, 1024).unwrap()
+                        PrimaryBackend::new_file_backed(fb_path, config.expected_records).unwrap()
                     }
                 }
             };
