@@ -152,6 +152,7 @@ impl DockerHelpers {
         let subnet_second = 30 + sid;
         let net = self.network_name();
         let config_dir = format!("{}/config", self.compose_dir);
+        let debug_shards = std::env::var("TERASLAB_DEBUG_SHARDS").ok();
 
         let mut yaml = format!(
             r#"networks:
@@ -211,6 +212,12 @@ services:
       - "{http_host_port}:9100"
 "#
             ));
+            if let Some(debug_shards) = &debug_shards {
+                yaml.push_str(&format!(
+                    "    environment:\n      TERASLAB_DEBUG_SHARDS: \"{}\"\n",
+                    debug_shards,
+                ));
+            }
         }
 
         yaml

@@ -800,6 +800,7 @@ impl Client {
             match &result {
                 Err(ClientError::Connection(msg)) if attempt == 0 => {
                     eprintln!("client: retry after connection error: {msg}");
+                    let _ = self.refresh_routing().await;
                     continue;
                 }
                 Err(ClientError::Partial(pe)) if attempt == 0
@@ -1235,6 +1236,7 @@ impl Client {
                 Ok(result) => return Ok(result),
                 Err(ClientError::Connection(ref msg)) if attempt == 0 => {
                     eprintln!("client: get_batch retry after connection error: {msg}");
+                    let _ = self.refresh_routing().await;
                     continue;
                 }
                 Err(e) => return Err(e),

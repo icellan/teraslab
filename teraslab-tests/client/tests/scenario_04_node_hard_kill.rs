@@ -358,10 +358,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     tlog!(t0, "test 4.8 start");
     eprintln!("[4.8] Background workload during kill");
 
-    // Restart node2 first so we have a full 3-node cluster again
-    docker.start_node("node2").await?;
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await?;
+    common::teardown_all(SID).await;
+    let (docker, client) = common::start_3node_cluster(SID).await?;
     client.refresh_routing().await?;
 
     // Create a separate verifier for this sub-test

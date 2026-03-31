@@ -341,11 +341,19 @@ fn migration_plan_minimal_moves() {
         }
     }
 
-    // Migration plan should have exactly as many tasks as changed shards
-    // (minus those where old master is dead and new master was already replica)
-    assert!(plan.len() <= changed,
-        "migration plan has {} tasks but only {} shards changed master",
-        plan.len(), changed);
+    let master_tasks = plan.iter().filter(|t| t.is_master).count();
+    let repair_tasks = plan.iter().filter(|t| !t.is_master).count();
+
+    // Master moves remain minimal: exactly one master migration per shard
+    // whose master changed.
+    assert_eq!(master_tasks, changed,
+        "migration plan has {} master tasks but {} shards changed master",
+        master_tasks, changed);
+    // Additional tasks are allowed only as non-master repair backfills.
+    assert_eq!(plan.len(), master_tasks + repair_tasks);
+    assert!(repair_tasks <= changed,
+        "migration plan has {} repair tasks but only {} shards changed master",
+        repair_tasks, changed);
     assert!(plan.len() > 0, "adding a node should require migrations");
 }
 

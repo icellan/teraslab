@@ -59,6 +59,24 @@ async fn run_scenario() -> Result<(), ClientError> {
     let txids = common::seed_records(&client, &verifier, 10000, 10).await?;
     assert_eq!(txids.len(), 10000, "expected 10000 seeded records");
 
+    let mut pre_scale_missing = 0u32;
+    for chunk in txids.chunks(100) {
+        let results = client.get_batch(FIELD_ALL, chunk).await?;
+        for (i, result) in results.iter().enumerate() {
+            if result.status() != 0 {
+                pre_scale_missing += 1;
+                if pre_scale_missing <= 5 {
+                    eprintln!(
+                        "[6.0] pre-scale missing txid {} status={}",
+                        txid_hex(&chunk[i]),
+                        result.status(),
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(pre_scale_missing, 0, "[6.0] {pre_scale_missing}/10000 seeded records unreadable before scale-up");
+
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Record shard counts before scale-up for test 6.6
@@ -127,8 +145,11 @@ async fn run_scenario() -> Result<(), ClientError> {
                         reporter_bg.record("read", op_start.elapsed());
                         workload_ops_bg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    Err(_) => {
-                        workload_errors_bg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(e) => {
+                        let error_idx = workload_errors_bg.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if error_idx <= 5 {
+                            eprintln!("[6.5] background read error #{error_idx}: {e}");
+                        }
                         workload_ops_bg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
@@ -165,8 +186,11 @@ async fn run_scenario() -> Result<(), ClientError> {
                         verifier_bg.record_create(txid, 1, vec![utxo_hash]);
                         workload_ops_bg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    Err(_) => {
-                        workload_errors_bg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(e) => {
+                        let error_idx = workload_errors_bg.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if error_idx <= 5 {
+                            eprintln!("[6.5] background create error #{error_idx}: {e}");
+                        }
                         workload_ops_bg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
@@ -243,13 +267,19 @@ async fn run_scenario() -> Result<(), ClientError> {
     tlog!(t0, "test 6.3: read all records");
     eprintln!("[6.3] Reading ALL 10000 original records");
     let mut read_failures = 0u32;
+    let mut failed_reads: Vec<([u8; 32], u8)> = Vec::new();
 
     for chunk in txids.chunks(100) {
         let results = client.get_batch(FIELD_ALL, chunk).await?;
         for (i, result) in results.iter().enumerate() {
             if result.status() != 0 {
                 read_failures += 1;
-                eprintln!("Test 6.3: txid {} returned unexpected result", txid_hex(&chunk[i]));
+                failed_reads.push((chunk[i], result.status()));
+                eprintln!(
+                    "Test 6.3: txid {} returned unexpected result status={}",
+                    txid_hex(&chunk[i]),
+                    result.status(),
+                );
             }
         }
     }
@@ -261,14 +291,71 @@ async fn run_scenario() -> Result<(), ClientError> {
         tokio::time::sleep(Duration::from_millis(500)).await;
         client.refresh_routing().await?;
         read_failures = 0;
+        failed_reads.clear();
         for chunk in txids.chunks(100) {
             let results = client.get_batch(FIELD_ALL, chunk).await?;
             for (i, result) in results.iter().enumerate() {
                 if result.status() != 0 {
                     read_failures += 1;
+                    failed_reads.push((chunk[i], result.status()));
                     if read_failures <= 5 {
-                        eprintln!("Test 6.3 retry: txid {} still not found", txid_hex(&chunk[i]));
+                        eprintln!(
+                            "Test 6.3 retry: txid {} still not found status={}",
+                            txid_hex(&chunk[i]),
+                            result.status(),
+                        );
                     }
+                }
+            }
+        }
+        for (txid, routed_status) in failed_reads.iter().take(5) {
+            eprintln!(
+                "[6.3] diag txid {} routed_status={}",
+                txid_hex(txid),
+                routed_status,
+            );
+            for node_num in 1..=4u32 {
+                let node_addr = format!("127.0.0.1:{}", docker5.client_port(node_num));
+                match common::direct_get(&client, &node_addr, &[*txid]).await {
+                    Ok((_frame_status, payload)) => {
+                        let item_status = common::parse_batch_response(&payload)
+                            .into_iter()
+                            .next()
+                            .map(|(status, _)| status)
+                            .unwrap_or(255);
+                        eprintln!(
+                            "[6.3] diag txid {} node{} local_status={}",
+                            txid_hex(txid),
+                            node_num,
+                            item_status,
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[6.3] diag txid {} node{} local_read_error={}",
+                            txid_hex(txid),
+                            node_num,
+                            e,
+                        );
+                    }
+                }
+            }
+        }
+        for node_num in 1..=4u32 {
+            match common::http_migration_status(&docker5, node_num).await {
+                Ok(status) => {
+                    eprintln!(
+                        "[6.3] migration_status node{} active={} failed={} inbound_pending={} fenced_shards={} migrations={}",
+                        node_num,
+                        status["active_count"].as_u64().unwrap_or(0),
+                        status["failed_count"].as_u64().unwrap_or(0),
+                        status["inbound_pending"].as_u64().unwrap_or(0),
+                        status["fenced_shards"].as_u64().unwrap_or(0),
+                        status["migrations"].as_array().map(|m| m.len()).unwrap_or(0),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[6.3] migration_status node{} error={}", node_num, e);
                 }
             }
         }

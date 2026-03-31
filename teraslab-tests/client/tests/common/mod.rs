@@ -803,79 +803,100 @@ pub async fn teardown_all(scenario_id: u16) {
     wait_ports_free(first_http_port, scenario_id, 5).await;
 }
 
+async fn docker_output_timeout(args: &[String], timeout: Duration) -> Option<std::process::Output> {
+    let mut cmd = tokio::process::Command::new("docker");
+    cmd.kill_on_drop(true);
+    cmd.args(args.iter().map(|s| s.as_str()));
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(out)) => Some(out),
+        _ => None,
+    }
+}
+
 /// Force-remove all Docker resources (containers, volumes, networks) for a
 /// scenario using direct docker commands. Much faster than `compose_down`
 /// because it skips compose file generation and runs a single bulk removal.
 async fn force_cleanup(scenario_id: u16) {
     let sid = format!("ts{scenario_id:02}");
 
-    // 1. Force-remove all containers for this scenario in one shot.
     let container_filter = format!("name={sid}-node");
-    if let Ok(out) = tokio::process::Command::new("docker")
-        .args(["ps", "-aq", "--filter", &container_filter])
-        .output()
-        .await
-    {
-        let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .map(|s| s.to_string())
-            .collect();
-        if !ids.is_empty() {
-            let mut args = vec!["rm".to_string(), "-f".to_string()];
-            args.extend(ids);
-            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-            let _ = tokio::process::Command::new("docker")
-                .args(&arg_refs)
-                .output()
-                .await;
+    let container_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let ids = docker_output_timeout(&vec![
+            "ps".to_string(),
+            "-aq".to_string(),
+            "--filter".to_string(),
+            container_filter.clone(),
+        ], Duration::from_secs(5)).await
+            .map(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        if ids.is_empty() || std::time::Instant::now() >= container_deadline {
+            break;
         }
+        let mut args = vec!["rm".to_string(), "-f".to_string()];
+        args.extend(ids);
+        let _ = docker_output_timeout(&args, Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // 2. Remove volumes and networks in parallel (safe now that containers are gone).
-    let sid2 = sid.clone();
+    let volume_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let volume_filter = format!("name={sid}");
     let vol_handle = tokio::spawn(async move {
-        let filter = format!("name={sid2}");
-        if let Ok(out) = tokio::process::Command::new("docker")
-            .args(["volume", "ls", "-q", "--filter", &filter])
-            .output()
-            .await
-        {
-            let vols: Vec<String> = String::from_utf8_lossy(&out.stdout)
-                .split_whitespace()
-                .map(|s| s.to_string())
-                .collect();
-            if !vols.is_empty() {
-                let mut args = vec!["volume".to_string(), "rm".to_string()];
-                args.extend(vols);
-                let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                let _ = tokio::process::Command::new("docker")
-                    .args(&arg_refs)
-                    .output()
-                    .await;
+        loop {
+            let vols = docker_output_timeout(&vec![
+                "volume".to_string(),
+                "ls".to_string(),
+                "-q".to_string(),
+                "--filter".to_string(),
+                volume_filter.clone(),
+            ], Duration::from_secs(5)).await
+                .map(|out| {
+                    String::from_utf8_lossy(&out.stdout)
+                        .split_whitespace()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default();
+            if vols.is_empty() || std::time::Instant::now() >= volume_deadline {
+                break;
             }
+            let mut args = vec!["volume".to_string(), "rm".to_string()];
+            args.extend(vols);
+            let _ = docker_output_timeout(&args, Duration::from_secs(15)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     });
 
+    let network_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let network_filter = format!("name={sid}");
     let net_handle = tokio::spawn(async move {
-        let filter = format!("name={sid}");
-        if let Ok(out) = tokio::process::Command::new("docker")
-            .args(["network", "ls", "-q", "--filter", &filter])
-            .output()
-            .await
-        {
-            let nets: Vec<String> = String::from_utf8_lossy(&out.stdout)
-                .split_whitespace()
-                .map(|s| s.to_string())
-                .collect();
-            if !nets.is_empty() {
-                let mut args = vec!["network".to_string(), "rm".to_string()];
-                args.extend(nets);
-                let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                let _ = tokio::process::Command::new("docker")
-                    .args(&arg_refs)
-                    .output()
-                    .await;
+        loop {
+            let nets = docker_output_timeout(&vec![
+                "network".to_string(),
+                "ls".to_string(),
+                "-q".to_string(),
+                "--filter".to_string(),
+                network_filter.clone(),
+            ], Duration::from_secs(5)).await
+                .map(|out| {
+                    String::from_utf8_lossy(&out.stdout)
+                        .split_whitespace()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default();
+            if nets.is_empty() || std::time::Instant::now() >= network_deadline {
+                break;
             }
+            let mut args = vec!["network".to_string(), "rm".to_string()];
+            args.extend(nets);
+            let _ = docker_output_timeout(&args, Duration::from_secs(15)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     });
 

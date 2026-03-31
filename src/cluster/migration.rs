@@ -284,8 +284,6 @@ impl MigrationManager {
             if task.from_node == self_id {
                 self.active.push(MigrationProgress::from_task(task));
             }
-            // Register inbound for shards that have data on the source node.
-            // Empty shards complete instantly with no data transfer.
             if task.to_node == self_id
                 && populated_shards.contains(&task.shard)
                 && !self.inbound_migrations.iter().any(|m| m.shard == task.shard && m.from_node == task.from_node)
@@ -307,7 +305,7 @@ impl MigrationManager {
     /// so the read/write path knows to wait for migration completion.
     /// Since we may not know the source node at dispatch time, register
     /// with `NodeId(0)` as a sentinel if no existing entry matches.
-    pub fn mark_inbound_active(&mut self, shard: u16) {
+    pub fn mark_inbound_active(&mut self, shard: u16) -> bool {
         if !self.inbound_migrations.iter().any(|m| m.shard == shard && !m.completed) {
             self.inbound_migrations.push(InboundMigration {
                 shard,
@@ -316,7 +314,9 @@ impl MigrationManager {
                 created_at: std::time::Instant::now(),
             });
             self.inbound_bitmap.set(shard);
+            return true;
         }
+        false
     }
 
     /// Mark an inbound shard as received (data has arrived and been verified).
@@ -330,6 +330,25 @@ impl MigrationManager {
             m.completed = true;
         }
         // Clear bitmap bit only if no more pending entries for this shard.
+        if !self.inbound_migrations.iter().any(|m| m.shard == shard && !m.completed) {
+            self.inbound_bitmap.clear(shard);
+        }
+    }
+
+    pub fn mark_inbound_complete_from_source(&mut self, shard: u16, from_node: NodeId) {
+        if let Some(m) = self.inbound_migrations.iter_mut()
+            .find(|m| m.shard == shard && m.from_node == from_node && !m.completed)
+        {
+            m.completed = true;
+        } else if let Some(m) = self.inbound_migrations.iter_mut()
+            .find(|m| m.shard == shard && m.from_node == NodeId(0) && !m.completed)
+        {
+            m.completed = true;
+        } else if let Some(m) = self.inbound_migrations.iter_mut()
+            .find(|m| m.shard == shard && !m.completed)
+        {
+            m.completed = true;
+        }
         if !self.inbound_migrations.iter().any(|m| m.shard == shard && !m.completed) {
             self.inbound_bitmap.clear(shard);
         }
@@ -623,7 +642,7 @@ impl MigrationManager {
     pub fn clear_stale_inbound(&mut self, max_age: std::time::Duration) -> usize {
         let before = self.inbound_migrations.len();
         self.inbound_migrations.retain(|m| {
-            !m.completed && m.created_at.elapsed() < max_age
+            !m.completed && (m.from_node != NodeId(0) || m.created_at.elapsed() < max_age)
         });
         let removed = before - self.inbound_migrations.len();
         if removed > 0 {
@@ -950,12 +969,12 @@ mod tests {
         let mut mgr = MigrationManager::new();
         assert!(!mgr.has_pending_inbound(42));
 
-        mgr.mark_inbound_active(42);
+        assert!(mgr.mark_inbound_active(42));
         assert!(mgr.has_pending_inbound(42));
         assert_eq!(mgr.inbound_count(), 1);
 
         // Duplicate call should not create a second entry.
-        mgr.mark_inbound_active(42);
+        assert!(!mgr.mark_inbound_active(42));
         assert_eq!(mgr.inbound_count(), 1);
 
         mgr.mark_inbound_complete(42);
@@ -967,22 +986,58 @@ mod tests {
         let mut mgr = MigrationManager::new();
         let t1 = MigrationTask { shard: 5, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
         let t2 = MigrationTask { shard: 5, from_node: NodeId(3), to_node: NodeId(1), is_master: false };
-
-        let mut populated = std::collections::HashSet::new();
-        populated.insert(5);
+        let populated: std::collections::HashSet<u16> = [5u16].into_iter().collect();
         mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &populated);
 
-        // Two inbound entries for the same shard from different sources.
         assert_eq!(mgr.inbound_count(), 2);
         assert!(mgr.has_pending_inbound(5));
 
-        // Complete one — shard should still be pending.
         mgr.mark_inbound_complete(5);
         assert!(mgr.has_pending_inbound(5));
         assert_eq!(mgr.inbound_count(), 1);
 
-        // Complete the second — now clear.
         mgr.mark_inbound_complete(5);
+        assert!(!mgr.has_pending_inbound(5));
+        assert_eq!(mgr.inbound_count(), 0);
+    }
+
+    #[test]
+    fn source_aware_inbound_complete_clears_exact_source() {
+        let mut mgr = MigrationManager::new();
+        let t1 = MigrationTask { shard: 10, from_node: NodeId(1), to_node: NodeId(9), is_master: true };
+        let t2 = MigrationTask { shard: 10, from_node: NodeId(2), to_node: NodeId(9), is_master: false };
+        let populated: std::collections::HashSet<u16> = [10u16].into_iter().collect();
+        mgr.start_outbound(&[t1, t2], NodeId(9), &populated);
+
+        mgr.mark_inbound_complete_from_source(10, NodeId(2));
+        assert!(mgr.has_pending_inbound(10));
+        assert_eq!(mgr.inbound_count(), 1);
+
+        mgr.mark_inbound_complete_from_source(10, NodeId(1));
+        assert!(!mgr.has_pending_inbound(10));
+        assert_eq!(mgr.inbound_count(), 0);
+    }
+
+    #[test]
+    fn source_aware_inbound_complete_falls_back_to_sentinel() {
+        let mut mgr = MigrationManager::new();
+        mgr.mark_inbound_active(42);
+        assert!(mgr.has_pending_inbound(42));
+
+        mgr.mark_inbound_complete_from_source(42, NodeId(7));
+        assert!(!mgr.has_pending_inbound(42));
+        assert_eq!(mgr.inbound_count(), 0);
+    }
+
+    #[test]
+    fn inbound_tracking_per_task_on_empty_target() {
+        let mut mgr = MigrationManager::new();
+        let t1 = MigrationTask { shard: 5, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
+        let t2 = MigrationTask { shard: 5, from_node: NodeId(3), to_node: NodeId(1), is_master: false };
+
+        mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &std::collections::HashSet::new());
+
+        assert_eq!(mgr.inbound_count(), 0);
         assert!(!mgr.has_pending_inbound(5));
     }
 
@@ -1320,6 +1375,31 @@ mod tests {
     }
 
     #[test]
+    fn clear_stale_inbound_preserves_real_sources() {
+        let mut mgr = MigrationManager::new();
+        mgr.inbound_migrations.push(InboundMigration {
+            shard: 10,
+            from_node: NodeId(1),
+            completed: false,
+            created_at: std::time::Instant::now(),
+        });
+        mgr.inbound_bitmap.set(10);
+        mgr.inbound_migrations.push(InboundMigration {
+            shard: 20,
+            from_node: NodeId(0),
+            completed: false,
+            created_at: std::time::Instant::now(),
+        });
+        mgr.inbound_bitmap.set(20);
+
+        let removed = mgr.clear_stale_inbound(Duration::ZERO);
+        assert_eq!(removed, 1);
+        assert!(mgr.has_pending_inbound(10));
+        assert!(!mgr.has_pending_inbound(20));
+        assert_eq!(mgr.inbound_count(), 1);
+    }
+
+    #[test]
     fn failed_migration_retry_resets_progress() {
         let mut mgr = MigrationManager::new();
         let task = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
@@ -1623,7 +1703,7 @@ mod tests {
         mgr.mark_inbound_active(10);
         mgr.mark_inbound_active(20);
 
-        // Duration::ZERO means everything is stale.
+        // Duration::ZERO means all sentinel entries are stale.
         let removed = mgr.clear_stale_inbound(Duration::ZERO);
         assert_eq!(removed, 2);
         assert!(!mgr.has_pending_inbound(10));

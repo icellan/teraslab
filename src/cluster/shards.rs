@@ -397,6 +397,17 @@ impl ShardTable {
                     to_node: new_master,
                     is_master: true,
                 });
+                if !old_assignment.replicas.contains(&new_master)
+                    && let Some(&repair_source) = old_assignment.replicas.iter()
+                        .find(|r| new_members.contains(r))
+                {
+                    tasks.push(MigrationTask {
+                        shard: shard as u16,
+                        from_node: repair_source,
+                        to_node: new_master,
+                        is_master: false,
+                    });
+                }
             }
         }
         tasks
@@ -410,6 +421,16 @@ impl ShardTable {
     /// the shard data backfilled.
     pub fn replica_migration_plan(old: &ShardTable, new: &ShardTable) -> Vec<MigrationTask> {
         let mut tasks = Vec::new();
+        let new_members: std::collections::HashSet<NodeId> = {
+            let mut set = std::collections::HashSet::new();
+            for a in &new.assignments {
+                set.insert(a.master);
+                for &r in &a.replicas {
+                    set.insert(r);
+                }
+            }
+            set
+        };
         for shard in 0..NUM_SHARDS {
             let old_a = &old.assignments[shard];
             let new_a = &new.assignments[shard];
@@ -419,10 +440,19 @@ impl ShardTable {
                 if old_a.replicas.contains(&new_replica) || old_a.master == new_replica {
                     continue;
                 }
-                // This is a new replica — it needs data from the current master
+                let source = if new_members.contains(&old_a.master) {
+                    Some(old_a.master)
+                } else if old_a.replicas.contains(&new_a.master) {
+                    Some(new_a.master)
+                } else {
+                    old_a.replicas.iter().copied().find(|r| new_members.contains(r))
+                };
+                let Some(source) = source else {
+                    continue;
+                };
                 tasks.push(MigrationTask {
                     shard: shard as u16,
-                    from_node: new_a.master,
+                    from_node: source,
                     to_node: new_replica,
                     is_master: false,
                 });
@@ -970,7 +1000,9 @@ mod tests {
 
         let plan = ShardTable::migration_plan(&old, &new);
         // ~1024 shards should move to node 4 (4096/4 = 1024)
-        let to_4: Vec<_> = plan.iter().filter(|t| t.to_node == NodeId(4)).collect();
+        let to_4: Vec<_> = plan.iter()
+            .filter(|t| t.to_node == NodeId(4) && t.is_master)
+            .collect();
         let expected = NUM_SHARDS / 4;
         let deviation = (to_4.len() as f64 - expected as f64).abs() / expected as f64;
         assert!(deviation < 0.05,
@@ -981,18 +1013,49 @@ mod tests {
         let from_2 = plan.iter().filter(|t| t.from_node == NodeId(2)).count();
         let from_3 = plan.iter().filter(|t| t.from_node == NodeId(3)).count();
         assert!(from_1 > 0, "should move some from node 1");
-        assert!(from_2 > 0, "should move some from node 2");
-        assert!(from_3 > 0, "should move some from node 3");
+        assert!(to_4.len() >= expected - 1 && to_4.len() <= expected + 1,
+            "expected ~{expected} migrations to node 4, got {}", to_4.len());
     }
 
     #[test]
-    fn migration_plan_remove_node_redistributes() {
+    fn migration_plan_add_node_includes_replica_repair_for_new_master() {
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 2);
+
+        let plan = ShardTable::migration_plan(&old, &new);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&shard| {
+                let old_a = &old.assignments[shard as usize];
+                let new_a = &new.assignments[shard as usize];
+                old_a.master != new_a.master && !old_a.replicas.contains(&new_a.master)
+            })
+            .expect("expected at least one shard whose new master was not an old owner");
+
+        let old_a = &old.assignments[shard as usize];
+        let new_a = &new.assignments[shard as usize];
+        let repair_source = old_a.replicas[0];
+
+        assert!(plan.iter().any(|t|
+            t.shard == shard
+                && t.from_node == old_a.master
+                && t.to_node == new_a.master
+                && t.is_master
+        ));
+        assert!(plan.iter().any(|t|
+            t.shard == shard
+                && t.from_node == repair_source
+                && t.to_node == new_a.master
+                && !t.is_master
+        ));
+    }
+
+    #[test]
+    fn migration_plan_remove_node_uses_surviving_replica() {
         let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1);
         let new = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 2);
 
         let plan = ShardTable::migration_plan(&old, &new);
         // Node 3's ~1365 shards should be redistributed to nodes 1 and 2.
-        // Since node 3 is dead (not in new), migration comes from replicas.
         for task in &plan {
             assert_ne!(task.from_node, NodeId(3),
                 "dead node 3 should not be a migration source");
@@ -1039,6 +1102,25 @@ mod tests {
                 "shard {} didn't change master ({:?}→{:?}) but is in migration plan",
                 task.shard, old_master, new_master);
         }
+    }
+
+    #[test]
+    fn replica_migration_plan_uses_existing_old_owner_when_master_changes() {
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 2);
+        let plan = ShardTable::replica_migration_plan(&old, &new);
+
+        // Shard 2179 is deterministic for this node set: its master changes
+        // when node 4 joins, and the old master is no longer in the new
+        // assignment, so the replica migration must source from a surviving
+        // old owner (node 2) rather than the dead old master.
+        let task = plan.iter()
+            .find(|t| t.shard == 2179)
+            .expect("expected replica migration task for shard 2179");
+
+        assert_eq!(task.from_node, NodeId(2));
+        assert_eq!(task.to_node, NodeId(1));
+        assert!(!task.is_master);
     }
 
     // -----------------------------------------------------------------------

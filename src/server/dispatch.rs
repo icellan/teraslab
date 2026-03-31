@@ -9,7 +9,7 @@
 //! - Replication ops are sent to replica nodes (if in cluster mode with RF > 1).
 
 use crate::cluster::coordinator::RunningCluster;
-use crate::cluster::shards::ShardTable;
+use crate::cluster::shards::{NodeId, ShardTable};
 use crate::index::TxKey;
 use crate::ops::create::*;
 use crate::ops::engine::{Engine, build_cold_data};
@@ -245,6 +245,38 @@ pub(crate) fn handle_request(
             } else {
                 None
             };
+            let (source_entries, completion_from_node): (Option<Vec<(TxKey, u32)>>, Option<NodeId>) = if request.payload.len() >= 60 {
+                let entry_count = u32::from_le_bytes(request.payload[56..60].try_into().unwrap()) as usize;
+                let needed = 60 + entry_count * 36;
+                if request.payload.len() < needed {
+                    return error_response(
+                        request.request_id,
+                        ERR_MIGRATION_IN_PROGRESS,
+                        &format!(
+                            "shard {shard} malformed exact-manifest payload: need {needed} bytes, got {}",
+                            request.payload.len(),
+                        ),
+                    );
+                }
+                let mut entries = Vec::with_capacity(entry_count);
+                let mut pos = 60;
+                for _ in 0..entry_count {
+                    let mut txid = [0u8; 32];
+                    txid.copy_from_slice(&request.payload[pos..pos + 32]);
+                    pos += 32;
+                    let generation = u32::from_le_bytes(request.payload[pos..pos + 4].try_into().unwrap());
+                    pos += 4;
+                    entries.push((TxKey { txid }, generation));
+                }
+                let completion_from_node = if request.payload.len() >= needed + 8 {
+                    Some(NodeId(u64::from_le_bytes(request.payload[needed..needed + 8].try_into().unwrap())))
+                } else {
+                    None
+                };
+                (Some(entries), completion_from_node)
+            } else {
+                (None, None)
+            };
 
             // Reject migrations from very stale topology epochs.
             // Allow 2 epochs of slack to accommodate re-activation cycles
@@ -281,17 +313,60 @@ pub(crate) fn handle_request(
                 );
             }
 
+            if let Some(entries) = source_entries.as_ref() {
+                for (key, expected_generation) in entries {
+                    let meta = match engine.read_metadata(key) {
+                        Ok(meta) => meta,
+                        Err(e) => {
+                            return error_response(
+                                request.request_id,
+                                ERR_MIGRATION_IN_PROGRESS,
+                                &format!(
+                                    "shard {shard} missing exact key {:?}: {e:?}",
+                                    key,
+                                ),
+                            );
+                        }
+                    };
+                    let actual_generation = meta.generation;
+                    if actual_generation != *expected_generation {
+                        return error_response(
+                            request.request_id,
+                            ERR_MIGRATION_IN_PROGRESS,
+                            &format!(
+                                "shard {shard} generation mismatch for {:?}: expected {}, got {}",
+                                key,
+                                expected_generation,
+                                actual_generation,
+                            ),
+                        );
+                    }
+                }
+            }
+
             // Verify manifest hash (content fingerprint) if provided.
-            // Skip when the target has more records than expected (pre-existing
-            // replica data makes the hash incomparable).
-            if let Some(expected_hash) = source_manifest
-                && actual == expected_records
-            {
+            // This must run even when `actual > expected_records`: concurrent
+            // creates between the source snapshot and fence legitimately
+            // increase the final shard count, and the manifest is the only
+            // authoritative check that the target's FINAL contents match the
+            // source after delta replay.
+            if let Some(expected_hash) = source_manifest {
                 let mut local_manifest = crate::cluster::coordinator::ManifestHasher::new();
                 for key in engine.keys_for_shard(shard) {
-                    if let Ok(meta) = engine.read_metadata(&key) {
-                        local_manifest.fold(&key.txid, meta.generation);
-                    }
+                    let meta = match engine.read_metadata(&key) {
+                        Ok(meta) => meta,
+                        Err(e) => {
+                            return error_response(
+                                request.request_id,
+                                ERR_MIGRATION_IN_PROGRESS,
+                                &format!(
+                                    "shard {shard} manifest read_metadata failed for {:?}: {e:?}",
+                                    key,
+                                ),
+                            );
+                        }
+                    };
+                    local_manifest.fold(&key.txid, meta.generation);
                 }
                 let local_hash = local_manifest.finalize();
                 if local_hash != expected_hash {
@@ -306,12 +381,19 @@ pub(crate) fn handle_request(
             }
 
             if let Some(cluster) = cluster {
-                cluster.mark_inbound_complete(shard);
-                // Also commit the handoff so the shard transitions from
-                // Copying to ServingNew. Without this, shards whose
-                // migration was pre-filtered (data already in place)
-                // would stay stuck in Copying indefinitely.
-                cluster.shard_table().write().commit_shard(shard);
+                if let Some(from_node) = completion_from_node {
+                    cluster.mark_inbound_complete_from_source(shard, from_node);
+                } else {
+                    cluster.mark_inbound_complete(shard);
+                }
+                let should_commit = {
+                    let shard_table = cluster.shard_table();
+                    let table = shard_table.read();
+                    table.target_assignment(shard).master == cluster.self_id()
+                } && !cluster.has_pending_inbound_shard(shard);
+                if should_commit {
+                    cluster.shard_table().write().commit_shard(shard);
+                }
             }
             ResponseFrame {
                 request_id: request.request_id,
