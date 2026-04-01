@@ -904,15 +904,9 @@ mod tests {
     #[test]
     fn catchup_transitions_to_needs_resync_when_redo_reclaimed() {
         let (master_tx, _replica_rx) = InMemoryTransport::pair();
-        let (_tx2, replica_side) = InMemoryTransport::pair();
 
         let config = ReplicationConfig::default();
         let mut mgr = ReplicationManager::new(config, vec![Box::new(master_tx)]);
-
-        // Replicate some ops to advance the sequence
-        let ops: Vec<ReplicaOp> = (0..5)
-            .map(|i| ReplicaOp::Freeze { tx_key: key(i), offset: 0, master_generation: 0 })
-            .collect();
 
         // Manually set up the scenario: replica is catching up
         mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 1 };

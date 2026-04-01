@@ -5577,29 +5577,6 @@ mod tests {
     // Phase 5: Creation path tests
     // ===================================================================
 
-    /// Owned storage for CreateRequest test data.
-    struct OwnedCreateReq {
-        hashes: Vec<[u8; 32]>,
-        tx_id: [u8; 32],
-    }
-
-    impl OwnedCreateReq {
-        fn new(n: u8, utxo_count: usize) -> Self {
-            let mut tx_id = [0u8; 32];
-            tx_id[0] = n;
-            tx_id[8..16].copy_from_slice(&(n as u64 * 0x9E37).to_le_bytes());
-            tx_id[16] = n;
-            let hashes = (0..utxo_count)
-                .map(|i| { let mut h = [0u8; 32]; h[0] = i as u8; h[1] = (i >> 8) as u8; h })
-                .collect();
-            Self { hashes, tx_id }
-        }
-
-        fn req(&self) -> CreateRequest<'_> {
-            make_create_req_from(&self.tx_id, &self.hashes)
-        }
-    }
-
     fn make_create_req(n: u8, utxo_count: usize) -> (Vec<[u8; 32]>, CreateRequest<'static>) {
         // SAFETY: We leak the Vec to get a 'static lifetime for test convenience.
         // This is fine in tests — the memory is small and the process exits after tests.
@@ -5634,31 +5611,6 @@ mod tests {
             parent_txids: &[],
         };
         (hashes, req)
-    }
-
-    fn make_create_req_from<'a>(tx_id: &[u8; 32], utxo_hashes: &'a [[u8; 32]]) -> CreateRequest<'a> {
-        CreateRequest {
-            tx_id: *tx_id,
-            tx_version: 1,
-            locktime: 0,
-            fee: 500,
-            size_in_bytes: 250,
-            extended_size: 0,
-            is_coinbase: false,
-            spending_height: 0,
-            utxo_hashes,
-            inputs: None,
-            outputs: None,
-            inpoints: None,
-            is_external: false,
-            created_at: 1710000000000,
-            block_height: 1000,
-            mined_block_infos: &[],
-            frozen: false,
-            conflicting: false,
-            locked: false,
-            parent_txids: &[],
-        }
     }
 
     fn create_engine() -> Arc<Engine> {

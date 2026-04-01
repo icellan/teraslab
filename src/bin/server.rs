@@ -94,6 +94,10 @@ fn main() {
         eprintln!("FATAL: invalid config: {e}");
         std::process::exit(1);
     }
+    if let Err(e) = config.validate_cluster_safety() {
+        eprintln!("FATAL: unsafe cluster config: {e}");
+        std::process::exit(1);
+    }
 
     // 2. Recover or create allocator
     let allocator = match SlotAllocator::recover(device.clone()) {

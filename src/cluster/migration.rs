@@ -234,10 +234,6 @@ struct InboundMigration {
     from_node: NodeId,
     /// True once `OP_MIGRATION_COMPLETE` confirmed data arrived.
     completed: bool,
-    /// When this entry was created. Used for staleness-based cleanup:
-    /// entries older than a threshold are removed to prevent indefinite
-    /// write-blocking from abandoned migrations.
-    created_at: std::time::Instant,
 }
 
 /// Manages active migrations for this node.
@@ -272,27 +268,26 @@ impl MigrationManager {
     ///
     /// Outbound tasks (this node is source) are fully tracked with progress.
     /// Inbound tasks (this node is target) are registered per-task with
-    /// the source node, only for shards that have data (`populated_shards`).
-    /// Empty shards need no transfer and should not block reads/writes.
+    /// the source node for every shard in the new topology. Empty shards are
+    /// still fenced until the source proves completion, preventing the new
+    /// owner from serving writes before the handoff is durably installed.
     pub fn start_outbound(
         &mut self,
         tasks: &[MigrationTask],
         self_id: NodeId,
-        populated_shards: &std::collections::HashSet<u16>,
+        _populated_shards: &std::collections::HashSet<u16>,
     ) {
         for task in tasks {
             if task.from_node == self_id {
                 self.active.push(MigrationProgress::from_task(task));
             }
             if task.to_node == self_id
-                && populated_shards.contains(&task.shard)
                 && !self.inbound_migrations.iter().any(|m| m.shard == task.shard && m.from_node == task.from_node)
             {
                 self.inbound_migrations.push(InboundMigration {
                     shard: task.shard,
                     from_node: task.from_node,
                     completed: false,
-                    created_at: std::time::Instant::now(),
                 });
                 self.inbound_bitmap.set(task.shard);
             }
@@ -311,7 +306,6 @@ impl MigrationManager {
                 shard,
                 from_node: NodeId(0),
                 completed: false,
-                created_at: std::time::Instant::now(),
             });
             self.inbound_bitmap.set(shard);
             return true;
@@ -617,7 +611,6 @@ impl MigrationManager {
                     shard,
                     from_node,
                     completed: false,
-                    created_at: std::time::Instant::now(),
                 });
                 self.inbound_bitmap.set(shard);
             }
@@ -631,19 +624,16 @@ impl MigrationManager {
         self.inbound_bitmap.clear_all();
     }
 
-    /// Remove inbound migrations older than `max_age`.
+    /// Remove completed inbound migrations.
     ///
-    /// Unlike [`clear_inbound`] which removes everything, this only evicts
-    /// entries that have been pending longer than the threshold. This
-    /// prevents indefinite write-blocking from abandoned migrations while
-    /// preserving protection for shards still actively receiving data.
+    /// Unlike [`clear_inbound`] which removes everything, this preserves all
+    /// pending entries regardless of age. A wall-clock timeout must never
+    /// reopen a shard for writes while a migration could still complete.
     ///
     /// Returns the number of entries removed.
-    pub fn clear_stale_inbound(&mut self, max_age: std::time::Duration) -> usize {
+    pub fn clear_stale_inbound(&mut self, _max_age: std::time::Duration) -> usize {
         let before = self.inbound_migrations.len();
-        self.inbound_migrations.retain(|m| {
-            !m.completed && (m.from_node != NodeId(0) || m.created_at.elapsed() < max_age)
-        });
+        self.inbound_migrations.retain(|m| !m.completed);
         let removed = before - self.inbound_migrations.len();
         if removed > 0 {
             // Rebuild bitmap from surviving entries.
@@ -1037,8 +1027,8 @@ mod tests {
 
         mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &std::collections::HashSet::new());
 
-        assert_eq!(mgr.inbound_count(), 0);
-        assert!(!mgr.has_pending_inbound(5));
+        assert_eq!(mgr.inbound_count(), 2);
+        assert!(mgr.has_pending_inbound(5));
     }
 
     #[test]
@@ -1375,28 +1365,26 @@ mod tests {
     }
 
     #[test]
-    fn clear_stale_inbound_preserves_real_sources() {
+    fn clear_stale_inbound_preserves_pending_entries() {
         let mut mgr = MigrationManager::new();
         mgr.inbound_migrations.push(InboundMigration {
             shard: 10,
             from_node: NodeId(1),
             completed: false,
-            created_at: std::time::Instant::now(),
         });
         mgr.inbound_bitmap.set(10);
         mgr.inbound_migrations.push(InboundMigration {
             shard: 20,
             from_node: NodeId(0),
             completed: false,
-            created_at: std::time::Instant::now(),
         });
         mgr.inbound_bitmap.set(20);
 
         let removed = mgr.clear_stale_inbound(Duration::ZERO);
-        assert_eq!(removed, 1);
+        assert_eq!(removed, 0);
         assert!(mgr.has_pending_inbound(10));
-        assert!(!mgr.has_pending_inbound(20));
-        assert_eq!(mgr.inbound_count(), 1);
+        assert!(mgr.has_pending_inbound(20));
+        assert_eq!(mgr.inbound_count(), 2);
     }
 
     #[test]
@@ -1580,9 +1568,9 @@ mod tests {
         assert!(!mgr.has_pending_inbound(10));
     }
 
-    /// start_outbound skips inbound registration for empty shards.
+    /// start_outbound pre-registers inbound ownership even for empty shards.
     #[test]
-    fn start_outbound_skips_empty_shards_for_inbound() {
+    fn start_outbound_registers_empty_shards_for_inbound() {
         let mut mgr = MigrationManager::new();
         let t1 = MigrationTask { shard: 10, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
         let t2 = MigrationTask { shard: 20, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
@@ -1592,10 +1580,10 @@ mod tests {
         pop.insert(10);
         mgr.start_outbound(&[t1, t2], NodeId(1), &pop);
 
-        // Only shard 10 should be registered as inbound.
+        // Both shards must be protected until the source proves completion.
         assert!(mgr.has_pending_inbound(10));
-        assert!(!mgr.has_pending_inbound(20), "empty shard 20 should not be inbound");
-        assert_eq!(mgr.inbound_count(), 1);
+        assert!(mgr.has_pending_inbound(20), "empty shard 20 still needs an ownership fence");
+        assert_eq!(mgr.inbound_count(), 2);
     }
 
     /// Outbound serialize/restore round-trip preserves Streaming state
@@ -1696,19 +1684,19 @@ mod tests {
         assert_eq!(mgr.inbound_count(), 2);
     }
 
-    /// All entries are removed when max_age is zero (everything is stale).
+    /// Pending inbound entries are never cleared just because time elapsed.
     #[test]
-    fn clear_stale_inbound_removes_old() {
+    fn clear_stale_inbound_keeps_old_pending_entries() {
         let mut mgr = MigrationManager::new();
         mgr.mark_inbound_active(10);
         mgr.mark_inbound_active(20);
 
-        // Duration::ZERO means all sentinel entries are stale.
+        // Duration::ZERO must not drop an active migration fence.
         let removed = mgr.clear_stale_inbound(Duration::ZERO);
-        assert_eq!(removed, 2);
-        assert!(!mgr.has_pending_inbound(10));
-        assert!(!mgr.has_pending_inbound(20));
-        assert_eq!(mgr.inbound_count(), 0);
+        assert_eq!(removed, 0);
+        assert!(mgr.has_pending_inbound(10));
+        assert!(mgr.has_pending_inbound(20));
+        assert_eq!(mgr.inbound_count(), 2);
     }
 
     /// Completed entries are also cleared by staleness sweep (retain

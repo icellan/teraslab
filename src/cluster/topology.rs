@@ -1128,7 +1128,7 @@ mod tests {
 
         // Now node2 is back, SWIM sees [1, 2, 3]. Catch-up code naively
         // uses remote_term=5 with current members=[1, 2, 3].
-        let bad_commit = TopologyCommit {
+        let _bad_commit = TopologyCommit {
             term: 5,
             proposer: NodeId(1),
             members: members(&[1, 2, 3]),

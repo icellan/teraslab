@@ -753,7 +753,7 @@ mod tests {
                 break;
             }
         }
-        let (shard, old_master, new_master) = changed_shard.expect("should have at least one changed shard");
+        let (shard, old_master, _new_master) = changed_shard.expect("should have at least one changed shard");
 
         // Begin handoff — old master still serves during handoff.
         table.begin_handoff(&new_table);
@@ -1010,8 +1010,6 @@ mod tests {
 
         // Moved shards should come from all 3 existing nodes (approximately evenly)
         let from_1 = plan.iter().filter(|t| t.from_node == NodeId(1)).count();
-        let from_2 = plan.iter().filter(|t| t.from_node == NodeId(2)).count();
-        let from_3 = plan.iter().filter(|t| t.from_node == NodeId(3)).count();
         assert!(from_1 > 0, "should move some from node 1");
         assert!(to_4.len() >= expected - 1 && to_4.len() <= expected + 1,
             "expected ~{expected} migrations to node 4, got {}", to_4.len());
@@ -1066,7 +1064,6 @@ mod tests {
     #[test]
     fn migration_plan_add_then_remove_net_zero() {
         let original = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1);
-        let with_4 = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 2);
         let back_to_3 = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 3);
 
         // After add then remove, the table should be identical to original

@@ -30,12 +30,41 @@ struct TestNode {
     swim_port: u16,
 }
 
+fn reserve_tcp_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
+}
+
+fn reserve_udp_port() -> u16 {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    drop(socket);
+    port
+}
+
 fn create_node(
     node_id: u64,
     tcp_port: u16,
     swim_port: u16,
     seed_swim_ports: &[u16],
 ) -> TestNode {
+    let tcp_port = if tcp_port == 0 {
+        reserve_tcp_port()
+    } else {
+        tcp_port
+    };
+    let swim_port = if swim_port == 0 {
+        let mut port = reserve_udp_port();
+        while port == tcp_port {
+            port = reserve_udp_port();
+        }
+        port
+    } else {
+        swim_port
+    };
+
     let dev: Arc<dyn BlockDevice> =
         Arc::new(MemoryDevice::new(32 * 1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
@@ -320,16 +349,17 @@ fn three_node_cluster_all_shards_assigned() {
 
 #[test]
 fn add_fourth_node_rebalance_triggers() {
-    // Start 3-node cluster (using ports well-separated from other tests)
-    let node1 = create_node(111, 13710, 13711, &[]);
-    let node2 = create_node(112, 13712, 13713, &[13711]);
-    let node3 = create_node(113, 13714, 13715, &[13711]);
+    // Start 3-node cluster on ephemeral ports so unrelated local services
+    // cannot collide with this integration test.
+    let node1 = create_node(111, 0, 0, &[]);
+    let node2 = create_node(112, 0, 0, &[node1.swim_port]);
+    let node3 = create_node(113, 0, 0, &[node1.swim_port]);
 
     std::thread::sleep(Duration::from_secs(4));
     let v_before = node1.cluster.shard_table_version();
 
     // Add 4th node
-    let node4 = create_node(114, 13716, 13717, &[13711]);
+    let node4 = create_node(114, 0, 0, &[node1.swim_port, node2.swim_port, node3.swim_port]);
 
     // Wait for SWIM discovery + rebalance
     std::thread::sleep(Duration::from_secs(5));
@@ -601,17 +631,21 @@ fn client_redirect_resends_to_new_node() {
     let node1 = create_node(171, 13470, 13471, &[]);
     let node2 = create_node(172, 13472, 13473, &[13471]);
 
-    std::thread::sleep(Duration::from_secs(2));
-
-    // Find a key that node 1 does NOT own (node 2 should own it)
+    // Wait for handoff activation to make some shard authoritative on node 2.
     let mut remote_txid = None;
-    for i in 0..1000u32 {
-        let txid = make_txid(i + 40000);
-        let key = TxKey { txid };
-        if !node1.cluster.is_master(&key) {
-            remote_txid = Some(txid);
+    for _ in 0..50 {
+        for i in 0..1000u32 {
+            let txid = make_txid(i + 40000);
+            let key = TxKey { txid };
+            if !node1.cluster.is_master(&key) {
+                remote_txid = Some(txid);
+                break;
+            }
+        }
+        if remote_txid.is_some() {
             break;
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
     let txid = remote_txid.expect("should find a key owned by node 2");
     let hash = [2u8; 32];

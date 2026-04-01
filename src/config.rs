@@ -367,6 +367,17 @@ impl ServerConfig {
         self.replication_degraded_mode == "best_effort"
     }
 
+    /// Validate cluster durability settings against the server safety contract.
+    pub fn validate_cluster_safety(&self) -> std::result::Result<(), String> {
+        if self.is_clustered() && self.replication_degraded_mode == "best_effort" {
+            return Err(
+                "clustered mode does not allow replication_degraded_mode = \"best_effort\""
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Validate the `device_id` config value, if set.
     ///
     /// Returns `Ok(())` if absent or a valid 32-char lowercase hex string.
@@ -492,5 +503,18 @@ backend = ""
         let toml_str = r#"backend = "file_backed""#;
         let cfg: IndexConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.backend, IndexBackendMode::FileBacked);
+    }
+
+    #[test]
+    fn clustered_best_effort_degraded_mode_is_rejected() {
+        let cfg = ServerConfig {
+            node_id: 7,
+            replication_degraded_mode: "best_effort".to_string(),
+            ..ServerConfig::default()
+        };
+
+        let err = cfg.validate_cluster_safety().unwrap_err();
+        assert!(err.contains("replication_degraded_mode"));
+        assert!(err.contains("best_effort"));
     }
 }

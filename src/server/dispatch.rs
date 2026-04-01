@@ -300,7 +300,7 @@ pub(crate) fn handle_request(
             // Target may already hold replica copies for this shard, so
             // actual count can exceed expected. Accept if >= expected.
             let count_ok = if expected_records == 0 {
-                true // empty shard, no data expected
+                actual == 0
             } else {
                 actual >= expected_records
             };
@@ -2375,57 +2375,34 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
             let is_migrating_out = cluster.is_migrating_outbound(&key);
 
             if !is_master && !is_migrating_out {
-                // Not master — check if we have it locally before rejecting.
-                if engine.read_metadata(&key).is_err() {
-                    // Redirect to the master so the client retries there
-                    // instead of treating the record as permanently absent.
-                    let route = cluster.route(&key);
-                    let redirect_status = match route {
-                        crate::cluster::shards::RouteDecision::RedirectTo { node, .. } => {
-                            match cluster.node_addr(&node) {
-                                Some(addr) => {
-                                    let addr_bytes = addr.to_string().into_bytes();
-                                    let mut data = Vec::with_capacity(2 + addr_bytes.len());
-                                    data.extend_from_slice(&(ERR_REDIRECT as u8).to_le_bytes());
-                                    data.extend_from_slice(&addr_bytes);
-                                    data
-                                }
-                                None => vec![ERR_REDIRECT as u8],
+                let route = cluster.route(&key);
+                let redirect_status = match route {
+                    crate::cluster::shards::RouteDecision::RedirectTo { node, .. } => {
+                        match cluster.node_addr(&node) {
+                            Some(addr) => {
+                                let addr_bytes = addr.to_string().into_bytes();
+                                let mut data = Vec::with_capacity(2 + addr_bytes.len());
+                                data.extend_from_slice(&(ERR_REDIRECT as u8).to_le_bytes());
+                                data.extend_from_slice(&addr_bytes);
+                                data
                             }
+                            None => vec![ERR_REDIRECT as u8],
                         }
-                        _ => vec![ERR_REDIRECT as u8],
-                    };
-                    results.push(WireGetResult { status: ERR_REDIRECT as u8, data: redirect_status });
-                    continue;
-                }
-                // We have it locally — serve it despite not being master.
+                    }
+                    _ => vec![ERR_REDIRECT as u8],
+                };
+                results.push(WireGetResult { status: ERR_REDIRECT as u8, data: redirect_status });
+                continue;
             }
 
-            // If we're master but don't have the data, and there's a pending
-            // inbound migration for this shard, wait briefly for it to arrive.
+            // If we're master but don't have the data and inbound migration
+            // is still pending, return a retry signal immediately instead of
+            // parking a request thread behind migration progress.
             if is_master && engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key) {
                 let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
-                eprintln!("dispatch: read waiting for shard {shard} inbound migration");
-                let mut found = false;
-                for tick in 0..10 { // up to 1 second (10 * 100ms)
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    if engine.read_metadata(&key).is_ok() {
-                        found = true;
-                        break;
-                    }
-                    if !cluster.has_pending_inbound(&key) {
-                        eprintln!("dispatch: shard {shard} inbound cleared after {tick}00ms (no data)");
-                        break;
-                    }
-                }
-                if !found {
-                    eprintln!("dispatch: read shard {shard} migration-in-progress after 1s wait");
-                    // Return migration-in-progress instead of NotFound so
-                    // clients know to retry rather than treating the record
-                    // as permanently absent.
-                    results.push(WireGetResult { status: ERR_MIGRATION_IN_PROGRESS as u8, data: vec![] });
-                    continue;
-                }
+                eprintln!("dispatch: read shard {shard} still waiting for inbound migration");
+                results.push(WireGetResult { status: ERR_MIGRATION_IN_PROGRESS as u8, data: vec![] });
+                continue;
             }
         }
         // Fast path: if ALL requested fields are cached in the primary index,
@@ -3077,6 +3054,30 @@ mod tests {
             };
             let mut conn_state = crate::server::ConnectionState::new();
             handle_request(&req, &self.engine, max_batch_size, None, None, &mut conn_state, None)
+        }
+
+        fn request_with_cluster(
+            &self,
+            op_code: u16,
+            payload: Vec<u8>,
+            cluster: &crate::cluster::coordinator::RunningCluster,
+        ) -> ResponseFrame {
+            let req = RequestFrame {
+                request_id: 1,
+                op_code,
+                flags: 0,
+                payload,
+            };
+            let mut conn_state = crate::server::ConnectionState::new();
+            handle_request(
+                &req,
+                &self.engine,
+                8192,
+                Some(cluster),
+                None,
+                &mut conn_state,
+                None,
+            )
         }
 
         /// Create a single transaction with the given utxo_count via OP_CREATE_BATCH.
@@ -3940,5 +3941,108 @@ mod tests {
                 txid[0]
             );
         }
+    }
+
+    #[test]
+    fn dispatch_get_redirects_non_master_even_if_local_copy_exists() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(90);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&TxKey { txid });
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 11);
+        let master = table.target_assignment(shard).master;
+        let self_id = if master == crate::cluster::shards::NodeId(1) {
+            crate::cluster::shards::NodeId(2)
+        } else {
+            crate::cluster::shards::NodeId(1)
+        };
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            self_id,
+            table,
+            &[
+                (crate::cluster::shards::NodeId(1), "127.0.0.1:4401".parse().unwrap()),
+                (crate::cluster::shards::NodeId(2), "127.0.0.1:4402".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+
+        let resp = h.request_with_cluster(
+            OP_GET_BATCH,
+            crate::protocol::codec::encode_get_batch(FieldMask::ALL_METADATA, &[txid]),
+            &cluster,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let results = crate::protocol::codec::decode_get_response(&resp.payload).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, ERR_REDIRECT as u8);
+    }
+
+    #[test]
+    fn dispatch_get_pending_inbound_returns_quick_retry_signal() {
+        let h = DispatchTestHarness::new();
+        let shard = 77u16;
+        let mut txid = [0u8; 32];
+        txid[..2].copy_from_slice(&shard.to_le_bytes());
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 12);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(crate::cluster::shards::NodeId(1), "127.0.0.1:4501".parse().unwrap())],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        let started = std::time::Instant::now();
+        let resp = h.request_with_cluster(
+            OP_GET_BATCH,
+            crate::protocol::codec::encode_get_batch(FieldMask::ALL_METADATA, &[txid]),
+            &cluster,
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(resp.status, STATUS_OK);
+        let results = crate::protocol::codec::decode_get_response(&resp.payload).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, ERR_MIGRATION_IN_PROGRESS as u8);
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "pending inbound read should fail fast, took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn migration_complete_rejects_empty_shard_when_target_still_has_records() {
+        let h = DispatchTestHarness::new();
+        let shard = 91u16;
+        let mut txid = [0u8; 32];
+        txid[..2].copy_from_slice(&shard.to_le_bytes());
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: 0u64.to_le_bytes().to_vec(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, None, None, &mut conn_state, None);
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, msg) = crate::protocol::codec::decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_MIGRATION_IN_PROGRESS);
+        assert!(msg.contains("record count mismatch"), "unexpected error: {msg}");
     }
 }
