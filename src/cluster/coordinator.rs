@@ -738,23 +738,44 @@ impl ClusterCoordinator {
             ClusterEvent::TopologyStale(remote_term) => {
                 let local_term = topology_authority.committed_term();
                 if *remote_term > local_term {
+                    // Spawn catch-up in a background thread so the event loop
+                    // stays responsive to SWIM probes and suspect expiration.
+                    // Previously, synchronous TCP connections to dead peers
+                    // blocked the event loop for 500ms-3s per peer, delaying
+                    // failure detection by 10-20x the configured timeout.
+                    let catch_up_ta = topology_authority.clone();
+                    let catch_up_addrs = node_addrs_for_topo.clone();
+                    let catch_up_st = shard_table.clone();
+                    let catch_up_mig = migration.clone();
+                    let catch_up_fenced = fenced_bm.clone();
+                    let catch_up_migrating = migrating_bm.clone();
+                    let catch_up_inbound = inbound_bm.clone();
+                    let catch_up_atm = active_topology_members.clone();
+                    let catch_up_inb_path = inbound_state_path.clone();
+                    let catch_up_out_path = outbound_state_path.clone();
+                    let catch_up_tx = topology_commit_tx.clone();
+                    let catch_up_topo_path = topology_state_path.clone();
+                    let catch_up_peak = peak_size.clone();
+                    let catch_up_si = swim_incarnation.clone();
+                    let remote_term = *remote_term;
+                    std::thread::spawn(move || {
                     eprintln!(
-                        "cluster: topology stale (local term {local_term}, remote has {remote_term}) — fetching committed topology from peer",
+                        "cluster: topology stale (local term {local_term}, remote has {remote_term}) — catch-up thread started",
                     );
-                    // Fetch the committed topology directly from a reachable
-                    // peer instead of inferring it from the client routing map.
-                    // Routing is an active shard-table snapshot; catch-up needs
-                    // the latest quorum-committed term even if activation is
-                    // still in flight on the peer.
-                    //
-                    // IMPORTANT: only contact peers that SWIM considers alive.
-                    // Including suspected/dead peers causes 3-5s TCP connect
-                    // timeouts per dead peer, blocking the event loop and
-                    // delaying failure detection by 10-20x.
-                    //
-                    // When committed_members is empty (fresh restart before
-                    // any topology has been committed), fall back to ALL known
-                    // peers so catch-up can find the existing cluster.
+                    let topology_authority = &catch_up_ta;
+                    let node_addrs_for_topo = &catch_up_addrs;
+                    let shard_table = &catch_up_st;
+                    let migration = &catch_up_mig;
+                    let fenced_bm = &catch_up_fenced;
+                    let migrating_bm = &catch_up_migrating;
+                    let inbound_bm = &catch_up_inbound;
+                    let active_topology_members = &catch_up_atm;
+                    let inbound_state_path = &catch_up_inb_path;
+                    let outbound_state_path = &catch_up_out_path;
+                    let topology_commit_tx = &catch_up_tx;
+                    let topology_state_path = &catch_up_topo_path;
+                    let peak_size = &catch_up_peak;
+                    let swim_incarnation = &catch_up_si;
                     let committed_members = topology_authority.committed_members();
                     let peers: Vec<SocketAddr> = {
                         let addrs = node_addrs_for_topo.read().unwrap();
@@ -830,18 +851,13 @@ impl ClusterCoordinator {
                                     "cluster: catch-up: applied term {} from peer {} ({} members)",
                                     applied_term, peer_addr, remote_members.len(),
                                 );
-                                if let Some(path) = topology_state_path {
+                                if let Some(ref path) = *topology_state_path {
                                     let peak = peak_size.load(Ordering::Relaxed) as u64;
                                     let inc = swim_incarnation.load(Ordering::Relaxed);
                                     persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
                                 }
-                                topology_epoch.store(commit.term, Ordering::Relaxed);
-                                Self::activate_topology(
-                                    &remote_members, commit.term, self_id, rf, shard_table, migration,
-                                    node_addrs, engine, redo_for_events, max_migration_threads,
-                                    migration_pool_size, migration_batch_size, fenced_bm, migrating_bm, inbound_bm,
-                                    active_topology_members,
-                                );
+                                // Signal the event loop to activate the topology.
+                                let _ = topology_commit_tx.send((remote_members.clone(), commit.term));
                                 caught_up = true;
                                 break;
                             }
@@ -877,14 +893,9 @@ impl ClusterCoordinator {
                                 voter_current_term: topology_authority.committed_term(),
                             };
                             if let Some(commit) = topology_authority.handle_vote(&self_vote) {
-                                topology_epoch.store(commit.term, Ordering::Relaxed);
+                                // Single-node quorum: signal the event loop to activate.
                                 topology_authority.handle_commit(&commit);
-                                Self::activate_topology(
-                                    &commit.members, commit.term, self_id, rf, shard_table, migration,
-                                    node_addrs, engine, redo_for_events, max_migration_threads,
-                                    migration_pool_size, migration_batch_size, fenced_bm, migrating_bm, inbound_bm,
-                                    active_topology_members,
-                                );
+                                let _ = topology_commit_tx.send((commit.members.clone(), commit.term));
                             } else {
                                 let ta = topology_authority.clone();
                                 let na = node_addrs_for_topo.clone();
@@ -892,12 +903,11 @@ impl ClusterCoordinator {
                                 let tp = topology_state_path.clone();
                                 let ps = peak_size.clone();
                                 let si = swim_incarnation.clone();
-                                std::thread::spawn(move || {
-                                    run_topology_proposer(proposal, ta, na, self_id, tx, tp, ps, si);
-                                });
+                                run_topology_proposer(proposal, ta, na, self_id, tx, tp, ps, si);
                             }
                         }
                     }
+                    }); // end of catch-up thread
                 }
             }
         }
