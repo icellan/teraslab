@@ -746,10 +746,17 @@ impl ClusterCoordinator {
                     // Routing is an active shard-table snapshot; catch-up needs
                     // the latest quorum-committed term even if activation is
                     // still in flight on the peer.
+                    //
+                    // IMPORTANT: only contact peers that SWIM considers alive.
+                    // Including suspected/dead peers causes 3-5s TCP connect
+                    // timeouts per dead peer, blocking the event loop and
+                    // delaying failure detection by 10-20x.
+                    let committed_members = topology_authority.committed_members();
                     let peers: Vec<SocketAddr> = {
                         let addrs = node_addrs_for_topo.read().unwrap();
                         addrs.iter()
                             .filter(|(id, _)| **id != self_id)
+                            .filter(|(id, _)| committed_members.contains(id))
                             .map(|(_, &addr)| addr)
                             .collect()
                     };
@@ -1478,10 +1485,10 @@ fn send_topology_frame(
     op_code: u16,
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500))
         .map_err(|e| format!("connect: {e}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|e| format!("set timeout: {e}"))?;
     crate::replication::tcp_transport::configure_tcp_keepalive(&stream);
 
