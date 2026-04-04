@@ -751,12 +751,18 @@ impl ClusterCoordinator {
                     // Including suspected/dead peers causes 3-5s TCP connect
                     // timeouts per dead peer, blocking the event loop and
                     // delaying failure detection by 10-20x.
+                    //
+                    // When committed_members is empty (fresh restart before
+                    // any topology has been committed), fall back to ALL known
+                    // peers so catch-up can find the existing cluster.
                     let committed_members = topology_authority.committed_members();
                     let peers: Vec<SocketAddr> = {
                         let addrs = node_addrs_for_topo.read().unwrap();
                         addrs.iter()
                             .filter(|(id, _)| **id != self_id)
-                            .filter(|(id, _)| committed_members.contains(id))
+                            .filter(|(id, _)| {
+                                committed_members.is_empty() || committed_members.contains(id)
+                            })
                             .map(|(_, &addr)| addr)
                             .collect()
                     };
