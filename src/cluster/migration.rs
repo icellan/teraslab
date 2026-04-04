@@ -281,15 +281,30 @@ impl MigrationManager {
             if task.from_node == self_id {
                 self.active.push(MigrationProgress::from_task(task));
             }
-            if task.to_node == self_id
-                && !self.inbound_migrations.iter().any(|m| m.shard == task.shard && m.from_node == task.from_node)
-            {
-                self.inbound_migrations.push(InboundMigration {
-                    shard: task.shard,
-                    from_node: task.from_node,
-                    completed: false,
-                });
-                self.inbound_bitmap.set(task.shard);
+            if task.to_node == self_id {
+                if let Some(existing) = self.inbound_migrations.iter_mut().find(
+                    |m| m.shard == task.shard && m.from_node == task.from_node,
+                ) {
+                    if !existing.completed {
+                        existing.completed = false;
+                        self.inbound_bitmap.set(task.shard);
+                    }
+                } else if let Some(sentinel) = self.inbound_migrations.iter_mut().find(
+                    |m| m.shard == task.shard && m.from_node == NodeId(0),
+                ) {
+                    sentinel.from_node = task.from_node;
+                    if !sentinel.completed {
+                        sentinel.completed = false;
+                        self.inbound_bitmap.set(task.shard);
+                    }
+                } else {
+                    self.inbound_migrations.push(InboundMigration {
+                        shard: task.shard,
+                        from_node: task.from_node,
+                        completed: false,
+                    });
+                    self.inbound_bitmap.set(task.shard);
+                }
             }
         }
     }
@@ -301,16 +316,16 @@ impl MigrationManager {
     /// Since we may not know the source node at dispatch time, register
     /// with `NodeId(0)` as a sentinel if no existing entry matches.
     pub fn mark_inbound_active(&mut self, shard: u16) -> bool {
-        if !self.inbound_migrations.iter().any(|m| m.shard == shard && !m.completed) {
-            self.inbound_migrations.push(InboundMigration {
-                shard,
-                from_node: NodeId(0),
-                completed: false,
-            });
-            self.inbound_bitmap.set(shard);
-            return true;
+        if self.inbound_migrations.iter().any(|m| m.shard == shard) {
+            return false;
         }
-        false
+        self.inbound_migrations.push(InboundMigration {
+            shard,
+            from_node: NodeId(0),
+            completed: false,
+        });
+        self.inbound_bitmap.set(shard);
+        true
     }
 
     /// Mark an inbound shard as received (data has arrived and been verified).
@@ -322,11 +337,26 @@ impl MigrationManager {
             .find(|m| m.shard == shard && !m.completed)
         {
             m.completed = true;
+        } else {
+            self.record_completed_inbound_tombstone(shard, NodeId(0));
         }
         // Clear bitmap bit only if no more pending entries for this shard.
         if !self.inbound_migrations.iter().any(|m| m.shard == shard && !m.completed) {
             self.inbound_bitmap.clear(shard);
         }
+    }
+
+    /// Mark all pending inbound entries for this shard as complete.
+    pub fn mark_inbound_complete_all(&mut self, shard: u16) {
+        let mut found = false;
+        for inbound in self.inbound_migrations.iter_mut().filter(|m| m.shard == shard) {
+            inbound.completed = true;
+            found = true;
+        }
+        if !found {
+            self.record_completed_inbound_tombstone(shard, NodeId(0));
+        }
+        self.inbound_bitmap.clear(shard);
     }
 
     pub fn mark_inbound_complete_from_source(&mut self, shard: u16, from_node: NodeId) {
@@ -342,6 +372,8 @@ impl MigrationManager {
             .find(|m| m.shard == shard && !m.completed)
         {
             m.completed = true;
+        } else {
+            self.record_completed_inbound_tombstone(shard, from_node);
         }
         if !self.inbound_migrations.iter().any(|m| m.shard == shard && !m.completed) {
             self.inbound_bitmap.clear(shard);
@@ -438,6 +470,19 @@ impl MigrationManager {
         })
     }
 
+    fn record_completed_inbound_tombstone(&mut self, shard: u16, from_node: NodeId) {
+        if self.inbound_migrations.iter().any(|m| {
+            m.shard == shard && m.from_node == from_node && m.completed
+        }) {
+            return;
+        }
+        self.inbound_migrations.push(InboundMigration {
+            shard,
+            from_node,
+            completed: true,
+        });
+    }
+
     /// Number of failed migrations.
     pub fn failed_count(&self) -> usize {
         self.active.iter().filter(|p| p.state == MigrationState::Failed).count()
@@ -521,6 +566,10 @@ impl MigrationManager {
             }
         }
 
+        if self.active.is_empty() {
+            self.fenced_shards.clear_all();
+        }
+
         self.inbound_migrations.retain(|m| !m.completed);
         // Rebuild inbound bitmap from remaining entries.
         self.inbound_bitmap.clear_all();
@@ -551,6 +600,14 @@ impl MigrationManager {
     /// Number of shards pending inbound data.
     pub fn inbound_count(&self) -> usize {
         self.inbound_migrations.iter().filter(|m| !m.completed).count()
+    }
+
+    /// Snapshot the currently pending inbound migrations.
+    pub fn pending_inbound_entries(&self) -> Vec<(u16, NodeId)> {
+        self.inbound_migrations.iter()
+            .filter(|m| !m.completed)
+            .map(|m| (m.shard, m.from_node))
+            .collect()
     }
 
     /// Number of shards with active write fences.
@@ -622,6 +679,33 @@ impl MigrationManager {
     pub fn clear_inbound(&mut self) {
         self.inbound_migrations.clear();
         self.inbound_bitmap.clear_all();
+    }
+
+    /// Remove pending inbound entries for the selected shards.
+    ///
+    /// This is used when the coordinator knows those shards are fully
+    /// settled in the active topology and any remaining inbound entries are
+    /// stale bookkeeping that would otherwise block the hot path forever.
+    ///
+    /// Returns the number of entries removed.
+    pub fn clear_pending_inbound_for_shards(
+        &mut self,
+        shards: &std::collections::HashSet<u16>,
+    ) -> usize {
+        let before = self.inbound_migrations.len();
+        self.inbound_migrations.retain(|m| {
+            m.completed || !shards.contains(&m.shard)
+        });
+        let removed = before - self.inbound_migrations.len();
+        if removed > 0 {
+            self.inbound_bitmap.clear_all();
+            for m in &self.inbound_migrations {
+                if !m.completed {
+                    self.inbound_bitmap.set(m.shard);
+                }
+            }
+        }
+        removed
     }
 
     /// Remove completed inbound migrations.
@@ -1016,6 +1100,87 @@ mod tests {
 
         mgr.mark_inbound_complete_from_source(42, NodeId(7));
         assert!(!mgr.has_pending_inbound(42));
+        assert_eq!(mgr.inbound_count(), 0);
+    }
+
+    #[test]
+    fn start_outbound_replaces_sentinel_inbound_entry_for_same_shard() {
+        let mut mgr = MigrationManager::new();
+        mgr.mark_inbound_active(42);
+        assert!(mgr.has_pending_inbound(42));
+        assert_eq!(mgr.inbound_count(), 1);
+
+        let task = MigrationTask {
+            shard: 42,
+            from_node: NodeId(7),
+            to_node: NodeId(9),
+            is_master: true,
+        };
+        let populated: std::collections::HashSet<u16> = [42u16].into_iter().collect();
+        mgr.start_outbound(&[task], NodeId(9), &populated);
+
+        assert_eq!(
+            mgr.inbound_count(),
+            1,
+            "authoritative inbound registration should replace the provisional sentinel entry",
+        );
+
+        mgr.mark_inbound_complete_from_source(42, NodeId(7));
+        assert!(
+            !mgr.has_pending_inbound(42),
+            "completion from the real source must clear the shard once the authoritative entry is registered",
+        );
+        assert_eq!(mgr.inbound_count(), 0);
+    }
+
+    #[test]
+    fn late_migration_batch_does_not_reopen_completed_inbound_shard() {
+        let mut mgr = MigrationManager::new();
+        let task = MigrationTask {
+            shard: 42,
+            from_node: NodeId(7),
+            to_node: NodeId(9),
+            is_master: true,
+        };
+        let populated: std::collections::HashSet<u16> = [42u16].into_iter().collect();
+        mgr.start_outbound(&[task], NodeId(9), &populated);
+
+        mgr.mark_inbound_complete_from_source(42, NodeId(7));
+        assert!(!mgr.has_pending_inbound(42));
+        assert_eq!(mgr.inbound_count(), 0);
+
+        assert!(
+            !mgr.mark_inbound_active(42),
+            "a late migration batch must not recreate inbound state after the authoritative completion arrived",
+        );
+        assert!(
+            !mgr.has_pending_inbound(42),
+            "completed inbound state should stay cleared after late batches",
+        );
+        assert_eq!(mgr.inbound_count(), 0);
+    }
+
+    #[test]
+    fn early_empty_completion_does_not_reopen_inbound_on_late_registration() {
+        let mut mgr = MigrationManager::new();
+        let task = MigrationTask {
+            shard: 3,
+            from_node: NodeId(3),
+            to_node: NodeId(1),
+            is_master: true,
+        };
+
+        // The source proved there was no data before the target finished
+        // registering its inbound expectation for this shard.
+        mgr.mark_inbound_complete_all(3);
+        assert!(!mgr.has_pending_inbound(3));
+
+        mgr.start_outbound(&[task], NodeId(1), &std::collections::HashSet::new());
+
+        assert!(
+            !mgr.has_pending_inbound(3),
+            "a zero-record completion that wins the race must prevent late inbound registration",
+        );
         assert_eq!(mgr.inbound_count(), 0);
     }
 
@@ -1568,6 +1733,19 @@ mod tests {
         assert!(!mgr.has_pending_inbound(10));
     }
 
+    #[test]
+    fn inbound_complete_all_clears_multi_source_shard() {
+        let mut mgr = MigrationManager::new();
+        let t1 = MigrationTask { shard: 10, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
+        let t2 = MigrationTask { shard: 10, from_node: NodeId(3), to_node: NodeId(1), is_master: false };
+        let populated: std::collections::HashSet<u16> = [10u16].into_iter().collect();
+        mgr.start_outbound(&[t1, t2], NodeId(1), &populated);
+
+        mgr.mark_inbound_complete_all(10);
+        assert_eq!(mgr.inbound_count(), 0);
+        assert!(!mgr.has_pending_inbound(10));
+    }
+
     /// start_outbound pre-registers inbound ownership even for empty shards.
     #[test]
     fn start_outbound_registers_empty_shards_for_inbound() {
@@ -1640,6 +1818,28 @@ mod tests {
         mgr.start_outbound(&[t], NodeId(1), &pop);
         assert_eq!(mgr.inbound_count(), 1);
         assert!(mgr.has_pending_inbound(10));
+    }
+
+    #[test]
+    fn clear_pending_inbound_for_selected_shards() {
+        let mut mgr = MigrationManager::new();
+        let tasks = vec![
+            MigrationTask { shard: 10, from_node: NodeId(2), to_node: NodeId(1), is_master: false },
+            MigrationTask { shard: 20, from_node: NodeId(3), to_node: NodeId(1), is_master: false },
+            MigrationTask { shard: 30, from_node: NodeId(4), to_node: NodeId(1), is_master: false },
+        ];
+        mgr.start_outbound(&tasks, NodeId(1), &std::collections::HashSet::new());
+
+        let mut clear = std::collections::HashSet::new();
+        clear.insert(20u16);
+        clear.insert(30u16);
+
+        let removed = mgr.clear_pending_inbound_for_shards(&clear);
+        assert_eq!(removed, 2);
+        assert_eq!(mgr.pending_inbound_entries(), vec![(10, NodeId(2))]);
+        assert!(mgr.has_pending_inbound(10));
+        assert!(!mgr.has_pending_inbound(20));
+        assert!(!mgr.has_pending_inbound(30));
     }
 
     /// AtomicShardBitmap: load_from must completely overwrite the previous
@@ -1786,6 +1986,19 @@ mod tests {
             "cleanup_completed must unfence shards with no remaining fenced tasks");
     }
 
+    #[test]
+    fn cleanup_completed_clears_orphaned_fences_when_no_tasks_remain() {
+        let mut mgr = MigrationManager::new();
+        mgr.fence_shard(42);
+
+        mgr.cleanup_completed();
+
+        assert!(
+            !mgr.is_shard_fenced(42),
+            "cleanup_completed must clear ghost fence bits once no outbound tasks remain"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Inbound entries must be clearable even when outbound task fails
     // -----------------------------------------------------------------------
@@ -1827,5 +2040,22 @@ mod tests {
         // Inbound must be cleared — writes should not be blocked.
         assert!(!mgr.has_pending_inbound(42),
             "inbound must be cleared when migration aborts for committed shard");
+    }
+
+    #[test]
+    fn pending_inbound_entries_excludes_completed_entries() {
+        let mut mgr = MigrationManager::new();
+        let t1 = MigrationTask {
+            shard: 10, from_node: NodeId(2), to_node: NodeId(1), is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 20, from_node: NodeId(3), to_node: NodeId(1), is_master: false,
+        };
+        let populated: std::collections::HashSet<u16> = [10u16, 20u16].into_iter().collect();
+
+        mgr.start_outbound(&[t1, t2], NodeId(1), &populated);
+        mgr.mark_inbound_complete(10);
+
+        assert_eq!(mgr.pending_inbound_entries(), vec![(20u16, NodeId(3))]);
     }
 }

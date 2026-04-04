@@ -295,6 +295,13 @@ pub struct TopologyAuthority {
     propose_timeout: Duration,
     /// Timestamp of last membership change (for fallback timing).
     last_membership_change: Mutex<Instant>,
+    /// Latest membership view that fallback proposals should target.
+    ///
+    /// This is updated from SWIM membership-change events and from
+    /// quorum-committed topology installs. Using this instead of the
+    /// current live socket map prevents graceful drain commits from
+    /// being undone while the departing node is still reachable.
+    observed_membership: Mutex<Vec<NodeId>>,
 }
 
 impl TopologyAuthority {
@@ -308,6 +315,7 @@ impl TopologyAuthority {
             pending_proposal: Mutex::new(None),
             propose_timeout,
             last_membership_change: Mutex::new(Instant::now()),
+            observed_membership: Mutex::new(Vec::new()),
         }
     }
 
@@ -325,6 +333,7 @@ impl TopologyAuthority {
         self.committed_term.store(state.committed_term, Ordering::Relaxed);
         self.voted_term.store(state.voted_term, Ordering::Relaxed);
         *self.committed_members.write().unwrap() = state.committed_members.clone();
+        *self.observed_membership.lock().unwrap() = state.committed_members.clone();
     }
 
     /// Current committed term.
@@ -366,6 +375,7 @@ impl TopologyAuthority {
     /// (i.e., this node is the deterministic proposer = `members[0]`).
     pub fn on_membership_changed(&self, members: &[NodeId]) -> Option<TopologyTerm> {
         *self.last_membership_change.lock().unwrap() = Instant::now();
+        *self.observed_membership.lock().unwrap() = members.to_vec();
 
         if members.is_empty() {
             return None;
@@ -522,6 +532,7 @@ impl TopologyAuthority {
         // Apply commit.
         self.committed_term.store(commit.term, Ordering::Relaxed);
         *self.committed_members.write().unwrap() = commit.members.clone();
+        *self.observed_membership.lock().unwrap() = commit.members.clone();
 
         // Clear any pending proposal (superseded by this commit).
         *self.pending_proposal.lock().unwrap() = None;
@@ -536,16 +547,30 @@ impl TopologyAuthority {
     /// up as a fallback proposer to prevent stalemate.
     ///
     /// Returns `Some(TopologyTerm)` if this node should propose as fallback.
+    ///
+    /// `members` is only a bootstrap fallback when no prior membership
+    /// view has been observed yet. Once SWIM reports a membership change
+    /// or a term is committed, fallback uses that stored target set so it
+    /// does not resurrect gracefully removed nodes that are still reachable.
     pub fn check_timeout(&self, members: &[NodeId]) -> Option<TopologyTerm> {
-        if members.is_empty() || members[0] == self.self_id {
+        let target_members = {
+            let observed = self.observed_membership.lock().unwrap();
+            if observed.is_empty() {
+                members.to_vec()
+            } else {
+                observed.clone()
+            }
+        };
+
+        if target_members.is_empty() || target_members[0] == self.self_id {
             return None; // We are already the deterministic proposer
         }
 
         // Skip if the committed membership is already identical.
         {
             let committed_members = self.committed_members.read().unwrap();
-            if committed_members.len() == members.len()
-                && committed_members.iter().zip(members.iter()).all(|(a, b)| a == b)
+            if committed_members.len() == target_members.len()
+                && committed_members.iter().zip(target_members.iter()).all(|(a, b)| a == b)
             {
                 return None;
             }
@@ -564,10 +589,10 @@ impl TopologyAuthority {
         // (which would mean another proposer is active).
         let new_term = committed.max(voted) + 1;
 
-        let term = TopologyTerm::new(new_term, members.to_vec(), self.self_id);
+        let term = TopologyTerm::new(new_term, target_members.clone(), self.self_id);
         self.voted_term.store(new_term, Ordering::Relaxed);
 
-        let quorum_needed = (members.len() / 2) + 1;
+        let quorum_needed = (target_members.len() / 2) + 1;
         let mut votes = std::collections::HashMap::new();
         votes.insert(self.self_id, true);
 
@@ -1116,6 +1141,34 @@ mod tests {
     }
 
     #[test]
+    fn fallback_proposer_does_not_resurrect_gracefully_removed_node() {
+        let auth = TopologyAuthority::new(NodeId(4), Duration::from_millis(10));
+        let original = members(&[1, 2, 3, 4]);
+        let drained = members(&[1, 2, 3]);
+
+        auth.handle_commit(&TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: original.clone(),
+            digest: TopologyTerm::compute_digest(4, &original),
+        });
+        auth.handle_commit(&TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: drained.clone(),
+            digest: TopologyTerm::compute_digest(5, &drained),
+        });
+
+        std::thread::sleep(Duration::from_millis(15));
+
+        let result = auth.check_timeout(&original);
+        assert!(
+            result.is_none(),
+            "fallback timeout must not resurrect a node that was already gracefully removed",
+        );
+    }
+
+    #[test]
     fn synthetic_commit_mixed_term_and_members_rejected() {
         // Regression test for the exact bug: synthetic commit uses
         // remote_term from SWIM gossip but members from current routing
@@ -1228,6 +1281,10 @@ mod tests {
             members: old_mems.clone(),
             digest: TopologyTerm::compute_digest(1, &old_mems),
         });
+        assert!(
+            auth.on_membership_changed(&mems).is_none(),
+            "node 2 is not the deterministic proposer for [1,2,3]",
+        );
 
         std::thread::sleep(Duration::from_millis(5));
 

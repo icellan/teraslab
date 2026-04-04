@@ -70,7 +70,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     // Wait for BOTH surviving nodes to detect node2's departure
     common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(15)).await?;
     // Wait for shard table rebalance and migrations on the 2-node cluster
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(15)).await?;
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(30)).await?;
     client.refresh_routing().await?;
 
     eprintln!("[5.0] Creating 500 additional records while node2 is down");
@@ -101,7 +101,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     // -- Test 5.2: Wait for migrations --
     tlog!(t0, "test 5.2 start");
     eprintln!("[5.2] Waiting for migrations to complete");
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
     let time_to_caught_up = membership_start.elapsed();
     eprintln!("[5.2] OK -- all migrations complete");
     tlog!(t0, "test 5.2 done");

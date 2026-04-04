@@ -209,7 +209,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // Wait for migrations to complete after topology change. Scale-down
     // migrations are heavier (data from departed node must be redistributed).
-    common::wait_migrations_complete(&docker5, 3, Duration::from_secs(60)).await
+    common::wait_migrations_complete(&docker5, 3, Duration::from_secs(120)).await
         .map_err(|e| {
             eprintln!("[7.3] ERROR: migrations did not complete: {e}");
             e

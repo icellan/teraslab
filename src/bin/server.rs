@@ -382,8 +382,12 @@ fn main() {
         } else {
             bind_addr
         };
-        let swim_bind: std::net::SocketAddr =
-            format!("{}:{}", bind_addr.ip(), config.swim_port).parse().unwrap();
+        // SWIM must bind to the same stable IP as `self_addr` (advertised identity),
+        // not `0.0.0.0` from a wildcard `listen_addr`. On multi-interface containers
+        // (several Docker bridges), binding UDP to 0.0.0.0 can produce probes whose
+        // source address does not match membership gossip, breaking convergence.
+        let swim_bind =
+            std::net::SocketAddr::new(self_addr.ip(), config.swim_port);
         let seed_addrs: Vec<std::net::SocketAddr> = config.seed_nodes.iter()
             .filter_map(|s| {
                 // Try direct parse first (IP:port), then fall back to DNS resolution.

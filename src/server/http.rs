@@ -4,7 +4,7 @@
 //! for routing. Does not block or slow the binary protocol path.
 
 use crate::cluster::coordinator::RunningCluster;
-use crate::cluster::shards::NUM_SHARDS;
+use crate::cluster::shards::{NodeId, ShardTable, NUM_SHARDS};
 use crate::index::TxKey;
 use crate::metrics::{ThreadHistograms, ThreadMetrics};
 use crate::ops::engine::Engine;
@@ -193,6 +193,39 @@ async fn handle_health_ready(State(state): State<Arc<HttpState>>) -> impl IntoRe
 // /status — cluster health overview JSON
 // ---------------------------------------------------------------------------
 
+fn shard_counts(table: &ShardTable, self_id: NodeId) -> (u32, u32, u32, u32, usize) {
+    let mut serving_master_count: u32 = 0;
+    let mut serving_replica_count: u32 = 0;
+    let mut target_master_count: u32 = 0;
+    let mut target_replica_count: u32 = 0;
+
+    for shard in 0..NUM_SHARDS as u16 {
+        let effective = table.effective_assignment(shard);
+        if effective.master == self_id {
+            serving_master_count += 1;
+        }
+        if effective.replicas.contains(&self_id) {
+            serving_replica_count += 1;
+        }
+
+        let target = table.target_assignment(shard);
+        if target.master == self_id {
+            target_master_count += 1;
+        }
+        if target.replicas.contains(&self_id) {
+            target_replica_count += 1;
+        }
+    }
+
+    (
+        serving_master_count,
+        serving_replica_count,
+        target_master_count,
+        target_replica_count,
+        table.pending_handoff_count(),
+    )
+}
+
 async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
     let m = state.metrics;
 
@@ -200,21 +233,13 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
         let table = cluster.shard_table();
         let table_guard = table.read();
         let self_id = cluster.self_id();
-        let mut master_count: u32 = 0;
-        let mut replica_count: u32 = 0;
-        for shard in 0..NUM_SHARDS as u16 {
-            // Use target_assignment to reflect the committed topology,
-            // not the in-flight handoff state. This matches the partition
-            // map and is_master which also use target_assignment.
-            let assignment = table_guard.target_assignment(shard);
-            if assignment.master == self_id {
-                master_count += 1;
-            }
-            if assignment.replicas.contains(&self_id) {
-                replica_count += 1;
-            }
-        }
-        let pending_handoff_shards = table_guard.pending_handoff_count();
+        let (
+            master_count,
+            replica_count,
+            target_master_count,
+            target_replica_count,
+            pending_handoff_shards,
+        ) = shard_counts(&table_guard, self_id);
         let cluster_size = cluster.alive_node_count();
         drop(table_guard);
 
@@ -225,6 +250,8 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
             "topology_term": cluster.committed_topology_term(),
             "master_shard_count": master_count,
             "replica_shard_count": replica_count,
+            "target_master_shard_count": target_master_count,
+            "target_replica_shard_count": target_replica_count,
             "pending_handoff_shards": pending_handoff_shards,
             "active_migrations": cluster.active_migrations(),
         })
@@ -235,6 +262,8 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
             "shard_table_version": 0,
             "master_shard_count": 0,
             "replica_shard_count": 0,
+            "target_master_shard_count": 0,
+            "target_replica_shard_count": 0,
             "pending_handoff_shards": 0,
             "active_migrations": 0,
         })
@@ -246,6 +275,8 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
         "shard_table_version": cluster_info["shard_table_version"],
         "master_shard_count": cluster_info["master_shard_count"],
         "replica_shard_count": cluster_info["replica_shard_count"],
+        "target_master_shard_count": cluster_info["target_master_shard_count"],
+        "target_replica_shard_count": cluster_info["target_replica_shard_count"],
         "pending_handoff_shards": cluster_info["pending_handoff_shards"],
         "active_migrations": cluster_info["active_migrations"],
         "records": {
@@ -292,6 +323,7 @@ async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> i
         Some(ref cluster) => {
             let migrations = cluster.migration_status();
             let inbound = cluster.inbound_pending_count();
+            let inbound_entries = cluster.pending_inbound_entries();
             let fenced = cluster.fenced_shard_count();
             let active_count = migrations.iter().filter(|m| {
                 m.state != crate::cluster::migration::MigrationState::Complete
@@ -304,6 +336,12 @@ async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> i
                 "active_count": active_count,
                 "failed_count": failed_count,
                 "inbound_pending": inbound,
+                "inbound_entries": inbound_entries.iter().map(|(shard, from_node)| {
+                    serde_json::json!({
+                        "shard": shard,
+                        "from_node": from_node.0,
+                    })
+                }).collect::<Vec<_>>(),
                 "fenced_shards": fenced,
                 "migrations": migrations.iter().map(|m| {
                     serde_json::json!({
@@ -979,5 +1017,42 @@ fn hex_nibble(c: u8) -> Option<u8> {
         b'a'..=b'f' => Some(c - b'a' + 10),
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shard_counts_report_serving_master_during_handoff() {
+        let old_members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 10);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 11);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                old_table.target_assignment(s).master == NodeId(4)
+                    && new_table.target_assignment(s).master != NodeId(4)
+            })
+            .expect("expected a shard whose master moves off node4");
+
+        let mut handoff = old_table.clone();
+        handoff.begin_handoff_with(&new_table, |s| s == shard);
+
+        let (
+            serving_master_count,
+            _serving_replica_count,
+            target_master_count,
+            _target_replica_count,
+            pending_handoffs,
+        ) = shard_counts(&handoff, NodeId(4));
+
+        assert_eq!(
+            serving_master_count,
+            target_master_count + 1,
+            "the serving count must include masters that are still in Copying/CommitReady on the old owner"
+        );
+        assert_eq!(pending_handoffs, 1);
     }
 }

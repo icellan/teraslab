@@ -259,6 +259,57 @@ impl Cluster {
         self.pool_for_shard(shard_for_txid(txid))
     }
 
+    /// Return a connection pool for a server-advertised redirect address.
+    ///
+    /// The address is first resolved through `addr_map`. If it corresponds to a
+    /// known node, the cached pool for that node is reused. Otherwise a short-
+    /// lived pool is created for the resolved address.
+    pub fn pool_for_redirect_addr(&self, addr: &str) -> Result<Arc<ConnPool>, ClientError> {
+        if addr.is_empty() {
+            return Err(ClientError::Connection(
+                "redirect did not include a target address".to_string(),
+            ));
+        }
+
+        if let Some(node_id) = self.addr_to_node.read().get(addr).copied()
+            && let Some(pool) = self.pools.read().get(&node_id)
+        {
+            return Ok(pool.clone());
+        }
+
+        let resolved = self.config.resolve_addr(addr).to_string();
+        let node_id = self.part_map.read().as_ref().and_then(|pm| {
+            pm.nodes
+                .iter()
+                .find(|node| {
+                    node.addr == addr || self.config.resolve_addr(&node.addr) == resolved
+                })
+                .map(|node| node.id)
+        });
+
+        if let Some(node_id) = node_id {
+            let pool = {
+                let mut pools = self.pools.write();
+                pools
+                    .entry(node_id)
+                    .or_insert_with(|| {
+                        Arc::new(ConnPool::new(
+                            resolved.clone(),
+                            self.config.pool_config.clone(),
+                        ))
+                    })
+                    .clone()
+            };
+            self.addr_to_node.write().insert(addr.to_string(), node_id);
+            return Ok(pool);
+        }
+
+        Ok(Arc::new(ConnPool::new(
+            resolved,
+            self.config.pool_config.clone(),
+        )))
+    }
+
     /// Return a clone of the cached partition map, or `None` if not yet bootstrapped.
     pub fn cached_partition_map(&self) -> Option<PartitionMap> {
         self.part_map.read().clone()
@@ -358,10 +409,23 @@ impl Cluster {
             }
 
             // Log partition map details for debugging.
-            let unique_masters: std::collections::HashSet<u64> =
+            let unique_masters: std::collections::BTreeSet<u64> =
                 pm.assignments.iter().copied().collect();
-            eprintln!("client: refreshed partition map: version={}, nodes={}, unique_masters={:?}",
-                pm.version, pm.nodes.len(), unique_masters);
+            let node_ids: std::collections::BTreeSet<u64> =
+                pm.nodes.iter().map(|node| node.id).collect();
+            let dangling_masters: Vec<u64> = unique_masters
+                .iter()
+                .copied()
+                .filter(|master| !node_ids.contains(master))
+                .collect();
+            eprintln!(
+                "client: refreshed partition map: version={}, nodes={}, node_ids={:?}, unique_masters={:?}, dangling_masters={:?}",
+                pm.version,
+                pm.nodes.len(),
+                node_ids,
+                unique_masters,
+                dangling_masters
+            );
 
             *self.part_map.write() = Some(pm);
             return Ok(());

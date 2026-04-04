@@ -1,5 +1,6 @@
 //! Shared setup/teardown for Docker cluster test scenarios.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Returns true when `TERASLAB_TEST_TIMING=1` is set, enabling detailed
@@ -19,6 +20,35 @@ pub fn compose_dir() -> String {
     let manifest = std::env::var("CARGO_MANIFEST_DIR")
         .unwrap_or_else(|_| ".".to_string());
     format!("{manifest}/../docker")
+}
+
+const POLL_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn poll_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(POLL_HTTP_TIMEOUT)
+            .build()
+            .expect("failed to build poll HTTP client")
+    })
+}
+
+async fn poll_json(url: &str) -> Result<serde_json::Value, ClientError> {
+    let resp = poll_http_client()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| ClientError::Connection(format!("GET {url} failed: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(ClientError::Connection(format!(
+            "GET {url} returned status {}",
+            resp.status()
+        )));
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| ClientError::Connection(format!("GET {url} JSON parse failed: {e}")))
 }
 
 /// Create a DockerHelpers for 3-node cluster with a specific scenario ID.
@@ -50,18 +80,7 @@ pub async fn create_client(docker: &DockerHelpers, node_count: usize) -> Result<
 pub async fn http_status(docker: &DockerHelpers, node_num: u32) -> Result<serde_json::Value, ClientError> {
     let port = docker.http_port(node_num);
     let url = format!("http://127.0.0.1:{port}/status");
-    let resp = reqwest::get(&url)
-        .await
-        .map_err(|e| ClientError::Connection(format!("GET {url} failed: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(ClientError::Connection(format!(
-            "GET {url} returned status {}",
-            resp.status()
-        )));
-    }
-    resp.json::<serde_json::Value>()
-        .await
-        .map_err(|e| ClientError::Connection(format!("GET {url} JSON parse failed: {e}")))
+    poll_json(&url).await
 }
 
 /// Send a PUT to the HTTP quiesce endpoint for a given node number.
@@ -86,12 +105,7 @@ pub async fn http_quiesce(docker: &DockerHelpers, node_num: u32) -> Result<(), C
 pub async fn http_migration_status(docker: &DockerHelpers, node_num: u32) -> Result<serde_json::Value, ClientError> {
     let port = docker.http_port(node_num);
     let url = format!("http://127.0.0.1:{port}/admin/migration_status");
-    let resp = reqwest::get(&url)
-        .await
-        .map_err(|e| ClientError::Connection(format!("GET {url} failed: {e}")))?;
-    resp.json::<serde_json::Value>()
-        .await
-        .map_err(|e| ClientError::Connection(format!("GET {url} JSON parse failed: {e}")))
+    poll_json(&url).await
 }
 
 /// Wait until all nodes report the expected cluster size via HTTP /status.
@@ -104,14 +118,12 @@ pub async fn wait_cluster_ready(docker: &DockerHelpers, node_count: u32, timeout
         for i in 1..=node_count {
             let port = docker.http_port(i);
             let url = format!("http://127.0.0.1:{port}/status");
-            if let Ok(resp) = reqwest::get(&url).await {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(size) = json["cluster_size"].as_u64() {
-                        if size == node_count as u64 {
-                            ready += 1;
-                            if let Some(v) = json["shard_table_version"].as_u64() {
-                                versions.push(v);
-                            }
+            if let Ok(json) = poll_json(&url).await {
+                if let Some(size) = json["cluster_size"].as_u64() {
+                    if size == node_count as u64 {
+                        ready += 1;
+                        if let Some(v) = json["shard_table_version"].as_u64() {
+                            versions.push(v);
                         }
                     }
                 }
@@ -127,11 +139,9 @@ pub async fn wait_cluster_ready(docker: &DockerHelpers, node_count: u32, timeout
         for i in 1..=node_count {
             let port = docker.http_port(i);
             let url = format!("http://127.0.0.1:{port}/status");
-            if let Ok(resp) = reqwest::get(&url).await {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(m) = json["master_shard_count"].as_u64() {
-                        min_masters = min_masters.min(m);
-                    }
+            if let Ok(json) = poll_json(&url).await {
+                if let Some(m) = json["master_shard_count"].as_u64() {
+                    min_masters = min_masters.min(m);
                 }
             }
         }
@@ -170,12 +180,10 @@ pub async fn wait_node_cluster_size(
     let start = std::time::Instant::now();
     loop {
         let url = format!("http://127.0.0.1:{port}/status");
-        if let Ok(resp) = reqwest::get(&url).await {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(size) = json["cluster_size"].as_u64() {
-                    if size == expected_size as u64 {
-                        return Ok(());
-                    }
+        if let Ok(json) = poll_json(&url).await {
+            if let Some(size) = json["cluster_size"].as_u64() {
+                if size == expected_size as u64 {
+                    return Ok(());
                 }
             }
         }
@@ -246,43 +254,61 @@ pub async fn wait_specific_migrations_complete(
     loop {
         let mut all_idle = true;
         let mut total_masters: u64 = 0;
+        let mut total_inbound_pending: u64 = 0;
+        let mut status_details = Vec::new();
         for &n in node_nums {
             let port = docker.http_port(n);
             let url = format!("http://127.0.0.1:{port}/admin/migration_status");
-            if let Ok(resp) = reqwest::get(&url).await {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(count) = json["active_count"].as_u64() {
-                        if count > 0 {
-                            all_idle = false;
-                        }
+            let mut active_count = None;
+            let mut inbound_pending = 0u64;
+            if let Ok(json) = poll_json(&url).await {
+                inbound_pending = json["inbound_pending"].as_u64().unwrap_or(0);
+                total_inbound_pending += inbound_pending;
+                if let Some(count) = json["active_count"].as_u64() {
+                    active_count = Some(count);
+                    if count > 0 {
+                        all_idle = false;
                     }
-                    // Note: inbound_pending is NOT checked here. It may
-                    // remain non-zero during retry cycles. The 30s timeout
-                    // fallback (line below) handles this case.
                 }
             }
             let status_url = format!("http://127.0.0.1:{port}/status");
-            if let Ok(resp) = reqwest::get(&status_url).await {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(m) = json["master_shard_count"].as_u64() {
-                        total_masters += m;
-                    }
+            if let Ok(json) = poll_json(&status_url).await {
+                let cluster_size = json["cluster_size"].as_u64().unwrap_or(0);
+                let shard_table_version = json["shard_table_version"].as_u64().unwrap_or(0);
+                let topology_term = json["topology_term"].as_u64().unwrap_or(0);
+                let pending_handoffs = json["pending_handoff_shards"].as_u64().unwrap_or(0);
+                if let Some(m) = json["master_shard_count"].as_u64() {
+                    total_masters += m;
+                    status_details.push(format!(
+                        "node{n}:size={cluster_size},ver={shard_table_version},term={topology_term},masters={m},handoff={pending_handoffs},mig={},inbound={inbound_pending}",
+                        active_count.unwrap_or(0),
+                    ));
                 }
+            } else {
+                status_details.push(format!(
+                    "node{n}:status-unavailable,mig={},inbound={inbound_pending}",
+                    active_count.unwrap_or(0)
+                ));
             }
         }
         // During handoff, shards may be counted on both old and new masters,
         // causing total_masters to briefly exceed 4096. Accept >= 4096.
-        if total_masters >= 4096 {
-            if all_idle {
-                return Ok(());
+        if total_masters >= 4096 && all_idle {
+            if timing_enabled() {
+                eprintln!(
+                    "  wait_specific_migrations: complete in {:.1}ms [{}]",
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    status_details.join(", ")
+                );
             }
-            if start.elapsed() >= timeout.min(Duration::from_secs(30)) {
-                return Ok(());
-            }
+            return Ok(());
         }
         if start.elapsed() >= timeout {
             return Err(ClientError::Connection(
-                format!("migrations still active on specific nodes after {timeout:?} [masters={total_masters}/4096]"),
+                format!(
+                    "migrations still active on specific nodes after {timeout:?} [masters={total_masters}/4096, inbound={total_inbound_pending}] [{}]",
+                    status_details.join(", ")
+                ),
             ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -307,41 +333,40 @@ pub async fn wait_migrations_complete(
         let mut all_idle = true;
         let mut total_masters: u64 = 0;
         let mut total_pending_handoffs: u64 = 0;
+        let mut total_inbound_pending: u64 = 0;
         let mut node_details = Vec::new();
         for i in 1..=node_count {
             let port = docker.http_port(i);
             let url = format!("http://127.0.0.1:{port}/admin/migration_status");
-            if let Ok(resp) = reqwest::get(&url).await {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(count) = json["active_count"].as_u64() {
-                        if count > 0 {
-                            all_idle = false;
-                            node_details.push(format!("node{i}:mig={count}"));
-                        }
+            if let Ok(json) = poll_json(&url).await {
+                let inbound_pending = json["inbound_pending"].as_u64().unwrap_or(0);
+                total_inbound_pending += inbound_pending;
+                if let Some(count) = json["active_count"].as_u64() {
+                    if count > 0 {
+                        all_idle = false;
+                        node_details.push(format!("node{i}:mig={count}"));
                     }
-                    // Note: inbound_pending is NOT checked here. It may
-                    // remain non-zero during retry cycles. The 30s timeout
-                    // fallback (line below) handles this case.
+                }
+                if inbound_pending > 0 {
+                    node_details.push(format!("node{i}:inbound={inbound_pending}"));
                 }
             }
             let status_url = format!("http://127.0.0.1:{port}/status");
-            if let Ok(resp) = reqwest::get(&status_url).await {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(m) = json["master_shard_count"].as_u64() {
-                        total_masters += m;
-                    }
-                    if let Some(h) = json["pending_handoff_shards"].as_u64() {
-                        total_pending_handoffs += h;
-                        if h > 0 {
-                            node_details.push(format!("node{i}:handoff={h}"));
-                        }
+            if let Ok(json) = poll_json(&status_url).await {
+                if let Some(m) = json["master_shard_count"].as_u64() {
+                    total_masters += m;
+                }
+                if let Some(h) = json["pending_handoff_shards"].as_u64() {
+                    total_pending_handoffs += h;
+                    if h > 0 {
+                        node_details.push(format!("node{i}:handoff={h}"));
                     }
                 }
             }
         }
         // Accept masters within ±4 of 4096 during handoff transitions.
         let masters_ok = total_masters >= 4092 && total_masters <= 4100;
-        if masters_ok && total_pending_handoffs == 0 && all_idle {
+        if masters_ok && total_pending_handoffs == 0 && total_inbound_pending == 0 && all_idle {
             if timing_enabled() {
                 eprintln!("  wait_migrations: complete in {:.1}ms", mig_start.elapsed().as_secs_f64() * 1000.0);
             }
@@ -353,7 +378,7 @@ pub async fn wait_migrations_complete(
         // catches genuinely orphaned handoffs (dead source node) without
         // accepting prematurely during live-node scenarios where handoffs
         // are still completing.
-        if masters_ok && all_idle && total_pending_handoffs > 0 {
+        if masters_ok && all_idle && total_pending_handoffs > 0 && total_inbound_pending == 0 {
             if let Some((prev_h, prev_t)) = last_handoff_snapshot {
                 if total_pending_handoffs >= prev_h
                     && start.elapsed().saturating_sub(prev_t) >= Duration::from_secs(3)
@@ -372,7 +397,7 @@ pub async fn wait_migrations_complete(
             }
         }
         if timing_enabled() && mig_last_log.elapsed() >= Duration::from_secs(2) {
-            eprintln!("  wait_migrations: masters={total_masters}/4096, handoffs={total_pending_handoffs}, idle={all_idle} ({:.1}s) [{}]",
+            eprintln!("  wait_migrations: masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}, idle={all_idle} ({:.1}s) [{}]",
                 mig_start.elapsed().as_secs_f64(), node_details.join(", "));
             mig_last_log = std::time::Instant::now();
         }
@@ -380,7 +405,7 @@ pub async fn wait_migrations_complete(
             let detail = if !node_details.is_empty() {
                 format!(" [{}]", node_details.join(", "))
             } else {
-                format!(" [masters={total_masters}/4096, handoffs={total_pending_handoffs}]")
+                format!(" [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}]")
             };
             return Err(ClientError::Connection(
                 format!("migrations still active after {timeout:?}{detail}"),
@@ -410,11 +435,9 @@ pub async fn wait_replication_settled(
         for i in 1..=node_count {
             let port = docker.http_port(i);
             let url = format!("http://127.0.0.1:{port}/debug/redo");
-            if let Ok(resp) = reqwest::get(&url).await {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(seq) = json["current_sequence"].as_u64() {
-                        seqs.push(seq);
-                    }
+            if let Ok(json) = poll_json(&url).await {
+                if let Some(seq) = json["current_sequence"].as_u64() {
+                    seqs.push(seq);
                 }
             }
         }
@@ -453,11 +476,9 @@ pub async fn wait_specific_replication_settled(
         for &n in node_nums {
             let port = docker.http_port(n);
             let url = format!("http://127.0.0.1:{port}/debug/redo");
-            if let Ok(resp) = reqwest::get(&url).await {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(seq) = json["current_sequence"].as_u64() {
-                        seqs.push(seq);
-                    }
+            if let Ok(json) = poll_json(&url).await {
+                if let Some(seq) = json["current_sequence"].as_u64() {
+                    seqs.push(seq);
                 }
             }
         }
@@ -485,22 +506,98 @@ pub async fn wait_specific_replication_settled(
 /// and a connected `Client`.
 pub async fn start_3node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Client), ClientError> {
     let mut docker = docker_3node(scenario_id);
+    let start = std::time::Instant::now();
+    if timing_enabled() {
+        eprintln!("  start_3node_cluster[{scenario_id}]: compose_up");
+    }
     docker.compose_up().await?;
+    if timing_enabled() {
+        eprintln!(
+            "  start_3node_cluster[{scenario_id}]: compose_up done in {:.1}ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        eprintln!("  start_3node_cluster[{scenario_id}]: wait_cluster_ready");
+    }
     wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
+    if timing_enabled() {
+        eprintln!(
+            "  start_3node_cluster[{scenario_id}]: cluster ready in {:.1}ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        eprintln!("  start_3node_cluster[{scenario_id}]: wait_migrations_complete");
+    }
     wait_migrations_complete(&docker, 3, Duration::from_secs(30)).await?;
+    if timing_enabled() {
+        eprintln!(
+            "  start_3node_cluster[{scenario_id}]: migrations complete in {:.1}ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        eprintln!("  start_3node_cluster[{scenario_id}]: create_client");
+    }
     let client = create_client(&docker, 3).await?;
+    if timing_enabled() {
+        eprintln!(
+            "  start_3node_cluster[{scenario_id}]: client created in {:.1}ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        eprintln!("  start_3node_cluster[{scenario_id}]: refresh_routing");
+    }
     client.refresh_routing().await?;
+    if timing_enabled() {
+        eprintln!(
+            "  start_3node_cluster[{scenario_id}]: ready in {:.1}ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     Ok((docker, client))
 }
 
 /// Start a 5-node cluster and wait for it to be ready.
 pub async fn start_5node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Client), ClientError> {
     let mut docker = docker_5node(scenario_id);
+    let start = std::time::Instant::now();
+    if timing_enabled() {
+        eprintln!("  start_5node_cluster[{scenario_id}]: compose_up");
+    }
     docker.compose_up().await?;
+    if timing_enabled() {
+        eprintln!(
+            "  start_5node_cluster[{scenario_id}]: compose_up done in {:.1}ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        eprintln!("  start_5node_cluster[{scenario_id}]: wait_cluster_ready");
+    }
     wait_cluster_ready(&docker, 5, Duration::from_secs(30)).await?;
+    if timing_enabled() {
+        eprintln!(
+            "  start_5node_cluster[{scenario_id}]: cluster ready in {:.1}ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        eprintln!("  start_5node_cluster[{scenario_id}]: wait_migrations_complete");
+    }
     wait_migrations_complete(&docker, 5, Duration::from_secs(30)).await?;
+    if timing_enabled() {
+        eprintln!(
+            "  start_5node_cluster[{scenario_id}]: migrations complete in {:.1}ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        eprintln!("  start_5node_cluster[{scenario_id}]: create_client");
+    }
     let client = create_client(&docker, 5).await?;
+    if timing_enabled() {
+        eprintln!(
+            "  start_5node_cluster[{scenario_id}]: client created in {:.1}ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        eprintln!("  start_5node_cluster[{scenario_id}]: refresh_routing");
+    }
     client.refresh_routing().await?;
+    if timing_enabled() {
+        eprintln!(
+            "  start_5node_cluster[{scenario_id}]: ready in {:.1}ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     Ok((docker, client))
 }
 
@@ -580,6 +677,20 @@ pub async fn seed_records(
                     // On partial error, extract which items failed and only
                     // retry those. Items not in the error list succeeded.
                     if let ClientError::Partial(pe) = e {
+                        let mut code_counts = std::collections::BTreeMap::new();
+                        for err in &pe.errors {
+                            *code_counts.entry(err.code).or_insert(0usize) += 1;
+                        }
+                        let code_summary = code_counts
+                            .iter()
+                            .map(|(code, count)| {
+                                format!(
+                                    "{}={count}",
+                                    teraslab_test_client::errors::error_code_string(*code),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         let failed_indices: std::collections::HashSet<usize> =
                             pe.errors.iter().map(|e| e.item_index as usize).collect();
                         let mut retry_items = Vec::new();
@@ -596,6 +707,10 @@ pub async fn seed_records(
                         }
                         remaining_items = retry_items;
                         remaining_meta = retry_meta;
+                        eprintln!(
+                            "seed_records: partial error on attempt {attempt}: {} failed item(s) [{code_summary}]",
+                            failed_indices.len()
+                        );
                     }
                     if remaining_items.is_empty() {
                         break;
@@ -912,7 +1027,7 @@ pub async fn wait_node_healthy(docker: &DockerHelpers, node_num: u32, timeout: D
     let url = format!("http://127.0.0.1:{port}/health/live");
     let start = std::time::Instant::now();
     loop {
-        if let Ok(resp) = reqwest::get(&url).await {
+        if let Ok(resp) = poll_http_client().get(&url).send().await {
             if resp.status().is_success() {
                 return Ok(());
             }

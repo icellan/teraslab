@@ -9,7 +9,7 @@
 //! - Replication ops are sent to replica nodes (if in cluster mode with RF > 1).
 
 use crate::cluster::coordinator::RunningCluster;
-use crate::cluster::shards::{NodeId, ShardTable};
+use crate::cluster::shards::{NodeId, ShardHandoff, ShardTable};
 use crate::index::TxKey;
 use crate::ops::create::*;
 use crate::ops::engine::{Engine, build_cold_data};
@@ -171,6 +171,7 @@ pub(crate) fn handle_request(
         OP_PRESERVE_TRANSACTIONS => handle_preserve_transactions(request, engine, max_batch_size, cluster, redo_log),
         OP_PROCESS_EXPIRED_PRESERVATIONS => handle_process_expired(request, engine, redo_log),
         OP_GET_PARTITION_MAP => handle_get_partition_map(request, cluster),
+        OP_GET_COMMITTED_TOPOLOGY => handle_get_committed_topology(request, cluster),
         OP_PING => ResponseFrame {
             request_id: request.request_id,
             status: STATUS_OK,
@@ -201,7 +202,16 @@ pub(crate) fn handle_request(
             if request.flags & FLAG_MIGRATION_BATCH != 0
                 && let Some(cluster) = cluster
             {
-                cluster.mark_inbound_active(request.request_id as u16);
+                let shard = request.request_id as u16;
+                let already_expected = cluster.inbound_bitmap().test(shard);
+                let should_track_handoff = {
+                    let table = cluster.shard_table();
+                    let table = table.read();
+                    table.shard_handoff_state(shard) != ShardHandoff::ServingNew
+                };
+                if already_expected || should_track_handoff {
+                    cluster.mark_inbound_active(shard);
+                }
             }
             DISPATCH_LAST_APPLIED.with(|la| {
                 handle_replica_batch(request, engine, la)
@@ -294,12 +304,22 @@ pub(crate) fn handle_request(
                 }
             }
 
+            // A bare zero-count completion (no manifest, no exact entries)
+            // is a control-plane signal used by fast paths to clear pending
+            // inbound state when the target already has the shard contents.
+            let no_data_completion =
+                expected_records == 0
+                    && source_manifest.is_none()
+                    && source_entries.as_ref().is_none_or(|entries| entries.is_empty());
+
             // Verify the actual record count matches expected exactly
             // using the O(1) per-shard counter.
             let actual = engine.shard_record_count(shard);
             // Target may already hold replica copies for this shard, so
             // actual count can exceed expected. Accept if >= expected.
-            let count_ok = if expected_records == 0 {
+            let count_ok = if no_data_completion {
+                true
+            } else if expected_records == 0 {
                 actual == 0
             } else {
                 actual >= expected_records
@@ -381,7 +401,9 @@ pub(crate) fn handle_request(
             }
 
             if let Some(cluster) = cluster {
-                if let Some(from_node) = completion_from_node {
+                if no_data_completion {
+                    cluster.mark_inbound_complete_all(shard);
+                } else if let Some(from_node) = completion_from_node {
                     cluster.mark_inbound_complete_from_source(shard, from_node);
                 } else {
                     cluster.mark_inbound_complete(shard);
@@ -395,6 +417,61 @@ pub(crate) fn handle_request(
                     cluster.shard_table().write().commit_shard(shard);
                 }
             }
+            ResponseFrame {
+                request_id: request.request_id,
+                status: STATUS_OK,
+                payload: Vec::new(),
+            }
+        }
+        OP_MIGRATION_BATCH_COMPLETE => {
+            // Batched migration-complete: marks multiple shards as done
+            // in a single TCP frame. Wire format:
+            //   [shard_count:4][shard_id:2 × count][from_node:8]
+            if request.payload.len() < 4 {
+                return error_response(request.request_id, ERR_INTERNAL, "batch-complete: too short");
+            }
+            let shard_count = u32::from_le_bytes(
+                request.payload[..4].try_into().unwrap(),
+            ) as usize;
+            let expected_len = 4 + shard_count * 2 + 8;
+            if request.payload.len() < expected_len {
+                return error_response(
+                    request.request_id,
+                    ERR_INTERNAL,
+                    &format!("batch-complete: need {expected_len} bytes, got {}", request.payload.len()),
+                );
+            }
+            let mut shards = Vec::with_capacity(shard_count);
+            for i in 0..shard_count {
+                let off = 4 + i * 2;
+                shards.push(u16::from_le_bytes(
+                    request.payload[off..off + 2].try_into().unwrap(),
+                ));
+            }
+            let from_node_off = 4 + shard_count * 2;
+            let from_node = NodeId(u64::from_le_bytes(
+                request.payload[from_node_off..from_node_off + 8].try_into().unwrap(),
+            ));
+
+            if let Some(cluster) = cluster {
+                for &shard in &shards {
+                    cluster.mark_inbound_complete_all(shard);
+                }
+                // Batch-commit all shards where this node is the new master
+                // and no inbound is pending.
+                let self_id = cluster.self_id();
+                let shard_table = cluster.shard_table();
+                let mut table = shard_table.write();
+                for &shard in &shards {
+                    let is_new_master = table.target_assignment(shard).master == self_id;
+                    if is_new_master && !cluster.has_pending_inbound_shard(shard) {
+                        table.commit_shard(shard);
+                    }
+                }
+                drop(table);
+                let _ = from_node; // Used for audit logging if needed
+            }
+
             ResponseFrame {
                 request_id: request.request_id,
                 status: STATUS_OK,
@@ -2998,6 +3075,20 @@ fn handle_get_partition_map(
     }
 }
 
+fn handle_get_committed_topology(
+    req: &RequestFrame,
+    cluster: Option<&RunningCluster>,
+) -> ResponseFrame {
+    match cluster {
+        Some(c) => ResponseFrame {
+            request_id: req.request_id,
+            status: STATUS_OK,
+            payload: c.encode_committed_topology(),
+        },
+        None => error_response(req.request_id, ERR_INTERNAL, "not clustered"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests — Layer 1 dispatch tests (no TCP, no Docker)
 // ---------------------------------------------------------------------------
@@ -4025,12 +4116,25 @@ mod tests {
     }
 
     #[test]
-    fn migration_complete_rejects_empty_shard_when_target_still_has_records() {
+    fn migration_complete_zero_count_clears_populated_inbound_shard() {
         let h = DispatchTestHarness::new();
         let shard = 91u16;
         let mut txid = [0u8; 32];
         txid[..2].copy_from_slice(&shard.to_le_bytes());
         assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 12);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(crate::cluster::shards::NodeId(1), "127.0.0.1:4601".parse().unwrap())],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
 
         let req = RequestFrame {
             request_id: shard as u64,
@@ -4039,10 +4143,122 @@ mod tests {
             payload: 0u64.to_le_bytes().to_vec(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
-        let resp = handle_request(&req, &h.engine, 8192, None, None, &mut conn_state, None);
-        assert_eq!(resp.status, STATUS_ERROR);
-        let (code, msg) = crate::protocol::codec::decode_error_payload(&resp.payload).unwrap();
-        assert_eq!(code, ERR_MIGRATION_IN_PROGRESS);
-        assert!(msg.contains("record count mismatch"), "unexpected error: {msg}");
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            0,
+            "zero-count completion should clear pending inbound even when the shard already has data"
+        );
+    }
+
+    #[test]
+    fn migration_complete_full_zero_payload_clears_populated_inbound_shard() {
+        let h = DispatchTestHarness::new();
+        let shard = 92u16;
+        let mut txid = [0u8; 32];
+        txid[..2].copy_from_slice(&shard.to_le_bytes());
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 12);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(crate::cluster::shards::NodeId(1), "127.0.0.1:4602".parse().unwrap())],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        assert_eq!(cluster.inbound_pending_count(), 1);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 32]);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&crate::cluster::shards::NodeId(7).0.to_le_bytes());
+
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload,
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            0,
+            "the real zero-count completion wire format should clear populated inbound shards"
+        );
+    }
+
+    #[test]
+    fn stale_migration_batch_does_not_recreate_inbound_on_settled_shard() {
+        let h = DispatchTestHarness::new();
+        let shard = 123u16;
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 20);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(crate::cluster::shards::NodeId(1), "127.0.0.1:4603".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_REPLICA_BATCH,
+            flags: FLAG_MIGRATION_BATCH,
+            payload: ReplicaBatch {
+                first_sequence: 0,
+                ops: vec![],
+            }
+            .serialize(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            0,
+            "late migration batches must not recreate inbound fences after handoff settled",
+        );
     }
 }

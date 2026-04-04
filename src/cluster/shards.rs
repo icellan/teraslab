@@ -397,17 +397,6 @@ impl ShardTable {
                     to_node: new_master,
                     is_master: true,
                 });
-                if !old_assignment.replicas.contains(&new_master)
-                    && let Some(&repair_source) = old_assignment.replicas.iter()
-                        .find(|r| new_members.contains(r))
-                {
-                    tasks.push(MigrationTask {
-                        shard: shard as u16,
-                        from_node: repair_source,
-                        to_node: new_master,
-                        is_master: false,
-                    });
-                }
             }
         }
         tasks
@@ -675,6 +664,43 @@ mod tests {
         // Same members → no migrations needed
         let plan = ShardTable::migration_plan(&table, &table);
         assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn migration_plan_uses_single_source_for_live_master_move() {
+        let old_members = nodes(&[1, 2, 3]);
+        let new_members = nodes(&[1, 2, 3, 4]);
+        let old_table = ShardTable::compute(&old_members, 2);
+        let new_table = ShardTable::compute(&new_members, 2);
+
+        let shard = (0..NUM_SHARDS)
+            .find(|&shard| {
+                let old_assignment = old_table.assignment(shard as u16);
+                let new_assignment = new_table.assignment(shard as u16);
+                old_assignment.master != new_assignment.master
+                    && !old_assignment.replicas.contains(&new_assignment.master)
+            })
+            .expect("expected a shard whose new master is a brand-new holder");
+
+        let plan = ShardTable::migration_plan(&old_table, &new_table);
+        let shard_tasks: Vec<_> = plan.iter().filter(|task| task.shard as usize == shard).collect();
+
+        assert_eq!(
+            shard_tasks.len(),
+            1,
+            "a live master move should stream from the authoritative old master only",
+        );
+        assert!(shard_tasks[0].is_master);
+        assert_eq!(
+            shard_tasks[0].from_node,
+            old_table.assignment(shard as u16).master,
+            "the old master should be the single source for a live master move",
+        );
+        assert_eq!(
+            shard_tasks[0].to_node,
+            new_table.assignment(shard as u16).master,
+            "the task should target the new master",
+        );
     }
 
     #[test]
@@ -1016,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_plan_add_node_includes_replica_repair_for_new_master() {
+    fn migration_plan_add_node_uses_authoritative_master_only() {
         let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1);
         let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 2);
 
@@ -1031,20 +1057,12 @@ mod tests {
 
         let old_a = &old.assignments[shard as usize];
         let new_a = &new.assignments[shard as usize];
-        let repair_source = old_a.replicas[0];
+        let shard_tasks: Vec<_> = plan.iter().filter(|t| t.shard == shard).collect();
 
-        assert!(plan.iter().any(|t|
-            t.shard == shard
-                && t.from_node == old_a.master
-                && t.to_node == new_a.master
-                && t.is_master
-        ));
-        assert!(plan.iter().any(|t|
-            t.shard == shard
-                && t.from_node == repair_source
-                && t.to_node == new_a.master
-                && !t.is_master
-        ));
+        assert_eq!(shard_tasks.len(), 1);
+        assert_eq!(shard_tasks[0].from_node, old_a.master);
+        assert_eq!(shard_tasks[0].to_node, new_a.master);
+        assert!(shard_tasks[0].is_master);
     }
 
     #[test]
@@ -1058,6 +1076,38 @@ mod tests {
             assert_ne!(task.from_node, NodeId(3),
                 "dead node 3 should not be a migration source");
             assert!(task.to_node == NodeId(1) || task.to_node == NodeId(2));
+        }
+    }
+
+    #[test]
+    fn migration_plan_remove_middle_node_never_sources_dead_member() {
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 2);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 3]), 2, 3);
+
+        let plan = ShardTable::migration_plan(&old, &new);
+        for task in &plan {
+            assert_ne!(
+                task.from_node,
+                NodeId(2),
+                "removed node 2 must never remain a master migration source"
+            );
+            assert!(task.to_node == NodeId(1) || task.to_node == NodeId(3));
+        }
+    }
+
+    #[test]
+    fn replica_migration_plan_remove_middle_node_never_sources_dead_member() {
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 2);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 3]), 2, 3);
+
+        let plan = ShardTable::replica_migration_plan(&old, &new);
+        for task in &plan {
+            assert_ne!(
+                task.from_node,
+                NodeId(2),
+                "removed node 2 must never remain a replica migration source"
+            );
+            assert!(task.to_node == NodeId(1) || task.to_node == NodeId(3));
         }
     }
 

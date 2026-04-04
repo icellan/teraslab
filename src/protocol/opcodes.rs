@@ -29,6 +29,7 @@ pub const OP_PROCESS_EXPIRED_PRESERVATIONS: u16 = 32;
 pub const OP_GET_PARTITION_MAP: u16 = 100;
 pub const OP_HEALTH: u16 = 101;
 pub const OP_PING: u16 = 102;
+pub const OP_GET_COMMITTED_TOPOLOGY: u16 = 103;
 
 // Streaming
 pub const OP_STREAM_CHUNK: u16 = 200;
@@ -40,6 +41,11 @@ pub const OP_REPLICA_ACK: u16 = 241;
 /// Sent after all migration batches for a shard to confirm the target
 /// has durably received the data. The target verifies and responds OK.
 pub const OP_MIGRATION_COMPLETE: u16 = 242;
+/// Batched variant of `OP_MIGRATION_COMPLETE`: marks multiple shards
+/// as migration-complete in a single TCP frame. Eliminates the per-shard
+/// round-trip overhead that made empty-shard completions take seconds
+/// instead of milliseconds.
+pub const OP_MIGRATION_BATCH_COMPLETE: u16 = 243;
 
 // Cluster (inter-node)
 pub const OP_HEARTBEAT: u16 = 250;

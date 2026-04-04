@@ -48,6 +48,88 @@ fn debug_shard_log(shard: u16, message: impl AsRef<str>) {
     }
 }
 
+fn sync_atomic_migration_bitmaps(
+    mgr: &MigrationManager,
+    fenced_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+) {
+    fenced_bm.load_from(mgr.fenced_bitmap());
+    inbound_bm.load_from(mgr.inbound_bitmap());
+    migrating_bm.clear_all();
+    for progress in mgr.active_migrations() {
+        if !progress.is_complete()
+            && progress.state != crate::cluster::migration::MigrationState::Failed
+        {
+            migrating_bm.set(progress.shard);
+        }
+    }
+}
+
+fn committed_topology_reactivation_metrics(
+    table: &ShardTable,
+    committed_members: &[NodeId],
+    rf: u8,
+    _committed_term: u64,
+) -> (u32, usize) {
+    let expected = ShardTable::compute_with_epoch(committed_members, rf, 0);
+    let mismatched = (0..crate::cluster::shards::NUM_SHARDS as u16)
+        .filter(|&shard| {
+            table.target_assignment(shard).master != expected.target_assignment(shard).master
+        })
+        .count() as u32;
+    (mismatched, table.pending_handoff_count())
+}
+
+fn install_active_routing_snapshot(
+    routing: &crate::cluster::routing::RoutingInfo,
+    rf: u8,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    migration: &Arc<Mutex<MigrationManager>>,
+    fenced_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    active_topology_members: &Arc<RwLock<Vec<NodeId>>>,
+    inbound_state_path: Option<&std::path::PathBuf>,
+    outbound_state_path: Option<&std::path::PathBuf>,
+) -> bool {
+    if routing.committed_members.is_empty() {
+        return false;
+    }
+
+    let snapshot = ShardTable::compute_with_epoch(
+        &routing.committed_members,
+        rf,
+        routing.shard_table_version,
+    );
+    *shard_table.write() = snapshot;
+    *active_topology_members.write().unwrap() = routing.committed_members.clone();
+
+    {
+        let mut mgr = migration.lock().unwrap();
+        *mgr = MigrationManager::new();
+        if let Some(path) = inbound_state_path {
+            crate::cluster::migration::persist_inbound_state(path, &mgr);
+        }
+        if let Some(path) = outbound_state_path {
+            crate::cluster::migration::persist_outbound_state(path, &mgr);
+        }
+    }
+
+    fenced_bm.clear_all();
+    migrating_bm.clear_all();
+    inbound_bm.clear_all();
+    true
+}
+
+fn old_master_available_for_handoff(
+    old_master: NodeId,
+    committed_members: &[NodeId],
+    live_addrs: &std::collections::HashMap<NodeId, SocketAddr>,
+) -> bool {
+    committed_members.contains(&old_master) && live_addrs.contains_key(&old_master)
+}
+
 /// Cluster coordinator configuration.
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
@@ -90,6 +172,8 @@ pub struct ClusterCoordinator {
     pub topology_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Topology authority for quorum-committed term management.
     pub topology_authority: Arc<crate::cluster::topology::TopologyAuthority>,
+    /// Members corresponding to the currently activated shard table.
+    active_topology_members: Arc<RwLock<Vec<NodeId>>>,
     /// Parallel connections per migration target.
     migration_pool_size: usize,
     /// Records per baseline streaming batch.
@@ -106,12 +190,15 @@ impl ClusterCoordinator {
     pub fn new(config: ClusterConfig, initial_peak: usize) -> Self {
         let mut members = vec![config.self_id];
         members.sort();
-        let initial_table = ShardTable::compute(&members, config.replication_factor);
+        // Bootstrap with the initial topology term so partition maps served
+        // before the first membership event still use term-based versioning.
+        let initial_table = ShardTable::compute_with_epoch(&members, config.replication_factor, 1);
 
         let topology_authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
             config.self_id,
             config.topology_propose_timeout,
         ));
+        let active_topology_members = Arc::new(RwLock::new(members.clone()));
         let swim = SwimRunner::new(SwimConfig {
             self_id: config.self_id,
             self_addr: config.self_addr,
@@ -140,6 +227,7 @@ impl ClusterCoordinator {
             max_migration_threads: config.max_migration_threads,
             topology_epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             topology_authority,
+            active_topology_members,
             migration_pool_size: config.migration_pool_size.max(1),
             migration_batch_size: config.migration_batch_size.max(1),
             swim_incarnation,
@@ -177,6 +265,8 @@ impl ClusterCoordinator {
         let redo_for_events = redo_log;
         let swim_incarnation_event = self.swim_incarnation.clone();
         let swim_incarnation_for_cluster = self.swim_incarnation.clone();
+        let active_topology_members_event = self.active_topology_members.clone();
+        let active_topology_members_for_cluster = self.active_topology_members.clone();
 
         // Atomic bitmaps shared between event loop, migration threads, and hot path.
         let fenced_bitmap = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
@@ -194,6 +284,7 @@ impl ClusterCoordinator {
             s.push(".inbound");
             std::path::PathBuf::from(s)
         });
+        let inbound_state_path_event = inbound_state_path.clone();
         let outbound_state_path = cluster_state_path.as_ref().map(|p| {
             let mut s = p.as_os_str().to_os_string();
             s.push(".outbound");
@@ -250,9 +341,16 @@ impl ClusterCoordinator {
                             &node_addrs_for_topo,
                             &topology_commit_tx_event,
                             &topo_state_path_event,
+                            &inbound_state_path_event,
+                            &outbound_state_path_event,
                             &peak_size_event,
                             &swim_incarnation_event,
+                            &active_topology_members_event,
                         );
+                        let activated_term = topology_epoch.load(Ordering::Relaxed);
+                        if activated_term > last_activated_term {
+                            last_activated_term = activated_term;
+                        }
                         // Track last activation for settle-time guard.
                         // handle_event may call activate_topology for
                         // MembershipChanged or TopologyStale events.
@@ -307,6 +405,7 @@ impl ClusterCoordinator {
                                         &commit.members, commit.term, self_id, rf, &shard_table, &migration,
                                         &node_addrs, &engine, &redo_for_events, max_migration_threads,
                                         migration_pool_size, migration_batch_size, &fenced_bm_event, &migrating_bm_event, &inbound_bm_event,
+                                        &active_topology_members_event,
                                     );
                                     last_activation_at = std::time::Instant::now();
                                 }
@@ -334,13 +433,46 @@ impl ClusterCoordinator {
                 {
                     let mut mgr = migration.lock().unwrap();
                     mgr.cleanup_completed();
+                    sync_atomic_migration_bitmaps(
+                        &mgr,
+                        &fenced_bm_event,
+                        &migrating_bm_event,
+                        &inbound_bm_event,
+                    );
                     if mgr.inbound_count() > 0
                         && last_inbound_clear.elapsed() >= Duration::from_secs(5)
                     {
-                        let removed = mgr.clear_stale_inbound(Duration::from_secs(30));
+                        let clear_settled_inbound = mgr.active_count() == 0 && {
+                            let table = shard_table.read();
+                            table.pending_handoff_count() == 0
+                        };
+                        let removed = if clear_settled_inbound {
+                            let settled_shards: std::collections::HashSet<u16> = mgr
+                                .pending_inbound_entries()
+                                .into_iter()
+                                .map(|(shard, _)| shard)
+                                .collect();
+                            mgr.clear_pending_inbound_for_shards(&settled_shards)
+                        } else {
+                            mgr.clear_stale_inbound(Duration::from_secs(30))
+                        };
                         if removed > 0 {
-                            inbound_bm_event.load_from(mgr.inbound_bitmap());
-                            eprintln!("cluster: cleared {removed} stale inbound migration(s)");
+                            sync_atomic_migration_bitmaps(
+                                &mgr,
+                                &fenced_bm_event,
+                                &migrating_bm_event,
+                                &inbound_bm_event,
+                            );
+                            if let Some(ref path) = inbound_state_path_event {
+                                crate::cluster::migration::persist_inbound_state(path, &mgr);
+                            }
+                            if clear_settled_inbound {
+                                eprintln!(
+                                    "cluster: cleared {removed} settled inbound migration(s) — no active migrations or handoffs remain"
+                                );
+                            } else {
+                                eprintln!("cluster: cleared {removed} stale inbound migration(s)");
+                            }
                         }
                         last_inbound_clear = std::time::Instant::now();
                     }
@@ -363,16 +495,15 @@ impl ClusterCoordinator {
                     // This avoids false mismatches during topology transitions.
                     let committed_members = topo_authority_event.committed_members();
                     if committed_members.len() > 1 {
-                        let expected = ShardTable::compute_with_epoch(&committed_members, rf, 0);
+                        let committed_term = topo_authority_event.committed_term();
                         let (mismatched, pending_handoffs) = {
                             let table = shard_table.read();
-                            let mismatched = (0..crate::cluster::shards::NUM_SHARDS as u16)
-                                .filter(|&shard| {
-                                    table.target_assignment(shard).master
-                                        != expected.target_assignment(shard).master
-                                })
-                                .count() as u32;
-                            (mismatched, table.pending_handoff_count())
+                            committed_topology_reactivation_metrics(
+                                &table,
+                                &committed_members,
+                                rf,
+                                committed_term,
+                            )
                         };
 
                         if should_trigger_topology_reactivation(
@@ -381,7 +512,6 @@ impl ClusterCoordinator {
                             mismatched,
                             pending_handoffs,
                         ) {
-                            let committed_term = topo_authority_event.committed_term();
                             topology_epoch.store(committed_term, Ordering::Relaxed);
                             if startup_reactivation_due {
                                 startup_reactivation_event.store(false, Ordering::Release);
@@ -399,6 +529,7 @@ impl ClusterCoordinator {
                                 &committed_members, committed_term, self_id, rf, &shard_table, &migration,
                                 &node_addrs, &engine, &redo_for_events, max_migration_threads,
                                 migration_pool_size, migration_batch_size, &fenced_bm_event, &migrating_bm_event, &inbound_bm_event,
+                                &active_topology_members_event,
                             );
                         }
                     }
@@ -424,6 +555,7 @@ impl ClusterCoordinator {
                         &members, term, self_id, rf, &shard_table, &migration,
                         &node_addrs, &engine, &redo_for_events, max_migration_threads,
                         migration_pool_size, migration_batch_size, &fenced_bm_event, &migrating_bm_event, &inbound_bm_event,
+                        &active_topology_members_event,
                     );
                     last_activation_at = std::time::Instant::now();
                     if let Some(ref path) = cluster_state_path {
@@ -449,6 +581,7 @@ impl ClusterCoordinator {
             repl_ack_policy,
             repl_best_effort,
             topology_authority: self.topology_authority.clone(),
+            active_topology_members: active_topology_members_for_cluster,
             inbound_state_path,
             outbound_state_path,
             fenced_bitmap,
@@ -484,8 +617,11 @@ impl ClusterCoordinator {
         node_addrs_for_topo: &Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
         topology_commit_tx: &std::sync::mpsc::Sender<(Vec<NodeId>, u64)>,
         topology_state_path: &Option<std::path::PathBuf>,
+        inbound_state_path: &Option<std::path::PathBuf>,
+        outbound_state_path: &Option<std::path::PathBuf>,
         peak_size: &Arc<std::sync::atomic::AtomicUsize>,
         swim_incarnation: &Arc<std::sync::atomic::AtomicU64>,
+        active_topology_members: &Arc<RwLock<Vec<NodeId>>>,
     ) {
         match event {
             ClusterEvent::NodeJoined(node, addr) => {
@@ -572,6 +708,7 @@ impl ClusterCoordinator {
                             &commit.members, commit.term, self_id, rf, shard_table, migration,
                             node_addrs, engine, redo_for_events, max_migration_threads,
                             migration_pool_size, migration_batch_size, fenced_bm, migrating_bm, inbound_bm,
+                            active_topology_members,
                         );
                         if let Some(path) = topology_state_path {
                             let peak = peak_size.load(Ordering::Relaxed) as u64;
@@ -605,10 +742,10 @@ impl ClusterCoordinator {
                         "cluster: topology stale (local term {local_term}, remote has {remote_term}) — fetching committed topology from peer",
                     );
                     // Fetch the committed topology directly from a reachable
-                    // peer instead of re-proposing a new term. This is faster
-                    // (no voting round) and doesn't increment the term counter
-                    // unnecessarily. We try each peer until one responds with
-                    // a valid commit for a term higher than ours.
+                    // peer instead of inferring it from the client routing map.
+                    // Routing is an active shard-table snapshot; catch-up needs
+                    // the latest quorum-committed term even if activation is
+                    // still in flight on the peer.
                     let peers: Vec<SocketAddr> = {
                         let addrs = node_addrs_for_topo.read().unwrap();
                         addrs.iter()
@@ -616,58 +753,66 @@ impl ClusterCoordinator {
                             .map(|(_, &addr)| addr)
                             .collect()
                     };
+                    let local_active_version = { shard_table.read().version };
+                    for peer_addr in &peers {
+                        if let Ok(payload) = send_topology_frame(*peer_addr, OP_GET_PARTITION_MAP, &[])
+                            && let Some(routing) =
+                                crate::cluster::routing::RoutingInfo::decode(&payload)
+                            && routing.shard_table_version > local_active_version
+                            && !routing.committed_members.is_empty()
+                        {
+                            let mut snapshot_members = routing.committed_members.clone();
+                            snapshot_members.sort();
+                            if routing.shard_table_version > topology_authority.committed_term() {
+                                let synthetic = crate::cluster::topology::TopologyCommit {
+                                    term: routing.shard_table_version,
+                                    proposer: snapshot_members[0],
+                                    members: snapshot_members.clone(),
+                                    digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                                        routing.shard_table_version,
+                                        &snapshot_members,
+                                    ),
+                                };
+                                let _ = topology_authority.handle_commit(&synthetic);
+                            }
+                            if install_active_routing_snapshot(
+                                &routing,
+                                rf,
+                                shard_table,
+                                migration,
+                                fenced_bm,
+                                migrating_bm,
+                                inbound_bm,
+                                active_topology_members,
+                                inbound_state_path.as_ref(),
+                                outbound_state_path.as_ref(),
+                            ) {
+                                eprintln!(
+                                    "cluster: catch-up: installed active routing snapshot term {} from peer {}",
+                                    routing.shard_table_version,
+                                    peer_addr,
+                                );
+                            }
+                            break;
+                        }
+                    }
+
+                    let local_term = topology_authority.committed_term();
                     let mut caught_up = false;
                     for peer_addr in &peers {
-                        // Fetch the peer's committed topology via
-                        // OP_GET_PARTITION_MAP, which returns the full routing
-                        // info including all node addresses and the shard table
-                        // version. We extract the member list from the routing
-                        // info and construct a synthetic commit to apply locally.
-                        if let Ok(payload) = send_topology_frame(*peer_addr, OP_GET_PARTITION_MAP, &[])
-                            && let Some(routing) = crate::cluster::routing::RoutingInfo::decode(&payload)
+                        if let Ok(payload) = send_topology_frame(*peer_addr, OP_GET_COMMITTED_TOPOLOGY, &[])
+                            && let Some(commit) = crate::cluster::topology::TopologyCommit::deserialize(&payload)
                         {
-                            // Use the committed_members from the routing info
-                            // (appended by encode_partition_map). These are the
-                            // EXACT members that were committed with the remote
-                            // term, so the digest will match. If the peer
-                            // doesn't include committed_members (older server),
-                            // skip it — constructing a synthetic commit from
-                            // SWIM-alive nodes could install a topology that
-                            // was never quorum-committed. The re-proposal
-                            // fallback path (below) will converge safely.
-                            let remote_members = if !routing.committed_members.is_empty() {
-                                let mut m = routing.committed_members.clone();
-                                m.sort();
-                                m
-                            } else {
-                                continue;
-                            };
+                            let remote_members = commit.members.clone();
                             if remote_members.len() <= 1 {
                                 continue; // Peer is single-node, skip
                             }
-                            // Skip if the partition map's term isn't higher
+                            // Skip if the committed term isn't higher
                             // than ours — the peer may not have advanced yet.
-                            if routing.shard_table_version <= local_term {
+                            if commit.term <= local_term {
                                 continue;
                             }
-
-                            // Construct and apply a synthetic commit.
-                            // Use the partition map's version (which equals
-                            // the peer's committed_term at the time the map
-                            // was built) rather than the SWIM gossip value.
-                            // The SWIM value may have advanced beyond the
-                            // partition map's snapshot, causing a digest
-                            // mismatch if we mix the two.
-                            let commit_term = routing.shard_table_version;
-                            let synthetic = crate::cluster::topology::TopologyCommit {
-                                term: commit_term,
-                                proposer: remote_members[0], // deterministic proposer
-                                members: remote_members.clone(),
-                                digest: crate::cluster::topology::TopologyTerm::compute_digest(
-                                    commit_term, &remote_members,
-                                ),
-                            };
-                            if let Some(applied_term) = topology_authority.handle_commit(&synthetic) {
+                            if let Some(applied_term) = topology_authority.handle_commit(&commit) {
                                 eprintln!(
                                     "cluster: catch-up: applied term {} from peer {} ({} members)",
                                     applied_term, peer_addr, remote_members.len(),
@@ -677,11 +822,12 @@ impl ClusterCoordinator {
                                     let inc = swim_incarnation.load(Ordering::Relaxed);
                                     persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
                                 }
-                                topology_epoch.store(commit_term, Ordering::Relaxed);
+                                topology_epoch.store(commit.term, Ordering::Relaxed);
                                 Self::activate_topology(
-                                    &remote_members, commit_term, self_id, rf, shard_table, migration,
+                                    &remote_members, commit.term, self_id, rf, shard_table, migration,
                                     node_addrs, engine, redo_for_events, max_migration_threads,
                                     migration_pool_size, migration_batch_size, fenced_bm, migrating_bm, inbound_bm,
+                                    active_topology_members,
                                 );
                                 caught_up = true;
                                 break;
@@ -724,6 +870,7 @@ impl ClusterCoordinator {
                                     &commit.members, commit.term, self_id, rf, shard_table, migration,
                                     node_addrs, engine, redo_for_events, max_migration_threads,
                                     migration_pool_size, migration_batch_size, fenced_bm, migrating_bm, inbound_bm,
+                                    active_topology_members,
                                 );
                             } else {
                                 let ta = topology_authority.clone();
@@ -760,7 +907,47 @@ impl ClusterCoordinator {
         fenced_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
         migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
         inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+        active_topology_members: &Arc<RwLock<Vec<NodeId>>>,
     ) {
+        *active_topology_members.write().unwrap() = members.to_vec();
+
+        // Fast path: when the engine has zero records AND the current shard
+        // table is single-node (this node only), skip the expensive migration
+        // machinery entirely. There's no data to migrate, no handoff to
+        // coordinate, and no completion handshakes to send. Just install the
+        // new shard table directly.
+        //
+        // This eliminates ~5461 empty-shard TCP handshakes per node during
+        // initial cluster formation. The condition is conservative: only
+        // fires on fresh startup (single-node bootstrap, empty engine) to
+        // avoid interfering with scale-up scenarios where existing nodes
+        // need to migrate data TO this node.
+        {
+            let old_table = shard_table.read();
+            let old_unique: std::collections::HashSet<NodeId> =
+                old_table.shard_counts().keys().copied().collect();
+            let is_single_node_bootstrap =
+                old_unique.len() == 1 && old_unique.contains(&self_id);
+            drop(old_table);
+
+            if engine.index_len() == 0 && is_single_node_bootstrap {
+                let new_table = ShardTable::compute_with_epoch(members, rf, epoch);
+                eprintln!(
+                    "cluster: empty engine — fast-path shard table install (epoch {epoch}, {} members)",
+                    members.len(),
+                );
+                *shard_table.write() = new_table;
+                {
+                    let mut mgr = migration.lock().unwrap();
+                    *mgr = MigrationManager::new();
+                }
+                fenced_bm.clear_all();
+                migrating_bm.clear_all();
+                inbound_bm.clear_all();
+                return;
+            }
+        }
+
         // Compute new migration plan FIRST so we know which existing
         // migrations can be preserved (same source, target, and type).
         let old_table_snap = shard_table.read().clone();
@@ -778,7 +965,7 @@ impl ClusterCoordinator {
             .collect();
 
         // Determine which existing migrations can be preserved.
-        let preserved_shards: std::collections::HashSet<u16>;
+        let preserved_tasks: std::collections::HashSet<(u16, NodeId, NodeId, bool)>;
         {
             let mut mgr = migration.lock().unwrap();
             let old_inbound = mgr.inbound_count();
@@ -787,13 +974,13 @@ impl ClusterCoordinator {
 
             // Identify preservable migrations: active, not complete/failed,
             // and appearing in the new plan with same source/target.
-            preserved_shards = mgr.active_migrations().iter()
+            preserved_tasks = mgr.active_migrations().iter()
                 .filter(|p| {
                     p.state != crate::cluster::migration::MigrationState::Complete
                         && p.state != crate::cluster::migration::MigrationState::Failed
                         && new_task_set.contains(&(p.shard, p.from_node, p.to_node, p.is_master))
                 })
-                .map(|p| p.shard)
+                .map(|p| (p.shard, p.from_node, p.to_node, p.is_master))
                 .collect();
 
             // Cancel only non-preserved migrations.
@@ -801,7 +988,7 @@ impl ClusterCoordinator {
                 .filter(|p| {
                     p.state != crate::cluster::migration::MigrationState::Complete
                         && p.state != crate::cluster::migration::MigrationState::Failed
-                        && !preserved_shards.contains(&p.shard)
+                        && !preserved_tasks.contains(&(p.shard, p.from_node, p.to_node, p.is_master))
                 })
                 .map(|p| MigrationTask {
                     shard: p.shard, from_node: p.from_node,
@@ -819,7 +1006,7 @@ impl ClusterCoordinator {
             mgr.clear_inbound();
             mgr.cleanup_completed();
 
-            let preserved_count = preserved_shards.len();
+            let preserved_count = preserved_tasks.len();
             let cancelled = old_active.saturating_sub(preserved_count);
             if old_inbound > 0 || cancelled > 0 || old_failed > 0 {
                 eprintln!(
@@ -830,7 +1017,7 @@ impl ClusterCoordinator {
 
         // Reset atomic bitmaps for non-preserved shards.
         // For preserved shards, keep their fenced/migrating state.
-        if preserved_shards.is_empty() {
+        if preserved_tasks.is_empty() {
             fenced_bm.clear_all();
             migrating_bm.clear_all();
             inbound_bm.clear_all();
@@ -862,7 +1049,10 @@ impl ClusterCoordinator {
             all_tasks.extend(replica_plan.iter().cloned());
 
             let outbound_tasks: Vec<MigrationTask> = all_tasks.iter()
-                .filter(|t| t.from_node == self_id && !preserved_shards.contains(&t.shard))
+                .filter(|t| {
+                    t.from_node == self_id
+                        && !preserved_tasks.contains(&(t.shard, t.from_node, t.to_node, t.is_master))
+                })
                 .cloned()
                 .collect();
             let inbound = all_tasks.iter()
@@ -875,11 +1065,6 @@ impl ClusterCoordinator {
                 plan.len(), replica_plan.len(), outbound_tasks.len(), master_out, replica_out, inbound
             );
 
-            let snapshot_seq: u64 = redo_for_events
-                .as_ref()
-                .map(|rl| rl.lock().current_sequence())
-                .unwrap_or(0);
-
             let outbound_shard_set: std::collections::HashSet<u16> = outbound_tasks.iter()
                 .map(|t| t.shard)
                 .collect();
@@ -887,6 +1072,11 @@ impl ClusterCoordinator {
                 .filter(|t| t.is_master)
                 .map(|t| t.shard)
                 .collect();
+
+            let populated_shards: std::collections::HashSet<u16> = (0..NUM_SHARDS as u16)
+                .filter(|&s| engine.shard_record_count(s) > 0)
+                .collect();
+            let local_store_empty = populated_shards.is_empty();
 
             // Build the set of shards that have MASTER migration tasks.
             // Only master migrations need the old master to keep serving
@@ -915,6 +1105,12 @@ impl ClusterCoordinator {
                     if !master_migration_shards.contains(&s) {
                         return false;
                     }
+                    // Fresh bootstrap nodes can briefly become the nominal
+                    // source for empty shards before the next topology term
+                    // supersedes them. Skip local handoff in that case.
+                    if local_store_empty && outbound_master_source_shards.contains(&s) {
+                        return false;
+                    }
                     let local_has_data = engine.shard_record_count(s) > 0;
                     let old_master = old_masters[s as usize];
                     should_begin_handoff_for_shard(
@@ -922,27 +1118,23 @@ impl ClusterCoordinator {
                         self_id,
                         old_master,
                         local_has_data,
-                        alive_addrs.contains_key(&old_master),
+                        old_master_available_for_handoff(old_master, members, &alive_addrs),
                         &outbound_master_source_shards,
                     )
                 });
                 drop(alive_addrs);
             }
 
-            let populated_shards: std::collections::HashSet<u16> = (0..NUM_SHARDS as u16)
-                .filter(|&s| engine.shard_record_count(s) > 0)
-                .collect();
-
             {
                 let mut mgr = migration.lock().unwrap();
                 let new_tasks: Vec<MigrationTask> = all_tasks.iter()
-                    .filter(|t| !preserved_shards.contains(&t.shard))
+                    .filter(|t| {
+                        !preserved_tasks.contains(&(t.shard, t.from_node, t.to_node, t.is_master))
+                            && !(local_store_empty && t.from_node == self_id)
+                    })
                     .cloned()
                     .collect();
                 mgr.start_outbound(&new_tasks, self_id, &populated_shards);
-                for t in new_tasks.iter().filter(|t| t.from_node == self_id) {
-                    mgr.set_snapshot_sequence(t, snapshot_seq);
-                }
             }
 
             // Phase 2 (worker thread): key snapshot + migration spawning.
@@ -1088,8 +1280,7 @@ fn should_begin_handoff_for_shard(
     outbound_source_shards: &std::collections::HashSet<u16>,
 ) -> bool {
     let is_outbound_source = outbound_source_shards.contains(&shard);
-    (local_has_data || is_outbound_source)
-        && (old_master_alive || old_master == self_id || is_outbound_source)
+    is_outbound_source || (old_master_alive && local_has_data && old_master == self_id)
 }
 
 fn should_trigger_topology_reactivation(
@@ -1453,34 +1644,43 @@ fn run_migration_batch(
     // by a previous topology cycle or by the begin_handoff_with callback).
     // Send OP_MIGRATION_COMPLETE to the target so it clears its inbound
     // state and unblocks writes for these shards.
-    let mut already_done = 0u32;
-    let mut skipped_shards: Vec<u16> = Vec::new();
-    let tasks: Vec<MigrationTask> = {
+    let mut skipped_tasks: Vec<MigrationTask> = Vec::new();
+    let skipped_shard_set: std::collections::HashSet<u16> = {
         let table = shard_table.read();
-        let mut mgr = migration.lock().unwrap();
+        tasks.iter()
+            .filter(|task| table.shard_handoff_state(task.shard) == ShardHandoff::ServingNew)
+            .map(|task| task.shard)
+            .collect()
+    };
+    let tasks: Vec<MigrationTask> = {
         tasks.into_iter().filter(|task| {
-            if table.shard_handoff_state(task.shard) == ShardHandoff::ServingNew {
-                mgr.mark_complete(task);
-                fenced_bm.clear(task.shard);
-                migrating_bm.clear(task.shard);
-                skipped_shards.push(task.shard);
-                already_done += 1;
+            if skipped_shard_set.contains(&task.shard) {
+                skipped_tasks.push(task.clone());
                 false
             } else {
                 true
             }
         }).collect()
     };
-    if already_done > 0 {
-        completed.fetch_add(already_done, Ordering::Relaxed);
-        eprintln!("cluster: {already_done} shards already serving — sending completions to {addr}");
-        // Notify the target over a SINGLE connection for all skipped shards.
-        if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-            crate::replication::tcp_transport::configure_tcp_keepalive(&stream);
-            for shard in &skipped_shards {
-                let _ = send_migration_complete(addr, *shard, self_id, 0, 0, 0, Some(&mut stream), &[0u8; 32], &[]);
+    if !skipped_tasks.is_empty() {
+        eprintln!(
+            "cluster: {} shards already serving — sending completion handshakes to {addr}",
+            skipped_tasks.len()
+        );
+        let delivered = send_completion_only_handshakes(addr, &skipped_tasks, self_id);
+        let mut mgr = migration.lock().unwrap();
+        for (task, delivered) in skipped_tasks.iter().zip(delivered) {
+            if delivered {
+                mgr.mark_complete(task);
+                completed.fetch_add(1, Ordering::Relaxed);
+            } else {
+                mgr.mark_failed(task);
+                failed.fetch_add(1, Ordering::Relaxed);
             }
+            if !mgr.is_shard_fenced(task.shard) {
+                fenced_bm.clear(task.shard);
+            }
+            migrating_bm.clear(task.shard);
         }
     }
 
@@ -1501,13 +1701,12 @@ fn run_migration_batch(
     // data path for full migration.
     if !empty_tasks.is_empty() {
         let mut promoted = Vec::new();
-        let mut empty_completion_shards: Vec<u16> = Vec::new();
+        let mut ready_empty_tasks: Vec<MigrationTask> = Vec::new();
         let empty_shards: std::collections::HashSet<u16> = empty_tasks.iter()
             .map(|t| t.shard)
             .collect();
         {
             let mut mgr = migration.lock().unwrap();
-            let mut table = shard_table.write();
             for task in &empty_tasks {
                 mgr.fence_shard(task.shard);
                 fenced_bm.set(task.shard);
@@ -1517,18 +1716,7 @@ fn run_migration_batch(
 
             for task in &empty_tasks {
                 if !fenced_keys_by_shard.contains_key(&task.shard) {
-                    mgr.mark_complete(task);
-                    fenced_bm.clear(task.shard);
-                    migrating_bm.clear(task.shard);
-                    let target_assignment = table.target_assignment(task.shard);
-                    if task.is_master
-                        || target_assignment.master == task.from_node
-                        || target_assignment.replicas.contains(&task.from_node)
-                    {
-                        table.commit_shard(task.shard);
-                    }
-                    empty_completion_shards.push(task.shard);
-                    completed.fetch_add(1, Ordering::Relaxed);
+                    ready_empty_tasks.push(task.clone());
                 } else {
                     if engine.shard_record_count(task.shard) == 0 {
                         let key_count = fenced_keys_by_shard
@@ -1549,15 +1737,40 @@ fn run_migration_batch(
                 }
             }
         }
-        let instant_count = empty_tasks.len() - promoted.len();
+        let instant_count = ready_empty_tasks.len();
         if instant_count > 0 {
             eprintln!("cluster: {} empty shards to {} committed instantly", instant_count, addr);
-            if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-                crate::replication::tcp_transport::configure_tcp_keepalive(&stream);
-                for shard in &empty_completion_shards {
-                    let _ = send_migration_complete(addr, *shard, self_id, 0, 0, 0, Some(&mut stream), &[0u8; 32], &[]);
+            let delivered = send_completion_only_handshakes(addr, &ready_empty_tasks, self_id);
+            for (task, delivered) in ready_empty_tasks.iter().zip(delivered) {
+                if delivered {
+                    let should_commit_local_handoff = {
+                        let table = shard_table.read();
+                        let target_assignment = table.target_assignment(task.shard);
+                        task.is_master
+                            || target_assignment.master == task.from_node
+                            || target_assignment.replicas.contains(&task.from_node)
+                    };
+                    let mut mgr = migration.lock().unwrap();
+                    mgr.mark_complete(task);
+                    if !mgr.is_shard_fenced(task.shard) {
+                        fenced_bm.clear(task.shard);
+                    }
+                    migrating_bm.clear(task.shard);
+                    drop(mgr);
+                    if should_commit_local_handoff {
+                        shard_table.write().commit_shard(task.shard);
+                    }
+                    completed.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    let mut mgr = migration.lock().unwrap();
+                    mgr.mark_failed(task);
+                    if !mgr.is_shard_fenced(task.shard) {
+                        fenced_bm.clear(task.shard);
+                    }
+                    migrating_bm.clear(task.shard);
+                    drop(mgr);
+                    shard_table.write().rollback_shard(task.shard);
+                    failed.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -1951,13 +2164,27 @@ fn migrate_single_shard(
     // Helper: mark task failed, rollback shard table, sync bitmaps.
     let fail_shard = |migration: &Arc<Mutex<MigrationManager>>,
                       shard_table: &Arc<ShardTableLock<ShardTable>>,
-                      failed: &Arc<std::sync::atomic::AtomicU32>| {
+                      failed: &Arc<std::sync::atomic::AtomicU32>,
+                      clear_target_inbound: bool| {
         debug_shard_log(task.shard, format!(
             "fail from={} to={} is_master={}",
             task.from_node.0,
             task.to_node.0,
             task.is_master,
         ));
+        if clear_target_inbound {
+            let _ = send_migration_complete(
+                addr,
+                task.shard,
+                task.from_node,
+                0,
+                0,
+                0,
+                None,
+                &[0u8; 32],
+                &[],
+            );
+        }
         let mut mgr = migration.lock().unwrap();
         mgr.mark_failed(task);
         if !mgr.is_shard_fenced(task.shard) {
@@ -1995,6 +2222,17 @@ fn migrate_single_shard(
             std::thread::sleep(Duration::from_millis(delay_ms));
         }
 
+        let snapshot_seq = redo_log.as_ref()
+            .map(|rl| {
+                let guard = rl.lock();
+                guard.current_sequence()
+            })
+            .unwrap_or(0);
+        {
+            let mut mgr = migration.lock().unwrap();
+            mgr.set_snapshot_sequence(task, snapshot_seq);
+        }
+
         // Phase 1: baseline
         let _baseline_manifest = match stream_shard_baseline(task, shard_keys, engine, stream, batch_size) {
             Ok(m) => m,
@@ -2002,7 +2240,7 @@ fn migrate_single_shard(
                 last_err = format!("baseline: {e}");
                 if attempt < 2 { continue; }
                 eprintln!("cluster: shard {} {last_err} (final attempt)", task.shard);
-                fail_shard(migration, shard_table, failed);
+                fail_shard(migration, shard_table, failed, true);
                 return false;
             }
         };
@@ -2023,7 +2261,7 @@ fn migrate_single_shard(
                 // inbound entry and stops blocking writes. Use record_count=0
                 // to signal this is a no-data completion.
                 let _ = send_migration_complete(addr, task.shard, task.from_node, 0, 0, 0, None, &[0u8; 32], &[]);
-                fail_shard(migration, shard_table, failed);
+                fail_shard(migration, shard_table, failed, false);
                 return false;
             }
         }
@@ -2032,17 +2270,9 @@ fn migrate_single_shard(
         // This guarantees no write can slip through between the sequence
         // capture and the fence. Any write that arrives between the
         // baseline snapshot and the fence is captured in the delta stream.
-        let snapshot_seq;
         let fence_seq;
         {
             let mut mgr = migration.lock().unwrap();
-            snapshot_seq = mgr.find_task_mut(task)
-                .map(|p| p.snapshot_sequence).unwrap_or(0)
-                // If snapshot_sequence was never set (e.g., quiesce path),
-                // default to 1 so delta streaming covers all redo entries
-                // between baseline and fence. Without this, writes between
-                // the key capture and the fence are silently lost.
-                .max(1);
             mgr.fence_shard(task.shard);
             fenced_bm.set(task.shard);
             drop(mgr);
@@ -2088,7 +2318,7 @@ fn migrate_single_shard(
                 last_err = format!("late baseline: {e}");
                 if attempt < 2 { continue; }
                 eprintln!("cluster: shard {} {last_err} (final attempt)", task.shard);
-                fail_shard(migration, shard_table, failed);
+                fail_shard(migration, shard_table, failed, true);
                 return false;
             }
         }
@@ -2139,7 +2369,7 @@ fn migrate_single_shard(
         if delta_failed {
             if attempt < 2 { continue; }
             eprintln!("cluster: shard {} {last_err} (final attempt)", task.shard);
-            fail_shard(migration, shard_table, failed);
+            fail_shard(migration, shard_table, failed, true);
             return false;
         }
 
@@ -2167,7 +2397,7 @@ fn migrate_single_shard(
                 last_err = format!("post-delta baseline: {e}");
                 if attempt < 2 { continue; }
                 eprintln!("cluster: shard {} {last_err} (final attempt)", task.shard);
-                fail_shard(migration, shard_table, failed);
+                fail_shard(migration, shard_table, failed, true);
                 return false;
             }
             known_fenced_keys.extend(post_delta_late_keys.iter().copied());
@@ -2191,7 +2421,7 @@ fn migrate_single_shard(
                 eprintln!("cluster: shard {} migration aborted before complete — shard already committed/rolled back", task.shard);
                 drop(table);
                 let _ = send_migration_complete(addr, task.shard, task.from_node, 0, 0, 0, Some(stream), &[0u8; 32], &[]);
-                fail_shard(migration, shard_table, failed);
+                fail_shard(migration, shard_table, failed, false);
                 return false;
             }
         }
@@ -2205,7 +2435,7 @@ fn migrate_single_shard(
                 last_err = e;
                 if attempt < 2 { continue; }
                 eprintln!("cluster: shard {} {last_err} (final attempt)", task.shard);
-                fail_shard(migration, shard_table, failed);
+                fail_shard(migration, shard_table, failed, true);
                 return false;
             }
         };
@@ -2224,7 +2454,7 @@ fn migrate_single_shard(
             last_err = format!("handshake: {e}");
             if attempt < 2 { continue; }
             eprintln!("cluster: shard {} {last_err} (final attempt)", task.shard);
-            fail_shard(migration, shard_table, failed);
+            fail_shard(migration, shard_table, failed, true);
             return false;
         }
 
@@ -2519,6 +2749,104 @@ fn send_migration_complete(
         return Err(format!("target rejected: status {}{detail}", response.status));
     }
     Ok(())
+}
+
+/// Send batched migration-complete handshakes for multiple shards in a
+/// single TCP frame. This replaces the old per-shard sequential approach
+/// that required one TCP round-trip per shard (~2730 round-trips ≈ 3-15s).
+/// The batched version sends all shard IDs in one `OP_MIGRATION_BATCH_COMPLETE`
+/// frame for a single round-trip (~1ms).
+fn send_completion_only_handshakes(
+    target_addr: SocketAddr,
+    tasks: &[MigrationTask],
+    from_node: NodeId,
+) -> Vec<bool> {
+    if tasks.is_empty() {
+        return Vec::new();
+    }
+
+    const MAX_RETRIES: usize = 40;
+    const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+    const IO_TIMEOUT: Duration = Duration::from_secs(5);
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
+
+    // Collect all shard IDs for the batch.
+    let shards: Vec<u16> = tasks.iter().map(|t| t.shard).collect();
+
+    // Wire format: [shard_count:4][shard_id:2 × count][from_node:8]
+    let mut payload = Vec::with_capacity(4 + shards.len() * 2 + 8);
+    payload.extend_from_slice(&(shards.len() as u32).to_le_bytes());
+    for &shard in &shards {
+        payload.extend_from_slice(&shard.to_le_bytes());
+    }
+    payload.extend_from_slice(&from_node.0.to_le_bytes());
+
+    let request = RequestFrame {
+        request_id: 0,
+        op_code: OP_MIGRATION_BATCH_COMPLETE,
+        flags: 0,
+        payload,
+    };
+
+    for attempt in 0..MAX_RETRIES {
+        if attempt > 0 {
+            std::thread::sleep(RETRY_DELAY);
+        }
+        let mut stream = match TcpStream::connect_timeout(&target_addr, CONNECT_TIMEOUT) {
+            Ok(s) => {
+                let _ = s.set_read_timeout(Some(IO_TIMEOUT));
+                let _ = s.set_write_timeout(Some(IO_TIMEOUT));
+                crate::replication::tcp_transport::configure_tcp_keepalive(&s);
+                s
+            }
+            Err(e) => {
+                eprintln!(
+                    "cluster: batch-complete connect to {target_addr} failed ({}/{MAX_RETRIES}): {e}",
+                    attempt + 1,
+                );
+                continue;
+            }
+        };
+
+        match exchange_frame(&mut stream, &request) {
+            Ok(response) => {
+                if response.status == STATUS_OK {
+                    return vec![true; tasks.len()];
+                }
+                // Parse per-shard results from response payload if present.
+                // Response format: [count:4][shard:2 + ok:1] × count
+                if response.payload.len() >= 4 {
+                    let count = u32::from_le_bytes(
+                        response.payload[..4].try_into().unwrap(),
+                    ) as usize;
+                    if count == tasks.len() && response.payload.len() >= 4 + count * 3 {
+                        let mut delivered = vec![false; tasks.len()];
+                        for i in 0..count {
+                            let off = 4 + i * 3;
+                            // shard at off..off+2, ok at off+2
+                            delivered[i] = response.payload[off + 2] != 0;
+                        }
+                        return delivered;
+                    }
+                }
+                // Fallback: treat entire batch as delivered on non-OK
+                // (the target processed what it could).
+                return vec![true; tasks.len()];
+            }
+            Err(e) => {
+                eprintln!(
+                    "cluster: batch-complete to {target_addr} failed ({}/{MAX_RETRIES}): {e}",
+                    attempt + 1,
+                );
+            }
+        }
+    }
+
+    eprintln!(
+        "cluster: batch-complete to {target_addr} failed after {MAX_RETRIES} retries ({} shards)",
+        tasks.len(),
+    );
+    vec![false; tasks.len()]
 }
 
 /// Convert a redo log entry to a ReplicaOp if it belongs to the given shard.
@@ -2850,6 +3178,8 @@ pub struct RunningCluster {
     repl_best_effort: bool,
     /// Topology authority for quorum-committed term management.
     topology_authority: Arc<crate::cluster::topology::TopologyAuthority>,
+    /// Members corresponding to the currently activated shard table.
+    active_topology_members: Arc<RwLock<Vec<NodeId>>>,
     /// Path for persisting inbound migration state across restarts.
     /// When set, every inbound state change is durably flushed so a
     /// crashed target knows which shards were mid-migration on recovery.
@@ -3024,6 +3354,15 @@ impl RunningCluster {
         }
     }
 
+    pub fn mark_inbound_complete_all(&self, shard: u16) {
+        let mgr = &mut self.migration.lock().unwrap();
+        mgr.mark_inbound_complete_all(shard);
+        self.inbound_atomic.load_from(mgr.inbound_bitmap());
+        if let Some(ref path) = self.inbound_state_path {
+            crate::cluster::migration::persist_inbound_state(path, mgr);
+        }
+    }
+
     pub fn mark_inbound_complete_from_source(&self, shard: u16, from_node: NodeId) {
         let mgr = &mut self.migration.lock().unwrap();
         mgr.mark_inbound_complete_from_source(shard, from_node);
@@ -3077,18 +3416,15 @@ impl RunningCluster {
     pub fn encode_partition_map(&self) -> Vec<u8> {
         let table = self.shard_table.read();
         let addrs = self.node_addrs.read().unwrap();
+        let active_members = self.active_topology_members.read().unwrap().clone();
 
         let mut buf = Vec::new();
-        // Version: use the maximum of the shard table's version and the
-        // committed topology term. The shard table version is set atomically
-        // with assignments; the committed term may advance before the event
-        // loop activates the shard table. Using max() ensures:
-        // - The version is never behind committed_term (needed for topology
-        //   catch-up: stale nodes compare this to decide if the peer is ahead)
-        // - The version is never behind table.version (needed for consistency)
-        let committed = self.topology_authority.committed_term();
-        let version = table.version.max(committed);
-        buf.extend_from_slice(&version.to_le_bytes());
+        // Partition maps must be a self-consistent snapshot: version,
+        // assignments, and committed_members must all describe the same
+        // activated topology. The authority may commit a newer term before
+        // the event loop installs its shard table, so do not advertise that
+        // newer term here.
+        buf.extend_from_slice(&table.version.to_le_bytes());
 
         // Node count + node info
         let nodes: Vec<_> = addrs.iter().collect();
@@ -3111,17 +3447,32 @@ impl RunningCluster {
             buf.extend_from_slice(&master.0.to_le_bytes());
         }
 
-        // Append committed topology members for catch-up. This is backward
-        // compatible: clients that don't understand the extra data just ignore
-        // it. The catch-up code uses these members to construct a synthetic
-        // commit with the correct digest (matching the original committed term).
-        let committed = self.topology_authority.committed_members();
-        buf.extend_from_slice(&(committed.len() as u32).to_le_bytes());
-        for m in &committed {
+        // Append the members that correspond to the activated shard table.
+        // Catch-up reconstructs a synthetic commit from this exact snapshot,
+        // so it must not observe a newer committed term than the assignments.
+        buf.extend_from_slice(&(active_members.len() as u32).to_le_bytes());
+        for m in &active_members {
             buf.extend_from_slice(&m.0.to_le_bytes());
         }
 
         buf
+    }
+
+    /// Encode the latest quorum-committed topology for catch-up.
+    pub fn encode_committed_topology(&self) -> Vec<u8> {
+        let term = self.topology_authority.committed_term();
+        let mut members = self.topology_authority.committed_members();
+        if term == 0 || members.is_empty() {
+            return Vec::new();
+        }
+        members.sort();
+        crate::cluster::topology::TopologyCommit {
+            term,
+            proposer: members[0],
+            members: members.clone(),
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(term, &members),
+        }
+        .serialize()
     }
 
     /// Number of alive nodes in the cluster.
@@ -3206,35 +3557,11 @@ impl RunningCluster {
             return;
         }
 
-        // Recompute shard table without this node
+        // Let the normal topology-activation path compute the shard plan and
+        // register migrations. Pre-mutating local state here can race the
+        // event loop and produce duplicate or stale migration bookkeeping.
         let mut members_for_new_table: Vec<NodeId> = other_members;
         members_for_new_table.sort();
-        let old_table = self.shard_table.read().clone();
-        let new_table = ShardTable::compute(&members_for_new_table, old_table.replication_factor());
-        let plan = ShardTable::migration_plan(&old_table, &new_table);
-
-        if plan.is_empty() {
-            // No migration needed — just swap.
-            *self.shard_table.write() = new_table;
-        } else {
-            // Two-phase handoff: old masters continue serving until
-            // migration completes per-shard.
-            let mut table = self.shard_table.write();
-            table.begin_handoff(&new_table);
-
-            let outbound: Vec<MigrationTask> = plan.iter()
-                .filter(|t| t.from_node == self.self_id)
-                .cloned()
-                .collect();
-            eprintln!(
-                "cluster: quiesce initiated — {} outbound migrations (two-phase handoff)",
-                outbound.len()
-            );
-            let all_shards: std::collections::HashSet<u16> = (0..4096).collect();
-            drop(table);
-            self.migration.lock().unwrap().start_outbound(&plan, self.self_id, &all_shards);
-            self.sync_migration_bitmaps();
-        }
 
         // Commit a topology change that removes this node from the cluster.
         // This ensures the surviving nodes know we're leaving WITHOUT relying
@@ -3253,6 +3580,7 @@ impl RunningCluster {
         };
         // Apply locally first.
         self.topology_authority.handle_commit(&commit);
+        self.signal_topology_committed(new_members.clone(), new_term);
         // Broadcast to all peers so they activate the new topology.
         let commit_payload = commit.serialize();
         for &addr in &peer_addrs {
@@ -3272,6 +3600,11 @@ impl RunningCluster {
     /// Number of shards pending inbound migration data.
     pub fn inbound_pending_count(&self) -> usize {
         self.migration.lock().unwrap().inbound_count()
+    }
+
+    /// Snapshot the pending inbound migration entries.
+    pub fn pending_inbound_entries(&self) -> Vec<(u16, NodeId)> {
+        self.migration.lock().unwrap().pending_inbound_entries()
     }
 
     /// Number of shards with write fences active.
@@ -3352,15 +3685,7 @@ impl RunningCluster {
     /// hot-path bitmaps consistent.
     pub fn sync_migration_bitmaps(&self) {
         let mgr = self.migration.lock().unwrap();
-        self.fenced_bitmap.load_from(mgr.fenced_bitmap());
-        self.inbound_atomic.load_from(mgr.inbound_bitmap());
-        // Rebuild migrating bitmap from active migrations.
-        self.migrating_bitmap.clear_all();
-        for p in mgr.active_migrations() {
-            if !p.is_complete() && p.state != crate::cluster::migration::MigrationState::Failed {
-                self.migrating_bitmap.set(p.shard);
-            }
-        }
+        sync_atomic_migration_bitmaps(&mgr, &self.fenced_bitmap, &self.migrating_bitmap, &self.inbound_atomic);
     }
 
     /// Signal that a topology term was committed (from dispatch or proposer).
@@ -3447,6 +3772,11 @@ pub(crate) fn new_test_running_cluster(
         self_id,
         Duration::from_secs(1),
     ));
+    let active_topology_members = Arc::new(RwLock::new(if committed_members.is_empty() {
+        vec![self_id]
+    } else {
+        committed_members.to_vec()
+    }));
     if !committed_members.is_empty() {
         let commit = crate::cluster::topology::TopologyCommit {
             term: table.version,
@@ -3479,6 +3809,7 @@ pub(crate) fn new_test_running_cluster(
         repl_ack_policy: None,
         repl_best_effort: false,
         topology_authority,
+        active_topology_members,
         inbound_state_path: None,
         outbound_state_path: None,
         fenced_bitmap,
@@ -3536,11 +3867,661 @@ mod tests {
     }
 
     #[test]
+    fn replica_holder_does_not_enter_handoff_when_old_master_is_still_serving() {
+        let outbound_source_shards = std::collections::HashSet::new();
+
+        assert!(
+            !should_begin_handoff_for_shard(
+                42,
+                NodeId(3),
+                NodeId(1),
+                true,
+                true,
+                &outbound_source_shards,
+            ),
+            "a replica holder with local data but no outbound migration task must not stay in Copying; \
+             only the serving source node should wait for commit"
+        );
+    }
+
+    #[test]
+    fn activate_topology_uses_committed_membership_for_old_master_liveness() {
+        let committed_members = vec![NodeId(1), NodeId(2)];
+        let live_addrs = std::collections::HashMap::from([
+            (NodeId(1), "127.0.0.1:11011".parse().unwrap()),
+            (NodeId(2), "127.0.0.1:11012".parse().unwrap()),
+            // Node 3 is still known to SWIM/address bookkeeping.
+            (NodeId(3), "127.0.0.1:11013".parse().unwrap()),
+        ]);
+
+        assert!(
+            old_master_available_for_handoff(NodeId(2), &committed_members, &live_addrs),
+            "a committed node with a known address should still count as an available old master"
+        );
+        assert!(
+            !old_master_available_for_handoff(NodeId(3), &committed_members, &live_addrs),
+            "nodes that are no longer in the committed topology must not keep replicas stuck in Copying"
+        );
+    }
+
+    #[test]
+    fn quiesce_signals_topology_activation_without_pre_mutating_local_state() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 7);
+        let live_nodes = [
+            (NodeId(1), "127.0.0.1:11001".parse().unwrap()),
+            (NodeId(2), "127.0.0.1:11002".parse().unwrap()),
+            (NodeId(3), "127.0.0.1:11003".parse().unwrap()),
+        ];
+        let mut cluster = new_test_running_cluster(
+            NodeId(1),
+            table.clone(),
+            &live_nodes,
+            &members,
+            &[],
+            &[],
+            &[],
+            members.len(),
+        );
+        let (topology_commit_tx, topology_commit_rx) = std::sync::mpsc::channel();
+        cluster.topology_commit_tx = topology_commit_tx;
+
+        cluster.quiesce();
+
+        let (new_members, new_term) = topology_commit_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("quiesce must signal the committed topology for event-loop activation");
+        assert_eq!(new_members, vec![NodeId(2), NodeId(3)]);
+        assert_eq!(new_term, table.version + 1);
+        assert_eq!(cluster.committed_topology_members(), vec![NodeId(2), NodeId(3)]);
+        assert_eq!(cluster.committed_topology_term(), table.version + 1);
+        assert_eq!(
+            cluster.shard_table.read().version,
+            table.version,
+            "quiesce should leave shard-table activation to the event loop"
+        );
+        assert_eq!(
+            cluster.shard_table.read().pending_handoff_count(),
+            0,
+            "quiesce should not begin handoff synchronously"
+        );
+        assert_eq!(
+            cluster.migration.lock().unwrap().active_count(),
+            0,
+            "quiesce should not pre-register outbound migrations outside activate_topology"
+        );
+        assert_eq!(cluster.inbound_pending_count(), 0);
+        assert_eq!(cluster.fenced_shard_count(), 0);
+    }
+
+    #[test]
+    fn empty_shard_completion_failure_rolls_back_master_handoff() {
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| old_table.target_assignment(s).master != new_table.target_assignment(s).master)
+            .expect("expected a shard whose master moves");
+        let old_master = old_table.target_assignment(shard).master;
+        let new_master = new_table.target_assignment(shard).master;
+        let task = MigrationTask {
+            shard,
+            from_node: old_master,
+            to_node: new_master,
+            is_master: true,
+        };
+
+        let mut handoff = old_table.clone();
+        handoff.begin_handoff_with(&new_table, |s| s == shard);
+        let shard_table = Arc::new(ShardTableLock::new(handoff));
+
+        let dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+        let index = crate::index::Index::new(128).unwrap();
+        let engine = Arc::new(crate::ops::engine::Engine::new(
+            dev,
+            index,
+            alloc,
+            crate::locks::StripedLocks::new(64),
+            crate::index::DahIndex::new(),
+            crate::index::UnminedIndex::new(),
+        ));
+
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration
+            .lock()
+            .unwrap()
+            .start_outbound(&[task.clone()], old_master, &std::collections::HashSet::new());
+
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        migrating_bm.set(shard);
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        run_migration_batch(
+            vec![task],
+            Some(target_addr),
+            &[],
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            new_table.version,
+            1,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            old_master,
+        );
+
+        let table = shard_table.read();
+        assert_eq!(
+            table.target_assignment(shard).master,
+            old_master,
+            "the source must not commit a master handoff when the completion signal cannot be delivered"
+        );
+    }
+
+    #[test]
+    fn empty_shard_completion_retries_until_target_is_ready() {
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| old_table.target_assignment(s).master != new_table.target_assignment(s).master)
+            .expect("expected a shard whose master moves");
+        let old_master = old_table.target_assignment(shard).master;
+        let new_master = new_table.target_assignment(shard).master;
+        let task = MigrationTask {
+            shard,
+            from_node: old_master,
+            to_node: new_master,
+            is_master: true,
+        };
+
+        let mut handoff = old_table.clone();
+        handoff.begin_handoff_with(&new_table, |s| s == shard);
+        assert_eq!(
+            handoff.shard_handoff_state(shard),
+            ShardHandoff::Copying,
+            "the shard must take the empty-shard handoff path"
+        );
+        let shard_table = Arc::new(ShardTableLock::new(handoff));
+
+        let dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+        let index = crate::index::Index::new(128).unwrap();
+        let engine = Arc::new(crate::ops::engine::Engine::new(
+            dev,
+            index,
+            alloc,
+            crate::locks::StripedLocks::new(64),
+            crate::index::DahIndex::new(),
+            crate::index::UnminedIndex::new(),
+        ));
+
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration
+            .lock()
+            .unwrap()
+            .start_outbound(&[task.clone()], old_master, &std::collections::HashSet::new());
+
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        migrating_bm.set(shard);
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let receiver = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            // Fresh Docker nodes can take a couple of seconds before they
+            // accept migration-complete handshakes during cluster bootstrap.
+            std::thread::sleep(Duration::from_millis(2500));
+            let listener = std::net::TcpListener::bind(target_addr).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).unwrap();
+            let payload_len = u32::from_le_bytes(header) as usize;
+            let mut rest = vec![0u8; payload_len];
+            stream.read_exact(&mut rest).unwrap();
+
+            let mut frame_bytes = header.to_vec();
+            frame_bytes.extend_from_slice(&rest);
+            let (request, _) = RequestFrame::decode(&frame_bytes).unwrap();
+            request_tx.send((request.op_code, request.request_id)).unwrap();
+
+            let response = ResponseFrame {
+                request_id: request.request_id,
+                status: STATUS_OK,
+                payload: Vec::new(),
+            };
+            stream.write_all(&response.encode()).unwrap();
+        });
+
+        run_migration_batch(
+            vec![task.clone()],
+            Some(target_addr),
+            &[],
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            new_table.version,
+            1,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            old_master,
+        );
+
+        let (op, _req_id) = request_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            op == OP_MIGRATION_COMPLETE || op == OP_MIGRATION_BATCH_COMPLETE,
+            "empty-shard migrations must retry the completion handshake until the target can acknowledge it (got op {op})"
+        );
+        receiver.join().unwrap();
+    }
+
+    #[test]
+    fn failed_data_migration_sends_abort_completion_handshake() {
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| old_table.target_assignment(s).master != new_table.target_assignment(s).master)
+            .expect("expected a shard whose master moves");
+        let old_master = old_table.target_assignment(shard).master;
+        let new_master = new_table.target_assignment(shard).master;
+        let task = MigrationTask {
+            shard,
+            from_node: old_master,
+            to_node: new_master,
+            is_master: true,
+        };
+
+        let mut handoff = old_table.clone();
+        handoff.begin_handoff_with(&new_table, |s| s == shard);
+        assert_eq!(
+            handoff.shard_handoff_state(shard),
+            ShardHandoff::Copying,
+            "the shard must take the data-migration path"
+        );
+        let shard_table = Arc::new(ShardTableLock::new(handoff));
+
+        let dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+        let index = crate::index::Index::new(128).unwrap();
+        let engine = Arc::new(crate::ops::engine::Engine::new(
+            dev,
+            index,
+            alloc,
+            crate::locks::StripedLocks::new(64),
+            crate::index::DahIndex::new(),
+            crate::index::UnminedIndex::new(),
+        ));
+
+        let tx_id = {
+            let mut nonce = 0u64;
+            loop {
+                let mut tx_id = [0u8; 32];
+                tx_id[..8].copy_from_slice(&nonce.to_le_bytes());
+                if ShardTable::shard_for_key(&TxKey { txid: tx_id }) == shard {
+                    break tx_id;
+                }
+                nonce += 1;
+            }
+        };
+        let key = TxKey { txid: tx_id };
+        let utxo_hashes = [[0x33u8; 32]];
+        engine.create(&crate::ops::create::CreateRequest {
+            tx_id,
+            tx_version: 1,
+            locktime: 0,
+            fee: 100,
+            size_in_bytes: 100,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: &utxo_hashes,
+            inputs: None,
+            outputs: None,
+            inpoints: None,
+            is_external: false,
+            created_at: 1710000000000,
+            block_height: 0,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+            parent_txids: &[],
+        }).unwrap();
+        assert_eq!(engine.shard_record_count(shard), 1);
+
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let populated: std::collections::HashSet<u16> = [shard].into_iter().collect();
+        migration
+            .lock()
+            .unwrap()
+            .start_outbound(&[task.clone()], old_master, &populated);
+
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        migrating_bm.set(shard);
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let receiver = std::thread::spawn(move || {
+            use std::io::{ErrorKind, Read, Write};
+
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut header = [0u8; 4];
+                        stream.read_exact(&mut header).unwrap();
+                        let payload_len = u32::from_le_bytes(header) as usize;
+                        let mut rest = vec![0u8; payload_len];
+                        stream.read_exact(&mut rest).unwrap();
+
+                        let mut frame_bytes = header.to_vec();
+                        frame_bytes.extend_from_slice(&rest);
+                        let (request, _) = RequestFrame::decode(&frame_bytes).unwrap();
+                        request_tx.send((request.op_code, request.request_id)).unwrap();
+
+                        if request.op_code == OP_MIGRATION_COMPLETE {
+                            let response = ResponseFrame {
+                                request_id: request.request_id,
+                                status: STATUS_OK,
+                                payload: Vec::new(),
+                            };
+                            stream.write_all(&response.encode()).unwrap();
+                            return;
+                        }
+                        // Drop the connection without replying so the source
+                        // treats the shard migration as failed after retries.
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            }
+        });
+
+        run_migration_batch(
+            vec![task.clone()],
+            Some(target_addr),
+            &[key],
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            new_table.version,
+            1,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            old_master,
+        );
+
+        let mut seen = Vec::new();
+        while let Ok(request) = request_rx.recv_timeout(Duration::from_millis(200)) {
+            seen.push(request);
+            if request.0 == OP_MIGRATION_COMPLETE {
+                break;
+            }
+        }
+        assert!(
+            seen.iter().any(|request| *request == (OP_MIGRATION_COMPLETE, shard as u64)),
+            "when a data migration gives up after partial streaming, the source must send a final completion/abort handshake to clear the target's provisional inbound state; saw {seen:?}"
+        );
+        receiver.join().unwrap();
+    }
+
+    #[test]
+    fn already_serving_completion_retries_until_target_is_ready() {
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| old_table.target_assignment(s).master != new_table.target_assignment(s).master)
+            .expect("expected a shard whose master moves");
+        let old_master = old_table.target_assignment(shard).master;
+        let new_master = new_table.target_assignment(shard).master;
+        let task = MigrationTask {
+            shard,
+            from_node: old_master,
+            to_node: new_master,
+            is_master: true,
+        };
+
+        let mut handoff = old_table.clone();
+        handoff.begin_handoff_with(&new_table, |_| false);
+        assert_eq!(
+            handoff.shard_handoff_state(shard),
+            ShardHandoff::ServingNew,
+            "the shard must use the completion-only fast path"
+        );
+        let shard_table = Arc::new(ShardTableLock::new(handoff));
+
+        let dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+        let index = crate::index::Index::new(128).unwrap();
+        let engine = Arc::new(crate::ops::engine::Engine::new(
+            dev,
+            index,
+            alloc,
+            crate::locks::StripedLocks::new(64),
+            crate::index::DahIndex::new(),
+            crate::index::UnminedIndex::new(),
+        ));
+
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration
+            .lock()
+            .unwrap()
+            .start_outbound(&[task.clone()], old_master, &std::collections::HashSet::new());
+
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        migrating_bm.set(shard);
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let receiver = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            std::thread::sleep(Duration::from_millis(300));
+            let listener = std::net::TcpListener::bind(target_addr).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).unwrap();
+            let payload_len = u32::from_le_bytes(header) as usize;
+            let mut rest = vec![0u8; payload_len];
+            stream.read_exact(&mut rest).unwrap();
+
+            let mut frame_bytes = header.to_vec();
+            frame_bytes.extend_from_slice(&rest);
+            let (request, _) = RequestFrame::decode(&frame_bytes).unwrap();
+            request_tx.send((request.op_code, request.request_id)).unwrap();
+
+            let response = ResponseFrame {
+                request_id: request.request_id,
+                status: STATUS_OK,
+                payload: Vec::new(),
+            };
+            stream.write_all(&response.encode()).unwrap();
+        });
+
+        run_migration_batch(
+            vec![task.clone()],
+            Some(target_addr),
+            &[],
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            new_table.version,
+            1,
+            100,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            old_master,
+        );
+
+        let (op, _req_id) = request_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            op == OP_MIGRATION_COMPLETE || op == OP_MIGRATION_BATCH_COMPLETE,
+            "the source must retry completion-only handshakes until the target can acknowledge them (got op {op})"
+        );
+        receiver.join().unwrap();
+    }
+
+    #[test]
     fn restored_outbound_state_forces_reactivation_even_without_assignment_mismatch() {
         assert!(should_trigger_topology_reactivation(true, false, 0, 0));
         assert!(should_trigger_topology_reactivation(false, true, 0, 1));
         assert!(should_trigger_topology_reactivation(false, true, 2, 0));
         assert!(!should_trigger_topology_reactivation(false, true, 0, 0));
+    }
+
+    #[test]
+    fn committed_reactivation_metrics_use_committed_term_assignments() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let rf = 2;
+        let committed_term = 4;
+        let table = ShardTable::compute_with_epoch(&members, rf, committed_term);
+
+        let (mismatched, pending_handoffs) =
+            committed_topology_reactivation_metrics(&table, &members, rf, committed_term);
+
+        assert_eq!(
+            mismatched, 0,
+            "a shard table that already matches the committed term must not trigger reactivation"
+        );
+        assert_eq!(pending_handoffs, 0);
+    }
+
+    #[test]
+    fn cleanup_completed_clears_atomic_fence_shadow() {
+        let task = MigrationTask {
+            shard: 42,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let populated: std::collections::HashSet<u16> = [42u16].into_iter().collect();
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced_bitmap = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bitmap = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let inbound_bitmap = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        {
+            let mgr = &mut migration.lock().unwrap();
+            mgr.start_outbound(std::slice::from_ref(&task), NodeId(1), &populated);
+            mgr.fence_shard(42);
+            fenced_bitmap.load_from(mgr.fenced_bitmap());
+            for progress in mgr.active_migrations() {
+                if !progress.is_complete()
+                    && progress.state != crate::cluster::migration::MigrationState::Failed
+                {
+                    migrating_bitmap.set(progress.shard);
+                }
+            }
+            mgr.mark_complete(&task);
+        }
+
+        {
+            let mut mgr = migration.lock().unwrap();
+            mgr.cleanup_completed();
+            sync_atomic_migration_bitmaps(&mgr, &fenced_bitmap, &migrating_bitmap, &inbound_bitmap);
+        }
+
+        assert!(!fenced_bitmap.test(42));
+        assert!(!migrating_bitmap.test(42));
+        assert!(!inbound_bitmap.test(42));
+    }
+
+    #[test]
+    fn preserved_reactivation_filters_tasks_by_full_identity() {
+        let master_task = MigrationTask {
+            shard: 42,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let replica_task = MigrationTask {
+            shard: 42,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        let populated: std::collections::HashSet<u16> = [42u16].into_iter().collect();
+
+        let mut mgr = MigrationManager::new();
+        mgr.start_outbound(&[master_task.clone(), replica_task.clone()], NodeId(1), &populated);
+
+        let new_task_set: std::collections::HashSet<(u16, NodeId, NodeId, bool)> =
+            [(42u16, NodeId(1), NodeId(2), true)].into_iter().collect();
+
+        let preserved_tasks: std::collections::HashSet<(u16, NodeId, NodeId, bool)> =
+            mgr.active_migrations()
+                .iter()
+                .filter(|p| {
+                    p.state != crate::cluster::migration::MigrationState::Complete
+                        && p.state != crate::cluster::migration::MigrationState::Failed
+                        && new_task_set.contains(&(p.shard, p.from_node, p.to_node, p.is_master))
+                })
+                .map(|p| (p.shard, p.from_node, p.to_node, p.is_master))
+                .collect();
+
+        let stale_tasks: Vec<MigrationTask> = mgr
+            .active_migrations()
+            .iter()
+            .filter(|p| {
+                p.state != crate::cluster::migration::MigrationState::Complete
+                    && p.state != crate::cluster::migration::MigrationState::Failed
+                    && !preserved_tasks.contains(&(p.shard, p.from_node, p.to_node, p.is_master))
+            })
+            .map(|p| MigrationTask {
+                shard: p.shard,
+                from_node: p.from_node,
+                to_node: p.to_node,
+                is_master: p.is_master,
+            })
+            .collect();
+
+        assert_eq!(preserved_tasks.len(), 1);
+        assert!(preserved_tasks.contains(&(42, NodeId(1), NodeId(2), true)));
+        assert_eq!(stale_tasks, vec![replica_task]);
     }
 
     #[test]
@@ -3776,6 +4757,81 @@ mod tests {
         let advertised = routing.shard_assignments[shard as usize].1;
 
         assert_eq!(advertised, new_master);
+    }
+
+    #[test]
+    fn partition_map_committed_members_match_active_table_version() {
+        let active_members = vec![NodeId(1), NodeId(3)];
+        let active_table = ShardTable::compute_with_epoch(&active_members, 2, 3);
+        let cluster = new_test_running_cluster(
+            NodeId(3),
+            active_table,
+            &[
+                (NodeId(1), "127.0.0.1:4601".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4602".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4603".parse().unwrap()),
+            ],
+            &active_members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+
+        let next_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let next_commit = crate::cluster::topology::TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: next_members.clone(),
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(4, &next_members),
+        };
+        assert_eq!(cluster.topology_authority().handle_commit(&next_commit), Some(4));
+
+        let routing = crate::cluster::routing::RoutingInfo::decode(&cluster.encode_partition_map())
+            .expect("partition map should decode");
+
+        assert_eq!(routing.shard_table_version, 3);
+        assert_eq!(routing.committed_members, active_members);
+    }
+
+    #[test]
+    fn committed_topology_encoding_tracks_latest_committed_term() {
+        let active_members = vec![NodeId(1), NodeId(3)];
+        let active_table = ShardTable::compute_with_epoch(&active_members, 2, 3);
+        let cluster = new_test_running_cluster(
+            NodeId(3),
+            active_table,
+            &[
+                (NodeId(1), "127.0.0.1:4701".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4702".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:4703".parse().unwrap()),
+            ],
+            &active_members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+
+        let committed_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let next_commit = crate::cluster::topology::TopologyCommit {
+            term: 4,
+            proposer: NodeId(1),
+            members: committed_members.clone(),
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(4, &committed_members),
+        };
+        assert_eq!(cluster.topology_authority().handle_commit(&next_commit), Some(4));
+
+        let encoded = cluster.encode_committed_topology();
+        let decoded = crate::cluster::topology::TopologyCommit::deserialize(&encoded)
+            .expect("committed topology should decode");
+
+        assert_eq!(decoded.term, 4);
+        assert_eq!(decoded.members, committed_members);
+        assert_eq!(
+            decoded.digest,
+            crate::cluster::topology::TopologyTerm::compute_digest(4, &committed_members),
+        );
     }
 
     #[test]

@@ -379,68 +379,40 @@ block_height_retention = 288
 
     // ── Network manipulation ────────────────────────────────────────
 
-    /// Creates a network partition between a node and one or more target nodes.
+    /// Creates a network partition by pausing the source container.
     ///
-    /// Uses iptables to DROP packets in both directions on both the source
-    /// and each target node, creating a symmetric partition.
+    /// Uses `docker pause` which reliably freezes the container on all
+    /// platforms including Docker Desktop for macOS (where iptables rules
+    /// inside the LinuxKit VM don't actually isolate bridge networks).
+    ///
+    /// Limitation: pauses the entire container, so partial partitions
+    /// (node can talk to A but not B) aren't supported. For most test
+    /// scenarios this is acceptable — a partitioned node is effectively
+    /// unreachable from all peers.
     ///
     /// # Parameters
-    /// - `name`: The node to partition (e.g. "node1").
-    /// - `targets`: Slice of target node names to partition from.
-    ///
-    /// # Errors
-    /// Returns `ClientError::Connection` if any docker exec command fails
-    /// or if a node name is not in the IP mapping.
-    pub async fn partition_node(&self, name: &str, targets: &[&str]) -> Result<(), ClientError> {
-        let source_ip = self.node_ip(name)?.to_string();
-        let source_container = self.container_name(name);
-
-        for &target in targets {
-            let target_ip = self.node_ip(target)?.to_string();
-            let target_container = self.container_name(target);
-
-            // Block traffic from target on source node
-            run_docker_cmd(&[
-                "exec", &source_container,
-                "iptables", "-A", "INPUT", "-s", &target_ip, "-j", "DROP",
-            ]).await?;
-            run_docker_cmd(&[
-                "exec", &source_container,
-                "iptables", "-A", "OUTPUT", "-d", &target_ip, "-j", "DROP",
-            ]).await?;
-
-            // Block traffic from source on target node
-            run_docker_cmd(&[
-                "exec", &target_container,
-                "iptables", "-A", "INPUT", "-s", &source_ip, "-j", "DROP",
-            ]).await?;
-            run_docker_cmd(&[
-                "exec", &target_container,
-                "iptables", "-A", "OUTPUT", "-d", &source_ip, "-j", "DROP",
-            ]).await?;
-        }
-
+    /// - `name`: The node to partition (e.g. "node3").
+    /// - `_targets`: Ignored; the pause affects all connectivity.
+    pub async fn partition_node(&self, name: &str, _targets: &[&str]) -> Result<(), ClientError> {
+        let container = self.container_name(name);
+        run_docker_cmd(&["pause", &container]).await?;
         Ok(())
     }
 
-    /// Heals all network partitions on a single node by flushing its iptables rules.
+    /// Heals a network partition by unpausing the container.
     ///
-    /// # Parameters
-    /// - `name`: Node name (e.g. "node1").
-    ///
-    /// # Errors
-    /// Returns `ClientError::Connection` if the docker exec command fails.
+    /// Errors are silently ignored because the node may already be
+    /// unpaused or may have been killed.
     pub async fn heal_partition(&self, name: &str) -> Result<(), ClientError> {
         let container = self.container_name(name);
-        run_docker_cmd(&["exec", &container, "iptables", "-F"]).await?;
+        let _ = run_docker_cmd(&["unpause", &container]).await;
         Ok(())
     }
 
-    /// Heals all network partitions on all 5 nodes by flushing iptables on each.
+    /// Heals all network partitions on all 5 nodes.
     ///
     /// Errors from individual nodes are silently ignored because some nodes
-    /// may not exist (e.g. a 3-node cluster only has nodes 1-3) or may be
-    /// stopped/killed. This is intentional -- the goal is best-effort cleanup.
+    /// may not exist or may be stopped/killed.
     pub async fn heal_all_partitions(&self) -> Result<(), ClientError> {
         for i in 1..=5 {
             let name = format!("node{i}");

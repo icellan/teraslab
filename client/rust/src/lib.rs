@@ -790,31 +790,99 @@ impl Client {
         }
 
         let encode_sub_arc = Arc::new(encode_sub);
+        let transient_retry_delays_ms = [10u64, 25, 50, 100, 200, 400, 800, 1600, 3200];
 
         // Retry once on transient errors (dead node / replication failure)
         // after routing refresh.
-        for attempt in 0..2u32 {
+        for attempt in 0..=(transient_retry_delays_ms.len() as u32) {
             let result = self.send_item_batch_cluster_inner(
                 op_code, items, &get_txid, &encode_sub_arc,
             ).await;
-            match &result {
+            match result {
                 Err(ClientError::Connection(msg)) if attempt == 0 => {
                     eprintln!("client: retry after connection error: {msg}");
+                    let _ = self.refresh_routing().await;
+                    continue;
+                }
+                Err(ClientError::Partial(pe))
+                    if pe.errors.len() == items.len()
+                        && all_errors_have_code(&pe.errors, ERR_MIGRATION_IN_PROGRESS)
+                        && (attempt as usize) < transient_retry_delays_ms.len() =>
+                {
+                    tokio::time::sleep(Duration::from_millis(
+                        transient_retry_delays_ms[attempt as usize],
+                    ))
+                    .await;
+                    let _ = self.refresh_routing().await;
+                    continue;
+                }
+                Err(ClientError::Partial(pe))
+                    if pe.errors.len() == items.len()
+                        && all_errors_have_code(&pe.errors, ERR_REDIRECT)
+                        && (attempt as usize) < transient_retry_delays_ms.len() =>
+                {
+                    if let Some(redirect_groups) =
+                        collect_redirect_groups(&pe.errors, &(0..items.len()).collect::<Vec<_>>())
+                    {
+                        match self
+                            .retry_redirected_mutation_items(
+                                op_code,
+                                items,
+                                redirect_groups,
+                                &encode_sub_arc,
+                            )
+                            .await
+                        {
+                            Ok(result) => return Ok(result),
+                            Err(ClientError::Partial(retry_pe))
+                                if retry_pe.errors.len() < items.len() =>
+                            {
+                                return Err(ClientError::Partial(retry_pe));
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(
+                        transient_retry_delays_ms[attempt as usize],
+                    ))
+                    .await;
                     let _ = self.refresh_routing().await;
                     continue;
                 }
                 Err(ClientError::Partial(pe)) if attempt == 0
                     && pe.errors.len() == items.len() =>
                 {
-                    eprintln!("client: retry after all-items-failed partial error");
+                    let code_summary = summarize_error_codes(&pe.errors);
+                    if let Some(redirect_groups) =
+                        collect_redirect_groups(&pe.errors, &(0..items.len()).collect::<Vec<_>>())
+                    {
+                        match self
+                            .retry_redirected_mutation_items(
+                                op_code,
+                                items,
+                                redirect_groups,
+                                &encode_sub_arc,
+                            )
+                            .await
+                        {
+                            Ok(result) => return Ok(result),
+                            Err(ClientError::Partial(retry_pe))
+                                if retry_pe.errors.len() < items.len() =>
+                            {
+                                return Err(ClientError::Partial(retry_pe));
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    eprintln!("client: retry after all-items-failed partial error [{code_summary}]");
                     let _ = self.refresh_routing().await;
                     continue;
                 }
-                Err(ClientError::Server { code, .. }) if attempt == 0 && *code == 15 => {
+                Err(ClientError::Server { code, .. }) if attempt == 0 && code == 15 => {
                     let _ = self.refresh_routing().await;
                     continue;
                 }
-                _ => return result,
+                other => return other,
             }
         }
         unreachable!()
@@ -854,6 +922,16 @@ impl Client {
             return match Self::handle_mutation_response(&resp) {
                 Ok(r) => Ok(r),
                 Err(ClientError::Partial(mut pe)) => {
+                    if let Some(redirect_groups) = collect_redirect_groups(&pe.errors, &idx_map) {
+                        return self
+                            .retry_redirected_mutation_items(
+                                op_code,
+                                items,
+                                redirect_groups,
+                                encode_sub,
+                            )
+                            .await;
+                    }
                     remap_partial_items(&mut pe, &idx_map);
                     Err(ClientError::Partial(pe))
                 }
@@ -928,6 +1006,89 @@ impl Client {
                 errors: all_errors,
             }));
         }
+        Ok(BatchResult { errors: Vec::new() })
+    }
+
+    async fn retry_redirected_mutation_items<T>(
+        &self,
+        op_code: u16,
+        items: &[T],
+        redirect_groups: HashMap<String, Vec<usize>>,
+        encode_sub: &Arc<impl Fn(&[T], &[usize]) -> Vec<u8> + Send + Sync + 'static>,
+    ) -> Result<BatchResult, ClientError>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        let cluster = self.cluster.as_ref().ok_or(ClientError::NoPartitionMap)?;
+        let items_arc = Arc::new(items.to_vec());
+        let mut handles = Vec::with_capacity(redirect_groups.len());
+
+        for (addr, idx_map) in redirect_groups {
+            let pool = cluster.pool_for_redirect_addr(&addr)?;
+            let items_ref = Arc::clone(&items_arc);
+            let encoder = Arc::clone(encode_sub);
+            handles.push(tokio::spawn(async move {
+                let payload = encoder(&items_ref, &idx_map);
+                let conn = pool.get().await?;
+                let resp = conn.round_trip(op_code, 0, payload).await?;
+                let result = Self::handle_mutation_response(&resp);
+                Ok::<(Result<BatchResult, ClientError>, Vec<usize>), ClientError>((
+                    result, idx_map,
+                ))
+            }));
+        }
+
+        let mut all_errors: Vec<BatchItemError> = Vec::new();
+        let mut got_no_quorum = false;
+        let mut had_connection_error = false;
+
+        for handle in handles {
+            let join_result = handle
+                .await
+                .map_err(|e| ClientError::Connection(format!("join: {e}")))?;
+            match join_result {
+                Ok((result, idx_map)) => match result {
+                    Ok(_) => {}
+                    Err(ClientError::Partial(pe)) => {
+                        all_errors.extend(remap_batch_errors(pe.errors, &idx_map));
+                    }
+                    Err(ClientError::Server { code, ref message })
+                        if code == 15 || message.contains("no quorum") =>
+                    {
+                        got_no_quorum = true;
+                    }
+                    Err(ClientError::Connection(_)) => {
+                        had_connection_error = true;
+                    }
+                    Err(e) => return Err(e),
+                },
+                Err(ClientError::Connection(_)) => {
+                    had_connection_error = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if had_connection_error {
+            return Err(ClientError::Connection(
+                "redirect retry connection error".to_string(),
+            ));
+        }
+
+        if got_no_quorum {
+            return Err(ClientError::Server {
+                code: 15,
+                message: "no quorum during redirect retry".to_string(),
+            });
+        }
+
+        if !all_errors.is_empty() {
+            return Err(ClientError::Partial(PartialError {
+                successes: Vec::new(),
+                errors: all_errors,
+            }));
+        }
+
         Ok(BatchResult { errors: Vec::new() })
     }
 
@@ -1925,5 +2086,344 @@ fn remap_partial_items(pe: &mut PartialError, idx_map: &[usize]) {
         if (e.item_index as usize) < idx_map.len() {
             e.item_index = idx_map[e.item_index as usize] as u32;
         }
+    }
+}
+
+fn collect_redirect_groups(
+    errors: &[BatchItemError],
+    idx_map: &[usize],
+) -> Option<HashMap<String, Vec<usize>>> {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for err in errors {
+        if err.code != ERR_REDIRECT || err.data.is_empty() {
+            return None;
+        }
+        let addr = std::str::from_utf8(&err.data).ok()?.trim();
+        if addr.is_empty() || (err.item_index as usize) >= idx_map.len() {
+            return None;
+        }
+        groups
+            .entry(addr.to_string())
+            .or_default()
+            .push(idx_map[err.item_index as usize]);
+    }
+    Some(groups)
+}
+
+fn summarize_error_codes(errors: &[BatchItemError]) -> String {
+    let mut code_counts = std::collections::BTreeMap::new();
+    for err in errors {
+        *code_counts.entry(err.code).or_insert(0usize) += 1;
+    }
+    code_counts
+        .iter()
+        .map(|(code, count)| format!("{}={count}", crate::errors::error_code_string(*code)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn all_errors_have_code(errors: &[BatchItemError], code: u16) -> bool {
+    !errors.is_empty() && errors.iter().all(|err| err.code == code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use teraslab::allocator::SlotAllocator;
+    use teraslab::cluster::coordinator::{
+        ClusterConfig as ServerClusterConfig, ClusterCoordinator, RunningCluster,
+    };
+    use teraslab::cluster::shards::{NodeId, ShardTable};
+    use teraslab::config::ServerConfig;
+    use teraslab::device::{BlockDevice, MemoryDevice};
+    use teraslab::index::{DahIndex, Index, UnminedIndex};
+    use teraslab::locks::StripedLocks;
+    use teraslab::ops::engine::Engine;
+    use teraslab::server::Server;
+
+    struct TestNode {
+        server: Arc<Server>,
+        cluster: Arc<RunningCluster>,
+    }
+
+    fn reserve_tcp_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    fn reserve_udp_port() -> u16 {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        drop(socket);
+        port
+    }
+
+    fn create_node(node_id: u64, tcp_port: u16, swim_port: u16, seed_swim_ports: &[u16]) -> TestNode {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(32 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(1000).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(256),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        let seeds: Vec<std::net::SocketAddr> = seed_swim_ports
+            .iter()
+            .map(|port| format!("127.0.0.1:{port}").parse().unwrap())
+            .collect();
+
+        let cluster_config = ServerClusterConfig {
+            self_id: NodeId(node_id),
+            self_addr: format!("127.0.0.1:{tcp_port}").parse().unwrap(),
+            swim_bind: format!("127.0.0.1:{swim_port}").parse().unwrap(),
+            seed_nodes: seeds,
+            replication_factor: 2,
+            probe_interval: Duration::from_millis(100),
+            suspicion_timeout: Duration::from_secs(2),
+            cluster_secret: None,
+            max_migration_threads: 16,
+            topology_propose_timeout: Duration::from_millis(300),
+            migration_pool_size: 4,
+            migration_batch_size: 100,
+            persisted_incarnation: 0,
+        };
+
+        let coordinator = ClusterCoordinator::new(cluster_config, 1);
+        let running = Arc::new(coordinator.start(engine.clone(), None, None, None, true));
+
+        let config = ServerConfig {
+            listen_addr: format!("127.0.0.1:{tcp_port}"),
+            max_connections: 64,
+            max_batch_size: 4096,
+            node_id,
+            ..Default::default()
+        };
+
+        let server = Arc::new(Server::new(engine, config).with_cluster(running.clone()));
+        let server_clone = server.clone();
+        std::thread::spawn(move || {
+            let _ = server_clone.run();
+        });
+        std::thread::sleep(Duration::from_millis(100));
+
+        TestNode {
+            server,
+            cluster: running,
+        }
+    }
+
+    fn shutdown_node(node: &TestNode) {
+        node.cluster.shutdown();
+        node.server.shutdown();
+    }
+
+    fn txid_for_shard(shard: u16) -> TxID {
+        let mut txid = [0u8; 32];
+        txid[..2].copy_from_slice(&shard.to_le_bytes());
+        txid
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn create_inner_follows_redirect_target_without_partition_map_refresh() {
+        let tcp1 = reserve_tcp_port();
+        let tcp2 = reserve_tcp_port();
+        let tcp3 = reserve_tcp_port();
+        let swim1 = reserve_udp_port();
+        let swim2 = reserve_udp_port();
+        let swim3 = reserve_udp_port();
+
+        let node1 = create_node(1, tcp1, swim1, &[]);
+        let node2 = create_node(2, tcp2, swim2, &[swim1]);
+        let node3 = create_node(3, tcp3, swim3, &[swim1]);
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let current_table = node2.cluster.shard_table().read().clone();
+        let stale_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3), NodeId(2)], 2, 999);
+        let (shard, actual_master, stale_master) = (0..teraslab::cluster::shards::NUM_SHARDS as u16)
+            .find_map(|shard| {
+                let actual = current_table.target_assignment(shard).master;
+                let stale = stale_table.target_assignment(shard).master;
+                (actual != stale && actual != NodeId(1) && stale != NodeId(1))
+                    .then_some((shard, actual, stale))
+            })
+            .expect("should find a shard whose stale route points at the wrong remote node");
+
+        {
+            let shard_table = node1.cluster.shard_table();
+            let mut guard = shard_table.write();
+            guard.begin_handoff(&stale_table);
+            guard.commit_shard(shard);
+        }
+
+        let client = Client::new(ClientConfig {
+            seeds: vec![format!("127.0.0.1:{tcp1}")],
+            cluster_refresh_interval: Duration::from_secs(3600),
+            ..Default::default()
+        })
+        .await
+        .expect("client should bootstrap from node1");
+
+        let item = CreateItem {
+            txid: txid_for_shard(shard),
+            utxo_hashes: vec![[0x42; 32]],
+            tx_version: 1,
+            locktime: 0,
+            fee: 100,
+            size_in_bytes: 100,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1710000000000,
+            flags: 0,
+            cold_data: vec![],
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+
+        let result = client
+            .send_item_batch_cluster_inner(
+                OP_CREATE_BATCH,
+                std::slice::from_ref(&item),
+                &|item| &item.txid,
+                &Arc::new(|items: &[CreateItem], indices: &[usize]| {
+                    let sub: Vec<CreateItem> = indices.iter().map(|&i| items[i].clone()).collect();
+                    encode_create_batch_payload(&sub)
+                }),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "stale node1 map routed shard {shard} to {stale_master:?}, but node {actual_master:?} should still be reachable via direct redirect follow: {result:?}"
+        );
+
+        client.close().await;
+        shutdown_node(&node1);
+        shutdown_node(&node2);
+        shutdown_node(&node3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn create_batch_retries_migration_in_progress_until_fence_clears() {
+        let tcp1 = reserve_tcp_port();
+        let swim1 = reserve_udp_port();
+        let node1 = create_node(1, tcp1, swim1, &[]);
+
+        let client = Client::new(ClientConfig {
+            seeds: vec![format!("127.0.0.1:{tcp1}")],
+            cluster_refresh_interval: Duration::from_secs(3600),
+            ..Default::default()
+        })
+        .await
+        .expect("client should bootstrap from node1");
+
+        let txid = txid_for_shard(123);
+        let shard = crate::cluster::shard_for_txid(&txid);
+        node1.cluster.fenced_bitmap().set(shard);
+
+        let cluster = Arc::clone(&node1.cluster);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            cluster.fenced_bitmap().clear(shard);
+        });
+
+        let item = CreateItem {
+            txid,
+            utxo_hashes: vec![[0x24; 32]],
+            tx_version: 1,
+            locktime: 0,
+            fee: 100,
+            size_in_bytes: 100,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1710000000000,
+            flags: 0,
+            cold_data: vec![],
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(2), client.create_batch(&[item]))
+            .await
+            .expect("create_batch should not hang");
+
+        assert!(
+            result.is_ok(),
+            "client should retry transient MIGRATION_IN_PROGRESS until the fence clears: {result:?}"
+        );
+
+        client.close().await;
+        shutdown_node(&node1);
+    }
+
+    #[tokio::test]
+    async fn create_batch_retries_migration_in_progress_for_long_rebalance_window() {
+        let tcp1 = reserve_tcp_port();
+        let swim1 = reserve_udp_port();
+        let node1 = create_node(1, tcp1, swim1, &[]);
+
+        let client = Client::new(ClientConfig {
+            seeds: vec![format!("127.0.0.1:{tcp1}")],
+            cluster_refresh_interval: Duration::from_secs(3600),
+            ..Default::default()
+        })
+        .await
+        .expect("client should bootstrap from node1");
+
+        let txid = txid_for_shard(321);
+        let shard = crate::cluster::shard_for_txid(&txid);
+        node1.cluster.fenced_bitmap().set(shard);
+
+        let cluster = Arc::clone(&node1.cluster);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(4500)).await;
+            cluster.fenced_bitmap().clear(shard);
+        });
+
+        let item = CreateItem {
+            txid,
+            utxo_hashes: vec![[0x42; 32]],
+            tx_version: 1,
+            locktime: 0,
+            fee: 100,
+            size_in_bytes: 100,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1710000000000,
+            flags: 0,
+            cold_data: vec![],
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(8), client.create_batch(&[item]))
+            .await
+            .expect("create_batch should not hang");
+
+        assert!(
+            result.is_ok(),
+            "client should keep retrying MIGRATION_IN_PROGRESS long enough for scale-up windows: {result:?}"
+        );
+
+        client.close().await;
+        shutdown_node(&node1);
     }
 }

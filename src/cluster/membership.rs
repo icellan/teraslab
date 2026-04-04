@@ -107,9 +107,14 @@ impl Membership {
             Some(info) => {
                 let dominated = incarnation > info.incarnation;
                 let same_inc_dead = incarnation == info.incarnation && info.state == NodeState::Dead;
-                let same_inc_suspect = incarnation == info.incarnation && info.state == NodeState::Suspect;
+                // Per the SWIM protocol, same-incarnation alive gossip from
+                // OTHER nodes must NOT override Suspect state. Only a higher
+                // incarnation (proving the suspect itself is alive and
+                // incremented its counter) can clear suspicion. Without this,
+                // uninformed peers keep resurrecting suspects via stale gossip,
+                // delaying failure detection by 10-20× the suspicion timeout.
 
-                if dominated || same_inc_dead || same_inc_suspect {
+                if dominated || same_inc_dead {
                     let was_dead = info.state == NodeState::Dead;
                     let was_suspect = info.state == NodeState::Suspect;
                     info.state = NodeState::Alive;
@@ -430,16 +435,20 @@ mod tests {
     }
 
     #[test]
-    fn alive_refutes_suspicion_same_incarnation() {
+    fn same_incarnation_alive_does_not_clear_suspicion() {
         let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
         m.mark_alive(NodeId(2), addr(3001), 5);
         m.mark_suspect(NodeId(2), 5);
         assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Suspect);
 
-        // Same incarnation alive refutes the suspicion
+        // Same incarnation alive gossip from a peer must NOT override
+        // suspicion — only a higher incarnation (from the suspect itself)
+        // can clear it. This prevents stale gossip from uninformed peers
+        // from delaying failure detection.
         let events = m.mark_alive(NodeId(2), addr(3001), 5);
-        assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive);
-        assert!(events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))));
+        assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Suspect,
+            "same-incarnation alive must not clear suspicion");
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -537,19 +546,24 @@ mod tests {
     }
 
     #[test]
-    fn suspect_rejoin_emits_membership_changed_but_not_joined() {
+    fn suspect_rejoin_requires_higher_incarnation() {
         let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
         m.mark_alive(NodeId(2), addr(3001), 1);
         m.mark_suspect(NodeId(2), 1);
 
-        // Revive with same incarnation (Suspect→Alive same-inc is allowed)
+        // Same incarnation does NOT clear suspicion.
         let events = m.mark_alive(NodeId(2), addr(3001), 1);
-        // Suspect→Alive should NOT emit NodeJoined (node never fully left)
+        assert!(events.is_empty(),
+            "same-inc alive must not revive suspect");
+        assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Suspect);
+
+        // Higher incarnation DOES clear suspicion (the suspect proved it's alive).
+        let events = m.mark_alive(NodeId(2), addr(3001), 2);
         assert!(!events.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
             "Suspect→Alive should not emit NodeJoined");
-        // But it should emit MembershipChanged (alive list changed)
         assert!(events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
             "Suspect→Alive should emit MembershipChanged");
+        assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive);
     }
 
     // -----------------------------------------------------------------------
@@ -709,19 +723,26 @@ mod tests {
         assert!(ev3.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))));
     }
 
-    /// Suspect → Alive with same incarnation: should emit MembershipChanged
-    /// (node returns to alive list) but NOT NodeJoined (never fully left).
+    /// Suspect → Alive requires higher incarnation. Same incarnation is
+    /// ignored per the SWIM protocol.
     #[test]
-    fn suspect_recovery_no_join_event() {
+    fn suspect_recovery_requires_higher_incarnation() {
         let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
         m.mark_alive(NodeId(2), addr(3001), 1);
         m.mark_suspect(NodeId(2), 1);
 
+        // Same incarnation: no effect
         let events = m.mark_alive(NodeId(2), addr(3001), 1);
-        let has_joined = events.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(_, _)));
-        let has_changed = events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_)));
-        assert!(!has_joined, "Suspect→Alive must NOT emit NodeJoined");
-        assert!(has_changed, "Suspect→Alive must emit MembershipChanged");
+        assert!(events.is_empty());
+        assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Suspect);
+
+        // Higher incarnation: clears suspicion
+        let events = m.mark_alive(NodeId(2), addr(3001), 2);
+        assert!(!events.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
+            "Suspect→Alive must NOT emit NodeJoined");
+        assert!(events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
+            "Suspect→Alive must emit MembershipChanged");
+        assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive);
     }
 
     /// expire_suspects with multiple suspects: all should expire, generating
