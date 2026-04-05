@@ -661,7 +661,7 @@ pub async fn seed_records(
         //
         // On partial success, only retry the failed items (not items that
         // already succeeded — re-sending those would cause ERR_ALREADY_EXISTS).
-        const MAX_SEED_RETRIES: u32 = 8;
+        const MAX_SEED_RETRIES: u32 = 16;
         let mut remaining_items = items;
         let mut remaining_meta = batch_meta;
         let mut succeeded_meta: Vec<([u8; 32], Vec<[u8; 32]>)> = Vec::new();
