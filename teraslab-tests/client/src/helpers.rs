@@ -381,13 +381,10 @@ block_height_retention = 288
 
     /// Creates a network partition between a node and one or more target nodes.
     ///
-    /// Uses `tc` (traffic control) with 100% packet loss filters targeted at
-    /// specific IPs. This works on Docker Desktop for macOS (where iptables
-    /// rules don't work) and supports partial partitions (node A can still
-    /// reach node B but not node C).
-    ///
-    /// The partition is symmetric: both source and each target get filters
-    /// blocking each other's IP.
+    /// Uses `iptables` to DROP packets in both directions between source and
+    /// each target. This works inside Docker Desktop containers (the rules
+    /// apply in the container's network namespace) and doesn't conflict with
+    /// `tc netem` (used by `slow_network` for latency/loss injection).
     ///
     /// # Parameters
     /// - `name`: The node to partition (e.g. "node3").
@@ -396,53 +393,40 @@ block_height_retention = 288
         let source_ip = self.node_ip(name)?.to_string();
         let source_container = self.container_name(name);
 
-        // Ensure the source has a netem qdisc on eth0 (idempotent).
-        let _ = run_docker_cmd(&[
-            "exec", &source_container,
-            "tc", "qdisc", "add", "dev", "eth0", "root", "handle", "1:", "prio",
-        ]).await;
-
         for &target in targets {
             let target_ip = self.node_ip(target)?.to_string();
             let target_container = self.container_name(target);
 
-            // Block source → target: add 100% loss filter for target IP
+            // Block traffic from target on source node
             let _ = run_docker_cmd(&[
                 "exec", &source_container,
-                "tc", "qdisc", "add", "dev", "eth0", "parent", "1:3", "handle", "30:", "netem", "loss", "100%",
+                "iptables", "-A", "INPUT", "-s", &target_ip, "-j", "DROP",
             ]).await;
             let _ = run_docker_cmd(&[
                 "exec", &source_container,
-                "tc", "filter", "add", "dev", "eth0", "parent", "1:0", "protocol", "ip",
-                "u32", "match", "ip", "dst", &format!("{target_ip}/32"), "flowid", "1:3",
+                "iptables", "-A", "OUTPUT", "-d", &target_ip, "-j", "DROP",
             ]).await;
 
-            // Block target → source: ensure target has qdisc, add filter
+            // Block traffic from source on target node
             let _ = run_docker_cmd(&[
                 "exec", &target_container,
-                "tc", "qdisc", "add", "dev", "eth0", "root", "handle", "1:", "prio",
+                "iptables", "-A", "INPUT", "-s", &source_ip, "-j", "DROP",
             ]).await;
             let _ = run_docker_cmd(&[
                 "exec", &target_container,
-                "tc", "qdisc", "add", "dev", "eth0", "parent", "1:3", "handle", "30:", "netem", "loss", "100%",
-            ]).await;
-            let _ = run_docker_cmd(&[
-                "exec", &target_container,
-                "tc", "filter", "add", "dev", "eth0", "parent", "1:0", "protocol", "ip",
-                "u32", "match", "ip", "dst", &format!("{source_ip}/32"), "flowid", "1:3",
+                "iptables", "-A", "OUTPUT", "-d", &source_ip, "-j", "DROP",
             ]).await;
         }
 
         Ok(())
     }
 
-    /// Heals all network partitions on a single node by removing tc qdiscs.
+    /// Heals all network partitions on a single node by flushing iptables.
     ///
-    /// Errors are silently ignored because the node may not have any
-    /// tc rules, may be stopped, or may not exist.
+    /// Errors are silently ignored because the node may be stopped or killed.
     pub async fn heal_partition(&self, name: &str) -> Result<(), ClientError> {
         let container = self.container_name(name);
-        let _ = run_docker_cmd(&["exec", &container, "tc", "qdisc", "del", "dev", "eth0", "root"]).await;
+        let _ = run_docker_cmd(&["exec", &container, "iptables", "-F"]).await;
         Ok(())
     }
 
