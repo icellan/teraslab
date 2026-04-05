@@ -342,7 +342,7 @@ impl SwimRunner {
             .membership
             .lock()
             .unwrap()
-            .mark_alive(sender_id, sender_tcp_addr, sender_incarnation);
+            .mark_alive(sender_id, sender_tcp_addr, sender_incarnation, true);
 
         // Process piggybacked membership updates
         // Wire format per entry:
@@ -395,7 +395,7 @@ impl SwimRunner {
                     }
                     let mut mem = self.membership.lock().unwrap();
                     let evts = match state {
-                        0 => mem.mark_alive(nid, tcp_addr, inc),
+                        0 => mem.mark_alive(nid, tcp_addr, inc, false),
                         1 => mem.mark_suspect(nid, inc),
                         2 => mem.mark_dead(nid, inc),
                         _ => vec![],
