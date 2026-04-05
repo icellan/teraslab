@@ -2317,7 +2317,15 @@ fn migrate_single_shard(
             .copied()
             .copied()
             .collect();
-        let mut fenced_keys = engine.keys_for_shard(task.shard);
+        // Fast check: if the shard record count matches the snapshot,
+        // no new keys appeared during the baseline and we can skip
+        // the expensive full index scan for late keys.
+        let fenced_count = engine.shard_record_count(task.shard);
+        let mut fenced_keys = if fenced_count as usize == snapshot_keys.len() {
+            shard_keys.iter().map(|k| **k).collect::<Vec<TxKey>>()
+        } else {
+            engine.keys_for_shard(task.shard)
+        };
         let late_keys: Vec<TxKey> = fenced_keys.iter()
             .copied()
             .filter(|k| !snapshot_keys.contains(k))
@@ -2400,6 +2408,12 @@ fn migrate_single_shard(
             .copied()
             .collect();
         for pass in 0..3 {
+            // Fast check: if the shard count hasn't changed since the
+            // fence, no new keys appeared and we can skip the full scan.
+            let current_count = engine.shard_record_count(task.shard) as usize;
+            if current_count == known_fenced_keys.len() {
+                break;
+            }
             let post_delta_keys = engine.keys_for_shard(task.shard);
             let post_delta_late_keys: Vec<TxKey> = post_delta_keys.iter()
                 .copied()

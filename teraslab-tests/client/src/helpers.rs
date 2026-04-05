@@ -379,33 +379,70 @@ block_height_retention = 288
 
     // ── Network manipulation ────────────────────────────────────────
 
-    /// Creates a network partition by pausing the source container.
+    /// Creates a network partition between a node and one or more target nodes.
     ///
-    /// Uses `docker pause` which reliably freezes the container on all
-    /// platforms including Docker Desktop for macOS (where iptables rules
-    /// inside the LinuxKit VM don't actually isolate bridge networks).
+    /// Uses `tc` (traffic control) with 100% packet loss filters targeted at
+    /// specific IPs. This works on Docker Desktop for macOS (where iptables
+    /// rules don't work) and supports partial partitions (node A can still
+    /// reach node B but not node C).
     ///
-    /// Limitation: pauses the entire container, so partial partitions
-    /// (node can talk to A but not B) aren't supported. For most test
-    /// scenarios this is acceptable — a partitioned node is effectively
-    /// unreachable from all peers.
+    /// The partition is symmetric: both source and each target get filters
+    /// blocking each other's IP.
     ///
     /// # Parameters
     /// - `name`: The node to partition (e.g. "node3").
-    /// - `_targets`: Ignored; the pause affects all connectivity.
-    pub async fn partition_node(&self, name: &str, _targets: &[&str]) -> Result<(), ClientError> {
-        let container = self.container_name(name);
-        run_docker_cmd(&["pause", &container]).await?;
+    /// - `targets`: Slice of target node names to partition from.
+    pub async fn partition_node(&self, name: &str, targets: &[&str]) -> Result<(), ClientError> {
+        let source_ip = self.node_ip(name)?.to_string();
+        let source_container = self.container_name(name);
+
+        // Ensure the source has a netem qdisc on eth0 (idempotent).
+        let _ = run_docker_cmd(&[
+            "exec", &source_container,
+            "tc", "qdisc", "add", "dev", "eth0", "root", "handle", "1:", "prio",
+        ]).await;
+
+        for &target in targets {
+            let target_ip = self.node_ip(target)?.to_string();
+            let target_container = self.container_name(target);
+
+            // Block source → target: add 100% loss filter for target IP
+            let _ = run_docker_cmd(&[
+                "exec", &source_container,
+                "tc", "qdisc", "add", "dev", "eth0", "parent", "1:3", "handle", "30:", "netem", "loss", "100%",
+            ]).await;
+            let _ = run_docker_cmd(&[
+                "exec", &source_container,
+                "tc", "filter", "add", "dev", "eth0", "parent", "1:0", "protocol", "ip",
+                "u32", "match", "ip", "dst", &format!("{target_ip}/32"), "flowid", "1:3",
+            ]).await;
+
+            // Block target → source: ensure target has qdisc, add filter
+            let _ = run_docker_cmd(&[
+                "exec", &target_container,
+                "tc", "qdisc", "add", "dev", "eth0", "root", "handle", "1:", "prio",
+            ]).await;
+            let _ = run_docker_cmd(&[
+                "exec", &target_container,
+                "tc", "qdisc", "add", "dev", "eth0", "parent", "1:3", "handle", "30:", "netem", "loss", "100%",
+            ]).await;
+            let _ = run_docker_cmd(&[
+                "exec", &target_container,
+                "tc", "filter", "add", "dev", "eth0", "parent", "1:0", "protocol", "ip",
+                "u32", "match", "ip", "dst", &format!("{source_ip}/32"), "flowid", "1:3",
+            ]).await;
+        }
+
         Ok(())
     }
 
-    /// Heals a network partition by unpausing the container.
+    /// Heals all network partitions on a single node by removing tc qdiscs.
     ///
-    /// Errors are silently ignored because the node may already be
-    /// unpaused or may have been killed.
+    /// Errors are silently ignored because the node may not have any
+    /// tc rules, may be stopped, or may not exist.
     pub async fn heal_partition(&self, name: &str) -> Result<(), ClientError> {
         let container = self.container_name(name);
-        let _ = run_docker_cmd(&["unpause", &container]).await;
+        let _ = run_docker_cmd(&["exec", &container, "tc", "qdisc", "del", "dev", "eth0", "root"]).await;
         Ok(())
     }
 
