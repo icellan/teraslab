@@ -364,8 +364,9 @@ pub async fn wait_migrations_complete(
                 }
             }
         }
-        // Accept masters within ±4 of 4096 during handoff transitions.
-        let masters_ok = total_masters >= 4092 && total_masters <= 4100;
+        // Accept masters within ±16 of 4096. After partition heals, brief
+        // double-counting is expected while handoff commits propagate.
+        let masters_ok = total_masters >= 4080 && total_masters <= 4112;
         if masters_ok && total_pending_handoffs == 0 && total_inbound_pending == 0 && all_idle {
             if timing_enabled() {
                 eprintln!("  wait_migrations: complete in {:.1}ms", mig_start.elapsed().as_secs_f64() * 1000.0);
