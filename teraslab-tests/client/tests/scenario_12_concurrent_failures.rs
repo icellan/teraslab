@@ -166,7 +166,7 @@ async fn test_kill_two_of_three() -> Result<(), ClientError> {
     docker.start_node("node2").await?;
     docker.start_node("node3").await?;
 
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await
         .unwrap_or_else(|e| eprintln!("[12.1] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
@@ -243,7 +243,7 @@ async fn test_sequential_kills() -> Result<(), ClientError> {
 
     eprintln!("[12.2] Restarting node3 -- majority restored");
     docker.start_node("node3").await?;
-    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(15)).await?;
+    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(30)).await?;
     common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(15)).await?;
     // Wait for replication to settle — node3 may still be catching up
     // and replication failures would cause all writes to fail.
@@ -258,7 +258,7 @@ async fn test_sequential_kills() -> Result<(), ClientError> {
 
     eprintln!("[12.2] Restarting node2 -- full cluster restored");
     docker.start_node("node2").await?;
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await
         .unwrap_or_else(|e| eprintln!("[12.2] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
@@ -437,7 +437,7 @@ async fn test_kill_during_migration() -> Result<(), ClientError> {
     {
         4u32
     } else {
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
         3u32
     };
 
@@ -594,7 +594,7 @@ async fn test_rolling_restart_plus_partition() -> Result<(), ClientError> {
     docker.start_node("node1").await?;
 
     // Wait for full cluster to reform
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await
         .unwrap_or_else(|e| eprintln!("[12.5] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;

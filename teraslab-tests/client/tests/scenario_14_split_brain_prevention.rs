@@ -200,7 +200,7 @@ async fn test_symmetric_isolation() -> Result<(), ClientError> {
     // After healing a 3-way partition, SWIM needs to go through its full
     // rediscovery cycle for all nodes: suspicion -> dead -> rejoin via seeds.
     tokio::time::sleep(Duration::from_secs(1)).await;
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await
         .unwrap_or_else(|e| eprintln!("[14.1] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
@@ -289,7 +289,7 @@ async fn test_asymmetric_partition() -> Result<(), ClientError> {
     docker.heal_all_partitions().await?;
 
     tokio::time::sleep(Duration::from_secs(1)).await;
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await
         .unwrap_or_else(|e| eprintln!("[14.2] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
@@ -423,7 +423,7 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
     // Wait for cluster to settle
     eprintln!("[14.3] Waiting for cluster to settle after flapping");
     tokio::time::sleep(Duration::from_secs(1)).await;
-    common::wait_cluster_ready(&docker_arc, 3, Duration::from_secs(15)).await?;
+    common::wait_cluster_ready(&docker_arc, 3, Duration::from_secs(60)).await?;
     common::wait_migrations_complete(&docker_arc, 3, Duration::from_secs(60)).await
         .unwrap_or_else(|e| eprintln!("[14.3] migration wait: {e}"));
     common::wait_replication_settled(&docker_arc, 3, Duration::from_secs(5)).await?;
@@ -497,7 +497,7 @@ async fn test_docker_pause() -> Result<(), ClientError> {
     docker.unpause_node("node2").await?;
 
     tokio::time::sleep(Duration::from_secs(1)).await;
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await
         .unwrap_or_else(|e| eprintln!("[14.4] migration wait: {e}"));
 

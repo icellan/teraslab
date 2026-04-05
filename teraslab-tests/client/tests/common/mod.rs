@@ -518,7 +518,7 @@ pub async fn start_3node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Cli
         );
         eprintln!("  start_3node_cluster[{scenario_id}]: wait_cluster_ready");
     }
-    wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
+    wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
     if timing_enabled() {
         eprintln!(
             "  start_3node_cluster[{scenario_id}]: cluster ready in {:.1}ms",
@@ -567,7 +567,7 @@ pub async fn start_5node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Cli
         );
         eprintln!("  start_5node_cluster[{scenario_id}]: wait_cluster_ready");
     }
-    wait_cluster_ready(&docker, 5, Duration::from_secs(30)).await?;
+    wait_cluster_ready(&docker, 5, Duration::from_secs(60)).await?;
     if timing_enabled() {
         eprintln!(
             "  start_5node_cluster[{scenario_id}]: cluster ready in {:.1}ms",

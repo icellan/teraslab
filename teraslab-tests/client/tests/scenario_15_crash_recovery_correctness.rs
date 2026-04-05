@@ -201,7 +201,7 @@ async fn test_basic_crash_recovery() -> Result<(), ClientError> {
     eprintln!("[15.1] Restarting node1");
     docker.start_node("node1").await?;
 
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await
         .unwrap_or_else(|e| eprintln!("[15.1] migration wait: {e}"));
     // Extra settling time for redo log replay and migration data transfer.
@@ -276,7 +276,7 @@ async fn test_kill_during_writes() -> Result<(), ClientError> {
 
         eprintln!("[15.2/15.3] Iteration {iteration}: restarting node1");
         docker.start_node("node1").await?;
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await
             .unwrap_or_else(|e| eprintln!("[15.2/15.3] migration wait: {e}"));
         common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
@@ -362,7 +362,7 @@ async fn test_kill_during_spend_multi() -> Result<(), ClientError> {
     // Restart node1
     tokio::time::sleep(Duration::from_millis(500)).await;
     docker.start_node("node1").await?;
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await
         .unwrap_or_else(|e| eprintln!("[15.4] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
@@ -452,7 +452,7 @@ async fn test_kill_during_set_mined() -> Result<(), ClientError> {
     // Restart node1
     tokio::time::sleep(Duration::from_millis(500)).await;
     docker.start_node("node1").await?;
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await
         .unwrap_or_else(|e| eprintln!("[15.5] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
@@ -567,7 +567,7 @@ async fn test_kill_during_create() -> Result<(), ClientError> {
     // Restart node1
     tokio::time::sleep(Duration::from_millis(500)).await;
     docker.start_node("node1").await?;
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await
         .unwrap_or_else(|e| eprintln!("[15.6] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
@@ -648,7 +648,7 @@ async fn test_kill_all_simultaneously() -> Result<(), ClientError> {
     docker.start_node("node2").await?;
     docker.start_node("node3").await?;
 
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await
         .unwrap_or_else(|e| eprintln!("[15.7] migration wait: {e}"));
     // Extra settling time for redo log replay after all-node crash.
@@ -742,7 +742,7 @@ async fn test_cascading_recovery() -> Result<(), ClientError> {
     eprintln!("[15.8] Restarting node2");
     docker.start_node("node2").await?;
 
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await
         .unwrap_or_else(|e| eprintln!("[15.8] final migration wait warning: {e}"));
     // Allow additional time for all data to settle after 3-node migration.

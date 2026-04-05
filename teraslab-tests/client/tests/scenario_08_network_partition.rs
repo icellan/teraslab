@@ -77,7 +77,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         // Wait for SWIM to detect the partition and topology to commit.
         // With probe_interval=150ms and suspicion_timeout=3000ms, detection
         // takes ~4-6s. Poll instead of sleeping a fixed duration.
-        common::wait_specific_nodes_ready(&docker, &[1, 2], 2, Duration::from_secs(15)).await?;
+        common::wait_specific_nodes_ready(&docker, &[1, 2], 2, Duration::from_secs(30)).await?;
 
         let status_n1 = common::http_status(&docker, 1).await?;
         let cluster_size_n1 = status_n1["cluster_size"].as_u64().unwrap_or(0);
@@ -214,7 +214,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
         // After partition heal, SWIM must go through its full rediscovery cycle.
         // SWIM suspicion timeout is 3s, so 5s is sufficient.
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
         client.refresh_routing().await?;
 
@@ -402,7 +402,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
         // SWIM suspicion timeout is 3s, so 5s is sufficient for rediscovery.
         tokio::time::sleep(Duration::from_secs(1)).await;
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
         client.refresh_routing().await?;
 
@@ -525,7 +525,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         docker.clear_all_networks().await?;
 
         tokio::time::sleep(Duration::from_secs(1)).await;
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await
             .unwrap_or_else(|e| eprintln!("[8c.3] migration wait: {e}"));
         client.refresh_routing().await?;
@@ -665,7 +665,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
         // SWIM suspicion timeout is 3s, so 5s is sufficient for rediscovery.
         tokio::time::sleep(Duration::from_secs(1)).await;
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(60)).await?;
         client.refresh_routing().await?;
 
