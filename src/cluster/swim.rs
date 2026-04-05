@@ -18,6 +18,10 @@ const MSG_ACK: u8 = 2;
 const MSG_JOIN: u8 = 3;
 /// Indirect probe request: "please probe this node for me".
 const MSG_PING_REQ: u8 = 4;
+/// Relayed result of an indirect probe: ACK from the probed target, forwarded by the relay.
+/// Wire layout matches [`SwimRunner::encode_message`] piggyback, then `[probed_target_id:8]`,
+/// then committed term (see [`SwimRunner::handle_message`]).
+const MSG_INDIRECT_ACK: u8 = 5;
 
 /// On-wire message format:
 /// [msg_type:1][sender_id:8][sender_incarnation:8][sender_addr_len:2][sender_addr:N]
@@ -389,10 +393,11 @@ impl SwimRunner {
                         continue;
                     }
                     self.peer_addrs.lock().unwrap().insert(nid, tcp_addr);
-                    // Store the swim address if present
-                    if let Ok(swim_addr) = swim_str.parse::<SocketAddr>() {
-                        self.swim_peer_addrs.lock().unwrap().insert(nid, swim_addr);
-                    }
+                    store_piggybacked_swim_if_routable(
+                        &mut self.swim_peer_addrs.lock().unwrap(),
+                        nid,
+                        swim_str,
+                    );
                     let mut mem = self.membership.lock().unwrap();
                     let evts = match state {
                         0 => mem.mark_alive(nid, tcp_addr, inc, false),
@@ -405,9 +410,24 @@ impl SwimRunner {
             }
         }
 
-        // Parse piggybacked committed topology term (appended after updates).
-        // If the remote node has a higher committed term, emit TopologyStale
-        // so the coordinator can request the committed topology for catch-up.
+        // Parse extension + committed topology term (after piggybacked updates).
+        // [`MSG_INDIRECT_ACK`] inserts `[probed_target_id:8]` before the committed term so the
+        // original requester can clear `pending_probe` for the probed node while the message
+        // header still identifies the relay (UDP source matches relay, not the probed target).
+        if msg_type == MSG_INDIRECT_ACK {
+            if data.len() < pos + 8 + 8 {
+                return events;
+            }
+            let probed_target = NodeId(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
+            pos += 8;
+            if let Some(ref pending) = self.pending_probe
+                && pending.target == probed_target
+            {
+                self.pending_probe = None;
+            }
+        }
+
+        // Committed topology term (appended after updates, and after indirect-ACK probed id if present).
         if data.len() >= pos + 8 {
             let remote_committed = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
             let local_committed = self.config.committed_term.load(std::sync::atomic::Ordering::Relaxed);
@@ -432,9 +452,11 @@ impl SwimRunner {
             }
             // Check if we should forward this ACK to a requester (PING_REQ flow)
             if let Some(requester_addr) = self.ping_req_forwarding.remove(&sender_id) {
-                // Forward the ACK back to the original requester
+                // Forward using MSG_INDIRECT_ACK: header/sender is this relay (UDP source matches),
+                // probed target id is appended so the requester clears pending_probe for the target
+                // without attributing the relay's address to the target in swim_peer_addrs.
                 let updates = self.collect_member_updates();
-                let ack = self.encode_message(MSG_ACK, &updates);
+                let ack = self.encode_indirect_ack_message(&updates, sender_id);
                 let _ = socket.send_to(&ack, requester_addr);
             }
         }
@@ -672,6 +694,36 @@ impl SwimRunner {
         buf
     }
 
+    /// Encode a relay-forwarded indirect probe result for the original PING_REQ requester.
+    ///
+    /// The header identifies the **relay** (same as a normal outgoing message from this node).
+    /// `probed_target` is the node that responded to the relay's PING; the requester uses it to
+    /// clear [`SwimRunner::pending_probe`] without mapping `probed_target` to the relay's UDP
+    /// source address.
+    fn encode_indirect_ack_message(&self, piggybacked_updates: &[u8], probed_target: NodeId) -> Vec<u8> {
+        let addr_str = self.config.self_addr.to_string();
+        let addr_bytes = addr_str.as_bytes();
+
+        let mut buf = Vec::with_capacity(
+            19 + addr_bytes.len() + piggybacked_updates.len() + 8 + 8 + 32,
+        );
+        buf.push(MSG_INDIRECT_ACK);
+        buf.extend_from_slice(&self.config.self_id.0.to_le_bytes());
+        buf.extend_from_slice(&self.incarnation.to_le_bytes());
+        buf.extend_from_slice(&(addr_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(addr_bytes);
+        buf.extend_from_slice(piggybacked_updates);
+        buf.extend_from_slice(&probed_target.0.to_le_bytes());
+
+        let ct = self.config.committed_term.load(std::sync::atomic::Ordering::Relaxed);
+        buf.extend_from_slice(&ct.to_le_bytes());
+
+        if let Some(ref secret) = self.config.cluster_secret {
+            buf = crate::cluster::auth::sign(secret, &buf);
+        }
+        buf
+    }
+
     fn collect_member_updates(&self) -> Vec<u8> {
         use crate::cluster::membership::NodeState;
 
@@ -683,12 +735,13 @@ impl SwimRunner {
         let mut entries: Vec<(NodeId, u8, u64, String, String)> = Vec::new();
 
         // Always include self as alive.
+        let self_swim = effective_swim_gossip_addr(self.config.self_addr, self.config.bind_addr);
         entries.push((
             self.config.self_id,
             0, // Alive
             self.incarnation,
             self.config.self_addr.to_string(),
-            self.config.bind_addr.to_string(),
+            self_swim.to_string(),
         ));
 
         // Collect all known members with their actual state.
@@ -746,5 +799,179 @@ impl SwimRunner {
     /// Signal the SWIM loop to stop.
     pub fn signal_shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn test_set_pending_probe(&mut self, target: NodeId) {
+        self.pending_probe = Some(PendingProbe {
+            target,
+            started: Instant::now(),
+            indirect_sent: true,
+        });
+    }
+
+    #[cfg(test)]
+    fn test_pending_probe_target(&self) -> Option<NodeId> {
+        self.pending_probe.as_ref().map(|p| p.target)
+    }
+
+    #[cfg(test)]
+    fn test_swim_addr(&self, id: NodeId) -> Option<SocketAddr> {
+        self.swim_peer_addrs.lock().unwrap().get(&id).copied()
+    }
+}
+
+/// Address used in gossip as this node's SWIM (UDP) reachability hint.
+///
+/// When [`SwimConfig::bind_addr`] uses an unspecified IP (e.g. `0.0.0.0` in Docker),
+/// piggybacking that address would advertise a non-routable destination. In that case
+/// we combine [`SwimConfig::self_addr`]'s IP with the bind port so peers retain a
+/// usable UDP target.
+pub(crate) fn effective_swim_gossip_addr(self_addr: SocketAddr, bind_addr: SocketAddr) -> SocketAddr {
+    if bind_addr.ip().is_unspecified() {
+        SocketAddr::new(self_addr.ip(), bind_addr.port())
+    } else {
+        bind_addr
+    }
+}
+
+/// Stores a peer SWIM address learned from gossip only when it is routable.
+///
+/// Unspecified addresses (`0.0.0.0` / `::`) are ignored so they cannot overwrite
+/// a valid address learned from the UDP source.
+fn store_piggybacked_swim_if_routable(
+    swim_peer_addrs: &mut HashMap<NodeId, SocketAddr>,
+    nid: NodeId,
+    swim_str: &str,
+) {
+    if let Ok(swim_addr) = swim_str.parse::<SocketAddr>() {
+        if swim_addr.ip().is_unspecified() {
+            return;
+        }
+        swim_peer_addrs.insert(nid, swim_addr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    impl SwimRunner {
+        pub fn collect_member_updates_for_test(&self) -> Vec<u8> {
+            self.collect_member_updates()
+        }
+    }
+
+    fn test_runner(bind: SocketAddr, self_addr: SocketAddr) -> SwimRunner {
+        test_runner_id(NodeId(1), bind, self_addr)
+    }
+
+    fn test_runner_id(self_id: NodeId, bind: SocketAddr, self_addr: SocketAddr) -> SwimRunner {
+        SwimRunner::new(SwimConfig {
+            self_id,
+            self_addr,
+            bind_addr: bind,
+            seed_nodes: vec![],
+            probe_interval: Duration::from_millis(100),
+            suspicion_timeout: Duration::from_secs(5),
+            cluster_secret: None,
+            persisted_incarnation: 0,
+            committed_term: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// Parses the first membership entry (self) swim address string from `collect_member_updates` output.
+    fn parse_first_entry_swim_addr(buf: &[u8]) -> String {
+        let mut pos = 2usize;
+        assert!(buf.len() >= pos + 19, "buffer too short");
+        pos += 8 + 1 + 8;
+        let tcp_len = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2 + tcp_len;
+        let swim_len = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        std::str::from_utf8(&buf[pos..pos + swim_len])
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn collect_member_updates_self_swim_uses_routable_addr_when_bind_unspecified() {
+        let bind: SocketAddr = "0.0.0.0:3301".parse().unwrap();
+        let self_addr: SocketAddr = "192.168.1.42:9000".parse().unwrap();
+        let runner = test_runner(bind, self_addr);
+        let buf = runner.collect_member_updates_for_test();
+        let swim = parse_first_entry_swim_addr(&buf);
+        assert_eq!(swim, "192.168.1.42:3301");
+    }
+
+    #[test]
+    fn piggyback_unspecified_swim_does_not_overwrite_routable_learned() {
+        let mut map = HashMap::new();
+        let peer = NodeId(2);
+        let learned: SocketAddr = "10.0.0.2:3301".parse().unwrap();
+        map.insert(peer, learned);
+        store_piggybacked_swim_if_routable(&mut map, peer, "0.0.0.0:3301");
+        assert_eq!(map.get(&peer), Some(&learned));
+    }
+
+    /// Regression: a relay must not forward an indirect probe ACK as a plain [`MSG_ACK`] with the
+    /// relay's sender id — that leaves the requester's `pending_probe` stuck on the real target.
+    #[test]
+    fn forwarded_plain_ack_does_not_clear_pending_for_probed_target() {
+        let requester_addr: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+        let relay_udp: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let probed_target = NodeId(3);
+
+        let mut requester = test_runner_id(NodeId(1), requester_addr, requester_addr);
+        requester
+            .swim_peer_addrs
+            .lock()
+            .unwrap()
+            .insert(probed_target, "10.0.0.3:3301".parse().unwrap());
+        requester.test_set_pending_probe(probed_target);
+
+        let relay = test_runner_id(NodeId(2), relay_udp, "10.0.0.2:9000".parse().unwrap());
+        let updates = relay.collect_member_updates_for_test();
+        let wrong_forward = relay.encode_message(MSG_ACK, &updates);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = requester.handle_message(&wrong_forward, relay_udp, &socket);
+
+        assert_eq!(
+            requester.test_pending_probe_target(),
+            Some(probed_target),
+            "plain ACK from relay must not clear pending_probe for the indirect target"
+        );
+        assert_eq!(
+            requester.test_swim_addr(probed_target),
+            Some("10.0.0.3:3301".parse().unwrap())
+        );
+    }
+
+    /// Indirect ACK carries probed target id so the requester clears the right pending probe
+    /// without mapping the probed node's SWIM address to the relay's UDP source.
+    #[test]
+    fn indirect_ack_clears_pending_for_probed_target_without_swim_addr_poisoning() {
+        let requester_addr: SocketAddr = "127.0.0.1:7002".parse().unwrap();
+        let relay_udp: SocketAddr = "10.0.0.2:5001".parse().unwrap();
+        let probed_target = NodeId(3);
+        let target_swim: SocketAddr = "10.0.0.3:3301".parse().unwrap();
+
+        let mut requester = test_runner_id(NodeId(1), requester_addr, requester_addr);
+        requester.swim_peer_addrs.lock().unwrap().insert(probed_target, target_swim);
+        requester.test_set_pending_probe(probed_target);
+
+        let relay = test_runner_id(NodeId(2), relay_udp, "10.0.0.2:9000".parse().unwrap());
+        let updates = relay.collect_member_updates_for_test();
+        let msg = relay.encode_indirect_ack_message(&updates, probed_target);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = requester.handle_message(&msg, relay_udp, &socket);
+
+        assert_eq!(requester.test_pending_probe_target(), None);
+        assert_eq!(requester.test_swim_addr(probed_target), Some(target_swim));
+        assert_eq!(requester.test_swim_addr(NodeId(2)), Some(relay_udp));
     }
 }
