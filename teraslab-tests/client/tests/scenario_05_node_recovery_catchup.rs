@@ -108,6 +108,19 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     client.refresh_routing().await?;
 
+    // Migration counters can flip to zero a beat before the rejoining node
+    // has committed all inbound shard data (pattern A). Probe before the
+    // downstream consistency checks.
+    common::wait_for_migration_reads_ready(
+        &client,
+        &docker,
+        &all_txids,
+        &[1, 2, 3],
+        2,
+        50,
+        Duration::from_secs(60),
+    ).await?;
+
     // -- Test 5.3: Verify balanced distribution --
     tlog!(t0, "test 5.3 start");
     eprintln!("[5.3] Checking shard distribution balance");

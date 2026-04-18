@@ -729,6 +729,24 @@ async fn run_scenario() -> Result<(), ClientError> {
     let client_4 = common::create_client(&docker_5, 4).await?;
     client_4.refresh_routing().await?;
 
+    // Probe the large records end-to-end — migrations to node4 finish
+    // accounting before the new replicas have committed blob writes
+    // (pattern A). These are the same txids we assert on below.
+    let probe_sample: Vec<[u8; 32]> = large_txids_5m
+        .iter()
+        .chain(large_txids_50m.iter())
+        .copied()
+        .collect();
+    common::wait_for_migration_reads_ready(
+        &client_4,
+        &docker_5,
+        &probe_sample,
+        &[1, 2, 3, 4],
+        2,
+        probe_sample.len(),
+        Duration::from_secs(60),
+    ).await?;
+
     // Read ALL 10 large records — verify they're all accessible and complete
     let all_large_txids: Vec<[u8; 32]> = large_txids_5m
         .iter()

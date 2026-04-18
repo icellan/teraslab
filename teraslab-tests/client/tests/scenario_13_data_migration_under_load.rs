@@ -47,7 +47,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     common::teardown_all(SID).await;
     tlog!(t0, "teardown_all done");
 
-    let (mut docker, client) = common::start_3node_cluster(SID).await?;
+    let (docker, client) = common::start_3node_cluster(SID).await?;
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
     client.refresh_routing().await?;
 
@@ -208,6 +208,22 @@ async fn run_scenario() -> Result<(), ClientError> {
     common::wait_migrations_complete(&docker_5, 4, Duration::from_secs(120)).await?;
     let migration_duration = migration_start.elapsed();
     eprintln!("[13.2] Migrations complete in {:.1}s", migration_duration.as_secs_f64());
+
+    // Probe end-to-end read readiness before consistency check (pattern A).
+    // Use the verifier's tracked txids as the sample source — this covers
+    // both the pre-migration seed and any background-created records.
+    {
+        let probe_sample = verifier.non_deleted_txids();
+        common::wait_for_migration_reads_ready(
+            &client,
+            &docker_5,
+            &probe_sample,
+            &[1, 2, 3, 4],
+            2,
+            50,
+            Duration::from_secs(60),
+        ).await?;
+    }
 
     // Stop the background workload
     stop_flag.store(true, Ordering::Relaxed);

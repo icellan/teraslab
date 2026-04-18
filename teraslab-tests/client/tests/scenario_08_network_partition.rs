@@ -86,7 +86,15 @@ async fn run_scenario() -> Result<(), ClientError> {
             "Test 8a.1: node1 reports cluster_size={cluster_size_n1}, expected exactly 2 \
              (majority partition of node1+node2 with node3 isolated)");
 
+        // Pattern B: the main client was seeded with all 3 nodes; its pool
+        // now includes node3, and the next `refresh_routing` can hit node3
+        // from the host and adopt the isolated minority partition map (which
+        // advertises node3 as the sole master). Replace the client with one
+        // seeded only from the majority side and assert it.
+        client.close().await;
+        let client = common::create_client_subset(&docker, &[1, 2]).await?;
         client.refresh_routing().await?;
+        common::assert_client_excludes_nodes(&client, &[3]).await?;
 
         // Verify that node3 REJECTS writes during partition.
         // Create a single-node client that connects ONLY to the partitioned node3.
@@ -221,6 +229,25 @@ async fn run_scenario() -> Result<(), ClientError> {
         common::wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
         client.refresh_routing().await?;
+
+        // Migration counters can flip to zero a beat before the receiving
+        // nodes have committed all inbound shard data to their indexes.
+        // Probe a sample of records end-to-end before declaring the cluster
+        // readable (pattern A).
+        let probe_sample: Vec<[u8; 32]> = initial_txids
+            .iter()
+            .chain(partition_txids.iter())
+            .copied()
+            .collect();
+        common::wait_for_migration_reads_ready(
+            &client,
+            &docker,
+            &probe_sample,
+            &[1, 2, 3],
+            2,
+            50,
+            Duration::from_secs(60),
+        ).await?;
 
         eprintln!("[8a.3] OK -- cluster reconverged to size 3");
 
@@ -423,6 +450,17 @@ async fn run_scenario() -> Result<(), ClientError> {
         }
         common::wait_replication_settled(&docker, 3, Duration::from_secs(10)).await?;
         client.refresh_routing().await?;
+
+        // Probe a sample of pre-partition records end-to-end (pattern A).
+        common::wait_for_migration_reads_ready(
+            &client,
+            &docker,
+            &pre_partition_txids,
+            &[1, 2, 3],
+            2,
+            50,
+            Duration::from_secs(60),
+        ).await?;
 
         eprintln!("[8b.3] OK -- cluster reformed after full isolation");
 
@@ -713,6 +751,22 @@ async fn run_scenario() -> Result<(), ClientError> {
         common::wait_cluster_ready(&docker, 3, Duration::from_secs(120)).await?;
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
         client.refresh_routing().await?;
+
+        // Probe a sample of records end-to-end (pattern A).
+        let probe_sample: Vec<[u8; 32]> = initial_txids
+            .iter()
+            .chain(partition_txids.iter())
+            .copied()
+            .collect();
+        common::wait_for_migration_reads_ready(
+            &client,
+            &docker,
+            &probe_sample,
+            &[1, 2, 3],
+            2,
+            50,
+            Duration::from_secs(60),
+        ).await?;
 
         eprintln!("[8d.3] OK -- cluster reconverged after asymmetric partition heal");
 

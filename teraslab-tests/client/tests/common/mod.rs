@@ -75,6 +75,60 @@ pub async fn create_client(docker: &DockerHelpers, node_count: usize) -> Result<
     Client::new(config).await
 }
 
+/// Create a Client seeded only with the specified subset of node numbers.
+///
+/// Use when the test has deliberately isolated some nodes — passing the
+/// minority side into the client's seed list would let the client adopt a
+/// stale/minority partition map on first refresh and route all writes into a
+/// no-quorum state. Callers should pick nodes known to be on the majority
+/// side at the time this is called (pattern B).
+pub async fn create_client_subset(
+    docker: &DockerHelpers,
+    node_nums: &[u32],
+) -> Result<Client, ClientError> {
+    let seeds: Vec<String> = node_nums
+        .iter()
+        .map(|&n| format!("127.0.0.1:{}", docker.client_port(n)))
+        .collect();
+    let config = ClientConfig {
+        addr: None,
+        seeds,
+        pool: PoolConfig::default(),
+        cluster_refresh_interval: Duration::from_secs(30),
+        max_redirects: 3,
+        addr_map: docker.docker_addr_map(),
+    };
+    Client::new(config).await
+}
+
+/// Return true if the client's current partition map contains no nodes from
+/// `excluded`. Used to verify the client is not seeing a minority-side view
+/// of the cluster after a partition (pattern B).
+///
+/// Fetches the partition map through `client.get_partition_map()` rather than
+/// introspecting internal state, so it reflects the view the next routed call
+/// will use.
+pub async fn assert_client_excludes_nodes(
+    client: &Client,
+    excluded: &[u64],
+) -> Result<(), ClientError> {
+    let pm = client.get_partition_map().await?;
+    let seen: std::collections::BTreeSet<u64> = pm.nodes.iter().map(|n| n.id).collect();
+    let overlap: Vec<u64> = excluded
+        .iter()
+        .copied()
+        .filter(|id| seen.contains(id))
+        .collect();
+    if !overlap.is_empty() {
+        return Err(ClientError::Connection(format!(
+            "client partition map still contains isolated node(s) {overlap:?}: \
+             version={}, nodes={seen:?} — client would route to minority side",
+            pm.version,
+        )));
+    }
+    Ok(())
+}
+
 /// Fetch the HTTP /status JSON for a given node number, using ports from the
 /// provided DockerHelpers.
 pub async fn http_status(docker: &DockerHelpers, node_num: u32) -> Result<serde_json::Value, ClientError> {
@@ -414,6 +468,187 @@ pub async fn wait_migrations_complete(
             ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Probe the tracked txids to confirm they are actually readable end-to-end
+/// after migrations report complete.
+///
+/// Closes the gap between `wait_migrations_complete` returning `Ok` (counters
+/// say zero in-flight) and the migrated records being visible on the replica
+/// nodes their shards now belong to. The migration-status counters can flip
+/// to zero a beat before the receiving node has committed every inbound write
+/// to its index, which shows up in scenarios as a brief window of
+/// `STATUS_NOT_FOUND` responses for records that physically exist.
+///
+/// The helper runs two checks per iteration:
+///
+/// 1. **Master-route**: every txid in `txids` must return `status=OK` from
+///    `client.get_batch(..)` (batched in chunks of 500). This is the exact
+///    read path the downstream test will exercise, so it is checked in full
+///    rather than sampled.
+/// 2. **Replica**: `sample_size` evenly-spaced txids must each be present on
+///    at least `min_replicas` of `node_nums` via `FLAG_LOCAL_READ`. Catches
+///    replica-lag where the master responds but the replica has not applied
+///    the migrated blob yet.
+///
+/// Retries both checks with exponential backoff (starting at 100ms, capped at
+/// 1s), refreshing routing between iterations, until every record satisfies
+/// both conditions or `timeout` elapses. On timeout returns
+/// `ClientError::Connection` prefixed with `migration read verify timeout`
+/// and carrying the first few failing-record prefixes with their observed
+/// local-read holder counts for diagnosis.
+///
+/// `node_nums` must list nodes known to be alive post-migration; dead nodes
+/// will fail `direct_get` and count against `min_replicas`.
+pub async fn wait_for_migration_reads_ready(
+    client: &Client,
+    docker: &DockerHelpers,
+    txids: &[[u8; 32]],
+    node_nums: &[u32],
+    min_replicas: usize,
+    sample_size: usize,
+    timeout: Duration,
+) -> Result<(), ClientError> {
+    if txids.is_empty() {
+        return Ok(());
+    }
+    let sample_count = sample_size.min(txids.len()).max(1);
+    let step = (txids.len() / sample_count).max(1);
+    let sample_indices: Vec<usize> = (0..sample_count)
+        .map(|i| (i * step) % txids.len())
+        .collect();
+
+    let node_addrs: Vec<String> = node_nums
+        .iter()
+        .map(|&n| format!("127.0.0.1:{}", docker.client_port(n)))
+        .collect();
+
+    let start = std::time::Instant::now();
+    let mut backoff = Duration::from_millis(100);
+    let mut last_log = std::time::Instant::now();
+    loop {
+        // (1) Master-route check across ALL txids — this is the exact path
+        //     downstream test reads will use.
+        let mut master_failed_idx: Vec<usize> = Vec::new();
+        {
+            let mut base = 0usize;
+            for chunk in txids.chunks(500) {
+                match client.get_batch(FIELD_ALL_METADATA, chunk).await {
+                    Ok(results) => {
+                        for (i, r) in results.iter().enumerate() {
+                            if r.status() != 0 {
+                                master_failed_idx.push(base + i);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        for i in 0..chunk.len() {
+                            master_failed_idx.push(base + i);
+                        }
+                    }
+                }
+                base += chunk.len();
+            }
+        }
+
+        // (2) Replica check via FLAG_LOCAL_READ on sampled txids.
+        let mut holders_by_sample: Vec<usize> = Vec::with_capacity(sample_indices.len());
+        for &idx in &sample_indices {
+            let txid = txids[idx];
+            let mut holders = 0usize;
+            for addr in &node_addrs {
+                let payload = encode_get_batch(FIELD_ALL_METADATA, std::slice::from_ref(&txid));
+                let ok = match client
+                    .send_to_addr(addr, OP_GET_BATCH, FLAG_LOCAL_READ, payload)
+                    .await
+                {
+                    Ok((frame_status, body)) => {
+                        frame_status == STATUS_OK && body.len() >= 5 && body[4] == 0
+                    }
+                    Err(_) => false,
+                };
+                if ok {
+                    holders += 1;
+                }
+            }
+            holders_by_sample.push(holders);
+        }
+        let under_replicated: usize = holders_by_sample
+            .iter()
+            .filter(|&&h| h < min_replicas)
+            .count();
+        let master_failed = master_failed_idx.len();
+
+        if master_failed == 0 && under_replicated == 0 {
+            if timing_enabled() {
+                eprintln!(
+                    "  wait_for_migration_reads_ready: {} txids verified ({} sampled for replicas) in {:.1}ms",
+                    txids.len(),
+                    sample_indices.len(),
+                    start.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            return Ok(());
+        }
+
+        if timing_enabled() && last_log.elapsed() >= Duration::from_secs(2) {
+            eprintln!(
+                "  wait_for_migration_reads_ready: master_failed={master_failed}/{}, \
+                 under_replicated={under_replicated}/{} (min_replicas={min_replicas}) \
+                 after {:.1}s",
+                txids.len(),
+                sample_indices.len(),
+                start.elapsed().as_secs_f64(),
+            );
+            last_log = std::time::Instant::now();
+        }
+
+        if start.elapsed() >= timeout {
+            // Diagnose the first few master-route failures by reading from
+            // each node directly so the error tells us whether the data is
+            // missing everywhere or only on the route's master.
+            let mut diag = Vec::new();
+            for &idx in master_failed_idx.iter().take(3) {
+                let txid = txids[idx];
+                let prefix: String = txid[..6].iter().map(|b| format!("{b:02x}")).collect();
+                let mut holders = 0usize;
+                for addr in &node_addrs {
+                    let payload =
+                        encode_get_batch(FIELD_ALL_METADATA, std::slice::from_ref(&txid));
+                    let ok = match client
+                        .send_to_addr(addr, OP_GET_BATCH, FLAG_LOCAL_READ, payload)
+                        .await
+                    {
+                        Ok((frame_status, body)) => {
+                            frame_status == STATUS_OK && body.len() >= 5 && body[4] == 0
+                        }
+                        Err(_) => false,
+                    };
+                    if ok {
+                        holders += 1;
+                    }
+                }
+                diag.push(format!(
+                    "txid_prefix={prefix} holders_via_local_read={}/{}",
+                    holders,
+                    node_nums.len(),
+                ));
+            }
+            return Err(ClientError::Connection(format!(
+                "migration read verify timeout after {timeout:?}: \
+                 master_failed={master_failed}/{}, under_replicated={under_replicated}/{} \
+                 (min_replicas={min_replicas}, nodes={node_nums:?}); \
+                 first_failures=[{}]",
+                txids.len(),
+                sample_indices.len(),
+                diag.join(" | "),
+            )));
+        }
+
+        let _ = client.refresh_routing().await;
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(1));
     }
 }
 
