@@ -540,6 +540,61 @@ impl TopologyAuthority {
         Some(commit.term)
     }
 
+    /// Retry a failed proposal as the deterministic proposer.
+    ///
+    /// Called by `run_topology_proposer` when quorum is not reached. Bumps
+    /// `voted_term` to a fresh value (so peers whose `voted_term` already
+    /// advanced during the previous attempt can accept us), refreshes the
+    /// target member set from the last SWIM observation, and returns a new
+    /// `TopologyTerm` to broadcast.
+    ///
+    /// Returns `None` if:
+    ///   * we are no longer the deterministic proposer (lowest NodeId), or
+    ///   * the cluster has already committed the target membership, or
+    ///   * observed_membership is empty (nothing to propose).
+    pub fn retry_proposal(&self) -> Option<TopologyTerm> {
+        let target_members = {
+            let observed = self.observed_membership.lock().unwrap();
+            if observed.is_empty() {
+                return None;
+            }
+            observed.clone()
+        };
+
+        if target_members[0] != self.self_id {
+            return None;
+        }
+
+        {
+            let committed_members = self.committed_members.read().unwrap();
+            if committed_members.len() == target_members.len()
+                && committed_members.iter().zip(target_members.iter()).all(|(a, b)| a == b)
+            {
+                return None;
+            }
+        }
+
+        let committed = self.committed_term.load(Ordering::Relaxed);
+        let voted = self.voted_term.load(Ordering::Relaxed);
+        let new_term = committed.max(voted) + 1;
+
+        let term = TopologyTerm::new(new_term, target_members.clone(), self.self_id);
+        self.voted_term.store(new_term, Ordering::Relaxed);
+
+        let quorum_needed = (target_members.len() / 2) + 1;
+        let mut votes = std::collections::HashMap::new();
+        votes.insert(self.self_id, true);
+
+        *self.pending_proposal.lock().unwrap() = Some(PendingProposal {
+            term: term.clone(),
+            votes,
+            quorum_needed,
+            _started_at: Instant::now(),
+        });
+
+        Some(term)
+    }
+
     /// Check if the proposal timeout has fired for fallback proposer.
     ///
     /// If this node is not the deterministic proposer but the timeout has
@@ -1247,6 +1302,43 @@ mod tests {
     /// on_membership_changed computes new_term as max(committed, voted) + 1.
     /// If voted_term > committed_term (voted for a term that wasn't committed),
     /// the next proposal skips past the voted term.
+    #[test]
+    fn retry_proposal_advances_term_and_keeps_membership() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let mems = members(&[1, 2, 3]);
+
+        let t1 = auth.on_membership_changed(&mems).unwrap();
+        assert_eq!(t1.term, 1);
+
+        // First attempt's quorum failed — retry.
+        let t2 = auth.retry_proposal().unwrap();
+        assert!(t2.term > t1.term, "retry must advance term");
+        assert_eq!(t2.members, mems, "retry uses observed membership");
+        assert_eq!(t2.proposer, NodeId(1));
+    }
+
+    #[test]
+    fn retry_proposal_returns_none_when_not_deterministic_proposer() {
+        let auth = TopologyAuthority::new(NodeId(3), Duration::from_secs(1));
+        // Observed membership: [1,2,3] — proposer would be node 1, not self.
+        *auth.observed_membership.lock().unwrap() = members(&[1, 2, 3]);
+        assert!(auth.retry_proposal().is_none());
+    }
+
+    #[test]
+    fn retry_proposal_returns_none_when_membership_already_committed() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let mems = members(&[1, 2]);
+        auth.handle_commit(&TopologyCommit {
+            term: 1,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            digest: TopologyTerm::compute_digest(1, &mems),
+        });
+        *auth.observed_membership.lock().unwrap() = mems;
+        assert!(auth.retry_proposal().is_none(), "nothing to do — already committed");
+    }
+
     #[test]
     fn on_membership_changed_skips_past_voted_term() {
         let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));

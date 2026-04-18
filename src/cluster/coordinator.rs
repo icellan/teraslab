@@ -81,6 +81,7 @@ fn committed_topology_reactivation_metrics(
     (mismatched, table.pending_handoff_count())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_active_routing_snapshot(
     routing: &crate::cluster::routing::RoutingInfo,
     rf: u8,
@@ -1152,8 +1153,10 @@ impl ClusterCoordinator {
                 let mut mgr = migration.lock().unwrap();
                 let new_tasks: Vec<MigrationTask> = all_tasks.iter()
                     .filter(|t| {
-                        !preserved_tasks.contains(&(t.shard, t.from_node, t.to_node, t.is_master))
-                            && !(local_store_empty && t.from_node == self_id)
+                        let preserved = preserved_tasks
+                            .contains(&(t.shard, t.from_node, t.to_node, t.is_master));
+                        let self_source_and_empty = local_store_empty && t.from_node == self_id;
+                        !preserved && !self_source_and_empty
                     })
                     .cloned()
                     .collect();
@@ -1333,6 +1336,62 @@ fn run_topology_proposer(
     peak_size: Arc<std::sync::atomic::AtomicUsize>,
     swim_incarnation: Arc<std::sync::atomic::AtomicU64>,
 ) {
+    // Retry up to 5 times on quorum failure — peers may be momentarily
+    // behind (e.g. catching up a lower term) when the first proposal lands,
+    // but will accept the retry once they finish their own state updates.
+    // Each retry generates a fresh term so peers whose voted_term advanced
+    // during the previous attempt can still accept.
+    let mut proposal = proposal;
+    for attempt in 0..5u32 {
+        if attempt > 0 {
+            // Exponential-ish backoff: 200ms, 500ms, 1s, 2s.
+            let delay_ms = 200u64 * (1u64 << (attempt - 1).min(3));
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            match topology_authority.retry_proposal() {
+                Some(fresh) => {
+                    eprintln!(
+                        "cluster: retry topology proposal as term {} (attempt {})",
+                        fresh.term, attempt
+                    );
+                    proposal = fresh;
+                }
+                None => {
+                    // Either no longer the proposer, cluster already committed,
+                    // or observed membership empty — nothing to retry.
+                    return;
+                }
+            }
+        }
+        if try_run_topology_proposal(
+            &proposal,
+            &topology_authority,
+            &node_addrs,
+            self_id,
+            &topology_commit_tx,
+            &topology_state_path,
+            &peak_size,
+            &swim_incarnation,
+        ) {
+            return;
+        }
+    }
+    eprintln!(
+        "cluster: topology proposer exhausted retries at term {}",
+        proposal.term
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_run_topology_proposal(
+    proposal: &crate::cluster::topology::TopologyTerm,
+    topology_authority: &Arc<crate::cluster::topology::TopologyAuthority>,
+    node_addrs: &Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
+    self_id: NodeId,
+    topology_commit_tx: &std::sync::mpsc::Sender<(Vec<NodeId>, u64)>,
+    topology_state_path: &Option<std::path::PathBuf>,
+    peak_size: &Arc<std::sync::atomic::AtomicUsize>,
+    swim_incarnation: &Arc<std::sync::atomic::AtomicU64>,
+) -> bool {
     let peers: Vec<(NodeId, SocketAddr)> = {
         let addrs = node_addrs.read().unwrap();
         addrs.iter()
@@ -1343,7 +1402,7 @@ fn run_topology_proposer(
 
     if peers.is_empty() {
         // No peers — single-node case should have been handled before spawning.
-        return;
+        return true;
     }
 
     let propose_payload = proposal.serialize();
@@ -1393,7 +1452,7 @@ fn run_topology_proposer(
                 "cluster: topology term {} — quorum not reached after contacting {} peers",
                 proposal.term, peers.len(),
             );
-            return;
+            return false;
         }
     };
 
@@ -1445,7 +1504,7 @@ fn run_topology_proposer(
 
     // Apply commit locally.
     topology_authority.handle_commit(&commit);
-    if let Some(ref path) = topology_state_path {
+    if let Some(path) = topology_state_path {
         let peak = peak_size.load(Ordering::Relaxed) as u64;
         let inc = swim_incarnation.load(Ordering::Relaxed);
         persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
@@ -1453,6 +1512,7 @@ fn run_topology_proposer(
 
     // Signal the event loop to activate the shard table.
     let _ = topology_commit_tx.send((commit.members.clone(), commit.term));
+    true
 }
 
 /// Send a request frame on an existing TCP stream and read the response.
@@ -1929,10 +1989,12 @@ fn run_migration_batch(
                 // 2. Fence ALL shards at once (one lock acquisition)
                 // 3. Send batched completion (one TCP round-trip total)
                 // This reduces per-shard lock overhead from ~700ms to ~10ms.
-                const PIPELINE_BATCH: usize = 32;
+                // Process ALL shards on this connection in one pass to avoid
+                // redundant fence/unfence cycles across sub-batches.
+                let pipeline_batch: usize = chunk.len();
                 let mut task_idx = 0;
                 while task_idx < chunk.len() {
-                    let sub_end = (task_idx + PIPELINE_BATCH).min(chunk.len());
+                    let sub_end = (task_idx + pipeline_batch).min(chunk.len());
                     let sub_batch = &chunk[task_idx..sub_end];
                     let sub_count = sub_batch.len();
 
@@ -1986,6 +2048,42 @@ fn run_migration_batch(
                                 engine.keys_for_shard(task.shard)
                             }
                         };
+                        // Close the window between Phase 1 snapshot and Phase 2
+                        // fence: any key present after fence but NOT streamed
+                        // in Phase 1 is a late write whose data never made it
+                        // to the destination. Stream those late records' data
+                        // before sending the completion handshake, otherwise
+                        // the manifest would list keys the receiver has no
+                        // payload for and the record would silently disappear.
+                        let snapshot_set: std::collections::HashSet<TxKey> = shard_keys_snapshot
+                            .iter()
+                            .map(|k| **k)
+                            .collect();
+                        let late_keys: Vec<TxKey> = fenced_keys
+                            .iter()
+                            .copied()
+                            .filter(|k| !snapshot_set.contains(k))
+                            .collect();
+                        if !late_keys.is_empty() {
+                            let late_refs: Vec<&TxKey> = late_keys.iter().collect();
+                            if let Err(e) = stream_shard_baseline(
+                                task, &late_refs, &engine, &mut stream, batch_size,
+                            ) {
+                                eprintln!(
+                                    "cluster: shard {} late-key streaming failed: {e}",
+                                    task.shard,
+                                );
+                                let mut mgr = migration.lock().unwrap();
+                                mgr.mark_failed(task);
+                                if !mgr.is_shard_fenced(task.shard) { fenced_bm.clear(task.shard); }
+                                migrating_bm.clear(task.shard);
+                                drop(mgr);
+                                shard_table.write().rollback_shard(task.shard);
+                                failed.fetch_add(1, Ordering::Relaxed);
+                                if let Some(s) = new_conn() { stream = s; }
+                                continue;
+                            }
+                        }
                         let manifest_entries = match collect_manifest_entries(&engine, task.shard, &fenced_keys) {
                             Ok(e) => e,
                             Err(e) => {
@@ -2244,9 +2342,16 @@ fn run_orphan_cleanup(
 /// Checks the shard table version before fencing and before the complete
 /// handshake. If the topology has changed (epoch advanced), the migration
 /// is aborted early — the new topology's coordinator will re-plan.
-#[allow(clippy::too_many_arguments)]
+///
 /// Returns `true` if the shard was migrated successfully, `false` if it failed.
 /// On failure the TCP stream may be broken and should be reconnected by the caller.
+///
+/// Kept as reference for the per-shard migration flow with redo-log delta
+/// replay. The production path is `run_migration_batch`, which pipelines
+/// baseline + late-key streaming + manifest handshake in one TCP session
+/// across many shards.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 fn migrate_single_shard(
     task: &MigrationTask,
     keys_by_shard: &std::collections::HashMap<u16, Vec<&TxKey>>,
@@ -2886,7 +2991,10 @@ fn send_completion_only_handshakes(
 
     const MAX_RETRIES: usize = 40;
     const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
-    const IO_TIMEOUT: Duration = Duration::from_secs(5);
+    // Batches can contain 2000+ shards; the receiver iterates all of them
+    // calling mark_inbound_complete + commit_shard per shard. Allow 30s
+    // to avoid EAGAIN (os error 11) on large batches.
+    const IO_TIMEOUT: Duration = Duration::from_secs(30);
     const RETRY_DELAY: Duration = Duration::from_millis(100);
 
     // Collect all shard IDs for the batch.
@@ -2940,10 +3048,10 @@ fn send_completion_only_handshakes(
                     ) as usize;
                     if count == tasks.len() && response.payload.len() >= 4 + count * 3 {
                         let mut delivered = vec![false; tasks.len()];
-                        for i in 0..count {
+                        for (i, slot) in delivered.iter_mut().enumerate().take(count) {
                             let off = 4 + i * 3;
                             // shard at off..off+2, ok at off+2
-                            delivered[i] = response.payload[off + 2] != 0;
+                            *slot = response.payload[off + 2] != 0;
                         }
                         return delivered;
                     }
@@ -3135,6 +3243,10 @@ pub fn redo_entry_to_replica_op(
 }
 
 /// Send delta ReplicaOps to the target on an existing stream and validate ACK.
+///
+/// Used only by the reference `migrate_single_shard` path; the pipelined
+/// batch migration doesn't replay redo-log deltas.
+#[allow(dead_code)]
 fn send_delta_ops(
     stream: &mut TcpStream,
     shard: u16,

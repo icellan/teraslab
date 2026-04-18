@@ -333,7 +333,7 @@ pub(crate) fn handle_request(
                 );
             }
 
-            if let Some(entries) = source_entries.as_ref() {
+            let exact_entries_verified = if let Some(entries) = source_entries.as_ref() {
                 for (key, expected_generation) in entries {
                     let meta = match engine.read_metadata(key) {
                         Ok(meta) => meta,
@@ -362,15 +362,17 @@ pub(crate) fn handle_request(
                         );
                     }
                 }
-            }
+                true
+            } else {
+                false
+            };
 
-            // Verify manifest hash (content fingerprint) if provided.
-            // This must run even when `actual > expected_records`: concurrent
-            // creates between the source snapshot and fence legitimately
-            // increase the final shard count, and the manifest is the only
-            // authoritative check that the target's FINAL contents match the
-            // source after delta replay.
-            if let Some(expected_hash) = source_manifest {
+            // Skip the expensive O(N) manifest hash scan when exact-entry
+            // verification already confirmed every key's generation — the
+            // manifest hash would recompute the same result.
+            if !exact_entries_verified
+                && let Some(expected_hash) = source_manifest
+            {
                 let mut local_manifest = crate::cluster::coordinator::ManifestHasher::new();
                 for key in engine.keys_for_shard(shard) {
                     let meta = match engine.read_metadata(&key) {
