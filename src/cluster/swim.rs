@@ -58,10 +58,61 @@ struct PendingProbe {
     started: Instant,
     /// Whether indirect (PING_REQ) probes have been sent.
     indirect_sent: bool,
+    /// Number of indirect probe rounds attempted. Used by the exponential
+    /// backoff in the suspect-timeout path so a transiently slow peer is
+    /// not immediately marked suspect on the first ping-req failure.
+    indirect_attempts: u32,
 }
 
 /// Number of indirect probe peers to ask when direct probe fails.
 const INDIRECT_PROBE_K: usize = 3;
+
+/// Return a jittered probe interval in `[0.75 * base, 1.25 * base]`.
+///
+/// Applies ±25% uniform jitter around the configured probe interval so
+/// consecutive probe cycles don't align across peers — lockstep probing
+/// creates network hot-spots and degrades failure-detection latency under
+/// packet loss. The random draw uses Rust's per-thread CSPRNG via
+/// [`getrandom`]-style [`std::hash::RandomState`] seeding, which is
+/// sufficient: we only need an unbiased uniform draw, not cryptographic
+/// unpredictability.
+fn jittered_probe_interval(base: Duration) -> Duration {
+    // Draw a u32 via the RandomState-seeded hasher trick: hashing an
+    // empty tuple with a freshly-seeded RandomState yields a pseudo-random
+    // u64 on every call. This avoids pulling in the `rand` crate for a
+    // single uniform draw.
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = RandomState::new().build_hasher();
+    h.write_u64(base.as_nanos() as u64);
+    let r = h.finish();
+    // Fraction in [0, 1).
+    let frac = (r as f64) / (u64::MAX as f64 + 1.0);
+    // Multiplier in [0.75, 1.25).
+    let mult = 0.75 + 0.5 * frac;
+    // Saturate against Duration overflow for safety.
+    let nanos = (base.as_nanos() as f64 * mult) as u128;
+    let clamped = nanos.min(u64::MAX as u128) as u64;
+    Duration::from_nanos(clamped)
+}
+
+/// Compute the suspect-timeout deadline with exponential backoff on
+/// repeated indirect probe rounds.
+///
+/// The first indirect round waits `2 * base` (the original behavior).
+/// Each subsequent round doubles that wait, capped at `16 * base`, so a
+/// transiently slow peer experiencing brief packet loss is not marked
+/// suspect until it has genuinely failed multiple probe rounds.
+fn suspect_backoff_delay(base: Duration, indirect_attempts: u32) -> Duration {
+    // `indirect_attempts` is the number of completed ping-req rounds;
+    // we back off starting from the first one.
+    let shift = indirect_attempts.saturating_sub(1).min(3); // cap at 2^3 = 8×
+    // Original wait was `base * 2`; add the backoff factor on top.
+    let mult = 2u64.saturating_mul(1u64 << shift);
+    let nanos = base.as_nanos().saturating_mul(mult as u128);
+    let clamped = nanos.min(u64::MAX as u128) as u64;
+    Duration::from_nanos(clamped)
+}
 
 /// A running SWIM protocol instance.
 pub struct SwimRunner {
@@ -187,6 +238,11 @@ impl SwimRunner {
 
         let probe_interval = self.config.probe_interval;
         let mut last_probe = Instant::now();
+        // Current jittered probe deadline: probe fires when `last_probe.elapsed()
+        // >= next_probe_delay`. Recomputed after every probe so consecutive
+        // intervals are independently jittered across the ±25% window, which
+        // breaks lockstep with peers and reduces collision on the network.
+        let mut next_probe_delay = jittered_probe_interval(probe_interval);
         let mut last_seed_retry = Instant::now();
         let mut recv_buf = [0u8; MAX_MSG_SIZE];
 
@@ -206,15 +262,22 @@ impl SwimRunner {
                 }
             }
 
-            // Check pending probe timeout
+            // Check pending probe timeout. The suspect deadline uses
+            // exponential backoff on repeated ping-req failures: each
+            // retry round doubles the wait so a transiently slow peer is
+            // not marked suspect on the first hiccup. The initial direct
+            // probe still uses the un-jittered `probe_interval` so we
+            // don't prolong the normal RTT budget.
             let mut should_suspect = false;
             if let Some(ref pending) = self.pending_probe {
                 let elapsed = pending.started.elapsed();
+                let indirect_timeout = suspect_backoff_delay(probe_interval, pending.indirect_attempts);
                 if !pending.indirect_sent && elapsed >= probe_interval {
                     // Direct probe timed out — send indirect probes
                     self.send_indirect_probes(&socket);
-                } else if pending.indirect_sent && elapsed >= probe_interval * 2 {
-                    // Both direct and indirect probes failed — mark suspect
+                } else if pending.indirect_sent && elapsed >= indirect_timeout {
+                    // Indirect round also failed — mark suspect. The caller
+                    // will move the pending entry out via `take()` below.
                     should_suspect = true;
                 }
             }
@@ -235,10 +298,13 @@ impl SwimRunner {
                 }
             }
 
-            // Periodic probe: select one random peer
-            if last_probe.elapsed() >= probe_interval {
+            // Periodic probe: select one random peer. Each cycle uses a
+            // freshly-jittered delay so consecutive probes don't align
+            // across peers.
+            if last_probe.elapsed() >= next_probe_delay {
                 self.send_probe(&socket);
                 last_probe = Instant::now();
+                next_probe_delay = jittered_probe_interval(probe_interval);
 
                 // Expire suspects
                 let events = self.membership.lock().unwrap().expire_suspects();
@@ -592,6 +658,7 @@ impl SwimRunner {
             target: target_id,
             started: Instant::now(),
             indirect_sent: false,
+            indirect_attempts: 0,
         });
     }
 
@@ -607,6 +674,7 @@ impl SwimRunner {
         // even if there are no other peers to ask (e.g. 2-node cluster).
         if let Some(ref mut p) = self.pending_probe {
             p.indirect_sent = true;
+            p.indirect_attempts = p.indirect_attempts.saturating_add(1);
         }
 
         // Filter out the suspect itself and dead nodes — dead peers
@@ -807,6 +875,7 @@ impl SwimRunner {
             target,
             started: Instant::now(),
             indirect_sent: true,
+            indirect_attempts: 1,
         });
     }
 
@@ -973,5 +1042,64 @@ mod tests {
         assert_eq!(requester.test_pending_probe_target(), None);
         assert_eq!(requester.test_swim_addr(probed_target), Some(target_swim));
         assert_eq!(requester.test_swim_addr(NodeId(2)), Some(relay_udp));
+    }
+
+    #[test]
+    fn jittered_probe_interval_stays_within_bounds() {
+        // Every draw must land in [0.75 * base, 1.25 * base]. Run many
+        // trials to catch off-by-one bounds bugs.
+        let base = Duration::from_millis(1000);
+        let lo = Duration::from_millis(750);
+        let hi = Duration::from_millis(1250);
+        for _ in 0..1024 {
+            let d = jittered_probe_interval(base);
+            assert!(
+                d >= lo && d <= hi,
+                "jittered interval {d:?} out of [{lo:?}, {hi:?}]"
+            );
+        }
+    }
+
+    #[test]
+    fn jittered_probe_interval_spreads_across_window() {
+        // Take a lot of samples and verify the spread covers a non-trivial
+        // fraction of the jitter window — otherwise we'd be getting
+        // constant output (lockstep).
+        let base = Duration::from_millis(1_000_000); // 1 s in μs for precision
+        let mut min = Duration::MAX;
+        let mut max = Duration::ZERO;
+        for _ in 0..512 {
+            let d = jittered_probe_interval(base);
+            if d < min { min = d; }
+            if d > max { max = d; }
+        }
+        let spread = max - min;
+        // The full theoretical spread is 0.5 * base = 500 ms; we require
+        // at least 20% of that to confirm we're not degenerate. In
+        // practice the RandomState-based draw gives near-full coverage.
+        let min_spread = base / 5;
+        assert!(
+            spread >= min_spread,
+            "jitter spread {spread:?} too tight; expected >= {min_spread:?}"
+        );
+        // And the min must be below base, max must be above base, so we
+        // actually see both sides of the window.
+        assert!(min < base, "jitter never produces a value below base");
+        assert!(max > base, "jitter never produces a value above base");
+    }
+
+    #[test]
+    fn suspect_backoff_doubles_per_indirect_round() {
+        let base = Duration::from_millis(100);
+        // attempts=0: before any indirect round sent — treat as first.
+        // attempts=1: first indirect round → 2 * base
+        assert_eq!(suspect_backoff_delay(base, 1), Duration::from_millis(200));
+        // attempts=2: second round → 4 * base
+        assert_eq!(suspect_backoff_delay(base, 2), Duration::from_millis(400));
+        // attempts=3: third round → 8 * base
+        assert_eq!(suspect_backoff_delay(base, 3), Duration::from_millis(800));
+        // attempts=4+: capped at 16 * base
+        assert_eq!(suspect_backoff_delay(base, 4), Duration::from_millis(1600));
+        assert_eq!(suspect_backoff_delay(base, 100), Duration::from_millis(1600));
     }
 }

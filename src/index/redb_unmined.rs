@@ -1,11 +1,20 @@
 //! ReDB-backed unmined secondary index.
 //!
-//! Same dual-table structure as the DAH index but returns `UnminedRedoEntry`
-//! from insert/remove for redo log persistence.
+//! Two-phase durability: every mutating `insert`/`remove` call appends and
+//! fsyncs a [`RedoOp::SecondaryUnminedUpdate`] entry BEFORE committing the
+//! redb transaction. If the fsync fails the redb commit is skipped and an
+//! error is returned — the on-disk secondary index never diverges from the
+//! redo log without a matching redo entry.
+//!
+//! On crash recovery, the replay path is idempotent: it reads the current
+//! `unmined_since` from the primary index and only reapplies the secondary
+//! update when the current state is stale.
 
 use crate::index::hashtable::TxKey;
 use crate::index::unmined_index::UnminedRedoEntry;
 use crate::index::IndexError;
+use crate::redo::{RedoLog, RedoOp};
+use parking_lot::Mutex;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::path::Path;
 
@@ -73,180 +82,178 @@ impl RedbUnminedIndex {
         Some(u32::from_le_bytes(guard.value()))
     }
 
-    /// Insert a transaction into the unmined index.
+    /// Insert a transaction into the unmined index with two-phase durability.
     ///
-    /// Returns an [`UnminedRedoEntry`] that MUST be written to the redo log.
+    /// Steps:
+    ///   1. Read the current height (if any) from redb.
+    ///   2. If a redo log is provided, append and fsync a
+    ///      [`RedoOp::SecondaryUnminedUpdate`] record.
+    ///   3. Commit the redb transaction.
     ///
-    /// On I/O errors the write is not committed and a **no-op** redo entry
-    /// (`old_height == new_height`) is returned so that replaying it is
-    /// harmless and does not create index/data inconsistency.
-    pub fn insert(&mut self, height: u32, key: TxKey) -> UnminedRedoEntry {
-        // Read old_height before attempting the write so we have the correct
-        // value even if the write transaction fails.
+    /// If the redo flush fails, the redb transaction is NOT committed — so
+    /// the on-disk state cannot race ahead of the redo log. If the redb
+    /// transaction fails, the error is returned to the caller, but a redo
+    /// entry may have been written — recovery replay is idempotent and
+    /// converges the secondary index to the primary's authoritative state.
+    ///
+    /// `redo_log` may be `None` in contexts where durability is not required
+    /// (unit tests, in-memory-only fixtures). Production callers MUST provide
+    /// the redo log — passing `None` skips step 2 and leaves the redb commit
+    /// unprotected.
+    pub fn insert(
+        &mut self,
+        height: u32,
+        key: TxKey,
+        redo_log: Option<&Mutex<RedoLog>>,
+    ) -> Result<(), IndexError> {
         let old_height = self.get_height(&key).unwrap_or(0);
+        if old_height == height {
+            // No-op: redb state already matches. No redo entry needed
+            // because the primary's current unmined_since equals `height`
+            // and recovery will not try to "undo" a no-op.
+            return Ok(());
+        }
 
-        // No-op redo entry returned on any I/O failure — replaying it is
-        // harmless because old_height == new_height means "nothing changed".
-        let noop = UnminedRedoEntry {
-            txid: key.txid,
-            old_height,
-            new_height: old_height,
-        };
+        // Phase 1: redo-first durability. If the fsync fails we MUST NOT
+        // commit redb, or recovery cannot reconcile the divergence.
+        if let Some(redo) = redo_log {
+            let op = RedoOp::SecondaryUnminedUpdate {
+                tx_key: key,
+                old_height,
+                new_height: height,
+            };
+            let mut log = redo.lock();
+            log.append_and_flush(op).map_err(|e| IndexError::FormatError {
+                detail: format!("redo append_and_flush (unmined insert): {e}"),
+            })?;
+        }
 
-        let txn = match self.begin_write() {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("redb unmined insert: begin_write failed: {e}");
-                return noop;
-            }
-        };
+        // Phase 2: commit redb. At this point the redo log (if any) has a
+        // durable record of the intent; recovery can re-apply if this fails.
+        let txn = self.begin_write().map_err(map_txn_err)?;
         let was_new;
         {
-            let mut fwd = match txn.open_table(UNMINED_FORWARD) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("redb unmined insert: open_table(forward) failed: {e}");
-                    return noop;
-                }
-            };
-            let mut rev = match txn.open_table(UNMINED_REVERSE) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("redb unmined insert: open_table(reverse) failed: {e}");
-                    return noop;
-                }
-            };
+            let mut fwd = txn.open_table(UNMINED_FORWARD).map_err(map_table_err)?;
+            let mut rev = txn.open_table(UNMINED_REVERSE).map_err(map_table_err)?;
 
-            match rev.get(key.txid) {
-                Ok(Some(guard)) => {
+            match rev.get(key.txid).map_err(map_storage_err)? {
+                Some(guard) => {
                     let existing_height = u32::from_le_bytes(guard.value());
                     drop(guard);
-                    if existing_height == height {
-                        return UnminedRedoEntry {
-                            txid: key.txid,
-                            old_height,
-                            new_height: height,
-                        };
-                    }
                     was_new = false;
                     let old_fwd_key = make_forward_key(existing_height, &key);
-                    if let Err(e) = fwd.remove(old_fwd_key) {
-                        eprintln!("redb unmined insert: remove old forward entry failed: {e}");
-                        return noop;
-                    }
+                    fwd.remove(old_fwd_key).map_err(map_storage_err)?;
                 }
-                Ok(None) => {
+                None => {
                     was_new = true;
                 }
-                Err(e) => {
-                    eprintln!("redb unmined insert: reverse lookup failed: {e}");
-                    return noop;
-                }
             }
 
-            if let Err(e) = rev.insert(key.txid, height.to_le_bytes()) {
-                eprintln!("redb unmined insert: reverse insert failed: {e}");
-                return noop;
-            }
-            if let Err(e) = fwd.insert(make_forward_key(height, &key), ()) {
-                eprintln!("redb unmined insert: forward insert failed: {e}");
-                return noop;
-            }
+            rev.insert(key.txid, height.to_le_bytes()).map_err(map_storage_err)?;
+            fwd.insert(make_forward_key(height, &key), ()).map_err(map_storage_err)?;
         }
-        match txn.commit() {
-            Ok(()) => {
-                if was_new {
-                    self.count += 1;
-                }
-            }
-            Err(e) => {
-                eprintln!("redb unmined insert: commit failed: {e}");
-                return noop;
-            }
+        // Fault-injection: crash between durable redo intent and the redb
+        // commit. Post-recovery, the secondary index MUST be reconciled
+        // from the durable redo entry (C4 two-phase durability contract).
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::BeforeSecondaryRedbCommit,
+        );
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::BeforeIndexCommit,
+        );
+        txn.commit().map_err(map_commit_err)?;
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::AfterSecondaryRedbCommit,
+        );
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::AfterIndexCommit,
+        );
+        if was_new {
+            self.count += 1;
         }
-
-        UnminedRedoEntry {
-            txid: key.txid,
-            old_height,
-            new_height: height,
-        }
+        Ok(())
     }
 
-    /// Remove a transaction from the unmined index.
+    /// Remove a transaction from the unmined index with two-phase durability.
     ///
-    /// Returns an [`UnminedRedoEntry`] that MUST be written to the redo log.
-    ///
-    /// On I/O errors the write is not committed and a **no-op** redo entry
-    /// (`old_height == new_height`) is returned so that replaying it is
-    /// harmless and does not create index/data inconsistency.
-    pub fn remove(&mut self, key: &TxKey) -> UnminedRedoEntry {
-        // Read old_height before attempting the write for correct redo entry.
-        let old_height = self.get_height(key).unwrap_or(0);
-
-        // No-op redo entry returned on any I/O failure.
-        let noop = UnminedRedoEntry {
-            txid: key.txid,
-            old_height,
-            new_height: old_height,
+    /// Steps are analogous to [`insert`]: read old_height, redo-first
+    /// fsync (if a log is provided), then commit the redb transaction.
+    /// See [`insert`] for the durability ordering rationale.
+    pub fn remove(
+        &mut self,
+        key: &TxKey,
+        redo_log: Option<&Mutex<RedoLog>>,
+    ) -> Result<(), IndexError> {
+        let old_height = match self.get_height(key) {
+            Some(h) => h,
+            None => return Ok(()), // Already absent — nothing to do, no redo.
         };
 
-        let txn = match self.begin_write() {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("redb unmined remove: begin_write failed: {e}");
-                return noop;
-            }
-        };
+        if let Some(redo) = redo_log {
+            let op = RedoOp::SecondaryUnminedUpdate {
+                tx_key: *key,
+                old_height,
+                new_height: 0,
+            };
+            let mut log = redo.lock();
+            log.append_and_flush(op).map_err(|e| IndexError::FormatError {
+                detail: format!("redo append_and_flush (unmined remove): {e}"),
+            })?;
+        }
+
+        let txn = self.begin_write().map_err(map_txn_err)?;
         let had_entry;
         {
-            let mut fwd = match txn.open_table(UNMINED_FORWARD) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("redb unmined remove: open_table(forward) failed: {e}");
-                    return noop;
-                }
-            };
-            let mut rev = match txn.open_table(UNMINED_REVERSE) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("redb unmined remove: open_table(reverse) failed: {e}");
-                    return noop;
-                }
-            };
+            let mut fwd = txn.open_table(UNMINED_FORWARD).map_err(map_table_err)?;
+            let mut rev = txn.open_table(UNMINED_REVERSE).map_err(map_table_err)?;
 
-            had_entry = match rev.remove(key.txid) {
-                Ok(Some(guard)) => {
+            had_entry = match rev.remove(key.txid).map_err(map_storage_err)? {
+                Some(guard) => {
                     let h = u32::from_le_bytes(guard.value());
-                    if let Err(e) = fwd.remove(make_forward_key(h, key)) {
-                        eprintln!("redb unmined remove: forward remove failed: {e}");
-                        return noop;
-                    }
+                    fwd.remove(make_forward_key(h, key)).map_err(map_storage_err)?;
                     true
                 }
-                Ok(None) => false,
-                Err(e) => {
-                    eprintln!("redb unmined remove: reverse remove failed: {e}");
-                    return noop;
-                }
+                None => false,
             };
         }
-        match txn.commit() {
-            Ok(()) => {
-                if had_entry {
-                    self.count -= 1;
-                }
-            }
-            Err(e) => {
-                eprintln!("redb unmined remove: commit failed: {e}");
-                return noop;
-            }
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::BeforeSecondaryRedbCommit,
+        );
+        txn.commit().map_err(map_commit_err)?;
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::AfterSecondaryRedbCommit,
+        );
+        if had_entry {
+            self.count -= 1;
         }
+        Ok(())
+    }
 
-        UnminedRedoEntry {
-            txid: key.txid,
-            old_height,
-            new_height: 0,
-        }
+    /// Commit the redb transaction for an already-fsynced redo entry.
+    ///
+    /// Used when the caller has already appended a batched redo flush covering
+    /// multiple secondary updates (e.g., a combined DAH + unmined change from
+    /// `mark_on_longest_chain`). The caller is responsible for ensuring the
+    /// matching [`RedoOp::SecondaryUnminedUpdate`] is already durable before
+    /// calling this function. Recovery replay handles any inconsistency if
+    /// this redb commit fails after the fsync.
+    pub fn commit_insert_post_fsync(
+        &mut self,
+        height: u32,
+        key: TxKey,
+    ) -> Result<(), IndexError> {
+        // Delegate to insert with no redo log: the caller has already done
+        // redo-first durability, so this just performs the redb commit.
+        self.insert(height, key, None)
+    }
+
+    /// Commit the redb remove for an already-fsynced redo entry.
+    /// See [`commit_insert_post_fsync`] for the caller contract.
+    pub fn commit_remove_post_fsync(
+        &mut self,
+        key: &TxKey,
+    ) -> Result<(), IndexError> {
+        self.remove(key, None)
     }
 
     /// Return all txids with unmined_since in `[0, cutoff_height]`.
@@ -394,14 +401,17 @@ impl RedbUnminedIndex {
     }
 
     /// Replay a redo entry to bring the index up to date.
-    pub fn replay_redo(&mut self, entry: &UnminedRedoEntry) {
-        let key = TxKey {
-            txid: entry.txid,
-        };
+    ///
+    /// Idempotent: if the redb state already matches the redo entry's
+    /// `new_height`, the replay is a no-op. No additional redo entry is
+    /// written during replay — the original intent record already covers
+    /// the transition.
+    pub fn replay_redo(&mut self, entry: &UnminedRedoEntry) -> Result<(), IndexError> {
+        let key = TxKey { txid: entry.txid };
         if entry.new_height == 0 {
-            self.remove(&key);
+            self.remove(&key, None)
         } else {
-            self.insert(entry.new_height, key);
+            self.insert(entry.new_height, key, None)
         }
     }
 
@@ -456,57 +466,53 @@ mod tests {
     }
 
     #[test]
-    fn insert_returns_redo_entry() {
+    fn insert_basic() {
         let (_dir, mut idx) = open_temp();
-        let redo = idx.insert(100, key(1));
-        assert_eq!(redo.old_height, 0);
-        assert_eq!(redo.new_height, 100);
-        assert_eq!(redo.txid[0], 1);
-    }
-
-    #[test]
-    fn insert_update_returns_old_height() {
-        let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        let redo = idx.insert(200, key(1));
-        assert_eq!(redo.old_height, 100);
-        assert_eq!(redo.new_height, 200);
-    }
-
-    #[test]
-    fn insert_same_height_returns_same() {
-        let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        let redo = idx.insert(100, key(1));
-        assert_eq!(redo.old_height, 100);
-        assert_eq!(redo.new_height, 100);
+        idx.insert(100, key(1), None).unwrap();
+        assert_eq!(idx.get_height(&key(1)), Some(100));
         assert_eq!(idx.len(), 1);
     }
 
     #[test]
-    fn remove_returns_redo_entry() {
+    fn insert_update_replaces_height() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        let redo = idx.remove(&key(1));
-        assert_eq!(redo.old_height, 100);
-        assert_eq!(redo.new_height, 0);
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(1), None).unwrap();
+        assert_eq!(idx.get_height(&key(1)), Some(200));
+        assert_eq!(idx.len(), 1);
+    }
+
+    #[test]
+    fn insert_same_height_is_noop() {
+        let (_dir, mut idx) = open_temp();
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(100, key(1), None).unwrap();
+        assert_eq!(idx.get_height(&key(1)), Some(100));
+        assert_eq!(idx.len(), 1);
+    }
+
+    #[test]
+    fn remove_basic() {
+        let (_dir, mut idx) = open_temp();
+        idx.insert(100, key(1), None).unwrap();
+        idx.remove(&key(1), None).unwrap();
+        assert_eq!(idx.get_height(&key(1)), None);
         assert_eq!(idx.len(), 0);
     }
 
     #[test]
-    fn remove_missing_returns_zero() {
+    fn remove_missing_is_noop() {
         let (_dir, mut idx) = open_temp();
-        let redo = idx.remove(&key(99));
-        assert_eq!(redo.old_height, 0);
-        assert_eq!(redo.new_height, 0);
+        idx.remove(&key(99), None).unwrap();
+        assert_eq!(idx.len(), 0);
     }
 
     #[test]
     fn range_query() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(200, key(2));
-        idx.insert(300, key(3));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
+        idx.insert(300, key(3), None).unwrap();
 
         let result = idx.range_query(200);
         assert_eq!(result.len(), 2);
@@ -517,8 +523,8 @@ mod tests {
     #[test]
     fn clear() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(200, key(2));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
         idx.clear();
         assert!(idx.is_empty());
     }
@@ -531,7 +537,7 @@ mod tests {
             old_height: 0,
             new_height: 500,
         };
-        idx.replay_redo(&entry);
+        idx.replay_redo(&entry).unwrap();
         assert_eq!(idx.len(), 1);
         let result = idx.range_query(500);
         assert_eq!(result.len(), 1);
@@ -540,13 +546,13 @@ mod tests {
     #[test]
     fn replay_redo_remove() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(500, key(1));
+        idx.insert(500, key(1), None).unwrap();
         let entry = UnminedRedoEntry {
             txid: key(1).txid,
             old_height: 500,
             new_height: 0,
         };
-        idx.replay_redo(&entry);
+        idx.replay_redo(&entry).unwrap();
         assert!(idx.is_empty());
     }
 
@@ -554,38 +560,38 @@ mod tests {
     fn insert_count_incremental() {
         let (_dir, mut idx) = open_temp();
         assert_eq!(idx.len(), 0);
-        idx.insert(100, key(1));
+        idx.insert(100, key(1), None).unwrap();
         assert_eq!(idx.len(), 1);
-        idx.insert(200, key(2));
+        idx.insert(200, key(2), None).unwrap();
         assert_eq!(idx.len(), 2);
-        idx.insert(300, key(3));
+        idx.insert(300, key(3), None).unwrap();
         assert_eq!(idx.len(), 3);
     }
 
     #[test]
     fn remove_count_incremental() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(200, key(2));
-        idx.insert(300, key(3));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
+        idx.insert(300, key(3), None).unwrap();
         assert_eq!(idx.len(), 3);
 
-        idx.remove(&key(2));
+        idx.remove(&key(2), None).unwrap();
         assert_eq!(idx.len(), 2);
-        idx.remove(&key(1));
+        idx.remove(&key(1), None).unwrap();
         assert_eq!(idx.len(), 1);
-        idx.remove(&key(3));
+        idx.remove(&key(3), None).unwrap();
         assert_eq!(idx.len(), 0);
     }
 
     #[test]
     fn insert_update_does_not_change_count() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
+        idx.insert(100, key(1), None).unwrap();
         assert_eq!(idx.len(), 1);
-        idx.insert(200, key(1)); // Update height, same key
+        idx.insert(200, key(1), None).unwrap(); // Update height, same key
         assert_eq!(idx.len(), 1);
-        idx.insert(300, key(1)); // Another update
+        idx.insert(300, key(1), None).unwrap(); // Another update
         assert_eq!(idx.len(), 1);
     }
 
@@ -628,7 +634,7 @@ mod tests {
         let dir1 = tempfile::tempdir().unwrap();
         let mut idx1 = RedbUnminedIndex::open(dir1.path().join("unmined.redb").as_path(), 16 * 1024 * 1024).unwrap();
         for n in 1..=20u8 {
-            idx1.insert(n as u32 * 100, key(n));
+            idx1.insert(n as u32 * 100, key(n), None).unwrap();
         }
 
         // Batch insert
@@ -648,13 +654,13 @@ mod tests {
         let (_dir, mut idx) = open_temp();
         assert!(idx.get_height(&key(1)).is_none());
 
-        idx.insert(100, key(1));
+        idx.insert(100, key(1), None).unwrap();
         assert_eq!(idx.get_height(&key(1)), Some(100));
 
-        idx.insert(200, key(1)); // Update
+        idx.insert(200, key(1), None).unwrap(); // Update
         assert_eq!(idx.get_height(&key(1)), Some(200));
 
-        idx.remove(&key(1));
+        idx.remove(&key(1), None).unwrap();
         assert!(idx.get_height(&key(1)).is_none());
     }
 
@@ -665,8 +671,8 @@ mod tests {
 
         {
             let mut idx = RedbUnminedIndex::open(&db_path, 16 * 1024 * 1024).unwrap();
-            idx.insert(100, key(1));
-            idx.insert(200, key(2));
+            idx.insert(100, key(1), None).unwrap();
+            idx.insert(200, key(2), None).unwrap();
         }
 
         {
@@ -680,9 +686,9 @@ mod tests {
     #[test]
     fn iter_returns_correct_height_key_pairs() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(200, key(2));
-        idx.insert(300, key(3));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
+        idx.insert(300, key(3), None).unwrap();
 
         let entries = idx.iter();
         assert_eq!(entries.len(), 3);
@@ -708,8 +714,8 @@ mod tests {
     #[test]
     fn range_query_below_all_heights() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(200, key(2));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
 
         let result = idx.range_query(99);
         assert!(result.is_empty());
@@ -718,9 +724,9 @@ mod tests {
     #[test]
     fn range_query_above_all_heights() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(200, key(2));
-        idx.insert(300, key(3));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
+        idx.insert(300, key(3), None).unwrap();
 
         let result = idx.range_query(u32::MAX);
         assert_eq!(result.len(), 3);
@@ -729,14 +735,14 @@ mod tests {
     #[test]
     fn clear_then_reinsert() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(200, key(2));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
         idx.clear();
         assert!(idx.is_empty());
         assert!(idx.range_query(1000).is_empty());
 
         // New inserts work on a clean slate
-        idx.insert(500, key(10));
+        idx.insert(500, key(10), None).unwrap();
         assert_eq!(idx.len(), 1);
         let result = idx.range_query(500);
         assert_eq!(result.len(), 1);
@@ -744,22 +750,18 @@ mod tests {
     }
 
     #[test]
-    fn remove_then_reinsert_tracks_redo_correctly() {
+    fn remove_then_reinsert_cycle() {
         let (_dir, mut idx) = open_temp();
-        let redo1 = idx.insert(100, key(1));
-        assert_eq!(redo1.old_height, 0);
-        assert_eq!(redo1.new_height, 100);
+        idx.insert(100, key(1), None).unwrap();
+        assert_eq!(idx.get_height(&key(1)), Some(100));
 
-        let redo2 = idx.remove(&key(1));
-        assert_eq!(redo2.old_height, 100);
-        assert_eq!(redo2.new_height, 0);
+        idx.remove(&key(1), None).unwrap();
         assert!(idx.is_empty());
 
-        // Re-insert: old_height should be 0 since we removed it
-        let redo3 = idx.insert(500, key(1));
-        assert_eq!(redo3.old_height, 0);
-        assert_eq!(redo3.new_height, 500);
+        // Re-insert
+        idx.insert(500, key(1), None).unwrap();
         assert_eq!(idx.len(), 1);
+        assert_eq!(idx.get_height(&key(1)), Some(500));
 
         let result = idx.range_query(500);
         assert_eq!(result.len(), 1);
@@ -773,21 +775,21 @@ mod tests {
         assert_eq!(idx.len(), 0);
         assert!(idx.is_empty());
 
-        idx.insert(100, key(1));
+        idx.insert(100, key(1), None).unwrap();
         assert_eq!(idx.len(), 1);
         assert!(!idx.is_empty());
 
-        idx.insert(200, key(2));
+        idx.insert(200, key(2), None).unwrap();
         assert_eq!(idx.len(), 2);
 
         // Update existing key (different height) — count stays the same
-        idx.insert(300, key(1));
+        idx.insert(300, key(1), None).unwrap();
         assert_eq!(idx.len(), 2);
 
-        idx.remove(&key(1));
+        idx.remove(&key(1), None).unwrap();
         assert_eq!(idx.len(), 1);
 
-        idx.remove(&key(2));
+        idx.remove(&key(2), None).unwrap();
         assert_eq!(idx.len(), 0);
         assert!(idx.is_empty());
     }
@@ -799,8 +801,8 @@ mod tests {
 
         {
             let mut idx = RedbUnminedIndex::open(&db_path, 16 * 1024 * 1024).unwrap();
-            idx.insert(100, key(1));
-            idx.insert(200, key(2));
+            idx.insert(100, key(1), None).unwrap();
+            idx.insert(200, key(2), None).unwrap();
             idx.clear();
         }
 
@@ -812,9 +814,9 @@ mod tests {
     #[test]
     fn multiple_entries_same_height() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(100, key(2));
-        idx.insert(100, key(3));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(100, key(2), None).unwrap();
+        idx.insert(100, key(3), None).unwrap();
 
         assert_eq!(idx.len(), 3);
         let result = idx.range_query(100);
@@ -830,9 +832,9 @@ mod tests {
     #[test]
     fn large_height_values() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(u32::MAX, key(1));
-        idx.insert(u32::MAX - 1, key(2));
-        idx.insert(1, key(3));
+        idx.insert(u32::MAX, key(1), None).unwrap();
+        idx.insert(u32::MAX - 1, key(2), None).unwrap();
+        idx.insert(1, key(3), None).unwrap();
 
         assert_eq!(idx.len(), 3);
 
@@ -842,5 +844,163 @@ mod tests {
 
         let result = idx.range_query(u32::MAX);
         assert_eq!(result.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Two-phase durability tests — these exercise the bug fix for C4.
+    // -----------------------------------------------------------------------
+
+    use crate::device::MemoryDevice;
+    use crate::redo::RedoLog;
+    use std::sync::Arc;
+
+    fn make_redo_log(size: u64) -> (Arc<MemoryDevice>, Mutex<RedoLog>) {
+        let dev = Arc::new(MemoryDevice::new(size, 4096).unwrap());
+        let log = RedoLog::open(dev.clone(), 0, size).unwrap();
+        (dev, Mutex::new(log))
+    }
+
+    #[test]
+    fn insert_with_redo_log_appends_intent_before_commit() {
+        let (_dir, mut idx) = open_temp();
+        let (redo_dev, redo) = make_redo_log(1024 * 1024);
+
+        idx.insert(500, key(1), Some(&redo)).unwrap();
+
+        // Redb committed
+        assert_eq!(idx.get_height(&key(1)), Some(500));
+
+        // Redo log has the intent record
+        let log = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+        let entries = log.recover().unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].op {
+            RedoOp::SecondaryUnminedUpdate { tx_key, old_height, new_height } => {
+                assert_eq!(tx_key.txid, key(1).txid);
+                assert_eq!(*old_height, 0);
+                assert_eq!(*new_height, 500);
+            }
+            other => panic!("expected SecondaryUnminedUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_with_redo_log_captures_old_height() {
+        let (_dir, mut idx) = open_temp();
+        let (redo_dev, redo) = make_redo_log(1024 * 1024);
+
+        // Seed without redo (bulk-import pattern)
+        idx.insert(100, key(1), None).unwrap();
+
+        // Update with redo
+        idx.insert(200, key(1), Some(&redo)).unwrap();
+
+        let log = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+        let entries = log.recover().unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].op {
+            RedoOp::SecondaryUnminedUpdate { old_height, new_height, .. } => {
+                assert_eq!(*old_height, 100);
+                assert_eq!(*new_height, 200);
+            }
+            other => panic!("expected SecondaryUnminedUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_with_redo_log_emits_removal_intent() {
+        let (_dir, mut idx) = open_temp();
+        idx.insert(500, key(1), None).unwrap();
+        let (redo_dev, redo) = make_redo_log(1024 * 1024);
+
+        idx.remove(&key(1), Some(&redo)).unwrap();
+        assert!(idx.is_empty());
+
+        let log = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+        let entries = log.recover().unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].op {
+            RedoOp::SecondaryUnminedUpdate { old_height, new_height, .. } => {
+                assert_eq!(*old_height, 500);
+                assert_eq!(*new_height, 0);
+            }
+            other => panic!("expected SecondaryUnminedUpdate removal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_noop_with_same_height_skips_redo() {
+        let (_dir, mut idx) = open_temp();
+        idx.insert(100, key(1), None).unwrap();
+        let (redo_dev, redo) = make_redo_log(1024 * 1024);
+
+        // Same-height insert is a no-op — no redo entry should be written.
+        idx.insert(100, key(1), Some(&redo)).unwrap();
+
+        let log = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+        let entries = log.recover().unwrap();
+        assert!(
+            entries.is_empty(),
+            "no-op same-height insert must not append redo entries"
+        );
+    }
+
+    #[test]
+    fn redo_flush_failure_blocks_redb_commit() {
+        // Use a redo log sized so small that a single append fills it,
+        // triggering LogFull on the second call.
+        let (_dir, mut idx) = open_temp();
+        let dev = Arc::new(MemoryDevice::new(4096, 4096).unwrap());
+        let log = RedoLog::open(dev.clone(), 0, 256).unwrap();
+        let redo = Mutex::new(log);
+
+        // First insert consumes space in the tiny log.
+        idx.insert(100, key(1), Some(&redo)).unwrap();
+        // Pack the log until it's near full so the next append fails.
+        // Each SecondaryUnminedUpdate entry is small but append fails when
+        // the buffer + fsynced offset exceed capacity. We force failure
+        // by appending unique keys until the log refuses.
+        let mut next: u8 = 2;
+        loop {
+            match idx.insert((next as u32) * 10, key(next), Some(&redo)) {
+                Ok(_) => next += 1,
+                Err(e) => {
+                    // Expect a redo-related error
+                    assert!(format!("{e}").contains("redo append_and_flush"),
+                            "expected redo error, got: {e}");
+                    break;
+                }
+            }
+            if next > 50 {
+                panic!("expected redo log to fill up");
+            }
+        }
+
+        // Assert that the failed insert did NOT commit to redb.
+        let failed_key = key(next);
+        assert!(
+            idx.get_height(&failed_key).is_none(),
+            "redb must NOT contain an entry whose redo flush failed"
+        );
+    }
+
+    #[test]
+    fn replay_redo_idempotent_against_existing_state() {
+        let (_dir, mut idx) = open_temp();
+        idx.insert(500, key(1), None).unwrap();
+
+        // Replay the same insert — should be a no-op
+        let entry = UnminedRedoEntry {
+            txid: key(1).txid,
+            old_height: 0,
+            new_height: 500,
+        };
+        idx.replay_redo(&entry).unwrap();
+        assert_eq!(idx.get_height(&key(1)), Some(500));
+        assert_eq!(idx.len(), 1);
+
+        // Replay again — still idempotent
+        idx.replay_redo(&entry).unwrap();
+        assert_eq!(idx.len(), 1);
     }
 }

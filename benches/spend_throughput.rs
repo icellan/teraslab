@@ -9,10 +9,8 @@ use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::*;
 use teraslab::ops::engine::Engine;
-use teraslab::ops::remaining::DeleteRequest;
 use teraslab::ops::set_mined::*;
 use teraslab::ops::spend::*;
-use teraslab::record::*;
 
 fn make_tx_id(n: u32) -> [u8; 32] {
     let mut txid = [0u8; 32];

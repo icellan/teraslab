@@ -88,7 +88,7 @@ fn stress_concurrent_membership_mutations() {
         let e1 = all_events.clone();
         s.spawn(move || {
             for i in 1..=50u64 {
-                let events = m1.lock().unwrap().mark_alive(NodeId(i), addr(3000 + i as u16), 1);
+                let events = m1.lock().unwrap().mark_alive(NodeId(i), addr(3000 + i as u16), 1, true);
                 e1.lock().unwrap().extend(events);
                 std::thread::sleep(Duration::from_micros(100));
             }
@@ -878,7 +878,7 @@ fn membership_suspect_alive_cycle_events() {
     let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3001));
 
-    m.mark_alive(NodeId(2), addr, 1);
+    m.mark_alive(NodeId(2), addr, 1, true);
     assert_eq!(m.alive_count(), 2);
 
     // Suspect: alive_count drops but no MembershipChanged
@@ -889,7 +889,8 @@ fn membership_suspect_alive_cycle_events() {
     assert!(suspect_events.iter().any(|e| matches!(e, ClusterEvent::NodeSuspect(_))));
 
     // Recovery: alive_count restored AND MembershipChanged emitted
-    let recover_events = m.mark_alive(NodeId(2), addr, 1);
+    // Direct probe ACK: clears Suspect even at same incarnation.
+    let recover_events = m.mark_alive(NodeId(2), addr, 1, true);
     assert_eq!(m.alive_count(), 2);
     assert!(recover_events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
         "suspect recovery should emit MembershipChanged");
@@ -902,13 +903,13 @@ fn membership_dead_rejoin_same_incarnation() {
     let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3001));
 
-    m.mark_alive(NodeId(2), addr, 5);
+    m.mark_alive(NodeId(2), addr, 5, true);
     m.mark_dead(NodeId(2), 5);
     assert_eq!(m.alive_count(), 1);
     assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Dead);
 
-    // Rejoin with same incarnation
-    let events = m.mark_alive(NodeId(2), addr, 5);
+    // Rejoin with same incarnation (direct probe from the recovered node).
+    let events = m.mark_alive(NodeId(2), addr, 5, true);
     assert_eq!(m.alive_count(), 2);
     assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive);
     assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(2), _))),
@@ -925,11 +926,13 @@ fn membership_stale_alive_on_dead_node_ignored() {
     let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3001));
 
-    m.mark_alive(NodeId(2), addr, 10);
+    m.mark_alive(NodeId(2), addr, 10, true);
     m.mark_dead(NodeId(2), 10);
 
     // Stale alive with incarnation 5 (< current 10) — must be ignored.
-    let events = m.mark_alive(NodeId(2), addr, 5);
+    // direct=false here because stale gossip from an uninformed peer is the
+    // realistic source of a below-current-incarnation alive message.
+    let events = m.mark_alive(NodeId(2), addr, 5, false);
     assert!(events.is_empty(), "stale alive should be ignored on dead node");
     assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Dead);
 }
@@ -942,7 +945,7 @@ fn membership_incarnation_advancement_tracked() {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3001));
 
     for inc in 1..=100u64 {
-        m.mark_alive(NodeId(2), addr, inc);
+        m.mark_alive(NodeId(2), addr, inc, true);
         assert_eq!(m.member_info(&NodeId(2)).unwrap().incarnation, inc);
         assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive);
 

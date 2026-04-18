@@ -1,13 +1,19 @@
 //! Secondary index backend abstractions.
 //!
-//! Separate enums for DAH and unmined because they have different return types
-//! (`UnminedIndex::insert` returns `UnminedRedoEntry`, `DahIndex::insert` does not).
+//! Two-phase durability (see C4): every mutating [`insert`](DahBackend::insert) /
+//! [`remove`](DahBackend::remove) on an on-disk backend appends and fsyncs a
+//! redo intent record BEFORE committing the redb transaction. In-memory
+//! backends have no on-disk state to protect and accept a `None` redo log —
+//! a crash rebuilds them from the primary redo log replay plus device scan.
 
-use crate::index::dah_index::DahIndex;
+use crate::index::dah_index::{DahIndex, DahRedoEntry};
 use crate::index::hashtable::TxKey;
 use crate::index::redb_dah::RedbDahIndex;
 use crate::index::redb_unmined::RedbUnminedIndex;
 use crate::index::unmined_index::{UnminedIndex, UnminedRedoEntry};
+use crate::index::IndexError;
+use crate::redo::RedoLog;
+use parking_lot::Mutex;
 
 // ---------------------------------------------------------------------------
 // Enum iterators (concrete dispatch, matching PrimaryIter pattern)
@@ -94,19 +100,53 @@ impl DahBackend {
         Self::InMemory(DahIndex::new())
     }
 
-    /// Insert a transaction into the DAH index.
-    pub fn insert(&mut self, height: u32, key: TxKey) {
+    /// Insert a transaction into the DAH index with two-phase durability.
+    ///
+    /// For on-disk backends, the redo log (if provided) receives a
+    /// [`RedoOp::SecondaryDahUpdate`] entry that is fsynced BEFORE the redb
+    /// commit. For in-memory backends, the redo log is ignored — a crash
+    /// rebuilds in-memory state from the primary redo replay + device scan.
+    ///
+    /// Returns an error only if the redo log flush or the redb commit fails;
+    /// in-memory updates are infallible.
+    pub fn insert(
+        &mut self,
+        height: u32,
+        key: TxKey,
+        redo_log: Option<&Mutex<RedoLog>>,
+    ) -> Result<(), IndexError> {
         match self {
-            Self::InMemory(idx) => idx.insert(height, key),
-            Self::OnDisk(redb) => redb.insert(height, key),
+            Self::InMemory(idx) => {
+                idx.insert(height, key);
+                Ok(())
+            }
+            Self::OnDisk(redb) => redb.insert(height, key, redo_log),
         }
     }
 
-    /// Remove a transaction from the DAH index.
-    pub fn remove(&mut self, key: &TxKey) {
+    /// Remove a transaction from the DAH index with two-phase durability.
+    pub fn remove(
+        &mut self,
+        key: &TxKey,
+        redo_log: Option<&Mutex<RedoLog>>,
+    ) -> Result<(), IndexError> {
         match self {
-            Self::InMemory(idx) => idx.remove(key),
-            Self::OnDisk(redb) => redb.remove(key),
+            Self::InMemory(idx) => {
+                idx.remove(key);
+                Ok(())
+            }
+            Self::OnDisk(redb) => redb.remove(key, redo_log),
+        }
+    }
+
+    /// Replay a DAH redo entry idempotently.
+    pub fn replay_redo(&mut self, entry: &DahRedoEntry) -> Result<(), IndexError> {
+        match self {
+            Self::InMemory(idx) => {
+                idx.replay_redo(entry);
+                Ok(())
+            }
+            Self::OnDisk(redb) => redb.replay_redo(entry),
         }
     }
 
@@ -192,23 +232,43 @@ impl UnminedBackend {
         Self::InMemory(UnminedIndex::new())
     }
 
-    /// Insert a transaction into the unmined index.
+    /// Insert a transaction into the unmined index with two-phase durability.
     ///
-    /// Returns an [`UnminedRedoEntry`] that MUST be written to the redo log.
-    pub fn insert(&mut self, height: u32, key: TxKey) -> UnminedRedoEntry {
+    /// For on-disk backends, the redo log (if provided) receives a
+    /// [`RedoOp::SecondaryUnminedUpdate`] entry that is fsynced BEFORE the
+    /// redb commit. For in-memory backends, the redo log is ignored.
+    ///
+    /// Returns an error only if the redo log flush or the redb commit fails.
+    pub fn insert(
+        &mut self,
+        height: u32,
+        key: TxKey,
+        redo_log: Option<&Mutex<RedoLog>>,
+    ) -> Result<(), IndexError> {
         match self {
-            Self::InMemory(idx) => idx.insert(height, key),
-            Self::OnDisk(redb) => redb.insert(height, key),
+            Self::InMemory(idx) => {
+                // UnminedRedoEntry is no longer propagated — the primary
+                // redo ops (SetMined / MarkOnLongestChain) carry enough
+                // information for recovery to reconstruct in-memory state.
+                let _ = idx.insert(height, key);
+                Ok(())
+            }
+            Self::OnDisk(redb) => redb.insert(height, key, redo_log),
         }
     }
 
-    /// Remove a transaction from the unmined index.
-    ///
-    /// Returns an [`UnminedRedoEntry`] that MUST be written to the redo log.
-    pub fn remove(&mut self, key: &TxKey) -> UnminedRedoEntry {
+    /// Remove a transaction from the unmined index with two-phase durability.
+    pub fn remove(
+        &mut self,
+        key: &TxKey,
+        redo_log: Option<&Mutex<RedoLog>>,
+    ) -> Result<(), IndexError> {
         match self {
-            Self::InMemory(idx) => idx.remove(key),
-            Self::OnDisk(redb) => redb.remove(key),
+            Self::InMemory(idx) => {
+                let _ = idx.remove(key);
+                Ok(())
+            }
+            Self::OnDisk(redb) => redb.remove(key, redo_log),
         }
     }
 
@@ -252,10 +312,13 @@ impl UnminedBackend {
         }
     }
 
-    /// Replay a redo entry to bring the index up to date.
-    pub fn replay_redo(&mut self, entry: &UnminedRedoEntry) {
+    /// Replay a redo entry idempotently.
+    pub fn replay_redo(&mut self, entry: &UnminedRedoEntry) -> Result<(), IndexError> {
         match self {
-            Self::InMemory(idx) => idx.replay_redo(entry),
+            Self::InMemory(idx) => {
+                idx.replay_redo(entry);
+                Ok(())
+            }
             Self::OnDisk(redb) => redb.replay_redo(entry),
         }
     }
@@ -322,9 +385,9 @@ mod tests {
     #[test]
     fn dah_both_insert_and_range_query() {
         with_both_dah_backends(|backend| {
-            backend.insert(100, key(1));
-            backend.insert(200, key(2));
-            backend.insert(300, key(3));
+            backend.insert(100, key(1), None).unwrap();
+            backend.insert(200, key(2), None).unwrap();
+            backend.insert(300, key(3), None).unwrap();
 
             assert_eq!(backend.len(), 3);
             assert!(!backend.is_empty());
@@ -334,11 +397,9 @@ mod tests {
             assert!(result.contains(&key(1)));
             assert!(result.contains(&key(2)));
 
-            // Above all heights
             let result = backend.range_query(300);
             assert_eq!(result.len(), 3);
 
-            // Below all heights
             let result = backend.range_query(99);
             assert!(result.is_empty());
         });
@@ -347,8 +408,8 @@ mod tests {
     #[test]
     fn dah_both_insert_updates_height() {
         with_both_dah_backends(|backend| {
-            backend.insert(100, key(1));
-            backend.insert(200, key(1)); // Move to new height
+            backend.insert(100, key(1), None).unwrap();
+            backend.insert(200, key(1), None).unwrap();
             assert_eq!(backend.len(), 1);
 
             let result = backend.range_query(100);
@@ -361,17 +422,16 @@ mod tests {
     #[test]
     fn dah_both_remove() {
         with_both_dah_backends(|backend| {
-            backend.insert(100, key(1));
-            backend.insert(200, key(2));
-            backend.remove(&key(1));
+            backend.insert(100, key(1), None).unwrap();
+            backend.insert(200, key(2), None).unwrap();
+            backend.remove(&key(1), None).unwrap();
 
             assert_eq!(backend.len(), 1);
             let result = backend.range_query(300);
             assert_eq!(result.len(), 1);
             assert_eq!(result[0], key(2));
 
-            // Remove missing is no-op
-            backend.remove(&key(99));
+            backend.remove(&key(99), None).unwrap();
             assert_eq!(backend.len(), 1);
         });
     }
@@ -379,8 +439,8 @@ mod tests {
     #[test]
     fn dah_both_clear() {
         with_both_dah_backends(|backend| {
-            backend.insert(100, key(1));
-            backend.insert(200, key(2));
+            backend.insert(100, key(1), None).unwrap();
+            backend.insert(200, key(2), None).unwrap();
             backend.clear();
             assert!(backend.is_empty());
             assert!(backend.range_query(1000).is_empty());
@@ -390,9 +450,9 @@ mod tests {
     #[test]
     fn dah_both_iter() {
         with_both_dah_backends(|backend| {
-            backend.insert(100, key(1));
-            backend.insert(200, key(2));
-            backend.insert(300, key(3));
+            backend.insert(100, key(1), None).unwrap();
+            backend.insert(200, key(2), None).unwrap();
+            backend.insert(300, key(3), None).unwrap();
 
             let entries: Vec<_> = backend.iter().collect();
             assert_eq!(entries.len(), 3);
@@ -429,51 +489,53 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn unmined_both_insert_returns_redo_entry() {
+    fn unmined_both_insert_records_entry() {
         with_both_unmined_backends(|backend| {
-            let redo = backend.insert(100, key(1));
-            assert_eq!(redo.old_height, 0);
-            assert_eq!(redo.new_height, 100);
-            assert_eq!(redo.txid[0], 1);
+            backend.insert(100, key(1), None).unwrap();
 
             assert_eq!(backend.len(), 1);
             assert!(!backend.is_empty());
+
+            // Verify by range query
+            let result = backend.range_query(100);
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0], key(1));
         });
     }
 
     #[test]
-    fn unmined_both_insert_update_returns_old_height() {
+    fn unmined_both_insert_update_replaces_height() {
         with_both_unmined_backends(|backend| {
-            backend.insert(100, key(1));
-            let redo = backend.insert(200, key(1));
-            assert_eq!(redo.old_height, 100);
-            assert_eq!(redo.new_height, 200);
+            backend.insert(100, key(1), None).unwrap();
+            backend.insert(200, key(1), None).unwrap();
             assert_eq!(backend.len(), 1);
+
+            // At the new height only
+            assert!(backend.range_query(100).is_empty());
+            let result = backend.range_query(200);
+            assert_eq!(result.len(), 1);
         });
     }
 
     #[test]
-    fn unmined_both_remove_returns_redo_entry() {
+    fn unmined_both_remove_behaves_correctly() {
         with_both_unmined_backends(|backend| {
-            backend.insert(100, key(1));
-            let redo = backend.remove(&key(1));
-            assert_eq!(redo.old_height, 100);
-            assert_eq!(redo.new_height, 0);
+            backend.insert(100, key(1), None).unwrap();
+            backend.remove(&key(1), None).unwrap();
             assert!(backend.is_empty());
 
-            // Remove missing
-            let redo = backend.remove(&key(99));
-            assert_eq!(redo.old_height, 0);
-            assert_eq!(redo.new_height, 0);
+            // Remove missing is a no-op
+            backend.remove(&key(99), None).unwrap();
+            assert!(backend.is_empty());
         });
     }
 
     #[test]
     fn unmined_both_range_query() {
         with_both_unmined_backends(|backend| {
-            backend.insert(100, key(1));
-            backend.insert(200, key(2));
-            backend.insert(300, key(3));
+            backend.insert(100, key(1), None).unwrap();
+            backend.insert(200, key(2), None).unwrap();
+            backend.insert(300, key(3), None).unwrap();
 
             let result = backend.range_query(200);
             assert_eq!(result.len(), 2);
@@ -485,8 +547,8 @@ mod tests {
     #[test]
     fn unmined_both_clear() {
         with_both_unmined_backends(|backend| {
-            backend.insert(100, key(1));
-            backend.insert(200, key(2));
+            backend.insert(100, key(1), None).unwrap();
+            backend.insert(200, key(2), None).unwrap();
             backend.clear();
             assert!(backend.is_empty());
         });
@@ -495,8 +557,8 @@ mod tests {
     #[test]
     fn unmined_both_iter() {
         with_both_unmined_backends(|backend| {
-            backend.insert(100, key(1));
-            backend.insert(200, key(2));
+            backend.insert(100, key(1), None).unwrap();
+            backend.insert(200, key(2), None).unwrap();
 
             let entries: Vec<_> = backend.iter().collect();
             assert_eq!(entries.len(), 2);
@@ -506,26 +568,24 @@ mod tests {
     #[test]
     fn unmined_both_replay_redo() {
         with_both_unmined_backends(|backend| {
-            // Replay insert
             let entry = UnminedRedoEntry {
                 txid: key(1).txid,
                 old_height: 0,
                 new_height: 500,
             };
-            backend.replay_redo(&entry);
+            backend.replay_redo(&entry).unwrap();
             assert_eq!(backend.len(), 1);
 
             let result = backend.range_query(500);
             assert_eq!(result.len(), 1);
             assert_eq!(result[0], key(1));
 
-            // Replay remove
             let entry = UnminedRedoEntry {
                 txid: key(1).txid,
                 old_height: 500,
                 new_height: 0,
             };
-            backend.replay_redo(&entry);
+            backend.replay_redo(&entry).unwrap();
             assert!(backend.is_empty());
         });
     }
@@ -549,9 +609,9 @@ mod tests {
         // On-disk (Collected variant) gives exact bounds
         let dir = tempfile::tempdir().unwrap();
         let mut redb = RedbDahIndex::open(dir.path().join("dah.redb").as_path(), 16 * 1024 * 1024).unwrap();
-        redb.insert(100, key(1));
-        redb.insert(200, key(2));
-        redb.insert(300, key(3));
+        redb.insert(100, key(1), None).unwrap();
+        redb.insert(200, key(2), None).unwrap();
+        redb.insert(300, key(3), None).unwrap();
         let disk = DahBackend::OnDisk(redb);
         let iter = disk.iter();
         let (lower, upper) = iter.size_hint();
@@ -564,8 +624,8 @@ mod tests {
         // On-disk (Collected variant) gives exact bounds
         let dir = tempfile::tempdir().unwrap();
         let mut redb = RedbUnminedIndex::open(dir.path().join("unmined.redb").as_path(), 16 * 1024 * 1024).unwrap();
-        redb.insert(100, key(1));
-        redb.insert(200, key(2));
+        redb.insert(100, key(1), None).unwrap();
+        redb.insert(200, key(2), None).unwrap();
         let disk = UnminedBackend::OnDisk(redb);
         let iter = disk.iter();
         let (lower, upper) = iter.size_hint();

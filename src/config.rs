@@ -368,12 +368,26 @@ impl ServerConfig {
     }
 
     /// Validate cluster durability settings against the server safety contract.
+    ///
+    /// Rejects `replication_degraded_mode = "best_effort"` when the configured
+    /// replication factor (RF) is greater than 1. With RF > 1 the cluster has
+    /// replicas whose ACKs define durability; allowing best-effort mode would
+    /// silently degrade the contract to single-node durability without any
+    /// operator-visible signal. If RF = 1 (or 0) there are no replicas to
+    /// ACK, so the flag is a no-op and the combination is allowed.
+    ///
+    /// See also: [`STATUS_DEGRADED_DURABILITY`](crate::protocol::opcodes::STATUS_DEGRADED_DURABILITY)
+    /// — the runtime signal emitted when RF > 1 best-effort is *not* in use
+    /// but individual best-effort paths fall back because replicas ACK-failed.
     pub fn validate_cluster_safety(&self) -> std::result::Result<(), String> {
-        if self.is_clustered() && self.replication_degraded_mode == "best_effort" {
-            return Err(
-                "clustered mode does not allow replication_degraded_mode = \"best_effort\""
-                    .to_string(),
-            );
+        if self.replication_factor > 1 && self.replication_degraded_mode == "best_effort" {
+            return Err(format!(
+                "replication_degraded_mode = \"best_effort\" is not allowed with \
+                 replication_factor = {} (> 1): acknowledged writes could be lost \
+                 if the master crashes before replicas catch up. Either set \
+                 replication_degraded_mode = \"reject\" or lower replication_factor to 1.",
+                self.replication_factor,
+            ));
         }
         Ok(())
     }
@@ -395,6 +409,37 @@ impl ServerConfig {
                     "device_id must contain only lowercase hex digits (0-9, a-f)".to_string()
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Maximum allowed `block_height_retention` value.
+    ///
+    /// At BSV's 10-minute target block time, 10,000,000 blocks is roughly
+    /// 190 years — well beyond any realistic retention policy. Capping here
+    /// ensures `current_block_height + block_height_retention` cannot
+    /// overflow `u32` for any remotely plausible current height, turning
+    /// the defense-in-depth `checked_add` in `evaluate_delete_at_height`
+    /// into an impossibility guard in practice. The runtime path still
+    /// returns `SpendError::DahOverflow` if overflow ever does occur.
+    pub const MAX_BLOCK_HEIGHT_RETENTION: u32 = 10_000_000;
+
+    /// Validate `block_height_retention` against the sanity bound.
+    ///
+    /// Returns `Err` if `block_height_retention` exceeds
+    /// [`Self::MAX_BLOCK_HEIGHT_RETENTION`] — a value so large that
+    /// configuring it is almost certainly an operator mistake and would
+    /// leave no headroom for `current_block_height` before `u32` overflow.
+    pub fn validate_block_height_retention(&self) -> std::result::Result<(), String> {
+        if self.block_height_retention > Self::MAX_BLOCK_HEIGHT_RETENTION {
+            return Err(format!(
+                "block_height_retention = {} exceeds maximum allowed value {} \
+                 (roughly 190 years at 10-minute target); configuring this \
+                 large a retention would risk u32 overflow on \
+                 current_block_height + retention",
+                self.block_height_retention,
+                Self::MAX_BLOCK_HEIGHT_RETENTION,
+            ));
         }
         Ok(())
     }
@@ -506,9 +551,10 @@ backend = ""
     }
 
     #[test]
-    fn clustered_best_effort_degraded_mode_is_rejected() {
+    fn best_effort_with_rf_3_is_rejected() {
         let cfg = ServerConfig {
             node_id: 7,
+            replication_factor: 3,
             replication_degraded_mode: "best_effort".to_string(),
             ..ServerConfig::default()
         };
@@ -516,5 +562,93 @@ backend = ""
         let err = cfg.validate_cluster_safety().unwrap_err();
         assert!(err.contains("replication_degraded_mode"));
         assert!(err.contains("best_effort"));
+        assert!(err.contains("replication_factor = 3"));
+    }
+
+    #[test]
+    fn best_effort_with_rf_2_is_rejected() {
+        let cfg = ServerConfig {
+            node_id: 2,
+            replication_factor: 2,
+            replication_degraded_mode: "best_effort".to_string(),
+            ..ServerConfig::default()
+        };
+
+        let err = cfg.validate_cluster_safety().unwrap_err();
+        assert!(err.contains("replication_factor = 2"));
+    }
+
+    #[test]
+    fn best_effort_with_rf_1_is_accepted() {
+        // RF=1 means no replicas — best_effort is a no-op and permitted.
+        let cfg = ServerConfig {
+            node_id: 7,
+            replication_factor: 1,
+            replication_degraded_mode: "best_effort".to_string(),
+            ..ServerConfig::default()
+        };
+
+        cfg.validate_cluster_safety()
+            .expect("RF=1 with best_effort must validate successfully");
+    }
+
+    #[test]
+    fn reject_mode_with_rf_3_is_accepted() {
+        let cfg = ServerConfig {
+            node_id: 7,
+            replication_factor: 3,
+            replication_degraded_mode: "reject".to_string(),
+            ..ServerConfig::default()
+        };
+
+        cfg.validate_cluster_safety()
+            .expect("reject mode must always validate");
+    }
+
+    #[test]
+    fn default_config_validates_cluster_safety() {
+        let cfg = ServerConfig::default();
+        cfg.validate_cluster_safety()
+            .expect("default config must validate");
+    }
+
+    #[test]
+    fn default_block_height_retention_passes_validation() {
+        let cfg = ServerConfig::default();
+        cfg.validate_block_height_retention()
+            .expect("default retention (288) must be well under the bound");
+    }
+
+    #[test]
+    fn block_height_retention_at_bound_is_accepted() {
+        let cfg = ServerConfig {
+            block_height_retention: ServerConfig::MAX_BLOCK_HEIGHT_RETENTION,
+            ..ServerConfig::default()
+        };
+        cfg.validate_block_height_retention()
+            .expect("exactly at the bound is allowed");
+    }
+
+    #[test]
+    fn block_height_retention_u32_max_is_rejected() {
+        let cfg = ServerConfig {
+            block_height_retention: u32::MAX,
+            ..ServerConfig::default()
+        };
+        let err = cfg
+            .validate_block_height_retention()
+            .expect_err("u32::MAX retention must be rejected");
+        assert!(err.contains("block_height_retention"));
+        assert!(err.contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn block_height_retention_one_past_bound_is_rejected() {
+        let cfg = ServerConfig {
+            block_height_retention: ServerConfig::MAX_BLOCK_HEIGHT_RETENTION + 1,
+            ..ServerConfig::default()
+        };
+        let err = cfg.validate_block_height_retention().unwrap_err();
+        assert!(err.contains("block_height_retention"));
     }
 }

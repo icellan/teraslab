@@ -160,6 +160,197 @@ impl AckTracker {
 }
 
 // ---------------------------------------------------------------------------
+// Replica-side applied-sequence tracker
+// ---------------------------------------------------------------------------
+
+/// Errors emitted by [`ReplicaAppliedTracker`] persistence operations.
+#[derive(thiserror::Error, Debug)]
+pub enum ReplicaAppliedError {
+    /// I/O error when reading or writing the on-disk state file.
+    #[error("replica applied tracker io: {0}")]
+    Io(#[from] std::io::Error),
+    /// On-disk state file failed structural validation.
+    #[error("replica applied tracker state corrupt: {0}")]
+    Corrupt(String),
+}
+
+/// Per-shard `(shard_or_stream_id, last_applied_seq)` journal used by
+/// the replication receiver to guarantee batch-level idempotency.
+///
+/// The receiver consults this tracker before dispatching an incoming
+/// batch: if the batch's first sequence is less-than-or-equal to
+/// `get(stream)`, the batch has already been applied and is skipped.
+/// On successful apply the tracker is updated and — subject to a
+/// configurable batch / time budget — flushed to disk so that a
+/// receiver restart resumes from the correct point.
+///
+/// The file format mirrors [`AckTracker`]:
+/// `[entry_count:4 LE]([id_len:2 LE][id_bytes][last_applied:8 LE])*`
+#[derive(Debug)]
+pub struct ReplicaAppliedTracker {
+    path: PathBuf,
+    inner: Mutex<ReplicaAppliedInner>,
+}
+
+#[derive(Debug)]
+struct ReplicaAppliedInner {
+    /// Per-stream / per-shard highest applied sequence.
+    last_applied: HashMap<String, u64>,
+    /// Unflushed updates accumulated since the last `flush`.
+    dirty: bool,
+}
+
+impl ReplicaAppliedTracker {
+    /// Open (or create) a tracker backed by the given path.
+    ///
+    /// If the file exists but is malformed, returns
+    /// [`ReplicaAppliedError::Corrupt`]. A missing file is NOT an
+    /// error; the tracker starts empty.
+    pub fn load(path: PathBuf) -> std::result::Result<Self, ReplicaAppliedError> {
+        let last_applied = Self::read_from_disk(&path)?;
+        Ok(Self {
+            path,
+            inner: Mutex::new(ReplicaAppliedInner {
+                last_applied,
+                dirty: false,
+            }),
+        })
+    }
+
+    /// Construct a tracker without touching disk — used for tests and
+    /// for receivers running without durable idempotency.
+    pub fn in_memory() -> Self {
+        Self {
+            path: PathBuf::new(),
+            inner: Mutex::new(ReplicaAppliedInner {
+                last_applied: HashMap::new(),
+                dirty: false,
+            }),
+        }
+    }
+
+    /// Highest sequence applied for `stream`. Returns `0` if the
+    /// stream has no record yet.
+    pub fn get(&self, stream: &str) -> u64 {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.last_applied.get(stream).copied().unwrap_or(0)
+    }
+
+    /// Record that `stream` has durably applied through `seq`.
+    ///
+    /// Only advances; a lower `seq` is ignored so concurrent callers
+    /// cannot rewind the journal. Marks the tracker dirty for the
+    /// next [`flush`](Self::flush) call.
+    pub fn set(&self, stream: &str, seq: u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = inner.last_applied.entry(stream.to_string()).or_insert(0);
+        if seq > *entry {
+            *entry = seq;
+            inner.dirty = true;
+        }
+    }
+
+    /// Force the in-memory state to disk if it has been modified.
+    ///
+    /// Returns `Ok(())` when the file already reflects the state
+    /// (either clean or the flush succeeded) and `Err` if writing the
+    /// temp file or the rename failed. The tracker is left dirty if
+    /// the flush failed so a later retry can persist the update.
+    pub fn flush(&self) -> std::result::Result<(), ReplicaAppliedError> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !inner.dirty {
+            return Ok(());
+        }
+        if self.path.as_os_str().is_empty() {
+            // Memory-only tracker: clearing the dirty flag is legal
+            // because there is no backing file to keep in sync.
+            inner.dirty = false;
+            return Ok(());
+        }
+        Self::write_to_disk(&self.path, &inner.last_applied)?;
+        inner.dirty = false;
+        Ok(())
+    }
+
+    /// Snapshot of all tracked streams and their last-applied
+    /// sequences — useful for diagnostics and tests.
+    pub fn snapshot(&self) -> HashMap<String, u64> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.last_applied.clone()
+    }
+
+    /// Serialize the state map to disk atomically.
+    fn write_to_disk(
+        path: &Path,
+        state: &HashMap<String, u64>,
+    ) -> std::result::Result<(), ReplicaAppliedError> {
+        let mut buf = Vec::with_capacity(4 + state.len() * 24);
+        buf.extend_from_slice(&(state.len() as u32).to_le_bytes());
+        for (id, &seq) in state {
+            let bytes = id.as_bytes();
+            buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(bytes);
+            buf.extend_from_slice(&seq.to_le_bytes());
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &buf)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load and parse the state map from disk.
+    fn read_from_disk(
+        path: &Path,
+    ) -> std::result::Result<HashMap<String, u64>, ReplicaAppliedError> {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(HashMap::new());
+            }
+            Err(e) => return Err(ReplicaAppliedError::Io(e)),
+        };
+        if data.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if data.len() < 4 {
+            return Err(ReplicaAppliedError::Corrupt("truncated header".into()));
+        }
+
+        let count = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4])) as usize;
+        let mut result = HashMap::with_capacity(count);
+        let mut pos = 4;
+        for _ in 0..count {
+            if pos + 2 > data.len() {
+                return Err(ReplicaAppliedError::Corrupt(
+                    "truncated entry length".into(),
+                ));
+            }
+            let id_len = u16::from_le_bytes(
+                data[pos..pos + 2]
+                    .try_into()
+                    .unwrap_or([0; 2]),
+            ) as usize;
+            pos += 2;
+            if pos + id_len + 8 > data.len() {
+                return Err(ReplicaAppliedError::Corrupt("truncated entry body".into()));
+            }
+            let id = std::str::from_utf8(&data[pos..pos + id_len])
+                .map_err(|e| ReplicaAppliedError::Corrupt(format!("invalid utf8: {e}")))?
+                .to_string();
+            pos += id_len;
+            let seq = u64::from_le_bytes(
+                data[pos..pos + 8]
+                    .try_into()
+                    .unwrap_or([0; 8]),
+            );
+            pos += 8;
+            result.insert(id, seq);
+        }
+        Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Catch-up runner
 // ---------------------------------------------------------------------------
 
@@ -366,5 +557,76 @@ mod tests {
         // No file exists — should load empty.
         let tracker = AckTracker::new(path);
         assert_eq!(tracker.all_acked().len(), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // ReplicaAppliedTracker
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn applied_tracker_set_and_get_monotonic() {
+        let t = ReplicaAppliedTracker::in_memory();
+        assert_eq!(t.get("shard-0"), 0);
+
+        t.set("shard-0", 50);
+        assert_eq!(t.get("shard-0"), 50);
+
+        // Lower sequence must not rewind.
+        t.set("shard-0", 10);
+        assert_eq!(t.get("shard-0"), 50);
+
+        // Higher advances.
+        t.set("shard-0", 100);
+        assert_eq!(t.get("shard-0"), 100);
+
+        // Independent streams are separate.
+        t.set("shard-1", 7);
+        assert_eq!(t.get("shard-1"), 7);
+        assert_eq!(t.get("shard-0"), 100);
+    }
+
+    #[test]
+    fn applied_tracker_persistence_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("applied.dat");
+
+        {
+            let t = ReplicaAppliedTracker::load(path.clone()).unwrap();
+            t.set("alpha", 42);
+            t.set("beta", 100);
+            t.flush().unwrap();
+        }
+
+        let t2 = ReplicaAppliedTracker::load(path).unwrap();
+        assert_eq!(t2.get("alpha"), 42);
+        assert_eq!(t2.get("beta"), 100);
+        assert_eq!(t2.get("unknown"), 0);
+    }
+
+    #[test]
+    fn applied_tracker_flush_clears_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("applied.dat");
+        let t = ReplicaAppliedTracker::load(path.clone()).unwrap();
+        t.set("s", 5);
+        t.flush().unwrap();
+        // Second flush is a no-op (not dirty) and must still succeed.
+        t.flush().unwrap();
+        // Reload verifies the flush actually persisted the value.
+        let t2 = ReplicaAppliedTracker::load(path).unwrap();
+        assert_eq!(t2.get("s"), 5);
+    }
+
+    #[test]
+    fn applied_tracker_corrupt_file_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("applied.dat");
+        // Write a truncated header (only 2 bytes instead of the required 4).
+        std::fs::write(&path, [0xFFu8; 2]).unwrap();
+        let err = ReplicaAppliedTracker::load(path).expect_err("should reject");
+        match err {
+            ReplicaAppliedError::Corrupt(_) => {}
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
     }
 }

@@ -11,6 +11,9 @@
 //! for better TLB performance at scale, falling back to regular pages.
 //! On macOS (development), regular pages are used directly.
 
+use crate::redo::{RedoLog, RedoOp};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -27,6 +30,14 @@ pub enum HashTableError {
     /// Memory allocation failed.
     #[error("mmap allocation failed: {0}")]
     AllocFailed(String),
+
+    /// Filesystem I/O error during a resize or rename.
+    #[error("resize I/O failure: {0}")]
+    ResizeIo(String),
+
+    /// Redo log journaling failure during a crash-atomic resize.
+    #[error("resize redo log failure: {0}")]
+    ResizeRedo(String),
 }
 
 pub type Result<T> = std::result::Result<T, HashTableError>;
@@ -277,6 +288,81 @@ unsafe fn dealloc_mmap_buckets(ptr: *mut Bucket, byte_len: usize) {
     }
 }
 
+/// Extract raw bytes from a filesystem path without UTF-8 validation.
+///
+/// POSIX paths are sequences of non-NUL bytes; they are NOT guaranteed to
+/// be valid UTF-8 and must not be lossily converted. On Unix we use
+/// `OsStrExt::as_bytes()`. On other platforms we fall back to
+/// `to_string_lossy().into_owned().into_bytes()` as a best-effort.
+fn path_to_bytes(path: &std::path::Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+/// msync + fsync a file-backed hash table so its on-disk contents are durable.
+///
+/// Issues `msync(MS_SYNC)` to flush mmap dirty pages, then `fsync` on the
+/// backing file descriptor via the POSIX `fsync(2)` system call. Returns
+/// [`HashTableError::ResizeIo`] on failure.
+fn sync_file_backed(table: &HashTable) -> Result<()> {
+    let Backing::FileBacked { fd, .. } = &table.backing else {
+        return Ok(());
+    };
+    if table.mmap_len > 0 && !table.ptr.is_null() {
+        // Safety: ptr/mmap_len describe the currently mapped region.
+        let rc = unsafe { libc::msync(table.ptr.cast(), table.mmap_len, libc::MS_SYNC) };
+        if rc != 0 {
+            return Err(HashTableError::ResizeIo(format!(
+                "msync failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    // Safety: fd was obtained from File::into_raw_fd and is still open.
+    let rc = unsafe { libc::fsync(*fd) };
+    if rc != 0 {
+        return Err(HashTableError::ResizeIo(format!(
+            "fsync failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+/// fsync the parent directory of `path` so that a recent rename into that
+/// directory is durable across a power failure.
+///
+/// On Unix, opens the parent directory read-only and calls
+/// [`std::fs::File::sync_all`]. On non-Unix platforms the call is a
+/// best-effort no-op (this server targets Linux/Unix).
+#[cfg(unix)]
+fn fsync_parent_dir(path: &std::path::Path) -> Result<()> {
+    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    let dir = std::fs::File::open(parent).map_err(|e| {
+        HashTableError::ResizeIo(format!("open parent dir {}: {e}", parent.display()))
+    })?;
+    dir.sync_all().map_err(|e| {
+        HashTableError::ResizeIo(format!(
+            "fsync parent dir {}: {e}",
+            parent.display()
+        ))
+    })?;
+    Ok(())
+}
+
+/// Non-Unix fallback: best-effort no-op. See [`fsync_parent_dir`].
+#[cfg(not(unix))]
+fn fsync_parent_dir(_path: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Backing
 // ---------------------------------------------------------------------------
@@ -389,6 +475,14 @@ pub struct HashTable {
     max_probe: usize,
     /// Whether this table is anonymous or file-backed.
     backing: Backing,
+    /// Optional redo log for journaling file-backed resize (crash atomicity).
+    ///
+    /// When attached and the table is file-backed, [`HashTable::resize`]
+    /// appends and fsyncs a [`RedoOp::HashtableResizeBegin`] before
+    /// writing the tmp file, and a [`RedoOp::HashtableResizeCommit`] after
+    /// the rename + parent directory fsync completes. Anonymous tables
+    /// ignore the redo log (nothing to recover).
+    redo_log: Option<Arc<Mutex<RedoLog>>>,
 }
 
 impl std::fmt::Debug for HashTable {
@@ -440,6 +534,7 @@ impl HashTable {
             hugepage,
             max_probe: 0,
             backing: Backing::Anonymous,
+            redo_log: None,
         })
     }
 
@@ -503,6 +598,7 @@ impl HashTable {
                     fd,
                     path: path.to_path_buf(),
                 },
+                redo_log: None,
             })
         } else {
             // Initialize all buckets to empty sentinel.
@@ -523,8 +619,33 @@ impl HashTable {
                     fd,
                     path: path.to_path_buf(),
                 },
+                redo_log: None,
             })
         }
+    }
+
+    /// Attach a redo log for journaling crash-atomic file-backed resizes.
+    ///
+    /// Once attached, [`HashTable::resize`] on a file-backed table will:
+    ///
+    /// 1. Append + fsync a [`RedoOp::HashtableResizeBegin`] (capturing the
+    ///    tmp file path and target capacity).
+    /// 2. Write the rehashed state into the tmp file and fsync it.
+    /// 3. Atomically rename the tmp file over the original.
+    /// 4. fsync the parent directory so the rename is durable.
+    /// 5. Append + fsync a [`RedoOp::HashtableResizeCommit`].
+    ///
+    /// Anonymous tables ignore the redo log. Without a redo log attached,
+    /// the resize still fsyncs the tmp file + parent directory, but crash
+    /// recovery cannot detect and clean up an orphaned tmp file left by
+    /// a crash between steps (1) and the rename.
+    pub fn set_redo_log(&mut self, redo_log: Arc<Mutex<RedoLog>>) {
+        self.redo_log = Some(redo_log);
+    }
+
+    /// Is a redo log currently attached?
+    pub fn has_redo_log(&self) -> bool {
+        self.redo_log.is_some()
     }
 
     /// Safe accessor for bucket at `idx` (immutable).
@@ -821,20 +942,91 @@ impl HashTable {
 
     /// Resize the table to at least `new_capacity` buckets.
     ///
-    /// For anonymous tables, allocates a new mmap region and rehashes.
-    /// For file-backed tables, creates a temporary file, rehashes into it,
-    /// then renames it over the original.
+    /// For anonymous tables, allocates a new mmap region and rehashes the
+    /// entries in place.
+    ///
+    /// For file-backed tables, the resize is crash-atomic when a redo log
+    /// has been attached via [`HashTable::set_redo_log`]:
+    ///
+    /// 1. A [`RedoOp::HashtableResizeBegin`] entry is appended and fsynced
+    ///    BEFORE any tmp file is created. The entry captures the raw bytes
+    ///    of the tmp file path and the target capacity.
+    /// 2. A tmp file is created, the rehashed state is written into its
+    ///    mmap, and the mmap is `msync(MS_SYNC)`'d. The file descriptor is
+    ///    then `fsync`'d via `File::sync_all`.
+    /// 3. The tmp file is renamed over the original file with `rename(2)`,
+    ///    which is atomic on POSIX.
+    /// 4. The parent directory is opened read-only and `fsync`'d so the
+    ///    rename itself is durable across a power failure (Linux/Unix).
+    /// 5. A [`RedoOp::HashtableResizeCommit`] with the matching capacity
+    ///    is appended and fsynced to mark the resize complete.
+    ///
+    /// On crash between steps 1 and 5, recovery scans the redo log for
+    /// `HashtableResizeBegin` without a matching `HashtableResizeCommit`
+    /// and deletes the dangling tmp file — the primary index file itself
+    /// is untouched until the rename in step 3.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HashTableError::ResizeIo`] on any filesystem I/O failure,
+    /// [`HashTableError::ResizeRedo`] on redo log append/flush failure,
+    /// and [`HashTableError::AllocFailed`] on memory mapping failure.
     pub fn resize(&mut self, new_capacity: usize) -> Result<()> {
         let new_cap = new_capacity.next_power_of_two().max(16);
-        let mut new_table = match &self.backing {
-            Backing::Anonymous => HashTable::new(new_cap)?,
-            Backing::FileBacked { path, .. } => {
-                let tmp_path = path.with_extension("tmp");
-                let _ = std::fs::remove_file(&tmp_path);
-                HashTable::open_file_backed(&tmp_path, new_cap)?
-            }
-        };
 
+        // Defensive re-check (M9): callers may request a resize based on a
+        // load-factor snapshot that has since been invalidated by concurrent
+        // removals. If `new_cap` is not actually larger than the current
+        // capacity, skip — doing the work would be wasted effort and, on
+        // the file-backed path, a wasted fsync/rename cycle. Callers like
+        // `Index::register` guard against this externally, but the
+        // invariant is defended here too so no internal path can trigger a
+        // no-op resize.
+        if new_cap <= self.capacity {
+            return Ok(());
+        }
+
+        // Fast path: anonymous table. No journaling required because the
+        // allocation is purely in-memory; a crash loses the table anyway.
+        if matches!(self.backing, Backing::Anonymous) {
+            let mut new_table = HashTable::new(new_cap)?;
+            for i in 0..self.capacity {
+                let bucket = self.bucket(i);
+                if bucket.is_occupied() {
+                    let key = TxKey { txid: bucket.txid };
+                    new_table.insert(key, bucket.entry())?;
+                }
+            }
+            let saved_redo = self.redo_log.take();
+            *self = new_table;
+            self.redo_log = saved_redo;
+            return Ok(());
+        }
+
+        // File-backed path with crash-atomic rename.
+        let old_path = match &self.backing {
+            Backing::FileBacked { path, .. } => path.clone(),
+            Backing::Anonymous => unreachable!("checked above"),
+        };
+        let tmp_path = old_path.with_extension("tmp");
+
+        // Step 1: journal the begin intent BEFORE any tmp file I/O.
+        if let Some(ref redo) = self.redo_log {
+            let tmp_path_bytes = path_to_bytes(&tmp_path);
+            let op = RedoOp::HashtableResizeBegin {
+                tmp_path_bytes,
+                new_capacity: new_cap as u64,
+            };
+            let mut guard = redo.lock();
+            guard
+                .append_and_flush(op)
+                .map_err(|e| HashTableError::ResizeRedo(format!("begin append: {e}")))?;
+        }
+
+        // Step 2: write tmp file with rehashed state.
+        // Remove any stale tmp file from a prior aborted resize.
+        let _ = std::fs::remove_file(&tmp_path);
+        let mut new_table = HashTable::open_file_backed(&tmp_path, new_cap)?;
         for i in 0..self.capacity {
             let bucket = self.bucket(i);
             if bucket.is_occupied() {
@@ -843,25 +1035,52 @@ impl HashTable {
             }
         }
 
-        if let (Backing::FileBacked { path: old_path, .. }, Backing::FileBacked { .. }) =
-            (&self.backing, &new_table.backing)
-        {
-            new_table.sync();
-            unsafe {
-                libc::msync(new_table.ptr.cast(), new_table.mmap_len, libc::MS_SYNC);
-            }
-            let tmp_path = old_path.with_extension("tmp");
-            std::fs::rename(&tmp_path, old_path).map_err(|e| {
-                HashTableError::AllocFailed(format!("rename during resize: {e}"))
-            })?;
-            if let Backing::FileBacked { path, .. } = &mut new_table.backing {
-                *path = old_path.clone();
-            }
+        // Step 3: msync + fsync the tmp file so its contents are durable
+        // on disk before the rename.
+        sync_file_backed(&new_table)?;
+
+        // Step 4: atomically rename tmp over original.
+        std::fs::rename(&tmp_path, &old_path).map_err(|e| {
+            HashTableError::ResizeIo(format!(
+                "rename {} -> {}: {e}",
+                tmp_path.display(),
+                old_path.display()
+            ))
+        })?;
+
+        // Fault-injection sync point: simulates a crash AFTER the tmp
+        // rename but BEFORE the parent-directory fsync. Post-recovery
+        // the orphan cleanup path (see `recovery::recover_all_with_allocator`)
+        // must leave the index consistent.
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::MidHashtableResize,
+        );
+
+        // Step 5: fsync the parent directory so the rename is durable.
+        fsync_parent_dir(&old_path)?;
+
+        // Adjust the new table's recorded path to the original path so
+        // subsequent reopens find the right file.
+        if let Backing::FileBacked { path, .. } = &mut new_table.backing {
+            *path = old_path.clone();
         }
 
-        // Replace self with new_table.
-        // The old self's Drop will run (munmapping the old region).
+        // Step 6: journal the commit AFTER the rename + dir fsync are durable.
+        if let Some(ref redo) = self.redo_log {
+            let op = RedoOp::HashtableResizeCommit {
+                new_capacity: new_cap as u64,
+            };
+            let mut guard = redo.lock();
+            guard
+                .append_and_flush(op)
+                .map_err(|e| HashTableError::ResizeRedo(format!("commit append: {e}")))?;
+        }
+
+        // Carry the redo log handle across the struct swap so subsequent
+        // resizes remain journaled.
+        let saved_redo = self.redo_log.take();
         *self = new_table;
+        self.redo_log = saved_redo;
         Ok(())
     }
 
@@ -1584,5 +1803,190 @@ mod tests {
         assert!(!t.is_file_backed());
         t.insert(make_key(1), make_entry(100)).unwrap();
         t.sync();
+    }
+
+    // -- Crash-atomic resize tests (C5) --
+
+    /// Shared helper: wrap a MemoryDevice-backed RedoLog so it can be
+    /// attached to a HashTable.
+    fn make_attached_redo_log() -> (
+        std::sync::Arc<crate::device::MemoryDevice>,
+        std::sync::Arc<parking_lot::Mutex<crate::redo::RedoLog>>,
+    ) {
+        let dev = std::sync::Arc::new(
+            crate::device::MemoryDevice::new(1024 * 1024, 4096).unwrap(),
+        );
+        let log = crate::redo::RedoLog::open(dev.clone(), 0, 1024 * 1024).unwrap();
+        (dev, std::sync::Arc::new(parking_lot::Mutex::new(log)))
+    }
+
+    #[test]
+    fn resize_journals_begin_and_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.idx");
+        let (redo_dev, redo_log) = make_attached_redo_log();
+
+        let mut t = HashTable::open_file_backed(&path, 16).unwrap();
+        t.set_redo_log(redo_log.clone());
+        for i in 0..10u64 {
+            t.insert(make_key(i), make_entry(i * 100)).unwrap();
+        }
+        let initial_cap = t.capacity();
+        t.resize(initial_cap * 2).unwrap();
+        let new_cap = t.capacity() as u64;
+
+        // Read back the redo log and assert both ops are present in order.
+        let readback = crate::redo::RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+        let entries = readback.recover().unwrap();
+
+        let resize_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(
+                e.op,
+                crate::redo::RedoOp::HashtableResizeBegin { .. }
+                    | crate::redo::RedoOp::HashtableResizeCommit { .. }
+            ))
+            .collect();
+        assert_eq!(
+            resize_entries.len(),
+            2,
+            "expected exactly Begin + Commit in redo log"
+        );
+
+        match &resize_entries[0].op {
+            crate::redo::RedoOp::HashtableResizeBegin {
+                tmp_path_bytes,
+                new_capacity,
+            } => {
+                assert_eq!(*new_capacity, new_cap, "Begin capacity must match final");
+                // Tmp path ends with `.tmp` and is derived from the index path.
+                use std::os::unix::ffi::OsStringExt;
+                let tmp_os = std::ffi::OsString::from_vec(tmp_path_bytes.clone());
+                let tmp = std::path::PathBuf::from(tmp_os);
+                assert_eq!(tmp, path.with_extension("tmp"));
+            }
+            other => panic!("expected ResizeBegin first, got {other:?}"),
+        }
+        match &resize_entries[1].op {
+            crate::redo::RedoOp::HashtableResizeCommit { new_capacity } => {
+                assert_eq!(*new_capacity, new_cap, "Commit capacity must match Begin");
+            }
+            other => panic!("expected ResizeCommit second, got {other:?}"),
+        }
+        // Ordering: Begin sequence < Commit sequence
+        assert!(
+            resize_entries[0].sequence < resize_entries[1].sequence,
+            "Begin must precede Commit in the log"
+        );
+    }
+
+    #[test]
+    fn resize_begin_without_commit_cleans_up_tmp_on_recovery() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let idx_path = dir.path().join("orphan.idx");
+        let tmp_path = idx_path.with_extension("tmp");
+
+        // Create a real primary index file so PrimaryBackend can open it.
+        let mut base = HashTable::open_file_backed(&idx_path, 16).unwrap();
+        base.insert(make_key(1), make_entry(100)).unwrap();
+        drop(base);
+
+        // Write an orphan tmp file as would be left by a crash between
+        // HashtableResizeBegin and the rename.
+        {
+            let mut f = std::fs::File::create(&tmp_path).unwrap();
+            f.write_all(b"partial contents from crashed resize").unwrap();
+            f.sync_all().unwrap();
+        }
+        assert!(tmp_path.exists(), "tmp file should exist before recovery");
+
+        // Build a redo log that contains ONLY the Begin (no Commit) and run
+        // recovery. The orphan tmp file must be removed.
+        let redo_dev = std::sync::Arc::new(
+            crate::device::MemoryDevice::new(1024 * 1024, 4096).unwrap(),
+        );
+        {
+            let mut log = crate::redo::RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
+            use std::os::unix::ffi::OsStrExt;
+            log.append_and_flush(crate::redo::RedoOp::HashtableResizeBegin {
+                tmp_path_bytes: tmp_path.as_os_str().as_bytes().to_vec(),
+                new_capacity: 32,
+            })
+            .unwrap();
+        }
+
+        let data_dev = std::sync::Arc::new(
+            crate::device::MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap(),
+        );
+        let mut alloc = crate::allocator::SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut index = crate::index::PrimaryBackend::new_in_memory(1000).unwrap();
+        let mut dah = crate::index::DahBackend::new_in_memory();
+        let mut unmined = crate::index::UnminedBackend::new_in_memory();
+
+        let redo_log =
+            crate::redo::RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
+        let stats = crate::recovery::recover_all_with_allocator(
+            &*data_dev,
+            &redo_log,
+            &mut index,
+            &mut dah,
+            &mut unmined,
+            Some(&mut alloc),
+        )
+        .unwrap();
+
+        assert_eq!(
+            stats.entries_replayed, 1,
+            "the Begin entry must be counted as replayed (pending-resize tracked)"
+        );
+        assert!(
+            !tmp_path.exists(),
+            "orphan resize tmp file must be removed by recovery"
+        );
+        // The original index file is untouched and still valid.
+        assert!(idx_path.exists(), "primary index file must survive recovery");
+    }
+
+    #[test]
+    fn resize_persists_across_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("persist.idx");
+        let (_redo_dev, redo_log) = make_attached_redo_log();
+
+        let initial_cap;
+        let new_cap;
+        {
+            let mut t = HashTable::open_file_backed(&path, 16).unwrap();
+            t.set_redo_log(redo_log.clone());
+            initial_cap = t.capacity();
+            for i in 0..14u64 {
+                t.insert(make_key(i), make_entry(i * 7 + 1)).unwrap();
+            }
+            t.resize(initial_cap * 4).unwrap();
+            new_cap = t.capacity();
+            assert!(new_cap >= initial_cap * 4);
+
+            // Sanity check all keys resolve before shutdown.
+            for i in 0..14u64 {
+                let e = t.get_entry(&make_key(i)).unwrap();
+                assert_eq!(e.record_offset, i * 7 + 1);
+            }
+        } // HashTable dropped — simulates clean shutdown
+
+        // Reopen — the on-disk file should have the new capacity and all keys.
+        let t2 = HashTable::open_file_backed(&path, 16).unwrap();
+        assert_eq!(t2.capacity(), new_cap, "reopened capacity must match post-resize");
+        assert_eq!(t2.len(), 14, "all entries must survive resize + reopen");
+        for i in 0..14u64 {
+            let e = t2
+                .get_entry(&make_key(i))
+                .unwrap_or_else(|| panic!("key {i} lost after resize + reopen"));
+            assert_eq!(e.record_offset, i * 7 + 1, "record_offset mismatch at key {i}");
+        }
+
+        // No orphan tmp file left behind.
+        assert!(!path.with_extension("tmp").exists(), "tmp file must not leak");
     }
 }

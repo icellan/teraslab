@@ -165,8 +165,17 @@ impl ReplicationManager {
 
     /// Replicate a batch of operations to all live replicas.
     ///
-    /// Sends to all live replicas in parallel (via threads), then waits
-    /// for ACKs according to the configured ack policy.
+    /// Sends to every `Live` replica in parallel using
+    /// [`std::thread::scope`] — one scoped worker thread per live sender
+    /// performs the `send_batch` + `recv_ack` round-trip concurrently.
+    /// A slow replica therefore no longer blocks the dispatch of the
+    /// remaining replicas.
+    ///
+    /// After all workers join, outcomes are reconciled against the
+    /// configured [`AckPolicy`]: `WriteAll` requires every live replica
+    /// to ACK, `WriteMajority` requires at least `required_ack_count()`.
+    /// On failure, the first error observed (in sender order) is
+    /// returned so the caller has a deterministic diagnostic.
     pub fn replicate_batch(
         &mut self,
         ops: &[ReplicaOp],
@@ -192,44 +201,84 @@ impl ReplicationManager {
         self.next_sequence += ops.len() as u64;
 
         let timeout = self.config.replication_timeout;
-        let mut successes = 0;
-        let mut first_error: Option<ReplicationError> = None;
 
-        for sender in &mut self.senders {
-            if *sender.state() != ReplicaState::Live {
-                continue;
-            }
+        // Per-sender outcome produced inside each scoped thread. We do
+        // not mutate `sender.state` or `sender.last_acked` from inside
+        // the thread so the reconciliation loop below can observe the
+        // same deterministic ordering as the previous serial loop.
+        enum Outcome {
+            Ok { through_sequence: u64 },
+            ReplicaErr { sequence: u64, message: String },
+            TransportErr(ReplicationError),
+            Skipped,
+        }
 
-            match sender.transport.send_batch(&batch) {
-                Ok(()) => {
-                    match sender.transport.recv_ack(timeout) {
-                        Ok(ReplicaAck::Ok { through_sequence }) => {
-                            sender.last_acked = through_sequence;
-                            successes += 1;
+        // Fan out to every live replica in parallel. Using
+        // `std::thread::scope` borrows each sender mutably for the
+        // duration of the scope without requiring 'static bounds.
+        let batch_ref = &batch;
+        let outcomes: Vec<Outcome> = std::thread::scope(|s| {
+            let handles: Vec<_> = self
+                .senders
+                .iter_mut()
+                .map(|sender| {
+                    s.spawn(move || {
+                        if *sender.state() != ReplicaState::Live {
+                            return Outcome::Skipped;
                         }
-                        Ok(ReplicaAck::Error { failed_sequence, message }) => {
-                            sender.state = ReplicaState::Down;
-                            if first_error.is_none() {
-                                first_error = Some(ReplicationError::ReplicaError {
+                        match sender.transport.send_batch(batch_ref) {
+                            Ok(()) => match sender.transport.recv_ack(timeout) {
+                                Ok(ReplicaAck::Ok { through_sequence }) => {
+                                    Outcome::Ok { through_sequence }
+                                }
+                                Ok(ReplicaAck::Error {
+                                    failed_sequence,
+                                    message,
+                                }) => Outcome::ReplicaErr {
                                     sequence: failed_sequence,
                                     message,
-                                });
-                            }
+                                },
+                                Err(e) => Outcome::TransportErr(e),
+                            },
+                            Err(e) => Outcome::TransportErr(e),
                         }
-                        Err(e) => {
-                            sender.state = ReplicaState::Down;
-                            if first_error.is_none() {
-                                first_error = Some(e);
-                            }
-                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or(Outcome::TransportErr(
+                    ReplicationError::Transport("replica worker panicked".into()),
+                )))
+                .collect()
+        });
+
+        // Reconcile outcomes into per-sender state. The ordering here
+        // matches `self.senders` so `first_error` is deterministic.
+        let mut successes = 0usize;
+        let mut first_error: Option<ReplicationError> = None;
+        for (sender, outcome) in self.senders.iter_mut().zip(outcomes.into_iter()) {
+            match outcome {
+                Outcome::Ok { through_sequence } => {
+                    sender.last_acked = through_sequence;
+                    successes += 1;
+                }
+                Outcome::ReplicaErr { sequence, message } => {
+                    sender.state = ReplicaState::Down;
+                    if first_error.is_none() {
+                        first_error = Some(ReplicationError::ReplicaError {
+                            sequence,
+                            message,
+                        });
                     }
                 }
-                Err(e) => {
+                Outcome::TransportErr(e) => {
                     sender.state = ReplicaState::Down;
                     if first_error.is_none() {
                         first_error = Some(e);
                     }
                 }
+                Outcome::Skipped => {}
             }
         }
 
@@ -1406,6 +1455,148 @@ mod tests {
             0,
         );
         assert_eq!(mgr.current_sequence(), 1);
+    }
+
+    /// Parallel fan-out: with N=3 replicas where one replica is
+    /// intentionally slow (200ms ACK delay) and the other two ACK
+    /// immediately, the total `replicate_batch` wall time must be
+    /// dominated by the slow replica — NOT the sum of all three
+    /// sleeps (as a serial loop would produce).
+    ///
+    /// Guarantees the replication dispatch runs concurrently.
+    #[test]
+    fn replicate_batch_fan_out_runs_in_parallel() {
+        // Helper: spawn a replica that sleeps `delay` before ACKing.
+        fn spawn_delayed_ack(
+            rt: InMemoryTransport,
+            delay: Duration,
+        ) -> std::thread::JoinHandle<()> {
+            std::thread::spawn(move || {
+                while let Ok(batch) = rt.recv_batch(Duration::from_secs(2)) {
+                    std::thread::sleep(delay);
+                    let ack = ReplicaAck::Ok {
+                        through_sequence: batch.last_sequence(),
+                    };
+                    if rt.send_ack(&ack).is_err() {
+                        return;
+                    }
+                }
+            })
+        }
+
+        let (mt1, rt1) = InMemoryTransport::pair();
+        let (mt2, rt2) = InMemoryTransport::pair();
+        let (mt3, rt3) = InMemoryTransport::pair();
+
+        // Replica 1 is the slow one (200ms); 2 and 3 ACK fast.
+        let h1 = spawn_delayed_ack(rt1, Duration::from_millis(200));
+        let h2 = spawn_delayed_ack(rt2, Duration::from_millis(5));
+        let h3 = spawn_delayed_ack(rt3, Duration::from_millis(5));
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteAll,
+                replication_timeout: Duration::from_secs(2),
+                ..Default::default()
+            },
+            vec![Box::new(mt1), Box::new(mt2), Box::new(mt3)],
+        );
+
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }];
+
+        let start = std::time::Instant::now();
+        mgr.replicate_batch(&ops).unwrap();
+        let elapsed = start.elapsed();
+
+        // Parallel: ~200ms (dominated by slowest replica).
+        // Serial would be ~210ms (200 + 5 + 5) — close enough that a
+        // tight bound is fragile, so we use a generous ceiling that
+        // still catches serial-regression cases with several extra
+        // slow replicas. Make the test more discriminating below.
+        //
+        // For a clearer signal, rerun with MORE slow replicas so the
+        // gap between serial and parallel is unambiguous.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "parallel replication took {:?}, expected well under 500ms",
+            elapsed
+        );
+
+        drop(mgr);
+        let _ = h1.join();
+        let _ = h2.join();
+        let _ = h3.join();
+    }
+
+    /// Stronger parallelism test: 3 replicas that each sleep 150ms
+    /// before ACKing. Serial execution would take ~450ms; parallel
+    /// execution takes ~150ms. Assert the wall time is strictly less
+    /// than what serial would require.
+    #[test]
+    fn replicate_batch_three_slow_replicas_run_concurrently() {
+        fn spawn_delayed_ack(
+            rt: InMemoryTransport,
+            delay: Duration,
+        ) -> std::thread::JoinHandle<()> {
+            std::thread::spawn(move || {
+                while let Ok(batch) = rt.recv_batch(Duration::from_secs(2)) {
+                    std::thread::sleep(delay);
+                    let ack = ReplicaAck::Ok {
+                        through_sequence: batch.last_sequence(),
+                    };
+                    if rt.send_ack(&ack).is_err() {
+                        return;
+                    }
+                }
+            })
+        }
+
+        let (mt1, rt1) = InMemoryTransport::pair();
+        let (mt2, rt2) = InMemoryTransport::pair();
+        let (mt3, rt3) = InMemoryTransport::pair();
+
+        let per_replica_delay = Duration::from_millis(150);
+        let h1 = spawn_delayed_ack(rt1, per_replica_delay);
+        let h2 = spawn_delayed_ack(rt2, per_replica_delay);
+        let h3 = spawn_delayed_ack(rt3, per_replica_delay);
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteAll,
+                replication_timeout: Duration::from_secs(2),
+                ..Default::default()
+            },
+            vec![Box::new(mt1), Box::new(mt2), Box::new(mt3)],
+        );
+
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }];
+
+        let start = std::time::Instant::now();
+        mgr.replicate_batch(&ops).unwrap();
+        let elapsed = start.elapsed();
+
+        // Serial lower bound: 3 * 150ms = 450ms.
+        // Parallel upper bound: ~150ms + thread-spawn overhead.
+        // Assert well below 3x to guarantee concurrency — allow generous
+        // headroom (300ms) for CI scheduler jitter.
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "expected parallel dispatch (~150ms), got {:?} (serial would be ~450ms)",
+            elapsed
+        );
+
+        drop(mgr);
+        let _ = h1.join();
+        let _ = h2.join();
+        let _ = h3.join();
     }
 
     /// Replica sends an error ACK: sender should be marked Down and the

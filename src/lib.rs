@@ -3,6 +3,7 @@ pub mod cluster;
 pub mod config;
 pub mod device;
 pub mod device_io;
+pub mod fault_injection;
 pub mod index;
 pub mod io;
 pub mod locks;

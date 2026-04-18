@@ -4,6 +4,7 @@
 //! unspend, setMined, and setConflicting. Pure function: reads metadata
 //! and returns what to change without performing I/O.
 
+use crate::ops::error::SpendError;
 use crate::ops::signal::Signal;
 use crate::record::{TxFlags, TxMetadata};
 
@@ -16,10 +17,41 @@ pub struct DahPatch {
     pub last_spent_all: bool,
 }
 
+/// Result of a `deleteAtHeight` evaluation: the signal to emit (if any)
+/// and an optional metadata patch to apply.
+pub type DahEvalResult = Result<(Signal, Option<DahPatch>), SpendError>;
+
+/// Compute `current_block_height + block_height_retention` with overflow
+/// detection.
+///
+/// Returns [`SpendError::DahOverflow`] if the addition would wrap past
+/// `u32::MAX`. Using `saturating_add` here would silently pin UTXOs as
+/// unprunable (because the clamped `u32::MAX` value is far above any real
+/// future block height), causing permanent store bloat with no error signal.
+fn checked_new_dah(
+    current_block_height: u32,
+    block_height_retention: u32,
+) -> Result<u32, SpendError> {
+    current_block_height
+        .checked_add(block_height_retention)
+        .ok_or(SpendError::DahOverflow {
+            current_height: current_block_height,
+            retention: block_height_retention,
+        })
+}
+
 /// Evaluate whether `delete_at_height` should be set, cleared, or left alone.
 ///
-/// Returns `(signal, optional_patch)`. The caller applies the patch to metadata
-/// and updates the DAH secondary index.
+/// Returns `Ok((signal, optional_patch))`. The caller applies the patch to
+/// metadata and updates the DAH secondary index.
+///
+/// # Errors
+///
+/// Returns [`SpendError::DahOverflow`] if `current_block_height +
+/// block_height_retention` would overflow `u32`. Never silently clamps,
+/// because a saturating-clamped DAH pins UTXOs as unprunable and causes
+/// permanent store bloat. Config validation bounds `block_height_retention`
+/// well below the overflow threshold, so this only fires on misconfiguration.
 ///
 /// # Logic (from spec §3.13 / Lua lines 927–1008)
 ///
@@ -34,17 +66,17 @@ pub fn evaluate_delete_at_height(
     metadata: &TxMetadata,
     current_block_height: u32,
     block_height_retention: u32,
-) -> (Signal, Option<DahPatch>) {
+) -> DahEvalResult {
     if block_height_retention == 0 {
-        return (Signal::None, None);
+        return Ok((Signal::None, None));
     }
 
     if { metadata.preserve_until } != 0 {
-        return (Signal::None, None);
+        return Ok((Signal::None, None));
     }
 
     let existing_dah = { metadata.delete_at_height };
-    let new_dah = current_block_height.saturating_add(block_height_retention);
+    let new_dah = checked_new_dah(current_block_height, block_height_retention)?;
     let is_external = metadata.flags.contains(TxFlags::EXTERNAL);
 
     // Handle conflicting transactions
@@ -55,15 +87,15 @@ pub fn evaluate_delete_at_height(
             } else {
                 Signal::None
             };
-            return (
+            return Ok((
                 signal,
                 Some(DahPatch {
                     new_delete_at_height: new_dah,
                     last_spent_all: metadata.flags.contains(TxFlags::LAST_SPENT_ALL),
                 }),
-            );
+            ));
         }
-        return (Signal::None, None);
+        return Ok((Signal::None, None));
     }
 
     let spent_utxos = { metadata.spent_utxos };
@@ -91,25 +123,25 @@ pub fn evaluate_delete_at_height(
             } else {
                 was_all_spent
             };
-            return (
+            return Ok((
                 signal,
                 Some(DahPatch {
                     new_delete_at_height: new_dah,
                     last_spent_all: last_all,
                 }),
-            );
+            ));
         }
         // DAH already set and >= new value — check for state transition signal
         if !was_all_spent {
-            return (
+            return Ok((
                 Signal::None,
                 Some(DahPatch {
                     new_delete_at_height: existing_dah,
                     last_spent_all: true,
                 }),
-            );
+            ));
         }
-        return (Signal::None, None);
+        return Ok((Signal::None, None));
     }
 
     // Conditions not met — clear DAH if it was set
@@ -119,13 +151,13 @@ pub fn evaluate_delete_at_height(
         } else {
             Signal::None
         };
-        return (
+        return Ok((
             signal,
             Some(DahPatch {
                 new_delete_at_height: 0,
                 last_spent_all: false,
             }),
-        );
+        ));
     }
 
     // Check for all-spent state transition (signal only, no DAH change)
@@ -135,16 +167,16 @@ pub fn evaluate_delete_at_height(
         } else {
             Signal::NotAllSpent
         };
-        return (
+        return Ok((
             signal,
             Some(DahPatch {
                 new_delete_at_height: 0,
                 last_spent_all: all_spent,
             }),
-        );
+        ));
     }
 
-    (Signal::None, None)
+    Ok((Signal::None, None))
 }
 
 /// Evaluate `deleteAtHeight` from cached index fields — no metadata read needed.
@@ -154,6 +186,12 @@ pub fn evaluate_delete_at_height(
 ///
 /// The `has_preserve_until` flag indicates whether `dah_or_preserve` holds
 /// `preserve_until` (true) or `delete_at_height` (false).
+///
+/// # Errors
+///
+/// Returns [`SpendError::DahOverflow`] if `current_block_height +
+/// block_height_retention` would overflow `u32`. See
+/// [`evaluate_delete_at_height`] for rationale.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_dah_cached(
     tx_flags: TxFlags,
@@ -165,17 +203,17 @@ pub fn evaluate_dah_cached(
     dah_or_preserve: u32,
     current_block_height: u32,
     block_height_retention: u32,
-) -> (Signal, Option<DahPatch>) {
+) -> DahEvalResult {
     if block_height_retention == 0 {
-        return (Signal::None, None);
+        return Ok((Signal::None, None));
     }
 
     if has_preserve_until {
-        return (Signal::None, None);
+        return Ok((Signal::None, None));
     }
 
     let existing_dah = dah_or_preserve; // it's delete_at_height when !has_preserve_until
-    let new_dah = current_block_height.saturating_add(block_height_retention);
+    let new_dah = checked_new_dah(current_block_height, block_height_retention)?;
     let is_external = tx_flags.contains(TxFlags::EXTERNAL);
 
     // Handle conflicting transactions
@@ -186,15 +224,15 @@ pub fn evaluate_dah_cached(
             } else {
                 Signal::None
             };
-            return (
+            return Ok((
                 signal,
                 Some(DahPatch {
                     new_delete_at_height: new_dah,
                     last_spent_all: tx_flags.contains(TxFlags::LAST_SPENT_ALL),
                 }),
-            );
+            ));
         }
-        return (Signal::None, None);
+        return Ok((Signal::None, None));
     }
 
     let all_spent = spent_utxos == utxo_count;
@@ -210,24 +248,24 @@ pub fn evaluate_dah_cached(
                 Signal::None
             };
             let last_all = if !was_all_spent { true } else { was_all_spent };
-            return (
+            return Ok((
                 signal,
                 Some(DahPatch {
                     new_delete_at_height: new_dah,
                     last_spent_all: last_all,
                 }),
-            );
+            ));
         }
         if !was_all_spent {
-            return (
+            return Ok((
                 Signal::None,
                 Some(DahPatch {
                     new_delete_at_height: existing_dah,
                     last_spent_all: true,
                 }),
-            );
+            ));
         }
-        return (Signal::None, None);
+        return Ok((Signal::None, None));
     }
 
     if existing_dah != 0 {
@@ -236,13 +274,13 @@ pub fn evaluate_dah_cached(
         } else {
             Signal::None
         };
-        return (
+        return Ok((
             signal,
             Some(DahPatch {
                 new_delete_at_height: 0,
                 last_spent_all: false,
             }),
-        );
+        ));
     }
 
     if all_spent != was_all_spent {
@@ -251,16 +289,16 @@ pub fn evaluate_dah_cached(
         } else {
             Signal::NotAllSpent
         };
-        return (
+        return Ok((
             signal,
             Some(DahPatch {
                 new_delete_at_height: 0,
                 last_spent_all: all_spent,
             }),
-        );
+        ));
     }
 
-    (Signal::None, None)
+    Ok((Signal::None, None))
 }
 
 #[cfg(test)]
@@ -288,7 +326,7 @@ mod tests {
     #[test]
     fn zero_retention_no_signal() {
         let m = make_meta(10, 10, TxFlags::empty());
-        let (sig, patch) = evaluate_delete_at_height(&m, 100, 0);
+        let (sig, patch) = evaluate_delete_at_height(&m, 100, 0).expect("no overflow");
         assert_eq!(sig, Signal::None);
         assert!(patch.is_none());
     }
@@ -297,7 +335,7 @@ mod tests {
     fn preserve_until_blocks_eval() {
         let mut m = make_meta(10, 10, TxFlags::empty());
         m.preserve_until = 500;
-        let (sig, patch) = evaluate_delete_at_height(&m, 100, 288);
+        let (sig, patch) = evaluate_delete_at_height(&m, 100, 288).expect("no overflow");
         assert_eq!(sig, Signal::None);
         assert!(patch.is_none());
     }
@@ -305,7 +343,7 @@ mod tests {
     #[test]
     fn conflicting_sets_dah() {
         let m = make_meta(10, 5, TxFlags::CONFLICTING);
-        let (sig, patch) = evaluate_delete_at_height(&m, 100, 288);
+        let (sig, patch) = evaluate_delete_at_height(&m, 100, 288).expect("no overflow");
         assert_eq!(sig, Signal::None); // Not external
         let p = patch.unwrap();
         assert_eq!(p.new_delete_at_height, 388);
@@ -315,7 +353,7 @@ mod tests {
     fn conflicting_existing_dah_no_change() {
         let mut m = make_meta(10, 5, TxFlags::CONFLICTING);
         m.delete_at_height = 500;
-        let (sig, patch) = evaluate_delete_at_height(&m, 100, 288);
+        let (sig, patch) = evaluate_delete_at_height(&m, 100, 288).expect("no overflow");
         assert_eq!(sig, Signal::None);
         assert!(patch.is_none());
     }
@@ -324,7 +362,7 @@ mod tests {
     fn all_spent_with_blocks_on_chain_sets_dah() {
         let m = with_blocks(make_meta(10, 10, TxFlags::empty()));
         // unmined_since = 0 means on longest chain
-        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288);
+        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288).expect("no overflow");
         assert_eq!(sig, Signal::None); // Not external
         let p = patch.unwrap();
         assert_eq!(p.new_delete_at_height, 1288);
@@ -335,7 +373,7 @@ mod tests {
     fn all_spent_no_blocks_no_dah() {
         let m = make_meta(10, 10, TxFlags::empty());
         // No blocks, but all spent
-        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288);
+        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288).expect("no overflow");
         // Should signal all-spent transition
         assert_eq!(sig, Signal::AllSpent);
         let p = patch.unwrap();
@@ -346,7 +384,7 @@ mod tests {
     #[test]
     fn not_all_spent_no_signal() {
         let m = with_blocks(make_meta(10, 5, TxFlags::empty()));
-        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288);
+        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288).expect("no overflow");
         assert_eq!(sig, Signal::None);
         assert!(patch.is_none());
     }
@@ -354,8 +392,8 @@ mod tests {
     #[test]
     fn transition_all_to_not_all_spent() {
         let m = with_blocks(make_meta(10, 5, TxFlags::LAST_SPENT_ALL));
-        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288);
-        // Was all-spent, now not → signal + clear DAH
+        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288).expect("no overflow");
+        // Was all-spent, now not -> signal + clear DAH
         assert_eq!(sig, Signal::NotAllSpent);
         let p = patch.unwrap();
         assert_eq!(p.new_delete_at_height, 0);
@@ -365,7 +403,7 @@ mod tests {
     #[test]
     fn external_tx_signals_dah_set() {
         let m = with_blocks(make_meta(10, 10, TxFlags::EXTERNAL));
-        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288);
+        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288).expect("no overflow");
         assert_eq!(sig, Signal::DeleteAtHeightSet);
         let p = patch.unwrap();
         assert_eq!(p.new_delete_at_height, 1288);
@@ -374,7 +412,7 @@ mod tests {
     #[test]
     fn external_conflicting_signals_dah_set() {
         let m = make_meta(10, 5, TxFlags::CONFLICTING | TxFlags::EXTERNAL);
-        let (sig, _) = evaluate_delete_at_height(&m, 100, 288);
+        let (sig, _) = evaluate_delete_at_height(&m, 100, 288).expect("no overflow");
         assert_eq!(sig, Signal::DeleteAtHeightSet);
     }
 
@@ -382,9 +420,9 @@ mod tests {
     fn clear_dah_when_conditions_unmet() {
         let mut m = with_blocks(make_meta(10, 5, TxFlags::LAST_SPENT_ALL));
         m.delete_at_height = 500;
-        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288);
+        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288).expect("no overflow");
         // Non-external tx: clearing DAH returns Signal::None (not DAHUNSET)
-        // The LAST_SPENT_ALL → not-all-spent transition is captured in the patch
+        // The LAST_SPENT_ALL -> not-all-spent transition is captured in the patch
         assert_eq!(sig, Signal::None);
         let p = patch.unwrap();
         assert_eq!(p.new_delete_at_height, 0);
@@ -395,7 +433,7 @@ mod tests {
     fn external_clear_dah_signals_unset() {
         let mut m = with_blocks(make_meta(10, 5, TxFlags::EXTERNAL | TxFlags::LAST_SPENT_ALL));
         m.delete_at_height = 500;
-        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288);
+        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288).expect("no overflow");
         assert_eq!(sig, Signal::DeleteAtHeightUnset);
         let p = patch.unwrap();
         assert_eq!(p.new_delete_at_height, 0);
@@ -405,10 +443,88 @@ mod tests {
     fn unmined_tx_no_dah() {
         let mut m = with_blocks(make_meta(10, 10, TxFlags::empty()));
         m.unmined_since = 500; // Not on longest chain
-        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288);
-        // All spent but not on longest chain → signal all-spent transition only
+        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288).expect("no overflow");
+        // All spent but not on longest chain -> signal all-spent transition only
         assert_eq!(sig, Signal::AllSpent);
         let p = patch.unwrap();
         assert_eq!(p.new_delete_at_height, 0);
+    }
+
+    // ----- Overflow tests (C8 regression guard) -----
+
+    #[test]
+    fn dah_overflow_errors_instead_of_saturating() {
+        // u32::MAX - 5 + 10 would wrap to 4. saturating_add would clamp to
+        // u32::MAX and pin the UTXO as unprunable. checked_add must error.
+        let m = with_blocks(make_meta(10, 10, TxFlags::empty()));
+        let err = evaluate_delete_at_height(&m, u32::MAX - 5, 10).unwrap_err();
+        match err {
+            SpendError::DahOverflow {
+                current_height,
+                retention,
+            } => {
+                assert_eq!(current_height, u32::MAX - 5);
+                assert_eq!(retention, 10);
+            }
+            other => panic!("expected DahOverflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dah_normal_height_returns_correct_sum() {
+        // Sanity guard: for realistic BSV heights, checked_add matches
+        // the documented behavior exactly.
+        let m = with_blocks(make_meta(10, 10, TxFlags::empty()));
+        let (_sig, patch) = evaluate_delete_at_height(&m, 800_000, 1000)
+            .expect("no overflow at normal heights");
+        let p = patch.expect("all-spent on-chain tx with blocks produces patch");
+        assert_eq!(p.new_delete_at_height, 801_000);
+    }
+
+    #[test]
+    fn dah_overflow_boundary_exact_u32_max() {
+        // current + retention == u32::MAX exactly is the last legal value.
+        let m = with_blocks(make_meta(10, 10, TxFlags::empty()));
+        let (_sig, patch) = evaluate_delete_at_height(&m, u32::MAX - 1000, 1000)
+            .expect("equal to u32::MAX is OK");
+        let p = patch.unwrap();
+        assert_eq!(p.new_delete_at_height, u32::MAX);
+    }
+
+    #[test]
+    fn dah_overflow_one_past_boundary_errors() {
+        // current + retention == u32::MAX + 1 must error.
+        let m = with_blocks(make_meta(10, 10, TxFlags::empty()));
+        let err = evaluate_delete_at_height(&m, u32::MAX - 1000, 1001).unwrap_err();
+        assert!(matches!(err, SpendError::DahOverflow { .. }));
+    }
+
+    #[test]
+    fn dah_cached_overflow_errors() {
+        // Cached-fields path must also enforce overflow detection.
+        let err = evaluate_dah_cached(
+            TxFlags::empty(),
+            10,
+            10,
+            1,
+            0,
+            false,
+            0,
+            u32::MAX - 5,
+            10,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SpendError::DahOverflow { .. }));
+    }
+
+    #[test]
+    fn dah_cached_normal_height_ok() {
+        let (_sig, patch) = evaluate_dah_cached(
+            TxFlags::empty(),
+            10, 10, 1, 0, false, 0, 800_000, 1000,
+        )
+        .expect("no overflow at normal heights");
+        let p = patch.unwrap();
+        assert_eq!(p.new_delete_at_height, 801_000);
     }
 }

@@ -16,8 +16,9 @@
 //! is harmless. Each replay checks the current on-disk state before
 //! writing to avoid double-application.
 
+use crate::allocator::SlotAllocator;
 use crate::device::BlockDevice;
-use crate::index::{PrimaryBackend, TxIndexEntry, TxKey};
+use crate::index::{DahBackend, DahRedoEntry, PrimaryBackend, TxIndexEntry, TxKey, UnminedBackend, UnminedRedoEntry};
 use crate::io;
 use crate::record::*;
 use crate::redo::{RedoEntry, RedoLog, RedoOp};
@@ -73,6 +74,230 @@ pub fn recover(
     Ok(stats)
 }
 
+/// Replay redo log entries, reconciling secondary indexes as well.
+///
+/// Like [`recover`], but also replays [`RedoOp::SecondaryUnminedUpdate`] and
+/// [`RedoOp::SecondaryDahUpdate`] entries against the provided secondary
+/// backends. The secondary replay is idempotent: the current primary-index
+/// value is checked, and the secondary update is only applied if the
+/// secondary index's current state is stale (i.e. does not match the
+/// primary's authoritative `unmined_since` / `delete_at_height`).
+///
+/// Call this instead of [`recover`] when the secondary indexes (particularly
+/// the on-disk redb-backed ones) need to be reconciled against the redo log
+/// after a crash.
+pub fn recover_all(
+    device: &dyn BlockDevice,
+    redo_log: &RedoLog,
+    index: &mut PrimaryBackend,
+    dah: &mut DahBackend,
+    unmined: &mut UnminedBackend,
+) -> Result<RecoveryStats, RecoveryError> {
+    recover_all_with_allocator(device, redo_log, index, dah, unmined, None)
+}
+
+/// Replay redo entries, reconciling secondary indexes and — if provided —
+/// the allocator's freelist and high-water mark.
+///
+/// This is the full-recovery entry point. When `allocator` is `Some`, every
+/// [`RedoOp::AllocateRegion`] and [`RedoOp::FreeRegion`] entry is applied
+/// via [`SlotAllocator::replay_redo`], which is idempotent. Callers that
+/// have already persisted the allocator snapshot may still call this — the
+/// idempotency check skips allocations already reflected in the snapshot.
+///
+/// Index and secondary reconciliation happens in the same single pass,
+/// preserving redo log ordering.
+///
+/// After a successful call, callers SHOULD invoke
+/// [`SlotAllocator::persist`] and then checkpoint/truncate the redo log so
+/// the next startup can skip replay.
+pub fn recover_all_with_allocator(
+    device: &dyn BlockDevice,
+    redo_log: &RedoLog,
+    index: &mut PrimaryBackend,
+    dah: &mut DahBackend,
+    unmined: &mut UnminedBackend,
+    mut allocator: Option<&mut SlotAllocator>,
+) -> Result<RecoveryStats, RecoveryError> {
+    let entries = redo_log.recover()?;
+    let mut stats = RecoveryStats::default();
+
+    // Track pending hash-table-resize intents by capacity. A Begin adds an
+    // entry; a matching Commit removes it. After the replay loop, any
+    // remaining Begin indicates a partial resize whose tmp file must be
+    // removed (the primary index file itself is untouched until rename).
+    let mut pending_resizes: std::collections::HashMap<u64, Vec<u8>> =
+        std::collections::HashMap::new();
+
+    for entry in &entries {
+        let outcome = match &entry.op {
+            RedoOp::SecondaryUnminedUpdate { tx_key, old_height, new_height } => {
+                replay_secondary_unmined(index, unmined, tx_key, *old_height, *new_height)
+            }
+            RedoOp::SecondaryDahUpdate { tx_key, old_height, new_height } => {
+                replay_secondary_dah(index, dah, tx_key, *old_height, *new_height)
+            }
+            RedoOp::AllocateRegion { .. } | RedoOp::FreeRegion { .. } => {
+                match allocator.as_deref_mut() {
+                    Some(alloc) => {
+                        if alloc.replay_redo(&entry.op) {
+                            ReplayResult::Applied
+                        } else {
+                            ReplayResult::Skipped
+                        }
+                    }
+                    None => ReplayResult::Skipped,
+                }
+            }
+            RedoOp::HashtableResizeBegin { tmp_path_bytes, new_capacity } => {
+                pending_resizes.insert(*new_capacity, tmp_path_bytes.clone());
+                ReplayResult::Applied
+            }
+            RedoOp::HashtableResizeCommit { new_capacity } => {
+                // Matching Begin → resize is durable, nothing to clean up.
+                pending_resizes.remove(new_capacity);
+                ReplayResult::Applied
+            }
+            _ => replay_entry(device, index, entry),
+        };
+        match outcome {
+            ReplayResult::Applied => stats.entries_replayed += 1,
+            ReplayResult::Skipped => stats.entries_skipped += 1,
+            ReplayResult::Failed => stats.entries_failed += 1,
+        }
+    }
+
+    // Clean up any orphan tmp files from resizes that started but never
+    // committed. The original index file is intact (rename is atomic and
+    // only happens after the tmp write completes), so removing the tmp
+    // file is safe and the server will re-attempt the resize on the next
+    // load-factor trigger.
+    for (_capacity, tmp_bytes) in pending_resizes {
+        let tmp_path = path_from_bytes(&tmp_bytes);
+        if tmp_path.exists() {
+            if let Err(e) = std::fs::remove_file(&tmp_path) {
+                eprintln!(
+                    "  recovery: failed to remove orphan resize tmp file {}: {e}",
+                    tmp_path.display()
+                );
+            } else {
+                eprintln!(
+                    "  recovery: removed orphan resize tmp file {}",
+                    tmp_path.display()
+                );
+            }
+        }
+    }
+
+    // Persist the allocator snapshot so next startup can skip replay of the
+    // allocator redo entries. The index and secondary indexes are persisted
+    // through their own paths (snapshot on shutdown / per-op redb commit).
+    if let Some(alloc) = allocator {
+        // Failure here is non-fatal for recovery — the next startup will
+        // simply replay the same entries again, which is idempotent.
+        let _ = alloc.persist();
+    }
+
+    Ok(stats)
+}
+
+/// Rebuild a filesystem path from raw bytes captured in a
+/// [`RedoOp::HashtableResizeBegin`] entry. On Unix the bytes are the raw
+/// `OsStr` (POSIX paths are not guaranteed UTF-8). On non-Unix platforms
+/// we fall back to `String::from_utf8_lossy` (this server targets
+/// Linux/Unix).
+fn path_from_bytes(bytes: &[u8]) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        std::path::PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// Reconcile the unmined secondary index with a redo intent record.
+///
+/// Idempotency rule: the secondary update is applied only when the
+/// secondary's current state does not already match the redo's `new_height`.
+/// The primary index's authoritative `unmined_since` is used as the
+/// ground-truth reference — if the redo record's `new_height` does not
+/// match the primary, the redo entry is stale (primary moved on) and we
+/// skip the secondary update entirely.
+fn replay_secondary_unmined(
+    index: &PrimaryBackend,
+    unmined: &mut UnminedBackend,
+    tx_key: &TxKey,
+    _old_height: u32,
+    new_height: u32,
+) -> ReplayResult {
+    // Primary's authoritative unmined_since. If absent, the record was
+    // deleted between when the redo was written and now — recovery skip.
+    let primary_unmined = match index.lookup(tx_key) {
+        Some(e) => e.unmined_since,
+        None => return ReplayResult::Skipped,
+    };
+    if primary_unmined != new_height {
+        // Redo is stale relative to primary — a later redo has already
+        // superseded this one. Skip.
+        return ReplayResult::Skipped;
+    }
+    let entry = UnminedRedoEntry {
+        txid: tx_key.txid,
+        old_height: _old_height,
+        new_height,
+    };
+    match unmined.replay_redo(&entry) {
+        Ok(()) => ReplayResult::Applied,
+        Err(_) => ReplayResult::Failed,
+    }
+}
+
+fn replay_secondary_dah(
+    index: &PrimaryBackend,
+    dah: &mut DahBackend,
+    tx_key: &TxKey,
+    old_height: u32,
+    new_height: u32,
+) -> ReplayResult {
+    let ie = match index.lookup(tx_key) {
+        Some(e) => e,
+        None => return ReplayResult::Skipped,
+    };
+    // Extract the primary's current delete_at_height from the cached fields.
+    // The `HAS_PRESERVE_UNTIL` flag determines whether dah_or_preserve holds
+    // the DAH or a preserve_until value; if the former, the DAH is 0.
+    let has_preserve = TxFlags::from_bits_truncate(ie.tx_flags)
+        .contains(TxFlags::HAS_PRESERVE_UNTIL);
+    let primary_dah = if has_preserve { 0 } else { ie.dah_or_preserve };
+    if primary_dah != new_height {
+        return ReplayResult::Skipped;
+    }
+    let entry = DahRedoEntry {
+        txid: tx_key.txid,
+        old_height,
+        new_height,
+    };
+    match dah.replay_redo(&entry) {
+        Ok(()) => ReplayResult::Applied,
+        Err(_) => ReplayResult::Failed,
+    }
+}
+
+/// Outcome of replaying a single redo entry.
+///
+/// - `Applied`: the entry's effect was written to the device (or index).
+/// - `Skipped`: the entry was idempotent against current state, or
+///   pointed to a record that was concurrently deleted between the
+///   redo append and recovery (a benign, non-fatal condition).
+/// - `Failed`: a non-I/O failure we deliberately tolerate during
+///   recovery (e.g. `replay_metadata_op` fell through a match). Real
+///   `DeviceError` surfaces as `Err(RecoveryError::Device)` via the
+///   `Result` return type so the caller in `bin/server.rs` can decide
+///   whether to fail startup.
+#[derive(Debug)]
 enum ReplayResult {
     Applied,
     Skipped,
@@ -107,6 +332,27 @@ fn replay_entry(
             replay_delete(index, tx_key)
         }
         RedoOp::Checkpoint => ReplayResult::Skipped,
+        // SecondaryUnminedUpdate / SecondaryDahUpdate are durability-intent
+        // records for redb secondary indexes — the primary index has no
+        // state to reconcile from them. `recover_all` handles them via the
+        // secondary backends; the single-backend `recover` path skips.
+        RedoOp::SecondaryUnminedUpdate { .. } | RedoOp::SecondaryDahUpdate { .. } => {
+            ReplayResult::Skipped
+        }
+        // AllocateRegion / FreeRegion are allocator-scoped records. The
+        // single-backend `recover` path has no allocator handle — skip
+        // here and rely on `recover_all_with_allocator` to process them.
+        RedoOp::AllocateRegion { .. } | RedoOp::FreeRegion { .. } => {
+            ReplayResult::Skipped
+        }
+        // HashtableResizeBegin / HashtableResizeCommit are file-backed
+        // index durability records handled by `recover_all_with_allocator`
+        // (which tracks the pending-resize set and cleans up orphan tmp
+        // files after replay). The single-backend `recover` path treats
+        // them as no-ops.
+        RedoOp::HashtableResizeBegin { .. } | RedoOp::HashtableResizeCommit { .. } => {
+            ReplayResult::Skipped
+        }
         // Remaining ops (Reassign, PruneSlot, SetConflicting, SetLocked,
         // PreserveUntil, MarkOnLongestChain) are metadata-only writes.
         // They're idempotent: the metadata pwrite is atomic at the block
@@ -444,7 +690,7 @@ fn replay_metadata_op(
             let _ = io::write_metadata(device, ie.record_offset, &meta);
             ReplayResult::Applied
         }
-        RedoOp::MarkOnLongestChain { tx_key, on_longest_chain, current_block_height, .. } => {
+        RedoOp::MarkOnLongestChain { tx_key, on_longest_chain, current_block_height, generation, .. } => {
             let ie = match index.lookup(tx_key) {
                 Some(e) => e,
                 None => return ReplayResult::Failed,
@@ -453,11 +699,40 @@ fn replay_metadata_op(
                 Ok(m) => m,
                 Err(_) => return ReplayResult::Failed,
             };
-            let target = if *on_longest_chain { 0 } else { *current_block_height };
-            if { meta.unmined_since } == target {
+            // H7: generation-based idempotency. The redo entry declares the
+            // target generation after applying the op. Skip when the
+            // on-device generation is already >= the target — a later op
+            // (or this op itself already replayed) has equal-or-newer
+            // state. On apply, bump the generation to the target so a
+            // subsequent replay of the same entry is correctly observed
+            // as already-applied. This prevents replay from leaving the
+            // generation counter stale and tripping replication staleness
+            // checks on otherwise-valid future ops.
+            //
+            // Generation comparison uses plain `<`. Generations are
+            // monotonically assigned per record and only wrap after ~4B
+            // mutations on a single record — far beyond any redo-log
+            // retention window. A target of 0 means the dispatcher did
+            // not record a generation (legacy/unknown); fall back to the
+            // prior unmined-since check so idempotency is still enforced.
+            let target_generation = *generation;
+            let current_generation = { meta.generation };
+            let target_unmined =
+                if *on_longest_chain { 0 } else { *current_block_height };
+            if target_generation == 0 {
+                // No generation supplied — fall back to value-equality
+                // idempotency on unmined_since alone.
+                if { meta.unmined_since } == target_unmined {
+                    return ReplayResult::Skipped;
+                }
+            } else if current_generation >= target_generation {
+                // Already caught up (or ahead).
                 return ReplayResult::Skipped;
             }
-            meta.unmined_since = target;
+            meta.unmined_since = target_unmined;
+            if target_generation != 0 {
+                meta.generation = target_generation;
+            }
             let _ = io::write_metadata(device, ie.record_offset, &meta);
             ReplayResult::Applied
         }
@@ -959,6 +1234,7 @@ mod tests {
             on_longest_chain: false,
             current_block_height: 800,
             block_height_retention: 288,
+            generation: 1,
         })
         .unwrap();
 
@@ -967,5 +1243,424 @@ mod tests {
 
         let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
         assert_eq!({ meta.unmined_since }, 800);
+        // H7: replay bumps the on-device generation to the entry target.
+        assert_eq!({ meta.generation }, 1);
+    }
+
+    #[test]
+    fn replay_mark_on_longest_chain_generation_idempotency() {
+        // H7: two redo entries with the same `unmined_since` target but
+        // different generations — first applies (generation bumped to the
+        // entry's target), second is skipped because the on-device
+        // generation now equals (>=) the second entry's generation.
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0x7A, 5);
+        let ie = h.index.lookup(&key).unwrap();
+
+        // Pre-state: generation = 0, unmined_since = 0.
+        let pre = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!({ pre.generation }, 0);
+        assert_eq!({ pre.unmined_since }, 0);
+
+        let mut redo = h.redo_log();
+
+        // Entry A: target generation = 7, unmined_since target = 1000.
+        redo.append_and_flush(RedoOp::MarkOnLongestChain {
+            tx_key: key,
+            on_longest_chain: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            generation: 7,
+        })
+        .unwrap();
+
+        // Entry B: SAME target (unmined_since = 1000) but earlier
+        // generation = 5. Should be skipped because after entry A the
+        // on-device generation is 7, which is >= 5.
+        redo.append_and_flush(RedoOp::MarkOnLongestChain {
+            tx_key: key,
+            on_longest_chain: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            generation: 5,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1, "first entry must apply");
+        assert_eq!(stats.entries_skipped, 1, "second entry must be skipped");
+        assert_eq!(stats.entries_failed, 0);
+
+        // Concrete post-state: unmined_since = 1000, generation = 7.
+        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!({ meta.unmined_since }, 1000);
+        assert_eq!(
+            { meta.generation },
+            7,
+            "generation must be the first entry's target, not overwritten by the skipped replay"
+        );
+    }
+
+    #[test]
+    fn replay_mark_on_longest_chain_newer_generation_applies() {
+        // H7: a second redo entry with a HIGHER generation than the first
+        // still applies (target_generation > current_generation), and the
+        // on-device generation is pushed to the newer target.
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0x7B, 5);
+        let ie = h.index.lookup(&key).unwrap();
+
+        let mut redo = h.redo_log();
+
+        redo.append_and_flush(RedoOp::MarkOnLongestChain {
+            tx_key: key,
+            on_longest_chain: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            generation: 3,
+        })
+        .unwrap();
+
+        redo.append_and_flush(RedoOp::MarkOnLongestChain {
+            tx_key: key,
+            on_longest_chain: true,
+            current_block_height: 1100,
+            block_height_retention: 288,
+            generation: 9,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 2);
+        assert_eq!(stats.entries_skipped, 0);
+
+        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!(
+            { meta.unmined_since },
+            0,
+            "second entry (on_longest_chain=true) wins"
+        );
+        assert_eq!({ meta.generation }, 9);
+    }
+
+    // -----------------------------------------------------------------------
+    // Secondary index two-phase durability recovery tests (C4).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn recover_all_applies_unmined_secondary_when_stale() {
+        // Simulate the bug window: redo of unmined intent was fsynced but the
+        // redb commit never happened. Primary has `unmined_since = 500`
+        // (matches the redo entry's new_height), so recovery MUST apply the
+        // secondary update to reconcile the on-disk index.
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(30, 5);
+
+        // Set primary index's cached unmined_since to 500 to simulate what
+        // the engine would have done (WAL-first MarkOnLongestChain replay).
+        let ie = h.index.lookup(&key).unwrap();
+        h.index.update_cached_fields(
+            &key, ie.tx_flags, ie.block_entry_count, ie.spent_utxos,
+            ie.dah_or_preserve, 500, ie.generation,
+        ).unwrap();
+
+        // Redo log: the intent record (as if fsynced) but redb commit skipped.
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SecondaryUnminedUpdate {
+            tx_key: key,
+            old_height: 0,
+            new_height: 500,
+        }).unwrap();
+
+        let mut dah_backend = DahBackend::new_in_memory();
+        let mut unmined_backend = UnminedBackend::new_in_memory();
+        // Secondary is currently EMPTY — stale relative to primary (500).
+
+        let stats = recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah_backend, &mut unmined_backend).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+
+        // Secondary index should now contain the entry.
+        let result = unmined_backend.range_query(500);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], key);
+    }
+
+    #[test]
+    fn recover_all_skips_stale_unmined_redo_relative_to_primary() {
+        // Primary has unmined_since = 0 (record got MARK_ON_LONGEST_CHAIN
+        // after the secondary intent was fsynced). The redo's new_height
+        // (500) does not match the primary's current (0), so we must NOT
+        // replay — another redo entry later in the log supersedes this one.
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(31, 5);
+
+        // Primary: unmined_since = 0.
+        let ie = h.index.lookup(&key).unwrap();
+        assert_eq!(ie.unmined_since, 0);
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SecondaryUnminedUpdate {
+            tx_key: key,
+            old_height: 0,
+            new_height: 500,
+        }).unwrap();
+
+        let mut dah_backend = DahBackend::new_in_memory();
+        let mut unmined_backend = UnminedBackend::new_in_memory();
+
+        let stats = recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah_backend, &mut unmined_backend).unwrap();
+        // The redo entry is stale — skipped.
+        assert_eq!(stats.entries_skipped, 1);
+        assert!(unmined_backend.is_empty());
+    }
+
+    #[test]
+    fn recover_all_skips_when_secondary_already_matches_primary() {
+        // Secondary already has the entry — replay must be a no-op (idempotent).
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(32, 5);
+
+        let ie = h.index.lookup(&key).unwrap();
+        h.index.update_cached_fields(
+            &key, ie.tx_flags, ie.block_entry_count, ie.spent_utxos,
+            ie.dah_or_preserve, 500, ie.generation,
+        ).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SecondaryUnminedUpdate {
+            tx_key: key,
+            old_height: 0,
+            new_height: 500,
+        }).unwrap();
+
+        let mut dah_backend = DahBackend::new_in_memory();
+        let mut unmined_backend = UnminedBackend::new_in_memory();
+        // Pre-populate secondary — matches primary already.
+        unmined_backend.insert(500, key, None).unwrap();
+
+        let stats = recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah_backend, &mut unmined_backend).unwrap();
+        // Idempotent replay — backend reports it as Applied (no-op commit).
+        // Per our replay_redo contract, the redb backend no-ops on same-state
+        // so ReplayResult::Applied here means the replay path returned Ok
+        // without actually mutating. That's still correct behavior.
+        assert!(stats.entries_replayed + stats.entries_skipped == 1);
+        assert_eq!(unmined_backend.len(), 1);
+    }
+
+    #[test]
+    fn recover_all_applies_dah_secondary_when_stale() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(33, 5);
+
+        // Set primary's DAH cache to 900.
+        let ie = h.index.lookup(&key).unwrap();
+        // Ensure HAS_PRESERVE_UNTIL is cleared so dah_or_preserve == DAH.
+        let tf = TxFlags::from_bits_truncate(ie.tx_flags) - TxFlags::HAS_PRESERVE_UNTIL;
+        h.index.update_cached_fields(
+            &key, tf.bits(), ie.block_entry_count, ie.spent_utxos,
+            900, ie.unmined_since, ie.generation,
+        ).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SecondaryDahUpdate {
+            tx_key: key,
+            old_height: 0,
+            new_height: 900,
+        }).unwrap();
+
+        let mut dah_backend = DahBackend::new_in_memory();
+        let mut unmined_backend = UnminedBackend::new_in_memory();
+
+        let stats = recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah_backend, &mut unmined_backend).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+
+        let result = dah_backend.range_query(900);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], key);
+    }
+
+    #[test]
+    fn recover_all_skips_missing_primary_record() {
+        let mut h = RecoveryTestHarness::new();
+
+        // Fabricate a key that is NOT in the primary index (as if the record
+        // was already deleted).
+        let mut txid = [0u8; 32];
+        txid[0] = 99;
+        let key = TxKey { txid };
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SecondaryUnminedUpdate {
+            tx_key: key,
+            old_height: 0,
+            new_height: 500,
+        }).unwrap();
+
+        let mut dah_backend = DahBackend::new_in_memory();
+        let mut unmined_backend = UnminedBackend::new_in_memory();
+
+        let stats = recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah_backend, &mut unmined_backend).unwrap();
+        // Skipped — primary has no entry for this key.
+        assert_eq!(stats.entries_skipped, 1);
+        assert!(unmined_backend.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Allocator redo-journaling recovery tests (C6).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn recover_all_replays_allocator_free_region() {
+        // Scenario: a free happened after the allocator snapshot but
+        // before a crash. The redo log contains the FreeRegion entry.
+        // Recovery must replay it into the rebuilt allocator.
+        let mut h = RecoveryTestHarness::new();
+
+        // Allocate a region, snapshot, then free — only the redo log
+        // captures the free.
+        let offset = h.alloc.allocate(8192).unwrap();
+        h.alloc.persist().unwrap();
+
+        // Simulate a free that was journaled but not snapshotted.
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::FreeRegion {
+            offset,
+            size: 8192,
+            device_id: 0,
+        }).unwrap();
+
+        // Rebuild the allocator from snapshot.
+        let mut recovered = SlotAllocator::recover(h.data_dev.clone()).unwrap();
+        assert_eq!(recovered.free_region_count(), 0, "snapshot lacks the free");
+
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+        let stats = recover_all_with_allocator(
+            &*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined,
+            Some(&mut recovered),
+        ).unwrap();
+
+        assert_eq!(stats.entries_replayed, 1, "the free entry must be replayed");
+        assert_eq!(recovered.free_region_count(), 1,
+            "replayed free must appear in the rebuilt freelist");
+        // And the region is reusable.
+        let reused = recovered.allocate(8192).unwrap();
+        assert_eq!(reused, offset);
+    }
+
+    #[test]
+    fn recover_all_replays_allocator_allocate_region() {
+        let mut h = RecoveryTestHarness::new();
+        h.alloc.persist().unwrap();
+
+        // A redo log containing an allocate that was never snapshotted.
+        let mut redo = h.redo_log();
+        let offset = crate::allocator::DATA_REGION_OFFSET;
+        redo.append_and_flush(RedoOp::AllocateRegion {
+            offset,
+            size: 4096,
+            device_id: 0,
+        }).unwrap();
+
+        let mut recovered = SlotAllocator::recover(h.data_dev.clone()).unwrap();
+        let before_next = recovered.next_offset();
+
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+        recover_all_with_allocator(
+            &*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined,
+            Some(&mut recovered),
+        ).unwrap();
+
+        assert!(
+            recovered.next_offset() >= offset + 4096,
+            "next_offset must cover the replayed allocate (was {before_next}, now {})",
+            recovered.next_offset(),
+        );
+    }
+
+    #[test]
+    fn recover_all_is_idempotent_for_allocator_ops() {
+        // Replaying the same allocator redo stream twice must yield the
+        // same allocator state.
+        let mut h = RecoveryTestHarness::new();
+        h.alloc.persist().unwrap();
+
+        let mut redo = h.redo_log();
+        let offset = crate::allocator::DATA_REGION_OFFSET;
+        redo.append_and_flush(RedoOp::AllocateRegion {
+            offset, size: 4096, device_id: 0,
+        }).unwrap();
+        redo.append_and_flush(RedoOp::AllocateRegion {
+            offset: offset + 4096, size: 8192, device_id: 0,
+        }).unwrap();
+        redo.append_and_flush(RedoOp::FreeRegion {
+            offset, size: 4096, device_id: 0,
+        }).unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+
+        let mut once = SlotAllocator::recover(h.data_dev.clone()).unwrap();
+        recover_all_with_allocator(
+            &*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined,
+            Some(&mut once),
+        ).unwrap();
+
+        let mut twice = SlotAllocator::recover(h.data_dev.clone()).unwrap();
+        for _ in 0..2 {
+            recover_all_with_allocator(
+                &*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined,
+                Some(&mut twice),
+            ).unwrap();
+        }
+
+        assert_eq!(once.next_offset(), twice.next_offset(),
+            "next_offset must be identical after any number of replays");
+        assert_eq!(once.free_region_count(), twice.free_region_count(),
+            "freelist size must be identical after any number of replays");
+    }
+
+    #[test]
+    fn recover_all_batched_pair_reconciles_both_indexes() {
+        // End-to-end: a MarkOnLongestChain-style update produces TWO secondary
+        // intent records (DAH + unmined) in a single fsync batch. Both are
+        // fsynced but the redb commits never happened (crash scenario).
+        // `recover_all` should apply both.
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(34, 5);
+
+        // Primary's post-mutation state: both fields set.
+        let ie = h.index.lookup(&key).unwrap();
+        let tf = TxFlags::from_bits_truncate(ie.tx_flags) - TxFlags::HAS_PRESERVE_UNTIL;
+        h.index.update_cached_fields(
+            &key, tf.bits(), ie.block_entry_count, ie.spent_utxos,
+            900, 500, ie.generation,
+        ).unwrap();
+
+        let mut redo = h.redo_log();
+        // Batched fsync — both ops in one flush, as the engine would do.
+        let ops = vec![
+            RedoOp::SecondaryDahUpdate {
+                tx_key: key,
+                old_height: 0,
+                new_height: 900,
+            },
+            RedoOp::SecondaryUnminedUpdate {
+                tx_key: key,
+                old_height: 0,
+                new_height: 500,
+            },
+        ];
+        redo.append_batch_and_flush(&ops).unwrap();
+
+        let mut dah_backend = DahBackend::new_in_memory();
+        let mut unmined_backend = UnminedBackend::new_in_memory();
+
+        let stats = recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah_backend, &mut unmined_backend).unwrap();
+        assert_eq!(stats.entries_replayed, 2);
+
+        assert_eq!(dah_backend.range_query(900).len(), 1);
+        assert_eq!(unmined_backend.range_query(500).len(), 1);
     }
 }

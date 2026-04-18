@@ -7,6 +7,9 @@ use super::{Completion, DeviceIo};
 use crate::device::AlignedBuf;
 use std::os::fd::RawFd;
 
+/// Stable identifier reported by [`DeviceIo::backend_name`] for this backend.
+pub const BACKEND_ID: &str = "sync";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpKind {
     Read,
@@ -124,6 +127,10 @@ impl DeviceIo for SyncFallback {
 
     fn pending(&self) -> usize {
         self.pending.len()
+    }
+
+    fn backend_name(&self) -> &'static str {
+        BACKEND_ID
     }
 }
 

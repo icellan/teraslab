@@ -31,6 +31,16 @@ pub enum RedoError {
     /// Corrupted or truncated entry.
     #[error("corrupted entry at offset {offset}")]
     Corrupted { offset: u64 },
+
+    /// The requested log region (`log_offset + log_size`) does not fit
+    /// within the backing device. Rejected at open-time so callers never
+    /// perform an I/O past the end of the device.
+    #[error("redo log region out of bounds: offset {log_offset} + size {log_size} > device size {device_size}")]
+    OutOfBounds {
+        log_offset: u64,
+        log_size: u64,
+        device_size: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, RedoError>;
@@ -54,6 +64,12 @@ const OP_SET_CONFLICTING: u8 = 12;
 const OP_SET_LOCKED: u8 = 13;
 const OP_PRESERVE_UNTIL: u8 = 14;
 const OP_MARK_LONGEST_CHAIN: u8 = 15;
+const OP_SECONDARY_UNMINED_UPDATE: u8 = 16;
+const OP_SECONDARY_DAH_UPDATE: u8 = 17;
+const OP_ALLOCATE_REGION: u8 = 18;
+const OP_FREE_REGION: u8 = 19;
+const OP_HASHTABLE_RESIZE_BEGIN: u8 = 20;
+const OP_HASHTABLE_RESIZE_COMMIT: u8 = 21;
 
 /// A redo log operation that can be serialized and replayed.
 #[derive(Debug, Clone, PartialEq)]
@@ -124,6 +140,93 @@ pub enum RedoOp {
         on_longest_chain: bool,
         current_block_height: u32,
         block_height_retention: u32,
+        /// Target record generation after this op is applied. Used by the
+        /// replay handler as the idempotency token (H7): replay skips when
+        /// the on-device `meta.generation` is already `>= generation`,
+        /// and on apply writes `meta.generation = generation` so subsequent
+        /// replays of the same entry are correctly observed as idempotent.
+        generation: u32,
+    },
+    /// Two-phase durability intent record for the unmined secondary index.
+    ///
+    /// Appended + fsynced BEFORE the redb secondary index transaction is
+    /// committed. On crash recovery, the replay path checks the primary
+    /// index's current `unmined_since` and only reapplies the secondary
+    /// update if it is stale, ensuring idempotency.
+    SecondaryUnminedUpdate {
+        tx_key: TxKey,
+        old_height: u32,
+        new_height: u32,
+    },
+    /// Two-phase durability intent record for the DAH secondary index.
+    ///
+    /// Appended + fsynced BEFORE the redb secondary index transaction is
+    /// committed. On crash recovery, the replay path checks the primary
+    /// index's current `delete_at_height` and only reapplies the secondary
+    /// update if it is stale, ensuring idempotency.
+    SecondaryDahUpdate {
+        tx_key: TxKey,
+        old_height: u32,
+        new_height: u32,
+    },
+    /// Durability record for a device-space reservation made by the allocator.
+    ///
+    /// Appended + fsynced BEFORE the offset is returned to any caller that
+    /// might issue a data write. On crash recovery, the replay handler
+    /// marks the region as allocated in the rebuilt in-memory allocator:
+    /// it removes the region from the freelist (if present) and bumps
+    /// `next_offset` if the allocation extended the high-water mark.
+    /// Replaying the same record twice is a no-op (idempotent).
+    AllocateRegion {
+        /// Device byte offset of the allocated region.
+        offset: u64,
+        /// Size of the allocation in bytes (already aligned).
+        size: u64,
+        /// Logical device identifier — currently always 0 (single device).
+        /// Reserved for future multi-device deployments.
+        device_id: u8,
+    },
+    /// Durability record for a device-space release by the allocator.
+    ///
+    /// Appended + fsynced BEFORE the freelist is mutated. On crash
+    /// recovery, the replay handler inserts the region into the rebuilt
+    /// in-memory allocator's freelist (with coalescing) so the region is
+    /// available for reuse. Replaying the same record twice is a no-op.
+    FreeRegion {
+        /// Device byte offset of the freed region.
+        offset: u64,
+        /// Size of the freed region in bytes (already aligned).
+        size: u64,
+        /// Logical device identifier — matches the paired `AllocateRegion`.
+        device_id: u8,
+    },
+    /// Durability record for the start of a file-backed hash table resize.
+    ///
+    /// Appended + fsynced BEFORE any tmp file is written. Captures the tmp
+    /// file path (as raw bytes, because filesystem paths are not guaranteed
+    /// to be UTF-8) and the target capacity. On crash recovery, a
+    /// `HashtableResizeBegin` without a matching `HashtableResizeCommit`
+    /// indicates a partially-written tmp file that must be removed: the
+    /// primary index file is untouched until the rename + commit, so the
+    /// server can safely retry the resize on the next load-factor trigger.
+    HashtableResizeBegin {
+        /// Raw bytes of the tmp file path. Stored as bytes (not `String`)
+        /// because POSIX paths can be any sequence of non-NUL bytes and are
+        /// not guaranteed to be valid UTF-8.
+        tmp_path_bytes: Vec<u8>,
+        /// Target capacity in buckets (power of two).
+        new_capacity: u64,
+    },
+    /// Durability record for a successfully completed hash table resize.
+    ///
+    /// Appended + fsynced AFTER the tmp file has been written, fsynced,
+    /// renamed over the original, and the parent directory fsynced. On
+    /// crash recovery, pairing a `HashtableResizeCommit` with its matching
+    /// `HashtableResizeBegin` (same `new_capacity`) indicates the resize
+    /// completed atomically — nothing to roll back.
+    HashtableResizeCommit {
+        /// Target capacity in buckets — matches the paired `Begin`.
+        new_capacity: u64,
     },
     Checkpoint,
 }
@@ -144,6 +247,12 @@ impl RedoOp {
             RedoOp::SetLocked { .. } => OP_SET_LOCKED,
             RedoOp::PreserveUntil { .. } => OP_PRESERVE_UNTIL,
             RedoOp::MarkOnLongestChain { .. } => OP_MARK_LONGEST_CHAIN,
+            RedoOp::SecondaryUnminedUpdate { .. } => OP_SECONDARY_UNMINED_UPDATE,
+            RedoOp::SecondaryDahUpdate { .. } => OP_SECONDARY_DAH_UPDATE,
+            RedoOp::AllocateRegion { .. } => OP_ALLOCATE_REGION,
+            RedoOp::FreeRegion { .. } => OP_FREE_REGION,
+            RedoOp::HashtableResizeBegin { .. } => OP_HASHTABLE_RESIZE_BEGIN,
+            RedoOp::HashtableResizeCommit { .. } => OP_HASHTABLE_RESIZE_COMMIT,
             RedoOp::Checkpoint => OP_CHECKPOINT,
         }
     }
@@ -165,8 +274,14 @@ impl RedoOp {
             | RedoOp::SetConflicting { tx_key, .. }
             | RedoOp::SetLocked { tx_key, .. }
             | RedoOp::PreserveUntil { tx_key, .. }
-            | RedoOp::MarkOnLongestChain { tx_key, .. } => Some(tx_key),
-            RedoOp::Checkpoint => None,
+            | RedoOp::MarkOnLongestChain { tx_key, .. }
+            | RedoOp::SecondaryUnminedUpdate { tx_key, .. }
+            | RedoOp::SecondaryDahUpdate { tx_key, .. } => Some(tx_key),
+            RedoOp::AllocateRegion { .. }
+            | RedoOp::FreeRegion { .. }
+            | RedoOp::HashtableResizeBegin { .. }
+            | RedoOp::HashtableResizeCommit { .. }
+            | RedoOp::Checkpoint => None,
         }
     }
 
@@ -227,11 +342,34 @@ impl RedoOp {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&block_height.to_le_bytes());
             }
-            RedoOp::MarkOnLongestChain { tx_key, on_longest_chain, current_block_height, block_height_retention } => {
+            RedoOp::MarkOnLongestChain { tx_key, on_longest_chain, current_block_height, block_height_retention, generation } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.push(if *on_longest_chain { 1 } else { 0 });
                 buf.extend_from_slice(&current_block_height.to_le_bytes());
                 buf.extend_from_slice(&block_height_retention.to_le_bytes());
+                buf.extend_from_slice(&generation.to_le_bytes());
+            }
+            RedoOp::SecondaryUnminedUpdate { tx_key, old_height, new_height }
+            | RedoOp::SecondaryDahUpdate { tx_key, old_height, new_height } => {
+                buf.extend_from_slice(&tx_key.txid);
+                buf.extend_from_slice(&old_height.to_le_bytes());
+                buf.extend_from_slice(&new_height.to_le_bytes());
+            }
+            RedoOp::AllocateRegion { offset, size, device_id }
+            | RedoOp::FreeRegion { offset, size, device_id } => {
+                buf.extend_from_slice(&offset.to_le_bytes());
+                buf.extend_from_slice(&size.to_le_bytes());
+                buf.push(*device_id);
+            }
+            RedoOp::HashtableResizeBegin { tmp_path_bytes, new_capacity } => {
+                // [new_capacity:8][path_len:4][path_bytes:N]
+                buf.extend_from_slice(&new_capacity.to_le_bytes());
+                let path_len = tmp_path_bytes.len() as u32;
+                buf.extend_from_slice(&path_len.to_le_bytes());
+                buf.extend_from_slice(tmp_path_bytes);
+            }
+            RedoOp::HashtableResizeCommit { new_capacity } => {
+                buf.extend_from_slice(&new_capacity.to_le_bytes());
             }
             RedoOp::Checkpoint => {}
         }
@@ -319,13 +457,55 @@ impl RedoOp {
                     block_height: u32::from_le_bytes(data[32..36].try_into().unwrap()),
                 })
             }
-            OP_MARK_LONGEST_CHAIN if data.len() >= 41 => {
+            OP_MARK_LONGEST_CHAIN if data.len() >= 45 => {
                 let mut txid = [0u8; 32]; txid.copy_from_slice(&data[..32]);
                 Some(RedoOp::MarkOnLongestChain {
                     tx_key: TxKey { txid }, on_longest_chain: data[32] != 0,
                     current_block_height: u32::from_le_bytes(data[33..37].try_into().unwrap()),
                     block_height_retention: u32::from_le_bytes(data[37..41].try_into().unwrap()),
+                    generation: u32::from_le_bytes(data[41..45].try_into().unwrap()),
                 })
+            }
+            OP_SECONDARY_UNMINED_UPDATE if data.len() >= 40 => {
+                let mut txid = [0u8; 32]; txid.copy_from_slice(&data[..32]);
+                Some(RedoOp::SecondaryUnminedUpdate {
+                    tx_key: TxKey { txid },
+                    old_height: u32::from_le_bytes(data[32..36].try_into().unwrap()),
+                    new_height: u32::from_le_bytes(data[36..40].try_into().unwrap()),
+                })
+            }
+            OP_SECONDARY_DAH_UPDATE if data.len() >= 40 => {
+                let mut txid = [0u8; 32]; txid.copy_from_slice(&data[..32]);
+                Some(RedoOp::SecondaryDahUpdate {
+                    tx_key: TxKey { txid },
+                    old_height: u32::from_le_bytes(data[32..36].try_into().unwrap()),
+                    new_height: u32::from_le_bytes(data[36..40].try_into().unwrap()),
+                })
+            }
+            OP_ALLOCATE_REGION if data.len() >= 17 => {
+                let offset = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                let size = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                let device_id = data[16];
+                Some(RedoOp::AllocateRegion { offset, size, device_id })
+            }
+            OP_FREE_REGION if data.len() >= 17 => {
+                let offset = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                let size = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                let device_id = data[16];
+                Some(RedoOp::FreeRegion { offset, size, device_id })
+            }
+            OP_HASHTABLE_RESIZE_BEGIN if data.len() >= 12 => {
+                let new_capacity = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                let path_len = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+                if data.len() < 12 + path_len {
+                    return None;
+                }
+                let tmp_path_bytes = data[12..12 + path_len].to_vec();
+                Some(RedoOp::HashtableResizeBegin { tmp_path_bytes, new_capacity })
+            }
+            OP_HASHTABLE_RESIZE_COMMIT if data.len() >= 8 => {
+                let new_capacity = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                Some(RedoOp::HashtableResizeCommit { new_capacity })
             }
             OP_CHECKPOINT => Some(RedoOp::Checkpoint),
             _ => None,
@@ -428,7 +608,28 @@ impl RedoLog {
     /// Open or create a redo log at the given device region.
     ///
     /// Scans for existing entries to determine the current position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RedoError::OutOfBounds`] if `log_offset + log_size` would
+    /// overflow `u64` or extend past the device's reported size. This
+    /// check runs before any I/O so invalid configurations are caught
+    /// immediately rather than surfacing as later `DeviceError::OutOfBounds`
+    /// failures from `pread`/`pwrite`.
     pub fn open(device: Arc<dyn BlockDevice>, log_offset: u64, log_size: u64) -> Result<Self> {
+        let device_size = device.size();
+        let end = log_offset.checked_add(log_size).ok_or(RedoError::OutOfBounds {
+            log_offset,
+            log_size,
+            device_size,
+        })?;
+        if end > device_size {
+            return Err(RedoError::OutOfBounds {
+                log_offset,
+                log_size,
+                device_size,
+            });
+        }
         let mut log = Self {
             device,
             log_offset,
@@ -504,7 +705,13 @@ impl RedoLog {
 
         buf[intra..intra + self.buffer.len()].copy_from_slice(&self.buffer);
         self.device.pwrite(&buf, aligned_offset)?;
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::BeforeRedoFsync,
+        );
         self.device.sync()?;
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::AfterRedoFsync,
+        );
 
         self.write_pos += self.buffer.len() as u64;
         self.flushed_pos = self.write_pos;
@@ -517,6 +724,30 @@ impl RedoLog {
         let seq = self.append(op)?;
         self.flush()?;
         Ok(seq)
+    }
+
+    /// Append a batch of operations and flush with a single fsync.
+    ///
+    /// All `ops` are appended to the in-memory buffer in order, then the
+    /// buffer is flushed to device. The returned `(first_seq, last_seq)`
+    /// covers the assigned sequence range. Empty `ops` returns `(current, current)`
+    /// without flushing.
+    ///
+    /// Used by two-phase durability for secondary indexes: multiple
+    /// secondary-intent entries (e.g. one DAH + one unmined) are grouped
+    /// into a single fsync before the redb transactions are committed.
+    pub fn append_batch_and_flush(&mut self, ops: &[RedoOp]) -> Result<(u64, u64)> {
+        if ops.is_empty() {
+            let seq = self.next_sequence;
+            return Ok((seq, seq));
+        }
+        let first_seq = self.next_sequence;
+        let mut last_seq = first_seq;
+        for op in ops {
+            last_seq = self.append(op.clone())?;
+        }
+        self.flush()?;
+        Ok((first_seq, last_seq))
     }
 
     /// Write a checkpoint marker. All entries before this are committed.
@@ -654,6 +885,31 @@ mod tests {
     // -- Basic tests --
 
     #[test]
+    fn open_with_out_of_bounds_log_region_fails() {
+        // Device is 64 KiB; attempt to open a log that extends past it.
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let log_offset = 32 * 1024;
+        let log_size = 64 * 1024; // end = 96 KiB > device size (64 KiB)
+        match RedoLog::open(dev.clone(), log_offset, log_size) {
+            Ok(_) => panic!("expected OutOfBounds, got Ok"),
+            Err(RedoError::OutOfBounds { log_offset: lo, log_size: ls, device_size }) => {
+                assert_eq!(lo, log_offset);
+                assert_eq!(ls, log_size);
+                assert_eq!(device_size, 64 * 1024);
+            }
+            Err(other) => panic!("expected OutOfBounds, got {other:?}"),
+        }
+
+        // Overflow case: u64::MAX offset.
+        match RedoLog::open(dev, u64::MAX, 1) {
+            Ok(_) => panic!("expected OutOfBounds on overflow, got Ok"),
+            Err(RedoError::OutOfBounds { .. }) => {}
+            Err(other) => panic!("expected OutOfBounds, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn append_flush_recover() {
         let (_, mut log) = make_log(1024 * 1024);
         log.append_and_flush(RedoOp::Spend {
@@ -766,7 +1022,9 @@ mod tests {
             RedoOp::SetConflicting { tx_key: test_key(11), value: true, current_block_height: 500, block_height_retention: 288 },
             RedoOp::SetLocked { tx_key: test_key(12), value: false },
             RedoOp::PreserveUntil { tx_key: test_key(13), block_height: 5000 },
-            RedoOp::MarkOnLongestChain { tx_key: test_key(14), on_longest_chain: true, current_block_height: 600, block_height_retention: 288 },
+            RedoOp::MarkOnLongestChain { tx_key: test_key(14), on_longest_chain: true, current_block_height: 600, block_height_retention: 288, generation: 1 },
+            RedoOp::SecondaryUnminedUpdate { tx_key: test_key(15), old_height: 0, new_height: 500 },
+            RedoOp::SecondaryDahUpdate { tx_key: test_key(16), old_height: 100, new_height: 600 },
             RedoOp::Checkpoint,
         ];
 
@@ -1132,6 +1390,7 @@ mod tests {
             on_longest_chain: true,
             current_block_height: 800_123,
             block_height_retention: 576,
+            generation: 42,
         });
     }
 
@@ -1142,6 +1401,97 @@ mod tests {
             on_longest_chain: false,
             current_block_height: 1,
             block_height_retention: 0,
+            generation: 0,
+        });
+    }
+
+    #[test]
+    fn round_trip_secondary_unmined_update() {
+        assert_round_trip(RedoOp::SecondaryUnminedUpdate {
+            tx_key: make_txid(0x70),
+            old_height: 0,
+            new_height: 500,
+        });
+        assert_round_trip(RedoOp::SecondaryUnminedUpdate {
+            tx_key: make_txid(0x71),
+            old_height: 500,
+            new_height: 0,
+        });
+        assert_round_trip(RedoOp::SecondaryUnminedUpdate {
+            tx_key: make_txid(0x72),
+            old_height: 100,
+            new_height: 200,
+        });
+    }
+
+    #[test]
+    fn round_trip_secondary_dah_update() {
+        assert_round_trip(RedoOp::SecondaryDahUpdate {
+            tx_key: make_txid(0x73),
+            old_height: 0,
+            new_height: 900,
+        });
+        assert_round_trip(RedoOp::SecondaryDahUpdate {
+            tx_key: make_txid(0x74),
+            old_height: 900,
+            new_height: 0,
+        });
+    }
+
+    #[test]
+    fn append_batch_and_flush_assigns_contiguous_sequences() {
+        let (_, mut log) = make_log(1024 * 1024);
+        let ops = vec![
+            RedoOp::SecondaryDahUpdate { tx_key: test_key(1), old_height: 0, new_height: 100 },
+            RedoOp::SecondaryUnminedUpdate { tx_key: test_key(1), old_height: 0, new_height: 500 },
+        ];
+        let (first, last) = log.append_batch_and_flush(&ops).unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(last, 2);
+
+        let entries = log.recover().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 2);
+        assert_eq!(entries[0].op, ops[0]);
+        assert_eq!(entries[1].op, ops[1]);
+    }
+
+    #[test]
+    fn append_batch_and_flush_empty_no_flush() {
+        let (_, mut log) = make_log(1024 * 1024);
+        let (first, last) = log.append_batch_and_flush(&[]).unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(last, 1);
+        let entries = log.recover().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn round_trip_allocate_region() {
+        assert_round_trip(RedoOp::AllocateRegion {
+            offset: 0x0000_1234_5678_9ABC,
+            size: 4096,
+            device_id: 0,
+        });
+        assert_round_trip(RedoOp::AllocateRegion {
+            offset: 1024 * 1024,
+            size: 16 * 1024,
+            device_id: 7,
+        });
+    }
+
+    #[test]
+    fn round_trip_free_region() {
+        assert_round_trip(RedoOp::FreeRegion {
+            offset: 0x0000_DEAD_BEEF_0000,
+            size: 8192,
+            device_id: 0,
+        });
+        assert_round_trip(RedoOp::FreeRegion {
+            offset: 2 * 1024 * 1024,
+            size: 32 * 1024,
+            device_id: 3,
         });
     }
 
@@ -1192,6 +1542,7 @@ mod tests {
                 on_longest_chain: true,
                 current_block_height: 300_000,
                 block_height_retention: 144,
+                generation: 7,
             },
         ];
 

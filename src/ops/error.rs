@@ -104,4 +104,18 @@ pub enum SpendError {
         /// Description of the I/O failure.
         detail: String,
     },
+
+    /// `current_block_height + block_height_retention` would overflow a `u32`.
+    ///
+    /// This indicates a misconfiguration: either `block_height_retention` is
+    /// absurdly large, or `current_block_height` is near `u32::MAX`. The
+    /// server returns this instead of silently clamping (which would pin
+    /// UTXOs as unprunable forever).
+    #[error("DAH_OVERFLOW: current_height={current_height} + retention={retention} exceeds u32::MAX")]
+    DahOverflow {
+        /// Current block height at the time of evaluation.
+        current_height: u32,
+        /// Configured block-height retention window.
+        retention: u32,
+    },
 }

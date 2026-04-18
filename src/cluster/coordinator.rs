@@ -382,7 +382,7 @@ impl ClusterCoordinator {
                             if let Some(ref path) = topo_state_path_event {
                                 let peak = peak_size_event.load(Ordering::Relaxed) as u64;
                                 let inc = swim_incarnation_event.load(Ordering::Relaxed);
-                                persist_topology_state(path, &topo_authority_event.persisted_state(peak, inc));
+                                let _ = persist_topology_state(path, &topo_authority_event.persisted_state(peak, inc));
                             }
                             // Check single-node quorum (self-vote already recorded).
                             let self_vote = crate::cluster::topology::TopologyVote {
@@ -689,7 +689,7 @@ impl ClusterCoordinator {
                     if let Some(path) = topology_state_path {
                         let peak = peak_size.load(Ordering::Relaxed) as u64;
                         let inc = swim_incarnation.load(Ordering::Relaxed);
-                        persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
+                        let _ = persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
                     }
 
                     // Check if self-vote already achieves quorum (single-node cluster).
@@ -714,7 +714,7 @@ impl ClusterCoordinator {
                         if let Some(path) = topology_state_path {
                             let peak = peak_size.load(Ordering::Relaxed) as u64;
                             let inc = swim_incarnation.load(Ordering::Relaxed);
-                            persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
+                            let _ = persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
                         }
                     } else {
                         // Multi-node: spawn proposer thread to broadcast proposal,
@@ -855,7 +855,7 @@ impl ClusterCoordinator {
                                 if let Some(ref path) = *topology_state_path {
                                     let peak = peak_size.load(Ordering::Relaxed) as u64;
                                     let inc = swim_incarnation.load(Ordering::Relaxed);
-                                    persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
+                                    let _ = persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
                                 }
                                 // Signal the event loop to activate the topology.
                                 let _ = topology_commit_tx.send((remote_members.clone(), commit.term));
@@ -884,7 +884,7 @@ impl ClusterCoordinator {
                             if let Some(path) = topology_state_path {
                                 let peak = peak_size.load(Ordering::Relaxed) as u64;
                                 let inc = swim_incarnation.load(Ordering::Relaxed);
-                                persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
+                                let _ = persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
                             }
                             let self_vote = crate::cluster::topology::TopologyVote {
                                 term: proposal.term,
@@ -1507,7 +1507,7 @@ fn try_run_topology_proposal(
     if let Some(path) = topology_state_path {
         let peak = peak_size.load(Ordering::Relaxed) as u64;
         let inc = swim_incarnation.load(Ordering::Relaxed);
-        persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
+        let _ = persist_topology_state(path, &topology_authority.persisted_state(peak, inc));
     }
 
     // Signal the event loop to activate the shard table.
@@ -3237,8 +3237,22 @@ pub fn redo_entry_to_replica_op(
             Some(ReplicaOp::Delete { tx_key: *tx_key })
         }
         // Checkpoint is a no-op. MarkOnLongestChain is a secondary index
-        // operation that gets rebuilt.
-        RedoOp::Checkpoint | RedoOp::MarkOnLongestChain { .. } => None,
+        // operation that gets rebuilt. SecondaryUnminedUpdate and
+        // SecondaryDahUpdate are local durability-intent records for the
+        // redb secondary indexes — replicas rebuild their secondaries from
+        // their own metadata replay. AllocateRegion/FreeRegion are local
+        // allocator-journal records with no replicated effect — replicas
+        // allocate their own regions independently. HashtableResizeBegin /
+        // HashtableResizeCommit are local file-backed-index durability
+        // records — replicas resize their own indexes independently.
+        RedoOp::Checkpoint
+        | RedoOp::MarkOnLongestChain { .. }
+        | RedoOp::SecondaryUnminedUpdate { .. }
+        | RedoOp::SecondaryDahUpdate { .. }
+        | RedoOp::AllocateRegion { .. }
+        | RedoOp::FreeRegion { .. }
+        | RedoOp::HashtableResizeBegin { .. }
+        | RedoOp::HashtableResizeCommit { .. } => None,
     }
 }
 
@@ -3325,10 +3339,16 @@ fn persist_cluster_state(path: &std::path::Path, peak: u64, epoch: u64) {
 }
 
 /// Persist the full topology state (new format with committed members).
+///
+/// Returns `Ok(())` on durable write + fsync + atomic rename. Errors are
+/// counted in [`PERSIST_FAILURES`] and logged, then surfaced to the caller.
+/// Safety-critical callers (the vote handler) MUST fail the request rather
+/// than reply when this returns `Err` — see H10: a voter must never
+/// advertise a vote it could lose across a crash.
 fn persist_topology_state(
     path: &std::path::Path,
     state: &crate::cluster::topology::PersistedTopologyState,
-) {
+) -> std::io::Result<()> {
     use std::io::Write as _;
     let tmp = path.with_extension("cluster.tmp");
     let data = state.serialize();
@@ -3339,10 +3359,11 @@ fn persist_topology_state(
         std::fs::rename(&tmp, path)?;
         Ok(())
     })();
-    if let Err(e) = result {
+    if let Err(ref e) = result {
         PERSIST_FAILURES.fetch_add(1, Ordering::Relaxed);
         eprintln!("cluster: failed to persist topology state: {e}");
     }
+    result
 }
 
 /// Load the full topology state from disk (backward-compatible).
@@ -3929,15 +3950,25 @@ impl RunningCluster {
 
     /// Persist the full topology state to disk.
     ///
-    /// Writes voted_term and committed_members durably so that after
-    /// a crash the node does not double-vote or lose track of the
-    /// committed topology.
-    pub fn persist_topology(&self) {
+    /// Writes `voted_term` and `committed_members` durably so that after a
+    /// crash the node does not double-vote or lose track of the committed
+    /// topology. Returns `Ok(())` if the fsync'd rename succeeded, or an
+    /// `io::Error` otherwise. Safety-critical callers — the
+    /// `OP_TOPOLOGY_PROPOSE` and `OP_TOPOLOGY_COMMIT` handlers — MUST check
+    /// this result and refuse to reply on failure (see H10: a voter must
+    /// never advertise a vote it could lose across a crash).
+    ///
+    /// When no topology-state path is configured (pure in-memory test
+    /// fixtures), returns `Ok(())` — there is nothing to persist and
+    /// callers can proceed to reply.
+    pub fn persist_topology(&self) -> std::io::Result<()> {
         if let Some(ref path) = self.topology_state_path {
             let peak = self.peak_size.load(Ordering::Relaxed) as u64;
             let inc = self.swim_incarnation.load(Ordering::Relaxed);
             let state = self.topology_authority.persisted_state(peak, inc);
-            persist_topology_state(path, &state);
+            persist_topology_state(path, &state)
+        } else {
+            Ok(())
         }
     }
 
@@ -3958,10 +3989,43 @@ impl RunningCluster {
     /// and voted term. Without this, topology changes received between
     /// the last event-driven persist and shutdown would be lost.
     pub fn shutdown(&self) {
-        self.persist_topology();
+        // Best-effort persist at shutdown — the safety-critical persists
+        // happen inline in the vote handler (see `OP_TOPOLOGY_PROPOSE` /
+        // `OP_TOPOLOGY_COMMIT` in `server/dispatch.rs`). Any error here is
+        // already counted in `PERSIST_FAILURES` and logged.
+        let _ = self.persist_topology();
         self.shutdown.store(true, Ordering::Relaxed);
         self.swim_shutdown.store(true, Ordering::Relaxed);
     }
+}
+
+/// Test-only: construct a [`RunningCluster`] with an explicit
+/// `topology_state_path`. Used by H10 tests that need to observe the
+/// on-disk persist of `voted_term` / `committed_term`.
+#[cfg(test)]
+pub(crate) fn new_test_running_cluster_with_topology_path(
+    self_id: NodeId,
+    table: ShardTable,
+    live_nodes: &[(NodeId, SocketAddr)],
+    committed_members: &[NodeId],
+    inbound_shards: &[u16],
+    migrating_shards: &[u16],
+    fenced_shards: &[u16],
+    peak_size: usize,
+    topology_state_path: Option<std::path::PathBuf>,
+) -> RunningCluster {
+    let mut c = new_test_running_cluster(
+        self_id,
+        table,
+        live_nodes,
+        committed_members,
+        inbound_shards,
+        migrating_shards,
+        fenced_shards,
+        peak_size,
+    );
+    c.topology_state_path = topology_state_path;
+    c
 }
 
 #[cfg(test)]

@@ -87,6 +87,26 @@ pub const ERR_MIGRATION_IN_PROGRESS: u16 = 19;
 /// the durability contract (RF copies) was not satisfied.
 pub const ERR_REPLICATION_FAILED: u16 = 20;
 
+/// OP_MIGRATION_COMPLETE arrived with `record_count > 0` but no manifest
+/// hash / exact-manifest entries. Safety: without the hash, we cannot
+/// verify every received record matches the source's contents, so a
+/// malformed or stale frame could mark a non-empty shard migrated
+/// prematurely. Sources must include a manifest when the shard has data.
+pub const ERR_MIGRATION_MANIFEST_REQUIRED: u16 = 21;
+
+/// OP_MIGRATION_COMPLETE carried a manifest hash that did not match the
+/// receiver's locally computed manifest (content differs even if record
+/// count matches). Distinct from `ERR_MIGRATION_IN_PROGRESS` so callers
+/// can distinguish "still streaming" from "data corruption".
+pub const ERR_MIGRATION_MANIFEST_MISMATCH: u16 = 22;
+
+/// A topology vote was recorded in memory but the subsequent on-disk
+/// persist (voted_term fsync) failed. Returned BEFORE the reply frame is
+/// built — the proposer treats this as "no vote" and will retry. This
+/// preserves the safety property: a voter never advertises a vote it
+/// could lose across a crash.
+pub const ERR_TOPOLOGY_PERSIST_FAILED: u16 = 23;
+
 // Streaming errors
 /// Blob stream not found for the given txid on this connection.
 pub const ERR_STREAM_NOT_FOUND: u16 = 16;
@@ -103,6 +123,23 @@ pub const STATUS_ERROR: u8 = 1;
 pub const STATUS_NOT_FOUND: u8 = 2;
 pub const STATUS_REDIRECT: u8 = 3;
 pub const STATUS_PARTIAL_ERROR: u8 = 4;
+/// The mutation was applied and redo-durable locally, but the configured
+/// replication ACK policy could not be satisfied AND the server is running
+/// in best-effort replication mode (so the request is not rejected).
+///
+/// Semantics: the client received an acknowledgment that is weaker than
+/// `STATUS_OK` — durability is single-node only, so if the master crashes
+/// before catch-up streaming propagates this write to replicas, it may be
+/// lost. Clients that require quorum durability must treat this as a
+/// failure; clients that prefer availability may treat it as best-effort
+/// success.
+///
+/// This status is only emitted when `replication_degraded_mode = "best_effort"`
+/// is configured AND the actual number of replica ACKs is below the
+/// configured ACK policy threshold (for the current implementation:
+/// zero replica ACKs out of one or more targets — see `replicate_all_ops`
+/// in `server/dispatch.rs`).
+pub const STATUS_DEGRADED_DURABILITY: u8 = 5;
 
 /// Wire flags bit indicating cold_data was pre-uploaded to blobstore.
 /// Set on CreateItem.flags byte (bit 3) when the client has already

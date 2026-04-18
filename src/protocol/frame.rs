@@ -14,7 +14,26 @@ pub enum FrameError {
     TooLarge { size: u32, max: u32 },
     #[error("truncated frame: declared {declared}, actual {actual}")]
     Truncated { declared: usize, actual: usize },
+    /// The declared `total_length` is below the minimum required for the
+    /// smallest valid frame (length prefix + at least one opcode byte).
+    /// Enforced BEFORE any allocation so malformed frames cannot drive
+    /// resource consumption.
+    #[error("frame below minimum size: total_length {total_length} < minimum {minimum}")]
+    BelowMinimum { total_length: u32, minimum: u32 },
 }
+
+/// Minimum `total_length` for any frame: at least 1 opcode byte after the
+/// 4-byte length prefix. The per-direction minimums ([`MIN_REQUEST_BODY`]
+/// and [`MIN_RESPONSE_BODY`]) are stricter, but this absolute floor is
+/// checked first so that grossly malformed inputs are rejected before
+/// any payload allocation. Value: 1 (a single opcode byte).
+pub const MIN_FRAME_BODY: u32 = 1;
+
+/// Minimum `total_length` for a request frame: `request_id(8) + op_code(2) + flags(2)`.
+pub const MIN_REQUEST_BODY: u32 = 8 + 2 + 2;
+
+/// Minimum `total_length` for a response frame: `request_id(8) + status(1)`.
+pub const MIN_RESPONSE_BODY: u32 = 8 + 1;
 
 pub type Result<T> = std::result::Result<T, FrameError>;
 
@@ -69,11 +88,30 @@ impl RequestFrame {
     /// Decode a request frame from bytes.
     ///
     /// Returns the frame and the total number of bytes consumed.
+    ///
+    /// # Errors
+    ///
+    /// Rejects frames smaller than `4 (length prefix) + 1 (opcode)` bytes
+    /// BEFORE any payload allocation via [`FrameError::BelowMinimum`].
+    /// Returns [`FrameError::TooLarge`] for frames exceeding the wire
+    /// maximum, [`FrameError::Truncated`] for declared lengths that
+    /// exceed the buffer, and [`FrameError::TooShort`] when the
+    /// remaining body cannot contain the fixed request header fields.
     pub fn decode(data: &[u8]) -> Result<(Self, usize)> {
         if data.len() < 4 {
             return Err(FrameError::TooShort { need: 4, have: data.len() });
         }
-        let total_length = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let total_length = u32::from_le_bytes(
+            data[0..4].try_into().map_err(|_| FrameError::TooShort { need: 4, have: data.len() })?,
+        );
+        // Absolute minimum frame check BEFORE any allocation — protects
+        // against adversarial inputs with tiny declared lengths.
+        if total_length < MIN_FRAME_BODY {
+            return Err(FrameError::BelowMinimum {
+                total_length,
+                minimum: MIN_FRAME_BODY,
+            });
+        }
         if total_length > MAX_FRAME_SIZE {
             return Err(FrameError::TooLarge { size: total_length, max: MAX_FRAME_SIZE });
         }
@@ -84,12 +122,30 @@ impl RequestFrame {
                 actual: data.len(),
             });
         }
-        if total_length < 12 {
-            return Err(FrameError::TooShort { need: 12, have: total_length as usize });
+        if total_length < MIN_REQUEST_BODY {
+            return Err(FrameError::TooShort {
+                need: MIN_REQUEST_BODY as usize,
+                have: total_length as usize,
+            });
         }
-        let request_id = u64::from_le_bytes(data[4..12].try_into().unwrap());
-        let op_code = u16::from_le_bytes(data[12..14].try_into().unwrap());
-        let flags = u16::from_le_bytes(data[14..16].try_into().unwrap());
+        let request_id = u64::from_le_bytes(
+            data[4..12].try_into().map_err(|_| FrameError::Truncated {
+                declared: frame_size,
+                actual: data.len(),
+            })?,
+        );
+        let op_code = u16::from_le_bytes(
+            data[12..14].try_into().map_err(|_| FrameError::Truncated {
+                declared: frame_size,
+                actual: data.len(),
+            })?,
+        );
+        let flags = u16::from_le_bytes(
+            data[14..16].try_into().map_err(|_| FrameError::Truncated {
+                declared: frame_size,
+                actual: data.len(),
+            })?,
+        );
         let payload = data[16..frame_size].to_vec();
 
         Ok((Self { request_id, op_code, flags, payload }, frame_size))
@@ -110,11 +166,24 @@ impl ResponseFrame {
     }
 
     /// Decode a response frame from bytes.
+    ///
+    /// # Errors
+    ///
+    /// Rejects frames smaller than `4 (length prefix) + 1 (opcode)` bytes
+    /// BEFORE any payload allocation via [`FrameError::BelowMinimum`].
     pub fn decode(data: &[u8]) -> Result<(Self, usize)> {
         if data.len() < 4 {
             return Err(FrameError::TooShort { need: 4, have: data.len() });
         }
-        let total_length = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let total_length = u32::from_le_bytes(
+            data[0..4].try_into().map_err(|_| FrameError::TooShort { need: 4, have: data.len() })?,
+        );
+        if total_length < MIN_FRAME_BODY {
+            return Err(FrameError::BelowMinimum {
+                total_length,
+                minimum: MIN_FRAME_BODY,
+            });
+        }
         if total_length > MAX_FRAME_SIZE {
             return Err(FrameError::TooLarge { size: total_length, max: MAX_FRAME_SIZE });
         }
@@ -125,10 +194,18 @@ impl ResponseFrame {
                 actual: data.len(),
             });
         }
-        if total_length < 9 {
-            return Err(FrameError::TooShort { need: 9, have: total_length as usize });
+        if total_length < MIN_RESPONSE_BODY {
+            return Err(FrameError::TooShort {
+                need: MIN_RESPONSE_BODY as usize,
+                have: total_length as usize,
+            });
         }
-        let request_id = u64::from_le_bytes(data[4..12].try_into().unwrap());
+        let request_id = u64::from_le_bytes(
+            data[4..12].try_into().map_err(|_| FrameError::Truncated {
+                declared: frame_size,
+                actual: data.len(),
+            })?,
+        );
         let status = data[12];
         let payload = data[13..frame_size].to_vec();
 
@@ -279,6 +356,48 @@ mod tests {
         let frame = ResponseFrame { request_id: 0, status: 0, payload: vec![] };
         let encoded = frame.encode();
         assert_eq!(encoded.len(), RESPONSE_HEADER_SIZE); // 13 bytes total for empty payload
+    }
+
+    #[test]
+    fn decode_frame_shorter_than_minimum_returns_error() {
+        // Request: declared total_length = 0 → below the 1-byte minimum.
+        let data = 0u32.to_le_bytes();
+        let err = RequestFrame::decode(&data).unwrap_err();
+        match err {
+            FrameError::BelowMinimum { total_length, minimum } => {
+                assert_eq!(total_length, 0);
+                assert_eq!(minimum, MIN_FRAME_BODY);
+            }
+            other => panic!("expected BelowMinimum, got {other:?}"),
+        }
+
+        // Response: same floor applies.
+        let err = ResponseFrame::decode(&data).unwrap_err();
+        match err {
+            FrameError::BelowMinimum { total_length, minimum } => {
+                assert_eq!(total_length, 0);
+                assert_eq!(minimum, MIN_FRAME_BODY);
+            }
+            other => panic!("expected BelowMinimum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_request_below_header_size_returns_too_short() {
+        // total_length = 5 passes the absolute minimum but is still below
+        // the request header's 12-byte requirement. Must return TooShort
+        // after the minimum guard has already run.
+        let mut data = Vec::new();
+        data.extend_from_slice(&5u32.to_le_bytes()); // total_length
+        data.extend_from_slice(&[0u8; 5]); // body
+        let err = RequestFrame::decode(&data).unwrap_err();
+        match err {
+            FrameError::TooShort { need, have } => {
+                assert_eq!(need, MIN_REQUEST_BODY as usize);
+                assert_eq!(have, 5);
+            }
+            other => panic!("expected TooShort, got {other:?}"),
+        }
     }
 
     #[test]

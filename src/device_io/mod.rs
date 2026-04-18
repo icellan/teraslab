@@ -2,6 +2,18 @@
 //!
 //! Both `IoUringBackend` and `SyncFallback` implement the `DeviceIo` trait,
 //! providing a single interface for the spend path regardless of kernel support.
+//!
+//! On Linux, [`create_device_io`] prefers `IoUringBackend` (kernel async I/O,
+//! Linux >= 5.6) and falls back to `SyncFallback` (sequential libc
+//! pread/pwrite) only if ring setup fails — e.g. kernel too old, `ulimit
+//! -l` too small, seccomp-filtered sandbox. On non-Linux platforms
+//! `SyncFallback` is the only available backend; the io_uring module
+//! returns an `Unsupported` error at `new()` time and this is a documented
+//! platform limitation, not a stub.
+//!
+//! Callers can query which backend is actually in use via
+//! [`DeviceIo::backend_name`] — useful for metrics / observability so the
+//! operator can see whether the server is running on the fast path.
 
 mod sync_fallback;
 
@@ -60,19 +72,47 @@ pub trait DeviceIo: Send + Sync {
 
     /// Number of operations currently pending (submitted but not completed).
     fn pending(&self) -> usize;
+
+    /// Stable identifier for the concrete backend ("io_uring" or "sync").
+    ///
+    /// Used by metrics / `/metrics` endpoints so operators can confirm
+    /// which I/O backend is actually serving the spend path. The default
+    /// implementation returns `"unknown"` — every concrete backend in this
+    /// module overrides it.
+    fn backend_name(&self) -> &'static str {
+        "unknown"
+    }
 }
 
 /// Create the best available `DeviceIo` backend.
 ///
 /// On Linux >= 5.6, attempts `IoUringBackend`. Falls back to `SyncFallback`
 /// on unsupported kernels or non-Linux platforms (macOS, test environments).
+/// When a fallback is taken on Linux, the reason is emitted to stderr so
+/// operators can diagnose why the faster path was not selected.
 pub fn create_device_io(queue_depth: u32) -> Box<dyn DeviceIo> {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(backend) = IoUringBackend::new(queue_depth) {
-            return Box::new(backend);
+        match IoUringBackend::new(queue_depth) {
+            Ok(backend) => return Box::new(backend),
+            Err(e) => {
+                // Operators should see this: it means the server is running
+                // on the slower sync path. Common causes: kernel < 5.6,
+                // ulimit -l too small, seccomp filter blocking io_uring_setup.
+                eprintln!(
+                    "device_io: io_uring init failed ({e}); falling back to SyncFallback"
+                );
+            }
         }
     }
     let _ = queue_depth;
-    Box::new(SyncFallback::new(queue_depth).expect("SyncFallback cannot fail"))
+    match SyncFallback::new(queue_depth) {
+        Ok(backend) => Box::new(backend),
+        Err(e) => {
+            // SyncFallback::new only returns Ok, so this is genuinely unreachable —
+            // but avoid unwrap/expect per CLAUDE.md and panic with a clear message
+            // instead of silently hiding the bug if the signature ever changes.
+            panic!("SyncFallback::new returned an error it documents as impossible: {e}");
+        }
+    }
 }

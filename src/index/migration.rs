@@ -169,11 +169,11 @@ mod tests {
             primary.register(make_key(i), make_entry(i * 100)).unwrap();
         }
         let mut dah = DahBackend::new_in_memory();
-        dah.insert(100, make_key(1));
-        dah.insert(200, make_key(2));
+        dah.insert(100, make_key(1), None).unwrap();
+        dah.insert(200, make_key(2), None).unwrap();
 
         let mut unmined = UnminedBackend::new_in_memory();
-        unmined.insert(500, make_key(3));
+        unmined.insert(500, make_key(3), None).unwrap();
 
         // Export
         let export_stats = export_index(&primary, &dah, &unmined, &snap_path).unwrap();
@@ -209,10 +209,10 @@ mod tests {
             primary.register(make_key(i), make_entry(i * 100)).unwrap();
         }
         let mut dah = DahBackend::new_in_memory();
-        dah.insert(100, make_key(1));
+        dah.insert(100, make_key(1), None).unwrap();
 
         let mut unmined = UnminedBackend::new_in_memory();
-        unmined.insert(500, make_key(3));
+        unmined.insert(500, make_key(3), None).unwrap();
 
         // Export
         export_index(&primary, &dah, &unmined, &snap_path).unwrap();
@@ -316,8 +316,8 @@ mod tests {
             )
             .unwrap(),
         );
-        dah.insert(100, make_key(1));
-        dah.insert(200, make_key(2));
+        dah.insert(100, make_key(1), None).unwrap();
+        dah.insert(200, make_key(2), None).unwrap();
 
         let mut unmined = UnminedBackend::OnDisk(
             crate::index::redb_unmined::RedbUnminedIndex::open(
@@ -326,7 +326,7 @@ mod tests {
             )
             .unwrap(),
         );
-        unmined.insert(500, make_key(3));
+        unmined.insert(500, make_key(3), None).unwrap();
 
         // Export from redb
         let export_stats = export_index(&primary, &dah, &unmined, &snap_path).unwrap();

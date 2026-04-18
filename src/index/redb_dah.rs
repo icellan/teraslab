@@ -3,9 +3,17 @@
 //! Uses two tables for O(1) lookup in both directions:
 //! - Forward: composite key `height_be(4) || txid(32)` -> `()` (big-endian for correct sort)
 //! - Reverse: `txid(32)` -> `height(4 LE)`
+//!
+//! Two-phase durability: every mutating `insert`/`remove` appends and
+//! fsyncs a [`RedoOp::SecondaryDahUpdate`] record BEFORE committing the
+//! redb transaction. If the fsync fails the redb commit is skipped so
+//! on-disk state cannot race ahead of the redo log.
 
+use crate::index::dah_index::DahRedoEntry;
 use crate::index::hashtable::TxKey;
 use crate::index::IndexError;
+use crate::redo::{RedoLog, RedoOp};
+use parking_lot::Mutex;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::path::Path;
 
@@ -62,136 +70,157 @@ impl RedbDahIndex {
         Ok(Self { db, count })
     }
 
-    /// Insert a transaction into the DAH index.
+    /// Look up the current height for a key using a cheap read transaction.
     ///
-    /// If the txid already has a DAH entry at a different height, the old
-    /// entry is removed first. Logs and returns early on I/O errors without
-    /// updating the cached count, keeping it consistent with committed state.
-    pub fn insert(&mut self, height: u32, key: TxKey) {
-        let txn = match self.begin_write() {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("redb dah insert: begin_write failed: {e}");
-                return;
-            }
-        };
-        let was_new;
-        {
-            let mut fwd = match txn.open_table(DAH_FORWARD) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("redb dah insert: open_table(forward) failed: {e}");
-                    return;
-                }
-            };
-            let mut rev = match txn.open_table(DAH_REVERSE) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("redb dah insert: open_table(reverse) failed: {e}");
-                    return;
-                }
-            };
-
-            // Remove old entry if at a different height.
-            let mut already_exists = false;
-            match rev.get(key.txid) {
-                Ok(Some(guard)) => {
-                    let old_height = u32::from_le_bytes(guard.value());
-                    drop(guard);
-                    if old_height == height {
-                        return; // Already at this height.
-                    }
-                    already_exists = true;
-                    let old_fwd_key = make_forward_key(old_height, &key);
-                    if let Err(e) = fwd.remove(old_fwd_key) {
-                        eprintln!("redb dah insert: remove old forward entry failed: {e}");
-                        return;
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!("redb dah insert: reverse lookup failed: {e}");
-                    return;
-                }
-            }
-            was_new = !already_exists;
-
-            if let Err(e) = rev.insert(key.txid, height.to_le_bytes()) {
-                eprintln!("redb dah insert: reverse insert failed: {e}");
-                return;
-            }
-            if let Err(e) = fwd.insert(make_forward_key(height, &key), ()) {
-                eprintln!("redb dah insert: forward insert failed: {e}");
-                return;
-            }
-        }
-        match txn.commit() {
-            Ok(()) => {
-                if was_new {
-                    self.count += 1;
-                }
-            }
-            Err(e) => {
-                eprintln!("redb dah insert: commit failed: {e}");
-            }
-        }
+    /// Returns `None` if the key is not present in the index.
+    pub fn get_height(&self, key: &TxKey) -> Option<u32> {
+        let txn = self.db.begin_read().ok()?;
+        let table = txn.open_table(DAH_REVERSE).ok()?;
+        let guard = table.get(key.txid).ok()??;
+        Some(u32::from_le_bytes(guard.value()))
     }
 
-    /// Remove a transaction from the DAH index.
+    /// Insert a transaction into the DAH index with two-phase durability.
     ///
-    /// Logs and returns early on I/O errors without updating the cached
-    /// count, keeping it consistent with committed state.
-    pub fn remove(&mut self, key: &TxKey) {
-        let txn = match self.begin_write() {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("redb dah remove: begin_write failed: {e}");
-                return;
+    /// Steps:
+    ///   1. Read the current height (if any) from redb.
+    ///   2. If a redo log is provided, append and fsync a
+    ///      [`RedoOp::SecondaryDahUpdate`] record.
+    ///   3. Commit the redb transaction.
+    ///
+    /// See [`crate::index::redb_unmined::RedbUnminedIndex::insert`] for the
+    /// durability rationale.
+    pub fn insert(
+        &mut self,
+        height: u32,
+        key: TxKey,
+        redo_log: Option<&Mutex<RedoLog>>,
+    ) -> Result<(), IndexError> {
+        let old_height = self.get_height(&key).unwrap_or(0);
+        if old_height == height {
+            return Ok(()); // No-op; no redo entry needed.
+        }
+
+        if let Some(redo) = redo_log {
+            let op = RedoOp::SecondaryDahUpdate {
+                tx_key: key,
+                old_height,
+                new_height: height,
+            };
+            let mut log = redo.lock();
+            log.append_and_flush(op).map_err(|e| IndexError::FormatError {
+                detail: format!("redo append_and_flush (dah insert): {e}"),
+            })?;
+        }
+
+        let txn = self.begin_write().map_err(map_txn_err)?;
+        let was_new;
+        {
+            let mut fwd = txn.open_table(DAH_FORWARD).map_err(map_table_err)?;
+            let mut rev = txn.open_table(DAH_REVERSE).map_err(map_table_err)?;
+
+            match rev.get(key.txid).map_err(map_storage_err)? {
+                Some(guard) => {
+                    let existing_height = u32::from_le_bytes(guard.value());
+                    drop(guard);
+                    was_new = false;
+                    let old_fwd_key = make_forward_key(existing_height, &key);
+                    fwd.remove(old_fwd_key).map_err(map_storage_err)?;
+                }
+                None => {
+                    was_new = true;
+                }
             }
+
+            rev.insert(key.txid, height.to_le_bytes()).map_err(map_storage_err)?;
+            fwd.insert(make_forward_key(height, &key), ()).map_err(map_storage_err)?;
+        }
+        // Fault-injection: crash between durable redo intent and the redb
+        // commit. Post-recovery, the secondary index MUST be reconciled
+        // from the durable redo entry (C4 two-phase durability contract).
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::BeforeSecondaryRedbCommit,
+        );
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::BeforeIndexCommit,
+        );
+        txn.commit().map_err(map_commit_err)?;
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::AfterSecondaryRedbCommit,
+        );
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::AfterIndexCommit,
+        );
+        if was_new {
+            self.count += 1;
+        }
+        Ok(())
+    }
+
+    /// Remove a transaction from the DAH index with two-phase durability.
+    ///
+    /// See [`insert`] for the ordering rationale.
+    pub fn remove(
+        &mut self,
+        key: &TxKey,
+        redo_log: Option<&Mutex<RedoLog>>,
+    ) -> Result<(), IndexError> {
+        let old_height = match self.get_height(key) {
+            Some(h) => h,
+            None => return Ok(()), // Already absent — no redo entry needed.
         };
+
+        if let Some(redo) = redo_log {
+            let op = RedoOp::SecondaryDahUpdate {
+                tx_key: *key,
+                old_height,
+                new_height: 0,
+            };
+            let mut log = redo.lock();
+            log.append_and_flush(op).map_err(|e| IndexError::FormatError {
+                detail: format!("redo append_and_flush (dah remove): {e}"),
+            })?;
+        }
+
+        let txn = self.begin_write().map_err(map_txn_err)?;
         let had_entry;
         {
-            let mut fwd = match txn.open_table(DAH_FORWARD) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("redb dah remove: open_table(forward) failed: {e}");
-                    return;
-                }
-            };
-            let mut rev = match txn.open_table(DAH_REVERSE) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("redb dah remove: open_table(reverse) failed: {e}");
-                    return;
-                }
-            };
+            let mut fwd = txn.open_table(DAH_FORWARD).map_err(map_table_err)?;
+            let mut rev = txn.open_table(DAH_REVERSE).map_err(map_table_err)?;
 
-            had_entry = match rev.remove(key.txid) {
-                Ok(Some(guard)) => {
-                    let height = u32::from_le_bytes(guard.value());
-                    drop(guard);
-                    if let Err(e) = fwd.remove(make_forward_key(height, key)) {
-                        eprintln!("redb dah remove: forward remove failed: {e}");
-                        return;
-                    }
+            had_entry = match rev.remove(key.txid).map_err(map_storage_err)? {
+                Some(guard) => {
+                    let h = u32::from_le_bytes(guard.value());
+                    fwd.remove(make_forward_key(h, key)).map_err(map_storage_err)?;
                     true
                 }
-                Ok(None) => false,
-                Err(e) => {
-                    eprintln!("redb dah remove: reverse remove failed: {e}");
-                    return;
-                }
+                None => false,
             };
         }
-        match txn.commit() {
-            Ok(()) => {
-                if had_entry {
-                    self.count -= 1;
-                }
-            }
-            Err(e) => {
-                eprintln!("redb dah remove: commit failed: {e}");
-            }
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::BeforeSecondaryRedbCommit,
+        );
+        txn.commit().map_err(map_commit_err)?;
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::AfterSecondaryRedbCommit,
+        );
+        if had_entry {
+            self.count -= 1;
+        }
+        Ok(())
+    }
+
+    /// Replay a DAH redo entry.
+    ///
+    /// Idempotent: the underlying `insert`/`remove` will no-op if redb
+    /// already matches the target state. No additional redo entry is
+    /// written during replay.
+    pub fn replay_redo(&mut self, entry: &DahRedoEntry) -> Result<(), IndexError> {
+        let key = TxKey { txid: entry.txid };
+        if entry.new_height == 0 {
+            self.remove(&key, None)
+        } else {
+            self.insert(entry.new_height, key, None)
         }
     }
 
@@ -393,9 +422,9 @@ mod tests {
     #[test]
     fn insert_and_range_query() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(200, key(2));
-        idx.insert(300, key(3));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
+        idx.insert(300, key(3), None).unwrap();
 
         let result = idx.range_query(200);
         assert_eq!(result.len(), 2);
@@ -406,12 +435,12 @@ mod tests {
     #[test]
     fn insert_updates_height() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(200, key(1)); // Move to new height
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(1), None).unwrap();
 
         assert_eq!(idx.len(), 1);
         let result = idx.range_query(100);
-        assert!(result.is_empty()); // No longer at 100
+        assert!(result.is_empty());
         let result = idx.range_query(200);
         assert_eq!(result.len(), 1);
     }
@@ -419,17 +448,17 @@ mod tests {
     #[test]
     fn insert_same_height_is_noop() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(100, key(1));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(100, key(1), None).unwrap();
         assert_eq!(idx.len(), 1);
     }
 
     #[test]
     fn remove() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(200, key(2));
-        idx.remove(&key(1));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
+        idx.remove(&key(1), None).unwrap();
 
         assert_eq!(idx.len(), 1);
         let result = idx.range_query(300);
@@ -440,15 +469,15 @@ mod tests {
     #[test]
     fn remove_missing_is_noop() {
         let (_dir, mut idx) = open_temp();
-        idx.remove(&key(99)); // Should not panic
+        idx.remove(&key(99), None).unwrap();
         assert_eq!(idx.len(), 0);
     }
 
     #[test]
     fn clear() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(200, key(2));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
         idx.clear();
         assert!(idx.is_empty());
         assert!(idx.range_query(1000).is_empty());
@@ -457,9 +486,9 @@ mod tests {
     #[test]
     fn iter_all() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(200, key(2));
-        idx.insert(300, key(3));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
+        idx.insert(300, key(3), None).unwrap();
 
         let entries = idx.iter();
         assert_eq!(entries.len(), 3);
@@ -469,38 +498,38 @@ mod tests {
     fn insert_count_incremental() {
         let (_dir, mut idx) = open_temp();
         assert_eq!(idx.len(), 0);
-        idx.insert(100, key(1));
+        idx.insert(100, key(1), None).unwrap();
         assert_eq!(idx.len(), 1);
-        idx.insert(200, key(2));
+        idx.insert(200, key(2), None).unwrap();
         assert_eq!(idx.len(), 2);
-        idx.insert(300, key(3));
+        idx.insert(300, key(3), None).unwrap();
         assert_eq!(idx.len(), 3);
     }
 
     #[test]
     fn remove_count_incremental() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(200, key(2));
-        idx.insert(300, key(3));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
+        idx.insert(300, key(3), None).unwrap();
         assert_eq!(idx.len(), 3);
 
-        idx.remove(&key(2));
+        idx.remove(&key(2), None).unwrap();
         assert_eq!(idx.len(), 2);
-        idx.remove(&key(1));
+        idx.remove(&key(1), None).unwrap();
         assert_eq!(idx.len(), 1);
-        idx.remove(&key(3));
+        idx.remove(&key(3), None).unwrap();
         assert_eq!(idx.len(), 0);
     }
 
     #[test]
     fn insert_update_does_not_change_count() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
+        idx.insert(100, key(1), None).unwrap();
         assert_eq!(idx.len(), 1);
-        idx.insert(200, key(1)); // Update height, same key
+        idx.insert(200, key(1), None).unwrap();
         assert_eq!(idx.len(), 1);
-        idx.insert(300, key(1)); // Another update
+        idx.insert(300, key(1), None).unwrap();
         assert_eq!(idx.len(), 1);
     }
 
@@ -543,7 +572,7 @@ mod tests {
         let dir1 = tempfile::tempdir().unwrap();
         let mut idx1 = RedbDahIndex::open(dir1.path().join("dah.redb").as_path(), 16 * 1024 * 1024).unwrap();
         for n in 1..=20u8 {
-            idx1.insert(n as u32 * 100, key(n));
+            idx1.insert(n as u32 * 100, key(n), None).unwrap();
         }
 
         // Batch insert
@@ -566,8 +595,8 @@ mod tests {
 
         {
             let mut idx = RedbDahIndex::open(&db_path, 16 * 1024 * 1024).unwrap();
-            idx.insert(100, key(1));
-            idx.insert(200, key(2));
+            idx.insert(100, key(1), None).unwrap();
+            idx.insert(200, key(2), None).unwrap();
         }
 
         {
@@ -587,8 +616,8 @@ mod tests {
     #[test]
     fn range_query_boundary() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(100, key(2)); // Same height, different key
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(100, key(2), None).unwrap();
 
         let result = idx.range_query(100);
         assert_eq!(result.len(), 2);
@@ -600,9 +629,9 @@ mod tests {
     #[test]
     fn iter_returns_correct_height_key_pairs() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(200, key(2));
-        idx.insert(300, key(3));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
+        idx.insert(300, key(3), None).unwrap();
 
         let entries = idx.iter();
         assert_eq!(entries.len(), 3);
@@ -621,36 +650,31 @@ mod tests {
     #[test]
     fn clear_then_reinsert() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(200, key(2));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
         idx.clear();
 
-        // After clear, old data is gone
         assert!(idx.range_query(1000).is_empty());
 
-        // New inserts work on a clean slate
-        idx.insert(500, key(10));
+        idx.insert(500, key(10), None).unwrap();
         assert_eq!(idx.len(), 1);
         let result = idx.range_query(500);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], key(10));
 
-        // Old keys are not present
         assert!(idx.range_query(200).is_empty());
     }
 
     #[test]
     fn remove_then_reinsert_at_different_height() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.remove(&key(1));
+        idx.insert(100, key(1), None).unwrap();
+        idx.remove(&key(1), None).unwrap();
         assert!(idx.is_empty());
 
-        // Re-insert at a different height
-        idx.insert(500, key(1));
+        idx.insert(500, key(1), None).unwrap();
         assert_eq!(idx.len(), 1);
 
-        // Should only be found at the new height
         assert!(idx.range_query(100).is_empty());
         assert_eq!(idx.range_query(500).len(), 1);
     }
@@ -658,19 +682,16 @@ mod tests {
     #[test]
     fn large_height_values() {
         let (_dir, mut idx) = open_temp();
-        // Test near u32::MAX to verify big-endian encoding handles high values
-        idx.insert(u32::MAX - 1, key(1));
-        idx.insert(u32::MAX, key(2));
-        idx.insert(1, key(3));
+        idx.insert(u32::MAX - 1, key(1), None).unwrap();
+        idx.insert(u32::MAX, key(2), None).unwrap();
+        idx.insert(1, key(3), None).unwrap();
 
         assert_eq!(idx.len(), 3);
 
-        // Low query should only find the low entry
         let result = idx.range_query(1);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], key(3));
 
-        // Max query should find all
         let result = idx.range_query(u32::MAX);
         assert_eq!(result.len(), 3);
     }
@@ -682,12 +703,11 @@ mod tests {
 
         {
             let mut idx = RedbDahIndex::open(&db_path, 16 * 1024 * 1024).unwrap();
-            idx.insert(100, key(1));
-            idx.insert(200, key(2));
+            idx.insert(100, key(1), None).unwrap();
+            idx.insert(200, key(2), None).unwrap();
             idx.clear();
         }
 
-        // Reopen and verify still empty
         let idx = RedbDahIndex::open(&db_path, 16 * 1024 * 1024).unwrap();
         assert!(idx.is_empty());
         assert!(idx.range_query(1000).is_empty());
@@ -696,11 +716,149 @@ mod tests {
     #[test]
     fn range_query_above_all_heights() {
         let (_dir, mut idx) = open_temp();
-        idx.insert(100, key(1));
-        idx.insert(200, key(2));
-        idx.insert(300, key(3));
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
+        idx.insert(300, key(3), None).unwrap();
 
         let result = idx.range_query(u32::MAX);
         assert_eq!(result.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Two-phase durability tests
+    // -----------------------------------------------------------------------
+
+    use crate::device::MemoryDevice;
+    use crate::redo::RedoLog;
+    use std::sync::Arc;
+
+    fn make_redo_log(size: u64) -> (Arc<MemoryDevice>, Mutex<RedoLog>) {
+        let dev = Arc::new(MemoryDevice::new(size, 4096).unwrap());
+        let log = RedoLog::open(dev.clone(), 0, size).unwrap();
+        (dev, Mutex::new(log))
+    }
+
+    #[test]
+    fn insert_with_redo_log_appends_intent_before_commit() {
+        let (_dir, mut idx) = open_temp();
+        let (redo_dev, redo) = make_redo_log(1024 * 1024);
+
+        idx.insert(900, key(1), Some(&redo)).unwrap();
+        assert_eq!(idx.get_height(&key(1)), Some(900));
+
+        let log = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+        let entries = log.recover().unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].op {
+            RedoOp::SecondaryDahUpdate { tx_key, old_height, new_height } => {
+                assert_eq!(tx_key.txid, key(1).txid);
+                assert_eq!(*old_height, 0);
+                assert_eq!(*new_height, 900);
+            }
+            other => panic!("expected SecondaryDahUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_with_redo_log_captures_old_height() {
+        let (_dir, mut idx) = open_temp();
+        let (redo_dev, redo) = make_redo_log(1024 * 1024);
+
+        idx.insert(500, key(1), None).unwrap();
+        idx.insert(800, key(1), Some(&redo)).unwrap();
+
+        let log = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+        let entries = log.recover().unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].op {
+            RedoOp::SecondaryDahUpdate { old_height, new_height, .. } => {
+                assert_eq!(*old_height, 500);
+                assert_eq!(*new_height, 800);
+            }
+            other => panic!("expected SecondaryDahUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_with_redo_log_emits_removal_intent() {
+        let (_dir, mut idx) = open_temp();
+        idx.insert(900, key(1), None).unwrap();
+        let (redo_dev, redo) = make_redo_log(1024 * 1024);
+
+        idx.remove(&key(1), Some(&redo)).unwrap();
+        assert!(idx.is_empty());
+
+        let log = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+        let entries = log.recover().unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].op {
+            RedoOp::SecondaryDahUpdate { old_height, new_height, .. } => {
+                assert_eq!(*old_height, 900);
+                assert_eq!(*new_height, 0);
+            }
+            other => panic!("expected SecondaryDahUpdate removal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_noop_with_same_height_skips_redo() {
+        let (_dir, mut idx) = open_temp();
+        idx.insert(100, key(1), None).unwrap();
+        let (redo_dev, redo) = make_redo_log(1024 * 1024);
+
+        idx.insert(100, key(1), Some(&redo)).unwrap();
+
+        let log = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+        let entries = log.recover().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn redo_flush_failure_blocks_redb_commit() {
+        let (_dir, mut idx) = open_temp();
+        let dev = Arc::new(MemoryDevice::new(4096, 4096).unwrap());
+        let log = RedoLog::open(dev.clone(), 0, 256).unwrap();
+        let redo = Mutex::new(log);
+
+        idx.insert(100, key(1), Some(&redo)).unwrap();
+
+        let mut next: u8 = 2;
+        loop {
+            match idx.insert((next as u32) * 10, key(next), Some(&redo)) {
+                Ok(_) => next += 1,
+                Err(e) => {
+                    assert!(format!("{e}").contains("redo append_and_flush"),
+                            "expected redo error, got: {e}");
+                    break;
+                }
+            }
+            if next > 50 {
+                panic!("expected redo log to fill up");
+            }
+        }
+
+        let failed_key = key(next);
+        assert!(
+            idx.get_height(&failed_key).is_none(),
+            "redb must NOT contain an entry whose redo flush failed"
+        );
+    }
+
+    #[test]
+    fn replay_redo_idempotent() {
+        let (_dir, mut idx) = open_temp();
+        idx.insert(500, key(1), None).unwrap();
+
+        let entry = DahRedoEntry {
+            txid: key(1).txid,
+            old_height: 0,
+            new_height: 500,
+        };
+        idx.replay_redo(&entry).unwrap();
+        assert_eq!(idx.get_height(&key(1)), Some(500));
+
+        // Replaying again is still a no-op (no-op insert path).
+        idx.replay_redo(&entry).unwrap();
+        assert_eq!(idx.len(), 1);
     }
 }

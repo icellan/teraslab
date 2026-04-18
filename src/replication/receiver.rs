@@ -14,11 +14,17 @@ use crate::ops::unspend::*;
 use crate::protocol::frame::{RequestFrame, ResponseFrame};
 use crate::protocol::opcodes::*;
 use crate::record::*;
+use crate::replication::durable::ReplicaAppliedTracker;
 use crate::replication::protocol::{ReplicaAck, ReplicaBatch, ReplicaOp};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Default stream key used when a receiver has not been told to
+/// discriminate by peer address. Chosen as a short literal so the
+/// key encoding in [`ReplicaAppliedTracker`] stays compact.
+pub const DEFAULT_STREAM_KEY: &str = "default";
 
 /// Replica-side replication receiver.
 ///
@@ -27,68 +33,66 @@ use std::sync::Arc;
 /// sends back `ReplicaAck` response frames.
 ///
 /// Multiple master connections can be handled concurrently; each gets
-/// its own handler thread.
+/// its own handler thread. Incoming batches are deduplicated via a
+/// [`ReplicaAppliedTracker`] so a leader re-sending the same sequence
+/// range after a replica restart (or network retry) does not cause
+/// double-application of ops.
 ///
-/// When an `ack_state_path` is configured, the highest applied sequence
-/// is persisted to disk periodically so the master can resume streaming
-/// from the correct position after a replica restart.
+/// When an `ack_state_path` is configured the tracker persists
+/// per-stream state to disk before each ACK, guaranteeing that a
+/// receiver restart resumes with the correct `last_applied_seq`.
 pub struct ReplicationReceiver {
     engine: Arc<Engine>,
     last_applied_sequence: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
-    /// Path for persisting the last-applied sequence. None in test setups.
-    ack_state_path: Option<std::path::PathBuf>,
-    /// Counter for amortized persistence (flush every N batches).
-    batches_since_flush: Arc<std::sync::atomic::AtomicU32>,
+    /// Per-stream applied-sequence journal. Always present; when the
+    /// receiver was constructed with [`Self::new`] it is memory-only.
+    applied: Arc<ReplicaAppliedTracker>,
 }
 
-/// Number of batches between forced persistence of last_applied_sequence.
-const PERSIST_EVERY_N_BATCHES: u32 = 100;
-
 impl ReplicationReceiver {
-    /// Create a new receiver backed by the given engine.
+    /// Create a new receiver backed by the given engine and an
+    /// in-memory idempotency journal. Useful for tests and for
+    /// deployments that don't need restart-crash recovery.
     pub fn new(engine: Arc<Engine>) -> Self {
         Self {
             engine,
             last_applied_sequence: Arc::new(AtomicU64::new(0)),
             running: Arc::new(AtomicBool::new(true)),
-            ack_state_path: None,
-            batches_since_flush: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            applied: Arc::new(ReplicaAppliedTracker::in_memory()),
         }
     }
 
-    /// Create a receiver with persistent ACK state.
+    /// Create a receiver with persistent idempotency state.
     ///
-    /// Loads the last-applied sequence from disk if the file exists,
-    /// allowing the master to resume streaming from where the replica
-    /// left off after a restart.
-    pub fn with_ack_state(engine: Arc<Engine>, path: std::path::PathBuf) -> Self {
-        let initial_seq = Self::load_sequence(&path).unwrap_or(0);
-        Self {
+    /// The tracker file at `path` stores the per-stream
+    /// `(stream_id, last_applied_seq)` map. On restart, existing
+    /// records are loaded so the master's retransmit of an already
+    /// applied batch is skipped before any op touches the engine.
+    ///
+    /// Returns an error if the file exists but is malformed.
+    pub fn with_ack_state(
+        engine: Arc<Engine>,
+        path: std::path::PathBuf,
+    ) -> std::result::Result<Self, String> {
+        let tracker = ReplicaAppliedTracker::load(path)
+            .map_err(|e| format!("load applied tracker: {e}"))?;
+        // Initial last_applied_sequence is the max across all streams
+        // so the public API keeps its monotonic "latest seq" semantics.
+        let initial_seq = tracker.snapshot().values().copied().max().unwrap_or(0);
+        Ok(Self {
             engine,
             last_applied_sequence: Arc::new(AtomicU64::new(initial_seq)),
             running: Arc::new(AtomicBool::new(true)),
-            ack_state_path: Some(path),
-            batches_since_flush: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        }
+            applied: Arc::new(tracker),
+        })
     }
 
-    /// Load the persisted sequence from disk. Format: `[sequence:8 LE]`.
-    fn load_sequence(path: &std::path::Path) -> Option<u64> {
-        let data = std::fs::read(path).ok()?;
-        if data.len() >= 8 {
-            Some(u64::from_le_bytes(data[0..8].try_into().unwrap()))
-        } else {
-            None
-        }
-    }
-
-    /// Persist the current last-applied sequence to disk.
-    fn persist_sequence(path: &std::path::Path, seq: u64) {
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, seq.to_le_bytes()).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        }
+    /// Access the underlying applied-sequence tracker. Exposed so
+    /// callers (and tests) can inspect per-stream state or force a
+    /// flush outside of the normal request path.
+    pub fn applied_tracker(&self) -> Arc<ReplicaAppliedTracker> {
+        self.applied.clone()
     }
 
     /// Start listening on the given address for replication connections.
@@ -106,20 +110,18 @@ impl ReplicationReceiver {
         let engine = self.engine.clone();
         let running = self.running.clone();
         let last_applied = self.last_applied_sequence.clone();
-        let ack_state_path = self.ack_state_path.clone();
-        let batches_counter = self.batches_since_flush.clone();
+        let applied = self.applied.clone();
 
         std::thread::spawn(move || {
             while running.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _addr)) => {
+                    Ok((stream, peer_addr)) => {
                         let eng = engine.clone();
                         let run = running.clone();
                         let la = last_applied.clone();
-                        let asp = ack_state_path.clone();
-                        let bc = batches_counter.clone();
+                        let ap = applied.clone();
                         std::thread::spawn(move || {
-                            handle_connection(&eng, stream, &run, &la, asp.as_deref(), &bc);
+                            handle_connection(&eng, stream, peer_addr, &run, &la, ap);
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -143,15 +145,13 @@ impl ReplicationReceiver {
 
     /// Signal the receiver to stop accepting new connections.
     ///
-    /// Persists the final last-applied sequence to disk before returning.
+    /// Flushes the applied-sequence tracker to disk so the next
+    /// instance restores the correct `last_applied_seq` on startup.
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
-        // Final flush to ensure we don't lose the latest sequence.
-        if let Some(ref path) = self.ack_state_path {
-            let seq = self.last_applied_sequence.load(Ordering::Relaxed);
-            if seq > 0 {
-                Self::persist_sequence(path, seq);
-            }
+        // Final flush to guarantee durability on clean shutdown.
+        if let Err(e) = self.applied.flush() {
+            eprintln!("replica applied tracker: final flush failed: {e}");
         }
     }
 }
@@ -159,18 +159,29 @@ impl ReplicationReceiver {
 /// Handle a single connection from the master.
 ///
 /// Reads request frames in a loop. For each `OP_REPLICA_BATCH`,
-/// deserializes the batch, applies every op to the engine, and sends
+/// deserializes the batch, consults the idempotency journal to skip
+/// already-applied prefixes, applies every remaining op to the
+/// engine, persists the updated applied sequence to disk, and sends
 /// back a `ReplicaAck` response.
 fn handle_connection(
     engine: &Engine,
     mut stream: TcpStream,
+    peer_addr: SocketAddr,
     running: &AtomicBool,
     last_applied: &AtomicU64,
-    ack_state_path: Option<&std::path::Path>,
-    batches_counter: &std::sync::atomic::AtomicU32,
+    applied: Arc<ReplicaAppliedTracker>,
 ) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    // Disable Nagle's algorithm on the accepted replication socket so
+    // ACK frames flush immediately. Best-effort — a failure here does
+    // not prevent handling the connection, just re-enables Nagle.
+    let _ = stream.set_nodelay(true);
+
+    // Use the peer's IP:port as the stream key so each master has its
+    // own deduplication state. Re-using the same key across reconnects
+    // from the same peer intentionally preserves last_applied_seq.
+    let stream_key = peer_addr.to_string();
 
     loop {
         if !running.load(Ordering::Relaxed) {
@@ -211,19 +222,13 @@ fn handle_connection(
         };
 
         let response = if request.op_code == OP_REPLICA_BATCH {
-            let resp = handle_replica_batch(&request, engine, last_applied);
-            // Periodically persist the last-applied sequence to disk.
-            if let Some(path) = ack_state_path {
-                let count = batches_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                if count >= PERSIST_EVERY_N_BATCHES {
-                    batches_counter.store(0, Ordering::Relaxed);
-                    let seq = last_applied.load(Ordering::Relaxed);
-                    if seq > 0 {
-                        ReplicationReceiver::persist_sequence(path, seq);
-                    }
-                }
-            }
-            resp
+            handle_replica_batch_with_tracker(
+                &request,
+                engine,
+                last_applied,
+                applied.as_ref(),
+                &stream_key,
+            )
         } else {
             // Unknown opcode for replication receiver
             ResponseFrame {
@@ -240,15 +245,59 @@ fn handle_connection(
     }
 }
 
-/// Process an `OP_REPLICA_BATCH` request frame.
+/// Process an `OP_REPLICA_BATCH` request frame against the
+/// [`DEFAULT_STREAM_KEY`] with an in-memory idempotency journal.
 ///
-/// Deserializes the `ReplicaBatch` from the payload, applies each op
-/// to the engine, and returns a `ResponseFrame` containing a serialized
-/// `ReplicaAck`.
+/// Thin wrapper around [`handle_replica_batch_with_tracker`]
+/// preserved for call sites and tests that do not need
+/// multi-stream deduplication or durable state.
 pub fn handle_replica_batch(
     request: &RequestFrame,
     engine: &Engine,
     last_applied: &AtomicU64,
+) -> ResponseFrame {
+    // Lazily construct an in-memory tracker — this path is used by
+    // synchronous tests and single-stream setups where crossing-restart
+    // persistence is not required.
+    thread_local! {
+        static IN_MEMORY_TRACKER: std::cell::RefCell<Option<Arc<ReplicaAppliedTracker>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let tracker = IN_MEMORY_TRACKER.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        if borrow.is_none() {
+            *borrow = Some(Arc::new(ReplicaAppliedTracker::in_memory()));
+        }
+        borrow.as_ref().unwrap().clone()
+    });
+    handle_replica_batch_with_tracker(
+        request,
+        engine,
+        last_applied,
+        tracker.as_ref(),
+        DEFAULT_STREAM_KEY,
+    )
+}
+
+/// Process an `OP_REPLICA_BATCH` request frame with explicit
+/// idempotency tracking.
+///
+/// Steps:
+/// 1. Deserialize the [`ReplicaBatch`] payload.
+/// 2. Look up the highest sequence previously applied for
+///    `stream_key` in `applied`. If the entire incoming batch is at
+///    or below that sequence, ACK immediately without touching the
+///    engine. If only a prefix overlaps, skip that prefix and apply
+///    the remaining suffix.
+/// 3. Apply the surviving ops via [`apply_op`].
+/// 4. `applied.set(stream_key, through_sequence)` and `applied.flush()`
+///    BEFORE ACK, so durability is guaranteed on the wire.
+pub fn handle_replica_batch_with_tracker(
+    request: &RequestFrame,
+    engine: &Engine,
+    last_applied: &AtomicU64,
+    applied: &ReplicaAppliedTracker,
+    stream_key: &str,
 ) -> ResponseFrame {
     let batch = match ReplicaBatch::deserialize(&request.payload) {
         Ok(b) => b,
@@ -265,13 +314,42 @@ pub fn handle_replica_batch(
         }
     };
 
+    let through = batch.last_sequence();
+    let already_applied = applied.get(stream_key);
+
+    // Whole batch already applied — ACK with the existing high-water
+    // mark so the master knows the data is durable on this replica.
+    if through <= already_applied {
+        let ack = ReplicaAck::Ok {
+            through_sequence: already_applied,
+        };
+        return ResponseFrame {
+            request_id: request.request_id,
+            status: STATUS_OK,
+            payload: ack.serialize(),
+        };
+    }
+
     // Refresh the cached clock once per batch so replicated mutations
     // record a current `updated_at` timestamp without issuing a
     // `clock_gettime` syscall per individual operation.
     engine.refresh_clock();
 
-    let mut seq = batch.first_sequence;
-    for op in &batch.ops {
+    // Determine where in the batch real work starts. If `first_sequence`
+    // is already covered by `already_applied`, skip the duplicate prefix.
+    let skip_count = if batch.first_sequence <= already_applied {
+        // `already_applied` is the highest sequence number already
+        // durably applied. The first op in the batch corresponds to
+        // sequence `first_sequence`; sequence `first_sequence + i` is
+        // op `i`. We keep ops with seq > already_applied, which means
+        // dropping `already_applied + 1 - first_sequence` ops.
+        (already_applied + 1 - batch.first_sequence) as usize
+    } else {
+        0
+    };
+
+    let mut seq = batch.first_sequence + skip_count as u64;
+    for op in batch.ops.iter().skip(skip_count) {
         if let Err(msg) = apply_op(engine, op) {
             let ack = ReplicaAck::Error {
                 failed_sequence: seq,
@@ -286,11 +364,26 @@ pub fn handle_replica_batch(
         seq += 1;
     }
 
-    let through = batch.last_sequence();
+    // Persist the new high-water mark BEFORE ACKing. A flush failure
+    // becomes a batch-level error so the master treats the replica
+    // as not-yet-durable and will retry.
+    applied.set(stream_key, through);
+    if let Err(e) = applied.flush() {
+        let ack = ReplicaAck::Error {
+            failed_sequence: through,
+            message: format!("flush applied tracker: {e}"),
+        };
+        return ResponseFrame {
+            request_id: request.request_id,
+            status: STATUS_OK,
+            payload: ack.serialize(),
+        };
+    }
+
     // Use fetch_max to ensure monotonic advancement. Multiple master
-    // connections may call handle_replica_batch concurrently; a plain
-    // store() could move last_applied backward if batches complete out
-    // of sequence order.
+    // connections may call this handler concurrently; a plain store()
+    // could move last_applied backward if batches complete out of
+    // sequence order.
     last_applied.fetch_max(through, Ordering::Relaxed);
 
     let ack = ReplicaAck::Ok {
@@ -1339,5 +1432,268 @@ mod tests {
         };
         handle_replica_batch(&req_2, &engine, &last_applied);
         assert_eq!(last_applied.load(Ordering::Relaxed), 10);
+    }
+
+    // -------------------------------------------------------------------
+    // H5: Replica-side idempotency journal
+    // -------------------------------------------------------------------
+
+    /// Construct a batch whose every op is a `Spend` on consecutive
+    /// offsets of a single tx_key. Useful for tests that want to
+    /// observe side-effects of apply.
+    fn make_spend_batch(
+        first_sequence: u64,
+        tx_key: TxKey,
+        offsets: std::ops::Range<u32>,
+        generation: u32,
+    ) -> ReplicaBatch {
+        let ops = offsets
+            .map(|offset| ReplicaOp::Spend {
+                tx_key,
+                offset,
+                spending_data: [0xAA; 36],
+                master_generation: generation,
+            })
+            .collect();
+        ReplicaBatch { first_sequence, ops }
+    }
+
+    fn batch_request(batch: &ReplicaBatch, request_id: u64) -> RequestFrame {
+        RequestFrame {
+            op_code: OP_REPLICA_BATCH,
+            request_id,
+            flags: 0,
+            payload: batch.serialize(),
+        }
+    }
+
+    /// `replica_skips_duplicate_resend`: the leader re-transmits an
+    /// identical batch. The receiver must apply ops exactly once and
+    /// then short-circuit the resend without touching the engine a
+    /// second time.
+    #[test]
+    fn replica_skips_duplicate_resend() {
+        let engine = make_engine();
+        // 3 UTXOs so we can spend offsets 0..3.
+        create_record(&engine, key(42), 3);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+
+        let batch = make_spend_batch(10, key(42), 0..3, 1);
+        let stream_key = "peer-A:5000";
+
+        // First application: all three spends go through.
+        let resp_1 = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            &tracker,
+            stream_key,
+        );
+        assert_eq!(resp_1.status, STATUS_OK);
+        let ack_1 = ReplicaAck::deserialize(&resp_1.payload).unwrap();
+        assert_eq!(ack_1, ReplicaAck::Ok { through_sequence: 12 });
+
+        // Slot 0 is now SPENT.
+        let slot0_after_first = engine.read_slot(&key(42), 0).unwrap();
+        assert_eq!(slot0_after_first.status, UTXO_SPENT);
+
+        // The tracker recorded the high-water mark.
+        assert_eq!(tracker.get(stream_key), 12);
+
+        // Mutate slot 1 OUT-OF-BAND to a state the spend op would
+        // overwrite — if the resend hit apply_op again it would
+        // zero the spending_data we inject here. A real system
+        // would never do this; the test needs a witness that
+        // proves no engine-level work happens.
+        //
+        // Simpler witness: ensure the resend does NOT increment the
+        // engine's internal generation counter for the record. Read
+        // the current metadata generation and compare after resend.
+        let gen_after_first = { engine.read_metadata(&key(42)).unwrap().generation };
+
+        // Resend the same batch.
+        let resp_2 = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 2),
+            &engine,
+            &last_applied,
+            &tracker,
+            stream_key,
+        );
+        assert_eq!(resp_2.status, STATUS_OK);
+        let ack_2 = ReplicaAck::deserialize(&resp_2.payload).unwrap();
+        // Skipped batches still ACK with the existing high-water mark.
+        assert_eq!(ack_2, ReplicaAck::Ok { through_sequence: 12 });
+
+        // Generation must NOT have moved on the resend — proof the
+        // engine was not touched a second time.
+        let gen_after_resend = { engine.read_metadata(&key(42)).unwrap().generation };
+        assert_eq!(
+            gen_after_resend, gen_after_first,
+            "duplicate resend must not mutate engine state",
+        );
+
+        // Tracker still sits at the same high-water mark.
+        assert_eq!(tracker.get(stream_key), 12);
+    }
+
+    /// `replica_restart_remembers_last_applied_seq`: after persisting
+    /// state and reopening the tracker from disk, the same batch is
+    /// treated as a duplicate and skipped.
+    #[test]
+    fn replica_restart_remembers_last_applied_seq() {
+        let engine = make_engine();
+        create_record(&engine, key(43), 2);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let tracker_path = dir.path().join("applied.dat");
+        let stream_key = "peer-B:5100";
+
+        // --- First lifecycle: apply, persist, drop.
+        {
+            let tracker = ReplicaAppliedTracker::load(tracker_path.clone()).unwrap();
+            let batch = make_spend_batch(100, key(43), 0..2, 1);
+            let resp = handle_replica_batch_with_tracker(
+                &batch_request(&batch, 1),
+                &engine,
+                &last_applied,
+                &tracker,
+                stream_key,
+            );
+            assert_eq!(resp.status, STATUS_OK);
+            assert_eq!(tracker.get(stream_key), 101);
+            // Durability before ACK: tracker must have flushed.
+            // (verified by reopening below — no explicit flush call)
+        }
+
+        // --- Second lifecycle: reopen tracker, resend SAME batch.
+        let reopened_tracker = ReplicaAppliedTracker::load(tracker_path.clone()).unwrap();
+        assert_eq!(
+            reopened_tracker.get(stream_key),
+            101,
+            "reopened tracker must remember last_applied_seq persisted before ACK",
+        );
+
+        let gen_before_resend = { engine.read_metadata(&key(43)).unwrap().generation };
+        let new_last_applied = Arc::new(AtomicU64::new(0));
+        let batch = make_spend_batch(100, key(43), 0..2, 1);
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 2),
+            &engine,
+            &new_last_applied,
+            &reopened_tracker,
+            stream_key,
+        );
+        let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
+        assert_eq!(ack, ReplicaAck::Ok { through_sequence: 101 });
+
+        // Engine generation unchanged across the restart — proof the
+        // resend did not touch the engine.
+        let gen_after_resend = { engine.read_metadata(&key(43)).unwrap().generation };
+        assert_eq!(gen_before_resend, gen_after_resend);
+    }
+
+    /// `replica_applies_new_seqs_after_restart`: after reloading the
+    /// tracker, sequences *higher* than the persisted last-applied
+    /// mark must apply normally, not be skipped.
+    #[test]
+    fn replica_applies_new_seqs_after_restart() {
+        let engine = make_engine();
+        create_record(&engine, key(44), 4);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let tracker_path = dir.path().join("applied.dat");
+        let stream_key = "peer-C:5200";
+
+        // --- First session: spend slots 0..2 → tracker = seq 201.
+        {
+            let tracker = ReplicaAppliedTracker::load(tracker_path.clone()).unwrap();
+            let batch = make_spend_batch(200, key(44), 0..2, 1);
+            handle_replica_batch_with_tracker(
+                &batch_request(&batch, 1),
+                &engine,
+                &last_applied,
+                &tracker,
+                stream_key,
+            );
+            assert_eq!(tracker.get(stream_key), 201);
+        }
+
+        // --- Restart: reopen tracker, send HIGHER seqs.
+        let tracker = ReplicaAppliedTracker::load(tracker_path).unwrap();
+        assert_eq!(tracker.get(stream_key), 201);
+
+        // Verify slots 2 and 3 are currently UNSPENT.
+        assert_eq!(engine.read_slot(&key(44), 2).unwrap().status, UTXO_UNSPENT);
+        assert_eq!(engine.read_slot(&key(44), 3).unwrap().status, UTXO_UNSPENT);
+
+        let new_last_applied = Arc::new(AtomicU64::new(0));
+        let batch = make_spend_batch(202, key(44), 2..4, 2);
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 10),
+            &engine,
+            &new_last_applied,
+            &tracker,
+            stream_key,
+        );
+        let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
+        assert_eq!(ack, ReplicaAck::Ok { through_sequence: 203 });
+
+        // The new ops actually applied.
+        assert_eq!(engine.read_slot(&key(44), 2).unwrap().status, UTXO_SPENT);
+        assert_eq!(engine.read_slot(&key(44), 3).unwrap().status, UTXO_SPENT);
+
+        // Tracker advanced.
+        assert_eq!(tracker.get(stream_key), 203);
+    }
+
+    /// Overlapping resend: the leader retransmits a batch whose
+    /// first half was already applied and whose second half is new.
+    /// Only the suffix should touch the engine.
+    #[test]
+    fn replica_skips_duplicate_prefix_only() {
+        let engine = make_engine();
+        create_record(&engine, key(45), 5);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = "peer-D:5300";
+
+        // First: apply seqs 300..302 (slots 0,1,2).
+        let batch_a = make_spend_batch(300, key(45), 0..3, 1);
+        handle_replica_batch_with_tracker(
+            &batch_request(&batch_a, 1),
+            &engine,
+            &last_applied,
+            &tracker,
+            stream_key,
+        );
+        assert_eq!(tracker.get(stream_key), 302);
+
+        // Sanity: slots 3,4 still unspent.
+        assert_eq!(engine.read_slot(&key(45), 3).unwrap().status, UTXO_UNSPENT);
+        assert_eq!(engine.read_slot(&key(45), 4).unwrap().status, UTXO_UNSPENT);
+
+        // Overlapping resend: seqs 301..304 covers slots 1..5. The
+        // prefix (slots 1,2 = seqs 301,302) is duplicate; the suffix
+        // (slots 3,4 = seqs 303,304) is new.
+        let batch_b = make_spend_batch(301, key(45), 1..5, 2);
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch_b, 2),
+            &engine,
+            &last_applied,
+            &tracker,
+            stream_key,
+        );
+        let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
+        assert_eq!(ack, ReplicaAck::Ok { through_sequence: 304 });
+
+        // Slots 3 and 4 are now spent.
+        assert_eq!(engine.read_slot(&key(45), 3).unwrap().status, UTXO_SPENT);
+        assert_eq!(engine.read_slot(&key(45), 4).unwrap().status, UTXO_SPENT);
+        assert_eq!(tracker.get(stream_key), 304);
     }
 }

@@ -107,7 +107,13 @@ impl PrimaryBackend {
     }
 
     /// Update the cached fields in the index entry for `key`.
-    /// Returns `true` if the key was found and updated.
+    ///
+    /// Returns `Ok(true)` if the key was found and updated, `Ok(false)` if the
+    /// key was not present, and an [`IndexError`] if the on-disk (redb) backend
+    /// fails to commit. Callers MUST propagate the error — silently dropping
+    /// it causes `dah_or_preserve`, `unmined_since`, and `generation` to drift
+    /// relative to the persisted state. The in-memory and file-backed variants
+    /// are infallible and always return `Ok(bool)`.
     #[allow(clippy::too_many_arguments)]
     pub fn update_cached_fields(
         &mut self,
@@ -118,9 +124,9 @@ impl PrimaryBackend {
         dah_or_preserve: u32,
         unmined_since: u32,
         generation: u32,
-    ) -> bool {
+    ) -> Result<bool, IndexError> {
         match self {
-            Self::InMemory(idx) | Self::FileBacked(idx) => idx.update_cached_fields(
+            Self::InMemory(idx) | Self::FileBacked(idx) => Ok(idx.update_cached_fields(
                 key,
                 tx_flags,
                 block_entry_count,
@@ -128,7 +134,7 @@ impl PrimaryBackend {
                 dah_or_preserve,
                 unmined_since,
                 generation,
-            ),
+            )),
             Self::OnDisk(redb) => redb.update_cached_fields(
                 key,
                 tx_flags,
@@ -148,8 +154,16 @@ impl PrimaryBackend {
     /// For the in-memory backend, updates are applied individually (no
     /// batching benefit for direct memory writes).
     ///
-    /// Returns the number of entries successfully updated.
-    pub fn update_cached_fields_batch(&mut self, updates: &[CachedFieldsUpdate]) -> usize {
+    /// Returns `Ok(n)` where `n` is the number of entries successfully updated.
+    /// Returns an [`IndexError`] if the on-disk (redb) backend fails to commit.
+    /// Callers MUST propagate the error — silently returning `0` on commit
+    /// failure would cause durability-critical cached fields (DAH,
+    /// `unmined_since`, `generation`) to drift relative to the persisted state,
+    /// leading to incorrect pruning and replication decisions downstream.
+    pub fn update_cached_fields_batch(
+        &mut self,
+        updates: &[CachedFieldsUpdate],
+    ) -> Result<usize, IndexError> {
         match self {
             Self::InMemory(idx) | Self::FileBacked(idx) => {
                 let mut count = 0;
@@ -166,7 +180,7 @@ impl PrimaryBackend {
                         count += 1;
                     }
                 }
-                count
+                Ok(count)
             }
             Self::OnDisk(redb) => redb.update_cached_fields_batch(updates),
         }
@@ -175,11 +189,16 @@ impl PrimaryBackend {
     /// Remove multiple transactions in a single transaction.
     ///
     /// Returns a `Vec` parallel to the input: `Some(entry)` for keys that
-    /// were found and removed, `None` for missing keys.
-    pub fn unregister_batch(&mut self, keys: &[TxKey]) -> Vec<Option<TxIndexEntry>> {
+    /// were found and removed, `None` for missing keys. Returns an
+    /// [`IndexError`] if the on-disk backend fails to commit; the in-memory
+    /// and file-backed variants are infallible.
+    pub fn unregister_batch(
+        &mut self,
+        keys: &[TxKey],
+    ) -> Result<Vec<Option<TxIndexEntry>>, IndexError> {
         match self {
             Self::InMemory(idx) | Self::FileBacked(idx) => {
-                keys.iter().map(|k| idx.unregister(k)).collect()
+                Ok(keys.iter().map(|k| idx.unregister(k)).collect())
             }
             Self::OnDisk(redb) => redb.unregister_batch(keys),
         }
@@ -256,6 +275,26 @@ impl PrimaryBackend {
     pub fn sync(&self) {
         if let Self::FileBacked(idx) = self {
             idx.sync();
+        }
+    }
+
+    /// Attach a redo log for journaling crash-atomic file-backed hash
+    /// table resizes.
+    ///
+    /// Only meaningful for [`PrimaryBackend::FileBacked`] (which holds
+    /// the Robin Hood hash table on an mmap'd file). No-op for the
+    /// [`PrimaryBackend::OnDisk`] redb variant (redb manages its own
+    /// durability) and for [`PrimaryBackend::InMemory`] (anonymous mmap
+    /// does not persist across restarts). Also attaches to `InMemory`
+    /// so the redo log survives any future in-memory → file-backed
+    /// migration path, but the attachment has no effect there.
+    pub fn set_redo_log(
+        &mut self,
+        redo_log: std::sync::Arc<parking_lot::Mutex<crate::redo::RedoLog>>,
+    ) {
+        match self {
+            Self::InMemory(idx) | Self::FileBacked(idx) => idx.set_redo_log(redo_log),
+            Self::OnDisk(_) => {}
         }
     }
 
@@ -355,9 +394,19 @@ impl PrimaryBackend {
                 continue;
             }
 
-            let meta = crate::record::TxMetadata::from_bytes(
+            let meta = match crate::record::TxMetadata::from_bytes(
                 &buf[..crate::record::METADATA_SIZE],
-            );
+            ) {
+                Ok(m) => m,
+                Err(_) => {
+                    // CRC mismatch during a rebuild scan is indistinguishable
+                    // from unformatted region or partial write — skip like an
+                    // invalid magic.
+                    skipped += 1;
+                    offset += align as u64;
+                    continue;
+                }
+            };
             if { meta.magic } != crate::record::METADATA_MAGIC {
                 offset += align as u64;
                 continue;
@@ -440,9 +489,16 @@ impl PrimaryBackend {
                 continue;
             }
 
-            let meta = crate::record::TxMetadata::from_bytes(
+            let meta = match crate::record::TxMetadata::from_bytes(
                 &buf[..crate::record::METADATA_SIZE],
-            );
+            ) {
+                Ok(m) => m,
+                Err(_) => {
+                    skipped += 1;
+                    offset += align as u64;
+                    continue;
+                }
+            };
             if { meta.magic } != crate::record::METADATA_MAGIC {
                 offset += align as u64;
                 continue;
@@ -660,9 +716,9 @@ mod tests {
         with_all_backends(|backend| {
             backend.register(make_key(1), make_entry(4096)).unwrap();
 
-            let updated = backend.update_cached_fields(
-                &make_key(1), 0xFF, 5, 8, 200, 600, 99,
-            );
+            let updated = backend
+                .update_cached_fields(&make_key(1), 0xFF, 5, 8, 200, 600, 99)
+                .unwrap();
             assert!(updated);
 
             let e = backend.lookup(&make_key(1)).unwrap();
@@ -677,9 +733,10 @@ mod tests {
             assert_eq!(e.utxo_count, 10);
 
             // Update missing key
-            assert!(!backend.update_cached_fields(
-                &make_key(999), 0, 0, 0, 0, 0, 0,
-            ));
+            let missing = backend
+                .update_cached_fields(&make_key(999), 0, 0, 0, 0, 0, 0)
+                .unwrap();
+            assert!(!missing);
         });
     }
 
@@ -1058,7 +1115,7 @@ mod tests {
                 })
                 .collect();
 
-            let updated = backend.update_cached_fields_batch(&updates);
+            let updated = backend.update_cached_fields_batch(&updates).unwrap();
             assert_eq!(updated, 5);
 
             for i in 0..5u64 {
@@ -1074,7 +1131,7 @@ mod tests {
     fn both_backends_update_cached_fields_batch_empty() {
         with_all_backends(|backend| {
             backend.register(make_key(1), make_entry(100)).unwrap();
-            let updated = backend.update_cached_fields_batch(&[]);
+            let updated = backend.update_cached_fields_batch(&[]).unwrap();
             assert_eq!(updated, 0);
         });
     }
@@ -1087,7 +1144,7 @@ mod tests {
             }
 
             let keys: Vec<_> = vec![make_key(1), make_key(2), make_key(99)];
-            let results = backend.unregister_batch(&keys);
+            let results = backend.unregister_batch(&keys).unwrap();
 
             assert_eq!(results.len(), 3);
             assert!(results[0].is_some());
@@ -1101,7 +1158,7 @@ mod tests {
     fn both_backends_unregister_batch_empty() {
         with_all_backends(|backend| {
             backend.register(make_key(1), make_entry(100)).unwrap();
-            let results = backend.unregister_batch(&[]);
+            let results = backend.unregister_batch(&[]).unwrap();
             assert!(results.is_empty());
             assert_eq!(backend.len(), 1);
         });

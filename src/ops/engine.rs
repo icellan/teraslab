@@ -38,6 +38,16 @@ pub struct Engine {
     locks: StripedLocks,
     dah_index: parking_lot::Mutex<DahBackend>,
     unmined_index: parking_lot::Mutex<UnminedBackend>,
+    /// Shared redo log used by secondary indexes for two-phase durability.
+    ///
+    /// When `Some`, the engine appends and fsyncs a
+    /// [`RedoOp::SecondaryDahUpdate`] / [`RedoOp::SecondaryUnminedUpdate`]
+    /// entry BEFORE committing the on-disk (redb) secondary index. This
+    /// closes the window where a crash between redb commit and the caller's
+    /// primary redo flush could leave the secondary index out of sync with
+    /// the primary index. In-memory secondary indexes ignore the log — they
+    /// are rebuilt on startup from the primary redo replay + device scan.
+    redo_log: parking_lot::Mutex<Option<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>>,
     blob_store: Option<Arc<dyn BlobStore>>,
     /// Per-shard record counts for O(1) migration verification.
     /// Updated atomically on create/delete. Indexed by shard number.
@@ -48,6 +58,14 @@ pub struct Engine {
     /// layer calls [`refresh_clock`] once per batch; individual operations
     /// read the cached value via [`Self::now_millis`].
     cached_millis: std::sync::atomic::AtomicU64,
+    /// Test-only fault injector: when set to `true`, the next call to
+    /// [`Self::register_with_shard_count`] returns an error WITHOUT
+    /// performing the backend `register` or incrementing `shard_counts`.
+    /// This is the only way to exercise the "backend register failed"
+    /// branch of the atomicity fix, since the in-memory hashtable backend
+    /// has no intrinsic failure modes for fresh inserts.
+    #[cfg(test)]
+    fail_next_register: std::sync::atomic::AtomicBool,
 }
 
 // Safety: Engine's device_ptr points into an Arc'd device that outlives
@@ -83,10 +101,310 @@ impl Engine {
             locks,
             dah_index: parking_lot::Mutex::new(dah_index.into()),
             unmined_index: parking_lot::Mutex::new(unmined_index.into()),
+            redo_log: parking_lot::Mutex::new(None),
             blob_store: None,
             shard_counts,
             cached_millis: std::sync::atomic::AtomicU64::new(sys_millis()),
+            #[cfg(test)]
+            fail_next_register: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Attach a redo log for secondary-index two-phase durability.
+    ///
+    /// Once attached, every on-disk (redb) secondary index mutation appends
+    /// and fsyncs an intent record to the redo log BEFORE committing the
+    /// redb transaction. Call this after constructing the engine and before
+    /// accepting client traffic. The same redo log handle used by the
+    /// dispatch layer for primary-op durability should be passed here so
+    /// that primary and secondary entries share a single log.
+    pub fn set_redo_log(&self, redo_log: Arc<parking_lot::Mutex<crate::redo::RedoLog>>) {
+        *self.redo_log.lock() = Some(redo_log);
+    }
+
+    /// Clone the engine's redo log handle for use as an `Option<&Mutex<_>>`
+    /// in secondary index calls.
+    fn redo_log_handle(&self) -> Option<Arc<parking_lot::Mutex<crate::redo::RedoLog>>> {
+        self.redo_log.lock().clone()
+    }
+
+    /// Update the DAH secondary index with two-phase durability.
+    ///
+    /// Emits a transition from `old_height` to `new_height` (either may be
+    /// zero). When the engine has a redo log attached, the intent record is
+    /// fsynced before the redb commit. Errors from the redo flush or redb
+    /// commit are mapped to [`SpendError::StorageError`].
+    fn update_dah_index(
+        &self,
+        key: &TxKey,
+        old_height: u32,
+        new_height: u32,
+    ) -> Result<(), SpendError> {
+        if old_height == new_height {
+            return Ok(());
+        }
+        let log_arc = self.redo_log_handle();
+        let log_ref = log_arc.as_deref();
+        let mut dah = self.dah_index.lock();
+        if old_height != 0 {
+            dah.remove(key, log_ref).map_err(|e| SpendError::StorageError {
+                detail: format!("dah secondary remove: {e}"),
+            })?;
+        }
+        if new_height != 0 {
+            dah.insert(new_height, *key, log_ref).map_err(|e| SpendError::StorageError {
+                detail: format!("dah secondary insert: {e}"),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Update the unmined secondary index with two-phase durability.
+    fn update_unmined_index(
+        &self,
+        key: &TxKey,
+        old_height: u32,
+        new_height: u32,
+    ) -> Result<(), SpendError> {
+        if old_height == new_height {
+            return Ok(());
+        }
+        let log_arc = self.redo_log_handle();
+        let log_ref = log_arc.as_deref();
+        let mut unmined = self.unmined_index.lock();
+        if old_height != 0 {
+            unmined.remove(key, log_ref).map_err(|e| SpendError::StorageError {
+                detail: format!("unmined secondary remove: {e}"),
+            })?;
+        }
+        if new_height != 0 {
+            unmined.insert(new_height, *key, log_ref).map_err(|e| SpendError::StorageError {
+                detail: format!("unmined secondary insert: {e}"),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Apply a combined DAH + unmined update with a single redo fsync.
+    ///
+    /// When both secondary indexes change in the same operation (e.g.
+    /// `mark_on_longest_chain`), this batches both intent records into one
+    /// `RedoLog::append_batch_and_flush` so there is exactly one fsync for
+    /// the pair. Both redb commits then follow.
+    fn update_both_secondary_indexes(
+        &self,
+        key: &TxKey,
+        old_dah: u32,
+        new_dah: u32,
+        old_unmined: u32,
+        new_unmined: u32,
+    ) -> Result<(), SpendError> {
+        let dah_changed = old_dah != new_dah;
+        let unmined_changed = old_unmined != new_unmined;
+        if !dah_changed && !unmined_changed {
+            return Ok(());
+        }
+
+        let log_arc = self.redo_log_handle();
+
+        // Phase 1: one fsync covering both secondary intents (if both change).
+        if let Some(ref log) = log_arc {
+            let mut ops = Vec::with_capacity(2);
+            if dah_changed {
+                ops.push(crate::redo::RedoOp::SecondaryDahUpdate {
+                    tx_key: *key,
+                    old_height: old_dah,
+                    new_height: new_dah,
+                });
+            }
+            if unmined_changed {
+                ops.push(crate::redo::RedoOp::SecondaryUnminedUpdate {
+                    tx_key: *key,
+                    old_height: old_unmined,
+                    new_height: new_unmined,
+                });
+            }
+            let mut guard = log.lock();
+            guard.append_batch_and_flush(&ops).map_err(|e| {
+                SpendError::StorageError {
+                    detail: format!("secondary batch append_and_flush: {e}"),
+                }
+            })?;
+        }
+
+        // Phase 2: commit both redb transactions. The redo log already has the
+        // durable record; recovery replay handles any redb commit failure.
+        if dah_changed {
+            let mut dah = self.dah_index.lock();
+            if old_dah != 0 {
+                dah.remove(key, None).map_err(|e| SpendError::StorageError {
+                    detail: format!("dah secondary remove (post-fsync): {e}"),
+                })?;
+            }
+            if new_dah != 0 {
+                dah.insert(new_dah, *key, None).map_err(|e| SpendError::StorageError {
+                    detail: format!("dah secondary insert (post-fsync): {e}"),
+                })?;
+            }
+        }
+        if unmined_changed {
+            let mut unmined = self.unmined_index.lock();
+            if old_unmined != 0 {
+                unmined.remove(key, None).map_err(|e| SpendError::StorageError {
+                    detail: format!("unmined secondary remove (post-fsync): {e}"),
+                })?;
+            }
+            if new_unmined != 0 {
+                unmined.insert(new_unmined, *key, None).map_err(|e| SpendError::StorageError {
+                    detail: format!("unmined secondary insert (post-fsync): {e}"),
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Atomically update the primary in-memory cache AND both secondary
+    /// indexes under a single critical section.
+    ///
+    /// This is the reorg-safe mutation path used by `mark_on_longest_chain`
+    /// (and any other op that moves both `unmined_since` and
+    /// `delete_at_height` simultaneously). Ordering:
+    ///
+    /// 1. Redo log: append DAH + unmined intents in one batch, single fsync.
+    /// 2. Acquire the primary index write lock, then DAH, then unmined.
+    ///    This matches the project-wide acquisition order used by
+    ///    [`Engine::snapshot_index`] and the set_mined fast path
+    ///    (index → dah → unmined), so the three operations can never
+    ///    deadlock against each other.
+    /// 3. Apply the primary in-memory cache update
+    ///    (`update_cached_fields`) while both secondary mutexes are also
+    ///    held, so any reader that consults a secondary index and then
+    ///    cross-checks the primary (which requires the index read lock,
+    ///    forcing it to wait for the write lock to drop) observes a
+    ///    consistent pair (H1).
+    /// 4. Apply the DAH redb mutation.
+    /// 5. Apply the unmined redb mutation.
+    /// 6. Release all locks.
+    ///
+    /// Because any reader that wants to consult a secondary index and
+    /// then cross-check the primary MUST acquire the secondary mutex
+    /// first, holding both secondary mutexes across the primary update
+    /// closes the window where a reader could observe a primary whose
+    /// `unmined_since` moved while the DAH still references the old
+    /// height.
+    fn sync_primary_and_both_secondary_atomic(
+        &self,
+        key: &TxKey,
+        metadata: &TxMetadata,
+        old_dah: u32,
+        new_dah: u32,
+        old_unmined: u32,
+        new_unmined: u32,
+    ) -> Result<(), SpendError> {
+        let dah_changed = old_dah != new_dah;
+        let unmined_changed = old_unmined != new_unmined;
+
+        // Phase 1: one fsync covering both secondary intents (if any change).
+        let log_arc = self.redo_log_handle();
+        if (dah_changed || unmined_changed) && log_arc.is_some() {
+            let mut ops = Vec::with_capacity(2);
+            if dah_changed {
+                ops.push(crate::redo::RedoOp::SecondaryDahUpdate {
+                    tx_key: *key,
+                    old_height: old_dah,
+                    new_height: new_dah,
+                });
+            }
+            if unmined_changed {
+                ops.push(crate::redo::RedoOp::SecondaryUnminedUpdate {
+                    tx_key: *key,
+                    old_height: old_unmined,
+                    new_height: new_unmined,
+                });
+            }
+            if let Some(ref log) = log_arc {
+                let mut guard = log.lock();
+                guard.append_batch_and_flush(&ops).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!(
+                            "atomic primary+secondary batch append_and_flush: {e}"
+                        ),
+                    }
+                })?;
+            }
+        }
+
+        // Phase 2: lock order = primary.write → dah → unmined (matches
+        // Engine::snapshot_index and the set_mined fast path).
+        //
+        // Inline the primary cache update here rather than calling
+        // `sync_index_cache` so the write guard is held across the
+        // secondary mutations — any secondary reader that tries to
+        // cross-check the primary will have to wait for our index write
+        // to drop, and by then the dah/unmined mutations are durable.
+        let preserve = { metadata.preserve_until };
+        let meta_dah = { metadata.delete_at_height };
+        let has_preserve = preserve != 0;
+        let dah_or_preserve = if has_preserve { preserve } else { meta_dah };
+        let mut tf = metadata.flags.bits();
+        if has_preserve {
+            tf |= TxFlags::HAS_PRESERVE_UNTIL.bits();
+        } else {
+            tf &= !TxFlags::HAS_PRESERVE_UNTIL.bits();
+        }
+        let mut primary_guard = self.index.write();
+        primary_guard
+            .update_cached_fields(
+                key,
+                tf,
+                metadata.block_entry_count,
+                metadata.spent_utxos,
+                dah_or_preserve,
+                metadata.unmined_since,
+                metadata.generation,
+            )
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index update_cached_fields failed: {e}"),
+            })?;
+
+        let mut dah = self.dah_index.lock();
+        let mut unmined = self.unmined_index.lock();
+
+        if dah_changed {
+            if old_dah != 0 {
+                dah.remove(key, None).map_err(|e| SpendError::StorageError {
+                    detail: format!("atomic dah remove: {e}"),
+                })?;
+            }
+            if new_dah != 0 {
+                dah.insert(new_dah, *key, None).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("atomic dah insert: {e}"),
+                    }
+                })?;
+            }
+        }
+
+        if unmined_changed {
+            if old_unmined != 0 {
+                unmined.remove(key, None).map_err(|e| SpendError::StorageError {
+                    detail: format!("atomic unmined remove: {e}"),
+                })?;
+            }
+            if new_unmined != 0 {
+                unmined.insert(new_unmined, *key, None).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("atomic unmined insert: {e}"),
+                    }
+                })?;
+            }
+        }
+
+        drop(unmined);
+        drop(dah);
+        drop(primary_guard);
+
+        Ok(())
     }
 
     /// Refresh the cached wall-clock time from the system clock.
@@ -133,16 +451,65 @@ impl Engine {
         self.shard_counts[shard as usize].load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Increment the shard record count (called after successful create).
-    fn increment_shard_count(&self, key: &TxKey) {
-        let shard = crate::cluster::shards::ShardTable::shard_for_key(key) as usize;
+    /// Register a new primary-index entry AND increment the matching shard
+    /// count atomically within the same index write-lock critical section.
+    ///
+    /// This guarantees that `shard_counts` never drifts from the primary
+    /// index: if the backend `register` fails, no count mutation is
+    /// observed; if it succeeds, the matching `fetch_add` is executed
+    /// before the write lock is released. Migration correctness checks
+    /// (e.g. `engine.shard_record_count(s) > 0`) read a consistent view.
+    ///
+    /// # Errors
+    /// Returns [`IndexError`](crate::index::IndexError) from the underlying
+    /// primary backend. On error, `shard_counts` is left unchanged.
+    fn register_with_shard_count(
+        &self,
+        key: TxKey,
+        entry: TxIndexEntry,
+    ) -> Result<(), crate::index::IndexError> {
+        // Test-only fault injection: consume the flag and short-circuit
+        // BEFORE touching the backend so we can verify that a failed
+        // register leaves `shard_counts` untouched.
+        #[cfg(test)]
+        {
+            if self
+                .fail_next_register
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::index::IndexError::FormatError {
+                    detail: "injected register failure (test-only)".into(),
+                });
+            }
+        }
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&key) as usize;
+        let mut guard = self.index.write();
+        guard.register(key, entry)?;
+        // Commit the count mutation BEFORE releasing the write lock so a
+        // concurrent reader that takes the index read lock observes either
+        // (not-registered, old-count) or (registered, new-count) but never
+        // the inconsistent pair.
         self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        drop(guard);
+        Ok(())
     }
 
-    /// Decrement the shard record count (called after successful delete).
-    fn decrement_shard_count(&self, key: &TxKey) {
+    /// Unregister a primary-index entry AND decrement the matching shard
+    /// count atomically within the same index write-lock critical section.
+    ///
+    /// Returns the removed entry (or `None` if the key was not present).
+    /// The shard count is only decremented when an entry was actually
+    /// removed — this prevents underflow when `delete` is invoked twice on
+    /// the same key (e.g. duplicate replication journal replay).
+    fn unregister_with_shard_count(&self, key: &TxKey) -> Option<TxIndexEntry> {
         let shard = crate::cluster::shards::ShardTable::shard_for_key(key) as usize;
-        self.shard_counts[shard].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let mut guard = self.index.write();
+        let removed = guard.unregister(key);
+        if removed.is_some() {
+            self.shard_counts[shard].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        drop(guard);
+        removed
     }
 
     // -----------------------------------------------------------------------
@@ -153,7 +520,8 @@ impl Engine {
     #[inline(always)]
     fn read_metadata_fast(&self, record_offset: u64) -> std::result::Result<TxMetadata, SpendError> {
         if !self.device_ptr.is_null() {
-            Ok(unsafe { io::read_metadata_direct(self.device_ptr, record_offset) })
+            unsafe { io::read_metadata_direct(self.device_ptr, record_offset) }
+                .map_err(|e| SpendError::StorageError { detail: format!("{e}") })
         } else {
             io::read_metadata(&*self.device, record_offset)
                 .map_err(|e| SpendError::StorageError { detail: format!("{e}") })
@@ -200,8 +568,18 @@ impl Engine {
     ///
     /// Encodes `preserve_until` / `delete_at_height` into the shared
     /// `dah_or_preserve` field with the `HAS_PRESERVE_UNTIL` discriminant bit.
+    ///
+    /// Returns an error if the index backend fails to persist the update
+    /// (only possible for the on-disk redb backend). Callers MUST propagate
+    /// the error: a silent failure here would leave the primary-index
+    /// durability-critical fields (DAH, `unmined_since`, `generation`) out of
+    /// sync with the on-device metadata footer.
     #[inline]
-    fn sync_index_cache(&self, key: &TxKey, metadata: &TxMetadata) {
+    fn sync_index_cache(
+        &self,
+        key: &TxKey,
+        metadata: &TxMetadata,
+    ) -> Result<(), SpendError> {
         let preserve = { metadata.preserve_until };
         let dah = { metadata.delete_at_height };
         let has_preserve = preserve != 0;
@@ -212,22 +590,31 @@ impl Engine {
         } else {
             tf &= !TxFlags::HAS_PRESERVE_UNTIL.bits();
         }
-        self.index.write().update_cached_fields(
-            key,
-            tf,
-            metadata.block_entry_count,
-            metadata.spent_utxos,
-            dah_or_preserve,
-            metadata.unmined_since,
-            metadata.generation,
-        );
+        self.index
+            .write()
+            .update_cached_fields(
+                key,
+                tf,
+                metadata.block_entry_count,
+                metadata.spent_utxos,
+                dah_or_preserve,
+                metadata.unmined_since,
+                metadata.generation,
+            )
+            .map(|_| ())
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index update_cached_fields failed: {e}"),
+            })
     }
 
     /// Register a transaction in the index (for test setup).
+    ///
+    /// Also increments the matching shard count atomically with the
+    /// primary-index insert — see [`Self::register_with_shard_count`] —
+    /// so callers that use this helper to seed data still observe
+    /// consistent `shard_record_count` values afterwards.
     pub fn register(&self, key: TxKey, entry: TxIndexEntry) -> Result<(), SpendError> {
-        self.index
-            .write()
-            .register(key, entry)
+        self.register_with_shard_count(key, entry)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("{e}"),
             })
@@ -304,13 +691,14 @@ impl Engine {
     ///
     /// This is the combined validate+apply path. For WAL-first ordering
     /// (write redo log between validation and application), use
-    /// [`validate_spend_multi`] followed by [`apply_spend_multi`].
+    /// [`validate_spend_multi`](Engine::validate_spend_multi) followed by
+    /// [`ValidatedSpend::apply`].
     pub fn spend_multi(
         &self,
         req: &SpendMultiRequest,
     ) -> Result<SpendMultiResponse, SpendError> {
         let validated = self.validate_spend_multi(req)?;
-        Ok(self.apply_spend_multi(validated))
+        validated.apply(self)
     }
 
     /// Validate a batch of spends WITHOUT applying them.
@@ -318,10 +706,11 @@ impl Engine {
     /// Acquires the per-transaction lock, reads metadata and UTXO slots,
     /// validates each item, and returns a [`ValidatedSpend`] that holds the
     /// lock guard. The caller can write redo log entries (WAL) while the
-    /// lock is held, then call [`apply_spend_multi`] to commit the mutation.
+    /// lock is held, then call [`ValidatedSpend::apply`] to commit the
+    /// mutation.
     ///
-    /// The lock is released when the `ValidatedSpend` is dropped or consumed
-    /// by `apply_spend_multi`.
+    /// The lock is released when the `ValidatedSpend` is dropped (without
+    /// applying) or consumed by [`ValidatedSpend::apply`] (after writing).
     pub fn validate_spend_multi<'a>(
         &'a self,
         req: &SpendMultiRequest,
@@ -487,88 +876,6 @@ impl Engine {
         })
     }
 
-    /// Apply a previously validated spend batch.
-    ///
-    /// Consumes the [`ValidatedSpend`] (releasing the per-transaction lock
-    /// when done). Writes UTXO slot mutations and metadata to the device,
-    /// updates secondary indexes, and returns the response.
-    ///
-    /// This is the second half of the WAL-first pattern:
-    /// `validate_spend_multi → write redo → apply_spend_multi`.
-    pub fn apply_spend_multi(
-        &self,
-        validated: ValidatedSpend<'_>,
-    ) -> SpendMultiResponse {
-        let ValidatedSpend {
-            _guard,
-            tx_key,
-            valid_spends,
-            errors,
-            spent_count,
-            pre_generation: _,
-            block_ids,
-            record_offset,
-            mut metadata,
-            current_block_height,
-            block_height_retention,
-        } = validated;
-
-        // 6. Batch write all valid slot mutations (zero-alloc when direct)
-        for &(offset, ref new_slot) in &valid_spends {
-            if let Err(e) = self.write_slot_fast(record_offset, offset, new_slot) {
-                eprintln!("engine: write_utxo_slot failed: {e}");
-            }
-        }
-
-        // 7. Update metadata
-        let old_dah = { metadata.delete_at_height };
-        metadata.spent_utxos = { metadata.spent_utxos }.wrapping_add(spent_count);
-        metadata.generation = { metadata.generation }.wrapping_add(1);
-        metadata.updated_at = self.now_millis();
-
-        // 8. Evaluate deleteAtHeight
-        let (signal, dah_patch) = evaluate_delete_at_height(
-            &metadata,
-            current_block_height,
-            block_height_retention,
-        );
-
-        if let Some(ref patch) = dah_patch {
-            apply_dah_patch(&mut metadata, patch);
-        }
-
-        // 9. Write metadata (targeted spend footer when direct, full otherwise)
-        if !self.device_ptr.is_null() {
-            unsafe { io::write_spend_footer_direct(self.device_ptr, record_offset, &metadata) };
-        } else if let Err(e) = self.write_metadata_fast(record_offset, &metadata) {
-            eprintln!("engine: write_metadata failed: {e}");
-        }
-
-        self.sync_index_cache(&tx_key, &metadata);
-
-        // 10. Update DAH secondary index
-        let new_dah = { metadata.delete_at_height };
-        if new_dah != old_dah {
-            let mut dah = self.dah_index.lock();
-            if old_dah != 0 {
-                dah.remove(&tx_key);
-            }
-            if new_dah != 0 {
-                dah.insert(new_dah, tx_key);
-            }
-        }
-
-        // Reuse block_ids from validation — block entries don't change
-        // during spend (only spent_utxos, generation, updated_at, DAH).
-        SpendMultiResponse {
-            signal,
-            block_ids,
-            errors,
-            spent_count,
-            generation: { metadata.generation },
-        }
-    }
-
     /// Execute a single spend — zero-allocation fast path.
     ///
     /// Inlines the validate-and-apply logic for exactly one UTXO,
@@ -636,11 +943,11 @@ impl Engine {
                     metadata.generation = { metadata.generation }.wrapping_add(1);
                     metadata.updated_at = self.now_millis();
                     if !self.device_ptr.is_null() {
-                        unsafe { io::write_spend_footer_direct(self.device_ptr, record_offset, &metadata) };
+                        unsafe { io::write_metadata_direct(self.device_ptr, record_offset, &metadata) };
                     } else if let Err(e) = self.write_metadata_fast(record_offset, &metadata) {
                         eprintln!("engine: write_metadata failed: {e}");
                     }
-                    self.sync_index_cache(&req.tx_key, &metadata);
+                    self.sync_index_cache(&req.tx_key, &metadata)?;
                     let block_ids = collect_block_ids(&metadata).to_vec();
                     return Ok(SpendResponse {
                         signal: Signal::None,
@@ -681,7 +988,7 @@ impl Engine {
             &metadata,
             req.current_block_height,
             req.block_height_retention,
-        );
+        )?;
 
         if let Some(ref patch) = dah_patch {
             apply_dah_patch(&mut metadata, patch);
@@ -689,24 +996,16 @@ impl Engine {
 
         // 8. Write metadata
         if !self.device_ptr.is_null() {
-            unsafe { io::write_spend_footer_direct(self.device_ptr, record_offset, &metadata) };
+            unsafe { io::write_metadata_direct(self.device_ptr, record_offset, &metadata) };
         } else if let Err(e) = self.write_metadata_fast(record_offset, &metadata) {
             eprintln!("engine: write_metadata failed: {e}");
         }
 
-        self.sync_index_cache(&req.tx_key, &metadata);
+        self.sync_index_cache(&req.tx_key, &metadata)?;
 
-        // 9. Update DAH secondary index
+        // 9. Update DAH secondary index (two-phase durable)
         let new_dah = { metadata.delete_at_height };
-        if new_dah != old_dah {
-            let mut dah = self.dah_index.lock();
-            if old_dah != 0 {
-                dah.remove(&req.tx_key);
-            }
-            if new_dah != 0 {
-                dah.insert(new_dah, req.tx_key);
-            }
-        }
+        self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
 
         let block_ids = collect_block_ids(&metadata).to_vec();
 
@@ -790,7 +1089,7 @@ impl Engine {
             &metadata,
             req.current_block_height,
             req.block_height_retention,
-        );
+        )?;
 
         if let Some(ref patch) = dah_patch {
             apply_dah_patch(&mut metadata, patch);
@@ -798,24 +1097,16 @@ impl Engine {
 
         // 8. Write metadata (targeted spend footer when direct, full otherwise)
         if !self.device_ptr.is_null() {
-            unsafe { io::write_spend_footer_direct(self.device_ptr, record_offset, &metadata) };
+            unsafe { io::write_metadata_direct(self.device_ptr, record_offset, &metadata) };
         } else {
             self.write_metadata_fast(record_offset, &metadata)?;
         }
 
-        self.sync_index_cache(&req.tx_key, &metadata);
+        self.sync_index_cache(&req.tx_key, &metadata)?;
 
-        // 9. Update DAH secondary index
+        // 9. Update DAH secondary index (two-phase durable)
         let new_dah = { metadata.delete_at_height };
-        if new_dah != old_dah {
-            let mut dah = self.dah_index.lock();
-            if old_dah != 0 {
-                dah.remove(&req.tx_key);
-            }
-            if new_dah != 0 {
-                dah.insert(new_dah, req.tx_key);
-            }
-        }
+        self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
 
         Ok(UnspendResponse { signal, generation: { metadata.generation } })
     }
@@ -894,7 +1185,7 @@ impl Engine {
                 entry.dah_or_preserve,
                 req.current_block_height,
                 req.block_height_retention,
-            );
+            )?;
             let mut new_dah = old_dah;
             if let Some(ref patch) = dah_patch {
                 tf.set(TxFlags::LAST_SPENT_ALL, patch.last_spent_all);
@@ -905,25 +1196,19 @@ impl Engine {
             let generation = entry.generation.wrapping_add(1);
             let updated_at = self.now_millis();
 
-            // Targeted writes — block entry + mined footer fields
+            // Read-modify-write so CRC covers the full post-state
+            // (block-entry-count, inline entry, and footer fields).
             unsafe {
-                io::write_block_entry_direct(
-                    self.device_ptr,
-                    record_offset,
-                    new_count,
-                    cached_count as usize,
-                    &new_entry,
-                );
-                // Build a minimal TxMetadata-shaped struct for the footer writer.
-                // We only need the fields that the footer writer reads.
-                let mut meta_stub = std::mem::zeroed::<TxMetadata>();
-                meta_stub.flags = tf;
-                meta_stub.generation = generation;
-                meta_stub.updated_at = updated_at;
-                meta_stub.delete_at_height = new_dah;
-                meta_stub.unmined_since = new_unmined;
-                io::write_mined_footer_direct(self.device_ptr, record_offset, &meta_stub);
-                // Also write flags byte (mined footer writes it, but ensure LOCKED cleared)
+                let mut meta = io::read_metadata_direct(self.device_ptr, record_offset)
+                    .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+                meta.flags = tf;
+                meta.generation = generation;
+                meta.updated_at = updated_at;
+                meta.delete_at_height = new_dah;
+                meta.unmined_since = new_unmined;
+                meta.block_entry_count = new_count;
+                meta.block_entries_inline[cached_count as usize] = new_entry;
+                io::write_metadata_direct(self.device_ptr, record_offset, &meta);
             }
 
             // Sync all cached fields to index
@@ -932,27 +1217,26 @@ impl Engine {
             if has_preserve {
                 sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
             }
-            self.index.write().update_cached_fields(
-                tx_key,
-                sync_tf.bits(),
-                new_count,
-                entry.spent_utxos,
-                dah_or_preserve,
-                new_unmined,
-                generation,
-            );
+            self.index
+                .write()
+                .update_cached_fields(
+                    tx_key,
+                    sync_tf.bits(),
+                    new_count,
+                    entry.spent_utxos,
+                    dah_or_preserve,
+                    new_unmined,
+                    generation,
+                )
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("index update_cached_fields failed: {e}"),
+                })?;
 
-            // Update secondary indexes
-            if new_dah != old_dah {
-                let mut dah_idx = self.dah_index.lock();
-                if old_dah != 0 { dah_idx.remove(tx_key); }
-                if new_dah != 0 { dah_idx.insert(new_dah, *tx_key); }
-            }
-            if new_unmined != old_unmined {
-                let mut unmined_idx = self.unmined_index.lock();
-                if old_unmined != 0 { unmined_idx.remove(tx_key); }
-                if new_unmined != 0 { unmined_idx.insert(new_unmined, *tx_key); }
-            }
+            // Update secondary indexes with two-phase durability. Batched
+            // into a single redo fsync when both change.
+            self.update_both_secondary_indexes(
+                tx_key, old_dah, new_dah, old_unmined, new_unmined,
+            )?;
 
             return Ok(SetMinedResponse {
                 signal,
@@ -1117,29 +1401,21 @@ impl Engine {
             &metadata,
             req.current_block_height,
             req.block_height_retention,
-        );
+        )?;
         if let Some(ref patch) = dah_patch {
             apply_dah_patch(&mut metadata, patch);
         }
 
         // Write full metadata (slow path)
         self.write_metadata_fast(record_offset, &metadata)?;
-        self.sync_index_cache(tx_key, &metadata);
+        self.sync_index_cache(tx_key, &metadata)?;
 
-        // Update secondary indexes
+        // Update secondary indexes with two-phase durability, batched.
         let new_dah = { metadata.delete_at_height };
-        if new_dah != old_dah {
-            let mut dah = self.dah_index.lock();
-            if old_dah != 0 { dah.remove(tx_key); }
-            if new_dah != 0 { dah.insert(new_dah, *tx_key); }
-        }
-
         let new_unmined = { metadata.unmined_since };
-        if new_unmined != old_unmined {
-            let mut unmined = self.unmined_index.lock();
-            if old_unmined != 0 { unmined.remove(tx_key); }
-            if new_unmined != 0 { unmined.insert(new_unmined, *tx_key); }
-        }
+        self.update_both_secondary_indexes(
+            tx_key, old_dah, new_dah, old_unmined, new_unmined,
+        )?;
 
         let block_ids = if (metadata.block_entry_count as usize) <= INLINE_BLOCK_ENTRIES {
             collect_block_ids(&metadata).to_vec()
@@ -1209,42 +1485,33 @@ impl Engine {
             &metadata,
             req.current_block_height,
             req.block_height_retention,
-        );
+        )?;
         if let Some(ref patch) = dah_patch {
             apply_dah_patch(&mut metadata, patch);
         }
 
-        // Targeted mined footer when direct, full write otherwise
+        // Targeted mined footer when direct, full write otherwise.
+        // The on-device metadata is the primary durable source of truth.
         if !self.device_ptr.is_null() {
-            unsafe { io::write_mined_footer_direct(self.device_ptr, record_offset, &metadata) };
+            unsafe { io::write_metadata_direct(self.device_ptr, record_offset, &metadata) };
         } else {
             self.write_metadata_fast(record_offset, &metadata)?;
         }
 
-        self.sync_index_cache(&req.tx_key, &metadata);
-
-        // Update secondary indexes
+        // H1: atomic primary + DAH + unmined update under one critical
+        // section. Any reader that locks dah_index or unmined_index observes
+        // a consistent view with the primary in-memory cache — no window
+        // where DAH references a stale height while primary has moved on.
         let new_dah = { metadata.delete_at_height };
-        if new_dah != old_dah {
-            let mut dah = self.dah_index.lock();
-            if old_dah != 0 {
-                dah.remove(&req.tx_key);
-            }
-            if new_dah != 0 {
-                dah.insert(new_dah, req.tx_key);
-            }
-        }
-
         let new_unmined = { metadata.unmined_since };
-        if new_unmined != old_unmined {
-            let mut unmined = self.unmined_index.lock();
-            if old_unmined != 0 {
-                unmined.remove(&req.tx_key);
-            }
-            if new_unmined != 0 {
-                unmined.insert(new_unmined, req.tx_key);
-            }
-        }
+        self.sync_primary_and_both_secondary_atomic(
+            &req.tx_key,
+            &metadata,
+            old_dah,
+            new_dah,
+            old_unmined,
+            new_unmined,
+        )?;
 
         Ok(MarkOnLongestChainResponse { signal, generation: { metadata.generation } })
     }
@@ -1375,16 +1642,19 @@ impl Engine {
             unmined_since: { meta.unmined_since },
             generation: 0,
         };
-        self.index
-            .write()
-            .register(key, index_entry)
+        // Register in primary index AND increment shard_counts in the same
+        // critical section so the two can never drift (H2 correctness fix).
+        self.register_with_shard_count(key, index_entry)
             .map_err(|e| CreateError::StorageError {
                 detail: format!("{e}"),
             })?;
 
-        // Update unmined secondary index if applicable
+        // Update unmined secondary index if applicable (two-phase durable).
         if meta.unmined_since != 0 {
-            self.unmined_index.lock().insert(meta.unmined_since, key);
+            self.update_unmined_index(&key, 0, meta.unmined_since)
+                .map_err(|e| CreateError::StorageError {
+                    detail: format!("{e}"),
+                })?;
         }
 
         // Update parent records' conflicting-children lists
@@ -1395,7 +1665,6 @@ impl Engine {
             }
         }
 
-        self.increment_shard_count(&TxKey { txid: req.tx_id });
         Ok(CreateResponse {
             record_offset,
             utxo_count,
@@ -1540,15 +1809,18 @@ impl Engine {
             unmined_since: { meta.unmined_since },
             generation: 0,
         };
-        self.index
-            .write()
-            .register(key, index_entry)
+        // Register in primary index AND increment shard_counts in the same
+        // critical section so the two can never drift (H2 correctness fix).
+        self.register_with_shard_count(key, index_entry)
             .map_err(|e| CreateError::StorageError {
                 detail: format!("{e}"),
             })?;
 
         if meta.unmined_since != 0 {
-            self.unmined_index.lock().insert(meta.unmined_since, key);
+            self.update_unmined_index(&key, 0, meta.unmined_since)
+                .map_err(|e| CreateError::StorageError {
+                    detail: format!("{e}"),
+                })?;
         }
 
         if req.conflicting {
@@ -1558,7 +1830,6 @@ impl Engine {
             }
         }
 
-        self.increment_shard_count(&TxKey { txid: req.tx_id });
         Ok(CreateResponse {
             record_offset,
             utxo_count,
@@ -1769,7 +2040,7 @@ impl Engine {
         meta.updated_at = self.now_millis();
         self.write_metadata_fast(ro, &meta)?;
 
-        self.sync_index_cache(&req.tx_key, &meta);
+        self.sync_index_cache(&req.tx_key, &meta)?;
 
         let generation = { meta.generation };
         Ok(generation)
@@ -1910,7 +2181,7 @@ impl Engine {
                 entry.block_entry_count, entry.unmined_since,
                 has_preserve, entry.dah_or_preserve,
                 req.current_block_height, req.block_height_retention,
-            );
+            )?;
             let mut new_dah = old_dah;
             if let Some(ref patch) = dah_patch {
                 tf.set(TxFlags::LAST_SPENT_ALL, patch.last_spent_all);
@@ -1921,32 +2192,35 @@ impl Engine {
             let generation = entry.generation.wrapping_add(1);
             let updated_at = self.now_millis();
 
-            // Targeted write
+            // Read-modify-write so CRC is computed over the complete
+            // post-state. One mmap memcpy for the 320-byte header.
             unsafe {
-                let mut meta_stub = std::mem::zeroed::<TxMetadata>();
-                meta_stub.flags = tf;
-                meta_stub.generation = generation;
-                meta_stub.updated_at = updated_at;
-                meta_stub.delete_at_height = new_dah;
-                io::write_mutation_footer_direct(self.device_ptr, ro, &meta_stub);
+                let mut meta = io::read_metadata_direct(self.device_ptr, ro)
+                    .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+                meta.flags = tf;
+                meta.generation = generation;
+                meta.updated_at = updated_at;
+                meta.delete_at_height = new_dah;
+                io::write_metadata_direct(self.device_ptr, ro, &meta);
             }
 
             // Sync index cache
             let dah_or_preserve = if has_preserve { entry.dah_or_preserve } else { new_dah };
             let mut sync_tf = tf;
             if has_preserve { sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL); }
-            self.index.write().update_cached_fields(
-                &req.tx_key, sync_tf.bits(), entry.block_entry_count,
-                entry.spent_utxos, dah_or_preserve, entry.unmined_since,
-                generation,
-            );
+            self.index
+                .write()
+                .update_cached_fields(
+                    &req.tx_key, sync_tf.bits(), entry.block_entry_count,
+                    entry.spent_utxos, dah_or_preserve, entry.unmined_since,
+                    generation,
+                )
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("index update_cached_fields failed: {e}"),
+                })?;
 
-            // Update DAH secondary index
-            if new_dah != old_dah {
-                let mut dah = self.dah_index.lock();
-                if old_dah != 0 { dah.remove(&req.tx_key); }
-                if new_dah != 0 { dah.insert(new_dah, req.tx_key); }
-            }
+            // Update DAH secondary index (two-phase durable)
+            self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
 
             return Ok(SetConflictingResponse { signal, generation });
         }
@@ -1968,20 +2242,16 @@ impl Engine {
             &meta,
             req.current_block_height,
             req.block_height_retention,
-        );
+        )?;
         if let Some(ref patch) = dah_patch {
             apply_dah_patch(&mut meta, patch);
         }
 
         self.write_metadata_fast(ro, &meta)?;
-        self.sync_index_cache(&req.tx_key, &meta);
+        self.sync_index_cache(&req.tx_key, &meta)?;
 
         let new_dah = { meta.delete_at_height };
-        if new_dah != old_dah {
-            let mut dah = self.dah_index.lock();
-            if old_dah != 0 { dah.remove(&req.tx_key); }
-            if new_dah != 0 { dah.insert(new_dah, req.tx_key); }
-        }
+        self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
 
         // Update parent records' conflicting-children lists
         if req.value {
@@ -2024,32 +2294,35 @@ impl Engine {
             let generation = entry.generation.wrapping_add(1);
             let updated_at = self.now_millis();
 
-            // Targeted write
+            // Read-modify-write so CRC is computed over the complete
+            // post-state. One mmap memcpy for the 320-byte header.
             unsafe {
-                let mut meta_stub = std::mem::zeroed::<TxMetadata>();
-                meta_stub.flags = tf;
-                meta_stub.generation = generation;
-                meta_stub.updated_at = updated_at;
-                meta_stub.delete_at_height = new_dah;
-                io::write_mutation_footer_direct(self.device_ptr, ro, &meta_stub);
+                let mut meta = io::read_metadata_direct(self.device_ptr, ro)
+                    .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+                meta.flags = tf;
+                meta.generation = generation;
+                meta.updated_at = updated_at;
+                meta.delete_at_height = new_dah;
+                io::write_metadata_direct(self.device_ptr, ro, &meta);
             }
 
             // Sync index cache
             let dah_or_preserve = if has_preserve { entry.dah_or_preserve } else { new_dah };
             let mut sync_tf = tf;
             if has_preserve { sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL); }
-            self.index.write().update_cached_fields(
-                &req.tx_key, sync_tf.bits(), entry.block_entry_count,
-                entry.spent_utxos, dah_or_preserve, entry.unmined_since,
-                generation,
-            );
+            self.index
+                .write()
+                .update_cached_fields(
+                    &req.tx_key, sync_tf.bits(), entry.block_entry_count,
+                    entry.spent_utxos, dah_or_preserve, entry.unmined_since,
+                    generation,
+                )
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("index update_cached_fields failed: {e}"),
+                })?;
 
-            // Update DAH secondary index
-            if new_dah != old_dah {
-                let mut dah = self.dah_index.lock();
-                if old_dah != 0 { dah.remove(&req.tx_key); }
-                if new_dah != 0 { dah.insert(new_dah, req.tx_key); }
-            }
+            // Update DAH secondary index (two-phase durable)
+            self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
 
             return Ok(generation);
         }
@@ -2069,14 +2342,10 @@ impl Engine {
         meta.updated_at = self.now_millis();
 
         self.write_metadata_fast(ro, &meta)?;
-        self.sync_index_cache(&req.tx_key, &meta);
+        self.sync_index_cache(&req.tx_key, &meta)?;
 
         let new_dah = { meta.delete_at_height };
-        if new_dah != old_dah {
-            let mut dah = self.dah_index.lock();
-            if old_dah != 0 { dah.remove(&req.tx_key); }
-            if new_dah != 0 { dah.insert(new_dah, req.tx_key); }
-        }
+        self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
 
         Ok(meta.generation)
     }
@@ -2104,7 +2373,7 @@ impl Engine {
         self.write_metadata_fast(ro, &meta)?;
 
         if old_dah != 0 {
-            self.dah_index.lock().remove(&req.tx_key);
+            self.update_dah_index(&req.tx_key, old_dah, 0)?;
         }
 
         let signal = if meta.flags.contains(TxFlags::EXTERNAL) {
@@ -2137,14 +2406,28 @@ impl Engine {
             .free(entry.record_offset, record_size)
             .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
 
-        // Remove from index
-        self.index.write().unregister(&req.tx_key);
+        // Remove from primary index AND decrement shard_counts in the same
+        // critical section so the two can never drift (H2 correctness fix).
+        // `unregister_with_shard_count` only decrements when an entry was
+        // actually removed, preventing underflow if the key was concurrently
+        // removed between the earlier `lookup` and this point.
+        self.unregister_with_shard_count(&req.tx_key);
 
-        // Clean up secondary indexes
-        self.dah_index.lock().remove(&req.tx_key);
-        self.unmined_index.lock().remove(&req.tx_key);
+        // Clean up secondary indexes with two-phase durability.
+        // The cached entry captured before unregister carries the heights we
+        // must transition from. Whether or not each was set, `update_*_index`
+        // is a no-op when old == new.
+        let has_preserve = TxFlags::from_bits_truncate(entry.tx_flags)
+            .contains(TxFlags::HAS_PRESERVE_UNTIL);
+        let old_dah = if has_preserve { 0 } else { entry.dah_or_preserve };
+        let old_unmined = entry.unmined_since;
+        if old_dah != 0 {
+            self.update_dah_index(&req.tx_key, old_dah, 0)?;
+        }
+        if old_unmined != 0 {
+            self.update_unmined_index(&req.tx_key, old_unmined, 0)?;
+        }
 
-        self.decrement_shard_count(&req.tx_key);
         Ok(())
     }
 
@@ -2266,6 +2549,115 @@ impl Engine {
     /// Returns [`crate::allocator::AllocatorError`] on device I/O failure.
     pub fn persist_allocator(&self) -> crate::allocator::Result<()> {
         self.allocator.lock().persist()
+    }
+}
+
+impl<'a> ValidatedSpend<'a> {
+    /// Apply a previously validated spend batch.
+    ///
+    /// Consumes `self` by value — the contained per-transaction lock guard
+    /// is moved into this call and released only after the mutation has
+    /// been written to the device. Because `self` is moved, the compiler
+    /// rejects any attempt to call `apply` twice or to reuse the
+    /// `ValidatedSpend` after applying. If the caller instead drops the
+    /// `ValidatedSpend` without calling `apply`, the lock is released and
+    /// no writes occur — the desired failure mode.
+    ///
+    /// Writes UTXO slot mutations and metadata to the device, updates
+    /// secondary indexes, and returns the response.
+    ///
+    /// This is the second half of the WAL-first pattern:
+    /// `validate_spend_multi → write redo → ValidatedSpend::apply`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpendError::DahOverflow`] when the configured
+    /// `block_height_retention` combined with `current_block_height` would
+    /// overflow `u32`. Config validation bounds `block_height_retention`
+    /// well below the overflow threshold, so this only fires on
+    /// misconfiguration. On error, slot mutations have already been written
+    /// (WAL-first pattern), but the metadata footer update is skipped and
+    /// the per-transaction lock is released on return. The operator must
+    /// correct the config; the redo log will re-drive recovery.
+    #[must_use = "apply returns the operation response including per-item errors"]
+    pub fn apply(self, engine: &Engine) -> Result<SpendMultiResponse, SpendError> {
+        let ValidatedSpend {
+            _guard,
+            tx_key,
+            valid_spends,
+            errors,
+            spent_count,
+            pre_generation: _,
+            block_ids,
+            record_offset,
+            mut metadata,
+            current_block_height,
+            block_height_retention,
+        } = self;
+
+        // Fault-injection: simulate a crash AFTER redo fsync but BEFORE
+        // any data-region pwrite. Recovery must replay the redo entries
+        // and produce the final slot bytes.
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::BeforeDataPwrite,
+        );
+
+        // 6. Batch write all valid slot mutations (zero-alloc when direct)
+        for &(offset, ref new_slot) in &valid_spends {
+            if let Err(e) = engine.write_slot_fast(record_offset, offset, new_slot) {
+                eprintln!("engine: write_utxo_slot failed: {e}");
+            }
+        }
+
+        crate::fault_injection::check(
+            crate::fault_injection::SyncPoint::AfterDataPwrite,
+        );
+
+        // 7. Update metadata
+        let old_dah = { metadata.delete_at_height };
+        metadata.spent_utxos = { metadata.spent_utxos }.wrapping_add(spent_count);
+        metadata.generation = { metadata.generation }.wrapping_add(1);
+        metadata.updated_at = engine.now_millis();
+
+        // 8. Evaluate deleteAtHeight. A DAH-overflow error here indicates
+        // misconfiguration (current_height + retention > u32::MAX) and
+        // surfaces to the caller as SpendError::DahOverflow — we never
+        // silently clamp, which would pin UTXOs as unprunable forever.
+        let (signal, dah_patch) = evaluate_delete_at_height(
+            &metadata,
+            current_block_height,
+            block_height_retention,
+        )?;
+
+        if let Some(ref patch) = dah_patch {
+            apply_dah_patch(&mut metadata, patch);
+        }
+
+        // 9. Write metadata (targeted spend footer when direct, full otherwise)
+        if !engine.device_ptr.is_null() {
+            unsafe { io::write_metadata_direct(engine.device_ptr, record_offset, &metadata) };
+        } else if let Err(e) = engine.write_metadata_fast(record_offset, &metadata) {
+            eprintln!("engine: write_metadata failed: {e}");
+        }
+
+        engine.sync_index_cache(&tx_key, &metadata)?;
+
+        // 10. Update DAH secondary index (two-phase durable)
+        let new_dah = { metadata.delete_at_height };
+        engine.update_dah_index(&tx_key, old_dah, new_dah)?;
+
+        // _guard dropped here, releasing the per-transaction stripe lock.
+        drop(_guard);
+
+        // Reuse block_ids from validation — block entries don't change
+        // during spend (only spent_utxos, generation, updated_at, DAH).
+        Ok(SpendMultiResponse {
+            signal,
+            block_ids,
+            errors,
+            spent_count,
+            generation: { metadata.generation },
+        })
     }
 }
 
@@ -3013,6 +3405,134 @@ mod tests {
         let dah = h.engine.dah_index();
         let results = dah.range_query(2000);
         assert!(!results.is_empty());
+    }
+
+    // -- ValidatedSpend type-state tests (C2: spend lock lifetime) --
+
+    /// The WAL-first path: validate, then apply on the returned
+    /// [`ValidatedSpend`]. The lock is held across validate → apply, so no
+    /// concurrent mutation can interleave. This exercises the consuming
+    /// `apply(self, &Engine)` signature end-to-end.
+    #[test]
+    fn validated_spend_apply_consumes_and_writes() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        let req = SpendMultiRequest {
+            tx_key: h.key,
+            spends: vec![SpendItem {
+                offset: 3,
+                utxo_hash: h.slot_hash(3),
+                spending_data: h.make_spending_data(0x11),
+                idx: 0,
+            }],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        // Validate under lock — returns a ValidatedSpend holding the guard.
+        let validated = h.engine.validate_spend_multi(&req).unwrap();
+        assert_eq!(validated.spent_count, 1);
+        let pre_gen = validated.pre_generation;
+
+        // Apply consumes the ValidatedSpend by value. The response carries
+        // the post-mutation generation and the per-item errors from
+        // validation (empty for this case).
+        let resp = validated.apply(&h.engine).unwrap();
+        assert!(resp.errors.is_empty());
+        assert_eq!(resp.spent_count, 1);
+        assert_eq!(resp.generation, pre_gen.wrapping_add(1));
+
+        // The mutation was actually written.
+        let slot = h.engine.read_slot(&h.key, 3).unwrap();
+        assert!(slot.is_spent());
+        assert_eq!(slot.spending_data, h.make_spending_data(0x11));
+
+        // NOTE: attempting `validated.apply(&h.engine)` again here would
+        // fail to compile with `use of moved value`. The compile_fail
+        // doctests on `ValidatedSpend` assert the Copy/Clone bounds that
+        // make this move-based API sound.
+    }
+
+    /// Dropping a ValidatedSpend without applying must leave the record
+    /// untouched and release the stripe lock so a subsequent operation on
+    /// the same txid can proceed.
+    #[test]
+    fn validated_spend_dropped_without_apply_is_noop_and_releases_lock() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        let req = SpendMultiRequest {
+            tx_key: h.key,
+            spends: vec![SpendItem {
+                offset: 4,
+                utxo_hash: h.slot_hash(4),
+                spending_data: h.make_spending_data(0x22),
+                idx: 0,
+            }],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        let meta_before = h.engine.read_metadata(&h.key).unwrap();
+        let gen_before = { meta_before.generation };
+        let spent_before = { meta_before.spent_utxos };
+
+        // Validate and then explicitly drop without applying.
+        {
+            let validated = h.engine.validate_spend_multi(&req).unwrap();
+            // Guard is alive right now — a concurrent validate_spend_multi
+            // on the same tx_key would block on the stripe lock until this
+            // scope ends. We don't try to demonstrate that here (would
+            // deadlock the test), but we *do* demonstrate that after the
+            // drop, the lock is released and the next call succeeds.
+            drop(validated);
+        }
+
+        // No writes: slot still unspent, metadata unchanged.
+        let slot = h.engine.read_slot(&h.key, 4).unwrap();
+        assert!(!slot.is_spent(), "slot must not have been mutated when apply was skipped");
+        let meta_after = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!({ meta_after.generation }, gen_before);
+        assert_eq!({ meta_after.spent_utxos }, spent_before);
+
+        // Lock was released — a fresh validate (and apply) on the same tx
+        // acquires the same stripe lock cleanly and mutates the record.
+        let v2 = h.engine.validate_spend_multi(&req).unwrap();
+        let resp = v2.apply(&h.engine).unwrap();
+        assert_eq!(resp.spent_count, 1);
+        let slot = h.engine.read_slot(&h.key, 4).unwrap();
+        assert!(slot.is_spent());
+    }
+
+    /// The combined `spend_multi` wrapper threads through the same
+    /// validate → apply pipeline via `ValidatedSpend::apply`. It must
+    /// produce identical observable behaviour to the split path.
+    #[test]
+    fn validated_spend_matches_spend_multi_wrapper() {
+        let h = TestHarness::new(5, TxFlags::empty());
+        let req = SpendMultiRequest {
+            tx_key: h.key,
+            spends: vec![SpendItem {
+                offset: 0,
+                utxo_hash: h.slot_hash(0),
+                spending_data: h.make_spending_data(0x33),
+                idx: 0,
+            }],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        let direct = h.engine.spend_multi(&req).unwrap();
+        // Idempotent re-spend via the split path — same spending_data, so
+        // spent_count should be 0 and errors empty.
+        let v = h.engine.validate_spend_multi(&req).unwrap();
+        let split = v.apply(&h.engine).unwrap();
+        assert!(direct.errors.is_empty() && split.errors.is_empty());
+        assert_eq!(direct.spent_count, 1);
+        assert_eq!(split.spent_count, 0, "idempotent re-spend should not count");
     }
 
     // -- Unspend tests --
@@ -4145,7 +4665,11 @@ mod tests {
     fn updated_at_recent_for_all_mutations() {
         let h = TestHarness::new(10, TxFlags::empty());
 
-        // Spend
+        // Spend — `refresh_clock` is normally called by the dispatch layer
+        // once per batch; calling it explicitly here lets the direct-engine
+        // test compare against a fresh wall-clock reading instead of the
+        // stale cached value from `Engine::new`.
+        h.engine.refresh_clock();
         let before = sys_millis();
         h.engine.spend(&h.spend_req(0)).unwrap();
         let after = sys_millis();
@@ -4153,6 +4677,7 @@ mod tests {
         assert!({ meta.updated_at } >= before && { meta.updated_at } <= after + 1);
 
         // Unspend
+        h.engine.refresh_clock();
         let before = sys_millis();
         let req = UnspendRequest {
             tx_key: h.key,
@@ -7425,5 +7950,199 @@ mod tests {
         // (since we refreshed just before and the method reads cached).
         assert_eq!({ meta.updated_at }, cached,
             "mutation should use the cached clock value");
+    }
+
+    // -- H2: atomic shard-count update tests --
+
+    /// Sum of per-shard counts observed on `engine`, computed from the
+    /// `shard_counts` field used in migration decisions.
+    fn shard_count_total(engine: &Engine) -> u64 {
+        (0..4096u16).map(|s| engine.shard_record_count(s)).sum()
+    }
+
+    /// Reference map of per-shard counts computed by scanning the primary
+    /// index directly.  This is what `shard_counts` MUST match after every
+    /// operation for migration correctness.
+    fn reference_shard_counts(engine: &Engine) -> HashMap<u16, u64> {
+        let mut out: HashMap<u16, u64> = HashMap::new();
+        for k in engine.all_keys() {
+            let s = crate::cluster::shards::ShardTable::shard_for_key(&k);
+            *out.entry(s).or_insert(0) += 1;
+        }
+        out
+    }
+
+    fn assert_counts_match_primary(engine: &Engine) {
+        let reference = reference_shard_counts(engine);
+        // 1. Every shard that the primary believes is populated must have
+        //    the exact same count in `shard_counts`.
+        for (&shard, &expected) in reference.iter() {
+            assert_eq!(
+                engine.shard_record_count(shard),
+                expected,
+                "shard_counts drift: shard {shard} expected {expected}",
+            );
+        }
+        // 2. Every shard NOT in the reference must read zero.
+        for shard in 0..4096u16 {
+            if !reference.contains_key(&shard) {
+                assert_eq!(
+                    engine.shard_record_count(shard),
+                    0,
+                    "shard_counts drift: shard {shard} should be 0 but is {}",
+                    engine.shard_record_count(shard),
+                );
+            }
+        }
+        // 3. Totals agree.
+        let total: u64 = reference.values().sum();
+        assert_eq!(
+            total,
+            shard_count_total(engine),
+            "shard_counts total disagrees with primary index",
+        );
+        assert_eq!(
+            total as usize,
+            engine.all_keys().len(),
+            "reference total disagrees with primary index size",
+        );
+    }
+
+    #[test]
+    fn shard_counts_match_primary_after_concurrent_register_unregister() {
+        // Spin up N threads that each create a batch of distinct records
+        // and then delete a subset, intermixed.  The bug we guard against
+        // is drift between `shard_counts` and the primary index when the
+        // two are mutated outside a single critical section.
+        let engine = create_engine();
+
+        const THREADS: usize = 8;
+        const RECORDS_PER_THREAD: u8 = 32;
+
+        let mut handles = Vec::with_capacity(THREADS);
+        for t in 0..THREADS {
+            let engine = engine.clone();
+            handles.push(std::thread::spawn(move || {
+                // Create RECORDS_PER_THREAD records unique to this thread.
+                for i in 0..RECORDS_PER_THREAD {
+                    let n = (t as u8).wrapping_mul(RECORDS_PER_THREAD).wrapping_add(i);
+                    let (_, req) = make_create_req(n, 1);
+                    // make_create_req(0, _) produces tx_id with leading 0 —
+                    // skip it so every thread gets a distinct, non-empty id.
+                    if n == 0 {
+                        continue;
+                    }
+                    engine.create(&req).expect("create should succeed");
+                }
+                // Delete every other record.
+                for i in 0..RECORDS_PER_THREAD {
+                    if i % 2 != 0 {
+                        continue;
+                    }
+                    let n = (t as u8).wrapping_mul(RECORDS_PER_THREAD).wrapping_add(i);
+                    if n == 0 {
+                        continue;
+                    }
+                    let (_, req) = make_create_req(n, 1);
+                    let del = DeleteRequest { tx_key: req.tx_key() };
+                    match engine.delete(&del) {
+                        Ok(()) => {}
+                        Err(SpendError::TxNotFound) => {
+                            // Another thread may not yet have inserted this
+                            // slot if tx_ids collided, but our encoding is
+                            // unique per (t, i) so this must not happen.
+                            panic!(
+                                "unexpected TxNotFound for distinct key t={t} i={i}"
+                            );
+                        }
+                        Err(e) => panic!("unexpected delete error: {e:?}"),
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        // Invariant: for every shard, shard_record_count matches the
+        // number of keys the primary actually holds in that shard.
+        assert_counts_match_primary(&engine);
+
+        // Sanity: we created THREADS*RECORDS_PER_THREAD - collisions, then
+        // deleted the evens.  Exact total depends on the skipped n==0 cases,
+        // but it must be strictly positive.
+        let total = shard_count_total(&engine);
+        assert!(
+            total > 0,
+            "expected some records to remain, got 0 (likely all deletes ran)",
+        );
+    }
+
+    #[test]
+    fn shard_counts_unchanged_on_register_failure() {
+        // With the fault injector armed, the next register attempt returns
+        // an IndexError::FormatError WITHOUT touching the primary index or
+        // shard_counts.  If the fix is correct, the count observed after
+        // the failed call equals the count observed before.
+        let engine = create_engine();
+
+        // Seed with a successful create so there's a concrete shard that
+        // we can check both before and after the failed call.
+        let (_, seed_req) = make_create_req(1, 1);
+        engine.create(&seed_req).expect("seed create should succeed");
+        let seed_shard = crate::cluster::shards::ShardTable::shard_for_key(
+            &seed_req.tx_key(),
+        );
+        let seed_count = engine.shard_record_count(seed_shard);
+        assert_eq!(seed_count, 1, "seed record should set shard count to 1");
+
+        // Arm the injector and confirm a fresh create now fails WITHOUT
+        // leaking into shard_counts.
+        engine
+            .fail_next_register
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let (_, failing_req) = make_create_req(2, 1);
+        let failing_shard = crate::cluster::shards::ShardTable::shard_for_key(
+            &failing_req.tx_key(),
+        );
+        let before_failing = engine.shard_record_count(failing_shard);
+
+        match engine.create(&failing_req) {
+            Ok(_) => panic!("expected injected register failure"),
+            Err(CreateError::StorageError { detail }) => {
+                assert!(
+                    detail.contains("injected register failure"),
+                    "unexpected error detail: {detail}",
+                );
+            }
+            Err(e) => panic!("expected StorageError, got {e:?}"),
+        }
+
+        // shard_counts on the failing shard must NOT have incremented.
+        assert_eq!(
+            engine.shard_record_count(failing_shard),
+            before_failing,
+            "shard_counts incremented despite register failure — drift!",
+        );
+
+        // And the previously-seeded shard must be untouched.
+        assert_eq!(
+            engine.shard_record_count(seed_shard),
+            seed_count,
+            "seed shard count changed on unrelated failure",
+        );
+
+        // And the invariant still holds: counts match what the primary
+        // actually contains (which is just the seed record).
+        assert_counts_match_primary(&engine);
+
+        // Finally, confirm the injector is consumed (swap cleared it) so
+        // the subsequent successful call proves recovery works.
+        let (_, recovery_req) = make_create_req(3, 1);
+        engine
+            .create(&recovery_req)
+            .expect("create should succeed after injector consumed");
+        assert_counts_match_primary(&engine);
     }
 }

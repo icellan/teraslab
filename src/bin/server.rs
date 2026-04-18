@@ -98,6 +98,10 @@ fn main() {
         eprintln!("FATAL: unsafe cluster config: {e}");
         std::process::exit(1);
     }
+    if let Err(e) = config.validate_block_height_retention() {
+        eprintln!("FATAL: invalid block_height_retention: {e}");
+        std::process::exit(1);
+    }
 
     // 2. Recover or create allocator
     let allocator = match SlotAllocator::recover(device.clone()) {
@@ -142,7 +146,7 @@ fn main() {
         IndexBackendMode::FileBacked => "file_backed",
     });
 
-    let (mut index, dah_index, unmined_index): (PrimaryBackend, DahBackend, UnminedBackend) =
+    let (mut index, mut dah_index, mut unmined_index): (PrimaryBackend, DahBackend, UnminedBackend) =
         if config.index.backend == IndexBackendMode::Redb {
             // ReDB on-disk backend
             let primary = match PrimaryBackend::restore_redb(&config.index) {
@@ -328,21 +332,67 @@ fn main() {
         }
     };
 
-    // Run recovery if we have a redo log, while index is still mutable
+    // Run recovery if we have a redo log, while indexes are still mutable.
+    // Uses `recover_all_with_allocator` so the two-phase secondary
+    // durability intent records (RedoOp::SecondaryUnminedUpdate /
+    // SecondaryDahUpdate) reconcile the on-disk redb secondary indexes AND
+    // RedoOp::AllocateRegion / FreeRegion entries replay into the rebuilt
+    // allocator so freelist mutations between snapshots are not lost.
+    let mut allocator = allocator;
     if let Some(ref redo) = redo_log {
-        match teraslab::recovery::recover(&*device, redo, &mut index) {
+        match teraslab::recovery::recover_all_with_allocator(
+            &*device, redo, &mut index, &mut dah_index, &mut unmined_index,
+            Some(&mut allocator),
+        ) {
             Ok(stats) => {
                 eprintln!("  recovery: {} replayed, {} skipped, {} failed",
                     stats.entries_replayed, stats.entries_skipped, stats.entries_failed);
+                // M8: A non-zero `entries_failed` count indicates per-entry
+                // replay returned `ReplayResult::Failed` — either a missing
+                // primary-index entry (benign: the record was deleted between
+                // the redo append and recovery) or an I/O error against the
+                // device. We cannot distinguish the two from the stats alone,
+                // so treat a significant failure rate as a hard error. A few
+                // per run is expected during hot-shutdown recovery; a sustained
+                // cluster of failures is not.
+                const MAX_TOLERATED_FAILURES: u64 = 32;
+                if stats.entries_failed > MAX_TOLERATED_FAILURES {
+                    eprintln!(
+                        "  recovery: aborting startup — {} replay failures exceed tolerance ({})",
+                        stats.entries_failed, MAX_TOLERATED_FAILURES,
+                    );
+                    std::process::exit(1);
+                }
             }
             Err(e) => {
-                eprintln!("  recovery failed: {e}");
+                // Top-level recovery errors (e.g. corrupt redo log, index
+                // error) are fatal — we cannot proceed without a consistent
+                // on-disk state. Exit immediately so the operator can
+                // investigate rather than serving stale or corrupt data.
+                eprintln!("  recovery failed — aborting startup: {e}");
+                std::process::exit(1);
             }
         }
     }
 
     // Wrap redo log in Arc<Mutex> for shared access from dispatch threads
     let redo_log: Option<Arc<Mutex<RedoLog>>> = redo_log.map(|log| Arc::new(Mutex::new(log)));
+
+    // Attach the redo log to the allocator BEFORE moving it into the engine,
+    // so all subsequent allocate/free operations are journaled and fsynced
+    // before the caller observes their effect. This closes the crash window
+    // between `persist()` snapshots.
+    if let Some(ref log) = redo_log {
+        allocator.set_redo_log(log.clone());
+    }
+
+    // Attach the redo log to the primary index so file-backed hash table
+    // resizes are crash-atomic (Begin/Commit journaling + parent-dir fsync).
+    // The FileBacked variant actually uses the redo log; InMemory / OnDisk
+    // accept the attachment but treat it as a no-op.
+    if let Some(ref log) = redo_log {
+        index.set_redo_log(log.clone());
+    }
 
     // 4. Create engine
     let locks = StripedLocks::new(config.lock_stripes);
@@ -354,6 +404,12 @@ fn main() {
         dah_index,
         unmined_index,
     );
+
+    // Attach the redo log so the engine performs two-phase durability for
+    // secondary index updates (redo fsync BEFORE redb commit).
+    if let Some(ref log) = redo_log {
+        engine.set_redo_log(log.clone());
+    }
 
     // 4b. Initialize blobstore from config and attach to engine
     let blob_store: Arc<dyn BlobStore> = Arc::new(

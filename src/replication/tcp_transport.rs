@@ -98,6 +98,13 @@ impl TcpReplicaTransport {
         stream
             .set_read_timeout(Some(timeout))
             .map_err(|e| ReplicationError::Transport(format!("set read timeout: {e}")))?;
+        // Disable Nagle's algorithm: replication payloads are
+        // latency-sensitive and already batched at the application
+        // layer. Letting the TCP stack coalesce small ACK frames
+        // adds tens of milliseconds of tail latency per round-trip.
+        stream
+            .set_nodelay(true)
+            .map_err(|e| ReplicationError::Transport(format!("set nodelay: {e}")))?;
         configure_tcp_keepalive(&stream);
         Ok(Self {
             stream,
@@ -107,7 +114,12 @@ impl TcpReplicaTransport {
 
     /// Wrap an existing `TcpStream` (for testing or when the connection is
     /// already established, e.g. from an accepted socket).
+    ///
+    /// Best-effort enables `TCP_NODELAY` so streams wrapped here receive
+    /// the same low-latency behavior as `connect()`. Any OS error is
+    /// ignored because the stream is already usable without the option.
     pub fn from_stream(stream: TcpStream) -> Self {
+        let _ = stream.set_nodelay(true);
         Self {
             stream,
             request_id: 0,
@@ -348,6 +360,63 @@ mod tests {
     fn connect_to_invalid_addr_returns_error() {
         let result = TcpReplicaTransport::connect("not_a_valid_address", Duration::from_secs(1));
         assert!(matches!(result, Err(ReplicationError::Transport(_))));
+    }
+
+    /// TCP_NODELAY must be enabled on every replication connection:
+    /// replication payloads are already batched at the application
+    /// layer and ACK frames are small, so Nagle's algorithm only
+    /// adds tail latency.
+    #[test]
+    fn tcp_nodelay_enabled_on_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Keep the server side alive long enough for the client
+            // to inspect its socket options.
+            std::thread::sleep(Duration::from_millis(200));
+            drop(stream);
+        });
+
+        let transport =
+            TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5)).unwrap();
+        assert!(
+            transport.stream.nodelay().expect("read nodelay"),
+            "TCP_NODELAY must be enabled on the replication socket",
+        );
+
+        drop(transport);
+        handle.join().unwrap();
+    }
+
+    /// `from_stream` wraps an already-connected socket and also makes
+    /// a best-effort attempt to enable TCP_NODELAY. Verify the option
+    /// is set after wrapping.
+    #[test]
+    fn tcp_nodelay_enabled_via_from_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            drop(stream);
+        });
+
+        let client = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        // Confirm nodelay is NOT enabled by default (sanity: the test
+        // then asserts from_stream flips it on).
+        let default_nodelay = client.nodelay().unwrap_or(false);
+        let transport = TcpReplicaTransport::from_stream(client);
+        assert!(
+            transport.stream.nodelay().expect("read nodelay"),
+            "from_stream must enable TCP_NODELAY (was default={})",
+            default_nodelay,
+        );
+
+        drop(transport);
+        handle.join().unwrap();
     }
 
     #[test]

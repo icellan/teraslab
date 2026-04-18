@@ -105,12 +105,40 @@ impl SpendRequest {
 /// Result of spend validation, holding the per-record lock.
 ///
 /// Produced by `Engine::validate_spend_multi()`. The lock guard prevents
-/// other mutations on this record until `Engine::apply_spend_multi()`
-/// consumes this struct and releases the lock. This enables the caller
-/// to write redo log entries (WAL) between validation and application.
+/// other mutations on this record until [`ValidatedSpend::apply`] consumes
+/// this struct and releases the lock. This enables the caller to write
+/// redo log entries (WAL) between validation and application.
+///
+/// # Type-state guarantee
+///
+/// [`ValidatedSpend::apply`] takes `self` by value, which forces a move of
+/// the entire struct — including the `_guard` lock. This makes the lock
+/// lifetime a structural property of the API: the compiler rejects any
+/// code path that calls `apply` twice or that uses the struct after
+/// applying, so the lock cannot be released before the mutation is
+/// written. If the caller abandons the `ValidatedSpend` without calling
+/// `apply`, the lock releases via `Drop` and no writes occur — which is
+/// the desired failure mode.
+///
+/// This struct is intentionally neither [`Copy`] nor [`Clone`]: the
+/// contained [`parking_lot::MutexGuard`] is itself not `Clone`, and the
+/// `valid_spends` / `errors` ownership must not be duplicated.
+///
+/// ```compile_fail
+/// # use teraslab::ops::spend::ValidatedSpend;
+/// fn assert_not_copy<T: Copy>() {}
+/// assert_not_copy::<ValidatedSpend<'static>>();
+/// ```
+///
+/// ```compile_fail
+/// # use teraslab::ops::spend::ValidatedSpend;
+/// fn assert_not_clone<T: Clone>() {}
+/// assert_not_clone::<ValidatedSpend<'static>>();
+/// ```
 pub struct ValidatedSpend<'a> {
     /// RAII lock guard — holds the per-transaction stripe lock.
-    /// Dropped when `apply_spend_multi()` consumes this struct.
+    /// Released when this struct is dropped or consumed by
+    /// [`ValidatedSpend::apply`].
     pub(crate) _guard: parking_lot::MutexGuard<'a, ()>,
     /// Transaction key being spent.
     pub tx_key: TxKey,

@@ -104,7 +104,23 @@ pub struct ThreadMetrics {
     /// Total delete operations attempted.
     pub deletes_attempted: PaddedCounter,
     /// Writes ACKed to client without full replication (best_effort degraded).
+    ///
+    /// This counter ticks whenever best-effort replication could not ACK all
+    /// target replicas but at least *one* replica succeeded — the write is
+    /// still multi-node durable, but the configured ACK policy was not fully
+    /// met. Clients receive STATUS_OK in this case.
     pub replication_degraded_acks: PaddedCounter,
+    /// Writes responded to with `STATUS_DEGRADED_DURABILITY` — i.e., the
+    /// mutation was applied and redo-durable locally, but **zero** replicas
+    /// ACKed and best-effort mode suppressed the error. Durability collapsed
+    /// to single-node for these writes; a master crash before catch-up
+    /// streaming loses them. Operators should alert on any non-zero rate.
+    pub repl_degraded_durability: PaddedCounter,
+    /// Incremented every time a stale-routed client request is redirected
+    /// to the correct master (`ERR_REDIRECT` reply emitted). A non-zero
+    /// rate is expected during topology changes; a persistently high rate
+    /// indicates clients are not refreshing their routing table.
+    pub stale_routing_request_total: PaddedCounter,
 }
 
 impl Default for ThreadMetrics {
@@ -137,6 +153,8 @@ impl ThreadMetrics {
             freezes_attempted: PaddedCounter::new(),
             deletes_attempted: PaddedCounter::new(),
             replication_degraded_acks: PaddedCounter::new(),
+            repl_degraded_durability: PaddedCounter::new(),
+            stale_routing_request_total: PaddedCounter::new(),
         }
     }
 }

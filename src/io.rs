@@ -12,7 +12,7 @@
 //!   the device does not expose direct memory access.
 
 use crate::device::{AlignedBuf, BlockDevice, DeviceError};
-use crate::record::{BlockEntry, TxMetadata, UtxoSlot, BLOCK_ENTRY_SIZE, METADATA_SIZE, UTXO_SLOT_SIZE};
+use crate::record::{BlockEntry, TxMetadata, UtxoSlot, BLOCK_ENTRY_SIZE, CRC32_OFFSET, METADATA_SIZE, UTXO_SLOT_SIZE};
 
 /// Result type for I/O helper operations.
 pub type Result<T> = std::result::Result<T, DeviceError>;
@@ -93,6 +93,10 @@ pub unsafe fn write_mutation_footer_direct(
             4,
         );
     }
+    // Callers MUST follow with [`write_crc_direct`] using a meta snapshot
+    // that reflects the final disk state of ALL fields (including those
+    // written by preceding targeted helpers). Without the CRC restamp a
+    // subsequent read will return `DeviceError::RecordCorruption`.
 }
 
 /// Write mutation footer + spent_utxos (for spend/unspend). 21 bytes at 5 offsets.
@@ -162,27 +166,57 @@ pub unsafe fn write_block_entry_direct(
         entry.to_bytes(&mut buf);
         std::ptr::copy_nonoverlapping(buf.as_ptr(), p.add(entry_offset), BLOCK_ENTRY_SIZE);
     }
+    // Callers MUST follow with [`write_crc_direct`] using a meta snapshot
+    // that reflects the final disk state.
+}
+
+/// Write only the CRC32 field of a metadata header (4 bytes at
+/// [`CRC32_OFFSET`]), computed from the full in-memory `meta`.
+///
+/// This is the required finalizer after any sequence of targeted metadata
+/// writes (footer, block-entry, etc.) — it stamps the checksum so that
+/// subsequent reads validate the header as a whole. `meta` must reflect
+/// the final disk state of every field, including those already written
+/// by preceding targeted helpers.
+///
+/// # Safety
+///
+/// Same as [`write_mutation_footer_direct`].
+#[inline]
+pub unsafe fn write_crc_direct(base_ptr: *mut u8, record_offset: u64, meta: &TxMetadata) {
+    unsafe {
+        let p = base_ptr.add(record_offset as usize);
+        let crc = meta.compute_crc();
+        std::ptr::copy_nonoverlapping(
+            crc.to_le_bytes().as_ptr(),
+            p.add(CRC32_OFFSET),
+            4,
+        );
+    }
 }
 
 // ===========================================================================
 // Direct memory access path — zero allocations
 // ===========================================================================
 
-/// Read [`TxMetadata`] directly from a memory-mapped device region.
+/// Read [`TxMetadata`] directly from a memory-mapped device region, validating
+/// the on-disk CRC32.
 ///
 /// Zero-copy: interprets the bytes in place and returns a bitwise copy.
-/// No `AlignedBuf` allocation, no `RwLock`, no syscalls.
+/// No `AlignedBuf` allocation, no `RwLock`, no syscalls. Returns
+/// [`DeviceError::RecordCorruption`] if the CRC slot disagrees with a
+/// freshly-computed CRC over the header bytes.
 ///
 /// # Safety
 ///
 /// `base_ptr` must be valid for at least `record_offset + METADATA_SIZE` bytes.
 /// Caller must hold the per-transaction stripe lock.
 #[inline]
-pub unsafe fn read_metadata_direct(base_ptr: *const u8, record_offset: u64) -> TxMetadata {
+pub unsafe fn read_metadata_direct(base_ptr: *const u8, record_offset: u64) -> Result<TxMetadata> {
     unsafe {
         let src = base_ptr.add(record_offset as usize);
         let bytes = std::slice::from_raw_parts(src, METADATA_SIZE);
-        TxMetadata::from_bytes(bytes)
+        Ok(TxMetadata::from_bytes(bytes)?)
     }
 }
 
@@ -276,7 +310,7 @@ pub fn read_metadata(
     buf[..METADATA_SIZE]
         .copy_from_slice(&read_buf[intra_offset..intra_offset + METADATA_SIZE]);
 
-    Ok(TxMetadata::from_bytes(&buf[..METADATA_SIZE]))
+    Ok(TxMetadata::from_bytes(&buf[..METADATA_SIZE])?)
 }
 
 /// Write the [`TxMetadata`] header of a record at `record_offset`.

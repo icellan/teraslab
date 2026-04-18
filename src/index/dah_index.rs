@@ -10,6 +10,21 @@
 use crate::index::TxKey;
 use std::collections::{BTreeMap, HashMap};
 
+/// Redo log entry for DAH secondary index mutations.
+///
+/// Parallel to [`crate::index::unmined_index::UnminedRedoEntry`]. Captures
+/// the before/after state so the mutation can be replayed idempotently
+/// on crash recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DahRedoEntry {
+    /// Transaction ID.
+    pub txid: [u8; 32],
+    /// Previous delete_at_height value (0 = was not in the index).
+    pub old_height: u32,
+    /// New delete_at_height value (0 = removed from the index).
+    pub new_height: u32,
+}
+
 /// Secondary index mapping delete_at_height to transactions.
 pub struct DahIndex {
     /// Forward map: height -> txids scheduled for deletion at that height.
@@ -84,6 +99,27 @@ impl DahIndex {
         self.by_height
             .iter()
             .flat_map(|(&h, keys)| keys.iter().map(move |&k| (h, k)))
+    }
+
+    /// Replay a DAH redo entry.
+    ///
+    /// Idempotent: replaying the same entry multiple times produces the
+    /// same result.
+    pub fn replay_redo(&mut self, entry: &DahRedoEntry) {
+        let key = TxKey { txid: entry.txid };
+        if entry.new_height == 0 {
+            self.remove(&key);
+        } else {
+            // Insert-or-update idempotently.
+            if let Some(&old_h) = self.by_txid.get(&key) {
+                if old_h == entry.new_height {
+                    return;
+                }
+                self.remove_from_height_vec(old_h, &key);
+            }
+            self.by_txid.insert(key, entry.new_height);
+            self.by_height.entry(entry.new_height).or_default().push(key);
+        }
     }
 
     /// Remove a key from the Vec at the given height, cleaning up empty vecs.

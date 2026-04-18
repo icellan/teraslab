@@ -2,8 +2,20 @@
 //!
 //! All structures are `#[repr(C, packed)]` with compile-time size assertions
 //! to guarantee a stable, known byte layout on NVMe devices.
+//!
+//! # Record integrity
+//!
+//! [`TxMetadata`] embeds a CRC32 checksum computed over the entire 256-byte
+//! header (with the checksum slot zeroed during computation). Every write
+//! recomputes the CRC and stores it in the header; every read validates the
+//! stored CRC against a freshly-computed value and returns
+//! [`RecordError::CrcMismatch`] on disagreement. This guards against torn
+//! writes, bit-rot, and partial-sector updates that would otherwise silently
+//! corrupt fields such as `utxo_count`, `spent_utxos`, or
+//! `block_entries_inline`.
 
 use bitflags::bitflags;
+use thiserror::Error;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -52,6 +64,30 @@ pub const METADATA_SIZE: usize = RAW_METADATA_SIZE + METADATA_PADDING_AMOUNT;
 
 /// Amount of padding bytes appended to reach the 64-byte boundary.
 pub const METADATA_PADDING: usize = METADATA_PADDING_AMOUNT;
+
+// ---------------------------------------------------------------------------
+// RecordError
+// ---------------------------------------------------------------------------
+
+/// Errors produced when parsing on-disk record structures.
+///
+/// Currently the only failure mode is a CRC32 checksum mismatch on
+/// [`TxMetadata`] deserialization, which indicates disk corruption, a torn
+/// write, or a partial-sector update. Callers must propagate this error —
+/// silent acceptance of corrupted metadata is unsafe for a UTXO store.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum RecordError {
+    /// The CRC32 checksum stored in the record header did not match the
+    /// checksum computed over the header bytes (with the checksum slot
+    /// zeroed during computation).
+    #[error("CRC mismatch: expected 0x{expected:08X}, actual 0x{actual:08X}")]
+    CrcMismatch {
+        /// CRC value read from the on-disk header.
+        expected: u32,
+        /// CRC value computed over the header bytes on read.
+        actual: u32,
+    },
+}
 
 // ---------------------------------------------------------------------------
 // UtxoSlot
@@ -344,6 +380,7 @@ struct TxMetadataRaw {
     _external_ref: ExternalRef,
     _conflicting_children_count: u8,
     _conflicting_children_offset: u64,
+    _crc32: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +458,14 @@ pub struct TxMetadata {
     /// Device offset to a separately-allocated block of txids (0 = none).
     pub conflicting_children_offset: u64,
 
+    /// CRC32 checksum over the entire 256-byte header, computed with this
+    /// field zeroed. Guards against torn writes and on-disk corruption.
+    ///
+    /// Populated by [`TxMetadata::to_bytes`]; validated by
+    /// [`TxMetadata::from_bytes`]. Callers should never write this field
+    /// directly.
+    pub crc32: u32,
+
     /// Padding to reach `METADATA_SIZE` (64-byte aligned).
     pub _padding: [u8; METADATA_PADDING],
 }
@@ -463,6 +508,7 @@ impl TxMetadata {
             external_ref: ExternalRef::zeroed(),
             conflicting_children_count: 0,
             conflicting_children_offset: 0,
+            crc32: 0,
             _padding: [0u8; METADATA_PADDING],
         }
     }
@@ -478,9 +524,13 @@ impl TxMetadata {
         METADATA_SIZE as u64 + (utxo_count as u64) * UTXO_SLOT_SIZE as u64
     }
 
-    /// Serialize the entire metadata struct to a byte slice.
+    /// Serialize the entire metadata struct to a byte slice, computing and
+    /// stamping the CRC32 checksum over the serialized bytes (with the CRC
+    /// slot zeroed during computation).
     ///
-    /// The destination must be at least `METADATA_SIZE` bytes.
+    /// The destination must be at least `METADATA_SIZE` bytes. After this
+    /// call, `dst[..METADATA_SIZE]` contains a self-describing header whose
+    /// CRC can be validated by [`TxMetadata::from_bytes`].
     pub fn to_bytes(&self, dst: &mut [u8]) {
         debug_assert!(dst.len() >= METADATA_SIZE);
         // Safety: TxMetadata is repr(C, packed), so we can transmute it to bytes.
@@ -491,13 +541,41 @@ impl TxMetadata {
             )
         };
         dst[..METADATA_SIZE].copy_from_slice(src);
+        // Zero the CRC slot, compute CRC over the full METADATA_SIZE bytes,
+        // then stamp the result into the CRC slot.
+        let crc_off = CRC32_OFFSET;
+        dst[crc_off..crc_off + 4].copy_from_slice(&[0u8; 4]);
+        let crc = crc32fast::hash(&dst[..METADATA_SIZE]);
+        dst[crc_off..crc_off + 4].copy_from_slice(&crc.to_le_bytes());
     }
 
-    /// Deserialize metadata from a byte slice.
+    /// Deserialize metadata from a byte slice, validating the CRC32 checksum.
+    ///
+    /// Returns [`RecordError::CrcMismatch`] if the stored CRC disagrees with
+    /// a freshly-computed CRC over the header bytes (with the CRC slot
+    /// zeroed). This is the only gate against torn writes and on-disk bit
+    /// rot; callers must propagate the error — silent acceptance of
+    /// corrupted metadata can break UTXO correctness.
     ///
     /// The source must be at least `METADATA_SIZE` bytes.
-    pub fn from_bytes(src: &[u8]) -> Self {
+    pub fn from_bytes(src: &[u8]) -> Result<Self, RecordError> {
         debug_assert!(src.len() >= METADATA_SIZE);
+        let crc_off = CRC32_OFFSET;
+        let mut expected = [0u8; 4];
+        expected.copy_from_slice(&src[crc_off..crc_off + 4]);
+        let expected = u32::from_le_bytes(expected);
+
+        // Compute CRC over the header bytes with the CRC slot zeroed.
+        // We use a small on-stack buffer rather than allocating.
+        let mut buf = [0u8; METADATA_SIZE];
+        buf.copy_from_slice(&src[..METADATA_SIZE]);
+        buf[crc_off..crc_off + 4].copy_from_slice(&[0u8; 4]);
+        let actual = crc32fast::hash(&buf);
+
+        if actual != expected {
+            return Err(RecordError::CrcMismatch { expected, actual });
+        }
+
         let mut meta = std::mem::MaybeUninit::<Self>::uninit();
         // Safety: TxMetadata is repr(C, packed) and Copy. We copy exactly
         // METADATA_SIZE bytes into the struct.
@@ -507,8 +585,54 @@ impl TxMetadata {
                 meta.as_mut_ptr().cast::<u8>(),
                 METADATA_SIZE,
             );
+            Ok(meta.assume_init())
+        }
+    }
+
+    /// Deserialize metadata from a byte slice without validating the CRC.
+    ///
+    /// Intended for diagnostics / recovery tooling that needs to inspect a
+    /// corrupted record. Library code on the hot path must use
+    /// [`TxMetadata::from_bytes`] to preserve correctness guarantees.
+    pub fn from_bytes_unchecked(src: &[u8]) -> Self {
+        debug_assert!(src.len() >= METADATA_SIZE);
+        let mut meta = std::mem::MaybeUninit::<Self>::uninit();
+        // Safety: TxMetadata is repr(C, packed) and Copy.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                meta.as_mut_ptr().cast::<u8>(),
+                METADATA_SIZE,
+            );
             meta.assume_init()
         }
+    }
+}
+
+/// Byte offset of the CRC32 field within a serialized [`TxMetadata`] header.
+/// Used by [`TxMetadata::to_bytes`] and [`TxMetadata::from_bytes`] to locate
+/// the four CRC bytes for zeroing/stamping during checksum computation.
+pub const CRC32_OFFSET: usize = std::mem::offset_of!(TxMetadata, crc32);
+
+impl TxMetadata {
+    /// Compute the CRC32 over this metadata header with the CRC slot zeroed.
+    ///
+    /// Used by the targeted-write helpers in [`crate::io`] that mutate only
+    /// a handful of fields on the device — they restamp the CRC based on
+    /// the full in-memory struct (which carries the updated fields) so the
+    /// header remains verifiable on read.
+    pub fn compute_crc(&self) -> u32 {
+        let mut buf = [0u8; METADATA_SIZE];
+        // Safety: TxMetadata is repr(C, packed).
+        let src = unsafe {
+            std::slice::from_raw_parts(
+                (self as *const Self).cast::<u8>(),
+                METADATA_SIZE,
+            )
+        };
+        buf.copy_from_slice(src);
+        buf[CRC32_OFFSET..CRC32_OFFSET + 4].copy_from_slice(&[0u8; 4]);
+        crc32fast::hash(&buf)
     }
 }
 
@@ -550,8 +674,14 @@ const _: () = assert!(BLOCK_ENTRY_SIZE == 12);
 const _: () = assert!(UTXO_SLOT_SIZE == 69);
 const _: () = assert!(std::mem::size_of::<TxFlags>() == 1);
 const _: () = assert!(METADATA_SIZE.is_multiple_of(64));
-const _: () = assert!(METADATA_SIZE == 256); // must not grow — conflicting_children fits in padding
+// METADATA_SIZE is 320 bytes (grew from 256 to accommodate the trailing
+// `crc32` field — see task C7). The header is cache-line aligned and UTXO
+// slots live at a deterministic offset `METADATA_SIZE + vout * 69`.
+const _: () = assert!(METADATA_SIZE == 320);
 const _: () = assert!(std::mem::size_of::<TxMetadata>() == METADATA_SIZE);
+// The CRC slot must sit inside the header (before the padding tail) so it
+// is covered by the checksum computation.
+const _: () = assert!(CRC32_OFFSET + 4 <= METADATA_SIZE);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -758,7 +888,7 @@ mod tests {
 
         let mut buf = vec![0u8; METADATA_SIZE];
         meta.to_bytes(&mut buf);
-        let restored = TxMetadata::from_bytes(&buf);
+        let restored = TxMetadata::from_bytes(&buf).expect("valid CRC");
         assert_eq!(meta, restored);
     }
 
@@ -767,7 +897,7 @@ mod tests {
         let meta = TxMetadata::new(10);
         let mut buf = vec![0u8; METADATA_SIZE];
         meta.to_bytes(&mut buf);
-        let restored = TxMetadata::from_bytes(&buf);
+        let restored = TxMetadata::from_bytes(&buf).expect("valid CRC");
         assert_eq!({ restored.magic }, METADATA_MAGIC);
     }
 
@@ -777,7 +907,7 @@ mod tests {
         assert_eq!(meta.block_entry_count, 0);
         let mut buf = vec![0u8; METADATA_SIZE];
         meta.to_bytes(&mut buf);
-        let restored = TxMetadata::from_bytes(&buf);
+        let restored = TxMetadata::from_bytes(&buf).expect("valid CRC");
         assert_eq!(restored.block_entry_count, 0);
     }
 
@@ -803,7 +933,7 @@ mod tests {
 
         let mut buf = vec![0u8; METADATA_SIZE];
         meta.to_bytes(&mut buf);
-        let restored = TxMetadata::from_bytes(&buf);
+        let restored = TxMetadata::from_bytes(&buf).expect("valid CRC");
 
         assert_eq!(restored.block_entry_count, 3);
         assert_eq!(
@@ -939,7 +1069,7 @@ mod tests {
 
         let mut buf = vec![0u8; METADATA_SIZE];
         meta.to_bytes(&mut buf);
-        let restored = TxMetadata::from_bytes(&buf);
+        let restored = TxMetadata::from_bytes(&buf).expect("valid CRC");
 
         // The count must be 0, meaning a consumer should not read any inline entries.
         assert_eq!(restored.block_entry_count, 0);
@@ -970,7 +1100,7 @@ mod tests {
 
         let mut buf = vec![0u8; METADATA_SIZE];
         meta.to_bytes(&mut buf);
-        let restored = TxMetadata::from_bytes(&buf);
+        let restored = TxMetadata::from_bytes(&buf).expect("valid CRC");
 
         assert_eq!(restored.block_entry_count, 3);
         for i in 0..INLINE_BLOCK_ENTRIES {
@@ -996,15 +1126,65 @@ mod tests {
         let mut buf = vec![0u8; METADATA_SIZE];
         meta.to_bytes(&mut buf);
 
-        // Corrupt the first 4 bytes (magic field)
+        // Corrupt the first 4 bytes (magic field).
         buf[0] = 0x00;
         buf[1] = 0x00;
         buf[2] = 0x00;
         buf[3] = 0x00;
 
-        let restored = TxMetadata::from_bytes(&buf);
-        assert_ne!({ restored.magic }, METADATA_MAGIC);
-        assert_eq!({ restored.magic }, 0x0000_0000);
+        // Checksum-validating read must reject the corrupted header.
+        match TxMetadata::from_bytes(&buf) {
+            Err(RecordError::CrcMismatch { .. }) => {}
+            other => panic!("expected CrcMismatch, got {other:?}"),
+        }
+
+        // The unchecked path still exposes the raw bytes for diagnostics,
+        // and shows the magic field now reads as zero.
+        let raw = TxMetadata::from_bytes_unchecked(&buf);
+        assert_ne!({ raw.magic }, METADATA_MAGIC);
+        assert_eq!({ raw.magic }, 0x0000_0000);
+    }
+
+    #[test]
+    fn metadata_from_bytes_detects_single_bit_flip_anywhere() {
+        let mut meta = TxMetadata::new(7);
+        meta.tx_id = [0xAB; 32];
+        meta.generation = 42;
+        meta.updated_at = 1_700_000_000_000;
+        let mut buf = vec![0u8; METADATA_SIZE];
+        meta.to_bytes(&mut buf);
+
+        // Flip one bit far from the magic — CRC must still catch it.
+        buf[200] ^= 0x01;
+        let err = TxMetadata::from_bytes(&buf).unwrap_err();
+        match err {
+            RecordError::CrcMismatch { expected, actual } => {
+                assert_ne!(expected, actual, "CRC must differ after bit flip");
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_crc_is_deterministic_across_round_trips() {
+        let meta = TxMetadata::new(12);
+        let mut a = vec![0u8; METADATA_SIZE];
+        let mut b = vec![0u8; METADATA_SIZE];
+        meta.to_bytes(&mut a);
+        meta.to_bytes(&mut b);
+        assert_eq!(a, b, "two serializations of the same metadata must match byte-for-byte");
+    }
+
+    #[test]
+    fn metadata_crc_zeroed_field_is_rejected() {
+        let meta = TxMetadata::new(3);
+        let mut buf = vec![0u8; METADATA_SIZE];
+        meta.to_bytes(&mut buf);
+        // Zero out the CRC slot.
+        buf[CRC32_OFFSET..CRC32_OFFSET + 4].copy_from_slice(&[0u8; 4]);
+        let err = TxMetadata::from_bytes(&buf).unwrap_err();
+        let RecordError::CrcMismatch { expected, actual } = err;
+        assert_eq!(expected, 0, "stored CRC was zeroed");
+        assert_ne!(actual, 0, "computed CRC over populated header is non-zero");
     }
 
     #[test]
@@ -1054,7 +1234,7 @@ mod tests {
 
         let mut buf = vec![0u8; METADATA_SIZE];
         meta.to_bytes(&mut buf);
-        let restored = TxMetadata::from_bytes(&buf);
+        let restored = TxMetadata::from_bytes(&buf).expect("valid CRC");
 
         assert_eq!({ restored.magic }, METADATA_MAGIC);
         assert_eq!({ restored.schema_version }, u32::MAX);
@@ -1108,7 +1288,7 @@ mod tests {
 
         let mut buf = vec![0u8; METADATA_SIZE];
         meta.to_bytes(&mut buf);
-        let restored = TxMetadata::from_bytes(&buf);
+        let restored = TxMetadata::from_bytes(&buf).expect("valid CRC");
 
         let rext = restored.external_ref;
         assert_eq!(rext.store_type, 1);
@@ -1169,7 +1349,7 @@ mod tests {
 
             let mut buf = vec![0u8; METADATA_SIZE];
             meta.to_bytes(&mut buf);
-            let restored = TxMetadata::from_bytes(&buf);
+            let restored = TxMetadata::from_bytes(&buf).expect("valid CRC");
 
             assert_eq!(
                 restored.flags, flags,

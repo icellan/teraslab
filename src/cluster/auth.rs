@@ -1,13 +1,48 @@
 //! Cluster authentication via HMAC-SHA256.
 //!
 //! When a cluster secret is configured, all SWIM UDP messages and
-//! inter-node TCP frames carry a 32-byte HMAC tag appended to the
-//! payload. Peers that cannot produce a valid tag are rejected.
+//! inter-node TCP frames carry an 8-byte millisecond Unix timestamp
+//! plus a 32-byte HMAC tag appended to the payload. Peers that cannot
+//! produce a valid tag — or whose timestamp falls outside the
+//! [`MAX_CLOCK_SKEW`] window — are rejected.
+//!
+//! The timestamp is covered by the HMAC (it is included in the signed
+//! input as `payload || timestamp`), which means an attacker cannot
+//! alter the time without invalidating the tag. The skew window
+//! bounds how old a captured message can be and still be accepted,
+//! limiting replay attacks to a short window even if the secret is
+//! known to an on-path attacker.
+//!
+//! This wire extension is additive: legacy unsigned peers still pass
+//! a payload through `sign`/`verify` unchanged (except for the
+//! timestamp+tag suffix). Since nobody runs TeraSlab in production
+//! yet, we do not maintain a bypass for tag-less peers.
 
 use std::io;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Length of the HMAC-SHA256 tag in bytes.
 pub const HMAC_TAG_LEN: usize = 32;
+
+/// Length of the millisecond Unix timestamp embedded alongside the HMAC tag.
+pub const TIMESTAMP_LEN: usize = 8;
+
+/// Total overhead appended to every signed message: `[timestamp_ms:8][tag:32]`.
+pub const SIGNED_SUFFIX_LEN: usize = TIMESTAMP_LEN + HMAC_TAG_LEN;
+
+/// Maximum tolerated clock skew between peers. Messages whose timestamp
+/// differs from local time by more than this are rejected as stale /
+/// replayed. Five minutes matches the wording in the security task and
+/// is generous enough to accommodate reasonable NTP drift.
+pub const MAX_CLOCK_SKEW: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Return the current Unix time in milliseconds, clamped to `u64`.
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Compute HMAC-SHA256 over `data` using the given `key`.
 ///
@@ -45,26 +80,65 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     sha256(&outer_input)
 }
 
-/// Sign `data` by appending a 32-byte HMAC tag. Returns a new Vec.
+/// Sign `data` by appending an 8-byte timestamp and a 32-byte HMAC tag.
+///
+/// The HMAC input is `payload || timestamp_ms_le`. The returned buffer
+/// has the layout `[payload][timestamp_ms:8][tag:32]`.
 pub fn sign(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let tag = hmac_sha256(key, data);
-    let mut signed = Vec::with_capacity(data.len() + HMAC_TAG_LEN);
+    sign_with_timestamp(key, data, now_unix_ms())
+}
+
+/// Sign `data` using a caller-supplied timestamp. Exposed for tests;
+/// production callers should use [`sign`].
+pub fn sign_with_timestamp(key: &[u8], data: &[u8], timestamp_ms: u64) -> Vec<u8> {
+    let mut to_sign = Vec::with_capacity(data.len() + TIMESTAMP_LEN);
+    to_sign.extend_from_slice(data);
+    to_sign.extend_from_slice(&timestamp_ms.to_le_bytes());
+    let tag = hmac_sha256(key, &to_sign);
+    let mut signed = Vec::with_capacity(data.len() + SIGNED_SUFFIX_LEN);
     signed.extend_from_slice(data);
+    signed.extend_from_slice(&timestamp_ms.to_le_bytes());
     signed.extend_from_slice(&tag);
     signed
 }
 
-/// Verify and strip the HMAC tag from `data`. Returns the payload
-/// without the tag on success, or an error if the tag is missing or
-/// invalid.
+/// Verify and strip the timestamp+HMAC tag from `data`.
+///
+/// Returns the payload without the suffix on success. Fails when:
+/// - `data` is shorter than [`SIGNED_SUFFIX_LEN`] (`InvalidData`);
+/// - the HMAC tag does not match (`PermissionDenied`);
+/// - the embedded timestamp differs from local wall-clock time by more
+///   than [`MAX_CLOCK_SKEW`] (`InvalidData`, message "stale timestamp").
 pub fn verify<'a>(key: &[u8], data: &'a [u8]) -> io::Result<&'a [u8]> {
-    if data.len() < HMAC_TAG_LEN {
+    verify_with_now(key, data, now_unix_ms())
+}
+
+/// Verify `data` against `now_ms` as the local wall-clock reference.
+/// Exposed for tests; production callers should use [`verify`].
+pub fn verify_with_now<'a>(key: &[u8], data: &'a [u8], now_ms: u64) -> io::Result<&'a [u8]> {
+    if data.len() < SIGNED_SUFFIX_LEN {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "message too short for HMAC"));
     }
-    let (payload, tag) = data.split_at(data.len() - HMAC_TAG_LEN);
-    let expected = hmac_sha256(key, payload);
+    let (head, tag) = data.split_at(data.len() - HMAC_TAG_LEN);
+    // head = payload || timestamp_ms_le
+    let (payload, ts_bytes) = head.split_at(head.len() - TIMESTAMP_LEN);
+    let expected = hmac_sha256(key, head);
     if !constant_time_eq(tag, &expected) {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "HMAC verification failed"));
+    }
+    // Tag is valid — now enforce the freshness window. The timestamp is
+    // covered by the HMAC so an attacker cannot shift it without
+    // invalidating the tag above.
+    let ts_arr: [u8; TIMESTAMP_LEN] = ts_bytes
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "timestamp read failed"))?;
+    let ts_ms = u64::from_le_bytes(ts_arr);
+    let skew_ms = now_ms.abs_diff(ts_ms);
+    if skew_ms > MAX_CLOCK_SKEW.as_millis() as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stale timestamp: outside clock skew window",
+        ));
     }
     Ok(payload)
 }
@@ -120,7 +194,11 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     for block in padded.chunks_exact(64) {
         let mut w = [0u32; 64];
         for i in 0..16 {
-            w[i] = u32::from_be_bytes(block[i * 4..(i + 1) * 4].try_into().unwrap());
+            w[i] = u32::from_be_bytes(
+                block[i * 4..(i + 1) * 4]
+                    .try_into()
+                    .expect("invariant: 64-byte block sliced in 4-byte windows always yields 4 bytes"),
+            );
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -217,7 +295,75 @@ mod tests {
 
     #[test]
     fn verify_rejects_truncated() {
-        assert!(verify(b"key", &[0u8; 10]).is_err());
+        // Too short to even contain the timestamp+tag suffix.
+        match verify(b"key", &[0u8; 10]) {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {}
+            Err(e) => panic!("expected InvalidData, got {e:?}"),
+            Ok(_) => panic!("expected error on truncated message"),
+        }
+    }
+
+    #[test]
+    fn hmac_with_valid_timestamp_accepted() {
+        let key = b"cluster-secret";
+        let data = b"some cluster gossip";
+        let now_ms = 1_700_000_000_000u64;
+        let signed = sign_with_timestamp(key, data, now_ms);
+        // Verify with a local clock that differs by 10s — well under the window.
+        let payload = verify_with_now(key, &signed, now_ms + 10_000)
+            .expect("verify must accept timestamps within skew window");
+        assert_eq!(payload, data);
+    }
+
+    #[test]
+    fn hmac_with_old_timestamp_is_rejected() {
+        let key = b"cluster-secret";
+        let data = b"some cluster gossip";
+        let now_ms = 1_700_000_000_000u64;
+        let six_minutes_ago = now_ms - 6 * 60 * 1000;
+        let signed = sign_with_timestamp(key, data, six_minutes_ago);
+        match verify_with_now(key, &signed, now_ms) {
+            Ok(_) => panic!("stale timestamp must be rejected"),
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+                assert!(
+                    e.to_string().contains("stale timestamp"),
+                    "error message must identify stale timestamp, got: {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hmac_with_future_timestamp_outside_skew_rejected() {
+        // Symmetric: far-future timestamps are also rejected.
+        let key = b"k";
+        let data = b"x";
+        let now_ms = 1_700_000_000_000u64;
+        let six_minutes_ahead = now_ms + 6 * 60 * 1000;
+        let signed = sign_with_timestamp(key, data, six_minutes_ahead);
+        match verify_with_now(key, &signed, now_ms) {
+            Ok(_) => panic!("future-skew timestamp must be rejected"),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+        }
+    }
+
+    #[test]
+    fn hmac_timestamp_is_covered_by_tag() {
+        // An attacker that flips a bit in the timestamp without recomputing
+        // the tag must be rejected on tag mismatch — NOT on skew — so
+        // the timestamp is cryptographically bound.
+        let key = b"k";
+        let data = b"payload";
+        let now_ms = 1_700_000_000_000u64;
+        let mut signed = sign_with_timestamp(key, data, now_ms);
+        // Tamper with the embedded timestamp bytes (right before the 32-byte tag).
+        let ts_start = signed.len() - HMAC_TAG_LEN - TIMESTAMP_LEN;
+        signed[ts_start] ^= 0xFF;
+        match verify_with_now(key, &signed, now_ms) {
+            Ok(_) => panic!("tampered timestamp must be rejected"),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
+        }
     }
 
     fn hex(data: &[u8]) -> String {

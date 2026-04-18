@@ -24,6 +24,12 @@ pub struct RedbPrimary {
     db: Database,
     /// Cached entry count, maintained on insert/remove to avoid table scans.
     count: usize,
+    /// Test-only: when set, the next `begin_write()` call synthesizes a
+    /// failure. Used in unit tests to assert that commit/storage errors are
+    /// propagated rather than silently swallowed. Always `false` in release
+    /// builds — the `#[cfg(test)]` accessor is the only way to flip it.
+    #[cfg(test)]
+    fail_next_write: bool,
 }
 
 /// Batch update parameters for [`RedbPrimary::update_cached_fields_batch`].
@@ -86,7 +92,42 @@ impl RedbPrimary {
             table.len().map_err(map_redb_storage_err)? as usize
         };
 
-        Ok(Self { db, count })
+        Ok(Self {
+            db,
+            count,
+            #[cfg(test)]
+            fail_next_write: false,
+        })
+    }
+
+    /// Test-only: arm a synthetic failure in the next write transaction.
+    ///
+    /// When armed, the next call to any method that opens a write transaction
+    /// (`update_cached_fields`, `update_cached_fields_batch`, `unregister_batch`,
+    /// etc.) returns an [`IndexError`] instead of performing the write. The
+    /// flag auto-disarms after firing, so subsequent calls behave normally.
+    ///
+    /// This exists solely to verify that error paths propagate correctly;
+    /// it is not compiled into release builds.
+    #[cfg(test)]
+    pub fn arm_fail_next_write(&mut self) {
+        self.fail_next_write = true;
+    }
+
+    /// Returns `Err` if the test-only fail flag is armed, clearing it.
+    ///
+    /// Always returns `Ok(())` in release builds.
+    #[inline]
+    #[allow(clippy::unnecessary_wraps)]
+    fn check_fail_injection(&mut self) -> Result<(), IndexError> {
+        #[cfg(test)]
+        if self.fail_next_write {
+            self.fail_next_write = false;
+            return Err(IndexError::FormatError {
+                detail: "redb test-injected commit failure".into(),
+            });
+        }
+        Ok(())
     }
 
     /// Look up a transaction's index entry.
@@ -176,66 +217,56 @@ impl RedbPrimary {
     /// Returns a `Vec` parallel to the input: `Some(entry)` for keys that were
     /// found and removed, `None` for missing keys.
     ///
-    /// All removals that succeed are committed atomically. If the commit fails,
-    /// the entire batch is treated as failed and `vec![None; keys.len()]` is
-    /// returned.
+    /// All removals that succeed are committed atomically. If the commit fails
+    /// or any storage-level error occurs, an [`IndexError`] is returned so the
+    /// caller can distinguish "nothing removed" from "removal attempted but
+    /// transaction aborted."
     ///
     /// When no keys are found (all-miss), the write transaction is aborted
     /// early to avoid holding the redb write lock unnecessarily.
-    pub fn unregister_batch(&mut self, keys: &[TxKey]) -> Vec<Option<TxIndexEntry>> {
+    pub fn unregister_batch(
+        &mut self,
+        keys: &[TxKey],
+    ) -> Result<Vec<Option<TxIndexEntry>>, IndexError> {
         if keys.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let txn = match self.begin_write() {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("redb unregister_batch: begin_write failed: {e}");
-                return vec![None; keys.len()];
-            }
-        };
+        self.check_fail_injection()?;
+        let txn = self.begin_write().map_err(map_redb_txn_err)?;
         let mut results = Vec::with_capacity(keys.len());
         let mut removed_count = 0usize;
         {
-            let mut table = match txn.open_table(PRIMARY_TABLE) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("redb unregister_batch: open_table failed: {e}");
-                    return vec![None; keys.len()];
-                }
-            };
+            let mut table = txn.open_table(PRIMARY_TABLE).map_err(map_redb_table_err)?;
             for key in keys {
-                match table.remove(key.txid) {
-                    Ok(Some(guard)) => {
+                match table.remove(key.txid).map_err(map_redb_storage_err)? {
+                    Some(guard) => {
                         results.push(Some(deserialize_entry(&guard.value())));
                         removed_count += 1;
                     }
-                    Ok(None) => results.push(None),
-                    Err(e) => {
-                        eprintln!("redb unregister_batch: remove failed for key: {e}");
-                        results.push(None);
-                    }
+                    None => results.push(None),
                 }
             }
         }
         if removed_count > 0 {
-            match txn.commit() {
-                Ok(()) => self.count -= removed_count,
-                Err(e) => {
-                    eprintln!("redb unregister_batch: commit failed: {e}");
-                    return vec![None; keys.len()];
-                }
-            }
+            txn.commit().map_err(map_redb_commit_err)?;
+            self.count -= removed_count;
         } else {
             // All keys were misses — abort the transaction early to release
             // the write lock without performing a commit.
             drop(txn);
         }
-        results
+        Ok(results)
     }
 
     /// Update cached fields for an existing entry.
     ///
-    /// Performs a read-modify-write within a single write transaction.
+    /// Performs a read-modify-write within a single write transaction. Returns
+    /// `Ok(true)` if the key was found and updated, `Ok(false)` if the key was
+    /// not present in the table, and an [`IndexError`] if any redb operation
+    /// (open table, read, insert, commit) fails. The caller MUST propagate the
+    /// error; silently dropping it would cause `dah_or_preserve`,
+    /// `unmined_since`, and `generation` to drift relative to the committed
+    /// state.
     ///
     /// # Concurrency
     ///
@@ -253,24 +284,16 @@ impl RedbPrimary {
         dah_or_preserve: u32,
         unmined_since: u32,
         generation: u32,
-    ) -> bool {
-        let txn = match self.begin_write() {
-            Ok(t) => t,
-            Err(_) => return false,
-        };
+    ) -> Result<bool, IndexError> {
+        self.check_fail_injection()?;
+        let txn = self.begin_write().map_err(map_redb_txn_err)?;
         let updated = {
-            let mut table = match txn.open_table(PRIMARY_TABLE) {
-                Ok(t) => t,
-                Err(_) => return false,
-            };
+            let mut table = txn.open_table(PRIMARY_TABLE).map_err(map_redb_table_err)?;
             // Read existing entry, copying the value to release the borrow.
-            let existing = match table.get(key.txid) {
-                Ok(Some(guard)) => {
-                    let entry = deserialize_entry(&guard.value());
-                    Some(entry)
-                }
-                _ => None,
-            };
+            let existing = table
+                .get(key.txid)
+                .map_err(map_redb_storage_err)?
+                .map(|guard| deserialize_entry(&guard.value()));
             if let Some(mut entry) = existing {
                 entry.tx_flags = tx_flags;
                 entry.block_entry_count = block_entry_count;
@@ -278,20 +301,18 @@ impl RedbPrimary {
                 entry.dah_or_preserve = dah_or_preserve;
                 entry.unmined_since = unmined_since;
                 entry.generation = generation;
-                if let Err(e) = table.insert(key.txid, serialize_entry(&entry)) {
-                    eprintln!("redb update_cached_fields: insert failed: {e}");
-                    return false;
-                }
+                table
+                    .insert(key.txid, serialize_entry(&entry))
+                    .map_err(map_redb_storage_err)?;
                 true
             } else {
                 false
             }
         };
-        if updated && let Err(e) = txn.commit() {
-            eprintln!("redb update_cached_fields: commit failed: {e}");
-            return false;
+        if updated {
+            txn.commit().map_err(map_redb_commit_err)?;
         }
-        updated
+        Ok(updated)
     }
 
     /// Number of entries.
@@ -392,31 +413,35 @@ impl RedbPrimary {
     ///
     /// Performs a read-modify-write for each entry within one redb transaction,
     /// amortizing the `begin_write() -> commit()` overhead across all updates.
-    /// Returns the number of entries successfully updated (missing keys are skipped).
+    /// Returns `Ok(n)` where `n` is the number of entries successfully updated
+    /// (missing keys are skipped). Returns an [`IndexError`] if any redb
+    /// operation — including the final commit — fails. Callers MUST propagate
+    /// this error; silently returning `0` on commit failure would cause
+    /// `dah_or_preserve`, `unmined_since`, and `generation` to drift relative
+    /// to the committed state, leading to incorrect pruning and replication
+    /// decisions downstream.
     ///
     /// # Concurrency
     ///
     /// The caller MUST hold an exclusive lock around the `PrimaryBackend` before
     /// calling this method, same as for individual `update_cached_fields` calls.
-    pub fn update_cached_fields_batch(&mut self, updates: &[CachedFieldsUpdate]) -> usize {
+    pub fn update_cached_fields_batch(
+        &mut self,
+        updates: &[CachedFieldsUpdate],
+    ) -> Result<usize, IndexError> {
         if updates.is_empty() {
-            return 0;
+            return Ok(0);
         }
-        let txn = match self.begin_write() {
-            Ok(t) => t,
-            Err(_) => return 0,
-        };
+        self.check_fail_injection()?;
+        let txn = self.begin_write().map_err(map_redb_txn_err)?;
         let mut count = 0usize;
         {
-            let mut table = match txn.open_table(PRIMARY_TABLE) {
-                Ok(t) => t,
-                Err(_) => return 0,
-            };
+            let mut table = txn.open_table(PRIMARY_TABLE).map_err(map_redb_table_err)?;
             for update in updates {
-                let existing = match table.get(update.key.txid) {
-                    Ok(Some(guard)) => Some(deserialize_entry(&guard.value())),
-                    _ => None,
-                };
+                let existing = table
+                    .get(update.key.txid)
+                    .map_err(map_redb_storage_err)?
+                    .map(|guard| deserialize_entry(&guard.value()));
                 if let Some(mut entry) = existing {
                     entry.tx_flags = update.tx_flags;
                     entry.block_entry_count = update.block_entry_count;
@@ -424,19 +449,17 @@ impl RedbPrimary {
                     entry.dah_or_preserve = update.dah_or_preserve;
                     entry.unmined_since = update.unmined_since;
                     entry.generation = update.generation;
-                    if table.insert(update.key.txid, serialize_entry(&entry)).is_ok() {
-                        count += 1;
-                    }
+                    table
+                        .insert(update.key.txid, serialize_entry(&entry))
+                        .map_err(map_redb_storage_err)?;
+                    count += 1;
                 }
             }
         }
-        if count > 0
-            && let Err(e) = txn.commit()
-        {
-            eprintln!("redb update_cached_fields_batch: commit failed: {e}");
-            return 0;
+        if count > 0 {
+            txn.commit().map_err(map_redb_commit_err)?;
         }
-        count
+        Ok(count)
     }
 
     /// Snapshot is a no-op for redb (already crash-durable).
@@ -605,7 +628,9 @@ mod tests {
         let key = make_key(1);
         primary.register(key, make_entry(4096)).unwrap();
 
-        let updated = primary.update_cached_fields(&key, 0xFF, 5, 8, 200, 600, 99);
+        let updated = primary
+            .update_cached_fields(&key, 0xFF, 5, 8, 200, 600, 99)
+            .unwrap();
         assert!(updated);
 
         let e = primary.lookup(&key).unwrap();
@@ -623,7 +648,10 @@ mod tests {
     #[test]
     fn update_cached_fields_missing_returns_false() {
         let (_dir, mut primary) = open_temp();
-        assert!(!primary.update_cached_fields(&make_key(1), 0, 0, 0, 0, 0, 0));
+        let updated = primary
+            .update_cached_fields(&make_key(1), 0, 0, 0, 0, 0, 0)
+            .unwrap();
+        assert!(!updated);
     }
 
     #[test]
@@ -965,7 +993,7 @@ mod tests {
             })
             .collect();
 
-        let updated = primary.update_cached_fields_batch(&updates);
+        let updated = primary.update_cached_fields_batch(&updates).unwrap();
         assert_eq!(updated, 5);
 
         for i in 0..5u64 {
@@ -1018,7 +1046,7 @@ mod tests {
             },
         ];
 
-        let updated = primary.update_cached_fields_batch(&updates);
+        let updated = primary.update_cached_fields_batch(&updates).unwrap();
         assert_eq!(updated, 2);
 
         let e1 = primary.lookup(&make_key(1)).unwrap();
@@ -1036,7 +1064,7 @@ mod tests {
     fn update_cached_fields_batch_empty() {
         let (_dir, mut primary) = open_temp();
         primary.register(make_key(1), make_entry(100)).unwrap();
-        let updated = primary.update_cached_fields_batch(&[]);
+        let updated = primary.update_cached_fields_batch(&[]).unwrap();
         assert_eq!(updated, 0);
         // Original entry unchanged
         let e = primary.lookup(&make_key(1)).unwrap();
@@ -1053,7 +1081,8 @@ mod tests {
             p1.register(make_key(i), make_entry(i * 100)).unwrap();
         }
         for i in 0..10u64 {
-            p1.update_cached_fields(&make_key(i), 0xCC, 3, i as u32, 400, 500, 60);
+            p1.update_cached_fields(&make_key(i), 0xCC, 3, i as u32, 400, 500, 60)
+                .unwrap();
         }
 
         // Batch update
@@ -1074,7 +1103,7 @@ mod tests {
                 generation: 60,
             })
             .collect();
-        let updated = p2.update_cached_fields_batch(&updates);
+        let updated = p2.update_cached_fields_batch(&updates).unwrap();
         assert_eq!(updated, 10);
 
         // Both should produce identical results
@@ -1113,7 +1142,7 @@ mod tests {
                     generation: 44,
                 })
                 .collect();
-            primary.update_cached_fields_batch(&updates);
+            primary.update_cached_fields_batch(&updates).unwrap();
         }
 
         // Reopen and verify
@@ -1143,7 +1172,9 @@ mod tests {
         };
         primary.register(key, entry).unwrap();
 
-        primary.update_cached_fields(&key, 0xFF, 10, 20, 300, 700, 50);
+        primary
+            .update_cached_fields(&key, 0xFF, 10, 20, 300, 700, 50)
+            .unwrap();
 
         let e = primary.lookup(&key).unwrap();
         // device_id and record_offset and utxo_count should be unchanged
@@ -1160,7 +1191,9 @@ mod tests {
         {
             let mut primary = RedbPrimary::open(&db_path, 64 * 1024 * 1024).unwrap();
             primary.register(make_key(1), make_entry(100)).unwrap();
-            primary.update_cached_fields(&make_key(1), 0xAA, 9, 99, 999, 9999, 42);
+            primary
+                .update_cached_fields(&make_key(1), 0xAA, 9, 99, 999, 9999, 42)
+                .unwrap();
         }
 
         // Reopen and verify the updated fields persisted
@@ -1185,7 +1218,7 @@ mod tests {
         assert_eq!(primary.len(), 5);
 
         let keys: Vec<_> = (1..4u64).map(make_key).collect();
-        let results = primary.unregister_batch(&keys);
+        let results = primary.unregister_batch(&keys).unwrap();
 
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].unwrap().record_offset, 100);
@@ -1209,7 +1242,7 @@ mod tests {
         primary.register(make_key(3), make_entry(300)).unwrap();
 
         let keys = vec![make_key(1), make_key(2), make_key(3), make_key(4)];
-        let results = primary.unregister_batch(&keys);
+        let results = primary.unregister_batch(&keys).unwrap();
 
         assert_eq!(results.len(), 4);
         assert!(results[0].is_some());
@@ -1223,7 +1256,7 @@ mod tests {
     fn unregister_batch_empty() {
         let (_dir, mut primary) = open_temp();
         primary.register(make_key(1), make_entry(100)).unwrap();
-        let results = primary.unregister_batch(&[]);
+        let results = primary.unregister_batch(&[]).unwrap();
         assert!(results.is_empty());
         assert_eq!(primary.len(), 1);
     }
@@ -1234,10 +1267,172 @@ mod tests {
         primary.register(make_key(1), make_entry(100)).unwrap();
 
         let keys = vec![make_key(99), make_key(100)];
-        let results = primary.unregister_batch(&keys);
+        let results = primary.unregister_batch(&keys).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results[0].is_none());
         assert!(results[1].is_none());
         assert_eq!(primary.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Commit-failure propagation tests (C3)
+    //
+    // Before the fix, update_cached_fields / _batch and unregister_batch
+    // silently swallowed redb commit errors and returned 0 / false /
+    // vec![None; N]. That silent drift could cause DAH, unmined_since, and
+    // generation to diverge from the persisted state.
+    //
+    // Triggering a real commit failure from userspace is unreliable — redb
+    // memory-maps the database and tolerates file truncation, unlinking, or
+    // directory perms changes for many operations. We therefore use a
+    // test-only injection hook (`arm_fail_next_write`) on RedbPrimary to
+    // synthesize an IndexError at the start of the next write, and assert
+    // that each wrapper method propagates that error to its caller instead
+    // of silently returning a zero/false/None result.
+    //
+    // The state after an injected failure is asserted to be unchanged so
+    // the test also confirms the "no partial update on error" guarantee.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn update_cached_fields_propagates_commit_failure() {
+        let (_dir, mut primary) = open_temp();
+        let key = make_key(1);
+        primary.register(key, make_entry(4096)).unwrap();
+        // Snapshot original cached fields for post-condition check.
+        let before = primary.lookup(&key).unwrap();
+
+        primary.arm_fail_next_write();
+        let result = primary.update_cached_fields(&key, 0xDD, 9, 77, 88, 99, 123);
+        let err = result.expect_err("injected failure must propagate");
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(
+                    detail.contains("test-injected"),
+                    "expected test-injection marker, got: {detail}"
+                );
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
+
+        // Post-condition: the entry is untouched because the write aborted
+        // before opening the transaction.
+        let after = primary.lookup(&key).unwrap();
+        assert_eq!(before.tx_flags, after.tx_flags);
+        assert_eq!(before.generation, after.generation);
+        assert_eq!(before.dah_or_preserve, after.dah_or_preserve);
+        assert_eq!(before.unmined_since, after.unmined_since);
+
+        // Disarmed after one firing — next call works normally.
+        let ok = primary
+            .update_cached_fields(&key, 0xDD, 9, 77, 88, 99, 123)
+            .expect("post-failure call must succeed");
+        assert!(ok);
+        let final_entry = primary.lookup(&key).unwrap();
+        assert_eq!(final_entry.tx_flags, 0xDD);
+        assert_eq!(final_entry.generation, 123);
+    }
+
+    #[test]
+    fn update_cached_fields_batch_propagates_commit_failure() {
+        let (_dir, mut primary) = open_temp();
+        for i in 0..3u64 {
+            primary.register(make_key(i), make_entry(i * 100)).unwrap();
+        }
+        let before: Vec<_> = (0..3u64)
+            .map(|i| primary.lookup(&make_key(i)).unwrap())
+            .collect();
+
+        let updates: Vec<CachedFieldsUpdate> = (0..3u64)
+            .map(|i| CachedFieldsUpdate {
+                key: make_key(i),
+                tx_flags: 0xDD,
+                block_entry_count: 5,
+                spent_utxos: 77,
+                dah_or_preserve: 88,
+                unmined_since: 99,
+                generation: 123,
+            })
+            .collect();
+
+        primary.arm_fail_next_write();
+        let result = primary.update_cached_fields_batch(&updates);
+        let err = result.expect_err("injected failure must propagate");
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(
+                    detail.contains("test-injected"),
+                    "expected test-injection marker, got: {detail}"
+                );
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
+
+        // Post-condition: nothing was applied — durability-critical fields
+        // are unchanged. Before the fix the function returned 0 on commit
+        // failure and callers saw "nothing to do" even though in-transaction
+        // inserts would have been lost.
+        for (i, prev) in before.iter().enumerate() {
+            let cur = primary.lookup(&make_key(i as u64)).unwrap();
+            assert_eq!(prev.tx_flags, cur.tx_flags);
+            assert_eq!(prev.generation, cur.generation);
+            assert_eq!(prev.dah_or_preserve, cur.dah_or_preserve);
+            assert_eq!(prev.unmined_since, cur.unmined_since);
+        }
+
+        // Disarmed after one firing — retry works normally.
+        let n = primary
+            .update_cached_fields_batch(&updates)
+            .expect("post-failure batch must succeed");
+        assert_eq!(n, 3);
+        for i in 0..3u64 {
+            let e = primary.lookup(&make_key(i)).unwrap();
+            assert_eq!(e.tx_flags, 0xDD);
+            assert_eq!(e.generation, 123);
+        }
+    }
+
+    #[test]
+    fn unregister_batch_propagates_commit_failure() {
+        let (_dir, mut primary) = open_temp();
+        for i in 0..3u64 {
+            primary.register(make_key(i), make_entry(i * 100)).unwrap();
+        }
+        let before_len = primary.len();
+
+        primary.arm_fail_next_write();
+        let keys: Vec<_> = (0..3u64).map(make_key).collect();
+        let result = primary.unregister_batch(&keys);
+        let err = result.expect_err("injected failure must propagate");
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(
+                    detail.contains("test-injected"),
+                    "expected test-injection marker, got: {detail}"
+                );
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
+
+        // Post-condition: nothing was removed. Pre-fix code returned
+        // `vec![None; 3]` on commit failure, making callers believe the
+        // keys were missing when they were actually still present.
+        assert_eq!(primary.len(), before_len);
+        for i in 0..3u64 {
+            assert!(
+                primary.lookup(&make_key(i)).is_some(),
+                "entry {i} should still exist after aborted unregister_batch"
+            );
+        }
+
+        // Retry succeeds and actually removes the entries.
+        let results = primary
+            .unregister_batch(&keys)
+            .expect("post-failure retry must succeed");
+        assert_eq!(results.len(), 3);
+        for r in &results {
+            assert!(r.is_some(), "every key should have been found and removed");
+        }
+        assert_eq!(primary.len(), 0);
     }
 }

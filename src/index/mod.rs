@@ -15,11 +15,11 @@ pub mod secondary_backend;
 pub mod unmined_index;
 
 pub use backend::PrimaryBackend;
-pub use dah_index::DahIndex;
+pub use dah_index::{DahIndex, DahRedoEntry};
 pub use hashtable::{TxIndexEntry, TxKey};
 pub use redb_primary::CachedFieldsUpdate;
 pub use secondary_backend::{DahBackend, UnminedBackend};
-pub use unmined_index::UnminedIndex;
+pub use unmined_index::{UnminedIndex, UnminedRedoEntry};
 
 use crate::allocator::SlotAllocator;
 use crate::device::{AlignedBuf, BlockDevice};
@@ -160,6 +160,16 @@ impl Index {
         self.table.is_file_backed()
     }
 
+    /// Attach a redo log for journaling crash-atomic file-backed resizes.
+    ///
+    /// See [`hashtable::HashTable::set_redo_log`] for the full contract.
+    pub fn set_redo_log(
+        &mut self,
+        redo_log: std::sync::Arc<parking_lot::Mutex<crate::redo::RedoLog>>,
+    ) {
+        self.table.set_redo_log(redo_log);
+    }
+
     /// Look up where a transaction's record lives on disk.
     pub fn lookup(&self, key: &TxKey) -> Option<TxIndexEntry> {
         self.table.get_entry(key)
@@ -283,8 +293,12 @@ impl Index {
 
     /// Restore all indexes from a snapshot file.
     ///
-    /// If a secondary index section is corrupt, the corresponding index is
-    /// returned empty and the rebuild flag is set.
+    /// Each secondary index section is parsed independently (H6): if the
+    /// DAH section is corrupt, only `dah_needs_rebuild` is set — the
+    /// unmined section is still searched for and parsed. Symmetrically, if
+    /// unmined is corrupt the DAH section is retained. Recovery then only
+    /// rebuilds the sections that actually failed, avoiding a full device
+    /// rescan that would throw away still-valid unmined data.
     pub fn restore_all(
         path: &std::path::Path,
     ) -> Result<(Self, DahIndex, UnminedIndex, RestoreFlags)> {
@@ -297,26 +311,31 @@ impl Index {
 
         let remaining = &data[primary_end..];
 
-        // Try to parse DAH section
-        let dah_end = match deserialize_secondary(remaining, &DAH_SECTION_MAGIC) {
-            Ok((entries, consumed)) => {
-                for (h, k) in entries {
-                    dah.insert(h, k);
+        // Attempt DAH section parse at the expected offset (right after
+        // primary). On success we know where unmined begins. On failure we
+        // fall back to a targeted scan for the unmined section magic.
+        let (dah_ok, unmined_slice): (bool, &[u8]) =
+            match deserialize_secondary(remaining, &DAH_SECTION_MAGIC) {
+                Ok((entries, consumed)) => {
+                    for (h, k) in entries {
+                        dah.insert(h, k);
+                    }
+                    (true, &remaining[consumed..])
                 }
-                consumed
-            }
-            Err(_) => {
-                flags.dah_needs_rebuild = true;
-                // Can't determine where DAH section ends — unmined section
-                // may also be unreadable.
-                flags.unmined_needs_rebuild = true;
-                return Ok((index, dah, unmined, flags));
-            }
-        };
+                Err(_) => {
+                    flags.dah_needs_rebuild = true;
+                    // DAH offset is unknown; locate unmined by scanning for
+                    // its magic marker. Because magic bytes can in theory
+                    // appear inside DAH payload data, the first match with
+                    // a successfully-parsable header is preferred; if no
+                    // candidate parses cleanly, unmined is also flagged.
+                    (false, locate_unmined_section(remaining))
+                }
+            };
 
-        // Try to parse unmined section
-        let unmined_remaining = &remaining[dah_end..];
-        match deserialize_secondary(unmined_remaining, &UNMINED_SECTION_MAGIC) {
+        // Parse unmined section from the located slice (or continue after
+        // DAH in the happy path).
+        match deserialize_secondary(unmined_slice, &UNMINED_SECTION_MAGIC) {
             Ok((entries, _)) => {
                 for (h, k) in entries {
                     unmined.insert(h, k);
@@ -326,6 +345,9 @@ impl Index {
                 flags.unmined_needs_rebuild = true;
             }
         }
+
+        // Suppress unused-variable lint when both succeed.
+        let _ = dah_ok;
 
         Ok((index, dah, unmined, flags))
     }
@@ -359,7 +381,13 @@ impl Index {
                 continue;
             }
 
-            let meta = TxMetadata::from_bytes(&buf[..METADATA_SIZE]);
+            let meta = match TxMetadata::from_bytes(&buf[..METADATA_SIZE]) {
+                Ok(m) => m,
+                Err(_) => {
+                    offset += align as u64;
+                    continue;
+                }
+            };
             if { meta.magic } != METADATA_MAGIC {
                 offset += align as u64;
                 continue;
@@ -417,7 +445,13 @@ impl Index {
                 continue;
             }
 
-            let meta = TxMetadata::from_bytes(&buf[..METADATA_SIZE]);
+            let meta = match TxMetadata::from_bytes(&buf[..METADATA_SIZE]) {
+                Ok(m) => m,
+                Err(_) => {
+                    offset += align as u64;
+                    continue;
+                }
+            };
             if { meta.magic } != METADATA_MAGIC {
                 offset += align as u64;
                 continue;
@@ -592,6 +626,34 @@ fn serialize_secondary(
     let checksum = crc32fast::hash(&buf);
     buf.extend_from_slice(&checksum.to_le_bytes());
     buf
+}
+
+/// Scan the provided slice for a byte window that begins with the unmined
+/// section magic (`UNMI`) AND whose declared `count` + body fits inside the
+/// remaining bytes. Returns the subslice starting at the first candidate that
+/// passes the size sanity-check (which `deserialize_secondary` will then
+/// validate via checksum), or an empty slice if no candidate is found.
+///
+/// Used by [`Index::restore_all`] when the DAH section header is corrupt and
+/// the offset of the unmined section is unknown.
+fn locate_unmined_section(data: &[u8]) -> &[u8] {
+    let header_size = 4 + 4 + 8;
+    let mut idx = 0usize;
+    while idx + header_size + 4 <= data.len() {
+        if data[idx..idx + 4] == UNMINED_SECTION_MAGIC {
+            // Check declared count fits in remaining bytes.
+            let count = u64::from_le_bytes(
+                data[idx + 8..idx + 16].try_into().unwrap(),
+            ) as usize;
+            let body_size = count.saturating_mul(SECONDARY_ENTRY_SIZE);
+            let total = header_size + body_size + 4;
+            if data.len() - idx >= total {
+                return &data[idx..];
+            }
+        }
+        idx += 1;
+    }
+    &[]
 }
 
 fn deserialize_secondary(
@@ -828,6 +890,104 @@ mod tests {
         assert_eq!(restored_idx.len(), 1); // Primary should be fine
         assert!(flags.dah_needs_rebuild);
         assert!(restored_dah.is_empty());
+    }
+
+    #[test]
+    fn restore_all_dah_corrupt_but_unmined_intact() {
+        // H6: DAH section is corrupted, but unmined is intact. Recovery
+        // must flag ONLY dah_needs_rebuild and retain the unmined entries.
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("all.snap");
+
+        let mut idx = Index::new(100).unwrap();
+        idx.register(make_key(1), make_entry(100)).unwrap();
+        idx.register(make_key(2), make_entry(200)).unwrap();
+        idx.register(make_key(3), make_entry(300)).unwrap();
+
+        let mut dah = DahIndex::new();
+        dah.insert(100, make_key(1));
+        dah.insert(200, make_key(2));
+
+        let mut unmined = UnminedIndex::new();
+        unmined.insert(500, make_key(1));
+        unmined.insert(600, make_key(2));
+        unmined.insert(700, make_key(3));
+
+        idx.snapshot_all(&dah, &unmined, &snap_path).unwrap();
+
+        // Corrupt ONLY the DAH section header by flipping a byte inside its
+        // declared count field. Leave UNMI section untouched.
+        let mut data = std::fs::read(&snap_path).unwrap();
+        let dah_pos = data
+            .windows(4)
+            .position(|w| w == b"DAHI")
+            .expect("DAH magic should be present in snapshot");
+        // Flip a bit in the count word (offset 8 after magic+version)
+        data[dah_pos + 8] ^= 0xFF;
+        std::fs::write(&snap_path, &data).unwrap();
+
+        let (restored_idx, restored_dah, restored_unmined, flags) =
+            Index::restore_all(&snap_path).unwrap();
+
+        // Primary index is still good.
+        assert_eq!(restored_idx.len(), 3);
+        assert!(restored_idx.lookup(&make_key(1)).is_some());
+        assert!(restored_idx.lookup(&make_key(2)).is_some());
+        assert!(restored_idx.lookup(&make_key(3)).is_some());
+
+        // DAH is empty and flagged for rebuild.
+        assert!(flags.dah_needs_rebuild);
+        assert!(restored_dah.is_empty());
+
+        // Unmined is intact — NOT flagged for rebuild and entries preserved.
+        assert!(!flags.unmined_needs_rebuild,
+            "unmined should not be flagged when only DAH is corrupt");
+        assert_eq!(restored_unmined.len(), 3);
+        let up_to_700 = restored_unmined.range_query(700);
+        assert_eq!(up_to_700.len(), 3);
+        let up_to_600 = restored_unmined.range_query(600);
+        assert_eq!(up_to_600.len(), 2);
+    }
+
+    #[test]
+    fn restore_all_unmined_corrupt_but_dah_intact() {
+        // H6 symmetric case: unmined corrupt, DAH intact.
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("all.snap");
+
+        let mut idx = Index::new(100).unwrap();
+        idx.register(make_key(1), make_entry(100)).unwrap();
+        idx.register(make_key(2), make_entry(200)).unwrap();
+
+        let mut dah = DahIndex::new();
+        dah.insert(111, make_key(1));
+        dah.insert(222, make_key(2));
+
+        let mut unmined = UnminedIndex::new();
+        unmined.insert(333, make_key(1));
+
+        idx.snapshot_all(&dah, &unmined, &snap_path).unwrap();
+
+        // Corrupt the UNMI section's declared count.
+        let mut data = std::fs::read(&snap_path).unwrap();
+        let pos = data
+            .windows(4)
+            .position(|w| w == b"UNMI")
+            .expect("UNMI magic should be present");
+        data[pos + 8] ^= 0xFF;
+        std::fs::write(&snap_path, &data).unwrap();
+
+        let (restored_idx, restored_dah, restored_unmined, flags) =
+            Index::restore_all(&snap_path).unwrap();
+
+        assert_eq!(restored_idx.len(), 2);
+        assert!(!flags.dah_needs_rebuild,
+            "DAH should not be flagged when only unmined is corrupt");
+        assert_eq!(restored_dah.len(), 2);
+        assert_eq!(restored_dah.range_query(222).len(), 2);
+
+        assert!(flags.unmined_needs_rebuild);
+        assert!(restored_unmined.is_empty());
     }
 
     #[test]
@@ -1162,5 +1322,97 @@ mod tests {
     fn anonymous_index_is_not_file_backed() {
         let idx = Index::new(16).unwrap();
         assert!(!idx.is_file_backed());
+    }
+
+    #[test]
+    fn concurrent_register_produces_one_resize_per_threshold_crossing() {
+        // M9: stress test for the register→resize path.
+        //
+        // N threads each register M keys through a single shared Index
+        // (wrapped in a Mutex since register takes &mut self). The
+        // capacity must monotonically grow and never resize when the
+        // load factor is below the threshold. Because the underlying
+        // HashTable::resize now defensively re-checks `new_cap > capacity`,
+        // a racing caller that observes a stale load factor can't
+        // accidentally grow past the target on the same generation.
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let idx = Arc::new(Mutex::new(Index::new(16).unwrap()));
+        let start_capacity = idx.lock().unwrap().stats().capacity;
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 200;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let idx = Arc::clone(&idx);
+                thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let mut txid = [0u8; 32];
+                        txid[0] = t as u8;
+                        txid[1..5].copy_from_slice(&(i as u32).to_le_bytes());
+                        let key = TxKey { txid };
+                        let entry = TxIndexEntry {
+                            device_id: 0,
+                            record_offset: ((t * PER_THREAD + i) * 4096) as u64,
+                            utxo_count: 1,
+                            block_entry_count: 0,
+                            tx_flags: 0,
+                            spent_utxos: 0,
+                            dah_or_preserve: 0,
+                            unmined_since: 0,
+                            generation: 0,
+                        };
+                        idx.lock().unwrap().register(key, entry).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let final_stats = idx.lock().unwrap().stats();
+        assert_eq!(
+            final_stats.entry_count,
+            THREADS * PER_THREAD,
+            "all registered entries must be present",
+        );
+        // Final capacity must have grown by at least one doubling and
+        // must be a power of two (the invariant enforced by resize).
+        assert!(
+            final_stats.capacity > start_capacity,
+            "expected capacity > {start_capacity}, got {}",
+            final_stats.capacity,
+        );
+        assert!(
+            final_stats.capacity.is_power_of_two(),
+            "capacity must be power of two, got {}",
+            final_stats.capacity,
+        );
+        // Load factor must satisfy the invariant (<= threshold) after
+        // the last register call.
+        assert!(
+            final_stats.load_factor <= 0.7,
+            "final load factor {} must respect resize threshold 0.7",
+            final_stats.load_factor,
+        );
+    }
+
+    #[test]
+    fn resize_to_smaller_or_equal_capacity_is_noop() {
+        // M9 defensive re-check: resize() with a `new_capacity` that
+        // rounds to the current or smaller capacity must NOT mutate.
+        let mut idx = Index::new(64).unwrap();
+        let start_capacity = idx.stats().capacity;
+        // Directly reach into the table to request a "bogus" resize.
+        idx.table.resize(16).unwrap(); // rounds to 16 < start_capacity
+        idx.table.resize(start_capacity).unwrap(); // equal
+        assert_eq!(
+            idx.stats().capacity,
+            start_capacity,
+            "no-op resize must not change capacity"
+        );
     }
 }

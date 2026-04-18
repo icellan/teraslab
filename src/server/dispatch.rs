@@ -312,6 +312,31 @@ pub(crate) fn handle_request(
                     && source_manifest.is_none()
                     && source_entries.as_ref().is_none_or(|entries| entries.is_empty());
 
+            // Safety requirement (H3): when the source claims `record_count > 0`,
+            // it MUST also send a manifest hash (or exact-entry manifest). Without
+            // one, we cannot verify that every received record matches the source's
+            // contents and a malformed/stale frame could mark a non-empty shard
+            // migrated prematurely. Reject non-empty completions that lack both.
+            let has_manifest_evidence = source_manifest.is_some()
+                || source_entries.as_ref().is_some_and(|e| !e.is_empty());
+            if expected_records > 0 && !has_manifest_evidence {
+                return error_response(
+                    request.request_id,
+                    ERR_MIGRATION_MANIFEST_REQUIRED,
+                    &format!(
+                        "shard {shard} migration-complete with record_count={expected_records} requires manifest hash or exact-entry manifest",
+                    ),
+                );
+            }
+
+            // Note: the zero-count + no-manifest fast-path is preserved as a
+            // legitimate control-plane signal used when the receiver already
+            // holds the shard contents (e.g. via prior replica delivery) and
+            // the source just needs to clear pending-inbound state. The
+            // `record_count > 0` guard above is sufficient to close H3: any
+            // frame claiming to have delivered data MUST include cryptographic
+            // evidence that the data actually matches the source.
+
             // Verify the actual record count matches expected exactly
             // using the O(1) per-shard counter.
             let actual = engine.shard_record_count(shard);
@@ -333,7 +358,15 @@ pub(crate) fn handle_request(
                 );
             }
 
-            let exact_entries_verified = if let Some(entries) = source_entries.as_ref() {
+            // Only treat the exact-entry manifest as "verified" when it is
+            // non-empty AND its length matches the expected record count.
+            // An empty exact-entry list with `record_count > 0` is not
+            // evidence of anything — the receiver must still verify via
+            // the SHA-256 manifest (H3 safety requirement).
+            let exact_entries_verified = if let Some(entries) = source_entries.as_ref()
+                && !entries.is_empty()
+                && entries.len() as u64 == expected_records
+            {
                 for (key, expected_generation) in entries {
                     let meta = match engine.read_metadata(key) {
                         Ok(meta) => meta,
@@ -394,7 +427,7 @@ pub(crate) fn handle_request(
                 if local_hash != expected_hash {
                     return error_response(
                         request.request_id,
-                        ERR_MIGRATION_IN_PROGRESS,
+                        ERR_MIGRATION_MANIFEST_MISMATCH,
                         &format!(
                             "shard {shard} manifest hash mismatch (count matched at {actual} records but content differs)",
                         ),
@@ -482,9 +515,20 @@ pub(crate) fn handle_request(
         }
         OP_TOPOLOGY_PROPOSE => {
             // Topology authority: another node is proposing a new term.
-            // Validate and vote. Persist voted_term BEFORE returning
-            // the vote — safety requirement to prevent double-voting
-            // after a crash.
+            //
+            // Safety requirement (H10): `voted_term` MUST be fsync'd to disk
+            // BEFORE the vote reply frame hits the wire. If the voter crashes
+            // between reply and persist, the proposer may have already
+            // counted our "yes" toward quorum while we come back thinking we
+            // never voted — giving us license to vote "yes" for a *conflicting*
+            // term and causing split-brain. The sequence is:
+            //
+            //   1. `handle_propose` records the vote in memory.
+            //   2. `persist_topology` fsyncs it durably.
+            //   3. Only then do we construct and return the reply frame.
+            //
+            // If step 2 fails we return `ERR_TOPOLOGY_PERSIST_FAILED` and the
+            // proposer treats it as "no vote / retry".
             let cluster = match cluster {
                 Some(c) => c,
                 None => return error_response(request.request_id, ERR_INTERNAL, "not clustered"),
@@ -492,8 +536,17 @@ pub(crate) fn handle_request(
             match crate::cluster::topology::TopologyTerm::deserialize(&request.payload) {
                 Some(propose) => {
                     let vote = cluster.topology_authority().handle_propose(&propose);
-                    if vote.accepted {
-                        cluster.persist_topology();
+                    if vote.accepted
+                        && let Err(e) = cluster.persist_topology()
+                    {
+                        return error_response(
+                            request.request_id,
+                            ERR_TOPOLOGY_PERSIST_FAILED,
+                            &format!(
+                                "topology vote accepted for term {} but persist failed: {e}",
+                                propose.term,
+                            ),
+                        );
                     }
                     ResponseFrame {
                         request_id: request.request_id,
@@ -540,12 +593,25 @@ pub(crate) fn handle_request(
                 Some(commit) => {
                     let members = commit.members.clone();
                     if let Some(term) = cluster.topology_authority().handle_commit(&commit) {
+                        // Safety requirement (H10): persist the committed
+                        // `committed_term` / `committed_members` BEFORE
+                        // replying so the commit survives a crash. If
+                        // persist fails, refuse to ack; the proposer will
+                        // retry and we'll re-apply on the retry.
+                        if let Err(e) = cluster.persist_topology() {
+                            return error_response(
+                                request.request_id,
+                                ERR_TOPOLOGY_PERSIST_FAILED,
+                                &format!(
+                                    "topology commit term {term} applied in memory but persist failed: {e}",
+                                ),
+                            );
+                        }
                         eprintln!("cluster: topology term {term} committed with {} members", members.len());
                         // Signal the coordinator event loop to activate the
-                        // shard table with the committed member list.
+                        // shard table with the committed member list — only
+                        // after the commit is durable.
                         cluster.signal_topology_committed(members, term);
-                        // Persist topology state so voted_term survives restarts.
-                        cluster.persist_topology();
                     }
                     ResponseFrame {
                         request_id: request.request_id,
@@ -617,6 +683,52 @@ fn write_redo_ops(redo_log: Option<&Mutex<RedoLog>>, ops: &[RedoOp]) -> std::res
 // Replication helper
 // ---------------------------------------------------------------------------
 
+/// Outcome of a replication attempt, conveyed back to request handlers so
+/// they can pick the right response status for the client.
+///
+/// - [`ReplicationOutcome::NotApplicable`]: no replication was attempted —
+///   either the server is not part of a cluster, there were no ops to
+///   replicate, or no replica targets were resolved. The client response
+///   is the natural `STATUS_OK` / `STATUS_PARTIAL_ERROR` for the handler.
+/// - [`ReplicationOutcome::Full`]: every replica target ACKed successfully
+///   (or the configured ACK policy was met for the normal case). Full
+///   cluster durability was achieved; respond with `STATUS_OK`.
+/// - [`ReplicationOutcome::Degraded`]: best-effort mode is active AND
+///   **zero** replica targets ACKed. The mutation is durable only on the
+///   local master; if the master crashes before catch-up streaming, the
+///   write is lost. Respond with `STATUS_DEGRADED_DURABILITY` so the
+///   client knows durability silently degraded to single-node.
+///
+/// The threshold for `Degraded` is deliberately "zero ACKs" (as opposed to
+/// "less than quorum") because the *middle* case — some but not all
+/// replicas ACKed — still satisfies the weakest commonly-desired invariant
+/// (the write exists on at least one peer, so a single master crash will
+/// not lose it). That case continues to emit `STATUS_OK` in best-effort
+/// mode and only ticks the `replication_degraded_acks` telemetry counter.
+/// The zero-ACK case is fundamentally different: the write exists on no
+/// peer at all, and a master crash loses it unconditionally — that is the
+/// signal the client actually needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplicationOutcome {
+    /// No replication was applicable (standalone, no ops, or no targets).
+    NotApplicable,
+    /// Every replica target ACKed successfully (or the ACK policy was met).
+    Full,
+    /// Best-effort mode: zero replica targets ACKed. Durability is
+    /// single-node only and clients should be informed via
+    /// `STATUS_DEGRADED_DURABILITY`.
+    Degraded,
+}
+
+impl ReplicationOutcome {
+    /// Whether this outcome indicates the client should receive
+    /// `STATUS_DEGRADED_DURABILITY` instead of `STATUS_OK`.
+    #[inline]
+    pub(crate) fn is_degraded(self) -> bool {
+        matches!(self, ReplicationOutcome::Degraded)
+    }
+}
+
 /// Send replication operations to replica nodes for the given keys.
 ///
 /// Uses the redo sequence range from `write_redo_ops()` to tag batches so
@@ -625,22 +737,25 @@ fn write_redo_ops(redo_log: Option<&Mutex<RedoLog>>, ops: &[RedoOp]) -> std::res
 ///
 /// When ACK policy enforcement is enabled (RF >= 2 with a non-best_effort
 /// policy), replication failures are returned as errors so the caller can
-/// fail the client request. In best-effort mode, failures are logged only.
+/// fail the client request. In best-effort mode, failures are logged only
+/// and the return value distinguishes `Full` (all replicas ACKed) from
+/// `Degraded` (zero replicas ACKed — durability collapsed to single-node).
 ///
-/// Returns `Ok(())` when either no replication is needed or the ACK policy
-/// is satisfied. Returns `Err(message)` when the required number of
-/// replica ACKs was not received.
+/// Returns `Ok(ReplicationOutcome)` when the ACK policy is satisfied or
+/// best-effort mode suppresses the error. Returns `Err(message)` when the
+/// required number of replica ACKs was not received AND best-effort is
+/// disabled.
 fn replicate_all_ops(
     cluster: Option<&RunningCluster>,
     ops_by_key: &[(TxKey, Vec<ReplicaOp>)],
     redo_seq_range: (u64, u64),
-) -> std::result::Result<(), String> {
+) -> std::result::Result<ReplicationOutcome, String> {
     let cluster = match cluster {
         Some(c) => c,
-        None => return Ok(()),
+        None => return Ok(ReplicationOutcome::NotApplicable),
     };
     if ops_by_key.is_empty() {
-        return Ok(());
+        return Ok(ReplicationOutcome::NotApplicable);
     }
 
     // Group all ops by target replica address
@@ -664,7 +779,8 @@ fn replicate_all_ops(
     drop(table_guard);
 
     if by_addr.is_empty() {
-        return Ok(()); // No replicas configured or no replica addresses known.
+        // No replicas configured or no replica addresses known.
+        return Ok(ReplicationOutcome::NotApplicable);
     }
 
     // Send to all replica targets in parallel using the shared replication
@@ -704,39 +820,115 @@ fn replicate_all_ops(
     }
     let total_targets = results.len();
 
-    // Check ACK policy. The policy is read from the cluster's replication
-    // config. The master (local node) always counts as one copy.
     let ack_policy = cluster.ack_policy();
     let best_effort = cluster.is_replication_best_effort();
-    let required = match ack_policy {
-        Some(crate::replication::manager::AckPolicy::WriteAll) => total_targets,
-        Some(crate::replication::manager::AckPolicy::WriteMajority) => {
-            // For majority: need floor(RF/2)+1 total copies. Master is 1,
-            // so need floor(RF/2) replica ACKs. But we count per-target
-            // here, so: total_targets / 2 + (if total_targets is even { 0 } else { 1 })
-            // Simplified: ceil(total_targets / 2)
-            total_targets.div_ceil(2)
-        }
-        None => 0, // best-effort: no minimum
-    };
+    let classification =
+        classify_replication_outcome(ack_count, total_targets, ack_policy, best_effort);
 
-    if ack_count < required && !best_effort {
-        Err(format!(
+    match classification {
+        ReplicationClassification::PolicyViolation { required } => Err(format!(
             "replication: {ack_count}/{total_targets} replicas ACKed, need {required}: {}",
             last_error.unwrap_or_default()
-        ))
-    } else {
-        if ack_count < total_targets {
-            // Acked to client despite incomplete replication (best_effort mode).
+        )),
+        ReplicationClassification::PartialAck => {
+            // At least one replica ACKed but not all — multi-node durability
+            // partially preserved. Tick the existing "degraded acks" counter
+            // but still return `Full`, so the client sees STATUS_OK.
             if let Some(metrics) = DISPATCH_METRICS.get() {
                 metrics.replication_degraded_acks.inc();
             }
             eprintln!(
                 "replication: degraded ack — {ack_count}/{total_targets} replicas succeeded (best_effort)",
             );
+            Ok(ReplicationOutcome::Full)
         }
-        Ok(())
+        ReplicationClassification::ZeroAckBestEffort => {
+            // Zero replicas ACKed in best-effort mode: durability collapsed
+            // to single-node. Escalate to `Degraded` so the caller responds
+            // with STATUS_DEGRADED_DURABILITY and the dedicated metric
+            // (`repl_degraded_durability`) ticks.
+            if let Some(metrics) = DISPATCH_METRICS.get() {
+                metrics.repl_degraded_durability.inc();
+            }
+            eprintln!(
+                "replication: DEGRADED DURABILITY — 0/{total_targets} replicas ACKed, \
+                 client will receive STATUS_DEGRADED_DURABILITY (best_effort): {}",
+                last_error.unwrap_or_default()
+            );
+            Ok(ReplicationOutcome::Degraded)
+        }
+        ReplicationClassification::FullAck => Ok(ReplicationOutcome::Full),
     }
+}
+
+/// Classification of an ACK tally against the configured ACK policy.
+///
+/// This is a pure function of the ACK counts, the policy, and the
+/// best-effort flag, so it can be tested without a live cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplicationClassification {
+    /// Every replica target ACKed successfully.
+    FullAck,
+    /// Some (but not all) replicas ACKed. In best-effort mode with at least
+    /// one ACK, the write is still multi-node durable so we respond OK.
+    /// In the non-best-effort case this only occurs when the configured
+    /// policy explicitly permits it (e.g. `WriteMajority` on RF=3 with
+    /// 2/3 ACKs).
+    PartialAck,
+    /// Best-effort mode AND zero replicas ACKed AND at least one target
+    /// existed. This is the "silently single-node" case that requires
+    /// STATUS_DEGRADED_DURABILITY.
+    ZeroAckBestEffort,
+    /// The ACK count is below the configured policy threshold and
+    /// best-effort is disabled. The caller must fail the client request
+    /// with ERR_REPLICATION_FAILED.
+    PolicyViolation {
+        /// Number of replica ACKs the configured policy required.
+        required: usize,
+    },
+}
+
+/// Pure, side-effect-free classification of replication ACK outcome.
+///
+/// Inputs:
+/// - `ack_count`: number of replica targets that ACKed successfully.
+/// - `total_targets`: number of replica targets the batch was sent to.
+/// - `ack_policy`: `Some(policy)` to enforce, `None` for best-effort (no
+///   minimum enforced).
+/// - `best_effort`: whether `replication_degraded_mode = "best_effort"`
+///   is active — determines whether a policy violation is suppressed and
+///   whether zero-ACK triggers the degraded-durability escalation.
+///
+/// See [`ReplicationClassification`] for semantics.
+pub(crate) fn classify_replication_outcome(
+    ack_count: usize,
+    total_targets: usize,
+    ack_policy: Option<crate::replication::manager::AckPolicy>,
+    best_effort: bool,
+) -> ReplicationClassification {
+    let required = match ack_policy {
+        Some(crate::replication::manager::AckPolicy::WriteAll) => total_targets,
+        Some(crate::replication::manager::AckPolicy::WriteMajority) => {
+            // For majority across N replica targets, we need ceil(N/2)
+            // replica ACKs (master itself counts implicitly as one copy).
+            total_targets.div_ceil(2)
+        }
+        None => 0, // best-effort: no minimum
+    };
+
+    if ack_count < required && !best_effort {
+        return ReplicationClassification::PolicyViolation { required };
+    }
+
+    if best_effort && ack_count == 0 && total_targets > 0 {
+        return ReplicationClassification::ZeroAckBestEffort;
+    }
+
+    if ack_count < total_targets {
+        return ReplicationClassification::PartialAck;
+    }
+
+    ReplicationClassification::FullAck
 }
 
 /// Compensate for a replication failure by reversing locally-applied mutations.
@@ -805,7 +997,7 @@ fn compensate_replication_failure(
                             current_block_height: 0, block_height_retention: 0,
                         };
                         if let Ok(v) = engine.validate_spend_multi(&req) {
-                            let _ = engine.apply_spend_multi(v);
+                            let _ = v.apply(engine);
                         }
                         comp_redo.push(RedoOp::Spend {
                             tx_key: *key, offset: *offset,
@@ -1143,6 +1335,13 @@ fn check_shard_ownership(
         }
         crate::cluster::shards::RouteDecision::HandleLocally => return None,
     };
+    // M10: count every stale-routed request so operators can alert on
+    // persistent stale-routing storms (indicates clients are not
+    // refreshing the partition map). Best-effort: no-op if metrics
+    // haven't been initialized (e.g. unit tests).
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.stale_routing_request_total.inc();
+    }
     Some(BatchItemError {
         item_index,
         error_code: ERR_REDIRECT,
@@ -1273,7 +1472,14 @@ fn handle_spend_batch(
         // Phase 4: Apply the mutation (still under lock).
         // ValidatedSpend is consumed, lock released after write.
         let validation_errors = validated.errors.clone();
-        let resp = engine.apply_spend_multi(validated);
+        let resp = match validated.apply(engine) {
+            Ok(r) => r,
+            Err(e) => {
+                // DAH overflow (config misconfiguration) or similar —
+                // surface as ERR_INTERNAL rather than silently clamping.
+                return error_response(req.request_id, ERR_INTERNAL, &e.to_string());
+            }
+        };
 
         if !key_repl_ops.is_empty() {
             repl_ops_by_key.push((key, key_repl_ops));
@@ -1288,15 +1494,23 @@ fn handle_spend_batch(
     }
 
     // Phase 5: Replicate (redo already fsynced, engine already applied).
-    if let Err(e) = replicate_all_ops(cluster, &repl_ops_by_key, spend_redo_range) {
-        compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
-        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
-    }
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, spend_redo_range) {
+        Ok(o) => o,
+        Err(e) => {
+            compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+        }
+    };
 
     if errors.is_empty() {
+        let status = if repl_outcome.is_degraded() {
+            STATUS_DEGRADED_DURABILITY
+        } else {
+            STATUS_OK
+        };
         ResponseFrame {
             request_id: req.request_id,
-            status: STATUS_OK,
+            status,
             payload: vec![],
         }
     } else {
@@ -1387,12 +1601,15 @@ fn handle_unspend_batch(
     }
 
     // Phase 4: Replicate.
-    if let Err(e) = replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
-        compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
-        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
-    }
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+        Ok(o) => o,
+        Err(e) => {
+            compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+        }
+    };
 
-    batch_response(req.request_id, &errors)
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -1484,12 +1701,15 @@ fn handle_set_mined_batch(
     }
 
     // Phase 4: Replicate.
-    if let Err(e) = replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
-        compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
-        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
-    }
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+        Ok(o) => o,
+        Err(e) => {
+            compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+        }
+    };
 
-    batch_response(req.request_id, &errors)
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -1760,12 +1980,15 @@ fn handle_create_batch(
     }
 
     // Phase 4: Replicate.
-    if let Err(e) = replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
-        compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
-        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
-    }
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+        Ok(o) => o,
+        Err(e) => {
+            compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+        }
+    };
 
-    batch_response(req.request_id, &errors)
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -1830,12 +2053,15 @@ fn handle_freeze_batch(
     }
 
     // Phase 4: Replicate.
-    if let Err(e) = replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
-        compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
-        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
-    }
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+        Ok(o) => o,
+        Err(e) => {
+            compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+        }
+    };
 
-    batch_response(req.request_id, &errors)
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
 fn handle_unfreeze_batch(
@@ -1896,12 +2122,15 @@ fn handle_unfreeze_batch(
     }
 
     // Phase 4: Replicate.
-    if let Err(e) = replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
-        compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
-        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
-    }
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+        Ok(o) => o,
+        Err(e) => {
+            compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+        }
+    };
 
-    batch_response(req.request_id, &errors)
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
 fn handle_reassign_batch(
@@ -1974,12 +2203,15 @@ fn handle_reassign_batch(
     }
 
     // Phase 4: Replicate.
-    if let Err(e) = replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
-        compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
-        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
-    }
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+        Ok(o) => o,
+        Err(e) => {
+            compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+        }
+    };
 
-    batch_response(req.request_id, &errors)
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
 fn handle_set_conflicting_batch(
@@ -2052,12 +2284,15 @@ fn handle_set_conflicting_batch(
     }
 
     // Phase 4: Replicate.
-    if let Err(e) = replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
-        compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
-        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
-    }
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+        Ok(o) => o,
+        Err(e) => {
+            compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+        }
+    };
 
-    batch_response(req.request_id, &errors)
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
 fn handle_set_locked_batch(
@@ -2119,12 +2354,15 @@ fn handle_set_locked_batch(
     }
 
     // Phase 4: Replicate.
-    if let Err(e) = replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
-        compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
-        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
-    }
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+        Ok(o) => o,
+        Err(e) => {
+            compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+        }
+    };
 
-    batch_response(req.request_id, &errors)
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
 fn handle_preserve_until_batch(
@@ -2189,12 +2427,15 @@ fn handle_preserve_until_batch(
     }
 
     // Phase 4: Replicate.
-    if let Err(e) = replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
-        compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
-        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
-    }
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+        Ok(o) => o,
+        Err(e) => {
+            compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+        }
+    };
 
-    batch_response(req.request_id, &errors)
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
 fn handle_delete_batch(
@@ -2315,49 +2556,52 @@ fn handle_delete_batch(
     }
 
     // Phase 4: Replicate.
-    if let Err(e) = replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
-        // Compensate: re-create deleted records from snapshots.
-        for (key, snap) in &deleted_snapshots {
-            let create_op = ReplicaOp::Create {
-                tx_key: *key,
-                metadata_bytes: snap.metadata_bytes.clone(),
-                utxo_hashes: snap.utxo_hashes.clone(),
-                cold_data: snap.cold_data.clone(),
-                is_external: snap.is_external,
-            };
-            // Apply the re-create through the replication receiver path
-            // which handles the full Create logic.
-            let create_req = crate::protocol::frame::RequestFrame {
-                request_id: 0,
-                op_code: OP_REPLICA_BATCH,
-                flags: 0,
-                payload: ReplicaBatch {
-                    first_sequence: 0,
-                    ops: vec![create_op],
-                }.serialize(),
-            };
-            let _ = handle_replica_batch(&create_req, engine, &std::sync::atomic::AtomicU64::new(0));
-            // Append a Create redo entry for crash recovery.
-            if let Some(entry) = engine.lookup(key) {
-                let _ = write_redo_ops(redo_log, &[RedoOp::Create {
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+        Ok(o) => o,
+        Err(e) => {
+            // Compensate: re-create deleted records from snapshots.
+            for (key, snap) in &deleted_snapshots {
+                let create_op = ReplicaOp::Create {
                     tx_key: *key,
-                    record_offset: entry.record_offset,
-                    utxo_count: snap.utxo_hashes.len() as u32,
-                }]);
+                    metadata_bytes: snap.metadata_bytes.clone(),
+                    utxo_hashes: snap.utxo_hashes.clone(),
+                    cold_data: snap.cold_data.clone(),
+                    is_external: snap.is_external,
+                };
+                // Apply the re-create through the replication receiver path
+                // which handles the full Create logic.
+                let create_req = crate::protocol::frame::RequestFrame {
+                    request_id: 0,
+                    op_code: OP_REPLICA_BATCH,
+                    flags: 0,
+                    payload: ReplicaBatch {
+                        first_sequence: 0,
+                        ops: vec![create_op],
+                    }.serialize(),
+                };
+                let _ = handle_replica_batch(&create_req, engine, &std::sync::atomic::AtomicU64::new(0));
+                // Append a Create redo entry for crash recovery.
+                if let Some(entry) = engine.lookup(key) {
+                    let _ = write_redo_ops(redo_log, &[RedoOp::Create {
+                        tx_key: *key,
+                        record_offset: entry.record_offset,
+                        utxo_count: snap.utxo_hashes.len() as u32,
+                    }]);
+                }
             }
+            // Also compensate any non-delete ops in the same batch.
+            let non_delete: Vec<_> = repl_ops_by_key.iter()
+                .filter(|(_, ops)| !ops.iter().any(|o| matches!(o, ReplicaOp::Delete { .. })))
+                .cloned()
+                .collect();
+            if !non_delete.is_empty() {
+                compensate_replication_failure(engine, &non_delete, redo_log);
+            }
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
-        // Also compensate any non-delete ops in the same batch.
-        let non_delete: Vec<_> = repl_ops_by_key.iter()
-            .filter(|(_, ops)| !ops.iter().any(|o| matches!(o, ReplicaOp::Delete { .. })))
-            .cloned()
-            .collect();
-        if !non_delete.is_empty() {
-            compensate_replication_failure(engine, &non_delete, redo_log);
-        }
-        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
-    }
+    };
 
-    batch_response(req.request_id, &errors)
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
 fn handle_mark_longest_chain_batch(
@@ -2390,11 +2634,23 @@ fn handle_mark_longest_chain_batch(
             continue;
         }
         let key = TxKey { txid: *txid };
+        // Target generation for this mutation is the current primary
+        // generation + 1. Replay uses this as the idempotency token (H7):
+        // once applied, meta.generation == target_generation, so a later
+        // replay with the same (or smaller) generation is skipped.
+        // If the record does not exist, default to 1 — the engine will
+        // produce TxNotFound, and the replay handler will treat the op as
+        // a no-op on the missing record.
+        let target_generation = engine
+            .lookup(&key)
+            .map(|e| e.generation.wrapping_add(1))
+            .unwrap_or(1);
         redo_ops.push(RedoOp::MarkOnLongestChain {
             tx_key: key,
             on_longest_chain,
             current_block_height: cbh,
             block_height_retention: bhr,
+            generation: target_generation,
         });
         valid_items.push(ValidMark { idx: i, key });
     }
@@ -2470,6 +2726,10 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
                     }
                     _ => vec![ERR_REDIRECT as u8],
                 };
+                // M10: count the stale-routed read.
+                if let Some(m) = DISPATCH_METRICS.get() {
+                    m.stale_routing_request_total.inc();
+                }
                 results.push(WireGetResult { status: ERR_REDIRECT as u8, data: redirect_status });
                 continue;
             }
@@ -2711,12 +2971,15 @@ fn handle_preserve_transactions(
     }
 
     // Phase 4: Replicate.
-    if let Err(e) = replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
-        compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
-        return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
-    }
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+        Ok(o) => o,
+        Err(e) => {
+            compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+        }
+    };
 
-    batch_response(req.request_id, &errors)
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
 fn handle_process_expired(
@@ -2797,6 +3060,10 @@ fn handle_get_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, c
         {
             let key = TxKey { txid: item.txid };
             if !cluster.is_master(&key) && !cluster.is_migrating_outbound(&key) {
+                // M10: count the stale-routed GetSpend.
+                if let Some(m) = DISPATCH_METRICS.get() {
+                    m.stale_routing_request_total.inc();
+                }
                 results.push(WireGetSpendResult {
                     status: 1,
                     error_code: ERR_REDIRECT,
@@ -2999,10 +3266,33 @@ fn error_response(request_id: u64, code: u16, msg: &str) -> ResponseFrame {
 }
 
 fn batch_response(request_id: u64, errors: &[BatchItemError]) -> ResponseFrame {
+    batch_response_with_outcome(request_id, errors, ReplicationOutcome::Full)
+}
+
+/// Like [`batch_response`], but promotes a clean response to
+/// `STATUS_DEGRADED_DURABILITY` when replication returned
+/// [`ReplicationOutcome::Degraded`] (best-effort mode, zero replica ACKs).
+///
+/// When there *are* per-item errors we still return `STATUS_PARTIAL_ERROR`:
+/// the partial-error path already conveys that not every item succeeded,
+/// and overwriting it with the degraded-durability status would erase the
+/// per-item diagnostic detail the client needs. The degraded-durability
+/// metric has already been incremented inside `replicate_all_ops`, so the
+/// server-side telemetry is unaffected.
+fn batch_response_with_outcome(
+    request_id: u64,
+    errors: &[BatchItemError],
+    outcome: ReplicationOutcome,
+) -> ResponseFrame {
     if errors.is_empty() {
+        let status = if outcome.is_degraded() {
+            STATUS_DEGRADED_DURABILITY
+        } else {
+            STATUS_OK
+        };
         ResponseFrame {
             request_id,
-            status: STATUS_OK,
+            status,
             payload: vec![],
         }
     } else {
@@ -3036,6 +3326,7 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
         SpendError::AlreadyFrozen { .. } => (ERR_ALREADY_FROZEN, vec![]),
         SpendError::NotFrozen { .. } => (ERR_UTXO_NOT_FROZEN, vec![]),
         SpendError::StorageError { .. } => (ERR_INTERNAL, vec![]),
+        SpendError::DahOverflow { .. } => (ERR_INTERNAL, vec![]),
     };
     BatchItemError { item_index, error_code: code, error_data: data }
 }
@@ -3235,9 +3526,9 @@ mod tests {
         // Manually insert into unmined index at different heights
         {
             let mut ui = h.engine.unmined_index();
-            ui.insert(100, TxKey { txid: txid_a });
-            ui.insert(200, TxKey { txid: txid_b });
-            ui.insert(300, TxKey { txid: txid_c });
+            ui.insert(100, TxKey { txid: txid_a }, None).unwrap();
+            ui.insert(200, TxKey { txid: txid_b }, None).unwrap();
+            ui.insert(300, TxKey { txid: txid_c }, None).unwrap();
         }
 
         // Query with cutoff_height=200 — should return txid_a (100) and txid_b (200)
@@ -3344,8 +3635,8 @@ mod tests {
         // Set DAH on txid_a and txid_b by inserting into the DAH index directly
         {
             let mut dah = h.engine.dah_index();
-            dah.insert(500, TxKey { txid: txid_a });
-            dah.insert(600, TxKey { txid: txid_b });
+            dah.insert(500, TxKey { txid: txid_a }, None).unwrap();
+            dah.insert(600, TxKey { txid: txid_b }, None).unwrap();
         }
 
         // Send OP_PROCESS_EXPIRED_PRESERVATIONS with current_height=700
@@ -4262,5 +4553,671 @@ mod tests {
             0,
             "late migration batches must not recreate inbound fences after handoff settled",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Replication outcome classifier (pure-function tests).
+    //
+    // Exercises the ACK-tally classifier that drives whether a write path
+    // returns STATUS_OK, STATUS_DEGRADED_DURABILITY, or ERR_REPLICATION_FAILED
+    // to the client. The response-frame tests below then confirm the byte
+    // mapping from classifier outcome → wire status.
+    // -----------------------------------------------------------------------
+
+    use crate::replication::manager::AckPolicy;
+
+    #[test]
+    fn classify_zero_acks_best_effort_is_degraded() {
+        // Best-effort cluster, 2 replicas targeted, 0 ACKed → silently single-node
+        let c = classify_replication_outcome(0, 2, None, true);
+        assert_eq!(c, ReplicationClassification::ZeroAckBestEffort);
+    }
+
+    #[test]
+    fn classify_partial_ack_best_effort_is_partial() {
+        // 1 of 2 replicas ACKed, best-effort mode — still multi-node durable
+        let c = classify_replication_outcome(1, 2, None, true);
+        assert_eq!(c, ReplicationClassification::PartialAck);
+    }
+
+    #[test]
+    fn classify_full_ack_best_effort_is_full() {
+        let c = classify_replication_outcome(2, 2, None, true);
+        assert_eq!(c, ReplicationClassification::FullAck);
+    }
+
+    #[test]
+    fn classify_zero_acks_strict_mode_is_policy_violation() {
+        // Not best-effort, WriteAll with 2 targets and 0 ACKs → violation
+        let c = classify_replication_outcome(0, 2, Some(AckPolicy::WriteAll), false);
+        assert_eq!(c, ReplicationClassification::PolicyViolation { required: 2 });
+    }
+
+    #[test]
+    fn classify_partial_below_majority_strict_is_policy_violation() {
+        // 3 replicas, majority requires ceil(3/2) = 2 ACKs; 1 ACK → violation
+        let c = classify_replication_outcome(1, 3, Some(AckPolicy::WriteMajority), false);
+        assert_eq!(c, ReplicationClassification::PolicyViolation { required: 2 });
+    }
+
+    #[test]
+    fn classify_majority_met_exactly_strict_is_partial_ack() {
+        // 3 replicas, 2 ACKs = majority met → `PartialAck` (not `FullAck`)
+        let c = classify_replication_outcome(2, 3, Some(AckPolicy::WriteMajority), false);
+        assert_eq!(c, ReplicationClassification::PartialAck);
+    }
+
+    #[test]
+    fn classify_no_targets_is_full() {
+        // Empty target list — nothing to ACK, trivially full.
+        let c = classify_replication_outcome(0, 0, None, true);
+        assert_eq!(c, ReplicationClassification::FullAck);
+    }
+
+    // -----------------------------------------------------------------------
+    // Status-byte mapping (batch_response_with_outcome).
+    //
+    // The spec requires asserting on the ACTUAL status byte, not `!=0`.
+    // These tests pin the byte value emitted for each outcome.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn degraded_outcome_maps_to_status_degraded_durability_byte() {
+        // STATUS_DEGRADED_DURABILITY has the concrete wire value 5.
+        assert_eq!(STATUS_DEGRADED_DURABILITY, 5);
+
+        let resp = batch_response_with_outcome(42, &[], ReplicationOutcome::Degraded);
+        // The test MUST check the exact status byte, not merely that
+        // status != STATUS_OK.
+        assert_eq!(resp.status, STATUS_DEGRADED_DURABILITY);
+        assert_eq!(resp.status, 5u8);
+        assert_ne!(resp.status, STATUS_OK);
+        assert_eq!(resp.request_id, 42);
+        assert!(resp.payload.is_empty());
+    }
+
+    #[test]
+    fn full_outcome_maps_to_status_ok_byte() {
+        let resp = batch_response_with_outcome(7, &[], ReplicationOutcome::Full);
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(resp.status, 0u8);
+    }
+
+    #[test]
+    fn not_applicable_outcome_maps_to_status_ok_byte() {
+        // Standalone server / no replicas resolved — clean STATUS_OK.
+        let resp = batch_response_with_outcome(11, &[], ReplicationOutcome::NotApplicable);
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(resp.status, 0u8);
+    }
+
+    #[test]
+    fn partial_errors_override_degraded_status() {
+        // If the batch had per-item errors, we must return STATUS_PARTIAL_ERROR
+        // so the client sees the per-item diagnostics, not a blanket status
+        // byte that hides them. The degraded-durability escalation is still
+        // visible via server metrics.
+        let errors = vec![BatchItemError { item_index: 0, error_code: ERR_TX_NOT_FOUND, error_data: vec![] }];
+        let resp = batch_response_with_outcome(1, &errors, ReplicationOutcome::Degraded);
+        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+        assert_ne!(resp.status, STATUS_DEGRADED_DURABILITY);
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end: the classifier-driven status byte selection matches the
+    // semantic requirements of the C9 bug fix.
+    //
+    // These tests compose classifier + response-frame builder in the same
+    // way `replicate_all_ops` does, so they verify that the "response seen
+    // by the client" is correct for the relevant ACK patterns. They
+    // intentionally do not spin up a RunningCluster (the cluster module is
+    // outside this fix's scope) — instead they model the exact ACK-counting
+    // boundary that was broken.
+    // -----------------------------------------------------------------------
+
+    /// Map a [`ReplicationClassification`] to the [`ReplicationOutcome`]
+    /// the real dispatch path would synthesize. Kept in sync with the logic
+    /// at the end of `replicate_all_ops`.
+    fn classification_to_outcome(c: ReplicationClassification) -> ReplicationOutcome {
+        match c {
+            ReplicationClassification::FullAck
+            | ReplicationClassification::PartialAck => ReplicationOutcome::Full,
+            ReplicationClassification::ZeroAckBestEffort => ReplicationOutcome::Degraded,
+            ReplicationClassification::PolicyViolation { .. } => {
+                // Strict mode — in the real dispatch this is returned as
+                // Err and becomes ERR_REPLICATION_FAILED; this helper is
+                // only exercised on success paths in the tests below.
+                ReplicationOutcome::Full
+            }
+        }
+    }
+
+    #[test]
+    fn best_effort_all_replicas_fail_yields_status_degraded_durability() {
+        // Simulated "all failed": 0 out of 2 replicas ACKed, best-effort.
+        let classification = classify_replication_outcome(0, 2, None, true);
+        assert_eq!(classification, ReplicationClassification::ZeroAckBestEffort);
+
+        let outcome = classification_to_outcome(classification);
+        assert_eq!(outcome, ReplicationOutcome::Degraded);
+
+        let resp = batch_response_with_outcome(1, &[], outcome);
+        // Exact status byte, per spec.
+        assert_eq!(resp.status, STATUS_DEGRADED_DURABILITY);
+        assert_ne!(resp.status, STATUS_OK);
+    }
+
+    #[test]
+    fn best_effort_some_replicas_ack_yields_status_ok() {
+        // Policy: "any ACK = OK in best-effort" — documented in
+        // `replicate_all_ops` as the PartialAck case. 1 of 3 ACKed → OK.
+        let classification = classify_replication_outcome(1, 3, None, true);
+        assert_eq!(classification, ReplicationClassification::PartialAck);
+
+        let outcome = classification_to_outcome(classification);
+        assert_eq!(outcome, ReplicationOutcome::Full);
+
+        let resp = batch_response_with_outcome(1, &[], outcome);
+        assert_eq!(resp.status, STATUS_OK);
+        assert_ne!(resp.status, STATUS_DEGRADED_DURABILITY);
+    }
+
+    #[test]
+    fn strict_mode_zero_acks_is_hard_error_not_degraded() {
+        // With non-best-effort mode the caller propagates Err which maps to
+        // ERR_REPLICATION_FAILED on the wire — not STATUS_DEGRADED_DURABILITY.
+        let classification =
+            classify_replication_outcome(0, 2, Some(AckPolicy::WriteAll), false);
+        assert_eq!(classification, ReplicationClassification::PolicyViolation { required: 2 });
+    }
+
+    // -----------------------------------------------------------------------
+    // H3: OP_MIGRATION_COMPLETE manifest enforcement.
+    //
+    // Source nodes MUST include a manifest hash (or exact-entry manifest)
+    // when `record_count > 0`. Without one, a malformed/stale frame could
+    // mark a non-empty shard migrated prematurely. These tests exercise
+    // the three required paths:
+    //   1. non-empty with no manifest → rejected with ERR_MIGRATION_MANIFEST_REQUIRED
+    //   2. non-empty with mismatched manifest → ERR_MIGRATION_MANIFEST_MISMATCH
+    //   3. non-empty with matching manifest → STATUS_OK and pending-inbound cleared
+    // -----------------------------------------------------------------------
+
+    /// Helper: build an `OP_MIGRATION_COMPLETE` payload with the given
+    /// `record_count`, optional manifest hash, optional exact-entry manifest,
+    /// and optional completion source node id. Mirrors the on-wire layout
+    /// the dispatch handler decodes.
+    fn build_migration_complete_payload(
+        record_count: u64,
+        fence_sequence: u64,
+        migration_epoch: u64,
+        manifest_hash: Option<[u8; 32]>,
+        exact_entries: Option<&[(TxKey, u32)]>,
+        from_node: Option<NodeId>,
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&record_count.to_le_bytes());
+        payload.extend_from_slice(&fence_sequence.to_le_bytes());
+        payload.extend_from_slice(&migration_epoch.to_le_bytes());
+        // manifest_hash (32 bytes, all-zero = "no manifest")
+        payload.extend_from_slice(&manifest_hash.unwrap_or([0u8; 32]));
+        let entries = exact_entries.unwrap_or(&[]);
+        payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (key, generation) in entries {
+            payload.extend_from_slice(&key.txid);
+            payload.extend_from_slice(&generation.to_le_bytes());
+        }
+        if let Some(node) = from_node {
+            payload.extend_from_slice(&node.0.to_le_bytes());
+        }
+        payload
+    }
+
+    /// Construct a txid whose shard (low 12 bits of txid[0..2]) equals `shard`.
+    fn txid_for_shard(shard: u16, salt: u8) -> [u8; 32] {
+        let mut txid = [0u8; 32];
+        // Low 12 bits of little-endian u16 at [0..2] = shard.
+        let bytes = (shard & 0x0FFF).to_le_bytes();
+        txid[0] = bytes[0];
+        // Preserve the shard bits in byte 1's low nibble.
+        txid[1] = bytes[1];
+        txid[2] = salt;
+        txid
+    }
+
+    #[test]
+    fn migration_complete_rejects_non_empty_without_manifest() {
+        let h = DispatchTestHarness::new();
+        let shard = 30u16;
+        let txid = txid_for_shard(shard, 1);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 42);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(crate::cluster::shards::NodeId(1), "127.0.0.1:4701".parse().unwrap())],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        // Claim record_count=1 but send no manifest hash and no exact entries.
+        let payload = build_migration_complete_payload(1, 0, 0, None, None, None);
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload,
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_ERROR, "non-empty without manifest must be rejected");
+        assert!(resp.payload.len() >= 2);
+        let err_code = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
+        assert_eq!(
+            err_code, ERR_MIGRATION_MANIFEST_REQUIRED,
+            "expected ERR_MIGRATION_MANIFEST_REQUIRED, got {err_code}"
+        );
+        // Pending-inbound MUST remain set — the unverified frame must not
+        // advance migration state.
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            1,
+            "rejected completion must not clear pending inbound"
+        );
+    }
+
+    #[test]
+    fn migration_complete_rejects_mismatched_manifest() {
+        let h = DispatchTestHarness::new();
+        let shard = 31u16;
+        let txid = txid_for_shard(shard, 2);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+        assert_eq!(
+            h.engine.shard_record_count(shard),
+            1,
+            "test precondition: shard {shard} must contain the created record"
+        );
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 43);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(crate::cluster::shards::NodeId(1), "127.0.0.1:4702".parse().unwrap())],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+        let pending_before = cluster.inbound_pending_count();
+        assert_eq!(
+            pending_before, 1,
+            "test precondition: 1 shard pending inbound before OP_MIGRATION_COMPLETE"
+        );
+
+        // Use a deliberately wrong manifest (all-ones → cannot match real data).
+        let wrong_manifest = [0xFFu8; 32];
+        let payload = build_migration_complete_payload(1, 0, 0, Some(wrong_manifest), None, None);
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload,
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_ERROR);
+        assert!(resp.payload.len() >= 2);
+        let err_code = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
+        assert_eq!(
+            err_code, ERR_MIGRATION_MANIFEST_MISMATCH,
+            "expected ERR_MIGRATION_MANIFEST_MISMATCH, got {err_code}"
+        );
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            1,
+            "mismatched manifest must not clear pending inbound"
+        );
+    }
+
+    #[test]
+    fn migration_complete_accepts_matching_manifest() {
+        let h = DispatchTestHarness::new();
+        let shard = 32u16;
+        let txid = txid_for_shard(shard, 3);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        // Compute the expected manifest hash over the single record present.
+        let key = TxKey { txid };
+        let meta = h.engine.read_metadata(&key).unwrap();
+        let mut expected = crate::cluster::coordinator::ManifestHasher::new();
+        expected.fold(&txid, meta.generation);
+        let expected_hash = expected.finalize();
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 44);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(crate::cluster::shards::NodeId(1), "127.0.0.1:4703".parse().unwrap())],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        let payload = build_migration_complete_payload(
+            1,
+            0,
+            0,
+            Some(expected_hash),
+            None,
+            None,
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload,
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_OK, "matching manifest should succeed");
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            0,
+            "matching manifest should clear pending inbound"
+        );
+    }
+
+    #[test]
+    fn migration_complete_accepts_non_empty_with_exact_entry_manifest() {
+        // The exact-entry manifest (list of (txid, generation)) is an
+        // alternative to the SHA-256 hash — also cryptographically strong
+        // evidence of shard content. A non-empty migration-complete with
+        // exact entries but no hash must still be accepted.
+        let h = DispatchTestHarness::new();
+        let shard = 33u16;
+        let txid = txid_for_shard(shard, 4);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+        let meta = h.engine.read_metadata(&TxKey { txid }).unwrap();
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 45);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(crate::cluster::shards::NodeId(1), "127.0.0.1:4704".parse().unwrap())],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        let entries = vec![(TxKey { txid }, meta.generation)];
+        let payload = build_migration_complete_payload(
+            1,
+            0,
+            0,
+            None,
+            Some(&entries),
+            Some(crate::cluster::shards::NodeId(1)),
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload,
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(cluster.inbound_pending_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // H10: topology vote MUST persist before reply.
+    //
+    // The voter persists `voted_term` / `committed_term` to disk BEFORE the
+    // reply frame is constructed. If the persist fails, the reply carries
+    // ERR_TOPOLOGY_PERSIST_FAILED (not STATUS_OK) so the proposer does not
+    // count the vote. Without this ordering, a voter that crashed between
+    // the reply and the persist could vote differently on restart →
+    // split-brain.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn topology_vote_persisted_before_reply() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("node.topology");
+
+        let h = DispatchTestHarness::new();
+        let self_id = crate::cluster::shards::NodeId(1);
+        let members = vec![self_id, crate::cluster::shards::NodeId(2)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&[self_id], 1, 10);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster_with_topology_path(
+            self_id,
+            table,
+            &[(self_id, "127.0.0.1:4710".parse().unwrap())],
+            &[self_id],
+            &[],
+            &[],
+            &[],
+            1,
+            Some(path.clone()),
+        );
+
+        // Propose a new term that subsumes this single-node cluster.
+        let proposer = crate::cluster::shards::NodeId(2);
+        let propose = crate::cluster::topology::TopologyTerm::new(500, members.clone(), proposer);
+
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_TOPOLOGY_PROPOSE,
+            flags: 0,
+            payload: propose.serialize(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_OK, "propose should be accepted");
+        // Decode the vote and confirm we accepted.
+        let vote = crate::cluster::topology::TopologyVote::deserialize(&resp.payload)
+            .expect("vote must deserialize");
+        assert!(vote.accepted, "vote must be accepted for subsuming proposal");
+        assert_eq!(vote.term, 500);
+
+        // The reply has already been returned by handle_request. The
+        // safety invariant: by the time the caller observes the reply,
+        // the on-disk state MUST contain voted_term=500.
+        let persisted = crate::cluster::coordinator::load_topology_state(&path);
+        assert_eq!(
+            persisted.voted_term, 500,
+            "voted_term must be persisted BEFORE the reply is observable; \
+             found {} on disk after reply returned",
+            persisted.voted_term,
+        );
+    }
+
+    #[test]
+    fn topology_vote_reply_failure_surfaces_persist_error() {
+        // Point topology_state_path at a non-existent parent directory —
+        // File::create will fail, persist_topology() returns Err, and the
+        // vote handler must respond with ERR_TOPOLOGY_PERSIST_FAILED rather
+        // than acking the vote.
+        let bogus = std::path::PathBuf::from("/nonexistent/teraslab-topology-h10/node.topology");
+        let h = DispatchTestHarness::new();
+        let self_id = crate::cluster::shards::NodeId(1);
+        let members = vec![self_id, crate::cluster::shards::NodeId(2)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&[self_id], 1, 10);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster_with_topology_path(
+            self_id,
+            table,
+            &[(self_id, "127.0.0.1:4711".parse().unwrap())],
+            &[self_id],
+            &[],
+            &[],
+            &[],
+            1,
+            Some(bogus),
+        );
+
+        let proposer = crate::cluster::shards::NodeId(2);
+        let propose = crate::cluster::topology::TopologyTerm::new(600, members.clone(), proposer);
+
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_TOPOLOGY_PROPOSE,
+            flags: 0,
+            payload: propose.serialize(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_ERROR, "persist failure must surface as error");
+        assert!(resp.payload.len() >= 2);
+        let err_code = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
+        assert_eq!(
+            err_code, ERR_TOPOLOGY_PERSIST_FAILED,
+            "expected ERR_TOPOLOGY_PERSIST_FAILED, got {err_code}"
+        );
+    }
+
+    #[test]
+    fn topology_commit_persisted_before_reply() {
+        // Committing a new term must also persist before the reply so
+        // restart-after-crash observes the committed term.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("node.topology");
+
+        let h = DispatchTestHarness::new();
+        let self_id = crate::cluster::shards::NodeId(1);
+        let members = vec![self_id, crate::cluster::shards::NodeId(2)];
+        // Start from a cluster already at term 10 (single-node).
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&[self_id], 1, 10);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster_with_topology_path(
+            self_id,
+            table,
+            &[(self_id, "127.0.0.1:4712".parse().unwrap())],
+            &[self_id],
+            &[],
+            &[],
+            &[],
+            1,
+            Some(path.clone()),
+        );
+
+        // Step 1: accept a proposal (sets voted_term).
+        let proposer = crate::cluster::shards::NodeId(2);
+        let propose = crate::cluster::topology::TopologyTerm::new(700, members.clone(), proposer);
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_TOPOLOGY_PROPOSE,
+            flags: 0,
+            payload: propose.serialize(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+
+        // Step 2: commit that term.
+        let commit = crate::cluster::topology::TopologyCommit {
+            term: 700,
+            proposer,
+            members: members.clone(),
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(700, &members),
+        };
+        let req = RequestFrame {
+            request_id: 2,
+            op_code: OP_TOPOLOGY_COMMIT,
+            flags: 0,
+            payload: commit.serialize(),
+        };
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_OK, "commit must succeed");
+
+        // By the time the reply is visible, committed_term=700 must be on disk.
+        let persisted = crate::cluster::coordinator::load_topology_state(&path);
+        assert_eq!(
+            persisted.committed_term, 700,
+            "committed_term must be persisted before the commit reply returns"
+        );
+        assert_eq!(persisted.committed_members, members);
     }
 }
