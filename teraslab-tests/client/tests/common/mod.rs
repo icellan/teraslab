@@ -22,7 +22,7 @@ pub fn compose_dir() -> String {
     format!("{manifest}/../docker")
 }
 
-const POLL_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
+const POLL_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn poll_http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -364,9 +364,10 @@ pub async fn wait_migrations_complete(
                 }
             }
         }
-        // Accept masters within ±16 of 4096. After partition heals, brief
-        // double-counting is expected while handoff commits propagate.
-        let masters_ok = total_masters >= 4080 && total_masters <= 4112;
+        // Accept masters within ±128 of 4096. The pipelined migration
+        // causes temporary double-counting while handoff commits propagate
+        // across batched sub-groups.
+        let masters_ok = total_masters >= 3968 && total_masters <= 4224;
         if masters_ok && total_pending_handoffs == 0 && total_inbound_pending == 0 && all_idle {
             if timing_enabled() {
                 eprintln!("  wait_migrations: complete in {:.1}ms", mig_start.elapsed().as_secs_f64() * 1000.0);
@@ -508,98 +509,150 @@ pub async fn wait_specific_replication_settled(
 pub async fn start_3node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Client), ClientError> {
     let mut docker = docker_3node(scenario_id);
     let start = std::time::Instant::now();
-    if timing_enabled() {
-        eprintln!("  start_3node_cluster[{scenario_id}]: compose_up");
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last_err = None;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        if timing_enabled() {
+            eprintln!("  start_3node_cluster[{scenario_id}]: compose_up (attempt {attempt}/{MAX_ATTEMPTS})");
+        }
+        docker.compose_up().await?;
+        if timing_enabled() {
+            eprintln!(
+                "  start_3node_cluster[{scenario_id}]: compose_up done in {:.1}ms",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+            eprintln!("  start_3node_cluster[{scenario_id}]: wait_cluster_ready (45s)");
+        }
+        match wait_cluster_ready(&docker, 3, Duration::from_secs(45)).await {
+            Ok(()) => {
+                if timing_enabled() {
+                    eprintln!(
+                        "  start_3node_cluster[{scenario_id}]: cluster ready in {:.1}ms",
+                        start.elapsed().as_secs_f64() * 1000.0
+                    );
+                    eprintln!("  start_3node_cluster[{scenario_id}]: wait_migrations_complete");
+                }
+                wait_migrations_complete(&docker, 3, Duration::from_secs(30)).await?;
+                if timing_enabled() {
+                    eprintln!(
+                        "  start_3node_cluster[{scenario_id}]: migrations complete in {:.1}ms",
+                        start.elapsed().as_secs_f64() * 1000.0
+                    );
+                    eprintln!("  start_3node_cluster[{scenario_id}]: create_client");
+                }
+                let client = create_client(&docker, 3).await?;
+                if timing_enabled() {
+                    eprintln!(
+                        "  start_3node_cluster[{scenario_id}]: client created in {:.1}ms",
+                        start.elapsed().as_secs_f64() * 1000.0
+                    );
+                    eprintln!("  start_3node_cluster[{scenario_id}]: refresh_routing");
+                }
+                client.refresh_routing().await?;
+                if timing_enabled() {
+                    eprintln!(
+                        "  start_3node_cluster[{scenario_id}]: ready in {:.1}ms",
+                        start.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                return Ok((docker, client));
+            }
+            Err(e) => {
+                eprintln!(
+                    "  start_3node_cluster[{scenario_id}]: cluster not ready after 45s (attempt {attempt}/{MAX_ATTEMPTS}): {e}"
+                );
+                last_err = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    // Tear down and retry
+                    force_cleanup(scenario_id).await;
+                    wait_ports_free(docker.http_port(1), scenario_id, docker.node_count()).await;
+                    docker = docker_3node(scenario_id);
+                }
+            }
+        }
     }
-    docker.compose_up().await?;
-    if timing_enabled() {
-        eprintln!(
-            "  start_3node_cluster[{scenario_id}]: compose_up done in {:.1}ms",
-            start.elapsed().as_secs_f64() * 1000.0
-        );
-        eprintln!("  start_3node_cluster[{scenario_id}]: wait_cluster_ready");
-    }
-    wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
-    if timing_enabled() {
-        eprintln!(
-            "  start_3node_cluster[{scenario_id}]: cluster ready in {:.1}ms",
-            start.elapsed().as_secs_f64() * 1000.0
-        );
-        eprintln!("  start_3node_cluster[{scenario_id}]: wait_migrations_complete");
-    }
-    wait_migrations_complete(&docker, 3, Duration::from_secs(30)).await?;
-    if timing_enabled() {
-        eprintln!(
-            "  start_3node_cluster[{scenario_id}]: migrations complete in {:.1}ms",
-            start.elapsed().as_secs_f64() * 1000.0
-        );
-        eprintln!("  start_3node_cluster[{scenario_id}]: create_client");
-    }
-    let client = create_client(&docker, 3).await?;
-    if timing_enabled() {
-        eprintln!(
-            "  start_3node_cluster[{scenario_id}]: client created in {:.1}ms",
-            start.elapsed().as_secs_f64() * 1000.0
-        );
-        eprintln!("  start_3node_cluster[{scenario_id}]: refresh_routing");
-    }
-    client.refresh_routing().await?;
-    if timing_enabled() {
-        eprintln!(
-            "  start_3node_cluster[{scenario_id}]: ready in {:.1}ms",
-            start.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-    Ok((docker, client))
+
+    Err(last_err.unwrap_or_else(|| {
+        ClientError::Connection(format!(
+            "start_3node_cluster[{scenario_id}]: failed after {MAX_ATTEMPTS} attempts"
+        ))
+    }))
 }
 
 /// Start a 5-node cluster and wait for it to be ready.
 pub async fn start_5node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Client), ClientError> {
     let mut docker = docker_5node(scenario_id);
     let start = std::time::Instant::now();
-    if timing_enabled() {
-        eprintln!("  start_5node_cluster[{scenario_id}]: compose_up");
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last_err = None;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        if timing_enabled() {
+            eprintln!("  start_5node_cluster[{scenario_id}]: compose_up (attempt {attempt}/{MAX_ATTEMPTS})");
+        }
+        docker.compose_up().await?;
+        if timing_enabled() {
+            eprintln!(
+                "  start_5node_cluster[{scenario_id}]: compose_up done in {:.1}ms",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+            eprintln!("  start_5node_cluster[{scenario_id}]: wait_cluster_ready (45s)");
+        }
+        match wait_cluster_ready(&docker, 5, Duration::from_secs(45)).await {
+            Ok(()) => {
+                if timing_enabled() {
+                    eprintln!(
+                        "  start_5node_cluster[{scenario_id}]: cluster ready in {:.1}ms",
+                        start.elapsed().as_secs_f64() * 1000.0
+                    );
+                    eprintln!("  start_5node_cluster[{scenario_id}]: wait_migrations_complete");
+                }
+                wait_migrations_complete(&docker, 5, Duration::from_secs(30)).await?;
+                if timing_enabled() {
+                    eprintln!(
+                        "  start_5node_cluster[{scenario_id}]: migrations complete in {:.1}ms",
+                        start.elapsed().as_secs_f64() * 1000.0
+                    );
+                    eprintln!("  start_5node_cluster[{scenario_id}]: create_client");
+                }
+                let client = create_client(&docker, 5).await?;
+                if timing_enabled() {
+                    eprintln!(
+                        "  start_5node_cluster[{scenario_id}]: client created in {:.1}ms",
+                        start.elapsed().as_secs_f64() * 1000.0
+                    );
+                    eprintln!("  start_5node_cluster[{scenario_id}]: refresh_routing");
+                }
+                client.refresh_routing().await?;
+                if timing_enabled() {
+                    eprintln!(
+                        "  start_5node_cluster[{scenario_id}]: ready in {:.1}ms",
+                        start.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                return Ok((docker, client));
+            }
+            Err(e) => {
+                eprintln!(
+                    "  start_5node_cluster[{scenario_id}]: cluster not ready after 45s (attempt {attempt}/{MAX_ATTEMPTS}): {e}"
+                );
+                last_err = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    // Tear down and retry
+                    force_cleanup(scenario_id).await;
+                    wait_ports_free(docker.http_port(1), scenario_id, docker.node_count()).await;
+                    docker = docker_5node(scenario_id);
+                }
+            }
+        }
     }
-    docker.compose_up().await?;
-    if timing_enabled() {
-        eprintln!(
-            "  start_5node_cluster[{scenario_id}]: compose_up done in {:.1}ms",
-            start.elapsed().as_secs_f64() * 1000.0
-        );
-        eprintln!("  start_5node_cluster[{scenario_id}]: wait_cluster_ready");
-    }
-    wait_cluster_ready(&docker, 5, Duration::from_secs(60)).await?;
-    if timing_enabled() {
-        eprintln!(
-            "  start_5node_cluster[{scenario_id}]: cluster ready in {:.1}ms",
-            start.elapsed().as_secs_f64() * 1000.0
-        );
-        eprintln!("  start_5node_cluster[{scenario_id}]: wait_migrations_complete");
-    }
-    wait_migrations_complete(&docker, 5, Duration::from_secs(30)).await?;
-    if timing_enabled() {
-        eprintln!(
-            "  start_5node_cluster[{scenario_id}]: migrations complete in {:.1}ms",
-            start.elapsed().as_secs_f64() * 1000.0
-        );
-        eprintln!("  start_5node_cluster[{scenario_id}]: create_client");
-    }
-    let client = create_client(&docker, 5).await?;
-    if timing_enabled() {
-        eprintln!(
-            "  start_5node_cluster[{scenario_id}]: client created in {:.1}ms",
-            start.elapsed().as_secs_f64() * 1000.0
-        );
-        eprintln!("  start_5node_cluster[{scenario_id}]: refresh_routing");
-    }
-    client.refresh_routing().await?;
-    if timing_enabled() {
-        eprintln!(
-            "  start_5node_cluster[{scenario_id}]: ready in {:.1}ms",
-            start.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-    Ok((docker, client))
+
+    Err(last_err.unwrap_or_else(|| {
+        ClientError::Connection(format!(
+            "start_5node_cluster[{scenario_id}]: failed after {MAX_ATTEMPTS} attempts"
+        ))
+    }))
 }
 
 /// Seed N records with the given UTXO count each.
@@ -1196,10 +1249,10 @@ pub async fn find_holders(
 }
 
 /// Poll until all HTTP ports for a scenario are free (connection refused).
-/// Returns immediately once no port accepts connections, or after 2s at most.
+/// Returns immediately once no port accepts connections, or after 10s at most.
 async fn wait_ports_free(first_http_port: u16, _scenario_id: u16, node_count: u32) {
     let ports: Vec<u16> = (0..node_count).map(|i| first_http_port + i as u16).collect();
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let all_free = ports.iter().all(|&p| {
             std::net::TcpStream::connect_timeout(

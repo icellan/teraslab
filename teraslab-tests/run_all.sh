@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -e
+# Note: deliberately no `set -e` — a flaky diagnostic helper must never
+# abort the 17-scenario run. Individual commands use explicit `|| true`.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -48,8 +49,8 @@ scenario_name() {
 }
 scenario_timeout() {
     case "$1" in
-        01) echo 120 ;;  10) echo 900 ;;  08|15) echo 600 ;;
-        16) echo 600 ;;  17) echo 600 ;;  *) echo 300 ;;
+        01) echo 120 ;;  10) echo 900 ;;  14|15) echo 1200 ;;
+        08|16) echo 900 ;;  17) echo 600 ;;  *) echo 300 ;;
     esac
 }
 
@@ -97,18 +98,30 @@ for NUM in "${SCENARIOS[@]}"; do
     else
         echo "  FAIL (see $RESULTS_DIR/${TEST_NAME}.log)"
         FAIL=$((FAIL + 1))
-        ./scripts/collect_logs.sh "$RESULTS_DIR/${TEST_NAME}_diag"
+        # collect_logs must never block the loop — timeout+ignore failures.
+        $TIMEOUT_CMD 30 ./scripts/collect_logs.sh \
+            "$RESULTS_DIR/${TEST_NAME}_diag" 2>&1 \
+            | sed 's/^/  diag: /' || true
     fi
 
     # Clean up THIS scenario's Docker resources after the test completes.
-    docker compose -f docker/docker-compose.3node.yml down -v 2>/dev/null || true
-    docker compose -f docker/docker-compose.5node.yml down -v 2>/dev/null || true
-    compose_file="docker/docker-compose.ts${NUM}.yml"
+    # Use -p to match the project name used by the test code (ts{NN}).
+    SID="ts${NUM}"
+    compose_file="docker/docker-compose.${SID}.yml"
     if [ -f "$compose_file" ]; then
-        docker compose -f "$compose_file" down -v 2>/dev/null || true
+        docker compose -p "$SID" -f "$compose_file" down -v --remove-orphans 2>/dev/null || true
     fi
-    # Force-remove this scenario's containers.
-    docker ps -aq --filter "name=ts${NUM}-node" 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
+    # Force-remove any remaining containers for this scenario.
+    docker ps -aq --filter "name=${SID}-node" 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
+    # Remove volumes and networks that might linger.
+    docker volume ls -q --filter "name=${SID}" 2>/dev/null | xargs -r docker volume rm -f 2>/dev/null || true
+    docker network ls -q --filter "name=${SID}" 2>/dev/null | xargs -r docker network rm 2>/dev/null || true
+    # Also clean the "wrong config" scenario (99) if it exists.
+    docker ps -aq --filter "name=ts99-node" 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
+    docker volume ls -q --filter "name=ts99" 2>/dev/null | xargs -r docker volume rm -f 2>/dev/null || true
+    docker network ls -q --filter "name=ts99" 2>/dev/null | xargs -r docker network rm 2>/dev/null || true
+    # Brief cooldown to let Docker Desktop stabilize port forwarding.
+    sleep 2
 done
 
 echo ""

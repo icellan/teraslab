@@ -561,6 +561,10 @@ block_height_retention = 288
         let mut args = self.compose_base_args(&compose_file);
         args.push("up".to_string());
         args.push("-d".to_string());
+        // Don't recreate already-running containers when adding new nodes.
+        // Without this, Docker Compose may restart existing containers if the
+        // compose file changed (e.g., when docker_5node overwrites docker_3node's file).
+        args.push("--no-recreate".to_string());
         for node in nodes {
             args.push(node.to_string());
         }
