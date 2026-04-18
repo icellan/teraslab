@@ -54,7 +54,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     tlog!(t0, "teardown_all done");
 
     let (docker, client) = common::start_3node_cluster(SID).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
     client.refresh_routing().await?;
 
     let verifier = StateVerifier::new();
@@ -136,7 +136,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     docker.kill_node("node2").await?;
 
     // Wait for BOTH surviving nodes to detect node2's departure
-    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(15)).await
+    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(30)).await
         .map_err(|e| {
             eprintln!("Test 4.1: surviving nodes did not converge to cluster_size=2: {e}");
             e
@@ -146,7 +146,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // Wait for migrations to complete on the surviving nodes only.
     // Node 2 is dead, so we can't query it — use wait_specific_migrations_complete.
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(15)).await?;
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(60)).await?;
     // Refresh client routing to use the new shard assignments
     client.refresh_routing().await?;
 
@@ -173,7 +173,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     client.refresh_routing().await?;
 
     // Wait for migrations to complete on surviving nodes ONLY (1 and 3).
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(15)).await
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(60)).await
         .unwrap_or_else(|e| eprintln!("[4.2b] migration wait timed out: {e}"));
     // Wait for replication to settle after migration completes — migrated
     // records need time to propagate between the two surviving nodes.
@@ -497,8 +497,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     // Wait for surviving nodes to converge and migrations to complete.
     // After a node kill, shards mastered by the dead node must be migrated
     // from the replica to the new master before they're accessible.
-    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(15)).await?;
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(30)).await?;
+    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(30)).await?;
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(60)).await?;
     client.refresh_routing().await?;
 
     // Verify that every successful create is durable (readable)

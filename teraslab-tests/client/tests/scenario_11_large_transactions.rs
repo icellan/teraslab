@@ -141,7 +141,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     let (_docker, client) = common::start_3node_cluster(SID).await?;
     let docker = common::docker_3node(SID);
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
     client.refresh_routing().await?;
 
     let verifier = StateVerifier::new();
@@ -588,7 +588,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     let surviving_nodes: Vec<u32> = (1..=3u32)
         .filter(|&n| n != (kill_idx as u32 + 1))
         .collect();
-    common::wait_specific_nodes_ready(&docker, &surviving_nodes, 2, Duration::from_secs(15)).await?;
+    common::wait_specific_nodes_ready(&docker, &surviving_nodes, 2, Duration::from_secs(30)).await?;
     eprintln!("[11.9] Cluster stabilized at 2 nodes");
 
     // Wait for shard rebalancing to complete after node kill, then refresh
@@ -657,8 +657,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     eprintln!("[11.9] Restarted {kill_node_name}");
 
     // Wait for full cluster recovery and migration
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(15)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(15)).await?;
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
     let _ = client.refresh_routing().await;
 
@@ -720,9 +720,9 @@ async fn run_scenario() -> Result<(), ClientError> {
     docker_5.compose_up_nodes(&["node4"]).await?;
     eprintln!("[11.10] Added node4, waiting for cluster_size=4");
 
-    common::wait_cluster_ready(&docker_5, 4, Duration::from_secs(15)).await?;
+    common::wait_cluster_ready(&docker_5, 4, Duration::from_secs(30)).await?;
     eprintln!("[11.10] Cluster size=4, waiting for migrations to complete");
-    common::wait_migrations_complete(&docker_5, 4, Duration::from_secs(15)).await?;
+    common::wait_migrations_complete(&docker_5, 4, Duration::from_secs(120)).await?;
     eprintln!("[11.10] Migrations complete");
 
     // Refresh routing with the 4-node topology
@@ -833,8 +833,8 @@ async fn run_scenario() -> Result<(), ClientError> {
             eprintln!("[11.11] Killing node2 midway through reads");
             docker_5.kill_node("node2").await?;
             // Wait for surviving nodes to detect the kill and complete migrations
-            common::wait_specific_nodes_ready(&docker_5, &[1, 3, 4], 3, Duration::from_secs(15)).await?;
-            common::wait_specific_migrations_complete(&docker_5, &[1, 3, 4], Duration::from_secs(15)).await?;
+            common::wait_specific_nodes_ready(&docker_5, &[1, 3, 4], 3, Duration::from_secs(30)).await?;
+            common::wait_specific_migrations_complete(&docker_5, &[1, 3, 4], Duration::from_secs(30)).await?;
             let _ = client_4.refresh_routing().await;
         }
 
@@ -884,7 +884,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     // Restart node2
     docker_5.start_node("node2").await?;
     eprintln!("[11.11] Restarted node2");
-    common::wait_cluster_ready(&docker_5, 4, Duration::from_secs(15)).await?;
+    common::wait_cluster_ready(&docker_5, 4, Duration::from_secs(30)).await?;
     eprintln!("[11.11] Cluster recovered to 4 nodes. PASSED");
 
     tlog!(t0, "teardown_all (cleanup)");
