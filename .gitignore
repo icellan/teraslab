@@ -21,3 +21,12 @@ _plans/
 
 # Coverage reports
 tarpaulin-report.json
+
+# Local agent state
+/.claude/
+
+# Local working notes (not shipped with the repo)
+/docs/superpowers/
+
+# Scenario debug log dumps
+/teraslab-tests/client/debug-logs/
