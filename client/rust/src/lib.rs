@@ -259,30 +259,48 @@ impl Client {
     }
 
     /// Handle a signal response (SpendBatch/SetMinedBatch with success signals).
+    /// Decode a spend- or set-mined-style response that may carry per-item
+    /// success signals.
+    ///
+    /// `item_count` is the number of items in the originating request. When
+    /// the server responds with `STATUS_OK` and an empty payload (the common
+    /// fully-successful, no-signals case for spend_batch), we synthesize one
+    /// `BatchItemSuccess` per request index so callers can rely on
+    /// `successes.len()` to reflect what actually happened on the cluster.
+    /// Likewise on `STATUS_PARTIAL_ERROR` the implicit successes (items
+    /// whose index is not in the sparse error list) are reconstructed so
+    /// every request item shows up in exactly one of `successes` or
+    /// `errors`, with no silent drops.
     fn handle_signal_response(
         resp: &teraslab::protocol::frame::ResponseFrame,
+        item_count: usize,
     ) -> Result<SpendBatchResponse, ClientError> {
         match resp.status {
             STATUS_OK => {
                 if !resp.payload.is_empty() {
                     let (successes, errs) =
                         decode_partial_with_signals(&resp.payload)?;
-                    let result = SpendBatchResponse {
-                        successes: successes.clone(),
-                        errors: errs.clone(),
-                    };
                     if !errs.is_empty() {
                         return Err(ClientError::Partial(PartialError {
                             successes,
                             errors: errs,
                         }));
                     }
-                    Ok(result)
+                    Ok(SpendBatchResponse { successes, errors: Vec::new() })
                 } else {
-                    Ok(SpendBatchResponse {
-                        successes: Vec::new(),
-                        errors: Vec::new(),
-                    })
+                    // Server convention: empty payload on STATUS_OK means
+                    // every request item succeeded and there are no
+                    // per-item signals to report. Synthesize one
+                    // `BatchItemSuccess` per input index so callers do not
+                    // have to special-case the wire format.
+                    let successes = (0..item_count as u32)
+                        .map(|item_index| BatchItemSuccess {
+                            item_index,
+                            signal: SIGNAL_NONE,
+                            block_ids: Vec::new(),
+                        })
+                        .collect();
+                    Ok(SpendBatchResponse { successes, errors: Vec::new() })
                 }
             }
             STATUS_ERROR => {
@@ -298,10 +316,23 @@ impl Client {
                 Err(ClientError::Redirect(addr))
             }
             STATUS_PARTIAL_ERROR => {
-                // PARTIAL_ERROR uses sparse error format (no success signals).
+                // PARTIAL_ERROR encodes only the failing items sparsely;
+                // any index in `0..item_count` that isn't in the error list
+                // succeeded. Reconstruct the implicit successes so the
+                // PartialError carries a complete per-item picture.
                 let errs = decode_sparse_errors(&resp.payload)?;
+                let failed: std::collections::HashSet<u32> =
+                    errs.iter().map(|e| e.item_index).collect();
+                let successes = (0..item_count as u32)
+                    .filter(|i| !failed.contains(i))
+                    .map(|item_index| BatchItemSuccess {
+                        item_index,
+                        signal: SIGNAL_NONE,
+                        block_ids: Vec::new(),
+                    })
+                    .collect();
                 Err(ClientError::Partial(PartialError {
-                    successes: Vec::new(),
+                    successes,
                     errors: errs,
                 }))
             }
@@ -515,7 +546,7 @@ impl Client {
         let pool = self.pool.as_ref().ok_or(ClientError::PoolClosed)?;
         let conn = pool.get().await?;
         let resp = conn.round_trip(OP_SPEND_BATCH, 0, payload).await?;
-        Self::handle_signal_response(&resp)
+        Self::handle_signal_response(&resp, items.len())
     }
 
     /// Cluster-aware spend batch: group items by target node, send in parallel,
@@ -546,7 +577,7 @@ impl Client {
             let payload = encode_spend_batch_payload(params, &sub_items);
             let conn = pool.get().await?;
             let resp = conn.round_trip(OP_SPEND_BATCH, 0, payload).await?;
-            let result = Self::handle_signal_response(&resp);
+            let result = Self::handle_signal_response(&resp, sub_items.len());
             return match result {
                 Ok(mut r) => {
                     remap_signal_result(&mut r, &idx_map);
@@ -564,6 +595,19 @@ impl Client {
                             true // keep
                         }
                     });
+                    // Drop the synthetic success entries for the indices
+                    // we are about to retry — they will be re-added (with
+                    // real success information) if the retry succeeds.
+                    let retry_src_indices: std::collections::HashSet<u32> = redirect_items
+                        .iter()
+                        .filter_map(|(orig_idx, _)| {
+                            idx_map
+                                .iter()
+                                .position(|&i| i == *orig_idx)
+                                .map(|p| p as u32)
+                        })
+                        .collect();
+                    pe.successes.retain(|s| !retry_src_indices.contains(&s.item_index));
                     if !redirect_items.is_empty() {
                         let _ = self.refresh_routing().await;
                         for (orig_idx, spend_item) in redirect_items {
@@ -571,7 +615,7 @@ impl Client {
                             if let Ok(retry_pool) = cluster.pool_for_txid(&items[orig_idx].txid) {
                                 if let Ok(retry_conn) = retry_pool.get().await {
                                     if let Ok(retry_resp) = retry_conn.round_trip(OP_SPEND_BATCH, 0, retry_payload).await {
-                                        match Self::handle_signal_response(&retry_resp) {
+                                        match Self::handle_signal_response(&retry_resp, 1) {
                                             Ok(r) => {
                                                 for mut s in r.successes {
                                                     s.item_index = orig_idx as u32;
@@ -618,10 +662,11 @@ impl Client {
                 idx_map.iter().map(|&i| items[i].clone()).collect();
             let payload = encode_spend_batch_payload(params, &sub_items);
 
+            let sub_len = sub_items.len();
             handles.push(tokio::spawn(async move {
                 let conn = pool.get().await?;
                 let resp = conn.round_trip(OP_SPEND_BATCH, 0, payload).await?;
-                let result = Self::handle_signal_response(&resp);
+                let result = Self::handle_signal_response(&resp, sub_len);
                 Ok::<(Result<SpendBatchResponse, ClientError>, Vec<usize>), ClientError>((
                     result, idx_map,
                 ))
@@ -650,19 +695,17 @@ impl Client {
                     }
                 }
                 Err(ClientError::Partial(pe)) => {
-                    for mut s in pe.successes {
-                        if (s.item_index as usize) < idx_map.len() {
-                            s.item_index = idx_map[s.item_index as usize] as u32;
-                        }
-                        merged.successes.push(s);
-                    }
-                    // Separate redirect errors from real errors.
-                    // Redirect errors mean routing is stale — refresh and retry.
+                    // Separate redirect errors from real errors before
+                    // copying implicit successes over, so items that are
+                    // about to be retried do not appear in `merged.successes`
+                    // twice.
                     let mut redirect_items: Vec<(usize, SpendItem)> = Vec::new();
+                    let mut retry_sub_indices: std::collections::HashSet<u32> = std::collections::HashSet::new();
                     for e in pe.errors {
                         if e.code == ERR_REDIRECT && (e.item_index as usize) < idx_map.len() {
                             let orig_idx = idx_map[e.item_index as usize];
                             redirect_items.push((orig_idx, items[orig_idx].clone()));
+                            retry_sub_indices.insert(e.item_index);
                         } else {
                             let mut remapped = e;
                             if (remapped.item_index as usize) < idx_map.len() {
@@ -670,6 +713,15 @@ impl Client {
                             }
                             all_errors.push(remapped);
                         }
+                    }
+                    for mut s in pe.successes {
+                        if retry_sub_indices.contains(&s.item_index) {
+                            continue;
+                        }
+                        if (s.item_index as usize) < idx_map.len() {
+                            s.item_index = idx_map[s.item_index as usize] as u32;
+                        }
+                        merged.successes.push(s);
                     }
                     if !redirect_items.is_empty() {
                         // Retry redirected spends after routing refresh.
@@ -679,7 +731,7 @@ impl Client {
                             if let Ok(pool) = cluster.pool_for_txid(&items[orig_idx].txid) {
                                 if let Ok(conn) = pool.get().await {
                                     if let Ok(retry_resp) = conn.round_trip(OP_SPEND_BATCH, 0, retry_payload).await {
-                                        match Self::handle_signal_response(&retry_resp) {
+                                        match Self::handle_signal_response(&retry_resp, 1) {
                                             Ok(r) => {
                                                 for mut s in r.successes {
                                                     s.item_index = orig_idx as u32;
@@ -2422,6 +2474,103 @@ mod tests {
             result.is_ok(),
             "client should keep retrying MIGRATION_IN_PROGRESS long enough for scale-up windows: {result:?}"
         );
+
+        client.close().await;
+        shutdown_node(&node1);
+    }
+
+    /// Pattern D regression: `spend_batch` on a fully-successful batch must
+    /// return `successes` populated with one entry per input item. The
+    /// server sends an empty payload on `STATUS_OK` (per-item detail is
+    /// only encoded on partial failure), so the client is responsible for
+    /// reconstructing per-item success information from the request. If
+    /// `successes` is empty here, any caller that guards on
+    /// `!resp.successes.is_empty()` (as scenario 10 did) silently drops
+    /// every successful spend from its metrics and from its verifier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn spend_batch_populates_successes_on_full_success() {
+        let tcp1 = reserve_tcp_port();
+        let swim1 = reserve_udp_port();
+        let node1 = create_node(1, tcp1, swim1, &[]);
+
+        let client = Client::new(ClientConfig {
+            seeds: vec![format!("127.0.0.1:{tcp1}")],
+            cluster_refresh_interval: Duration::from_secs(3600),
+            ..Default::default()
+        })
+        .await
+        .expect("client should bootstrap from node1");
+
+        // Create a record with two UTXO slots so the spend batch below
+        // exercises multi-item success reporting.
+        let txid = txid_for_shard(7);
+        let utxo_a = [0xAA; 32];
+        let utxo_b = [0xBB; 32];
+        let create_item = CreateItem {
+            txid,
+            utxo_hashes: vec![utxo_a, utxo_b],
+            tx_version: 1,
+            locktime: 0,
+            fee: 100,
+            size_in_bytes: 100,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1710000000000,
+            flags: 0,
+            cold_data: vec![],
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+        client
+            .create_batch(&[create_item])
+            .await
+            .expect("create_batch should succeed on a freshly-started node");
+
+        let spend_items = vec![
+            SpendItem {
+                txid,
+                vout: 0,
+                utxo_hash: utxo_a,
+                spending_data: [0xC1; 36],
+            },
+            SpendItem {
+                txid,
+                vout: 1,
+                utxo_hash: utxo_b,
+                spending_data: [0xC2; 36],
+            },
+        ];
+        let params = SpendBatchParams {
+            ignore_conflicting: true,
+            ignore_locked: true,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        let resp = client
+            .spend_batch(&params, &spend_items)
+            .await
+            .expect("fully-successful spend_batch must return Ok");
+
+        assert!(
+            resp.errors.is_empty(),
+            "expected no per-item errors on a fully-successful spend_batch, got {:?}",
+            resp.errors,
+        );
+        assert_eq!(
+            resp.successes.len(),
+            spend_items.len(),
+            "fully-successful spend_batch must report per-item success for each request item; \
+             got {} success entries for a batch of {} items",
+            resp.successes.len(),
+            spend_items.len(),
+        );
+        let mut idxs: Vec<u32> = resp.successes.iter().map(|s| s.item_index).collect();
+        idxs.sort_unstable();
+        assert_eq!(idxs, vec![0, 1], "success entries should reference each input index");
 
         client.close().await;
         shutdown_node(&node1);
