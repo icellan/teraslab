@@ -54,6 +54,36 @@ scenario_timeout() {
     esac
 }
 
+# Timestamp-prefixing filter for scenario stdout/stderr. Each line coming
+# through stdin is prefixed with [HH:MM:SS] so a wedged scenario is
+# distinguishable from a slow-but-progressing one. Uses awk for portability
+# (moreutils' `ts` is not installed by default on macOS).
+if command -v ts >/dev/null 2>&1; then
+    ts_filter() { ts '[%H:%M:%S]'; }
+else
+    ts_filter() { awk '{ cmd = "date +%H:%M:%S"; cmd | getline t; close(cmd); printf "[%s] %s\n", t, $0; fflush(); }'; }
+fi
+
+# Wait until no containers matching the scenario-container pattern remain
+# and `docker ps` responds cleanly. Protects scenario 15 (next up) from
+# starting on a Docker daemon still recovering from the previous scenario's
+# mass tear-down. Bounded at 30 seconds.
+wait_docker_ready() {
+    local deadline=$(( $(date +%s) + 30 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if docker ps --format '{{.Names}}' >/dev/null 2>&1; then
+            local lingering
+            lingering="$(docker ps -aq --filter 'name=^ts[0-9]\{2\}-node' 2>/dev/null | wc -l | tr -d ' ')"
+            if [ "${lingering:-0}" -eq 0 ]; then
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+    echo "  warning: docker still has lingering ts*-node containers after 30s"
+    return 0
+}
+
 echo "============================================"
 echo "TeraSlab Docker Cluster Test Suite"
 echo "Tier: $TIER"
@@ -73,6 +103,8 @@ cd client && cargo build --release 2>&1 | tail -5 && cd ..
 
 PASS=0
 FAIL=0
+# Per-scenario results tracked for SUMMARY.md.
+declare -a SUMMARY_ROWS=()
 
 for NUM in "${SCENARIOS[@]}"; do
     NAME="$(scenario_name "$NUM")"
@@ -86,16 +118,24 @@ for NUM in "${SCENARIOS[@]}"; do
     TEST_NAME=$(ls client/tests/scenario_${NUM}_*.rs 2>/dev/null | head -1 | sed 's|.*/||;s|\.rs$||' || echo "")
     if [ -z "$TEST_NAME" ]; then
         echo "  SKIP (test file not found)"
+        SUMMARY_ROWS+=("| $NUM | $NAME | SKIP | 0s | _test file not found_ |")
         continue
     fi
 
     TIMEOUT_CMD="timeout"
     command -v timeout >/dev/null 2>&1 || TIMEOUT_CMD="gtimeout"
+    SCENARIO_START=$(date +%s)
+    # Pipe stdout/stderr through the timestamp filter before redirecting
+    # into the log so a wedged scenario can be distinguished from a
+    # slow-but-progressing one during post-mortem review.
     if $TIMEOUT_CMD "$TIMEOUT" cargo test --manifest-path client/Cargo.toml \
-        --release --test "$TEST_NAME" -- --nocapture > "$RESULTS_DIR/${TEST_NAME}.log" 2>&1; then
+        --release --test "$TEST_NAME" -- --nocapture 2>&1 \
+        | ts_filter > "$RESULTS_DIR/${TEST_NAME}.log"; then
+        STATUS="PASS"
         echo "  PASS"
         PASS=$((PASS + 1))
     else
+        STATUS="FAIL"
         echo "  FAIL (see $RESULTS_DIR/${TEST_NAME}.log)"
         FAIL=$((FAIL + 1))
         # collect_logs must never block the loop — timeout+ignore failures.
@@ -103,6 +143,15 @@ for NUM in "${SCENARIOS[@]}"; do
             "$RESULTS_DIR/${TEST_NAME}_diag" 2>&1 \
             | sed 's/^/  diag: /' || true
     fi
+    SCENARIO_DURATION=$(( $(date +%s) - SCENARIO_START ))
+
+    # For FAIL rows capture the first panic line (if any) for the summary.
+    FIRST_PANIC=""
+    if [ "$STATUS" = "FAIL" ]; then
+        FIRST_PANIC="$(grep -m1 -E 'panicked at|scenario failed' "$RESULTS_DIR/${TEST_NAME}.log" 2>/dev/null \
+            | sed 's/[|]/\\|/g' | head -c 200 || true)"
+    fi
+    SUMMARY_ROWS+=("| $NUM | $NAME | $STATUS | ${SCENARIO_DURATION}s | ${FIRST_PANIC} |")
 
     # Clean up THIS scenario's Docker resources after the test completes.
     # Use -p to match the project name used by the test code (ts{NN}).
@@ -120,12 +169,33 @@ for NUM in "${SCENARIOS[@]}"; do
     docker ps -aq --filter "name=ts99-node" 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
     docker volume ls -q --filter "name=ts99" 2>/dev/null | xargs -r docker volume rm -f 2>/dev/null || true
     docker network ls -q --filter "name=ts99" 2>/dev/null | xargs -r docker network rm 2>/dev/null || true
-    # Brief cooldown to let Docker Desktop stabilize port forwarding.
-    sleep 2
+    # Wait for Docker to actually finish the tear-down (and its daemon to
+    # settle) before the next scenario spins up. Specifically protects
+    # scenario 15 from starting on a daemon still draining the previous
+    # scenario's containers.
+    wait_docker_ready
 done
+
+# Emit SUMMARY.md for cheap historical comparison across results/ runs.
+SUMMARY_FILE="$RESULTS_DIR/SUMMARY.md"
+{
+    echo "# Run summary"
+    echo ""
+    echo "- Tier: $TIER"
+    echo "- Results dir: $RESULTS_DIR"
+    echo "- Passed: $PASS"
+    echo "- Failed: $FAIL"
+    echo ""
+    echo "| # | Name | Status | Duration | First panic line (FAIL only) |"
+    echo "|---|------|--------|----------|------------------------------|"
+    for row in "${SUMMARY_ROWS[@]}"; do
+        echo "$row"
+    done
+} > "$SUMMARY_FILE"
 
 echo ""
 echo "============================================"
 echo "RESULTS: $PASS passed, $FAIL failed"
+echo "Summary: $SUMMARY_FILE"
 echo "============================================"
 [ "$FAIL" -eq 0 ] || exit 1
