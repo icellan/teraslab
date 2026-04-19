@@ -259,6 +259,7 @@ fn as_f64(v: &serde_json::Value) -> f64 {
 // Command implementations
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout
 fn cmd_status(http: &HttpClient, json: bool) -> Result<(), CliError> {
     let status = http.get_json("/status")?;
     let index = http.get_json("/debug/index")?;
@@ -305,6 +306,7 @@ fn cmd_status(http: &HttpClient, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout
 fn cmd_nodes(http: &HttpClient, json: bool) -> Result<(), CliError> {
     let data = http.get_json("/admin/nodes")?;
     if json {
@@ -341,6 +343,7 @@ fn cmd_nodes(http: &HttpClient, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout
 fn cmd_shards(http: &HttpClient, json: bool, _node: Option<String>) -> Result<(), CliError> {
     let status = http.get_json("/status")?;
     if json {
@@ -358,6 +361,7 @@ fn cmd_shards(http: &HttpClient, json: bool, _node: Option<String>) -> Result<()
     Ok(())
 }
 
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout
 fn cmd_storage(http: &HttpClient, json: bool) -> Result<(), CliError> {
     let data = http.get_json("/debug/freelist")?;
     if json {
@@ -378,6 +382,7 @@ fn cmd_storage(http: &HttpClient, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout
 fn cmd_memory(http: &HttpClient, json: bool) -> Result<(), CliError> {
     let data = http.get_json("/admin/memory")?;
     if json {
@@ -395,6 +400,7 @@ fn cmd_memory(http: &HttpClient, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout
 fn cmd_records(http: &HttpClient, json: bool) -> Result<(), CliError> {
     let data = http.get_json("/admin/records")?;
     if json {
@@ -411,6 +417,7 @@ fn cmd_records(http: &HttpClient, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout
 fn cmd_record(http: &HttpClient, json: bool, txid: &str, _slots: bool, _raw: bool) -> Result<(), CliError> {
     let data = http.get_json(&format!("/debug/records/{txid}"))?;
     if json {
@@ -429,6 +436,7 @@ fn cmd_record(http: &HttpClient, json: bool, txid: &str, _slots: bool, _raw: boo
     Ok(())
 }
 
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout
 fn cmd_index(http: &HttpClient, json: bool, secondary: bool) -> Result<(), CliError> {
     let data = http.get_json("/debug/index")?;
     if json {
@@ -454,6 +462,7 @@ fn cmd_index(http: &HttpClient, json: bool, secondary: bool) -> Result<(), CliEr
     Ok(())
 }
 
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout
 fn cmd_replication(http: &HttpClient, json: bool) -> Result<(), CliError> {
     let data = http.get_json("/admin/replication")?;
     if json {
@@ -475,6 +484,7 @@ fn cmd_replication(http: &HttpClient, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout
 fn cmd_redo(http: &HttpClient, json: bool) -> Result<(), CliError> {
     let data = http.get_json("/debug/redo")?;
     if json {
@@ -498,6 +508,7 @@ fn cmd_redo(http: &HttpClient, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout
 fn cmd_rebalance(http: &HttpClient, json: bool, dry_run: bool) -> Result<(), CliError> {
     if dry_run {
         let status = http.get_json("/status")?;
@@ -519,6 +530,7 @@ fn cmd_rebalance(http: &HttpClient, json: bool, dry_run: bool) -> Result<(), Cli
     Ok(())
 }
 
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout
 fn cmd_drain(http: &HttpClient, json: bool, node_id: &str) -> Result<(), CliError> {
     let result = http.put_text(&format!("/admin/drain/{node_id}"), "")?;
     if json {
@@ -529,6 +541,7 @@ fn cmd_drain(http: &HttpClient, json: bool, node_id: &str) -> Result<(), CliErro
     Ok(())
 }
 
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout
 fn cmd_log_level(http: &HttpClient, json: bool, level: Option<&str>) -> Result<(), CliError> {
     match level {
         Some(l) => {
@@ -551,6 +564,7 @@ fn cmd_log_level(http: &HttpClient, json: bool, level: Option<&str>) -> Result<(
     Ok(())
 }
 
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout
 fn cmd_healthcheck(http: &HttpClient, json: bool) -> Result<bool, CliError> {
     let healthy = http.is_ready();
     if json {
@@ -563,6 +577,7 @@ fn cmd_healthcheck(http: &HttpClient, json: bool) -> Result<bool, CliError> {
     Ok(healthy)
 }
 
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout
 fn cmd_bench(http: &HttpClient, data_addr: &str, json: bool, operation: &str, count: u32) -> Result<(), CliError> {
     // For bench, we use the binary protocol directly.
     // First verify the server is up.
@@ -958,6 +973,7 @@ fn render_waiting(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
 // Main
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::disallowed_macros)] // CLI user-facing stderr on error
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let http = HttpClient::new(&cli.addr);

@@ -5,9 +5,11 @@
 //! adjacent free regions to reduce fragmentation.
 
 use crate::device::{AlignedBuf, BlockDevice, DeviceError};
+use crate::metrics::allocator_metrics;
 use crate::redo::{RedoLog, RedoOp};
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -546,6 +548,12 @@ impl SlotAllocator {
             );
         }
 
+        if let Some(m) = allocator_metrics() {
+            m.alloc_total.inc();
+            m.alloc_bytes_total.inc_by(aligned_size);
+            self.refresh_freelist_gauges(m);
+        }
+
         Ok(offset)
     }
 
@@ -618,7 +626,32 @@ impl SlotAllocator {
         self.freelist.insert(final_offset, final_size);
         self.freelist.maybe_promote();
 
+        if let Some(m) = allocator_metrics() {
+            m.free_total.inc();
+            m.free_bytes_total.inc_by(aligned_size);
+            self.refresh_freelist_gauges(m);
+        }
+
         Ok(())
+    }
+
+    /// Refresh the freelist-shape gauges in [`crate::metrics::AllocatorMetrics`].
+    ///
+    /// Called from `allocate`/`free` after mutating the freelist. Walks the
+    /// freelist once to compute the region count and the largest contiguous
+    /// region — `best_fit` already does the same O(freelist) traversal so
+    /// the worst-case complexity is unchanged.
+    fn refresh_freelist_gauges(&self, m: &crate::metrics::AllocatorMetrics) {
+        let mut count: u32 = 0;
+        let mut largest: u64 = 0;
+        for (_, size) in self.freelist.iter_offset_order() {
+            count = count.saturating_add(1);
+            if size > largest {
+                largest = size;
+            }
+        }
+        m.freelist_region_count.store(count, Ordering::Relaxed);
+        m.freelist_largest_region_bytes.store(largest, Ordering::Relaxed);
     }
 
     /// Apply a redo-log entry during crash recovery.
@@ -2046,5 +2079,68 @@ mod tests {
         alloc.allocate(4096).unwrap();
         // Second allocate is not journaled.
         assert_eq!(redo.lock().recover().unwrap().len(), 1);
+    }
+
+    /// Phase 5: allocate 3 regions, then free 2. Observe deltas on the
+    /// allocator counters so the test is robust to parallel tests that
+    /// also install and tick the metrics.
+    #[test]
+    fn allocator_ticks_alloc_and_free_counters() {
+        use crate::metrics::{init_allocator_metrics, allocator_metrics, AllocatorMetrics};
+        use std::sync::OnceLock;
+
+        static TEST_METRICS: OnceLock<AllocatorMetrics> = OnceLock::new();
+        let m_ref: &'static AllocatorMetrics =
+            TEST_METRICS.get_or_init(AllocatorMetrics::new);
+        init_allocator_metrics(m_ref);
+        let metrics = allocator_metrics().expect("metrics installed");
+
+        let before_alloc = metrics.alloc_total.get();
+        let before_alloc_bytes = metrics.alloc_bytes_total.get();
+        let before_free = metrics.free_total.get();
+
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+
+        // Allocate 3 distinct 4 KiB regions.
+        let off1 = alloc.allocate(4096).unwrap();
+        let off2 = alloc.allocate(4096).unwrap();
+        let _off3 = alloc.allocate(4096).unwrap();
+
+        // Also verify that `allocator_stats` reports ≥ 1 freelist region
+        // after this allocator's own free calls — this is a fresh local
+        // allocator so the invariant holds regardless of what other tests
+        // are doing on the shared `OnceLock` gauge.
+        alloc.free(off1, 4096).unwrap();
+        alloc.free(off2, 4096).unwrap();
+        let local_stats = alloc.stats();
+
+        // Other parallel tests may also drive the allocator metrics, so
+        // assert ≥ rather than == to remain robust.
+        assert!(
+            metrics.alloc_total.get() - before_alloc >= 3,
+            "alloc_total must advance by ≥ 3, got {}",
+            metrics.alloc_total.get() - before_alloc,
+        );
+        assert!(
+            metrics.alloc_bytes_total.get() - before_alloc_bytes >= 3 * 4096,
+            "alloc_bytes_total must advance by ≥ 3*4096, got {}",
+            metrics.alloc_bytes_total.get() - before_alloc_bytes,
+        );
+        assert!(
+            metrics.free_total.get() - before_free >= 2,
+            "free_total must advance by ≥ 2, got {}",
+            metrics.free_total.get() - before_free,
+        );
+
+        // Invariant specific to this allocator's state: after freeing two
+        // regions, the freelist must contain at least one entry. Read it
+        // from the local allocator rather than the global gauge, which is
+        // raced by parallel tests running their own fresh allocators.
+        assert!(
+            local_stats.free_region_count >= 1,
+            "local freelist should contain ≥ 1 region after freeing (got {})",
+            local_stats.free_region_count,
+        );
     }
 }

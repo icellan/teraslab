@@ -4,6 +4,8 @@
 //! shard table convergence, partition map serving, coordinator behaviour,
 //! data migration, and end-to-end cluster operations.
 
+#![allow(clippy::disallowed_macros)] // integration tests may use eprintln!/println! for diagnostics
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;

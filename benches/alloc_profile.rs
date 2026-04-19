@@ -4,6 +4,8 @@
 //! and total bytes each engine operation, codec function, and index operation
 //! triggers. This is NOT a criterion benchmark — it outputs a report to stdout.
 
+#![allow(clippy::disallowed_macros)] // bench tool emits to stdout by design
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

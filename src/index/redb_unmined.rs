@@ -319,7 +319,7 @@ impl RedbUnminedIndex {
         let txn = match self.begin_write() {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("redb unmined insert_batch: begin_write failed: {e}");
+                tracing::warn!(err = %e, "redb unmined insert_batch: begin_write failed");
                 return;
             }
         };
@@ -328,14 +328,14 @@ impl RedbUnminedIndex {
             let mut fwd = match txn.open_table(UNMINED_FORWARD) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("redb unmined insert_batch: open_table(forward) failed: {e}");
+                    tracing::warn!(err = %e, "redb unmined insert_batch: open_table(forward) failed");
                     return;
                 }
             };
             let mut rev = match txn.open_table(UNMINED_REVERSE) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("redb unmined insert_batch: open_table(reverse) failed: {e}");
+                    tracing::warn!(err = %e, "redb unmined insert_batch: open_table(reverse) failed");
                     return;
                 }
             };
@@ -351,13 +351,13 @@ impl RedbUnminedIndex {
                         }
                         already_exists = true;
                         if let Err(e) = fwd.remove(make_forward_key(old_height, &key)) {
-                            eprintln!("redb unmined insert_batch: remove old forward failed: {e}");
+                            tracing::warn!(err = %e, "redb unmined insert_batch: remove old forward failed");
                             return;
                         }
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        eprintln!("redb unmined insert_batch: reverse lookup failed: {e}");
+                        tracing::warn!(err = %e, "redb unmined insert_batch: reverse lookup failed");
                         return;
                     }
                 }
@@ -365,11 +365,11 @@ impl RedbUnminedIndex {
                     new_count += 1;
                 }
                 if let Err(e) = rev.insert(key.txid, height.to_le_bytes()) {
-                    eprintln!("redb unmined insert_batch: reverse insert failed: {e}");
+                    tracing::warn!(err = %e, "redb unmined insert_batch: reverse insert failed");
                     return;
                 }
                 if let Err(e) = fwd.insert(make_forward_key(height, &key), ()) {
-                    eprintln!("redb unmined insert_batch: forward insert failed: {e}");
+                    tracing::warn!(err = %e, "redb unmined insert_batch: forward insert failed");
                     return;
                 }
             }
@@ -379,7 +379,7 @@ impl RedbUnminedIndex {
                 self.count += new_count;
             }
             Err(e) => {
-                eprintln!("redb unmined insert_batch: commit failed: {e}");
+                tracing::warn!(err = %e, "redb unmined insert_batch: commit failed");
             }
         }
     }

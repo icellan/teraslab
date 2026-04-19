@@ -6,6 +6,7 @@
 
 use crate::cluster::membership::{ClusterEvent, Membership};
 use crate::cluster::shards::NodeId;
+use crate::metrics::swim_metrics;
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -193,7 +194,7 @@ impl SwimRunner {
 
         let handle = std::thread::spawn(move || {
             if let Err(e) = self.run_loop(event_tx) {
-                eprintln!("SWIM loop error: {e}");
+                tracing::error!(err = %e, "SWIM loop error");
             }
         });
 
@@ -227,7 +228,7 @@ impl SwimRunner {
             }
         }
 
-        eprintln!("SWIM listening on {}", self.config.bind_addr);
+        tracing::info!(bind_addr = %self.config.bind_addr, "SWIM listening");
 
         // Initial join attempt to seed nodes
         for seed in &self.config.seed_nodes {
@@ -284,6 +285,9 @@ impl SwimRunner {
             if should_suspect
                 && let Some(pending) = self.pending_probe.take()
             {
+                if let Some(m) = swim_metrics() {
+                    m.swim_probe_timeouts_total.inc();
+                }
                 let mut mem = self.membership.lock().unwrap();
                 // Use the member's current incarnation for local suspicion.
                 // This is not a gossipped suspicion — it's our own probe
@@ -345,7 +349,7 @@ impl SwimRunner {
                         peers.remove(id);
                         swim.remove(id);
                     }
-                    eprintln!("SWIM: garbage-collected {} dead node(s)", forgotten.len());
+                    tracing::info!(count = forgotten.len(), "SWIM: garbage-collected dead nodes");
                 }
             }
 
@@ -654,6 +658,9 @@ impl SwimRunner {
         let msg = self.encode_message(MSG_PING, &updates);
 
         let _ = socket.send_to(&msg, target_swim_addr);
+        if let Some(m) = swim_metrics() {
+            m.swim_probes_sent_total.inc();
+        }
         self.pending_probe = Some(PendingProbe {
             target: target_id,
             started: Instant::now(),
@@ -675,6 +682,9 @@ impl SwimRunner {
         if let Some(ref mut p) = self.pending_probe {
             p.indirect_sent = true;
             p.indirect_attempts = p.indirect_attempts.saturating_add(1);
+        }
+        if let Some(m) = swim_metrics() {
+            m.swim_indirect_probes_total.inc();
         }
 
         // Filter out the suspect itself and dead nodes — dead peers

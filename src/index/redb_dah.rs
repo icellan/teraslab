@@ -286,7 +286,7 @@ impl RedbDahIndex {
         let txn = match self.begin_write() {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("redb dah insert_batch: begin_write failed: {e}");
+                tracing::warn!(err = %e, "redb dah insert_batch: begin_write failed");
                 return;
             }
         };
@@ -295,14 +295,14 @@ impl RedbDahIndex {
             let mut fwd = match txn.open_table(DAH_FORWARD) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("redb dah insert_batch: open_table(forward) failed: {e}");
+                    tracing::warn!(err = %e, "redb dah insert_batch: open_table(forward) failed");
                     return;
                 }
             };
             let mut rev = match txn.open_table(DAH_REVERSE) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("redb dah insert_batch: open_table(reverse) failed: {e}");
+                    tracing::warn!(err = %e, "redb dah insert_batch: open_table(reverse) failed");
                     return;
                 }
             };
@@ -318,13 +318,13 @@ impl RedbDahIndex {
                         }
                         already_exists = true;
                         if let Err(e) = fwd.remove(make_forward_key(old_height, &key)) {
-                            eprintln!("redb dah insert_batch: remove old forward failed: {e}");
+                            tracing::warn!(err = %e, "redb dah insert_batch: remove old forward failed");
                             return;
                         }
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        eprintln!("redb dah insert_batch: reverse lookup failed: {e}");
+                        tracing::warn!(err = %e, "redb dah insert_batch: reverse lookup failed");
                         return;
                     }
                 }
@@ -332,11 +332,11 @@ impl RedbDahIndex {
                     new_count += 1;
                 }
                 if let Err(e) = rev.insert(key.txid, height.to_le_bytes()) {
-                    eprintln!("redb dah insert_batch: reverse insert failed: {e}");
+                    tracing::warn!(err = %e, "redb dah insert_batch: reverse insert failed");
                     return;
                 }
                 if let Err(e) = fwd.insert(make_forward_key(height, &key), ()) {
-                    eprintln!("redb dah insert_batch: forward insert failed: {e}");
+                    tracing::warn!(err = %e, "redb dah insert_batch: forward insert failed");
                     return;
                 }
             }
@@ -346,7 +346,7 @@ impl RedbDahIndex {
                 self.count += new_count;
             }
             Err(e) => {
-                eprintln!("redb dah insert_batch: commit failed: {e}");
+                tracing::warn!(err = %e, "redb dah insert_batch: commit failed");
             }
         }
     }

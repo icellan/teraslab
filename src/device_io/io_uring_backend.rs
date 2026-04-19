@@ -30,12 +30,27 @@
 
 use super::{Completion, DeviceIo};
 use crate::device::AlignedBuf;
+use crate::metrics::io_uring_metrics;
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use io_uring::{IoUring, opcode, squeue, types};
 
 /// Human-readable identifier used by metrics to report the selected backend.
 pub const BACKEND_ID: &str = "io_uring";
+
+/// Fixed-size timestamp ring used to correlate SQE submissions with CQE
+/// completions for latency measurement. Indexed by `user_data & MASK`.
+///
+/// A power-of-two size is required so the mask is cheap. Collisions (two
+/// outstanding ops sharing the low `RING_BITS` bits of user_data) are
+/// possible but have no correctness impact — the latency for the colliding
+/// CQE is measured from the more recent SQE's timestamp, which is within
+/// a single batch's lifetime.
+const RING_BITS: u32 = 10;
+const RING_SIZE: usize = 1 << RING_BITS; // 1024
+const RING_MASK: u64 = (RING_SIZE as u64) - 1;
 
 /// io_uring-based I/O backend for Linux >= 5.6.
 ///
@@ -47,6 +62,17 @@ pub struct IoUringBackend {
     pending: usize,
     /// Configured queue depth (power of two, rounded up by the kernel).
     queue_depth: u32,
+    /// Timestamp ring indexed by `user_data & RING_MASK` — each SQE push
+    /// stores `Instant::now()` (encoded as nanoseconds since a fixed base)
+    /// so the completion path can compute submit→complete latency.
+    ///
+    /// Zeros mean "no outstanding timestamp" which — because `now_ns()` is
+    /// never exactly 0 — is an acceptable empty sentinel.
+    ts_ring: Box<[AtomicU64; RING_SIZE]>,
+    /// Common base `Instant` used to encode timestamps as compact `u64`
+    /// nanoseconds. Recorded once at ring construction so subtraction is
+    /// always monotonic.
+    ts_base: Instant,
 }
 
 impl IoUringBackend {
@@ -59,11 +85,51 @@ impl IoUringBackend {
         // Clamp to at least 1 — IoUring::new rejects 0.
         let entries = queue_depth.max(1);
         let ring = IoUring::new(entries)?;
+        // Allocate the timestamp ring on the heap so the `IoUringBackend`
+        // stays cheap to move. Each cell is 8 bytes → 8 KiB total.
+        let ts_ring: Box<[AtomicU64; RING_SIZE]> = {
+            let v: Vec<AtomicU64> = (0..RING_SIZE).map(|_| AtomicU64::new(0)).collect();
+            let boxed_slice: Box<[AtomicU64]> = v.into_boxed_slice();
+            // Safety: boxed_slice has exactly RING_SIZE elements; converting
+            // to a fixed-size array box is safe when the length matches.
+            let ptr = Box::into_raw(boxed_slice) as *mut [AtomicU64; RING_SIZE];
+            unsafe { Box::from_raw(ptr) }
+        };
         Ok(Self {
             ring,
             pending: 0,
             queue_depth: entries,
+            ts_ring,
+            ts_base: Instant::now(),
         })
+    }
+
+    /// Encode `now` as nanoseconds since `self.ts_base`.
+    #[inline(always)]
+    fn now_ns(&self) -> u64 {
+        self.ts_base.elapsed().as_nanos() as u64
+    }
+
+    /// Remember the submission time for `user_data`.
+    #[inline(always)]
+    fn record_submit_ts(&self, user_data: u64) {
+        let idx = (user_data & RING_MASK) as usize;
+        self.ts_ring[idx].store(self.now_ns(), Ordering::Relaxed);
+    }
+
+    /// Read and clear the submission time for `user_data`, returning the
+    /// elapsed nanoseconds since submission. Returns `None` if the slot is
+    /// empty (e.g. because a collision overwrote it) so the caller can
+    /// skip recording a nonsensical latency.
+    #[inline(always)]
+    fn consume_submit_ts(&self, user_data: u64) -> Option<u64> {
+        let idx = (user_data & RING_MASK) as usize;
+        let stored = self.ts_ring[idx].swap(0, Ordering::Relaxed);
+        if stored == 0 {
+            return None;
+        }
+        let now = self.now_ns();
+        Some(now.saturating_sub(stored))
     }
 
     /// Drain the completion queue into `out`, returning the number of completions harvested.
@@ -72,23 +138,48 @@ impl IoUringBackend {
     /// `submit_and_wait` (after the kernel has guaranteed `min_complete`
     /// entries are ready).
     fn drain_completions(&mut self, out: &mut Vec<Completion>) -> usize {
+        let metrics = io_uring_metrics();
         let mut cq = self.ring.completion();
         cq.sync();
         let mut drained = 0usize;
         for cqe in &mut cq {
+            let user_data = cqe.user_data();
+            let result = cqe.result();
+            if let Some(m) = metrics {
+                if let Some(elapsed_ns) = self.consume_submit_ts(user_data) {
+                    m.uring_completion_latency_ns.record_ns(elapsed_ns);
+                }
+                if result < 0 {
+                    m.record_completion_error(result);
+                }
+            } else {
+                // Drain the timestamp slot even when metrics aren't installed
+                // so stale timestamps don't linger across resets.
+                let _ = self.consume_submit_ts(user_data);
+            }
             out.push(Completion {
-                user_data: cqe.user_data(),
-                result: cqe.result(),
+                user_data,
+                result,
             });
             drained += 1;
         }
         // When `cq` is dropped, the updated head is stored back to the ring,
         // releasing the slots for the kernel to fill again.
         self.pending = self.pending.saturating_sub(drained);
+        if let Some(m) = metrics {
+            m.uring_pending.store(self.pending as u32, Ordering::Relaxed);
+        }
         drained
     }
 
-    fn push_sqe(&mut self, entry: &squeue::Entry) -> Result<(), std::io::Error> {
+    fn push_sqe(&mut self, entry: &squeue::Entry, user_data: u64) -> Result<(), std::io::Error> {
+        // Record the submission timestamp BEFORE pushing so a concurrent
+        // completion on another op cannot race us to an empty slot. If the
+        // push fails the slot is stale but will be overwritten by the next
+        // successful submission on the same ring index.
+        if io_uring_metrics().is_some() {
+            self.record_submit_ts(user_data);
+        }
         // SAFETY: The SQE's underlying buffer/fd are owned by the caller and the caller
         // has accepted the buffer-lifetime invariant documented at module level. The
         // entry itself is a local value owned by this stack frame; `push` copies it.
@@ -96,6 +187,9 @@ impl IoUringBackend {
         match result {
             Ok(()) => {
                 self.pending += 1;
+                if let Some(m) = io_uring_metrics() {
+                    m.uring_pending.store(self.pending as u32, Ordering::Relaxed);
+                }
                 Ok(())
             }
             Err(_push_err) => Err(std::io::Error::new(
@@ -126,7 +220,7 @@ impl DeviceIo for IoUringBackend {
             .offset(offset)
             .build()
             .user_data(user_data);
-        self.push_sqe(&entry)
+        self.push_sqe(&entry, user_data)
     }
 
     fn submit_write(
@@ -148,20 +242,36 @@ impl DeviceIo for IoUringBackend {
             .offset(offset)
             .build()
             .user_data(user_data);
-        self.push_sqe(&entry)
+        self.push_sqe(&entry, user_data)
     }
 
     fn submit_and_wait(&mut self, min_complete: usize) -> Result<Vec<Completion>, std::io::Error> {
         // `submitter().submit_and_wait` both submits outstanding SQEs and
         // blocks until at least `min_complete` CQEs are available.
-        self.ring.submitter().submit_and_wait(min_complete)?;
+        let submit_start = Instant::now();
+        let res = self.ring.submitter().submit_and_wait(min_complete);
+        if let Some(m) = io_uring_metrics() {
+            m.uring_submit_latency_ns.record_since(submit_start);
+            if res.is_err() {
+                m.uring_submit_errors_total.inc();
+            }
+        }
+        res?;
         let mut out = Vec::with_capacity(min_complete.max(1));
         self.drain_completions(&mut out);
         Ok(out)
     }
 
     fn submit(&mut self) -> Result<(), std::io::Error> {
-        self.ring.submitter().submit()?;
+        let submit_start = Instant::now();
+        let res = self.ring.submitter().submit();
+        if let Some(m) = io_uring_metrics() {
+            m.uring_submit_latency_ns.record_since(submit_start);
+            if res.is_err() {
+                m.uring_submit_errors_total.inc();
+            }
+        }
+        res?;
         Ok(())
     }
 
@@ -188,6 +298,7 @@ impl IoUringBackend {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_macros)]
 mod tests {
     use super::*;
     use crate::device::AlignedBuf;
@@ -394,5 +505,46 @@ mod tests {
         // CQ should now be empty.
         assert!(io.completions().is_empty());
         assert_eq!(io.pending(), 0);
+    }
+
+    /// Phase 5: after submitting a read and draining the completion, both
+    /// submit-latency and completion-latency histograms must have at least
+    /// one sample recorded.
+    #[test]
+    fn uring_submit_latency_recorded_on_linux() {
+        use crate::metrics::{init_io_uring_metrics, io_uring_metrics, IoUringMetrics};
+        use std::sync::OnceLock;
+
+        static TEST_METRICS: OnceLock<IoUringMetrics> = OnceLock::new();
+        let m_ref: &'static IoUringMetrics =
+            TEST_METRICS.get_or_init(IoUringMetrics::new);
+        init_io_uring_metrics(m_ref);
+        let metrics = io_uring_metrics().expect("metrics installed");
+
+        let Some(mut io) = try_backend(16) else {
+            tracing::warn!("io_uring backend unavailable; skipping test body");
+            return;
+        };
+        let f = create_test_file(ALIGNMENT * 2);
+        let fd = f.as_raw_fd();
+
+        let before_submit = metrics.uring_submit_latency_ns.count();
+        let before_complete = metrics.uring_completion_latency_ns.count();
+
+        let mut rbuf = AlignedBuf::new(ALIGNMENT, ALIGNMENT);
+        io.submit_read(fd, &mut rbuf, 0, 0xBEEF).expect("submit read");
+        let comps = io.submit_and_wait(1).expect("wait");
+        assert_eq!(comps.len(), 1);
+
+        let after_submit = metrics.uring_submit_latency_ns.count();
+        let after_complete = metrics.uring_completion_latency_ns.count();
+        assert!(
+            after_submit > before_submit,
+            "uring_submit_latency_ns should record a sample",
+        );
+        assert!(
+            after_complete > before_complete,
+            "uring_completion_latency_ns should record a sample",
+        );
     }
 }

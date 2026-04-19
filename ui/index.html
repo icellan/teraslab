@@ -15,6 +15,7 @@
         <div class="nav-links">
             <a href="#/" class="nav-link" data-page="dashboard">Overview</a>
             <a href="#/flow" class="nav-link" data-page="flow">Flow</a>
+            <a href="#/observability" class="nav-link" data-page="observability">Observability</a>
             <a href="#/top" class="nav-link" data-page="top">Live</a>
             <a href="#/nodes" class="nav-link" data-page="nodes">Nodes</a>
             <a href="#/storage" class="nav-link" data-page="storage">Storage</a>
@@ -29,6 +30,82 @@
         </div>
     </nav>
     <main id="content"></main>
+    <div id="selfcheck" hidden></div>
     <script src="/ui/app.js"></script>
+    <script>
+    // Selfcheck: validates that /admin/top returns every top-level metric
+    // surface the UI depends on. Triggered by appending ?selfcheck=1 to the
+    // admin-UI URL. Result is written to #selfcheck as a single line prefixed
+    // with PASS or FAIL. Field names here mirror the exact shape produced by
+    // build_local_top_snapshot / aggregate_snapshots in src/server/http.rs.
+    (function () {
+        'use strict';
+        var params = new URLSearchParams(window.location.search);
+        if (params.get('selfcheck') !== '1') return;
+        var el = document.getElementById('selfcheck');
+        el.hidden = false;
+        el.style.cssText = 'position:fixed;top:60px;right:20px;z-index:9999;padding:12px 18px;' +
+            'background:#0f1217;border:1px solid #232a36;border-radius:6px;' +
+            'font-family:"JetBrains Mono",monospace;font-size:12px;color:#e6ecf3;' +
+            'max-width:520px;box-shadow:0 8px 24px rgba(0,0,0,0.4);';
+        el.textContent = 'selfcheck: running...';
+
+        function hasPath(obj, path) {
+            var parts = path.split('.');
+            var cur = obj;
+            for (var i = 0; i < parts.length; i++) {
+                if (cur == null || typeof cur !== 'object') return false;
+                if (!(parts[i] in cur)) return false;
+                cur = cur[parts[i]];
+            }
+            return cur !== undefined;
+        }
+
+        function renderResult(ok, detail) {
+            while (el.firstChild) el.removeChild(el.firstChild);
+            var tag = document.createElement('span');
+            tag.textContent = ok ? 'PASS' : 'FAIL';
+            tag.style.color = ok ? '#7cf0b3' : '#ff6b6b';
+            tag.style.fontWeight = '600';
+            el.appendChild(tag);
+            el.appendChild(document.createTextNode(' ' + detail));
+        }
+
+        // Required paths. Note: the task brief used naming like
+        // `replication_metrics.repl_batches_sent_total` but the actual server
+        // JSON (see src/server/http.rs:942-972) scopes these names inside
+        // replication_metrics{}, so the server field is `batches_sent`, not
+        // `repl_batches_sent_total`. The selfcheck asserts the ACTUAL shape.
+        var REQUIRED = [
+            'operations.spend.ok',
+            'replication_metrics.batches_sent',
+            'uring_metrics.pending',
+            'redo_metrics.append_total',
+            'migration_metrics.active',
+            'swim_metrics.probes_sent',
+            'allocator_metrics.alloc_total',
+        ];
+
+        fetch('/admin/top?local=true')
+            .then(function (r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.json();
+            })
+            .then(function (body) {
+                // /admin/top?local=true always returns the bare local snapshot
+                // (see handle_admin_top in http.rs:1362); new observability
+                // fields live at its top level.
+                var missing = REQUIRED.filter(function (p) { return !hasPath(body, p); });
+                if (missing.length === 0) {
+                    renderResult(true, REQUIRED.length + ' required paths present on /admin/top');
+                } else {
+                    renderResult(false, 'missing: ' + missing.join(', '));
+                }
+            })
+            .catch(function (e) {
+                renderResult(false, String(e));
+            });
+    })();
+    </script>
 </body>
 </html>

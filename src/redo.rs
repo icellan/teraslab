@@ -6,7 +6,9 @@
 
 use crate::device::{AlignedBuf, BlockDevice};
 use crate::index::TxKey;
+use crate::metrics::redo_metrics;
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -602,6 +604,11 @@ pub struct RedoLog {
     next_sequence: u64,
     buffer: Vec<u8>,
     flushed_pos: u64,
+    /// Entry count for metrics: number of `append()` calls currently sitting
+    /// in `buffer`. Reset to 0 after a successful `flush()`. Zero-cost when
+    /// metrics are not initialized — the counter is still updated but never
+    /// read by the hot path.
+    buffered_entries: u64,
 }
 
 impl RedoLog {
@@ -639,6 +646,7 @@ impl RedoLog {
             next_sequence: 1,
             buffer: Vec::new(),
             flushed_pos: 0,
+            buffered_entries: 0,
         };
 
         // Scan existing entries to find write position and checkpoint
@@ -676,10 +684,15 @@ impl RedoLog {
         }
 
         self.buffer.extend_from_slice(&bytes);
+        if let Some(m) = redo_metrics() {
+            m.redo_append_total.inc();
+            self.buffered_entries += 1;
+        }
         Ok(seq)
     }
 
     /// Flush the buffer to device, making all appended entries durable.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn flush(&mut self) -> Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
@@ -704,22 +717,47 @@ impl RedoLog {
         }
 
         buf[intra..intra + self.buffer.len()].copy_from_slice(&self.buffer);
-        self.device.pwrite(&buf, aligned_offset)?;
+        if let Err(e) = self.device.pwrite(&buf, aligned_offset) {
+            if let Some(m) = redo_metrics() {
+                m.redo_flush_errors_total.inc();
+            }
+            return Err(e.into());
+        }
         crate::fault_injection::check(
             crate::fault_injection::SyncPoint::BeforeRedoFsync,
         );
-        self.device.sync()?;
+        // Scope the sync call tightly so the latency histogram reflects only
+        // the fsync wall time, not the buffer-assembly / pwrite preamble.
+        let sync_start = Instant::now();
+        let sync_res = self.device.sync();
+        if let Some(m) = redo_metrics() {
+            m.redo_flush_latency_ns.record_since(sync_start);
+        }
+        if let Err(e) = sync_res {
+            if let Some(m) = redo_metrics() {
+                m.redo_flush_errors_total.inc();
+            }
+            return Err(e.into());
+        }
         crate::fault_injection::check(
             crate::fault_injection::SyncPoint::AfterRedoFsync,
         );
 
-        self.write_pos += self.buffer.len() as u64;
+        let flushed_bytes = self.buffer.len() as u64;
+        let flushed_entries = self.buffered_entries;
+        self.write_pos += flushed_bytes;
         self.flushed_pos = self.write_pos;
         self.buffer.clear();
+        self.buffered_entries = 0;
+        if let Some(m) = redo_metrics() {
+            m.redo_bytes_per_flush.record_ns(flushed_bytes);
+            m.redo_entries_per_flush.record_ns(flushed_entries);
+        }
         Ok(())
     }
 
     /// Append and flush in one call.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn append_and_flush(&mut self, op: RedoOp) -> Result<u64> {
         let seq = self.append(op)?;
         self.flush()?;
@@ -831,6 +869,7 @@ impl RedoLog {
         self.write_pos = 0;
         self.flushed_pos = 0;
         self.buffer.clear();
+        self.buffered_entries = 0;
         Ok(())
     }
 
@@ -1665,5 +1704,55 @@ mod tests {
         assert_eq!(entries.len(), 2, "expected 2 post-checkpoint entries");
         assert_eq!(entries[0].op, post_ops[0], "first post-checkpoint op mismatch");
         assert_eq!(entries[1].op, post_ops[1], "second post-checkpoint op mismatch");
+    }
+
+    /// Phase 5: appending 100 entries and flushing records non-zero
+    /// flush latency, bumps the append counter, and sets the bytes/entries
+    /// distribution buckets.
+    #[test]
+    fn redo_flush_records_latency_and_bytes() {
+        use crate::metrics::{init_redo_metrics, redo_metrics, RedoMetrics};
+        use std::sync::OnceLock;
+
+        static TEST_METRICS: OnceLock<RedoMetrics> = OnceLock::new();
+        let m_ref: &'static RedoMetrics = TEST_METRICS.get_or_init(RedoMetrics::new);
+        init_redo_metrics(m_ref);
+        let metrics = redo_metrics().expect("metrics installed");
+        let before_flush_count = metrics.redo_flush_latency_ns.count();
+        let before_append = metrics.redo_append_total.get();
+        let before_bytes_count = metrics.redo_bytes_per_flush.count();
+        let before_entries_count = metrics.redo_entries_per_flush.count();
+
+        let (_, mut log) = make_log(1024 * 1024);
+        for i in 0..100u8 {
+            log.append(RedoOp::Freeze {
+                tx_key: make_txid(i),
+                offset: i as u32,
+            })
+            .unwrap();
+        }
+        log.flush().unwrap();
+
+        // Exactly one flush call. flush_latency count must advance by at
+        // least 1 (≥ to be robust to other parallel flushes in the process).
+        assert!(
+            metrics.redo_flush_latency_ns.count() > before_flush_count,
+            "redo_flush_latency_ns.count() should advance",
+        );
+        // 100 appends -> append counter advances by at least 100.
+        assert!(
+            metrics.redo_append_total.get() - before_append >= 100,
+            "redo_append_total should advance by at least 100",
+        );
+        // bytes/entries histograms should have recorded exactly 1 datum
+        // per flush call — assert that this flush contributed.
+        assert!(
+            metrics.redo_bytes_per_flush.count() > before_bytes_count,
+            "redo_bytes_per_flush.count() should advance",
+        );
+        assert!(
+            metrics.redo_entries_per_flush.count() > before_entries_count,
+            "redo_entries_per_flush.count() should advance",
+        );
     }
 }

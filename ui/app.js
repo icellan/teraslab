@@ -13,7 +13,11 @@
         migrations: null, logLevel: null,
         topSnapshot: null, prevSnapshot: null, wsConnected: false,
         // rolling history buffers (N samples)
-        history: { ops: [], p99: [], p50: [], storage: [], redo: [], repl: [], errors: [] },
+        history: {
+            ops: [], p99: [], p50: [], storage: [], redo: [], repl: [], errors: [],
+            repl_lag: [], redo_flush_p99: [], alloc_rate: [],
+        },
+        _prevObs: null,
     };
     const HISTORY_MAX = 60;
     let refreshTimer = null;
@@ -68,6 +72,11 @@
         const ts = store.topSnapshot;
         if (!ts) return;
         const agg = ts.aggregate || ts;
+        // Observability sub-shapes (replication_metrics / redo_metrics / etc.)
+        // are produced by build_local_top_snapshot (see src/server/http.rs) but
+        // NOT propagated by aggregate_snapshots. When the WS envelope wraps a
+        // cluster snapshot, those live on nodes[0]. Fall back gracefully.
+        const localNode = ts.nodes && ts.nodes.length ? ts.nodes[0] : agg;
         const c = agg.counters || {};
         const lat = agg.latency || {};
         const prev = store._prevForRate;
@@ -83,7 +92,38 @@
         push(store.history.p50, (lat.spend?.p50_ns || 0) / 1000);
         push(store.history.storage, (agg.storage?.utilization || 0) * 100);
         push(store.history.redo, (agg.redo?.utilization || 0) * 100);
-        push(store.history.repl, (store.replication?.ack_p99_ms) || 0);
+
+        // Replication lag: max (leader_seq - last_acked_seq) across replicas
+        const rm = localNode.replication_metrics || {};
+        const leaderSeq = rm.leader_sequence || 0;
+        let maxLag = 0;
+        for (const pr of rm.per_replica || []) {
+            const lag = pr.lag != null ? pr.lag : Math.max(0, leaderSeq - (pr.last_acked_seq || 0));
+            if (lag > maxLag) maxLag = lag;
+        }
+        push(store.history.repl_lag, maxLag);
+        // Keep the old .repl buffer populated for KPI continuity — using the
+        // replication batch latency p99 in ms if available, else 0.
+        const replLatP99Ns = rm.latency?.p99_ns || 0;
+        push(store.history.repl, replLatP99Ns / 1e6);
+
+        // Redo flush p99 in µs
+        const redoFlushP99 = (localNode.redo_metrics?.flush_latency?.p99_ns || 0) / 1000;
+        push(store.history.redo_flush_p99, redoFlushP99);
+
+        // Allocator alloc-rate (alloc_total deltas per second)
+        const am = localNode.allocator_metrics || {};
+        const nowTs = agg.timestamp_ms || 0;
+        let allocRate = 0;
+        if (store._prevObs && nowTs > store._prevObs.ts) {
+            const dt = (nowTs - store._prevObs.ts) / 1000;
+            if (dt > 0) {
+                allocRate = Math.max(0, ((am.alloc_total || 0) - store._prevObs.alloc_total) / dt);
+            }
+        }
+        store._prevObs = { ts: nowTs, alloc_total: am.alloc_total || 0 };
+        push(store.history.alloc_rate, allocRate);
+
         const errRate = ((c.spends_attempted || 0) - (c.spends_succeeded || 0));
         push(store.history.errors, errRate);
     }
@@ -591,7 +631,7 @@
             store.prevSnapshot = store.topSnapshot;
             store.topSnapshot = JSON.parse(e.data);
             pushHistory();
-            if (['top', 'dashboard', 'flow'].includes(currentPage())) renderCurrentPage();
+            if (['top', 'dashboard', 'flow', 'observability'].includes(currentPage())) renderCurrentPage();
         };
         ws.onclose = () => { store.wsConnected = false; renderCurrentPage(); setTimeout(connectWs, 2000); };
         ws.onerror = () => ws.close();
@@ -607,11 +647,672 @@
     }
 
     // ---------------------------------------------------------------------------
+    // Page: Observability — per-op outcomes, latencies, replication, io_uring,
+    //                     redo, migrations, swim, allocator
+    //
+    // Each panel is guarded against missing data: `fmt()` returns '-' for null,
+    // and panels print "no activity" placeholders when a subsystem has zero
+    // traffic. Field names mirror the server JSON (src/server/http.rs:853-1135).
+    // ---------------------------------------------------------------------------
+
+    // Stable opcode list for outcome table. Must match OpCode::all() in
+    // src/metrics.rs so rows render in a consistent order.
+    const OP_CODES = [
+        'spend', 'unspend', 'create', 'set_mined', 'freeze', 'unfreeze',
+        'reassign', 'set_conflicting', 'set_locked', 'preserve_until',
+        'delete', 'mark_longest_chain', 'get', 'get_spend',
+    ];
+    // Per-op latency histograms are only exposed for 3 opcodes today
+    // (spend, spend_multi, unspend, lock_wait). Map OP_CODE → histogram key.
+    const OP_LATENCY_KEY = {
+        spend: 'spend', unspend: 'unspend',
+        // Everything else shares the spend histogram as a rough proxy.
+        // When phase-4 adds per-op histograms this map will grow; for now we
+        // leave the latency cells showing '-' for ops without a dedicated
+        // histogram so operators aren't misled by stale data.
+    };
+    const OUTCOMES = [
+        'ok', 'idempotent', 'err_not_found', 'err_conflicting',
+        'err_frozen', 'err_storage', 'redirect', 'other',
+    ];
+    const ERR_OUTCOMES = new Set(['err_not_found', 'err_conflicting', 'err_frozen', 'err_storage']);
+
+    function getLocalSnap() {
+        const ts = store.topSnapshot;
+        if (!ts) return null;
+        // The WS envelope is { aggregate, nodes: [...] }; the new observability
+        // sub-shapes are per-node. Pick nodes[0] if available; else treat the
+        // payload itself as the local snapshot.
+        if (ts.nodes && ts.nodes.length) return ts.nodes[0];
+        return ts.aggregate || ts;
+    }
+    function getAggSnap() {
+        const ts = store.topSnapshot;
+        if (!ts) return null;
+        return ts.aggregate || ts;
+    }
+
+    function renderObservability() {
+        const ts = store.topSnapshot;
+        if (!ts) {
+            return '<div class="ts-panel"><div class="ts-panel__body">Waiting for metrics stream…</div></div>';
+        }
+        const agg = getAggSnap();
+        const local = getLocalSnap();
+
+        return [
+            opsOutcomePanel(agg),
+            replicationPanel(local),
+            uringPanel(local),
+            redoPanel(local),
+            migrationPanel(local),
+            swimPanel(local),
+            allocatorPanel(local),
+        ].join('');
+    }
+
+    // --- Panel: per-op outcome breakdown + latency percentiles --------------
+    function opsOutcomePanel(agg) {
+        const ops = agg?.operations || {};
+        const lat = agg?.latency || {};
+        // Build rows with totals, % per outcome, error-severity flag
+        const rows = OP_CODES.map(op => {
+            const row = ops[op] || {};
+            const total = OUTCOMES.reduce((s, o) => s + (row[o] || 0), 0);
+            const errs = ['err_not_found', 'err_conflicting', 'err_frozen', 'err_storage']
+                .reduce((s, o) => s + (row[o] || 0), 0);
+            const errRatio = total > 0 ? errs / total : 0;
+            return { op, row, total, errs, errRatio };
+        });
+        const activeRows = rows.filter(r => r.total > 0);
+        const totalOps = rows.reduce((s, r) => s + r.total, 0);
+        const totalErrs = rows.reduce((s, r) => s + r.errs, 0);
+
+        // Outcome column headers with short label
+        const head = `<thead><tr>
+            <th>OP</th>
+            <th style="text-align:right">TOTAL</th>
+            <th style="text-align:right">OK</th>
+            <th style="text-align:right">IDEMP</th>
+            <th style="text-align:right">NOT-FOUND</th>
+            <th style="text-align:right">CONFLICT</th>
+            <th style="text-align:right">FROZEN</th>
+            <th style="text-align:right">STORAGE</th>
+            <th style="text-align:right">REDIRECT</th>
+            <th style="text-align:right">OTHER</th>
+            <th style="text-align:right">ERR %</th>
+            <th style="text-align:right">P50</th>
+            <th style="text-align:right">P99</th>
+            <th style="text-align:left">MIX</th>
+        </tr></thead>`;
+
+        const body = rows.map(r => {
+            if (r.total === 0) {
+                return `<tr>
+                    <td style="color:var(--ts-text)">${r.op}</td>
+                    <td style="text-align:right;color:var(--ts-text-3)">-</td>
+                    ${OUTCOMES.map(() => '<td style="text-align:right;color:var(--ts-text-4)">-</td>').join('')}
+                    <td style="text-align:right;color:var(--ts-text-4)">-</td>
+                    <td style="text-align:right;color:var(--ts-text-4)">-</td>
+                    <td style="text-align:right;color:var(--ts-text-4)">-</td>
+                    <td></td>
+                </tr>`;
+            }
+            const errPct = (r.errRatio * 100);
+            const errClass = errPct > 1 ? 'ts-bad' : errPct > 0.1 ? 'ts-warn' : 'ts-ok';
+            const latKey = OP_LATENCY_KEY[r.op];
+            const p50 = latKey ? lat[latKey]?.p50_ns : null;
+            const p99 = latKey ? lat[latKey]?.p99_ns : null;
+            return `<tr>
+                <td style="color:var(--ts-text)">${r.op}</td>
+                <td style="text-align:right;color:var(--ts-text)">${fmt(r.total)}</td>
+                ${OUTCOMES.map(o => {
+                    const v = r.row[o] || 0;
+                    if (v === 0) return `<td style="text-align:right;color:var(--ts-text-4)">-</td>`;
+                    const isErr = ERR_OUTCOMES.has(o);
+                    const color = isErr && v > 0 ? 'var(--ts-warn)' : 'var(--ts-text-2)';
+                    return `<td style="text-align:right;color:${color}">${fmt(v)}</td>`;
+                }).join('')}
+                <td style="text-align:right" class="${errClass}">${errPct.toFixed(2)}%</td>
+                <td style="text-align:right">${fmtNs(p50)}</td>
+                <td style="text-align:right">${fmtNs(p99)}</td>
+                <td>${stackedMix(r.row, r.total)}</td>
+            </tr>`;
+        }).join('');
+
+        const summary = totalOps > 0
+            ? `${fmt(totalOps)} total ops · ${fmt(totalErrs)} errors · ${(totalErrs / totalOps * 100).toFixed(3)}% err rate · ${activeRows.length}/${OP_CODES.length} ops with activity`
+            : 'no activity';
+
+        return `<div class="ts-panel">
+            <div class="ts-panel__head">
+                <div class="ts-panel__title"><span class="ts-dot"></span>Per-op outcomes · cluster aggregate</div>
+                <div class="ts-panel__meta">${summary}</div>
+            </div>
+            <div class="ts-panel__body" style="padding:0;overflow-x:auto">
+                <table class="ts-obs-table">${head}<tbody>${body}</tbody></table>
+            </div>
+        </div>`;
+    }
+
+    // Render a horizontal stacked bar showing the outcome mix for an op.
+    function stackedMix(row, total) {
+        if (total === 0) return '';
+        const segs = [];
+        const colorFor = o => {
+            if (o === 'ok') return 'var(--ts-ok)';
+            if (o === 'idempotent') return 'var(--ts-info)';
+            if (o === 'redirect') return 'var(--ts-text-3)';
+            if (o === 'other') return 'var(--ts-text-4)';
+            if (ERR_OUTCOMES.has(o)) {
+                // darker for rarer errors, red for storage
+                if (o === 'err_storage') return 'var(--ts-bad)';
+                return 'var(--ts-warn)';
+            }
+            return 'var(--ts-text-4)';
+        };
+        for (const o of OUTCOMES) {
+            const v = row[o] || 0;
+            if (v === 0) continue;
+            const pct = (v / total) * 100;
+            segs.push(`<span title="${o}: ${fmt(v)} (${pct.toFixed(2)}%)" style="background:${colorFor(o)};display:inline-block;height:10px;width:${pct}%;"></span>`);
+        }
+        return `<div class="ts-stackbar" style="display:flex;width:160px;border-radius:3px;overflow:hidden;background:var(--ts-bg-3);">${segs.join('')}</div>`;
+    }
+
+    // --- Panel: replication -------------------------------------------------
+    function replicationPanel(local) {
+        const rm = local?.replication_metrics;
+        const replState = store.replication || {};
+        if (!rm) {
+            return panel('Replication', 'not populated', '<div style="padding:14px;color:var(--ts-text-3)">Replication metrics not available.</div>');
+        }
+        const leader = rm.leader_sequence || 0;
+        const lat = rm.latency || {};
+        const perRep = rm.per_replica || [];
+        // Only show replicas that have non-zero activity OR are known from cluster topology
+        const interesting = perRep.filter(p =>
+            (p.bytes_sent || 0) > 0 ||
+            (p.batches_acked || 0) > 0 ||
+            (p.batches_failed || 0) > 0 ||
+            (p.in_flight || 0) > 0 ||
+            (p.last_acked_seq || 0) > 0
+        );
+
+        const lagColor = lag => lag < 100 ? 'var(--ts-ok)' : lag < 10000 ? 'var(--ts-warn)' : 'var(--ts-bad)';
+        const lagClass = lag => lag < 100 ? 'ts-ok' : lag < 10000 ? 'ts-warn' : 'ts-bad';
+
+        const rows = interesting.length === 0
+            ? `<tr><td colspan="7" style="color:var(--ts-text-3);text-align:center;padding:14px;">no replica activity</td></tr>`
+            : interesting.map(p => {
+                const lag = p.lag != null ? p.lag : Math.max(0, leader - (p.last_acked_seq || 0));
+                return `<tr>
+                    <td style="color:var(--ts-text)">replica-${p.replica_idx}</td>
+                    <td style="text-align:right">${fmt(p.last_acked_seq)}</td>
+                    <td style="text-align:right;color:${lagColor(lag)}" class="${lagClass(lag)}">${fmt(lag)}</td>
+                    <td style="text-align:right">${fmt(p.in_flight)}</td>
+                    <td style="text-align:right">${fmt(p.batches_acked)}</td>
+                    <td style="text-align:right">${p.batches_failed > 0 ? '<span class="ts-bad">' + fmt(p.batches_failed) + '</span>' : fmt(p.batches_failed)}</td>
+                    <td style="text-align:right">${fmtBytes(p.bytes_sent)}</td>
+                </tr>`;
+            }).join('');
+
+        const meta = [
+            `batch p99 ${fmtNs(lat.p99_ns)}`,
+            `p50 ${fmtNs(lat.p50_ns)}`,
+            `${fmt(rm.batches_sent)} sent`,
+            `${fmtBytes(rm.bytes_sent)} out`,
+            `leader seq ${fmt(leader)}`,
+            replState.enabled ? `rf ${replState.replication_factor || '-'}` : 'single-node',
+        ].join(' · ');
+
+        const kpis = `<div class="grid" style="grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px;">
+            <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                <div class="ts-label">MAX LAG (SEQS)</div>
+                <div class="ts-num" style="font-size:20px;color:${lagColor(store.history.repl_lag.at(-1) || 0)};">${fmt(store.history.repl_lag.at(-1) || 0)}</div>
+                <div class="ts-kpi__spark">${sparkline(store.history.repl_lag, { w: 200, h: 24, color: 'var(--ts-warn)' })}</div>
+            </div>
+            <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                <div class="ts-label">BATCH LATENCY P99</div>
+                <div class="ts-num" style="font-size:20px">${fmtNs(lat.p99_ns)}</div>
+                <div class="ts-label" style="margin-top:6px">p50 ${fmtNs(lat.p50_ns)} · p95 ${fmtNs(lat.p95_ns)}</div>
+            </div>
+            <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                <div class="ts-label">BATCHES SENT</div>
+                <div class="ts-num" style="font-size:20px">${fmt(rm.batches_sent)}</div>
+                <div class="ts-label" style="margin-top:6px">${fmt(lat.count)} sampled · ${fmtBytes(rm.bytes_sent)}</div>
+            </div>
+            <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                <div class="ts-label">FAILURES</div>
+                <div class="ts-num" style="font-size:20px;${totalFailures(perRep) > 0 ? 'color:var(--ts-bad)' : ''}">${fmt(totalFailures(perRep))}</div>
+                <div class="ts-label" style="margin-top:6px">across ${perRep.filter(p => p.batches_acked > 0 || p.batches_failed > 0).length} replicas</div>
+            </div>
+        </div>`;
+
+        const table = `<table>
+            <thead><tr>
+                <th>REPLICA</th>
+                <th style="text-align:right">LAST ACKED SEQ</th>
+                <th style="text-align:right">LAG</th>
+                <th style="text-align:right">IN FLIGHT</th>
+                <th style="text-align:right">ACKED</th>
+                <th style="text-align:right">FAILED</th>
+                <th style="text-align:right">BYTES SENT</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+        </table>`;
+
+        return `<div class="ts-panel">
+            <div class="ts-panel__head">
+                <div class="ts-panel__title"><span class="ts-dot"></span>Replication</div>
+                <div class="ts-panel__meta">${meta}</div>
+            </div>
+            <div class="ts-panel__body">
+                ${kpis}
+                <div style="overflow-x:auto">${table}</div>
+            </div>
+        </div>`;
+    }
+    function totalFailures(per) { return (per || []).reduce((s, p) => s + (p.batches_failed || 0), 0); }
+
+    // --- Panel: io_uring ----------------------------------------------------
+    function uringPanel(local) {
+        const u = local?.uring_metrics;
+        if (!u) {
+            return panel('io_uring', 'not populated', '<div style="padding:14px;color:var(--ts-text-3)">io_uring metrics not available.</div>');
+        }
+        const subCount = u.submit_latency?.count || 0;
+        const cmpCount = u.completion_latency?.count || 0;
+        const anyActivity = subCount + cmpCount + (u.pending || 0) + (u.submit_errors || 0);
+        if (anyActivity === 0) {
+            return panel('io_uring', 'no activity', '<div style="padding:14px;color:var(--ts-text-3)">No io_uring traffic recorded yet.</div>');
+        }
+        const errs = u.completion_errors || {};
+        const ERR_KEYS = ['eio', 'enomem', 'enospc', 'eagain', 'eperm', 'einval', 'eintr', 'other'];
+        const totalErrs = ERR_KEYS.reduce((s, k) => s + (errs[k] || 0), 0);
+
+        const latRow = (label, h) => `<div style="display:grid;grid-template-columns:90px 1fr 1fr 1fr;gap:8px;padding:6px 0;font-family:var(--ts-mono);font-size:11px;border-bottom:1px solid var(--ts-line)">
+            <span class="ts-label">${label}</span>
+            <span><span class="ts-label">count</span> ${fmt(h?.count)}</span>
+            <span><span class="ts-label">p50</span> ${fmtNs(h?.p50_ns)}</span>
+            <span><span class="ts-label">p99</span> ${fmtNs(h?.p99_ns)}</span>
+        </div>`;
+
+        const errRows = ERR_KEYS.map(k => {
+            const v = errs[k] || 0;
+            if (v === 0) return `<div style="display:flex;justify-content:space-between;padding:4px 0;"><span class="ts-label">${k.toUpperCase()}</span><span style="color:var(--ts-text-4)">-</span></div>`;
+            const color = k === 'eio' || k === 'enospc' ? 'var(--ts-bad)' : k === 'enomem' || k === 'eagain' ? 'var(--ts-warn)' : 'var(--ts-text)';
+            return `<div style="display:flex;justify-content:space-between;padding:4px 0;"><span class="ts-label">${k.toUpperCase()}</span><span style="color:${color}">${fmt(v)}</span></div>`;
+        }).join('');
+
+        return `<div class="ts-panel">
+            <div class="ts-panel__head">
+                <div class="ts-panel__title"><span class="ts-dot"></span>io_uring</div>
+                <div class="ts-panel__meta">pending ${fmt(u.pending)} · submit errors ${fmt(u.submit_errors)} · completion errors ${fmt(totalErrs)}</div>
+            </div>
+            <div class="ts-panel__body">
+                <div class="grid" style="grid-template-columns:repeat(3,1fr);gap:10px;">
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label">PENDING</div>
+                        <div class="ts-num" style="font-size:22px">${fmt(u.pending)}</div>
+                        <div class="ts-label" style="margin-top:6px">in-flight SQEs</div>
+                    </div>
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label">SUBMIT ERRORS</div>
+                        <div class="ts-num" style="font-size:22px;${(u.submit_errors || 0) > 0 ? 'color:var(--ts-bad)' : ''}">${fmt(u.submit_errors)}</div>
+                        <div class="ts-label" style="margin-top:6px">total since boot</div>
+                    </div>
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label">COMPLETION ERRORS</div>
+                        <div class="ts-num" style="font-size:22px;${totalErrs > 0 ? 'color:var(--ts-bad)' : ''}">${fmt(totalErrs)}</div>
+                        <div class="ts-label" style="margin-top:6px">across all errno classes</div>
+                    </div>
+                </div>
+                <div class="grid" style="grid-template-columns:1.6fr 1fr;gap:10px;margin-top:10px;">
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label" style="margin-bottom:6px">LATENCY</div>
+                        ${latRow('SUBMIT', u.submit_latency)}
+                        ${latRow('COMPLETION', u.completion_latency)}
+                    </div>
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label" style="margin-bottom:6px">COMPLETION ERRORS BY ERRNO</div>
+                        ${errRows}
+                    </div>
+                </div>
+            </div>
+        </div>`;
+    }
+
+    // --- Panel: redo log ----------------------------------------------------
+    function redoPanel(local) {
+        const r = local?.redo_metrics;
+        if (!r) {
+            return panel('Redo log', 'not populated', '<div style="padding:14px;color:var(--ts-text-3)">Redo metrics not available.</div>');
+        }
+        const flush = r.flush_latency || {};
+        const bytes = r.bytes_per_flush || {};
+        const entries = r.entries_per_flush || {};
+        if (!r.append_total && !flush.count) {
+            return panel('Redo log', 'no activity', '<div style="padding:14px;color:var(--ts-text-3)">No redo appends since boot.</div>');
+        }
+        // Derive append-rate from rolling op-rate: we don't track redo append_total
+        // per-tick, but flush_latency.count * avg(entries_per_flush.mean) gives a
+        // close proxy. Prefer the direct mean if available.
+        const appendRate = flush.count > 0 && store.history.ops.length >= 2
+            ? store.history.ops.at(-1) // rough: ops/s is a decent proxy for append/s when all writes redo
+            : 0;
+
+        return `<div class="ts-panel">
+            <div class="ts-panel__head">
+                <div class="ts-panel__title"><span class="ts-dot"></span>Redo log</div>
+                <div class="ts-panel__meta">${fmt(r.append_total)} appends · ${fmt(flush.count)} flushes · ${fmt(r.flush_errors_total)} errors</div>
+            </div>
+            <div class="ts-panel__body">
+                <div class="grid" style="grid-template-columns:repeat(4,1fr);gap:10px;">
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label">FLUSH P99</div>
+                        <div class="ts-num" style="font-size:20px">${fmtNs(flush.p99_ns)}</div>
+                        <div class="ts-kpi__spark">${sparkline(store.history.redo_flush_p99, { w: 220, h: 24, color: 'var(--ts-info)' })}</div>
+                    </div>
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label">FLUSH P50</div>
+                        <div class="ts-num" style="font-size:20px">${fmtNs(flush.p50_ns)}</div>
+                        <div class="ts-label" style="margin-top:6px">mean ${fmtNs(flush.mean_ns)}</div>
+                    </div>
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label">BYTES / FLUSH</div>
+                        <div class="ts-num" style="font-size:20px">${bytes.mean_ns != null ? fmtBytes(bytes.mean_ns) : '-'}</div>
+                        <div class="ts-label" style="margin-top:6px">p99 ${bytes.p99_ns != null ? fmtBytes(bytes.p99_ns) : '-'}</div>
+                    </div>
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label">ENTRIES / FLUSH</div>
+                        <div class="ts-num" style="font-size:20px">${entries.mean_ns != null ? fmt(entries.mean_ns) : '-'}</div>
+                        <div class="ts-label" style="margin-top:6px">p99 ${entries.p99_ns != null ? fmt(entries.p99_ns) : '-'}</div>
+                    </div>
+                </div>
+                <div style="margin-top:10px;display:flex;gap:18px;padding:10px 14px;background:var(--ts-bg-2);border-radius:4px;font-family:var(--ts-mono);font-size:11px;">
+                    <div><span class="ts-label">APPEND TOTAL</span> <span style="color:var(--ts-text)">${fmt(r.append_total)}</span></div>
+                    <div><span class="ts-label">APPEND/s (proxy)</span> <span style="color:var(--ts-text)">${fmt(appendRate)}</span></div>
+                    <div><span class="ts-label">FLUSH ERRORS</span> <span style="${r.flush_errors_total > 0 ? 'color:var(--ts-bad)' : 'color:var(--ts-text)'}">${fmt(r.flush_errors_total)}</span></div>
+                </div>
+                <div class="ts-label" style="margin-top:8px;font-size:9px;">
+                    Note: BYTES / ENTRIES per flush reuse the latency-histogram
+                    shape, so "mean_ns" is the server-reported mean sample value
+                    (bytes or entries, not nanoseconds).
+                </div>
+            </div>
+        </div>`;
+    }
+
+    // --- Panel: migrations --------------------------------------------------
+    function migrationPanel(local) {
+        const m = local?.migration_metrics;
+        if (!m) {
+            return panel('Migrations', 'not populated', '<div style="padding:14px;color:var(--ts-text-3)">Migration metrics not available.</div>');
+        }
+        const bytes = m.bytes_transferred || {};
+        const phase = m.phase || {};
+        const migs = m.migrations || [];
+
+        const phaseStrip = `<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px;">
+            ${phaseCell('PREPARING', phase.preparing, 'var(--ts-text-2)')}
+            ${phaseCell('COPYING', phase.copying, 'var(--ts-info)')}
+            ${phaseCell('DELTA', phase.delta, 'var(--ts-warn)')}
+            ${phaseCell('SERVING NEW', phase.serving_new, 'var(--ts-ok)')}
+        </div>`;
+
+        const bytesStrip = `<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px;font-family:var(--ts-mono);font-size:11px;">
+            <div><span class="ts-label">OUT · MASTER</span><div style="color:var(--ts-text)">${fmtBytes(bytes.outbound_master)}</div></div>
+            <div><span class="ts-label">OUT · REPLICA</span><div style="color:var(--ts-text)">${fmtBytes(bytes.outbound_replica)}</div></div>
+            <div><span class="ts-label">IN · MASTER</span><div style="color:var(--ts-text)">${fmtBytes(bytes.inbound_master)}</div></div>
+            <div><span class="ts-label">IN · REPLICA</span><div style="color:var(--ts-text)">${fmtBytes(bytes.inbound_replica)}</div></div>
+        </div>`;
+
+        // ETA: extrapolate using live per-migration rate. We key off
+        // `migrations[i].records_transferred` deltas vs prior topSnapshot.
+        const prevLocal = store.prevSnapshot ? (store.prevSnapshot.nodes?.[0] || store.prevSnapshot.aggregate || store.prevSnapshot) : null;
+        const prevMigs = prevLocal?.migration_metrics?.migrations || [];
+        const prevBy = {};
+        for (const pm of prevMigs) prevBy[pm.shard + ':' + pm.to_node] = pm;
+        const dtMs = (local?.timestamp_ms || 0) - (prevLocal?.timestamp_ms || 0);
+
+        const table = migs.length === 0
+            ? '<div style="padding:14px;color:var(--ts-text-3)">No active migrations.</div>'
+            : `<table>
+                <thead><tr>
+                    <th>SHARD</th>
+                    <th>FROM → TO</th>
+                    <th>ROLE</th>
+                    <th>PHASE</th>
+                    <th style="text-align:right">RECORDS</th>
+                    <th style="text-align:right">BYTES</th>
+                    <th style="min-width:160px">PROGRESS</th>
+                    <th style="text-align:right">ETA</th>
+                </tr></thead>
+                <tbody>${migs.map(mi => {
+                    const done = mi.records_transferred || 0;
+                    const tot = mi.total_records || 0;
+                    const pct = tot > 0 ? Math.min(100, (done / tot) * 100) : 0;
+                    const key = mi.shard + ':' + mi.to_node;
+                    const prev = prevBy[key];
+                    let eta = '-';
+                    if (prev && dtMs > 0 && tot > 0) {
+                        const rate = (done - (prev.records_transferred || 0)) * 1000 / dtMs;
+                        if (rate > 0) {
+                            const secs = (tot - done) / rate;
+                            eta = secs > 3600 ? (secs / 3600).toFixed(1) + 'h' : secs > 60 ? (secs / 60).toFixed(1) + 'm' : secs.toFixed(0) + 's';
+                        }
+                    }
+                    return `<tr>
+                        <td style="color:var(--ts-text)">${mi.shard}</td>
+                        <td>node-${mi.from_node} → node-${mi.to_node}</td>
+                        <td>${mi.is_master ? 'master' : 'replica'}</td>
+                        <td>${mi.phase}</td>
+                        <td style="text-align:right">${fmt(done)} / ${fmt(tot)}</td>
+                        <td style="text-align:right">${fmtBytes(mi.bytes_transferred)}</td>
+                        <td>
+                            <div class="ts-bar"><div class="ts-bar__fill" style="width:${pct}%;background:var(--ts-info)"></div></div>
+                            <div class="ts-label" style="margin-top:2px">${pct.toFixed(1)}%</div>
+                        </td>
+                        <td style="text-align:right">${eta}</td>
+                    </tr>`;
+                }).join('')}</tbody>
+            </table>`;
+
+        return `<div class="ts-panel">
+            <div class="ts-panel__head">
+                <div class="ts-panel__title"><span class="ts-dot"></span>Shard migrations</div>
+                <div class="ts-panel__meta">${fmt(m.active)} active · ${fmt(m.entries_applied_total)} entries applied</div>
+            </div>
+            <div class="ts-panel__body">
+                ${phaseStrip}
+                ${bytesStrip}
+                <div style="overflow-x:auto">${table}</div>
+            </div>
+        </div>`;
+    }
+    function phaseCell(label, v, color) {
+        return `<div class="ts-panel" style="padding:10px 14px;margin:0;">
+            <div class="ts-label">${label}</div>
+            <div class="ts-num" style="font-size:20px;color:${(v || 0) > 0 ? color : 'var(--ts-text-3)'}">${fmt(v || 0)}</div>
+        </div>`;
+    }
+
+    // --- Panel: SWIM --------------------------------------------------------
+    function swimPanel(local) {
+        const sw = local?.swim_metrics;
+        if (!sw) {
+            return panel('SWIM failure detector', 'not populated', '<div style="padding:14px;color:var(--ts-text-3)">SWIM metrics not available.</div>');
+        }
+        const churn = sw.churn || {};
+        const susp = sw.suspicion_duration || {};
+        const totalProbes = sw.probes_sent || 0;
+        const anyActivity = totalProbes + (sw.probe_timeouts || 0) + (sw.indirect_probes || 0) +
+            Object.values(churn).reduce((s, v) => s + (v || 0), 0);
+        if (anyActivity === 0) {
+            return panel('SWIM failure detector', 'no activity', '<div style="padding:14px;color:var(--ts-text-3)">No SWIM activity yet.</div>');
+        }
+
+        // Probe-rate derived from rolling history (reusing cadence of pushHistory):
+        // probes are cumulative — compute last delta per second if we have prev.
+        const prev = store.prevSnapshot ? (store.prevSnapshot.nodes?.[0] || store.prevSnapshot.aggregate || store.prevSnapshot) : null;
+        const prevSw = prev?.swim_metrics;
+        const now = local.timestamp_ms || 0;
+        const then = prev?.timestamp_ms || 0;
+        let probeRate = 0;
+        if (prevSw && now > then) {
+            probeRate = Math.max(0, (totalProbes - (prevSw.probes_sent || 0)) * 1000 / (now - then));
+        }
+
+        const timeoutPct = totalProbes > 0 ? (sw.probe_timeouts / totalProbes) * 100 : 0;
+        const timeoutClass = timeoutPct > 5 ? 'ts-bad' : timeoutPct > 1 ? 'ts-warn' : 'ts-ok';
+
+        const churnRows = `<tr>
+            <td><span class="ts-label">JOIN</span></td>
+            <td style="text-align:right;color:var(--ts-ok)">${fmt(churn.join || 0)}</td>
+            <td><span class="ts-label">SUSPECT</span></td>
+            <td style="text-align:right;color:${churn.suspect > 0 ? 'var(--ts-warn)' : 'var(--ts-text-3)'}">${fmt(churn.suspect || 0)}</td>
+            <td><span class="ts-label">ALIVE←SUSPECT</span></td>
+            <td style="text-align:right;color:var(--ts-info)">${fmt(churn.alive_from_suspect || 0)}</td>
+            <td><span class="ts-label">LEAVE</span></td>
+            <td style="text-align:right;color:${churn.leave > 0 ? 'var(--ts-bad)' : 'var(--ts-text-3)'}">${fmt(churn.leave || 0)}</td>
+        </tr>`;
+
+        return `<div class="ts-panel">
+            <div class="ts-panel__head">
+                <div class="ts-panel__title"><span class="ts-dot"></span>SWIM failure detector</div>
+                <div class="ts-panel__meta">${fmt(totalProbes)} probes · ${fmt(sw.probe_timeouts)} timeouts · ${fmt(sw.indirect_probes)} indirect</div>
+            </div>
+            <div class="ts-panel__body">
+                <div class="grid" style="grid-template-columns:repeat(4,1fr);gap:10px;">
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label">PROBE RATE</div>
+                        <div class="ts-num" style="font-size:20px">${fmt(probeRate)}<span class="ts-label"> /s</span></div>
+                        <div class="ts-label" style="margin-top:6px">total ${fmt(totalProbes)}</div>
+                    </div>
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label">TIMEOUT %</div>
+                        <div class="ts-num ${timeoutClass}" style="font-size:20px">${timeoutPct.toFixed(2)}%</div>
+                        <div class="ts-label" style="margin-top:6px">${fmt(sw.probe_timeouts)} timeouts</div>
+                    </div>
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label">SUSPICION P99</div>
+                        <div class="ts-num" style="font-size:20px">${fmtNs(susp.p99_ns)}</div>
+                        <div class="ts-label" style="margin-top:6px">${fmt(susp.count)} events · p50 ${fmtNs(susp.p50_ns)}</div>
+                    </div>
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label">INDIRECT PROBES</div>
+                        <div class="ts-num" style="font-size:20px">${fmt(sw.indirect_probes)}</div>
+                        <div class="ts-label" style="margin-top:6px">PING_REQ rounds</div>
+                    </div>
+                </div>
+                <div class="ts-panel" style="margin:10px 0 0 0;padding:10px 14px;">
+                    <div class="ts-label" style="margin-bottom:8px">MEMBERSHIP CHURN</div>
+                    <table style="font-size:11px"><tbody>${churnRows}</tbody></table>
+                </div>
+            </div>
+        </div>`;
+    }
+
+    // --- Panel: allocator ---------------------------------------------------
+    function allocatorPanel(local) {
+        const a = local?.allocator_metrics;
+        if (!a) {
+            return panel('Allocator', 'not populated', '<div style="padding:14px;color:var(--ts-text-3)">Allocator metrics not available.</div>');
+        }
+        if (!a.alloc_total && !a.free_total && !a.freelist_region_count) {
+            return panel('Allocator', 'no activity', '<div style="padding:14px;color:var(--ts-text-3)">No allocations recorded yet.</div>');
+        }
+        // Free-rate: deltas vs prev snapshot.
+        const prev = store.prevSnapshot ? (store.prevSnapshot.nodes?.[0] || store.prevSnapshot.aggregate || store.prevSnapshot) : null;
+        const prevA = prev?.allocator_metrics;
+        const now = local.timestamp_ms || 0;
+        const then = prev?.timestamp_ms || 0;
+        let freeRate = 0, freeBytesRate = 0, allocBytesRate = 0;
+        if (prevA && now > then) {
+            const dt = (now - then) / 1000;
+            freeRate = Math.max(0, ((a.free_total || 0) - (prevA.free_total || 0)) / dt);
+            freeBytesRate = Math.max(0, ((a.free_bytes_total || 0) - (prevA.free_bytes_total || 0)) / dt);
+            allocBytesRate = Math.max(0, ((a.alloc_bytes_total || 0) - (prevA.alloc_bytes_total || 0)) / dt);
+        }
+        const allocRate = store.history.alloc_rate.at(-1) || 0;
+        const liveBytes = Math.max(0, (a.alloc_bytes_total || 0) - (a.free_bytes_total || 0));
+        const liveAllocs = Math.max(0, (a.alloc_total || 0) - (a.free_total || 0));
+
+        // Simple fragmentation estimate: 1 - (largest_region / avg_region)
+        // When regions are well-coalesced, largest ≈ avg and fragmentation → 0.
+        // When fragmented, largest ≪ total/regions, so ratio grows.
+        const regions = a.freelist_region_count || 0;
+        const largest = a.freelist_largest_region_bytes || 0;
+        // Free bytes available can't be derived from allocator_metrics alone
+        // (free_bytes_total is cumulative, not a live balance). Use store.freelist
+        // snapshot when available for total_free_bytes.
+        const freeBytesLive = store.freelist?.total_free_bytes || 0;
+        let fragPct = null;
+        if (regions > 0 && freeBytesLive > 0) {
+            const avgRegion = freeBytesLive / regions;
+            fragPct = avgRegion > 0 ? Math.max(0, Math.min(100, (1 - largest / freeBytesLive) * 100)) : 0;
+        }
+        const fragClass = fragPct == null ? '' : fragPct > 80 ? 'ts-bad' : fragPct > 50 ? 'ts-warn' : 'ts-ok';
+
+        return `<div class="ts-panel">
+            <div class="ts-panel__head">
+                <div class="ts-panel__title"><span class="ts-dot"></span>Allocator</div>
+                <div class="ts-panel__meta">${fmt(liveAllocs)} live · ${fmtBytes(liveBytes)} · ${fmt(regions)} free regions</div>
+            </div>
+            <div class="ts-panel__body">
+                <div class="grid" style="grid-template-columns:repeat(4,1fr);gap:10px;">
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label">ALLOC RATE</div>
+                        <div class="ts-num" style="font-size:20px">${fmt(allocRate)}<span class="ts-label"> /s</span></div>
+                        <div class="ts-kpi__spark">${sparkline(store.history.alloc_rate, { w: 220, h: 24, color: 'var(--ts-accent)' })}</div>
+                    </div>
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label">FREE RATE</div>
+                        <div class="ts-num" style="font-size:20px">${fmt(freeRate)}<span class="ts-label"> /s</span></div>
+                        <div class="ts-label" style="margin-top:6px">${fmtBytes(freeBytesRate)}/s released</div>
+                    </div>
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label">ALLOC BYTES/s</div>
+                        <div class="ts-num" style="font-size:20px">${fmtBytes(allocBytesRate)}</div>
+                        <div class="ts-label" style="margin-top:6px">total ${fmtBytes(a.alloc_bytes_total)}</div>
+                    </div>
+                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
+                        <div class="ts-label">FRAGMENTATION</div>
+                        <div class="ts-num ${fragClass}" style="font-size:20px">${fragPct == null ? '-' : fragPct.toFixed(1) + '%'}</div>
+                        <div class="ts-label" style="margin-top:6px">largest ${fmtBytes(largest)}</div>
+                    </div>
+                </div>
+                <div style="margin-top:10px;display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:10px 14px;background:var(--ts-bg-2);border-radius:4px;font-family:var(--ts-mono);font-size:11px;">
+                    <div><span class="ts-label">ALLOC TOTAL</span> <span style="color:var(--ts-text)">${fmt(a.alloc_total)}</span></div>
+                    <div><span class="ts-label">FREE TOTAL</span> <span style="color:var(--ts-text)">${fmt(a.free_total)}</span></div>
+                    <div><span class="ts-label">REGIONS</span> <span style="color:var(--ts-text)">${fmt(regions)}</span></div>
+                    <div><span class="ts-label">ALLOC BYTES</span> <span style="color:var(--ts-text)">${fmtBytes(a.alloc_bytes_total)}</span></div>
+                    <div><span class="ts-label">FREE BYTES</span> <span style="color:var(--ts-text)">${fmtBytes(a.free_bytes_total)}</span></div>
+                    <div><span class="ts-label">LARGEST REGION</span> <span style="color:var(--ts-text)">${fmtBytes(largest)}</span></div>
+                </div>
+            </div>
+        </div>`;
+    }
+
+    // Small helper for panels with no data
+    function panel(title, meta, body) {
+        return `<div class="ts-panel">
+            <div class="ts-panel__head">
+                <div class="ts-panel__title"><span class="ts-dot" style="background:var(--ts-text-3)"></span>${title}</div>
+                <div class="ts-panel__meta">${meta}</div>
+            </div>
+            <div class="ts-panel__body" style="padding:0">${body}</div>
+        </div>`;
+    }
+
+    // ---------------------------------------------------------------------------
     // Router
     // ---------------------------------------------------------------------------
     const pages = {
         dashboard: renderDashboard,
         flow: renderFlow,
+        observability: renderObservability,
         top: renderTop,
         nodes: renderNodes,
         storage: renderStorage,

@@ -44,7 +44,7 @@ fn debug_shard_enabled(shard: u16) -> bool {
 
 fn debug_shard_log(shard: u16, message: impl AsRef<str>) {
     if debug_shard_enabled(shard) {
-        eprintln!("cluster: debug shard {} {}", shard, message.as_ref());
+        tracing::debug!(shard, message = message.as_ref(), "cluster: debug shard");
     }
 }
 
@@ -375,9 +375,9 @@ impl ClusterCoordinator {
                             m
                         };
                         if let Some(fallback_proposal) = topo_authority_event.check_timeout(&members) {
-                            eprintln!(
-                                "cluster: fallback proposer stepping up for term {}",
-                                fallback_proposal.term,
+                            tracing::info!(
+                                term = fallback_proposal.term,
+                                "cluster: fallback proposer stepping up",
                             );
                             if let Some(ref path) = topo_state_path_event {
                                 let peak = peak_size_event.load(Ordering::Relaxed) as u64;
@@ -394,10 +394,10 @@ impl ClusterCoordinator {
                             };
                             if let Some(commit) = topo_authority_event.handle_vote(&self_vote) {
                                 if commit.term <= last_activated_term {
-                                    eprintln!(
-                                        "cluster: skipping duplicate self-vote activation for term {} \
-                                         (already activated at term {last_activated_term})",
-                                        commit.term,
+                                    tracing::debug!(
+                                        term = commit.term,
+                                        last_activated_term,
+                                        "cluster: skipping duplicate self-vote activation",
                                     );
                                 } else {
                                     last_activated_term = commit.term;
@@ -468,11 +468,12 @@ impl ClusterCoordinator {
                                 crate::cluster::migration::persist_inbound_state(path, &mgr);
                             }
                             if clear_settled_inbound {
-                                eprintln!(
-                                    "cluster: cleared {removed} settled inbound migration(s) — no active migrations or handoffs remain"
+                                tracing::info!(
+                                    removed,
+                                    "cluster: cleared settled inbound migrations — no active migrations or handoffs remain",
                                 );
                             } else {
-                                eprintln!("cluster: cleared {removed} stale inbound migration(s)");
+                                tracing::info!(removed, "cluster: cleared stale inbound migrations");
                             }
                         }
                         last_inbound_clear = std::time::Instant::now();
@@ -516,12 +517,18 @@ impl ClusterCoordinator {
                             topology_epoch.store(committed_term, Ordering::Relaxed);
                             if startup_reactivation_due {
                                 startup_reactivation_event.store(false, Ordering::Release);
-                                eprintln!(
-                                    "cluster: re-activating topology after restored outbound migration state (term {committed_term}, {pending_handoffs} pending handoff shards, {mismatched} mismatched shards)",
+                                tracing::info!(
+                                    term = committed_term,
+                                    pending_handoffs,
+                                    mismatched,
+                                    "cluster: re-activating topology after restored outbound migration state",
                                 );
                             } else {
-                                eprintln!(
-                                    "cluster: re-activating topology — {mismatched} mismatched shards, {pending_handoffs} pending handoff shards (term {committed_term})",
+                                tracing::info!(
+                                    term = committed_term,
+                                    pending_handoffs,
+                                    mismatched,
+                                    "cluster: re-activating topology",
                                 );
                             }
                             last_reactivation_at = std::time::Instant::now();
@@ -543,15 +550,16 @@ impl ClusterCoordinator {
                     // the same term arrive close together (e.g., deterministic
                     // proposer commit + fallback proposer timeout).
                     if term <= last_activated_term {
-                        eprintln!(
-                            "cluster: skipping duplicate topology commit for term {term} \
-                             (already activated at term {last_activated_term})"
+                        tracing::debug!(
+                            term,
+                            last_activated_term,
+                            "cluster: skipping duplicate topology commit",
                         );
                         continue;
                     }
                     last_activated_term = term;
                     topology_epoch.store(term, Ordering::Relaxed);
-                    eprintln!("cluster: activating topology from commit signal (term {term}, epoch {term})");
+                    tracing::info!(term, epoch = term, "cluster: activating topology from commit signal");
                     Self::activate_topology(
                         &members, term, self_id, rf, &shard_table, &migration,
                         &node_addrs, &engine, &redo_for_events, max_migration_threads,
@@ -626,14 +634,14 @@ impl ClusterCoordinator {
     ) {
         match event {
             ClusterEvent::NodeJoined(node, addr) => {
-                eprintln!("cluster: node {:?} joined at {addr}", node);
+                tracing::info!(?node, %addr, "cluster: node joined");
                 node_addrs.write().unwrap().insert(*node, *addr);
 
                 // Retry any previously failed migrations — the newly
                 // joined node may be the target that was unavailable.
                 let retry_tasks = migration.lock().unwrap().take_failed_tasks();
                 if !retry_tasks.is_empty() {
-                    eprintln!("cluster: retrying {} failed migration(s)", retry_tasks.len());
+                    tracing::info!(count = retry_tasks.len(), "cluster: retrying failed migrations");
                     let epoch = topology_epoch.load(Ordering::Relaxed);
                     let retry_shards: std::collections::HashSet<u16> = retry_tasks.iter()
                         .map(|t| t.shard)
@@ -671,19 +679,20 @@ impl ClusterCoordinator {
                 }
             }
             ClusterEvent::NodeLeft(node) => {
-                eprintln!("cluster: node {:?} left", node);
+                tracing::info!(?node, "cluster: node left");
                 node_addrs.write().unwrap().remove(node);
             }
             ClusterEvent::MembershipChanged(members) => {
-                eprintln!("cluster: membership changed to {} nodes: {members:?}", members.len());
+                tracing::info!(count = members.len(), ?members, "cluster: membership changed");
 
                 // Gate through topology authority: only the deterministic
                 // proposer (lowest NodeId) initiates the quorum protocol.
                 // The shard table is NOT activated until quorum commits.
                 if let Some(proposal) = topology_authority.on_membership_changed(members) {
-                    eprintln!(
-                        "cluster: proposing topology term {} ({} members)",
-                        proposal.term, proposal.members.len(),
+                    tracing::info!(
+                        term = proposal.term,
+                        members = proposal.members.len(),
+                        "cluster: proposing topology",
                     );
                     // Persist voted_term before broadcasting.
                     if let Some(path) = topology_state_path {
@@ -703,7 +712,7 @@ impl ClusterCoordinator {
                     if let Some(commit) = topology_authority.handle_vote(&self_vote) {
                         // Single-node: quorum met immediately. Activate directly.
                         topology_epoch.store(commit.term, Ordering::Relaxed);
-                        eprintln!("cluster: single-node quorum — activating term {}", commit.term);
+                        tracing::info!(term = commit.term, "cluster: single-node quorum — activating");
                         topology_authority.handle_commit(&commit);
                         Self::activate_topology(
                             &commit.members, commit.term, self_id, rf, shard_table, migration,
@@ -734,7 +743,7 @@ impl ClusterCoordinator {
                 // OP_TOPOLOGY_COMMIT via dispatch and signal_topology_committed().
             }
             ClusterEvent::NodeSuspect(node) => {
-                eprintln!("cluster: node {:?} suspected", node);
+                tracing::info!(?node, "cluster: node suspected");
             }
             ClusterEvent::TopologyStale(remote_term) => {
                 let local_term = topology_authority.committed_term();
@@ -760,8 +769,10 @@ impl ClusterCoordinator {
                     let catch_up_si = swim_incarnation.clone();
                     let remote_term = *remote_term;
                     std::thread::spawn(move || {
-                    eprintln!(
-                        "cluster: topology stale (local term {local_term}, remote has {remote_term}) — catch-up thread started",
+                    tracing::info!(
+                        local_term,
+                        remote_term,
+                        "cluster: topology stale — catch-up thread started",
                     );
                     let topology_authority = &catch_up_ta;
                     let node_addrs_for_topo = &catch_up_addrs;
@@ -822,10 +833,10 @@ impl ClusterCoordinator {
                                 inbound_state_path.as_ref(),
                                 outbound_state_path.as_ref(),
                             ) {
-                                eprintln!(
-                                    "cluster: catch-up: installed active routing snapshot term {} from peer {}",
-                                    routing.shard_table_version,
-                                    peer_addr,
+                                tracing::info!(
+                                    term = routing.shard_table_version,
+                                    %peer_addr,
+                                    "cluster: catch-up: installed active routing snapshot",
                                 );
                             }
                             break;
@@ -848,9 +859,11 @@ impl ClusterCoordinator {
                                 continue;
                             }
                             if let Some(applied_term) = topology_authority.handle_commit(&commit) {
-                                eprintln!(
-                                    "cluster: catch-up: applied term {} from peer {} ({} members)",
-                                    applied_term, peer_addr, remote_members.len(),
+                                tracing::info!(
+                                    term = applied_term,
+                                    %peer_addr,
+                                    members = remote_members.len(),
+                                    "cluster: catch-up: applied term from peer",
                                 );
                                 if let Some(ref path) = *topology_state_path {
                                     let peak = peak_size.load(Ordering::Relaxed) as u64;
@@ -877,9 +890,10 @@ impl ClusterCoordinator {
                         };
                         topology_authority.reset_membership_timer();
                         if let Some(proposal) = topology_authority.on_membership_changed(&members) {
-                            eprintln!(
-                                "cluster: catch-up: re-proposing topology term {} ({} members)",
-                                proposal.term, proposal.members.len(),
+                            tracing::info!(
+                                term = proposal.term,
+                                members = proposal.members.len(),
+                                "cluster: catch-up: re-proposing topology",
                             );
                             if let Some(path) = topology_state_path {
                                 let peak = peak_size.load(Ordering::Relaxed) as u64;
@@ -956,9 +970,10 @@ impl ClusterCoordinator {
 
             if engine.index_len() == 0 && is_single_node_bootstrap {
                 let new_table = ShardTable::compute_with_epoch(members, rf, epoch);
-                eprintln!(
-                    "cluster: empty engine — fast-path shard table install (epoch {epoch}, {} members)",
-                    members.len(),
+                tracing::info!(
+                    epoch,
+                    members = members.len(),
+                    "cluster: empty engine — fast-path shard table install",
                 );
                 *shard_table.write() = new_table;
                 {
@@ -1033,8 +1048,12 @@ impl ClusterCoordinator {
             let preserved_count = preserved_tasks.len();
             let cancelled = old_active.saturating_sub(preserved_count);
             if old_inbound > 0 || cancelled > 0 || old_failed > 0 {
-                eprintln!(
-                    "cluster: topology change — preserved {preserved_count}, cancelled {cancelled} active + {old_failed} failed outbound, cleared {old_inbound} inbound",
+                tracing::info!(
+                    preserved = preserved_count,
+                    cancelled,
+                    old_failed,
+                    old_inbound,
+                    "cluster: topology change — preserved, cancelled, and cleared migrations",
                 );
             }
         }
@@ -1084,9 +1103,14 @@ impl ClusterCoordinator {
                 .count();
             let master_out = outbound_tasks.iter().filter(|t| t.is_master).count();
             let replica_out = outbound_tasks.iter().filter(|t| !t.is_master).count();
-            eprintln!(
-                "cluster: migration plan: {} master + {} replica moves ({} outbound [{} master, {} replica], {} inbound from this node)",
-                plan.len(), replica_plan.len(), outbound_tasks.len(), master_out, replica_out, inbound
+            tracing::info!(
+                masters = plan.len(),
+                replicas = replica_plan.len(),
+                outbound = outbound_tasks.len(),
+                master_out,
+                replica_out,
+                inbound,
+                "cluster: migration plan",
             );
 
             let outbound_shard_set: std::collections::HashSet<u16> = outbound_tasks.iter()
@@ -1349,9 +1373,10 @@ fn run_topology_proposer(
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             match topology_authority.retry_proposal() {
                 Some(fresh) => {
-                    eprintln!(
-                        "cluster: retry topology proposal as term {} (attempt {})",
-                        fresh.term, attempt
+                    tracing::info!(
+                        term = fresh.term,
+                        attempt,
+                        "cluster: retry topology proposal",
                     );
                     proposal = fresh;
                 }
@@ -1375,9 +1400,9 @@ fn run_topology_proposer(
             return;
         }
     }
-    eprintln!(
-        "cluster: topology proposer exhausted retries at term {}",
-        proposal.term
+    tracing::warn!(
+        term = proposal.term,
+        "cluster: topology proposer exhausted retries",
     );
 }
 
@@ -1421,13 +1446,13 @@ fn try_run_topology_proposal(
                         match crate::cluster::topology::TopologyVote::deserialize(&response_payload) {
                             Some(v) => Some(v),
                             None => {
-                                eprintln!("cluster: topology propose to {:?} ({}) — malformed vote", pid, paddr);
+                                tracing::warn!(?pid, %paddr, "cluster: topology propose — malformed vote");
                                 None
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("cluster: topology propose to {:?} ({}) failed: {e}", pid, paddr);
+                        tracing::warn!(?pid, %paddr, err = %e, "cluster: topology propose failed");
                         None
                     }
                 }
@@ -1448,18 +1473,16 @@ fn try_run_topology_proposal(
     let commit = match commit_result {
         Some(c) => c,
         None => {
-            eprintln!(
-                "cluster: topology term {} — quorum not reached after contacting {} peers",
-                proposal.term, peers.len(),
+            tracing::warn!(
+                term = proposal.term,
+                peers = peers.len(),
+                "cluster: topology quorum not reached",
             );
             return false;
         }
     };
 
-    eprintln!(
-        "cluster: quorum reached for term {} — broadcasting commit",
-        commit.term,
-    );
+    tracing::info!(term = commit.term, "cluster: quorum reached — broadcasting commit");
 
     // Broadcast OP_TOPOLOGY_COMMIT to all peers in parallel with retry.
     let commit_payload = commit.serialize();
@@ -1469,7 +1492,7 @@ fn try_run_topology_proposal(
             let a = *addr;
             scope.spawn(move || -> Option<SocketAddr> {
                 if let Err(e) = send_topology_frame(a, OP_TOPOLOGY_COMMIT, payload) {
-                    eprintln!("cluster: topology commit broadcast to {a} failed: {e}");
+                    tracing::warn!(addr = %a, err = %e, "cluster: topology commit broadcast failed");
                     Some(a)
                 } else {
                     None
@@ -1488,7 +1511,7 @@ fn try_run_topology_proposal(
         std::thread::sleep(Duration::from_millis(delay_ms));
         still_failed.retain(|addr| {
             if let Err(e) = send_topology_frame(*addr, OP_TOPOLOGY_COMMIT, &commit_payload) {
-                eprintln!("cluster: topology commit retry {retry} to {addr} failed: {e}");
+                tracing::warn!(retry, %addr, err = %e, "cluster: topology commit retry failed");
                 true
             } else {
                 false
@@ -1496,9 +1519,9 @@ fn try_run_topology_proposal(
         });
     }
     if !still_failed.is_empty() {
-        eprintln!(
-            "cluster: topology commit: {} node(s) unreachable after retries",
-            still_failed.len(),
+        tracing::warn!(
+            unreachable = still_failed.len(),
+            "cluster: topology commit: nodes unreachable after retries",
         );
     }
 
@@ -1686,7 +1709,7 @@ fn run_migration_batch(
     let addr = match target_addr {
         Some(a) => a,
         None => {
-            eprintln!("cluster: no address for target, cannot migrate {} shards", tasks.len());
+            tracing::warn!(tasks = tasks.len(), "cluster: no address for target, cannot migrate shards");
             let mut mgr = migration.lock().unwrap();
             for task in &tasks {
                 mgr.mark_failed(task);
@@ -1746,9 +1769,10 @@ fn run_migration_batch(
         }).collect()
     };
     if !skipped_tasks.is_empty() {
-        eprintln!(
-            "cluster: {} shards already serving — sending completion handshakes to {addr}",
-            skipped_tasks.len()
+        tracing::info!(
+            shards = skipped_tasks.len(),
+            %addr,
+            "cluster: shards already serving — sending completion handshakes",
         );
         let delivered = send_completion_only_handshakes(addr, &skipped_tasks, self_id);
         let mut mgr = migration.lock().unwrap();
@@ -1806,10 +1830,10 @@ fn run_migration_batch(
                             .get(&task.shard)
                             .map(|v| v.len())
                             .unwrap_or(0);
-                        eprintln!(
-                            "cluster: shard {} empty recheck found {} key(s) despite zero shard count",
-                            task.shard,
-                            key_count,
+                        tracing::warn!(
+                            shard = task.shard,
+                            keys = key_count,
+                            "cluster: shard empty recheck found keys despite zero shard count",
                         );
                     }
                     // Records appeared between snapshot and fence.
@@ -1822,7 +1846,7 @@ fn run_migration_batch(
         }
         let instant_count = ready_empty_tasks.len();
         if instant_count > 0 {
-            eprintln!("cluster: {} empty shards to {} committed instantly", instant_count, addr);
+            tracing::info!(shards = instant_count, %addr, "cluster: empty shards committed instantly");
             let delivered = send_completion_only_handshakes(addr, &ready_empty_tasks, self_id);
             for (task, delivered) in ready_empty_tasks.iter().zip(delivered) {
                 if delivered {
@@ -1871,7 +1895,7 @@ fn run_migration_batch(
         migration.lock().unwrap().cleanup_completed();
         let c = completed.load(Ordering::Relaxed);
         let f = failed.load(Ordering::Relaxed);
-        eprintln!("cluster: batch migration to {}: {} completed, {} failed", addr, c, f);
+        tracing::info!(%addr, completed = c, failed = f, "cluster: batch migration finished");
         if f == 0 {
             let ce = engine.clone(); let cs = shard_table.clone(); let cm = migration.clone();
             std::thread::spawn(move || { run_orphan_cleanup(self_id, &ce, &cs, &cm, topology_epoch); });
@@ -1887,9 +1911,13 @@ fn run_migration_batch(
     let total_keys: usize = data_tasks.iter()
         .map(|t| keys_by_shard.get(&t.shard).map(|v| v.len()).unwrap_or(0))
         .sum();
-    eprintln!(
-        "cluster: migrating {} data shards ({} records) to {} across {} connections (batch_size={})",
-        total, total_keys, addr, pool_size.min(total), batch_size,
+    tracing::info!(
+        shards = total,
+        records = total_keys,
+        %addr,
+        connections = pool_size.min(total),
+        batch_size,
+        "cluster: migrating data shards",
     );
 
     let completed = Arc::new(std::sync::atomic::AtomicU32::new(
@@ -1930,9 +1958,11 @@ fn run_migration_batch(
                             break;
                         }
                         Err(e) => {
-                            eprintln!(
-                                "cluster: connect to {} attempt {} failed: {e}",
-                                addr, attempt + 1,
+                            tracing::warn!(
+                                %addr,
+                                attempt = attempt + 1,
+                                err = %e,
+                                "cluster: connect failed",
                             );
                             if attempt < 2 {
                                 std::thread::sleep(Duration::from_millis(delay_ms));
@@ -1964,7 +1994,7 @@ fn run_migration_batch(
                 let mut stream = match stream {
                     Some(s) => s,
                     None => {
-                        eprintln!("cluster: connect to {} failed after retries", addr);
+                        tracing::warn!(%addr, "cluster: connect failed after retries");
                         let mut mgr = migration.lock().unwrap();
                         for task in chunk {
                             mgr.mark_failed(task);
@@ -2006,7 +2036,7 @@ fn run_migration_batch(
                         let ok = match stream_shard_baseline(task, shard_keys, &engine, &mut stream, batch_size) {
                             Ok(_) => true,
                             Err(e) => {
-                                eprintln!("cluster: shard {} baseline failed: {e}", task.shard);
+                                tracing::warn!(shard = task.shard, err = %e, "cluster: shard baseline failed");
                                 false
                             }
                         };
@@ -2069,9 +2099,10 @@ fn run_migration_batch(
                             if let Err(e) = stream_shard_baseline(
                                 task, &late_refs, &engine, &mut stream, batch_size,
                             ) {
-                                eprintln!(
-                                    "cluster: shard {} late-key streaming failed: {e}",
-                                    task.shard,
+                                tracing::warn!(
+                                    shard = task.shard,
+                                    err = %e,
+                                    "cluster: shard late-key streaming failed",
                                 );
                                 let mut mgr = migration.lock().unwrap();
                                 mgr.mark_failed(task);
@@ -2087,7 +2118,7 @@ fn run_migration_batch(
                         let manifest_entries = match collect_manifest_entries(&engine, task.shard, &fenced_keys) {
                             Ok(e) => e,
                             Err(e) => {
-                                eprintln!("cluster: shard {} manifest failed: {e}", task.shard);
+                                tracing::warn!(shard = task.shard, err = %e, "cluster: shard manifest failed");
                                 let mut mgr = migration.lock().unwrap();
                                 mgr.mark_failed(task);
                                 if !mgr.is_shard_fenced(task.shard) { fenced_bm.clear(task.shard); }
@@ -2100,7 +2131,7 @@ fn run_migration_batch(
                         };
                         let manifest_hash = compute_manifest_for_entries(&manifest_entries);
                         if let Err(e) = send_migration_complete(addr, task.shard, task.from_node, fenced_keys.len() as u64, 0, topology_epoch, Some(&mut stream), &manifest_hash, &manifest_entries) {
-                            eprintln!("cluster: shard {} completion failed: {e}", task.shard);
+                            tracing::warn!(shard = task.shard, err = %e, "cluster: shard completion failed");
                             let mut mgr = migration.lock().unwrap();
                             mgr.mark_failed(task);
                             if !mgr.is_shard_fenced(task.shard) { fenced_bm.clear(task.shard); }
@@ -2164,9 +2195,13 @@ fn run_migration_batch(
     } else {
         0.0
     };
-    eprintln!(
-        "cluster: batch migration to {}: {} completed, {} failed in {:.1}s ({:.0} records/s)",
-        addr, c, f, elapsed.as_secs_f64(), rate,
+    tracing::info!(
+        %addr,
+        completed = c,
+        failed = f,
+        elapsed_secs = elapsed.as_secs_f64(),
+        records_per_sec = rate,
+        "cluster: batch migration finished",
     );
 
     if has_retry_tasks {
@@ -2185,9 +2220,9 @@ fn run_migration_batch(
         let retry_migrating_bm = migrating_bm.clone();
         let retry_inbound_bm = inbound_bm.clone();
         let retry_epoch = shard_table.read().version;
-        eprintln!(
-            "cluster: requeueing {} failed migration(s) for immediate retry",
-            retry_tasks.len(),
+        tracing::info!(
+            count = retry_tasks.len(),
+            "cluster: requeueing failed migrations for immediate retry",
         );
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
@@ -2230,14 +2265,14 @@ fn run_migration_batch(
             let removed = mgr.clear_stale_inbound(Duration::from_secs(30));
             if removed > 0 {
                 inbound_bm.load_from(mgr.inbound_bitmap());
-                eprintln!("cluster: cleared {removed} stale inbound migration(s) — no active outbound migrations remain");
+                tracing::info!(removed, "cluster: cleared stale inbound migrations — no active outbound migrations remain");
             }
         }
         drop(mgr);
     }
 
     if f > 0 {
-        eprintln!("cluster: {} migration(s) failed — will re-attempt on next topology cycle", f);
+        tracing::warn!(failed = f, "cluster: migrations failed — will re-attempt on next topology cycle");
     }
 }
 
@@ -2302,16 +2337,17 @@ fn run_orphan_cleanup(
     let total_orphaned: u64 = orphaned_shards.iter()
         .map(|&s| engine.shard_record_count(s))
         .sum();
-    eprintln!(
-        "cluster: orphan cleanup — {} shard(s) with {} records to delete",
-        orphaned_shards.len(), total_orphaned,
+    tracing::info!(
+        shards = orphaned_shards.len(),
+        records = total_orphaned,
+        "cluster: orphan cleanup — deleting orphaned records",
     );
 
     let mut total_deleted: u64 = 0;
     for &shard in &orphaned_shards {
         // Re-check epoch before each shard.
         if shard_table.read().version != topology_epoch {
-            eprintln!("cluster: orphan cleanup aborted — topology epoch changed");
+            tracing::info!("cluster: orphan cleanup aborted — topology epoch changed");
             break;
         }
 
@@ -2325,15 +2361,16 @@ fn run_orphan_cleanup(
                 Ok(()) => total_deleted += 1,
                 Err(crate::ops::error::SpendError::TxNotFound) => {}
                 Err(e) => {
-                    eprintln!("cluster: orphan cleanup shard {shard} delete error: {e:?}");
+                    tracing::warn!(shard, err = ?e, "cluster: orphan cleanup delete error");
                 }
             }
         }
     }
 
-    eprintln!(
-        "cluster: orphan cleanup complete — deleted {} records across {} shards",
-        total_deleted, orphaned_shards.len(),
+    tracing::info!(
+        deleted = total_deleted,
+        shards = orphaned_shards.len(),
+        "cluster: orphan cleanup complete",
     );
 }
 
@@ -2422,9 +2459,11 @@ fn migrate_single_shard(
             ));
         }
         if attempt > 0 {
-            eprintln!(
-                "cluster: shard {} retry attempt {} (after {}ms)",
-                task.shard, attempt + 1, delay_ms,
+            tracing::info!(
+                shard = task.shard,
+                attempt = attempt + 1,
+                delay_ms,
+                "cluster: shard retry attempt",
             );
             // Unfence before retry — the fence will be re-set in phase 2.
             migration.lock().unwrap().unfence_shard(task.shard);
@@ -2449,7 +2488,7 @@ fn migrate_single_shard(
             Err(e) => {
                 last_err = format!("baseline: {e}");
                 if attempt < 2 { continue; }
-                eprintln!("cluster: shard {} {last_err} (final attempt)", task.shard);
+                tracing::warn!(shard = task.shard, err = %last_err, "cluster: shard migration failed (final attempt)");
                 fail_shard(migration, shard_table, failed, true);
                 return false;
             }
@@ -2464,7 +2503,7 @@ fn migrate_single_shard(
             let table = shard_table.read();
             let handoff = table.shard_handoff_state(task.shard);
             if handoff == ShardHandoff::ServingNew {
-                eprintln!("cluster: shard {} migration aborted — shard already committed/rolled back", task.shard);
+                tracing::info!(shard = task.shard, "cluster: shard migration aborted — shard already committed/rolled back");
                 drop(table);
                 // Shard is already being served by the new master. Send
                 // OP_MIGRATION_COMPLETE to the RECEIVER so it clears the
@@ -2526,16 +2565,16 @@ fn migrate_single_shard(
             fence_seq,
         ));
         if !late_keys.is_empty() {
-            eprintln!(
-                "cluster: shard {} fenced re-scan found {} missing pre-snapshot key(s)",
-                task.shard,
-                late_keys.len(),
+            tracing::info!(
+                shard = task.shard,
+                late_keys = late_keys.len(),
+                "cluster: shard fenced re-scan found missing pre-snapshot keys",
             );
             let late_key_refs: Vec<&TxKey> = late_keys.iter().collect();
             if let Err(e) = stream_shard_baseline(task, &late_key_refs, engine, stream, batch_size) {
                 last_err = format!("late baseline: {e}");
                 if attempt < 2 { continue; }
-                eprintln!("cluster: shard {} {last_err} (final attempt)", task.shard);
+                tracing::warn!(shard = task.shard, err = %last_err, "cluster: shard migration failed (final attempt)");
                 fail_shard(migration, shard_table, failed, true);
                 return false;
             }
@@ -2554,9 +2593,10 @@ fn migrate_single_shard(
         {
             let first_entry_seq = entries.first().map(|e| e.sequence);
             if let Err(trunc_err) = crate::replication::durable::check_redo_truncation(first_entry_seq, snapshot_seq) {
-                eprintln!(
-                    "cluster: shard {} {trunc_err} — migration must restart",
-                    task.shard,
+                tracing::warn!(
+                    shard = task.shard,
+                    err = %trunc_err,
+                    "cluster: shard migration must restart due to redo truncation",
                 );
                 last_err = trunc_err;
                 delta_failed = true;
@@ -2573,12 +2613,15 @@ fn migrate_single_shard(
                     fence_seq,
                 ));
                 if !delta_ops.is_empty() {
-                    eprintln!(
-                        "cluster: shard {} streaming {} delta ops (seq {}..{})",
-                        task.shard, delta_ops.len(), snapshot_seq, fence_seq
+                    tracing::debug!(
+                        shard = task.shard,
+                        delta_ops = delta_ops.len(),
+                        snapshot_seq,
+                        fence_seq,
+                        "cluster: shard streaming delta ops",
                     );
                     if let Err(e) = send_delta_ops(stream, task.shard, &delta_ops) {
-                        eprintln!("cluster: shard {} delta streaming failed: {e}", task.shard);
+                        tracing::warn!(shard = task.shard, err = %e, "cluster: shard delta streaming failed");
                         delta_failed = true;
                     }
                 }
@@ -2586,7 +2629,7 @@ fn migrate_single_shard(
         }
         if delta_failed {
             if attempt < 2 { continue; }
-            eprintln!("cluster: shard {} {last_err} (final attempt)", task.shard);
+            tracing::warn!(shard = task.shard, err = %last_err, "cluster: shard migration failed (final attempt)");
             fail_shard(migration, shard_table, failed, true);
             return false;
         }
@@ -2610,26 +2653,26 @@ fn migrate_single_shard(
                 fenced_keys = post_delta_keys;
                 break;
             }
-            eprintln!(
-                "cluster: shard {} post-delta stabilization pass {} found {} newly appeared key(s)",
-                task.shard,
-                pass + 1,
-                post_delta_late_keys.len(),
+            tracing::info!(
+                shard = task.shard,
+                pass = pass + 1,
+                new_keys = post_delta_late_keys.len(),
+                "cluster: shard post-delta stabilization found newly appeared keys",
             );
             let late_key_refs: Vec<&TxKey> = post_delta_late_keys.iter().collect();
             if let Err(e) = stream_shard_baseline(task, &late_key_refs, engine, stream, batch_size) {
                 last_err = format!("post-delta baseline: {e}");
                 if attempt < 2 { continue; }
-                eprintln!("cluster: shard {} {last_err} (final attempt)", task.shard);
+                tracing::warn!(shard = task.shard, err = %last_err, "cluster: shard migration failed (final attempt)");
                 fail_shard(migration, shard_table, failed, true);
                 return false;
             }
             known_fenced_keys.extend(post_delta_late_keys.iter().copied());
             fenced_keys = post_delta_keys;
             if pass == 2 {
-                eprintln!(
-                    "cluster: shard {} post-delta stabilization did not converge after 3 passes",
-                    task.shard,
+                tracing::warn!(
+                    shard = task.shard,
+                    "cluster: shard post-delta stabilization did not converge after 3 passes",
                 );
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -2642,7 +2685,7 @@ fn migrate_single_shard(
             let table = shard_table.read();
             let handoff = table.shard_handoff_state(task.shard);
             if handoff == ShardHandoff::ServingNew {
-                eprintln!("cluster: shard {} migration aborted before complete — shard already committed/rolled back", task.shard);
+                tracing::info!(shard = task.shard, "cluster: shard migration aborted before complete — shard already committed/rolled back");
                 drop(table);
                 let _ = send_migration_complete(addr, task.shard, task.from_node, 0, 0, 0, Some(stream), &[0u8; 32], &[]);
                 fail_shard(migration, shard_table, failed, false);
@@ -2658,7 +2701,7 @@ fn migrate_single_shard(
             Err(e) => {
                 last_err = e;
                 if attempt < 2 { continue; }
-                eprintln!("cluster: shard {} {last_err} (final attempt)", task.shard);
+                tracing::warn!(shard = task.shard, err = %last_err, "cluster: shard migration failed (final attempt)");
                 fail_shard(migration, shard_table, failed, true);
                 return false;
             }
@@ -2677,7 +2720,7 @@ fn migrate_single_shard(
         if let Err(e) = send_migration_complete(addr, task.shard, task.from_node, fenced_keys.len() as u64, fence_seq, _topology_epoch, Some(stream), &manifest_hash, &manifest_entries) {
             last_err = format!("handshake: {e}");
             if attempt < 2 { continue; }
-            eprintln!("cluster: shard {} {last_err} (final attempt)", task.shard);
+            tracing::warn!(shard = task.shard, err = %last_err, "cluster: shard migration failed (final attempt)");
             fail_shard(migration, shard_table, failed, true);
             return false;
         }
@@ -2846,6 +2889,7 @@ fn stream_shard_baseline(
         let batch = ReplicaBatch {
             first_sequence: 0,
             ops,
+            trace_ctx: crate::observability::WireTraceContext::from_current_span(),
         };
 
         // Send as OP_REPLICA_BATCH with FLAG_MIGRATION_BATCH so the
@@ -3027,9 +3071,12 @@ fn send_completion_only_handshakes(
                 s
             }
             Err(e) => {
-                eprintln!(
-                    "cluster: batch-complete connect to {target_addr} failed ({}/{MAX_RETRIES}): {e}",
-                    attempt + 1,
+                tracing::warn!(
+                    %target_addr,
+                    attempt = attempt + 1,
+                    max_retries = MAX_RETRIES,
+                    err = %e,
+                    "cluster: batch-complete connect failed",
                 );
                 continue;
             }
@@ -3061,17 +3108,22 @@ fn send_completion_only_handshakes(
                 return vec![true; tasks.len()];
             }
             Err(e) => {
-                eprintln!(
-                    "cluster: batch-complete to {target_addr} failed ({}/{MAX_RETRIES}): {e}",
-                    attempt + 1,
+                tracing::warn!(
+                    %target_addr,
+                    attempt = attempt + 1,
+                    max_retries = MAX_RETRIES,
+                    err = %e,
+                    "cluster: batch-complete failed",
                 );
             }
         }
     }
 
-    eprintln!(
-        "cluster: batch-complete to {target_addr} failed after {MAX_RETRIES} retries ({} shards)",
-        tasks.len(),
+    tracing::warn!(
+        %target_addr,
+        max_retries = MAX_RETRIES,
+        shards = tasks.len(),
+        "cluster: batch-complete exhausted retries",
     );
     vec![false; tasks.len()]
 }
@@ -3271,6 +3323,7 @@ fn send_delta_ops(
     let batch = ReplicaBatch {
         first_sequence: 0,
         ops: ops.to_vec(),
+        trace_ctx: crate::observability::WireTraceContext::from_current_span(),
     };
     let request = RequestFrame {
         request_id: shard as u64,
@@ -3334,7 +3387,7 @@ fn persist_cluster_state(path: &std::path::Path, peak: u64, epoch: u64) {
     })();
     if let Err(e) = result {
         PERSIST_FAILURES.fetch_add(1, Ordering::Relaxed);
-        eprintln!("cluster: failed to persist cluster state: {e}");
+        tracing::warn!(err = %e, "cluster: failed to persist cluster state");
     }
 }
 
@@ -3361,7 +3414,7 @@ fn persist_topology_state(
     })();
     if let Err(ref e) = result {
         PERSIST_FAILURES.fetch_add(1, Ordering::Relaxed);
-        eprintln!("cluster: failed to persist topology state: {e}");
+        tracing::warn!(err = %e, "cluster: failed to persist topology state");
     }
     result
 }
@@ -3805,7 +3858,7 @@ impl RunningCluster {
         drop(addrs);
 
         if other_members.is_empty() {
-            eprintln!("cluster: cannot quiesce — no other nodes");
+            tracing::warn!("cluster: cannot quiesce — no other nodes");
             return;
         }
 
@@ -3838,9 +3891,10 @@ impl RunningCluster {
         for &addr in &peer_addrs {
             let _ = send_topology_frame(addr, OP_TOPOLOGY_COMMIT, &commit_payload);
         }
-        eprintln!(
-            "cluster: quiesce: committed topology term {} ({} members, excluding self)",
-            new_term, new_members.len(),
+        tracing::info!(
+            term = new_term,
+            members = new_members.len(),
+            "cluster: quiesce: committed topology (excluding self)",
         );
     }
 
@@ -3879,7 +3933,7 @@ impl RunningCluster {
                 self.inbound_atomic.load_from(mgr.inbound_bitmap());
                 let count = mgr.inbound_count();
                 if count > 0 {
-                    eprintln!("cluster: restored {} pending inbound migration(s) from disk", count);
+                    tracing::info!(count, "cluster: restored pending inbound migrations from disk");
                 }
             }
         }
@@ -3916,7 +3970,7 @@ impl RunningCluster {
                 mgr.cleanup_completed();
                 if count > 0 {
                     self.startup_reactivation_needed.store(true, Ordering::Release);
-                    eprintln!("cluster: restored {count} pending outbound migration(s) from disk; scheduling topology re-activation");
+                    tracing::info!(count, "cluster: restored pending outbound migrations from disk; scheduling topology re-activation");
                 }
                 crate::cluster::migration::persist_outbound_state(path, &mgr);
                 self.fenced_bitmap.load_from(mgr.fenced_bitmap());
@@ -3961,6 +4015,7 @@ impl RunningCluster {
     /// When no topology-state path is configured (pure in-memory test
     /// fixtures), returns `Ok(())` — there is nothing to persist and
     /// callers can proceed to reply.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn persist_topology(&self) -> std::io::Result<()> {
         if let Some(ref path) = self.topology_state_path {
             let peak = self.peak_size.load(Ordering::Relaxed) as u64;

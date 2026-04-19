@@ -135,14 +135,14 @@ impl RedbPrimary {
         let txn = match self.db.begin_read() {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("redb lookup: begin_read failed: {e}");
+                tracing::warn!(err = %e, "redb lookup: begin_read failed");
                 return None;
             }
         };
         let table = match txn.open_table(PRIMARY_TABLE) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("redb lookup: open_table failed: {e}");
+                tracing::warn!(err = %e, "redb lookup: open_table failed");
                 return None;
             }
         };
@@ -150,7 +150,7 @@ impl RedbPrimary {
             Ok(Some(guard)) => Some(deserialize_entry(&guard.value())),
             Ok(None) => None,
             Err(e) => {
-                eprintln!("redb lookup: get failed: {e}");
+                tracing::warn!(err = %e, "redb lookup: get failed");
                 None
             }
         }
@@ -177,7 +177,7 @@ impl RedbPrimary {
         let txn = match self.begin_write() {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("redb unregister: begin_write failed: {e}");
+                tracing::warn!(err = %e, "redb unregister: begin_write failed");
                 return None;
             }
         };
@@ -185,7 +185,7 @@ impl RedbPrimary {
             let mut table = match txn.open_table(PRIMARY_TABLE) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("redb unregister: open_table failed: {e}");
+                    tracing::warn!(err = %e, "redb unregister: open_table failed");
                     return None;
                 }
             };
@@ -193,7 +193,7 @@ impl RedbPrimary {
                 Ok(Some(guard)) => Some(deserialize_entry(&guard.value())),
                 Ok(None) => None,
                 Err(e) => {
-                    eprintln!("redb unregister: remove failed: {e}");
+                    tracing::warn!(err = %e, "redb unregister: remove failed");
                     return None;
                 }
             }
@@ -205,7 +205,7 @@ impl RedbPrimary {
                 }
             }
             Err(e) => {
-                eprintln!("redb unregister: commit failed: {e}");
+                tracing::warn!(err = %e, "redb unregister: commit failed");
                 return None;
             }
         }
@@ -335,10 +335,10 @@ impl RedbPrimary {
     /// streaming approaches or batch processing instead.
     pub fn iter_collected(&self) -> Vec<(TxKey, TxIndexEntry)> {
         if self.count > 1_000_000 {
-            eprintln!(
-                "redb iter_collected: materializing {} entries (~{} MB in RAM)",
-                self.count,
-                self.count * 63 / (1024 * 1024)
+            tracing::warn!(
+                entries = self.count,
+                mb = self.count * 63 / (1024 * 1024),
+                "redb iter_collected: materializing large entry set in RAM",
             );
         }
         let mut result = Vec::with_capacity(self.count);

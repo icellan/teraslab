@@ -1140,6 +1140,7 @@ impl<'a> Iterator for HashTableIter<'a> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_macros)]
 mod tests {
     use super::*;
 

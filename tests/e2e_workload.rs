@@ -3,6 +3,8 @@
 //! By default, tests run at 1/10 scale for fast development iteration.
 //! Set `TERASLAB_FULL_WORKLOAD=1` to run at full volume (for nightly CI).
 
+#![allow(clippy::disallowed_macros)] // integration tests may use eprintln!/println! for diagnostics
+
 mod workload;
 mod simulation;
 

@@ -99,8 +99,9 @@ pub fn create_device_io(queue_depth: u32) -> Box<dyn DeviceIo> {
                 // Operators should see this: it means the server is running
                 // on the slower sync path. Common causes: kernel < 5.6,
                 // ulimit -l too small, seccomp filter blocking io_uring_setup.
-                eprintln!(
-                    "device_io: io_uring init failed ({e}); falling back to SyncFallback"
+                tracing::warn!(
+                    err = %e,
+                    "device_io: io_uring init failed; falling back to SyncFallback",
                 );
             }
         }

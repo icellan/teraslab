@@ -367,6 +367,23 @@ tr:hover td { background: var(--ts-bg-2); color: var(--ts-text); }
 .flow-wrap { overflow-x: auto; padding: 8px; }
 .flow-wrap svg { width: 100%; min-width: 1100px; display: block; }
 
+/* Observability page — compact per-op table with sticky headers */
+.ts-obs-table {
+    font-size: 10.5px;
+    min-width: 1200px;
+}
+.ts-obs-table th, .ts-obs-table td { padding: 6px 10px; white-space: nowrap; }
+.ts-obs-table th {
+    background: var(--ts-bg-1);
+    position: sticky;
+    top: 0;
+}
+
+/* Stacked outcome-mix bar (used per row in opsOutcomePanel) */
+.ts-stackbar {
+    border: 1px solid var(--ts-line);
+}
+
 /* Responsive */
 @media (max-width: 900px) {
     .nav-links { gap: 1px; }
