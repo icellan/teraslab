@@ -22,7 +22,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Clippy
+      - name: Clippy (workspace)
+        # The sibling crates (`client/rust/`, `teraslab-tests/client/`)
+        # are not subject to the main crate's disallowed-macros lint since
+        # their CLI/test-harness code legitimately uses eprintln!/println!.
         run: cargo clippy --all -- -D warnings
 
   test:
@@ -39,8 +42,25 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run tests
+      - name: Run tests (default features)
         run: cargo test --all
+
+      - name: Run doctests
+        run: cargo test --doc
+
+      - name: Run fault-injection tests
+        # Behind a feature flag so production builds stay zero-cost.
+        # `cargo test --all` does not enable features; run this target
+        # explicitly so the fault_injection integration tests execute.
+        run: cargo test --features fault-injection --test fault_injection
+
+      - name: Run Rust client crate tests
+        run: cargo test --manifest-path client/rust/Cargo.toml --all
+
+      - name: Run teraslab-tests client unit tests
+        # Library-only: integration scenarios under teraslab-tests/client/tests/
+        # require a Docker cluster and are exercised in the nightly E2E job.
+        run: cargo test --manifest-path teraslab-tests/client/Cargo.toml --lib
 
       - name: Build release binary
         run: cargo build --release

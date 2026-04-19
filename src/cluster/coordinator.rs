@@ -226,7 +226,17 @@ impl ClusterCoordinator {
             shutdown: Arc::new(AtomicBool::new(false)),
             initial_peak,
             max_migration_threads: config.max_migration_threads,
-            topology_epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            // Initial value 0 (NOT 1): `last_activated_term` in the event
+            // loop is raised to `topology_epoch.load()` after every event.
+            // If this atomic started at 1, the first real commit with
+            // `term == 1` (produced by on_membership_changed when two
+            // nodes discover each other) would be classified as a
+            // "duplicate" against the baked-in 1 and the shard table
+            // would never be activated. The initial single-node shard
+            // table still uses a hard-coded `version = 1` in its own
+            // `compute_with_epoch` call — that's unrelated to this
+            // counter.
+            topology_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             topology_authority,
             active_topology_members,
             migration_pool_size: config.migration_pool_size.max(1),
