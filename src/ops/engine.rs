@@ -693,6 +693,7 @@ impl Engine {
     /// (write redo log between validation and application), use
     /// [`validate_spend_multi`](Engine::validate_spend_multi) followed by
     /// [`ValidatedSpend::apply`].
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn spend_multi(
         &self,
         req: &SpendMultiRequest,
@@ -945,7 +946,7 @@ impl Engine {
                     if !self.device_ptr.is_null() {
                         unsafe { io::write_metadata_direct(self.device_ptr, record_offset, &metadata) };
                     } else if let Err(e) = self.write_metadata_fast(record_offset, &metadata) {
-                        eprintln!("engine: write_metadata failed: {e}");
+                        tracing::warn!(err = ?e, "engine: write_metadata failed");
                     }
                     self.sync_index_cache(&req.tx_key, &metadata)?;
                     let block_ids = collect_block_ids(&metadata).to_vec();
@@ -974,7 +975,7 @@ impl Engine {
         // 5. Write the spent slot
         let new_slot = UtxoSlot::new_spent(req.utxo_hash, req.spending_data);
         if let Err(e) = self.write_slot_fast(record_offset, req.offset, &new_slot) {
-            eprintln!("engine: write_utxo_slot failed: {e}");
+            tracing::warn!(err = ?e, "engine: write_utxo_slot failed");
         }
 
         // 6. Update metadata
@@ -998,7 +999,7 @@ impl Engine {
         if !self.device_ptr.is_null() {
             unsafe { io::write_metadata_direct(self.device_ptr, record_offset, &metadata) };
         } else if let Err(e) = self.write_metadata_fast(record_offset, &metadata) {
-            eprintln!("engine: write_metadata failed: {e}");
+            tracing::warn!(err = ?e, "engine: write_metadata failed");
         }
 
         self.sync_index_cache(&req.tx_key, &metadata)?;
@@ -1115,6 +1116,7 @@ impl Engine {
     ///
     /// Adds or removes a block entry in the metadata. Only modifies the
     /// metadata region — UTXO slots are not touched.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn set_mined(&self, req: &SetMinedRequest) -> Result<SetMinedResponse, SpendError> {
         let params = SetMinedSharedParams {
             block_id: req.block_id,
@@ -1452,6 +1454,7 @@ impl Engine {
     ///
     /// Only modifies `unmined_since` — block entries and UTXO slots are
     /// not touched. Called during chain reorganizations.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn mark_on_longest_chain(
         &self,
         req: &MarkOnLongestChainRequest,
@@ -1525,6 +1528,7 @@ impl Engine {
     /// Allocates space, writes the complete record (metadata + UTXO slots +
     /// optional cold data) in one I/O operation, and registers it in the
     /// index. The record is immediately available for spend/setMined.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn create(&self, req: &CreateRequest) -> Result<CreateResponse, CreateError> {
         let utxo_count = req.utxo_hashes.len() as u32;
         if utxo_count == 0 {
@@ -2387,6 +2391,7 @@ impl Engine {
     /// Delete a transaction record.
     ///
     /// Removes from index, frees device space, and cleans up secondary indexes.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
 
@@ -2580,6 +2585,7 @@ impl<'a> ValidatedSpend<'a> {
     /// the per-transaction lock is released on return. The operator must
     /// correct the config; the redo log will re-drive recovery.
     #[must_use = "apply returns the operation response including per-item errors"]
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn apply(self, engine: &Engine) -> Result<SpendMultiResponse, SpendError> {
         let ValidatedSpend {
             _guard,
@@ -2605,7 +2611,7 @@ impl<'a> ValidatedSpend<'a> {
         // 6. Batch write all valid slot mutations (zero-alloc when direct)
         for &(offset, ref new_slot) in &valid_spends {
             if let Err(e) = engine.write_slot_fast(record_offset, offset, new_slot) {
-                eprintln!("engine: write_utxo_slot failed: {e}");
+                tracing::warn!(err = ?e, "engine: write_utxo_slot failed");
             }
         }
 
@@ -2637,7 +2643,7 @@ impl<'a> ValidatedSpend<'a> {
         if !engine.device_ptr.is_null() {
             unsafe { io::write_metadata_direct(engine.device_ptr, record_offset, &metadata) };
         } else if let Err(e) = engine.write_metadata_fast(record_offset, &metadata) {
-            eprintln!("engine: write_metadata failed: {e}");
+            tracing::warn!(err = ?e, "engine: write_metadata failed");
         }
 
         engine.sync_index_cache(&tx_key, &metadata)?;

@@ -548,6 +548,12 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
     };
     auth.handle_commit(&old_commit);
 
+    // handle_commit pins observed_membership to the old committed set;
+    // check_timeout's `members` arg is only used as a bootstrap fallback
+    // when no prior view has been observed. Simulate SWIM detecting the
+    // third node so check_timeout sees the extended membership.
+    let _ = auth.on_membership_changed(&mems);
+
     std::thread::sleep(Duration::from_millis(5));
 
     // First timeout fires → proposes term 2

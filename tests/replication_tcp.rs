@@ -211,6 +211,7 @@ fn tcp_replicate_spend() {
             spending_data: sd,
             master_generation: 0,
         }],
+        trace_ctx: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch);
     assert_eq!(
@@ -251,6 +252,7 @@ fn tcp_replicate_create_and_spend_lifecycle() {
             cold_data: None,
             is_external: false,
         }],
+        trace_ctx: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &create_batch);
     assert_eq!(
@@ -288,6 +290,7 @@ fn tcp_replicate_create_and_spend_lifecycle() {
             spending_data: sd,
             master_generation: 0,
         }],
+        trace_ctx: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &spend_batch);
     assert_eq!(
@@ -348,6 +351,7 @@ fn tcp_replicate_batch_50_ops() {
     let batch = ReplicaBatch {
         first_sequence: 1,
         ops,
+        trace_ctx: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch);
     assert_eq!(
@@ -456,6 +460,7 @@ fn tcp_replicate_mixed_ops() {
                 master_generation: 0,
             },
         ],
+        trace_ctx: None,
     };
 
     let ack = send_replica_batch_tcp(replica_port, &batch);
@@ -534,6 +539,7 @@ fn tcp_catchup_missed_ops() {
     let batch1 = ReplicaBatch {
         first_sequence: 1,
         ops: all_ops[0..5].to_vec(),
+        trace_ctx: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch1);
     assert_eq!(
@@ -547,6 +553,7 @@ fn tcp_catchup_missed_ops() {
     let catchup_batch = ReplicaBatch {
         first_sequence: 6,
         ops: all_ops[5..10].to_vec(),
+        trace_ctx: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &catchup_batch);
     assert_eq!(
@@ -654,6 +661,7 @@ fn tcp_concurrent_replicate_and_client() {
         let batch = ReplicaBatch {
             first_sequence: 1,
             ops,
+            trace_ctx: None,
         };
         transport.send_batch(&batch).unwrap();
         let ack = transport.recv_ack(Duration::from_secs(5)).unwrap();
@@ -713,6 +721,7 @@ fn tcp_replica_timeout() {
             offset: 0,
             master_generation: 0,
         }],
+        trace_ctx: None,
     };
     transport.send_batch(&batch).unwrap();
 
@@ -836,6 +845,7 @@ fn tcp_consistency_verification() {
     let batch = ReplicaBatch {
         first_sequence: 1,
         ops: ops.clone(),
+        trace_ctx: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch);
     let expected_through = ops.len() as u64;

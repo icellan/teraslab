@@ -1,3 +1,5 @@
+#![warn(clippy::disallowed_macros)]
+
 pub mod allocator;
 pub mod cluster;
 pub mod config;
@@ -8,6 +10,7 @@ pub mod index;
 pub mod io;
 pub mod locks;
 pub mod metrics;
+pub mod observability;
 pub mod ops;
 pub mod protocol;
 pub mod record;

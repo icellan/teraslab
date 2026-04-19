@@ -87,7 +87,7 @@ impl AckTracker {
 
     fn flush_locked(&self, inner: &mut AckTrackerInner) {
         if let Err(e) = Self::write_to_disk(&self.path, &inner.last_acked) {
-            eprintln!("ack_tracker: flush failed: {e}");
+            tracing::warn!(err = %e, "ack_tracker: flush failed");
             return;
         }
         inner.dirty = false;
@@ -427,6 +427,7 @@ pub fn run_catchup_for_replica(
         let batch = ReplicaBatch {
             first_sequence: last_acked,
             ops: chunk.to_vec(),
+            trace_ctx: crate::observability::WireTraceContext::from_current_span(),
         };
         transport.send_batch(&batch)
             .map_err(|e| format!("catchup send to {addr}: {e}"))?;
@@ -476,8 +477,12 @@ pub fn spawn_lag_monitor(
             for (addr, last_acked) in &all {
                 let lag = master_seq.saturating_sub(*last_acked);
                 if lag > warn_threshold {
-                    eprintln!(
-                        "replication: replica {addr} lag={lag} ops (last_acked={last_acked}, master={master_seq})"
+                    tracing::warn!(
+                        %addr,
+                        lag,
+                        last_acked,
+                        master_seq,
+                        "replication: replica lag exceeds threshold",
                     );
                 }
             }

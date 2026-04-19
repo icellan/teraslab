@@ -305,6 +305,7 @@ fn field_offset(field_mask: u32, target_bit: u32) -> Option<usize> {
 /// ```no_run
 /// # use teraslab_client::*;
 /// # async fn example(client: &Client) -> Result<(), ClientError> {
+/// let txids: Vec<[u8; 32]> = vec![];
 /// let mask = FIELD_SPENT_UTXOS | FIELD_BLOCK_ENTRY_COUNT;
 /// let batch = client.get_batch(mask, &txids).await?;
 /// for i in 0..batch.len() {
@@ -323,6 +324,7 @@ fn field_offset(field_mask: u32, target_bit: u32) -> Option<usize> {
 /// ```no_run
 /// # use teraslab_client::*;
 /// # async fn example(client: &Client) -> Result<(), ClientError> {
+/// let txids: Vec<[u8; 32]> = vec![];
 /// let batch = client.get_batch(FIELD_ALL_METADATA, &txids).await?;
 /// for i in 0..batch.len() {
 ///     if let Some((meta, _)) = batch.decode_metadata(i)? {

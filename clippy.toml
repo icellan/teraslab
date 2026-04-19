@@ -1,0 +1,4 @@
+disallowed-macros = [
+    { path = "std::eprintln", reason = "use tracing::error! or tracing::warn!" },
+    { path = "std::println", reason = "use tracing::info! or tracing::debug!" },
+]

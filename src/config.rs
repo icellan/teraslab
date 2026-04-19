@@ -1,5 +1,6 @@
 //! Server configuration.
 
+use crate::observability::ObservabilityConfig;
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -269,6 +270,14 @@ pub struct ServerConfig {
     /// The expected value is a 32-character lowercase hex string, as printed
     /// by `device_id_hex()` and logged on first startup.
     pub device_id: Option<String>,
+
+    /// Observability configuration (Phase 4: OTLP tracing).
+    ///
+    /// Populated from the `[observability]` TOML section. Every field can
+    /// be individually overridden via `TERASLAB_*` environment variables —
+    /// call [`ServerConfig::apply_observability_env_overrides`] after
+    /// loading to apply them.
+    pub observability: ObservabilityConfig,
 }
 
 impl Default for ServerConfig {
@@ -306,6 +315,7 @@ impl Default for ServerConfig {
             replica_lag_check_interval_secs: 30,
             index: IndexConfig::default(),
             device_id: None,
+            observability: ObservabilityConfig::default(),
         }
     }
 }
@@ -423,6 +433,28 @@ impl ServerConfig {
     /// into an impossibility guard in practice. The runtime path still
     /// returns `SpendError::DahOverflow` if overflow ever does occur.
     pub const MAX_BLOCK_HEIGHT_RETENTION: u32 = 10_000_000;
+
+    /// Apply `TERASLAB_*` environment overrides to the observability
+    /// subsection. Call this once after [`Self::load`] so config-file
+    /// values are visible to validation before env vars take precedence.
+    ///
+    /// Returns an error if `TERASLAB_TRACE_SAMPLING_RATIO` is present but
+    /// does not parse as `f64`.
+    pub fn apply_observability_env_overrides(&mut self) -> std::result::Result<(), String> {
+        self.observability
+            .apply_env_overrides()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Validate observability settings against the startup contract.
+    ///
+    /// Currently only checks that `trace_sampling_ratio` is in `[0.0, 1.0]`.
+    /// OTLP endpoint shape is left to the exporter build step — a malformed
+    /// endpoint surfaces as an exporter construction error at init time, not
+    /// a config-time error, because DNS/TCP reachability is runtime-only.
+    pub fn validate_observability(&self) -> std::result::Result<(), String> {
+        self.observability.validate().map_err(|e| e.to_string())
+    }
 
     /// Validate `block_height_retention` against the sanity bound.
     ///
@@ -650,5 +682,136 @@ backend = ""
         };
         let err = cfg.validate_block_height_retention().unwrap_err();
         assert!(err.contains("block_height_retention"));
+    }
+
+    // ------------------------------------------------------------------
+    // Observability (Phase 4): TOML + env override wiring
+    // ------------------------------------------------------------------
+
+    /// Guards the `TERASLAB_*` env vars across tests so two parallel test
+    /// threads don't clobber each other.
+    fn obs_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::Mutex;
+        use std::sync::OnceLock;
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let m = LOCK.get_or_init(|| Mutex::new(()));
+        // Poisoned locks are safe here — the inner () has no invariants
+        // to break, so we just recover and move on.
+        m.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    #[test]
+    fn observability_config_parses_toml_and_env_override() {
+        let _guard = obs_env_guard();
+        unsafe {
+            std::env::remove_var(ObservabilityConfig::ENV_OTLP_ENDPOINT);
+            std::env::remove_var(ObservabilityConfig::ENV_SAMPLING_RATIO);
+            std::env::remove_var(ObservabilityConfig::ENV_SERVICE_NAME);
+        }
+
+        let toml_str = r#"
+[observability]
+otlp_endpoint = "http://jaeger.local:4317"
+trace_sampling_ratio = 0.25
+service_name = "teraslab-test"
+"#;
+        let mut cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            cfg.observability.otlp_endpoint.as_deref(),
+            Some("http://jaeger.local:4317")
+        );
+        assert_eq!(cfg.observability.trace_sampling_ratio, 0.25);
+        assert_eq!(
+            cfg.observability.service_name.as_deref(),
+            Some("teraslab-test")
+        );
+
+        // Env vars override TOML values.
+        unsafe {
+            std::env::set_var(
+                ObservabilityConfig::ENV_OTLP_ENDPOINT,
+                "http://otel-collector:4318",
+            );
+            std::env::set_var(ObservabilityConfig::ENV_SAMPLING_RATIO, "0.5");
+            std::env::set_var(ObservabilityConfig::ENV_SERVICE_NAME, "teraslab-env");
+        }
+        cfg.apply_observability_env_overrides()
+            .expect("env overrides apply cleanly");
+        assert_eq!(
+            cfg.observability.otlp_endpoint.as_deref(),
+            Some("http://otel-collector:4318"),
+        );
+        assert_eq!(cfg.observability.trace_sampling_ratio, 0.5);
+        assert_eq!(
+            cfg.observability.service_name.as_deref(),
+            Some("teraslab-env"),
+        );
+
+        // Ratios outside [0.0, 1.0] fail validation.
+        cfg.observability.trace_sampling_ratio = 2.0;
+        let err = cfg.validate_observability().unwrap_err();
+        assert!(
+            err.contains("trace_sampling_ratio"),
+            "validation error was: {err}",
+        );
+        cfg.observability.trace_sampling_ratio = -0.01;
+        assert!(cfg.validate_observability().is_err());
+
+        unsafe {
+            std::env::remove_var(ObservabilityConfig::ENV_OTLP_ENDPOINT);
+            std::env::remove_var(ObservabilityConfig::ENV_SAMPLING_RATIO);
+            std::env::remove_var(ObservabilityConfig::ENV_SERVICE_NAME);
+        }
+    }
+
+    #[test]
+    fn observability_absent_toml_section_defaults_to_otlp_disabled() {
+        let _guard = obs_env_guard();
+        unsafe {
+            std::env::remove_var(ObservabilityConfig::ENV_OTLP_ENDPOINT);
+        }
+        let toml_str = r#"
+listen_addr = "0.0.0.0:3300"
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.observability.otlp_endpoint.is_none());
+        assert_eq!(cfg.observability.trace_sampling_ratio, 0.01);
+    }
+
+    #[test]
+    fn observability_empty_env_endpoint_clears_toml_value() {
+        let _guard = obs_env_guard();
+        let toml_str = r#"
+[observability]
+otlp_endpoint = "http://set-via-toml:4317"
+"#;
+        let mut cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.observability.otlp_endpoint.is_some());
+
+        unsafe {
+            std::env::set_var(ObservabilityConfig::ENV_OTLP_ENDPOINT, "");
+        }
+        cfg.apply_observability_env_overrides().unwrap();
+        assert!(
+            cfg.observability.otlp_endpoint.is_none(),
+            "empty env var must clear the endpoint (disable OTLP)",
+        );
+        unsafe {
+            std::env::remove_var(ObservabilityConfig::ENV_OTLP_ENDPOINT);
+        }
+    }
+
+    #[test]
+    fn observability_env_malformed_ratio_is_error() {
+        let _guard = obs_env_guard();
+        let mut cfg = ServerConfig::default();
+        unsafe {
+            std::env::set_var(ObservabilityConfig::ENV_SAMPLING_RATIO, "not-a-float");
+        }
+        let err = cfg.apply_observability_env_overrides().unwrap_err();
+        assert!(err.contains("TERASLAB_TRACE_SAMPLING_RATIO"), "err was: {err}");
+        unsafe {
+            std::env::remove_var(ObservabilityConfig::ENV_SAMPLING_RATIO);
+        }
     }
 }

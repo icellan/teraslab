@@ -1,8 +1,10 @@
 //! Replication manager — orchestrates sending to multiple replicas
 //! with configurable acknowledgment policies.
 
+use crate::metrics::replication_metrics;
+use crate::observability::WireTraceContext;
 use crate::replication::protocol::*;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 /// Errors from the replication manager.
@@ -176,6 +178,7 @@ impl ReplicationManager {
     /// to ACK, `WriteMajority` requires at least `required_ack_count()`.
     /// On failure, the first error observed (in sender order) is
     /// returned so the caller has a deterministic diagnostic.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn replicate_batch(
         &mut self,
         ops: &[ReplicaOp],
@@ -194,13 +197,30 @@ impl ReplicationManager {
             });
         }
 
+        // Snapshot the current span's trace context so every wire frame
+        // carries the sender's provenance. `from_current_span` is a cheap
+        // no-op when no subscriber is installed or the span isn't sampled.
+        let trace_ctx = WireTraceContext::from_current_span();
         let batch = ReplicaBatch {
             first_sequence: self.next_sequence,
             ops: ops.to_vec(),
+            trace_ctx,
         };
         self.next_sequence += ops.len() as u64;
 
         let timeout = self.config.replication_timeout;
+
+        // Cache the subsystem metrics pointer once so the scoped workers
+        // do not repeatedly pay the `OnceLock::get()` cost. `bytes` is
+        // the serialized-batch size, computed once for all replicas.
+        let metrics = replication_metrics();
+        let batch_bytes = batch.serialize().len() as u64;
+        if let Some(m) = metrics {
+            m.repl_batches_sent_total.inc();
+            m.leader_sequence
+                .store(self.next_sequence, std::sync::atomic::Ordering::Relaxed);
+        }
+        let start = Instant::now();
 
         // Per-sender outcome produced inside each scoped thread. We do
         // not mutate `sender.state` or `sender.last_acked` from inside
@@ -221,10 +241,14 @@ impl ReplicationManager {
             let handles: Vec<_> = self
                 .senders
                 .iter_mut()
-                .map(|sender| {
+                .enumerate()
+                .map(|(idx, sender)| {
                     s.spawn(move || {
                         if *sender.state() != ReplicaState::Live {
                             return Outcome::Skipped;
+                        }
+                        if let Some(m) = metrics {
+                            m.mark_in_flight(idx);
                         }
                         match sender.transport.send_batch(batch_ref) {
                             Ok(()) => match sender.transport.recv_ack(timeout) {
@@ -253,18 +277,33 @@ impl ReplicationManager {
                 .collect()
         });
 
+        // Record end-to-end latency once for the whole fan-out. Per-replica
+        // drill-down is recorded below alongside the reconciliation loop so
+        // each cell reflects the correct success/failure accounting.
+        if let Some(m) = metrics {
+            m.repl_batch_latency_ns.record_since(start);
+        }
+
         // Reconcile outcomes into per-sender state. The ordering here
         // matches `self.senders` so `first_error` is deterministic.
         let mut successes = 0usize;
         let mut first_error: Option<ReplicationError> = None;
-        for (sender, outcome) in self.senders.iter_mut().zip(outcomes.into_iter()) {
+        for (idx, (sender, outcome)) in
+            self.senders.iter_mut().zip(outcomes.into_iter()).enumerate()
+        {
             match outcome {
                 Outcome::Ok { through_sequence } => {
                     sender.last_acked = through_sequence;
                     successes += 1;
+                    if let Some(m) = metrics {
+                        m.record_ack(idx, through_sequence, batch_bytes);
+                    }
                 }
                 Outcome::ReplicaErr { sequence, message } => {
                     sender.state = ReplicaState::Down;
+                    if let Some(m) = metrics {
+                        m.record_failure(idx);
+                    }
                     if first_error.is_none() {
                         first_error = Some(ReplicationError::ReplicaError {
                             sequence,
@@ -274,6 +313,9 @@ impl ReplicationManager {
                 }
                 Outcome::TransportErr(e) => {
                     sender.state = ReplicaState::Down;
+                    if let Some(m) = metrics {
+                        m.record_failure(idx);
+                    }
                     if first_error.is_none() {
                         first_error = Some(e);
                     }
@@ -395,6 +437,7 @@ impl ReplicationManager {
                 let batch = ReplicaBatch {
                     first_sequence: chunk_seq,
                     ops: chunk.to_vec(),
+                    trace_ctx: WireTraceContext::from_current_span(),
                 };
                 if let Err(_e) = sender.transport.send_batch(&batch) {
                     sender.state = ReplicaState::Down;
@@ -1597,6 +1640,93 @@ mod tests {
         let _ = h1.join();
         let _ = h2.join();
         let _ = h3.join();
+    }
+
+    /// Drive 10 batches through `replicate_batch` with an auto-ACK replica
+    /// that sleeps briefly per batch, then assert that the Phase 5
+    /// replication metrics correctly record latency and bytes.
+    ///
+    /// The metrics ref may already be installed (by e.g. a sibling test); we
+    /// install our own test-only static lazily and observe deltas rather than
+    /// absolute counts.
+    #[test]
+    fn replication_records_batch_latency_and_lag() {
+        use crate::metrics::{init_replication_metrics, replication_metrics, ReplicationMetrics};
+        use std::sync::OnceLock;
+        static TEST_METRICS: OnceLock<ReplicationMetrics> = OnceLock::new();
+        let m_ref: &'static ReplicationMetrics =
+            TEST_METRICS.get_or_init(ReplicationMetrics::new);
+        init_replication_metrics(m_ref);
+        // Use the real installed metrics for observation (may be the one we
+        // just tried to install, or an earlier one from another test).
+        let metrics = replication_metrics().expect("metrics installed");
+        let before_count = metrics.repl_batch_latency_ns.count();
+        let before_sum = metrics.repl_batch_latency_ns.sum_ns();
+        let before_bytes0 = metrics.per_replica[0].bytes_sent.get();
+        let before_sent = metrics.repl_batches_sent_total.get();
+
+        // Spawn a deliberately-slow auto-ACK replica so the histogram
+        // captures a non-zero sum.
+        let (mt, rt) = InMemoryTransport::pair();
+        let handle = std::thread::spawn(move || {
+            while let Ok(batch) = rt.recv_batch(Duration::from_secs(2)) {
+                std::thread::sleep(Duration::from_millis(5));
+                let ack = ReplicaAck::Ok {
+                    through_sequence: batch.last_sequence(),
+                };
+                if rt.send_ack(&ack).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig {
+                replication_timeout: Duration::from_secs(2),
+                ..Default::default()
+            },
+            vec![Box::new(mt)],
+        );
+
+        for i in 0..10u8 {
+            let ops = vec![ReplicaOp::Freeze {
+                tx_key: key(i),
+                offset: 0,
+                master_generation: 0,
+            }];
+            mgr.replicate_batch(&ops).unwrap();
+        }
+
+        drop(mgr);
+        let _ = handle.join();
+
+        let after_count = metrics.repl_batch_latency_ns.count();
+        let after_sum = metrics.repl_batch_latency_ns.sum_ns();
+        let after_bytes0 = metrics.per_replica[0].bytes_sent.get();
+        let after_sent = metrics.repl_batches_sent_total.get();
+
+        // Use >= rather than == because parallel tests may also drive the
+        // same global metrics counters.
+        assert!(
+            after_count - before_count >= 10,
+            "repl_batch_latency_ns should record at least 10 samples, got {}",
+            after_count - before_count
+        );
+        assert!(
+            after_sent - before_sent >= 10,
+            "repl_batches_sent_total should advance by ≥ 10, got {}",
+            after_sent - before_sent
+        );
+        // 10 batches × 5ms sleep lower bound = 50ms. Histogram sum is in ns.
+        assert!(
+            after_sum - before_sum >= 50_000_000,
+            "sum_ns advanced by {} ns, expected >= 50,000,000",
+            after_sum - before_sum,
+        );
+        assert!(
+            after_bytes0 > before_bytes0,
+            "per-replica bytes_sent should advance (before={before_bytes0}, after={after_bytes0})"
+        );
     }
 
     /// Replica sends an error ACK: sender should be marked Down and the

@@ -4,6 +4,8 @@
 //! shard table convergence, partition map serving, coordinator behaviour,
 //! data migration, and end-to-end cluster operations.
 
+#![allow(clippy::disallowed_macros)] // integration tests may use eprintln!/println! for diagnostics
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -119,7 +121,27 @@ fn create_node(
         let _ = server_clone.run();
     });
 
-    // Wait for server to start
+    // Wait for the SWIM UDP socket to actually bind. The coordinator
+    // spawns SWIM on a background thread; 100ms was racy on loaded
+    // runners. Poll the port with a connect probe (UDP connect is
+    // bind-only semantics — it does not send a packet) until the
+    // address is accepting, or give up after 2 seconds.
+    let swim_target: std::net::SocketAddr =
+        format!("127.0.0.1:{swim_port}").parse().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").ok();
+        let bound = match probe {
+            Some(s) => s.connect(swim_target).is_ok(),
+            None => false,
+        };
+        if bound {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Also give the server TCP listener a moment so that test clients
+    // can connect without racing on `accept()`.
     std::thread::sleep(Duration::from_millis(100));
 
     TestNode {
@@ -310,6 +332,43 @@ fn shutdown_node(node: &TestNode) {
     node.server.shutdown();
 }
 
+/// Poll until `node` sees at least one key that routes to a peer (i.e. the
+/// multi-node shard table has been committed and installed). Returns the
+/// first such txid on success, or panics with diagnostics if the cluster
+/// hasn't converged within `timeout`.
+///
+/// Fixed sleeps were flaky on loaded CI runners; this helper waits only as
+/// long as actually needed (up to `timeout`) and scans a wider txid range
+/// than a single iteration would.
+fn wait_for_shard_split(node: &TestNode, timeout: Duration) -> [u8; 32] {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_attempt = 0u32;
+    while std::time::Instant::now() < deadline {
+        for i in 0..4096u32 {
+            let txid = make_txid(i + last_attempt);
+            let key = TxKey { txid };
+            if !node.cluster.is_master(&key) {
+                return txid;
+            }
+        }
+        last_attempt = last_attempt.wrapping_add(4096);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let committed_term = node.cluster.committed_topology_term();
+    let version = node.cluster.shard_table_version();
+    let committed_members = node.cluster.committed_topology_members();
+    let alive = node.cluster.alive_node_count();
+    let shard_counts = {
+        let table = node.cluster.shard_table();
+        let t = table.read();
+        t.shard_counts()
+    };
+    panic!(
+        "cluster did not converge within {:?}: committed_term={}, shard_table_version={}, committed_members={:?}, alive_node_count={}, shard_counts={:?}",
+        timeout, committed_term, version, committed_members, alive, shard_counts,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Coordinator tests
 // ---------------------------------------------------------------------------
@@ -428,12 +487,13 @@ fn route_or_handle_coordinator_level() {
     let node1 = create_node(131, 13430, 13431, &[]);
     let node2 = create_node(132, 13432, 13433, &[13431]);
 
-    std::thread::sleep(Duration::from_secs(2));
+    // Wait for SWIM discovery + 2-node topology commit + shard-table install.
+    let _ = wait_for_shard_split(&node1, Duration::from_secs(15));
 
     let mut found_local = false;
     let mut found_redirect = false;
 
-    for i in 0..256u32 {
+    for i in 0..4096u32 {
         let txid = make_txid(i);
         let key = TxKey { txid };
         if node1.cluster.is_master(&key) {
@@ -573,24 +633,13 @@ fn during_migration_writes_redirect_to_new_node() {
     let node1 = create_node(161, 13460, 13461, &[]);
     let node2 = create_node(162, 13462, 13463, &[13461]);
 
-    std::thread::sleep(Duration::from_secs(2));
+    // Wait for SWIM discovery + 2-node topology commit + shard-table install.
+    let txid = wait_for_shard_split(&node1, Duration::from_secs(15));
 
     let mut stream1 = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
     stream1
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-
-    // Find a key that node 1 does NOT own
-    let mut remote_txid = None;
-    for i in 0..1000u32 {
-        let txid = make_txid(i + 30000);
-        let key = TxKey { txid };
-        if !node1.cluster.is_master(&key) {
-            remote_txid = Some(txid);
-            break;
-        }
-    }
-    let txid = remote_txid.expect("should find a remote key");
     let hash = [1u8; 32];
 
     // Try to create a record on node 1 for a key it doesn't own
@@ -631,23 +680,8 @@ fn client_redirect_resends_to_new_node() {
     let node1 = create_node(171, 13470, 13471, &[]);
     let node2 = create_node(172, 13472, 13473, &[13471]);
 
-    // Wait for handoff activation to make some shard authoritative on node 2.
-    let mut remote_txid = None;
-    for _ in 0..50 {
-        for i in 0..1000u32 {
-            let txid = make_txid(i + 40000);
-            let key = TxKey { txid };
-            if !node1.cluster.is_master(&key) {
-                remote_txid = Some(txid);
-                break;
-            }
-        }
-        if remote_txid.is_some() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let txid = remote_txid.expect("should find a key owned by node 2");
+    // Wait for SWIM discovery + 2-node topology commit + shard-table install.
+    let txid = wait_for_shard_split(&node1, Duration::from_secs(15));
     let hash = [2u8; 32];
 
     // Send create to node 1 → should get redirect

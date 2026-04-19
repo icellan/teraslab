@@ -5,6 +5,7 @@
 //! manages the state transitions and event generation.
 
 use crate::cluster::shards::NodeId;
+use crate::metrics::{swim_metrics, SwimChurnKind};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -130,15 +131,29 @@ impl Membership {
                 if dominated || same_inc_dead || same_inc_suspect_direct {
                     let was_dead = info.state == NodeState::Dead;
                     let was_suspect = info.state == NodeState::Suspect;
+                    let suspect_started_at = info.state_changed_at;
                     info.state = NodeState::Alive;
                     info.incarnation = incarnation;
                     info.addr = addr;
-                    info.state_changed_at = Instant::now();
+                    let now = Instant::now();
+                    info.state_changed_at = now;
 
                     if was_dead || was_suspect {
                         self.rebuild_alive_cache();
                         if was_dead {
                             events.push(ClusterEvent::NodeJoined(node, addr));
+                            if let Some(m) = swim_metrics() {
+                                m.record_churn(SwimChurnKind::Join);
+                            }
+                        }
+                        if was_suspect
+                            && let Some(m) = swim_metrics()
+                        {
+                            m.record_churn(SwimChurnKind::AliveFromSuspect);
+                            let elapsed =
+                                now.saturating_duration_since(suspect_started_at);
+                            m.swim_suspicion_duration_ns
+                                .record_ns(elapsed.as_nanos() as u64);
                         }
                         // Both Dead→Alive and Suspect→Alive emit MembershipChanged
                         // so routing recomputes.
@@ -156,6 +171,9 @@ impl Membership {
                 self.rebuild_alive_cache();
                 events.push(ClusterEvent::NodeJoined(node, addr));
                 events.push(ClusterEvent::MembershipChanged(self.alive_members()));
+                if let Some(m) = swim_metrics() {
+                    m.record_churn(SwimChurnKind::Join);
+                }
             }
         }
 
@@ -178,6 +196,9 @@ impl Membership {
             info.state_changed_at = Instant::now();
             self.rebuild_alive_cache();
             events.push(ClusterEvent::NodeSuspect(node));
+            if let Some(m) = swim_metrics() {
+                m.record_churn(SwimChurnKind::Suspect);
+            }
         }
 
         events
@@ -191,15 +212,30 @@ impl Membership {
     pub fn mark_dead(&mut self, node: NodeId, incarnation: u64) -> Vec<ClusterEvent> {
         let mut events = Vec::new();
 
+        let mut post_transition: Option<(bool, std::time::Duration)> = None;
         if let Some(info) = self.members.get_mut(&node)
             && info.state != NodeState::Dead
             && incarnation >= info.incarnation
         {
+            let was_suspect = info.state == NodeState::Suspect;
+            let suspect_started_at = info.state_changed_at;
+            let now = Instant::now();
             info.state = NodeState::Dead;
-            info.state_changed_at = Instant::now();
+            info.state_changed_at = now;
+            let elapsed = now.saturating_duration_since(suspect_started_at);
+            post_transition = Some((was_suspect, elapsed));
+        }
+        if let Some((was_suspect, elapsed)) = post_transition {
             self.rebuild_alive_cache();
             events.push(ClusterEvent::NodeLeft(node));
             events.push(ClusterEvent::MembershipChanged(self.alive_members()));
+            if let Some(m) = swim_metrics() {
+                m.record_churn(SwimChurnKind::Leave);
+                if was_suspect {
+                    m.swim_suspicion_duration_ns
+                        .record_ns(elapsed.as_nanos() as u64);
+                }
+            }
         }
 
         events
@@ -841,6 +877,83 @@ mod tests {
 
         let n3 = states.iter().find(|(id, _, _, _)| *id == NodeId(3)).unwrap();
         assert_eq!(n3.1, NodeState::Suspect);
+    }
+
+    /// Phase 5: driving state transitions must tick the churn counters
+    /// in `SwimMetrics`. Observe deltas rather than absolute counts so
+    /// the test is parallel-safe.
+    #[test]
+    fn swim_churn_counter_ticks_on_state_transitions() {
+        use crate::metrics::{
+            init_swim_metrics, swim_metrics, SwimChurnKind, SwimMetrics,
+        };
+        use std::sync::OnceLock;
+
+        static TEST_METRICS: OnceLock<SwimMetrics> = OnceLock::new();
+        let m_ref: &'static SwimMetrics = TEST_METRICS.get_or_init(SwimMetrics::new);
+        init_swim_metrics(m_ref);
+        let metrics = swim_metrics().expect("metrics installed");
+        let before = [
+            metrics
+                .swim_membership_churn_total
+                .get(SwimChurnKind::Join as usize),
+            metrics
+                .swim_membership_churn_total
+                .get(SwimChurnKind::Suspect as usize),
+            metrics
+                .swim_membership_churn_total
+                .get(SwimChurnKind::AliveFromSuspect as usize),
+            metrics
+                .swim_membership_churn_total
+                .get(SwimChurnKind::Leave as usize),
+        ];
+
+        let mut m = Membership::new(NodeId(1), Duration::from_millis(5));
+        // 1 Join (new node Alive).
+        m.mark_alive(NodeId(2), addr(3001), 1, true);
+        // 1 Suspect.
+        m.mark_suspect(NodeId(2), 1);
+        // 1 AliveFromSuspect (same-inc direct clears suspicion).
+        m.mark_alive(NodeId(2), addr(3001), 1, true);
+        // 1 Leave.
+        m.mark_dead(NodeId(2), 1);
+
+        let after = [
+            metrics
+                .swim_membership_churn_total
+                .get(SwimChurnKind::Join as usize),
+            metrics
+                .swim_membership_churn_total
+                .get(SwimChurnKind::Suspect as usize),
+            metrics
+                .swim_membership_churn_total
+                .get(SwimChurnKind::AliveFromSuspect as usize),
+            metrics
+                .swim_membership_churn_total
+                .get(SwimChurnKind::Leave as usize),
+        ];
+        // Assert delta ≥ 1 rather than == 1: other parallel tests in the
+        // same process also exercise these state transitions.
+        assert!(
+            after[0] - before[0] >= 1,
+            "Join should tick ≥ 1 (delta={})",
+            after[0] - before[0]
+        );
+        assert!(
+            after[1] - before[1] >= 1,
+            "Suspect should tick ≥ 1 (delta={})",
+            after[1] - before[1]
+        );
+        assert!(
+            after[2] - before[2] >= 1,
+            "AliveFromSuspect should tick ≥ 1 (delta={})",
+            after[2] - before[2]
+        );
+        assert!(
+            after[3] - before[3] >= 1,
+            "Leave should tick ≥ 1 (delta={})",
+            after[3] - before[3]
+        );
     }
 
     /// Address update: mark_alive with a new address should update the stored

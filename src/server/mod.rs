@@ -114,14 +114,14 @@ impl Server {
             .set_nonblocking(true)
             .map_err(|e| format!("failed to set non-blocking: {e}"))?;
 
-        eprintln!("TeraSlab server listening on {}", self.config.listen_addr);
+        tracing::info!(listen_addr = %self.config.listen_addr, "TeraSlab server listening");
 
         while !self.shutdown.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, addr)) => {
                     let active = self.active_connections.load(Ordering::Relaxed);
                     if active >= self.config.max_connections {
-                        eprintln!("rejecting connection from {addr}: max connections reached ({active})");
+                        tracing::warn!(peer_addr = %addr, active, "rejecting connection: max connections reached");
                         drop(stream);
                         continue;
                     }
@@ -146,7 +146,7 @@ impl Server {
                             redo_log.as_deref(),
                             blob_store.as_deref(),
                         ) {
-                            eprintln!("connection from {addr} error: {e}");
+                            tracing::warn!(peer_addr = %addr, err = %e, "connection error");
                         }
                         active_conns.fetch_sub(1, Ordering::Relaxed);
                     });
@@ -156,13 +156,15 @@ impl Server {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 Err(e) => {
-                    eprintln!("accept error: {e}");
+                    tracing::warn!(err = %e, "accept error");
                 }
             }
         }
 
-        eprintln!("server shutting down, waiting for {} active connections",
-            self.active_connections.load(Ordering::Relaxed));
+        tracing::info!(
+            active = self.active_connections.load(Ordering::Relaxed),
+            "server shutting down, waiting for active connections to drain",
+        );
 
         // Wait for active connections to drain
         while self.active_connections.load(Ordering::Relaxed) > 0 {

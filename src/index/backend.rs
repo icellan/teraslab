@@ -448,9 +448,10 @@ impl PrimaryBackend {
         }
 
         if skipped > 0 {
-            eprintln!(
-                "  rebuild_redb: WARNING: skipped {skipped} offsets due to I/O errors \
-                 ({indexed} records indexed successfully)"
+            tracing::warn!(
+                skipped,
+                indexed,
+                "rebuild_redb: skipped offsets due to I/O errors",
             );
         }
 
@@ -530,9 +531,10 @@ impl PrimaryBackend {
         }
 
         if skipped > 0 {
-            eprintln!(
-                "  rebuild_file_backed: WARNING: skipped {skipped} offsets due to I/O errors \
-                 ({indexed} records indexed successfully)"
+            tracing::warn!(
+                skipped,
+                indexed,
+                "rebuild_file_backed: skipped offsets due to I/O errors",
             );
         }
 

@@ -1,6 +1,31 @@
 //! Data migration tracking for shard rebalancing.
 
 use crate::cluster::shards::{MigrationTask, NodeId, NUM_SHARDS};
+use crate::metrics::{migration_metrics, MigrationLabel, MigrationMetrics};
+use std::sync::atomic::Ordering;
+
+/// Saturating-decrement of the active-migrations gauge.
+fn dec_active(m: &MigrationMetrics) {
+    let prev = m.migration_active.load(Ordering::Relaxed);
+    if prev > 0 {
+        m.migration_active.store(prev - 1, Ordering::Relaxed);
+    }
+}
+
+/// Saturating-decrement of the phase gauge corresponding to `state`.
+fn dec_phase_gauge(m: &MigrationMetrics, state: &MigrationState) {
+    let gauge = match state {
+        MigrationState::Preparing => &m.migration_phase_preparing,
+        MigrationState::Streaming => &m.migration_phase_copying,
+        MigrationState::Fenced => &m.migration_phase_delta,
+        MigrationState::Complete => &m.migration_phase_serving_new,
+        MigrationState::Failed => return,
+    };
+    let prev = gauge.load(Ordering::Relaxed);
+    if prev > 0 {
+        gauge.store(prev - 1, Ordering::Relaxed);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ShardBitmap — O(1) per-shard flag storage
@@ -280,6 +305,10 @@ impl MigrationManager {
         for task in tasks {
             if task.from_node == self_id {
                 self.active.push(MigrationProgress::from_task(task));
+                if let Some(m) = migration_metrics() {
+                    m.migration_active.fetch_add(1, Ordering::Relaxed);
+                    m.migration_phase_preparing.fetch_add(1, Ordering::Relaxed);
+                }
             }
             if task.to_node == self_id {
                 if let Some(existing) = self.inbound_migrations.iter_mut().find(
@@ -407,26 +436,51 @@ impl MigrationManager {
 
     /// Transition a migration to the Fenced state and record the fence sequence.
     pub fn mark_fenced(&mut self, task: &MigrationTask, fence_sequence: u64) {
+        let prev_state = self.find_task_mut(task).map(|p| p.state.clone());
         if let Some(p) = self.find_task_mut(task) {
             p.state = MigrationState::Fenced;
             p.fence_sequence = fence_sequence;
         }
         self.fence_shard(task.shard);
+        if let Some(m) = migration_metrics() {
+            if let Some(prev) = prev_state {
+                dec_phase_gauge(m, &prev);
+            }
+            m.migration_phase_delta.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Set the snapshot sequence checkpoint for a migration task.
     pub fn set_snapshot_sequence(&mut self, task: &MigrationTask, seq: u64) {
+        let prev_state = self.find_task_mut(task).map(|p| p.state.clone());
         if let Some(p) = self.find_task_mut(task) {
             p.snapshot_sequence = seq;
             p.state = MigrationState::Streaming;
+        }
+        if let Some(m) = migration_metrics() {
+            if let Some(prev) = prev_state {
+                dec_phase_gauge(m, &prev);
+            }
+            m.migration_phase_copying.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// Mark records as migrated for a task identified by (shard, from, to).
     pub fn record_progress(&mut self, task: &MigrationTask, records: u64, bytes: u64) {
+        let is_master = self.find_task_mut(task).map(|p| p.is_master).unwrap_or(true);
         if let Some(p) = self.find_task_mut(task) {
             p.migrated_records += records;
             p.bytes_sent += bytes;
+        }
+        if let Some(m) = migration_metrics() {
+            m.migration_entries_applied_total.inc_by(records);
+            // This node is the source (`from_node == self_id`) — outbound.
+            let label = if is_master {
+                MigrationLabel::OutboundMaster
+            } else {
+                MigrationLabel::OutboundReplica
+            };
+            m.record_bytes(label, bytes);
         }
     }
 
@@ -437,11 +491,19 @@ impl MigrationManager {
     /// unfencing when multiple tasks target the same shard (e.g., master
     /// migration + replica backfill).
     pub fn mark_complete(&mut self, task: &MigrationTask) {
+        let prev_state = self.find_task_mut(task).map(|p| p.state.clone());
         if let Some(p) = self.find_task_mut(task) {
             p.state = MigrationState::Complete;
         }
         if !self.has_other_fenced_task(task.shard, task) {
             self.unfence_shard(task.shard);
+        }
+        if let Some(m) = migration_metrics() {
+            if let Some(prev) = prev_state {
+                dec_phase_gauge(m, &prev);
+            }
+            m.migration_phase_serving_new.fetch_add(1, Ordering::Relaxed);
+            dec_active(m);
         }
     }
 
@@ -452,11 +514,18 @@ impl MigrationManager {
     /// in the Fenced state. Failed migrations are removed from the
     /// active list by the next call to `cleanup_completed()`.
     pub fn mark_failed(&mut self, task: &MigrationTask) {
+        let prev_state = self.find_task_mut(task).map(|p| p.state.clone());
         if let Some(p) = self.find_task_mut(task) {
             p.state = MigrationState::Failed;
         }
         if !self.has_other_fenced_task(task.shard, task) {
             self.unfence_shard(task.shard);
+        }
+        if let Some(m) = migration_metrics() {
+            if let Some(prev) = prev_state {
+                dec_phase_gauge(m, &prev);
+            }
+            dec_active(m);
         }
     }
 
@@ -822,7 +891,7 @@ pub fn persist_inbound_state(path: &std::path::Path, mgr: &MigrationManager) {
         Ok(())
     })();
     if let Err(e) = result {
-        eprintln!("cluster: failed to persist inbound migration state: {e}");
+        tracing::warn!(err = %e, "cluster: failed to persist inbound migration state");
     }
 }
 
@@ -850,7 +919,7 @@ pub fn persist_outbound_state(path: &std::path::Path, mgr: &MigrationManager) {
         Ok(())
     })();
     if let Err(e) = result {
-        eprintln!("cluster: failed to persist outbound migration state: {e}");
+        tracing::warn!(err = %e, "cluster: failed to persist outbound migration state");
     }
 }
 
@@ -2057,5 +2126,58 @@ mod tests {
         mgr.mark_inbound_complete(10);
 
         assert_eq!(mgr.pending_inbound_entries(), vec![(20u16, NodeId(3))]);
+    }
+
+    /// Phase 5: starting an outbound migration should bump the
+    /// `migration_active` gauge; completing it should decrement back.
+    #[test]
+    fn migration_active_gauge_tracks_inflight_shards() {
+        use crate::metrics::{init_migration_metrics, migration_metrics, MigrationMetrics};
+        use std::sync::atomic::Ordering;
+        use std::sync::OnceLock;
+
+        static TEST_METRICS: OnceLock<MigrationMetrics> = OnceLock::new();
+        let m_ref: &'static MigrationMetrics =
+            TEST_METRICS.get_or_init(MigrationMetrics::new);
+        init_migration_metrics(m_ref);
+        let metrics = migration_metrics().expect("metrics installed");
+
+        let before = metrics.migration_active.load(Ordering::Relaxed);
+        let before_entries = metrics.migration_entries_applied_total.get();
+
+        let mut mgr = MigrationManager::new();
+        let task = MigrationTask {
+            shard: 99,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let populated: std::collections::HashSet<u16> = std::iter::once(99u16).collect();
+
+        // Source is self_id = NodeId(1), matches task.from_node, so this is
+        // an outbound migration that should bump the gauge.
+        mgr.start_outbound(std::slice::from_ref(&task), NodeId(1), &populated);
+        assert!(
+            metrics.migration_active.load(Ordering::Relaxed) > before,
+            "migration_active gauge must advance on start_outbound"
+        );
+
+        // Transition through states + record progress.
+        mgr.set_snapshot_sequence(&task, 42);
+        mgr.record_progress(&task, 10, 1024);
+        mgr.mark_fenced(&task, 50);
+        mgr.mark_complete(&task);
+
+        // After completion the active gauge must return to (at least) the
+        // baseline we observed going in. Other parallel tests may have
+        // added their own in-flight migrations, so we assert ≤ rather than ==.
+        assert!(
+            metrics.migration_active.load(Ordering::Relaxed) <= before,
+            "migration_active gauge must decrement back after mark_complete"
+        );
+        assert!(
+            metrics.migration_entries_applied_total.get() - before_entries >= 10,
+            "migration_entries_applied_total must advance by ≥ records migrated"
+        );
     }
 }

@@ -129,6 +129,17 @@ impl TcpReplicaTransport {
 
 impl ReplicaTransport for TcpReplicaTransport {
     /// Send a `ReplicaBatch` to the replica as a wire-protocol request frame.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(
+            replica_addr = %self.stream.peer_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "<unknown>".to_string()),
+            request_id = self.request_id + 1,
+            batch_len = batch.ops.len(),
+        ),
+    )]
     fn send_batch(&mut self, batch: &ReplicaBatch) -> std::result::Result<(), ReplicationError> {
         self.request_id += 1;
         let frame = RequestFrame {
@@ -257,6 +268,7 @@ mod tests {
                 offset: 0,
                 master_generation: 0,
             }],
+            trace_ctx: None,
         };
 
         let batch_clone = batch.clone();
@@ -328,6 +340,7 @@ mod tests {
                 offset: 0,
                 master_generation: 0,
             }],
+            trace_ctx: None,
         };
         transport.send_batch(&batch).unwrap();
 
@@ -457,5 +470,135 @@ mod tests {
         super::configure_tcp_keepalive(&stream);
 
         handle.join().unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 3 — tracing span integration tests
+    // -----------------------------------------------------------------
+
+    /// Driving a `TcpReplicaTransport::send_batch` call should emit a
+    /// `send_batch` span with a `replica_addr` field equal to the peer's
+    /// socket address.
+    #[test]
+    fn replication_send_batch_span_has_replica_addr_field() {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id};
+        use tracing_subscriber::layer::Context;
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::registry::LookupSpan;
+        use tracing_subscriber::Layer;
+
+        #[derive(Clone, Debug)]
+        struct Captured {
+            name: &'static str,
+            fields: HashMap<String, String>,
+        }
+
+        #[derive(Default)]
+        struct CaptureLayer {
+            spans: Arc<Mutex<Vec<Captured>>>,
+        }
+
+        struct FieldVisitor<'a>(&'a mut HashMap<String, String>);
+
+        impl<'a> Visit for FieldVisitor<'a> {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_string(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        impl<S> Layer<S> for CaptureLayer
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+                let mut fields = HashMap::new();
+                attrs.record(&mut FieldVisitor(&mut fields));
+                self.spans
+                    .lock()
+                    .expect("capture lock")
+                    .push(Captured {
+                        name: attrs.metadata().name(),
+                        fields,
+                    });
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let addr_str = addr.to_string();
+
+        // Accept and drain one send so the write doesn't block.
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut len_buf = [0u8; 4];
+            let _ = stream.read_exact(&mut len_buf);
+            let total_len = u32::from_le_bytes(len_buf) as usize;
+            let mut body = vec![0u8; total_len];
+            let _ = stream.read_exact(&mut body);
+        });
+
+        let spans_captured = Arc::new(Mutex::new(Vec::<Captured>::new()));
+        let layer = CaptureLayer {
+            spans: spans_captured.clone(),
+        };
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("debug"))
+            .with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut transport =
+                TcpReplicaTransport::connect(&addr_str, Duration::from_secs(5)).unwrap();
+            let batch = ReplicaBatch {
+                first_sequence: 7,
+                ops: vec![ReplicaOp::Freeze {
+                    tx_key: key(7),
+                    offset: 0,
+                    master_generation: 0,
+                }],
+                trace_ctx: None,
+            };
+            transport.send_batch(&batch).unwrap();
+        });
+
+        handle.join().unwrap();
+
+        let captured = spans_captured.lock().expect("capture lock").clone();
+        let send_span = captured
+            .iter()
+            .find(|s| s.name == "send_batch")
+            .expect("no send_batch span captured");
+
+        let field = send_span
+            .fields
+            .get("replica_addr")
+            .expect("send_batch span missing replica_addr field");
+        assert_eq!(
+            field, &addr_str,
+            "replica_addr field should match the peer socket address",
+        );
+        // And the batch length field is wired for free — validate it too so
+        // the assertion isn't a single-signal check.
+        assert_eq!(
+            send_span.fields.get("batch_len").map(String::as_str),
+            Some("1"),
+        );
     }
 }

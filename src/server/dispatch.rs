@@ -92,6 +92,14 @@ static ACK_TRACKER: std::sync::OnceLock<crate::replication::durable::AckTracker>
 static DISPATCH_METRICS: std::sync::OnceLock<&'static crate::metrics::ThreadMetrics> =
     std::sync::OnceLock::new();
 
+/// Global histograms reference. Initialized during server startup via
+/// `init_dispatch_histograms()`. Records per-handler end-to-end latency
+/// for Prometheus histogram export. Like `DISPATCH_METRICS`, all call
+/// sites are guarded with `if let Some(h) = DISPATCH_HISTOGRAMS.get()`
+/// so tests that skip init still work.
+static DISPATCH_HISTOGRAMS: std::sync::OnceLock<&'static crate::metrics::ThreadHistograms> =
+    std::sync::OnceLock::new();
+
 /// Initialize the persistent ACK tracker.
 ///
 /// Must be called once during server startup before any replication occurs.
@@ -108,6 +116,15 @@ pub fn init_dispatch_metrics(metrics: &'static crate::metrics::ThreadMetrics) {
     let _ = DISPATCH_METRICS.set(metrics);
 }
 
+/// Initialize the dispatch histograms reference.
+///
+/// Must be called once during server startup before any requests are
+/// processed. Tests that don't install a histogram reference still work —
+/// handlers skip the `record_since` call in that case.
+pub fn init_dispatch_histograms(histograms: &'static crate::metrics::ThreadHistograms) {
+    let _ = DISPATCH_HISTOGRAMS.set(histograms);
+}
+
 
 /// Dispatch a request frame to the appropriate Engine method.
 ///
@@ -120,6 +137,11 @@ pub fn init_dispatch_metrics(metrics: &'static crate::metrics::ThreadMetrics) {
 ///    the client request).
 /// 3. Replication sends to replicas with durable sequence numbers.
 /// 4. Client response is sent.
+#[tracing::instrument(
+    skip_all,
+    level = "debug",
+    fields(op = %request.op_code, request_id = request.request_id),
+)]
 pub(crate) fn handle_request(
     request: &RequestFrame,
     engine: &Engine,
@@ -140,17 +162,32 @@ pub(crate) fn handle_request(
     // individual operations within the batch share the same timestamp.
     engine.refresh_clock();
 
-    // Increment operation counters (best-effort — no-op if metrics not initialized).
+    // Batch-level entry counters (one per request frame). Item-level
+    // `_items_attempted` counters are incremented inside each handler once
+    // the payload is decoded — they can't be incremented here because the
+    // item count is payload-dependent.
     if let Some(m) = DISPATCH_METRICS.get() {
         match request.op_code {
             OP_CREATE_BATCH => m.creates_attempted.inc(),
             OP_SET_MINED_BATCH => m.set_mined_attempted.inc(),
             OP_GET_BATCH | OP_GET_SPEND_BATCH => m.gets_attempted.inc(),
             OP_FREEZE_BATCH => m.freezes_attempted.inc(),
+            OP_UNFREEZE_BATCH => m.unfreezes_attempted.inc(),
             OP_DELETE_BATCH => m.deletes_attempted.inc(),
+            OP_REASSIGN_BATCH => m.reassign_attempted.inc(),
+            OP_SET_CONFLICTING_BATCH => m.set_conflicting_attempted.inc(),
+            OP_SET_LOCKED_BATCH => m.set_locked_attempted.inc(),
+            OP_PRESERVE_UNTIL_BATCH => m.preserve_until_attempted.inc(),
+            OP_MARK_LONGEST_CHAIN_BATCH => m.mark_longest_chain_attempted.inc(),
             _ => {}
         }
     }
+
+    // Wrap each handler with latency timing. The timer closure fetches the
+    // global histograms ref once per request (a `Relaxed` atomic load) and
+    // does nothing if the handler didn't opt into timing or if histograms
+    // weren't initialized.
+    let start = std::time::Instant::now();
 
     let response = match request.op_code {
         OP_SPEND_BATCH => handle_spend_batch(request, engine, max_batch_size, cluster, redo_log),
@@ -607,7 +644,7 @@ pub(crate) fn handle_request(
                                 ),
                             );
                         }
-                        eprintln!("cluster: topology term {term} committed with {} members", members.len());
+                        tracing::info!(term = term, members = members.len(), "cluster: topology committed");
                         // Signal the coordinator event loop to activate the
                         // shard table with the committed member list — only
                         // after the commit is durable.
@@ -625,14 +662,29 @@ pub(crate) fn handle_request(
         _ => error_response(request.request_id, ERR_INTERNAL, "unknown opcode"),
     };
 
-    // Increment success counters based on response status.
-    if response.status == STATUS_OK
-        && let Some(m) = DISPATCH_METRICS.get()
-    {
+    // Record end-to-end handler latency into the appropriate histogram.
+    // The per-item outcome counters are incremented inside each handler;
+    // this records wall-clock time from dispatch entry to response built.
+    if let Some(h) = DISPATCH_HISTOGRAMS.get() {
         match request.op_code {
-            OP_CREATE_BATCH => m.creates_succeeded.inc(),
-            OP_SET_MINED_BATCH => m.set_mined_succeeded.inc(),
-            OP_GET_BATCH | OP_GET_SPEND_BATCH => m.gets_succeeded.inc(),
+            OP_SPEND_BATCH => {
+                h.spend_latency.record_since(start);
+                // spend_multi_latency shadows spend_latency for legacy
+                // /admin/top compatibility — same samples.
+                h.spend_multi_latency.record_since(start);
+            }
+            OP_UNSPEND_BATCH => h.unspend_latency.record_since(start),
+            OP_CREATE_BATCH => h.create_latency.record_since(start),
+            OP_SET_MINED_BATCH => h.set_mined_latency.record_since(start),
+            OP_FREEZE_BATCH => h.freeze_latency.record_since(start),
+            OP_UNFREEZE_BATCH => h.unfreeze_latency.record_since(start),
+            OP_DELETE_BATCH => h.delete_latency.record_since(start),
+            OP_GET_BATCH | OP_GET_SPEND_BATCH => h.get_latency.record_since(start),
+            OP_MARK_LONGEST_CHAIN_BATCH => h.mark_longest_chain_latency.record_since(start),
+            OP_REASSIGN_BATCH => h.reassign_latency.record_since(start),
+            OP_SET_CONFLICTING_BATCH => h.set_conflicting_latency.record_since(start),
+            OP_SET_LOCKED_BATCH => h.set_locked_latency.record_since(start),
+            OP_PRESERVE_UNTIL_BATCH => h.preserve_until_latency.record_since(start),
             _ => {}
         }
     }
@@ -796,6 +848,7 @@ fn replicate_all_ops(
                 let batch = ReplicaBatch {
                     first_sequence: redo_seq_range.0,
                     ops,
+                    trace_ctx: crate::observability::WireTraceContext::from_current_span(),
                 };
                 send_replica_batch_to(addr, &batch)
             }));
@@ -813,7 +866,7 @@ fn replicate_all_ops(
         match result {
             Ok(()) => { ack_count += 1; }
             Err(e) => {
-                eprintln!("replication to replica failed: {e}");
+                tracing::warn!(err = %e, "replication to replica failed");
                 last_error = Some(e.clone());
             }
         }
@@ -837,8 +890,10 @@ fn replicate_all_ops(
             if let Some(metrics) = DISPATCH_METRICS.get() {
                 metrics.replication_degraded_acks.inc();
             }
-            eprintln!(
-                "replication: degraded ack — {ack_count}/{total_targets} replicas succeeded (best_effort)",
+            tracing::warn!(
+                ack_count,
+                total_targets,
+                "replication: degraded ack (best_effort)",
             );
             Ok(ReplicationOutcome::Full)
         }
@@ -850,10 +905,10 @@ fn replicate_all_ops(
             if let Some(metrics) = DISPATCH_METRICS.get() {
                 metrics.repl_degraded_durability.inc();
             }
-            eprintln!(
-                "replication: DEGRADED DURABILITY — 0/{total_targets} replicas ACKed, \
-                 client will receive STATUS_DEGRADED_DURABILITY (best_effort): {}",
-                last_error.unwrap_or_default()
+            tracing::warn!(
+                total_targets,
+                err = %last_error.clone().unwrap_or_default(),
+                "replication: DEGRADED DURABILITY — 0 replicas ACKed, client will receive STATUS_DEGRADED_DURABILITY (best_effort)",
             );
             Ok(ReplicationOutcome::Degraded)
         }
@@ -1301,7 +1356,7 @@ fn check_shard_ownership(
         // Reads are handled separately with a wait loop.
         if !allow_if_migrating && cluster.has_pending_inbound(&key) {
             let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
-            eprintln!("dispatch: write rejected shard {shard} — pending inbound migration");
+            tracing::debug!(shard, "dispatch: write rejected — pending inbound migration");
             return Some(BatchItemError {
                 item_index,
                 error_code: ERR_MIGRATION_IN_PROGRESS,
@@ -1310,7 +1365,7 @@ fn check_shard_ownership(
         }
         if !allow_if_migrating && cluster.is_shard_write_fenced(&key) {
             let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
-            eprintln!("dispatch: write rejected shard {shard} — write-fenced (delta streaming)");
+            tracing::debug!(shard, "dispatch: write rejected — write-fenced (delta streaming)");
             return Some(BatchItemError {
                 item_index,
                 error_code: ERR_MIGRATION_IN_PROGRESS,
@@ -1368,12 +1423,24 @@ fn handle_spend_batch(
         return error_response(req.request_id, ERR_INTERNAL, "batch too large");
     }
 
+    // Tick entry counters: one batch, N attempted items.
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.spend_multi_batches.inc();
+        m.spends_attempted.inc_by(items.len() as u64);
+        m.spend_multi_items_attempted.inc_by(items.len() as u64);
+    }
+
     // Group items by txid for efficient locking
     let mut by_txid: HashMap<[u8; 32], Vec<(usize, &WireSpendItem)>> = HashMap::new();
     for (i, item) in items.iter().enumerate() {
         by_txid.entry(item.txid).or_default().push((i, item));
     }
 
+    // Track per-item outcome. `succeeded` is incremented once per item that
+    // actually transitioned the slot to SPENT (valid_spends during apply).
+    // `idempotent` is items that were silently no-op (already SPENT with the
+    // same spending_data). `failed` is items present in the errors vec.
+    let mut succeeded: u64 = 0;
     let mut errors: Vec<BatchItemError> = Vec::new();
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
     let mut spend_redo_range: (u64, u64) = (0, 0);
@@ -1485,12 +1552,41 @@ fn handle_spend_batch(
             repl_ops_by_key.push((key, key_repl_ops));
         }
 
+        // Tally this group's outcomes before draining the validation
+        // errors: real transitions come from resp.spent_count (which
+        // excludes idempotent re-spends), failed from the error map.
+        // Idempotent = group.len() - succeeded - failed.
+        succeeded += resp.spent_count as u64;
+
         for (idx, err) in validation_errors {
             errors.push(spend_error_to_batch_error(idx, &err));
         }
 
         // Use signal/block_ids from resp if needed in the future.
         let _ = resp.signal;
+    }
+
+    // Final per-item outcome classification for this batch. `errors` holds
+    // validation failures *and* redirect errors (when the txid is not owned
+    // by this node), so all three buckets sum to items.len().
+    let failed_total = errors.len() as u64;
+    let idempotent_total = (items.len() as u64)
+        .saturating_sub(succeeded)
+        .saturating_sub(failed_total);
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.spends_succeeded.inc_by(succeeded);
+        m.spends_idempotent.inc_by(idempotent_total);
+        m.spends_failed.inc_by(failed_total);
+        m.spend_multi_items_succeeded.inc_by(succeeded);
+        m.spend_multi_items_idempotent.inc_by(idempotent_total);
+        m.spend_multi_items_failed.inc_by(failed_total);
+        // Dual-write: labeled operations table.
+        use crate::metrics::{OpCode, Outcome};
+        m.operations.inc_by(OpCode::Spend, Outcome::Ok, succeeded);
+        m.operations.inc_by(OpCode::Spend, Outcome::Idempotent, idempotent_total);
+        for e in &errors {
+            m.operations.inc(OpCode::Spend, classify_wire_error_code(e.error_code));
+        }
     }
 
     // Phase 5: Replicate (redo already fsynced, engine already applied).
@@ -1551,11 +1647,18 @@ fn handle_unspend_batch(
         return error_response(req.request_id, ERR_INTERNAL, "batch too large");
     }
 
+    // Tick entry counters: one batch, N attempted items.
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.unspend_multi_batches.inc();
+        m.unspends_attempted.inc_by(items.len() as u64);
+        m.unspend_multi_items_attempted.inc_by(items.len() as u64);
+    }
+
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
     // Phase 1: Validate ownership and build redo ops from request parameters.
-    struct ValidUnspend<'a> { idx: usize, key: TxKey, item: &'a WireSlotItem }
+    struct ValidUnspend<'a> { idx: usize, key: TxKey, item: &'a WireSlotItem, pre_generation: u32 }
     let mut valid_items: Vec<ValidUnspend> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
@@ -1563,12 +1666,16 @@ fn handle_unspend_batch(
             continue;
         }
         let key = TxKey { txid: item.txid };
+        // Snapshot the generation BEFORE unspend so we can classify the
+        // outcome as "real unspend" (gen bumped) vs "idempotent noop"
+        // (gen unchanged — slot was already UNSPENT).
+        let pre_generation = engine.lookup(&key).map(|e| e.generation).unwrap_or(0);
         redo_ops.push(RedoOp::Unspend {
             tx_key: key,
             offset: item.vout,
             new_spent_count: 0,
         });
-        valid_items.push(ValidUnspend { idx: i, key, item });
+        valid_items.push(ValidUnspend { idx: i, key, item, pre_generation });
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
@@ -1579,6 +1686,8 @@ fn handle_unspend_batch(
 
     // Phase 3: Apply engine mutations and build repl ops.
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    let mut succeeded: u64 = 0;
+    let mut idempotent: u64 = 0;
     for v in &valid_items {
         match engine.unspend(&UnspendRequest {
             tx_key: v.key,
@@ -1588,6 +1697,12 @@ fn handle_unspend_batch(
             block_height_retention: params.block_height_retention,
         }) {
             Ok(resp) => {
+                if resp.generation == v.pre_generation {
+                    // No-op: slot was already UNSPENT, generation unchanged.
+                    idempotent += 1;
+                } else {
+                    succeeded += 1;
+                }
                 repl_ops_by_key.push((v.key, vec![ReplicaOp::Unspend {
                     tx_key: v.key,
                     offset: v.item.vout,
@@ -1597,6 +1712,23 @@ fn handle_unspend_batch(
             Err(err) => {
                 errors.push(spend_error_to_batch_error(v.idx as u32, &err));
             }
+        }
+    }
+
+    let failed_total = errors.len() as u64;
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.unspends_succeeded.inc_by(succeeded);
+        m.unspends_noop.inc_by(idempotent);
+        m.unspends_failed.inc_by(failed_total);
+        m.unspend_multi_items_succeeded.inc_by(succeeded);
+        m.unspend_multi_items_idempotent.inc_by(idempotent);
+        m.unspend_multi_items_failed.inc_by(failed_total);
+        // Dual-write: labeled operations table.
+        use crate::metrics::{OpCode, Outcome};
+        m.operations.inc_by(OpCode::Unspend, Outcome::Ok, succeeded);
+        m.operations.inc_by(OpCode::Unspend, Outcome::Idempotent, idempotent);
+        for e in &errors {
+            m.operations.inc(OpCode::Unspend, classify_wire_error_code(e.error_code));
         }
     }
 
@@ -1629,6 +1761,10 @@ fn handle_set_mined_batch(
     };
     if txids.len() as u32 > max_batch {
         return error_response(req.request_id, ERR_INTERNAL, "batch too large");
+    }
+
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.set_mined_items_attempted.inc_by(txids.len() as u64);
     }
 
     let mut errors = Vec::new();
@@ -1673,9 +1809,11 @@ fn handle_set_mined_batch(
     let results = engine.set_mined_batch(&engine_params, &keys);
 
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    let mut succeeded: u64 = 0;
     for (v, result) in valid_items.iter().zip(results) {
         match result {
             Ok(resp) => {
+                succeeded += 1;
                 let mgen = resp.generation;
                 if params.unset_mined {
                     repl_ops_by_key.push((v.key, vec![ReplicaOp::UnsetMined {
@@ -1700,6 +1838,18 @@ fn handle_set_mined_batch(
         }
     }
 
+    let failed_total = errors.len() as u64;
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.set_mined_items_succeeded.inc_by(succeeded);
+        m.set_mined_items_failed.inc_by(failed_total);
+        // Dual-write: labeled operations table.
+        use crate::metrics::{OpCode, Outcome};
+        m.operations.inc_by(OpCode::SetMined, Outcome::Ok, succeeded);
+        for e in &errors {
+            m.operations.inc(OpCode::SetMined, classify_wire_error_code(e.error_code));
+        }
+    }
+
     // Phase 4: Replicate.
     let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
         Ok(o) => o,
@@ -1708,6 +1858,14 @@ fn handle_set_mined_batch(
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
+
+    // Final batch-level ticks: set_mined_succeeded counts a successful batch,
+    // set_mined_attempted incremented at dispatch entry. Tick succeeded only
+    // if no items failed to preserve a useful "batches that fully succeeded"
+    // gauge separate from item-level accounting.
+    if let Some(m) = DISPATCH_METRICS.get() && failed_total == 0 {
+        m.set_mined_succeeded.inc();
+    }
 
     batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
@@ -1988,6 +2146,20 @@ fn handle_create_batch(
         }
     };
 
+    // Tick per-item outcome counters. Succeeded = items.len() - errors.len().
+    let failed_total = errors.len() as u64;
+    let succeeded_total = (items.len() as u64).saturating_sub(failed_total);
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.creates_succeeded.inc_by(succeeded_total);
+        m.creates_failed.inc_by(failed_total);
+        // Dual-write: labeled operations table.
+        use crate::metrics::{OpCode, Outcome};
+        m.operations.inc_by(OpCode::Create, Outcome::Ok, succeeded_total);
+        for e in &errors {
+            m.operations.inc(OpCode::Create, classify_wire_error_code(e.error_code));
+        }
+    }
+
     batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
@@ -2024,6 +2196,7 @@ fn handle_freeze_batch(
         redo_ops.push(RedoOp::Freeze { tx_key: key, offset: item.vout });
         valid_items.push(ValidFreeze { idx: i, key, item });
     }
+    let total_items = items.len() as u64;
 
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_redo_ops(redo_log, &redo_ops) {
@@ -2061,6 +2234,19 @@ fn handle_freeze_batch(
         }
     };
 
+    let failed_total = errors.len() as u64;
+    let succeeded_total = total_items.saturating_sub(failed_total);
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.freezes_succeeded.inc_by(succeeded_total);
+        m.freezes_failed.inc_by(failed_total);
+        // Dual-write: labeled operations table.
+        use crate::metrics::{OpCode, Outcome};
+        m.operations.inc_by(OpCode::Freeze, Outcome::Ok, succeeded_total);
+        for e in &errors {
+            m.operations.inc(OpCode::Freeze, classify_wire_error_code(e.error_code));
+        }
+    }
+
     batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
@@ -2078,6 +2264,7 @@ fn handle_unfreeze_batch(
     if items.len() as u32 > max_batch {
         return error_response(req.request_id, ERR_INTERNAL, "batch too large");
     }
+    let total_items = items.len() as u64;
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
@@ -2130,6 +2317,19 @@ fn handle_unfreeze_batch(
         }
     };
 
+    let failed_total = errors.len() as u64;
+    let succeeded_total = total_items.saturating_sub(failed_total);
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.unfreezes_succeeded.inc_by(succeeded_total);
+        m.unfreezes_failed.inc_by(failed_total);
+        // Dual-write: labeled operations table.
+        use crate::metrics::{OpCode, Outcome};
+        m.operations.inc_by(OpCode::Unfreeze, Outcome::Ok, succeeded_total);
+        for e in &errors {
+            m.operations.inc(OpCode::Unfreeze, classify_wire_error_code(e.error_code));
+        }
+    }
+
     batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
@@ -2147,6 +2347,7 @@ fn handle_reassign_batch(
     if items.len() as u32 > max_batch {
         return error_response(req.request_id, ERR_INTERNAL, "batch too large");
     }
+    let total_items = items.len() as u64;
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
@@ -2211,6 +2412,19 @@ fn handle_reassign_batch(
         }
     };
 
+    let failed_total = errors.len() as u64;
+    let succeeded_total = total_items.saturating_sub(failed_total);
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.reassign_succeeded.inc_by(succeeded_total);
+        m.reassign_failed.inc_by(failed_total);
+        // Dual-write: labeled operations table.
+        use crate::metrics::{OpCode, Outcome};
+        m.operations.inc_by(OpCode::Reassign, Outcome::Ok, succeeded_total);
+        for e in &errors {
+            m.operations.inc(OpCode::Reassign, classify_wire_error_code(e.error_code));
+        }
+    }
+
     batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
@@ -2231,6 +2445,7 @@ fn handle_set_conflicting_batch(
     let value = shared[0] != 0;
     let cbh = u32::from_le_bytes(shared[1..5].try_into().unwrap());
     let bhr = u32::from_le_bytes(shared[5..9].try_into().unwrap());
+    let total_items = txids.len() as u64;
 
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
@@ -2292,6 +2507,19 @@ fn handle_set_conflicting_batch(
         }
     };
 
+    let failed_total = errors.len() as u64;
+    let succeeded_total = total_items.saturating_sub(failed_total);
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.set_conflicting_succeeded.inc_by(succeeded_total);
+        m.set_conflicting_failed.inc_by(failed_total);
+        // Dual-write: labeled operations table.
+        use crate::metrics::{OpCode, Outcome};
+        m.operations.inc_by(OpCode::SetConflicting, Outcome::Ok, succeeded_total);
+        for e in &errors {
+            m.operations.inc(OpCode::SetConflicting, classify_wire_error_code(e.error_code));
+        }
+    }
+
     batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
@@ -2310,6 +2538,7 @@ fn handle_set_locked_batch(
         return error_response(req.request_id, ERR_INTERNAL, "batch too large");
     }
     let value = shared[0] != 0;
+    let total_items = txids.len() as u64;
 
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
@@ -2362,6 +2591,19 @@ fn handle_set_locked_batch(
         }
     };
 
+    let failed_total = errors.len() as u64;
+    let succeeded_total = total_items.saturating_sub(failed_total);
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.set_locked_succeeded.inc_by(succeeded_total);
+        m.set_locked_failed.inc_by(failed_total);
+        // Dual-write: labeled operations table.
+        use crate::metrics::{OpCode, Outcome};
+        m.operations.inc_by(OpCode::SetLocked, Outcome::Ok, succeeded_total);
+        for e in &errors {
+            m.operations.inc(OpCode::SetLocked, classify_wire_error_code(e.error_code));
+        }
+    }
+
     batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
@@ -2380,6 +2622,7 @@ fn handle_preserve_until_batch(
         return error_response(req.request_id, ERR_INTERNAL, "batch too large");
     }
     let height = u32::from_le_bytes(shared[0..4].try_into().unwrap());
+    let total_items = txids.len() as u64;
 
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
@@ -2435,6 +2678,19 @@ fn handle_preserve_until_batch(
         }
     };
 
+    let failed_total = errors.len() as u64;
+    let succeeded_total = total_items.saturating_sub(failed_total);
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.preserve_until_succeeded.inc_by(succeeded_total);
+        m.preserve_until_failed.inc_by(failed_total);
+        // Dual-write: labeled operations table.
+        use crate::metrics::{OpCode, Outcome};
+        m.operations.inc_by(OpCode::PreserveUntil, Outcome::Ok, succeeded_total);
+        for e in &errors {
+            m.operations.inc(OpCode::PreserveUntil, classify_wire_error_code(e.error_code));
+        }
+    }
+
     batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
@@ -2452,6 +2708,7 @@ fn handle_delete_batch(
     if txids.len() as u32 > max_batch {
         return error_response(req.request_id, ERR_INTERNAL, "batch too large");
     }
+    let total_items = txids.len() as u64;
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
@@ -2577,6 +2834,7 @@ fn handle_delete_batch(
                     payload: ReplicaBatch {
                         first_sequence: 0,
                         ops: vec![create_op],
+                        trace_ctx: None,
                     }.serialize(),
                 };
                 let _ = handle_replica_batch(&create_req, engine, &std::sync::atomic::AtomicU64::new(0));
@@ -2601,6 +2859,19 @@ fn handle_delete_batch(
         }
     };
 
+    let failed_total = errors.len() as u64;
+    let succeeded_total = total_items.saturating_sub(failed_total);
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.deletes_succeeded.inc_by(succeeded_total);
+        m.deletes_failed.inc_by(failed_total);
+        // Dual-write: labeled operations table.
+        use crate::metrics::{OpCode, Outcome};
+        m.operations.inc_by(OpCode::Delete, Outcome::Ok, succeeded_total);
+        for e in &errors {
+            m.operations.inc(OpCode::Delete, classify_wire_error_code(e.error_code));
+        }
+    }
+
     batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
@@ -2621,6 +2892,7 @@ fn handle_mark_longest_chain_batch(
     let on_longest_chain = shared[0] != 0;
     let cbh = u32::from_le_bytes(shared[1..5].try_into().unwrap());
     let bhr = u32::from_le_bytes(shared[5..9].try_into().unwrap());
+    let total_items = txids.len() as u64;
 
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
@@ -2678,6 +2950,19 @@ fn handle_mark_longest_chain_batch(
         }
     }
 
+    let failed_total = errors.len() as u64;
+    let succeeded_total = total_items.saturating_sub(failed_total);
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.mark_longest_chain_succeeded.inc_by(succeeded_total);
+        m.mark_longest_chain_failed.inc_by(failed_total);
+        // Dual-write: labeled operations table.
+        use crate::metrics::{OpCode, Outcome};
+        m.operations.inc_by(OpCode::MarkLongestChain, Outcome::Ok, succeeded_total);
+        for e in &errors {
+            m.operations.inc(OpCode::MarkLongestChain, classify_wire_error_code(e.error_code));
+        }
+    }
+
     batch_response(req.request_id, &errors)
 }
 
@@ -2697,6 +2982,11 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
     let local_read = req.flags & FLAG_LOCAL_READ != 0;
 
     let mut results = Vec::with_capacity(txids.len());
+    // Track per-item outcomes: STATUS_OK => succeeded, ERR_TX_NOT_FOUND =>
+    // not_found, anything else => failed.
+    let mut ok_count: u64 = 0;
+    let mut not_found_count: u64 = 0;
+    let mut failed_count: u64 = 0;
     for txid in &txids {
         let key = TxKey { txid: *txid };
 
@@ -2739,7 +3029,7 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
             // parking a request thread behind migration progress.
             if is_master && engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key) {
                 let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
-                eprintln!("dispatch: read shard {shard} still waiting for inbound migration");
+                tracing::debug!(shard, "dispatch: read still waiting for inbound migration");
                 results.push(WireGetResult { status: ERR_MIGRATION_IN_PROGRESS as u8, data: vec![] });
                 continue;
             }
@@ -2874,6 +3164,40 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
                 results.push(WireGetResult { status: 1, data: vec![] });
             }
         }
+    }
+
+    // Classify per-item outcome.
+    for r in &results {
+        match r.status {
+            STATUS_OK => ok_count += 1,
+            s if s == ERR_TX_NOT_FOUND as u8 => not_found_count += 1,
+            _ => failed_count += 1,
+        }
+    }
+    // Count redirects separately from the "failed" bucket so the labeled
+    // operations table can distinguish them. `WireGetResult::status` uses
+    // the low byte of the wire error code, so `ERR_REDIRECT as u8` is
+    // distinguishable without decoding `data`.
+    let mut redirect_count: u64 = 0;
+    let mut other_failed: u64 = 0;
+    for r in &results {
+        match r.status {
+            STATUS_OK => {}
+            s if s == ERR_TX_NOT_FOUND as u8 => {}
+            s if s == ERR_REDIRECT as u8 => redirect_count += 1,
+            _ => other_failed += 1,
+        }
+    }
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.gets_succeeded.inc_by(ok_count);
+        m.gets_not_found.inc_by(not_found_count);
+        m.gets_failed.inc_by(failed_count);
+        // Dual-write: labeled operations table.
+        use crate::metrics::{OpCode, Outcome};
+        m.operations.inc_by(OpCode::Get, Outcome::Ok, ok_count);
+        m.operations.inc_by(OpCode::Get, Outcome::ErrNotFound, not_found_count);
+        m.operations.inc_by(OpCode::Get, Outcome::Redirect, redirect_count);
+        m.operations.inc_by(OpCode::Get, Outcome::Other, other_failed);
     }
 
     ResponseFrame {
@@ -3128,6 +3452,20 @@ fn handle_get_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, c
         }
     }
 
+    // Dual-write: labeled operations table for GetSpend. Classify by the
+    // result's `error_code` (already a u16) so the mapping is exact.
+    if let Some(m) = DISPATCH_METRICS.get() {
+        use crate::metrics::{OpCode, Outcome};
+        for r in &results {
+            let outcome = if r.status == 0 {
+                Outcome::Ok
+            } else {
+                classify_wire_error_code(r.error_code)
+            };
+            m.operations.inc(OpCode::GetSpend, outcome);
+        }
+    }
+
     ResponseFrame {
         request_id: req.request_id,
         status: STATUS_OK,
@@ -3331,6 +3669,57 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
     BatchItemError { item_index, error_code: code, error_data: data }
 }
 
+/// Classify a [`SpendError`] into its coarse-grained [`Outcome`] bucket.
+///
+/// Mapping (stable — keep in sync with the Phase 2 spec):
+/// - `TxNotFound`                         → `ErrNotFound`
+/// - `Conflicting`, `AlreadySpent`,
+///   `InvalidSpend`, `Pruned`              → `ErrConflicting`
+/// - `Locked`, `Frozen`, `FrozenUntil`,
+///   `AlreadyFrozen`, `NotFrozen`          → `ErrFrozen`
+/// - `StorageError`, `DahOverflow`         → `ErrStorage`
+/// - `CoinbaseImmature`, `UtxoNotFound`,
+///   `UtxoHashMismatch`                    → `Other`
+#[allow(dead_code)] // used by tests + future refactor of error classification
+pub(crate) fn classify_spend_error(err: &SpendError) -> crate::metrics::Outcome {
+    use crate::metrics::Outcome;
+    match err {
+        SpendError::TxNotFound => Outcome::ErrNotFound,
+        SpendError::Conflicting
+        | SpendError::AlreadySpent { .. }
+        | SpendError::InvalidSpend { .. }
+        | SpendError::Pruned { .. } => Outcome::ErrConflicting,
+        SpendError::Locked
+        | SpendError::Frozen { .. }
+        | SpendError::FrozenUntil { .. }
+        | SpendError::AlreadyFrozen { .. }
+        | SpendError::NotFrozen { .. } => Outcome::ErrFrozen,
+        SpendError::StorageError { .. } | SpendError::DahOverflow { .. } => Outcome::ErrStorage,
+        SpendError::CoinbaseImmature { .. }
+        | SpendError::UtxoNotFound { .. }
+        | SpendError::UtxoHashMismatch { .. } => Outcome::Other,
+    }
+}
+
+/// Classify a wire-level error code (produced by decode/redirect) into an
+/// [`Outcome`]. Used when the dispatch handler constructs a
+/// [`BatchItemError`] directly rather than through
+/// [`spend_error_to_batch_error`].
+pub(crate) fn classify_wire_error_code(code: u16) -> crate::metrics::Outcome {
+    use crate::metrics::Outcome;
+    match code {
+        ERR_REDIRECT => Outcome::Redirect,
+        ERR_TX_NOT_FOUND => Outcome::ErrNotFound,
+        ERR_CONFLICTING | ERR_ALREADY_SPENT | ERR_INVALID_SPEND | ERR_ALREADY_EXISTS => {
+            Outcome::ErrConflicting
+        }
+        ERR_LOCKED | ERR_FROZEN | ERR_FROZEN_UNTIL | ERR_ALREADY_FROZEN
+        | ERR_UTXO_NOT_FROZEN => Outcome::ErrFrozen,
+        ERR_INTERNAL => Outcome::ErrStorage,
+        _ => Outcome::Other,
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Partition map
@@ -3387,6 +3776,7 @@ fn handle_get_committed_topology(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_macros)]
 mod tests {
     use super::*;
     use crate::allocator::SlotAllocator;
@@ -4533,6 +4923,7 @@ mod tests {
             payload: ReplicaBatch {
                 first_sequence: 0,
                 ops: vec![],
+                trace_ctx: None,
             }
             .serialize(),
         };
@@ -5219,5 +5610,935 @@ mod tests {
             "committed_term must be persisted before the commit reply returns"
         );
         assert_eq!(persisted.committed_members, members);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1: observability counters + latency histograms
+    //
+    // These tests exercise the instrumentation inside each `handle_*_batch`
+    // handler. They all share a single process-global `ThreadMetrics`
+    // because DISPATCH_METRICS is a OnceLock — so each test takes
+    // `METRICS_TEST_LOCK` and snapshots counter deltas instead of relying
+    // on absolute values.
+    // -----------------------------------------------------------------------
+
+    use crate::metrics::{ThreadHistograms, ThreadMetrics};
+    use std::sync::{Mutex as StdMutex, OnceLock};
+
+    /// Lazily-initialized global test metrics. Installed into DISPATCH_METRICS
+    /// on first access; subsequent accesses return the same reference.
+    fn test_metrics() -> &'static ThreadMetrics {
+        static INIT: OnceLock<&'static ThreadMetrics> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let leaked: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
+            super::init_dispatch_metrics(leaked);
+            leaked
+        })
+    }
+
+    fn test_histograms() -> &'static ThreadHistograms {
+        static INIT: OnceLock<&'static ThreadHistograms> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let leaked: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
+            super::init_dispatch_histograms(leaked);
+            leaked
+        })
+    }
+
+    /// Serialize metrics-observing tests so concurrent increments from
+    /// neighbours do not pollute each test's delta. `Mutex` is fine here;
+    /// if a test panics the poison is cleared manually.
+    fn metrics_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        match LOCK.get_or_init(|| StdMutex::new(())).lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Capture the current counter values as a named tuple for delta math.
+    fn snapshot_spend(m: &ThreadMetrics) -> (u64, u64, u64, u64, u64) {
+        (
+            m.spend_multi_items_attempted.get(),
+            m.spend_multi_items_succeeded.get(),
+            m.spend_multi_items_idempotent.get(),
+            m.spend_multi_items_failed.get(),
+            m.spend_multi_batches.get(),
+        )
+    }
+
+    fn snapshot_unspend(m: &ThreadMetrics) -> (u64, u64, u64, u64, u64) {
+        (
+            m.unspend_multi_items_attempted.get(),
+            m.unspend_multi_items_succeeded.get(),
+            m.unspend_multi_items_idempotent.get(),
+            m.unspend_multi_items_failed.get(),
+            m.unspend_multi_batches.get(),
+        )
+    }
+
+    /// Submit a spend batch with three items: two valid, one with a wrong
+    /// utxo_hash. Assert the per-item counters advance by (3, 2, 0, 1).
+    #[test]
+    fn handle_spend_batch_increments_items_succeeded_and_failed() {
+        let _guard = metrics_test_lock();
+        let m = test_metrics();
+        let _ = test_histograms();
+
+        let h = DispatchTestHarness::new();
+        let txid_a = DispatchTestHarness::make_txid(40);
+        let txid_b = DispatchTestHarness::make_txid(41);
+        let txid_c = DispatchTestHarness::make_txid(42);
+        assert_eq!(h.create_tx(txid_a, 2).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 2).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_c, 2).status, STATUS_OK);
+
+        // Hash generated by create_tx for vout=0 is all-zeros with the
+        // low-order nibble encoding the vout.
+        let utxo_hash_vout0 = [0u8; 32];
+        // Deliberately wrong hash for item C — will produce UtxoHashMismatch.
+        let wrong_hash = [0xEEu8; 32];
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let items = vec![
+            WireSpendItem { txid: txid_a, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0xA1; 36] },
+            WireSpendItem { txid: txid_b, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0xB2; 36] },
+            WireSpendItem { txid: txid_c, vout: 0, utxo_hash: wrong_hash,     spending_data: [0xC3; 36] },
+        ];
+        let before = snapshot_spend(m);
+        let resp = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &items));
+        let after = snapshot_spend(m);
+
+        // Expect STATUS_PARTIAL_ERROR because one item failed validation.
+        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+        assert_eq!(after.0 - before.0, 3, "items_attempted += 3");
+        assert_eq!(after.1 - before.1, 2, "items_succeeded += 2");
+        assert_eq!(after.2 - before.2, 0, "no idempotent items");
+        assert_eq!(after.3 - before.3, 1, "items_failed += 1 (hash mismatch)");
+        assert_eq!(after.4 - before.4, 1, "one batch processed");
+    }
+
+    /// Re-sending the exact same spend should classify the second send as
+    /// idempotent rather than succeeded or failed.
+    #[test]
+    fn handle_spend_batch_idempotent_counted_as_idempotent() {
+        let _guard = metrics_test_lock();
+        let m = test_metrics();
+        let _ = test_histograms();
+
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(43);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let utxo_hash_vout0 = [0u8; 32];
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let item = WireSpendItem {
+            txid,
+            vout: 0,
+            utxo_hash: utxo_hash_vout0,
+            spending_data: [0xAB; 36],
+        };
+
+        // First spend: succeeds.
+        let before1 = snapshot_spend(m);
+        let r1 = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, std::slice::from_ref(&item)));
+        let after1 = snapshot_spend(m);
+        assert_eq!(r1.status, STATUS_OK);
+        assert_eq!(after1.1 - before1.1, 1, "first spend: 1 success");
+        assert_eq!(after1.2 - before1.2, 0, "first spend: 0 idempotent");
+
+        // Second identical spend: idempotent.
+        let before2 = snapshot_spend(m);
+        let r2 = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, std::slice::from_ref(&item)));
+        let after2 = snapshot_spend(m);
+        assert_eq!(r2.status, STATUS_OK);
+        assert_eq!(after2.0 - before2.0, 1, "items_attempted += 1");
+        assert_eq!(after2.1 - before2.1, 0, "second spend: no new success");
+        assert_eq!(after2.2 - before2.2, 1, "second spend: 1 idempotent");
+        assert_eq!(after2.3 - before2.3, 0, "second spend: no failures");
+    }
+
+    /// Unspend should classify each item as succeeded (real unspend),
+    /// idempotent (already-unspent noop), or failed (hash mismatch).
+    #[test]
+    fn handle_unspend_batch_ticks_outcome_counters() {
+        let _guard = metrics_test_lock();
+        let m = test_metrics();
+        let _ = test_histograms();
+
+        let h = DispatchTestHarness::new();
+        let txid_a = DispatchTestHarness::make_txid(50);
+        let txid_b = DispatchTestHarness::make_txid(51);
+        let txid_c = DispatchTestHarness::make_txid(52);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_c, 1).status, STATUS_OK);
+
+        // Spend txid_a first so the subsequent unspend is a real unspend
+        // (the other two are never spent → unspend is an idempotent no-op).
+        let utxo_hash_vout0 = [0u8; 32];
+        let sp = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let spend_item = WireSpendItem {
+            txid: txid_a,
+            vout: 0,
+            utxo_hash: utxo_hash_vout0,
+            spending_data: [0x77; 36],
+        };
+        assert_eq!(
+            h.request(OP_SPEND_BATCH, encode_spend_batch(&sp, &[spend_item])).status,
+            STATUS_OK,
+        );
+
+        // Now submit unspend for A (real), B (noop), and C with wrong hash (fail).
+        let wrong_hash = [0x88u8; 32];
+        let items = vec![
+            WireSlotItem { txid: txid_a, vout: 0, utxo_hash: utxo_hash_vout0 },
+            WireSlotItem { txid: txid_b, vout: 0, utxo_hash: utxo_hash_vout0 },
+            WireSlotItem { txid: txid_c, vout: 0, utxo_hash: wrong_hash },
+        ];
+        let params = UnspendBatchParams {
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        let before = snapshot_unspend(m);
+        let resp = h.request(OP_UNSPEND_BATCH, encode_unspend_batch(&params, &items));
+        let after = snapshot_unspend(m);
+        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+        assert_eq!(after.0 - before.0, 3, "items_attempted += 3");
+        assert_eq!(after.1 - before.1, 1, "items_succeeded += 1 (A)");
+        assert_eq!(after.2 - before.2, 1, "items_idempotent += 1 (B)");
+        assert_eq!(after.3 - before.3, 1, "items_failed += 1 (C wrong hash)");
+        assert_eq!(after.4 - before.4, 1, "one unspend batch");
+    }
+
+    /// SetMined items should tick attempted/succeeded/failed per item.
+    #[test]
+    fn handle_set_mined_batch_ticks_outcome_counters() {
+        let _guard = metrics_test_lock();
+        let m = test_metrics();
+        let _ = test_histograms();
+
+        let h = DispatchTestHarness::new();
+        let txid_a = DispatchTestHarness::make_txid(60);
+        let txid_b = DispatchTestHarness::make_txid(61);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+        // txid_c is NOT created — set_mined on it must fail with TxNotFound.
+        let txid_c = DispatchTestHarness::make_txid(62);
+
+        let params = SetMinedBatchParams {
+            block_id: 42,
+            block_height: 100,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let before_att = m.set_mined_items_attempted.get();
+        let before_succ = m.set_mined_items_succeeded.get();
+        let before_fail = m.set_mined_items_failed.get();
+
+        let payload = encode_set_mined_batch(&params, &[txid_a, txid_b, txid_c]);
+        let resp = h.request(OP_SET_MINED_BATCH, payload);
+        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+
+        let after_att = m.set_mined_items_attempted.get();
+        let after_succ = m.set_mined_items_succeeded.get();
+        let after_fail = m.set_mined_items_failed.get();
+        assert_eq!(after_att - before_att, 3, "set_mined_items_attempted += 3");
+        assert_eq!(after_succ - before_succ, 2, "set_mined_items_succeeded += 2");
+        assert_eq!(after_fail - before_fail, 1, "set_mined_items_failed += 1");
+    }
+
+    /// Create items should tick creates_attempted (once per batch),
+    /// creates_succeeded, and creates_failed.
+    #[test]
+    fn handle_create_batch_ticks_outcome_counters() {
+        let _guard = metrics_test_lock();
+        let m = test_metrics();
+        let _ = test_histograms();
+
+        let h = DispatchTestHarness::new();
+        let txid_a = DispatchTestHarness::make_txid(70);
+        // Pre-create txid_a so the second create in the batch below collides.
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+
+        let before_att = m.creates_attempted.get();
+        let before_succ = m.creates_succeeded.get();
+        let before_fail = m.creates_failed.get();
+
+        // Batch: [new, duplicate-of-txid_a] → one success + one failure.
+        let txid_new = DispatchTestHarness::make_txid(71);
+        let items = vec![
+            WireCreateItem {
+                txid: txid_new, tx_version: 1, locktime: 0, fee: 100,
+                size_in_bytes: 200, extended_size: 200, is_coinbase: false,
+                spending_height: 0, created_at: 1700000000000, flags: 0,
+                utxo_hashes: vec![[0u8; 32]], cold_data: vec![],
+                block_height: 0, mined_block_id: None, mined_block_height: None,
+                mined_subtree_idx: None, parent_txids: vec![],
+            },
+            WireCreateItem {
+                txid: txid_a, tx_version: 1, locktime: 0, fee: 100,
+                size_in_bytes: 200, extended_size: 200, is_coinbase: false,
+                spending_height: 0, created_at: 1700000000000, flags: 0,
+                utxo_hashes: vec![[0u8; 32]], cold_data: vec![],
+                block_height: 0, mined_block_id: None, mined_block_height: None,
+                mined_subtree_idx: None, parent_txids: vec![],
+            },
+        ];
+        let payload = encode_create_batch(&items);
+        let resp = h.request(OP_CREATE_BATCH, payload);
+        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+
+        let after_att = m.creates_attempted.get();
+        let after_succ = m.creates_succeeded.get();
+        let after_fail = m.creates_failed.get();
+        assert_eq!(after_att - before_att, 1, "creates_attempted += 1 (per batch)");
+        assert_eq!(after_succ - before_succ, 1, "creates_succeeded += 1");
+        assert_eq!(after_fail - before_fail, 1, "creates_failed += 1");
+    }
+
+    /// Freeze items should tick freezes_succeeded / freezes_failed per item.
+    #[test]
+    fn handle_freeze_batch_ticks_outcome_counters() {
+        let _guard = metrics_test_lock();
+        let m = test_metrics();
+        let _ = test_histograms();
+
+        let h = DispatchTestHarness::new();
+        let txid_a = DispatchTestHarness::make_txid(80);
+        assert_eq!(h.create_tx(txid_a, 2).status, STATUS_OK);
+        let txid_missing = DispatchTestHarness::make_txid(81);
+
+        let utxo_hash_vout0 = [0u8; 32];
+        let items = vec![
+            WireSlotItem { txid: txid_a, vout: 0, utxo_hash: utxo_hash_vout0 },
+            WireSlotItem { txid: txid_missing, vout: 0, utxo_hash: utxo_hash_vout0 },
+        ];
+        let payload = encode_slot_item_batch(&items);
+
+        let before_succ = m.freezes_succeeded.get();
+        let before_fail = m.freezes_failed.get();
+        let resp = h.request(OP_FREEZE_BATCH, payload);
+        let after_succ = m.freezes_succeeded.get();
+        let after_fail = m.freezes_failed.get();
+        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+        assert_eq!(after_succ - before_succ, 1, "freezes_succeeded += 1");
+        assert_eq!(after_fail - before_fail, 1, "freezes_failed += 1");
+    }
+
+    /// Delete items should tick deletes_succeeded / deletes_failed per item.
+    #[test]
+    fn handle_delete_batch_ticks_outcome_counters() {
+        let _guard = metrics_test_lock();
+        let m = test_metrics();
+        let _ = test_histograms();
+
+        let h = DispatchTestHarness::new();
+        let txid_a = DispatchTestHarness::make_txid(90);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        let txid_missing = DispatchTestHarness::make_txid(91);
+
+        let payload = encode_txid_batch(&[txid_a, txid_missing], &[]);
+        let before_succ = m.deletes_succeeded.get();
+        let before_fail = m.deletes_failed.get();
+        let resp = h.request(OP_DELETE_BATCH, payload);
+        let after_succ = m.deletes_succeeded.get();
+        let after_fail = m.deletes_failed.get();
+        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+        assert_eq!(after_succ - before_succ, 1, "deletes_succeeded += 1 (A deleted)");
+        assert_eq!(after_fail - before_fail, 1, "deletes_failed += 1 (missing)");
+    }
+
+    /// Dispatch must record an end-to-end latency sample into
+    /// `h.spend_latency` for every spend batch processed.
+    #[test]
+    fn dispatch_records_spend_latency_histogram() {
+        let _guard = metrics_test_lock();
+        let _ = test_metrics();
+        let hists = test_histograms();
+
+        let h = DispatchTestHarness::new();
+        // Create several txs and spend each.
+        let base = DispatchTestHarness::make_txid(100)[0];
+        let n: u8 = 5;
+        for i in 0..n {
+            let txid = DispatchTestHarness::make_txid(base.wrapping_add(i));
+            assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+        }
+
+        let before_count = hists.spend_latency.count();
+        let before_sum = hists.spend_latency.sum_ns();
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let utxo_hash_vout0 = [0u8; 32];
+        for i in 0..n {
+            let txid = DispatchTestHarness::make_txid(base.wrapping_add(i));
+            let item = WireSpendItem {
+                txid,
+                vout: 0,
+                utxo_hash: utxo_hash_vout0,
+                spending_data: {
+                    let mut sd = [0u8; 36];
+                    sd[0] = i;
+                    sd
+                },
+            };
+            let resp = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &[item]));
+            assert_eq!(resp.status, STATUS_OK);
+        }
+        let after_count = hists.spend_latency.count();
+        let after_sum = hists.spend_latency.sum_ns();
+        assert_eq!(
+            after_count - before_count,
+            n as u64,
+            "spend_latency.count() should advance by exactly {n}",
+        );
+        assert!(
+            after_sum > before_sum,
+            "spend_latency.sum_ns() must be strictly greater after processing {n} batches",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: LabeledCounter / {op, outcome} table dual-writes
+    // -----------------------------------------------------------------------
+
+    /// Drive a mix of Ok / Idempotent / ErrConflicting spends through
+    /// handle_spend_batch and assert the labeled operations table advances
+    /// by the exact expected counts for each outcome bucket.
+    #[test]
+    fn operations_table_counts_spend_ok_and_err() {
+        use crate::metrics::{OpCode, Outcome};
+        let _guard = metrics_test_lock();
+        let m = test_metrics();
+        let _ = test_histograms();
+
+        let h = DispatchTestHarness::new();
+        let txid_a = DispatchTestHarness::make_txid(150);
+        let txid_b = DispatchTestHarness::make_txid(151);
+        let txid_c = DispatchTestHarness::make_txid(152);
+        let txid_missing = DispatchTestHarness::make_txid(153);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_c, 1).status, STATUS_OK);
+
+        let utxo_hash_vout0 = [0u8; 32];
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        // Round 1: spend A and B successfully, C with wrong hash → Other.
+        let wrong_hash = [0xEEu8; 32];
+        let items = vec![
+            WireSpendItem { txid: txid_a, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0x11; 36] },
+            WireSpendItem { txid: txid_b, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0x22; 36] },
+            WireSpendItem { txid: txid_c, vout: 0, utxo_hash: wrong_hash,     spending_data: [0x33; 36] },
+        ];
+        let before_ok = m.operations.get(OpCode::Spend, Outcome::Ok);
+        let before_idem = m.operations.get(OpCode::Spend, Outcome::Idempotent);
+        let before_other = m.operations.get(OpCode::Spend, Outcome::Other);
+        let before_conflict = m.operations.get(OpCode::Spend, Outcome::ErrConflicting);
+        let before_not_found = m.operations.get(OpCode::Spend, Outcome::ErrNotFound);
+        let resp = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &items));
+        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+
+        // Round 2: replay A with identical spending_data → Idempotent.
+        // Also try D which does not exist → ErrNotFound.
+        let items2 = vec![
+            WireSpendItem { txid: txid_a, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0x11; 36] },
+            WireSpendItem { txid: txid_missing, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0x44; 36] },
+        ];
+        let resp2 = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &items2));
+        assert_eq!(resp2.status, STATUS_PARTIAL_ERROR);
+
+        // Round 3: attempt to spend A again with DIFFERENT spending_data →
+        // ErrConflicting (AlreadySpent).
+        let items3 = vec![
+            WireSpendItem { txid: txid_a, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0x55; 36] },
+        ];
+        let resp3 = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &items3));
+        assert_eq!(resp3.status, STATUS_PARTIAL_ERROR);
+
+        let after_ok = m.operations.get(OpCode::Spend, Outcome::Ok);
+        let after_idem = m.operations.get(OpCode::Spend, Outcome::Idempotent);
+        let after_other = m.operations.get(OpCode::Spend, Outcome::Other);
+        let after_conflict = m.operations.get(OpCode::Spend, Outcome::ErrConflicting);
+        let after_not_found = m.operations.get(OpCode::Spend, Outcome::ErrNotFound);
+
+        assert_eq!(after_ok - before_ok, 2, "Ok += 2 (A + B)");
+        assert_eq!(after_idem - before_idem, 1, "Idempotent += 1 (A replayed)");
+        assert_eq!(
+            after_other - before_other, 1,
+            "Other += 1 (C UtxoHashMismatch)"
+        );
+        assert_eq!(
+            after_conflict - before_conflict, 1,
+            "ErrConflicting += 1 (A AlreadySpent)"
+        );
+        assert_eq!(
+            after_not_found - before_not_found, 1,
+            "ErrNotFound += 1 (missing txid)"
+        );
+    }
+
+    /// Exercise every `SpendError` variant through `classify_spend_error` and
+    /// assert the mapping is stable. This guards against silent drift when
+    /// variants are added or renamed — a compile error here forces the
+    /// author to update the Phase 2 spec.
+    #[test]
+    fn outcome_classification_is_stable_for_every_spend_error_variant() {
+        use crate::metrics::Outcome;
+        use super::classify_spend_error;
+
+        let fresh_spending_data = [0u8; 36];
+        let cases: Vec<(SpendError, Outcome)> = vec![
+            (SpendError::TxNotFound, Outcome::ErrNotFound),
+            (SpendError::Conflicting, Outcome::ErrConflicting),
+            (SpendError::Locked, Outcome::ErrFrozen),
+            (
+                SpendError::CoinbaseImmature { spending_height: 5, current_height: 1 },
+                Outcome::Other,
+            ),
+            (SpendError::UtxoNotFound { offset: 0 }, Outcome::Other),
+            (SpendError::UtxoHashMismatch { offset: 0 }, Outcome::Other),
+            (
+                SpendError::AlreadySpent { offset: 0, spending_data: fresh_spending_data },
+                Outcome::ErrConflicting,
+            ),
+            (SpendError::Frozen { offset: 0 }, Outcome::ErrFrozen),
+            (
+                SpendError::FrozenUntil { offset: 0, spendable_at_height: 1 },
+                Outcome::ErrFrozen,
+            ),
+            (
+                SpendError::InvalidSpend { offset: 0, spending_data: fresh_spending_data },
+                Outcome::ErrConflicting,
+            ),
+            (SpendError::Pruned { offset: 0 }, Outcome::ErrConflicting),
+            (SpendError::AlreadyFrozen { offset: 0 }, Outcome::ErrFrozen),
+            (SpendError::NotFrozen { offset: 0 }, Outcome::ErrFrozen),
+            (
+                SpendError::StorageError { detail: "disk".into() },
+                Outcome::ErrStorage,
+            ),
+            (
+                SpendError::DahOverflow { current_height: u32::MAX - 1, retention: 288 },
+                Outcome::ErrStorage,
+            ),
+        ];
+        for (err, expected) in cases {
+            let got = classify_spend_error(&err);
+            assert_eq!(got, expected, "classify_spend_error({err:?}) → {got:?}, expected {expected:?}");
+        }
+    }
+
+    /// `/metrics` must emit one `teraslab_operations_total{op=..,outcome=..}`
+    /// line per cell in the labeled table, with values matching
+    /// `ThreadMetrics.operations.get(op, outcome)`.
+    #[test]
+    fn prometheus_emits_operations_total_with_labels() {
+        use crate::metrics::{OpCode, Outcome};
+        let _guard = metrics_test_lock();
+        let m = test_metrics();
+        let _ = test_histograms();
+
+        let h = DispatchTestHarness::new();
+        // Seed concrete, known values through the dispatch path: one Ok spend,
+        // one Idempotent replay, one ErrNotFound.
+        let txid_a = DispatchTestHarness::make_txid(200);
+        let txid_missing = DispatchTestHarness::make_txid(201);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        let utxo_hash_vout0 = [0u8; 32];
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let item_a = WireSpendItem { txid: txid_a, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0xAA; 36] };
+        let item_missing = WireSpendItem { txid: txid_missing, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0xBB; 36] };
+        assert_eq!(
+            h.request(OP_SPEND_BATCH, encode_spend_batch(&params, std::slice::from_ref(&item_a))).status,
+            STATUS_OK
+        );
+        assert_eq!(
+            h.request(OP_SPEND_BATCH, encode_spend_batch(&params, std::slice::from_ref(&item_a))).status,
+            STATUS_OK // idempotent replay reports STATUS_OK
+        );
+        let _ = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, std::slice::from_ref(&item_missing)));
+
+        let hists = crate::metrics::ThreadHistograms::new();
+        let text = crate::server::http::render_metrics_text(m, &hists, 0, 0, 0, 0);
+
+        // Every (op, outcome) cell must appear exactly once with matching value.
+        let mut found_spend_ok = false;
+        let mut found_spend_not_found = false;
+        let mut found_spend_idempotent = false;
+        for &op in OpCode::all() {
+            for &outcome in Outcome::all() {
+                let needle = format!(
+                    "teraslab_operations_total{{op=\"{}\",outcome=\"{}\"}} ",
+                    op.as_str(),
+                    outcome.as_str(),
+                );
+                let line = text
+                    .lines()
+                    .find(|l| l.starts_with(&needle))
+                    .unwrap_or_else(|| panic!("missing Prometheus line for {needle}"));
+                let val: u64 = line
+                    .rsplit(' ')
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| panic!("unparseable Prometheus line: {line}"));
+                let expected = m.operations.get(op, outcome);
+                assert_eq!(
+                    val, expected,
+                    "label value mismatch for {needle}: metric={val} counter={expected}"
+                );
+                if op == OpCode::Spend && outcome == Outcome::Ok && val > 0 {
+                    found_spend_ok = true;
+                }
+                if op == OpCode::Spend && outcome == Outcome::ErrNotFound && val > 0 {
+                    found_spend_not_found = true;
+                }
+                if op == OpCode::Spend && outcome == Outcome::Idempotent && val > 0 {
+                    found_spend_idempotent = true;
+                }
+            }
+        }
+        assert!(found_spend_ok, "expected at least one Spend/Ok tick");
+        assert!(found_spend_idempotent, "expected at least one Spend/Idempotent tick");
+        assert!(found_spend_not_found, "expected at least one Spend/ErrNotFound tick");
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 3 — tracing span integration tests
+    // -----------------------------------------------------------------
+
+    /// Capturing `tracing_subscriber::Layer` that records every span it sees
+    /// along with the values of selected fields and the parent span id.
+    ///
+    /// This is a real layer (not a stub): each new span pushes a record onto
+    /// a shared `Vec`, and every field event is serialised into the record.
+    /// Used by the span-integration tests below to assert on structure.
+    mod capture {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::Context;
+        use tracing_subscriber::registry::LookupSpan;
+        use tracing_subscriber::Layer;
+
+        #[derive(Clone, Debug)]
+        pub struct CapturedSpan {
+            pub name: &'static str,
+            pub id: u64,
+            pub parent_id: Option<u64>,
+            pub fields: HashMap<String, String>,
+        }
+
+        #[derive(Default)]
+        pub struct CaptureLayer {
+            pub spans: Arc<Mutex<Vec<CapturedSpan>>>,
+        }
+
+        impl CaptureLayer {
+            pub fn new() -> Self {
+                Self::default()
+            }
+        }
+
+        struct FieldVisitor<'a>(&'a mut HashMap<String, String>);
+
+        impl<'a> Visit for FieldVisitor<'a> {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_string(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        impl<S> Layer<S> for CaptureLayer
+        where
+            S: Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+                let mut fields = HashMap::new();
+                attrs.record(&mut FieldVisitor(&mut fields));
+                let parent_id = ctx.span(id).and_then(|s| s.parent()).map(|p| p.id().into_u64());
+                let mut spans = self.spans.lock().expect("capture lock poisoned");
+                spans.push(CapturedSpan {
+                    name: attrs.metadata().name(),
+                    id: id.into_u64(),
+                    parent_id,
+                    fields,
+                });
+            }
+        }
+    }
+
+    /// Run a closure inside a scoped `tracing` subscriber composed from a
+    /// capturing layer, and return the captured spans.
+    ///
+    /// Uses `tracing::subscriber::with_default` to scope the subscriber to the
+    /// current thread so concurrent tests do not interfere. The subscriber
+    /// honours `DEBUG` level so `#[instrument(level = "debug")]` sites fire.
+    fn with_capture<F: FnOnce()>(f: F) -> Vec<capture::CapturedSpan> {
+        use tracing_subscriber::prelude::*;
+        let layer = capture::CaptureLayer::new();
+        let spans = layer.spans.clone();
+        let filter = tracing_subscriber::EnvFilter::new("debug");
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(layer);
+        tracing::subscriber::with_default(subscriber, f);
+        let guard = spans.lock().expect("capture lock poisoned");
+        guard.clone()
+    }
+
+    /// Emit a single `info!` event through a `tracing_subscriber::fmt::Layer`
+    /// configured to write JSON into a `Vec<u8>` sink, then parse the output
+    /// and assert on the level and a field value.
+    #[test]
+    fn tracing_subscriber_emits_json_for_info_events() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+        impl io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().expect("sink lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for SharedBuf {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let sink = SharedBuf::default();
+        let layer = tracing_subscriber::fmt::Layer::new()
+            .json()
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_writer(sink.clone());
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("info"))
+            .with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(service = "teraslab-test", answer = 42u64, "hello world");
+        });
+
+        let bytes = sink.0.lock().expect("sink lock").clone();
+        let line = std::str::from_utf8(&bytes).expect("json layer emitted invalid utf-8");
+        // The fmt::Layer may emit multiple JSON objects separated by newlines;
+        // take the first line (the event we emitted).
+        let first = line
+            .lines()
+            .find(|l| !l.is_empty())
+            .expect("no JSON output captured");
+        let parsed: serde_json::Value =
+            serde_json::from_str(first).expect("output line is not valid JSON");
+
+        assert_eq!(parsed["level"], "INFO");
+        // The fmt layer nests the event fields under `fields`.
+        assert_eq!(parsed["fields"]["service"], "teraslab-test");
+        assert_eq!(parsed["fields"]["answer"], 42);
+        assert_eq!(parsed["fields"]["message"], "hello world");
+    }
+
+    /// Driving a single `handle_request` through the dispatch path should
+    /// create exactly one top-level dispatch span with `op` and `request_id`
+    /// fields matching the supplied frame.
+    #[test]
+    fn dispatch_handle_request_emits_request_scoped_span() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(200);
+
+        // Seed a tx so the following spend targets a real record.
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let utxo_hash_vout0 = [0u8; 32];
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let item = WireSpendItem {
+            txid,
+            vout: 0,
+            utxo_hash: utxo_hash_vout0,
+            spending_data: [0xCE; 36],
+        };
+        let payload = encode_spend_batch(&params, std::slice::from_ref(&item));
+        let request = RequestFrame {
+            request_id: 777,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload,
+        };
+
+        let spans = with_capture(|| {
+            let mut conn_state = crate::server::ConnectionState::new();
+            let _ = handle_request(&request, &h.engine, 8192, None, None, &mut conn_state, None);
+        });
+
+        let dispatch_spans: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == "handle_request")
+            .collect();
+        assert_eq!(
+            dispatch_spans.len(),
+            1,
+            "expected exactly one handle_request span, got {spans:?}",
+        );
+        let s = dispatch_spans[0];
+        assert_eq!(
+            s.fields.get("op").map(String::as_str),
+            Some(OP_SPEND_BATCH.to_string().as_str()),
+        );
+        assert_eq!(
+            s.fields.get("request_id").map(String::as_str),
+            Some("777"),
+        );
+    }
+
+    /// The `spend_multi` engine span is emitted under the current dispatch
+    /// span, so its captured `parent_id` must equal the dispatch span's id.
+    #[test]
+    fn engine_spend_multi_span_child_of_dispatch_span() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(201);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let utxo_hash_vout0 = [0u8; 32];
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let item = WireSpendItem {
+            txid,
+            vout: 0,
+            utxo_hash: utxo_hash_vout0,
+            spending_data: [0xD1; 36],
+        };
+        let payload = encode_spend_batch(&params, std::slice::from_ref(&item));
+        let request = RequestFrame {
+            request_id: 888,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload,
+        };
+
+        let spans = with_capture(|| {
+            let mut conn_state = crate::server::ConnectionState::new();
+            let _ = handle_request(&request, &h.engine, 8192, None, None, &mut conn_state, None);
+        });
+
+        let dispatch_span = spans
+            .iter()
+            .find(|s| s.name == "handle_request")
+            .expect("no dispatch span captured");
+        // The dispatch path calls `Engine::validate_spend_multi` followed by
+        // `ValidatedSpend::apply`. `apply` is the instrumented span that
+        // runs under the dispatch span; `spend_multi` (a wrapper that calls
+        // both) is not invoked on the OP_SPEND_BATCH hot path. Either span
+        // proves the parent linkage; we assert on `apply` because it is the
+        // site reached from the dispatch wire opcode.
+        let apply_span = spans
+            .iter()
+            .find(|s| s.name == "apply")
+            .expect("no apply span captured");
+        assert_eq!(
+            apply_span.parent_id,
+            Some(dispatch_span.id),
+            "apply parent ({:?}) should be dispatch span ({})",
+            apply_span.parent_id, dispatch_span.id,
+        );
+
+        // Drive the higher-level wrapper directly so the spend_multi span is
+        // also exercised and its parent/child wiring verified.
+        let second_txid = DispatchTestHarness::make_txid(202);
+        assert_eq!(h.create_tx(second_txid, 1).status, STATUS_OK);
+
+        let wrapped_spans = with_capture(|| {
+            let _ = h.engine.spend_multi(&crate::ops::spend::SpendMultiRequest {
+                tx_key: crate::index::TxKey { txid: second_txid },
+                spends: vec![crate::ops::spend::SpendItem {
+                    utxo_hash: [0u8; 32],
+                    offset: 0,
+                    spending_data: [0xD2; 36],
+                    idx: 0,
+                }],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            });
+        });
+        let sm = wrapped_spans
+            .iter()
+            .find(|s| s.name == "spend_multi")
+            .expect("no spend_multi span captured from direct call");
+        let sm_apply = wrapped_spans
+            .iter()
+            .find(|s| s.name == "apply")
+            .expect("no apply span captured from direct call");
+        assert_eq!(
+            sm_apply.parent_id,
+            Some(sm.id),
+            "direct spend_multi should parent its inner apply span",
+        );
     }
 }

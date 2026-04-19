@@ -176,14 +176,15 @@ pub fn recover_all_with_allocator(
         let tmp_path = path_from_bytes(&tmp_bytes);
         if tmp_path.exists() {
             if let Err(e) = std::fs::remove_file(&tmp_path) {
-                eprintln!(
-                    "  recovery: failed to remove orphan resize tmp file {}: {e}",
-                    tmp_path.display()
+                tracing::warn!(
+                    tmp_path = %tmp_path.display(),
+                    err = %e,
+                    "recovery: failed to remove orphan resize tmp file",
                 );
             } else {
-                eprintln!(
-                    "  recovery: removed orphan resize tmp file {}",
-                    tmp_path.display()
+                tracing::info!(
+                    tmp_path = %tmp_path.display(),
+                    "recovery: removed orphan resize tmp file",
                 );
             }
         }
