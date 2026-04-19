@@ -392,24 +392,39 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
         }
     });
 
-    // Toggle partition every 500ms for 30 seconds
-    eprintln!("[14.3] Starting flapping partition (toggle every 500ms for 30s)");
+    // Toggle partition / heal for 30 seconds, but between each topology
+    // change wait for the previous cycle's migration queue to at least
+    // start draining before enqueueing the next one. A fixed 500ms toggle
+    // piles up thousands of migrations that the final drain phase cannot
+    // catch up on (pattern C). Best-effort — we cap each between-flap
+    // wait at 5s so the flap workload still exercises topology churn,
+    // just without the runaway backlog.
+    eprintln!("[14.3] Starting flapping partition (rate-limited by migration drain, 30s wall clock)");
     let flap_duration = Duration::from_secs(30);
     let flap_start = Instant::now();
     let mut partitioned = false;
+    let mut flap_cycles = 0u32;
 
     while flap_start.elapsed() < flap_duration {
         if partitioned {
-            // Heal
             let _ = docker_arc.heal_all_partitions().await;
             partitioned = false;
         } else {
-            // Partition node1 from node2 and node3
             let _ = docker_arc.partition_node("node1", &["node2", "node3"]).await;
             partitioned = true;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        flap_cycles += 1;
+        // Between cycles: let the current topology change's migrations
+        // start draining before enqueueing the next. Ignore timeout —
+        // we only need the queue to be progressing, not fully empty.
+        let _ = common::wait_specific_migrations_complete(
+            &docker_arc,
+            &[1, 2, 3],
+            Duration::from_secs(5),
+        )
+        .await;
     }
+    eprintln!("[14.3] Flap loop completed {flap_cycles} topology changes");
 
     // Ensure healed at the end
     if partitioned {
@@ -426,15 +441,15 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
     let creates_err = bg_creates_err.load(Ordering::Relaxed);
     eprintln!("[14.3] Background workload: {creates_ok} creates ok, {creates_err} errors");
 
-    // Wait for cluster to settle. 30 seconds of 500ms flapping = ~60 topology
-    // changes, each enqueuing shard migrations. Draining can take longer than
-    // a single 120s window — retry up to 3x total before giving up.
+    // Wait for cluster to settle. After a rate-limited flap the backlog is
+    // bounded but can still be non-trivial. Use a single long drain with
+    // cluster_ready retries (SWIM + proposer reconverge after the final
+    // topology change). Do NOT fall back to "proceed despite incomplete
+    // migrations" — if migrations can't drain, we want the panic message
+    // to say that directly, not a cryptic downstream seed-connect timeout
+    // (pattern C).
     eprintln!("[14.3] Waiting for cluster to settle after flapping");
     tokio::time::sleep(Duration::from_secs(1)).await;
-    // 30 seconds of 500ms flapping drives the topology term up fast. After
-    // the last heal, SWIM still needs to reconverge and the deterministic
-    // proposer needs to commit a fresh term that sticks. Give it several
-    // retries rather than a single short window.
     let mut c143_err = None;
     for attempt in 0..3u32 {
         match common::wait_cluster_ready(&docker_arc, 3, Duration::from_secs(120)).await {
@@ -447,17 +462,12 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
         }
     }
     if let Some(e) = c143_err { return Err(e); }
-    for attempt in 0..3u32 {
-        match common::wait_migrations_complete(&docker_arc, 3, Duration::from_secs(180)).await {
-            Ok(()) => break,
-            Err(e) => {
-                eprintln!("[14.3] migration wait attempt {attempt}: {e}");
-                if attempt == 2 {
-                    eprintln!("[14.3] proceeding despite incomplete migrations");
-                }
-            }
-        }
-    }
+
+    // Single long drain — rate-limited flap caps the backlog, so 600s
+    // is plenty of headroom. Fail hard with the real drain error if it
+    // doesn't complete.
+    common::wait_migrations_complete(&docker_arc, 3, Duration::from_secs(600)).await?;
+
     common::wait_replication_settled(&docker_arc, 3, Duration::from_secs(10)).await?;
 
     // Full consistency check. Give an extra settling window before reading
