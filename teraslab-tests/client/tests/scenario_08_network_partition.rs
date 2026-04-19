@@ -90,11 +90,13 @@ async fn run_scenario() -> Result<(), ClientError> {
         // now includes node3, and the next `refresh_routing` can hit node3
         // from the host and adopt the isolated minority partition map (which
         // advertises node3 as the sole master). Replace the client with one
-        // seeded only from the majority side and assert it.
+        // seeded only from the majority side and wait for the majority's
+        // partition map to stop assigning any shards to node3 (topology
+        // proposal + commit takes up to a few seconds after SWIM detects
+        // the isolation).
         client.close().await;
         let client = common::create_client_subset(&docker, &[1, 2]).await?;
-        client.refresh_routing().await?;
-        common::assert_client_excludes_nodes(&client, &[3]).await?;
+        common::wait_client_excludes_nodes(&client, &[3], Duration::from_secs(30)).await?;
 
         // Verify that node3 REJECTS writes during partition.
         // Create a single-node client that connects ONLY to the partitioned node3.
@@ -227,7 +229,12 @@ async fn run_scenario() -> Result<(), ClientError> {
         // After partition heal, SWIM must go through its full rediscovery cycle.
         // SWIM suspicion timeout is 3s, so 5s is sufficient.
         common::wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
+        // After partition heal, up to ~1/3 of all 4096 shards may migrate
+        // to node3 as its new master (plus replica-side backfill for the
+        // rest). Each shard carries real streamed data now (see pattern A
+        // fix in the replication receiver), so this wait can legitimately
+        // need a few minutes on a full-record scenario.
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(300)).await?;
         client.refresh_routing().await?;
 
         // Migration counters can flip to zero a beat before the receiving
@@ -749,7 +756,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         // topology versions diverged during the partition.
         tokio::time::sleep(Duration::from_secs(2)).await;
         common::wait_cluster_ready(&docker, 3, Duration::from_secs(120)).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(300)).await?;
         client.refresh_routing().await?;
 
         // Probe a sample of records end-to-end (pattern A).

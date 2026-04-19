@@ -722,7 +722,11 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     common::wait_cluster_ready(&docker_5, 4, Duration::from_secs(30)).await?;
     eprintln!("[11.10] Cluster size=4, waiting for migrations to complete");
-    common::wait_migrations_complete(&docker_5, 4, Duration::from_secs(120)).await?;
+    // 3→4 scale-up migrates ~1/4 of all 4096 shards to node4 as its new
+    // master, plus replica-side backfill. With pattern A fixed each shard
+    // now streams its actual record data instead of silently no-oping, so
+    // this wait needs headroom beyond the old 120s ceiling.
+    common::wait_migrations_complete(&docker_5, 4, Duration::from_secs(300)).await?;
     eprintln!("[11.10] Migrations complete");
 
     // Refresh routing with the 4-node topology

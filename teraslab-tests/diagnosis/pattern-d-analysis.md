@@ -1,5 +1,16 @@
 # Pattern D — scenario 10 verifier/cluster disagreement (findings)
 
+## Resolution
+
+**Fixed** in the client (and scenario 10 workload + reconciliation
+cleanup). See "Recommended fix" section — the recommendation has been
+implemented; the TDD regression test
+`spend_batch_populates_successes_on_full_success` lives in
+`client/rust/src/lib.rs`, and scenario 10 now passes without the
+reconciliation block. See the commit
+`client: synthesize spend_batch successes on STATUS_OK (pattern D fix)`
+for the full change set.
+
 ## Verdict
 
 **(a) — the spends are actually succeeding on the cluster, but the client's

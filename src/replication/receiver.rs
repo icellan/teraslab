@@ -317,9 +317,29 @@ pub fn handle_replica_batch_with_tracker(
     let through = batch.last_sequence();
     let already_applied = applied.get(stream_key);
 
+    // Migration batches are coordinated out-of-band by the migration
+    // pipeline (see `stream_shard_baseline`) and always start at
+    // `first_sequence: 0`. They share the receiver's
+    // `ReplicaAppliedTracker` with the normal-replication stream, so
+    // applying the dedup / skip_count logic to them would silently
+    // discard the batch any time the tracker has already seen a
+    // higher sequence from normal replication — which is the common
+    // case after a partition heal or scale-up migration, and the root
+    // cause of "records unreadable on their new master" (pattern A).
+    //
+    // Treat migration batches as independent: apply every op in the
+    // batch unconditionally and do NOT advance the normal-replication
+    // high-water mark. The `OP_MIGRATION_COMPLETE` handshake performs
+    // its own count + manifest verification so idempotency here is not
+    // required for correctness — migrations are one-shot by protocol
+    // and retried at the shard level on failure, not op-level via this
+    // tracker.
+    let is_migration = request.flags & FLAG_MIGRATION_BATCH != 0;
+
     // Whole batch already applied — ACK with the existing high-water
     // mark so the master knows the data is durable on this replica.
-    if through <= already_applied {
+    // Skipped for migration batches (see above).
+    if !is_migration && through <= already_applied {
         let ack = ReplicaAck::Ok {
             through_sequence: already_applied,
         };
@@ -337,7 +357,10 @@ pub fn handle_replica_batch_with_tracker(
 
     // Determine where in the batch real work starts. If `first_sequence`
     // is already covered by `already_applied`, skip the duplicate prefix.
-    let skip_count = if batch.first_sequence <= already_applied {
+    // Migration batches bypass this skip — every op applies.
+    let skip_count = if is_migration {
+        0
+    } else if batch.first_sequence <= already_applied {
         // `already_applied` is the highest sequence number already
         // durably applied. The first op in the batch corresponds to
         // sequence `first_sequence`; sequence `first_sequence + i` is
@@ -364,30 +387,36 @@ pub fn handle_replica_batch_with_tracker(
         seq += 1;
     }
 
-    // Persist the new high-water mark BEFORE ACKing. A flush failure
-    // becomes a batch-level error so the master treats the replica
-    // as not-yet-durable and will retry.
-    applied.set(stream_key, through);
-    if let Err(e) = applied.flush() {
-        let ack = ReplicaAck::Error {
-            failed_sequence: through,
-            message: format!("flush applied tracker: {e}"),
-        };
-        return ResponseFrame {
-            request_id: request.request_id,
-            status: STATUS_OK,
-            payload: ack.serialize(),
-        };
+    // Migration batches do not participate in the normal-replication
+    // sequence space — don't let their `first_sequence: 0` overwrite
+    // the receiver's high-water mark, and skip the flush on their
+    // behalf.
+    if !is_migration {
+        // Persist the new high-water mark BEFORE ACKing. A flush failure
+        // becomes a batch-level error so the master treats the replica
+        // as not-yet-durable and will retry.
+        applied.set(stream_key, through);
+        if let Err(e) = applied.flush() {
+            let ack = ReplicaAck::Error {
+                failed_sequence: through,
+                message: format!("flush applied tracker: {e}"),
+            };
+            return ResponseFrame {
+                request_id: request.request_id,
+                status: STATUS_OK,
+                payload: ack.serialize(),
+            };
+        }
+
+        // Use fetch_max to ensure monotonic advancement. Multiple master
+        // connections may call this handler concurrently; a plain store()
+        // could move last_applied backward if batches complete out of
+        // sequence order.
+        last_applied.fetch_max(through, Ordering::Relaxed);
     }
 
-    // Use fetch_max to ensure monotonic advancement. Multiple master
-    // connections may call this handler concurrently; a plain store()
-    // could move last_applied backward if batches complete out of
-    // sequence order.
-    last_applied.fetch_max(through, Ordering::Relaxed);
-
     let ack = ReplicaAck::Ok {
-        through_sequence: through,
+        through_sequence: if is_migration { already_applied } else { through },
     };
     ResponseFrame {
         request_id: request.request_id,
@@ -1695,5 +1724,94 @@ mod tests {
         assert_eq!(engine.read_slot(&key(45), 3).unwrap().status, UTXO_SPENT);
         assert_eq!(engine.read_slot(&key(45), 4).unwrap().status, UTXO_SPENT);
         assert_eq!(tracker.get(stream_key), 304);
+    }
+
+    /// Pattern A root-cause regression: a migration batch uses
+    /// `first_sequence: 0` because migrations are coordinated out-of-band,
+    /// not through the replication sequence-number stream. If the receiver
+    /// has already seen normal-replication batches with higher sequences on
+    /// the same stream key, the dedup check silently skips the migration
+    /// batch and the receiver ACKs OK without touching the engine — the
+    /// source then sends OP_MIGRATION_COMPLETE, the manifest check either
+    /// trivially passes (receiver's prior state satisfies `actual >=
+    /// expected_records`) or collides, and records physically never land
+    /// on the new master. Clients subsequently see `TX_NOT_FOUND` on reads
+    /// that route to that new master.
+    ///
+    /// This test reproduces the silent-skip by threading a high-watermark
+    /// batch through first (emulating normal replication traffic), then
+    /// sending a `FLAG_MIGRATION_BATCH` batch with `first_sequence: 0`.
+    /// The migration ops must be applied regardless of the tracker's
+    /// current high-water mark.
+    #[test]
+    fn migration_batch_applies_even_when_tracker_seq_is_ahead() {
+        let engine = make_engine();
+        // One record with four slots so we can observe which batches
+        // actually applied by reading slot status afterward.
+        create_record(&engine, key(60), 4);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = DEFAULT_STREAM_KEY;
+
+        // Step 1: normal-replication batch at sequences 100..=102 that
+        // spends slot 0. This pushes the tracker's high-water mark up to
+        // 102 for `stream_key`.
+        let normal_batch = make_spend_batch(100, key(60), 0..1, 1);
+        let normal_req = RequestFrame {
+            op_code: OP_REPLICA_BATCH,
+            request_id: 1,
+            flags: 0,
+            payload: normal_batch.serialize(),
+        };
+        let resp = handle_replica_batch_with_tracker(
+            &normal_req,
+            &engine,
+            &last_applied,
+            &tracker,
+            stream_key,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(tracker.get(stream_key), 100);
+        assert_eq!(engine.read_slot(&key(60), 0).unwrap().status, UTXO_SPENT);
+
+        // Step 2: migration batch delivering a spend on slot 2. Uses
+        // `first_sequence: 0` (migrations don't participate in the
+        // master's replication sequence stream) and sets
+        // `FLAG_MIGRATION_BATCH`. Before the fix the dedup check
+        // `through (0) <= already_applied (100)` silently skipped every
+        // op in this batch and slot 2 stayed UNSPENT.
+        let migration_batch = make_spend_batch(0, key(60), 2..3, 1);
+        let migration_req = RequestFrame {
+            op_code: OP_REPLICA_BATCH,
+            request_id: /* shard id goes here in prod */ 7,
+            flags: FLAG_MIGRATION_BATCH,
+            payload: migration_batch.serialize(),
+        };
+        let resp = handle_replica_batch_with_tracker(
+            &migration_req,
+            &engine,
+            &last_applied,
+            &tracker,
+            stream_key,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        // The ops in the migration batch must have been applied. Slot 2
+        // transitions from UNSPENT to SPENT.
+        assert_eq!(
+            engine.read_slot(&key(60), 2).unwrap().status,
+            UTXO_SPENT,
+            "migration batch with first_sequence=0 was silently skipped \
+             because the tracker already had a higher high-water mark \
+             from normal replication",
+        );
+        // The migration batch must NOT advance the normal-replication
+        // high-water mark backward — migrations are out-of-band.
+        assert_eq!(
+            tracker.get(stream_key),
+            100,
+            "migration batch should not overwrite the normal-replication \
+             high-water mark with its own sequence space",
+        );
     }
 }

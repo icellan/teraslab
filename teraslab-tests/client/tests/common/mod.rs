@@ -101,32 +101,59 @@ pub async fn create_client_subset(
     Client::new(config).await
 }
 
-/// Return true if the client's current partition map contains no nodes from
-/// `excluded`. Used to verify the client is not seeing a minority-side view
-/// of the cluster after a partition (pattern B).
+/// Wait until the client's current partition map stops assigning any
+/// shard master to the `excluded` node IDs. Used to verify the client is
+/// not seeing a minority-side view of the cluster after a partition
+/// (pattern B).
 ///
-/// Fetches the partition map through `client.get_partition_map()` rather than
-/// introspecting internal state, so it reflects the view the next routed call
-/// will use.
-pub async fn assert_client_excludes_nodes(
+/// A node can still be present in `pm.nodes` after being isolated — the
+/// majority side's membership list doesn't always prune the isolated node
+/// immediately. What matters for routing is whether any shard in
+/// `pm.assignments` points at the isolated node as master. The wait
+/// allows the majority to propose + commit a fresh shard table that
+/// excludes the isolated node before the caller proceeds; polls via
+/// `client.get_partition_map()` so it reflects the view the next routed
+/// call will use.
+///
+/// On timeout returns `ClientError::Connection` describing the latest
+/// observed state of the partition map.
+pub async fn wait_client_excludes_nodes(
     client: &Client,
     excluded: &[u64],
+    timeout: Duration,
 ) -> Result<(), ClientError> {
-    let pm = client.get_partition_map().await?;
-    let seen: std::collections::BTreeSet<u64> = pm.nodes.iter().map(|n| n.id).collect();
-    let overlap: Vec<u64> = excluded
-        .iter()
-        .copied()
-        .filter(|id| seen.contains(id))
-        .collect();
-    if !overlap.is_empty() {
-        return Err(ClientError::Connection(format!(
-            "client partition map still contains isolated node(s) {overlap:?}: \
-             version={}, nodes={seen:?} — client would route to minority side",
-            pm.version,
-        )));
+    let start = std::time::Instant::now();
+    let mut backoff = Duration::from_millis(100);
+    let mut last_overlap: Vec<u64> = excluded.to_vec();
+    let mut last_version = 0u64;
+    let mut last_masters: std::collections::BTreeSet<u64> =
+        std::collections::BTreeSet::new();
+    loop {
+        let _ = client.refresh_routing().await;
+        let pm = client.get_partition_map().await?;
+        let masters: std::collections::BTreeSet<u64> =
+            pm.assignments.iter().copied().collect();
+        let overlap: Vec<u64> = excluded
+            .iter()
+            .copied()
+            .filter(|id| masters.contains(id))
+            .collect();
+        if overlap.is_empty() {
+            return Ok(());
+        }
+        last_overlap = overlap;
+        last_version = pm.version;
+        last_masters = masters;
+        if start.elapsed() >= timeout {
+            return Err(ClientError::Connection(format!(
+                "client partition map still routes shards to isolated node(s) \
+                 {last_overlap:?} after {timeout:?}: version={last_version}, \
+                 unique_masters={last_masters:?} — client would route to minority side",
+            )));
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(1));
     }
-    Ok(())
 }
 
 /// Fetch the HTTP /status JSON for a given node number, using ports from the
@@ -580,10 +607,26 @@ pub async fn wait_for_migration_reads_ready(
             .count();
         let master_failed = master_failed_idx.len();
 
-        if master_failed == 0 && under_replicated == 0 {
+        // Gate on the master-route check — this is the exact path the
+        // downstream test reads will use and the primary correctness
+        // signal. `under_replicated` is reported as a warning: a record
+        // may be briefly under-replicated while replica backfill catches
+        // up after a migration, but as long as the master serves it the
+        // test's reads succeed. Keeping `under_replicated` blocking here
+        // would entangle the barrier with replica-lag concerns that are
+        // separate from pattern A's master-miss failure mode.
+        if master_failed == 0 {
             if timing_enabled() {
+                let under_repl_note = if under_replicated > 0 {
+                    format!(
+                        " (info: {under_replicated}/{} sampled txids under-replicated)",
+                        sample_indices.len(),
+                    )
+                } else {
+                    String::new()
+                };
                 eprintln!(
-                    "  wait_for_migration_reads_ready: {} txids verified ({} sampled for replicas) in {:.1}ms",
+                    "  wait_for_migration_reads_ready: {} txids verified ({} sampled for replicas) in {:.1}ms{under_repl_note}",
                     txids.len(),
                     sample_indices.len(),
                     start.elapsed().as_secs_f64() * 1000.0,
