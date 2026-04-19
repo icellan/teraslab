@@ -179,4 +179,25 @@ containing the full criterion stdout/stderr.
   and are **not** committed to the repo. Regenerate after intentional
   perf-affecting changes: `scripts/check_perf_budget.sh --save-baseline`.
 
+## Known follow-ups
+
+- **Cluster-level metric validation under sustained load** is not yet
+  wired into `teraslab-tests/client/tests/`. `scenario_10_sustained_load`
+  tracks client-side counters (`WorkloadRunner::metrics`) but does not
+  scrape the server's `/metrics` endpoint and assert post-run invariants
+  on `teraslab_operations_total`, `teraslab_repl_lag_sequences`, or
+  `teraslab_redo_flush_latency_ns`. The unit-level
+  `tests/prometheus_conformance.rs` validates the emitted shape; a
+  future scenario should validate the values **under real cluster load**.
+- **Always-sample-on-error** span policy is not in effect. The sampler
+  is `ParentBased(TraceIdRatioBased)` — operators who need full error
+  coverage set `trace_sampling_ratio = 1.0`. Re-sampling at event time
+  is non-trivial in the current `opentelemetry_sdk` `ShouldSample` API
+  and is left as a follow-up.
+- **Cluster-wide aggregation** of the six new metric blocks
+  (`replication_metrics`, `uring_metrics`, `redo_metrics`,
+  `migration_metrics`, `swim_metrics`, `allocator_metrics`) is not
+  summed across nodes in `aggregate_snapshots`. The UI reads them
+  from the first node only. Multi-node aggregation is a follow-up.
+
 [render]: ../src/server/http.rs
