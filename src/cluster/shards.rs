@@ -97,7 +97,10 @@ impl ShardTable {
     /// Each topology change increments the epoch so ownership transitions
     /// are totally ordered and stale views can be detected.
     pub fn compute_with_epoch(members: &[NodeId], replication_factor: u8, epoch: u64) -> Self {
-        assert!(!members.is_empty(), "cannot compute shard table with 0 members");
+        assert!(
+            !members.is_empty(),
+            "cannot compute shard table with 0 members"
+        );
         let n = members.len();
         let mut assignments = Vec::with_capacity(NUM_SHARDS);
 
@@ -193,16 +196,12 @@ impl ShardTable {
     /// remains authoritative until the target has all data.
     pub fn effective_assignment(&self, shard: u16) -> &ShardAssignment {
         match (&self.handoff_state, &self.prev_assignments) {
-            (Some(hs), Some(prev)) => {
-                match hs[shard as usize] {
-                    ShardHandoff::ServingCurrent | ShardHandoff::Copying | ShardHandoff::CommitReady => {
-                        &prev[shard as usize]
-                    }
-                    ShardHandoff::ServingNew => {
-                        &self.assignments[shard as usize]
-                    }
-                }
-            }
+            (Some(hs), Some(prev)) => match hs[shard as usize] {
+                ShardHandoff::ServingCurrent
+                | ShardHandoff::Copying
+                | ShardHandoff::CommitReady => &prev[shard as usize],
+                ShardHandoff::ServingNew => &self.assignments[shard as usize],
+            },
             _ => &self.assignments[shard as usize],
         }
     }
@@ -235,7 +234,9 @@ impl ShardTable {
         // master would make the shard unreachable.
         if let Some(hs) = &mut self.handoff_state {
             match hs[shard as usize] {
-                ShardHandoff::Copying | ShardHandoff::CommitReady | ShardHandoff::ServingCurrent => {
+                ShardHandoff::Copying
+                | ShardHandoff::CommitReady
+                | ShardHandoff::ServingCurrent => {
                     self.assignments[shard as usize] = old_assignment;
                     hs[shard as usize] = ShardHandoff::ServingNew;
                 }
@@ -256,7 +257,10 @@ impl ShardTable {
     /// Number of shards still in handoff (not yet ServingNew).
     pub fn pending_handoff_count(&self) -> usize {
         match &self.handoff_state {
-            Some(hs) => hs.iter().filter(|s| **s != ShardHandoff::ServingNew).count(),
+            Some(hs) => hs
+                .iter()
+                .filter(|s| **s != ShardHandoff::ServingNew)
+                .count(),
             None => 0,
         }
     }
@@ -375,7 +379,9 @@ impl ShardTable {
                 }
                 // New master is NOT the old replica. Find a surviving replica
                 // that can serve as the migration source.
-                let surviving_replica = old_assignment.replicas.iter()
+                let surviving_replica = old_assignment
+                    .replicas
+                    .iter()
                     .find(|r| new_members.contains(r));
                 if let Some(&source) = surviving_replica {
                     tasks.push(MigrationTask {
@@ -434,7 +440,11 @@ impl ShardTable {
                 } else if old_a.replicas.contains(&new_a.master) {
                     Some(new_a.master)
                 } else {
-                    old_a.replicas.iter().copied().find(|r| new_members.contains(r))
+                    old_a
+                        .replicas
+                        .iter()
+                        .copied()
+                        .find(|r| new_members.contains(r))
                 };
                 let Some(source) = source else {
                     continue;
@@ -502,9 +512,15 @@ mod tests {
             counts[shard] += 1;
         }
         let expected = 100_000.0 / NUM_SHARDS as f64;
-        let max_deviation = counts.iter().map(|&c| (c as f64 - expected).abs()).fold(0.0f64, f64::max);
+        let max_deviation = counts
+            .iter()
+            .map(|&c| (c as f64 - expected).abs())
+            .fold(0.0f64, f64::max);
         // Within 50% of expected per shard is reasonable for uniform distribution
-        assert!(max_deviation < expected * 0.5, "distribution too skewed: max deviation {max_deviation}");
+        assert!(
+            max_deviation < expected * 0.5,
+            "distribution too skewed: max deviation {max_deviation}"
+        );
     }
 
     #[test]
@@ -527,8 +543,7 @@ mod tests {
 
         for i in 0..NUM_SHARDS {
             assert_eq!(
-                table_node_a.assignments[i],
-                table_node_b.assignments[i],
+                table_node_a.assignments[i], table_node_b.assignments[i],
                 "shard {i} differs"
             );
         }
@@ -556,8 +571,11 @@ mod tests {
         let table = ShardTable::compute(&members, 2);
 
         for (i, a) in table.assignments.iter().enumerate() {
-            assert!(!a.replicas.contains(&a.master),
-                "shard {i}: master {:?} is also a replica", a.master);
+            assert!(
+                !a.replicas.contains(&a.master),
+                "shard {i}: master {:?} is also a replica",
+                a.master
+            );
         }
     }
 
@@ -580,7 +598,10 @@ mod tests {
         let expected = NUM_SHARDS / 5;
         for (&node, &count) in &counts {
             let deviation = (count as f64 - expected as f64).abs() / expected as f64;
-            assert!(deviation < 0.05, "node {node:?} has {count} shards, expected ~{expected} (deviation {deviation:.2})");
+            assert!(
+                deviation < 0.05,
+                "node {node:?} has {count} shards, expected ~{expected} (deviation {deviation:.2})"
+            );
         }
     }
 
@@ -645,14 +666,19 @@ mod tests {
         // replica require migration from a surviving replica.
         // There should be no tasks with from_node == NodeId(4) since it's dead.
         let from_dead: Vec<_> = plan.iter().filter(|t| t.from_node == NodeId(4)).collect();
-        assert!(from_dead.is_empty(),
+        assert!(
+            from_dead.is_empty(),
             "dead node 4 should not be a migration source, but found {} tasks from it",
-            from_dead.len());
+            from_dead.len()
+        );
 
         // All migration sources should be surviving nodes
         for task in &plan {
-            assert!(new_members.contains(&task.from_node),
-                "migration source {:?} should be a surviving node", task.from_node);
+            assert!(
+                new_members.contains(&task.from_node),
+                "migration source {:?} should be a surviving node",
+                task.from_node
+            );
         }
     }
 
@@ -683,7 +709,10 @@ mod tests {
             .expect("expected a shard whose new master is a brand-new holder");
 
         let plan = ShardTable::migration_plan(&old_table, &new_table);
-        let shard_tasks: Vec<_> = plan.iter().filter(|task| task.shard as usize == shard).collect();
+        let shard_tasks: Vec<_> = plan
+            .iter()
+            .filter(|task| task.shard as usize == shard)
+            .collect();
 
         assert_eq!(
             shard_tasks.len(),
@@ -779,7 +808,8 @@ mod tests {
                 break;
             }
         }
-        let (shard, old_master, _new_master) = changed_shard.expect("should have at least one changed shard");
+        let (shard, old_master, _new_master) =
+            changed_shard.expect("should have at least one changed shard");
 
         // Begin handoff — old master still serves during handoff.
         table.begin_handoff(&new_table);
@@ -841,7 +871,8 @@ mod tests {
 
         // Every shard should be owned by exactly 2 nodes (RF=2).
         for shard in 0..NUM_SHARDS as u16 {
-            let count = [&owned1, &owned2, &owned3].iter()
+            let count = [&owned1, &owned2, &owned3]
+                .iter()
                 .filter(|s| s.contains(&shard))
                 .count();
             assert_eq!(count, 2, "shard {shard} owned by {count} nodes, expected 2");
@@ -876,10 +907,14 @@ mod tests {
         let t2 = ShardTable::compute_with_epoch(&b, 2, 1);
 
         for i in 0..NUM_SHARDS {
-            assert_eq!(t1.assignments[i].master, t2.assignments[i].master,
-                "shard {i} master differs");
-            assert_eq!(t1.assignments[i].replicas, t2.assignments[i].replicas,
-                "shard {i} replicas differ");
+            assert_eq!(
+                t1.assignments[i].master, t2.assignments[i].master,
+                "shard {i} master differs"
+            );
+            assert_eq!(
+                t1.assignments[i].replicas, t2.assignments[i].replicas,
+                "shard {i} replicas differ"
+            );
         }
     }
 
@@ -892,8 +927,10 @@ mod tests {
         let table = ShardTable::compute_with_epoch(&nodes(&[1]), 2, 1);
         for shard in 0..NUM_SHARDS {
             assert_eq!(table.assignments[shard].master, NodeId(1));
-            assert!(table.assignments[shard].replicas.is_empty(),
-                "single node should have no replicas");
+            assert!(
+                table.assignments[shard].replicas.is_empty(),
+                "single node should have no replicas"
+            );
         }
     }
 
@@ -909,9 +946,18 @@ mod tests {
         for shard in 0..NUM_SHARDS {
             let a = &table.assignments[shard];
             assert_eq!(a.replicas.len(), 2, "shard {shard} should have 2 replicas");
-            assert_ne!(a.master, a.replicas[0], "shard {shard} master == replica[0]");
-            assert_ne!(a.master, a.replicas[1], "shard {shard} master == replica[1]");
-            assert_ne!(a.replicas[0], a.replicas[1], "shard {shard} replica[0] == replica[1]");
+            assert_ne!(
+                a.master, a.replicas[0],
+                "shard {shard} master == replica[0]"
+            );
+            assert_ne!(
+                a.master, a.replicas[1],
+                "shard {shard} master == replica[1]"
+            );
+            assert_ne!(
+                a.replicas[0], a.replicas[1],
+                "shard {shard} replica[0] == replica[1]"
+            );
         }
     }
 
@@ -926,7 +972,10 @@ mod tests {
         for shard in 0..NUM_SHARDS {
             let a = &table.assignments[shard];
             // Should have at most 1 replica (since only 2 nodes)
-            assert!(a.replicas.len() <= 1, "shard {shard}: replicas should be clamped to 1");
+            assert!(
+                a.replicas.len() <= 1,
+                "shard {shard}: replicas should be clamped to 1"
+            );
             if !a.replicas.is_empty() {
                 assert_ne!(a.master, a.replicas[0]);
             }
@@ -944,8 +993,10 @@ mod tests {
         let expected = NUM_SHARDS as f64 / 3.0;
         for (&node, &count) in &counts {
             let deviation = (count as f64 - expected).abs() / expected;
-            assert!(deviation < 0.02,
-                "node {node:?}: {count} shards, expected ~{expected:.0}, deviation {deviation:.4}");
+            assert!(
+                deviation < 0.02,
+                "node {node:?}: {count} shards, expected ~{expected:.0}, deviation {deviation:.4}"
+            );
         }
     }
 
@@ -956,20 +1007,24 @@ mod tests {
         let expected = NUM_SHARDS as f64 / 4.0;
         for (&node, &count) in &counts {
             let deviation = (count as f64 - expected).abs() / expected;
-            assert!(deviation < 0.02,
-                "node {node:?}: {count} shards, expected ~{expected:.0}, deviation {deviation:.4}");
+            assert!(
+                deviation < 0.02,
+                "node {node:?}: {count} shards, expected ~{expected:.0}, deviation {deviation:.4}"
+            );
         }
     }
 
     #[test]
     fn balance_10_nodes() {
-        let table = ShardTable::compute_with_epoch(&nodes(&[1,2,3,4,5,6,7,8,9,10]), 2, 1);
+        let table = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]), 2, 1);
         let counts = table.shard_counts();
         let expected = NUM_SHARDS as f64 / 10.0;
         for (&node, &count) in &counts {
             let deviation = (count as f64 - expected).abs() / expected;
-            assert!(deviation < 0.02,
-                "node {node:?}: {count} shards, expected ~{expected:.0}, deviation {deviation:.4}");
+            assert!(
+                deviation < 0.02,
+                "node {node:?}: {count} shards, expected ~{expected:.0}, deviation {deviation:.4}"
+            );
         }
     }
 
@@ -985,8 +1040,10 @@ mod tests {
             // and 4 get 40. Max deviation is 1 shard from the mean (40.96).
             // Allow up to 1 shard off (tolerance ~3% for small per-node counts).
             let diff = (count as f64 - expected).abs();
-            assert!(diff <= 1.0,
-                "node {node:?}: {count} shards, expected ~{expected:.1}, diff {diff:.2}");
+            assert!(
+                diff <= 1.0,
+                "node {node:?}: {count} shards, expected ~{expected:.1}, diff {diff:.2}"
+            );
         }
     }
 
@@ -1026,19 +1083,26 @@ mod tests {
 
         let plan = ShardTable::migration_plan(&old, &new);
         // ~1024 shards should move to node 4 (4096/4 = 1024)
-        let to_4: Vec<_> = plan.iter()
+        let to_4: Vec<_> = plan
+            .iter()
             .filter(|t| t.to_node == NodeId(4) && t.is_master)
             .collect();
         let expected = NUM_SHARDS / 4;
         let deviation = (to_4.len() as f64 - expected as f64).abs() / expected as f64;
-        assert!(deviation < 0.05,
-            "expected ~{expected} shards to node 4, got {}", to_4.len());
+        assert!(
+            deviation < 0.05,
+            "expected ~{expected} shards to node 4, got {}",
+            to_4.len()
+        );
 
         // Moved shards should come from all 3 existing nodes (approximately evenly)
         let from_1 = plan.iter().filter(|t| t.from_node == NodeId(1)).count();
         assert!(from_1 > 0, "should move some from node 1");
-        assert!(to_4.len() >= expected - 1 && to_4.len() <= expected + 1,
-            "expected ~{expected} migrations to node 4, got {}", to_4.len());
+        assert!(
+            to_4.len() >= expected - 1 && to_4.len() <= expected + 1,
+            "expected ~{expected} migrations to node 4, got {}",
+            to_4.len()
+        );
     }
 
     #[test]
@@ -1073,8 +1137,11 @@ mod tests {
         let plan = ShardTable::migration_plan(&old, &new);
         // Node 3's ~1365 shards should be redistributed to nodes 1 and 2.
         for task in &plan {
-            assert_ne!(task.from_node, NodeId(3),
-                "dead node 3 should not be a migration source");
+            assert_ne!(
+                task.from_node,
+                NodeId(3),
+                "dead node 3 should not be a migration source"
+            );
             assert!(task.to_node == NodeId(1) || task.to_node == NodeId(2));
         }
     }
@@ -1119,19 +1186,21 @@ mod tests {
         // After add then remove, the table should be identical to original
         // (same members, same algorithm)
         for shard in 0..NUM_SHARDS {
-            assert_eq!(original.assignments[shard].master,
-                       back_to_3.assignments[shard].master,
-                       "shard {shard} master should be same after add+remove");
+            assert_eq!(
+                original.assignments[shard].master, back_to_3.assignments[shard].master,
+                "shard {shard} master should be same after add+remove"
+            );
         }
 
         // No migration needed between original and back_to_3
         // (same member set => same assignments => empty plan)
         let plan = ShardTable::migration_plan(&original, &back_to_3);
-        // Versions differ, but assignments are the same
-        for task in &plan {
-            // This would mean the assignments actually differ despite same members
-            panic!("unexpected migration: shard {} from {:?} to {:?}",
-                task.shard, task.from_node, task.to_node);
+        // Versions differ, but assignments are the same.
+        if let Some(task) = plan.first() {
+            panic!(
+                "unexpected migration: shard {} from {:?} to {:?}",
+                task.shard, task.from_node, task.to_node
+            );
         }
     }
 
@@ -1145,9 +1214,11 @@ mod tests {
         for task in &plan {
             let old_master = old.assignments[task.shard as usize].master;
             let new_master = new.assignments[task.shard as usize].master;
-            assert_ne!(old_master, new_master,
+            assert_ne!(
+                old_master, new_master,
                 "shard {} didn't change master ({:?}→{:?}) but is in migration plan",
-                task.shard, old_master, new_master);
+                task.shard, old_master, new_master
+            );
         }
     }
 
@@ -1161,7 +1232,8 @@ mod tests {
         // when node 4 joins, and the old master is no longer in the new
         // assignment, so the replica migration must source from a surviving
         // old owner (node 2) rather than the dead old master.
-        let task = plan.iter()
+        let task = plan
+            .iter()
             .find(|t| t.shard == 2179)
             .expect("expected replica migration task for shard 2179");
 
@@ -1195,8 +1267,10 @@ mod tests {
             let members: Vec<NodeId> = ids.iter().map(|&id| NodeId(id)).collect();
             let table = ShardTable::compute_with_epoch(&members, 2, 1);
             let total: usize = table.shard_counts().values().sum();
-            assert_eq!(total, NUM_SHARDS,
-                "with {n} nodes: total mastered shards should be {NUM_SHARDS}, got {total}");
+            assert_eq!(
+                total, NUM_SHARDS,
+                "with {n} nodes: total mastered shards should be {NUM_SHARDS}, got {total}"
+            );
         }
     }
 
@@ -1222,13 +1296,19 @@ mod tests {
                 let table = ShardTable::compute_with_epoch(&members, rf as u8, 1);
                 for shard in 0..NUM_SHARDS {
                     let a = &table.assignments[shard];
-                    assert!(!a.replicas.contains(&a.master),
-                        "n={n} rf={rf} shard {shard}: master {:?} in replicas", a.master);
+                    assert!(
+                        !a.replicas.contains(&a.master),
+                        "n={n} rf={rf} shard {shard}: master {:?} in replicas",
+                        a.master
+                    );
                     // No duplicate replicas
                     let mut seen = std::collections::HashSet::new();
                     for r in &a.replicas {
-                        assert!(seen.insert(r),
-                            "n={n} rf={rf} shard {shard}: duplicate replica {:?}", r);
+                        assert!(
+                            seen.insert(r),
+                            "n={n} rf={rf} shard {shard}: duplicate replica {:?}",
+                            r
+                        );
                     }
                 }
             }
@@ -1248,8 +1328,11 @@ mod tests {
 
         // All shards are empty → shard_has_data returns false → skip Copying
         table.begin_handoff_with(&new_table, |_| false);
-        assert_eq!(table.pending_handoff_count(), 0,
-            "all empty shards should skip directly to ServingNew");
+        assert_eq!(
+            table.pending_handoff_count(),
+            0,
+            "all empty shards should skip directly to ServingNew"
+        );
     }
 
     #[test]
@@ -1276,8 +1359,8 @@ mod tests {
         table.begin_handoff_with(&new_table, |_| true);
 
         // Find a shard in Copying state
-        let copying_shard = (0..NUM_SHARDS as u16)
-            .find(|&s| table.shard_handoff_state(s) == ShardHandoff::Copying);
+        let copying_shard =
+            (0..NUM_SHARDS as u16).find(|&s| table.shard_handoff_state(s) == ShardHandoff::Copying);
         if let Some(shard) = copying_shard {
             table.commit_shard(shard);
             assert_eq!(table.shard_handoff_state(shard), ShardHandoff::ServingNew);

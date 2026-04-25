@@ -3,7 +3,7 @@
 //! Covers: unspend, delete, freeze, unfreeze, reassign, set_locked,
 //! preserve_until, mark_on_longest_chain, and get_spend.
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::sync::Arc;
 
 use teraslab::allocator::SlotAllocator;
@@ -34,8 +34,7 @@ fn make_utxo_hash(tx_n: u32, vout: u32) -> [u8; 32] {
 }
 
 fn create_engine() -> Arc<Engine> {
-    let dev: Arc<dyn BlockDevice> =
-        Arc::new(MemoryDevice::new(512 * 1024 * 1024, 4096).unwrap());
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(512 * 1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(200_000).unwrap();
     Arc::new(Engine::new(
@@ -50,8 +49,7 @@ fn create_engine() -> Arc<Engine> {
 
 fn create_tx(engine: &Engine, tx_idx: u32, utxo_count: u32) {
     let tx_id = make_tx_id(tx_idx);
-    let utxo_hashes: Vec<[u8; 32]> =
-        (0..utxo_count).map(|v| make_utxo_hash(tx_idx, v)).collect();
+    let utxo_hashes: Vec<[u8; 32]> = (0..utxo_count).map(|v| make_utxo_hash(tx_idx, v)).collect();
     let req = CreateRequest {
         tx_id,
         tx_version: 1,
@@ -90,7 +88,9 @@ fn setup_engine(count: u32, utxos_per_tx: u32) -> Arc<Engine> {
 fn setup_engine_with_spent(count: u32, utxos_per_tx: u32) -> Arc<Engine> {
     let engine = setup_engine(count, utxos_per_tx);
     for i in 0..count {
-        let key = TxKey { txid: make_tx_id(i) };
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
         let mut sd = [0u8; 36];
         sd[0..4].copy_from_slice(&(i + 10000).to_le_bytes());
         let _ = engine.spend(&SpendRequest {
@@ -122,7 +122,9 @@ fn bench_unspend(c: &mut Criterion) {
 
     group.bench_function("unspend_one", |b| {
         b.iter(|| {
-            let key = TxKey { txid: make_tx_id(tx_idx) };
+            let key = TxKey {
+                txid: make_tx_id(tx_idx),
+            };
             let _ = engine.unspend(&UnspendRequest {
                 tx_key: key,
                 offset: 0,
@@ -135,7 +137,9 @@ fn bench_unspend(c: &mut Criterion) {
             if tx_idx >= 20_000 {
                 // Re-spend all so the next pass has something to unspend.
                 for i in 0..20_000u32 {
-                    let k = TxKey { txid: make_tx_id(i) };
+                    let k = TxKey {
+                        txid: make_tx_id(i),
+                    };
                     let mut sd = [0u8; 36];
                     sd[0..4].copy_from_slice(&(i + 10000).to_le_bytes());
                     let _ = engine.spend(&SpendRequest {
@@ -170,7 +174,9 @@ fn bench_freeze(c: &mut Criterion) {
 
     group.bench_function("freeze_one", |b| {
         b.iter(|| {
-            let key = TxKey { txid: make_tx_id(tx_idx) };
+            let key = TxKey {
+                txid: make_tx_id(tx_idx),
+            };
             let _ = engine.freeze(&FreezeRequest {
                 tx_key: key,
                 offset: 0,
@@ -193,7 +199,9 @@ fn bench_unfreeze(c: &mut Criterion) {
     // Pre-freeze all vout=0 UTXOs, then benchmark unfreezing.
     let engine = setup_engine(20_000, 5);
     for i in 0..20_000u32 {
-        let key = TxKey { txid: make_tx_id(i) };
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
         let _ = engine.freeze(&FreezeRequest {
             tx_key: key,
             offset: 0,
@@ -205,7 +213,9 @@ fn bench_unfreeze(c: &mut Criterion) {
 
     group.bench_function("unfreeze_one", |b| {
         b.iter(|| {
-            let key = TxKey { txid: make_tx_id(tx_idx) };
+            let key = TxKey {
+                txid: make_tx_id(tx_idx),
+            };
             let _ = engine.unfreeze(&UnfreezeRequest {
                 tx_key: key,
                 offset: 0,
@@ -215,7 +225,9 @@ fn bench_unfreeze(c: &mut Criterion) {
             if tx_idx >= 20_000 {
                 // Re-freeze for next pass.
                 for i in 0..20_000u32 {
-                    let k = TxKey { txid: make_tx_id(i) };
+                    let k = TxKey {
+                        txid: make_tx_id(i),
+                    };
                     let _ = engine.freeze(&FreezeRequest {
                         tx_key: k,
                         offset: 0,
@@ -241,7 +253,9 @@ fn bench_reassign(c: &mut Criterion) {
     // Reassign requires the UTXO to be frozen first.
     let engine = setup_engine(20_000, 5);
     for i in 0..20_000u32 {
-        let key = TxKey { txid: make_tx_id(i) };
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
         let _ = engine.freeze(&FreezeRequest {
             tx_key: key,
             offset: 0,
@@ -254,14 +268,16 @@ fn bench_reassign(c: &mut Criterion) {
 
     group.bench_function("reassign_one", |b| {
         b.iter(|| {
-            let key = TxKey { txid: make_tx_id(tx_idx) };
+            let key = TxKey {
+                txid: make_tx_id(tx_idx),
+            };
             // Alternate between two hashes to keep the benchmark going.
-            let old_hash = if pass % 2 == 0 {
+            let old_hash = if pass.is_multiple_of(2) {
                 make_utxo_hash(tx_idx, 0)
             } else {
                 make_utxo_hash(tx_idx + 1_000_000, 0)
             };
-            let new_hash = if pass % 2 == 0 {
+            let new_hash = if pass.is_multiple_of(2) {
                 make_utxo_hash(tx_idx + 1_000_000, 0)
             } else {
                 make_utxo_hash(tx_idx, 0)
@@ -301,7 +317,9 @@ fn bench_set_locked(c: &mut Criterion) {
 
     group.bench_function("toggle", |b| {
         b.iter(|| {
-            let key = TxKey { txid: make_tx_id(tx_idx) };
+            let key = TxKey {
+                txid: make_tx_id(tx_idx),
+            };
             let _ = engine.set_locked(&SetLockedRequest {
                 tx_key: key,
                 value: toggle,
@@ -330,7 +348,9 @@ fn bench_preserve_until(c: &mut Criterion) {
 
     group.bench_function("set_preserve", |b| {
         b.iter(|| {
-            let key = TxKey { txid: make_tx_id(tx_idx) };
+            let key = TxKey {
+                txid: make_tx_id(tx_idx),
+            };
             let _ = engine.preserve_until(&PreserveUntilRequest {
                 tx_key: key,
                 block_height: 5000,
@@ -359,7 +379,9 @@ fn bench_mark_on_longest_chain(c: &mut Criterion) {
 
     group.bench_function("toggle", |b| {
         b.iter(|| {
-            let key = TxKey { txid: make_tx_id(tx_idx) };
+            let key = TxKey {
+                txid: make_tx_id(tx_idx),
+            };
             let _ = engine.mark_on_longest_chain(&MarkOnLongestChainRequest {
                 tx_key: key,
                 on_longest_chain: toggle,
@@ -398,7 +420,9 @@ fn bench_delete(c: &mut Criterion) {
 
     group.bench_function("delete_one", |b| {
         b.iter(|| {
-            let key = TxKey { txid: make_tx_id(del_idx) };
+            let key = TxKey {
+                txid: make_tx_id(del_idx),
+            };
             let _ = engine.delete(&DeleteRequest { tx_key: key });
             del_idx += 1;
             if del_idx >= next_create {
@@ -426,7 +450,9 @@ fn bench_get_spend(c: &mut Criterion) {
     let engine = setup_engine(50_000, 5);
     // Spend vout=0 on first 25k txs so we have both states.
     for i in 0..25_000u32 {
-        let key = TxKey { txid: make_tx_id(i) };
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
         let mut sd = [0u8; 36];
         sd[0..4].copy_from_slice(&(i + 10000).to_le_bytes());
         let _ = engine.spend(&SpendRequest {
@@ -445,7 +471,9 @@ fn bench_get_spend(c: &mut Criterion) {
 
     group.bench_function("get_spend_one", |b| {
         b.iter(|| {
-            let key = TxKey { txid: make_tx_id(tx_idx) };
+            let key = TxKey {
+                txid: make_tx_id(tx_idx),
+            };
             let _ = engine.get_spend(&GetSpendRequest {
                 tx_key: key,
                 offset: 0,
@@ -475,7 +503,9 @@ fn bench_set_conflicting(c: &mut Criterion) {
 
     group.bench_function("toggle", |b| {
         b.iter(|| {
-            let key = TxKey { txid: make_tx_id(tx_idx) };
+            let key = TxKey {
+                txid: make_tx_id(tx_idx),
+            };
             let _ = engine.set_conflicting(&SetConflictingRequest {
                 tx_key: key,
                 value: toggle,

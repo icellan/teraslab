@@ -54,7 +54,8 @@ struct SwimNode {
 
 impl SwimNode {
     fn stop(&mut self) {
-        self.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -68,13 +69,23 @@ impl Drop for SwimNode {
 }
 
 fn start_swim(id: u64, swim_port: u16, tcp_port: u16, seeds: &[u16]) -> SwimNode {
-    start_swim_with_config(id, swim_port, tcp_port, seeds,
-        TEST_PROBE_INTERVAL, TEST_SUSPICION_TIMEOUT)
+    start_swim_with_config(
+        id,
+        swim_port,
+        tcp_port,
+        seeds,
+        TEST_PROBE_INTERVAL,
+        TEST_SUSPICION_TIMEOUT,
+    )
 }
 
 fn start_swim_with_config(
-    id: u64, swim_port: u16, tcp_port: u16, seeds: &[u16],
-    probe_interval: Duration, suspicion_timeout: Duration,
+    id: u64,
+    swim_port: u16,
+    tcp_port: u16,
+    seeds: &[u16],
+    probe_interval: Duration,
+    suspicion_timeout: Duration,
 ) -> SwimNode {
     let seed_addrs: Vec<SocketAddr> = seeds.iter().map(|&p| swim_addr(p)).collect();
     let runner = SwimRunner::new(SwimConfig {
@@ -89,7 +100,11 @@ fn start_swim_with_config(
         committed_term: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
     let (shutdown, handle, rx) = runner.start();
-    SwimNode { shutdown, handle: Some(handle), rx }
+    SwimNode {
+        shutdown,
+        handle: Some(handle),
+        rx,
+    }
 }
 
 /// Wait until a predicate is satisfied or timeout.
@@ -124,29 +139,58 @@ fn three_nodes_form_cluster_over_udp() {
     let n3 = start_swim(3, 15004, 15005, &[15000]);
 
     // Wait for n1 to discover both peers (event-driven, not sleep)
-    let events1 = wait_for(&n1.rx,
+    let events1 = wait_for(
+        &n1.rx,
         |evts| {
-            let joins: Vec<_> = evts.iter()
-                .filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _))).collect();
+            let joins: Vec<_> = evts
+                .iter()
+                .filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _)))
+                .collect();
             joins.len() >= 2
         },
-        WAIT_CEILING);
+        WAIT_CEILING,
+    );
 
-    let count = |evts: &[ClusterEvent]| evts.iter()
-        .filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _))).count();
+    let count = |evts: &[ClusterEvent]| {
+        evts.iter()
+            .filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _)))
+            .count()
+    };
 
-    assert!(count(&events1) >= 2, "node 1 should see 2 joins, got {}", count(&events1));
+    assert!(
+        count(&events1) >= 2,
+        "node 1 should see 2 joins, got {}",
+        count(&events1)
+    );
 
     // n2 and n3 should also have discovered peers
-    let events2 = wait_for(&n2.rx,
-        |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
-        WAIT_CEILING);
-    let events3 = wait_for(&n3.rx,
-        |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
-        WAIT_CEILING);
+    let events2 = wait_for(
+        &n2.rx,
+        |evts| {
+            evts.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(_, _)))
+        },
+        WAIT_CEILING,
+    );
+    let events3 = wait_for(
+        &n3.rx,
+        |evts| {
+            evts.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(_, _)))
+        },
+        WAIT_CEILING,
+    );
 
-    assert!(count(&events2) >= 1, "node 2 should see at least 1 join, got {}", count(&events2));
-    assert!(count(&events3) >= 1, "node 3 should see at least 1 join, got {}", count(&events3));
+    assert!(
+        count(&events2) >= 1,
+        "node 2 should see at least 1 join, got {}",
+        count(&events2)
+    );
+    assert!(
+        count(&events3) >= 1,
+        "node 3 should see at least 1 join, got {}",
+        count(&events3)
+    );
 }
 
 #[test]
@@ -154,23 +198,42 @@ fn node_stops_responding_suspect_then_dead() {
     let n1 = start_swim(10, 15010, 15011, &[]);
     let mut n2 = start_swim(11, 15012, 15013, &[15010]);
 
-    let discovery = wait_for(&n1.rx,
-        |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(11), _))),
-        WAIT_CEILING);
-    assert!(discovery.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(11), _))),
-        "node 10 should discover node 11");
+    let discovery = wait_for(
+        &n1.rx,
+        |evts| {
+            evts.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(11), _)))
+        },
+        WAIT_CEILING,
+    );
+    assert!(
+        discovery
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(11), _))),
+        "node 10 should discover node 11"
+    );
 
     // Stop node 2 and JOIN its thread so the socket is released
     n2.stop();
 
-    let events = wait_for(&n1.rx,
+    let events = wait_for(
+        &n1.rx,
         |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(_))),
-        WAIT_CEILING);
+        WAIT_CEILING,
+    );
 
-    assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeSuspect(NodeId(11)))),
-        "should have suspected node 11, events: {events:?}");
-    assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(11)))),
-        "should have declared node 11 dead, events: {events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeSuspect(NodeId(11)))),
+        "should have suspected node 11, events: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(11)))),
+        "should have declared node 11 dead, events: {events:?}"
+    );
 }
 
 #[test]
@@ -178,20 +241,38 @@ fn dead_node_restarts_with_new_incarnation() {
     let n1 = start_swim(20, 15020, 15021, &[]);
     let mut n2 = start_swim(21, 15022, 15023, &[15020]);
 
-    let discovery = wait_for(&n1.rx,
-        |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(21), _))),
-        WAIT_CEILING);
-    assert!(discovery.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(21), _))),
-        "node 20 should discover node 21");
+    let discovery = wait_for(
+        &n1.rx,
+        |evts| {
+            evts.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(21), _)))
+        },
+        WAIT_CEILING,
+    );
+    assert!(
+        discovery
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(21), _))),
+        "node 20 should discover node 21"
+    );
 
     // Stop and JOIN so the socket is released
     n2.stop();
 
-    let death = wait_for(&n1.rx,
-        |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(21)))),
-        WAIT_CEILING);
-    assert!(death.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(21)))),
-        "node 20 should declare node 21 dead");
+    let death = wait_for(
+        &n1.rx,
+        |evts| {
+            evts.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(21))))
+        },
+        WAIT_CEILING,
+    );
+    assert!(
+        death
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(21)))),
+        "node 20 should declare node 21 dead"
+    );
 
     // Brief pause to ensure the restarted node gets a strictly higher incarnation
     // (incarnation = SystemTime::now().as_millis(), so 2ms guarantees a new value)
@@ -200,11 +281,20 @@ fn dead_node_restarts_with_new_incarnation() {
     // Restart node 2 on a DIFFERENT swim port (old one may still be in TIME_WAIT)
     let _n2b = start_swim(21, 15024, 15023, &[15020]);
 
-    let events = wait_for(&n1.rx,
-        |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(21), _))),
-        WAIT_CEILING);
-    assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(21), _))),
-        "node 21 should have rejoined, events: {events:?}");
+    let events = wait_for(
+        &n1.rx,
+        |evts| {
+            evts.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(21), _)))
+        },
+        WAIT_CEILING,
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(21), _))),
+        "node 21 should have rejoined, events: {events:?}"
+    );
 }
 
 #[test]
@@ -214,39 +304,75 @@ fn indirect_probes_three_node_cluster() {
     let n_c = start_swim(32, 15034, 15035, &[15030]);
 
     // Wait for A to discover both B and C
-    let discovery = wait_for(&n_a.rx,
+    let discovery = wait_for(
+        &n_a.rx,
         |evts| {
-            evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(31), _)))
-            && evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(32), _)))
+            evts.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(31), _)))
+                && evts
+                    .iter()
+                    .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(32), _)))
         },
-        WAIT_CEILING);
-    assert!(discovery.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(31), _))),
-        "A should discover B");
+        WAIT_CEILING,
+    );
+    assert!(
+        discovery
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(31), _))),
+        "A should discover B"
+    );
 
     // Wait for C to see at least one join too
-    let _ = wait_for(&n_c.rx,
-        |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
-        WAIT_CEILING);
+    let _ = wait_for(
+        &n_c.rx,
+        |evts| {
+            evts.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(_, _)))
+        },
+        WAIT_CEILING,
+    );
 
     // Stop B and JOIN so socket is released
     n_b.stop();
 
     // Wait for A to detect B's failure
-    let events_a = wait_for(&n_a.rx,
-        |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(31)))),
-        WAIT_CEILING);
+    let events_a = wait_for(
+        &n_a.rx,
+        |evts| {
+            evts.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(31))))
+        },
+        WAIT_CEILING,
+    );
 
-    assert!(events_a.iter().any(|e| matches!(e, ClusterEvent::NodeSuspect(NodeId(31)))),
-        "A should suspect B after all probes fail");
-    assert!(events_a.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(31)))),
-        "A should declare B dead after suspicion timeout");
+    assert!(
+        events_a
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeSuspect(NodeId(31)))),
+        "A should suspect B after all probes fail"
+    );
+    assert!(
+        events_a
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(31)))),
+        "A should declare B dead after suspicion timeout"
+    );
 
     // Wait for C to also detect B's failure (via gossip from A)
-    let events_c = wait_for(&n_c.rx,
-        |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(31)))),
-        WAIT_CEILING);
-    assert!(events_c.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(31)))),
-        "C should also detect B's failure");
+    let events_c = wait_for(
+        &n_c.rx,
+        |evts| {
+            evts.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(31))))
+        },
+        WAIT_CEILING,
+    );
+    assert!(
+        events_c
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(31)))),
+        "C should also detect B's failure"
+    );
 }
 
 #[test]
@@ -254,10 +380,19 @@ fn cluster_event_node_joined_emitted() {
     let n1 = start_swim(40, 15040, 15041, &[]);
     let _n2 = start_swim(41, 15042, 15043, &[15040]);
 
-    let events = wait_for(&n1.rx,
-        |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(41), _))),
-        WAIT_CEILING);
-    assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(41), _))));
+    let events = wait_for(
+        &n1.rx,
+        |evts| {
+            evts.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(41), _)))
+        },
+        WAIT_CEILING,
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(41), _)))
+    );
 }
 
 #[test]
@@ -267,23 +402,35 @@ fn membership_changed_sorted_member_list() {
     let _n3 = start_swim(52, 15054, 15055, &[15050]);
 
     // Wait for n1 to see both peers join
-    let events = wait_for(&n1.rx,
+    let events = wait_for(
+        &n1.rx,
         |evts| {
-            evts.iter().filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _))).count() >= 2
+            evts.iter()
+                .filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _)))
+                .count()
+                >= 2
         },
-        WAIT_CEILING);
+        WAIT_CEILING,
+    );
 
-    let membership_events: Vec<_> = events.iter()
+    let membership_events: Vec<_> = events
+        .iter()
         .filter_map(|e| match e {
             ClusterEvent::MembershipChanged(members) => Some(members.clone()),
             _ => None,
         })
         .collect();
 
-    assert!(!membership_events.is_empty(), "should have MembershipChanged events");
+    assert!(
+        !membership_events.is_empty(),
+        "should have MembershipChanged events"
+    );
 
     let last = membership_events.last().unwrap();
-    assert!(last.len() >= 2, "should have at least 2 members in the last MembershipChanged");
+    assert!(
+        last.len() >= 2,
+        "should have at least 2 members in the last MembershipChanged"
+    );
     for window in last.windows(2) {
         assert!(window[0] <= window[1], "members should be sorted");
     }
@@ -308,33 +455,52 @@ fn dissemination_across_10_nodes() {
     }
 
     // Wait for node 0 to discover at least n-2 peers
-    let events0 = wait_for(&nodes[0].rx,
+    let events0 = wait_for(
+        &nodes[0].rx,
         |evts| {
-            evts.iter().filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _))).count() >= n - 2
+            evts.iter()
+                .filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _)))
+                .count()
+                >= n - 2
         },
-        WAIT_CEILING);
+        WAIT_CEILING,
+    );
 
-    let joined: Vec<_> = events0.iter()
+    let joined: Vec<_> = events0
+        .iter()
         .filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _)))
         .collect();
 
-    assert!(joined.len() >= n - 2,
-        "node 0 should see at least {} joins, got {}: {joined:?}", n - 2, joined.len());
+    assert!(
+        joined.len() >= n - 2,
+        "node 0 should see at least {} joins, got {}: {joined:?}",
+        n - 2,
+        joined.len()
+    );
 
     // Wait for node 5 to discover at least half via piggybacked gossip
-    let events5 = wait_for(&nodes[5].rx,
+    let events5 = wait_for(
+        &nodes[5].rx,
         |evts| {
-            evts.iter().filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _))).count() >= n / 2
+            evts.iter()
+                .filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _)))
+                .count()
+                >= n / 2
         },
-        WAIT_CEILING);
+        WAIT_CEILING,
+    );
 
-    let joined5: Vec<_> = events5.iter()
+    let joined5: Vec<_> = events5
+        .iter()
         .filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _)))
         .collect();
 
-    assert!(joined5.len() >= n / 2,
+    assert!(
+        joined5.len() >= n / 2,
         "node 5 should see at least {} joins (piggybacked dissemination), got {}",
-        n / 2, joined5.len());
+        n / 2,
+        joined5.len()
+    );
 }
 
 #[test]
@@ -344,7 +510,9 @@ fn network_load_per_node_constant() {
     let _n3 = start_swim(72, 15104, 15105, &[15100]);
 
     let config_3 = SwimConfig {
-        self_id: NodeId(70), self_addr: tcp_addr(15101), bind_addr: swim_addr(15100),
+        self_id: NodeId(70),
+        self_addr: tcp_addr(15101),
+        bind_addr: swim_addr(15100),
         seed_nodes: vec![],
         probe_interval: Duration::from_millis(100),
         suspicion_timeout: Duration::from_millis(500),
@@ -353,7 +521,9 @@ fn network_load_per_node_constant() {
         committed_term: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     let config_20 = SwimConfig {
-        self_id: NodeId(80), self_addr: tcp_addr(15201), bind_addr: swim_addr(15200),
+        self_id: NodeId(80),
+        self_addr: tcp_addr(15201),
+        bind_addr: swim_addr(15200),
         seed_nodes: vec![],
         probe_interval: Duration::from_millis(100),
         suspicion_timeout: Duration::from_millis(500),
@@ -373,17 +543,32 @@ fn after_membership_change_all_nodes_compute_same_shard_table() {
 
     // Wait for at least one node to see all 3 members
     // Try all three nodes' event streams
-    let events1 = wait_for(&n1.rx,
+    let events1 = wait_for(
+        &n1.rx,
         |evts| {
-            evts.iter().filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _))).count() >= 2
+            evts.iter()
+                .filter(|e| matches!(e, ClusterEvent::NodeJoined(_, _)))
+                .count()
+                >= 2
         },
-        WAIT_CEILING);
-    let events2 = wait_for(&n2.rx,
-        |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
-        WAIT_CEILING);
-    let events3 = wait_for(&n3.rx,
-        |evts| evts.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
-        WAIT_CEILING);
+        WAIT_CEILING,
+    );
+    let events2 = wait_for(
+        &n2.rx,
+        |evts| {
+            evts.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(_, _)))
+        },
+        WAIT_CEILING,
+    );
+    let events3 = wait_for(
+        &n3.rx,
+        |evts| {
+            evts.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(_, _)))
+        },
+        WAIT_CEILING,
+    );
 
     let get_last_membership = |events: &[ClusterEvent]| -> Option<Vec<NodeId>> {
         events.iter().rev().find_map(|e| match e {
@@ -396,10 +581,13 @@ fn after_membership_change_all_nodes_compute_same_shard_table() {
     let members2 = get_last_membership(&events2);
     let members3 = get_last_membership(&events3);
 
-    assert!(members1.is_some() || members2.is_some() || members3.is_some(),
-        "at least one node should have a MembershipChanged event");
+    assert!(
+        members1.is_some() || members2.is_some() || members3.is_some(),
+        "at least one node should have a MembershipChanged event"
+    );
 
-    let full_members = [&members1, &members2, &members3].iter()
+    let full_members = [&members1, &members2, &members3]
+        .iter()
         .filter_map(|m| m.as_ref())
         .find(|m| m.len() == 3);
 
@@ -410,8 +598,10 @@ fn after_membership_change_all_nodes_compute_same_shard_table() {
 
         for shard in 0..4096u16 {
             let master = table.assignment(shard).master;
-            assert!(members.contains(&master),
-                "shard {shard} master {master:?} not in member list");
+            assert!(
+                members.contains(&master),
+                "shard {shard} master {master:?} not in member list"
+            );
         }
     }
 }

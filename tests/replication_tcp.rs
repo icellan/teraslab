@@ -31,8 +31,7 @@ use teraslab::server::Server;
 
 /// Build an Engine from an in-memory device.
 fn make_engine() -> Arc<Engine> {
-    let dev: Arc<dyn BlockDevice> =
-        Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(10_000).unwrap();
     Arc::new(Engine::new(
@@ -212,6 +211,7 @@ fn tcp_replicate_spend() {
             master_generation: 0,
         }],
         trace_ctx: None,
+        source_node_id: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch);
     assert_eq!(
@@ -253,6 +253,7 @@ fn tcp_replicate_create_and_spend_lifecycle() {
             is_external: false,
         }],
         trace_ctx: None,
+        source_node_id: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &create_batch);
     assert_eq!(
@@ -291,6 +292,7 @@ fn tcp_replicate_create_and_spend_lifecycle() {
             master_generation: 0,
         }],
         trace_ctx: None,
+        source_node_id: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &spend_batch);
     assert_eq!(
@@ -352,6 +354,7 @@ fn tcp_replicate_batch_50_ops() {
         first_sequence: 1,
         ops,
         trace_ctx: None,
+        source_node_id: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch);
     assert_eq!(
@@ -461,6 +464,7 @@ fn tcp_replicate_mixed_ops() {
             },
         ],
         trace_ctx: None,
+        source_node_id: None,
     };
 
     let ack = send_replica_batch_tcp(replica_port, &batch);
@@ -540,6 +544,7 @@ fn tcp_catchup_missed_ops() {
         first_sequence: 1,
         ops: all_ops[0..5].to_vec(),
         trace_ctx: None,
+        source_node_id: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch1);
     assert_eq!(
@@ -554,6 +559,7 @@ fn tcp_catchup_missed_ops() {
         first_sequence: 6,
         ops: all_ops[5..10].to_vec(),
         trace_ctx: None,
+        source_node_id: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &catchup_batch);
     assert_eq!(
@@ -598,8 +604,7 @@ fn tcp_concurrent_replicate_and_client() {
 
     // Client thread: spend records 0..10 via regular TCP
     let client_handle = std::thread::spawn(move || {
-        let mut stream =
-            TcpStream::connect(format!("127.0.0.1:{replica_port}")).unwrap();
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{replica_port}")).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -640,8 +645,7 @@ fn tcp_concurrent_replicate_and_client() {
     // Replication thread: replicate spend ops for records 10..20
     let replication_handle = std::thread::spawn(move || {
         let addr = format!("127.0.0.1:{replica_port}");
-        let mut transport =
-            TcpReplicaTransport::connect(&addr, Duration::from_secs(5)).unwrap();
+        let mut transport = TcpReplicaTransport::connect(&addr, Duration::from_secs(5)).unwrap();
 
         let mut ops = Vec::new();
         for i in 10..20u32 {
@@ -662,6 +666,7 @@ fn tcp_concurrent_replicate_and_client() {
             first_sequence: 1,
             ops,
             trace_ctx: None,
+            source_node_id: None,
         };
         transport.send_batch(&batch).unwrap();
         let ack = transport.recv_ack(Duration::from_secs(5)).unwrap();
@@ -722,6 +727,7 @@ fn tcp_replica_timeout() {
             master_generation: 0,
         }],
         trace_ctx: None,
+        source_node_id: None,
     };
     transport.send_batch(&batch).unwrap();
 
@@ -846,6 +852,7 @@ fn tcp_consistency_verification() {
         first_sequence: 1,
         ops: ops.clone(),
         trace_ctx: None,
+        source_node_id: None,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch);
     let expected_through = ops.len() as u64;
@@ -904,8 +911,12 @@ fn tcp_consistency_verification() {
         let master_meta = master_engine.read_metadata(&key).unwrap();
         let replica_meta = replica_engine.read_metadata(&key).unwrap();
         assert_eq!(
-            master_meta.flags.contains(teraslab::record::TxFlags::LOCKED),
-            replica_meta.flags.contains(teraslab::record::TxFlags::LOCKED),
+            master_meta
+                .flags
+                .contains(teraslab::record::TxFlags::LOCKED),
+            replica_meta
+                .flags
+                .contains(teraslab::record::TxFlags::LOCKED),
             "locked flag mismatch for record {i}"
         );
     }

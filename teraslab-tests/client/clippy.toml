@@ -1,0 +1,5 @@
+# The teraslab-tests crate is integration-test infrastructure: scenarios under
+# tests/ use eprintln!/println! as their primary reporting channel (visible in
+# CI logs and developer terminals). Library code in src/ does not call those
+# macros, so dropping them from the disallow list here is a no-op for src/.
+disallowed-macros = []

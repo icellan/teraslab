@@ -101,7 +101,9 @@ impl StorageManager {
             StorageTier::Inline => {
                 let cold_offset = record_offset + Self::inline_cold_offset(utxo_count);
                 self.write_aligned(&serialized, cold_offset)?;
-                Ok(ColdDataRef::Inline { cold_size: data_size as u32 })
+                Ok(ColdDataRef::Inline {
+                    cold_size: data_size as u32,
+                })
             }
             StorageTier::SeparateNvme => {
                 let device_offset = self.allocator.lock().allocate(data_size as u64)?;
@@ -123,7 +125,7 @@ impl StorageManager {
     /// Determines the tier from metadata flags and record_size:
     /// - `EXTERNAL` flag set → fetches from blob store
     /// - `record_size > METADATA_SIZE + utxo_count * 69` → inline cold data
-    /// - Otherwise → no cold data (separate NVMe is read via [`read_cold_data_at`])
+    /// - Otherwise → no cold data (separate NVMe is read via [`Self::read_cold_data_at`])
     pub fn read_cold_data(
         &self,
         record_offset: u64,
@@ -136,8 +138,7 @@ impl StorageManager {
         if flags.contains(TxFlags::EXTERNAL) {
             let data = self.blob_store.get(&metadata.tx_id)?;
             match data {
-                Some(bytes) => ColdData::deserialize(&bytes)
-                    .ok_or(StorageError::InvalidColdData),
+                Some(bytes) => ColdData::deserialize(&bytes).ok_or(StorageError::InvalidColdData),
                 None => Ok(ColdData {
                     inputs: vec![],
                     outputs: vec![],
@@ -152,7 +153,11 @@ impl StorageManager {
             let cold_size = cold_end.saturating_sub(cold_offset);
 
             if cold_size == 0 {
-                return Ok(ColdData { inputs: vec![], outputs: vec![], inpoints: vec![] });
+                return Ok(ColdData {
+                    inputs: vec![],
+                    outputs: vec![],
+                    inpoints: vec![],
+                });
             }
 
             let bytes = self.read_aligned(cold_offset, cold_size as usize)?;
@@ -166,7 +171,11 @@ impl StorageManager {
     /// `cold_offset` and `cold_size` fields.
     pub fn read_cold_data_at(&self, device_offset: u64, size: u32) -> Result<ColdData> {
         if size == 0 {
-            return Ok(ColdData { inputs: vec![], outputs: vec![], inpoints: vec![] });
+            return Ok(ColdData {
+                inputs: vec![],
+                outputs: vec![],
+                inpoints: vec![],
+            });
         }
         let bytes = self.read_aligned(device_offset, size as usize)?;
         ColdData::deserialize(&bytes).ok_or(StorageError::InvalidColdData)
@@ -197,7 +206,8 @@ impl StorageManager {
             }
 
             let bytes = self.read_aligned(cold_offset, cold_size as usize)?;
-            writer.write_all(&bytes)
+            writer
+                .write_all(&bytes)
                 .map_err(|e| StorageError::Blob(crate::storage::blobstore::BlobError::Io(e)))?;
             Ok(cold_size)
         }
@@ -327,12 +337,21 @@ mod tests {
         (dev, mgr)
     }
 
-    fn write_test_record(dev: &dyn BlockDevice, offset: u64, utxo_count: u32, flags: TxFlags) -> TxMetadata {
+    fn write_test_record(
+        dev: &dyn BlockDevice,
+        offset: u64,
+        utxo_count: u32,
+        flags: TxFlags,
+    ) -> TxMetadata {
         let mut meta = TxMetadata::new(utxo_count);
         meta.tx_id[0] = 0xAA;
         meta.flags = flags;
         let slots: Vec<UtxoSlot> = (0..utxo_count)
-            .map(|i| { let mut h = [0u8; 32]; h[0] = i as u8; UtxoSlot::new_unspent(h) })
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i as u8;
+                UtxoSlot::new_unspent(h)
+            })
             .collect();
         io::write_full_record(dev, offset, &meta, &slots).unwrap();
         meta
@@ -403,7 +422,9 @@ mod tests {
         io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
 
         // Write cold data
-        let result = mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset).unwrap();
+        let result = mgr
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .unwrap();
         assert!(matches!(result, ColdDataRef::Inline { .. }));
 
         // Read back
@@ -440,12 +461,17 @@ mod tests {
             .collect();
         io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
 
-        let result = mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset).unwrap();
+        let result = mgr
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .unwrap();
         if let ColdDataRef::Inline { cold_size: cs } = result {
             assert_eq!(cs, cold_size as u32);
             // Verify cold data is exactly at the deterministic offset
             let expected_offset = METADATA_SIZE as u64 + utxo_count as u64 * UTXO_SLOT_SIZE as u64;
-            assert_eq!(StorageManager::inline_cold_offset(utxo_count), expected_offset);
+            assert_eq!(
+                StorageManager::inline_cold_offset(utxo_count),
+                expected_offset
+            );
         } else {
             panic!("expected Inline tier");
         }
@@ -467,13 +493,19 @@ mod tests {
         meta.record_size = total as u32;
         meta.tx_id[0] = 0x02;
         let slots: Vec<UtxoSlot> = (0..utxo_count)
-            .map(|i| { let mut h = [0u8; 32]; h[0] = i as u8; UtxoSlot::new_unspent(h) })
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i as u8;
+                UtxoSlot::new_unspent(h)
+            })
             .collect();
         io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
-        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset).unwrap();
+        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .unwrap();
 
         // Simulate a spend (write to slot 2)
-        let mut sd = [0u8; 36]; sd[0] = 0xFF;
+        let mut sd = [0u8; 36];
+        sd[0] = 0xFF;
         let spent = UtxoSlot::new_spent(slots[2].hash, sd);
         io::write_utxo_slot(&*dev, offset, 2, &spent).unwrap();
 
@@ -501,13 +533,16 @@ mod tests {
             .map(|_| UtxoSlot::new_unspent([0; 32]))
             .collect();
         io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
-        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset).unwrap();
+        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .unwrap();
 
         // Simulate setMined (modify metadata only)
         let mut updated_meta = io::read_metadata(&*dev, offset).unwrap();
         updated_meta.block_entry_count = 1;
         updated_meta.block_entries_inline[0] = crate::record::BlockEntry {
-            block_id: 1, block_height: 1000, subtree_idx: 0,
+            block_id: 1,
+            block_height: 1000,
+            subtree_idx: 0,
         };
         updated_meta.unmined_since = 0;
         io::write_metadata(&*dev, offset, &updated_meta).unwrap();
@@ -573,9 +608,14 @@ mod tests {
         io::write_full_record(&*dev, record_offset, &meta, &slots).unwrap();
 
         // Write cold data — should go to separate allocation
-        let result = mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset).unwrap();
+        let result = mgr
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset)
+            .unwrap();
         let (sep_offset, sep_size) = match result {
-            ColdDataRef::SeparateNvme { device_offset, cold_size } => (device_offset, cold_size),
+            ColdDataRef::SeparateNvme {
+                device_offset,
+                cold_size,
+            } => (device_offset, cold_size),
             other => panic!("expected SeparateNvme, got {other:?}"),
         };
 
@@ -622,14 +662,20 @@ mod tests {
             .collect();
         io::write_full_record(&*dev, record_offset, &meta, &slots).unwrap();
 
-        let result = mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset).unwrap();
+        let result = mgr
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset)
+            .unwrap();
         let (sep_offset, sep_size) = match result {
-            ColdDataRef::SeparateNvme { device_offset, cold_size } => (device_offset, cold_size),
+            ColdDataRef::SeparateNvme {
+                device_offset,
+                cold_size,
+            } => (device_offset, cold_size),
             other => panic!("expected SeparateNvme, got {other:?}"),
         };
 
         // Delete both hot record and separate cold allocation
-        mgr.delete_cold_data(&meta, Some((sep_offset, sep_size))).unwrap();
+        mgr.delete_cold_data(&meta, Some((sep_offset, sep_size)))
+            .unwrap();
         mgr.allocator.lock().free(record_offset, hot_size).unwrap();
 
         // Both allocations should be reusable
@@ -670,7 +716,9 @@ mod tests {
             outputs: vec![],
             inpoints: vec![],
         };
-        let result = mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset).unwrap();
+        let result = mgr
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset)
+            .unwrap();
         assert!(matches!(result, ColdDataRef::SeparateNvme { .. }));
 
         // Hot record should still be readable
@@ -706,7 +754,8 @@ mod tests {
             outputs: vec![],
             inpoints: vec![],
         };
-        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset).unwrap();
+        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset)
+            .unwrap();
 
         // UTXO should still be readable
         let slot_after = io::read_utxo_slot(&*dev, record_offset, 0).unwrap();
@@ -731,7 +780,9 @@ mod tests {
             inpoints: vec![],
         };
 
-        let result = mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset).unwrap();
+        let result = mgr
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .unwrap();
         assert_eq!(result, ColdDataRef::External);
 
         // Read back via blob store
@@ -773,7 +824,9 @@ mod tests {
             inpoints: vec![0x33; 500],
         };
 
-        let result = mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset).unwrap();
+        let result = mgr
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .unwrap();
         assert_eq!(result, ColdDataRef::External);
 
         // Verify blob exists in store
@@ -817,10 +870,13 @@ mod tests {
             outputs: vec![0xBB; 1000],
             inpoints: vec![],
         };
-        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset).unwrap();
+        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .unwrap();
 
         let mut output = Vec::new();
-        let bytes = mgr.stream_cold_data(offset, utxo_count, &meta, &mut output).unwrap();
+        let bytes = mgr
+            .stream_cold_data(offset, utxo_count, &meta, &mut output)
+            .unwrap();
         assert!(bytes > 0);
         // The streamed data should be the serialized cold data
         let deserialized = ColdData::deserialize(&output).unwrap();
@@ -845,7 +901,11 @@ mod tests {
     #[test]
     fn empty_cold_data() {
         let (_dev, mgr) = setup();
-        let cold = ColdData { inputs: vec![], outputs: vec![], inpoints: vec![] };
+        let cold = ColdData {
+            inputs: vec![],
+            outputs: vec![],
+            inpoints: vec![],
+        };
         let result = mgr.write_cold_data(&[0; 32], &cold, 1, 0).unwrap();
         assert_eq!(result, ColdDataRef::None);
     }
@@ -867,7 +927,8 @@ mod tests {
         meta.tx_id[0] = 0x99;
         let slots = vec![UtxoSlot::new_unspent([0; 32]); utxo_count as usize];
         io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
-        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset).unwrap();
+        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .unwrap();
 
         let inputs = mgr.read_inputs(offset, utxo_count, &meta).unwrap();
         assert_eq!(inputs, Some(vec![0x01, 0x02, 0x03]));
@@ -901,7 +962,8 @@ mod tests {
         meta.record_size = total as u32;
         let slots = vec![UtxoSlot::new_unspent([0; 32]); utxo_count as usize];
         io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
-        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset).unwrap();
+        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .unwrap();
 
         let output = mgr.read_output_at(offset, utxo_count, &meta, 0).unwrap();
         assert_eq!(output, Some(vec![0xA1, 0xA2, 0xA3]));
@@ -935,10 +997,13 @@ mod tests {
         meta.record_size = total as u32;
         let slots = vec![UtxoSlot::new_unspent([0; 32]); utxo_count as usize];
         io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
-        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset).unwrap();
+        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .unwrap();
 
         let mut output = Vec::new();
-        let bytes = mgr.stream_cold_data(offset, utxo_count, &meta, &mut output).unwrap();
+        let bytes = mgr
+            .stream_cold_data(offset, utxo_count, &meta, &mut output)
+            .unwrap();
         assert_eq!(bytes, cold.serialized_size() as u64);
         let deserialized = ColdData::deserialize(&output).unwrap();
         assert_eq!(deserialized, cold);
@@ -957,14 +1022,17 @@ mod tests {
             inpoints: vec![0x03; 28], // 80+80+28+12 = 200 bytes serialized
         };
         let small_utxo = 2u32;
-        let small_total = TxMetadata::record_size_for(small_utxo) + small_cold.serialized_size() as u64;
+        let small_total =
+            TxMetadata::record_size_for(small_utxo) + small_cold.serialized_size() as u64;
         let small_offset = mgr.allocator.lock().allocate(small_total).unwrap();
         let mut small_meta = TxMetadata::new(small_utxo);
         small_meta.record_size = small_total as u32;
         small_meta.tx_id[0] = 0x01;
         let slots = vec![UtxoSlot::new_unspent([0; 32]); small_utxo as usize];
         io::write_full_record(&*dev, small_offset, &small_meta, &slots).unwrap();
-        let small_ref = mgr.write_cold_data(&small_meta.tx_id, &small_cold, small_utxo, small_offset).unwrap();
+        let small_ref = mgr
+            .write_cold_data(&small_meta.tx_id, &small_cold, small_utxo, small_offset)
+            .unwrap();
         assert!(matches!(small_ref, ColdDataRef::Inline { .. }));
 
         // Medium tx (50 KiB) → SeparateNvme
@@ -981,9 +1049,14 @@ mod tests {
         med_meta.tx_id[0] = 0x02;
         let slots = vec![UtxoSlot::new_unspent([0; 32]); med_utxo as usize];
         io::write_full_record(&*dev, med_offset, &med_meta, &slots).unwrap();
-        let med_result = mgr.write_cold_data(&med_meta.tx_id, &med_cold, med_utxo, med_offset).unwrap();
+        let med_result = mgr
+            .write_cold_data(&med_meta.tx_id, &med_cold, med_utxo, med_offset)
+            .unwrap();
         let (med_sep_off, med_sep_sz) = match med_result {
-            ColdDataRef::SeparateNvme { device_offset, cold_size } => (device_offset, cold_size),
+            ColdDataRef::SeparateNvme {
+                device_offset,
+                cold_size,
+            } => (device_offset, cold_size),
             other => panic!("expected SeparateNvme for medium tx, got {other:?}"),
         };
 
@@ -1002,17 +1075,23 @@ mod tests {
         large_meta.flags = TxFlags::EXTERNAL;
         let slots = vec![UtxoSlot::new_unspent([0; 32]); large_utxo as usize];
         io::write_full_record(&*dev, large_offset, &large_meta, &slots).unwrap();
-        let large_result = mgr.write_cold_data(&large_meta.tx_id, &large_cold, large_utxo, large_offset).unwrap();
+        let large_result = mgr
+            .write_cold_data(&large_meta.tx_id, &large_cold, large_utxo, large_offset)
+            .unwrap();
         assert_eq!(large_result, ColdDataRef::External);
 
         // Verify all data retrievable
-        let read_small = mgr.read_cold_data(small_offset, small_utxo, &small_meta).unwrap();
+        let read_small = mgr
+            .read_cold_data(small_offset, small_utxo, &small_meta)
+            .unwrap();
         assert_eq!(read_small, small_cold);
 
         let read_med = mgr.read_cold_data_at(med_sep_off, med_sep_sz).unwrap();
         assert_eq!(read_med, med_cold);
 
-        let read_large = mgr.read_cold_data(large_offset, large_utxo, &large_meta).unwrap();
+        let read_large = mgr
+            .read_cold_data(large_offset, large_utxo, &large_meta)
+            .unwrap();
         assert_eq!(read_large, large_cold);
     }
 
@@ -1021,7 +1100,11 @@ mod tests {
         let (dev, mgr) = setup();
 
         // Inline
-        let cold1 = ColdData { inputs: vec![1; 100], outputs: vec![], inpoints: vec![] };
+        let cold1 = ColdData {
+            inputs: vec![1; 100],
+            outputs: vec![],
+            inpoints: vec![],
+        };
         let total1 = TxMetadata::record_size_for(1) + cold1.serialized_size() as u64;
         let off1 = mgr.allocator.lock().allocate(total1).unwrap();
         let mut meta1 = TxMetadata::new(1);
@@ -1031,7 +1114,11 @@ mod tests {
         mgr.write_cold_data(&meta1.tx_id, &cold1, 1, off1).unwrap();
 
         // Separate NVMe
-        let cold2 = ColdData { inputs: vec![2; 20 * 1024], outputs: vec![], inpoints: vec![] };
+        let cold2 = ColdData {
+            inputs: vec![2; 20 * 1024],
+            outputs: vec![],
+            inpoints: vec![],
+        };
         let hot2 = TxMetadata::record_size_for(1);
         let off2 = mgr.allocator.lock().allocate(hot2).unwrap();
         let mut meta2 = TxMetadata::new(1);
@@ -1040,12 +1127,19 @@ mod tests {
         io::write_full_record(&*dev, off2, &meta2, &[UtxoSlot::new_unspent([0; 32])]).unwrap();
         let sep = mgr.write_cold_data(&meta2.tx_id, &cold2, 1, off2).unwrap();
         let (sep_off, sep_sz) = match sep {
-            ColdDataRef::SeparateNvme { device_offset, cold_size } => (device_offset, cold_size),
+            ColdDataRef::SeparateNvme {
+                device_offset,
+                cold_size,
+            } => (device_offset, cold_size),
             other => panic!("expected SeparateNvme, got {other:?}"),
         };
 
         // External
-        let cold3 = ColdData { inputs: vec![3; 2 * 1024 * 1024], outputs: vec![], inpoints: vec![] };
+        let cold3 = ColdData {
+            inputs: vec![3; 2 * 1024 * 1024],
+            outputs: vec![],
+            inpoints: vec![],
+        };
         let hot3 = TxMetadata::record_size_for(1);
         let off3 = mgr.allocator.lock().allocate(hot3).unwrap();
         let mut meta3 = TxMetadata::new(1);
@@ -1059,7 +1153,8 @@ mod tests {
         mgr.delete_cold_data(&meta1, None).unwrap(); // inline: no-op
         mgr.allocator.lock().free(off1, total1).unwrap();
 
-        mgr.delete_cold_data(&meta2, Some((sep_off, sep_sz))).unwrap(); // separate: frees allocation
+        mgr.delete_cold_data(&meta2, Some((sep_off, sep_sz)))
+            .unwrap(); // separate: frees allocation
         mgr.allocator.lock().free(off2, hot2).unwrap();
 
         mgr.delete_cold_data(&meta3, None).unwrap(); // external: deletes blob
@@ -1107,7 +1202,10 @@ mod tests {
             io::write_full_record(&*dev, offset, &meta, &[UtxoSlot::new_unspent([0; 32])]).unwrap();
             let result = mgr.write_cold_data(&meta.tx_id, &cold, 1, offset).unwrap();
             let (sep_off, sep_sz) = match result {
-                ColdDataRef::SeparateNvme { device_offset, cold_size } => (device_offset, cold_size),
+                ColdDataRef::SeparateNvme {
+                    device_offset,
+                    cold_size,
+                } => (device_offset, cold_size),
                 other => panic!("expected SeparateNvme, got {other:?}"),
             };
             let read = mgr.read_cold_data_at(sep_off, sep_sz).unwrap();
@@ -1155,10 +1253,12 @@ mod tests {
                 .map(|_| UtxoSlot::new_unspent([0; 32]))
                 .collect();
             io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
-            mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset).unwrap();
+            mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+                .unwrap();
 
             // Verify the cold data offset matches the formula
-            let expected_cold_offset = METADATA_SIZE as u64 + utxo_count as u64 * UTXO_SLOT_SIZE as u64;
+            let expected_cold_offset =
+                METADATA_SIZE as u64 + utxo_count as u64 * UTXO_SLOT_SIZE as u64;
             assert_eq!(
                 StorageManager::inline_cold_offset(utxo_count),
                 expected_cold_offset,

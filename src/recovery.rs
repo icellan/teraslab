@@ -18,7 +18,9 @@
 
 use crate::allocator::SlotAllocator;
 use crate::device::BlockDevice;
-use crate::index::{DahBackend, DahRedoEntry, PrimaryBackend, TxIndexEntry, TxKey, UnminedBackend, UnminedRedoEntry};
+use crate::index::{
+    DahBackend, DahRedoEntry, PrimaryBackend, TxIndexEntry, TxKey, UnminedBackend, UnminedRedoEntry,
+};
 use crate::io;
 use crate::record::*;
 use crate::redo::{RedoEntry, RedoLog, RedoOp};
@@ -131,12 +133,16 @@ pub fn recover_all_with_allocator(
 
     for entry in &entries {
         let outcome = match &entry.op {
-            RedoOp::SecondaryUnminedUpdate { tx_key, old_height, new_height } => {
-                replay_secondary_unmined(index, unmined, tx_key, *old_height, *new_height)
-            }
-            RedoOp::SecondaryDahUpdate { tx_key, old_height, new_height } => {
-                replay_secondary_dah(index, dah, tx_key, *old_height, *new_height)
-            }
+            RedoOp::SecondaryUnminedUpdate {
+                tx_key,
+                old_height,
+                new_height,
+            } => replay_secondary_unmined(index, unmined, tx_key, *old_height, *new_height),
+            RedoOp::SecondaryDahUpdate {
+                tx_key,
+                old_height,
+                new_height,
+            } => replay_secondary_dah(index, dah, tx_key, *old_height, *new_height),
             RedoOp::AllocateRegion { .. } | RedoOp::FreeRegion { .. } => {
                 match allocator.as_deref_mut() {
                     Some(alloc) => {
@@ -149,7 +155,10 @@ pub fn recover_all_with_allocator(
                     None => ReplayResult::Skipped,
                 }
             }
-            RedoOp::HashtableResizeBegin { tmp_path_bytes, new_capacity } => {
+            RedoOp::HashtableResizeBegin {
+                tmp_path_bytes,
+                new_capacity,
+            } => {
                 pending_resizes.insert(*new_capacity, tmp_path_bytes.clone());
                 ReplayResult::Applied
             }
@@ -270,8 +279,8 @@ fn replay_secondary_dah(
     // Extract the primary's current delete_at_height from the cached fields.
     // The `HAS_PRESERVE_UNTIL` flag determines whether dah_or_preserve holds
     // the DAH or a preserve_until value; if the former, the DAH is 0.
-    let has_preserve = TxFlags::from_bits_truncate(ie.tx_flags)
-        .contains(TxFlags::HAS_PRESERVE_UNTIL);
+    let has_preserve =
+        TxFlags::from_bits_truncate(ie.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL);
     let primary_dah = if has_preserve { 0 } else { ie.dah_or_preserve };
     if primary_dah != new_height {
         return ReplayResult::Skipped;
@@ -311,27 +320,47 @@ fn replay_entry(
     entry: &RedoEntry,
 ) -> ReplayResult {
     match &entry.op {
-        RedoOp::Spend { tx_key, offset, spending_data, new_spent_count } => {
-            replay_spend(device, index, tx_key, *offset, spending_data, *new_spent_count)
-        }
-        RedoOp::Unspend { tx_key, offset, new_spent_count } => {
-            replay_unspend(device, index, tx_key, *offset, *new_spent_count)
-        }
-        RedoOp::SetMined { tx_key, block_id, block_height, subtree_idx, unset } => {
-            replay_set_mined(device, index, tx_key, *block_id, *block_height, *subtree_idx, *unset)
-        }
-        RedoOp::Freeze { tx_key, offset } => {
-            replay_freeze(device, index, tx_key, *offset)
-        }
-        RedoOp::Unfreeze { tx_key, offset } => {
-            replay_unfreeze(device, index, tx_key, *offset)
-        }
-        RedoOp::Create { tx_key, record_offset, utxo_count } => {
-            replay_create(index, tx_key, *record_offset, *utxo_count)
-        }
-        RedoOp::Delete { tx_key, .. } => {
-            replay_delete(index, tx_key)
-        }
+        RedoOp::Spend {
+            tx_key,
+            offset,
+            spending_data,
+            new_spent_count,
+        } => replay_spend(
+            device,
+            index,
+            tx_key,
+            *offset,
+            spending_data,
+            *new_spent_count,
+        ),
+        RedoOp::Unspend {
+            tx_key,
+            offset,
+            new_spent_count,
+        } => replay_unspend(device, index, tx_key, *offset, *new_spent_count),
+        RedoOp::SetMined {
+            tx_key,
+            block_id,
+            block_height,
+            subtree_idx,
+            unset,
+        } => replay_set_mined(
+            device,
+            index,
+            tx_key,
+            *block_id,
+            *block_height,
+            *subtree_idx,
+            *unset,
+        ),
+        RedoOp::Freeze { tx_key, offset } => replay_freeze(device, index, tx_key, *offset),
+        RedoOp::Unfreeze { tx_key, offset } => replay_unfreeze(device, index, tx_key, *offset),
+        RedoOp::Create {
+            tx_key,
+            record_offset,
+            utxo_count,
+        } => replay_create(index, tx_key, *record_offset, *utxo_count),
+        RedoOp::Delete { tx_key, .. } => replay_delete(index, tx_key),
         RedoOp::Checkpoint => ReplayResult::Skipped,
         // SecondaryUnminedUpdate / SecondaryDahUpdate are durability-intent
         // records for redb secondary indexes — the primary index has no
@@ -343,9 +372,7 @@ fn replay_entry(
         // AllocateRegion / FreeRegion are allocator-scoped records. The
         // single-backend `recover` path has no allocator handle — skip
         // here and rely on `recover_all_with_allocator` to process them.
-        RedoOp::AllocateRegion { .. } | RedoOp::FreeRegion { .. } => {
-            ReplayResult::Skipped
-        }
+        RedoOp::AllocateRegion { .. } | RedoOp::FreeRegion { .. } => ReplayResult::Skipped,
         // HashtableResizeBegin / HashtableResizeCommit are file-backed
         // index durability records handled by `recover_all_with_allocator`
         // (which tracks the pending-resize set and cleans up orphan tmp
@@ -464,7 +491,9 @@ fn replay_set_mined(
                     meta.block_entries_inline[i] = meta.block_entries_inline[inline - 1];
                 }
                 meta.block_entries_inline[inline - 1] = BlockEntry {
-                    block_id: 0, block_height: 0, subtree_idx: 0,
+                    block_id: 0,
+                    block_height: 0,
+                    subtree_idx: 0,
                 };
                 meta.block_entry_count -= 1;
                 found = true;
@@ -482,7 +511,11 @@ fn replay_set_mined(
             }
         }
         if count < INLINE_BLOCK_ENTRIES {
-            meta.block_entries_inline[count] = BlockEntry { block_id, block_height, subtree_idx };
+            meta.block_entries_inline[count] = BlockEntry {
+                block_id,
+                block_height,
+                subtree_idx,
+            };
             meta.block_entry_count += 1;
         }
     }
@@ -573,10 +606,7 @@ fn replay_create(
     }
 }
 
-fn replay_delete(
-    index: &mut PrimaryBackend,
-    tx_key: &TxKey,
-) -> ReplayResult {
+fn replay_delete(index: &mut PrimaryBackend, tx_key: &TxKey) -> ReplayResult {
     match index.unregister(tx_key) {
         Some(_) => ReplayResult::Applied,
         None => ReplayResult::Skipped,
@@ -589,7 +619,13 @@ fn replay_metadata_op(
     entry: &RedoEntry,
 ) -> ReplayResult {
     match &entry.op {
-        RedoOp::Reassign { tx_key, offset, new_hash, block_height, spendable_after } => {
+        RedoOp::Reassign {
+            tx_key,
+            offset,
+            new_hash,
+            block_height,
+            spendable_after,
+        } => {
             let ie = match index.lookup(tx_key) {
                 Some(e) => e,
                 None => return ReplayResult::Failed,
@@ -674,7 +710,10 @@ fn replay_metadata_op(
             let _ = io::write_metadata(device, ie.record_offset, &meta);
             ReplayResult::Applied
         }
-        RedoOp::PreserveUntil { tx_key, block_height } => {
+        RedoOp::PreserveUntil {
+            tx_key,
+            block_height,
+        } => {
             let ie = match index.lookup(tx_key) {
                 Some(e) => e,
                 None => return ReplayResult::Failed,
@@ -691,7 +730,13 @@ fn replay_metadata_op(
             let _ = io::write_metadata(device, ie.record_offset, &meta);
             ReplayResult::Applied
         }
-        RedoOp::MarkOnLongestChain { tx_key, on_longest_chain, current_block_height, generation, .. } => {
+        RedoOp::MarkOnLongestChain {
+            tx_key,
+            on_longest_chain,
+            current_block_height,
+            generation,
+            ..
+        } => {
             let ie = match index.lookup(tx_key) {
                 Some(e) => e,
                 None => return ReplayResult::Failed,
@@ -718,8 +763,11 @@ fn replay_metadata_op(
             // prior unmined-since check so idempotency is still enforced.
             let target_generation = *generation;
             let current_generation = { meta.generation };
-            let target_unmined =
-                if *on_longest_chain { 0 } else { *current_block_height };
+            let target_unmined = if *on_longest_chain {
+                0
+            } else {
+                *current_block_height
+            };
             if target_generation == 0 {
                 // No generation supplied — fall back to value-equality
                 // idempotency on unmined_since alone.
@@ -767,7 +815,12 @@ mod tests {
             let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
             let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
             let index = PrimaryBackend::new_in_memory(1000).unwrap();
-            Self { data_dev, redo_dev, index, alloc }
+            Self {
+                data_dev,
+                redo_dev,
+                index,
+                alloc,
+            }
         }
 
         fn create_record(&mut self, n: u8, utxo_count: u32) -> TxKey {
@@ -791,12 +844,22 @@ mod tests {
 
             io::write_full_record(&*self.data_dev, offset, &meta, &slots).unwrap();
 
-            self.index.register(key, TxIndexEntry {
-                device_id: 0, record_offset: offset, utxo_count,
-                block_entry_count: 0, tx_flags: 0,
-                spent_utxos: 0, dah_or_preserve: 0, unmined_since: 0,
-                generation: 0,
-            }).unwrap();
+            self.index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: offset,
+                        utxo_count,
+                        block_entry_count: 0,
+                        tx_flags: 0,
+                        spent_utxos: 0,
+                        dah_or_preserve: 0,
+                        unmined_since: 0,
+                        generation: 0,
+                    },
+                )
+                .unwrap();
 
             key
         }
@@ -819,7 +882,8 @@ mod tests {
             offset: 0,
             spending_data: [0xAB; 36],
             new_spent_count: 1,
-        }).unwrap();
+        })
+        .unwrap();
 
         // Slot is still unspent (crash prevented the data write)
         let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
@@ -849,7 +913,8 @@ mod tests {
             block_height: 1000,
             subtree_idx: 7,
             unset: false,
-        }).unwrap();
+        })
+        .unwrap();
 
         // Block entry not yet written
         let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
@@ -882,7 +947,8 @@ mod tests {
             offset: 0,
             spending_data: [0xAB; 36],
             new_spent_count: 1,
-        }).unwrap();
+        })
+        .unwrap();
 
         // Recovery sees it's already applied
         let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
@@ -898,11 +964,19 @@ mod tests {
         let mut redo = h.redo_log();
         // Log the same spend twice
         redo.append_and_flush(RedoOp::Spend {
-            tx_key: key, offset: 0, spending_data: [0xAB; 36], new_spent_count: 1,
-        }).unwrap();
+            tx_key: key,
+            offset: 0,
+            spending_data: [0xAB; 36],
+            new_spent_count: 1,
+        })
+        .unwrap();
         redo.append_and_flush(RedoOp::Spend {
-            tx_key: key, offset: 0, spending_data: [0xAB; 36], new_spent_count: 1,
-        }).unwrap();
+            tx_key: key,
+            offset: 0,
+            spending_data: [0xAB; 36],
+            new_spent_count: 1,
+        })
+        .unwrap();
 
         let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
         // First is applied, second is skipped (idempotent)
@@ -921,11 +995,21 @@ mod tests {
 
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::SetMined {
-            tx_key: key, block_id: 10, block_height: 100, subtree_idx: 0, unset: false,
-        }).unwrap();
+            tx_key: key,
+            block_id: 10,
+            block_height: 100,
+            subtree_idx: 0,
+            unset: false,
+        })
+        .unwrap();
         redo.append_and_flush(RedoOp::SetMined {
-            tx_key: key, block_id: 10, block_height: 100, subtree_idx: 0, unset: false,
-        }).unwrap();
+            tx_key: key,
+            block_id: 10,
+            block_height: 100,
+            subtree_idx: 0,
+            unset: false,
+        })
+        .unwrap();
 
         let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
@@ -944,8 +1028,11 @@ mod tests {
 
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::Create {
-            tx_key: key, record_offset: ie.record_offset, utxo_count: 5,
-        }).unwrap();
+            tx_key: key,
+            record_offset: ie.record_offset,
+            utxo_count: 5,
+        })
+        .unwrap();
 
         let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
         assert_eq!(stats.entries_skipped, 1); // Already in index
@@ -957,8 +1044,16 @@ mod tests {
         let key = h.create_record(7, 5);
 
         let mut redo = h.redo_log();
-        redo.append_and_flush(RedoOp::Freeze { tx_key: key, offset: 0 }).unwrap();
-        redo.append_and_flush(RedoOp::Freeze { tx_key: key, offset: 0 }).unwrap();
+        redo.append_and_flush(RedoOp::Freeze {
+            tx_key: key,
+            offset: 0,
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::Freeze {
+            tx_key: key,
+            offset: 0,
+        })
+        .unwrap();
 
         let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
@@ -982,7 +1077,8 @@ mod tests {
                     sd
                 },
                 new_spent_count: i + 1,
-            }).unwrap();
+            })
+            .unwrap();
         }
         redo.flush().unwrap();
 
@@ -1005,8 +1101,12 @@ mod tests {
 
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::Spend {
-            tx_key: key, offset: 0, spending_data: [0xAA; 36], new_spent_count: 1,
-        }).unwrap();
+            tx_key: key,
+            offset: 0,
+            spending_data: [0xAA; 36],
+            new_spent_count: 1,
+        })
+        .unwrap();
 
         recover(&*h.data_dev, &redo, &mut h.index).unwrap();
 
@@ -1025,8 +1125,11 @@ mod tests {
 
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::Delete {
-            tx_key: key, record_offset: ie.record_offset, record_size: 1024,
-        }).unwrap();
+            tx_key: key,
+            record_offset: ie.record_offset,
+            record_size: 1024,
+        })
+        .unwrap();
 
         // Index entry still exists (crash before index removal)
         assert!(h.index.lookup(&key).is_some());
@@ -1043,8 +1146,11 @@ mod tests {
 
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::Unspend {
-            tx_key: key, offset: 0, new_spent_count: 0,
-        }).unwrap();
+            tx_key: key,
+            offset: 0,
+            new_spent_count: 0,
+        })
+        .unwrap();
 
         // Slot is already unspent
         let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
@@ -1360,10 +1466,17 @@ mod tests {
         // Set primary index's cached unmined_since to 500 to simulate what
         // the engine would have done (WAL-first MarkOnLongestChain replay).
         let ie = h.index.lookup(&key).unwrap();
-        h.index.update_cached_fields(
-            &key, ie.tx_flags, ie.block_entry_count, ie.spent_utxos,
-            ie.dah_or_preserve, 500, ie.generation,
-        ).unwrap();
+        h.index
+            .update_cached_fields(
+                &key,
+                ie.tx_flags,
+                ie.block_entry_count,
+                ie.spent_utxos,
+                ie.dah_or_preserve,
+                500,
+                ie.generation,
+            )
+            .unwrap();
 
         // Redo log: the intent record (as if fsynced) but redb commit skipped.
         let mut redo = h.redo_log();
@@ -1371,13 +1484,21 @@ mod tests {
             tx_key: key,
             old_height: 0,
             new_height: 500,
-        }).unwrap();
+        })
+        .unwrap();
 
         let mut dah_backend = DahBackend::new_in_memory();
         let mut unmined_backend = UnminedBackend::new_in_memory();
         // Secondary is currently EMPTY — stale relative to primary (500).
 
-        let stats = recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah_backend, &mut unmined_backend).unwrap();
+        let stats = recover_all(
+            &*h.data_dev,
+            &redo,
+            &mut h.index,
+            &mut dah_backend,
+            &mut unmined_backend,
+        )
+        .unwrap();
         assert_eq!(stats.entries_replayed, 1);
 
         // Secondary index should now contain the entry.
@@ -1404,12 +1525,20 @@ mod tests {
             tx_key: key,
             old_height: 0,
             new_height: 500,
-        }).unwrap();
+        })
+        .unwrap();
 
         let mut dah_backend = DahBackend::new_in_memory();
         let mut unmined_backend = UnminedBackend::new_in_memory();
 
-        let stats = recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah_backend, &mut unmined_backend).unwrap();
+        let stats = recover_all(
+            &*h.data_dev,
+            &redo,
+            &mut h.index,
+            &mut dah_backend,
+            &mut unmined_backend,
+        )
+        .unwrap();
         // The redo entry is stale — skipped.
         assert_eq!(stats.entries_skipped, 1);
         assert!(unmined_backend.is_empty());
@@ -1422,24 +1551,39 @@ mod tests {
         let key = h.create_record(32, 5);
 
         let ie = h.index.lookup(&key).unwrap();
-        h.index.update_cached_fields(
-            &key, ie.tx_flags, ie.block_entry_count, ie.spent_utxos,
-            ie.dah_or_preserve, 500, ie.generation,
-        ).unwrap();
+        h.index
+            .update_cached_fields(
+                &key,
+                ie.tx_flags,
+                ie.block_entry_count,
+                ie.spent_utxos,
+                ie.dah_or_preserve,
+                500,
+                ie.generation,
+            )
+            .unwrap();
 
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::SecondaryUnminedUpdate {
             tx_key: key,
             old_height: 0,
             new_height: 500,
-        }).unwrap();
+        })
+        .unwrap();
 
         let mut dah_backend = DahBackend::new_in_memory();
         let mut unmined_backend = UnminedBackend::new_in_memory();
         // Pre-populate secondary — matches primary already.
         unmined_backend.insert(500, key, None).unwrap();
 
-        let stats = recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah_backend, &mut unmined_backend).unwrap();
+        let stats = recover_all(
+            &*h.data_dev,
+            &redo,
+            &mut h.index,
+            &mut dah_backend,
+            &mut unmined_backend,
+        )
+        .unwrap();
         // Idempotent replay — backend reports it as Applied (no-op commit).
         // Per our replay_redo contract, the redb backend no-ops on same-state
         // so ReplayResult::Applied here means the replay path returned Ok
@@ -1457,22 +1601,37 @@ mod tests {
         let ie = h.index.lookup(&key).unwrap();
         // Ensure HAS_PRESERVE_UNTIL is cleared so dah_or_preserve == DAH.
         let tf = TxFlags::from_bits_truncate(ie.tx_flags) - TxFlags::HAS_PRESERVE_UNTIL;
-        h.index.update_cached_fields(
-            &key, tf.bits(), ie.block_entry_count, ie.spent_utxos,
-            900, ie.unmined_since, ie.generation,
-        ).unwrap();
+        h.index
+            .update_cached_fields(
+                &key,
+                tf.bits(),
+                ie.block_entry_count,
+                ie.spent_utxos,
+                900,
+                ie.unmined_since,
+                ie.generation,
+            )
+            .unwrap();
 
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::SecondaryDahUpdate {
             tx_key: key,
             old_height: 0,
             new_height: 900,
-        }).unwrap();
+        })
+        .unwrap();
 
         let mut dah_backend = DahBackend::new_in_memory();
         let mut unmined_backend = UnminedBackend::new_in_memory();
 
-        let stats = recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah_backend, &mut unmined_backend).unwrap();
+        let stats = recover_all(
+            &*h.data_dev,
+            &redo,
+            &mut h.index,
+            &mut dah_backend,
+            &mut unmined_backend,
+        )
+        .unwrap();
         assert_eq!(stats.entries_replayed, 1);
 
         let result = dah_backend.range_query(900);
@@ -1495,12 +1654,20 @@ mod tests {
             tx_key: key,
             old_height: 0,
             new_height: 500,
-        }).unwrap();
+        })
+        .unwrap();
 
         let mut dah_backend = DahBackend::new_in_memory();
         let mut unmined_backend = UnminedBackend::new_in_memory();
 
-        let stats = recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah_backend, &mut unmined_backend).unwrap();
+        let stats = recover_all(
+            &*h.data_dev,
+            &redo,
+            &mut h.index,
+            &mut dah_backend,
+            &mut unmined_backend,
+        )
+        .unwrap();
         // Skipped — primary has no entry for this key.
         assert_eq!(stats.entries_skipped, 1);
         assert!(unmined_backend.is_empty());
@@ -1528,7 +1695,8 @@ mod tests {
             offset,
             size: 8192,
             device_id: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
         // Rebuild the allocator from snapshot.
         let mut recovered = SlotAllocator::recover(h.data_dev.clone()).unwrap();
@@ -1537,13 +1705,21 @@ mod tests {
         let mut dah = DahBackend::new_in_memory();
         let mut unmined = UnminedBackend::new_in_memory();
         let stats = recover_all_with_allocator(
-            &*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined,
+            &*h.data_dev,
+            &redo,
+            &mut h.index,
+            &mut dah,
+            &mut unmined,
             Some(&mut recovered),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(stats.entries_replayed, 1, "the free entry must be replayed");
-        assert_eq!(recovered.free_region_count(), 1,
-            "replayed free must appear in the rebuilt freelist");
+        assert_eq!(
+            recovered.free_region_count(),
+            1,
+            "replayed free must appear in the rebuilt freelist"
+        );
         // And the region is reusable.
         let reused = recovered.allocate(8192).unwrap();
         assert_eq!(reused, offset);
@@ -1561,7 +1737,8 @@ mod tests {
             offset,
             size: 4096,
             device_id: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
         let mut recovered = SlotAllocator::recover(h.data_dev.clone()).unwrap();
         let before_next = recovered.next_offset();
@@ -1569,9 +1746,14 @@ mod tests {
         let mut dah = DahBackend::new_in_memory();
         let mut unmined = UnminedBackend::new_in_memory();
         recover_all_with_allocator(
-            &*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined,
+            &*h.data_dev,
+            &redo,
+            &mut h.index,
+            &mut dah,
+            &mut unmined,
             Some(&mut recovered),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(
             recovered.next_offset() >= offset + 4096,
@@ -1590,36 +1772,61 @@ mod tests {
         let mut redo = h.redo_log();
         let offset = crate::allocator::DATA_REGION_OFFSET;
         redo.append_and_flush(RedoOp::AllocateRegion {
-            offset, size: 4096, device_id: 0,
-        }).unwrap();
+            offset,
+            size: 4096,
+            device_id: 0,
+        })
+        .unwrap();
         redo.append_and_flush(RedoOp::AllocateRegion {
-            offset: offset + 4096, size: 8192, device_id: 0,
-        }).unwrap();
+            offset: offset + 4096,
+            size: 8192,
+            device_id: 0,
+        })
+        .unwrap();
         redo.append_and_flush(RedoOp::FreeRegion {
-            offset, size: 4096, device_id: 0,
-        }).unwrap();
+            offset,
+            size: 4096,
+            device_id: 0,
+        })
+        .unwrap();
 
         let mut dah = DahBackend::new_in_memory();
         let mut unmined = UnminedBackend::new_in_memory();
 
         let mut once = SlotAllocator::recover(h.data_dev.clone()).unwrap();
         recover_all_with_allocator(
-            &*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined,
+            &*h.data_dev,
+            &redo,
+            &mut h.index,
+            &mut dah,
+            &mut unmined,
             Some(&mut once),
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut twice = SlotAllocator::recover(h.data_dev.clone()).unwrap();
         for _ in 0..2 {
             recover_all_with_allocator(
-                &*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined,
+                &*h.data_dev,
+                &redo,
+                &mut h.index,
+                &mut dah,
+                &mut unmined,
                 Some(&mut twice),
-            ).unwrap();
+            )
+            .unwrap();
         }
 
-        assert_eq!(once.next_offset(), twice.next_offset(),
-            "next_offset must be identical after any number of replays");
-        assert_eq!(once.free_region_count(), twice.free_region_count(),
-            "freelist size must be identical after any number of replays");
+        assert_eq!(
+            once.next_offset(),
+            twice.next_offset(),
+            "next_offset must be identical after any number of replays"
+        );
+        assert_eq!(
+            once.free_region_count(),
+            twice.free_region_count(),
+            "freelist size must be identical after any number of replays"
+        );
     }
 
     #[test]
@@ -1634,10 +1841,17 @@ mod tests {
         // Primary's post-mutation state: both fields set.
         let ie = h.index.lookup(&key).unwrap();
         let tf = TxFlags::from_bits_truncate(ie.tx_flags) - TxFlags::HAS_PRESERVE_UNTIL;
-        h.index.update_cached_fields(
-            &key, tf.bits(), ie.block_entry_count, ie.spent_utxos,
-            900, 500, ie.generation,
-        ).unwrap();
+        h.index
+            .update_cached_fields(
+                &key,
+                tf.bits(),
+                ie.block_entry_count,
+                ie.spent_utxos,
+                900,
+                500,
+                ie.generation,
+            )
+            .unwrap();
 
         let mut redo = h.redo_log();
         // Batched fsync — both ops in one flush, as the engine would do.
@@ -1658,7 +1872,14 @@ mod tests {
         let mut dah_backend = DahBackend::new_in_memory();
         let mut unmined_backend = UnminedBackend::new_in_memory();
 
-        let stats = recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah_backend, &mut unmined_backend).unwrap();
+        let stats = recover_all(
+            &*h.data_dev,
+            &redo,
+            &mut h.index,
+            &mut dah_backend,
+            &mut unmined_backend,
+        )
+        .unwrap();
         assert_eq!(stats.entries_replayed, 2);
 
         assert_eq!(dah_backend.range_query(900).len(), 1);

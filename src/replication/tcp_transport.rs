@@ -31,7 +31,9 @@ pub fn configure_tcp_keepalive(stream: &TcpStream) {
             // Enable keepalive
             let enable: libc::c_int = 1;
             libc::setsockopt(
-                fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE,
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_KEEPALIVE,
                 &enable as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
@@ -40,13 +42,17 @@ pub fn configure_tcp_keepalive(stream: &TcpStream) {
             let idle: libc::c_int = 5;
             #[cfg(target_os = "macos")]
             libc::setsockopt(
-                fd, libc::IPPROTO_TCP, libc::TCP_KEEPALIVE,
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPALIVE,
                 &idle as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
             #[cfg(target_os = "linux")]
             libc::setsockopt(
-                fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPIDLE,
                 &idle as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
@@ -54,7 +60,9 @@ pub fn configure_tcp_keepalive(stream: &TcpStream) {
             // Interval between keepalive probes (seconds)
             let interval: libc::c_int = 1;
             libc::setsockopt(
-                fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL,
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPINTVL,
                 &interval as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
@@ -62,7 +70,9 @@ pub fn configure_tcp_keepalive(stream: &TcpStream) {
             // Number of failed probes before declaring dead
             let count: libc::c_int = 3;
             libc::setsockopt(
-                fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPCNT,
                 &count as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
@@ -227,13 +237,11 @@ impl ReplicaTransport for TcpReplicaTransport {
     fn is_connected(&self) -> bool {
         // Save current timeout, set to very short for the probe
         let orig = self.stream.read_timeout().ok().flatten();
-        let _ = self
-            .stream
-            .set_read_timeout(Some(Duration::from_millis(1)));
+        let _ = self.stream.set_read_timeout(Some(Duration::from_millis(1)));
         let mut probe = [0u8; 1];
         let connected = match self.stream.peek(&mut probe) {
-            Ok(0) => false,             // EOF — peer closed
-            Ok(_) => true,              // Data available
+            Ok(0) => false, // EOF — peer closed
+            Ok(_) => true,  // Data available
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => true,
             Err(_) => false,
@@ -269,6 +277,7 @@ mod tests {
                 master_generation: 0,
             }],
             trace_ctx: None,
+            source_node_id: None,
         };
 
         let batch_clone = batch.clone();
@@ -311,7 +320,12 @@ mod tests {
             TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5)).unwrap();
         transport.send_batch(&batch).unwrap();
         let ack = transport.recv_ack(Duration::from_secs(5)).unwrap();
-        assert_eq!(ack, ReplicaAck::Ok { through_sequence: 1 });
+        assert_eq!(
+            ack,
+            ReplicaAck::Ok {
+                through_sequence: 1
+            }
+        );
 
         handle.join().unwrap();
     }
@@ -329,8 +343,7 @@ mod tests {
             drop(stream);
         });
 
-        let stream =
-            TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
         let mut transport = TcpReplicaTransport::from_stream(stream);
 
         let batch = ReplicaBatch {
@@ -341,6 +354,7 @@ mod tests {
                 master_generation: 0,
             }],
             trace_ctx: None,
+            source_node_id: None,
         };
         transport.send_batch(&batch).unwrap();
 
@@ -361,8 +375,7 @@ mod tests {
             drop(stream);
         });
 
-        let stream =
-            TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
         let transport = TcpReplicaTransport::from_stream(stream);
         assert!(transport.is_connected());
 
@@ -485,10 +498,10 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use tracing::field::{Field, Visit};
         use tracing::span::{Attributes, Id};
+        use tracing_subscriber::Layer;
         use tracing_subscriber::layer::Context;
         use tracing_subscriber::prelude::*;
         use tracing_subscriber::registry::LookupSpan;
-        use tracing_subscriber::Layer;
 
         #[derive(Clone, Debug)]
         struct Captured {
@@ -505,7 +518,8 @@ mod tests {
 
         impl<'a> Visit for FieldVisitor<'a> {
             fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                self.0.insert(field.name().to_string(), format!("{value:?}"));
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
             }
             fn record_str(&mut self, field: &Field, value: &str) {
                 self.0.insert(field.name().to_string(), value.to_string());
@@ -528,13 +542,10 @@ mod tests {
             fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
                 let mut fields = HashMap::new();
                 attrs.record(&mut FieldVisitor(&mut fields));
-                self.spans
-                    .lock()
-                    .expect("capture lock")
-                    .push(Captured {
-                        name: attrs.metadata().name(),
-                        fields,
-                    });
+                self.spans.lock().expect("capture lock").push(Captured {
+                    name: attrs.metadata().name(),
+                    fields,
+                });
             }
         }
 
@@ -574,6 +585,7 @@ mod tests {
                     master_generation: 0,
                 }],
                 trace_ctx: None,
+                source_node_id: None,
             };
             transport.send_batch(&batch).unwrap();
         });

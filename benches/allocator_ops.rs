@@ -3,7 +3,7 @@
 //! Covers allocation throughput, free (with coalescing), and allocation under
 //! fragmented freelist conditions.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::sync::Arc;
 
 use teraslab::allocator::SlotAllocator;
@@ -43,9 +43,7 @@ fn bench_free(c: &mut Criterion) {
     group.bench_function("free_4096", |b| {
         let dev = make_device(512);
         let mut alloc = SlotAllocator::new(dev).unwrap();
-        let mut offsets: Vec<u64> = (0..10_000)
-            .map(|_| alloc.allocate(4096).unwrap())
-            .collect();
+        let mut offsets: Vec<u64> = (0..10_000).map(|_| alloc.allocate(4096).unwrap()).collect();
         let mut idx = 0;
 
         b.iter(|| {
@@ -74,9 +72,7 @@ fn bench_allocate_fragmented(c: &mut Criterion) {
         let dev = make_device(512);
         let mut alloc = SlotAllocator::new(dev).unwrap();
 
-        let offsets: Vec<u64> = (0..20_000)
-            .map(|_| alloc.allocate(4096).unwrap())
-            .collect();
+        let offsets: Vec<u64> = (0..20_000).map(|_| alloc.allocate(4096).unwrap()).collect();
 
         // Free every other slot to create fragmentation.
         for i in (0..20_000).step_by(2) {

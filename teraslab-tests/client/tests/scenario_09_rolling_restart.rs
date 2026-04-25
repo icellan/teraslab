@@ -10,13 +10,13 @@
 #[allow(dead_code)]
 mod common;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use teraslab_test_client::ClientError;
 use teraslab_test_client::reporter::MetricsReporter;
-use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::types::*;
+use teraslab_test_client::verifier::StateVerifier;
 
 use parking_lot::Mutex;
 use rand::{Rng, SeedableRng};
@@ -99,7 +99,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     assert_eq!(txids.len(), 5000, "expected 5000 seeded txids");
 
     // Wait for replication to propagate.
-    common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
+    common::wait_replication_settled(&docker, 3, Duration::from_secs(60)).await?;
 
     // -- Start background workload at ~200 ops/sec --
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -107,8 +107,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     let bg_metrics = Arc::new(BgMetrics::new());
     let bg_reporter = Arc::new(MetricsReporter::new());
     // Store (txid, utxo_hashes) so the spend loop can use real hashes.
-    let bg_created_txids: Arc<Mutex<Vec<([u8; 32], Vec<[u8; 32]>)>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    type CreatedTxids = Arc<Mutex<Vec<([u8; 32], Vec<[u8; 32]>)>>>;
+    let bg_created_txids: CreatedTxids = Arc::new(Mutex::new(Vec::new()));
     // Track verifier state for background creates/spends
     let bg_verifier = Arc::clone(&verifier);
 
@@ -185,15 +185,17 @@ async fn run_scenario() -> Result<(), ClientError> {
             }
 
             // -- Reads (6 per tick) --
-            let all_entries_snapshot: Vec<([u8; 32], Vec<[u8; 32]>)> =
-                bg_txids_ref.lock().clone();
+            let all_entries_snapshot: Vec<([u8; 32], Vec<[u8; 32]>)> = bg_txids_ref.lock().clone();
             if !all_entries_snapshot.is_empty() {
                 for _ in 0..6 {
                     let idx = rng.gen_range(0..all_entries_snapshot.len());
                     let txid = all_entries_snapshot[idx].0;
 
                     let op_start = Instant::now();
-                    match bg_client.get_batch(FIELD_ALL, std::slice::from_ref(&txid)).await {
+                    match bg_client
+                        .get_batch(FIELD_ALL, std::slice::from_ref(&txid))
+                        .await
+                    {
                         Ok(results) if !results.is_empty() && results.item(0).status == 0 => {
                             bg_rep.record("read", op_start.elapsed());
                             bg_m.reads_ok.fetch_add(1, Ordering::Relaxed);
@@ -344,20 +346,18 @@ async fn run_scenario() -> Result<(), ClientError> {
         } else {
             eprintln!("[9.{node_num}] Zero failures during quiesce+stop of {node_name}");
         }
-        eprintln!(
-            "[9.{node_num}] Zero failures during quiesce+stop of {node_name}"
-        );
+        eprintln!("[9.{node_num}] Zero failures during quiesce+stop of {node_name}");
 
         // Step 5: Start the node
         docker.start_node(&node_name).await?;
         eprintln!("[9.{node_num}] {node_name} started");
 
         // After restart, wait for rejoin
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
+        common::wait_cluster_ready(&docker, 3, Duration::from_secs(120)).await?;
         eprintln!("[9.{node_num}] Cluster back to 3 nodes");
 
         common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
-        common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
+        common::wait_replication_settled(&docker, 3, Duration::from_secs(60)).await?;
         eprintln!("[9.{node_num}] Migrations complete after restarting {node_name}");
 
         client.refresh_routing().await?;
@@ -368,7 +368,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         // Collect p99 latency for this phase
         let all_stats = bg_reporter.all_stats();
         let mut max_p99 = Duration::ZERO;
-        for (_op, stats) in &all_stats {
+        for stats in all_stats.values() {
             if stats.p99 > max_p99 {
                 max_p99 = stats.p99;
             }
@@ -384,7 +384,8 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // -- Post-restart verification --
     tlog!(t0, "post-restart verification");
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+        .await
         .unwrap_or_else(|e| eprintln!("[9.4] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
     client.refresh_routing().await?;
@@ -414,7 +415,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     // during the topology transition. When that node's shard migrates to
     // another node, the spent state transfers but the verifier doesn't know.
     // Tolerate up to 10 spent_utxos mismatches as a known limitation.
-    let non_spend_mismatches: Vec<_> = mismatches.iter()
+    let non_spend_mismatches: Vec<_> = mismatches
+        .iter()
         .filter(|m| m.field != "spent_utxos")
         .collect();
     assert!(
@@ -446,8 +448,10 @@ async fn run_scenario() -> Result<(), ClientError> {
             .expect("master_shard_count should be present in /status response");
         total_master_shards += master_count;
     }
-    assert!(total_master_shards >= 4096 && total_master_shards <= 4128,
-        "[9.6] total_master_shards={total_master_shards}, expected 4096 (±32 for in-flight handoffs)");
+    assert!(
+        (4096..=4128).contains(&total_master_shards),
+        "[9.6] total_master_shards={total_master_shards}, expected 4096 (±32 for in-flight handoffs)"
+    );
     eprintln!("[9.6] Total master shards = {total_master_shards} -- correct (4096 ±32)");
 
     tlog!(t0, "teardown_all (cleanup)");

@@ -13,13 +13,13 @@ use std::time::Duration;
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::cluster::coordinator::{ClusterConfig, ClusterCoordinator, RunningCluster};
-use teraslab::cluster::shards::{NodeId, ShardTable, NUM_SHARDS};
+use teraslab::cluster::shards::{NUM_SHARDS, NodeId, ShardTable};
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, MemoryDevice};
 use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
-use teraslab::protocol::codec::{encode_create_batch, WireCreateItem};
+use teraslab::protocol::codec::{WireCreateItem, encode_create_batch};
 use teraslab::protocol::frame::*;
 use teraslab::protocol::opcodes::*;
 use teraslab::server::Server;
@@ -46,11 +46,18 @@ fn reserve_udp_port() -> u16 {
     port
 }
 
+/// Create a `TestNode` with an explicit replication factor.
+///
+/// `rf=1` disables replication (single-copy durability) — useful for tests
+/// that exercise a single-node cluster or that don't need replica handling.
+/// `rf=2` is the production default; pass it for tests that join multiple
+/// nodes and want to exercise the replication path.
 fn create_node(
     node_id: u64,
     tcp_port: u16,
     swim_port: u16,
     seed_swim_ports: &[u16],
+    rf: u8,
 ) -> TestNode {
     let tcp_port = if tcp_port == 0 {
         reserve_tcp_port()
@@ -67,8 +74,7 @@ fn create_node(
         swim_port
     };
 
-    let dev: Arc<dyn BlockDevice> =
-        Arc::new(MemoryDevice::new(32 * 1024 * 1024, 4096).unwrap());
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(32 * 1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(1000).unwrap();
     let engine = Arc::new(Engine::new(
@@ -90,7 +96,7 @@ fn create_node(
         self_addr: format!("127.0.0.1:{tcp_port}").parse().unwrap(),
         swim_bind: format!("127.0.0.1:{swim_port}").parse().unwrap(),
         seed_nodes: seeds,
-        replication_factor: 2,
+        replication_factor: rf,
         probe_interval: Duration::from_millis(100),
         suspicion_timeout: Duration::from_secs(2),
         cluster_secret: None,
@@ -102,7 +108,14 @@ fn create_node(
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);
-    let running = Arc::new(coordinator.start(engine.clone(), None, None, None, true));
+    let running = Arc::new(coordinator.start(
+        engine.clone(),
+        None,
+        None,
+        None,
+        true,
+        Duration::from_secs(3),
+    ));
 
     let config = ServerConfig {
         listen_addr: format!("127.0.0.1:{tcp_port}"),
@@ -112,9 +125,7 @@ fn create_node(
         ..Default::default()
     };
 
-    let server = Arc::new(
-        Server::new(engine, config).with_cluster(running.clone()),
-    );
+    let server = Arc::new(Server::new(engine, config).with_cluster(running.clone()));
 
     let server_clone = server.clone();
     std::thread::spawn(move || {
@@ -126,8 +137,7 @@ fn create_node(
     // runners. Poll the port with a connect probe (UDP connect is
     // bind-only semantics — it does not send a packet) until the
     // address is accepting, or give up after 2 seconds.
-    let swim_target: std::net::SocketAddr =
-        format!("127.0.0.1:{swim_port}").parse().unwrap();
+    let swim_target: std::net::SocketAddr = format!("127.0.0.1:{swim_port}").parse().unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").ok();
@@ -176,10 +186,10 @@ fn send_request(stream: &mut TcpStream, frame: &RequestFrame) -> ResponseFrame {
 #[test]
 fn two_nodes_discover_each_other() {
     // Start node 1 (no seeds)
-    let node1 = create_node(1, 13300, 13301, &[]);
+    let node1 = create_node(1, 13300, 13301, &[], 2);
 
     // Start node 2 with node 1 as seed
-    let node2 = create_node(2, 13302, 13303, &[13301]);
+    let node2 = create_node(2, 13302, 13303, &[13301], 2);
 
     // Wait for SWIM discovery
     std::thread::sleep(Duration::from_secs(2));
@@ -190,7 +200,10 @@ fn two_nodes_discover_each_other() {
 
     // Shard table versions should be non-zero (computed from member list)
     // They may not be identical yet if timing is tight, but they should exist
-    assert!(members1 > 0 || members2 > 0, "at least one node should have discovered peers");
+    assert!(
+        members1 > 0 || members2 > 0,
+        "at least one node should have discovered peers"
+    );
 
     node1.cluster.shutdown();
     node2.cluster.shutdown();
@@ -200,17 +213,22 @@ fn two_nodes_discover_each_other() {
 
 #[test]
 fn partition_map_served_over_tcp() {
-    let node = create_node(10, 13310, 13311, &[]);
+    let node = create_node(10, 13310, 13311, &[], 2);
 
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node.tcp_port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
-    let resp = send_request(&mut stream, &RequestFrame {
-        request_id: 1,
-        op_code: OP_GET_PARTITION_MAP,
-        flags: 0,
-        payload: vec![],
-    });
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1,
+            op_code: OP_GET_PARTITION_MAP,
+            flags: 0,
+            payload: vec![],
+        },
+    );
 
     assert_eq!(resp.status, STATUS_OK);
     assert!(!resp.payload.is_empty());
@@ -221,7 +239,10 @@ fn partition_map_served_over_tcp() {
     let node_count = u32::from_le_bytes(resp.payload[8..12].try_into().unwrap());
 
     assert!(node_count >= 1, "should have at least 1 node");
-    eprintln!("partition map: version={version}, nodes={node_count}, payload_size={}", resp.payload.len());
+    eprintln!(
+        "partition map: version={version}, nodes={node_count}, payload_size={}",
+        resp.payload.len()
+    );
 
     node.cluster.shutdown();
     node.server.shutdown();
@@ -229,7 +250,7 @@ fn partition_map_served_over_tcp() {
 
 #[test]
 fn single_node_cluster_owns_all_shards() {
-    let node = create_node(20, 13320, 13321, &[]);
+    let node = create_node(20, 13320, 13321, &[], 2);
 
     // In single-node cluster, this node should own all shards
     let mut txid = [0u8; 32];
@@ -248,10 +269,13 @@ fn single_node_cluster_owns_all_shards() {
 
 #[test]
 fn cluster_node_serves_operations() {
-    let node = create_node(30, 13330, 13331, &[]);
+    // Single-node cluster: RF=1 (no peers available for replication).
+    let node = create_node(30, 13330, 13331, &[], 1);
 
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node.tcp_port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     // Create a record via the cluster node
     let txid = [42u8; 32];
@@ -259,15 +283,30 @@ fn cluster_node_serves_operations() {
     let items = vec![make_wire_create_item(txid, &[hash])];
     let cp = encode_create_batch(&items);
 
-    let resp = send_request(&mut stream, &RequestFrame {
-        request_id: 1, op_code: OP_CREATE_BATCH, flags: 0, payload: cp,
-    });
-    assert_eq!(resp.status, STATUS_OK, "create should succeed on cluster node");
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: cp,
+        },
+    );
+    assert_eq!(
+        resp.status, STATUS_OK,
+        "create should succeed on cluster node"
+    );
 
     // Ping still works
-    let resp = send_request(&mut stream, &RequestFrame {
-        request_id: 2, op_code: OP_PING, flags: 0, payload: vec![],
-    });
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 2,
+            op_code: OP_PING,
+            flags: 0,
+            payload: vec![],
+        },
+    );
     assert_eq!(resp.status, STATUS_OK);
 
     node.cluster.shutdown();
@@ -321,8 +360,8 @@ fn make_txid(seed: u32) -> [u8; 32] {
     let mut txid = [0u8; 32];
     txid[0..4].copy_from_slice(&seed.to_le_bytes());
     // Fill remaining bytes with a pattern for uniqueness
-    for i in 4..32 {
-        txid[i] = (seed.wrapping_mul(7).wrapping_add(i as u32) & 0xFF) as u8;
+    for (i, byte) in txid.iter_mut().enumerate().skip(4) {
+        *byte = (seed.wrapping_mul(7).wrapping_add(i as u32) & 0xFF) as u8;
     }
     txid
 }
@@ -375,9 +414,9 @@ fn wait_for_shard_split(node: &TestNode, timeout: Duration) -> [u8; 32] {
 
 #[test]
 fn three_node_cluster_all_shards_assigned() {
-    let node1 = create_node(101, 13400, 13401, &[]);
-    let node2 = create_node(102, 13402, 13403, &[13401]);
-    let node3 = create_node(103, 13404, 13405, &[13401]);
+    let node1 = create_node(101, 13400, 13401, &[], 2);
+    let node2 = create_node(102, 13402, 13403, &[13401], 2);
+    let node3 = create_node(103, 13404, 13405, &[13401], 2);
 
     // Wait for SWIM discovery
     std::thread::sleep(Duration::from_secs(3));
@@ -388,7 +427,10 @@ fn three_node_cluster_all_shards_assigned() {
     let v3 = node3.cluster.shard_table_version();
 
     // At least two nodes should have converged to the same version
-    assert!(v1 > 0 || v2 > 0 || v3 > 0, "at least one node should have a shard table");
+    assert!(
+        v1 > 0 || v2 > 0 || v3 > 0,
+        "at least one node should have a shard table"
+    );
 
     // Verify the shard table covers all 4096 shards with valid masters
     let table = node1.cluster.shard_table();
@@ -410,15 +452,21 @@ fn three_node_cluster_all_shards_assigned() {
 fn add_fourth_node_rebalance_triggers() {
     // Start 3-node cluster on ephemeral ports so unrelated local services
     // cannot collide with this integration test.
-    let node1 = create_node(111, 0, 0, &[]);
-    let node2 = create_node(112, 0, 0, &[node1.swim_port]);
-    let node3 = create_node(113, 0, 0, &[node1.swim_port]);
+    let node1 = create_node(111, 0, 0, &[], 2);
+    let node2 = create_node(112, 0, 0, &[node1.swim_port], 2);
+    let node3 = create_node(113, 0, 0, &[node1.swim_port], 2);
 
     std::thread::sleep(Duration::from_secs(4));
     let v_before = node1.cluster.shard_table_version();
 
     // Add 4th node
-    let node4 = create_node(114, 0, 0, &[node1.swim_port, node2.swim_port, node3.swim_port]);
+    let node4 = create_node(
+        114,
+        0,
+        0,
+        &[node1.swim_port, node2.swim_port, node3.swim_port],
+        2,
+    );
 
     // Wait for SWIM discovery + rebalance
     std::thread::sleep(Duration::from_secs(5));
@@ -447,9 +495,9 @@ fn add_fourth_node_rebalance_triggers() {
 
 #[test]
 fn remove_node_rebalance_triggers() {
-    let node1 = create_node(121, 13420, 13421, &[]);
-    let node2 = create_node(122, 13422, 13423, &[13421]);
-    let node3 = create_node(123, 13424, 13425, &[13421]);
+    let node1 = create_node(121, 13420, 13421, &[], 2);
+    let node2 = create_node(122, 13422, 13423, &[13421], 2);
+    let node3 = create_node(123, 13424, 13425, &[13421], 2);
 
     std::thread::sleep(Duration::from_secs(3));
 
@@ -484,8 +532,8 @@ fn remove_node_rebalance_triggers() {
 fn route_or_handle_coordinator_level() {
     // In a 2-node cluster, verify that each node correctly routes
     // keys it doesn't own via RedirectTo.
-    let node1 = create_node(131, 13430, 13431, &[]);
-    let node2 = create_node(132, 13432, 13433, &[13431]);
+    let node1 = create_node(131, 13430, 13431, &[], 2);
+    let node2 = create_node(132, 13432, 13433, &[13431], 2);
 
     // Wait for SWIM discovery + 2-node topology commit + shard-table install.
     let _ = wait_for_shard_split(&node1, Duration::from_secs(15));
@@ -558,7 +606,9 @@ fn two_coordinators_same_event_identical_tables() {
 fn migrate_shard_with_records_to_new_node() {
     // Start single node, create 100 records, add 2nd node.
     // After migration, verify records are accessible via the 2nd node.
-    let node1 = create_node(151, 13450, 13451, &[]);
+    // RF=1: writes happen on node1 alone before node2 joins, so the
+    // initial cluster cannot satisfy replication for RF>=2.
+    let node1 = create_node(151, 13450, 13451, &[], 1);
 
     // Create 100 records on node 1
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
@@ -594,7 +644,7 @@ fn migrate_shard_with_records_to_new_node() {
     }
 
     // Add 2nd node — triggers shard rebalancing and migration
-    let node2 = create_node(152, 13452, 13453, &[13451]);
+    let node2 = create_node(152, 13452, 13453, &[13451], 1);
 
     // Wait for SWIM + migration to complete
     std::thread::sleep(Duration::from_secs(5));
@@ -630,8 +680,8 @@ fn migrate_shard_with_records_to_new_node() {
 #[test]
 fn during_migration_writes_redirect_to_new_node() {
     // In a 2-node cluster, keys not owned by this node get a Redirect response.
-    let node1 = create_node(161, 13460, 13461, &[]);
-    let node2 = create_node(162, 13462, 13463, &[13461]);
+    let node1 = create_node(161, 13460, 13461, &[], 2);
+    let node2 = create_node(162, 13462, 13463, &[13461], 2);
 
     // Wait for SWIM discovery + 2-node topology commit + shard-table install.
     let txid = wait_for_shard_split(&node1, Duration::from_secs(15));
@@ -663,10 +713,7 @@ fn during_migration_writes_redirect_to_new_node() {
     // Decode the error — sparse error format: [count:4][item_index:4][error_code:2][data_len:2][data:N]
     if resp.payload.len() >= 10 {
         let error_code = u16::from_le_bytes(resp.payload[8..10].try_into().unwrap());
-        assert_eq!(
-            error_code, ERR_REDIRECT,
-            "error should be ERR_REDIRECT"
-        );
+        assert_eq!(error_code, ERR_REDIRECT, "error should be ERR_REDIRECT");
     }
 
     shutdown_node(&node1);
@@ -677,8 +724,8 @@ fn during_migration_writes_redirect_to_new_node() {
 fn client_redirect_resends_to_new_node() {
     // When a client receives a Redirect, it re-sends the write to
     // the indicated node. Verify the write succeeds there.
-    let node1 = create_node(171, 13470, 13471, &[]);
-    let node2 = create_node(172, 13472, 13473, &[13471]);
+    let node1 = create_node(171, 13470, 13471, &[], 2);
+    let node2 = create_node(172, 13472, 13473, &[13471], 2);
 
     // Wait for SWIM discovery + 2-node topology commit + shard-table install.
     let txid = wait_for_shard_split(&node1, Duration::from_secs(15));
@@ -731,7 +778,7 @@ fn after_migration_complete_all_ops_go_to_new_node() {
     // Start single node, create records, add 2nd node.
     // After migration completes, operations for migrated shards
     // should go to the new node.
-    let node1 = create_node(181, 13480, 13481, &[]);
+    let node1 = create_node(181, 13480, 13481, &[], 2);
 
     let mut stream1 = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
     stream1
@@ -755,7 +802,7 @@ fn after_migration_complete_all_ops_go_to_new_node() {
     }
 
     // Add 2nd node
-    let node2 = create_node(182, 13482, 13483, &[13481]);
+    let node2 = create_node(182, 13482, 13483, &[13481], 2);
     std::thread::sleep(Duration::from_secs(5));
 
     // After migration, verify that node 2 handles operations for its shards
@@ -801,7 +848,8 @@ fn after_migration_complete_all_ops_go_to_new_node() {
 fn no_records_lost_during_migration() {
     // Create N records on a single node, add a 2nd node, then verify
     // all N records are assigned to exactly one node across the cluster.
-    let node1 = create_node(191, 13490, 13491, &[]);
+    // RF=1: writes on node1 alone before node2 joins.
+    let node1 = create_node(191, 13490, 13491, &[], 1);
 
     let mut stream1 = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
     stream1
@@ -831,7 +879,7 @@ fn no_records_lost_during_migration() {
     assert!(before_count > 0, "should have created some records");
 
     // Add 2nd node
-    let node2 = create_node(192, 13492, 13493, &[13491]);
+    let node2 = create_node(192, 13492, 13493, &[13491], 1);
     std::thread::sleep(Duration::from_secs(5));
 
     // Count records accessible on each node
@@ -889,15 +937,18 @@ fn no_duplicate_records_after_migration() {
     // Every shard has exactly one master
     let counts = new_table.shard_counts();
     let total: usize = counts.values().sum();
-    assert_eq!(total, NUM_SHARDS, "total master assignments must equal NUM_SHARDS");
+    assert_eq!(
+        total, NUM_SHARDS,
+        "total master assignments must equal NUM_SHARDS"
+    );
 }
 
 #[test]
 fn migration_of_empty_shard_completes_without_error() {
     // Start 2-node cluster — some shards will have no records.
     // The migration should handle empty shards gracefully.
-    let node1 = create_node(211, 13500, 13501, &[]);
-    let node2 = create_node(212, 13502, 13503, &[13501]);
+    let node1 = create_node(211, 13500, 13501, &[], 2);
+    let node2 = create_node(212, 13502, 13503, &[13501], 2);
 
     // Wait for SWIM + rebalance (migration of empty shards)
     std::thread::sleep(Duration::from_secs(3));
@@ -905,7 +956,9 @@ fn migration_of_empty_shard_completes_without_error() {
     // If we got here without panics, empty shard migration succeeded.
     // Verify both nodes are still responsive.
     let mut stream1 = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
-    stream1.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    stream1
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
     let resp = send_request(
         &mut stream1,
         &RequestFrame {
@@ -918,7 +971,9 @@ fn migration_of_empty_shard_completes_without_error() {
     assert_eq!(resp.status, STATUS_OK);
 
     let mut stream2 = TcpStream::connect(format!("127.0.0.1:{}", node2.tcp_port)).unwrap();
-    stream2.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    stream2
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
     let resp = send_request(
         &mut stream2,
         &RequestFrame {
@@ -940,15 +995,17 @@ fn migration_of_empty_shard_completes_without_error() {
 
 #[test]
 fn start_three_node_cluster_create_records_distributed() {
-    let node1 = create_node(221, 13510, 13511, &[]);
-    let node2 = create_node(222, 13512, 13513, &[13511]);
-    let node3 = create_node(223, 13514, 13515, &[13511]);
+    let node1 = create_node(221, 13510, 13511, &[], 2);
+    let node2 = create_node(222, 13512, 13513, &[13511], 2);
+    let node3 = create_node(223, 13514, 13515, &[13511], 2);
 
     std::thread::sleep(Duration::from_secs(3));
 
     // Create 100 records via node 1
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     let mut created = 0;
     let mut redirected = 0;
@@ -973,10 +1030,7 @@ fn start_three_node_cluster_create_records_distributed() {
     }
 
     // In a 3-node cluster, ~1/3 of keys should be owned by node 1
-    assert!(
-        created > 0,
-        "some records should be created locally"
-    );
+    assert!(created > 0, "some records should be created locally");
     assert!(
         redirected > 0,
         "some records should be redirected to other nodes"
@@ -992,10 +1046,13 @@ fn start_three_node_cluster_create_records_distributed() {
 #[test]
 fn query_reaches_correct_node_returns_data() {
     // Create records on a single-node cluster, verify queries work.
-    let node = create_node(231, 13520, 13521, &[]);
+    // Single-node cluster: RF=1 (no peers available for replication).
+    let node = create_node(231, 13520, 13521, &[], 1);
 
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node.tcp_port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     // Create a record
     let txid = make_txid(300000);
@@ -1037,8 +1094,8 @@ fn query_reaches_correct_node_returns_data() {
 #[test]
 fn spend_routed_to_correct_master() {
     // In a 2-node cluster, spend on a key owned by this node should succeed.
-    let node1 = create_node(241, 13530, 13531, &[]);
-    let node2 = create_node(242, 13532, 13533, &[13531]);
+    let node1 = create_node(241, 13530, 13531, &[], 2);
+    let node2 = create_node(242, 13532, 13533, &[13531], 2);
 
     std::thread::sleep(Duration::from_secs(2));
 
@@ -1056,7 +1113,9 @@ fn spend_routed_to_correct_master() {
     let hash = [5u8; 32];
 
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     // Create the record first
     let payload = encode_create_payload(&txid, &hash);
@@ -1110,10 +1169,12 @@ fn spend_routed_to_correct_master() {
 fn add_node_all_records_still_accessible() {
     // Create records on 1-node cluster, add 2nd node, verify all records
     // can be reached by sending to the correct owner.
-    let node1 = create_node(251, 13540, 13541, &[]);
+    let node1 = create_node(251, 13540, 13541, &[], 2);
 
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     // Create 30 records
     let mut txids = Vec::new();
@@ -1137,16 +1198,14 @@ fn add_node_all_records_still_accessible() {
     drop(stream);
 
     // Add 2nd node
-    let node2 = create_node(252, 13542, 13543, &[13541]);
+    let node2 = create_node(252, 13542, 13543, &[13541], 2);
     std::thread::sleep(Duration::from_secs(5));
 
     // Verify all records are accessible from their correct owner
     let mut accessible = 0;
     for txid in &txids {
         let key = TxKey { txid: *txid };
-        if node1.cluster.is_master(&key) {
-            accessible += 1;
-        } else if node2.cluster.is_master(&key) {
+        if node1.cluster.is_master(&key) || node2.cluster.is_master(&key) {
             accessible += 1;
         }
     }
@@ -1163,9 +1222,9 @@ fn add_node_all_records_still_accessible() {
 
 #[test]
 fn kill_node_detection_affected_shards() {
-    let node1 = create_node(261, 13550, 13551, &[]);
-    let node2 = create_node(262, 13552, 13553, &[13551]);
-    let node3 = create_node(263, 13554, 13555, &[13551]);
+    let node1 = create_node(261, 13550, 13551, &[], 2);
+    let node2 = create_node(262, 13552, 13553, &[13551], 2);
+    let node3 = create_node(263, 13554, 13555, &[13551], 2);
 
     std::thread::sleep(Duration::from_secs(3));
 
@@ -1189,7 +1248,9 @@ fn kill_node_detection_affected_shards() {
 
     // Node 1 should still be responsive
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
     let resp = send_request(
         &mut stream,
         &RequestFrame {

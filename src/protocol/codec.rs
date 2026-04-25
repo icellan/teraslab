@@ -4,10 +4,18 @@
 //! `[count:4][shared_params][items × count]`
 
 /// Helper: append a u32 LE.
-fn put_u32(buf: &mut Vec<u8>, v: u32) { buf.extend_from_slice(&v.to_le_bytes()); }
-fn put_u16(buf: &mut Vec<u8>, v: u16) { buf.extend_from_slice(&v.to_le_bytes()); }
-fn get_u32(d: &[u8], o: usize) -> u32 { u32::from_le_bytes(d[o..o+4].try_into().unwrap()) }
-fn get_u16(d: &[u8], o: usize) -> u16 { u16::from_le_bytes(d[o..o+2].try_into().unwrap()) }
+fn put_u32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+fn put_u16(buf: &mut Vec<u8>, v: u16) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+fn get_u32(d: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes(d[o..o + 4].try_into().unwrap())
+}
+fn get_u16(d: &[u8], o: usize) -> u16 {
+    u16::from_le_bytes(d[o..o + 2].try_into().unwrap())
+}
 
 // ---------------------------------------------------------------------------
 // Spend batch
@@ -51,7 +59,9 @@ pub fn encode_spend_batch(params: &SpendBatchParams, items: &[WireSpendItem]) ->
 
 /// Decode a SpendBatch request payload.
 pub fn decode_spend_batch(data: &[u8]) -> Option<(SpendBatchParams, Vec<WireSpendItem>)> {
-    if data.len() < 14 { return None; }
+    if data.len() < 14 {
+        return None;
+    }
     let count = get_u32(data, 0) as usize;
     let params = SpendBatchParams {
         ignore_conflicting: data[4] != 0,
@@ -62,12 +72,22 @@ pub fn decode_spend_batch(data: &[u8]) -> Option<(SpendBatchParams, Vec<WireSpen
     let mut items = Vec::with_capacity(count);
     let mut pos = 14;
     for _ in 0..count {
-        if pos + 104 > data.len() { return None; }
-        let mut txid = [0u8; 32]; txid.copy_from_slice(&data[pos..pos+32]);
-        let vout = get_u32(data, pos+32);
-        let mut uh = [0u8; 32]; uh.copy_from_slice(&data[pos+36..pos+68]);
-        let mut sd = [0u8; 36]; sd.copy_from_slice(&data[pos+68..pos+104]);
-        items.push(WireSpendItem { txid, vout, utxo_hash: uh, spending_data: sd });
+        if pos + 104 > data.len() {
+            return None;
+        }
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&data[pos..pos + 32]);
+        let vout = get_u32(data, pos + 32);
+        let mut uh = [0u8; 32];
+        uh.copy_from_slice(&data[pos + 36..pos + 68]);
+        let mut sd = [0u8; 36];
+        sd.copy_from_slice(&data[pos + 68..pos + 104]);
+        items.push(WireSpendItem {
+            txid,
+            vout,
+            utxo_hash: uh,
+            spending_data: sd,
+        });
         pos += 104;
     }
     Some((params, items))
@@ -100,13 +120,17 @@ pub fn encode_set_mined_batch(params: &SetMinedBatchParams, txids: &[[u8; 32]]) 
     buf.push(u8::from(params.unset_mined));
     put_u32(&mut buf, params.current_block_height);
     put_u32(&mut buf, params.block_height_retention);
-    for txid in txids { buf.extend_from_slice(txid); }
+    for txid in txids {
+        buf.extend_from_slice(txid);
+    }
     buf
 }
 
 /// Decode a SetMinedBatch request payload.
 pub fn decode_set_mined_batch(data: &[u8]) -> Option<(SetMinedBatchParams, Vec<[u8; 32]>)> {
-    if data.len() < 26 { return None; }
+    if data.len() < 26 {
+        return None;
+    }
     let count = get_u32(data, 0) as usize;
     let params = SetMinedBatchParams {
         block_id: get_u32(data, 4),
@@ -120,8 +144,11 @@ pub fn decode_set_mined_batch(data: &[u8]) -> Option<(SetMinedBatchParams, Vec<[
     let mut txids = Vec::with_capacity(count);
     let mut pos = 26;
     for _ in 0..count {
-        if pos + 32 > data.len() { return None; }
-        let mut txid = [0u8; 32]; txid.copy_from_slice(&data[pos..pos+32]);
+        if pos + 32 > data.len() {
+            return None;
+        }
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&data[pos..pos + 32]);
         txids.push(txid);
         pos += 32;
     }
@@ -133,25 +160,36 @@ pub fn decode_set_mined_batch(data: &[u8]) -> Option<(SetMinedBatchParams, Vec<[
 // ---------------------------------------------------------------------------
 
 /// Encode a batch of txids with optional shared u8 + u32 params.
-/// Format: [count:4][shared_params][txids × count]
+///
+/// Format:
+/// ```text
+/// [count:4][shared_params][txids × count]
+/// ```
 pub fn encode_txid_batch(txids: &[[u8; 32]], shared: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + shared.len() + txids.len() * 32);
     put_u32(&mut buf, txids.len() as u32);
     buf.extend_from_slice(shared);
-    for txid in txids { buf.extend_from_slice(txid); }
+    for txid in txids {
+        buf.extend_from_slice(txid);
+    }
     buf
 }
 
 /// Decode a batch of txids with a given shared params size.
 pub fn decode_txid_batch(data: &[u8], shared_len: usize) -> Option<(Vec<u8>, Vec<[u8; 32]>)> {
-    if data.len() < 4 + shared_len { return None; }
+    if data.len() < 4 + shared_len {
+        return None;
+    }
     let count = get_u32(data, 0) as usize;
-    let shared = data[4..4+shared_len].to_vec();
+    let shared = data[4..4 + shared_len].to_vec();
     let mut txids = Vec::with_capacity(count);
     let mut pos = 4 + shared_len;
     for _ in 0..count {
-        if pos + 32 > data.len() { return None; }
-        let mut txid = [0u8; 32]; txid.copy_from_slice(&data[pos..pos+32]);
+        if pos + 32 > data.len() {
+            return None;
+        }
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&data[pos..pos + 32]);
         txids.push(txid);
         pos += 32;
     }
@@ -184,16 +222,26 @@ pub fn encode_slot_item_batch(items: &[WireSlotItem]) -> Vec<u8> {
 
 /// Decode a batch of slot items.
 pub fn decode_slot_item_batch(data: &[u8]) -> Option<Vec<WireSlotItem>> {
-    if data.len() < 4 { return None; }
+    if data.len() < 4 {
+        return None;
+    }
     let count = get_u32(data, 0) as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 4;
     for _ in 0..count {
-        if pos + 68 > data.len() { return None; }
-        let mut txid = [0u8; 32]; txid.copy_from_slice(&data[pos..pos+32]);
-        let vout = get_u32(data, pos+32);
-        let mut uh = [0u8; 32]; uh.copy_from_slice(&data[pos+36..pos+68]);
-        items.push(WireSlotItem { txid, vout, utxo_hash: uh });
+        if pos + 68 > data.len() {
+            return None;
+        }
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&data[pos..pos + 32]);
+        let vout = get_u32(data, pos + 32);
+        let mut uh = [0u8; 32];
+        uh.copy_from_slice(&data[pos + 36..pos + 68]);
+        items.push(WireSlotItem {
+            txid,
+            vout,
+            utxo_hash: uh,
+        });
         pos += 68;
     }
     Some(items)
@@ -236,7 +284,9 @@ pub fn encode_reassign_batch(params: &ReassignBatchParams, items: &[WireReassign
 
 /// Decode a ReassignBatch request payload.
 pub fn decode_reassign_batch(data: &[u8]) -> Option<(ReassignBatchParams, Vec<WireReassignItem>)> {
-    if data.len() < 12 { return None; }
+    if data.len() < 12 {
+        return None;
+    }
     let count = get_u32(data, 0) as usize;
     let params = ReassignBatchParams {
         block_height: get_u32(data, 4),
@@ -245,12 +295,22 @@ pub fn decode_reassign_batch(data: &[u8]) -> Option<(ReassignBatchParams, Vec<Wi
     let mut items = Vec::with_capacity(count);
     let mut pos = 12;
     for _ in 0..count {
-        if pos + 100 > data.len() { return None; }
-        let mut txid = [0u8; 32]; txid.copy_from_slice(&data[pos..pos+32]);
-        let vout = get_u32(data, pos+32);
-        let mut uh = [0u8; 32]; uh.copy_from_slice(&data[pos+36..pos+68]);
-        let mut nh = [0u8; 32]; nh.copy_from_slice(&data[pos+68..pos+100]);
-        items.push(WireReassignItem { txid, vout, utxo_hash: uh, new_utxo_hash: nh });
+        if pos + 100 > data.len() {
+            return None;
+        }
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&data[pos..pos + 32]);
+        let vout = get_u32(data, pos + 32);
+        let mut uh = [0u8; 32];
+        uh.copy_from_slice(&data[pos + 36..pos + 68]);
+        let mut nh = [0u8; 32];
+        nh.copy_from_slice(&data[pos + 68..pos + 100]);
+        items.push(WireReassignItem {
+            txid,
+            vout,
+            utxo_hash: uh,
+            new_utxo_hash: nh,
+        });
         pos += 100;
     }
     Some((params, items))
@@ -285,7 +345,9 @@ pub fn encode_unspend_batch(params: &UnspendBatchParams, items: &[WireSlotItem])
 
 /// Decode an UnspendBatch request payload.
 pub fn decode_unspend_batch(data: &[u8]) -> Option<(UnspendBatchParams, Vec<WireSlotItem>)> {
-    if data.len() < 12 { return None; }
+    if data.len() < 12 {
+        return None;
+    }
     let count = get_u32(data, 0) as usize;
     let params = UnspendBatchParams {
         current_block_height: get_u32(data, 4),
@@ -294,11 +356,19 @@ pub fn decode_unspend_batch(data: &[u8]) -> Option<(UnspendBatchParams, Vec<Wire
     let mut items = Vec::with_capacity(count);
     let mut pos = 12;
     for _ in 0..count {
-        if pos + 68 > data.len() { return None; }
-        let mut txid = [0u8; 32]; txid.copy_from_slice(&data[pos..pos+32]);
-        let vout = get_u32(data, pos+32);
-        let mut uh = [0u8; 32]; uh.copy_from_slice(&data[pos+36..pos+68]);
-        items.push(WireSlotItem { txid, vout, utxo_hash: uh });
+        if pos + 68 > data.len() {
+            return None;
+        }
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&data[pos..pos + 32]);
+        let vout = get_u32(data, pos + 32);
+        let mut uh = [0u8; 32];
+        uh.copy_from_slice(&data[pos + 36..pos + 68]);
+        items.push(WireSlotItem {
+            txid,
+            vout,
+            utxo_hash: uh,
+        });
         pos += 68;
     }
     Some((params, items))
@@ -377,69 +447,124 @@ pub fn encode_create_batch(items: &[WireCreateItem]) -> Vec<u8> {
 
 /// Decode a CreateBatch request payload.
 pub fn decode_create_batch(data: &[u8]) -> Option<Vec<WireCreateItem>> {
-    if data.len() < 4 { return None; }
+    if data.len() < 4 {
+        return None;
+    }
     let count = get_u32(data, 0) as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 4;
     for _ in 0..count {
         // Fixed fields: txid(32)+tx_version(4)+locktime(4)+fee(8)+size(8)+ext(8)+coinbase(1)+sh(4)+created(8)+flags(1)+utxo_count(4) = 82
-        if pos + 82 > data.len() { return None; }
-        let mut txid = [0u8; 32]; txid.copy_from_slice(&data[pos..pos+32]); pos += 32;
-        let tx_version = get_u32(data, pos); pos += 4;
-        let locktime = get_u32(data, pos); pos += 4;
-        let fee = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap()); pos += 8;
-        let size_in_bytes = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap()); pos += 8;
-        let extended_size = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap()); pos += 8;
-        let is_coinbase = data[pos] != 0; pos += 1;
-        let spending_height = get_u32(data, pos); pos += 4;
-        let created_at = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap()); pos += 8;
-        let flags = data[pos]; pos += 1;
-        let utxo_count = get_u32(data, pos) as usize; pos += 4;
+        if pos + 82 > data.len() {
+            return None;
+        }
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&data[pos..pos + 32]);
+        pos += 32;
+        let tx_version = get_u32(data, pos);
+        pos += 4;
+        let locktime = get_u32(data, pos);
+        pos += 4;
+        let fee = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let size_in_bytes = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let extended_size = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let is_coinbase = data[pos] != 0;
+        pos += 1;
+        let spending_height = get_u32(data, pos);
+        pos += 4;
+        let created_at = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let flags = data[pos];
+        pos += 1;
+        let utxo_count = get_u32(data, pos) as usize;
+        pos += 4;
 
-        if pos + utxo_count * 32 > data.len() { return None; }
+        if pos + utxo_count * 32 > data.len() {
+            return None;
+        }
         let mut utxo_hashes = Vec::with_capacity(utxo_count);
         for _ in 0..utxo_count {
-            let mut h = [0u8; 32]; h.copy_from_slice(&data[pos..pos+32]);
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&data[pos..pos + 32]);
             utxo_hashes.push(h);
             pos += 32;
         }
 
-        if pos + 5 > data.len() { return None; } // has_cold(1) + cold_len(4)
-        let _has_cold = data[pos]; pos += 1;
-        let cold_len = get_u32(data, pos) as usize; pos += 4;
-        if pos + cold_len > data.len() { return None; }
-        let cold_data = data[pos..pos+cold_len].to_vec(); pos += cold_len;
+        if pos + 5 > data.len() {
+            return None;
+        } // has_cold(1) + cold_len(4)
+        let _has_cold = data[pos];
+        pos += 1;
+        let cold_len = get_u32(data, pos) as usize;
+        pos += 4;
+        if pos + cold_len > data.len() {
+            return None;
+        }
+        let cold_data = data[pos..pos + cold_len].to_vec();
+        pos += cold_len;
 
-        if pos + 4 > data.len() { return None; }
-        let block_height = get_u32(data, pos); pos += 4;
+        if pos + 4 > data.len() {
+            return None;
+        }
+        let block_height = get_u32(data, pos);
+        pos += 4;
 
-        if pos >= data.len() { return None; }
-        let has_mined = data[pos] != 0; pos += 1;
+        if pos >= data.len() {
+            return None;
+        }
+        let has_mined = data[pos] != 0;
+        pos += 1;
         let (mined_block_id, mined_block_height, mined_subtree_idx) = if has_mined {
-            if pos + 12 > data.len() { return None; }
-            let bid = get_u32(data, pos); pos += 4;
-            let bh = get_u32(data, pos); pos += 4;
-            let si = get_u32(data, pos); pos += 4;
+            if pos + 12 > data.len() {
+                return None;
+            }
+            let bid = get_u32(data, pos);
+            pos += 4;
+            let bh = get_u32(data, pos);
+            pos += 4;
+            let si = get_u32(data, pos);
+            pos += 4;
             (Some(bid), Some(bh), Some(si))
         } else {
             (None, None, None)
         };
 
-        if pos + 4 > data.len() { return None; }
-        let parent_count = get_u32(data, pos) as usize; pos += 4;
-        if pos + parent_count * 32 > data.len() { return None; }
+        if pos + 4 > data.len() {
+            return None;
+        }
+        let parent_count = get_u32(data, pos) as usize;
+        pos += 4;
+        if pos + parent_count * 32 > data.len() {
+            return None;
+        }
         let mut parent_txids = Vec::with_capacity(parent_count);
         for _ in 0..parent_count {
             let mut ptx = [0u8; 32];
-            ptx.copy_from_slice(&data[pos..pos+32]);
+            ptx.copy_from_slice(&data[pos..pos + 32]);
             parent_txids.push(ptx);
             pos += 32;
         }
 
         items.push(WireCreateItem {
-            txid, tx_version, locktime, fee, size_in_bytes, extended_size,
-            is_coinbase, spending_height, created_at, flags, utxo_hashes,
-            cold_data, block_height, mined_block_id, mined_block_height, mined_subtree_idx,
+            txid,
+            tx_version,
+            locktime,
+            fee,
+            size_in_bytes,
+            extended_size,
+            is_coinbase,
+            spending_height,
+            created_at,
+            flags,
+            utxo_hashes,
+            cold_data,
+            block_height,
+            mined_block_id,
+            mined_block_height,
+            mined_subtree_idx,
             parent_txids,
         });
     }
@@ -461,63 +586,63 @@ pub struct FieldMask(pub u32);
 impl FieldMask {
     // Per-field bits for fixed-size metadata fields:
     /// Transaction version (4 bytes).
-    pub const TX_VERSION: u32         = 1 << 0;
+    pub const TX_VERSION: u32 = 1 << 0;
     /// Transaction locktime (4 bytes).
-    pub const LOCKTIME: u32           = 1 << 1;
+    pub const LOCKTIME: u32 = 1 << 1;
     /// Transaction fee in satoshis (8 bytes).
-    pub const FEE: u32                = 1 << 2;
+    pub const FEE: u32 = 1 << 2;
     /// Transaction size in bytes (8 bytes).
-    pub const SIZE_IN_BYTES: u32      = 1 << 3;
+    pub const SIZE_IN_BYTES: u32 = 1 << 3;
     /// Extended transaction size (8 bytes).
-    pub const EXTENDED_SIZE: u32      = 1 << 4;
+    pub const EXTENDED_SIZE: u32 = 1 << 4;
     /// Flags byte (1 byte).
-    pub const FLAGS: u32              = 1 << 5;
+    pub const FLAGS: u32 = 1 << 5;
     /// Spending height for coinbase maturity (4 bytes).
-    pub const SPENDING_HEIGHT: u32    = 1 << 6;
+    pub const SPENDING_HEIGHT: u32 = 1 << 6;
     /// Creation timestamp in Unix millis (8 bytes).
-    pub const CREATED_AT: u32         = 1 << 7;
+    pub const CREATED_AT: u32 = 1 << 7;
     /// Number of spent UTXOs (4 bytes).
-    pub const SPENT_UTXOS: u32        = 1 << 8;
+    pub const SPENT_UTXOS: u32 = 1 << 8;
     /// Number of pruned UTXOs (4 bytes).
-    pub const PRUNED_UTXOS: u32       = 1 << 9;
+    pub const PRUNED_UTXOS: u32 = 1 << 9;
     /// Total UTXO count (4 bytes).
-    pub const UTXO_COUNT: u32         = 1 << 10;
+    pub const UTXO_COUNT: u32 = 1 << 10;
     /// Record generation counter (4 bytes).
-    pub const GENERATION: u32         = 1 << 11;
+    pub const GENERATION: u32 = 1 << 11;
     /// Last update timestamp in Unix millis (8 bytes).
-    pub const UPDATED_AT: u32         = 1 << 12;
+    pub const UPDATED_AT: u32 = 1 << 12;
     /// Block height since the transaction was unmined (4 bytes).
-    pub const UNMINED_SINCE: u32      = 1 << 13;
+    pub const UNMINED_SINCE: u32 = 1 << 13;
     /// Block height at which the record should be deleted (4 bytes).
-    pub const DELETE_AT_HEIGHT: u32   = 1 << 14;
+    pub const DELETE_AT_HEIGHT: u32 = 1 << 14;
     /// Block height until which the record is preserved (4 bytes).
-    pub const PRESERVE_UNTIL: u32     = 1 << 15;
+    pub const PRESERVE_UNTIL: u32 = 1 << 15;
     /// External blob reference (65 bytes).
-    pub const EXTERNAL_REF: u32       = 1 << 16;
+    pub const EXTERNAL_REF: u32 = 1 << 16;
     /// Number of reassignments recorded (1 byte).
     pub const REASSIGNMENT_COUNT: u32 = 1 << 17;
     /// Number of block entries (1 byte).
-    pub const BLOCK_ENTRY_COUNT: u32  = 1 << 18;
+    pub const BLOCK_ENTRY_COUNT: u32 = 1 << 18;
 
     // Variable-size sections:
     /// Include UTXO slot data (variable).
-    pub const UTXO_SLOTS: u32        = 1 << 19;
+    pub const UTXO_SLOTS: u32 = 1 << 19;
     /// Include cold data — inputs/outputs/inpoints (variable).
-    pub const COLD_DATA: u32         = 1 << 20;
+    pub const COLD_DATA: u32 = 1 << 20;
     /// Include block entries (variable).
-    pub const BLOCK_ENTRIES: u32     = 1 << 21;
+    pub const BLOCK_ENTRIES: u32 = 1 << 21;
     /// Include conflicting children txids (variable).
     pub const CONFLICTING_CHILDREN: u32 = 1 << 22;
     /// Include the raw on-disk metadata struct (256 bytes, for debugging).
     /// When set, the full struct is returned as-is including internal
     /// fields (magic, schema_version, device offsets, padding).
     /// Takes precedence over per-field metadata bits if both are set.
-    pub const RAW_METADATA: u32      = 1 << 23;
+    pub const RAW_METADATA: u32 = 1 << 23;
 
     /// Convenience alias: all per-field metadata bits (bits 0-18).
     pub const ALL_METADATA: u32 = 0x0007_FFFF;
     /// Include all client-facing fields (bits 0-22, excludes RAW_METADATA).
-    pub const ALL: u32          = 0x007F_FFFF;
+    pub const ALL: u32 = 0x007F_FFFF;
 
     /// Whether the mask includes the given flag.
     pub fn has(self, flag: u32) -> bool {
@@ -526,8 +651,7 @@ impl FieldMask {
 
     /// Bitmask of fields that can be served entirely from the primary index
     /// cache without reading metadata from device memory.
-    pub const INDEX_CACHED: u32 =
-        Self::FLAGS
+    pub const INDEX_CACHED: u32 = Self::FLAGS
         | Self::SPENT_UTXOS
         | Self::UTXO_COUNT
         | Self::UNMINED_SINCE
@@ -549,20 +673,27 @@ pub fn encode_get_batch(field_mask: u32, txids: &[[u8; 32]]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(8 + txids.len() * 32);
     put_u32(&mut buf, txids.len() as u32);
     put_u32(&mut buf, field_mask);
-    for txid in txids { buf.extend_from_slice(txid); }
+    for txid in txids {
+        buf.extend_from_slice(txid);
+    }
     buf
 }
 
 /// Decode a GetBatch request payload.
 pub fn decode_get_batch(data: &[u8]) -> Option<(FieldMask, Vec<[u8; 32]>)> {
-    if data.len() < 8 { return None; }
+    if data.len() < 8 {
+        return None;
+    }
     let count = get_u32(data, 0) as usize;
     let field_mask = FieldMask(get_u32(data, 4));
     let mut txids = Vec::with_capacity(count);
     let mut pos = 8;
     for _ in 0..count {
-        if pos + 32 > data.len() { return None; }
-        let mut txid = [0u8; 32]; txid.copy_from_slice(&data[pos..pos+32]);
+        if pos + 32 > data.len() {
+            return None;
+        }
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&data[pos..pos + 32]);
         txids.push(txid);
         pos += 32;
     }
@@ -593,17 +724,29 @@ pub fn encode_get_response(items: &[WireGetResult]) -> Vec<u8> {
 
 /// Decode GetBatch response items.
 pub fn decode_get_response(data: &[u8]) -> Option<Vec<WireGetResult>> {
-    if data.len() < 4 { return None; }
+    if data.len() < 4 {
+        return None;
+    }
     let count = get_u32(data, 0) as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 4;
     for _ in 0..count {
-        if pos + 5 > data.len() { return None; } // status(1) + data_len(4)
-        let status = data[pos]; pos += 1;
-        let data_len = get_u32(data, pos) as usize; pos += 4;
-        if pos + data_len > data.len() { return None; }
-        let item_data = data[pos..pos+data_len].to_vec(); pos += data_len;
-        items.push(WireGetResult { status, data: item_data });
+        if pos + 5 > data.len() {
+            return None;
+        } // status(1) + data_len(4)
+        let status = data[pos];
+        pos += 1;
+        let data_len = get_u32(data, pos) as usize;
+        pos += 4;
+        if pos + data_len > data.len() {
+            return None;
+        }
+        let item_data = data[pos..pos + data_len].to_vec();
+        pos += data_len;
+        items.push(WireGetResult {
+            status,
+            data: item_data,
+        });
     }
     Some(items)
 }
@@ -656,38 +799,66 @@ pub fn encode_partial_with_signals(
 }
 
 /// Decode a SpendBatch/SetMinedBatch PartialError response with both sections.
-pub fn decode_partial_with_signals(data: &[u8]) -> Option<(Vec<BatchItemSuccess>, Vec<BatchItemError>)> {
-    if data.len() < 4 { return None; }
+pub fn decode_partial_with_signals(
+    data: &[u8],
+) -> Option<(Vec<BatchItemSuccess>, Vec<BatchItemError>)> {
+    if data.len() < 4 {
+        return None;
+    }
     let mut pos = 0;
 
-    let success_count = get_u32(data, pos) as usize; pos += 4;
+    let success_count = get_u32(data, pos) as usize;
+    pos += 4;
     let mut successes = Vec::with_capacity(success_count);
     for _ in 0..success_count {
-        if pos + 6 > data.len() { return None; } // item_index(4) + signal(1) + bid_count(1)
-        let item_index = get_u32(data, pos); pos += 4;
-        let signal = data[pos]; pos += 1;
-        let bid_count = data[pos] as usize; pos += 1;
-        if pos + bid_count * 4 > data.len() { return None; }
+        if pos + 6 > data.len() {
+            return None;
+        } // item_index(4) + signal(1) + bid_count(1)
+        let item_index = get_u32(data, pos);
+        pos += 4;
+        let signal = data[pos];
+        pos += 1;
+        let bid_count = data[pos] as usize;
+        pos += 1;
+        if pos + bid_count * 4 > data.len() {
+            return None;
+        }
         let mut block_ids = Vec::with_capacity(bid_count);
         for _ in 0..bid_count {
-            block_ids.push(get_u32(data, pos)); pos += 4;
+            block_ids.push(get_u32(data, pos));
+            pos += 4;
         }
-        successes.push(BatchItemSuccess { item_index, signal, block_ids });
+        successes.push(BatchItemSuccess {
+            item_index,
+            signal,
+            block_ids,
+        });
     }
 
-    if pos + 4 > data.len() { return None; }
-    let error_count = get_u32(data, pos) as usize; pos += 4;
+    if pos + 4 > data.len() {
+        return None;
+    }
+    let error_count = get_u32(data, pos) as usize;
+    pos += 4;
     let mut errors = Vec::with_capacity(error_count);
     for _ in 0..error_count {
-        if pos + 8 > data.len() { return None; }
+        if pos + 8 > data.len() {
+            return None;
+        }
         let item_index = get_u32(data, pos);
         let error_code = get_u16(data, pos + 4);
         let data_len = get_u16(data, pos + 6) as usize;
         pos += 8;
-        if pos + data_len > data.len() { return None; }
+        if pos + data_len > data.len() {
+            return None;
+        }
         let error_data = data[pos..pos + data_len].to_vec();
         pos += data_len;
-        errors.push(BatchItemError { item_index, error_code, error_data });
+        errors.push(BatchItemError {
+            item_index,
+            error_code,
+            error_data,
+        });
     }
 
     Some((successes, errors))
@@ -710,11 +881,15 @@ pub fn encode_error_payload(error_code: u16, message: &str) -> Vec<u8> {
 
 /// Decode a global error response payload.
 pub fn decode_error_payload(data: &[u8]) -> Option<(u16, String)> {
-    if data.len() < 4 { return None; }
+    if data.len() < 4 {
+        return None;
+    }
     let error_code = get_u16(data, 0);
     let msg_len = get_u16(data, 2) as usize;
-    if data.len() < 4 + msg_len { return None; }
-    let message = String::from_utf8_lossy(&data[4..4+msg_len]).to_string();
+    if data.len() < 4 + msg_len {
+        return None;
+    }
+    let message = String::from_utf8_lossy(&data[4..4 + msg_len]).to_string();
     Some((error_code, message))
 }
 
@@ -734,10 +909,14 @@ pub fn encode_redirect(addr: &str) -> Vec<u8> {
 
 /// Decode a redirect response payload.
 pub fn decode_redirect(data: &[u8]) -> Option<String> {
-    if data.len() < 2 { return None; }
+    if data.len() < 2 {
+        return None;
+    }
     let len = get_u16(data, 0) as usize;
-    if data.len() < 2 + len { return None; }
-    Some(String::from_utf8_lossy(&data[2..2+len]).to_string())
+    if data.len() < 2 + len {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&data[2..2 + len]).to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -771,20 +950,30 @@ pub fn encode_sparse_errors(errors: &[BatchItemError]) -> Vec<u8> {
 
 /// Decode a sparse error list.
 pub fn decode_sparse_errors(data: &[u8]) -> Option<Vec<BatchItemError>> {
-    if data.len() < 4 { return None; }
+    if data.len() < 4 {
+        return None;
+    }
     let count = get_u32(data, 0) as usize;
     let mut errors = Vec::with_capacity(count);
     let mut pos = 4;
     for _ in 0..count {
-        if pos + 8 > data.len() { return None; }
+        if pos + 8 > data.len() {
+            return None;
+        }
         let item_index = get_u32(data, pos);
         let error_code = get_u16(data, pos + 4);
         let data_len = get_u16(data, pos + 6) as usize;
         pos += 8;
-        if pos + data_len > data.len() { return None; }
+        if pos + data_len > data.len() {
+            return None;
+        }
         let error_data = data[pos..pos + data_len].to_vec();
         pos += data_len;
-        errors.push(BatchItemError { item_index, error_code, error_data });
+        errors.push(BatchItemError {
+            item_index,
+            error_code,
+            error_data,
+        });
     }
     Some(errors)
 }
@@ -813,13 +1002,18 @@ pub fn encode_get_spend_batch(items: &[WireGetSpendItem]) -> Vec<u8> {
 
 /// Decode a GetSpendBatch request payload.
 pub fn decode_get_spend_batch(data: &[u8]) -> Option<Vec<WireGetSpendItem>> {
-    if data.len() < 4 { return None; }
+    if data.len() < 4 {
+        return None;
+    }
     let count = get_u32(data, 0) as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 4;
     for _ in 0..count {
-        if pos + 36 > data.len() { return None; }
-        let mut txid = [0u8; 32]; txid.copy_from_slice(&data[pos..pos+32]);
+        if pos + 36 > data.len() {
+            return None;
+        }
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&data[pos..pos + 32]);
         let vout = get_u32(data, pos + 32);
         items.push(WireGetSpendItem { txid, vout });
         pos += 36;
@@ -851,17 +1045,27 @@ pub fn encode_get_spend_response(items: &[WireGetSpendResult]) -> Vec<u8> {
 
 /// Decode GetSpendBatch response items.
 pub fn decode_get_spend_response(data: &[u8]) -> Option<Vec<WireGetSpendResult>> {
-    if data.len() < 4 { return None; }
+    if data.len() < 4 {
+        return None;
+    }
     let count = get_u32(data, 0) as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 4;
     for _ in 0..count {
-        if pos + 40 > data.len() { return None; }
+        if pos + 40 > data.len() {
+            return None;
+        }
         let status = data[pos];
         let error_code = get_u16(data, pos + 1);
         let slot_status = data[pos + 3];
-        let mut sd = [0u8; 36]; sd.copy_from_slice(&data[pos+4..pos+40]);
-        items.push(WireGetSpendResult { status, error_code, slot_status, spending_data: sd });
+        let mut sd = [0u8; 36];
+        sd.copy_from_slice(&data[pos + 4..pos + 40]);
+        items.push(WireGetSpendResult {
+            status,
+            error_code,
+            slot_status,
+            spending_data: sd,
+        });
         pos += 40;
     }
     Some(items)
@@ -894,12 +1098,16 @@ pub struct StreamChunk<'a> {
 ///
 /// Returns None if the payload is too short or malformed.
 pub fn decode_stream_chunk(payload: &[u8]) -> Option<StreamChunk<'_>> {
-    if payload.len() < 44 { return None; } // 32 + 8 + 4
+    if payload.len() < 44 {
+        return None;
+    } // 32 + 8 + 4
     let mut txid = [0u8; 32];
     txid.copy_from_slice(&payload[0..32]);
     let offset = u64::from_le_bytes(payload[32..40].try_into().unwrap());
     let data_len = get_u32(payload, 40) as usize;
-    if payload.len() < 44 + data_len { return None; }
+    if payload.len() < 44 + data_len {
+        return None;
+    }
     Some(StreamChunk {
         txid,
         offset,
@@ -931,7 +1139,9 @@ pub struct StreamEnd {
 ///
 /// Returns None if the payload is too short.
 pub fn decode_stream_end(payload: &[u8]) -> Option<StreamEnd> {
-    if payload.len() < 40 { return None; }
+    if payload.len() < 40 {
+        return None;
+    }
     let mut txid = [0u8; 32];
     txid.copy_from_slice(&payload[0..32]);
     let total_size = u64::from_le_bytes(payload[32..40].try_into().unwrap());
@@ -947,18 +1157,27 @@ mod tests {
     use super::*;
     use crate::protocol::opcodes::*;
 
-    fn test_txid(n: u8) -> [u8; 32] { let mut t = [0u8; 32]; t[0] = n; t }
+    fn test_txid(n: u8) -> [u8; 32] {
+        let mut t = [0u8; 32];
+        t[0] = n;
+        t
+    }
 
     // -- SpendBatch --
 
     #[test]
     fn spend_batch_1_item_round_trip() {
         let params = SpendBatchParams {
-            ignore_conflicting: true, ignore_locked: false,
-            current_block_height: 1000, block_height_retention: 288,
+            ignore_conflicting: true,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
         };
         let items = vec![WireSpendItem {
-            txid: test_txid(1), vout: 5, utxo_hash: test_txid(2), spending_data: [0xAB; 36],
+            txid: test_txid(1),
+            vout: 5,
+            utxo_hash: test_txid(2),
+            spending_data: [0xAB; 36],
         }];
         let encoded = encode_spend_batch(&params, &items);
         let (dp, di) = decode_spend_batch(&encoded).unwrap();
@@ -969,13 +1188,23 @@ mod tests {
     #[test]
     fn spend_batch_1024_items_round_trip() {
         let params = SpendBatchParams {
-            ignore_conflicting: false, ignore_locked: true,
-            current_block_height: 500, block_height_retention: 144,
+            ignore_conflicting: false,
+            ignore_locked: true,
+            current_block_height: 500,
+            block_height_retention: 144,
         };
-        let items: Vec<WireSpendItem> = (0..1024u16).map(|i| WireSpendItem {
-            txid: { let mut t = [0u8; 32]; t[0..2].copy_from_slice(&i.to_le_bytes()); t },
-            vout: i as u32, utxo_hash: test_txid(i as u8), spending_data: [i as u8; 36],
-        }).collect();
+        let items: Vec<WireSpendItem> = (0..1024u16)
+            .map(|i| WireSpendItem {
+                txid: {
+                    let mut t = [0u8; 32];
+                    t[0..2].copy_from_slice(&i.to_le_bytes());
+                    t
+                },
+                vout: i as u32,
+                utxo_hash: test_txid(i as u8),
+                spending_data: [i as u8; 36],
+            })
+            .collect();
         let encoded = encode_spend_batch(&params, &items);
         let (dp, di) = decode_spend_batch(&encoded).unwrap();
         assert_eq!(dp, params);
@@ -989,13 +1218,21 @@ mod tests {
     #[test]
     fn set_mined_batch_round_trip() {
         let params = SetMinedBatchParams {
-            block_id: 42, block_height: 800_000, subtree_idx: 7,
-            on_longest_chain: true, unset_mined: false,
-            current_block_height: 800_000, block_height_retention: 288,
+            block_id: 42,
+            block_height: 800_000,
+            subtree_idx: 7,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 800_000,
+            block_height_retention: 288,
         };
-        let txids: Vec<[u8; 32]> = (0..512u16).map(|i| {
-            let mut t = [0u8; 32]; t[0..2].copy_from_slice(&i.to_le_bytes()); t
-        }).collect();
+        let txids: Vec<[u8; 32]> = (0..512u16)
+            .map(|i| {
+                let mut t = [0u8; 32];
+                t[0..2].copy_from_slice(&i.to_le_bytes());
+                t
+            })
+            .collect();
         let encoded = encode_set_mined_batch(&params, &txids);
         let (dp, dt) = decode_set_mined_batch(&encoded).unwrap();
         assert_eq!(dp, params);
@@ -1041,9 +1278,13 @@ mod tests {
 
     #[test]
     fn mark_longest_chain_batch_round_trip() {
-        let txids: Vec<[u8; 32]> = (0..1024u16).map(|i| {
-            let mut t = [0u8; 32]; t[0..2].copy_from_slice(&i.to_le_bytes()); t
-        }).collect();
+        let txids: Vec<[u8; 32]> = (0..1024u16)
+            .map(|i| {
+                let mut t = [0u8; 32];
+                t[0..2].copy_from_slice(&i.to_le_bytes());
+                t
+            })
+            .collect();
         // shared: on_longest_chain(1) + cbh(4) + bhr(4) = 9 bytes
         let mut shared = Vec::new();
         shared.push(1);
@@ -1069,9 +1310,13 @@ mod tests {
 
     #[test]
     fn freeze_batch_round_trip() {
-        let items: Vec<WireSlotItem> = (0..50u8).map(|i| WireSlotItem {
-            txid: test_txid(i), vout: i as u32, utxo_hash: test_txid(i + 100),
-        }).collect();
+        let items: Vec<WireSlotItem> = (0..50u8)
+            .map(|i| WireSlotItem {
+                txid: test_txid(i),
+                vout: i as u32,
+                utxo_hash: test_txid(i + 100),
+            })
+            .collect();
         let encoded = encode_slot_item_batch(&items);
         let decoded = decode_slot_item_batch(&encoded).unwrap();
         assert_eq!(decoded, items);
@@ -1079,7 +1324,11 @@ mod tests {
 
     #[test]
     fn unfreeze_batch_1_item() {
-        let items = vec![WireSlotItem { txid: test_txid(1), vout: 7, utxo_hash: test_txid(2) }];
+        let items = vec![WireSlotItem {
+            txid: test_txid(1),
+            vout: 7,
+            utxo_hash: test_txid(2),
+        }];
         let encoded = encode_slot_item_batch(&items);
         let decoded = decode_slot_item_batch(&encoded).unwrap();
         assert_eq!(decoded, items);
@@ -1089,10 +1338,18 @@ mod tests {
 
     #[test]
     fn reassign_batch_round_trip() {
-        let params = ReassignBatchParams { block_height: 1000, spendable_after: 100 };
-        let items: Vec<WireReassignItem> = (0..50u8).map(|i| WireReassignItem {
-            txid: test_txid(i), vout: i as u32, utxo_hash: test_txid(i), new_utxo_hash: test_txid(i + 50),
-        }).collect();
+        let params = ReassignBatchParams {
+            block_height: 1000,
+            spendable_after: 100,
+        };
+        let items: Vec<WireReassignItem> = (0..50u8)
+            .map(|i| WireReassignItem {
+                txid: test_txid(i),
+                vout: i as u32,
+                utxo_hash: test_txid(i),
+                new_utxo_hash: test_txid(i + 50),
+            })
+            .collect();
         let encoded = encode_reassign_batch(&params, &items);
         let (dp, di) = decode_reassign_batch(&encoded).unwrap();
         assert_eq!(dp, params);
@@ -1104,9 +1361,21 @@ mod tests {
     #[test]
     fn sparse_errors_round_trip() {
         let errors = vec![
-            BatchItemError { item_index: 3, error_code: ERR_TX_NOT_FOUND, error_data: vec![] },
-            BatchItemError { item_index: 7, error_code: ERR_ALREADY_SPENT, error_data: vec![0xAB; 36] },
-            BatchItemError { item_index: 999, error_code: ERR_FROZEN, error_data: vec![] },
+            BatchItemError {
+                item_index: 3,
+                error_code: ERR_TX_NOT_FOUND,
+                error_data: vec![],
+            },
+            BatchItemError {
+                item_index: 7,
+                error_code: ERR_ALREADY_SPENT,
+                error_data: vec![0xAB; 36],
+            },
+            BatchItemError {
+                item_index: 999,
+                error_code: ERR_FROZEN,
+                error_data: vec![],
+            },
         ];
         let encoded = encode_sparse_errors(&errors);
         let decoded = decode_sparse_errors(&encoded).unwrap();
@@ -1116,9 +1385,21 @@ mod tests {
     #[test]
     fn sparse_errors_ascending_indices() {
         let errors = vec![
-            BatchItemError { item_index: 1, error_code: ERR_TX_NOT_FOUND, error_data: vec![] },
-            BatchItemError { item_index: 5, error_code: ERR_FROZEN, error_data: vec![] },
-            BatchItemError { item_index: 10, error_code: ERR_LOCKED, error_data: vec![] },
+            BatchItemError {
+                item_index: 1,
+                error_code: ERR_TX_NOT_FOUND,
+                error_data: vec![],
+            },
+            BatchItemError {
+                item_index: 5,
+                error_code: ERR_FROZEN,
+                error_data: vec![],
+            },
+            BatchItemError {
+                item_index: 10,
+                error_code: ERR_LOCKED,
+                error_data: vec![],
+            },
         ];
         let encoded = encode_sparse_errors(&errors);
         let decoded = decode_sparse_errors(&encoded).unwrap();
@@ -1131,10 +1412,16 @@ mod tests {
 
     #[test]
     fn get_spend_batch_round_trip() {
-        let items: Vec<WireGetSpendItem> = (0..1024u16).map(|i| WireGetSpendItem {
-            txid: { let mut t = [0u8; 32]; t[0..2].copy_from_slice(&i.to_le_bytes()); t },
-            vout: i as u32,
-        }).collect();
+        let items: Vec<WireGetSpendItem> = (0..1024u16)
+            .map(|i| WireGetSpendItem {
+                txid: {
+                    let mut t = [0u8; 32];
+                    t[0..2].copy_from_slice(&i.to_le_bytes());
+                    t
+                },
+                vout: i as u32,
+            })
+            .collect();
         let encoded = encode_get_spend_batch(&items);
         let decoded = decode_get_spend_batch(&encoded).unwrap();
         assert_eq!(decoded, items);
@@ -1143,9 +1430,24 @@ mod tests {
     #[test]
     fn get_spend_response_round_trip() {
         let items = vec![
-            WireGetSpendResult { status: 0, error_code: ERR_OK, slot_status: 0x00, spending_data: [0; 36] },
-            WireGetSpendResult { status: 0, error_code: ERR_OK, slot_status: 0x01, spending_data: [0xAB; 36] },
-            WireGetSpendResult { status: 1, error_code: ERR_TX_NOT_FOUND, slot_status: 0, spending_data: [0; 36] },
+            WireGetSpendResult {
+                status: 0,
+                error_code: ERR_OK,
+                slot_status: 0x00,
+                spending_data: [0; 36],
+            },
+            WireGetSpendResult {
+                status: 0,
+                error_code: ERR_OK,
+                slot_status: 0x01,
+                spending_data: [0xAB; 36],
+            },
+            WireGetSpendResult {
+                status: 1,
+                error_code: ERR_TX_NOT_FOUND,
+                slot_status: 0,
+                spending_data: [0; 36],
+            },
         ];
         let encoded = encode_get_spend_response(&items);
         let decoded = decode_get_spend_response(&encoded).unwrap();
@@ -1158,8 +1460,16 @@ mod tests {
     fn spend_batch_response_mixed_ok_error() {
         // Mixed success/error via sparse errors
         let errors = vec![
-            BatchItemError { item_index: 2, error_code: ERR_TX_NOT_FOUND, error_data: vec![] },
-            BatchItemError { item_index: 5, error_code: ERR_ALREADY_SPENT, error_data: vec![0xCC; 36] },
+            BatchItemError {
+                item_index: 2,
+                error_code: ERR_TX_NOT_FOUND,
+                error_data: vec![],
+            },
+            BatchItemError {
+                item_index: 5,
+                error_code: ERR_ALREADY_SPENT,
+                error_data: vec![0xCC; 36],
+            },
         ];
         let encoded = encode_sparse_errors(&errors);
         let decoded = decode_sparse_errors(&encoded).unwrap();
@@ -1175,7 +1485,9 @@ mod tests {
             block_height_retention: 288,
         };
         let items = vec![WireSlotItem {
-            txid: test_txid(1), vout: 3, utxo_hash: test_txid(2),
+            txid: test_txid(1),
+            vout: 3,
+            utxo_hash: test_txid(2),
         }];
         let encoded = encode_unspend_batch(&params, &items);
         let (dp, di) = decode_unspend_batch(&encoded).unwrap();
@@ -1189,11 +1501,17 @@ mod tests {
             current_block_height: 1000,
             block_height_retention: 144,
         };
-        let items: Vec<WireSlotItem> = (0..512u16).map(|i| WireSlotItem {
-            txid: { let mut t = [0u8; 32]; t[0..2].copy_from_slice(&i.to_le_bytes()); t },
-            vout: i as u32,
-            utxo_hash: test_txid(i as u8),
-        }).collect();
+        let items: Vec<WireSlotItem> = (0..512u16)
+            .map(|i| WireSlotItem {
+                txid: {
+                    let mut t = [0u8; 32];
+                    t[0..2].copy_from_slice(&i.to_le_bytes());
+                    t
+                },
+                vout: i as u32,
+                utxo_hash: test_txid(i as u8),
+            })
+            .collect();
         let encoded = encode_unspend_batch(&params, &items);
         let (dp, di) = decode_unspend_batch(&encoded).unwrap();
         assert_eq!(dp, params);
@@ -1205,8 +1523,16 @@ mod tests {
     #[test]
     fn unspend_batch_response_mixed_ok_error() {
         let errors = vec![
-            BatchItemError { item_index: 0, error_code: ERR_TX_NOT_FOUND, error_data: vec![] },
-            BatchItemError { item_index: 3, error_code: ERR_UTXO_HASH_MISMATCH, error_data: vec![] },
+            BatchItemError {
+                item_index: 0,
+                error_code: ERR_TX_NOT_FOUND,
+                error_data: vec![],
+            },
+            BatchItemError {
+                item_index: 3,
+                error_code: ERR_UTXO_HASH_MISMATCH,
+                error_data: vec![],
+            },
         ];
         let encoded = encode_sparse_errors(&errors);
         let decoded = decode_sparse_errors(&encoded).unwrap();
@@ -1218,12 +1544,22 @@ mod tests {
     #[test]
     fn set_mined_batch_response_with_signals_and_block_ids() {
         let successes = vec![
-            BatchItemSuccess { item_index: 0, signal: 1, block_ids: vec![42, 43] },
-            BatchItemSuccess { item_index: 2, signal: 0, block_ids: vec![] },
+            BatchItemSuccess {
+                item_index: 0,
+                signal: 1,
+                block_ids: vec![42, 43],
+            },
+            BatchItemSuccess {
+                item_index: 2,
+                signal: 0,
+                block_ids: vec![],
+            },
         ];
-        let errors = vec![
-            BatchItemError { item_index: 1, error_code: ERR_TX_NOT_FOUND, error_data: vec![] },
-        ];
+        let errors = vec![BatchItemError {
+            item_index: 1,
+            error_code: ERR_TX_NOT_FOUND,
+            error_data: vec![],
+        }];
         let encoded = encode_partial_with_signals(&successes, &errors);
         let (ds, de) = decode_partial_with_signals(&encoded).unwrap();
         assert_eq!(ds, successes);
@@ -1234,27 +1570,34 @@ mod tests {
 
     #[test]
     fn create_batch_100_items_round_trip() {
-        let items: Vec<WireCreateItem> = (0..100u8).map(|i| WireCreateItem {
-            txid: test_txid(i),
-            tx_version: 2,
-            locktime: 0,
-            fee: 1000 + i as u64,
-            size_in_bytes: 250,
-            extended_size: 0,
-            is_coinbase: false,
-            spending_height: 0,
-            created_at: 1700000000000 + i as u64,
-            flags: 0,
-            utxo_hashes: (0..((i % 5) + 1) as usize).map(|v| {
-                let mut h = [0u8; 32]; h[0] = v as u8; h[1] = i; h
-            }).collect(),
-            cold_data: vec![],
-            block_height: 0,
-            mined_block_id: None,
-            mined_block_height: None,
-            mined_subtree_idx: None,
-            parent_txids: vec![],
-        }).collect();
+        let items: Vec<WireCreateItem> = (0..100u8)
+            .map(|i| WireCreateItem {
+                txid: test_txid(i),
+                tx_version: 2,
+                locktime: 0,
+                fee: 1000 + i as u64,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1700000000000 + i as u64,
+                flags: 0,
+                utxo_hashes: (0..((i % 5) + 1) as usize)
+                    .map(|v| {
+                        let mut h = [0u8; 32];
+                        h[0] = v as u8;
+                        h[1] = i;
+                        h
+                    })
+                    .collect(),
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            })
+            .collect();
         let encoded = encode_create_batch(&items);
         let decoded = decode_create_batch(&encoded).unwrap();
         assert_eq!(decoded.len(), 100);
@@ -1286,7 +1629,10 @@ mod tests {
         let encoded = encode_create_batch(&items);
         let decoded = decode_create_batch(&encoded).unwrap();
         assert_eq!(decoded, items);
-        assert_eq!(decoded[0].cold_data, vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03]);
+        assert_eq!(
+            decoded[0].cold_data,
+            vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03]
+        );
         assert_eq!(decoded[0].mined_block_id, Some(42));
     }
 
@@ -1294,9 +1640,13 @@ mod tests {
 
     #[test]
     fn get_batch_4096_items_round_trip() {
-        let txids: Vec<[u8; 32]> = (0..4096u16).map(|i| {
-            let mut t = [0u8; 32]; t[0..2].copy_from_slice(&i.to_le_bytes()); t
-        }).collect();
+        let txids: Vec<[u8; 32]> = (0..4096u16)
+            .map(|i| {
+                let mut t = [0u8; 32];
+                t[0..2].copy_from_slice(&i.to_le_bytes());
+                t
+            })
+            .collect();
         let encoded = encode_get_batch(FieldMask::ALL, &txids);
         assert_eq!(encoded.len(), 8 + 4096 * 32); // count(4) + mask(4) + txids
         let (mask, decoded) = decode_get_batch(&encoded).unwrap();
@@ -1309,9 +1659,18 @@ mod tests {
     #[test]
     fn get_batch_response_mixed_ok_not_found() {
         let items = vec![
-            WireGetResult { status: 0, data: vec![1, 2, 3, 4, 5] },
-            WireGetResult { status: 1, data: vec![] }, // not found
-            WireGetResult { status: 0, data: vec![0xAA; 100] },
+            WireGetResult {
+                status: 0,
+                data: vec![1, 2, 3, 4, 5],
+            },
+            WireGetResult {
+                status: 1,
+                data: vec![],
+            }, // not found
+            WireGetResult {
+                status: 0,
+                data: vec![0xAA; 100],
+            },
         ];
         let encoded = encode_get_response(&items);
         let decoded = decode_get_response(&encoded).unwrap();
@@ -1323,10 +1682,30 @@ mod tests {
     #[test]
     fn get_spend_response_mixed_slot_statuses() {
         let items = vec![
-            WireGetSpendResult { status: 0, error_code: ERR_OK, slot_status: 0x00, spending_data: [0; 36] },
-            WireGetSpendResult { status: 0, error_code: ERR_OK, slot_status: 0x01, spending_data: [0xAB; 36] },
-            WireGetSpendResult { status: 0, error_code: ERR_OK, slot_status: 0x02, spending_data: [0xCD; 36] },
-            WireGetSpendResult { status: 0, error_code: ERR_OK, slot_status: 0xFF, spending_data: [0xFF; 36] },
+            WireGetSpendResult {
+                status: 0,
+                error_code: ERR_OK,
+                slot_status: 0x00,
+                spending_data: [0; 36],
+            },
+            WireGetSpendResult {
+                status: 0,
+                error_code: ERR_OK,
+                slot_status: 0x01,
+                spending_data: [0xAB; 36],
+            },
+            WireGetSpendResult {
+                status: 0,
+                error_code: ERR_OK,
+                slot_status: 0x02,
+                spending_data: [0xCD; 36],
+            },
+            WireGetSpendResult {
+                status: 0,
+                error_code: ERR_OK,
+                slot_status: 0xFF,
+                spending_data: [0xFF; 36],
+            },
         ];
         let encoded = encode_get_spend_response(&items);
         let decoded = decode_get_spend_response(&encoded).unwrap();
@@ -1337,9 +1716,11 @@ mod tests {
 
     #[test]
     fn freeze_batch_response_spent_error_with_spending_data() {
-        let errors = vec![
-            BatchItemError { item_index: 0, error_code: ERR_ALREADY_SPENT, error_data: vec![0xAB; 36] },
-        ];
+        let errors = vec![BatchItemError {
+            item_index: 0,
+            error_code: ERR_ALREADY_SPENT,
+            error_data: vec![0xAB; 36],
+        }];
         let encoded = encode_sparse_errors(&errors);
         let decoded = decode_sparse_errors(&encoded).unwrap();
         assert_eq!(decoded[0].error_data.len(), 36);
@@ -1350,9 +1731,11 @@ mod tests {
 
     #[test]
     fn unfreeze_batch_response_not_frozen_error() {
-        let errors = vec![
-            BatchItemError { item_index: 2, error_code: ERR_UTXO_NOT_FROZEN, error_data: vec![] },
-        ];
+        let errors = vec![BatchItemError {
+            item_index: 2,
+            error_code: ERR_UTXO_NOT_FROZEN,
+            error_data: vec![],
+        }];
         let encoded = encode_sparse_errors(&errors);
         let decoded = decode_sparse_errors(&encoded).unwrap();
         assert_eq!(decoded[0].error_code, ERR_UTXO_NOT_FROZEN);
@@ -1362,9 +1745,15 @@ mod tests {
 
     #[test]
     fn reassign_batch_1_item_round_trip() {
-        let params = ReassignBatchParams { block_height: 500, spendable_after: 1000 };
+        let params = ReassignBatchParams {
+            block_height: 500,
+            spendable_after: 1000,
+        };
         let items = vec![WireReassignItem {
-            txid: test_txid(1), vout: 0, utxo_hash: test_txid(10), new_utxo_hash: test_txid(20),
+            txid: test_txid(1),
+            vout: 0,
+            utxo_hash: test_txid(10),
+            new_utxo_hash: test_txid(20),
         }];
         let encoded = encode_reassign_batch(&params, &items);
         let (dp, di) = decode_reassign_batch(&encoded).unwrap();
@@ -1374,9 +1763,11 @@ mod tests {
 
     #[test]
     fn reassign_batch_response_not_frozen_error() {
-        let errors = vec![
-            BatchItemError { item_index: 3, error_code: ERR_UTXO_NOT_FROZEN, error_data: vec![] },
-        ];
+        let errors = vec![BatchItemError {
+            item_index: 3,
+            error_code: ERR_UTXO_NOT_FROZEN,
+            error_data: vec![],
+        }];
         let encoded = encode_sparse_errors(&errors);
         let decoded = decode_sparse_errors(&encoded).unwrap();
         assert_eq!(decoded[0].error_code, ERR_UTXO_NOT_FROZEN);
@@ -1387,7 +1778,11 @@ mod tests {
     #[test]
     fn set_conflicting_batch_response_dahset_signal() {
         let successes = vec![
-            BatchItemSuccess { item_index: 0, signal: 1, block_ids: vec![] }, // DAHSET
+            BatchItemSuccess {
+                item_index: 0,
+                signal: 1,
+                block_ids: vec![],
+            }, // DAHSET
         ];
         let errors: Vec<BatchItemError> = vec![];
         let encoded = encode_partial_with_signals(&successes, &errors);
@@ -1400,9 +1795,13 @@ mod tests {
 
     #[test]
     fn set_locked_batch_1024_items_round_trip() {
-        let txids: Vec<[u8; 32]> = (0..1024u16).map(|i| {
-            let mut t = [0u8; 32]; t[0..2].copy_from_slice(&i.to_le_bytes()); t
-        }).collect();
+        let txids: Vec<[u8; 32]> = (0..1024u16)
+            .map(|i| {
+                let mut t = [0u8; 32];
+                t[0..2].copy_from_slice(&i.to_le_bytes());
+                t
+            })
+            .collect();
         let shared = vec![1u8]; // value=true
         let encoded = encode_txid_batch(&txids, &shared);
         let (ds, dt) = decode_txid_batch(&encoded, 1).unwrap();
@@ -1412,9 +1811,11 @@ mod tests {
 
     #[test]
     fn set_locked_batch_response_not_found() {
-        let errors = vec![
-            BatchItemError { item_index: 5, error_code: ERR_TX_NOT_FOUND, error_data: vec![] },
-        ];
+        let errors = vec![BatchItemError {
+            item_index: 5,
+            error_code: ERR_TX_NOT_FOUND,
+            error_data: vec![],
+        }];
         let encoded = encode_sparse_errors(&errors);
         let decoded = decode_sparse_errors(&encoded).unwrap();
         assert_eq!(decoded[0].error_code, ERR_TX_NOT_FOUND);
@@ -1424,9 +1825,13 @@ mod tests {
 
     #[test]
     fn preserve_until_batch_1024_items_round_trip() {
-        let txids: Vec<[u8; 32]> = (0..1024u16).map(|i| {
-            let mut t = [0u8; 32]; t[0..2].copy_from_slice(&i.to_le_bytes()); t
-        }).collect();
+        let txids: Vec<[u8; 32]> = (0..1024u16)
+            .map(|i| {
+                let mut t = [0u8; 32];
+                t[0..2].copy_from_slice(&i.to_le_bytes());
+                t
+            })
+            .collect();
         let shared = 10000u32.to_le_bytes().to_vec();
         let encoded = encode_txid_batch(&txids, &shared);
         let (ds, dt) = decode_txid_batch(&encoded, 4).unwrap();
@@ -1437,7 +1842,11 @@ mod tests {
     #[test]
     fn preserve_until_batch_response_preserve_signal() {
         let successes = vec![
-            BatchItemSuccess { item_index: 0, signal: 2, block_ids: vec![] }, // PRESERVE
+            BatchItemSuccess {
+                item_index: 0,
+                signal: 2,
+                block_ids: vec![],
+            }, // PRESERVE
         ];
         let errors: Vec<BatchItemError> = vec![];
         let encoded = encode_partial_with_signals(&successes, &errors);
@@ -1458,8 +1867,16 @@ mod tests {
     #[test]
     fn delete_batch_response_not_found() {
         let errors = vec![
-            BatchItemError { item_index: 0, error_code: ERR_TX_NOT_FOUND, error_data: vec![] },
-            BatchItemError { item_index: 3, error_code: ERR_TX_NOT_FOUND, error_data: vec![] },
+            BatchItemError {
+                item_index: 0,
+                error_code: ERR_TX_NOT_FOUND,
+                error_data: vec![],
+            },
+            BatchItemError {
+                item_index: 3,
+                error_code: ERR_TX_NOT_FOUND,
+                error_data: vec![],
+            },
         ];
         let encoded = encode_sparse_errors(&errors);
         let decoded = decode_sparse_errors(&encoded).unwrap();
@@ -1485,7 +1902,11 @@ mod tests {
     #[test]
     fn mark_longest_chain_batch_response_dahset_signal() {
         let successes = vec![
-            BatchItemSuccess { item_index: 0, signal: 1, block_ids: vec![42] }, // DAHSET
+            BatchItemSuccess {
+                item_index: 0,
+                signal: 1,
+                block_ids: vec![42],
+            }, // DAHSET
         ];
         let errors: Vec<BatchItemError> = vec![];
         let encoded = encode_partial_with_signals(&successes, &errors);
@@ -1499,13 +1920,11 @@ mod tests {
     #[test]
     fn partial_error_coinbase_immature_4_bytes() {
         let spending_height: u32 = 800_100;
-        let errors = vec![
-            BatchItemError {
-                item_index: 7,
-                error_code: ERR_COINBASE_IMMATURE,
-                error_data: spending_height.to_le_bytes().to_vec(),
-            },
-        ];
+        let errors = vec![BatchItemError {
+            item_index: 7,
+            error_code: ERR_COINBASE_IMMATURE,
+            error_data: spending_height.to_le_bytes().to_vec(),
+        }];
         let encoded = encode_sparse_errors(&errors);
         let decoded = decode_sparse_errors(&encoded).unwrap();
         assert_eq!(decoded[0].error_data.len(), 4);
@@ -1516,13 +1935,33 @@ mod tests {
     #[test]
     fn spend_batch_partial_error_with_success_signals_and_errors() {
         let successes = vec![
-            BatchItemSuccess { item_index: 0, signal: 0, block_ids: vec![100, 200] },
-            BatchItemSuccess { item_index: 1, signal: 1, block_ids: vec![] },
-            BatchItemSuccess { item_index: 3, signal: 0, block_ids: vec![300] },
+            BatchItemSuccess {
+                item_index: 0,
+                signal: 0,
+                block_ids: vec![100, 200],
+            },
+            BatchItemSuccess {
+                item_index: 1,
+                signal: 1,
+                block_ids: vec![],
+            },
+            BatchItemSuccess {
+                item_index: 3,
+                signal: 0,
+                block_ids: vec![300],
+            },
         ];
         let errors = vec![
-            BatchItemError { item_index: 2, error_code: ERR_TX_NOT_FOUND, error_data: vec![] },
-            BatchItemError { item_index: 4, error_code: ERR_FROZEN, error_data: vec![] },
+            BatchItemError {
+                item_index: 2,
+                error_code: ERR_TX_NOT_FOUND,
+                error_data: vec![],
+            },
+            BatchItemError {
+                item_index: 4,
+                error_code: ERR_FROZEN,
+                error_data: vec![],
+            },
         ];
         let encoded = encode_partial_with_signals(&successes, &errors);
         let (ds, de) = decode_partial_with_signals(&encoded).unwrap();
@@ -1555,7 +1994,9 @@ mod tests {
     #[test]
     fn freeze_batch_1_item_round_trip() {
         let items = vec![WireSlotItem {
-            txid: test_txid(99), vout: 0, utxo_hash: test_txid(200),
+            txid: test_txid(99),
+            vout: 0,
+            utxo_hash: test_txid(200),
         }];
         let encoded = encode_slot_item_batch(&items);
         let decoded = decode_slot_item_batch(&encoded).unwrap();
@@ -1566,9 +2007,13 @@ mod tests {
 
     #[test]
     fn unfreeze_batch_50_items_round_trip() {
-        let items: Vec<WireSlotItem> = (0..50u8).map(|i| WireSlotItem {
-            txid: test_txid(i), vout: i as u32, utxo_hash: test_txid(i + 50),
-        }).collect();
+        let items: Vec<WireSlotItem> = (0..50u8)
+            .map(|i| WireSlotItem {
+                txid: test_txid(i),
+                vout: i as u32,
+                utxo_hash: test_txid(i + 50),
+            })
+            .collect();
         let encoded = encode_slot_item_batch(&items);
         let decoded = decode_slot_item_batch(&encoded).unwrap();
         assert_eq!(decoded.len(), 50);
@@ -1642,9 +2087,13 @@ mod tests {
     #[test]
     fn encode_set_mined_batch_no_realloc() {
         let params = SetMinedBatchParams {
-            block_id: 1, block_height: 2, subtree_idx: 3,
-            on_longest_chain: true, unset_mined: false,
-            current_block_height: 4, block_height_retention: 5,
+            block_id: 1,
+            block_height: 2,
+            subtree_idx: 3,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 4,
+            block_height_retention: 5,
         };
         for count in [0, 1, 10, 1024] {
             let txids: Vec<[u8; 32]> = (0..count).map(|i| test_txid(i as u8)).collect();
@@ -1652,25 +2101,37 @@ mod tests {
             // The final length should not exceed initial capacity.
             // Vec::with_capacity returns at least what was asked for.
             // If there was a realloc, capacity would be > the pre-calculated estimate.
-            assert_eq!(encoded.len(), 26 + count * 32,
-                "set_mined_batch length mismatch for count={count}");
+            assert_eq!(
+                encoded.len(),
+                26 + count * 32,
+                "set_mined_batch length mismatch for count={count}"
+            );
         }
     }
 
     #[test]
     fn encode_spend_batch_no_realloc() {
         let params = SpendBatchParams {
-            ignore_conflicting: false, ignore_locked: false,
-            current_block_height: 1000, block_height_retention: 288,
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
         };
         for count in [0, 1, 100] {
-            let items: Vec<WireSpendItem> = (0..count).map(|i| WireSpendItem {
-                txid: test_txid(i as u8), vout: i as u32,
-                utxo_hash: test_txid(0), spending_data: [0; 36],
-            }).collect();
+            let items: Vec<WireSpendItem> = (0..count)
+                .map(|i| WireSpendItem {
+                    txid: test_txid(i as u8),
+                    vout: i as u32,
+                    utxo_hash: test_txid(0),
+                    spending_data: [0; 36],
+                })
+                .collect();
             let encoded = encode_spend_batch(&params, &items);
-            assert_eq!(encoded.len(), 14 + count * 104,
-                "spend_batch length mismatch for count={count}");
+            assert_eq!(
+                encoded.len(),
+                14 + count * 104,
+                "spend_batch length mismatch for count={count}"
+            );
         }
     }
 
@@ -1678,55 +2139,94 @@ mod tests {
     fn encode_create_batch_capacity_sufficient() {
         // Minimal items (no cold_data, few utxo_hashes) should not exceed
         // the pre-allocated capacity.
-        let items: Vec<WireCreateItem> = (0..50).map(|i| WireCreateItem {
-            txid: test_txid(i as u8), tx_version: 1, locktime: 0,
-            fee: 0, size_in_bytes: 0, extended_size: 0,
-            is_coinbase: false, spending_height: 0, created_at: 0,
-            flags: 0, utxo_hashes: vec![], cold_data: vec![],
-            block_height: 0, mined_block_id: None,
-            mined_block_height: None, mined_subtree_idx: None,
-            parent_txids: vec![],
-        }).collect();
+        let items: Vec<WireCreateItem> = (0..50)
+            .map(|i| WireCreateItem {
+                txid: test_txid(i as u8),
+                tx_version: 1,
+                locktime: 0,
+                fee: 0,
+                size_in_bytes: 0,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 0,
+                flags: 0,
+                utxo_hashes: vec![],
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            })
+            .collect();
         let encoded = encode_create_batch(&items);
         // With no utxo_hashes/cold_data/parents/mined: per item is 96 bytes.
-        assert!(encoded.capacity() >= encoded.len(),
+        assert!(
+            encoded.capacity() >= encoded.len(),
             "create_batch had insufficient capacity: cap={} len={}",
-            encoded.capacity(), encoded.len());
+            encoded.capacity(),
+            encoded.len()
+        );
     }
 
     #[test]
     fn encode_get_response_capacity_sufficient() {
-        let items: Vec<WireGetResult> = (0..100).map(|_| WireGetResult {
-            status: 0, data: vec![0u8; 64],
-        }).collect();
+        let items: Vec<WireGetResult> = (0..100)
+            .map(|_| WireGetResult {
+                status: 0,
+                data: vec![0u8; 64],
+            })
+            .collect();
         let encoded = encode_get_response(&items);
-        assert!(encoded.capacity() >= encoded.len(),
+        assert!(
+            encoded.capacity() >= encoded.len(),
             "get_response had insufficient capacity: cap={} len={}",
-            encoded.capacity(), encoded.len());
+            encoded.capacity(),
+            encoded.len()
+        );
     }
 
     #[test]
     fn encode_sparse_errors_capacity_sufficient() {
-        let errors: Vec<BatchItemError> = (0..100).map(|i| BatchItemError {
-            item_index: i, error_code: ERR_TX_NOT_FOUND, error_data: vec![0u8; 4],
-        }).collect();
+        let errors: Vec<BatchItemError> = (0..100)
+            .map(|i| BatchItemError {
+                item_index: i,
+                error_code: ERR_TX_NOT_FOUND,
+                error_data: vec![0u8; 4],
+            })
+            .collect();
         let encoded = encode_sparse_errors(&errors);
-        assert!(encoded.capacity() >= encoded.len(),
+        assert!(
+            encoded.capacity() >= encoded.len(),
             "sparse_errors had insufficient capacity: cap={} len={}",
-            encoded.capacity(), encoded.len());
+            encoded.capacity(),
+            encoded.len()
+        );
     }
 
     #[test]
     fn encode_partial_with_signals_capacity_sufficient() {
-        let successes: Vec<BatchItemSuccess> = (0..50).map(|i| BatchItemSuccess {
-            item_index: i, signal: 1, block_ids: vec![42, 43],
-        }).collect();
-        let errors: Vec<BatchItemError> = (0..10).map(|i| BatchItemError {
-            item_index: i + 50, error_code: ERR_TX_NOT_FOUND, error_data: vec![],
-        }).collect();
+        let successes: Vec<BatchItemSuccess> = (0..50)
+            .map(|i| BatchItemSuccess {
+                item_index: i,
+                signal: 1,
+                block_ids: vec![42, 43],
+            })
+            .collect();
+        let errors: Vec<BatchItemError> = (0..10)
+            .map(|i| BatchItemError {
+                item_index: i + 50,
+                error_code: ERR_TX_NOT_FOUND,
+                error_data: vec![],
+            })
+            .collect();
         let encoded = encode_partial_with_signals(&successes, &errors);
-        assert!(encoded.capacity() >= encoded.len(),
+        assert!(
+            encoded.capacity() >= encoded.len(),
             "partial_with_signals had insufficient capacity: cap={} len={}",
-            encoded.capacity(), encoded.len());
+            encoded.capacity(),
+            encoded.len()
+        );
     }
 }

@@ -111,7 +111,9 @@ pub enum SpendError {
     /// absurdly large, or `current_block_height` is near `u32::MAX`. The
     /// server returns this instead of silently clamping (which would pin
     /// UTXOs as unprunable forever).
-    #[error("DAH_OVERFLOW: current_height={current_height} + retention={retention} exceeds u32::MAX")]
+    #[error(
+        "DAH_OVERFLOW: current_height={current_height} + retention={retention} exceeds u32::MAX"
+    )]
     DahOverflow {
         /// Current block height at the time of evaluation.
         current_height: u32,

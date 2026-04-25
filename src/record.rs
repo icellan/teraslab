@@ -473,8 +473,7 @@ pub struct TxMetadata {
 impl TxMetadata {
     /// Create a new metadata header with default/zero values and the magic number set.
     pub fn new(utxo_count: u32) -> Self {
-        let record_size =
-            METADATA_SIZE as u32 + utxo_count * UTXO_SLOT_SIZE as u32;
+        let record_size = METADATA_SIZE as u32 + utxo_count * UTXO_SLOT_SIZE as u32;
         Self {
             magic: METADATA_MAGIC,
             schema_version: METADATA_VERSION,
@@ -535,10 +534,7 @@ impl TxMetadata {
         debug_assert!(dst.len() >= METADATA_SIZE);
         // Safety: TxMetadata is repr(C, packed), so we can transmute it to bytes.
         let src = unsafe {
-            std::slice::from_raw_parts(
-                (self as *const Self).cast::<u8>(),
-                METADATA_SIZE,
-            )
+            std::slice::from_raw_parts((self as *const Self).cast::<u8>(), METADATA_SIZE)
         };
         dst[..METADATA_SIZE].copy_from_slice(src);
         // Zero the CRC slot, compute CRC over the full METADATA_SIZE bytes,
@@ -625,10 +621,7 @@ impl TxMetadata {
         let mut buf = [0u8; METADATA_SIZE];
         // Safety: TxMetadata is repr(C, packed).
         let src = unsafe {
-            std::slice::from_raw_parts(
-                (self as *const Self).cast::<u8>(),
-                METADATA_SIZE,
-            )
+            std::slice::from_raw_parts((self as *const Self).cast::<u8>(), METADATA_SIZE)
         };
         buf.copy_from_slice(src);
         buf[CRC32_OFFSET..CRC32_OFFSET + 4].copy_from_slice(&[0u8; 4]);
@@ -936,18 +929,9 @@ mod tests {
         let restored = TxMetadata::from_bytes(&buf).expect("valid CRC");
 
         assert_eq!(restored.block_entry_count, 3);
-        assert_eq!(
-            { restored.block_entries_inline[0].block_id },
-            100
-        );
-        assert_eq!(
-            { restored.block_entries_inline[1].block_id },
-            200
-        );
-        assert_eq!(
-            { restored.block_entries_inline[2].block_id },
-            300
-        );
+        assert_eq!({ restored.block_entries_inline[0].block_id }, 100);
+        assert_eq!({ restored.block_entries_inline[1].block_id }, 200);
+        assert_eq!({ restored.block_entries_inline[2].block_id }, 300);
     }
 
     #[test]
@@ -988,10 +972,7 @@ mod tests {
 
     #[test]
     fn record_size_calculation() {
-        assert_eq!(
-            TxMetadata::record_size_for(0),
-            METADATA_SIZE as u64
-        );
+        assert_eq!(TxMetadata::record_size_for(0), METADATA_SIZE as u64);
         assert_eq!(
             TxMetadata::record_size_for(1),
             METADATA_SIZE as u64 + UTXO_SLOT_SIZE as u64
@@ -1104,18 +1085,15 @@ mod tests {
 
         assert_eq!(restored.block_entry_count, 3);
         for i in 0..INLINE_BLOCK_ENTRIES {
-            assert_eq!(
-                { restored.block_entries_inline[i].block_id },
-                { meta.block_entries_inline[i].block_id }
-            );
-            assert_eq!(
-                { restored.block_entries_inline[i].block_height },
-                { meta.block_entries_inline[i].block_height }
-            );
-            assert_eq!(
-                { restored.block_entries_inline[i].subtree_idx },
-                { meta.block_entries_inline[i].subtree_idx }
-            );
+            assert_eq!({ restored.block_entries_inline[i].block_id }, {
+                meta.block_entries_inline[i].block_id
+            });
+            assert_eq!({ restored.block_entries_inline[i].block_height }, {
+                meta.block_entries_inline[i].block_height
+            });
+            assert_eq!({ restored.block_entries_inline[i].subtree_idx }, {
+                meta.block_entries_inline[i].subtree_idx
+            });
         }
         assert_eq!(meta, restored);
     }
@@ -1171,7 +1149,10 @@ mod tests {
         let mut b = vec![0u8; METADATA_SIZE];
         meta.to_bytes(&mut a);
         meta.to_bytes(&mut b);
-        assert_eq!(a, b, "two serializations of the same metadata must match byte-for-byte");
+        assert_eq!(
+            a, b,
+            "two serializations of the same metadata must match byte-for-byte"
+        );
     }
 
     #[test]
@@ -1316,12 +1297,8 @@ mod tests {
 
         // Verify the raw byte representation is all zeros
         let size = std::mem::size_of::<ExternalRef>();
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                (&ext as *const ExternalRef).cast::<u8>(),
-                size,
-            )
-        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts((&ext as *const ExternalRef).cast::<u8>(), size) };
         assert!(bytes.iter().all(|&b| b == 0));
     }
 
@@ -1390,11 +1367,10 @@ mod tests {
 
         assert_eq!(restored.status, UTXO_SPENT);
         assert_eq!(restored.hash, hash);
-        for i in 0..36 {
+        for (i, (&got, &want)) in restored.spending_data.iter().zip(sd.iter()).enumerate() {
             assert_eq!(
-                restored.spending_data[i], sd[i],
-                "spending_data[{i}] mismatch: expected {:#04x}, got {:#04x}",
-                sd[i], restored.spending_data[i]
+                got, want,
+                "spending_data[{i}] mismatch: expected {want:#04x}, got {got:#04x}",
             );
         }
         assert_eq!(slot, restored);

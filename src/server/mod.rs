@@ -17,8 +17,8 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Per-connection state for streaming blob uploads.
 ///
@@ -255,8 +255,8 @@ fn handle_connection(
         frame_bytes.extend_from_slice(&len_buf);
         frame_bytes.extend_from_slice(&read_buf[..frame_len]);
 
-        let (request, _) = RequestFrame::decode(&frame_bytes)
-            .map_err(|e| format!("decode frame: {e}"))?;
+        let (request, _) =
+            RequestFrame::decode(&frame_bytes).map_err(|e| format!("decode frame: {e}"))?;
 
         // Dispatch to handler
         let response = dispatch::handle_request(

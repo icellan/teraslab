@@ -9,9 +9,9 @@
 //! redb transaction. If the fsync fails the redb commit is skipped so
 //! on-disk state cannot race ahead of the redo log.
 
+use crate::index::IndexError;
 use crate::index::dah_index::DahRedoEntry;
 use crate::index::hashtable::TxKey;
-use crate::index::IndexError;
 use crate::redo::{RedoLog, RedoOp};
 use parking_lot::Mutex;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -108,9 +108,10 @@ impl RedbDahIndex {
                 new_height: height,
             };
             let mut log = redo.lock();
-            log.append_and_flush(op).map_err(|e| IndexError::FormatError {
-                detail: format!("redo append_and_flush (dah insert): {e}"),
-            })?;
+            log.append_and_flush(op)
+                .map_err(|e| IndexError::FormatError {
+                    detail: format!("redo append_and_flush (dah insert): {e}"),
+                })?;
         }
 
         let txn = self.begin_write().map_err(map_txn_err)?;
@@ -132,25 +133,19 @@ impl RedbDahIndex {
                 }
             }
 
-            rev.insert(key.txid, height.to_le_bytes()).map_err(map_storage_err)?;
-            fwd.insert(make_forward_key(height, &key), ()).map_err(map_storage_err)?;
+            rev.insert(key.txid, height.to_le_bytes())
+                .map_err(map_storage_err)?;
+            fwd.insert(make_forward_key(height, &key), ())
+                .map_err(map_storage_err)?;
         }
         // Fault-injection: crash between durable redo intent and the redb
         // commit. Post-recovery, the secondary index MUST be reconciled
         // from the durable redo entry (C4 two-phase durability contract).
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::BeforeSecondaryRedbCommit,
-        );
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::BeforeIndexCommit,
-        );
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeSecondaryRedbCommit);
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeIndexCommit);
         txn.commit().map_err(map_commit_err)?;
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::AfterSecondaryRedbCommit,
-        );
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::AfterIndexCommit,
-        );
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterSecondaryRedbCommit);
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterIndexCommit);
         if was_new {
             self.count += 1;
         }
@@ -159,7 +154,7 @@ impl RedbDahIndex {
 
     /// Remove a transaction from the DAH index with two-phase durability.
     ///
-    /// See [`insert`] for the ordering rationale.
+    /// See [`Self::insert`] for the ordering rationale.
     pub fn remove(
         &mut self,
         key: &TxKey,
@@ -177,9 +172,10 @@ impl RedbDahIndex {
                 new_height: 0,
             };
             let mut log = redo.lock();
-            log.append_and_flush(op).map_err(|e| IndexError::FormatError {
-                detail: format!("redo append_and_flush (dah remove): {e}"),
-            })?;
+            log.append_and_flush(op)
+                .map_err(|e| IndexError::FormatError {
+                    detail: format!("redo append_and_flush (dah remove): {e}"),
+                })?;
         }
 
         let txn = self.begin_write().map_err(map_txn_err)?;
@@ -191,19 +187,16 @@ impl RedbDahIndex {
             had_entry = match rev.remove(key.txid).map_err(map_storage_err)? {
                 Some(guard) => {
                     let h = u32::from_le_bytes(guard.value());
-                    fwd.remove(make_forward_key(h, key)).map_err(map_storage_err)?;
+                    fwd.remove(make_forward_key(h, key))
+                        .map_err(map_storage_err)?;
                     true
                 }
                 None => false,
             };
         }
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::BeforeSecondaryRedbCommit,
-        );
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeSecondaryRedbCommit);
         txn.commit().map_err(map_commit_err)?;
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::AfterSecondaryRedbCommit,
-        );
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterSecondaryRedbCommit);
         if had_entry {
             self.count -= 1;
         }
@@ -366,7 +359,6 @@ impl RedbDahIndex {
         }
         result
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -383,19 +375,27 @@ fn make_forward_key(height: u32, key: &TxKey) -> [u8; 36] {
 }
 
 fn map_txn_err(e: redb::TransactionError) -> IndexError {
-    IndexError::FormatError { detail: format!("redb txn error (dah): {e}") }
+    IndexError::FormatError {
+        detail: format!("redb txn error (dah): {e}"),
+    }
 }
 
 fn map_table_err(e: redb::TableError) -> IndexError {
-    IndexError::FormatError { detail: format!("redb table error (dah): {e}") }
+    IndexError::FormatError {
+        detail: format!("redb table error (dah): {e}"),
+    }
 }
 
 fn map_commit_err(e: redb::CommitError) -> IndexError {
-    IndexError::FormatError { detail: format!("redb commit error (dah): {e}") }
+    IndexError::FormatError {
+        detail: format!("redb commit error (dah): {e}"),
+    }
 }
 
 fn map_storage_err(e: redb::StorageError) -> IndexError {
-    IndexError::FormatError { detail: format!("redb storage error (dah): {e}") }
+    IndexError::FormatError {
+        detail: format!("redb storage error (dah): {e}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -570,14 +570,16 @@ mod tests {
     fn insert_batch_matches_individual() {
         // Individual inserts
         let dir1 = tempfile::tempdir().unwrap();
-        let mut idx1 = RedbDahIndex::open(dir1.path().join("dah.redb").as_path(), 16 * 1024 * 1024).unwrap();
+        let mut idx1 =
+            RedbDahIndex::open(dir1.path().join("dah.redb").as_path(), 16 * 1024 * 1024).unwrap();
         for n in 1..=20u8 {
             idx1.insert(n as u32 * 100, key(n), None).unwrap();
         }
 
         // Batch insert
         let dir2 = tempfile::tempdir().unwrap();
-        let mut idx2 = RedbDahIndex::open(dir2.path().join("dah.redb").as_path(), 16 * 1024 * 1024).unwrap();
+        let mut idx2 =
+            RedbDahIndex::open(dir2.path().join("dah.redb").as_path(), 16 * 1024 * 1024).unwrap();
         let entries: Vec<_> = (1..=20u8).map(|n| (n as u32 * 100, key(n))).collect();
         idx2.insert_batch(&entries);
 
@@ -750,7 +752,11 @@ mod tests {
         let entries = log.recover().unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0].op {
-            RedoOp::SecondaryDahUpdate { tx_key, old_height, new_height } => {
+            RedoOp::SecondaryDahUpdate {
+                tx_key,
+                old_height,
+                new_height,
+            } => {
                 assert_eq!(tx_key.txid, key(1).txid);
                 assert_eq!(*old_height, 0);
                 assert_eq!(*new_height, 900);
@@ -771,7 +777,11 @@ mod tests {
         let entries = log.recover().unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0].op {
-            RedoOp::SecondaryDahUpdate { old_height, new_height, .. } => {
+            RedoOp::SecondaryDahUpdate {
+                old_height,
+                new_height,
+                ..
+            } => {
                 assert_eq!(*old_height, 500);
                 assert_eq!(*new_height, 800);
             }
@@ -792,7 +802,11 @@ mod tests {
         let entries = log.recover().unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0].op {
-            RedoOp::SecondaryDahUpdate { old_height, new_height, .. } => {
+            RedoOp::SecondaryDahUpdate {
+                old_height,
+                new_height,
+                ..
+            } => {
                 assert_eq!(*old_height, 900);
                 assert_eq!(*new_height, 0);
             }
@@ -827,8 +841,10 @@ mod tests {
             match idx.insert((next as u32) * 10, key(next), Some(&redo)) {
                 Ok(_) => next += 1,
                 Err(e) => {
-                    assert!(format!("{e}").contains("redo append_and_flush"),
-                            "expected redo error, got: {e}");
+                    assert!(
+                        format!("{e}").contains("redo append_and_flush"),
+                        "expected redo error, got: {e}"
+                    );
                     break;
                 }
             }

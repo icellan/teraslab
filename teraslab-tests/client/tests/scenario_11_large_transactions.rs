@@ -9,10 +9,10 @@
 mod common;
 
 use std::time::{Duration, Instant};
-use teraslab_test_client::{Client, ClientError};
 use teraslab_test_client::reporter::MetricsReporter;
-use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::types::*;
+use teraslab_test_client::verifier::StateVerifier;
+use teraslab_test_client::{Client, ClientError};
 
 use teraslab::protocol::codec::encode_get_batch;
 use teraslab::protocol::opcodes::{FLAG_LOCAL_READ, OP_GET_BATCH, STATUS_OK};
@@ -83,7 +83,9 @@ async fn direct_get(
     txids: &[[u8; 32]],
 ) -> Result<(u8, Vec<u8>), ClientError> {
     let payload = encode_get_batch(FIELD_ALL, txids);
-    client.send_to_addr(node_addr, OP_GET_BATCH, FLAG_LOCAL_READ, payload).await
+    client
+        .send_to_addr(node_addr, OP_GET_BATCH, FLAG_LOCAL_READ, payload)
+        .await
 }
 
 /// For a given txid, determine which nodes (by index) hold it.
@@ -177,7 +179,9 @@ async fn run_scenario() -> Result<(), ClientError> {
         ("large/5MiB", &large_txid),
         ("vlarge/50MiB", &vlarge_txid),
     ] {
-        let results = client.get_batch(FIELD_ALL, std::slice::from_ref(txid)).await?;
+        let results = client
+            .get_batch(FIELD_ALL, std::slice::from_ref(txid))
+            .await?;
         assert!(
             !results.is_empty() && results.item(0).status == 0,
             "11.1: {label} tx read failed"
@@ -238,10 +242,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // Compare latencies: all should be within 2x of each other
     let all_stats = reporter.all_stats();
-    let latencies: Vec<(&String, Duration)> = all_stats
-        .iter()
-        .map(|(k, v)| (k, v.p50))
-        .collect();
+    let latencies: Vec<(&String, Duration)> = all_stats.iter().map(|(k, v)| (k, v.p50)).collect();
     if latencies.len() >= 2 {
         let min_lat = latencies.iter().map(|(_, d)| *d).min().unwrap();
         let max_lat = latencies.iter().map(|(_, d)| *d).max().unwrap();
@@ -384,26 +385,10 @@ async fn run_scenario() -> Result<(), ClientError> {
     let (del_large_txid, _, del_large_item) = make_create_item(5 * 1024 * 1024);
     let (del_vlarge_txid, _, del_vlarge_item) = make_create_item(50 * 1024 * 1024);
 
-    verifier.record_create(
-        del_small_txid,
-        1,
-        del_small_item.utxo_hashes.clone(),
-    );
-    verifier.record_create(
-        del_medium_txid,
-        1,
-        del_medium_item.utxo_hashes.clone(),
-    );
-    verifier.record_create(
-        del_large_txid,
-        1,
-        del_large_item.utxo_hashes.clone(),
-    );
-    verifier.record_create(
-        del_vlarge_txid,
-        1,
-        del_vlarge_item.utxo_hashes.clone(),
-    );
+    verifier.record_create(del_small_txid, 1, del_small_item.utxo_hashes.clone());
+    verifier.record_create(del_medium_txid, 1, del_medium_item.utxo_hashes.clone());
+    verifier.record_create(del_large_txid, 1, del_large_item.utxo_hashes.clone());
+    verifier.record_create(del_vlarge_txid, 1, del_vlarge_item.utxo_hashes.clone());
 
     client.create_batch(&[del_small_item]).await?;
     client.create_batch(&[del_medium_item]).await?;
@@ -414,7 +399,12 @@ async fn run_scenario() -> Result<(), ClientError> {
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
     // Delete all four
-    let del_txids = [del_small_txid, del_medium_txid, del_large_txid, del_vlarge_txid];
+    let del_txids = [
+        del_small_txid,
+        del_medium_txid,
+        del_large_txid,
+        del_vlarge_txid,
+    ];
     for txid in &del_txids {
         client.delete_batch(std::slice::from_ref(txid)).await?;
         verifier.record_delete(*txid);
@@ -493,9 +483,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         concurrent_failures, 0,
         "11.7: {concurrent_failures}/10 concurrent large creates failed"
     );
-    eprintln!(
-        "[11.7] All 10 concurrent large creates succeeded in {concurrent_elapsed:?}"
-    );
+    eprintln!("[11.7] All 10 concurrent large creates succeeded in {concurrent_elapsed:?}");
 
     // ======================================================================
     // Test 11.8: Large tx creation does not block small tx operations
@@ -508,9 +496,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     let bg_client = common::create_client(&docker, 3).await?;
     let bg_items = vec![bg_item];
 
-    let large_handle = tokio::spawn(async move {
-        bg_client.create_batch(&bg_items).await
-    });
+    let large_handle = tokio::spawn(async move { bg_client.create_batch(&bg_items).await });
 
     // Immediately do small operations in parallel
     let small_start = Instant::now();
@@ -518,9 +504,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     for _ in 0..20 {
         let (s_txid, _, s_item) = make_create_item(200);
         verifier.record_create(s_txid, 1, s_item.utxo_hashes.clone());
-        match client.create_batch(&[s_item]).await {
-            Ok(_) => small_ok += 1,
-            Err(_) => {}
+        if client.create_batch(&[s_item]).await.is_ok() {
+            small_ok += 1;
         }
     }
     let small_elapsed = small_start.elapsed();
@@ -585,18 +570,17 @@ async fn run_scenario() -> Result<(), ClientError> {
     docker.kill_node(&kill_node_name).await?;
 
     // Wait for cluster to stabilize at 2 nodes
-    let surviving_nodes: Vec<u32> = (1..=3u32)
-        .filter(|&n| n != (kill_idx as u32 + 1))
-        .collect();
-    common::wait_specific_nodes_ready(&docker, &surviving_nodes, 2, Duration::from_secs(30)).await?;
+    let surviving_nodes: Vec<u32> = (1..=3u32).filter(|&n| n != (kill_idx as u32 + 1)).collect();
+    common::wait_specific_nodes_ready(&docker, &surviving_nodes, 2, Duration::from_secs(30))
+        .await?;
     eprintln!("[11.9] Cluster stabilized at 2 nodes");
 
     // Wait for shard rebalancing to complete after node kill, then refresh
     // routing to ensure the client knows the surviving holder is the new master.
-    common::wait_specific_migrations_complete(
-        &docker, &surviving_nodes, Duration::from_secs(60),
-    ).await?;
-    common::wait_specific_replication_settled(&docker, &surviving_nodes, Duration::from_secs(5)).await?;
+    common::wait_specific_migrations_complete(&docker, &surviving_nodes, Duration::from_secs(60))
+        .await?;
+    common::wait_specific_replication_settled(&docker, &surviving_nodes, Duration::from_secs(5))
+        .await?;
     let _ = client.refresh_routing().await;
 
     // Read the record using the normal routed client — should succeed via
@@ -612,7 +596,8 @@ async fn run_scenario() -> Result<(), ClientError> {
         "11.9: blob record metadata should be accessible after killing master"
     );
     eprintln!(
-        "[11.9] Metadata read OK after kill, len={}", meta_results.item(0).data.len()
+        "[11.9] Metadata read OK after kill, len={}",
+        meta_results.item(0).data.len()
     );
 
     // Now read with FIELD_ALL which includes FIELD_COLD_DATA
@@ -648,9 +633,7 @@ async fn run_scenario() -> Result<(), ClientError> {
          This likely means the blobstore file is not accessible from the surviving node, \
          or the EXTERNAL flag was not set on the replica's record."
     );
-    eprintln!(
-        "[11.9] Blob record accessible after node kill, data len={data_len}"
-    );
+    eprintln!("[11.9] Blob record accessible after node kill, data len={data_len}");
 
     // Restart the killed node
     docker.start_node(&kill_node_name).await?;
@@ -749,7 +732,8 @@ async fn run_scenario() -> Result<(), ClientError> {
         2,
         probe_sample.len(),
         Duration::from_secs(60),
-    ).await?;
+    )
+    .await?;
 
     // Read ALL 10 large records — verify they're all accessible and complete
     let all_large_txids: Vec<[u8; 32]> = large_txids_5m
@@ -770,8 +754,10 @@ async fn run_scenario() -> Result<(), ClientError> {
     // Retry any missing records after routing refresh — the partition map
     // may be stale for shards that recently migrated to node4.
     if !missing_after_first.is_empty() {
-        eprintln!("[11.10] {} records not found on first pass, retrying after routing refresh...",
-            missing_after_first.len());
+        eprintln!(
+            "[11.10] {} records not found on first pass, retrying after routing refresh...",
+            missing_after_first.len()
+        );
         client_4.refresh_routing().await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
         client_4.refresh_routing().await?;
@@ -793,8 +779,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     let node4_addr = &node4_addrs[3]; // 0-indexed, node4 is index 3
     let mut node4_holds = 0u32;
     for txid in &all_large_txids {
-        let (frame_status, payload) =
-            direct_get(&client_4, node4_addr, &[*txid]).await?;
+        let (frame_status, payload) = direct_get(&client_4, node4_addr, &[*txid]).await?;
         if frame_status == STATUS_OK && !payload.is_empty() && payload.len() >= 5 {
             let item_status = payload[4];
             if item_status == 0 {
@@ -807,9 +792,7 @@ async fn run_scenario() -> Result<(), ClientError> {
             }
         }
     }
-    eprintln!(
-        "[11.10] node4 holds {node4_holds}/10 large records via local read"
-    );
+    eprintln!("[11.10] node4 holds {node4_holds}/10 large records via local read");
     // With 4 nodes and RF=2, node4 should hold roughly half the shards
     // (some records). At minimum it should hold at least 1.
     assert!(
@@ -855,8 +838,14 @@ async fn run_scenario() -> Result<(), ClientError> {
             eprintln!("[11.11] Killing node2 midway through reads");
             docker_5.kill_node("node2").await?;
             // Wait for surviving nodes to detect the kill and complete migrations
-            common::wait_specific_nodes_ready(&docker_5, &[1, 3, 4], 3, Duration::from_secs(30)).await?;
-            common::wait_specific_migrations_complete(&docker_5, &[1, 3, 4], Duration::from_secs(30)).await?;
+            common::wait_specific_nodes_ready(&docker_5, &[1, 3, 4], 3, Duration::from_secs(30))
+                .await?;
+            common::wait_specific_migrations_complete(
+                &docker_5,
+                &[1, 3, 4],
+                Duration::from_secs(30),
+            )
+            .await?;
             let _ = client_4.refresh_routing().await;
         }
 
@@ -876,7 +865,11 @@ async fn run_scenario() -> Result<(), ClientError> {
                     failed_reads += 1;
                     eprintln!(
                         "[11.11] Read {read_num}: record not found (status={})",
-                        if results.is_empty() { 255 } else { results.item(0).status }
+                        if results.is_empty() {
+                            255
+                        } else {
+                            results.item(0).status
+                        }
                     );
                 }
             }
@@ -889,9 +882,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         }
     }
 
-    eprintln!(
-        "[11.11] Reads: {successful_reads} succeeded, {failed_reads} failed"
-    );
+    eprintln!("[11.11] Reads: {successful_reads} succeeded, {failed_reads} failed");
     // The first 3 reads (before kill) must succeed. After the kill, the client
     // routes to surviving nodes after detecting the failure. With 4 nodes (one
     // killed), reads should eventually succeed. We require at least 4/10 total

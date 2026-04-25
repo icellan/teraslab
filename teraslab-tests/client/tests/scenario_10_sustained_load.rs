@@ -11,15 +11,15 @@
 #[allow(dead_code)]
 mod common;
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use teraslab_test_client::{Client, ClientError};
 use teraslab_test_client::helpers::DockerHelpers;
 use teraslab_test_client::reporter::MetricsReporter;
-use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::types::*;
+use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::workload::{WorkloadConfig, WorkloadRunner};
+use teraslab_test_client::{Client, ClientError};
 
 use teraslab::protocol::codec::encode_get_batch;
 use teraslab::protocol::opcodes::{FLAG_LOCAL_READ, OP_GET_BATCH, STATUS_OK};
@@ -74,8 +74,6 @@ struct Checkpoint {
     mismatches: usize,
     /// Number of replication mismatches (records not present on RF=2 nodes).
     replication_mismatches: usize,
-    /// Total operations at this checkpoint.
-    total_ops: u64,
     /// RSS bytes scraped from the first node's /status endpoint.
     rss_bytes: u64,
     /// p99 latency across all operation types (from reporter).
@@ -111,8 +109,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     let reporter = Arc::new(MetricsReporter::new());
 
     // Shared state: list of created txids and their utxo hashes for spend/delete targeting
-    let created_txids: Arc<Mutex<Vec<([u8; 32], Vec<[u8; 32]>)>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    type CreatedTxids = Arc<Mutex<Vec<([u8; 32], Vec<[u8; 32]>)>>>;
+    let created_txids: CreatedTxids = Arc::new(Mutex::new(Vec::new()));
     // Track txids that have been set-mined (for unset-mined etc.)
     let mined_txids: Arc<Mutex<Vec<[u8; 32]>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -220,8 +218,7 @@ async fn run_scenario() -> Result<(), ClientError> {
             // Multi-item batches with cluster routing can produce ambiguous results
             // when items redirect to different nodes.
             {
-                let created_snapshot: Vec<([u8; 32], Vec<[u8; 32]>)> =
-                    bg_created.lock().clone();
+                let created_snapshot: Vec<([u8; 32], Vec<[u8; 32]>)> = bg_created.lock().clone();
                 if !created_snapshot.is_empty() {
                     for _ in 0..2000 {
                         let idx = rng.gen_range(0..created_snapshot.len());
@@ -286,8 +283,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
             // -- SetMined (500 per tick = 5000/sec) --
             {
-                let created_snapshot: Vec<([u8; 32], Vec<[u8; 32]>)> =
-                    bg_created.lock().clone();
+                let created_snapshot: Vec<([u8; 32], Vec<[u8; 32]>)> = bg_created.lock().clone();
                 if !created_snapshot.is_empty() {
                     let mut set_mined_txids: Vec<[u8; 32]> = Vec::with_capacity(500);
                     for _ in 0..500 {
@@ -309,9 +305,7 @@ async fn run_scenario() -> Result<(), ClientError> {
                     match bg_client.set_mined_batch(&params, &set_mined_txids).await {
                         Ok(_) => {
                             bg_reporter.record("set_mined", op_start.elapsed());
-                            bg_metrics
-                                .set_mined_ok
-                                .fetch_add(500, Ordering::Relaxed);
+                            bg_metrics.set_mined_ok.fetch_add(500, Ordering::Relaxed);
                             bg_metrics.total_ops.fetch_add(500, Ordering::Relaxed);
                             for txid in &set_mined_txids {
                                 bg_verifier.record_set_mined(*txid);
@@ -319,9 +313,7 @@ async fn run_scenario() -> Result<(), ClientError> {
                             bg_mined.lock().extend_from_slice(&set_mined_txids);
                         }
                         Err(_) => {
-                            bg_metrics
-                                .set_mined_err
-                                .fetch_add(500, Ordering::Relaxed);
+                            bg_metrics.set_mined_err.fetch_add(500, Ordering::Relaxed);
                             bg_metrics.total_ops.fetch_add(500, Ordering::Relaxed);
                             bg_metrics.total_errors.fetch_add(500, Ordering::Relaxed);
                             let _ = bg_client.refresh_routing().await;
@@ -332,8 +324,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
             // -- Reads (1000 per tick = 10000/sec, in batches of 20) --
             for _ in 0..50 {
-                let created_snapshot: Vec<([u8; 32], Vec<[u8; 32]>)> =
-                    bg_created.lock().clone();
+                let created_snapshot: Vec<([u8; 32], Vec<[u8; 32]>)> = bg_created.lock().clone();
                 if created_snapshot.is_empty() {
                     break;
                 }
@@ -348,10 +339,7 @@ async fn run_scenario() -> Result<(), ClientError> {
                 match bg_client.get_batch(FIELD_ALL, &read_txids).await {
                     Ok(results) => {
                         bg_reporter.record("read", op_start.elapsed());
-                        let ok_count = results
-                            .iter()
-                            .filter(|r| r.status() == 0)
-                            .count() as u64;
+                        let ok_count = results.iter().filter(|r| r.status() == 0).count() as u64;
                         bg_metrics.reads_ok.fetch_add(ok_count, Ordering::Relaxed);
                         bg_metrics.total_ops.fetch_add(20, Ordering::Relaxed);
                     }
@@ -403,9 +391,10 @@ async fn run_scenario() -> Result<(), ClientError> {
 
             // -- Freeze + Unfreeze (10 per tick = 100/sec total) --
             for _ in 0..10 {
-                let created_snapshot: Vec<([u8; 32], Vec<[u8; 32]>)> =
-                    bg_created.lock().clone();
-                if created_snapshot.is_empty() { break; }
+                let created_snapshot: Vec<([u8; 32], Vec<[u8; 32]>)> = bg_created.lock().clone();
+                if created_snapshot.is_empty() {
+                    break;
+                }
                 {
                     let idx = rng.gen_range(0..created_snapshot.len());
                     let (txid, ref hashes) = created_snapshot[idx];
@@ -419,7 +408,10 @@ async fn run_scenario() -> Result<(), ClientError> {
                     };
 
                     let op_start = Instant::now();
-                    match bg_client.freeze_batch(&[freeze_item.clone()]).await {
+                    match bg_client
+                        .freeze_batch(std::slice::from_ref(&freeze_item))
+                        .await
+                    {
                         Ok(_) => {
                             bg_reporter.record("freeze", op_start.elapsed());
                             bg_verifier.record_freeze(txid, vout);
@@ -435,9 +427,7 @@ async fn run_scenario() -> Result<(), ClientError> {
                                 }
                                 Err(_) => {
                                     bg_metrics.total_ops.fetch_add(1, Ordering::Relaxed);
-                                    bg_metrics
-                                        .total_errors
-                                        .fetch_add(1, Ordering::Relaxed);
+                                    bg_metrics.total_errors.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
                         }
@@ -471,9 +461,7 @@ async fn run_scenario() -> Result<(), ClientError> {
 
         if start.elapsed() >= next_checkpoint {
             let elapsed_secs = start.elapsed().as_secs();
-            eprintln!(
-                "[10.checkpoint] {elapsed_secs}s elapsed, pausing for consistency check"
-            );
+            eprintln!("[10.checkpoint] {elapsed_secs}s elapsed, pausing for consistency check");
 
             // Pause workload
             runner.pause();
@@ -491,8 +479,7 @@ async fn run_scenario() -> Result<(), ClientError> {
             }
 
             // Run replication verification on a sample of records
-            let repl_mismatches =
-                verify_replication_sample(&client, &docker, &verifier).await?;
+            let repl_mismatches = verify_replication_sample(&client, &docker, &verifier).await?;
             if repl_mismatches > 0 {
                 eprintln!(
                     "[10.checkpoint] WARNING: {} replication mismatches at {elapsed_secs}s",
@@ -509,13 +496,12 @@ async fn run_scenario() -> Result<(), ClientError> {
             // Get throughput and p99
             let total_ops = metrics.total_ops.load(Ordering::Relaxed);
             let interval_ops = total_ops - last_total_ops;
-            let throughput =
-                interval_ops as f64 / CHECKPOINT_INTERVAL_SECS as f64;
+            let throughput = interval_ops as f64 / CHECKPOINT_INTERVAL_SECS as f64;
             last_total_ops = total_ops;
 
             let all_stats = reporter.all_stats();
             let mut max_p99 = Duration::ZERO;
-            for (_op, stats) in &all_stats {
+            for stats in all_stats.values() {
                 if stats.p99 > max_p99 {
                     max_p99 = stats.p99;
                 }
@@ -525,7 +511,6 @@ async fn run_scenario() -> Result<(), ClientError> {
                 elapsed_secs,
                 mismatches: mismatch_count,
                 replication_mismatches: repl_mismatches,
-                total_ops,
                 rss_bytes,
                 p99_latency: max_p99,
                 throughput,
@@ -650,8 +635,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         let first_rss = checkpoints[0].rss_bytes;
         let last_rss = checkpoints[checkpoints.len() - 1].rss_bytes;
         if first_rss > 0 {
-            let growth_pct =
-                ((last_rss as f64 - first_rss as f64) / first_rss as f64) * 100.0;
+            let growth_pct = ((last_rss as f64 - first_rss as f64) / first_rss as f64) * 100.0;
             assert!(
                 growth_pct < 20.0,
                 "10: RSS grew {growth_pct:.1}% (first={first_rss}, last={last_rss}), \
@@ -759,7 +743,10 @@ async fn verify_replication_sample(
         if holder_payloads.len() < 2 {
             eprintln!(
                 "[10.repl_check] txid {:02x}{:02x}..{:02x}{:02x} found on {} nodes (expected >=2)",
-                txid[0], txid[1], txid[30], txid[31],
+                txid[0],
+                txid[1],
+                txid[30],
+                txid[31],
                 holder_payloads.len()
             );
             mismatch_count += 1;
@@ -773,9 +760,14 @@ async fn verify_replication_sample(
                 eprintln!(
                     "[10.repl_check] txid {:02x}{:02x}..{:02x}{:02x} data mismatch between \
                      node {} and node {} (len {}  vs {})",
-                    txid[0], txid[1], txid[30], txid[31],
-                    holder_payloads[0].0, node_idx,
-                    reference.len(), payload.len()
+                    txid[0],
+                    txid[1],
+                    txid[30],
+                    txid[31],
+                    holder_payloads[0].0,
+                    node_idx,
+                    reference.len(),
+                    payload.len()
                 );
                 mismatch_count += 1;
                 break;

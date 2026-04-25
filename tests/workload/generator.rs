@@ -375,7 +375,10 @@ impl WorkloadGenerator {
         let mut ops = Vec::with_capacity(total as usize);
 
         // Bootstrap: create initial transactions so spends have targets
-        let bootstrap_count = std::cmp::max(10, (total as f64 * self.config.tx_creation_rate * 0.3) as u64);
+        let bootstrap_count = std::cmp::max(
+            10,
+            (total as f64 * self.config.tx_creation_rate * 0.3) as u64,
+        );
         for _ in 0..bootstrap_count {
             ops.push(self.generate_create());
         }
@@ -394,7 +397,7 @@ impl WorkloadGenerator {
         self.ops_generated += 1;
 
         // Periodically advance block height
-        if self.ops_generated % 500 == 0 {
+        if self.ops_generated.is_multiple_of(500) {
             self.state.current_block_height += 1;
         }
 

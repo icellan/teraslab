@@ -5,8 +5,8 @@
 
 #![allow(clippy::disallowed_macros)] // integration tests may use eprintln!/println! for diagnostics
 
-mod workload;
 mod simulation;
+mod workload;
 
 use std::sync::Arc;
 
@@ -20,9 +20,9 @@ use teraslab::ops::remaining::*;
 use teraslab::ops::set_mined::*;
 use teraslab::ops::spend::*;
 
+use simulation::{Simulation, SimulationConfig};
 use workload::generator::{Distribution, WorkloadConfig, WorkloadGenerator, WorkloadOp};
 use workload::verifier::StateVerifier;
-use simulation::{Simulation, SimulationConfig};
 
 // ---------------------------------------------------------------------------
 // Scale control
@@ -30,7 +30,7 @@ use simulation::{Simulation, SimulationConfig};
 
 /// Returns true when running at full CI volume.
 fn full_scale() -> bool {
-    std::env::var("TERASLAB_FULL_WORKLOAD").map_or(false, |v| v == "1")
+    std::env::var("TERASLAB_FULL_WORKLOAD").is_ok_and(|v| v == "1")
 }
 
 /// Pick between full and fast value.
@@ -51,8 +51,7 @@ fn create_engine() -> Arc<Engine> {
 }
 
 fn create_engine_with_size(size: u64) -> Arc<Engine> {
-    let dev: Arc<dyn BlockDevice> =
-        Arc::new(MemoryDevice::new(size, 4096).unwrap());
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(size, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(200_000).unwrap();
     Arc::new(Engine::new(
@@ -120,7 +119,12 @@ fn e2e_mixed_single_node_zero_mismatches() {
         mismatches.is_empty(),
         "found {} mismatches:\n{}",
         mismatches.len(),
-        mismatches.iter().take(20).map(|m| m.detail.as_str()).collect::<Vec<_>>().join("\n")
+        mismatches
+            .iter()
+            .take(20)
+            .map(|m| m.detail.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
@@ -133,17 +137,43 @@ fn e2e_concurrent_10_threads_zero_mismatches() {
     for i in 0..tx_count {
         let tx_id = make_tx_id(i);
         let utxo_hashes: Vec<[u8; 32]> = (0..10u32).map(|v| make_utxo_hash(i, v)).collect();
-        engine.create(&CreateRequest {
-            tx_id, tx_version: 1, locktime: 0, fee: 500, size_in_bytes: 250,
-            extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
-            is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
-        }).unwrap();
+        engine
+            .create(&CreateRequest {
+                tx_id,
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &utxo_hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 1710000000000,
+                block_height: 1000,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                parent_txids: &[],
+            })
+            .unwrap();
     }
 
     let chunk_size = tx_count as usize / 10;
-    let keys: Vec<(TxKey, u32)> = (0..tx_count).map(|i| (TxKey { txid: make_tx_id(i) }, i)).collect();
+    let keys: Vec<(TxKey, u32)> = (0..tx_count)
+        .map(|i| {
+            (
+                TxKey {
+                    txid: make_tx_id(i),
+                },
+                i,
+            )
+        })
+        .collect();
 
     let handles: Vec<_> = (0..10)
         .map(|t| {
@@ -155,26 +185,44 @@ fn e2e_concurrent_10_threads_zero_mismatches() {
                         let mut sd = [0u8; 36];
                         sd[0..4].copy_from_slice(&(tx_n + 10000).to_le_bytes());
                         sd[32..36].copy_from_slice(&v.to_le_bytes());
-                        engine.spend(&SpendRequest {
-                            tx_key: key, offset: v, utxo_hash: make_utxo_hash(tx_n, v),
-                            spending_data: sd, ignore_conflicting: false, ignore_locked: false,
-                            current_block_height: 2000, block_height_retention: 288,
-                        }).unwrap();
+                        engine
+                            .spend(&SpendRequest {
+                                tx_key: key,
+                                offset: v,
+                                utxo_hash: make_utxo_hash(tx_n, v),
+                                spending_data: sd,
+                                ignore_conflicting: false,
+                                ignore_locked: false,
+                                current_block_height: 2000,
+                                block_height_retention: 288,
+                            })
+                            .unwrap();
                     }
-                    engine.set_mined(&SetMinedRequest {
-                        tx_key: key, block_id: tx_n + 1000, block_height: 2000, subtree_idx: 0,
-                        current_block_height: 2000, block_height_retention: 288,
-                        on_longest_chain: true, unset_mined: false,
-                    }).unwrap();
+                    engine
+                        .set_mined(&SetMinedRequest {
+                            tx_key: key,
+                            block_id: tx_n + 1000,
+                            block_height: 2000,
+                            subtree_idx: 0,
+                            current_block_height: 2000,
+                            block_height_retention: 288,
+                            on_longest_chain: true,
+                            unset_mined: false,
+                        })
+                        .unwrap();
                 }
             })
         })
         .collect();
 
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
 
     for i in 0..tx_count {
-        let key = TxKey { txid: make_tx_id(i) };
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.spent_utxos }, 5);
         assert_eq!(meta.block_entry_count, 1);
@@ -196,7 +244,8 @@ fn e2e_crash_injection_10_seeds() {
         assert!(
             !result.data_loss_detected,
             "seed {}: data loss detected. Inconsistencies: {:?}",
-            seed, &result.inconsistencies_found[..result.inconsistencies_found.len().min(5)]
+            seed,
+            &result.inconsistencies_found[..result.inconsistencies_found.len().min(5)]
         );
     }
 }
@@ -215,17 +264,35 @@ fn realistic_block_arrival() {
     for i in 0..tx_count {
         let tx_id = make_tx_id(i);
         let utxo_hashes: Vec<[u8; 32]> = (0..10u32).map(|v| make_utxo_hash(i, v)).collect();
-        verifier.apply(&WorkloadOp::Create {
-            tx_id, utxo_hashes, is_coinbase: false, spending_height: 0,
-            is_external: false, block_height: 1000,
-        }, &engine).unwrap();
+        verifier
+            .apply(
+                &WorkloadOp::Create {
+                    tx_id,
+                    utxo_hashes,
+                    is_coinbase: false,
+                    spending_height: 0,
+                    is_external: false,
+                    block_height: 1000,
+                },
+                &engine,
+            )
+            .unwrap();
     }
 
     for i in 0..tx_count {
-        verifier.apply(&WorkloadOp::SetMined {
-            tx_key: TxKey { txid: make_tx_id(i) }, block_id: 500,
-            block_height: 5000, current_block_height: 5000,
-        }, &engine).unwrap();
+        verifier
+            .apply(
+                &WorkloadOp::SetMined {
+                    tx_key: TxKey {
+                        txid: make_tx_id(i),
+                    },
+                    block_id: 500,
+                    block_height: 5000,
+                    current_block_height: 5000,
+                },
+                &engine,
+            )
+            .unwrap();
     }
 
     for i in 0..tx_count {
@@ -233,19 +300,36 @@ fn realistic_block_arrival() {
             let mut sd = [0u8; 36];
             sd[0..4].copy_from_slice(&(i + 10000).to_le_bytes());
             sd[32..36].copy_from_slice(&v.to_le_bytes());
-            verifier.apply(&WorkloadOp::Spend {
-                tx_key: TxKey { txid: make_tx_id(i) }, offset: v,
-                utxo_hash: make_utxo_hash(i, v), spending_data: sd,
-                current_block_height: 5000,
-            }, &engine).unwrap();
+            verifier
+                .apply(
+                    &WorkloadOp::Spend {
+                        tx_key: TxKey {
+                            txid: make_tx_id(i),
+                        },
+                        offset: v,
+                        utxo_hash: make_utxo_hash(i, v),
+                        spending_data: sd,
+                        current_block_height: 5000,
+                    },
+                    &engine,
+                )
+                .unwrap();
         }
     }
 
     let mismatches = verifier.verify_against(&engine);
-    assert!(mismatches.is_empty(), "block arrival: {} mismatches", mismatches.len());
+    assert!(
+        mismatches.is_empty(),
+        "block arrival: {} mismatches",
+        mismatches.len()
+    );
 
     for i in 0..tx_count {
-        let meta = engine.read_metadata(&TxKey { txid: make_tx_id(i) }).unwrap();
+        let meta = engine
+            .read_metadata(&TxKey {
+                txid: make_tx_id(i),
+            })
+            .unwrap();
         assert_eq!({ meta.spent_utxos }, 5);
         assert_eq!(meta.block_entry_count, 1);
     }
@@ -259,37 +343,84 @@ fn realistic_block_reorg() {
 
     for i in 0..tx_count {
         let utxo_hashes: Vec<[u8; 32]> = (0..5u32).map(|v| make_utxo_hash(i, v)).collect();
-        engine.create(&CreateRequest {
-            tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
-            size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
-            is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
-        }).unwrap();
+        engine
+            .create(&CreateRequest {
+                tx_id: make_tx_id(i),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &utxo_hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 1710000000000,
+                block_height: 1000,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                parent_txids: &[],
+            })
+            .unwrap();
     }
 
     // Mine all
     for i in 0..tx_count {
-        engine.set_mined(&SetMinedRequest {
-            tx_key: TxKey { txid: make_tx_id(i) }, block_id: 200, block_height: 2000,
-            subtree_idx: 0, current_block_height: 2000, block_height_retention: 288,
-            on_longest_chain: true, unset_mined: false,
-        }).unwrap();
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: TxKey {
+                    txid: make_tx_id(i),
+                },
+                block_id: 200,
+                block_height: 2000,
+                subtree_idx: 0,
+                current_block_height: 2000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
     }
     for i in 0..tx_count {
-        assert_eq!(engine.read_metadata(&TxKey { txid: make_tx_id(i) }).unwrap().block_entry_count, 1);
+        assert_eq!(
+            engine
+                .read_metadata(&TxKey {
+                    txid: make_tx_id(i)
+                })
+                .unwrap()
+                .block_entry_count,
+            1
+        );
     }
 
     // Reorg: unmine all
     for i in 0..tx_count {
-        engine.set_mined(&SetMinedRequest {
-            tx_key: TxKey { txid: make_tx_id(i) }, block_id: 200, block_height: 2000,
-            subtree_idx: 0, current_block_height: 2001, block_height_retention: 288,
-            on_longest_chain: true, unset_mined: true,
-        }).unwrap();
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: TxKey {
+                    txid: make_tx_id(i),
+                },
+                block_id: 200,
+                block_height: 2000,
+                subtree_idx: 0,
+                current_block_height: 2001,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: true,
+            })
+            .unwrap();
     }
     for i in 0..tx_count {
-        let meta = engine.read_metadata(&TxKey { txid: make_tx_id(i) }).unwrap();
+        let meta = engine
+            .read_metadata(&TxKey {
+                txid: make_tx_id(i),
+            })
+            .unwrap();
         assert_eq!(meta.block_entry_count, 0);
         assert_ne!({ meta.unmined_since }, 0);
     }
@@ -325,7 +456,11 @@ fn realistic_mempool_churn() {
     }
 
     let mismatches = verifier.verify_against(&engine);
-    assert!(mismatches.is_empty(), "mempool churn: {} mismatches", mismatches.len());
+    assert!(
+        mismatches.is_empty(),
+        "mempool churn: {} mismatches",
+        mismatches.len()
+    );
 }
 
 /// Large transaction: create tx with many UTXOs, spend them, read back.
@@ -338,27 +473,54 @@ fn realistic_large_transaction() {
     let utxo_hashes: Vec<[u8; 32]> = (0..utxo_count).map(|v| make_utxo_hash(1, v)).collect();
     let inputs_data = vec![0xDE; 5000];
     let outputs_data = vec![0xBE; 5000];
-    engine.create(&CreateRequest {
-        tx_id, tx_version: 1, locktime: 0, fee: 500, size_in_bytes: 100_000,
-        extended_size: 0, is_coinbase: false, spending_height: 0, utxo_hashes: &utxo_hashes,
-        inputs: Some(&inputs_data), outputs: Some(&outputs_data),
-        inpoints: None, is_external: false, created_at: 1710000000000, block_height: 1000,
-        mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
-    }).unwrap();
+    engine
+        .create(&CreateRequest {
+            tx_id,
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 100_000,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: &utxo_hashes,
+            inputs: Some(&inputs_data),
+            outputs: Some(&outputs_data),
+            inpoints: None,
+            is_external: false,
+            created_at: 1710000000000,
+            block_height: 1000,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+            parent_txids: &[],
+        })
+        .unwrap();
     let key = TxKey { txid: tx_id };
 
     for v in 0..utxo_count {
         let mut sd = [0u8; 36];
         sd[0..4].copy_from_slice(&(v + 10000).to_le_bytes());
         sd[32..36].copy_from_slice(&v.to_le_bytes());
-        engine.spend(&SpendRequest {
-            tx_key: key, offset: v, utxo_hash: make_utxo_hash(1, v), spending_data: sd,
-            ignore_conflicting: false, ignore_locked: false,
-            current_block_height: 2000, block_height_retention: 288,
-        }).unwrap();
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: v,
+                utxo_hash: make_utxo_hash(1, v),
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 2000,
+                block_height_retention: 288,
+            })
+            .unwrap();
     }
 
-    assert_eq!({ engine.read_metadata(&key).unwrap().spent_utxos }, utxo_count);
+    assert_eq!(
+        { engine.read_metadata(&key).unwrap().spent_utxos },
+        utxo_count
+    );
     for v in 0..utxo_count {
         assert!(engine.read_slot(&key, v).unwrap().is_spent());
     }
@@ -380,13 +542,30 @@ fn tiered_storage_mixed_workload() {
         let utxo_hashes: Vec<[u8; 32]> = (0..5u32).map(|v| make_utxo_hash(i, v)).collect();
         let inp = vec![0xAA; 100];
         let outp = vec![0xBB; 100];
-        engine.create(&CreateRequest {
-            tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
-            size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes: &utxo_hashes, inputs: Some(&inp), outputs: Some(&outp),
-            inpoints: None, is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
-        }).unwrap();
+        engine
+            .create(&CreateRequest {
+                tx_id: make_tx_id(i),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &utxo_hashes,
+                inputs: Some(&inp),
+                outputs: Some(&outp),
+                inpoints: None,
+                is_external: false,
+                created_at: 1710000000000,
+                block_height: 1000,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                parent_txids: &[],
+            })
+            .unwrap();
     }
     let offset = small_count;
     for i in 0..medium_count {
@@ -394,40 +573,80 @@ fn tiered_storage_mixed_workload() {
         let utxo_hashes: Vec<[u8; 32]> = (0..50u32).map(|v| make_utxo_hash(idx, v)).collect();
         let inp = vec![0xCC; 2000];
         let outp = vec![0xDD; 2000];
-        engine.create(&CreateRequest {
-            tx_id: make_tx_id(idx), tx_version: 1, locktime: 0, fee: 5000,
-            size_in_bytes: 10_000, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes: &utxo_hashes, inputs: Some(&inp), outputs: Some(&outp),
-            inpoints: None, is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
-        }).unwrap();
+        engine
+            .create(&CreateRequest {
+                tx_id: make_tx_id(idx),
+                tx_version: 1,
+                locktime: 0,
+                fee: 5000,
+                size_in_bytes: 10_000,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &utxo_hashes,
+                inputs: Some(&inp),
+                outputs: Some(&outp),
+                inpoints: None,
+                is_external: false,
+                created_at: 1710000000000,
+                block_height: 1000,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                parent_txids: &[],
+            })
+            .unwrap();
     }
 
     let total = small_count + medium_count;
     for i in 0..total {
-        let key = TxKey { txid: make_tx_id(i) };
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
         assert!(engine.read_metadata(&key).unwrap().utxo_count > 0);
         assert!(!engine.read_cold_data(&key).unwrap().is_empty());
     }
 
     // Spend one UTXO per tx
     for i in 0..total {
-        let key = TxKey { txid: make_tx_id(i) };
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
         let mut sd = [0u8; 36];
         sd[0..4].copy_from_slice(&(i + 10000).to_le_bytes());
-        engine.spend(&SpendRequest {
-            tx_key: key, offset: 0, utxo_hash: make_utxo_hash(i, 0), spending_data: sd,
-            ignore_conflicting: false, ignore_locked: false,
-            current_block_height: 2000, block_height_retention: 288,
-        }).unwrap();
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: make_utxo_hash(i, 0),
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 2000,
+                block_height_retention: 288,
+            })
+            .unwrap();
     }
     for i in 0..total {
-        assert_eq!({ engine.read_metadata(&TxKey { txid: make_tx_id(i) }).unwrap().spent_utxos }, 1);
+        assert_eq!(
+            {
+                engine
+                    .read_metadata(&TxKey {
+                        txid: make_tx_id(i),
+                    })
+                    .unwrap()
+                    .spent_utxos
+            },
+            1
+        );
     }
 
     // Delete and verify cleanup
     for i in 0..total {
-        let key = TxKey { txid: make_tx_id(i) };
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
         engine.delete(&DeleteRequest { tx_key: key }).unwrap();
         assert!(engine.lookup(&key).is_none());
     }
@@ -442,23 +661,46 @@ fn tiered_storage_cold_data_read() {
     let inputs_data = vec![0xDE; 4096];
     let outputs_data = vec![0xBE; 4096];
     let inpoints_data = vec![0xFE; 2048];
-    engine.create(&CreateRequest {
-        tx_id, tx_version: 1, locktime: 0, fee: 500, size_in_bytes: 10000,
-        extended_size: 0, is_coinbase: false, spending_height: 0,
-        utxo_hashes: &utxo_hashes,
-        inputs: Some(&inputs_data), outputs: Some(&outputs_data),
-        inpoints: Some(&inpoints_data), is_external: false,
-        created_at: 1710000000000, block_height: 1000,
-        mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
-    }).unwrap();
+    engine
+        .create(&CreateRequest {
+            tx_id,
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 10000,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: &utxo_hashes,
+            inputs: Some(&inputs_data),
+            outputs: Some(&outputs_data),
+            inpoints: Some(&inpoints_data),
+            is_external: false,
+            created_at: 1710000000000,
+            block_height: 1000,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+            parent_txids: &[],
+        })
+        .unwrap();
     let key = TxKey { txid: tx_id };
 
-    let mut sd = [0u8; 36]; sd[0] = 0xAA;
-    engine.spend(&SpendRequest {
-        tx_key: key, offset: 0, utxo_hash: make_utxo_hash(1, 0), spending_data: sd,
-        ignore_conflicting: false, ignore_locked: false,
-        current_block_height: 2000, block_height_retention: 288,
-    }).unwrap();
+    let mut sd = [0u8; 36];
+    sd[0] = 0xAA;
+    engine
+        .spend(&SpendRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: make_utxo_hash(1, 0),
+            spending_data: sd,
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 2000,
+            block_height_retention: 288,
+        })
+        .unwrap();
 
     assert!(!engine.read_cold_data(&key).unwrap().is_empty());
 }
@@ -475,11 +717,14 @@ fn simulation_crash_1pct() {
     for seed in 0..seeds {
         let mut sim = Simulation::new_single_node(seed + 200);
         let result = sim.run_with_faults(SimulationConfig {
-            operations: ops, crash_probability: 0.01, ..SimulationConfig::default()
+            operations: ops,
+            crash_probability: 0.01,
+            ..SimulationConfig::default()
         });
         assert!(
             result.inconsistencies_found.is_empty(),
-            "seed {}: {} inconsistencies: {:?}", seed,
+            "seed {}: {} inconsistencies: {:?}",
+            seed,
             result.inconsistencies_found.len(),
             &result.inconsistencies_found[..result.inconsistencies_found.len().min(5)]
         );
@@ -494,11 +739,14 @@ fn simulation_combined_faults() {
     for seed in 0..seeds {
         let mut sim = Simulation::new_single_node(seed + 300);
         let result = sim.run_with_faults(SimulationConfig {
-            operations: ops, crash_probability: 0.005, ..SimulationConfig::default()
+            operations: ops,
+            crash_probability: 0.005,
+            ..SimulationConfig::default()
         });
         assert!(
             !result.data_loss_detected,
-            "seed {}: data loss. Inconsistencies: {:?}", seed,
+            "seed {}: data loss. Inconsistencies: {:?}",
+            seed,
             &result.inconsistencies_found[..result.inconsistencies_found.len().min(5)]
         );
     }
@@ -508,7 +756,9 @@ fn simulation_combined_faults() {
 #[test]
 fn simulation_reproducibility() {
     let config = SimulationConfig {
-        operations: 5_000, crash_probability: 0.02, seed: 999,
+        operations: 5_000,
+        crash_probability: 0.02,
+        seed: 999,
         ..SimulationConfig::default()
     };
 
@@ -519,7 +769,10 @@ fn simulation_reproducibility() {
 
     assert_eq!(r1.operations_completed, r2.operations_completed);
     assert_eq!(r1.crashes_injected, r2.crashes_injected);
-    assert_eq!(r1.inconsistencies_found.len(), r2.inconsistencies_found.len());
+    assert_eq!(
+        r1.inconsistencies_found.len(),
+        r2.inconsistencies_found.len()
+    );
 }
 
 // ===========================================================================
@@ -562,7 +815,12 @@ fn stability_sustained_workload_no_growth() {
         }
 
         let mismatches = verifier.verify_against(&engine);
-        assert!(mismatches.is_empty(), "round {}: {} mismatches", round, mismatches.len());
+        assert!(
+            mismatches.is_empty(),
+            "round {}: {} mismatches",
+            round,
+            mismatches.len()
+        );
     }
 }
 
@@ -576,13 +834,33 @@ fn stability_device_fill_and_churn() {
     for i in 0..2000u32 {
         let utxo_hashes: Vec<[u8; 32]> = (0..5u32).map(|v| make_utxo_hash(i, v)).collect();
         match engine.create(&CreateRequest {
-            tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
-            size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
-            is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
+            tx_id: make_tx_id(i),
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: &utxo_hashes,
+            inputs: None,
+            outputs: None,
+            inpoints: None,
+            is_external: false,
+            created_at: 1710000000000,
+            block_height: 1000,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+            parent_txids: &[],
         }) {
-            Ok(_) => { keys.push(TxKey { txid: make_tx_id(i) }); created += 1; }
+            Ok(_) => {
+                keys.push(TxKey {
+                    txid: make_tx_id(i),
+                });
+                created += 1;
+            }
             Err(_) => break,
         }
     }
@@ -597,11 +875,26 @@ fn stability_device_fill_and_churn() {
     for i in 5000..7000u32 {
         let utxo_hashes: Vec<[u8; 32]> = (0..3u32).map(|v| make_utxo_hash(i, v)).collect();
         match engine.create(&CreateRequest {
-            tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
-            size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
-            is_external: false, created_at: 1710000000000, block_height: 2000,
-            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
+            tx_id: make_tx_id(i),
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: &utxo_hashes,
+            inputs: None,
+            outputs: None,
+            inpoints: None,
+            is_external: false,
+            created_at: 1710000000000,
+            block_height: 2000,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+            parent_txids: &[],
         }) {
             Ok(_) => new_created += 1,
             Err(_) => break,
@@ -622,33 +915,64 @@ fn perf_spend_throughput() {
 
     for i in 0..count {
         let utxo_hashes: Vec<[u8; 32]> = (0..10u32).map(|v| make_utxo_hash(i, v)).collect();
-        engine.create(&CreateRequest {
-            tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
-            size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
-            is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
-        }).unwrap();
+        engine
+            .create(&CreateRequest {
+                tx_id: make_tx_id(i),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &utxo_hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 1710000000000,
+                block_height: 1000,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                parent_txids: &[],
+            })
+            .unwrap();
     }
 
     let start = std::time::Instant::now();
     let mut spend_count = 0u64;
     for i in 0..count {
-        let key = TxKey { txid: make_tx_id(i) };
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
         for v in 0..5u32 {
             let mut sd = [0u8; 36];
             sd[0..4].copy_from_slice(&(i + 10000).to_le_bytes());
             sd[32..36].copy_from_slice(&v.to_le_bytes());
-            engine.spend(&SpendRequest {
-                tx_key: key, offset: v, utxo_hash: make_utxo_hash(i, v), spending_data: sd,
-                ignore_conflicting: false, ignore_locked: false,
-                current_block_height: 2000, block_height_retention: 288,
-            }).unwrap();
+            engine
+                .spend(&SpendRequest {
+                    tx_key: key,
+                    offset: v,
+                    utxo_hash: make_utxo_hash(i, v),
+                    spending_data: sd,
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 2000,
+                    block_height_retention: 288,
+                })
+                .unwrap();
             spend_count += 1;
         }
     }
     let elapsed = start.elapsed();
-    eprintln!("Spend: {:.0} ops/sec ({} in {:.2}s)", spend_count as f64 / elapsed.as_secs_f64(), spend_count, elapsed.as_secs_f64());
+    eprintln!(
+        "Spend: {:.0} ops/sec ({} in {:.2}s)",
+        spend_count as f64 / elapsed.as_secs_f64(),
+        spend_count,
+        elapsed.as_secs_f64()
+    );
 }
 
 /// Create throughput. fast=1K, full=10K.
@@ -659,16 +983,38 @@ fn perf_create_throughput() {
     let start = std::time::Instant::now();
     for i in 0..count {
         let utxo_hashes: Vec<[u8; 32]> = (0..10u32).map(|v| make_utxo_hash(i, v)).collect();
-        engine.create(&CreateRequest {
-            tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
-            size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
-            is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
-        }).unwrap();
+        engine
+            .create(&CreateRequest {
+                tx_id: make_tx_id(i),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &utxo_hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 1710000000000,
+                block_height: 1000,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                parent_txids: &[],
+            })
+            .unwrap();
     }
     let elapsed = start.elapsed();
-    eprintln!("Create (10 UTXOs): {:.0} ops/sec ({} in {:.2}s)", count as f64 / elapsed.as_secs_f64(), count, elapsed.as_secs_f64());
+    eprintln!(
+        "Create (10 UTXOs): {:.0} ops/sec ({} in {:.2}s)",
+        count as f64 / elapsed.as_secs_f64(),
+        count,
+        elapsed.as_secs_f64()
+    );
 }
 
 /// SetMined throughput. fast=1K, full=10K.
@@ -678,24 +1024,55 @@ fn perf_set_mined_throughput() {
     let engine = create_engine();
     for i in 0..count {
         let utxo_hashes: Vec<[u8; 32]> = (0..5u32).map(|v| make_utxo_hash(i, v)).collect();
-        engine.create(&CreateRequest {
-            tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
-            size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
-            is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
-        }).unwrap();
+        engine
+            .create(&CreateRequest {
+                tx_id: make_tx_id(i),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &utxo_hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 1710000000000,
+                block_height: 1000,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                parent_txids: &[],
+            })
+            .unwrap();
     }
     let start = std::time::Instant::now();
     for i in 0..count {
-        engine.set_mined(&SetMinedRequest {
-            tx_key: TxKey { txid: make_tx_id(i) }, block_id: i + 100, block_height: 2000,
-            subtree_idx: 0, current_block_height: 2000, block_height_retention: 288,
-            on_longest_chain: true, unset_mined: false,
-        }).unwrap();
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: TxKey {
+                    txid: make_tx_id(i),
+                },
+                block_id: i + 100,
+                block_height: 2000,
+                subtree_idx: 0,
+                current_block_height: 2000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
     }
     let elapsed = start.elapsed();
-    eprintln!("SetMined: {:.0} ops/sec ({} in {:.2}s)", count as f64 / elapsed.as_secs_f64(), count, elapsed.as_secs_f64());
+    eprintln!(
+        "SetMined: {:.0} ops/sec ({} in {:.2}s)",
+        count as f64 / elapsed.as_secs_f64(),
+        count,
+        elapsed.as_secs_f64()
+    );
 }
 
 /// SpendMulti (batch 10) throughput. fast=500, full=5K batches.
@@ -705,30 +1082,67 @@ fn perf_spend_multi_throughput() {
     let engine = create_engine();
     for i in 0..count {
         let utxo_hashes: Vec<[u8; 32]> = (0..10u32).map(|v| make_utxo_hash(i, v)).collect();
-        engine.create(&CreateRequest {
-            tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
-            size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
-            is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
-        }).unwrap();
+        engine
+            .create(&CreateRequest {
+                tx_id: make_tx_id(i),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &utxo_hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 1710000000000,
+                block_height: 1000,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                parent_txids: &[],
+            })
+            .unwrap();
     }
     let start = std::time::Instant::now();
     for i in 0..count {
-        let key = TxKey { txid: make_tx_id(i) };
-        let spends: Vec<SpendItem> = (0..10u32).map(|v| {
-            let mut sd = [0u8; 36];
-            sd[0..4].copy_from_slice(&(i + 10000).to_le_bytes());
-            sd[32..36].copy_from_slice(&v.to_le_bytes());
-            SpendItem { offset: v, utxo_hash: make_utxo_hash(i, v), spending_data: sd, idx: v }
-        }).collect();
-        engine.spend_multi(&SpendMultiRequest {
-            tx_key: key, spends, ignore_conflicting: false, ignore_locked: false,
-            current_block_height: 2000, block_height_retention: 288,
-        }).unwrap();
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
+        let spends: Vec<SpendItem> = (0..10u32)
+            .map(|v| {
+                let mut sd = [0u8; 36];
+                sd[0..4].copy_from_slice(&(i + 10000).to_le_bytes());
+                sd[32..36].copy_from_slice(&v.to_le_bytes());
+                SpendItem {
+                    offset: v,
+                    utxo_hash: make_utxo_hash(i, v),
+                    spending_data: sd,
+                    idx: v,
+                }
+            })
+            .collect();
+        engine
+            .spend_multi(&SpendMultiRequest {
+                tx_key: key,
+                spends,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 2000,
+                block_height_retention: 288,
+            })
+            .unwrap();
     }
     let elapsed = start.elapsed();
-    eprintln!("SpendMulti (batch 10): {:.0} batches/sec ({} in {:.2}s)", count as f64 / elapsed.as_secs_f64(), count, elapsed.as_secs_f64());
+    eprintln!(
+        "SpendMulti (batch 10): {:.0} batches/sec ({} in {:.2}s)",
+        count as f64 / elapsed.as_secs_f64(),
+        count,
+        elapsed.as_secs_f64()
+    );
 }
 
 /// Memory per record: verify < 64 bytes per index entry.
@@ -738,13 +1152,30 @@ fn perf_memory_per_record() {
     let count = 10_000u32;
     for i in 0..count {
         let utxo_hashes: Vec<[u8; 32]> = (0..5u32).map(|v| make_utxo_hash(i, v)).collect();
-        engine.create(&CreateRequest {
-            tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
-            size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
-            is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
-        }).unwrap();
+        engine
+            .create(&CreateRequest {
+                tx_id: make_tx_id(i),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &utxo_hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 1710000000000,
+                block_height: 1000,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                parent_txids: &[],
+            })
+            .unwrap();
     }
 
     let stats = engine.index_stats();
@@ -757,7 +1188,11 @@ fn perf_memory_per_record() {
         "Index: {} entries, capacity {}, load {:.3}, raw entry size {} bytes",
         stats.entry_count, stats.capacity, stats.load_factor, entry_bytes
     );
-    assert!(entry_bytes <= 64, "raw entry size {} exceeds 64 byte target", entry_bytes);
+    assert!(
+        entry_bytes <= 64,
+        "raw entry size {} exceeds 64 byte target",
+        entry_bytes
+    );
 }
 
 /// Read throughput. fast=1K, full=10K txs.
@@ -767,24 +1202,50 @@ fn perf_read_throughput() {
     let engine = create_engine();
     for i in 0..count {
         let utxo_hashes: Vec<[u8; 32]> = (0..5u32).map(|v| make_utxo_hash(i, v)).collect();
-        engine.create(&CreateRequest {
-            tx_id: make_tx_id(i), tx_version: 1, locktime: 0, fee: 500,
-            size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
-            is_external: false, created_at: 1710000000000, block_height: 1000,
-            mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
-        }).unwrap();
+        engine
+            .create(&CreateRequest {
+                tx_id: make_tx_id(i),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &utxo_hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 1710000000000,
+                block_height: 1000,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                parent_txids: &[],
+            })
+            .unwrap();
     }
     let start = std::time::Instant::now();
     let mut reads = 0u64;
     for _ in 0..3 {
         for i in 0..count {
-            let _ = engine.read_metadata(&TxKey { txid: make_tx_id(i) }).unwrap();
+            let _ = engine
+                .read_metadata(&TxKey {
+                    txid: make_tx_id(i),
+                })
+                .unwrap();
             reads += 1;
         }
     }
     let elapsed = start.elapsed();
-    eprintln!("Read: {:.0} ops/sec ({} in {:.2}s)", reads as f64 / elapsed.as_secs_f64(), reads, elapsed.as_secs_f64());
+    eprintln!(
+        "Read: {:.0} ops/sec ({} in {:.2}s)",
+        reads as f64 / elapsed.as_secs_f64(),
+        reads,
+        elapsed.as_secs_f64()
+    );
 }
 
 /// Concurrent spend throughput: 1, 4, 8, 16 threads. fast=1K txs, full=10K.
@@ -798,46 +1259,84 @@ fn perf_concurrent_spend_throughput() {
         for i in 0..count {
             let tx_id = make_tx_id(i as u32);
             if engine.lookup(&TxKey { txid: tx_id }).is_some() {
-                engine.delete(&DeleteRequest { tx_key: TxKey { txid: tx_id } }).unwrap();
+                engine
+                    .delete(&DeleteRequest {
+                        tx_key: TxKey { txid: tx_id },
+                    })
+                    .unwrap();
             }
-            let utxo_hashes: Vec<[u8; 32]> = (0..10u32).map(|v| make_utxo_hash(i as u32, v)).collect();
-            engine.create(&CreateRequest {
-                tx_id, tx_version: 1, locktime: 0, fee: 500,
-                size_in_bytes: 250, extended_size: 0, is_coinbase: false, spending_height: 0,
-                utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
-                is_external: false, created_at: 1710000000000, block_height: 1000,
-                mined_block_infos: &[], frozen: false, conflicting: false, locked: false, parent_txids: &[],
-            }).unwrap();
+            let utxo_hashes: Vec<[u8; 32]> =
+                (0..10u32).map(|v| make_utxo_hash(i as u32, v)).collect();
+            engine
+                .create(&CreateRequest {
+                    tx_id,
+                    tx_version: 1,
+                    locktime: 0,
+                    fee: 500,
+                    size_in_bytes: 250,
+                    extended_size: 0,
+                    is_coinbase: false,
+                    spending_height: 0,
+                    utxo_hashes: &utxo_hashes,
+                    inputs: None,
+                    outputs: None,
+                    inpoints: None,
+                    is_external: false,
+                    created_at: 1710000000000,
+                    block_height: 1000,
+                    mined_block_infos: &[],
+                    frozen: false,
+                    conflicting: false,
+                    locked: false,
+                    parent_txids: &[],
+                })
+                .unwrap();
         }
 
         let chunk = count / thread_count;
         let start = std::time::Instant::now();
-        let handles: Vec<_> = (0..thread_count).map(|t| {
-            let engine = engine.clone();
-            let lo = t * chunk;
-            let hi = lo + chunk;
-            std::thread::spawn(move || {
-                let mut n = 0u64;
-                for i in lo..hi {
-                    let key = TxKey { txid: make_tx_id(i as u32) };
-                    for v in 0..5u32 {
-                        let mut sd = [0u8; 36];
-                        sd[0..4].copy_from_slice(&((i as u32) + 10000).to_le_bytes());
-                        sd[32..36].copy_from_slice(&v.to_le_bytes());
-                        engine.spend(&SpendRequest {
-                            tx_key: key, offset: v, utxo_hash: make_utxo_hash(i as u32, v),
-                            spending_data: sd, ignore_conflicting: false, ignore_locked: false,
-                            current_block_height: 2000, block_height_retention: 288,
-                        }).unwrap();
-                        n += 1;
+        let handles: Vec<_> = (0..thread_count)
+            .map(|t| {
+                let engine = engine.clone();
+                let lo = t * chunk;
+                let hi = lo + chunk;
+                std::thread::spawn(move || {
+                    let mut n = 0u64;
+                    for i in lo..hi {
+                        let key = TxKey {
+                            txid: make_tx_id(i as u32),
+                        };
+                        for v in 0..5u32 {
+                            let mut sd = [0u8; 36];
+                            sd[0..4].copy_from_slice(&((i as u32) + 10000).to_le_bytes());
+                            sd[32..36].copy_from_slice(&v.to_le_bytes());
+                            engine
+                                .spend(&SpendRequest {
+                                    tx_key: key,
+                                    offset: v,
+                                    utxo_hash: make_utxo_hash(i as u32, v),
+                                    spending_data: sd,
+                                    ignore_conflicting: false,
+                                    ignore_locked: false,
+                                    current_block_height: 2000,
+                                    block_height_retention: 288,
+                                })
+                                .unwrap();
+                            n += 1;
+                        }
                     }
-                }
-                n
+                    n
+                })
             })
-        }).collect();
+            .collect();
         let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
         let elapsed = start.elapsed();
-        eprintln!("Concurrent spend ({} threads): {:.0} ops/sec ({} in {:.2}s)",
-            thread_count, total as f64 / elapsed.as_secs_f64(), total, elapsed.as_secs_f64());
+        eprintln!(
+            "Concurrent spend ({} threads): {:.0} ops/sec ({} in {:.2}s)",
+            thread_count,
+            total as f64 / elapsed.as_secs_f64(),
+            total,
+            elapsed.as_secs_f64()
+        );
     }
 }

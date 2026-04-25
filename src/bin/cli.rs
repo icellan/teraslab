@@ -220,19 +220,31 @@ impl HttpClient {
 // ---------------------------------------------------------------------------
 
 fn fmt_num(n: u64) -> String {
-    if n >= 1_000_000_000_000 { format!("{:.1}T", n as f64 / 1e12) }
-    else if n >= 1_000_000_000 { format!("{:.1}B", n as f64 / 1e9) }
-    else if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1e6) }
-    else if n >= 1_000 { format!("{:.1}K", n as f64 / 1e3) }
-    else { n.to_string() }
+    if n >= 1_000_000_000_000 {
+        format!("{:.1}T", n as f64 / 1e12)
+    } else if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1e9)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1e3)
+    } else {
+        n.to_string()
+    }
 }
 
 fn fmt_bytes(n: u64) -> String {
-    if n >= 1_000_000_000_000 { format!("{:.1} TB", n as f64 / 1e12) }
-    else if n >= 1_000_000_000 { format!("{:.1} GB", n as f64 / 1e9) }
-    else if n >= 1_000_000 { format!("{:.1} MB", n as f64 / 1e6) }
-    else if n >= 1_000 { format!("{:.1} KB", n as f64 / 1e3) }
-    else { format!("{n} B") }
+    if n >= 1_000_000_000_000 {
+        format!("{:.1} TB", n as f64 / 1e12)
+    } else if n >= 1_000_000_000 {
+        format!("{:.1} GB", n as f64 / 1e9)
+    } else if n >= 1_000_000 {
+        format!("{:.1} MB", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1} KB", n as f64 / 1e3)
+    } else {
+        format!("{n} B")
+    }
 }
 
 fn fmt_pct(val: f64) -> String {
@@ -240,11 +252,18 @@ fn fmt_pct(val: f64) -> String {
 }
 
 fn fmt_ns(ns: u64) -> String {
-    if ns == 0 { return "-".to_string(); }
-    if ns >= 1_000_000_000 { format!("{:.1}s", ns as f64 / 1e9) }
-    else if ns >= 1_000_000 { format!("{:.1}ms", ns as f64 / 1e6) }
-    else if ns >= 1_000 { format!("{:.1}us", ns as f64 / 1e3) }
-    else { format!("{ns}ns") }
+    if ns == 0 {
+        return "-".to_string();
+    }
+    if ns >= 1_000_000_000 {
+        format!("{:.1}s", ns as f64 / 1e9)
+    } else if ns >= 1_000_000 {
+        format!("{:.1}ms", ns as f64 / 1e6)
+    } else if ns >= 1_000 {
+        format!("{:.1}us", ns as f64 / 1e3)
+    } else {
+        format!("{ns}ns")
+    }
 }
 
 fn as_u64(v: &serde_json::Value) -> u64 {
@@ -279,25 +298,36 @@ fn cmd_status(http: &HttpClient, json: bool) -> Result<(), CliError> {
 
     println!("TeraSlab Cluster Status");
     println!("=======================");
-    println!("Nodes:       {} (node_id: {})", as_u64(&status["cluster_size"]), as_u64(&status["node_id"]));
-    println!("Records:     {}", fmt_num(as_u64(&status["records"]["total"])));
-    println!("Index:       {} entries, LF {}, memory {}",
+    println!(
+        "Nodes:       {} (node_id: {})",
+        as_u64(&status["cluster_size"]),
+        as_u64(&status["node_id"])
+    );
+    println!(
+        "Records:     {}",
+        fmt_num(as_u64(&status["records"]["total"]))
+    );
+    println!(
+        "Index:       {} entries, LF {}, memory {}",
         fmt_num(as_u64(&index["entries"])),
         fmt_pct(as_f64(&index["load_factor"])),
         fmt_bytes(as_u64(&index["memory_bytes"])),
     );
-    println!("Storage:     {} / {} ({})",
+    println!(
+        "Storage:     {} / {} ({})",
         fmt_bytes(as_u64(&freelist["used_bytes"])),
         fmt_bytes(as_u64(&freelist["device_size"])),
         fmt_pct(as_f64(&freelist["utilization"])),
     );
-    println!("Throughput:  spends {} (succeeded: {}, failed: {})",
+    println!(
+        "Throughput:  spends {} (succeeded: {}, failed: {})",
         fmt_num(as_u64(&status["throughput"]["spends_attempted"])),
         fmt_num(as_u64(&status["throughput"]["spends_succeeded"])),
         fmt_num(as_u64(&status["throughput"]["spends_failed"])),
     );
     if redo["available"].as_bool() == Some(true) {
-        println!("Redo log:    {} utilized, seq {}",
+        println!(
+            "Redo log:    {} utilized, seq {}",
             fmt_pct(as_f64(&redo["utilization"])),
             fmt_num(as_u64(&redo["current_sequence"])),
         );
@@ -353,10 +383,22 @@ fn cmd_shards(http: &HttpClient, json: bool, _node: Option<String>) -> Result<()
 
     let mut table = Table::new();
     table.set_header(vec!["Metric", "Value"]);
-    table.add_row(vec!["Shard table version", &status["shard_table_version"].to_string()]);
-    table.add_row(vec!["Master shards", &status["master_shard_count"].to_string()]);
-    table.add_row(vec!["Replica shards", &status["replica_shard_count"].to_string()]);
-    table.add_row(vec!["Active migrations", &status["active_migrations"].to_string()]);
+    table.add_row(vec![
+        "Shard table version",
+        &status["shard_table_version"].to_string(),
+    ]);
+    table.add_row(vec![
+        "Master shards",
+        &status["master_shard_count"].to_string(),
+    ]);
+    table.add_row(vec![
+        "Replica shards",
+        &status["replica_shard_count"].to_string(),
+    ]);
+    table.add_row(vec![
+        "Active migrations",
+        &status["active_migrations"].to_string(),
+    ]);
     println!("{table}");
     Ok(())
 }
@@ -371,13 +413,22 @@ fn cmd_storage(http: &HttpClient, json: bool) -> Result<(), CliError> {
 
     let mut table = Table::new();
     table.set_header(vec!["Metric", "Value"]);
-    table.add_row(vec!["Device size", &fmt_bytes(as_u64(&data["device_size"]))]);
+    table.add_row(vec![
+        "Device size",
+        &fmt_bytes(as_u64(&data["device_size"])),
+    ]);
     table.add_row(vec!["Used", &fmt_bytes(as_u64(&data["used_bytes"]))]);
     table.add_row(vec!["Free", &fmt_bytes(as_u64(&data["total_free_bytes"]))]);
     table.add_row(vec!["Utilization", &fmt_pct(as_f64(&data["utilization"]))]);
     table.add_row(vec!["Free regions", &data["free_region_count"].to_string()]);
-    table.add_row(vec!["Largest free", &fmt_bytes(as_u64(&data["largest_free_region"]))]);
-    table.add_row(vec!["Alignment", &format!("{} bytes", as_u64(&data["alignment"]))]);
+    table.add_row(vec![
+        "Largest free",
+        &fmt_bytes(as_u64(&data["largest_free_region"])),
+    ]);
+    table.add_row(vec![
+        "Alignment",
+        &format!("{} bytes", as_u64(&data["alignment"])),
+    ]);
     println!("{table}");
     Ok(())
 }
@@ -392,10 +443,22 @@ fn cmd_memory(http: &HttpClient, json: bool) -> Result<(), CliError> {
 
     let mut table = Table::new();
     table.set_header(vec!["Metric", "Value"]);
-    table.add_row(vec!["Index memory", &fmt_bytes(as_u64(&data["index_bytes"]))]);
-    table.add_row(vec!["Index entries", &fmt_num(as_u64(&data["index_entries"]))]);
-    table.add_row(vec!["DAH index entries", &fmt_num(as_u64(&data["dah_index_entries"]))]);
-    table.add_row(vec!["Unmined index entries", &fmt_num(as_u64(&data["unmined_index_entries"]))]);
+    table.add_row(vec![
+        "Index memory",
+        &fmt_bytes(as_u64(&data["index_bytes"])),
+    ]);
+    table.add_row(vec![
+        "Index entries",
+        &fmt_num(as_u64(&data["index_entries"])),
+    ]);
+    table.add_row(vec![
+        "DAH index entries",
+        &fmt_num(as_u64(&data["dah_index_entries"])),
+    ]);
+    table.add_row(vec![
+        "Unmined index entries",
+        &fmt_num(as_u64(&data["unmined_index_entries"])),
+    ]);
     println!("{table}");
     Ok(())
 }
@@ -410,15 +473,30 @@ fn cmd_records(http: &HttpClient, json: bool) -> Result<(), CliError> {
 
     let mut table = Table::new();
     table.set_header(vec!["Metric", "Value"]);
-    table.add_row(vec!["Total records", &fmt_num(as_u64(&data["total_records"]))]);
-    table.add_row(vec!["DAH index count", &fmt_num(as_u64(&data["dah_index_count"]))]);
-    table.add_row(vec!["Unmined count", &fmt_num(as_u64(&data["unmined_count"]))]);
+    table.add_row(vec![
+        "Total records",
+        &fmt_num(as_u64(&data["total_records"])),
+    ]);
+    table.add_row(vec![
+        "DAH index count",
+        &fmt_num(as_u64(&data["dah_index_count"])),
+    ]);
+    table.add_row(vec![
+        "Unmined count",
+        &fmt_num(as_u64(&data["unmined_count"])),
+    ]);
     println!("{table}");
     Ok(())
 }
 
 #[allow(clippy::disallowed_macros)] // CLI user-facing stdout
-fn cmd_record(http: &HttpClient, json: bool, txid: &str, _slots: bool, _raw: bool) -> Result<(), CliError> {
+fn cmd_record(
+    http: &HttpClient,
+    json: bool,
+    txid: &str,
+    _slots: bool,
+    _raw: bool,
+) -> Result<(), CliError> {
     let data = http.get_json(&format!("/debug/records/{txid}"))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&data)?);
@@ -449,14 +527,26 @@ fn cmd_index(http: &HttpClient, json: bool, secondary: bool) -> Result<(), CliEr
     table.add_row(vec!["Entries", &fmt_num(as_u64(&data["entries"]))]);
     table.add_row(vec!["Capacity", &fmt_num(as_u64(&data["capacity"]))]);
     table.add_row(vec!["Load factor", &fmt_pct(as_f64(&data["load_factor"]))]);
-    table.add_row(vec!["Hugepage enabled", &data["hugepage_enabled"].to_string()]);
-    table.add_row(vec!["Max probe distance", &data["max_probe_distance"].to_string()]);
+    table.add_row(vec![
+        "Hugepage enabled",
+        &data["hugepage_enabled"].to_string(),
+    ]);
+    table.add_row(vec![
+        "Max probe distance",
+        &data["max_probe_distance"].to_string(),
+    ]);
     table.add_row(vec!["Memory", &fmt_bytes(as_u64(&data["memory_bytes"]))]);
 
     if secondary {
         let status = http.get_json("/status")?;
-        table.add_row(vec!["DAH index entries", &fmt_num(as_u64(&status["records"]["dah_index"]))]);
-        table.add_row(vec!["Unmined index entries", &fmt_num(as_u64(&status["records"]["unmined_index"]))]);
+        table.add_row(vec![
+            "DAH index entries",
+            &fmt_num(as_u64(&status["records"]["dah_index"])),
+        ]);
+        table.add_row(vec![
+            "Unmined index entries",
+            &fmt_num(as_u64(&status["records"]["unmined_index"])),
+        ]);
     }
     println!("{table}");
     Ok(())
@@ -474,11 +564,17 @@ fn cmd_replication(http: &HttpClient, json: bool) -> Result<(), CliError> {
     table.set_header(vec!["Metric", "Value"]);
     table.add_row(vec!["Enabled", &data["enabled"].to_string()]);
     if data["enabled"].as_bool() == Some(true) {
-        table.add_row(vec!["ACK policy", data["ack_policy"].as_str().unwrap_or("-")]);
+        table.add_row(vec![
+            "ACK policy",
+            data["ack_policy"].as_str().unwrap_or("-"),
+        ]);
         table.add_row(vec!["Best effort", &data["best_effort"].to_string()]);
         table.add_row(vec!["Topology term", &data["topology_term"].to_string()]);
         table.add_row(vec!["Topology epoch", &data["topology_epoch"].to_string()]);
-        table.add_row(vec!["Peak cluster size", &data["peak_cluster_size"].to_string()]);
+        table.add_row(vec![
+            "Peak cluster size",
+            &data["peak_cluster_size"].to_string(),
+        ]);
     }
     println!("{table}");
     Ok(())
@@ -496,9 +592,18 @@ fn cmd_redo(http: &HttpClient, json: bool) -> Result<(), CliError> {
     table.set_header(vec!["Metric", "Value"]);
     if data["available"].as_bool() == Some(true) {
         table.add_row(vec!["Available", "true"]);
-        table.add_row(vec!["Current sequence", &fmt_num(as_u64(&data["current_sequence"]))]);
-        table.add_row(vec!["Write position", &fmt_bytes(as_u64(&data["write_position"]))]);
-        table.add_row(vec!["Available space", &fmt_bytes(as_u64(&data["available_space"]))]);
+        table.add_row(vec![
+            "Current sequence",
+            &fmt_num(as_u64(&data["current_sequence"])),
+        ]);
+        table.add_row(vec![
+            "Write position",
+            &fmt_bytes(as_u64(&data["write_position"])),
+        ]);
+        table.add_row(vec![
+            "Available space",
+            &fmt_bytes(as_u64(&data["available_space"])),
+        ]);
         table.add_row(vec!["Log size", &fmt_bytes(as_u64(&data["log_size"]))]);
         table.add_row(vec!["Utilization", &fmt_pct(as_f64(&data["utilization"]))]);
     } else {
@@ -515,9 +620,11 @@ fn cmd_rebalance(http: &HttpClient, json: bool, dry_run: bool) -> Result<(), Cli
         if json {
             println!("{}", serde_json::to_string_pretty(&status)?);
         } else {
-            println!("Dry run: current node has {} master shards, {} replica shards",
+            println!(
+                "Dry run: current node has {} master shards, {} replica shards",
                 as_u64(&status["master_shard_count"]),
-                as_u64(&status["replica_shard_count"]));
+                as_u64(&status["replica_shard_count"])
+            );
         }
         return Ok(());
     }
@@ -578,7 +685,13 @@ fn cmd_healthcheck(http: &HttpClient, json: bool) -> Result<bool, CliError> {
 }
 
 #[allow(clippy::disallowed_macros)] // CLI user-facing stdout
-fn cmd_bench(http: &HttpClient, data_addr: &str, json: bool, operation: &str, count: u32) -> Result<(), CliError> {
+fn cmd_bench(
+    http: &HttpClient,
+    data_addr: &str,
+    json: bool,
+    operation: &str,
+    count: u32,
+) -> Result<(), CliError> {
     // For bench, we use the binary protocol directly.
     // First verify the server is up.
     if !http.is_ready() {
@@ -622,15 +735,25 @@ fn cmd_bench(http: &HttpClient, data_addr: &str, json: bool, operation: &str, co
     };
 
     if json {
-        println!("{}", serde_json::json!({
-            "operation": operation,
-            "count": count,
-            "elapsed_ms": elapsed.as_millis(),
-            "ops_per_sec": ops_per_sec as u64,
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "operation": operation,
+                "count": count,
+                "elapsed_ms": elapsed.as_millis(),
+                "ops_per_sec": ops_per_sec as u64,
+            })
+        );
     } else {
-        println!("Bench: {} x {} {operation} operations",
-            fmt_num(count as u64), if operation == "ping" { "PING" } else { operation });
+        println!(
+            "Bench: {} x {} {operation} operations",
+            fmt_num(count as u64),
+            if operation == "ping" {
+                "PING"
+            } else {
+                operation
+            }
+        );
         println!("Elapsed: {:.2}s", elapsed.as_secs_f64());
         println!("Throughput: {} ops/sec", fmt_num(ops_per_sec as u64));
     }
@@ -651,16 +774,19 @@ enum TopView {
 }
 
 fn cmd_top(http: &HttpClient) -> Result<(), CliError> {
+    use crossterm::ExecutableCommand;
     use crossterm::event::{self, Event, KeyCode, KeyEventKind};
     use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-    use crossterm::ExecutableCommand;
     use ratatui::prelude::*;
 
     terminal::enable_raw_mode().map_err(|e| CliError::Other(format!("terminal: {e}")))?;
     let mut stdout = std::io::stdout();
-    stdout.execute(EnterAlternateScreen).map_err(|e| CliError::Other(format!("terminal: {e}")))?;
+    stdout
+        .execute(EnterAlternateScreen)
+        .map_err(|e| CliError::Other(format!("terminal: {e}")))?;
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).map_err(|e| CliError::Other(format!("terminal: {e}")))?;
+    let mut terminal =
+        Terminal::new(backend).map_err(|e| CliError::Other(format!("terminal: {e}")))?;
 
     let mut prev_response: Option<serde_json::Value> = None;
     let mut error_msg: Option<String>;
@@ -669,13 +795,27 @@ fn cmd_top(http: &HttpClient) -> Result<(), CliError> {
     loop {
         // Fetch cluster-wide snapshot
         let response = match http.get_json("/admin/top") {
-            Ok(s) => { error_msg = None; Some(s) }
-            Err(e) => { error_msg = Some(format!("Connection lost: {e}")); None }
+            Ok(s) => {
+                error_msg = None;
+                Some(s)
+            }
+            Err(e) => {
+                error_msg = Some(format!("Connection lost: {e}"));
+                None
+            }
         };
 
-        terminal.draw(|frame| {
-            draw_top(frame, response.as_ref(), prev_response.as_ref(), error_msg.as_deref(), view);
-        }).map_err(|e| CliError::Other(format!("render: {e}")))?;
+        terminal
+            .draw(|frame| {
+                draw_top(
+                    frame,
+                    response.as_ref(),
+                    prev_response.as_ref(),
+                    error_msg.as_deref(),
+                    view,
+                );
+            })
+            .map_err(|e| CliError::Other(format!("render: {e}")))?;
 
         if response.is_some() {
             prev_response = response;
@@ -716,9 +856,14 @@ fn get_view_data(response: &serde_json::Value) -> &serde_json::Value {
 }
 
 /// Compute per-second rates from two consecutive snapshots of the same shape.
-fn compute_rates(prev: &serde_json::Value, cur: &serde_json::Value) -> Vec<(String, u64, u64, u64, String, String)> {
+fn compute_rates(
+    prev: &serde_json::Value,
+    cur: &serde_json::Value,
+) -> Vec<(String, u64, u64, u64, String, String)> {
     let dt_ms = as_u64(&cur["timestamp_ms"]).saturating_sub(as_u64(&prev["timestamp_ms"]));
-    if dt_ms == 0 { return Vec::new(); }
+    if dt_ms == 0 {
+        return Vec::new();
+    }
     let dt = dt_ms as f64 / 1000.0;
 
     let rate = |key: &str| -> u64 {
@@ -728,27 +873,57 @@ fn compute_rates(prev: &serde_json::Value, cur: &serde_json::Value) -> Vec<(Stri
     };
 
     vec![
-        ("spend".into(), rate("spends_attempted"), as_u64(&cur["counters"]["spends_attempted"]),
-         as_u64(&cur["counters"]["spends_failed"]),
-         fmt_ns(as_u64(&cur["latency"]["spend"]["p50_ns"])),
-         fmt_ns(as_u64(&cur["latency"]["spend"]["p99_ns"]))),
-        ("spend_multi".into(), rate("spend_multi_batches"), as_u64(&cur["counters"]["spend_multi_batches"]),
-         0,
-         fmt_ns(as_u64(&cur["latency"]["spend_multi"]["p50_ns"])),
-         fmt_ns(as_u64(&cur["latency"]["spend_multi"]["p99_ns"]))),
-        ("create".into(), rate("creates_attempted"), as_u64(&cur["counters"]["creates_attempted"]),
-         as_u64(&cur["counters"]["creates_attempted"]).saturating_sub(as_u64(&cur["counters"]["creates_succeeded"])),
-         "-".into(), "-".into()),
-        ("set_mined".into(), rate("set_mined_attempted"), as_u64(&cur["counters"]["set_mined_attempted"]),
-         as_u64(&cur["counters"]["set_mined_attempted"]).saturating_sub(as_u64(&cur["counters"]["set_mined_succeeded"])),
-         "-".into(), "-".into()),
-        ("get".into(), rate("gets_attempted"), as_u64(&cur["counters"]["gets_attempted"]),
-         as_u64(&cur["counters"]["gets_attempted"]).saturating_sub(as_u64(&cur["counters"]["gets_succeeded"])),
-         "-".into(), "-".into()),
-        ("unspend".into(), rate("unspends_attempted"), as_u64(&cur["counters"]["unspends_attempted"]),
-         as_u64(&cur["counters"]["unspends_failed"]),
-         fmt_ns(as_u64(&cur["latency"]["unspend"]["p50_ns"])),
-         fmt_ns(as_u64(&cur["latency"]["unspend"]["p99_ns"]))),
+        (
+            "spend".into(),
+            rate("spends_attempted"),
+            as_u64(&cur["counters"]["spends_attempted"]),
+            as_u64(&cur["counters"]["spends_failed"]),
+            fmt_ns(as_u64(&cur["latency"]["spend"]["p50_ns"])),
+            fmt_ns(as_u64(&cur["latency"]["spend"]["p99_ns"])),
+        ),
+        (
+            "spend_multi".into(),
+            rate("spend_multi_batches"),
+            as_u64(&cur["counters"]["spend_multi_batches"]),
+            0,
+            fmt_ns(as_u64(&cur["latency"]["spend_multi"]["p50_ns"])),
+            fmt_ns(as_u64(&cur["latency"]["spend_multi"]["p99_ns"])),
+        ),
+        (
+            "create".into(),
+            rate("creates_attempted"),
+            as_u64(&cur["counters"]["creates_attempted"]),
+            as_u64(&cur["counters"]["creates_attempted"])
+                .saturating_sub(as_u64(&cur["counters"]["creates_succeeded"])),
+            "-".into(),
+            "-".into(),
+        ),
+        (
+            "set_mined".into(),
+            rate("set_mined_attempted"),
+            as_u64(&cur["counters"]["set_mined_attempted"]),
+            as_u64(&cur["counters"]["set_mined_attempted"])
+                .saturating_sub(as_u64(&cur["counters"]["set_mined_succeeded"])),
+            "-".into(),
+            "-".into(),
+        ),
+        (
+            "get".into(),
+            rate("gets_attempted"),
+            as_u64(&cur["counters"]["gets_attempted"]),
+            as_u64(&cur["counters"]["gets_attempted"])
+                .saturating_sub(as_u64(&cur["counters"]["gets_succeeded"])),
+            "-".into(),
+            "-".into(),
+        ),
+        (
+            "unspend".into(),
+            rate("unspends_attempted"),
+            as_u64(&cur["counters"]["unspends_attempted"]),
+            as_u64(&cur["counters"]["unspends_failed"]),
+            fmt_ns(as_u64(&cur["latency"]["unspend"]["p50_ns"])),
+            fmt_ns(as_u64(&cur["latency"]["unspend"]["p99_ns"])),
+        ),
     ]
 }
 
@@ -768,7 +943,7 @@ fn draw_top(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // header
+            Constraint::Length(3), // header
             Constraint::Min(10),   // ops table
             Constraint::Length(5), // stats
             Constraint::Length(1), // footer
@@ -778,9 +953,7 @@ fn draw_top(
     // Header
     let header_text = if let Some(resp) = response {
         let agg = get_view_data(resp);
-        let node_count = agg.get("node_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1);
+        let node_count = agg.get("node_count").and_then(|v| v.as_u64()).unwrap_or(1);
         let view_label = match view {
             TopView::Aggregate => format!("CLUSTER ({node_count} nodes)"),
             TopView::PerNode => format!("PER-NODE ({node_count} nodes)"),
@@ -798,7 +971,11 @@ fn draw_top(
     };
 
     let header = Paragraph::new(header_text)
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, chunks[0]);
 
@@ -846,24 +1023,47 @@ fn draw_top(
     frame.render_widget(footer, chunks[3]);
 }
 
-fn render_ops_table(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, rates: &[(String, u64, u64, u64, String, String)], title: &str) {
+fn render_ops_table(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    rates: &[(String, u64, u64, u64, String, String)],
+    title: &str,
+) {
     use ratatui::prelude::*;
     use ratatui::widgets::*;
 
-    let header_row = Row::new(vec!["Operation", "Ops/sec", "Total", "Errors", "p50", "p99"])
-        .style(Style::default().add_modifier(Modifier::BOLD));
-    let rows: Vec<Row> = rates.iter().map(|(name, rate, total, errors, p50, p99)| {
-        Row::new(vec![
-            name.clone(), fmt_num(*rate), fmt_num(*total),
-            errors.to_string(), p50.clone(), p99.clone(),
-        ])
-    }).collect();
+    let header_row = Row::new(vec![
+        "Operation",
+        "Ops/sec",
+        "Total",
+        "Errors",
+        "p50",
+        "p99",
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
+    let rows: Vec<Row> = rates
+        .iter()
+        .map(|(name, rate, total, errors, p50, p99)| {
+            Row::new(vec![
+                name.clone(),
+                fmt_num(*rate),
+                fmt_num(*total),
+                errors.to_string(),
+                p50.clone(),
+                p99.clone(),
+            ])
+        })
+        .collect();
 
     let table = ratatui::widgets::Table::new(
         rows,
         [
-            Constraint::Length(14), Constraint::Length(12), Constraint::Length(10),
-            Constraint::Length(10), Constraint::Length(10), Constraint::Length(10),
+            Constraint::Length(14),
+            Constraint::Length(12),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
         ],
     )
     .header(header_row)
@@ -881,8 +1081,15 @@ fn render_per_node_table(
     use ratatui::widgets::*;
 
     let header_row = Row::new(vec![
-        "Node", "Spends/s", "Creates/s", "Gets/s", "Records", "Storage", "Conns",
-    ]).style(Style::default().add_modifier(Modifier::BOLD));
+        "Node",
+        "Spends/s",
+        "Creates/s",
+        "Gets/s",
+        "Records",
+        "Storage",
+        "Conns",
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
 
     let prev_nodes: Vec<&serde_json::Value> = prev_response
         .and_then(|r| r.get("nodes"))
@@ -890,58 +1097,83 @@ fn render_per_node_table(
         .map(|a| a.iter().collect())
         .unwrap_or_default();
 
-    let rows: Vec<Row> = nodes.iter().map(|node| {
-        let node_id = as_u64(&node["node_id"]);
-        // Find matching previous node for rate calculation
-        let prev_node = prev_nodes.iter().find(|p| as_u64(&p["node_id"]) == node_id);
-        let dt_ms = prev_node
-            .map(|p| as_u64(&node["timestamp_ms"]).saturating_sub(as_u64(&p["timestamp_ms"])))
-            .unwrap_or(0);
-        let dt = if dt_ms > 0 { dt_ms as f64 / 1000.0 } else { 1.0 };
+    let rows: Vec<Row> = nodes
+        .iter()
+        .map(|node| {
+            let node_id = as_u64(&node["node_id"]);
+            // Find matching previous node for rate calculation
+            let prev_node = prev_nodes.iter().find(|p| as_u64(&p["node_id"]) == node_id);
+            let dt_ms = prev_node
+                .map(|p| as_u64(&node["timestamp_ms"]).saturating_sub(as_u64(&p["timestamp_ms"])))
+                .unwrap_or(0);
+            let dt = if dt_ms > 0 {
+                dt_ms as f64 / 1000.0
+            } else {
+                1.0
+            };
 
-        let spend_rate = prev_node.map(|p| {
-            let c = as_u64(&node["counters"]["spends_attempted"]);
-            let prev = as_u64(&p["counters"]["spends_attempted"]);
-            (c.saturating_sub(prev) as f64 / dt) as u64
-        }).unwrap_or(0);
+            let spend_rate = prev_node
+                .map(|p| {
+                    let c = as_u64(&node["counters"]["spends_attempted"]);
+                    let prev = as_u64(&p["counters"]["spends_attempted"]);
+                    (c.saturating_sub(prev) as f64 / dt) as u64
+                })
+                .unwrap_or(0);
 
-        let create_rate = prev_node.map(|p| {
-            let c = as_u64(&node["counters"]["creates_attempted"]);
-            let prev = as_u64(&p["counters"]["creates_attempted"]);
-            (c.saturating_sub(prev) as f64 / dt) as u64
-        }).unwrap_or(0);
+            let create_rate = prev_node
+                .map(|p| {
+                    let c = as_u64(&node["counters"]["creates_attempted"]);
+                    let prev = as_u64(&p["counters"]["creates_attempted"]);
+                    (c.saturating_sub(prev) as f64 / dt) as u64
+                })
+                .unwrap_or(0);
 
-        let get_rate = prev_node.map(|p| {
-            let c = as_u64(&node["counters"]["gets_attempted"]);
-            let prev = as_u64(&p["counters"]["gets_attempted"]);
-            (c.saturating_sub(prev) as f64 / dt) as u64
-        }).unwrap_or(0);
+            let get_rate = prev_node
+                .map(|p| {
+                    let c = as_u64(&node["counters"]["gets_attempted"]);
+                    let prev = as_u64(&p["counters"]["gets_attempted"]);
+                    (c.saturating_sub(prev) as f64 / dt) as u64
+                })
+                .unwrap_or(0);
 
-        Row::new(vec![
-            format!("node {node_id}"),
-            fmt_num(spend_rate),
-            fmt_num(create_rate),
-            fmt_num(get_rate),
-            fmt_num(as_u64(&node["index"]["entries"])),
-            fmt_pct(as_f64(&node["storage"]["utilization"])),
-            as_u64(&node["connections"]).to_string(),
-        ])
-    }).collect();
+            Row::new(vec![
+                format!("node {node_id}"),
+                fmt_num(spend_rate),
+                fmt_num(create_rate),
+                fmt_num(get_rate),
+                fmt_num(as_u64(&node["index"]["entries"])),
+                fmt_pct(as_f64(&node["storage"]["utilization"])),
+                as_u64(&node["connections"]).to_string(),
+            ])
+        })
+        .collect();
 
     let table = ratatui::widgets::Table::new(
         rows,
         [
-            Constraint::Length(10), Constraint::Length(12), Constraint::Length(12),
-            Constraint::Length(10), Constraint::Length(10), Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
             Constraint::Length(6),
         ],
     )
     .header(header_row)
-    .block(Block::default().title(" Per-Node Breakdown ").borders(Borders::ALL));
+    .block(
+        Block::default()
+            .title(" Per-Node Breakdown ")
+            .borders(Borders::ALL),
+    );
     frame.render_widget(table, area);
 }
 
-fn render_system_stats(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, snap: &serde_json::Value) {
+fn render_system_stats(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    snap: &serde_json::Value,
+) {
     use ratatui::widgets::*;
 
     let stats_text = format!(
@@ -964,8 +1196,7 @@ fn render_system_stats(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, 
 
 fn render_waiting(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     use ratatui::widgets::*;
-    let p = Paragraph::new(" Waiting for data...")
-        .block(Block::default().borders(Borders::ALL));
+    let p = Paragraph::new(" Waiting for data...").block(Block::default().borders(Borders::ALL));
     frame.render_widget(p, area);
 }
 
@@ -992,17 +1223,17 @@ fn main() -> ExitCode {
         Command::Rebalance { dry_run, .. } => cmd_rebalance(&http, cli.json, dry_run),
         Command::Drain { node_id, .. } => cmd_drain(&http, cli.json, &node_id),
         Command::LogLevel { level, .. } => cmd_log_level(&http, cli.json, level.as_deref()),
-        Command::Bench { operation, count } => cmd_bench(&http, &cli.data_addr, cli.json, &operation, count),
-        Command::Healthcheck => {
-            match cmd_healthcheck(&http, cli.json) {
-                Ok(true) => return ExitCode::SUCCESS,
-                Ok(false) => return ExitCode::FAILURE,
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
+        Command::Bench { operation, count } => {
+            cmd_bench(&http, &cli.data_addr, cli.json, &operation, count)
         }
+        Command::Healthcheck => match cmd_healthcheck(&http, cli.json) {
+            Ok(true) => return ExitCode::SUCCESS,
+            Ok(false) => return ExitCode::FAILURE,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
         Command::Top => cmd_top(&http),
     };
 

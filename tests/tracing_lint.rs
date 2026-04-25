@@ -145,8 +145,16 @@ fn find_violations() -> Vec<(PathBuf, usize, String)> {
                 let prev = content[..abs].chars().next_back();
                 let is_boundary = matches!(
                     prev,
-                    None | Some(' ') | Some('\t') | Some('\n') | Some('{') | Some('(')
-                    | Some(',') | Some('}') | Some(';') | Some('/') | Some('+')
+                    None | Some(' ')
+                        | Some('\t')
+                        | Some('\n')
+                        | Some('{')
+                        | Some('(')
+                        | Some(',')
+                        | Some('}')
+                        | Some(';')
+                        | Some('/')
+                        | Some('+')
                 );
                 if is_boundary && !under_test_or_allowed(&content, abs) {
                     // Locate the line number.

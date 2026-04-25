@@ -201,10 +201,7 @@ impl SwimRunner {
         (shutdown, handle, event_rx)
     }
 
-    fn run_loop(
-        mut self,
-        event_tx: std::sync::mpsc::Sender<ClusterEvent>,
-    ) -> Result<(), String> {
+    fn run_loop(mut self, event_tx: std::sync::mpsc::Sender<ClusterEvent>) -> Result<(), String> {
         let socket = UdpSocket::bind(self.config.bind_addr)
             .map_err(|e| format!("SWIM bind {}: {e}", self.config.bind_addr))?;
         socket
@@ -272,7 +269,8 @@ impl SwimRunner {
             let mut should_suspect = false;
             if let Some(ref pending) = self.pending_probe {
                 let elapsed = pending.started.elapsed();
-                let indirect_timeout = suspect_backoff_delay(probe_interval, pending.indirect_attempts);
+                let indirect_timeout =
+                    suspect_backoff_delay(probe_interval, pending.indirect_attempts);
                 if !pending.indirect_sent && elapsed >= probe_interval {
                     // Direct probe timed out — send indirect probes
                     self.send_indirect_probes(&socket);
@@ -282,9 +280,7 @@ impl SwimRunner {
                     should_suspect = true;
                 }
             }
-            if should_suspect
-                && let Some(pending) = self.pending_probe.take()
-            {
+            if should_suspect && let Some(pending) = self.pending_probe.take() {
                 if let Some(m) = swim_metrics() {
                     m.swim_probe_timeouts_total.inc();
                 }
@@ -292,7 +288,8 @@ impl SwimRunner {
                 // Use the member's current incarnation for local suspicion.
                 // This is not a gossipped suspicion — it's our own probe
                 // failure, so we always know the current incarnation.
-                let inc = mem.member_info(&pending.target)
+                let inc = mem
+                    .member_info(&pending.target)
                     .map(|i| i.incarnation)
                     .unwrap_or(0);
                 let events = mem.mark_suspect(pending.target, inc);
@@ -340,7 +337,10 @@ impl SwimRunner {
                 // Garbage-collect dead nodes older than 1 hour to prevent
                 // unbounded memory growth. Also clean up their address entries
                 // so gossip stops including them.
-                let forgotten = self.membership.lock().unwrap()
+                let forgotten = self
+                    .membership
+                    .lock()
+                    .unwrap()
                     .forget_dead_older_than(Duration::from_secs(3600));
                 if !forgotten.is_empty() {
                     let mut peers = self.peer_addrs.lock().unwrap();
@@ -349,7 +349,10 @@ impl SwimRunner {
                         peers.remove(id);
                         swim.remove(id);
                     }
-                    tracing::info!(count = forgotten.len(), "SWIM: garbage-collected dead nodes");
+                    tracing::info!(
+                        count = forgotten.len(),
+                        "SWIM: garbage-collected dead nodes"
+                    );
                 }
             }
 
@@ -412,11 +415,12 @@ impl SwimRunner {
             .unwrap()
             .insert(sender_id, from_addr);
 
-        let mut events = self
-            .membership
-            .lock()
-            .unwrap()
-            .mark_alive(sender_id, sender_tcp_addr, sender_incarnation, true);
+        let mut events = self.membership.lock().unwrap().mark_alive(
+            sender_id,
+            sender_tcp_addr,
+            sender_incarnation,
+            true,
+        );
 
         // Process piggybacked membership updates
         // Wire format per entry:
@@ -435,7 +439,8 @@ impl SwimRunner {
                 let nid = NodeId(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
                 let state = data[pos + 8];
                 let inc = u64::from_le_bytes(data[pos + 9..pos + 17].try_into().unwrap());
-                let tcp_alen = u16::from_le_bytes(data[pos + 17..pos + 19].try_into().unwrap()) as usize;
+                let tcp_alen =
+                    u16::from_le_bytes(data[pos + 17..pos + 19].try_into().unwrap()) as usize;
                 pos += 19;
                 if pos + tcp_alen > data.len() {
                     break;
@@ -445,7 +450,8 @@ impl SwimRunner {
 
                 // Parse swim address (new field)
                 let swim_str = if pos + 2 <= data.len() {
-                    let swim_alen = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+                    let swim_alen =
+                        u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
                     pos += 2;
                     if pos + swim_alen <= data.len() {
                         let s = std::str::from_utf8(&data[pos..pos + swim_alen]).unwrap_or("");
@@ -500,7 +506,10 @@ impl SwimRunner {
         // Committed topology term (appended after updates, and after indirect-ACK probed id if present).
         if data.len() >= pos + 8 {
             let remote_committed = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-            let local_committed = self.config.committed_term.load(std::sync::atomic::Ordering::Relaxed);
+            let local_committed = self
+                .config
+                .committed_term
+                .load(std::sync::atomic::Ordering::Relaxed);
             if remote_committed > local_committed {
                 events.push(ClusterEvent::TopologyStale(remote_committed));
             }
@@ -574,7 +583,8 @@ impl SwimRunner {
             if pos + 19 > data.len() {
                 return None;
             }
-            let tcp_alen = u16::from_le_bytes(data[pos + 17..pos + 19].try_into().unwrap()) as usize;
+            let tcp_alen =
+                u16::from_le_bytes(data[pos + 17..pos + 19].try_into().unwrap()) as usize;
             pos += 19 + tcp_alen;
             if pos + 2 > data.len() {
                 return None;
@@ -751,7 +761,8 @@ impl SwimRunner {
         let addr_str = self.config.self_addr.to_string();
         let addr_bytes = addr_str.as_bytes();
 
-        let mut buf = Vec::with_capacity(19 + addr_bytes.len() + piggybacked_updates.len() + 8 + 32);
+        let mut buf =
+            Vec::with_capacity(19 + addr_bytes.len() + piggybacked_updates.len() + 8 + 32);
         buf.push(msg_type);
         buf.extend_from_slice(&self.config.self_id.0.to_le_bytes());
         buf.extend_from_slice(&self.incarnation.to_le_bytes());
@@ -762,7 +773,10 @@ impl SwimRunner {
         // Append committed topology term for catch-up detection.
         // Receivers compare this against their local committed term
         // and emit TopologyStale if they are behind.
-        let ct = self.config.committed_term.load(std::sync::atomic::Ordering::Relaxed);
+        let ct = self
+            .config
+            .committed_term
+            .load(std::sync::atomic::Ordering::Relaxed);
         buf.extend_from_slice(&ct.to_le_bytes());
 
         // If a cluster secret is configured, append HMAC-SHA256 tag.
@@ -778,13 +792,16 @@ impl SwimRunner {
     /// `probed_target` is the node that responded to the relay's PING; the requester uses it to
     /// clear [`SwimRunner::pending_probe`] without mapping `probed_target` to the relay's UDP
     /// source address.
-    fn encode_indirect_ack_message(&self, piggybacked_updates: &[u8], probed_target: NodeId) -> Vec<u8> {
+    fn encode_indirect_ack_message(
+        &self,
+        piggybacked_updates: &[u8],
+        probed_target: NodeId,
+    ) -> Vec<u8> {
         let addr_str = self.config.self_addr.to_string();
         let addr_bytes = addr_str.as_bytes();
 
-        let mut buf = Vec::with_capacity(
-            19 + addr_bytes.len() + piggybacked_updates.len() + 8 + 8 + 32,
-        );
+        let mut buf =
+            Vec::with_capacity(19 + addr_bytes.len() + piggybacked_updates.len() + 8 + 8 + 32);
         buf.push(MSG_INDIRECT_ACK);
         buf.extend_from_slice(&self.config.self_id.0.to_le_bytes());
         buf.extend_from_slice(&self.incarnation.to_le_bytes());
@@ -793,7 +810,10 @@ impl SwimRunner {
         buf.extend_from_slice(piggybacked_updates);
         buf.extend_from_slice(&probed_target.0.to_le_bytes());
 
-        let ct = self.config.committed_term.load(std::sync::atomic::Ordering::Relaxed);
+        let ct = self
+            .config
+            .committed_term
+            .load(std::sync::atomic::Ordering::Relaxed);
         buf.extend_from_slice(&ct.to_le_bytes());
 
         if let Some(ref secret) = self.config.cluster_secret {
@@ -826,10 +846,12 @@ impl SwimRunner {
         // Prioritize suspect/dead entries — they carry convergence-critical
         // failure information that other nodes need to learn quickly.
         let all_states = membership.all_member_states();
-        let mut suspect_dead: Vec<_> = all_states.iter()
+        let mut suspect_dead: Vec<_> = all_states
+            .iter()
             .filter(|(_, st, _, _)| *st != NodeState::Alive)
             .collect();
-        let mut alive: Vec<_> = all_states.iter()
+        let mut alive: Vec<_> = all_states
+            .iter()
             .filter(|(_, st, _, _)| *st == NodeState::Alive)
             .collect();
         // Stable ordering within each group
@@ -906,7 +928,10 @@ impl SwimRunner {
 /// piggybacking that address would advertise a non-routable destination. In that case
 /// we combine [`SwimConfig::self_addr`]'s IP with the bind port so peers retain a
 /// usable UDP target.
-pub(crate) fn effective_swim_gossip_addr(self_addr: SocketAddr, bind_addr: SocketAddr) -> SocketAddr {
+pub(crate) fn effective_swim_gossip_addr(
+    self_addr: SocketAddr,
+    bind_addr: SocketAddr,
+) -> SocketAddr {
     if bind_addr.ip().is_unspecified() {
         SocketAddr::new(self_addr.ip(), bind_addr.port())
     } else {
@@ -934,8 +959,8 @@ fn store_piggybacked_swim_if_routable(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
 
     impl SwimRunner {
         pub fn collect_member_updates_for_test(&self) -> Vec<u8> {
@@ -1039,7 +1064,11 @@ mod tests {
         let target_swim: SocketAddr = "10.0.0.3:3301".parse().unwrap();
 
         let mut requester = test_runner_id(NodeId(1), requester_addr, requester_addr);
-        requester.swim_peer_addrs.lock().unwrap().insert(probed_target, target_swim);
+        requester
+            .swim_peer_addrs
+            .lock()
+            .unwrap()
+            .insert(probed_target, target_swim);
         requester.test_set_pending_probe(probed_target);
 
         let relay = test_runner_id(NodeId(2), relay_udp, "10.0.0.2:9000".parse().unwrap());
@@ -1080,8 +1109,12 @@ mod tests {
         let mut max = Duration::ZERO;
         for _ in 0..512 {
             let d = jittered_probe_interval(base);
-            if d < min { min = d; }
-            if d > max { max = d; }
+            if d < min {
+                min = d;
+            }
+            if d > max {
+                max = d;
+            }
         }
         let spread = max - min;
         // The full theoretical spread is 0.5 * base = 500 ms; we require
@@ -1110,6 +1143,9 @@ mod tests {
         assert_eq!(suspect_backoff_delay(base, 3), Duration::from_millis(800));
         // attempts=4+: capped at 16 * base
         assert_eq!(suspect_backoff_delay(base, 4), Duration::from_millis(1600));
-        assert_eq!(suspect_backoff_delay(base, 100), Duration::from_millis(1600));
+        assert_eq!(
+            suspect_backoff_delay(base, 100),
+            Duration::from_millis(1600)
+        );
     }
 }

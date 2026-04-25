@@ -3,7 +3,7 @@
 //! Covers lookup, register, unregister, and update_cached_fields on the
 //! primary hash table index — the critical path for every engine operation.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use teraslab::index::{Index, TxIndexEntry, TxKey};
 
@@ -45,20 +45,16 @@ fn bench_lookup(c: &mut Criterion) {
         let mut i = 0u32;
 
         group.throughput(Throughput::Elements(1));
-        group.bench_with_input(
-            BenchmarkId::new("hit", count),
-            &count,
-            |b, _| {
-                b.iter(|| {
-                    let key = make_tx_key(i);
-                    let _ = index.lookup(&key);
-                    i += 1;
-                    if i >= count as u32 {
-                        i = 0;
-                    }
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("hit", count), &count, |b, _| {
+            b.iter(|| {
+                let key = make_tx_key(i);
+                let _ = index.lookup(&key);
+                i += 1;
+                if i >= count as u32 {
+                    i = 0;
+                }
+            })
+        });
     }
 
     // Benchmark lookup misses (keys that don't exist).

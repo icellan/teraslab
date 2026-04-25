@@ -135,10 +135,7 @@ impl Index {
     /// (rounded to the next power of two) to keep the load factor below 70%.
     /// If the file already exists with the correct size, entries are recovered
     /// from the mapped file. Otherwise a fresh empty index is created.
-    pub fn open_file_backed(
-        path: &std::path::Path,
-        expected_records: usize,
-    ) -> Result<Self> {
+    pub fn open_file_backed(path: &std::path::Path, expected_records: usize) -> Result<Self> {
         let capacity = (expected_records as f64 / 0.7).ceil() as usize;
         let table = HashTable::open_file_backed(path, capacity.max(16))?;
         Ok(Self {
@@ -205,8 +202,15 @@ impl Index {
         unmined_since: u32,
         generation: u32,
     ) -> bool {
-        self.table
-            .update_cached_fields(key, tx_flags, block_entry_count, spent_utxos, dah_or_preserve, unmined_since, generation)
+        self.table.update_cached_fields(
+            key,
+            tx_flags,
+            block_entry_count,
+            spent_utxos,
+            dah_or_preserve,
+            unmined_since,
+            generation,
+        )
     }
 
     /// Number of entries in the primary index.
@@ -279,10 +283,7 @@ impl Index {
         let tmp_path = path.with_extension("tmp");
         let mut data = self.serialize_primary();
         data.extend_from_slice(&serialize_secondary(&DAH_SECTION_MAGIC, dah.iter()));
-        data.extend_from_slice(&serialize_secondary(
-            &UNMINED_SECTION_MAGIC,
-            unmined.iter(),
-        ));
+        data.extend_from_slice(&serialize_secondary(&UNMINED_SECTION_MAGIC, unmined.iter()));
         std::fs::write(&tmp_path, &data)?;
         let f = std::fs::File::open(&tmp_path)?;
         f.sync_all()?;
@@ -361,10 +362,7 @@ impl Index {
     /// This is the cold-start path when no snapshot exists. Reads every
     /// record header between `allocator.data_region_start()` and
     /// `allocator.next_offset()`, checking for valid magic numbers.
-    pub fn rebuild(
-        device: &dyn BlockDevice,
-        allocator: &SlotAllocator,
-    ) -> Result<Self> {
+    pub fn rebuild(device: &dyn BlockDevice, allocator: &SlotAllocator) -> Result<Self> {
         let mut index = Self::new(1024)?;
         let align = allocator.device_alignment();
         let start = allocator.data_region_start();
@@ -551,8 +549,7 @@ impl Index {
         }
 
         // Verify checksum
-        let stored_checksum =
-            u32::from_le_bytes(data[total - 4..total].try_into().unwrap());
+        let stored_checksum = u32::from_le_bytes(data[total - 4..total].try_into().unwrap());
         let computed_checksum = crc32fast::hash(&data[..total - 4]);
         if stored_checksum != computed_checksum {
             return Err(IndexError::ChecksumMismatch {
@@ -571,26 +568,14 @@ impl Index {
 
             let entry = TxIndexEntry {
                 device_id: data[base + 32],
-                record_offset: u64::from_le_bytes(
-                    data[base + 33..base + 41].try_into().unwrap(),
-                ),
-                utxo_count: u32::from_le_bytes(
-                    data[base + 41..base + 45].try_into().unwrap(),
-                ),
+                record_offset: u64::from_le_bytes(data[base + 33..base + 41].try_into().unwrap()),
+                utxo_count: u32::from_le_bytes(data[base + 41..base + 45].try_into().unwrap()),
                 block_entry_count: data[base + 45],
                 tx_flags: data[base + 46],
-                spent_utxos: u32::from_le_bytes(
-                    data[base + 47..base + 51].try_into().unwrap(),
-                ),
-                dah_or_preserve: u32::from_le_bytes(
-                    data[base + 51..base + 55].try_into().unwrap(),
-                ),
-                unmined_since: u32::from_le_bytes(
-                    data[base + 55..base + 59].try_into().unwrap(),
-                ),
-                generation: u32::from_le_bytes(
-                    data[base + 59..base + 63].try_into().unwrap(),
-                ),
+                spent_utxos: u32::from_le_bytes(data[base + 47..base + 51].try_into().unwrap()),
+                dah_or_preserve: u32::from_le_bytes(data[base + 51..base + 55].try_into().unwrap()),
+                unmined_since: u32::from_le_bytes(data[base + 55..base + 59].try_into().unwrap()),
+                generation: u32::from_le_bytes(data[base + 59..base + 63].try_into().unwrap()),
             };
             index.register(key, entry)?;
         }
@@ -603,10 +588,7 @@ impl Index {
 // Secondary index serialization helpers
 // ---------------------------------------------------------------------------
 
-fn serialize_secondary(
-    magic: &[u8; 4],
-    entries: impl Iterator<Item = (u32, TxKey)>,
-) -> Vec<u8> {
+fn serialize_secondary(magic: &[u8; 4], entries: impl Iterator<Item = (u32, TxKey)>) -> Vec<u8> {
     let collected: Vec<_> = entries.collect();
     let count = collected.len() as u64;
     let header_size = 4 + 4 + 8; // magic + version + count
@@ -642,9 +624,7 @@ fn locate_unmined_section(data: &[u8]) -> &[u8] {
     while idx + header_size + 4 <= data.len() {
         if data[idx..idx + 4] == UNMINED_SECTION_MAGIC {
             // Check declared count fits in remaining bytes.
-            let count = u64::from_le_bytes(
-                data[idx + 8..idx + 16].try_into().unwrap(),
-            ) as usize;
+            let count = u64::from_le_bytes(data[idx + 8..idx + 16].try_into().unwrap()) as usize;
             let body_size = count.saturating_mul(SECONDARY_ENTRY_SIZE);
             let total = header_size + body_size + 4;
             if data.len() - idx >= total {
@@ -688,8 +668,7 @@ fn deserialize_secondary(
         });
     }
 
-    let stored_checksum =
-        u32::from_le_bytes(data[total - 4..total].try_into().unwrap());
+    let stored_checksum = u32::from_le_bytes(data[total - 4..total].try_into().unwrap());
     let computed_checksum = crc32fast::hash(&data[..total - 4]);
     if stored_checksum != computed_checksum {
         return Err(IndexError::ChecksumMismatch {
@@ -876,10 +855,7 @@ mod tests {
         // Corrupt the DAH section (after primary index data)
         let mut data = std::fs::read(&snap_path).unwrap();
         // Find DAHI magic and corrupt it
-        if let Some(pos) = data
-            .windows(4)
-            .position(|w| w == b"DAHI")
-        {
+        if let Some(pos) = data.windows(4).position(|w| w == b"DAHI") {
             data[pos + 10] ^= 0xFF; // Corrupt a data byte
         }
         std::fs::write(&snap_path, &data).unwrap();
@@ -940,8 +916,10 @@ mod tests {
         assert!(restored_dah.is_empty());
 
         // Unmined is intact — NOT flagged for rebuild and entries preserved.
-        assert!(!flags.unmined_needs_rebuild,
-            "unmined should not be flagged when only DAH is corrupt");
+        assert!(
+            !flags.unmined_needs_rebuild,
+            "unmined should not be flagged when only DAH is corrupt"
+        );
         assert_eq!(restored_unmined.len(), 3);
         let up_to_700 = restored_unmined.range_query(700);
         assert_eq!(up_to_700.len(), 3);
@@ -981,8 +959,10 @@ mod tests {
             Index::restore_all(&snap_path).unwrap();
 
         assert_eq!(restored_idx.len(), 2);
-        assert!(!flags.dah_needs_rebuild,
-            "DAH should not be flagged when only unmined is corrupt");
+        assert!(
+            !flags.dah_needs_rebuild,
+            "DAH should not be flagged when only unmined is corrupt"
+        );
         assert_eq!(restored_dah.len(), 2);
         assert_eq!(restored_dah.range_query(222).len(), 2);
 
@@ -1006,10 +986,7 @@ mod tests {
 
         // Corrupt the UNMI section
         let mut data = std::fs::read(&snap_path).unwrap();
-        if let Some(pos) = data
-            .windows(4)
-            .position(|w| w == b"UNMI")
-        {
+        if let Some(pos) = data.windows(4).position(|w| w == b"UNMI") {
             data[pos + 10] ^= 0xFF;
         }
         std::fs::write(&snap_path, &data).unwrap();
@@ -1035,8 +1012,7 @@ mod tests {
 
         idx.snapshot_all(&dah, &unmined, &snap_path).unwrap();
 
-        let (_, restored_dah, restored_unmined, flags) =
-            Index::restore_all(&snap_path).unwrap();
+        let (_, restored_dah, restored_unmined, flags) = Index::restore_all(&snap_path).unwrap();
 
         assert!(!flags.dah_needs_rebuild);
         assert!(!flags.unmined_needs_rebuild);
@@ -1064,8 +1040,7 @@ mod tests {
         dah.insert(200, make_key(2));
 
         // Restore — should only have entries from snapshot time
-        let (restored_idx, restored_dah, _, _) =
-            Index::restore_all(&snap_path).unwrap();
+        let (restored_idx, restored_dah, _, _) = Index::restore_all(&snap_path).unwrap();
 
         assert_eq!(restored_idx.len(), 1);
         assert!(restored_idx.lookup(&make_key(2)).is_none());
@@ -1085,9 +1060,8 @@ mod tests {
             let mut meta = TxMetadata::new(5);
             let mut txid = [0u8; 32];
             txid[0..8].copy_from_slice(&(i as u64).to_le_bytes());
-            txid[8..16].copy_from_slice(
-                &((i as u64).wrapping_mul(0x9E3779B97F4A7C15)).to_le_bytes(),
-            );
+            txid[8..16]
+                .copy_from_slice(&((i as u64).wrapping_mul(0x9E3779B97F4A7C15)).to_le_bytes());
             meta.tx_id = txid;
             meta.delete_at_height = if i % 2 == 0 { (i as u32 + 1) * 100 } else { 0 };
             meta.unmined_since = if i % 4 == 0 { (i as u32 + 1) * 50 } else { 0 };
@@ -1282,9 +1256,8 @@ mod tests {
                 let key = TxKey::from_bytes({
                     let mut txid = [0u8; 32];
                     txid[0..8].copy_from_slice(&i.to_le_bytes());
-                    txid[8..16].copy_from_slice(
-                        &(i.wrapping_mul(0x9E3779B97F4A7C15)).to_le_bytes(),
-                    );
+                    txid[8..16]
+                        .copy_from_slice(&(i.wrapping_mul(0x9E3779B97F4A7C15)).to_le_bytes());
                     txid
                 });
                 let entry = TxIndexEntry {

@@ -162,7 +162,9 @@ impl RedbPrimary {
         let txn = self.begin_write().map_err(map_redb_txn_err)?;
         let is_new = {
             let mut table = txn.open_table(PRIMARY_TABLE).map_err(map_redb_table_err)?;
-            let existed = table.insert(key.txid, value).map_err(map_redb_storage_err)?;
+            let existed = table
+                .insert(key.txid, value)
+                .map_err(map_redb_storage_err)?;
             existed.is_none()
         };
         txn.commit().map_err(map_redb_commit_err)?;
@@ -383,10 +385,7 @@ impl RedbPrimary {
     /// Much faster than calling [`register`](Self::register) in a loop because
     /// only one fsync is performed for the entire batch. Tracks new-vs-update
     /// per entry for accurate count maintenance.
-    pub fn register_batch(
-        &mut self,
-        entries: &[(TxKey, TxIndexEntry)],
-    ) -> Result<(), IndexError> {
+    pub fn register_batch(&mut self, entries: &[(TxKey, TxIndexEntry)]) -> Result<(), IndexError> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -610,7 +609,9 @@ mod tests {
         let key = make_key(42);
         primary.register(key, make_entry(8192)).unwrap();
 
-        let removed = primary.unregister(&key).expect("should return removed entry");
+        let removed = primary
+            .unregister(&key)
+            .expect("should return removed entry");
         assert_eq!(removed.record_offset, 8192);
         assert_eq!(primary.len(), 0);
         assert!(primary.lookup(&key).is_none());
@@ -691,7 +692,9 @@ mod tests {
             let primary = RedbPrimary::open(&db_path, 64 * 1024 * 1024).unwrap();
             assert_eq!(primary.len(), 100);
             for i in 0..100u64 {
-                let e = primary.lookup(&make_key(i)).expect("entry should survive reopen");
+                let e = primary
+                    .lookup(&make_key(i))
+                    .expect("entry should survive reopen");
                 assert_eq!(e.record_offset, i * 100);
             }
         }
@@ -727,7 +730,9 @@ mod tests {
     fn snapshot_is_noop() {
         let (_dir, primary) = open_temp();
         let dir2 = tempfile::tempdir().unwrap();
-        primary.snapshot(dir2.path().join("noop.snap").as_path()).unwrap();
+        primary
+            .snapshot(dir2.path().join("noop.snap").as_path())
+            .unwrap();
     }
 
     #[test]

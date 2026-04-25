@@ -5,10 +5,10 @@ mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
-use teraslab_test_client::{Client, ClientConfig, ClientError, PoolConfig};
-use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::reporter::MetricsReporter;
 use teraslab_test_client::types::*;
+use teraslab_test_client::verifier::StateVerifier;
+use teraslab_test_client::{Client, ClientConfig, ClientError, PoolConfig};
 
 macro_rules! tlog {
     ($t0:expr, $($arg:tt)*) => {
@@ -23,7 +23,10 @@ const SID: u16 = 8;
 
 /// Format a txid as a short hex prefix for assertion messages.
 fn txid_hex(txid: &[u8; 32]) -> String {
-    txid.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
+    txid.iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 
 /// Note: This test requires iptables inside Docker containers, which works on
@@ -82,9 +85,11 @@ async fn run_scenario() -> Result<(), ClientError> {
         let status_n1 = common::http_status(&docker, 1).await?;
         let cluster_size_n1 = status_n1["cluster_size"].as_u64().unwrap_or(0);
         eprintln!("[8a.1] node1 reports cluster_size={cluster_size_n1}");
-        assert!(cluster_size_n1 == 2,
+        assert!(
+            cluster_size_n1 == 2,
             "Test 8a.1: node1 reports cluster_size={cluster_size_n1}, expected exactly 2 \
-             (majority partition of node1+node2 with node3 isolated)");
+             (majority partition of node1+node2 with node3 isolated)"
+        );
 
         // Pattern B: the main client was seeded with all 3 nodes; its pool
         // now includes node3, and the next `refresh_routing` can hit node3
@@ -205,15 +210,19 @@ async fn run_scenario() -> Result<(), ClientError> {
                 eprintln!("[8a.1b] retry {retry}: node3 still accepted write");
             }
         }
-        assert!(node3_write_rejected,
-            "node3 should reject writes during minority partition");
+        assert!(
+            node3_write_rejected,
+            "node3 should reject writes during minority partition"
+        );
 
         // Wait for migrations between majority nodes to settle before writing.
         // After partition, TCP connections to the partitioned node may hang.
         // Allow generous time for migration workers to time out and complete.
-        common::wait_specific_migrations_complete(&docker, &[1, 2], Duration::from_secs(120)).await?;
+        common::wait_specific_migrations_complete(&docker, &[1, 2], Duration::from_secs(120))
+            .await?;
         // Brief settle for newly-migrated shards to become writable.
-        common::wait_specific_replication_settled(&docker, &[1, 2], Duration::from_secs(10)).await?;
+        common::wait_specific_replication_settled(&docker, &[1, 2], Duration::from_secs(10))
+            .await?;
         client.refresh_routing().await?;
 
         eprintln!("[8a.2] Creating 200 records while node3 is isolated");
@@ -254,7 +263,8 @@ async fn run_scenario() -> Result<(), ClientError> {
             2,
             50,
             Duration::from_secs(60),
-        ).await?;
+        )
+        .await?;
 
         eprintln!("[8a.3] OK -- cluster reconverged to size 3");
 
@@ -273,14 +283,17 @@ async fn run_scenario() -> Result<(), ClientError> {
                 if result.status() != 0 {
                     read_failures += 1;
                     if read_failures <= 5 {
-                        eprintln!("Test 8a.4: txid {} returned unexpected result", txid_hex(&chunk[i]));
+                        eprintln!(
+                            "Test 8a.4: txid {} returned unexpected result",
+                            txid_hex(&chunk[i])
+                        );
                     }
                 }
             }
         }
         // Retry not-found records after routing refresh (inbound migrations
         // may still be settling after partition heal).
-        if read_failures > 0 && read_failures <= 50 {
+        if read_failures > 0 {
             eprintln!("[8a.4] {read_failures} records not found, retrying after refresh...");
             client.refresh_routing().await?;
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -289,7 +302,9 @@ async fn run_scenario() -> Result<(), ClientError> {
             for chunk in all_txids.chunks(100) {
                 let results = client.get_batch(FIELD_ALL, chunk).await?;
                 for result in results.iter() {
-                    if result.status() != 0 { read_failures += 1; }
+                    if result.status() != 0 {
+                        read_failures += 1;
+                    }
                 }
             }
         }
@@ -303,13 +318,22 @@ async fn run_scenario() -> Result<(), ClientError> {
             for chunk in all_txids.chunks(100) {
                 let results = client.get_batch(FIELD_ALL_METADATA, chunk).await?;
                 for r in results.iter() {
-                    if r.status() != 0 { read_failures += 1; }
+                    if r.status() != 0 {
+                        read_failures += 1;
+                    }
                 }
             }
         }
-        assert_eq!(read_failures, 0,
-            "Test 8a.4: {read_failures}/{} records not accessible after partition heal", all_txids.len());
-        eprintln!("[8a.4] OK -- all {} records intact after partition healing", all_txids.len());
+        assert_eq!(
+            read_failures,
+            0,
+            "Test 8a.4: {read_failures}/{} records not accessible after partition heal",
+            all_txids.len()
+        );
+        eprintln!(
+            "[8a.4] OK -- all {} records intact after partition healing",
+            all_txids.len()
+        );
 
         let _ = docker.compose_down().await;
         eprintln!("[8a] === Minority isolation sub-scenario complete ===");
@@ -344,7 +368,8 @@ async fn run_scenario() -> Result<(), ClientError> {
 
         // Wait for SWIM to detect full isolation. Each node sees all peers as dead.
         // Poll node1 until it reports cluster_size=1 (only itself).
-        common::wait_node_cluster_size(&docker, 1, 1, Duration::from_secs(30)).await
+        common::wait_node_cluster_size(&docker, 1, 1, Duration::from_secs(30))
+            .await
             .unwrap_or_else(|e| eprintln!("[8b.1] node1 did not reach cluster_size=1: {e}"));
 
         // All writes should fail on all nodes when fully isolated
@@ -375,14 +400,18 @@ async fn run_scenario() -> Result<(), ClientError> {
 
             match client.create_batch(&[item]).await {
                 Ok(_) => {
-                    eprintln!("[8b.2] WARNING: write succeeded during full isolation (attempt {attempt})");
+                    eprintln!(
+                        "[8b.2] WARNING: write succeeded during full isolation (attempt {attempt})"
+                    );
                     // In a full partition, no node has majority so writes should fail.
                     // But the client may have cached routes from before the partition.
                     // Give the cluster time to detect the partition.
                     all_writes_failed = false;
                 }
                 Err(_) => {
-                    eprintln!("[8b.2] Write correctly rejected during full isolation (attempt {attempt})");
+                    eprintln!(
+                        "[8b.2] Write correctly rejected during full isolation (attempt {attempt})"
+                    );
                 }
             }
         }
@@ -417,7 +446,9 @@ async fn run_scenario() -> Result<(), ClientError> {
                     };
                     match client.create_batch(&[item]).await {
                         Ok(_) => {
-                            eprintln!("[8b.2] round {round} attempt {attempt}: write still succeeded");
+                            eprintln!(
+                                "[8b.2] round {round} attempt {attempt}: write still succeeded"
+                            );
                             round_all_failed = false;
                         }
                         Err(_) => {
@@ -432,8 +463,10 @@ async fn run_scenario() -> Result<(), ClientError> {
                 }
             }
         }
-        assert!(all_writes_failed,
-            "all nodes should reject writes during full isolation");
+        assert!(
+            all_writes_failed,
+            "all nodes should reject writes during full isolation"
+        );
 
         eprintln!("[8b.3] Healing all partitions");
         docker.heal_all_partitions().await?;
@@ -467,7 +500,8 @@ async fn run_scenario() -> Result<(), ClientError> {
             2,
             50,
             Duration::from_secs(60),
-        ).await?;
+        )
+        .await?;
 
         eprintln!("[8b.3] OK -- cluster reformed after full isolation");
 
@@ -479,14 +513,23 @@ async fn run_scenario() -> Result<(), ClientError> {
             for (i, result) in results.iter().enumerate() {
                 if result.status() != 0 {
                     read_failures += 1;
-                    eprintln!("Test 8b.4: txid {} not found after heal", txid_hex(&chunk[i]));
+                    eprintln!(
+                        "Test 8b.4: txid {} not found after heal",
+                        txid_hex(&chunk[i])
+                    );
                 }
             }
         }
-        assert_eq!(read_failures, 0,
+        assert_eq!(
+            read_failures,
+            0,
             "Test 8b.4: {read_failures}/{} pre-partition records lost after full isolation heal",
-            pre_partition_txids.len());
-        eprintln!("[8b.4] OK -- all {} pre-partition records intact", pre_partition_txids.len());
+            pre_partition_txids.len()
+        );
+        eprintln!(
+            "[8b.4] OK -- all {} pre-partition records intact",
+            pre_partition_txids.len()
+        );
 
         let _ = docker.compose_down().await;
         eprintln!("[8b] === Full isolation sub-scenario complete ===");
@@ -545,11 +588,17 @@ async fn run_scenario() -> Result<(), ClientError> {
             batch_idx += 1;
 
             // Mix of creates and reads
-            if batch_idx % 3 == 0 {
+            if batch_idx.is_multiple_of(3) {
                 // Read some baseline records
                 let read_idx = (batch_idx as usize) % baseline_txids.len();
                 let op_start = std::time::Instant::now();
-                match client.get_batch(FIELD_ALL_METADATA, std::slice::from_ref(&baseline_txids[read_idx])).await {
+                match client
+                    .get_batch(
+                        FIELD_ALL_METADATA,
+                        std::slice::from_ref(&baseline_txids[read_idx]),
+                    )
+                    .await
+                {
                     Ok(_) => {
                         reporter.record("read", op_start.elapsed());
                         total_ops += 1;
@@ -580,8 +629,10 @@ async fn run_scenario() -> Result<(), ClientError> {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        eprintln!("[8c.2] Workload complete: {total_ops} ops, {slow_errors} errors, {} records created",
-            slow_txids.len());
+        eprintln!(
+            "[8c.2] Workload complete: {total_ops} ops, {slow_errors} errors, {} records created",
+            slow_txids.len()
+        );
         eprintln!("[8c.2] {}", reporter.format_summary());
 
         eprintln!("[8c.3] Clearing network degradation");
@@ -594,7 +645,10 @@ async fn run_scenario() -> Result<(), ClientError> {
         let mut c83_err = None;
         for attempt in 0..3u32 {
             match common::wait_cluster_ready(&docker, 3, Duration::from_secs(120)).await {
-                Ok(()) => { c83_err = None; break; }
+                Ok(()) => {
+                    c83_err = None;
+                    break;
+                }
                 Err(e) => {
                     eprintln!("[8c.3] cluster_ready attempt {attempt}: {e}");
                     c83_err = Some(e);
@@ -602,7 +656,9 @@ async fn run_scenario() -> Result<(), ClientError> {
                 }
             }
         }
-        if let Some(e) = c83_err { return Err(e); }
+        if let Some(e) = c83_err {
+            return Err(e);
+        }
         for attempt in 0..3u32 {
             match common::wait_migrations_complete(&docker, 3, Duration::from_secs(180)).await {
                 Ok(()) => break,
@@ -618,9 +674,11 @@ async fn run_scenario() -> Result<(), ClientError> {
         for node_num in 1..=3u32 {
             let status = common::http_status(&docker, node_num).await?;
             let cluster_size = status["cluster_size"].as_u64().unwrap_or(0);
-            assert_eq!(cluster_size, 3,
+            assert_eq!(
+                cluster_size, 3,
                 "Test 8c.4: node {node_num} reports cluster_size={cluster_size}, expected 3 \
-                 (false-positive node death detected)");
+                 (false-positive node death detected)"
+            );
         }
         eprintln!("[8c.4] OK -- all 3 nodes still in cluster after clearing degradation");
 
@@ -630,9 +688,12 @@ async fn run_scenario() -> Result<(), ClientError> {
         let fresh_client = common::create_client(&docker, 3).await?;
 
         let (found, not_found) = common::count_accessible(&fresh_client, &slow_txids).await?;
-        assert_eq!(not_found, 0,
+        assert_eq!(
+            not_found,
+            0,
             "Test 8c.5: {not_found}/{} records written during degradation are unreadable",
-            slow_txids.len());
+            slow_txids.len()
+        );
         eprintln!("[8c.5] OK -- all {found} records written during degradation are readable");
 
         // Verify baseline records too
@@ -646,24 +707,26 @@ async fn run_scenario() -> Result<(), ClientError> {
                 }
             }
         }
-        assert_eq!(baseline_failures, 0,
-            "Test 8c.5: {baseline_failures}/{} baseline records lost", baseline_txids.len());
+        assert_eq!(
+            baseline_failures,
+            0,
+            "Test 8c.5: {baseline_failures}/{} baseline records lost",
+            baseline_txids.len()
+        );
         eprintln!("[8c.5] OK -- baseline data also intact");
 
         // Full consistency check
         eprintln!("[8c.6] Full consistency check");
         let mismatches = common::verify_consistency(&client, &verifier).await?;
-        let max_allowed = std::cmp::max(3, (verifier.record_count() as f64 * 0.001).ceil() as usize);
-        if !mismatches.is_empty() {
-            eprintln!("[8c.6] WARN -- {} mismatches within tolerance (max {max_allowed}): {:?}",
-                mismatches.len(), mismatches.iter().take(5).collect::<Vec<_>>());
-        }
-        assert!(mismatches.len() <= max_allowed,
-            "Test 8c.6: verify_consistency found {} mismatches (max allowed {}): {:?}",
-            mismatches.len(), max_allowed,
-            mismatches.iter().take(5).collect::<Vec<_>>());
-        eprintln!("[8c.6] OK -- full consistency check passed ({} mismatches, max allowed {max_allowed})",
-            mismatches.len());
+        assert!(
+            mismatches.is_empty(),
+            "Test 8c.6: verify_consistency found {} mismatches: {:?}",
+            mismatches.len(),
+            mismatches.iter().take(5).collect::<Vec<_>>()
+        );
+        let non_deleted = verifier.non_deleted_txids();
+        common::assert_rf2_replication_exact(&client, &docker, 3, &non_deleted, "8c.6").await?;
+        eprintln!("[8c.6] OK -- full consistency check passed with zero mismatches");
 
         let _ = docker.compose_down().await;
         eprintln!("[8c] === Slow network sub-scenario complete ===");
@@ -728,7 +791,13 @@ async fn run_scenario() -> Result<(), ClientError> {
             if !initial_txids.is_empty() {
                 let read_idx = (batch_idx as usize) % initial_txids.len();
                 let op_start = std::time::Instant::now();
-                match client.get_batch(FIELD_ALL_METADATA, std::slice::from_ref(&initial_txids[read_idx])).await {
+                match client
+                    .get_batch(
+                        FIELD_ALL_METADATA,
+                        std::slice::from_ref(&initial_txids[read_idx]),
+                    )
+                    .await
+                {
                     Ok(_) => {
                         reporter.record("read", op_start.elapsed());
                         total_ops += 1;
@@ -744,8 +813,10 @@ async fn run_scenario() -> Result<(), ClientError> {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        eprintln!("[8d.2] Workload complete: {total_ops} ops, {errors} errors, {} records created",
-            partition_txids.len());
+        eprintln!(
+            "[8d.2] Workload complete: {total_ops} ops, {errors} errors, {} records created",
+            partition_txids.len()
+        );
         eprintln!("[8d.2] {}", reporter.format_summary());
 
         // Heal the asymmetric partition
@@ -773,7 +844,8 @@ async fn run_scenario() -> Result<(), ClientError> {
             2,
             50,
             Duration::from_secs(60),
-        ).await?;
+        )
+        .await?;
 
         eprintln!("[8d.3] OK -- cluster reconverged after asymmetric partition heal");
 
@@ -782,10 +854,12 @@ async fn run_scenario() -> Result<(), ClientError> {
         // conflicting writes for the same shard, the consistency check would fail.
         eprintln!("[8d.4] Verifying no split-brain writes (full consistency check)");
         let mismatches = common::verify_consistency(&client, &verifier).await?;
-        assert!(mismatches.is_empty(),
+        assert!(
+            mismatches.is_empty(),
             "Test 8d.4: verify_consistency found {} mismatches (possible split-brain): {:?}",
             mismatches.len(),
-            mismatches.iter().take(5).collect::<Vec<_>>());
+            mismatches.iter().take(5).collect::<Vec<_>>()
+        );
         eprintln!("[8d.4] OK -- no split-brain detected, full consistency check passed");
 
         // Verify all data accessible
@@ -805,9 +879,16 @@ async fn run_scenario() -> Result<(), ClientError> {
                 }
             }
         }
-        assert_eq!(read_failures, 0,
-            "Test 8d.4: {read_failures}/{} records not accessible after heal", all_txids.len());
-        eprintln!("[8d.4] OK -- all {} records accessible after asymmetric partition heal", all_txids.len());
+        assert_eq!(
+            read_failures,
+            0,
+            "Test 8d.4: {read_failures}/{} records not accessible after heal",
+            all_txids.len()
+        );
+        eprintln!(
+            "[8d.4] OK -- all {} records accessible after asymmetric partition heal",
+            all_txids.len()
+        );
 
         eprintln!("[8d] === Asymmetric partition sub-scenario complete ===");
         tlog!(t0, "test 8d: done");

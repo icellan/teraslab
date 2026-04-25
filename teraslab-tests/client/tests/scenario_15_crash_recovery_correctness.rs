@@ -5,9 +5,9 @@ mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
-use teraslab_test_client::{Client, ClientConfig, ClientError, PoolConfig};
-use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::types::*;
+use teraslab_test_client::verifier::StateVerifier;
+use teraslab_test_client::{Client, ClientConfig, ClientError, PoolConfig};
 
 macro_rules! tlog {
     ($t0:expr, $($arg:tt)*) => {
@@ -22,7 +22,10 @@ const SID: u16 = 15;
 
 /// Format a txid as a short hex prefix for assertion messages.
 fn txid_hex(txid: &[u8; 32]) -> String {
-    txid.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
+    txid.iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 
 /// Read a sample of txids from the cluster, returning the count of records
@@ -33,7 +36,11 @@ async fn verify_sample(
     sample_size: usize,
     _test_label: &str,
 ) -> Result<u32, ClientError> {
-    let step = if txids.len() <= sample_size { 1 } else { txids.len() / sample_size };
+    let step = if txids.len() <= sample_size {
+        1
+    } else {
+        txids.len() / sample_size
+    };
     let count = sample_size.min(txids.len());
     let sample: Vec<[u8; 32]> = (0..txids.len())
         .step_by(step)
@@ -202,7 +209,8 @@ async fn test_basic_crash_recovery() -> Result<(), ClientError> {
     docker.start_node("node1").await?;
 
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+        .await
         .unwrap_or_else(|e| eprintln!("[15.1] migration wait: {e}"));
     // Extra settling time for redo log replay and migration data transfer.
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
@@ -214,12 +222,16 @@ async fn test_basic_crash_recovery() -> Result<(), ClientError> {
     let total = txids.len() as u32;
     let readable = verify_sample(&client, &txids, txids.len(), "15.1").await?;
     if readable < total {
-        eprintln!("[15.1] First read pass: {readable}/{total} -- waiting for more migration settling");
+        eprintln!(
+            "[15.1] First read pass: {readable}/{total} -- waiting for more migration settling"
+        );
         common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
         client.refresh_routing().await?;
         let readable = verify_sample(&client, &txids, txids.len(), "15.1 retry").await?;
-        assert_eq!(readable, total,
-            "Test 15.1: post-recovery: expected {total} readable records, got {readable}.");
+        assert_eq!(
+            readable, total,
+            "Test 15.1: post-recovery: expected {total} readable records, got {readable}."
+        );
     }
 
     eprintln!("[15.1] OK -- basic crash recovery passed ({readable}/{total} readable)");
@@ -261,7 +273,9 @@ async fn test_kill_during_writes() -> Result<(), ClientError> {
             }
 
             if !killed && workload_start.elapsed() >= Duration::from_secs(5) {
-                eprintln!("[15.2/15.3] Iteration {iteration}: killing node1 after {attempted} write attempts");
+                eprintln!(
+                    "[15.2/15.3] Iteration {iteration}: killing node1 after {attempted} write attempts"
+                );
                 docker.kill_node("node1").await?;
                 killed = true;
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -271,35 +285,34 @@ async fn test_kill_during_writes() -> Result<(), ClientError> {
         }
 
         let total_confirmed = confirmed_txids.len();
-        eprintln!("[15.2/15.3] Iteration {iteration}: {total_confirmed} confirmed creates \
-             out of {attempted} attempts (+ 200 baseline)");
+        eprintln!(
+            "[15.2/15.3] Iteration {iteration}: {total_confirmed} confirmed creates \
+             out of {attempted} attempts (+ 200 baseline)"
+        );
 
         eprintln!("[15.2/15.3] Iteration {iteration}: restarting node1");
         docker.start_node("node1").await?;
         common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+            .await
             .unwrap_or_else(|e| eprintln!("[15.2/15.3] migration wait: {e}"));
         common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
         let client = common::create_client(&docker, 3).await?;
         client.refresh_routing().await?;
 
-        // Full consistency check. Records written during the kill window
-        // may not be replicated — allow up to 15% mismatches from the
-        // in-flight writes at the moment of SIGKILL.
+        // Full consistency check: every acknowledged write must survive recovery.
         let mismatches = common::verify_consistency(&client, &verifier).await?;
-        let max_allowed = std::cmp::max(5, (verifier.record_count() as f64 * 0.15).ceil() as usize);
-        assert!(mismatches.len() <= max_allowed,
-            "Test 15.3 iteration {iteration}: {} mismatches (max {max_allowed}) after recovery: {:?}",
+        assert!(
+            mismatches.is_empty(),
+            "Test 15.3 iteration {iteration}: {} mismatches after recovery: {:?}",
             mismatches.len(),
-            mismatches.iter().take(5).collect::<Vec<_>>());
+            mismatches.iter().take(5).collect::<Vec<_>>()
+        );
+        let non_deleted = verifier.non_deleted_txids();
+        common::assert_rf2_replication_exact(&client, &docker, 3, &non_deleted, "15.3").await?;
 
-        if mismatches.is_empty() {
-            eprintln!("[15.2/15.3] Iteration {iteration}: OK -- zero mismatches");
-        } else {
-            eprintln!("[15.2/15.3] Iteration {iteration}: {} mismatches within tolerance (max {max_allowed})",
-                mismatches.len());
-        }
+        eprintln!("[15.2/15.3] Iteration {iteration}: OK -- zero mismatches");
 
         common::teardown_all(SID).await;
     }
@@ -351,13 +364,15 @@ async fn test_kill_during_spend_multi() -> Result<(), ClientError> {
         block_height_retention: 288,
     };
 
-    eprintln!("[15.4] Sending {} spend items and killing node1 concurrently", spend_items.len());
+    eprintln!(
+        "[15.4] Sending {} spend items and killing node1 concurrently",
+        spend_items.len()
+    );
 
     // Fire the spend batch and kill node1 concurrently
     let client_clone = common::create_client(&docker, 3).await?;
-    let spend_handle = tokio::spawn(async move {
-        client_clone.spend_batch(&spend_params, &spend_items).await
-    });
+    let spend_handle =
+        tokio::spawn(async move { client_clone.spend_batch(&spend_params, &spend_items).await });
 
     // Small delay then kill
     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -371,7 +386,8 @@ async fn test_kill_during_spend_multi() -> Result<(), ClientError> {
     tokio::time::sleep(Duration::from_millis(500)).await;
     docker.start_node("node1").await?;
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+        .await
         .unwrap_or_else(|e| eprintln!("[15.4] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
@@ -382,15 +398,20 @@ async fn test_kill_during_spend_multi() -> Result<(), ClientError> {
     // (Atomicity check)
     let mut atomicity_violations = 0u32;
     for txid in &target_txids {
-        match client.get_batch(FIELD_ALL_METADATA, std::slice::from_ref(txid)).await {
+        match client
+            .get_batch(FIELD_ALL_METADATA, std::slice::from_ref(txid))
+            .await
+        {
             Ok(results) if !results.is_empty() && results.item(0).status == 0 => {
                 if let Some((spent_count, _, _, _)) =
                     teraslab_test_client::verifier::parse_metadata_fields(&results.item(0).data)
                 {
                     // Either all 5 spent (batch applied) or 0 spent (batch not applied)
                     if spent_count != 0 && spent_count != 5 {
-                        eprintln!("[15.4] ATOMICITY VIOLATION: txid {} has {spent_count}/5 spent (partial batch!)",
-                            txid_hex(txid));
+                        eprintln!(
+                            "[15.4] ATOMICITY VIOLATION: txid {} has {spent_count}/5 spent (partial batch!)",
+                            txid_hex(txid)
+                        );
                         atomicity_violations += 1;
                     }
                 }
@@ -401,8 +422,10 @@ async fn test_kill_during_spend_multi() -> Result<(), ClientError> {
         }
     }
 
-    assert_eq!(atomicity_violations, 0,
-        "Test 15.4: {atomicity_violations} txids have partial spendMulti batches -- atomicity violated");
+    assert_eq!(
+        atomicity_violations, 0,
+        "Test 15.4: {atomicity_violations} txids have partial spendMulti batches -- atomicity violated"
+    );
     eprintln!("[15.4] OK -- spendMulti atomicity verified (either all or none applied)");
     Ok(())
 }
@@ -434,8 +457,10 @@ async fn test_kill_during_set_mined() -> Result<(), ClientError> {
         block_height_retention: 288,
     };
 
-    eprintln!("[15.5] Sending setMined for {} txids and killing node1 concurrently",
-        target_txids.len());
+    eprintln!(
+        "[15.5] Sending setMined for {} txids and killing node1 concurrently",
+        target_txids.len()
+    );
 
     // Use tokio::select! to race the setMined batch against a delayed kill.
     // This avoids spawning a task (which would fail because set_mined_batch
@@ -461,7 +486,8 @@ async fn test_kill_during_set_mined() -> Result<(), ClientError> {
     tokio::time::sleep(Duration::from_millis(500)).await;
     docker.start_node("node1").await?;
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+        .await
         .unwrap_or_else(|e| eprintln!("[15.5] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
@@ -476,7 +502,10 @@ async fn test_kill_during_set_mined() -> Result<(), ClientError> {
     let mut mined_count = 0u32;
     let mut unmined_count = 0u32;
     for txid in &target_txids {
-        match client.get_batch(FIELD_ALL_METADATA, std::slice::from_ref(txid)).await {
+        match client
+            .get_batch(FIELD_ALL_METADATA, std::slice::from_ref(txid))
+            .await
+        {
             Ok(results) if !results.is_empty() && results.item(0).status == 0 => {
                 if let Some((_spent_utxos, is_mined, _is_conflicting, _is_locked)) =
                     teraslab_test_client::verifier::parse_metadata_fields(&results.item(0).data)
@@ -493,8 +522,10 @@ async fn test_kill_during_set_mined() -> Result<(), ClientError> {
                 } else {
                     // parse_metadata_fields returned None -- data is truncated or corrupt,
                     // indicating a half-written record.
-                    eprintln!("[15.5] Corrupt/truncated metadata for txid {} (half-written block entry?)",
-                        txid_hex(txid));
+                    eprintln!(
+                        "[15.5] Corrupt/truncated metadata for txid {} (half-written block entry?)",
+                        txid_hex(txid)
+                    );
                     half_written += 1;
                 }
             }
@@ -508,9 +539,13 @@ async fn test_kill_during_set_mined() -> Result<(), ClientError> {
         }
     }
 
-    eprintln!("[15.5] setMined results: {mined_count} mined, {unmined_count} unmined, {half_written} corrupt");
-    assert_eq!(half_written, 0,
-        "Test 15.5: {half_written} records have half-written block entries");
+    eprintln!(
+        "[15.5] setMined results: {mined_count} mined, {unmined_count} unmined, {half_written} corrupt"
+    );
+    assert_eq!(
+        half_written, 0,
+        "Test 15.5: {half_written} records have half-written block entries"
+    );
     eprintln!("[15.5] OK -- setMined crash safety verified (no half-written block entries)");
     Ok(())
 }
@@ -531,11 +566,13 @@ async fn test_kill_during_create() -> Result<(), ClientError> {
     for _ in 0..200 {
         let mut txid = [0u8; 32];
         rng.fill(&mut txid);
-        let utxo_hashes: Vec<[u8; 32]> = (0..5).map(|_| {
-            let mut h = [0u8; 32];
-            rng.fill(&mut h);
-            h
-        }).collect();
+        let utxo_hashes: Vec<[u8; 32]> = (0..5)
+            .map(|_| {
+                let mut h = [0u8; 32];
+                rng.fill(&mut h);
+                h
+            })
+            .collect();
 
         items.push(CreateItem {
             txid,
@@ -561,9 +598,7 @@ async fn test_kill_during_create() -> Result<(), ClientError> {
     eprintln!("[15.6] Sending 200 creates and killing node1 concurrently");
 
     let client_clone = common::create_client(&docker, 3).await?;
-    let create_handle = tokio::spawn(async move {
-        client_clone.create_batch(&items).await
-    });
+    let create_handle = tokio::spawn(async move { client_clone.create_batch(&items).await });
 
     tokio::time::sleep(Duration::from_millis(5)).await;
     docker.kill_node("node1").await?;
@@ -576,7 +611,8 @@ async fn test_kill_during_create() -> Result<(), ClientError> {
     tokio::time::sleep(Duration::from_millis(500)).await;
     docker.start_node("node1").await?;
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+        .await
         .unwrap_or_else(|e| eprintln!("[15.6] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
@@ -590,7 +626,10 @@ async fn test_kill_during_create() -> Result<(), ClientError> {
     let mut not_found = 0u32;
 
     for txid in &create_txids {
-        match client.get_batch(FIELD_ALL, std::slice::from_ref(txid)).await {
+        match client
+            .get_batch(FIELD_ALL, std::slice::from_ref(txid))
+            .await
+        {
             Ok(results) if !results.is_empty() => {
                 let item = results.item(0);
                 if item.status == 0 && !item.data.is_empty() {
@@ -606,8 +645,11 @@ async fn test_kill_during_create() -> Result<(), ClientError> {
                             partial_records += 1;
                         }
                     } else {
-                        eprintln!("[15.6] Short data ({} bytes) for txid {}",
-                            item.data.len(), txid_hex(txid));
+                        eprintln!(
+                            "[15.6] Short data ({} bytes) for txid {}",
+                            item.data.len(),
+                            txid_hex(txid)
+                        );
                         partial_records += 1;
                     }
                 } else {
@@ -620,9 +662,13 @@ async fn test_kill_during_create() -> Result<(), ClientError> {
         }
     }
 
-    eprintln!("[15.6] Results: {full_records} full, {not_found} not found, {partial_records} partial");
-    assert_eq!(partial_records, 0,
-        "Test 15.6: {partial_records} records are partially written -- crash safety violated");
+    eprintln!(
+        "[15.6] Results: {full_records} full, {not_found} not found, {partial_records} partial"
+    );
+    assert_eq!(
+        partial_records, 0,
+        "Test 15.6: {partial_records} records are partially written -- crash safety violated"
+    );
     eprintln!("[15.6] OK -- create crash safety verified (no partial records)");
     Ok(())
 }
@@ -657,7 +703,8 @@ async fn test_kill_all_simultaneously() -> Result<(), ClientError> {
     docker.start_node("node3").await?;
 
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+        .await
         .unwrap_or_else(|e| eprintln!("[15.7] migration wait: {e}"));
     // Extra settling time for redo log replay after all-node crash.
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
@@ -669,12 +716,16 @@ async fn test_kill_all_simultaneously() -> Result<(), ClientError> {
     let total = txids.len() as u32;
     let readable = verify_sample(&client, &txids, txids.len(), "15.7").await?;
     if readable < total {
-        eprintln!("[15.7] First read pass: {readable}/{total} -- waiting for more migration settling");
+        eprintln!(
+            "[15.7] First read pass: {readable}/{total} -- waiting for more migration settling"
+        );
         common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
         client.refresh_routing().await?;
         let readable = verify_sample(&client, &txids, txids.len(), "15.7 retry").await?;
-        assert_eq!(readable, total,
-            "Test 15.7: post-recovery: expected {total} readable, got {readable}.");
+        assert_eq!(
+            readable, total,
+            "Test 15.7: post-recovery: expected {total} readable, got {readable}."
+        );
     }
 
     eprintln!("[15.7] OK -- all-node crash recovery passed ({readable}/{total} readable)");
@@ -703,10 +754,12 @@ async fn test_cascading_recovery() -> Result<(), ClientError> {
     docker.kill_node("node1").await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    common::wait_specific_nodes_ready(&docker, &[2, 3], 2, Duration::from_secs(30)).await
+    common::wait_specific_nodes_ready(&docker, &[2, 3], 2, Duration::from_secs(30))
+        .await
         .unwrap_or_else(|e| eprintln!("[15.8] wait_specific_nodes_ready warning: {e}"));
     // Wait for the 2-node topology to stabilize and migrations to finish.
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(30)).await
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(30))
+        .await
         .unwrap_or_else(|e| eprintln!("[15.8] migration wait (after node1 kill) warning: {e}"));
     common::wait_specific_replication_settled(&docker, &[2, 3], Duration::from_secs(5)).await?;
 
@@ -740,9 +793,11 @@ async fn test_cascading_recovery() -> Result<(), ClientError> {
     docker.start_node("node1").await?;
 
     // Wait for node1+node3 to see each other and complete migrations between them.
-    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(30)).await
+    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(30))
+        .await
         .unwrap_or_else(|e| eprintln!("[15.8] wait node1+node3 ready warning: {e}"));
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(30)).await
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(30))
+        .await
         .unwrap_or_else(|e| eprintln!("[15.8] migration wait (2-node) warning: {e}"));
     // Extra settling time for node3 -> node1 data transfer.
     common::wait_specific_replication_settled(&docker, &[1, 3], Duration::from_secs(5)).await?;
@@ -751,7 +806,8 @@ async fn test_cascading_recovery() -> Result<(), ClientError> {
     docker.start_node("node2").await?;
 
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+        .await
         .unwrap_or_else(|e| eprintln!("[15.8] final migration wait warning: {e}"));
     // Allow additional time for all data to settle after 3-node migration.
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
@@ -770,20 +826,24 @@ async fn test_cascading_recovery() -> Result<(), ClientError> {
     let mut readable = 0u32;
     for attempt in 0..4u32 {
         if attempt > 0 {
-            common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await.ok();
+            common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+                .await
+                .ok();
             common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
             client.refresh_routing().await?;
         }
-        readable = verify_sample(&client, &all_txids, total, &format!("15.8 pass {attempt}")).await?;
+        readable =
+            verify_sample(&client, &all_txids, total, &format!("15.8 pass {attempt}")).await?;
         if readable == total as u32 {
             break;
         }
         eprintln!("[15.8] pass {attempt}: {readable}/{total} readable, retrying...");
     }
-    // Allow up to 5% loss during cascading recovery.
-    let max_loss = (total as f64 * 0.05) as u32;
-    assert!(readable >= (total as u32).saturating_sub(max_loss),
-        "Test 15.8: cascading recovery: expected {total} readable (±{max_loss}), got {readable}.");
+    assert_eq!(
+        readable, total as u32,
+        "Test 15.8: cascading recovery: expected all {total} records readable, got {readable}."
+    );
+    common::assert_rf2_replication_exact(&client, &docker, 3, &all_txids, "15.8").await?;
 
     eprintln!("[15.8] OK -- cascading recovery passed ({readable}/{total} readable)");
     Ok(())

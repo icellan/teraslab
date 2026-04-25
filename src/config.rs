@@ -4,6 +4,18 @@ use crate::observability::ObservabilityConfig;
 use serde::Deserialize;
 use std::path::PathBuf;
 
+fn parse_usize_env(name: &str) -> std::result::Result<Option<usize>, String> {
+    match std::env::var(name) {
+        Ok(raw) if raw.trim().is_empty() => Ok(None),
+        Ok(raw) => raw
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|e| format!("{name} must be a non-negative integer: {e}")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(format!("{name} could not be read: {e}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Index backend configuration
 // ---------------------------------------------------------------------------
@@ -169,7 +181,6 @@ pub struct ServerConfig {
     pub block_height_retention: u32,
 
     // -- Cluster settings --
-
     /// Unique node ID. Must be different for each node in the cluster.
     /// 0 = single-node mode (no clustering).
     pub node_id: u64,
@@ -208,7 +219,6 @@ pub struct ServerConfig {
     pub max_migration_threads: usize,
 
     // -- Replication durability settings --
-
     /// Replication acknowledgment policy.
     ///
     /// - `"auto"` (default): WriteAll for RF=2, WriteMajority for RF>=3,
@@ -242,10 +252,11 @@ pub struct ServerConfig {
     pub replication_degraded_mode: String,
 
     // -- Migration performance settings --
-
     /// Number of parallel TCP connections per migration target.
-    /// More connections = higher throughput for large migrations.
-    /// Default: 4.
+    /// More connections = higher throughput for large migrations, up to the
+    /// point where socket/file-descriptor pressure dominates. Override with
+    /// TOML or `TERASLAB_MIGRATION_POOL_SIZE` for environment-specific limits.
+    /// Default: 128.
     pub migration_pool_size: usize,
 
     /// Number of records per baseline streaming batch during migration.
@@ -258,7 +269,6 @@ pub struct ServerConfig {
     pub replica_lag_check_interval_secs: u64,
 
     // -- Index backend settings --
-
     /// Index backend configuration. Controls whether the primary and secondary
     /// indexes use in-memory hash tables or on-disk redb B+ trees.
     pub index: IndexConfig,
@@ -275,8 +285,7 @@ pub struct ServerConfig {
     ///
     /// Populated from the `[observability]` TOML section. Every field can
     /// be individually overridden via `TERASLAB_*` environment variables —
-    /// call [`ServerConfig::apply_observability_env_overrides`] after
-    /// loading to apply them.
+    /// call [`ServerConfig::apply_env_overrides`] after loading to apply them.
     pub observability: ObservabilityConfig,
 }
 
@@ -310,7 +319,7 @@ impl Default for ServerConfig {
             ack_policy: "auto".to_string(),
             replication_timeout_ms: 3000,
             replication_degraded_mode: "reject".to_string(),
-            migration_pool_size: 32,
+            migration_pool_size: 128,
             migration_batch_size: 500,
             replica_lag_check_interval_secs: 30,
             index: IndexConfig::default(),
@@ -321,6 +330,9 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    pub const ENV_MIGRATION_POOL_SIZE: &'static str = "TERASLAB_MIGRATION_POOL_SIZE";
+    pub const ENV_MIGRATION_BATCH_SIZE: &'static str = "TERASLAB_MIGRATION_BATCH_SIZE";
+
     /// Whether clustering is enabled (node_id > 0).
     pub fn is_clustered(&self) -> bool {
         self.node_id > 0
@@ -362,13 +374,11 @@ impl ServerConfig {
             "write_all" => Some(AckPolicy::WriteAll),
             "write_majority" => Some(AckPolicy::WriteMajority),
             "best_effort" => None,
-            _ => {
-                match self.replication_factor {
-                    0 | 1 => None,
-                    2 => Some(AckPolicy::WriteAll),
-                    _ => Some(AckPolicy::WriteMajority),
-                }
-            }
+            _ => match self.replication_factor {
+                0 | 1 => None,
+                2 => Some(AckPolicy::WriteAll),
+                _ => Some(AckPolicy::WriteMajority),
+            },
         }
     }
 
@@ -414,9 +424,12 @@ impl ServerConfig {
                     id.len()
                 ));
             }
-            if !id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+            if !id
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            {
                 return Err(
-                    "device_id must contain only lowercase hex digits (0-9, a-f)".to_string()
+                    "device_id must contain only lowercase hex digits (0-9, a-f)".to_string(),
                 );
             }
         }
@@ -433,6 +446,28 @@ impl ServerConfig {
     /// into an impossibility guard in practice. The runtime path still
     /// returns `SpendError::DahOverflow` if overflow ever does occur.
     pub const MAX_BLOCK_HEIGHT_RETENTION: u32 = 10_000_000;
+
+    /// Apply all `TERASLAB_*` environment overrides to runtime config.
+    pub fn apply_env_overrides(&mut self) -> std::result::Result<(), String> {
+        self.apply_migration_env_overrides()?;
+        self.apply_observability_env_overrides()?;
+        Ok(())
+    }
+
+    /// Apply `TERASLAB_*` environment overrides to migration tuning.
+    ///
+    /// These knobs are intentionally independent from the TOML defaults so
+    /// constrained Docker runs can lower fan-out while production can keep or
+    /// raise it without baking environment-specific limits into code.
+    pub fn apply_migration_env_overrides(&mut self) -> std::result::Result<(), String> {
+        if let Some(value) = parse_usize_env(Self::ENV_MIGRATION_POOL_SIZE)? {
+            self.migration_pool_size = value;
+        }
+        if let Some(value) = parse_usize_env(Self::ENV_MIGRATION_BATCH_SIZE)? {
+            self.migration_batch_size = value;
+        }
+        Ok(())
+    }
 
     /// Apply `TERASLAB_*` environment overrides to the observability
     /// subsection. Call this once after [`Self::load`] so config-file
@@ -482,8 +517,7 @@ impl ServerConfig {
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read config file: {e}"))?;
-        toml::from_str(&content)
-            .map_err(|e| format!("failed to parse config: {e}"))
+        toml::from_str(&content).map_err(|e| format!("failed to parse config: {e}"))
     }
 }
 
@@ -527,7 +561,10 @@ redb_cache_size = 536870912
         assert!(cfg.index.is_redb());
         assert_eq!(cfg.index.redb_path, PathBuf::from("/data/primary.redb"));
         assert_eq!(cfg.index.redb_dah_path, PathBuf::from("/data/dah.redb"));
-        assert_eq!(cfg.index.redb_unmined_path, PathBuf::from("/data/unmined.redb"));
+        assert_eq!(
+            cfg.index.redb_unmined_path,
+            PathBuf::from("/data/unmined.redb")
+        );
         assert_eq!(cfg.index.redb_cache_size, 536870912);
     }
 
@@ -645,6 +682,13 @@ backend = ""
     }
 
     #[test]
+    fn default_migration_pool_prioritizes_fast_rebalancing() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.migration_pool_size, 128);
+        assert_eq!(cfg.migration_batch_size, 500);
+    }
+
+    #[test]
     fn default_block_height_retention_passes_validation() {
         let cfg = ServerConfig::default();
         cfg.validate_block_height_retention()
@@ -698,6 +742,105 @@ backend = ""
         // Poisoned locks are safe here — the inner () has no invariants
         // to break, so we just recover and move on.
         m.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn clear_migration_env() {
+        unsafe {
+            std::env::remove_var(ServerConfig::ENV_MIGRATION_POOL_SIZE);
+            std::env::remove_var(ServerConfig::ENV_MIGRATION_BATCH_SIZE);
+        }
+    }
+
+    #[test]
+    fn migration_env_overrides_replace_toml_values() {
+        let _guard = obs_env_guard();
+        clear_migration_env();
+
+        let mut cfg = ServerConfig {
+            migration_pool_size: 8,
+            migration_batch_size: 64,
+            ..ServerConfig::default()
+        };
+        unsafe {
+            std::env::set_var(ServerConfig::ENV_MIGRATION_POOL_SIZE, "256");
+            std::env::set_var(ServerConfig::ENV_MIGRATION_BATCH_SIZE, "2048");
+        }
+
+        cfg.apply_migration_env_overrides()
+            .expect("migration env overrides apply cleanly");
+
+        assert_eq!(cfg.migration_pool_size, 256);
+        assert_eq!(cfg.migration_batch_size, 2048);
+        clear_migration_env();
+    }
+
+    #[test]
+    fn migration_env_empty_values_leave_config_unchanged() {
+        let _guard = obs_env_guard();
+        clear_migration_env();
+
+        let mut cfg = ServerConfig {
+            migration_pool_size: 24,
+            migration_batch_size: 300,
+            ..ServerConfig::default()
+        };
+        unsafe {
+            std::env::set_var(ServerConfig::ENV_MIGRATION_POOL_SIZE, "");
+            std::env::set_var(ServerConfig::ENV_MIGRATION_BATCH_SIZE, "  ");
+        }
+
+        cfg.apply_migration_env_overrides()
+            .expect("empty migration env overrides are ignored");
+
+        assert_eq!(cfg.migration_pool_size, 24);
+        assert_eq!(cfg.migration_batch_size, 300);
+        clear_migration_env();
+    }
+
+    #[test]
+    fn migration_env_malformed_pool_is_error() {
+        let _guard = obs_env_guard();
+        clear_migration_env();
+
+        let mut cfg = ServerConfig::default();
+        unsafe {
+            std::env::set_var(ServerConfig::ENV_MIGRATION_POOL_SIZE, "many");
+        }
+
+        let err = cfg.apply_migration_env_overrides().unwrap_err();
+        assert!(
+            err.contains(ServerConfig::ENV_MIGRATION_POOL_SIZE),
+            "err was: {err}",
+        );
+        clear_migration_env();
+    }
+
+    #[test]
+    fn apply_env_overrides_applies_migration_and_observability() {
+        let _guard = obs_env_guard();
+        clear_migration_env();
+        unsafe {
+            std::env::remove_var(ObservabilityConfig::ENV_OTLP_ENDPOINT);
+            std::env::remove_var(ObservabilityConfig::ENV_SAMPLING_RATIO);
+            std::env::remove_var(ObservabilityConfig::ENV_SERVICE_NAME);
+        }
+
+        let mut cfg = ServerConfig::default();
+        unsafe {
+            std::env::set_var(ServerConfig::ENV_MIGRATION_POOL_SIZE, "192");
+            std::env::set_var(ObservabilityConfig::ENV_SAMPLING_RATIO, "0.75");
+        }
+
+        cfg.apply_env_overrides()
+            .expect("combined env overrides apply cleanly");
+
+        assert_eq!(cfg.migration_pool_size, 192);
+        assert_eq!(cfg.observability.trace_sampling_ratio, 0.75);
+
+        clear_migration_env();
+        unsafe {
+            std::env::remove_var(ObservabilityConfig::ENV_SAMPLING_RATIO);
+        }
     }
 
     #[test]
@@ -809,7 +952,10 @@ otlp_endpoint = "http://set-via-toml:4317"
             std::env::set_var(ObservabilityConfig::ENV_SAMPLING_RATIO, "not-a-float");
         }
         let err = cfg.apply_observability_env_overrides().unwrap_err();
-        assert!(err.contains("TERASLAB_TRACE_SAMPLING_RATIO"), "err was: {err}");
+        assert!(
+            err.contains("TERASLAB_TRACE_SAMPLING_RATIO"),
+            "err was: {err}"
+        );
         unsafe {
             std::env::remove_var(ObservabilityConfig::ENV_SAMPLING_RATIO);
         }

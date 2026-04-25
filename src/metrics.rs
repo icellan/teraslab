@@ -132,11 +132,7 @@ impl<const N: usize> LabeledCounter<N> {
     /// Read the current value of the cell at `idx`. Returns 0 for
     /// out-of-range indices.
     pub fn get(&self, idx: usize) -> u64 {
-        if idx < N {
-            self.cells[idx].get()
-        } else {
-            0
-        }
+        if idx < N { self.cells[idx].get() } else { 0 }
     }
 }
 
@@ -657,11 +653,7 @@ impl LatencyHistogram {
     /// Mean latency in nanoseconds, or 0 if no values recorded.
     pub fn mean_ns(&self) -> u64 {
         let c = self.count();
-        if c == 0 {
-            0
-        } else {
-            self.sum_ns() / c
-        }
+        if c == 0 { 0 } else { self.sum_ns() / c }
     }
 
     /// Approximate percentile (0.0–1.0). Returns the upper bound of the
@@ -1174,8 +1166,7 @@ impl MigrationMetrics {
     /// Create a new, zero-initialized migration metrics table.
     pub const fn new() -> Self {
         Self {
-            migration_bytes_transferred_total:
-                LabeledCounter::<MIGRATION_LABEL_CARDINALITY>::new(),
+            migration_bytes_transferred_total: LabeledCounter::<MIGRATION_LABEL_CARDINALITY>::new(),
             migration_entries_applied_total: PaddedCounter::new(),
             migration_active: AtomicU32::new(0),
             migration_phase_preparing: AtomicU32::new(0),
@@ -1265,8 +1256,7 @@ impl SwimMetrics {
             swim_probe_timeouts_total: PaddedCounter::new(),
             swim_indirect_probes_total: PaddedCounter::new(),
             swim_suspicion_duration_ns: LatencyHistogram::new(),
-            swim_membership_churn_total:
-                LabeledCounter::<SWIM_CHURN_CARDINALITY>::new(),
+            swim_membership_churn_total: LabeledCounter::<SWIM_CHURN_CARDINALITY>::new(),
         }
     }
 
@@ -1641,7 +1631,13 @@ mod tests {
         METRICS.operations.inc(OpCode::Freeze, Outcome::ErrFrozen);
         METRICS.operations.inc(OpCode::Freeze, Outcome::ErrFrozen);
         assert_eq!(METRICS.operations.get(OpCode::Freeze, Outcome::Ok), 1);
-        assert_eq!(METRICS.operations.get(OpCode::Freeze, Outcome::ErrFrozen), 2);
-        assert_eq!(METRICS.operations.get(OpCode::Freeze, Outcome::Idempotent), 0);
+        assert_eq!(
+            METRICS.operations.get(OpCode::Freeze, Outcome::ErrFrozen),
+            2
+        );
+        assert_eq!(
+            METRICS.operations.get(OpCode::Freeze, Outcome::Idempotent),
+            0
+        );
     }
 }

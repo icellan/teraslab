@@ -5,7 +5,7 @@
 //! manages the state transitions and event generation.
 
 use crate::cluster::shards::NodeId;
-use crate::metrics::{swim_metrics, SwimChurnKind};
+use crate::metrics::{SwimChurnKind, swim_metrics};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -75,7 +75,9 @@ impl Membership {
 
     /// Recompute the cached sorted list of alive members (including self).
     fn rebuild_alive_cache(&mut self) {
-        let mut members: Vec<NodeId> = self.members.iter()
+        let mut members: Vec<NodeId> = self
+            .members
+            .iter()
             .filter(|(_, info)| info.state == NodeState::Alive)
             .map(|(&id, _)| id)
             .collect();
@@ -119,14 +121,14 @@ impl Membership {
         match self.members.get_mut(&node) {
             Some(info) => {
                 let dominated = incarnation > info.incarnation;
-                let same_inc_dead = incarnation == info.incarnation && info.state == NodeState::Dead;
+                let same_inc_dead =
+                    incarnation == info.incarnation && info.state == NodeState::Dead;
                 // Same-incarnation alive from a direct probe ACK can clear
                 // suspicion (the node proved it's alive). But same-inc alive
                 // from gossip cannot — the gossiper may not have probed
                 // the suspect recently.
-                let same_inc_suspect_direct = direct
-                    && incarnation == info.incarnation
-                    && info.state == NodeState::Suspect;
+                let same_inc_suspect_direct =
+                    direct && incarnation == info.incarnation && info.state == NodeState::Suspect;
 
                 if dominated || same_inc_dead || same_inc_suspect_direct {
                     let was_dead = info.state == NodeState::Dead;
@@ -146,12 +148,9 @@ impl Membership {
                                 m.record_churn(SwimChurnKind::Join);
                             }
                         }
-                        if was_suspect
-                            && let Some(m) = swim_metrics()
-                        {
+                        if was_suspect && let Some(m) = swim_metrics() {
                             m.record_churn(SwimChurnKind::AliveFromSuspect);
-                            let elapsed =
-                                now.saturating_duration_since(suspect_started_at);
+                            let elapsed = now.saturating_duration_since(suspect_started_at);
                             m.swim_suspicion_duration_ns
                                 .record_ns(elapsed.as_nanos() as u64);
                         }
@@ -162,12 +161,15 @@ impl Membership {
                 }
             }
             None => {
-                self.members.insert(node, MemberInfo {
-                    addr,
-                    state: NodeState::Alive,
-                    incarnation,
-                    state_changed_at: Instant::now(),
-                });
+                self.members.insert(
+                    node,
+                    MemberInfo {
+                        addr,
+                        state: NodeState::Alive,
+                        incarnation,
+                        state_changed_at: Instant::now(),
+                    },
+                );
                 self.rebuild_alive_cache();
                 events.push(ClusterEvent::NodeJoined(node, addr));
                 events.push(ClusterEvent::MembershipChanged(self.alive_members()));
@@ -249,7 +251,9 @@ impl Membership {
     pub fn expire_suspects(&mut self) -> Vec<ClusterEvent> {
         let now = Instant::now();
         let timeout = self.suspicion_timeout;
-        let expired: Vec<(NodeId, u64)> = self.members.iter()
+        let expired: Vec<(NodeId, u64)> = self
+            .members
+            .iter()
             .filter(|(_, info)| {
                 info.state == NodeState::Suspect
                     && now.duration_since(info.state_changed_at) >= timeout
@@ -312,7 +316,9 @@ impl Membership {
     /// associated state (e.g., peer address maps).
     pub fn forget_dead_older_than(&mut self, max_age: Duration) -> Vec<NodeId> {
         let now = Instant::now();
-        let to_remove: Vec<NodeId> = self.members.iter()
+        let to_remove: Vec<NodeId> = self
+            .members
+            .iter()
             .filter(|(_, info)| {
                 info.state == NodeState::Dead
                     && now.duration_since(info.state_changed_at) >= max_age
@@ -342,7 +348,11 @@ mod tests {
         let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
         let events = m.mark_alive(NodeId(2), addr(3001), 1, true);
 
-        assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(2), _))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(2), _)))
+        );
         assert_eq!(m.alive_count(), 2);
     }
 
@@ -365,12 +375,20 @@ mod tests {
         m.mark_alive(NodeId(2), addr(3001), 1, true);
 
         let events = m.mark_suspect(NodeId(2), 1);
-        assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeSuspect(NodeId(2)))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::NodeSuspect(NodeId(2))))
+        );
         assert_eq!(m.alive_count(), 1);
 
         std::thread::sleep(Duration::from_millis(15));
         let events = m.expire_suspects();
-        assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(2)))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(2))))
+        );
         assert_eq!(m.alive_count(), 1);
     }
 
@@ -382,7 +400,11 @@ mod tests {
         assert_eq!(m.alive_count(), 1);
 
         let events = m.mark_alive(NodeId(2), addr(3001), 2, true); // Higher incarnation
-        assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(2), _))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(2), _)))
+        );
         assert_eq!(m.alive_count(), 2);
     }
 
@@ -433,10 +455,18 @@ mod tests {
         let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
 
         let events = m.mark_alive(NodeId(2), addr(3001), 1, true);
-        assert!(events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::MembershipChanged(_)))
+        );
 
         let events = m.mark_dead(NodeId(2), 1);
-        assert!(events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::MembershipChanged(_)))
+        );
     }
 
     // --- P0-A: Incarnation-aware state transitions ---
@@ -458,7 +488,11 @@ mod tests {
         m.mark_alive(NodeId(2), addr(3001), 5, true);
 
         let events = m.mark_suspect(NodeId(2), 5);
-        assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeSuspect(NodeId(2)))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::NodeSuspect(NodeId(2))))
+        );
         assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Suspect);
     }
 
@@ -479,7 +513,11 @@ mod tests {
         m.mark_alive(NodeId(2), addr(3001), 5, true);
 
         let events = m.mark_dead(NodeId(2), 5);
-        assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(2)))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(2))))
+        );
         assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Dead);
     }
 
@@ -492,15 +530,25 @@ mod tests {
 
         // Same incarnation alive from GOSSIP (direct=false) must NOT clear.
         let events = m.mark_alive(NodeId(2), addr(3001), 5, false);
-        assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Suspect,
-            "same-incarnation gossip must not clear suspicion");
+        assert_eq!(
+            m.member_info(&NodeId(2)).unwrap().state,
+            NodeState::Suspect,
+            "same-incarnation gossip must not clear suspicion"
+        );
         assert!(events.is_empty());
 
         // Same incarnation alive from DIRECT probe ACK (direct=true) SHOULD clear.
         let events = m.mark_alive(NodeId(2), addr(3001), 5, true);
-        assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive,
-            "same-incarnation direct probe should clear suspicion");
-        assert!(events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))));
+        assert_eq!(
+            m.member_info(&NodeId(2)).unwrap().state,
+            NodeState::Alive,
+            "same-incarnation direct probe should clear suspicion"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::MembershipChanged(_)))
+        );
     }
 
     #[test]
@@ -514,7 +562,11 @@ mod tests {
         let events = m.mark_alive(NodeId(2), addr(3001), 6, true);
         assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive);
         assert_eq!(m.member_info(&NodeId(2)).unwrap().incarnation, 6);
-        assert!(events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::MembershipChanged(_)))
+        );
     }
 
     #[test]
@@ -565,13 +617,22 @@ mod tests {
 
         // Kill node 3 — first time should emit NodeLeft
         let events = m.mark_dead(NodeId(3), 1);
-        let left_count = events.iter().filter(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(3)))).count();
+        let left_count = events
+            .iter()
+            .filter(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(3))))
+            .count();
         assert_eq!(left_count, 1, "NodeLeft should fire exactly once");
 
         // Second mark_dead with same incarnation should NOT emit again
         let events2 = m.mark_dead(NodeId(3), 1);
-        let left_count2 = events2.iter().filter(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(3)))).count();
-        assert_eq!(left_count2, 0, "repeated mark_dead should not fire NodeLeft again");
+        let left_count2 = events2
+            .iter()
+            .filter(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(3))))
+            .count();
+        assert_eq!(
+            left_count2, 0,
+            "repeated mark_dead should not fire NodeLeft again"
+        );
 
         // Node 2 should still be alive and unaffected
         assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive);
@@ -590,10 +651,18 @@ mod tests {
 
         // Rejoin with same incarnation (Dead→Alive same-inc is allowed)
         let events = m.mark_alive(NodeId(2), addr(3001), 1, true);
-        assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(2), _))),
-            "should emit NodeJoined on rejoin from Dead");
-        assert!(events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
-            "should emit MembershipChanged on rejoin from Dead");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(2), _))),
+            "should emit NodeJoined on rejoin from Dead"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
+            "should emit MembershipChanged on rejoin from Dead"
+        );
         assert_eq!(m.alive_count(), 2);
     }
 
@@ -605,16 +674,23 @@ mod tests {
 
         // Same incarnation from gossip does NOT clear suspicion.
         let events = m.mark_alive(NodeId(2), addr(3001), 1, false);
-        assert!(events.is_empty(),
-            "same-inc gossip must not revive suspect");
+        assert!(events.is_empty(), "same-inc gossip must not revive suspect");
         assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Suspect);
 
         // Higher incarnation DOES clear suspicion (the suspect proved it's alive).
         let events = m.mark_alive(NodeId(2), addr(3001), 2, true);
-        assert!(!events.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
-            "Suspect→Alive should not emit NodeJoined");
-        assert!(events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
-            "Suspect→Alive should emit MembershipChanged");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
+            "Suspect→Alive should not emit NodeJoined"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
+            "Suspect→Alive should emit MembershipChanged"
+        );
         assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive);
     }
 
@@ -650,7 +726,12 @@ mod tests {
 
             m.mark_alive(NodeId(2), addr(3001), incarnation + 1, true);
             let state = m.member_info(&NodeId(2)).unwrap().state;
-            assert_eq!(state, NodeState::Alive, "inc {}: should be alive", incarnation + 1);
+            assert_eq!(
+                state,
+                NodeState::Alive,
+                "inc {}: should be alive",
+                incarnation + 1
+            );
             assert!(m.alive_members().contains(&NodeId(2)));
         }
 
@@ -688,7 +769,10 @@ mod tests {
         m.mark_alive(NodeId(2), addr(3004), 1, true);
 
         let alive = m.alive_members();
-        assert_eq!(alive, vec![NodeId(1), NodeId(2), NodeId(3), NodeId(5), NodeId(7)]);
+        assert_eq!(
+            alive,
+            vec![NodeId(1), NodeId(2), NodeId(3), NodeId(5), NodeId(7)]
+        );
 
         // Remove one and check sort is maintained
         m.mark_dead(NodeId(3), 1);
@@ -766,13 +850,25 @@ mod tests {
         // Suspect → Dead (via expire): NodeLeft + MembershipChanged
         std::thread::sleep(Duration::from_millis(10));
         let ev2 = m.expire_suspects();
-        assert!(ev2.iter().any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(2)))));
-        assert!(ev2.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))));
+        assert!(
+            ev2.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeLeft(NodeId(2))))
+        );
+        assert!(
+            ev2.iter()
+                .any(|e| matches!(e, ClusterEvent::MembershipChanged(_)))
+        );
 
         // Dead → Alive (rejoin): NodeJoined + MembershipChanged
         let ev3 = m.mark_alive(NodeId(2), addr(3001), 2, true);
-        assert!(ev3.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(2), _))));
-        assert!(ev3.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))));
+        assert!(
+            ev3.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(2), _)))
+        );
+        assert!(
+            ev3.iter()
+                .any(|e| matches!(e, ClusterEvent::MembershipChanged(_)))
+        );
     }
 
     /// Suspect → Alive via gossip requires higher incarnation.
@@ -790,10 +886,18 @@ mod tests {
 
         // Higher incarnation: clears suspicion
         let events = m.mark_alive(NodeId(2), addr(3001), 2, true);
-        assert!(!events.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
-            "Suspect→Alive must NOT emit NodeJoined");
-        assert!(events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
-            "Suspect→Alive must emit MembershipChanged");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(_, _))),
+            "Suspect→Alive must NOT emit NodeJoined"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
+            "Suspect→Alive must emit MembershipChanged"
+        );
         assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive);
     }
 
@@ -813,9 +917,13 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         let events = m.expire_suspects();
 
-        let left_nodes: Vec<NodeId> = events.iter().filter_map(|e| {
-            match e { ClusterEvent::NodeLeft(id) => Some(*id), _ => None }
-        }).collect();
+        let left_nodes: Vec<NodeId> = events
+            .iter()
+            .filter_map(|e| match e {
+                ClusterEvent::NodeLeft(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
         assert_eq!(left_nodes.len(), 2, "both suspects should expire");
         assert!(left_nodes.contains(&NodeId(2)));
         assert!(left_nodes.contains(&NodeId(3)));
@@ -839,7 +947,11 @@ mod tests {
         let events = m.mark_alive(NodeId(2), addr(3001), 6, true);
         assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive);
         assert_eq!(m.member_info(&NodeId(2)).unwrap().incarnation, 6);
-        assert!(events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::MembershipChanged(_)))
+        );
     }
 
     /// forget_dead_older_than must not affect nodes that have since been
@@ -871,11 +983,17 @@ mod tests {
         let states = m.all_member_states();
         assert_eq!(states.len(), 2);
 
-        let n2 = states.iter().find(|(id, _, _, _)| *id == NodeId(2)).unwrap();
+        let n2 = states
+            .iter()
+            .find(|(id, _, _, _)| *id == NodeId(2))
+            .unwrap();
         assert_eq!(n2.1, NodeState::Alive);
         assert_eq!(n2.2, 1); // incarnation
 
-        let n3 = states.iter().find(|(id, _, _, _)| *id == NodeId(3)).unwrap();
+        let n3 = states
+            .iter()
+            .find(|(id, _, _, _)| *id == NodeId(3))
+            .unwrap();
         assert_eq!(n3.1, NodeState::Suspect);
     }
 
@@ -884,9 +1002,7 @@ mod tests {
     /// the test is parallel-safe.
     #[test]
     fn swim_churn_counter_ticks_on_state_transitions() {
-        use crate::metrics::{
-            init_swim_metrics, swim_metrics, SwimChurnKind, SwimMetrics,
-        };
+        use crate::metrics::{SwimChurnKind, SwimMetrics, init_swim_metrics, swim_metrics};
         use std::sync::OnceLock;
 
         static TEST_METRICS: OnceLock<SwimMetrics> = OnceLock::new();
@@ -966,7 +1082,10 @@ mod tests {
 
         // Same incarnation, different address, already alive → no events
         let events = m.mark_alive(NodeId(2), addr(4001), 1, true);
-        assert!(events.is_empty(), "same-inc alive-to-alive should be noop even with different addr");
+        assert!(
+            events.is_empty(),
+            "same-inc alive-to-alive should be noop even with different addr"
+        );
         // Address stays as original (no update on same-inc alive→alive)
         // This is the current behavior — the address is NOT updated.
         // This could be a problem if a node restarts on a different port

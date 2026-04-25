@@ -1,7 +1,7 @@
 //! Data migration tracking for shard rebalancing.
 
-use crate::cluster::shards::{MigrationTask, NodeId, NUM_SHARDS};
-use crate::metrics::{migration_metrics, MigrationLabel, MigrationMetrics};
+use crate::cluster::shards::{MigrationTask, NUM_SHARDS, NodeId};
+use crate::metrics::{MigrationLabel, MigrationMetrics, migration_metrics};
 use std::sync::atomic::Ordering;
 
 /// Saturating-decrement of the active-migrations gauge.
@@ -45,7 +45,9 @@ impl ShardBitmap {
 
     /// Create an empty bitmap (all bits clear).
     pub const fn new() -> Self {
-        Self { words: [0u64; Self::WORDS] }
+        Self {
+            words: [0u64; Self::WORDS],
+        }
     }
 
     /// Set the bit for `shard`.
@@ -311,16 +313,20 @@ impl MigrationManager {
                 }
             }
             if task.to_node == self_id {
-                if let Some(existing) = self.inbound_migrations.iter_mut().find(
-                    |m| m.shard == task.shard && m.from_node == task.from_node,
-                ) {
+                if let Some(existing) = self
+                    .inbound_migrations
+                    .iter_mut()
+                    .find(|m| m.shard == task.shard && m.from_node == task.from_node)
+                {
                     if !existing.completed {
                         existing.completed = false;
                         self.inbound_bitmap.set(task.shard);
                     }
-                } else if let Some(sentinel) = self.inbound_migrations.iter_mut().find(
-                    |m| m.shard == task.shard && m.from_node == NodeId(0),
-                ) {
+                } else if let Some(sentinel) = self
+                    .inbound_migrations
+                    .iter_mut()
+                    .find(|m| m.shard == task.shard && m.from_node == NodeId(0))
+                {
                     sentinel.from_node = task.from_node;
                     if !sentinel.completed {
                         sentinel.completed = false;
@@ -362,7 +368,9 @@ impl MigrationManager {
     /// Marks the first non-completed entry for this shard as completed.
     /// The entry is retained until `cleanup_completed()` removes it.
     pub fn mark_inbound_complete(&mut self, shard: u16) {
-        if let Some(m) = self.inbound_migrations.iter_mut()
+        if let Some(m) = self
+            .inbound_migrations
+            .iter_mut()
             .find(|m| m.shard == shard && !m.completed)
         {
             m.completed = true;
@@ -370,7 +378,11 @@ impl MigrationManager {
             self.record_completed_inbound_tombstone(shard, NodeId(0));
         }
         // Clear bitmap bit only if no more pending entries for this shard.
-        if !self.inbound_migrations.iter().any(|m| m.shard == shard && !m.completed) {
+        if !self
+            .inbound_migrations
+            .iter()
+            .any(|m| m.shard == shard && !m.completed)
+        {
             self.inbound_bitmap.clear(shard);
         }
     }
@@ -378,7 +390,11 @@ impl MigrationManager {
     /// Mark all pending inbound entries for this shard as complete.
     pub fn mark_inbound_complete_all(&mut self, shard: u16) {
         let mut found = false;
-        for inbound in self.inbound_migrations.iter_mut().filter(|m| m.shard == shard) {
+        for inbound in self
+            .inbound_migrations
+            .iter_mut()
+            .filter(|m| m.shard == shard)
+        {
             inbound.completed = true;
             found = true;
         }
@@ -389,23 +405,36 @@ impl MigrationManager {
     }
 
     pub fn mark_inbound_complete_from_source(&mut self, shard: u16, from_node: NodeId) {
-        if let Some(m) = self.inbound_migrations.iter_mut()
+        if let Some(m) = self
+            .inbound_migrations
+            .iter_mut()
             .find(|m| m.shard == shard && m.from_node == from_node && !m.completed)
         {
             m.completed = true;
-        } else if let Some(m) = self.inbound_migrations.iter_mut()
+        } else if let Some(m) = self
+            .inbound_migrations
+            .iter_mut()
             .find(|m| m.shard == shard && m.from_node == NodeId(0) && !m.completed)
-        {
-            m.completed = true;
-        } else if let Some(m) = self.inbound_migrations.iter_mut()
-            .find(|m| m.shard == shard && !m.completed)
         {
             m.completed = true;
         } else {
             self.record_completed_inbound_tombstone(shard, from_node);
         }
-        if !self.inbound_migrations.iter().any(|m| m.shard == shard && !m.completed) {
+        if !self
+            .inbound_migrations
+            .iter()
+            .any(|m| m.shard == shard && !m.completed)
+        {
             self.inbound_bitmap.clear(shard);
+        }
+    }
+
+    pub fn mark_inbound_complete_many_from_source<I>(&mut self, shards: I, from_node: NodeId)
+    where
+        I: IntoIterator<Item = u16>,
+    {
+        for shard in shards {
+            self.mark_inbound_complete_from_source(shard, from_node);
         }
     }
 
@@ -467,7 +496,10 @@ impl MigrationManager {
 
     /// Mark records as migrated for a task identified by (shard, from, to).
     pub fn record_progress(&mut self, task: &MigrationTask, records: u64, bytes: u64) {
-        let is_master = self.find_task_mut(task).map(|p| p.is_master).unwrap_or(true);
+        let is_master = self
+            .find_task_mut(task)
+            .map(|p| p.is_master)
+            .unwrap_or(true);
         if let Some(p) = self.find_task_mut(task) {
             p.migrated_records += records;
             p.bytes_sent += bytes;
@@ -494,6 +526,8 @@ impl MigrationManager {
         let prev_state = self.find_task_mut(task).map(|p| p.state.clone());
         if let Some(p) = self.find_task_mut(task) {
             p.state = MigrationState::Complete;
+        } else {
+            return;
         }
         if !self.has_other_fenced_task(task.shard, task) {
             self.unfence_shard(task.shard);
@@ -502,7 +536,8 @@ impl MigrationManager {
             if let Some(prev) = prev_state {
                 dec_phase_gauge(m, &prev);
             }
-            m.migration_phase_serving_new.fetch_add(1, Ordering::Relaxed);
+            m.migration_phase_serving_new
+                .fetch_add(1, Ordering::Relaxed);
             dec_active(m);
         }
     }
@@ -517,6 +552,8 @@ impl MigrationManager {
         let prev_state = self.find_task_mut(task).map(|p| p.state.clone());
         if let Some(p) = self.find_task_mut(task) {
             p.state = MigrationState::Failed;
+        } else {
+            return;
         }
         if !self.has_other_fenced_task(task.shard, task) {
             self.unfence_shard(task.shard);
@@ -540,9 +577,11 @@ impl MigrationManager {
     }
 
     fn record_completed_inbound_tombstone(&mut self, shard: u16, from_node: NodeId) {
-        if self.inbound_migrations.iter().any(|m| {
-            m.shard == shard && m.from_node == from_node && m.completed
-        }) {
+        if self
+            .inbound_migrations
+            .iter()
+            .any(|m| m.shard == shard && m.from_node == from_node && m.completed)
+        {
             return;
         }
         self.inbound_migrations.push(InboundMigration {
@@ -554,7 +593,10 @@ impl MigrationManager {
 
     /// Number of failed migrations.
     pub fn failed_count(&self) -> usize {
-        self.active.iter().filter(|p| p.state == MigrationState::Failed).count()
+        self.active
+            .iter()
+            .filter(|p| p.state == MigrationState::Failed)
+            .count()
     }
 
     /// Reset a failed migration back to Streaming so it can be retried.
@@ -562,8 +604,10 @@ impl MigrationManager {
     /// Returns true if the migration was found and reset, false otherwise.
     pub fn retry_failed(&mut self, task: &MigrationTask) -> bool {
         if let Some(p) = self.active.iter_mut().find(|p| {
-            p.shard == task.shard && p.from_node == task.from_node
-                && p.to_node == task.to_node && p.state == MigrationState::Failed
+            p.shard == task.shard
+                && p.from_node == task.from_node
+                && p.to_node == task.to_node
+                && p.state == MigrationState::Failed
         }) {
             p.state = MigrationState::Streaming;
             p.migrated_records = 0;
@@ -576,7 +620,9 @@ impl MigrationManager {
 
     /// Collect all failed migration tasks for re-execution.
     pub fn take_failed_tasks(&mut self) -> Vec<MigrationTask> {
-        let tasks: Vec<MigrationTask> = self.active.iter()
+        let tasks: Vec<MigrationTask> = self
+            .active
+            .iter()
             .filter(|p| p.state == MigrationState::Failed)
             .map(|p| MigrationTask {
                 shard: p.shard,
@@ -621,15 +667,15 @@ impl MigrationManager {
             }
         }
 
-        self.active.retain(|p| {
-            !p.is_complete() && p.state != MigrationState::Failed
-        });
+        self.active
+            .retain(|p| !p.is_complete() && p.state != MigrationState::Failed);
 
         // Unfence shards that no longer have any fenced task.
         for shard in maybe_unfence {
-            let still_fenced = self.active.iter().any(|p| {
-                p.shard == shard && p.state == MigrationState::Fenced
-            });
+            let still_fenced = self
+                .active
+                .iter()
+                .any(|p| p.shard == shard && p.state == MigrationState::Fenced);
             if !still_fenced {
                 self.unfence_shard(shard);
             }
@@ -656,9 +702,10 @@ impl MigrationManager {
 
     /// Number of in-progress migrations (excludes Complete and Failed).
     pub fn active_count(&self) -> usize {
-        self.active.iter().filter(|p| {
-            !p.is_complete() && p.state != MigrationState::Failed
-        }).count()
+        self.active
+            .iter()
+            .filter(|p| !p.is_complete() && p.state != MigrationState::Failed)
+            .count()
     }
 
     /// Get all active migrations.
@@ -668,12 +715,16 @@ impl MigrationManager {
 
     /// Number of shards pending inbound data.
     pub fn inbound_count(&self) -> usize {
-        self.inbound_migrations.iter().filter(|m| !m.completed).count()
+        self.inbound_migrations
+            .iter()
+            .filter(|m| !m.completed)
+            .count()
     }
 
     /// Snapshot the currently pending inbound migrations.
     pub fn pending_inbound_entries(&self) -> Vec<(u16, NodeId)> {
-        self.inbound_migrations.iter()
+        self.inbound_migrations
+            .iter()
             .filter(|m| !m.completed)
             .map(|m| (m.shard, m.from_node))
             .collect()
@@ -699,7 +750,9 @@ impl MigrationManager {
     /// Format: `[count:4][shard:2 + from_node:8] × count`.
     /// Only pending entries are persisted — completed ones are omitted.
     pub fn serialize_inbound(&self) -> Vec<u8> {
-        let pending: Vec<_> = self.inbound_migrations.iter()
+        let pending: Vec<_> = self
+            .inbound_migrations
+            .iter()
             .filter(|m| !m.completed)
             .collect();
         let mut buf = Vec::with_capacity(4 + pending.len() * 10);
@@ -732,7 +785,11 @@ impl MigrationManager {
             ));
             pos += 10;
             // Only add if not already present.
-            if !self.inbound_migrations.iter().any(|m| m.shard == shard && m.from_node == from_node) {
+            if !self
+                .inbound_migrations
+                .iter()
+                .any(|m| m.shard == shard && m.from_node == from_node)
+            {
                 self.inbound_migrations.push(InboundMigration {
                     shard,
                     from_node,
@@ -762,9 +819,8 @@ impl MigrationManager {
         shards: &std::collections::HashSet<u16>,
     ) -> usize {
         let before = self.inbound_migrations.len();
-        self.inbound_migrations.retain(|m| {
-            m.completed || !shards.contains(&m.shard)
-        });
+        self.inbound_migrations
+            .retain(|m| m.completed || !shards.contains(&m.shard));
         let removed = before - self.inbound_migrations.len();
         if removed > 0 {
             self.inbound_bitmap.clear_all();
@@ -779,7 +835,7 @@ impl MigrationManager {
 
     /// Remove completed inbound migrations.
     ///
-    /// Unlike [`clear_inbound`] which removes everything, this preserves all
+    /// Unlike [`Self::clear_inbound`] which removes everything, this preserves all
     /// pending entries regardless of age. A wall-clock timeout must never
     /// reopen a shard for writes while a migration could still complete.
     ///
@@ -802,14 +858,19 @@ impl MigrationManager {
 
     /// Serialize active outbound migration state to bytes.
     ///
-    /// Format: `[count:4][ shard:2 + from_node:8 + to_node:8 + is_master:1
-    ///   + state:1 + snapshot_seq:8 + fence_seq:8 ] × count`
+    /// Format:
+    /// ```text
+    /// [count:4][ shard:2 + from_node:8 + to_node:8 + is_master:1
+    ///   + state:1 + snapshot_seq:8 + fence_seq:8 ] × count
+    /// ```
     ///
     /// Per-entry size: 36 bytes. Only non-complete, non-failed entries
     /// are persisted — on restart these indicate migrations that were
     /// interrupted and may need to be re-initiated.
     pub fn serialize_outbound(&self) -> Vec<u8> {
-        let active: Vec<_> = self.active.iter()
+        let active: Vec<_> = self
+            .active
+            .iter()
             .filter(|p| !p.is_complete() && p.state != MigrationState::Failed)
             .collect();
         let mut buf = Vec::with_capacity(4 + active.len() * 36);
@@ -849,8 +910,12 @@ impl MigrationManager {
                 break;
             }
             let shard = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap_or([0; 2]));
-            let from_node = NodeId(u64::from_le_bytes(data[pos + 2..pos + 10].try_into().unwrap_or([0; 8])));
-            let to_node = NodeId(u64::from_le_bytes(data[pos + 10..pos + 18].try_into().unwrap_or([0; 8])));
+            let from_node = NodeId(u64::from_le_bytes(
+                data[pos + 2..pos + 10].try_into().unwrap_or([0; 8]),
+            ));
+            let to_node = NodeId(u64::from_le_bytes(
+                data[pos + 10..pos + 18].try_into().unwrap_or([0; 8]),
+            ));
             let is_master = data[pos + 18] != 0;
             let state = match data[pos + 19] {
                 0 => MigrationState::Preparing,
@@ -859,11 +924,18 @@ impl MigrationManager {
                 3 => MigrationState::Complete,
                 _ => MigrationState::Failed,
             };
-            let snapshot_sequence = u64::from_le_bytes(data[pos + 20..pos + 28].try_into().unwrap_or([0; 8]));
-            let fence_sequence = u64::from_le_bytes(data[pos + 28..pos + 36].try_into().unwrap_or([0; 8]));
+            let snapshot_sequence =
+                u64::from_le_bytes(data[pos + 20..pos + 28].try_into().unwrap_or([0; 8]));
+            let fence_sequence =
+                u64::from_le_bytes(data[pos + 28..pos + 36].try_into().unwrap_or([0; 8]));
             pos += 36;
 
-            let task = MigrationTask { shard, from_node, to_node, is_master };
+            let task = MigrationTask {
+                shard,
+                from_node,
+                to_node,
+                is_master,
+            };
             // Only add if not already tracked.
             if self.find_task_mut(&task).is_none() {
                 let mut progress = MigrationProgress::from_task(&task);
@@ -973,9 +1045,24 @@ mod tests {
     fn start_outbound_filters_by_self() {
         let mut mgr = MigrationManager::new();
         let tasks = vec![
-            MigrationTask { shard: 0, from_node: NodeId(1), to_node: NodeId(2), is_master: true },
-            MigrationTask { shard: 1, from_node: NodeId(2), to_node: NodeId(1), is_master: true },
-            MigrationTask { shard: 2, from_node: NodeId(1), to_node: NodeId(3), is_master: true },
+            MigrationTask {
+                shard: 0,
+                from_node: NodeId(1),
+                to_node: NodeId(2),
+                is_master: true,
+            },
+            MigrationTask {
+                shard: 1,
+                from_node: NodeId(2),
+                to_node: NodeId(1),
+                is_master: true,
+            },
+            MigrationTask {
+                shard: 2,
+                from_node: NodeId(1),
+                to_node: NodeId(3),
+                is_master: true,
+            },
         ];
 
         mgr.start_outbound(&tasks, NodeId(1), &std::collections::HashSet::new());
@@ -985,8 +1072,17 @@ mod tests {
     #[test]
     fn progress_tracking() {
         let mut mgr = MigrationManager::new();
-        let task = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        mgr.start_outbound(&[task.clone()], NodeId(1), &std::collections::HashSet::new());
+        let task = MigrationTask {
+            shard: 5,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
 
         let p = &mgr.active_migrations()[0];
         assert_eq!(p.state, MigrationState::Preparing);
@@ -1010,7 +1106,12 @@ mod tests {
 
     #[test]
     fn empty_migration() {
-        let task = MigrationTask { shard: 0, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        let task = MigrationTask {
+            shard: 0,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
         let progress = MigrationProgress::from_task(&task);
         assert_eq!(progress.fraction_complete(), 1.0); // 0 total → 100%
     }
@@ -1018,8 +1119,17 @@ mod tests {
     #[test]
     fn failed_migration_cleaned_up_by_cleanup() {
         let mut mgr = MigrationManager::new();
-        let task = MigrationTask { shard: 3, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        mgr.start_outbound(&[task.clone()], NodeId(1), &std::collections::HashSet::new());
+        let task = MigrationTask {
+            shard: 3,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
 
         mgr.mark_failed(&task);
         assert_eq!(mgr.active_migrations()[0].state, MigrationState::Failed);
@@ -1036,8 +1146,17 @@ mod tests {
     #[test]
     fn full_lifecycle_preparing_to_complete() {
         let mut mgr = MigrationManager::new();
-        let task = MigrationTask { shard: 7, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        mgr.start_outbound(&[task.clone()], NodeId(1), &std::collections::HashSet::new());
+        let task = MigrationTask {
+            shard: 7,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(mgr.active_migrations()[0].state, MigrationState::Preparing);
 
@@ -1060,16 +1179,36 @@ mod tests {
     #[test]
     fn different_tasks_same_shard_tracked_independently() {
         let mut mgr = MigrationManager::new();
-        let t1 = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        let t2 = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(3), is_master: false };
-        mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &std::collections::HashSet::new());
+        let t1 = MigrationTask {
+            shard: 5,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 5,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        mgr.start_outbound(
+            &[t1.clone(), t2.clone()],
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(mgr.active_count(), 2);
 
         mgr.mark_complete(&t1);
         assert_eq!(mgr.active_count(), 1);
         // t2 should still be in preparing state
-        assert_eq!(mgr.active_migrations().iter()
-            .find(|p| p.to_node == NodeId(3)).unwrap().state, MigrationState::Preparing);
+        assert_eq!(
+            mgr.active_migrations()
+                .iter()
+                .find(|p| p.to_node == NodeId(3))
+                .unwrap()
+                .state,
+            MigrationState::Preparing
+        );
 
         mgr.mark_complete(&t2);
         assert_eq!(mgr.active_count(), 0);
@@ -1080,8 +1219,18 @@ mod tests {
         let mut mgr = MigrationManager::new();
         // Node 1 sends shard 10 to node 3 (outbound for node 1).
         // Node 2 sends shard 5 to node 1 (inbound for node 1).
-        let outbound = MigrationTask { shard: 10, from_node: NodeId(1), to_node: NodeId(3), is_master: true };
-        let inbound = MigrationTask { shard: 5, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
+        let outbound = MigrationTask {
+            shard: 10,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: true,
+        };
+        let inbound = MigrationTask {
+            shard: 5,
+            from_node: NodeId(2),
+            to_node: NodeId(1),
+            is_master: true,
+        };
 
         let mut populated = std::collections::HashSet::new();
         populated.insert(5);
@@ -1127,8 +1276,18 @@ mod tests {
     #[test]
     fn inbound_tracking_per_task() {
         let mut mgr = MigrationManager::new();
-        let t1 = MigrationTask { shard: 5, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
-        let t2 = MigrationTask { shard: 5, from_node: NodeId(3), to_node: NodeId(1), is_master: false };
+        let t1 = MigrationTask {
+            shard: 5,
+            from_node: NodeId(2),
+            to_node: NodeId(1),
+            is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 5,
+            from_node: NodeId(3),
+            to_node: NodeId(1),
+            is_master: false,
+        };
         let populated: std::collections::HashSet<u16> = [5u16].into_iter().collect();
         mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &populated);
 
@@ -1147,8 +1306,18 @@ mod tests {
     #[test]
     fn source_aware_inbound_complete_clears_exact_source() {
         let mut mgr = MigrationManager::new();
-        let t1 = MigrationTask { shard: 10, from_node: NodeId(1), to_node: NodeId(9), is_master: true };
-        let t2 = MigrationTask { shard: 10, from_node: NodeId(2), to_node: NodeId(9), is_master: false };
+        let t1 = MigrationTask {
+            shard: 10,
+            from_node: NodeId(1),
+            to_node: NodeId(9),
+            is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 10,
+            from_node: NodeId(2),
+            to_node: NodeId(9),
+            is_master: false,
+        };
         let populated: std::collections::HashSet<u16> = [10u16].into_iter().collect();
         mgr.start_outbound(&[t1, t2], NodeId(9), &populated);
 
@@ -1162,6 +1331,46 @@ mod tests {
     }
 
     #[test]
+    fn source_aware_batch_inbound_complete_clears_exact_sources() {
+        let mut mgr = MigrationManager::new();
+        let tasks = [
+            MigrationTask {
+                shard: 10,
+                from_node: NodeId(1),
+                to_node: NodeId(9),
+                is_master: true,
+            },
+            MigrationTask {
+                shard: 11,
+                from_node: NodeId(1),
+                to_node: NodeId(9),
+                is_master: true,
+            },
+            MigrationTask {
+                shard: 10,
+                from_node: NodeId(2),
+                to_node: NodeId(9),
+                is_master: false,
+            },
+        ];
+        let populated: std::collections::HashSet<u16> = [10u16, 11u16].into_iter().collect();
+        mgr.start_outbound(&tasks, NodeId(9), &populated);
+
+        mgr.mark_inbound_complete_many_from_source([10, 11], NodeId(1));
+
+        assert!(
+            mgr.has_pending_inbound(10),
+            "batch completion from source 1 must not clear source 2's pending entry"
+        );
+        assert!(!mgr.has_pending_inbound(11));
+        assert_eq!(mgr.inbound_count(), 1);
+
+        mgr.mark_inbound_complete_many_from_source([10], NodeId(2));
+        assert!(!mgr.has_pending_inbound(10));
+        assert_eq!(mgr.inbound_count(), 0);
+    }
+
+    #[test]
     fn source_aware_inbound_complete_falls_back_to_sentinel() {
         let mut mgr = MigrationManager::new();
         mgr.mark_inbound_active(42);
@@ -1170,6 +1379,26 @@ mod tests {
         mgr.mark_inbound_complete_from_source(42, NodeId(7));
         assert!(!mgr.has_pending_inbound(42));
         assert_eq!(mgr.inbound_count(), 0);
+    }
+
+    #[test]
+    fn source_aware_inbound_complete_does_not_clear_wrong_source() {
+        let mut mgr = MigrationManager::new();
+        let task = MigrationTask {
+            shard: 43,
+            from_node: NodeId(7),
+            to_node: NodeId(9),
+            is_master: true,
+        };
+        let populated: std::collections::HashSet<u16> = [43u16].into_iter().collect();
+        mgr.start_outbound(&[task], NodeId(9), &populated);
+
+        mgr.mark_inbound_complete_from_source(43, NodeId(8));
+        assert!(
+            mgr.has_pending_inbound(43),
+            "completion from an unrelated source must not clear the authoritative pending source"
+        );
+        assert_eq!(mgr.inbound_count(), 1);
     }
 
     #[test]
@@ -1256,10 +1485,24 @@ mod tests {
     #[test]
     fn inbound_tracking_per_task_on_empty_target() {
         let mut mgr = MigrationManager::new();
-        let t1 = MigrationTask { shard: 5, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
-        let t2 = MigrationTask { shard: 5, from_node: NodeId(3), to_node: NodeId(1), is_master: false };
+        let t1 = MigrationTask {
+            shard: 5,
+            from_node: NodeId(2),
+            to_node: NodeId(1),
+            is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 5,
+            from_node: NodeId(3),
+            to_node: NodeId(1),
+            is_master: false,
+        };
 
-        mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &std::collections::HashSet::new());
+        mgr.start_outbound(
+            &[t1.clone(), t2.clone()],
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(mgr.inbound_count(), 2);
         assert!(mgr.has_pending_inbound(5));
@@ -1269,7 +1512,12 @@ mod tests {
     fn serialize_restore_inbound_round_trip() {
         let mut mgr = MigrationManager::new();
         mgr.mark_inbound_active(10);
-        let t = MigrationTask { shard: 20, from_node: NodeId(5), to_node: NodeId(1), is_master: true };
+        let t = MigrationTask {
+            shard: 20,
+            from_node: NodeId(5),
+            to_node: NodeId(1),
+            is_master: true,
+        };
         let mut populated = std::collections::HashSet::new();
         populated.insert(20);
         mgr.start_outbound(&[t], NodeId(1), &populated);
@@ -1365,9 +1613,23 @@ mod tests {
     #[test]
     fn serialize_restore_outbound_round_trip() {
         let mut mgr = MigrationManager::new();
-        let t1 = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        let t2 = MigrationTask { shard: 10, from_node: NodeId(1), to_node: NodeId(3), is_master: false };
-        mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &std::collections::HashSet::new());
+        let t1 = MigrationTask {
+            shard: 5,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 10,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        mgr.start_outbound(
+            &[t1.clone(), t2.clone()],
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
 
         // Advance t1 to Streaming with a snapshot sequence.
         mgr.set_snapshot_sequence(&t1, 42);
@@ -1379,23 +1641,48 @@ mod tests {
 
         // Both tasks should be restored.
         assert_eq!(restored.active_count(), 2);
-        let p1 = restored.active_migrations().iter()
-            .find(|p| p.shard == 5).expect("shard 5 restored");
+        let p1 = restored
+            .active_migrations()
+            .iter()
+            .find(|p| p.shard == 5)
+            .expect("shard 5 restored");
         assert_eq!(p1.state, MigrationState::Streaming);
         assert_eq!(p1.snapshot_sequence, 42);
         assert!(p1.is_master);
-        let p2 = restored.active_migrations().iter()
-            .find(|p| p.shard == 10).expect("shard 10 restored");
+        let p2 = restored
+            .active_migrations()
+            .iter()
+            .find(|p| p.shard == 10)
+            .expect("shard 10 restored");
         assert!(!p2.is_master);
     }
 
     #[test]
     fn serialize_outbound_skips_complete_and_failed() {
         let mut mgr = MigrationManager::new();
-        let t1 = MigrationTask { shard: 1, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        let t2 = MigrationTask { shard: 2, from_node: NodeId(1), to_node: NodeId(3), is_master: true };
-        let t3 = MigrationTask { shard: 3, from_node: NodeId(1), to_node: NodeId(4), is_master: true };
-        mgr.start_outbound(&[t1.clone(), t2.clone(), t3.clone()], NodeId(1), &std::collections::HashSet::new());
+        let t1 = MigrationTask {
+            shard: 1,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 2,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: true,
+        };
+        let t3 = MigrationTask {
+            shard: 3,
+            from_node: NodeId(1),
+            to_node: NodeId(4),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            &[t1.clone(), t2.clone(), t3.clone()],
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
 
         mgr.mark_complete(&t1);
         mgr.mark_failed(&t2);
@@ -1415,8 +1702,17 @@ mod tests {
         let path = dir.path().join("outbound.state");
 
         let mut mgr = MigrationManager::new();
-        let t = MigrationTask { shard: 42, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        mgr.start_outbound(&[t.clone()], NodeId(1), &std::collections::HashSet::new());
+        let t = MigrationTask {
+            shard: 42,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&t),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
         mgr.set_snapshot_sequence(&t, 100);
 
         super::persist_outbound_state(&path, &mgr);
@@ -1447,10 +1743,29 @@ mod tests {
     #[test]
     fn cleanup_removes_failed_migrations() {
         let mut mgr = MigrationManager::new();
-        let t1 = MigrationTask { shard: 1, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        let t2 = MigrationTask { shard: 2, from_node: NodeId(1), to_node: NodeId(3), is_master: true };
-        let t3 = MigrationTask { shard: 3, from_node: NodeId(1), to_node: NodeId(4), is_master: true };
-        mgr.start_outbound(&[t1.clone(), t2.clone(), t3.clone()], NodeId(1), &std::collections::HashSet::new());
+        let t1 = MigrationTask {
+            shard: 1,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 2,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: true,
+        };
+        let t3 = MigrationTask {
+            shard: 3,
+            from_node: NodeId(1),
+            to_node: NodeId(4),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            &[t1.clone(), t2.clone(), t3.clone()],
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
 
         mgr.mark_complete(&t1);
         mgr.mark_failed(&t2);
@@ -1473,9 +1788,14 @@ mod tests {
     #[test]
     fn cleanup_removes_all_failed_migrations() {
         let mut mgr = MigrationManager::new();
-        let tasks: Vec<MigrationTask> = (0..5).map(|i| {
-            MigrationTask { shard: i, from_node: NodeId(1), to_node: NodeId(2), is_master: true }
-        }).collect();
+        let tasks: Vec<MigrationTask> = (0..5)
+            .map(|i| MigrationTask {
+                shard: i,
+                from_node: NodeId(1),
+                to_node: NodeId(2),
+                is_master: true,
+            })
+            .collect();
         mgr.start_outbound(&tasks, NodeId(1), &std::collections::HashSet::new());
 
         for t in &tasks {
@@ -1496,11 +1816,35 @@ mod tests {
     #[test]
     fn active_count_matches_http_expectation() {
         let mut mgr = MigrationManager::new();
-        let t1 = MigrationTask { shard: 1, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        let t2 = MigrationTask { shard: 2, from_node: NodeId(1), to_node: NodeId(3), is_master: true };
-        let t3 = MigrationTask { shard: 3, from_node: NodeId(1), to_node: NodeId(4), is_master: true };
-        let t4 = MigrationTask { shard: 4, from_node: NodeId(1), to_node: NodeId(5), is_master: true };
-        mgr.start_outbound(&[t1.clone(), t2.clone(), t3.clone(), t4.clone()], NodeId(1), &std::collections::HashSet::new());
+        let t1 = MigrationTask {
+            shard: 1,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 2,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: true,
+        };
+        let t3 = MigrationTask {
+            shard: 3,
+            from_node: NodeId(1),
+            to_node: NodeId(4),
+            is_master: true,
+        };
+        let t4 = MigrationTask {
+            shard: 4,
+            from_node: NodeId(1),
+            to_node: NodeId(5),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            &[t1.clone(), t2.clone(), t3.clone(), t4.clone()],
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
 
         mgr.mark_complete(&t1);
         mgr.mark_failed(&t2);
@@ -1511,9 +1855,10 @@ mod tests {
         assert_eq!(mgr.active_count(), 2); // t3 (Streaming) + t4 (Preparing)
         // The HTTP endpoint should report the same
         let all = mgr.active_migrations();
-        let http_active = all.iter().filter(|m| {
-            m.state != MigrationState::Complete && m.state != MigrationState::Failed
-        }).count();
+        let http_active = all
+            .iter()
+            .filter(|m| m.state != MigrationState::Complete && m.state != MigrationState::Failed)
+            .count();
         assert_eq!(http_active, mgr.active_count());
     }
 
@@ -1522,9 +1867,23 @@ mod tests {
     #[test]
     fn take_failed_tasks_before_cleanup() {
         let mut mgr = MigrationManager::new();
-        let t1 = MigrationTask { shard: 1, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        let t2 = MigrationTask { shard: 2, from_node: NodeId(1), to_node: NodeId(3), is_master: true };
-        mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &std::collections::HashSet::new());
+        let t1 = MigrationTask {
+            shard: 1,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 2,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            &[t1.clone(), t2.clone()],
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
 
         mgr.mark_failed(&t1);
         mgr.mark_failed(&t2);
@@ -1540,8 +1899,17 @@ mod tests {
     #[test]
     fn mark_failed_lifts_fence() {
         let mut mgr = MigrationManager::new();
-        let t = MigrationTask { shard: 42, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        mgr.start_outbound(&[t.clone()], NodeId(1), &std::collections::HashSet::new());
+        let t = MigrationTask {
+            shard: 42,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&t),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
 
         mgr.mark_fenced(&t, 100);
         assert!(mgr.is_shard_fenced(42));
@@ -1558,8 +1926,17 @@ mod tests {
     #[test]
     fn fence_and_complete_lifecycle() {
         let mut mgr = MigrationManager::new();
-        let task = MigrationTask { shard: 42, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        mgr.start_outbound(&[task.clone()], NodeId(1), &std::collections::HashSet::new());
+        let task = MigrationTask {
+            shard: 42,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
 
         // Full lifecycle: Preparing → Streaming → Fenced → Complete
         mgr.set_snapshot_sequence(&task, 100);
@@ -1572,7 +1949,10 @@ mod tests {
         assert!(mgr.is_shard_fenced(42));
 
         mgr.mark_complete(&task);
-        assert!(!mgr.is_shard_fenced(42), "fence should be lifted on complete");
+        assert!(
+            !mgr.is_shard_fenced(42),
+            "fence should be lifted on complete"
+        );
         assert!(mgr.active_migrations()[0].is_complete());
     }
 
@@ -1593,7 +1973,10 @@ mod tests {
 
         // Bitmap should accurately reflect remaining state
         assert!(mgr.has_pending_inbound(10));
-        assert!(!mgr.has_pending_inbound(20), "completed shard should be cleared");
+        assert!(
+            !mgr.has_pending_inbound(20),
+            "completed shard should be cleared"
+        );
         assert!(mgr.has_pending_inbound(30));
         assert_eq!(mgr.inbound_count(), 2);
     }
@@ -1624,8 +2007,17 @@ mod tests {
     #[test]
     fn failed_migration_retry_resets_progress() {
         let mut mgr = MigrationManager::new();
-        let task = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        mgr.start_outbound(&[task.clone()], NodeId(1), &std::collections::HashSet::new());
+        let task = MigrationTask {
+            shard: 5,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
 
         mgr.set_snapshot_sequence(&task, 100);
         mgr.record_progress(&task, 500, 500_000);
@@ -1698,8 +2090,17 @@ mod tests {
     #[test]
     fn is_migrating_shard_excludes_failed() {
         let mut mgr = MigrationManager::new();
-        let t = MigrationTask { shard: 7, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        mgr.start_outbound(&[t.clone()], NodeId(1), &std::collections::HashSet::new());
+        let t = MigrationTask {
+            shard: 7,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&t),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
 
         assert!(mgr.is_migrating_shard(7));
         mgr.mark_failed(&t);
@@ -1716,9 +2117,23 @@ mod tests {
     #[test]
     fn two_fenced_tasks_same_shard_complete_one_keeps_fence() {
         let mut mgr = MigrationManager::new();
-        let t1 = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        let t2 = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(3), is_master: false };
-        mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &std::collections::HashSet::new());
+        let t1 = MigrationTask {
+            shard: 5,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 5,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        mgr.start_outbound(
+            &[t1.clone(), t2.clone()],
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
 
         mgr.mark_fenced(&t1, 100);
         mgr.mark_fenced(&t2, 200);
@@ -1726,49 +2141,69 @@ mod tests {
 
         // Complete t1 → shard 5 STAYS fenced because t2 is still Fenced.
         mgr.mark_complete(&t1);
-        assert!(mgr.is_shard_fenced(5),
-            "shard should remain fenced while another task is in Fenced state");
+        assert!(
+            mgr.is_shard_fenced(5),
+            "shard should remain fenced while another task is in Fenced state"
+        );
 
         // t2 is still tracked as Fenced in its progress entry.
-        let t2_progress = mgr.active_migrations().iter()
+        let t2_progress = mgr
+            .active_migrations()
+            .iter()
             .find(|p| p.to_node == NodeId(3))
             .expect("t2 should still be active");
         assert_eq!(t2_progress.state, MigrationState::Fenced);
 
         // Complete t2 → NOW the shard is unfenced.
         mgr.mark_complete(&t2);
-        assert!(!mgr.is_shard_fenced(5),
-            "shard should unfence once all fenced tasks are done");
+        assert!(
+            !mgr.is_shard_fenced(5),
+            "shard should unfence once all fenced tasks are done"
+        );
     }
 
-    /// mark_complete and mark_failed always call unfence_shard regardless
-    /// of whether find_task_mut found the task. This means calling
-    /// mark_complete on a task that was already cleaned up still unfences.
+    /// mark_complete must not clear a fence for an untracked task. Stale
+    /// migration workers can report completion after a newer topology has
+    /// installed a fresh fence for the same shard.
     #[test]
-    fn mark_complete_unfences_even_when_task_not_found() {
+    fn mark_complete_does_not_unfence_when_task_not_found() {
         let mut mgr = MigrationManager::new();
 
         // Fence a shard manually without registering a task.
         mgr.fence_shard(99);
         assert!(mgr.is_shard_fenced(99));
 
-        // mark_complete with a non-existent task → find_task_mut returns None,
-        // but unfence_shard(99) still runs.
-        let phantom = MigrationTask { shard: 99, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        let phantom = MigrationTask {
+            shard: 99,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
         mgr.mark_complete(&phantom);
-        assert!(!mgr.is_shard_fenced(99));
+        assert!(
+            mgr.is_shard_fenced(99),
+            "untracked completion must not clear a current fence"
+        );
     }
 
-    /// mark_failed also unfences even when the task isn't found.
+    /// mark_failed must not clear a fence for an untracked task.
     #[test]
-    fn mark_failed_unfences_even_when_task_not_found() {
+    fn mark_failed_does_not_unfence_when_task_not_found() {
         let mut mgr = MigrationManager::new();
         mgr.fence_shard(42);
         assert!(mgr.is_shard_fenced(42));
 
-        let phantom = MigrationTask { shard: 42, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+        let phantom = MigrationTask {
+            shard: 42,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
         mgr.mark_failed(&phantom);
-        assert!(!mgr.is_shard_fenced(42));
+        assert!(
+            mgr.is_shard_fenced(42),
+            "untracked failure must not clear a current fence"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1780,8 +2215,18 @@ mod tests {
     #[test]
     fn inbound_multiple_sources_independent_completion() {
         let mut mgr = MigrationManager::new();
-        let t1 = MigrationTask { shard: 10, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
-        let t2 = MigrationTask { shard: 10, from_node: NodeId(3), to_node: NodeId(1), is_master: false };
+        let t1 = MigrationTask {
+            shard: 10,
+            from_node: NodeId(2),
+            to_node: NodeId(1),
+            is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 10,
+            from_node: NodeId(3),
+            to_node: NodeId(1),
+            is_master: false,
+        };
 
         let mut pop = std::collections::HashSet::new();
         pop.insert(10);
@@ -1794,7 +2239,10 @@ mod tests {
         // Complete one source.
         mgr.mark_inbound_complete(10);
         assert_eq!(mgr.inbound_count(), 1);
-        assert!(mgr.has_pending_inbound(10), "shard still has one pending source");
+        assert!(
+            mgr.has_pending_inbound(10),
+            "shard still has one pending source"
+        );
 
         // Complete the second source.
         mgr.mark_inbound_complete(10);
@@ -1805,8 +2253,18 @@ mod tests {
     #[test]
     fn inbound_complete_all_clears_multi_source_shard() {
         let mut mgr = MigrationManager::new();
-        let t1 = MigrationTask { shard: 10, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
-        let t2 = MigrationTask { shard: 10, from_node: NodeId(3), to_node: NodeId(1), is_master: false };
+        let t1 = MigrationTask {
+            shard: 10,
+            from_node: NodeId(2),
+            to_node: NodeId(1),
+            is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 10,
+            from_node: NodeId(3),
+            to_node: NodeId(1),
+            is_master: false,
+        };
         let populated: std::collections::HashSet<u16> = [10u16].into_iter().collect();
         mgr.start_outbound(&[t1, t2], NodeId(1), &populated);
 
@@ -1819,8 +2277,18 @@ mod tests {
     #[test]
     fn start_outbound_registers_empty_shards_for_inbound() {
         let mut mgr = MigrationManager::new();
-        let t1 = MigrationTask { shard: 10, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
-        let t2 = MigrationTask { shard: 20, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
+        let t1 = MigrationTask {
+            shard: 10,
+            from_node: NodeId(2),
+            to_node: NodeId(1),
+            is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 20,
+            from_node: NodeId(2),
+            to_node: NodeId(1),
+            is_master: true,
+        };
 
         // Only shard 10 is populated.
         let mut pop = std::collections::HashSet::new();
@@ -1829,7 +2297,10 @@ mod tests {
 
         // Both shards must be protected until the source proves completion.
         assert!(mgr.has_pending_inbound(10));
-        assert!(mgr.has_pending_inbound(20), "empty shard 20 still needs an ownership fence");
+        assert!(
+            mgr.has_pending_inbound(20),
+            "empty shard 20 still needs an ownership fence"
+        );
         assert_eq!(mgr.inbound_count(), 2);
     }
 
@@ -1839,10 +2310,29 @@ mod tests {
     #[test]
     fn outbound_serialize_preserves_all_active_states() {
         let mut mgr = MigrationManager::new();
-        let t1 = MigrationTask { shard: 1, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        let t2 = MigrationTask { shard: 2, from_node: NodeId(1), to_node: NodeId(3), is_master: true };
-        let t3 = MigrationTask { shard: 3, from_node: NodeId(1), to_node: NodeId(4), is_master: false };
-        mgr.start_outbound(&[t1.clone(), t2.clone(), t3.clone()], NodeId(1), &std::collections::HashSet::new());
+        let t1 = MigrationTask {
+            shard: 1,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 2,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: true,
+        };
+        let t3 = MigrationTask {
+            shard: 3,
+            from_node: NodeId(1),
+            to_node: NodeId(4),
+            is_master: false,
+        };
+        mgr.start_outbound(
+            &[t1.clone(), t2.clone(), t3.clone()],
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
 
         mgr.set_snapshot_sequence(&t1, 100); // Streaming
         mgr.mark_fenced(&t2, 200); // Fenced
@@ -1853,15 +2343,27 @@ mod tests {
         restored.restore_outbound(&data);
 
         assert_eq!(restored.active_count(), 3);
-        let r1 = restored.active_migrations().iter().find(|p| p.shard == 1).unwrap();
+        let r1 = restored
+            .active_migrations()
+            .iter()
+            .find(|p| p.shard == 1)
+            .unwrap();
         assert_eq!(r1.state, MigrationState::Streaming);
         assert_eq!(r1.snapshot_sequence, 100);
 
-        let r2 = restored.active_migrations().iter().find(|p| p.shard == 2).unwrap();
+        let r2 = restored
+            .active_migrations()
+            .iter()
+            .find(|p| p.shard == 2)
+            .unwrap();
         assert_eq!(r2.state, MigrationState::Fenced);
         assert_eq!(r2.fence_sequence, 200);
 
-        let r3 = restored.active_migrations().iter().find(|p| p.shard == 3).unwrap();
+        let r3 = restored
+            .active_migrations()
+            .iter()
+            .find(|p| p.shard == 3)
+            .unwrap();
         assert_eq!(r3.state, MigrationState::Preparing);
         assert!(!r3.is_master);
     }
@@ -1881,7 +2383,12 @@ mod tests {
         assert!(!mgr.has_pending_inbound(20));
 
         // Re-register via start_outbound.
-        let t = MigrationTask { shard: 10, from_node: NodeId(2), to_node: NodeId(1), is_master: true };
+        let t = MigrationTask {
+            shard: 10,
+            from_node: NodeId(2),
+            to_node: NodeId(1),
+            is_master: true,
+        };
         let mut pop = std::collections::HashSet::new();
         pop.insert(10);
         mgr.start_outbound(&[t], NodeId(1), &pop);
@@ -1893,9 +2400,24 @@ mod tests {
     fn clear_pending_inbound_for_selected_shards() {
         let mut mgr = MigrationManager::new();
         let tasks = vec![
-            MigrationTask { shard: 10, from_node: NodeId(2), to_node: NodeId(1), is_master: false },
-            MigrationTask { shard: 20, from_node: NodeId(3), to_node: NodeId(1), is_master: false },
-            MigrationTask { shard: 30, from_node: NodeId(4), to_node: NodeId(1), is_master: false },
+            MigrationTask {
+                shard: 10,
+                from_node: NodeId(2),
+                to_node: NodeId(1),
+                is_master: false,
+            },
+            MigrationTask {
+                shard: 20,
+                from_node: NodeId(3),
+                to_node: NodeId(1),
+                is_master: false,
+            },
+            MigrationTask {
+                shard: 30,
+                from_node: NodeId(4),
+                to_node: NodeId(1),
+                is_master: false,
+            },
         ];
         mgr.start_outbound(&tasks, NodeId(1), &std::collections::HashSet::new());
 
@@ -2022,9 +2544,23 @@ mod tests {
     #[test]
     fn cleanup_completed_unfences_shard_with_no_remaining_fenced_tasks() {
         let mut mgr = MigrationManager::new();
-        let t1 = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-        let t2 = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(3), is_master: false };
-        mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &std::collections::HashSet::new());
+        let t1 = MigrationTask {
+            shard: 5,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let t2 = MigrationTask {
+            shard: 5,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        mgr.start_outbound(
+            &[t1.clone(), t2.clone()],
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
 
         mgr.mark_fenced(&t1, 100);
         mgr.mark_fenced(&t2, 200);
@@ -2034,12 +2570,19 @@ mod tests {
         // Fenced). mark_complete on t2 unfences (no other Fenced task).
         mgr.mark_complete(&t1);
         mgr.mark_complete(&t2);
-        assert!(!mgr.is_shard_fenced(5), "both completed, should be unfenced");
+        assert!(
+            !mgr.is_shard_fenced(5),
+            "both completed, should be unfenced"
+        );
 
         // Re-fence for the dangerous scenario: both completed, then cleanup.
         mgr.fence_shard(5);
         // Simulate: re-add two completed tasks.
-        mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &std::collections::HashSet::new());
+        mgr.start_outbound(
+            &[t1.clone(), t2.clone()],
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
         mgr.mark_fenced(&t1, 100);
         mgr.mark_fenced(&t2, 200);
         mgr.mark_complete(&t1);
@@ -2051,8 +2594,10 @@ mod tests {
         // Call cleanup — it should unfence shard 5 since all tasks are
         // Complete (none remaining in Fenced state).
         mgr.cleanup_completed();
-        assert!(!mgr.is_shard_fenced(5),
-            "cleanup_completed must unfence shards with no remaining fenced tasks");
+        assert!(
+            !mgr.is_shard_fenced(5),
+            "cleanup_completed must unfence shards with no remaining fenced tasks"
+        );
     }
 
     #[test]
@@ -2083,10 +2628,16 @@ mod tests {
     fn inbound_cleared_when_migration_aborted_for_committed_shard() {
         let mut mgr = MigrationManager::new();
         let master_task = MigrationTask {
-            shard: 42, from_node: NodeId(1), to_node: NodeId(3), is_master: true,
+            shard: 42,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: true,
         };
         let replica_task = MigrationTask {
-            shard: 42, from_node: NodeId(1), to_node: NodeId(3), is_master: false,
+            shard: 42,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
         };
         mgr.start_outbound(
             &[master_task.clone(), replica_task.clone()],
@@ -2099,7 +2650,10 @@ mod tests {
 
         // Simulate: replica migration sent data, receiver registered inbound.
         mgr.mark_inbound_active(42);
-        assert!(mgr.has_pending_inbound(42), "inbound should be active after data arrived");
+        assert!(
+            mgr.has_pending_inbound(42),
+            "inbound should be active after data arrived"
+        );
 
         // Simulate: replica task fails because shard is already committed.
         // The coordinator should call mark_inbound_complete BEFORE mark_failed.
@@ -2107,18 +2661,26 @@ mod tests {
         mgr.mark_failed(&replica_task);
 
         // Inbound must be cleared — writes should not be blocked.
-        assert!(!mgr.has_pending_inbound(42),
-            "inbound must be cleared when migration aborts for committed shard");
+        assert!(
+            !mgr.has_pending_inbound(42),
+            "inbound must be cleared when migration aborts for committed shard"
+        );
     }
 
     #[test]
     fn pending_inbound_entries_excludes_completed_entries() {
         let mut mgr = MigrationManager::new();
         let t1 = MigrationTask {
-            shard: 10, from_node: NodeId(2), to_node: NodeId(1), is_master: true,
+            shard: 10,
+            from_node: NodeId(2),
+            to_node: NodeId(1),
+            is_master: true,
         };
         let t2 = MigrationTask {
-            shard: 20, from_node: NodeId(3), to_node: NodeId(1), is_master: false,
+            shard: 20,
+            from_node: NodeId(3),
+            to_node: NodeId(1),
+            is_master: false,
         };
         let populated: std::collections::HashSet<u16> = [10u16, 20u16].into_iter().collect();
 
@@ -2132,13 +2694,12 @@ mod tests {
     /// `migration_active` gauge; completing it should decrement back.
     #[test]
     fn migration_active_gauge_tracks_inflight_shards() {
-        use crate::metrics::{init_migration_metrics, migration_metrics, MigrationMetrics};
-        use std::sync::atomic::Ordering;
+        use crate::metrics::{MigrationMetrics, init_migration_metrics, migration_metrics};
         use std::sync::OnceLock;
+        use std::sync::atomic::Ordering;
 
         static TEST_METRICS: OnceLock<MigrationMetrics> = OnceLock::new();
-        let m_ref: &'static MigrationMetrics =
-            TEST_METRICS.get_or_init(MigrationMetrics::new);
+        let m_ref: &'static MigrationMetrics = TEST_METRICS.get_or_init(MigrationMetrics::new);
         init_migration_metrics(m_ref);
         let metrics = migration_metrics().expect("metrics installed");
 

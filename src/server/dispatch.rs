@@ -13,7 +13,6 @@ use crate::cluster::shards::{NodeId, ShardHandoff, ShardTable};
 use crate::index::TxKey;
 use crate::ops::create::*;
 use crate::ops::engine::{Engine, build_cold_data};
-use crate::record::{METADATA_SIZE, TxFlags};
 use crate::ops::error::SpendError;
 use crate::ops::mark_longest_chain::*;
 use crate::ops::remaining::*;
@@ -22,18 +21,23 @@ use crate::ops::unspend::*;
 use crate::protocol::codec::*;
 use crate::protocol::frame::*;
 use crate::protocol::opcodes::*;
+use crate::record::{METADATA_SIZE, TxFlags};
 use crate::redo::{RedoLog, RedoOp};
 use crate::replication::manager::ReplicaTransport;
 use crate::replication::protocol::{ReplicaAck, ReplicaBatch, ReplicaOp};
-use crate::replication::receiver::handle_replica_batch;
+use crate::replication::receiver::{
+    DEFAULT_STREAM_KEY, handle_replica_batch, handle_replica_batch_with_tracker,
+};
 use crate::replication::tcp_transport::TcpReplicaTransport;
 use crate::storage::blobstore::BlobStore;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU64;
 use std::sync::LazyLock;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
+
+const MIGRATION_REPLICATION_TIMEOUT_FLOOR: Duration = Duration::from_secs(30);
 
 /// Per-address replication connection slot. Each replica address gets its
 /// own independent mutex, so concurrent sends to different replicas never
@@ -86,6 +90,22 @@ static REPL_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 static ACK_TRACKER: std::sync::OnceLock<crate::replication::durable::AckTracker> =
     std::sync::OnceLock::new();
 
+/// Persistent receiver-side applied tracker for production `OP_REPLICA_BATCH`
+/// dispatch through the main server port. Initialized at startup beside the
+/// cluster state file. This closes the gap where production dispatch used a
+/// thread-local in-memory high-water mark and lost dedup state on restart.
+static REPLICA_APPLIED_TRACKER: std::sync::OnceLock<
+    crate::replication::durable::ReplicaAppliedTracker,
+> = std::sync::OnceLock::new();
+
+/// Persistent master-side pending replication intent tracker.
+static REPLICATION_INTENT_TRACKER: std::sync::OnceLock<
+    crate::replication::durable::ReplicationIntentTracker,
+> = std::sync::OnceLock::new();
+
+/// Monotonic diagnostic high-water mark across all source streams.
+static DISPATCH_REPLICA_LAST_APPLIED: AtomicU64 = AtomicU64::new(0);
+
 /// Global metrics reference. Initialized during server startup via
 /// `init_dispatch_metrics()`. Used to increment operation counters
 /// without threading metrics through every handler function.
@@ -109,6 +129,32 @@ pub fn init_ack_tracker(path: std::path::PathBuf) {
     let _ = ACK_TRACKER.set(tracker);
 }
 
+/// Initialize the persistent receiver-side applied tracker.
+///
+/// Must be called once during clustered server startup before accepting
+/// replication frames. A corrupt tracker is returned as an error so startup
+/// can fail closed instead of serving with unknown receiver durability state.
+pub fn init_replica_applied_tracker(path: std::path::PathBuf) -> std::result::Result<(), String> {
+    let tracker = crate::replication::durable::ReplicaAppliedTracker::load(path)
+        .map_err(|e| format!("load replica applied tracker: {e}"))?;
+    let initial = tracker.snapshot().values().copied().max().unwrap_or(0);
+    DISPATCH_REPLICA_LAST_APPLIED.store(initial, std::sync::atomic::Ordering::Relaxed);
+    REPLICA_APPLIED_TRACKER
+        .set(tracker)
+        .map_err(|_| "replica applied tracker already initialized".to_string())
+}
+
+/// Initialize the persistent master-side replication intent tracker.
+pub fn init_replication_intent_tracker(
+    path: std::path::PathBuf,
+) -> std::result::Result<(), String> {
+    let tracker = crate::replication::durable::ReplicationIntentTracker::load(path)
+        .map_err(|e| format!("load replication intent tracker: {e}"))?;
+    REPLICATION_INTENT_TRACKER
+        .set(tracker)
+        .map_err(|_| "replication intent tracker already initialized".to_string())
+}
+
 /// Initialize the dispatch metrics reference.
 ///
 /// Must be called once during server startup before any requests are processed.
@@ -124,7 +170,6 @@ pub fn init_dispatch_metrics(metrics: &'static crate::metrics::ThreadMetrics) {
 pub fn init_dispatch_histograms(histograms: &'static crate::metrics::ThreadHistograms) {
     let _ = DISPATCH_HISTOGRAMS.set(histograms);
 }
-
 
 /// Dispatch a request frame to the appropriate Engine method.
 ///
@@ -191,21 +236,46 @@ pub(crate) fn handle_request(
 
     let response = match request.op_code {
         OP_SPEND_BATCH => handle_spend_batch(request, engine, max_batch_size, cluster, redo_log),
-        OP_UNSPEND_BATCH => handle_unspend_batch(request, engine, max_batch_size, cluster, redo_log),
-        OP_SET_MINED_BATCH => handle_set_mined_batch(request, engine, max_batch_size, cluster, redo_log),
-        OP_CREATE_BATCH => handle_create_batch(request, engine, max_batch_size, cluster, redo_log, blob_store),
+        OP_UNSPEND_BATCH => {
+            handle_unspend_batch(request, engine, max_batch_size, cluster, redo_log)
+        }
+        OP_SET_MINED_BATCH => {
+            handle_set_mined_batch(request, engine, max_batch_size, cluster, redo_log)
+        }
+        OP_CREATE_BATCH => handle_create_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            blob_store,
+        ),
         OP_FREEZE_BATCH => handle_freeze_batch(request, engine, max_batch_size, cluster, redo_log),
-        OP_UNFREEZE_BATCH => handle_unfreeze_batch(request, engine, max_batch_size, cluster, redo_log),
-        OP_REASSIGN_BATCH => handle_reassign_batch(request, engine, max_batch_size, cluster, redo_log),
-        OP_SET_CONFLICTING_BATCH => handle_set_conflicting_batch(request, engine, max_batch_size, cluster, redo_log),
-        OP_SET_LOCKED_BATCH => handle_set_locked_batch(request, engine, max_batch_size, cluster, redo_log),
-        OP_PRESERVE_UNTIL_BATCH => handle_preserve_until_batch(request, engine, max_batch_size, cluster, redo_log),
+        OP_UNFREEZE_BATCH => {
+            handle_unfreeze_batch(request, engine, max_batch_size, cluster, redo_log)
+        }
+        OP_REASSIGN_BATCH => {
+            handle_reassign_batch(request, engine, max_batch_size, cluster, redo_log)
+        }
+        OP_SET_CONFLICTING_BATCH => {
+            handle_set_conflicting_batch(request, engine, max_batch_size, cluster, redo_log)
+        }
+        OP_SET_LOCKED_BATCH => {
+            handle_set_locked_batch(request, engine, max_batch_size, cluster, redo_log)
+        }
+        OP_PRESERVE_UNTIL_BATCH => {
+            handle_preserve_until_batch(request, engine, max_batch_size, cluster, redo_log)
+        }
         OP_DELETE_BATCH => handle_delete_batch(request, engine, max_batch_size, cluster, redo_log),
-        OP_MARK_LONGEST_CHAIN_BATCH => handle_mark_longest_chain_batch(request, engine, max_batch_size, cluster, redo_log),
+        OP_MARK_LONGEST_CHAIN_BATCH => {
+            handle_mark_longest_chain_batch(request, engine, max_batch_size, cluster, redo_log)
+        }
         OP_GET_BATCH => handle_get_batch(request, engine, max_batch_size, cluster),
         OP_GET_SPEND_BATCH => handle_get_spend_batch(request, engine, max_batch_size, cluster),
         OP_QUERY_OLD_UNMINED => handle_query_old_unmined(request, engine),
-        OP_PRESERVE_TRANSACTIONS => handle_preserve_transactions(request, engine, max_batch_size, cluster, redo_log),
+        OP_PRESERVE_TRANSACTIONS => {
+            handle_preserve_transactions(request, engine, max_batch_size, cluster, redo_log)
+        }
         OP_PROCESS_EXPIRED_PRESERVATIONS => handle_process_expired(request, engine, redo_log),
         OP_GET_PARTITION_MAP => handle_get_partition_map(request, cluster),
         OP_GET_COMMITTED_TOPOLOGY => handle_get_committed_topology(request, cluster),
@@ -228,9 +298,6 @@ pub(crate) fn handle_request(
         OP_STREAM_END => handle_stream_end(request, conn_state),
         OP_REPLICA_BATCH => {
             // Dispatch replication batch to the receiver's apply logic.
-            thread_local! {
-                static DISPATCH_LAST_APPLIED: AtomicU64 = const { AtomicU64::new(0) };
-            }
             // During migration, flags bit FLAG_MIGRATION_BATCH is set
             // and request_id carries the shard number. Register this
             // shard as actively receiving inbound migration data so
@@ -250,9 +317,17 @@ pub(crate) fn handle_request(
                     cluster.mark_inbound_active(shard);
                 }
             }
-            DISPATCH_LAST_APPLIED.with(|la| {
-                handle_replica_batch(request, engine, la)
-            })
+            if let Some(applied) = REPLICA_APPLIED_TRACKER.get() {
+                handle_replica_batch_with_tracker(
+                    request,
+                    engine,
+                    &DISPATCH_REPLICA_LAST_APPLIED,
+                    applied,
+                    DEFAULT_STREAM_KEY,
+                )
+            } else {
+                handle_replica_batch(request, engine, &DISPATCH_REPLICA_LAST_APPLIED)
+            }
             // NOTE: We do NOT mark inbound shards as complete here.
             // Only the OP_MIGRATION_COMPLETE handshake clears the
             // pending-inbound flag, after verifying the data arrived.
@@ -292,8 +367,12 @@ pub(crate) fn handle_request(
             } else {
                 None
             };
-            let (source_entries, completion_from_node): (Option<Vec<(TxKey, u32)>>, Option<NodeId>) = if request.payload.len() >= 60 {
-                let entry_count = u32::from_le_bytes(request.payload[56..60].try_into().unwrap()) as usize;
+            let (source_entries, completion_from_node): (
+                Option<Vec<(TxKey, u32)>>,
+                Option<NodeId>,
+            ) = if request.payload.len() >= 60 {
+                let entry_count =
+                    u32::from_le_bytes(request.payload[56..60].try_into().unwrap()) as usize;
                 let needed = 60 + entry_count * 36;
                 if request.payload.len() < needed {
                     return error_response(
@@ -311,12 +390,15 @@ pub(crate) fn handle_request(
                     let mut txid = [0u8; 32];
                     txid.copy_from_slice(&request.payload[pos..pos + 32]);
                     pos += 32;
-                    let generation = u32::from_le_bytes(request.payload[pos..pos + 4].try_into().unwrap());
+                    let generation =
+                        u32::from_le_bytes(request.payload[pos..pos + 4].try_into().unwrap());
                     pos += 4;
                     entries.push((TxKey { txid }, generation));
                 }
                 let completion_from_node = if request.payload.len() >= needed + 8 {
-                    Some(NodeId(u64::from_le_bytes(request.payload[needed..needed + 8].try_into().unwrap())))
+                    Some(NodeId(u64::from_le_bytes(
+                        request.payload[needed..needed + 8].try_into().unwrap(),
+                    )))
                 } else {
                     None
                 };
@@ -336,7 +418,9 @@ pub(crate) fn handle_request(
                     return error_response(
                         request.request_id,
                         ERR_MIGRATION_IN_PROGRESS,
-                        &format!("stale migration epoch {migration_epoch} < current {current_epoch}"),
+                        &format!(
+                            "stale migration epoch {migration_epoch} < current {current_epoch}"
+                        ),
                     );
                 }
             }
@@ -344,18 +428,20 @@ pub(crate) fn handle_request(
             // A bare zero-count completion (no manifest, no exact entries)
             // is a control-plane signal used by fast paths to clear pending
             // inbound state when the target already has the shard contents.
-            let no_data_completion =
-                expected_records == 0
-                    && source_manifest.is_none()
-                    && source_entries.as_ref().is_none_or(|entries| entries.is_empty());
+            let no_data_completion = expected_records == 0
+                && source_manifest.is_none()
+                && source_entries
+                    .as_ref()
+                    .is_none_or(|entries| entries.is_empty());
+            let verify_only = request.flags & FLAG_MIGRATION_VERIFY_ONLY != 0;
 
             // Safety requirement (H3): when the source claims `record_count > 0`,
             // it MUST also send a manifest hash (or exact-entry manifest). Without
             // one, we cannot verify that every received record matches the source's
             // contents and a malformed/stale frame could mark a non-empty shard
             // migrated prematurely. Reject non-empty completions that lack both.
-            let has_manifest_evidence = source_manifest.is_some()
-                || source_entries.as_ref().is_some_and(|e| !e.is_empty());
+            let has_manifest_evidence =
+                source_manifest.is_some() || source_entries.as_ref().is_some_and(|e| !e.is_empty());
             if expected_records > 0 && !has_manifest_evidence {
                 return error_response(
                     request.request_id,
@@ -364,6 +450,32 @@ pub(crate) fn handle_request(
                         "shard {shard} migration-complete with record_count={expected_records} requires manifest hash or exact-entry manifest",
                     ),
                 );
+            }
+
+            if let Some(entries) = source_entries.as_ref()
+                && !entries.is_empty()
+                && entries.len() as u64 == expected_records
+            {
+                let expected_keys: std::collections::HashSet<TxKey> =
+                    entries.iter().map(|(key, _)| *key).collect();
+                for key in engine.keys_for_shard(shard) {
+                    if expected_keys.contains(&key) {
+                        continue;
+                    }
+                    match engine.delete(&crate::ops::remaining::DeleteRequest { tx_key: key }) {
+                        Ok(()) | Err(crate::ops::error::SpendError::TxNotFound) => {}
+                        Err(e) => {
+                            return error_response(
+                                request.request_id,
+                                ERR_MIGRATION_IN_PROGRESS,
+                                &format!(
+                                    "shard {shard} failed to prune stale key {:?}: {e:?}",
+                                    key,
+                                ),
+                            );
+                        }
+                    }
+                }
             }
 
             // Note: the zero-count + no-manifest fast-path is preserved as a
@@ -377,21 +489,21 @@ pub(crate) fn handle_request(
             // Verify the actual record count matches expected exactly
             // using the O(1) per-shard counter.
             let actual = engine.shard_record_count(shard);
-            // Target may already hold replica copies for this shard, so
-            // actual count can exceed expected. Accept if >= expected.
             let count_ok = if no_data_completion {
                 true
             } else if expected_records == 0 {
                 actual == 0
             } else {
-                actual >= expected_records
+                actual == expected_records
             };
 
             if !count_ok {
                 return error_response(
                     request.request_id,
                     ERR_MIGRATION_IN_PROGRESS,
-                    &format!("shard {shard} record count mismatch: expected {expected_records}, got {actual}"),
+                    &format!(
+                        "shard {shard} record count mismatch: expected {expected_records}, got {actual}"
+                    ),
                 );
             }
 
@@ -411,10 +523,7 @@ pub(crate) fn handle_request(
                             return error_response(
                                 request.request_id,
                                 ERR_MIGRATION_IN_PROGRESS,
-                                &format!(
-                                    "shard {shard} missing exact key {:?}: {e:?}",
-                                    key,
-                                ),
+                                &format!("shard {shard} missing exact key {:?}: {e:?}", key,),
                             );
                         }
                     };
@@ -425,9 +534,7 @@ pub(crate) fn handle_request(
                             ERR_MIGRATION_IN_PROGRESS,
                             &format!(
                                 "shard {shard} generation mismatch for {:?}: expected {}, got {}",
-                                key,
-                                expected_generation,
-                                actual_generation,
+                                key, expected_generation, actual_generation,
                             ),
                         );
                     }
@@ -440,9 +547,7 @@ pub(crate) fn handle_request(
             // Skip the expensive O(N) manifest hash scan when exact-entry
             // verification already confirmed every key's generation — the
             // manifest hash would recompute the same result.
-            if !exact_entries_verified
-                && let Some(expected_hash) = source_manifest
-            {
+            if !exact_entries_verified && let Some(expected_hash) = source_manifest {
                 let mut local_manifest = crate::cluster::coordinator::ManifestHasher::new();
                 for key in engine.keys_for_shard(shard) {
                     let meta = match engine.read_metadata(&key) {
@@ -472,9 +577,21 @@ pub(crate) fn handle_request(
                 }
             }
 
+            if verify_only {
+                return ResponseFrame {
+                    request_id: request.request_id,
+                    status: STATUS_OK,
+                    payload: Vec::new(),
+                };
+            }
+
             if let Some(cluster) = cluster {
                 if no_data_completion {
-                    cluster.mark_inbound_complete_all(shard);
+                    if let Some(from_node) = completion_from_node {
+                        cluster.mark_inbound_complete_from_source(shard, from_node);
+                    } else {
+                        cluster.mark_inbound_complete_all(shard);
+                    }
                 } else if let Some(from_node) = completion_from_node {
                     cluster.mark_inbound_complete_from_source(shard, from_node);
                 } else {
@@ -500,17 +617,22 @@ pub(crate) fn handle_request(
             // in a single TCP frame. Wire format:
             //   [shard_count:4][shard_id:2 × count][from_node:8]
             if request.payload.len() < 4 {
-                return error_response(request.request_id, ERR_INTERNAL, "batch-complete: too short");
+                return error_response(
+                    request.request_id,
+                    ERR_INTERNAL,
+                    "batch-complete: too short",
+                );
             }
-            let shard_count = u32::from_le_bytes(
-                request.payload[..4].try_into().unwrap(),
-            ) as usize;
+            let shard_count = u32::from_le_bytes(request.payload[..4].try_into().unwrap()) as usize;
             let expected_len = 4 + shard_count * 2 + 8;
             if request.payload.len() < expected_len {
                 return error_response(
                     request.request_id,
                     ERR_INTERNAL,
-                    &format!("batch-complete: need {expected_len} bytes, got {}", request.payload.len()),
+                    &format!(
+                        "batch-complete: need {expected_len} bytes, got {}",
+                        request.payload.len()
+                    ),
                 );
             }
             let mut shards = Vec::with_capacity(shard_count);
@@ -522,13 +644,13 @@ pub(crate) fn handle_request(
             }
             let from_node_off = 4 + shard_count * 2;
             let from_node = NodeId(u64::from_le_bytes(
-                request.payload[from_node_off..from_node_off + 8].try_into().unwrap(),
+                request.payload[from_node_off..from_node_off + 8]
+                    .try_into()
+                    .unwrap(),
             ));
 
             if let Some(cluster) = cluster {
-                for &shard in &shards {
-                    cluster.mark_inbound_complete_all(shard);
-                }
+                cluster.mark_inbound_complete_many_from_source(&shards, from_node);
                 // Batch-commit all shards where this node is the new master
                 // and no inbound is pending.
                 let self_id = cluster.self_id();
@@ -591,7 +713,11 @@ pub(crate) fn handle_request(
                         payload: vote.serialize(),
                     }
                 }
-                None => error_response(request.request_id, ERR_INTERNAL, "malformed topology propose"),
+                None => error_response(
+                    request.request_id,
+                    ERR_INTERNAL,
+                    "malformed topology propose",
+                ),
             }
         }
         OP_TOPOLOGY_VOTE => {
@@ -644,7 +770,11 @@ pub(crate) fn handle_request(
                                 ),
                             );
                         }
-                        tracing::info!(term = term, members = members.len(), "cluster: topology committed");
+                        tracing::info!(
+                            term = term,
+                            members = members.len(),
+                            "cluster: topology committed"
+                        );
                         // Signal the coordinator event loop to activate the
                         // shard table with the committed member list — only
                         // after the commit is durable.
@@ -656,7 +786,11 @@ pub(crate) fn handle_request(
                         payload: Vec::new(),
                     }
                 }
-                None => error_response(request.request_id, ERR_INTERNAL, "malformed topology commit"),
+                None => error_response(
+                    request.request_id,
+                    ERR_INTERNAL,
+                    "malformed topology commit",
+                ),
             }
         }
         _ => error_response(request.request_id, ERR_INTERNAL, "unknown opcode"),
@@ -711,7 +845,10 @@ pub(crate) fn handle_request(
 /// Returns `(first_seq, last_seq)` — the redo sequence range assigned to the
 /// appended entries. These are the authoritative sequence numbers used by
 /// replica catch-up and ACK tracking.
-fn write_redo_ops(redo_log: Option<&Mutex<RedoLog>>, ops: &[RedoOp]) -> std::result::Result<(u64, u64), String> {
+fn write_redo_ops(
+    redo_log: Option<&Mutex<RedoLog>>,
+    ops: &[RedoOp],
+) -> std::result::Result<(u64, u64), String> {
     let redo = match redo_log {
         Some(r) => r,
         None => return Ok((0, 0)),
@@ -723,11 +860,11 @@ fn write_redo_ops(redo_log: Option<&Mutex<RedoLog>>, ops: &[RedoOp]) -> std::res
     let first_seq = log.current_sequence();
     let mut last_seq = first_seq;
     for op in ops {
-        last_seq = log.append(op.clone())
+        last_seq = log
+            .append(op.clone())
             .map_err(|e| format!("redo log append: {e}"))?;
     }
-    log.flush()
-        .map_err(|e| format!("redo log flush: {e}"))?;
+    log.flush().map_err(|e| format!("redo log flush: {e}"))?;
     Ok((first_seq, last_seq))
 }
 
@@ -781,6 +918,50 @@ impl ReplicationOutcome {
     }
 }
 
+#[inline]
+fn valid_redo_range(range: (u64, u64)) -> bool {
+    range.0 != 0 && range.1 >= range.0
+}
+
+fn begin_replication_intent(range: (u64, u64)) -> std::result::Result<(), String> {
+    if !valid_redo_range(range) {
+        return Ok(());
+    }
+    if let Some(tracker) = REPLICATION_INTENT_TRACKER.get() {
+        tracker
+            .begin(range.0, range.1)
+            .map_err(|e| format!("replication intent begin: {e}"))?;
+    }
+    Ok(())
+}
+
+fn commit_replication_intent(range: (u64, u64)) -> std::result::Result<(), String> {
+    if !valid_redo_range(range) {
+        return Ok(());
+    }
+    if let Some(tracker) = REPLICATION_INTENT_TRACKER.get() {
+        tracker
+            .commit(range.0, range.1)
+            .map_err(|e| format!("replication intent commit: {e}"))?;
+    }
+    Ok(())
+}
+
+fn clear_replication_intent_after_compensation(range: (u64, u64)) {
+    if let Err(e) = commit_replication_intent(range) {
+        tracing::warn!(err = %e, "replication intent: failed to clear after compensation");
+    }
+}
+
+fn clear_replication_intent_after_success(range: (u64, u64)) {
+    if let Err(e) = commit_replication_intent(range) {
+        tracing::warn!(
+            err = %e,
+            "replication intent: failed to clear after successful replica ACKs; startup recovery will replay"
+        );
+    }
+}
+
 /// Send replication operations to replica nodes for the given keys.
 ///
 /// Uses the redo sequence range from `write_redo_ops()` to tag batches so
@@ -809,11 +990,15 @@ fn replicate_all_ops(
     if ops_by_key.is_empty() {
         return Ok(ReplicationOutcome::NotApplicable);
     }
+    begin_replication_intent(redo_seq_range)?;
 
     // Group all ops by target replica address
     let table = cluster.shard_table();
     let table_guard = table.read();
+    let rf = table_guard.replication_factor();
+    let expected_replicas_per_key = rf.saturating_sub(1) as usize;
     let mut by_addr: HashMap<SocketAddr, Vec<ReplicaOp>> = HashMap::new();
+    let mut target_errors = Vec::new();
 
     for (key, ops) in ops_by_key {
         let shard = ShardTable::shard_for_key(key);
@@ -822,22 +1007,58 @@ fn replicate_all_ops(
         // NEW member list — the old assignment may reference dead nodes whose
         // departure triggered the topology change.
         let assignment = table_guard.target_assignment(shard);
+        if rf > 1 && assignment.replicas.len() < expected_replicas_per_key {
+            target_errors.push(format!(
+                "shard {shard} has {} replica targets, expected {expected_replicas_per_key} for RF={rf}",
+                assignment.replicas.len(),
+            ));
+            continue;
+        }
         for replica_id in &assignment.replicas {
-            if let Some(addr) = cluster.node_addr(replica_id) {
-                by_addr.entry(addr).or_default().extend(ops.clone());
+            match cluster.node_addr(replica_id) {
+                Some(addr) => {
+                    by_addr.entry(addr).or_default().extend(ops.clone());
+                }
+                None if rf > 1 => {
+                    target_errors.push(format!(
+                        "shard {shard} replica node {} has no resolved address",
+                        replica_id.0,
+                    ));
+                }
+                None => {}
             }
         }
     }
     drop(table_guard);
 
+    if !target_errors.is_empty() {
+        target_errors.sort();
+        target_errors.dedup();
+        return Err(format!(
+            "replication target resolution failed: {}",
+            target_errors.join("; "),
+        ));
+    }
+
     if by_addr.is_empty() {
         // No replicas configured or no replica addresses known.
+        if rf > 1 {
+            return Err(format!(
+                "replication target resolution failed: no replica targets for RF={rf}",
+            ));
+        }
+        clear_replication_intent_after_success(redo_seq_range);
         return Ok(ReplicationOutcome::NotApplicable);
     }
 
     // Send to all replica targets in parallel using the shared replication
     // runtime. Each send runs on a blocking task (reusing pooled threads)
     // instead of spawning a new OS thread per replication call.
+    let source_node_id = cluster.self_id().0;
+    let ack_timeout = replication_ack_timeout_for(
+        cluster.replication_timeout(),
+        cluster.migration_pressure_active(),
+    );
     let results: Vec<std::result::Result<(), String>> = REPL_RUNTIME.block_on(async {
         let mut handles = Vec::with_capacity(by_addr.len());
         for (addr, ops) in by_addr {
@@ -849,13 +1070,18 @@ fn replicate_all_ops(
                     first_sequence: redo_seq_range.0,
                     ops,
                     trace_ctx: crate::observability::WireTraceContext::from_current_span(),
+                    source_node_id: Some(source_node_id),
                 };
-                send_replica_batch_to(addr, &batch)
+                send_replica_batch_to(addr, &batch, ack_timeout)
             }));
         }
         let mut results = Vec::with_capacity(handles.len());
         for handle in handles {
-            results.push(handle.await.unwrap_or_else(|_| Err("task panicked".to_string())));
+            results.push(
+                handle
+                    .await
+                    .unwrap_or_else(|_| Err("task panicked".to_string())),
+            );
         }
         results
     });
@@ -864,7 +1090,9 @@ fn replicate_all_ops(
     let mut last_error: Option<String> = None;
     for result in &results {
         match result {
-            Ok(()) => { ack_count += 1; }
+            Ok(()) => {
+                ack_count += 1;
+            }
             Err(e) => {
                 tracing::warn!(err = %e, "replication to replica failed");
                 last_error = Some(e.clone());
@@ -895,6 +1123,7 @@ fn replicate_all_ops(
                 total_targets,
                 "replication: degraded ack (best_effort)",
             );
+            clear_replication_intent_after_success(redo_seq_range);
             Ok(ReplicationOutcome::Full)
         }
         ReplicationClassification::ZeroAckBestEffort => {
@@ -910,10 +1139,115 @@ fn replicate_all_ops(
                 err = %last_error.clone().unwrap_or_default(),
                 "replication: DEGRADED DURABILITY — 0 replicas ACKed, client will receive STATUS_DEGRADED_DURABILITY (best_effort)",
             );
+            clear_replication_intent_after_success(redo_seq_range);
             Ok(ReplicationOutcome::Degraded)
         }
-        ReplicationClassification::FullAck => Ok(ReplicationOutcome::Full),
+        ReplicationClassification::FullAck => {
+            clear_replication_intent_after_success(redo_seq_range);
+            Ok(ReplicationOutcome::Full)
+        }
     }
+}
+
+fn replication_ack_timeout_for(base: Duration, migration_pressure: bool) -> Duration {
+    if migration_pressure {
+        base.max(MIGRATION_REPLICATION_TIMEOUT_FLOOR)
+    } else {
+        base
+    }
+}
+
+/// Resolve durable pending replication intents before the server starts
+/// serving client traffic.
+///
+/// Any range left in the intent tracker means the previous process applied a
+/// mutation locally but crashed before it could prove the replica ACK policy
+/// and clear the marker. We reconstruct replica ops from the redo log and
+/// replicate them to the current target holders. If any range cannot be
+/// resolved, startup must fail closed.
+pub fn recover_pending_replication_intents(
+    cluster: &RunningCluster,
+    redo_log: Option<&Mutex<RedoLog>>,
+    engine: &Engine,
+) -> std::result::Result<(), String> {
+    let tracker = match REPLICATION_INTENT_TRACKER.get() {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    recover_pending_replication_intents_from_tracker(tracker, redo_log, engine, |ops, range| {
+        replicate_all_ops(Some(cluster), ops, range).map(|_| ())
+    })
+}
+
+fn recover_pending_replication_intents_from_tracker<F>(
+    tracker: &crate::replication::durable::ReplicationIntentTracker,
+    redo_log: Option<&Mutex<RedoLog>>,
+    engine: &Engine,
+    mut replicate: F,
+) -> std::result::Result<(), String>
+where
+    F: FnMut(&[(TxKey, Vec<ReplicaOp>)], (u64, u64)) -> std::result::Result<(), String>,
+{
+    let pending = tracker.pending();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let redo_log = redo_log.ok_or_else(|| {
+        format!(
+            "replication intent recovery requires redo log; {} pending range(s)",
+            pending.len(),
+        )
+    })?;
+
+    for range in pending {
+        let entries = {
+            let log = redo_log.lock();
+            log.read_from_sequence(range.first_sequence)
+                .map_err(|e| format!("read redo for pending replication intent: {e}"))?
+        };
+        let entries: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| {
+                entry.sequence >= range.first_sequence && entry.sequence <= range.last_sequence
+            })
+            .collect();
+        if entries.is_empty()
+            || entries.first().map(|e| e.sequence) != Some(range.first_sequence)
+            || entries.last().map(|e| e.sequence) != Some(range.last_sequence)
+        {
+            return Err(format!(
+                "pending replication intent {}..{} cannot be resolved: redo entries missing",
+                range.first_sequence, range.last_sequence,
+            ));
+        }
+
+        let mut ops_by_key = Vec::new();
+        for entry in &entries {
+            let Some(tx_key) = entry.op.tx_key().copied() else {
+                continue;
+            };
+            let shard = ShardTable::shard_for_key(&tx_key);
+            if let Some(op) =
+                crate::cluster::coordinator::redo_entry_to_replica_op(entry, shard, engine)
+            {
+                ops_by_key.push((tx_key, vec![op]));
+            }
+        }
+
+        if ops_by_key.is_empty() {
+            tracker
+                .commit(range.first_sequence, range.last_sequence)
+                .map_err(|e| format!("replication intent commit: {e}"))?;
+            continue;
+        }
+
+        replicate(&ops_by_key, (range.first_sequence, range.last_sequence))?;
+        tracker
+            .commit(range.first_sequence, range.last_sequence)
+            .map_err(|e| format!("replication intent commit: {e}"))?;
+    }
+
+    Ok(())
 }
 
 /// Classification of an ACK tally against the configured ACK policy.
@@ -1030,12 +1364,17 @@ fn compensate_replication_failure(
                 ReplicaOp::Spend { offset, .. } => {
                     if let Ok(slot) = engine.read_slot(key, *offset) {
                         let req = crate::ops::unspend::UnspendRequest {
-                            tx_key: *key, offset: *offset, utxo_hash: slot.hash,
-                            current_block_height: 0, block_height_retention: 0,
+                            tx_key: *key,
+                            offset: *offset,
+                            utxo_hash: slot.hash,
+                            current_block_height: 0,
+                            block_height_retention: 0,
                         };
                         let _ = engine.unspend(&req);
                         comp_redo.push(RedoOp::Unspend {
-                            tx_key: *key, offset: *offset, new_spent_count: 0,
+                            tx_key: *key,
+                            offset: *offset,
+                            new_spent_count: 0,
                         });
                     }
                 }
@@ -1045,54 +1384,77 @@ fn compensate_replication_failure(
                         let req = crate::ops::spend::SpendMultiRequest {
                             tx_key: *key,
                             spends: vec![crate::ops::spend::SpendItem {
-                                offset: *offset, utxo_hash: slot.hash,
-                                spending_data: [0u8; 36], idx: 0,
+                                offset: *offset,
+                                utxo_hash: slot.hash,
+                                spending_data: [0u8; 36],
+                                idx: 0,
                             }],
-                            ignore_conflicting: true, ignore_locked: true,
-                            current_block_height: 0, block_height_retention: 0,
+                            ignore_conflicting: true,
+                            ignore_locked: true,
+                            current_block_height: 0,
+                            block_height_retention: 0,
                         };
                         if let Ok(v) = engine.validate_spend_multi(&req) {
                             let _ = v.apply(engine);
                         }
                         comp_redo.push(RedoOp::Spend {
-                            tx_key: *key, offset: *offset,
-                            spending_data: [0u8; 36], new_spent_count: 0,
+                            tx_key: *key,
+                            offset: *offset,
+                            spending_data: [0u8; 36],
+                            new_spent_count: 0,
                         });
                     }
                 }
                 ReplicaOp::Freeze { offset, .. } => {
                     if let Ok(slot) = engine.read_slot(key, *offset) {
                         let req = crate::ops::remaining::UnfreezeRequest {
-                            tx_key: *key, offset: *offset, utxo_hash: slot.hash,
+                            tx_key: *key,
+                            offset: *offset,
+                            utxo_hash: slot.hash,
                         };
                         let _ = engine.unfreeze(&req);
                         comp_redo.push(RedoOp::Unfreeze {
-                            tx_key: *key, offset: *offset,
+                            tx_key: *key,
+                            offset: *offset,
                         });
                     }
                 }
                 ReplicaOp::Unfreeze { offset, .. } => {
                     if let Ok(slot) = engine.read_slot(key, *offset) {
                         let req = crate::ops::remaining::FreezeRequest {
-                            tx_key: *key, offset: *offset, utxo_hash: slot.hash,
+                            tx_key: *key,
+                            offset: *offset,
+                            utxo_hash: slot.hash,
                         };
                         let _ = engine.freeze(&req);
                         comp_redo.push(RedoOp::Freeze {
-                            tx_key: *key, offset: *offset,
+                            tx_key: *key,
+                            offset: *offset,
                         });
                     }
                 }
-                ReplicaOp::SetMined { block_id, block_height, subtree_idx, .. } => {
+                ReplicaOp::SetMined {
+                    block_id,
+                    block_height,
+                    subtree_idx,
+                    ..
+                } => {
                     let req = crate::ops::set_mined::SetMinedRequest {
-                        tx_key: *key, block_id: *block_id,
-                        block_height: *block_height, subtree_idx: *subtree_idx,
-                        on_longest_chain: false, unset_mined: true,
-                        current_block_height: 0, block_height_retention: 0,
+                        tx_key: *key,
+                        block_id: *block_id,
+                        block_height: *block_height,
+                        subtree_idx: *subtree_idx,
+                        on_longest_chain: false,
+                        unset_mined: true,
+                        current_block_height: 0,
+                        block_height_retention: 0,
                     };
                     let _ = engine.set_mined(&req);
                     comp_redo.push(RedoOp::SetMined {
-                        tx_key: *key, block_id: *block_id,
-                        block_height: *block_height, subtree_idx: *subtree_idx,
+                        tx_key: *key,
+                        block_id: *block_id,
+                        block_height: *block_height,
+                        subtree_idx: *subtree_idx,
                         unset: true,
                     });
                 }
@@ -1102,18 +1464,31 @@ fn compensate_replication_failure(
                     // defaults. The caller (set_mined handler) should have
                     // included these in the op if they were needed for reversal.
                     let req = crate::ops::set_mined::SetMinedRequest {
-                        tx_key: *key, block_id: *block_id,
-                        block_height: 0, subtree_idx: 0,
-                        on_longest_chain: true, unset_mined: false,
-                        current_block_height: 0, block_height_retention: 0,
+                        tx_key: *key,
+                        block_id: *block_id,
+                        block_height: 0,
+                        subtree_idx: 0,
+                        on_longest_chain: true,
+                        unset_mined: false,
+                        current_block_height: 0,
+                        block_height_retention: 0,
                     };
                     let _ = engine.set_mined(&req);
                     comp_redo.push(RedoOp::SetMined {
-                        tx_key: *key, block_id: *block_id,
-                        block_height: 0, subtree_idx: 0, unset: false,
+                        tx_key: *key,
+                        block_id: *block_id,
+                        block_height: 0,
+                        subtree_idx: 0,
+                        unset: false,
                     });
                 }
-                ReplicaOp::Reassign { offset, new_hash, block_height, spendable_after, .. } => {
+                ReplicaOp::Reassign {
+                    offset,
+                    new_hash,
+                    block_height,
+                    spendable_after,
+                    ..
+                } => {
                     // Reverse reassign: reassign back to the old hash. The
                     // old hash is the current slot hash (since the reassign
                     // was already applied, the slot now has new_hash). We need
@@ -1122,15 +1497,17 @@ fn compensate_replication_failure(
                     // In practice, reassign compensation is rare (only on
                     // frozen UTXOs during coinbase maturation).
                     let req = crate::ops::remaining::ReassignRequest {
-                        tx_key: *key, offset: *offset,
-                        utxo_hash: *new_hash, // current hash after reassign
-                        new_utxo_hash: [0u8; 32],  // can't restore original
+                        tx_key: *key,
+                        offset: *offset,
+                        utxo_hash: *new_hash,     // current hash after reassign
+                        new_utxo_hash: [0u8; 32], // can't restore original
                         block_height: *block_height,
                         spendable_after: *spendable_after,
                     };
                     let _ = engine.reassign(&req);
                     comp_redo.push(RedoOp::Reassign {
-                        tx_key: *key, offset: *offset,
+                        tx_key: *key,
+                        offset: *offset,
                         new_hash: [0u8; 32],
                         block_height: *block_height,
                         spendable_after: *spendable_after,
@@ -1144,55 +1521,70 @@ fn compensate_replication_failure(
                     // (could have been SPENT or FROZEN), but UNSPENT is the
                     // safest default since the record will be re-evaluated.
                     if let Some(entry) = engine.lookup(key)
-                        && let Ok(mut slot) = crate::io::read_utxo_slot(
-                            engine.device(), entry.record_offset, *offset,
-                        )
+                        && let Ok(mut slot) =
+                            crate::io::read_utxo_slot(engine.device(), entry.record_offset, *offset)
                         && slot.status == crate::record::UTXO_PRUNED
                     {
                         slot.status = crate::record::UTXO_UNSPENT;
                         let _ = crate::io::write_utxo_slot(
-                            engine.device(), entry.record_offset, *offset, &slot,
+                            engine.device(),
+                            entry.record_offset,
+                            *offset,
+                            &slot,
                         );
                     }
                     // No redo entry needed: PruneSlot is only generated during
                     // migration delta replay, not from client dispatch handlers.
                 }
-                ReplicaOp::SetConflicting { value, current_block_height, retention, .. } => {
+                ReplicaOp::SetConflicting {
+                    value,
+                    current_block_height,
+                    retention,
+                    ..
+                } => {
                     let req = crate::ops::remaining::SetConflictingRequest {
-                        tx_key: *key, value: !value,
+                        tx_key: *key,
+                        value: !value,
                         current_block_height: *current_block_height,
                         block_height_retention: *retention,
                     };
                     let _ = engine.set_conflicting(&req);
                     comp_redo.push(RedoOp::SetConflicting {
-                        tx_key: *key, value: !value,
+                        tx_key: *key,
+                        value: !value,
                         current_block_height: *current_block_height,
                         block_height_retention: *retention,
                     });
                 }
                 ReplicaOp::SetLocked { value, .. } => {
                     let req = crate::ops::remaining::SetLockedRequest {
-                        tx_key: *key, value: !value,
+                        tx_key: *key,
+                        value: !value,
                     };
                     let _ = engine.set_locked(&req);
                     comp_redo.push(RedoOp::SetLocked {
-                        tx_key: *key, value: !value,
+                        tx_key: *key,
+                        value: !value,
                     });
                 }
                 ReplicaOp::PreserveUntil { .. } => {
                     let req = crate::ops::remaining::PreserveUntilRequest {
-                        tx_key: *key, block_height: 0,
+                        tx_key: *key,
+                        block_height: 0,
                     };
                     let _ = engine.preserve_until(&req);
                     comp_redo.push(RedoOp::PreserveUntil {
-                        tx_key: *key, block_height: 0,
+                        tx_key: *key,
+                        block_height: 0,
                     });
                 }
                 ReplicaOp::Create { .. } => {
                     let req = crate::ops::remaining::DeleteRequest { tx_key: *key };
                     let _ = engine.delete(&req);
                     comp_redo.push(RedoOp::Delete {
-                        tx_key: *key, record_offset: 0, record_size: 0,
+                        tx_key: *key,
+                        record_offset: 0,
+                        record_size: 0,
                     });
                 }
                 ReplicaOp::Delete { .. } => {
@@ -1220,14 +1612,20 @@ fn compensate_replication_failure(
 fn send_replica_batch_to(
     addr: SocketAddr,
     batch: &ReplicaBatch,
+    ack_timeout: Duration,
 ) -> std::result::Result<(), String> {
     // Get or create the per-address slot. The outer pool lock is held
     // only for the HashMap lookup/insert, not during I/O.
     let slot = {
         let mut pool = REPL_POOL.lock();
-        pool.entry(addr).or_insert_with(|| {
-            std::sync::Arc::new(Mutex::new(PerAddrSlot { connection: None, last_acked: 0 }))
-        }).clone()
+        pool.entry(addr)
+            .or_insert_with(|| {
+                std::sync::Arc::new(Mutex::new(PerAddrSlot {
+                    connection: None,
+                    last_acked: 0,
+                }))
+            })
+            .clone()
     };
 
     // Lock only this address's slot. Other addresses are uncontended.
@@ -1235,25 +1633,24 @@ fn send_replica_batch_to(
 
     let mut transport = match slot_guard.connection.take() {
         Some(t) if t.is_connected() => t,
-        _ => {
-            TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5))
-                .map_err(|e| format!("connect: {e}"))?
-        }
+        _ => TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5))
+            .map_err(|e| format!("connect: {e}"))?,
     };
 
     if let Err(e) = transport.send_batch(batch) {
         // Connection may be stale (broken by partition, killed node, etc.).
         // Drop the broken transport and reconnect once before giving up.
         drop(transport);
-        let mut retry_transport = TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5))
-            .map_err(|e2| format!("send: {e}; reconnect: {e2}"))?;
+        let mut retry_transport =
+            TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5))
+                .map_err(|e2| format!("send: {e}; reconnect: {e2}"))?;
         if let Err(e2) = retry_transport.send_batch(batch) {
             return Err(format!("send after reconnect: {e2}"));
         }
         transport = retry_transport;
     }
 
-    match transport.recv_ack(Duration::from_secs(3)) {
+    match transport.recv_ack(ack_timeout) {
         Ok(ReplicaAck::Ok { through_sequence }) => {
             slot_guard.connection = Some(transport);
             slot_guard.last_acked = through_sequence;
@@ -1267,9 +1664,7 @@ fn send_replica_batch_to(
             slot_guard.connection = Some(transport);
             Err(format!("replica error: {message}"))
         }
-        Err(e) => {
-            Err(format!("recv_ack: {e}"))
-        }
+        Err(e) => Err(format!("recv_ack: {e}")),
     }
 }
 
@@ -1356,7 +1751,10 @@ fn check_shard_ownership(
         // Reads are handled separately with a wait loop.
         if !allow_if_migrating && cluster.has_pending_inbound(&key) {
             let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
-            tracing::debug!(shard, "dispatch: write rejected — pending inbound migration");
+            tracing::debug!(
+                shard,
+                "dispatch: write rejected — pending inbound migration"
+            );
             return Some(BatchItemError {
                 item_index,
                 error_code: ERR_MIGRATION_IN_PROGRESS,
@@ -1365,7 +1763,10 @@ fn check_shard_ownership(
         }
         if !allow_if_migrating && cluster.is_shard_write_fenced(&key) {
             let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
-            tracing::debug!(shard, "dispatch: write rejected — write-fenced (delta streaming)");
+            tracing::debug!(
+                shard,
+                "dispatch: write rejected — write-fenced (delta streaming)"
+            );
             return Some(BatchItemError {
                 item_index,
                 error_code: ERR_MIGRATION_IN_PROGRESS,
@@ -1583,9 +1984,11 @@ fn handle_spend_batch(
         // Dual-write: labeled operations table.
         use crate::metrics::{OpCode, Outcome};
         m.operations.inc_by(OpCode::Spend, Outcome::Ok, succeeded);
-        m.operations.inc_by(OpCode::Spend, Outcome::Idempotent, idempotent_total);
+        m.operations
+            .inc_by(OpCode::Spend, Outcome::Idempotent, idempotent_total);
         for e in &errors {
-            m.operations.inc(OpCode::Spend, classify_wire_error_code(e.error_code));
+            m.operations
+                .inc(OpCode::Spend, classify_wire_error_code(e.error_code));
         }
     }
 
@@ -1594,6 +1997,7 @@ fn handle_spend_batch(
         Ok(o) => o,
         Err(e) => {
             compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            clear_replication_intent_after_compensation(spend_redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -1658,7 +2062,12 @@ fn handle_unspend_batch(
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
     // Phase 1: Validate ownership and build redo ops from request parameters.
-    struct ValidUnspend<'a> { idx: usize, key: TxKey, item: &'a WireSlotItem, pre_generation: u32 }
+    struct ValidUnspend<'a> {
+        idx: usize,
+        key: TxKey,
+        item: &'a WireSlotItem,
+        pre_generation: u32,
+    }
     let mut valid_items: Vec<ValidUnspend> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
@@ -1675,7 +2084,12 @@ fn handle_unspend_batch(
             offset: item.vout,
             new_spent_count: 0,
         });
-        valid_items.push(ValidUnspend { idx: i, key, item, pre_generation });
+        valid_items.push(ValidUnspend {
+            idx: i,
+            key,
+            item,
+            pre_generation,
+        });
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
@@ -1703,11 +2117,14 @@ fn handle_unspend_batch(
                 } else {
                     succeeded += 1;
                 }
-                repl_ops_by_key.push((v.key, vec![ReplicaOp::Unspend {
-                    tx_key: v.key,
-                    offset: v.item.vout,
-                    master_generation: resp.generation,
-                }]));
+                repl_ops_by_key.push((
+                    v.key,
+                    vec![ReplicaOp::Unspend {
+                        tx_key: v.key,
+                        offset: v.item.vout,
+                        master_generation: resp.generation,
+                    }],
+                ));
             }
             Err(err) => {
                 errors.push(spend_error_to_batch_error(v.idx as u32, &err));
@@ -1726,9 +2143,11 @@ fn handle_unspend_batch(
         // Dual-write: labeled operations table.
         use crate::metrics::{OpCode, Outcome};
         m.operations.inc_by(OpCode::Unspend, Outcome::Ok, succeeded);
-        m.operations.inc_by(OpCode::Unspend, Outcome::Idempotent, idempotent);
+        m.operations
+            .inc_by(OpCode::Unspend, Outcome::Idempotent, idempotent);
         for e in &errors {
-            m.operations.inc(OpCode::Unspend, classify_wire_error_code(e.error_code));
+            m.operations
+                .inc(OpCode::Unspend, classify_wire_error_code(e.error_code));
         }
     }
 
@@ -1737,6 +2156,7 @@ fn handle_unspend_batch(
         Ok(o) => o,
         Err(e) => {
             compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -1771,7 +2191,10 @@ fn handle_set_mined_batch(
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
     // Phase 1: Validate ownership and build redo ops from request params.
-    struct ValidSetMined { idx: usize, key: TxKey }
+    struct ValidSetMined {
+        idx: usize,
+        key: TxKey,
+    }
     let mut valid_items: Vec<ValidSetMined> = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
@@ -1816,20 +2239,26 @@ fn handle_set_mined_batch(
                 succeeded += 1;
                 let mgen = resp.generation;
                 if params.unset_mined {
-                    repl_ops_by_key.push((v.key, vec![ReplicaOp::UnsetMined {
-                        tx_key: v.key,
-                        block_id: params.block_id,
-                        master_generation: mgen,
-                    }]));
+                    repl_ops_by_key.push((
+                        v.key,
+                        vec![ReplicaOp::UnsetMined {
+                            tx_key: v.key,
+                            block_id: params.block_id,
+                            master_generation: mgen,
+                        }],
+                    ));
                 } else {
-                    repl_ops_by_key.push((v.key, vec![ReplicaOp::SetMined {
-                        tx_key: v.key,
-                        block_id: params.block_id,
-                        block_height: params.block_height,
-                        subtree_idx: params.subtree_idx,
-                        on_longest_chain: params.on_longest_chain,
-                        master_generation: mgen,
-                    }]));
+                    repl_ops_by_key.push((
+                        v.key,
+                        vec![ReplicaOp::SetMined {
+                            tx_key: v.key,
+                            block_id: params.block_id,
+                            block_height: params.block_height,
+                            subtree_idx: params.subtree_idx,
+                            on_longest_chain: params.on_longest_chain,
+                            master_generation: mgen,
+                        }],
+                    ));
                 }
             }
             Err(err) => {
@@ -1844,9 +2273,11 @@ fn handle_set_mined_batch(
         m.set_mined_items_failed.inc_by(failed_total);
         // Dual-write: labeled operations table.
         use crate::metrics::{OpCode, Outcome};
-        m.operations.inc_by(OpCode::SetMined, Outcome::Ok, succeeded);
+        m.operations
+            .inc_by(OpCode::SetMined, Outcome::Ok, succeeded);
         for e in &errors {
-            m.operations.inc(OpCode::SetMined, classify_wire_error_code(e.error_code));
+            m.operations
+                .inc(OpCode::SetMined, classify_wire_error_code(e.error_code));
         }
     }
 
@@ -1855,6 +2286,7 @@ fn handle_set_mined_batch(
         Ok(o) => o,
         Err(e) => {
             compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -1863,7 +2295,9 @@ fn handle_set_mined_batch(
     // set_mined_attempted incremented at dispatch entry. Tick succeeded only
     // if no items failed to preserve a useful "batches that fully succeeded"
     // gauge separate from item-level accounting.
-    if let Some(m) = DISPATCH_METRICS.get() && failed_total == 0 {
+    if let Some(m) = DISPATCH_METRICS.get()
+        && failed_total == 0
+    {
         m.set_mined_succeeded.inc();
     }
 
@@ -1885,28 +2319,50 @@ fn parse_cold_data_fields(cold_data: &[u8]) -> (Option<&[u8]>, Option<&[u8]>, Op
 
     let il = u32::from_le_bytes(cold_data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
-    if pos + il > cold_data.len() { return (None, None, None); }
+    if pos + il > cold_data.len() {
+        return (None, None, None);
+    }
     let inputs = &cold_data[pos..pos + il];
     pos += il;
 
-    let inputs_opt = if inputs.is_empty() { None } else { Some(inputs) };
+    let inputs_opt = if inputs.is_empty() {
+        None
+    } else {
+        Some(inputs)
+    };
 
-    if pos + 4 > cold_data.len() { return (inputs_opt, None, None); }
+    if pos + 4 > cold_data.len() {
+        return (inputs_opt, None, None);
+    }
     let ol = u32::from_le_bytes(cold_data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
-    if pos + ol > cold_data.len() { return (inputs_opt, None, None); }
+    if pos + ol > cold_data.len() {
+        return (inputs_opt, None, None);
+    }
     let outputs = &cold_data[pos..pos + ol];
     pos += ol;
 
-    let outputs_opt = if outputs.is_empty() { None } else { Some(outputs) };
+    let outputs_opt = if outputs.is_empty() {
+        None
+    } else {
+        Some(outputs)
+    };
 
-    if pos + 4 > cold_data.len() { return (inputs_opt, outputs_opt, None); }
+    if pos + 4 > cold_data.len() {
+        return (inputs_opt, outputs_opt, None);
+    }
     let pl = u32::from_le_bytes(cold_data[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
-    if pos + pl > cold_data.len() { return (inputs_opt, outputs_opt, None); }
+    if pos + pl > cold_data.len() {
+        return (inputs_opt, outputs_opt, None);
+    }
     let inpoints = &cold_data[pos..pos + pl];
 
-    let inpoints_opt = if inpoints.is_empty() { None } else { Some(inpoints) };
+    let inpoints_opt = if inpoints.is_empty() {
+        None
+    } else {
+        Some(inpoints)
+    };
 
     (inputs_opt, outputs_opt, inpoints_opt)
 }
@@ -1962,9 +2418,7 @@ fn handle_create_batch(
 
         // Check whether this item uses an externally-uploaded blob.
         let is_ext = item.flags & FLAG_EXTERNAL_BLOB != 0;
-        if is_ext
-            && let Some(bs) = blob_store
-        {
+        if is_ext && let Some(bs) = blob_store {
             match bs.exists(&item.txid) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -2024,7 +2478,11 @@ fn handle_create_batch(
                     record_offset,
                     utxo_count,
                 });
-                valid_items.push(ValidCreate { idx: i, create_req, record_offset });
+                valid_items.push(ValidCreate {
+                    idx: i,
+                    create_req,
+                    record_offset,
+                });
             }
             Err(CreateError::DuplicateTxId) => {
                 errors.push(BatchItemError {
@@ -2055,10 +2513,16 @@ fn handle_create_batch(
                     0u64
                 } else {
                     build_cold_data(
-                        v.create_req.inputs, v.create_req.outputs, v.create_req.inpoints,
-                    ).len() as u64
+                        v.create_req.inputs,
+                        v.create_req.outputs,
+                        v.create_req.inpoints,
+                    )
+                    .len() as u64
                 };
-                let _ = engine.allocator().lock().free(v.record_offset, base_size + cold_len);
+                let _ = engine
+                    .allocator()
+                    .lock()
+                    .free(v.record_offset, base_size + cold_len);
             }
             return error_response(req.request_id, ERR_INTERNAL, &e);
         }
@@ -2087,9 +2551,13 @@ fn handle_create_batch(
                 // Lifecycle 24 bytes
                 let (r_gen, r_upd, r_ums, r_dah, r_pu) =
                     if let Ok(meta) = engine.read_metadata(&key) {
-                        ({ meta.generation }, { meta.updated_at },
-                         { meta.unmined_since }, { meta.delete_at_height },
-                         { meta.preserve_until })
+                        (
+                            { meta.generation },
+                            { meta.updated_at },
+                            { meta.unmined_since },
+                            { meta.delete_at_height },
+                            { meta.preserve_until },
+                        )
                     } else {
                         (0u32, 0u64, 0u32, 0u32, 0u32)
                     };
@@ -2112,13 +2580,20 @@ fn handle_create_batch(
                     meta_buf.extend_from_slice(ptx);
                 }
 
-                repl_ops_by_key.push((key, vec![ReplicaOp::Create {
-                    tx_key: key,
-                    metadata_bytes: meta_buf,
-                    utxo_hashes: item.utxo_hashes.clone(),
-                    cold_data: if item.cold_data.is_empty() { None } else { Some(item.cold_data.clone()) },
-                    is_external: item.flags & FLAG_EXTERNAL_BLOB != 0,
-                }]));
+                repl_ops_by_key.push((
+                    key,
+                    vec![ReplicaOp::Create {
+                        tx_key: key,
+                        metadata_bytes: meta_buf,
+                        utxo_hashes: item.utxo_hashes.clone(),
+                        cold_data: if item.cold_data.is_empty() {
+                            None
+                        } else {
+                            Some(item.cold_data.clone())
+                        },
+                        is_external: item.flags & FLAG_EXTERNAL_BLOB != 0,
+                    }],
+                ));
             }
             Err(CreateError::DuplicateTxId) => {
                 errors.push(BatchItemError {
@@ -2142,6 +2617,7 @@ fn handle_create_batch(
         Ok(o) => o,
         Err(e) => {
             compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -2154,9 +2630,11 @@ fn handle_create_batch(
         m.creates_failed.inc_by(failed_total);
         // Dual-write: labeled operations table.
         use crate::metrics::{OpCode, Outcome};
-        m.operations.inc_by(OpCode::Create, Outcome::Ok, succeeded_total);
+        m.operations
+            .inc_by(OpCode::Create, Outcome::Ok, succeeded_total);
         for e in &errors {
-            m.operations.inc(OpCode::Create, classify_wire_error_code(e.error_code));
+            m.operations
+                .inc(OpCode::Create, classify_wire_error_code(e.error_code));
         }
     }
 
@@ -2185,7 +2663,11 @@ fn handle_freeze_batch(
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
     // Phase 1: Validate ownership and build redo ops from request params.
-    struct ValidFreeze<'a> { idx: usize, key: TxKey, item: &'a WireSlotItem }
+    struct ValidFreeze<'a> {
+        idx: usize,
+        key: TxKey,
+        item: &'a WireSlotItem,
+    }
     let mut valid_items: Vec<ValidFreeze> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
@@ -2193,7 +2675,10 @@ fn handle_freeze_batch(
             continue;
         }
         let key = TxKey { txid: item.txid };
-        redo_ops.push(RedoOp::Freeze { tx_key: key, offset: item.vout });
+        redo_ops.push(RedoOp::Freeze {
+            tx_key: key,
+            offset: item.vout,
+        });
         valid_items.push(ValidFreeze { idx: i, key, item });
     }
     let total_items = items.len() as u64;
@@ -2213,11 +2698,14 @@ fn handle_freeze_batch(
             utxo_hash: v.item.utxo_hash,
         }) {
             Ok(mgen) => {
-                repl_ops_by_key.push((v.key, vec![ReplicaOp::Freeze {
-                    tx_key: v.key,
-                    offset: v.item.vout,
-                    master_generation: mgen,
-                }]));
+                repl_ops_by_key.push((
+                    v.key,
+                    vec![ReplicaOp::Freeze {
+                        tx_key: v.key,
+                        offset: v.item.vout,
+                        master_generation: mgen,
+                    }],
+                ));
             }
             Err(err) => {
                 errors.push(spend_error_to_batch_error(v.idx as u32, &err));
@@ -2230,6 +2718,7 @@ fn handle_freeze_batch(
         Ok(o) => o,
         Err(e) => {
             compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -2241,9 +2730,11 @@ fn handle_freeze_batch(
         m.freezes_failed.inc_by(failed_total);
         // Dual-write: labeled operations table.
         use crate::metrics::{OpCode, Outcome};
-        m.operations.inc_by(OpCode::Freeze, Outcome::Ok, succeeded_total);
+        m.operations
+            .inc_by(OpCode::Freeze, Outcome::Ok, succeeded_total);
         for e in &errors {
-            m.operations.inc(OpCode::Freeze, classify_wire_error_code(e.error_code));
+            m.operations
+                .inc(OpCode::Freeze, classify_wire_error_code(e.error_code));
         }
     }
 
@@ -2269,7 +2760,11 @@ fn handle_unfreeze_batch(
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
     // Phase 1: Validate ownership and build redo ops from request params.
-    struct ValidUnfreeze<'a> { idx: usize, key: TxKey, item: &'a WireSlotItem }
+    struct ValidUnfreeze<'a> {
+        idx: usize,
+        key: TxKey,
+        item: &'a WireSlotItem,
+    }
     let mut valid_items: Vec<ValidUnfreeze> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
@@ -2277,7 +2772,10 @@ fn handle_unfreeze_batch(
             continue;
         }
         let key = TxKey { txid: item.txid };
-        redo_ops.push(RedoOp::Unfreeze { tx_key: key, offset: item.vout });
+        redo_ops.push(RedoOp::Unfreeze {
+            tx_key: key,
+            offset: item.vout,
+        });
         valid_items.push(ValidUnfreeze { idx: i, key, item });
     }
 
@@ -2296,11 +2794,14 @@ fn handle_unfreeze_batch(
             utxo_hash: v.item.utxo_hash,
         }) {
             Ok(mgen) => {
-                repl_ops_by_key.push((v.key, vec![ReplicaOp::Unfreeze {
-                    tx_key: v.key,
-                    offset: v.item.vout,
-                    master_generation: mgen,
-                }]));
+                repl_ops_by_key.push((
+                    v.key,
+                    vec![ReplicaOp::Unfreeze {
+                        tx_key: v.key,
+                        offset: v.item.vout,
+                        master_generation: mgen,
+                    }],
+                ));
             }
             Err(err) => {
                 errors.push(spend_error_to_batch_error(v.idx as u32, &err));
@@ -2313,6 +2814,7 @@ fn handle_unfreeze_batch(
         Ok(o) => o,
         Err(e) => {
             compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -2324,9 +2826,11 @@ fn handle_unfreeze_batch(
         m.unfreezes_failed.inc_by(failed_total);
         // Dual-write: labeled operations table.
         use crate::metrics::{OpCode, Outcome};
-        m.operations.inc_by(OpCode::Unfreeze, Outcome::Ok, succeeded_total);
+        m.operations
+            .inc_by(OpCode::Unfreeze, Outcome::Ok, succeeded_total);
         for e in &errors {
-            m.operations.inc(OpCode::Unfreeze, classify_wire_error_code(e.error_code));
+            m.operations
+                .inc(OpCode::Unfreeze, classify_wire_error_code(e.error_code));
         }
     }
 
@@ -2352,7 +2856,11 @@ fn handle_reassign_batch(
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
     // Phase 1: Validate ownership and build redo ops from request params.
-    struct ValidReassign<'a> { idx: usize, key: TxKey, item: &'a WireReassignItem }
+    struct ValidReassign<'a> {
+        idx: usize,
+        key: TxKey,
+        item: &'a WireReassignItem,
+    }
     let mut valid_items: Vec<ValidReassign> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
@@ -2388,14 +2896,17 @@ fn handle_reassign_batch(
             spendable_after: params.spendable_after,
         }) {
             Ok(mgen) => {
-                repl_ops_by_key.push((v.key, vec![ReplicaOp::Reassign {
-                    tx_key: v.key,
-                    offset: v.item.vout,
-                    new_hash: v.item.new_utxo_hash,
-                    block_height: params.block_height,
-                    spendable_after: params.spendable_after,
-                    master_generation: mgen,
-                }]));
+                repl_ops_by_key.push((
+                    v.key,
+                    vec![ReplicaOp::Reassign {
+                        tx_key: v.key,
+                        offset: v.item.vout,
+                        new_hash: v.item.new_utxo_hash,
+                        block_height: params.block_height,
+                        spendable_after: params.spendable_after,
+                        master_generation: mgen,
+                    }],
+                ));
             }
             Err(err) => {
                 errors.push(spend_error_to_batch_error(v.idx as u32, &err));
@@ -2408,6 +2919,7 @@ fn handle_reassign_batch(
         Ok(o) => o,
         Err(e) => {
             compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -2419,9 +2931,11 @@ fn handle_reassign_batch(
         m.reassign_failed.inc_by(failed_total);
         // Dual-write: labeled operations table.
         use crate::metrics::{OpCode, Outcome};
-        m.operations.inc_by(OpCode::Reassign, Outcome::Ok, succeeded_total);
+        m.operations
+            .inc_by(OpCode::Reassign, Outcome::Ok, succeeded_total);
         for e in &errors {
-            m.operations.inc(OpCode::Reassign, classify_wire_error_code(e.error_code));
+            m.operations
+                .inc(OpCode::Reassign, classify_wire_error_code(e.error_code));
         }
     }
 
@@ -2435,7 +2949,8 @@ fn handle_set_conflicting_batch(
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
 ) -> ResponseFrame {
-    let (shared, txids) = match decode_txid_batch(&req.payload, 9) { // value(1) + cbh(4) + bhr(4)
+    let (shared, txids) = match decode_txid_batch(&req.payload, 9) {
+        // value(1) + cbh(4) + bhr(4)
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
     };
@@ -2451,7 +2966,10 @@ fn handle_set_conflicting_batch(
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
     // Phase 1: Validate ownership and build redo ops from request params.
-    struct ValidSetConflicting { idx: usize, key: TxKey }
+    struct ValidSetConflicting {
+        idx: usize,
+        key: TxKey,
+    }
     let mut valid_items: Vec<ValidSetConflicting> = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
@@ -2484,13 +3002,16 @@ fn handle_set_conflicting_batch(
             block_height_retention: bhr,
         }) {
             Ok(resp) => {
-                repl_ops_by_key.push((v.key, vec![ReplicaOp::SetConflicting {
-                    tx_key: v.key,
-                    value,
-                    current_block_height: cbh,
-                    retention: bhr,
-                    master_generation: resp.generation,
-                }]));
+                repl_ops_by_key.push((
+                    v.key,
+                    vec![ReplicaOp::SetConflicting {
+                        tx_key: v.key,
+                        value,
+                        current_block_height: cbh,
+                        retention: bhr,
+                        master_generation: resp.generation,
+                    }],
+                ));
             }
             Err(err) => {
                 errors.push(spend_error_to_batch_error(v.idx as u32, &err));
@@ -2503,6 +3024,7 @@ fn handle_set_conflicting_batch(
         Ok(o) => o,
         Err(e) => {
             compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -2514,9 +3036,13 @@ fn handle_set_conflicting_batch(
         m.set_conflicting_failed.inc_by(failed_total);
         // Dual-write: labeled operations table.
         use crate::metrics::{OpCode, Outcome};
-        m.operations.inc_by(OpCode::SetConflicting, Outcome::Ok, succeeded_total);
+        m.operations
+            .inc_by(OpCode::SetConflicting, Outcome::Ok, succeeded_total);
         for e in &errors {
-            m.operations.inc(OpCode::SetConflicting, classify_wire_error_code(e.error_code));
+            m.operations.inc(
+                OpCode::SetConflicting,
+                classify_wire_error_code(e.error_code),
+            );
         }
     }
 
@@ -2544,7 +3070,10 @@ fn handle_set_locked_batch(
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
     // Phase 1: Validate ownership and build redo ops from request params.
-    struct ValidSetLocked { idx: usize, key: TxKey }
+    struct ValidSetLocked {
+        idx: usize,
+        key: TxKey,
+    }
     let mut valid_items: Vec<ValidSetLocked> = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
@@ -2570,11 +3099,14 @@ fn handle_set_locked_batch(
             value,
         }) {
             Ok(mgen) => {
-                repl_ops_by_key.push((v.key, vec![ReplicaOp::SetLocked {
-                    tx_key: v.key,
-                    value,
-                    master_generation: mgen,
-                }]));
+                repl_ops_by_key.push((
+                    v.key,
+                    vec![ReplicaOp::SetLocked {
+                        tx_key: v.key,
+                        value,
+                        master_generation: mgen,
+                    }],
+                ));
             }
             Err(err) => {
                 errors.push(spend_error_to_batch_error(v.idx as u32, &err));
@@ -2587,6 +3119,7 @@ fn handle_set_locked_batch(
         Ok(o) => o,
         Err(e) => {
             compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -2598,9 +3131,11 @@ fn handle_set_locked_batch(
         m.set_locked_failed.inc_by(failed_total);
         // Dual-write: labeled operations table.
         use crate::metrics::{OpCode, Outcome};
-        m.operations.inc_by(OpCode::SetLocked, Outcome::Ok, succeeded_total);
+        m.operations
+            .inc_by(OpCode::SetLocked, Outcome::Ok, succeeded_total);
         for e in &errors {
-            m.operations.inc(OpCode::SetLocked, classify_wire_error_code(e.error_code));
+            m.operations
+                .inc(OpCode::SetLocked, classify_wire_error_code(e.error_code));
         }
     }
 
@@ -2628,7 +3163,10 @@ fn handle_preserve_until_batch(
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
     // Phase 1: Validate ownership and build redo ops from request params.
-    struct ValidPreserve { idx: usize, key: TxKey }
+    struct ValidPreserve {
+        idx: usize,
+        key: TxKey,
+    }
     let mut valid_items: Vec<ValidPreserve> = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
@@ -2657,11 +3195,14 @@ fn handle_preserve_until_batch(
             block_height: height,
         }) {
             Ok(resp) => {
-                repl_ops_by_key.push((v.key, vec![ReplicaOp::PreserveUntil {
-                    tx_key: v.key,
-                    block_height: height,
-                    master_generation: resp.generation,
-                }]));
+                repl_ops_by_key.push((
+                    v.key,
+                    vec![ReplicaOp::PreserveUntil {
+                        tx_key: v.key,
+                        block_height: height,
+                        master_generation: resp.generation,
+                    }],
+                ));
             }
             Err(err) => {
                 errors.push(spend_error_to_batch_error(v.idx as u32, &err));
@@ -2674,6 +3215,7 @@ fn handle_preserve_until_batch(
         Ok(o) => o,
         Err(e) => {
             compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -2685,9 +3227,13 @@ fn handle_preserve_until_batch(
         m.preserve_until_failed.inc_by(failed_total);
         // Dual-write: labeled operations table.
         use crate::metrics::{OpCode, Outcome};
-        m.operations.inc_by(OpCode::PreserveUntil, Outcome::Ok, succeeded_total);
+        m.operations
+            .inc_by(OpCode::PreserveUntil, Outcome::Ok, succeeded_total);
         for e in &errors {
-            m.operations.inc(OpCode::PreserveUntil, classify_wire_error_code(e.error_code));
+            m.operations.inc(
+                OpCode::PreserveUntil,
+                classify_wire_error_code(e.error_code),
+            );
         }
     }
 
@@ -2757,10 +3303,12 @@ fn handle_delete_batch(
             meta_buf.extend_from_slice(&meta.fee.to_le_bytes());
             meta_buf.extend_from_slice(&meta.size_in_bytes.to_le_bytes());
             meta_buf.extend_from_slice(&meta.extended_size.to_le_bytes());
-            meta_buf.push(meta.flags.bits());
+            let (is_coinbase, wire_flags) =
+                crate::replication::protocol::create_metadata_flag_bytes(meta.flags);
+            meta_buf.push(is_coinbase);
             meta_buf.extend_from_slice(&meta.spending_height.to_le_bytes());
             meta_buf.extend_from_slice(&meta.created_at.to_le_bytes());
-            meta_buf.push(0); // wire flags
+            meta_buf.push(wire_flags);
             meta_buf.extend_from_slice(&meta.generation.to_le_bytes());
             meta_buf.extend_from_slice(&meta.updated_at.to_le_bytes());
             meta_buf.extend_from_slice(&meta.unmined_since.to_le_bytes());
@@ -2768,7 +3316,9 @@ fn handle_delete_batch(
             meta_buf.extend_from_slice(&meta.preserve_until.to_le_bytes());
 
             let cold_data = if meta.flags.contains(crate::record::TxFlags::EXTERNAL) {
-                engine.blob_store().and_then(|bs| bs.get(&key.txid).ok().flatten())
+                engine
+                    .blob_store()
+                    .and_then(|bs| bs.get(&key.txid).ok().flatten())
             } else {
                 None
             };
@@ -2783,7 +3333,11 @@ fn handle_delete_batch(
             None
         };
 
-        valid_items.push(ValidDelete { idx: i, key, snapshot });
+        valid_items.push(ValidDelete {
+            idx: i,
+            key,
+            snapshot,
+        });
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
@@ -2807,7 +3361,9 @@ fn handle_delete_batch(
     }
     // Collect snapshots for successfully deleted records.
     for v in valid_items {
-        if let Some(snap) = v.snapshot && repl_ops_by_key.iter().any(|(k, _)| *k == v.key) {
+        if let Some(snap) = v.snapshot
+            && repl_ops_by_key.iter().any(|(k, _)| *k == v.key)
+        {
             deleted_snapshots.push((v.key, snap));
         }
     }
@@ -2835,26 +3391,37 @@ fn handle_delete_batch(
                         first_sequence: 0,
                         ops: vec![create_op],
                         trace_ctx: None,
-                    }.serialize(),
+                        source_node_id: None,
+                    }
+                    .serialize(),
                 };
-                let _ = handle_replica_batch(&create_req, engine, &std::sync::atomic::AtomicU64::new(0));
+                let _ = handle_replica_batch(
+                    &create_req,
+                    engine,
+                    &std::sync::atomic::AtomicU64::new(0),
+                );
                 // Append a Create redo entry for crash recovery.
                 if let Some(entry) = engine.lookup(key) {
-                    let _ = write_redo_ops(redo_log, &[RedoOp::Create {
-                        tx_key: *key,
-                        record_offset: entry.record_offset,
-                        utxo_count: snap.utxo_hashes.len() as u32,
-                    }]);
+                    let _ = write_redo_ops(
+                        redo_log,
+                        &[RedoOp::Create {
+                            tx_key: *key,
+                            record_offset: entry.record_offset,
+                            utxo_count: snap.utxo_hashes.len() as u32,
+                        }],
+                    );
                 }
             }
             // Also compensate any non-delete ops in the same batch.
-            let non_delete: Vec<_> = repl_ops_by_key.iter()
+            let non_delete: Vec<_> = repl_ops_by_key
+                .iter()
                 .filter(|(_, ops)| !ops.iter().any(|o| matches!(o, ReplicaOp::Delete { .. })))
                 .cloned()
                 .collect();
             if !non_delete.is_empty() {
                 compensate_replication_failure(engine, &non_delete, redo_log);
             }
+            clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -2866,9 +3433,11 @@ fn handle_delete_batch(
         m.deletes_failed.inc_by(failed_total);
         // Dual-write: labeled operations table.
         use crate::metrics::{OpCode, Outcome};
-        m.operations.inc_by(OpCode::Delete, Outcome::Ok, succeeded_total);
+        m.operations
+            .inc_by(OpCode::Delete, Outcome::Ok, succeeded_total);
         for e in &errors {
-            m.operations.inc(OpCode::Delete, classify_wire_error_code(e.error_code));
+            m.operations
+                .inc(OpCode::Delete, classify_wire_error_code(e.error_code));
         }
     }
 
@@ -2898,7 +3467,10 @@ fn handle_mark_longest_chain_batch(
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
     // Phase 1: Validate ownership and build redo ops from request params.
-    struct ValidMark { idx: usize, key: TxKey }
+    struct ValidMark {
+        idx: usize,
+        key: TxKey,
+    }
     let mut valid_items: Vec<ValidMark> = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
@@ -2957,9 +3529,13 @@ fn handle_mark_longest_chain_batch(
         m.mark_longest_chain_failed.inc_by(failed_total);
         // Dual-write: labeled operations table.
         use crate::metrics::{OpCode, Outcome};
-        m.operations.inc_by(OpCode::MarkLongestChain, Outcome::Ok, succeeded_total);
+        m.operations
+            .inc_by(OpCode::MarkLongestChain, Outcome::Ok, succeeded_total);
         for e in &errors {
-            m.operations.inc(OpCode::MarkLongestChain, classify_wire_error_code(e.error_code));
+            m.operations.inc(
+                OpCode::MarkLongestChain,
+                classify_wire_error_code(e.error_code),
+            );
         }
     }
 
@@ -2970,7 +3546,12 @@ fn handle_mark_longest_chain_batch(
 // GetBatch
 // ---------------------------------------------------------------------------
 
-fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+fn handle_get_batch(
+    req: &RequestFrame,
+    engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
+) -> ResponseFrame {
     let (field_mask, txids) = match decode_get_batch(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed get batch"),
@@ -2993,9 +3574,7 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
         // In cluster mode, serve reads if we're master OR if the record is
         // available locally (handles the migration window where shard tables
         // may be inconsistent across nodes).
-        if !local_read
-            && let Some(cluster) = cluster
-        {
+        if !local_read && let Some(cluster) = cluster {
             let is_master = cluster.is_master(&key);
             let is_migrating_out = cluster.is_migrating_outbound(&key);
 
@@ -3020,17 +3599,24 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
                 if let Some(m) = DISPATCH_METRICS.get() {
                     m.stale_routing_request_total.inc();
                 }
-                results.push(WireGetResult { status: ERR_REDIRECT as u8, data: redirect_status });
+                results.push(WireGetResult {
+                    status: ERR_REDIRECT as u8,
+                    data: redirect_status,
+                });
                 continue;
             }
 
             // If we're master but don't have the data and inbound migration
             // is still pending, return a retry signal immediately instead of
             // parking a request thread behind migration progress.
-            if is_master && engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key) {
+            if is_master && engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key)
+            {
                 let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
                 tracing::debug!(shard, "dispatch: read still waiting for inbound migration");
-                results.push(WireGetResult { status: ERR_MIGRATION_IN_PROGRESS as u8, data: vec![] });
+                results.push(WireGetResult {
+                    status: ERR_MIGRATION_IN_PROGRESS as u8,
+                    data: vec![],
+                });
                 continue;
             }
         }
@@ -3042,24 +3628,48 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
                 let has_preserve = entry.tx_flags & TxFlags::HAS_PRESERVE_UNTIL.bits() != 0;
                 // Strip the index-only HAS_PRESERVE_UNTIL bit before returning flags
                 let wire_flags = entry.tx_flags & !TxFlags::HAS_PRESERVE_UNTIL.bits();
-                if field_mask.has(FieldMask::FLAGS)              { data.push(wire_flags); }
-                if field_mask.has(FieldMask::SPENT_UTXOS)       { data.extend_from_slice(&entry.spent_utxos.to_le_bytes()); }
-                if field_mask.has(FieldMask::UTXO_COUNT)        { data.extend_from_slice(&entry.utxo_count.to_le_bytes()); }
-                if field_mask.has(FieldMask::UNMINED_SINCE)      { data.extend_from_slice(&entry.unmined_since.to_le_bytes()); }
-                if field_mask.has(FieldMask::DELETE_AT_HEIGHT)  {
-                    let dah = if has_preserve { 0u32 } else { entry.dah_or_preserve };
+                if field_mask.has(FieldMask::FLAGS) {
+                    data.push(wire_flags);
+                }
+                if field_mask.has(FieldMask::SPENT_UTXOS) {
+                    data.extend_from_slice(&entry.spent_utxos.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::UTXO_COUNT) {
+                    data.extend_from_slice(&entry.utxo_count.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::UNMINED_SINCE) {
+                    data.extend_from_slice(&entry.unmined_since.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::DELETE_AT_HEIGHT) {
+                    let dah = if has_preserve {
+                        0u32
+                    } else {
+                        entry.dah_or_preserve
+                    };
                     data.extend_from_slice(&dah.to_le_bytes());
                 }
-                if field_mask.has(FieldMask::PRESERVE_UNTIL)    {
-                    let pu = if has_preserve { entry.dah_or_preserve } else { 0u32 };
+                if field_mask.has(FieldMask::PRESERVE_UNTIL) {
+                    let pu = if has_preserve {
+                        entry.dah_or_preserve
+                    } else {
+                        0u32
+                    };
                     data.extend_from_slice(&pu.to_le_bytes());
                 }
-                if field_mask.has(FieldMask::BLOCK_ENTRY_COUNT)  { data.push(entry.block_entry_count); }
-                results.push(WireGetResult { status: STATUS_OK, data });
+                if field_mask.has(FieldMask::BLOCK_ENTRY_COUNT) {
+                    data.push(entry.block_entry_count);
+                }
+                results.push(WireGetResult {
+                    status: STATUS_OK,
+                    data,
+                });
                 continue;
             }
             // Not in index — fall through to TxNotFound below
-            results.push(WireGetResult { status: ERR_TX_NOT_FOUND as u8, data: vec![] });
+            results.push(WireGetResult {
+                status: ERR_TX_NOT_FOUND as u8,
+                data: vec![],
+            });
             continue;
         }
 
@@ -3074,22 +3684,54 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
                     data.extend_from_slice(&buf);
                 } else {
                     // Per-field metadata serialization.
-                    if field_mask.has(FieldMask::TX_VERSION)       { data.extend_from_slice(&{ meta.tx_version }.to_le_bytes()); }
-                    if field_mask.has(FieldMask::LOCKTIME)          { data.extend_from_slice(&{ meta.locktime }.to_le_bytes()); }
-                    if field_mask.has(FieldMask::FEE)               { data.extend_from_slice(&{ meta.fee }.to_le_bytes()); }
-                    if field_mask.has(FieldMask::SIZE_IN_BYTES)     { data.extend_from_slice(&{ meta.size_in_bytes }.to_le_bytes()); }
-                    if field_mask.has(FieldMask::EXTENDED_SIZE)      { data.extend_from_slice(&{ meta.extended_size }.to_le_bytes()); }
-                    if field_mask.has(FieldMask::FLAGS)              { data.push({ meta.flags }.bits()); }
-                    if field_mask.has(FieldMask::SPENDING_HEIGHT)   { data.extend_from_slice(&{ meta.spending_height }.to_le_bytes()); }
-                    if field_mask.has(FieldMask::CREATED_AT)        { data.extend_from_slice(&{ meta.created_at }.to_le_bytes()); }
-                    if field_mask.has(FieldMask::SPENT_UTXOS)       { data.extend_from_slice(&{ meta.spent_utxos }.to_le_bytes()); }
-                    if field_mask.has(FieldMask::PRUNED_UTXOS)      { data.extend_from_slice(&{ meta.pruned_utxos }.to_le_bytes()); }
-                    if field_mask.has(FieldMask::UTXO_COUNT)        { data.extend_from_slice(&{ meta.utxo_count }.to_le_bytes()); }
-                    if field_mask.has(FieldMask::GENERATION)        { data.extend_from_slice(&{ meta.generation }.to_le_bytes()); }
-                    if field_mask.has(FieldMask::UPDATED_AT)        { data.extend_from_slice(&{ meta.updated_at }.to_le_bytes()); }
-                    if field_mask.has(FieldMask::UNMINED_SINCE)      { data.extend_from_slice(&{ meta.unmined_since }.to_le_bytes()); }
-                    if field_mask.has(FieldMask::DELETE_AT_HEIGHT)  { data.extend_from_slice(&{ meta.delete_at_height }.to_le_bytes()); }
-                    if field_mask.has(FieldMask::PRESERVE_UNTIL)    { data.extend_from_slice(&{ meta.preserve_until }.to_le_bytes()); }
+                    if field_mask.has(FieldMask::TX_VERSION) {
+                        data.extend_from_slice(&{ meta.tx_version }.to_le_bytes());
+                    }
+                    if field_mask.has(FieldMask::LOCKTIME) {
+                        data.extend_from_slice(&{ meta.locktime }.to_le_bytes());
+                    }
+                    if field_mask.has(FieldMask::FEE) {
+                        data.extend_from_slice(&{ meta.fee }.to_le_bytes());
+                    }
+                    if field_mask.has(FieldMask::SIZE_IN_BYTES) {
+                        data.extend_from_slice(&{ meta.size_in_bytes }.to_le_bytes());
+                    }
+                    if field_mask.has(FieldMask::EXTENDED_SIZE) {
+                        data.extend_from_slice(&{ meta.extended_size }.to_le_bytes());
+                    }
+                    if field_mask.has(FieldMask::FLAGS) {
+                        data.push({ meta.flags }.bits());
+                    }
+                    if field_mask.has(FieldMask::SPENDING_HEIGHT) {
+                        data.extend_from_slice(&{ meta.spending_height }.to_le_bytes());
+                    }
+                    if field_mask.has(FieldMask::CREATED_AT) {
+                        data.extend_from_slice(&{ meta.created_at }.to_le_bytes());
+                    }
+                    if field_mask.has(FieldMask::SPENT_UTXOS) {
+                        data.extend_from_slice(&{ meta.spent_utxos }.to_le_bytes());
+                    }
+                    if field_mask.has(FieldMask::PRUNED_UTXOS) {
+                        data.extend_from_slice(&{ meta.pruned_utxos }.to_le_bytes());
+                    }
+                    if field_mask.has(FieldMask::UTXO_COUNT) {
+                        data.extend_from_slice(&{ meta.utxo_count }.to_le_bytes());
+                    }
+                    if field_mask.has(FieldMask::GENERATION) {
+                        data.extend_from_slice(&{ meta.generation }.to_le_bytes());
+                    }
+                    if field_mask.has(FieldMask::UPDATED_AT) {
+                        data.extend_from_slice(&{ meta.updated_at }.to_le_bytes());
+                    }
+                    if field_mask.has(FieldMask::UNMINED_SINCE) {
+                        data.extend_from_slice(&{ meta.unmined_since }.to_le_bytes());
+                    }
+                    if field_mask.has(FieldMask::DELETE_AT_HEIGHT) {
+                        data.extend_from_slice(&{ meta.delete_at_height }.to_le_bytes());
+                    }
+                    if field_mask.has(FieldMask::PRESERVE_UNTIL) {
+                        data.extend_from_slice(&{ meta.preserve_until }.to_le_bytes());
+                    }
                     if field_mask.has(FieldMask::EXTERNAL_REF) {
                         let ext = { meta.external_ref };
                         data.push(ext.store_type);
@@ -3100,8 +3742,12 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
                         data.extend_from_slice(&ext.inputs_offset.to_le_bytes());
                         data.extend_from_slice(&ext.outputs_offset.to_le_bytes());
                     }
-                    if field_mask.has(FieldMask::REASSIGNMENT_COUNT) { data.push(meta.reassignment_count); }
-                    if field_mask.has(FieldMask::BLOCK_ENTRY_COUNT)  { data.push(meta.block_entry_count); }
+                    if field_mask.has(FieldMask::REASSIGNMENT_COUNT) {
+                        data.push(meta.reassignment_count);
+                    }
+                    if field_mask.has(FieldMask::BLOCK_ENTRY_COUNT) {
+                        data.push(meta.block_entry_count);
+                    }
                 }
                 if field_mask.has(FieldMask::UTXO_SLOTS) {
                     let utxo_count = { meta.utxo_count };
@@ -3158,10 +3804,16 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
                 results.push(WireGetResult { status: 0, data });
             }
             Err(SpendError::TxNotFound) => {
-                results.push(WireGetResult { status: 1, data: vec![] });
+                results.push(WireGetResult {
+                    status: 1,
+                    data: vec![],
+                });
             }
             Err(_) => {
-                results.push(WireGetResult { status: 1, data: vec![] });
+                results.push(WireGetResult {
+                    status: 1,
+                    data: vec![],
+                });
             }
         }
     }
@@ -3195,9 +3847,12 @@ fn handle_get_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster
         // Dual-write: labeled operations table.
         use crate::metrics::{OpCode, Outcome};
         m.operations.inc_by(OpCode::Get, Outcome::Ok, ok_count);
-        m.operations.inc_by(OpCode::Get, Outcome::ErrNotFound, not_found_count);
-        m.operations.inc_by(OpCode::Get, Outcome::Redirect, redirect_count);
-        m.operations.inc_by(OpCode::Get, Outcome::Other, other_failed);
+        m.operations
+            .inc_by(OpCode::Get, Outcome::ErrNotFound, not_found_count);
+        m.operations
+            .inc_by(OpCode::Get, Outcome::Redirect, redirect_count);
+        m.operations
+            .inc_by(OpCode::Get, Outcome::Other, other_failed);
     }
 
     ResponseFrame {
@@ -3253,7 +3908,10 @@ fn handle_preserve_transactions(
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
     // Phase 1: Validate ownership and build redo ops from request params.
-    struct ValidPreserveTx { idx: usize, key: TxKey }
+    struct ValidPreserveTx {
+        idx: usize,
+        key: TxKey,
+    }
     let mut valid_items: Vec<ValidPreserveTx> = Vec::new();
     for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
@@ -3282,11 +3940,14 @@ fn handle_preserve_transactions(
             block_height: height,
         }) {
             Ok(resp) => {
-                repl_ops_by_key.push((v.key, vec![ReplicaOp::PreserveUntil {
-                    tx_key: v.key,
-                    block_height: height,
-                    master_generation: resp.generation,
-                }]));
+                repl_ops_by_key.push((
+                    v.key,
+                    vec![ReplicaOp::PreserveUntil {
+                        tx_key: v.key,
+                        block_height: height,
+                        master_generation: resp.generation,
+                    }],
+                ));
             }
             Err(err) => {
                 errors.push(spend_error_to_batch_error(v.idx as u32, &err));
@@ -3299,6 +3960,7 @@ fn handle_preserve_transactions(
         Ok(o) => o,
         Err(e) => {
             compensate_replication_failure(engine, &repl_ops_by_key, redo_log);
+            clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -3363,7 +4025,12 @@ fn handle_process_expired(
 // GetSpend
 // ---------------------------------------------------------------------------
 
-fn handle_get_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, cluster: Option<&RunningCluster>) -> ResponseFrame {
+fn handle_get_spend_batch(
+    req: &RequestFrame,
+    engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
+) -> ResponseFrame {
     let items = match decode_get_spend_batch(&req.payload) {
         Some(r) => r,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
@@ -3379,9 +4046,7 @@ fn handle_get_spend_batch(req: &RequestFrame, engine: &Engine, max_batch: u32, c
         // Check shard ownership — reads are allowed during outbound migration
         // because this node still holds the data until migration completes.
         // FLAG_LOCAL_READ bypasses this check for replication verification.
-        if !local_read
-            && let Some(cluster) = cluster
-        {
+        if !local_read && let Some(cluster) = cluster {
             let key = TxKey { txid: item.txid };
             if !cluster.is_master(&key) && !cluster.is_migrating_outbound(&key) {
                 // M10: count the stale-routed GetSpend.
@@ -3514,18 +4179,26 @@ fn handle_stream_chunk(
                     bytes_received: 0,
                 });
             }
-            Err(e) => return error_response(req.request_id, ERR_INTERNAL, &format!("begin_stream: {e}")),
+            Err(e) => {
+                return error_response(req.request_id, ERR_INTERNAL, &format!("begin_stream: {e}"));
+            }
         }
     }
 
-    let stream = conn_state.streams.get_mut(&chunk.txid).expect("just inserted");
+    let stream = conn_state
+        .streams
+        .get_mut(&chunk.txid)
+        .expect("just inserted");
 
     // Verify chunk offset matches expected position.
     if chunk.offset != stream.bytes_received {
         return error_response(
             req.request_id,
             ERR_STREAM_OFFSET_MISMATCH,
-            &format!("expected offset {}, got {}", stream.bytes_received, chunk.offset),
+            &format!(
+                "expected offset {}, got {}",
+                stream.bytes_received, chunk.offset
+            ),
         );
     }
 
@@ -3552,10 +4225,7 @@ fn handle_stream_chunk(
 /// Removes the active stream session from the connection state, verifies
 /// the total bytes received match the declared total, and calls `finish`
 /// on the blob stream writer to atomically commit the blob.
-fn handle_stream_end(
-    req: &RequestFrame,
-    conn_state: &mut super::ConnectionState,
-) -> ResponseFrame {
+fn handle_stream_end(req: &RequestFrame, conn_state: &mut super::ConnectionState) -> ResponseFrame {
     let end = match decode_stream_end(&req.payload) {
         Some(e) => e,
         None => return error_response(req.request_id, ERR_INTERNAL, "malformed stream end"),
@@ -3563,7 +4233,13 @@ fn handle_stream_end(
 
     let stream = match conn_state.streams.remove(&end.txid) {
         Some(s) => s,
-        None => return error_response(req.request_id, ERR_STREAM_NOT_FOUND, "no active stream for txid"),
+        None => {
+            return error_response(
+                req.request_id,
+                ERR_STREAM_NOT_FOUND,
+                "no active stream for txid",
+            );
+        }
     };
 
     // Verify total size matches what was received.
@@ -3572,7 +4248,10 @@ fn handle_stream_end(
         return error_response(
             req.request_id,
             ERR_INTERNAL,
-            &format!("size mismatch: received {} bytes, expected {}", stream.bytes_received, end.total_size),
+            &format!(
+                "size mismatch: received {} bytes, expected {}",
+                stream.bytes_received, end.total_size
+            ),
         );
     }
 
@@ -3647,9 +4326,12 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
         SpendError::TxNotFound => (ERR_TX_NOT_FOUND, vec![]),
         SpendError::Conflicting => (ERR_CONFLICTING, vec![]),
         SpendError::Locked => (ERR_LOCKED, vec![]),
-        SpendError::CoinbaseImmature { spending_height, .. } => {
-            (ERR_COINBASE_IMMATURE, spending_height.to_le_bytes().to_vec())
-        }
+        SpendError::CoinbaseImmature {
+            spending_height, ..
+        } => (
+            ERR_COINBASE_IMMATURE,
+            spending_height.to_le_bytes().to_vec(),
+        ),
         SpendError::UtxoNotFound { .. } => (ERR_VOUT_OUT_OF_RANGE, vec![]),
         SpendError::UtxoHashMismatch { .. } => (ERR_UTXO_HASH_MISMATCH, vec![]),
         SpendError::AlreadySpent { spending_data, .. } => {
@@ -3666,7 +4348,11 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
         SpendError::StorageError { .. } => (ERR_INTERNAL, vec![]),
         SpendError::DahOverflow { .. } => (ERR_INTERNAL, vec![]),
     };
-    BatchItemError { item_index, error_code: code, error_data: data }
+    BatchItemError {
+        item_index,
+        error_code: code,
+        error_data: data,
+    }
 }
 
 /// Classify a [`SpendError`] into its coarse-grained [`Outcome`] bucket.
@@ -3713,22 +4399,19 @@ pub(crate) fn classify_wire_error_code(code: u16) -> crate::metrics::Outcome {
         ERR_CONFLICTING | ERR_ALREADY_SPENT | ERR_INVALID_SPEND | ERR_ALREADY_EXISTS => {
             Outcome::ErrConflicting
         }
-        ERR_LOCKED | ERR_FROZEN | ERR_FROZEN_UNTIL | ERR_ALREADY_FROZEN
-        | ERR_UTXO_NOT_FROZEN => Outcome::ErrFrozen,
+        ERR_LOCKED | ERR_FROZEN | ERR_FROZEN_UNTIL | ERR_ALREADY_FROZEN | ERR_UTXO_NOT_FROZEN => {
+            Outcome::ErrFrozen
+        }
         ERR_INTERNAL => Outcome::ErrStorage,
         _ => Outcome::Other,
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Partition map
 // ---------------------------------------------------------------------------
 
-fn handle_get_partition_map(
-    req: &RequestFrame,
-    cluster: Option<&RunningCluster>,
-) -> ResponseFrame {
+fn handle_get_partition_map(req: &RequestFrame, cluster: Option<&RunningCluster>) -> ResponseFrame {
     match cluster {
         Some(c) => ResponseFrame {
             request_id: req.request_id,
@@ -3827,7 +4510,15 @@ mod tests {
                 payload,
             };
             let mut conn_state = crate::server::ConnectionState::new();
-            handle_request(&req, &self.engine, max_batch_size, None, None, &mut conn_state, None)
+            handle_request(
+                &req,
+                &self.engine,
+                max_batch_size,
+                None,
+                None,
+                &mut conn_state,
+                None,
+            )
         }
 
         fn request_with_cluster(
@@ -4090,7 +4781,10 @@ mod tests {
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
         assert_eq!(code, ERR_INTERNAL);
-        assert!(msg.contains("unknown opcode"), "expected 'unknown opcode' in: {msg}");
+        assert!(
+            msg.contains("unknown opcode"),
+            "expected 'unknown opcode' in: {msg}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4195,30 +4889,40 @@ mod tests {
         let data = &results[0].data;
         let mut pos = 0;
 
-        let tx_version = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()); pos += 4;
+        let tx_version = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
         assert_eq!(tx_version, 1);
 
-        let locktime = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()); pos += 4;
+        let locktime = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
         assert_eq!(locktime, 0);
 
-        let fee = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()); pos += 8;
+        let fee = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
         assert_eq!(fee, 500);
 
-        let size_in_bytes = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()); pos += 8;
+        let size_in_bytes = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
         assert_eq!(size_in_bytes, 250);
 
-        let _extended_size = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()); pos += 8;
+        let _extended_size = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
 
-        let _flags = data[pos]; pos += 1;
+        let _flags = data[pos];
+        pos += 1;
 
-        let _spending_height = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()); pos += 4;
+        let _spending_height = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
 
-        let _created_at = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()); pos += 8;
+        let _created_at = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
 
-        let spent_utxos = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()); pos += 4;
+        let spent_utxos = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
         assert_eq!(spent_utxos, 0, "no UTXOs should be spent");
 
-        let _pruned_utxos = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()); pos += 4;
+        let _pruned_utxos = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
 
         let utxo_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         assert_eq!(utxo_count, 3, "utxo_count should be 3");
@@ -4339,7 +5043,10 @@ mod tests {
 
         let results = decode_get_response(&resp.payload).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status, 1, "expected not-found status=1 after delete");
+        assert_eq!(
+            results[0].status, 1,
+            "expected not-found status=1 after delete"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4406,7 +5113,10 @@ mod tests {
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
         assert_eq!(code, ERR_INTERNAL);
-        assert!(msg.contains("batch too large"), "expected 'batch too large' in: {msg}");
+        assert!(
+            msg.contains("batch too large"),
+            "expected 'batch too large' in: {msg}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4527,12 +5237,9 @@ mod tests {
             let mut index: crate::index::PrimaryBackend = Index::new(10000).unwrap().into();
 
             // Run recovery to rebuild index from redo log
-            let stats = crate::recovery::recover(
-                &*data_dev as &dyn BlockDevice,
-                &redo_log,
-                &mut index,
-            )
-            .unwrap();
+            let stats =
+                crate::recovery::recover(&*data_dev as &dyn BlockDevice, &redo_log, &mut index)
+                    .unwrap();
             eprintln!(
                 "recovery: {} replayed, {} skipped, {} failed",
                 stats.entries_replayed, stats.entries_skipped, stats.entries_failed
@@ -4653,7 +5360,8 @@ mod tests {
             }
         }
         assert_eq!(
-            lost, 0,
+            lost,
+            0,
             "ACKed spends lost after crash: {}/{} not spent",
             lost,
             acked_spends.len()
@@ -4739,8 +5447,14 @@ mod tests {
             self_id,
             table,
             &[
-                (crate::cluster::shards::NodeId(1), "127.0.0.1:4401".parse().unwrap()),
-                (crate::cluster::shards::NodeId(2), "127.0.0.1:4402".parse().unwrap()),
+                (
+                    crate::cluster::shards::NodeId(1),
+                    "127.0.0.1:4401".parse().unwrap(),
+                ),
+                (
+                    crate::cluster::shards::NodeId(2),
+                    "127.0.0.1:4402".parse().unwrap(),
+                ),
             ],
             &members,
             &[],
@@ -4771,7 +5485,10 @@ mod tests {
         let cluster = crate::cluster::coordinator::new_test_running_cluster(
             crate::cluster::shards::NodeId(1),
             table,
-            &[(crate::cluster::shards::NodeId(1), "127.0.0.1:4501".parse().unwrap())],
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4501".parse().unwrap(),
+            )],
             &members,
             &[shard],
             &[],
@@ -4811,7 +5528,10 @@ mod tests {
         let cluster = crate::cluster::coordinator::new_test_running_cluster(
             crate::cluster::shards::NodeId(1),
             table,
-            &[(crate::cluster::shards::NodeId(1), "127.0.0.1:4601".parse().unwrap())],
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4601".parse().unwrap(),
+            )],
             &members,
             &[shard],
             &[],
@@ -4856,7 +5576,10 @@ mod tests {
         let cluster = crate::cluster::coordinator::new_test_running_cluster(
             crate::cluster::shards::NodeId(1),
             table,
-            &[(crate::cluster::shards::NodeId(1), "127.0.0.1:4602".parse().unwrap())],
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4602".parse().unwrap(),
+            )],
             &members,
             &[shard],
             &[],
@@ -4908,7 +5631,10 @@ mod tests {
         let cluster = crate::cluster::coordinator::new_test_running_cluster(
             crate::cluster::shards::NodeId(1),
             table,
-            &[(crate::cluster::shards::NodeId(1), "127.0.0.1:4603".parse().unwrap())],
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4603".parse().unwrap(),
+            )],
             &members,
             &[],
             &[],
@@ -4924,6 +5650,7 @@ mod tests {
                 first_sequence: 0,
                 ops: vec![],
                 trace_ctx: None,
+                source_node_id: None,
             }
             .serialize(),
         };
@@ -4981,14 +5708,20 @@ mod tests {
     fn classify_zero_acks_strict_mode_is_policy_violation() {
         // Not best-effort, WriteAll with 2 targets and 0 ACKs → violation
         let c = classify_replication_outcome(0, 2, Some(AckPolicy::WriteAll), false);
-        assert_eq!(c, ReplicationClassification::PolicyViolation { required: 2 });
+        assert_eq!(
+            c,
+            ReplicationClassification::PolicyViolation { required: 2 }
+        );
     }
 
     #[test]
     fn classify_partial_below_majority_strict_is_policy_violation() {
         // 3 replicas, majority requires ceil(3/2) = 2 ACKs; 1 ACK → violation
         let c = classify_replication_outcome(1, 3, Some(AckPolicy::WriteMajority), false);
-        assert_eq!(c, ReplicationClassification::PolicyViolation { required: 2 });
+        assert_eq!(
+            c,
+            ReplicationClassification::PolicyViolation { required: 2 }
+        );
     }
 
     #[test]
@@ -5003,6 +5736,22 @@ mod tests {
         // Empty target list — nothing to ACK, trivially full.
         let c = classify_replication_outcome(0, 0, None, true);
         assert_eq!(c, ReplicationClassification::FullAck);
+    }
+
+    #[test]
+    fn replication_ack_timeout_extends_only_during_migration_pressure() {
+        assert_eq!(
+            replication_ack_timeout_for(Duration::from_secs(3), false),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            replication_ack_timeout_for(Duration::from_secs(3), true),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            replication_ack_timeout_for(Duration::from_secs(45), true),
+            Duration::from_secs(45)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5048,7 +5797,11 @@ mod tests {
         // so the client sees the per-item diagnostics, not a blanket status
         // byte that hides them. The degraded-durability escalation is still
         // visible via server metrics.
-        let errors = vec![BatchItemError { item_index: 0, error_code: ERR_TX_NOT_FOUND, error_data: vec![] }];
+        let errors = vec![BatchItemError {
+            item_index: 0,
+            error_code: ERR_TX_NOT_FOUND,
+            error_data: vec![],
+        }];
         let resp = batch_response_with_outcome(1, &errors, ReplicationOutcome::Degraded);
         assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
         assert_ne!(resp.status, STATUS_DEGRADED_DURABILITY);
@@ -5071,8 +5824,9 @@ mod tests {
     /// at the end of `replicate_all_ops`.
     fn classification_to_outcome(c: ReplicationClassification) -> ReplicationOutcome {
         match c {
-            ReplicationClassification::FullAck
-            | ReplicationClassification::PartialAck => ReplicationOutcome::Full,
+            ReplicationClassification::FullAck | ReplicationClassification::PartialAck => {
+                ReplicationOutcome::Full
+            }
             ReplicationClassification::ZeroAckBestEffort => ReplicationOutcome::Degraded,
             ReplicationClassification::PolicyViolation { .. } => {
                 // Strict mode — in the real dispatch this is returned as
@@ -5117,9 +5871,11 @@ mod tests {
     fn strict_mode_zero_acks_is_hard_error_not_degraded() {
         // With non-best-effort mode the caller propagates Err which maps to
         // ERR_REPLICATION_FAILED on the wire — not STATUS_DEGRADED_DURABILITY.
-        let classification =
-            classify_replication_outcome(0, 2, Some(AckPolicy::WriteAll), false);
-        assert_eq!(classification, ReplicationClassification::PolicyViolation { required: 2 });
+        let classification = classify_replication_outcome(0, 2, Some(AckPolicy::WriteAll), false);
+        assert_eq!(
+            classification,
+            ReplicationClassification::PolicyViolation { required: 2 }
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5177,6 +5933,114 @@ mod tests {
     }
 
     #[test]
+    fn pending_replication_recovery_requires_redo_log() {
+        let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
+        tracker.begin(7, 7).unwrap();
+        let h = DispatchTestHarness::new();
+
+        let err =
+            recover_pending_replication_intents_from_tracker(&tracker, None, &h.engine, |_, _| {
+                panic!("replication must not run without redo")
+            })
+            .unwrap_err();
+
+        assert!(err.contains("requires redo log"), "err was: {err}");
+        assert_eq!(tracker.pending().len(), 1);
+    }
+
+    #[test]
+    fn pending_replication_recovery_replays_redo_and_commits_intent() {
+        let h = DispatchTestHarness::new();
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let redo_log = Mutex::new(
+            RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).expect("redo log opens on memory device"),
+        );
+        let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
+        let tx_key = TxKey {
+            txid: txid_for_shard(40, 9),
+        };
+        let range = write_redo_ops(
+            Some(&redo_log),
+            &[RedoOp::Delete {
+                tx_key,
+                record_offset: 4096,
+                record_size: 256,
+            }],
+        )
+        .expect("redo write succeeds");
+        tracker.begin(range.0, range.1).unwrap();
+
+        let mut observed_range = None;
+        let mut observed_ops = Vec::new();
+        recover_pending_replication_intents_from_tracker(
+            &tracker,
+            Some(&redo_log),
+            &h.engine,
+            |ops, range| {
+                observed_range = Some(range);
+                observed_ops = ops.to_vec();
+                Ok(())
+            },
+        )
+        .expect("pending intent recovery succeeds");
+
+        assert!(tracker.pending().is_empty());
+        assert_eq!(observed_range, Some(range));
+        assert_eq!(observed_ops.len(), 1);
+        assert_eq!(observed_ops[0].0, tx_key);
+        assert!(matches!(
+            observed_ops[0].1.as_slice(),
+            [ReplicaOp::Delete { tx_key: deleted }] if *deleted == tx_key
+        ));
+    }
+
+    #[test]
+    fn replicate_all_ops_rf2_missing_replica_address_fails() {
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 90);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let assignment = table.target_assignment(s);
+                assignment.master == crate::cluster::shards::NodeId(1)
+                    && assignment
+                        .replicas
+                        .contains(&crate::cluster::shards::NodeId(2))
+            })
+            .expect("expected a shard mastered by node 1 with node 2 as replica");
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4801".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        let tx_key = TxKey {
+            txid: txid_for_shard(shard, 9),
+        };
+        let ops = vec![(
+            tx_key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+        )];
+
+        let err = replicate_all_ops(Some(&cluster), &ops, (0, 0))
+            .expect_err("RF>1 write must fail when the replica address is unresolved");
+        assert!(
+            err.contains("has no resolved address"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
     fn migration_complete_rejects_non_empty_without_manifest() {
         let h = DispatchTestHarness::new();
         let shard = 30u16;
@@ -5188,7 +6052,10 @@ mod tests {
         let cluster = crate::cluster::coordinator::new_test_running_cluster(
             crate::cluster::shards::NodeId(1),
             table,
-            &[(crate::cluster::shards::NodeId(1), "127.0.0.1:4701".parse().unwrap())],
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4701".parse().unwrap(),
+            )],
             &members,
             &[shard],
             &[],
@@ -5215,7 +6082,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(resp.status, STATUS_ERROR, "non-empty without manifest must be rejected");
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "non-empty without manifest must be rejected"
+        );
         assert!(resp.payload.len() >= 2);
         let err_code = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
         assert_eq!(
@@ -5248,7 +6118,10 @@ mod tests {
         let cluster = crate::cluster::coordinator::new_test_running_cluster(
             crate::cluster::shards::NodeId(1),
             table,
-            &[(crate::cluster::shards::NodeId(1), "127.0.0.1:4702".parse().unwrap())],
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4702".parse().unwrap(),
+            )],
             &members,
             &[shard],
             &[],
@@ -5314,7 +6187,10 @@ mod tests {
         let cluster = crate::cluster::coordinator::new_test_running_cluster(
             crate::cluster::shards::NodeId(1),
             table,
-            &[(crate::cluster::shards::NodeId(1), "127.0.0.1:4703".parse().unwrap())],
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4703".parse().unwrap(),
+            )],
             &members,
             &[shard],
             &[],
@@ -5322,14 +6198,7 @@ mod tests {
             1,
         );
 
-        let payload = build_migration_complete_payload(
-            1,
-            0,
-            0,
-            Some(expected_hash),
-            None,
-            None,
-        );
+        let payload = build_migration_complete_payload(1, 0, 0, Some(expected_hash), None, None);
         let req = RequestFrame {
             request_id: shard as u64,
             op_code: OP_MIGRATION_COMPLETE,
@@ -5356,6 +6225,186 @@ mod tests {
     }
 
     #[test]
+    fn migration_complete_exact_entries_prune_extra_local_records() {
+        let h = DispatchTestHarness::new();
+        let shard = 37u16;
+        let txid_a = txid_for_shard(shard, 7);
+        let txid_b = txid_for_shard(shard, 8);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+
+        let key_a = TxKey { txid: txid_a };
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        let entries = vec![(key_a, meta_a.generation)];
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 49);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4708".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        let payload = build_migration_complete_payload(
+            1,
+            0,
+            0,
+            None,
+            Some(&entries),
+            Some(crate::cluster::shards::NodeId(2)),
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload,
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            0,
+            "successful exact-entry reconciliation should clear pending inbound"
+        );
+        assert_eq!(h.engine.shard_record_count(shard), 1);
+        assert!(h.engine.read_metadata(&key_a).is_ok());
+        assert!(h.engine.read_metadata(&TxKey { txid: txid_b }).is_err());
+    }
+
+    #[test]
+    fn migration_complete_rejects_count_mismatch_without_exact_entries() {
+        let h = DispatchTestHarness::new();
+        let shard = 38u16;
+        let txid_a = txid_for_shard(shard, 9);
+        let txid_b = txid_for_shard(shard, 10);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+
+        let key_a = TxKey { txid: txid_a };
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        let mut expected = crate::cluster::coordinator::ManifestHasher::new();
+        expected.fold(&txid_a, meta_a.generation);
+        let expected_hash = expected.finalize();
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 50);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4709".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        let payload = build_migration_complete_payload(1, 0, 0, Some(expected_hash), None, None);
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload,
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_ERROR);
+        assert!(resp.payload.len() >= 2);
+        let err_code = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
+        assert_eq!(err_code, ERR_MIGRATION_IN_PROGRESS);
+        assert_eq!(cluster.inbound_pending_count(), 1);
+    }
+
+    #[test]
+    fn migration_complete_verify_only_keeps_inbound_pending() {
+        let h = DispatchTestHarness::new();
+        let shard = 36u16;
+        let txid = txid_for_shard(shard, 6);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let key = TxKey { txid };
+        let meta = h.engine.read_metadata(&key).unwrap();
+        let entries = vec![(key, meta.generation)];
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 48);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4707".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        let payload = build_migration_complete_payload(
+            1,
+            0,
+            0,
+            None,
+            Some(&entries),
+            Some(crate::cluster::shards::NodeId(2)),
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: FLAG_MIGRATION_VERIFY_ONLY,
+            payload,
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            1,
+            "verify-only completion must not clear pending inbound until the batched durable completion arrives"
+        );
+    }
+
+    #[test]
     fn migration_complete_accepts_non_empty_with_exact_entry_manifest() {
         // The exact-entry manifest (list of (txid, generation)) is an
         // alternative to the SHA-256 hash — also cryptographically strong
@@ -5372,7 +6421,10 @@ mod tests {
         let cluster = crate::cluster::coordinator::new_test_running_cluster(
             crate::cluster::shards::NodeId(1),
             table,
-            &[(crate::cluster::shards::NodeId(1), "127.0.0.1:4704".parse().unwrap())],
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4704".parse().unwrap(),
+            )],
             &members,
             &[shard],
             &[],
@@ -5408,6 +6460,124 @@ mod tests {
 
         assert_eq!(resp.status, STATUS_OK);
         assert_eq!(cluster.inbound_pending_count(), 0);
+    }
+
+    #[test]
+    fn migration_no_data_completion_clears_only_source_inbound() {
+        let h = DispatchTestHarness::new();
+        let shard = 34u16;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+            crate::cluster::shards::NodeId(3),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 46);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4705".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(2));
+        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(3));
+        assert_eq!(cluster.inbound_pending_count(), 2);
+
+        let payload = build_migration_complete_payload(
+            0,
+            0,
+            0,
+            None,
+            Some(&[]),
+            Some(crate::cluster::shards::NodeId(2)),
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload,
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            cluster.pending_inbound_entries(),
+            vec![(shard, crate::cluster::shards::NodeId(3))],
+            "zero-record completion from one source must not clear other sources"
+        );
+        assert!(cluster.has_pending_inbound_shard(shard));
+    }
+
+    #[test]
+    fn migration_batch_complete_clears_only_source_inbound() {
+        let h = DispatchTestHarness::new();
+        let shard = 35u16;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+            crate::cluster::shards::NodeId(3),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 47);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4706".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(2));
+        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(3));
+        assert_eq!(cluster.inbound_pending_count(), 2);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&shard.to_le_bytes());
+        payload.extend_from_slice(&crate::cluster::shards::NodeId(2).0.to_le_bytes());
+        let req = RequestFrame {
+            request_id: 0,
+            op_code: OP_MIGRATION_BATCH_COMPLETE,
+            flags: 0,
+            payload,
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            cluster.pending_inbound_entries(),
+            vec![(shard, crate::cluster::shards::NodeId(3))],
+            "batch completion from one source must not clear other sources"
+        );
+        assert!(cluster.has_pending_inbound_shard(shard));
     }
 
     // -----------------------------------------------------------------------
@@ -5467,7 +6637,10 @@ mod tests {
         // Decode the vote and confirm we accepted.
         let vote = crate::cluster::topology::TopologyVote::deserialize(&resp.payload)
             .expect("vote must deserialize");
-        assert!(vote.accepted, "vote must be accepted for subsuming proposal");
+        assert!(
+            vote.accepted,
+            "vote must be accepted for subsuming proposal"
+        );
         assert_eq!(vote.term, 500);
 
         // The reply has already been returned by handle_request. The
@@ -5525,7 +6698,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(resp.status, STATUS_ERROR, "persist failure must surface as error");
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "persist failure must surface as error"
+        );
         assert!(resp.payload.len() >= 2);
         let err_code = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
         assert_eq!(
@@ -5705,9 +6881,24 @@ mod tests {
             block_height_retention: 288,
         };
         let items = vec![
-            WireSpendItem { txid: txid_a, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0xA1; 36] },
-            WireSpendItem { txid: txid_b, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0xB2; 36] },
-            WireSpendItem { txid: txid_c, vout: 0, utxo_hash: wrong_hash,     spending_data: [0xC3; 36] },
+            WireSpendItem {
+                txid: txid_a,
+                vout: 0,
+                utxo_hash: utxo_hash_vout0,
+                spending_data: [0xA1; 36],
+            },
+            WireSpendItem {
+                txid: txid_b,
+                vout: 0,
+                utxo_hash: utxo_hash_vout0,
+                spending_data: [0xB2; 36],
+            },
+            WireSpendItem {
+                txid: txid_c,
+                vout: 0,
+                utxo_hash: wrong_hash,
+                spending_data: [0xC3; 36],
+            },
         ];
         let before = snapshot_spend(m);
         let resp = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &items));
@@ -5750,7 +6941,10 @@ mod tests {
 
         // First spend: succeeds.
         let before1 = snapshot_spend(m);
-        let r1 = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, std::slice::from_ref(&item)));
+        let r1 = h.request(
+            OP_SPEND_BATCH,
+            encode_spend_batch(&params, std::slice::from_ref(&item)),
+        );
         let after1 = snapshot_spend(m);
         assert_eq!(r1.status, STATUS_OK);
         assert_eq!(after1.1 - before1.1, 1, "first spend: 1 success");
@@ -5758,7 +6952,10 @@ mod tests {
 
         // Second identical spend: idempotent.
         let before2 = snapshot_spend(m);
-        let r2 = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, std::slice::from_ref(&item)));
+        let r2 = h.request(
+            OP_SPEND_BATCH,
+            encode_spend_batch(&params, std::slice::from_ref(&item)),
+        );
         let after2 = snapshot_spend(m);
         assert_eq!(r2.status, STATUS_OK);
         assert_eq!(after2.0 - before2.0, 1, "items_attempted += 1");
@@ -5799,16 +6996,29 @@ mod tests {
             spending_data: [0x77; 36],
         };
         assert_eq!(
-            h.request(OP_SPEND_BATCH, encode_spend_batch(&sp, &[spend_item])).status,
+            h.request(OP_SPEND_BATCH, encode_spend_batch(&sp, &[spend_item]))
+                .status,
             STATUS_OK,
         );
 
         // Now submit unspend for A (real), B (noop), and C with wrong hash (fail).
         let wrong_hash = [0x88u8; 32];
         let items = vec![
-            WireSlotItem { txid: txid_a, vout: 0, utxo_hash: utxo_hash_vout0 },
-            WireSlotItem { txid: txid_b, vout: 0, utxo_hash: utxo_hash_vout0 },
-            WireSlotItem { txid: txid_c, vout: 0, utxo_hash: wrong_hash },
+            WireSlotItem {
+                txid: txid_a,
+                vout: 0,
+                utxo_hash: utxo_hash_vout0,
+            },
+            WireSlotItem {
+                txid: txid_b,
+                vout: 0,
+                utxo_hash: utxo_hash_vout0,
+            },
+            WireSlotItem {
+                txid: txid_c,
+                vout: 0,
+                utxo_hash: wrong_hash,
+            },
         ];
         let params = UnspendBatchParams {
             current_block_height: 1000,
@@ -5862,7 +7072,11 @@ mod tests {
         let after_succ = m.set_mined_items_succeeded.get();
         let after_fail = m.set_mined_items_failed.get();
         assert_eq!(after_att - before_att, 3, "set_mined_items_attempted += 3");
-        assert_eq!(after_succ - before_succ, 2, "set_mined_items_succeeded += 2");
+        assert_eq!(
+            after_succ - before_succ,
+            2,
+            "set_mined_items_succeeded += 2"
+        );
         assert_eq!(after_fail - before_fail, 1, "set_mined_items_failed += 1");
     }
 
@@ -5887,20 +7101,42 @@ mod tests {
         let txid_new = DispatchTestHarness::make_txid(71);
         let items = vec![
             WireCreateItem {
-                txid: txid_new, tx_version: 1, locktime: 0, fee: 100,
-                size_in_bytes: 200, extended_size: 200, is_coinbase: false,
-                spending_height: 0, created_at: 1700000000000, flags: 0,
-                utxo_hashes: vec![[0u8; 32]], cold_data: vec![],
-                block_height: 0, mined_block_id: None, mined_block_height: None,
-                mined_subtree_idx: None, parent_txids: vec![],
+                txid: txid_new,
+                tx_version: 1,
+                locktime: 0,
+                fee: 100,
+                size_in_bytes: 200,
+                extended_size: 200,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1700000000000,
+                flags: 0,
+                utxo_hashes: vec![[0u8; 32]],
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
             },
             WireCreateItem {
-                txid: txid_a, tx_version: 1, locktime: 0, fee: 100,
-                size_in_bytes: 200, extended_size: 200, is_coinbase: false,
-                spending_height: 0, created_at: 1700000000000, flags: 0,
-                utxo_hashes: vec![[0u8; 32]], cold_data: vec![],
-                block_height: 0, mined_block_id: None, mined_block_height: None,
-                mined_subtree_idx: None, parent_txids: vec![],
+                txid: txid_a,
+                tx_version: 1,
+                locktime: 0,
+                fee: 100,
+                size_in_bytes: 200,
+                extended_size: 200,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1700000000000,
+                flags: 0,
+                utxo_hashes: vec![[0u8; 32]],
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
             },
         ];
         let payload = encode_create_batch(&items);
@@ -5910,7 +7146,11 @@ mod tests {
         let after_att = m.creates_attempted.get();
         let after_succ = m.creates_succeeded.get();
         let after_fail = m.creates_failed.get();
-        assert_eq!(after_att - before_att, 1, "creates_attempted += 1 (per batch)");
+        assert_eq!(
+            after_att - before_att,
+            1,
+            "creates_attempted += 1 (per batch)"
+        );
         assert_eq!(after_succ - before_succ, 1, "creates_succeeded += 1");
         assert_eq!(after_fail - before_fail, 1, "creates_failed += 1");
     }
@@ -5929,8 +7169,16 @@ mod tests {
 
         let utxo_hash_vout0 = [0u8; 32];
         let items = vec![
-            WireSlotItem { txid: txid_a, vout: 0, utxo_hash: utxo_hash_vout0 },
-            WireSlotItem { txid: txid_missing, vout: 0, utxo_hash: utxo_hash_vout0 },
+            WireSlotItem {
+                txid: txid_a,
+                vout: 0,
+                utxo_hash: utxo_hash_vout0,
+            },
+            WireSlotItem {
+                txid: txid_missing,
+                vout: 0,
+                utxo_hash: utxo_hash_vout0,
+            },
         ];
         let payload = encode_slot_item_batch(&items);
 
@@ -5963,7 +7211,11 @@ mod tests {
         let after_succ = m.deletes_succeeded.get();
         let after_fail = m.deletes_failed.get();
         assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
-        assert_eq!(after_succ - before_succ, 1, "deletes_succeeded += 1 (A deleted)");
+        assert_eq!(
+            after_succ - before_succ,
+            1,
+            "deletes_succeeded += 1 (A deleted)"
+        );
         assert_eq!(after_fail - before_fail, 1, "deletes_failed += 1 (missing)");
     }
 
@@ -6055,9 +7307,24 @@ mod tests {
         // Round 1: spend A and B successfully, C with wrong hash → Other.
         let wrong_hash = [0xEEu8; 32];
         let items = vec![
-            WireSpendItem { txid: txid_a, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0x11; 36] },
-            WireSpendItem { txid: txid_b, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0x22; 36] },
-            WireSpendItem { txid: txid_c, vout: 0, utxo_hash: wrong_hash,     spending_data: [0x33; 36] },
+            WireSpendItem {
+                txid: txid_a,
+                vout: 0,
+                utxo_hash: utxo_hash_vout0,
+                spending_data: [0x11; 36],
+            },
+            WireSpendItem {
+                txid: txid_b,
+                vout: 0,
+                utxo_hash: utxo_hash_vout0,
+                spending_data: [0x22; 36],
+            },
+            WireSpendItem {
+                txid: txid_c,
+                vout: 0,
+                utxo_hash: wrong_hash,
+                spending_data: [0x33; 36],
+            },
         ];
         let before_ok = m.operations.get(OpCode::Spend, Outcome::Ok);
         let before_idem = m.operations.get(OpCode::Spend, Outcome::Idempotent);
@@ -6070,17 +7337,30 @@ mod tests {
         // Round 2: replay A with identical spending_data → Idempotent.
         // Also try D which does not exist → ErrNotFound.
         let items2 = vec![
-            WireSpendItem { txid: txid_a, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0x11; 36] },
-            WireSpendItem { txid: txid_missing, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0x44; 36] },
+            WireSpendItem {
+                txid: txid_a,
+                vout: 0,
+                utxo_hash: utxo_hash_vout0,
+                spending_data: [0x11; 36],
+            },
+            WireSpendItem {
+                txid: txid_missing,
+                vout: 0,
+                utxo_hash: utxo_hash_vout0,
+                spending_data: [0x44; 36],
+            },
         ];
         let resp2 = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &items2));
         assert_eq!(resp2.status, STATUS_PARTIAL_ERROR);
 
         // Round 3: attempt to spend A again with DIFFERENT spending_data →
         // ErrConflicting (AlreadySpent).
-        let items3 = vec![
-            WireSpendItem { txid: txid_a, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0x55; 36] },
-        ];
+        let items3 = vec![WireSpendItem {
+            txid: txid_a,
+            vout: 0,
+            utxo_hash: utxo_hash_vout0,
+            spending_data: [0x55; 36],
+        }];
         let resp3 = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &items3));
         assert_eq!(resp3.status, STATUS_PARTIAL_ERROR);
 
@@ -6093,15 +7373,18 @@ mod tests {
         assert_eq!(after_ok - before_ok, 2, "Ok += 2 (A + B)");
         assert_eq!(after_idem - before_idem, 1, "Idempotent += 1 (A replayed)");
         assert_eq!(
-            after_other - before_other, 1,
+            after_other - before_other,
+            1,
             "Other += 1 (C UtxoHashMismatch)"
         );
         assert_eq!(
-            after_conflict - before_conflict, 1,
+            after_conflict - before_conflict,
+            1,
             "ErrConflicting += 1 (A AlreadySpent)"
         );
         assert_eq!(
-            after_not_found - before_not_found, 1,
+            after_not_found - before_not_found,
+            1,
             "ErrNotFound += 1 (missing txid)"
         );
     }
@@ -6112,8 +7395,8 @@ mod tests {
     /// author to update the Phase 2 spec.
     #[test]
     fn outcome_classification_is_stable_for_every_spend_error_variant() {
-        use crate::metrics::Outcome;
         use super::classify_spend_error;
+        use crate::metrics::Outcome;
 
         let fresh_spending_data = [0u8; 36];
         let cases: Vec<(SpendError, Outcome)> = vec![
@@ -6121,39 +7404,59 @@ mod tests {
             (SpendError::Conflicting, Outcome::ErrConflicting),
             (SpendError::Locked, Outcome::ErrFrozen),
             (
-                SpendError::CoinbaseImmature { spending_height: 5, current_height: 1 },
+                SpendError::CoinbaseImmature {
+                    spending_height: 5,
+                    current_height: 1,
+                },
                 Outcome::Other,
             ),
             (SpendError::UtxoNotFound { offset: 0 }, Outcome::Other),
             (SpendError::UtxoHashMismatch { offset: 0 }, Outcome::Other),
             (
-                SpendError::AlreadySpent { offset: 0, spending_data: fresh_spending_data },
+                SpendError::AlreadySpent {
+                    offset: 0,
+                    spending_data: fresh_spending_data,
+                },
                 Outcome::ErrConflicting,
             ),
             (SpendError::Frozen { offset: 0 }, Outcome::ErrFrozen),
             (
-                SpendError::FrozenUntil { offset: 0, spendable_at_height: 1 },
+                SpendError::FrozenUntil {
+                    offset: 0,
+                    spendable_at_height: 1,
+                },
                 Outcome::ErrFrozen,
             ),
             (
-                SpendError::InvalidSpend { offset: 0, spending_data: fresh_spending_data },
+                SpendError::InvalidSpend {
+                    offset: 0,
+                    spending_data: fresh_spending_data,
+                },
                 Outcome::ErrConflicting,
             ),
             (SpendError::Pruned { offset: 0 }, Outcome::ErrConflicting),
             (SpendError::AlreadyFrozen { offset: 0 }, Outcome::ErrFrozen),
             (SpendError::NotFrozen { offset: 0 }, Outcome::ErrFrozen),
             (
-                SpendError::StorageError { detail: "disk".into() },
+                SpendError::StorageError {
+                    detail: "disk".into(),
+                },
                 Outcome::ErrStorage,
             ),
             (
-                SpendError::DahOverflow { current_height: u32::MAX - 1, retention: 288 },
+                SpendError::DahOverflow {
+                    current_height: u32::MAX - 1,
+                    retention: 288,
+                },
                 Outcome::ErrStorage,
             ),
         ];
         for (err, expected) in cases {
             let got = classify_spend_error(&err);
-            assert_eq!(got, expected, "classify_spend_error({err:?}) → {got:?}, expected {expected:?}");
+            assert_eq!(
+                got, expected,
+                "classify_spend_error({err:?}) → {got:?}, expected {expected:?}"
+            );
         }
     }
 
@@ -6180,17 +7483,38 @@ mod tests {
             current_block_height: 1000,
             block_height_retention: 288,
         };
-        let item_a = WireSpendItem { txid: txid_a, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0xAA; 36] };
-        let item_missing = WireSpendItem { txid: txid_missing, vout: 0, utxo_hash: utxo_hash_vout0, spending_data: [0xBB; 36] };
+        let item_a = WireSpendItem {
+            txid: txid_a,
+            vout: 0,
+            utxo_hash: utxo_hash_vout0,
+            spending_data: [0xAA; 36],
+        };
+        let item_missing = WireSpendItem {
+            txid: txid_missing,
+            vout: 0,
+            utxo_hash: utxo_hash_vout0,
+            spending_data: [0xBB; 36],
+        };
         assert_eq!(
-            h.request(OP_SPEND_BATCH, encode_spend_batch(&params, std::slice::from_ref(&item_a))).status,
+            h.request(
+                OP_SPEND_BATCH,
+                encode_spend_batch(&params, std::slice::from_ref(&item_a))
+            )
+            .status,
             STATUS_OK
         );
         assert_eq!(
-            h.request(OP_SPEND_BATCH, encode_spend_batch(&params, std::slice::from_ref(&item_a))).status,
+            h.request(
+                OP_SPEND_BATCH,
+                encode_spend_batch(&params, std::slice::from_ref(&item_a))
+            )
+            .status,
             STATUS_OK // idempotent replay reports STATUS_OK
         );
-        let _ = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, std::slice::from_ref(&item_missing)));
+        let _ = h.request(
+            OP_SPEND_BATCH,
+            encode_spend_batch(&params, std::slice::from_ref(&item_missing)),
+        );
 
         let hists = crate::metrics::ThreadHistograms::new();
         let text = crate::server::http::render_metrics_text(m, &hists, 0, 0, 0, 0);
@@ -6232,8 +7556,14 @@ mod tests {
             }
         }
         assert!(found_spend_ok, "expected at least one Spend/Ok tick");
-        assert!(found_spend_idempotent, "expected at least one Spend/Idempotent tick");
-        assert!(found_spend_not_found, "expected at least one Spend/ErrNotFound tick");
+        assert!(
+            found_spend_idempotent,
+            "expected at least one Spend/Idempotent tick"
+        );
+        assert!(
+            found_spend_not_found,
+            "expected at least one Spend/ErrNotFound tick"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -6249,12 +7579,12 @@ mod tests {
     mod capture {
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
+        use tracing::Subscriber;
         use tracing::field::{Field, Visit};
         use tracing::span::{Attributes, Id};
-        use tracing::Subscriber;
+        use tracing_subscriber::Layer;
         use tracing_subscriber::layer::Context;
         use tracing_subscriber::registry::LookupSpan;
-        use tracing_subscriber::Layer;
 
         #[derive(Clone, Debug)]
         pub struct CapturedSpan {
@@ -6279,7 +7609,8 @@ mod tests {
 
         impl<'a> Visit for FieldVisitor<'a> {
             fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                self.0.insert(field.name().to_string(), format!("{value:?}"));
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
             }
             fn record_str(&mut self, field: &Field, value: &str) {
                 self.0.insert(field.name().to_string(), value.to_string());
@@ -6302,7 +7633,10 @@ mod tests {
             fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
                 let mut fields = HashMap::new();
                 attrs.record(&mut FieldVisitor(&mut fields));
-                let parent_id = ctx.span(id).and_then(|s| s.parent()).map(|p| p.id().into_u64());
+                let parent_id = ctx
+                    .span(id)
+                    .and_then(|s| s.parent())
+                    .map(|p| p.id().into_u64());
                 let mut spans = self.spans.lock().expect("capture lock poisoned");
                 spans.push(CapturedSpan {
                     name: attrs.metadata().name(),
@@ -6325,9 +7659,7 @@ mod tests {
         let layer = capture::CaptureLayer::new();
         let spans = layer.spans.clone();
         let filter = tracing_subscriber::EnvFilter::new("debug");
-        let subscriber = tracing_subscriber::registry()
-            .with(filter)
-            .with(layer);
+        let subscriber = tracing_subscriber::registry().with(filter).with(layer);
         tracing::subscriber::with_default(subscriber, f);
         let guard = spans.lock().expect("capture lock poisoned");
         guard.clone()
@@ -6446,10 +7778,7 @@ mod tests {
             s.fields.get("op").map(String::as_str),
             Some(OP_SPEND_BATCH.to_string().as_str()),
         );
-        assert_eq!(
-            s.fields.get("request_id").map(String::as_str),
-            Some("777"),
-        );
+        assert_eq!(s.fields.get("request_id").map(String::as_str), Some("777"),);
     }
 
     /// The `spend_multi` engine span is emitted under the current dispatch
@@ -6504,7 +7833,8 @@ mod tests {
             apply_span.parent_id,
             Some(dispatch_span.id),
             "apply parent ({:?}) should be dispatch span ({})",
-            apply_span.parent_id, dispatch_span.id,
+            apply_span.parent_id,
+            dispatch_span.id,
         );
 
         // Drive the higher-level wrapper directly so the spend_multi span is

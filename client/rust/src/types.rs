@@ -411,70 +411,140 @@ impl GetBatchResult {
     #[inline]
     fn read_u32(&self, i: usize, field_bit: u32) -> Option<u32> {
         let item = &self.items[i];
-        if item.status != 0 { return None; }
+        if item.status != 0 {
+            return None;
+        }
         let off = field_offset(self.field_mask, field_bit)?;
-        if off + 4 > item.data.len() { return None; }
-        Some(u32::from_le_bytes(item.data[off..off + 4].try_into().unwrap()))
+        if off + 4 > item.data.len() {
+            return None;
+        }
+        Some(u32::from_le_bytes(
+            item.data[off..off + 4].try_into().unwrap(),
+        ))
     }
 
     /// Read a `u64` field from item `i`. Zero-alloc.
     #[inline]
     fn read_u64(&self, i: usize, field_bit: u32) -> Option<u64> {
         let item = &self.items[i];
-        if item.status != 0 { return None; }
+        if item.status != 0 {
+            return None;
+        }
         let off = field_offset(self.field_mask, field_bit)?;
-        if off + 8 > item.data.len() { return None; }
-        Some(u64::from_le_bytes(item.data[off..off + 8].try_into().unwrap()))
+        if off + 8 > item.data.len() {
+            return None;
+        }
+        Some(u64::from_le_bytes(
+            item.data[off..off + 8].try_into().unwrap(),
+        ))
     }
 
     /// Read a `u8` field from item `i`. Zero-alloc.
     #[inline]
     fn read_u8(&self, i: usize, field_bit: u32) -> Option<u8> {
         let item = &self.items[i];
-        if item.status != 0 { return None; }
+        if item.status != 0 {
+            return None;
+        }
         let off = field_offset(self.field_mask, field_bit)?;
-        if off >= item.data.len() { return None; }
+        if off >= item.data.len() {
+            return None;
+        }
         Some(item.data[off])
     }
 
     // -- Typed convenience accessors --
 
     /// Read `tx_version` for item `i` (bit 0, u32). Zero-alloc.
-    #[inline] pub fn tx_version(&self, i: usize) -> Option<u32> { self.read_u32(i, 0) }
+    #[inline]
+    pub fn tx_version(&self, i: usize) -> Option<u32> {
+        self.read_u32(i, 0)
+    }
     /// Read `locktime` for item `i` (bit 1, u32). Zero-alloc.
-    #[inline] pub fn locktime(&self, i: usize) -> Option<u32> { self.read_u32(i, 1) }
+    #[inline]
+    pub fn locktime(&self, i: usize) -> Option<u32> {
+        self.read_u32(i, 1)
+    }
     /// Read `fee` for item `i` (bit 2, u64). Zero-alloc.
-    #[inline] pub fn fee(&self, i: usize) -> Option<u64> { self.read_u64(i, 2) }
+    #[inline]
+    pub fn fee(&self, i: usize) -> Option<u64> {
+        self.read_u64(i, 2)
+    }
     /// Read `size_in_bytes` for item `i` (bit 3, u64). Zero-alloc.
-    #[inline] pub fn size_in_bytes(&self, i: usize) -> Option<u64> { self.read_u64(i, 3) }
+    #[inline]
+    pub fn size_in_bytes(&self, i: usize) -> Option<u64> {
+        self.read_u64(i, 3)
+    }
     /// Read `extended_size` for item `i` (bit 4, u64). Zero-alloc.
-    #[inline] pub fn extended_size(&self, i: usize) -> Option<u64> { self.read_u64(i, 4) }
+    #[inline]
+    pub fn extended_size(&self, i: usize) -> Option<u64> {
+        self.read_u64(i, 4)
+    }
     /// Read `flags` byte for item `i` (bit 5, u8). Zero-alloc.
-    #[inline] pub fn flags(&self, i: usize) -> Option<u8> { self.read_u8(i, 5) }
+    #[inline]
+    pub fn flags(&self, i: usize) -> Option<u8> {
+        self.read_u8(i, 5)
+    }
     /// Read `spending_height` for item `i` (bit 6, u32). Zero-alloc.
-    #[inline] pub fn spending_height(&self, i: usize) -> Option<u32> { self.read_u32(i, 6) }
+    #[inline]
+    pub fn spending_height(&self, i: usize) -> Option<u32> {
+        self.read_u32(i, 6)
+    }
     /// Read `created_at` for item `i` (bit 7, u64). Zero-alloc.
-    #[inline] pub fn created_at(&self, i: usize) -> Option<u64> { self.read_u64(i, 7) }
+    #[inline]
+    pub fn created_at(&self, i: usize) -> Option<u64> {
+        self.read_u64(i, 7)
+    }
     /// Read `spent_utxos` for item `i` (bit 8, u32). Zero-alloc.
-    #[inline] pub fn spent_utxos(&self, i: usize) -> Option<u32> { self.read_u32(i, 8) }
+    #[inline]
+    pub fn spent_utxos(&self, i: usize) -> Option<u32> {
+        self.read_u32(i, 8)
+    }
     /// Read `pruned_utxos` for item `i` (bit 9, u32). Zero-alloc.
-    #[inline] pub fn pruned_utxos(&self, i: usize) -> Option<u32> { self.read_u32(i, 9) }
+    #[inline]
+    pub fn pruned_utxos(&self, i: usize) -> Option<u32> {
+        self.read_u32(i, 9)
+    }
     /// Read `utxo_count` for item `i` (bit 10, u32). Zero-alloc.
-    #[inline] pub fn utxo_count(&self, i: usize) -> Option<u32> { self.read_u32(i, 10) }
+    #[inline]
+    pub fn utxo_count(&self, i: usize) -> Option<u32> {
+        self.read_u32(i, 10)
+    }
     /// Read `generation` for item `i` (bit 11, u32). Zero-alloc.
-    #[inline] pub fn generation(&self, i: usize) -> Option<u32> { self.read_u32(i, 11) }
+    #[inline]
+    pub fn generation(&self, i: usize) -> Option<u32> {
+        self.read_u32(i, 11)
+    }
     /// Read `updated_at` for item `i` (bit 12, u64). Zero-alloc.
-    #[inline] pub fn updated_at(&self, i: usize) -> Option<u64> { self.read_u64(i, 12) }
+    #[inline]
+    pub fn updated_at(&self, i: usize) -> Option<u64> {
+        self.read_u64(i, 12)
+    }
     /// Read `unmined_since` for item `i` (bit 13, u32). Zero-alloc.
-    #[inline] pub fn unmined_since(&self, i: usize) -> Option<u32> { self.read_u32(i, 13) }
+    #[inline]
+    pub fn unmined_since(&self, i: usize) -> Option<u32> {
+        self.read_u32(i, 13)
+    }
     /// Read `delete_at_height` for item `i` (bit 14, u32). Zero-alloc.
-    #[inline] pub fn delete_at_height(&self, i: usize) -> Option<u32> { self.read_u32(i, 14) }
+    #[inline]
+    pub fn delete_at_height(&self, i: usize) -> Option<u32> {
+        self.read_u32(i, 14)
+    }
     /// Read `preserve_until` for item `i` (bit 15, u32). Zero-alloc.
-    #[inline] pub fn preserve_until(&self, i: usize) -> Option<u32> { self.read_u32(i, 15) }
+    #[inline]
+    pub fn preserve_until(&self, i: usize) -> Option<u32> {
+        self.read_u32(i, 15)
+    }
     /// Read `reassignment_count` for item `i` (bit 17, u8). Zero-alloc.
-    #[inline] pub fn reassignment_count(&self, i: usize) -> Option<u8> { self.read_u8(i, 17) }
+    #[inline]
+    pub fn reassignment_count(&self, i: usize) -> Option<u8> {
+        self.read_u8(i, 17)
+    }
     /// Read `block_entry_count` for item `i` (bit 18, u8). Zero-alloc.
-    #[inline] pub fn block_entry_count(&self, i: usize) -> Option<u8> { self.read_u8(i, 18) }
+    #[inline]
+    pub fn block_entry_count(&self, i: usize) -> Option<u8> {
+        self.read_u8(i, 18)
+    }
 
     // -- Derived convenience accessors --
 
@@ -571,17 +641,31 @@ pub struct GetResultRef<'a> {
 
 impl<'a> GetResultRef<'a> {
     /// Returns `true` if the record was found (status == 0).
-    #[inline] pub fn found(&self) -> bool { self.item.status == 0 }
+    #[inline]
+    pub fn found(&self) -> bool {
+        self.item.status == 0
+    }
     /// Returns the raw status byte.
-    #[inline] pub fn status(&self) -> u8 { self.item.status }
+    #[inline]
+    pub fn status(&self) -> u8 {
+        self.item.status
+    }
     /// Returns the raw data bytes.
-    #[inline] pub fn data(&self) -> &[u8] { &self.item.data }
+    #[inline]
+    pub fn data(&self) -> &[u8] {
+        &self.item.data
+    }
     /// Returns the field mask.
-    #[inline] pub fn field_mask(&self) -> u32 { self.field_mask }
+    #[inline]
+    pub fn field_mask(&self) -> u32 {
+        self.field_mask
+    }
 
     /// Decode full [`TxMetadata`]. Allocates.
     pub fn decode_metadata(&self) -> Result<Option<(TxMetadata, usize)>, ClientError> {
-        if self.item.status != 0 { return Ok(None); }
+        if self.item.status != 0 {
+            return Ok(None);
+        }
         let (meta, n) = TxMetadata::decode(self.field_mask, &self.item.data)?;
         Ok(Some((meta, n)))
     }
@@ -590,77 +674,159 @@ impl<'a> GetResultRef<'a> {
 
     #[inline]
     fn read_u32(&self, field_bit: u32) -> Option<u32> {
-        if self.item.status != 0 { return None; }
+        if self.item.status != 0 {
+            return None;
+        }
         let off = field_offset(self.field_mask, field_bit)?;
-        if off + 4 > self.item.data.len() { return None; }
-        Some(u32::from_le_bytes(self.item.data[off..off + 4].try_into().unwrap()))
+        if off + 4 > self.item.data.len() {
+            return None;
+        }
+        Some(u32::from_le_bytes(
+            self.item.data[off..off + 4].try_into().unwrap(),
+        ))
     }
 
     #[inline]
     fn read_u64(&self, field_bit: u32) -> Option<u64> {
-        if self.item.status != 0 { return None; }
+        if self.item.status != 0 {
+            return None;
+        }
         let off = field_offset(self.field_mask, field_bit)?;
-        if off + 8 > self.item.data.len() { return None; }
-        Some(u64::from_le_bytes(self.item.data[off..off + 8].try_into().unwrap()))
+        if off + 8 > self.item.data.len() {
+            return None;
+        }
+        Some(u64::from_le_bytes(
+            self.item.data[off..off + 8].try_into().unwrap(),
+        ))
     }
 
     #[inline]
     fn read_u8(&self, field_bit: u32) -> Option<u8> {
-        if self.item.status != 0 { return None; }
+        if self.item.status != 0 {
+            return None;
+        }
         let off = field_offset(self.field_mask, field_bit)?;
-        if off >= self.item.data.len() { return None; }
+        if off >= self.item.data.len() {
+            return None;
+        }
         Some(self.item.data[off])
     }
 
     // -- Typed field accessors --
 
     /// Read `tx_version` (bit 0, u32). Zero-alloc.
-    #[inline] pub fn tx_version(&self) -> Option<u32> { self.read_u32(0) }
+    #[inline]
+    pub fn tx_version(&self) -> Option<u32> {
+        self.read_u32(0)
+    }
     /// Read `locktime` (bit 1, u32). Zero-alloc.
-    #[inline] pub fn locktime(&self) -> Option<u32> { self.read_u32(1) }
+    #[inline]
+    pub fn locktime(&self) -> Option<u32> {
+        self.read_u32(1)
+    }
     /// Read `fee` (bit 2, u64). Zero-alloc.
-    #[inline] pub fn fee(&self) -> Option<u64> { self.read_u64(2) }
+    #[inline]
+    pub fn fee(&self) -> Option<u64> {
+        self.read_u64(2)
+    }
     /// Read `size_in_bytes` (bit 3, u64). Zero-alloc.
-    #[inline] pub fn size_in_bytes(&self) -> Option<u64> { self.read_u64(3) }
+    #[inline]
+    pub fn size_in_bytes(&self) -> Option<u64> {
+        self.read_u64(3)
+    }
     /// Read `extended_size` (bit 4, u64). Zero-alloc.
-    #[inline] pub fn extended_size(&self) -> Option<u64> { self.read_u64(4) }
+    #[inline]
+    pub fn extended_size(&self) -> Option<u64> {
+        self.read_u64(4)
+    }
     /// Read `flags` byte (bit 5, u8). Zero-alloc.
-    #[inline] pub fn flags(&self) -> Option<u8> { self.read_u8(5) }
+    #[inline]
+    pub fn flags(&self) -> Option<u8> {
+        self.read_u8(5)
+    }
     /// Read `spending_height` (bit 6, u32). Zero-alloc.
-    #[inline] pub fn spending_height(&self) -> Option<u32> { self.read_u32(6) }
+    #[inline]
+    pub fn spending_height(&self) -> Option<u32> {
+        self.read_u32(6)
+    }
     /// Read `created_at` (bit 7, u64). Zero-alloc.
-    #[inline] pub fn created_at(&self) -> Option<u64> { self.read_u64(7) }
+    #[inline]
+    pub fn created_at(&self) -> Option<u64> {
+        self.read_u64(7)
+    }
     /// Read `spent_utxos` (bit 8, u32). Zero-alloc.
-    #[inline] pub fn spent_utxos(&self) -> Option<u32> { self.read_u32(8) }
+    #[inline]
+    pub fn spent_utxos(&self) -> Option<u32> {
+        self.read_u32(8)
+    }
     /// Read `pruned_utxos` (bit 9, u32). Zero-alloc.
-    #[inline] pub fn pruned_utxos(&self) -> Option<u32> { self.read_u32(9) }
+    #[inline]
+    pub fn pruned_utxos(&self) -> Option<u32> {
+        self.read_u32(9)
+    }
     /// Read `utxo_count` (bit 10, u32). Zero-alloc.
-    #[inline] pub fn utxo_count(&self) -> Option<u32> { self.read_u32(10) }
+    #[inline]
+    pub fn utxo_count(&self) -> Option<u32> {
+        self.read_u32(10)
+    }
     /// Read `generation` (bit 11, u32). Zero-alloc.
-    #[inline] pub fn generation(&self) -> Option<u32> { self.read_u32(11) }
+    #[inline]
+    pub fn generation(&self) -> Option<u32> {
+        self.read_u32(11)
+    }
     /// Read `updated_at` (bit 12, u64). Zero-alloc.
-    #[inline] pub fn updated_at(&self) -> Option<u64> { self.read_u64(12) }
+    #[inline]
+    pub fn updated_at(&self) -> Option<u64> {
+        self.read_u64(12)
+    }
     /// Read `unmined_since` (bit 13, u32). Zero-alloc.
-    #[inline] pub fn unmined_since(&self) -> Option<u32> { self.read_u32(13) }
+    #[inline]
+    pub fn unmined_since(&self) -> Option<u32> {
+        self.read_u32(13)
+    }
     /// Read `delete_at_height` (bit 14, u32). Zero-alloc.
-    #[inline] pub fn delete_at_height(&self) -> Option<u32> { self.read_u32(14) }
+    #[inline]
+    pub fn delete_at_height(&self) -> Option<u32> {
+        self.read_u32(14)
+    }
     /// Read `preserve_until` (bit 15, u32). Zero-alloc.
-    #[inline] pub fn preserve_until(&self) -> Option<u32> { self.read_u32(15) }
+    #[inline]
+    pub fn preserve_until(&self) -> Option<u32> {
+        self.read_u32(15)
+    }
     /// Read `reassignment_count` (bit 17, u8). Zero-alloc.
-    #[inline] pub fn reassignment_count(&self) -> Option<u8> { self.read_u8(17) }
+    #[inline]
+    pub fn reassignment_count(&self) -> Option<u8> {
+        self.read_u8(17)
+    }
     /// Read `block_entry_count` (bit 18, u8). Zero-alloc.
-    #[inline] pub fn block_entry_count(&self) -> Option<u8> { self.read_u8(18) }
+    #[inline]
+    pub fn block_entry_count(&self) -> Option<u8> {
+        self.read_u8(18)
+    }
 
     // -- Derived accessors --
 
     /// Check if conflicting (flags bit 1). Zero-alloc.
-    #[inline] pub fn is_conflicting(&self) -> Option<bool> { self.flags().map(|f| f & 0b0000_0010 != 0) }
+    #[inline]
+    pub fn is_conflicting(&self) -> Option<bool> {
+        self.flags().map(|f| f & 0b0000_0010 != 0)
+    }
     /// Check if locked (flags bit 2). Zero-alloc.
-    #[inline] pub fn is_locked(&self) -> Option<bool> { self.flags().map(|f| f & 0b0000_0100 != 0) }
+    #[inline]
+    pub fn is_locked(&self) -> Option<bool> {
+        self.flags().map(|f| f & 0b0000_0100 != 0)
+    }
     /// Check if coinbase (flags bit 0). Zero-alloc.
-    #[inline] pub fn is_coinbase(&self) -> Option<bool> { self.flags().map(|f| f & 0b0000_0001 != 0) }
+    #[inline]
+    pub fn is_coinbase(&self) -> Option<bool> {
+        self.flags().map(|f| f & 0b0000_0001 != 0)
+    }
     /// Check if mined (block_entry_count > 0). Zero-alloc.
-    #[inline] pub fn is_mined(&self) -> Option<bool> { self.block_entry_count().map(|c| c > 0) }
+    #[inline]
+    pub fn is_mined(&self) -> Option<bool> {
+        self.block_entry_count().map(|c| c > 0)
+    }
 }
 
 /// A single item in a [`GetSpendBatch`](crate::Client::get_spend_batch) response.
@@ -712,7 +878,7 @@ pub struct NodeInfo {
 /// Parsed transaction metadata from a [`GetBatch`](crate::Client::get_batch) response.
 ///
 /// Decode with [`TxMetadata::decode`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TxMetadata {
     /// Transaction version.
     pub tx_version: u32,
@@ -800,7 +966,9 @@ impl TxMetadata {
                 if pos + $n > data.len() {
                     return Err(ClientError::Protocol(format!(
                         "tx metadata: need {} more bytes at offset {}, have {}",
-                        $n, pos, data.len()
+                        $n,
+                        pos,
+                        data.len()
                     )));
                 }
             };
@@ -824,32 +992,73 @@ impl TxMetadata {
             }};
         }
 
-        if field_mask & FIELD_TX_VERSION != 0       { meta.tx_version = read_u32!(); }
-        if field_mask & FIELD_LOCKTIME != 0          { meta.locktime = read_u32!(); }
-        if field_mask & FIELD_FEE != 0               { meta.fee = read_u64!(); }
-        if field_mask & FIELD_SIZE_IN_BYTES != 0     { meta.size_in_bytes = read_u64!(); }
-        if field_mask & FIELD_EXTENDED_SIZE != 0      { meta.extended_size = read_u64!(); }
-        if field_mask & FIELD_FLAGS != 0              { need!(1); meta.flags = data[pos]; pos += 1; }
-        if field_mask & FIELD_SPENDING_HEIGHT != 0   { meta.spending_height = read_u32!(); }
-        if field_mask & FIELD_CREATED_AT != 0        { meta.created_at = read_u64!(); }
-        if field_mask & FIELD_SPENT_UTXOS != 0       { meta.spent_utxos = read_u32!(); }
-        if field_mask & FIELD_PRUNED_UTXOS != 0      { meta.pruned_utxos = read_u32!(); }
-        if field_mask & FIELD_UTXO_COUNT != 0        { meta.utxo_count = read_u32!(); }
-        if field_mask & FIELD_GENERATION != 0        { meta.generation = read_u32!(); }
-        if field_mask & FIELD_UPDATED_AT != 0        { meta.updated_at = read_u64!(); }
-        if field_mask & FIELD_UNMINED_SINCE != 0      { meta.unmined_since = read_u32!(); }
-        if field_mask & FIELD_DELETE_AT_HEIGHT != 0  { meta.delete_at_height = read_u32!(); }
-        if field_mask & FIELD_PRESERVE_UNTIL != 0    { meta.preserve_until = read_u32!(); }
+        if field_mask & FIELD_TX_VERSION != 0 {
+            meta.tx_version = read_u32!();
+        }
+        if field_mask & FIELD_LOCKTIME != 0 {
+            meta.locktime = read_u32!();
+        }
+        if field_mask & FIELD_FEE != 0 {
+            meta.fee = read_u64!();
+        }
+        if field_mask & FIELD_SIZE_IN_BYTES != 0 {
+            meta.size_in_bytes = read_u64!();
+        }
+        if field_mask & FIELD_EXTENDED_SIZE != 0 {
+            meta.extended_size = read_u64!();
+        }
+        if field_mask & FIELD_FLAGS != 0 {
+            need!(1);
+            meta.flags = data[pos];
+            pos += 1;
+        }
+        if field_mask & FIELD_SPENDING_HEIGHT != 0 {
+            meta.spending_height = read_u32!();
+        }
+        if field_mask & FIELD_CREATED_AT != 0 {
+            meta.created_at = read_u64!();
+        }
+        if field_mask & FIELD_SPENT_UTXOS != 0 {
+            meta.spent_utxos = read_u32!();
+        }
+        if field_mask & FIELD_PRUNED_UTXOS != 0 {
+            meta.pruned_utxos = read_u32!();
+        }
+        if field_mask & FIELD_UTXO_COUNT != 0 {
+            meta.utxo_count = read_u32!();
+        }
+        if field_mask & FIELD_GENERATION != 0 {
+            meta.generation = read_u32!();
+        }
+        if field_mask & FIELD_UPDATED_AT != 0 {
+            meta.updated_at = read_u64!();
+        }
+        if field_mask & FIELD_UNMINED_SINCE != 0 {
+            meta.unmined_since = read_u32!();
+        }
+        if field_mask & FIELD_DELETE_AT_HEIGHT != 0 {
+            meta.delete_at_height = read_u32!();
+        }
+        if field_mask & FIELD_PRESERVE_UNTIL != 0 {
+            meta.preserve_until = read_u32!();
+        }
         if field_mask & FIELD_EXTERNAL_REF != 0 {
             need!(65);
-            let store_type = data[pos]; pos += 1;
+            let store_type = data[pos];
+            pos += 1;
             let mut content_hash = [0u8; 32];
-            content_hash.copy_from_slice(&data[pos..pos + 32]); pos += 32;
-            let total_size = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()); pos += 8;
-            let input_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()); pos += 4;
-            let output_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()); pos += 4;
-            let inputs_offset = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()); pos += 8;
-            let outputs_offset = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()); pos += 8;
+            content_hash.copy_from_slice(&data[pos..pos + 32]);
+            pos += 32;
+            let total_size = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let input_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let output_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let inputs_offset = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let outputs_offset = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            pos += 8;
             meta.external_ref = ExternalRef {
                 store_type,
                 content_hash,
@@ -860,36 +1069,18 @@ impl TxMetadata {
                 outputs_offset,
             };
         }
-        if field_mask & FIELD_REASSIGNMENT_COUNT != 0 { need!(1); meta.reassignment_count = data[pos]; pos += 1; }
-        if field_mask & FIELD_BLOCK_ENTRY_COUNT != 0  { need!(1); meta.block_entry_count = data[pos]; pos += 1; }
+        if field_mask & FIELD_REASSIGNMENT_COUNT != 0 {
+            need!(1);
+            meta.reassignment_count = data[pos];
+            pos += 1;
+        }
+        if field_mask & FIELD_BLOCK_ENTRY_COUNT != 0 {
+            need!(1);
+            meta.block_entry_count = data[pos];
+            pos += 1;
+        }
 
         Ok((meta, pos))
-    }
-}
-
-impl Default for TxMetadata {
-    fn default() -> Self {
-        Self {
-            tx_version: 0,
-            locktime: 0,
-            fee: 0,
-            size_in_bytes: 0,
-            extended_size: 0,
-            flags: 0,
-            spending_height: 0,
-            created_at: 0,
-            spent_utxos: 0,
-            pruned_utxos: 0,
-            utxo_count: 0,
-            generation: 0,
-            updated_at: 0,
-            unmined_since: 0,
-            delete_at_height: 0,
-            preserve_until: 0,
-            external_ref: ExternalRef::default(),
-            reassignment_count: 0,
-            block_entry_count: 0,
-        }
     }
 }
 
@@ -1129,60 +1320,60 @@ impl BlockEntry {
 // ---------------------------------------------------------------------------
 
 /// Include transaction version (4 bytes).
-pub const FIELD_TX_VERSION: u32         = 1 << 0;
+pub const FIELD_TX_VERSION: u32 = 1 << 0;
 /// Include transaction locktime (4 bytes).
-pub const FIELD_LOCKTIME: u32           = 1 << 1;
+pub const FIELD_LOCKTIME: u32 = 1 << 1;
 /// Include transaction fee (8 bytes).
-pub const FIELD_FEE: u32                = 1 << 2;
+pub const FIELD_FEE: u32 = 1 << 2;
 /// Include transaction size in bytes (8 bytes).
-pub const FIELD_SIZE_IN_BYTES: u32      = 1 << 3;
+pub const FIELD_SIZE_IN_BYTES: u32 = 1 << 3;
 /// Include extended transaction size (8 bytes).
-pub const FIELD_EXTENDED_SIZE: u32      = 1 << 4;
+pub const FIELD_EXTENDED_SIZE: u32 = 1 << 4;
 /// Include flags byte (1 byte).
-pub const FIELD_FLAGS: u32              = 1 << 5;
+pub const FIELD_FLAGS: u32 = 1 << 5;
 /// Include spending height (4 bytes).
-pub const FIELD_SPENDING_HEIGHT: u32    = 1 << 6;
+pub const FIELD_SPENDING_HEIGHT: u32 = 1 << 6;
 /// Include creation timestamp (8 bytes).
-pub const FIELD_CREATED_AT: u32         = 1 << 7;
+pub const FIELD_CREATED_AT: u32 = 1 << 7;
 /// Include spent UTXO count (4 bytes).
-pub const FIELD_SPENT_UTXOS: u32        = 1 << 8;
+pub const FIELD_SPENT_UTXOS: u32 = 1 << 8;
 /// Include pruned UTXO count (4 bytes).
-pub const FIELD_PRUNED_UTXOS: u32       = 1 << 9;
+pub const FIELD_PRUNED_UTXOS: u32 = 1 << 9;
 /// Include total UTXO count (4 bytes).
-pub const FIELD_UTXO_COUNT: u32         = 1 << 10;
+pub const FIELD_UTXO_COUNT: u32 = 1 << 10;
 /// Include record generation counter (4 bytes).
-pub const FIELD_GENERATION: u32         = 1 << 11;
+pub const FIELD_GENERATION: u32 = 1 << 11;
 /// Include last update timestamp (8 bytes).
-pub const FIELD_UPDATED_AT: u32         = 1 << 12;
+pub const FIELD_UPDATED_AT: u32 = 1 << 12;
 /// Include unmined_since block height (4 bytes).
-pub const FIELD_UNMINED_SINCE: u32      = 1 << 13;
+pub const FIELD_UNMINED_SINCE: u32 = 1 << 13;
 /// Include delete_at_height (4 bytes).
-pub const FIELD_DELETE_AT_HEIGHT: u32   = 1 << 14;
+pub const FIELD_DELETE_AT_HEIGHT: u32 = 1 << 14;
 /// Include preserve_until block height (4 bytes).
-pub const FIELD_PRESERVE_UNTIL: u32     = 1 << 15;
+pub const FIELD_PRESERVE_UNTIL: u32 = 1 << 15;
 /// Include external blob reference (65 bytes).
-pub const FIELD_EXTERNAL_REF: u32       = 1 << 16;
+pub const FIELD_EXTERNAL_REF: u32 = 1 << 16;
 /// Include reassignment count (1 byte).
 pub const FIELD_REASSIGNMENT_COUNT: u32 = 1 << 17;
 /// Include block entry count (1 byte).
-pub const FIELD_BLOCK_ENTRY_COUNT: u32  = 1 << 18;
+pub const FIELD_BLOCK_ENTRY_COUNT: u32 = 1 << 18;
 /// Include UTXO slot data in GetBatch response (variable).
-pub const FIELD_UTXO_SLOTS: u32        = 1 << 19;
+pub const FIELD_UTXO_SLOTS: u32 = 1 << 19;
 /// Include cold data in GetBatch response (variable).
-pub const FIELD_COLD_DATA: u32         = 1 << 20;
+pub const FIELD_COLD_DATA: u32 = 1 << 20;
 /// Include block entries in GetBatch response (variable).
-pub const FIELD_BLOCK_ENTRIES: u32     = 1 << 21;
+pub const FIELD_BLOCK_ENTRIES: u32 = 1 << 21;
 /// Include conflicting children txids in GetBatch response (variable).
 pub const FIELD_CONFLICTING_CHILDREN: u32 = 1 << 22;
 /// Include the raw on-disk metadata struct (256 bytes, for debugging).
 /// When set, the full struct is returned as-is including internal fields.
 /// Takes precedence over per-field metadata bits if both are set.
-pub const FIELD_RAW_METADATA: u32      = 1 << 23;
+pub const FIELD_RAW_METADATA: u32 = 1 << 23;
 
 /// Convenience alias: all per-field metadata bits (bits 0-18).
 pub const FIELD_ALL_METADATA: u32 = 0x0007_FFFF;
 /// Include all client-facing fields in GetBatch response (bits 0-22, excludes RAW_METADATA).
-pub const FIELD_ALL: u32          = 0x007F_FFFF;
+pub const FIELD_ALL: u32 = 0x007F_FFFF;
 
 // ---------------------------------------------------------------------------
 // Slot status constants

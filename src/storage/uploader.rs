@@ -34,7 +34,12 @@ impl UploadHandle {
             result: parking_lot::Mutex::new(None),
             condvar: parking_lot::Condvar::new(),
         });
-        (Self { inner: inner.clone() }, inner)
+        (
+            Self {
+                inner: inner.clone(),
+            },
+            inner,
+        )
     }
 
     /// Block until the upload completes and return the result.
@@ -79,10 +84,7 @@ impl BlobUploader {
     /// # Parameters
     /// - `blob_store`: the external blob store to upload to
     /// - `device`: the NVMe device (for pwriting ExternalRef into metadata)
-    pub fn new(
-        blob_store: Arc<dyn BlobStore>,
-        device: Arc<dyn BlockDevice>,
-    ) -> Self {
+    pub fn new(blob_store: Arc<dyn BlobStore>, device: Arc<dyn BlockDevice>) -> Self {
         let (task_tx, task_rx) = std::sync::mpsc::channel::<UploadTask>();
 
         let handle = std::thread::Builder::new()
@@ -126,7 +128,7 @@ impl BlobUploader {
 
         // Build ExternalRef
         let ext_ref = ExternalRef {
-            store_type: 1, // 1 = file/object store
+            store_type: 1,            // 1 = file/object store
             content_hash: task.tx_id, // Use txid as content key
             total_size: task.data.len() as u64,
             input_count: task.inputs_len,
@@ -136,8 +138,9 @@ impl BlobUploader {
         };
 
         // pwrite the ExternalRef into the metadata region
-        Self::write_external_ref(device, task.record_offset, &ext_ref, crc)
-            .map_err(|e| BlobError::Io(std::io::Error::other(format!("device write failed: {e}"))))?;
+        Self::write_external_ref(device, task.record_offset, &ext_ref, crc).map_err(|e| {
+            BlobError::Io(std::io::Error::other(format!("device write failed: {e}")))
+        })?;
 
         Ok(())
     }
@@ -215,7 +218,12 @@ mod tests {
         (dev, blob, uploader)
     }
 
-    fn write_hot_record(dev: &dyn BlockDevice, offset: u64, utxo_count: u32, tx_id: [u8; 32]) -> TxMetadata {
+    fn write_hot_record(
+        dev: &dyn BlockDevice,
+        offset: u64,
+        utxo_count: u32,
+        tx_id: [u8; 32],
+    ) -> TxMetadata {
         let mut meta = TxMetadata::new(utxo_count);
         meta.tx_id = tx_id;
         meta.flags = TxFlags::EXTERNAL;
@@ -232,7 +240,9 @@ mod tests {
         let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
 
         let utxo_count = 2u32;
-        let offset = alloc.allocate(TxMetadata::record_size_for(utxo_count)).unwrap();
+        let offset = alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
         let mut tx_id = [0u8; 32];
         tx_id[0] = 0xAA;
         write_hot_record(&*dev, offset, utxo_count, tx_id);
@@ -261,7 +271,9 @@ mod tests {
         let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
 
         let utxo_count = 1u32;
-        let offset = alloc.allocate(TxMetadata::record_size_for(utxo_count)).unwrap();
+        let offset = alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
         let mut tx_id = [0u8; 32];
         tx_id[0] = 0xBB;
         write_hot_record(&*dev, offset, utxo_count, tx_id);
@@ -280,7 +292,9 @@ mod tests {
         let mut handles = Vec::new();
         for i in 0..10u8 {
             let utxo_count = 1u32;
-            let offset = alloc.allocate(TxMetadata::record_size_for(utxo_count)).unwrap();
+            let offset = alloc
+                .allocate(TxMetadata::record_size_for(utxo_count))
+                .unwrap();
             let mut tx_id = [0u8; 32];
             tx_id[0] = i;
             write_hot_record(&*dev, offset, utxo_count, tx_id);
@@ -302,7 +316,9 @@ mod tests {
         let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
 
         let utxo_count = 3u32;
-        let offset = alloc.allocate(TxMetadata::record_size_for(utxo_count)).unwrap();
+        let offset = alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
         let mut tx_id = [0u8; 32];
         tx_id[0] = 0xCC;
 
@@ -321,7 +337,10 @@ mod tests {
         // Verify UTXO slots are untouched
         for i in 0..utxo_count {
             let slot = io::read_utxo_slot(&*dev, offset, i).unwrap();
-            assert_eq!(slot.hash, hash, "UTXO slot {i} corrupted by ExternalRef pwrite");
+            assert_eq!(
+                slot.hash, hash,
+                "UTXO slot {i} corrupted by ExternalRef pwrite"
+            );
             assert!(slot.is_unspent(), "UTXO slot {i} status corrupted");
         }
 

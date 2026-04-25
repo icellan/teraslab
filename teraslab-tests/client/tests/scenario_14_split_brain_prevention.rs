@@ -3,12 +3,12 @@
 #[allow(dead_code)]
 mod common;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use teraslab_test_client::{Client, ClientConfig, ClientError, PoolConfig};
-use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::types::*;
+use teraslab_test_client::verifier::StateVerifier;
+use teraslab_test_client::{Client, ClientConfig, ClientError, PoolConfig};
 
 use parking_lot::Mutex;
 use rand::{Rng, SeedableRng};
@@ -82,7 +82,11 @@ async fn verify_sample_readable(
     txids: &[[u8; 32]],
     sample_size: usize,
 ) -> Result<u32, ClientError> {
-    let step = if txids.len() <= sample_size { 1 } else { txids.len() / sample_size };
+    let step = if txids.len() <= sample_size {
+        1
+    } else {
+        txids.len() / sample_size
+    };
     let sample: Vec<[u8; 32]> = (0..txids.len())
         .step_by(step)
         .take(sample_size)
@@ -189,9 +193,11 @@ async fn test_symmetric_isolation() -> Result<(), ClientError> {
     }
 
     let successful_writes = write_results.iter().filter(|(_, r)| r.is_ok()).count();
-    assert_eq!(successful_writes, 0,
+    assert_eq!(
+        successful_writes, 0,
         "Test 14.1: {successful_writes}/3 isolated nodes accepted writes, \
-         expected 0 (quorum should reject all writes when every node is isolated).");
+         expected 0 (quorum should reject all writes when every node is isolated)."
+    );
     eprintln!("[14.1] {successful_writes}/3 isolated nodes accepted writes (expected 0)");
 
     eprintln!("[14.1] Healing all partitions");
@@ -214,8 +220,10 @@ async fn test_symmetric_isolation() -> Result<(), ClientError> {
     let client = common::create_client(&docker, 3).await?;
 
     let post_heal_readable = verify_sample_readable(&client, &txids, 50).await?;
-    assert_eq!(post_heal_readable, 50,
-        "Test 14.1: post-heal read check: expected 50, got {post_heal_readable}.");
+    assert_eq!(
+        post_heal_readable, 50,
+        "Test 14.1: post-heal read check: expected 50, got {post_heal_readable}."
+    );
 
     eprintln!("[14.1] OK -- symmetric isolation test passed");
     Ok(())
@@ -237,7 +245,9 @@ async fn test_asymmetric_partition() -> Result<(), ClientError> {
     // Allow extra time for replication to propagate to all replicas.
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
-    eprintln!("[14.2] Creating asymmetric partition: node1<->node3 broken, node1<->node2 ok, node2<->node3 ok");
+    eprintln!(
+        "[14.2] Creating asymmetric partition: node1<->node3 broken, node1<->node2 ok, node2<->node3 ok"
+    );
     // Only break the connection between node1 and node3
     docker.partition_node("node1", &["node3"]).await?;
 
@@ -256,18 +266,19 @@ async fn test_asymmetric_partition() -> Result<(), ClientError> {
             let mut txid = [0u8; 32];
             rng.fill(&mut txid);
 
-            match try_create_on_port(port, txid, &docker).await {
-                Ok(()) => {
-                    writes_on_node[node_idx].push(txid);
-                }
-                Err(_) => {}
+            if try_create_on_port(port, txid, &docker).await.is_ok() {
+                writes_on_node[node_idx].push(txid);
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    eprintln!("[14.2] Writes accepted: node1={}, node2={}, node3={}",
-        writes_on_node[0].len(), writes_on_node[1].len(), writes_on_node[2].len());
+    eprintln!(
+        "[14.2] Writes accepted: node1={}, node2={}, node3={}",
+        writes_on_node[0].len(),
+        writes_on_node[1].len(),
+        writes_on_node[2].len()
+    );
 
     // Check that no shard has writes accepted on two different masters.
     // With the asymmetric partition, the cluster should still maintain quorum
@@ -277,26 +288,35 @@ async fn test_asymmetric_partition() -> Result<(), ClientError> {
     // same shard.
 
     // Check split-brain invariant: no shard accepted writes from two different masters
-    let mut shard_writers: std::collections::HashMap<u16, Vec<u32>> = std::collections::HashMap::new();
+    let mut shard_writers: std::collections::HashMap<u16, Vec<u32>> =
+        std::collections::HashMap::new();
     for (node_idx, txids_on_node) in writes_on_node.iter().enumerate() {
         for txid in txids_on_node {
             let shard = u16::from_le_bytes([txid[0], txid[1]]) % 4096;
-            shard_writers.entry(shard).or_default().push(node_idx as u32 + 1);
+            shard_writers
+                .entry(shard)
+                .or_default()
+                .push(node_idx as u32 + 1);
         }
     }
     for (shard, writers) in &shard_writers {
         let unique: std::collections::HashSet<_> = writers.iter().collect();
-        assert!(unique.len() <= 1,
-            "shard {shard} had writes from multiple masters: {unique:?} — split-brain detected!");
+        assert!(
+            unique.len() <= 1,
+            "shard {shard} had writes from multiple masters: {unique:?} — split-brain detected!"
+        );
     }
-    eprintln!("[14.2] Split-brain invariant check passed: no shard had writes from multiple masters");
+    eprintln!(
+        "[14.2] Split-brain invariant check passed: no shard had writes from multiple masters"
+    );
 
     eprintln!("[14.2] Healing partition");
     docker.heal_all_partitions().await?;
 
     tokio::time::sleep(Duration::from_secs(1)).await;
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+        .await
         .unwrap_or_else(|e| eprintln!("[14.2] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
@@ -305,11 +325,14 @@ async fn test_asymmetric_partition() -> Result<(), ClientError> {
 
     // Verify all pre-partition records are intact
     let post_heal_readable = verify_sample_readable(&client, &txids, 50).await?;
-    assert_eq!(post_heal_readable, 50,
-        "Test 14.2: post-heal read check: expected 50 readable, got {post_heal_readable}.");
+    assert_eq!(
+        post_heal_readable, 50,
+        "Test 14.2: post-heal read check: expected 50 readable, got {post_heal_readable}."
+    );
 
     // Verify records written during partition are readable
-    let all_partition_writes: Vec<[u8; 32]> = writes_on_node.iter()
+    let all_partition_writes: Vec<[u8; 32]> = writes_on_node
+        .iter()
         .flat_map(|v| v.iter().copied())
         .collect();
     if !all_partition_writes.is_empty() {
@@ -399,7 +422,9 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
     // catch up on (pattern C). Best-effort — we cap each between-flap
     // wait at 5s so the flap workload still exercises topology churn,
     // just without the runaway backlog.
-    eprintln!("[14.3] Starting flapping partition (rate-limited by migration drain, 30s wall clock)");
+    eprintln!(
+        "[14.3] Starting flapping partition (rate-limited by migration drain, 30s wall clock)"
+    );
     let flap_duration = Duration::from_secs(30);
     let flap_start = Instant::now();
     let mut partitioned = false;
@@ -410,7 +435,9 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
             let _ = docker_arc.heal_all_partitions().await;
             partitioned = false;
         } else {
-            let _ = docker_arc.partition_node("node1", &["node2", "node3"]).await;
+            let _ = docker_arc
+                .partition_node("node1", &["node2", "node3"])
+                .await;
             partitioned = true;
         }
         flap_cycles += 1;
@@ -453,7 +480,10 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
     let mut c143_err = None;
     for attempt in 0..3u32 {
         match common::wait_cluster_ready(&docker_arc, 3, Duration::from_secs(120)).await {
-            Ok(()) => { c143_err = None; break; }
+            Ok(()) => {
+                c143_err = None;
+                break;
+            }
             Err(e) => {
                 eprintln!("[14.3] cluster_ready attempt {attempt}: {e}");
                 c143_err = Some(e);
@@ -461,7 +491,9 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
             }
         }
     }
-    if let Some(e) = c143_err { return Err(e); }
+    if let Some(e) = c143_err {
+        return Err(e);
+    }
 
     // Single long drain — rate-limited flap caps the backlog, so 600s
     // is plenty of headroom. Fail hard with the real drain error if it
@@ -485,11 +517,20 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
     // without an assigned master after aggressive topology churn), which is
     // a separate liveness concern from split-brain safety. Zero data
     // corruption = the invariant this scenario exists to prove.
-    let not_found = mismatches.iter().filter(|m| m.actual.contains("NotFound")).count();
-    let corrupt: Vec<_> = mismatches.iter().filter(|m| !m.actual.contains("NotFound")).collect();
-    assert!(corrupt.is_empty(),
+    let not_found = mismatches
+        .iter()
+        .filter(|m| m.actual.contains("NotFound"))
+        .count();
+    let corrupt: Vec<_> = mismatches
+        .iter()
+        .filter(|m| !m.actual.contains("NotFound"))
+        .collect();
+    assert!(
+        corrupt.is_empty(),
         "Test 14.3: {} data corruption mismatches (split-brain signal): {:?}",
-        corrupt.len(), corrupt.iter().take(5).collect::<Vec<_>>());
+        corrupt.len(),
+        corrupt.iter().take(5).collect::<Vec<_>>()
+    );
     // NotFound after 500ms-period flapping for 30s reflects a liveness gap
     // (shards without an assigned master after rapid topology churn) rather
     // than split-brain. A tight bound here would be noise, but a complete
@@ -498,9 +539,11 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
     // is a regression worth failing on.
     let total_records = verifier.record_count();
     let max_not_found = ((total_records as f64) * 0.9) as usize;
-    assert!(not_found <= max_not_found,
+    assert!(
+        not_found <= max_not_found,
         "Test 14.3: {not_found}/{total_records} records NotFound after flapping \
-         (max {max_not_found}; >90% loss means the cluster failed to recover)");
+         (max {max_not_found}; >90% loss means the cluster failed to recover)"
+    );
     if not_found > 0 {
         eprintln!(
             "[14.3] WARN -- {not_found}/{total_records} records NotFound after flapping \
@@ -549,8 +592,14 @@ async fn test_docker_pause() -> Result<(), ClientError> {
         let cs3 = s3["cluster_size"].as_u64().unwrap_or(0);
         eprintln!("  During pause: node1 cluster_size={cs1}, node3 cluster_size={cs3}");
         // SWIM should detect the pause within suspicion timeout
-        assert!(cs1 <= 2, "node1 should detect node2 failure, cluster_size={cs1}");
-        assert!(cs3 <= 2, "node3 should detect node2 failure, cluster_size={cs3}");
+        assert!(
+            cs1 <= 2,
+            "node1 should detect node2 failure, cluster_size={cs1}"
+        );
+        assert!(
+            cs3 <= 2,
+            "node3 should detect node2 failure, cluster_size={cs3}"
+        );
     }
 
     eprintln!("[14.4] Unpausing node2");
@@ -558,7 +607,8 @@ async fn test_docker_pause() -> Result<(), ClientError> {
 
     tokio::time::sleep(Duration::from_secs(1)).await;
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(60)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+        .await
         .unwrap_or_else(|e| eprintln!("[14.4] migration wait: {e}"));
 
     for node_num in 1..=3u32 {
@@ -568,8 +618,10 @@ async fn test_docker_pause() -> Result<(), ClientError> {
     let client = common::create_client(&docker, 3).await?;
 
     let post_unpause_readable = verify_sample_readable(&client, &txids, 50).await?;
-    assert_eq!(post_unpause_readable, 50,
-        "Test 14.4: post-unpause read check: expected 50, got {post_unpause_readable}.");
+    assert_eq!(
+        post_unpause_readable, 50,
+        "Test 14.4: post-unpause read check: expected 50, got {post_unpause_readable}."
+    );
 
     eprintln!("[14.4] OK -- Docker pause test passed, no split-brain detected");
     Ok(())

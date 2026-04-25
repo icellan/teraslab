@@ -133,9 +133,7 @@ impl UnminedIndex {
     /// Idempotent: replaying the same entry multiple times produces the
     /// same result.
     pub fn replay_redo(&mut self, entry: &UnminedRedoEntry) {
-        let key = TxKey {
-            txid: entry.txid,
-        };
+        let key = TxKey { txid: entry.txid };
         if entry.new_height == 0 {
             // Removal
             self.by_txid.remove(&key).inspect(|&h| {
@@ -151,7 +149,10 @@ impl UnminedIndex {
                 }
             }
             self.by_txid.insert(key, entry.new_height);
-            self.by_height.entry(entry.new_height).or_default().push(key);
+            self.by_height
+                .entry(entry.new_height)
+                .or_default()
+                .push(key);
         }
     }
 

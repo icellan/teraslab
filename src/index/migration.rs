@@ -93,8 +93,7 @@ pub fn import_index(
         let primary_entries: Vec<_> = mem_idx.iter().collect();
         redb_primary.register_batch(&primary_entries)?;
 
-        let mut redb_dah =
-            RedbDahIndex::open(&config.redb_dah_path, config.redb_cache_size)?;
+        let mut redb_dah = RedbDahIndex::open(&config.redb_dah_path, config.redb_cache_size)?;
         let dah_entries: Vec<_> = mem_dah.iter().collect();
         redb_dah.insert_batch(&dah_entries);
 
@@ -193,7 +192,9 @@ mod tests {
 
         // Verify data
         for i in 0..50u64 {
-            let e = restored_primary.lookup(&make_key(i)).expect("entry should exist");
+            let e = restored_primary
+                .lookup(&make_key(i))
+                .expect("entry should exist");
             assert_eq!(e.record_offset, i * 100);
         }
     }
@@ -235,7 +236,9 @@ mod tests {
         assert_eq!(restored_unmined.len(), 1);
 
         for i in 0..20u64 {
-            let e = restored_primary.lookup(&make_key(i)).expect("entry should exist");
+            let e = restored_primary
+                .lookup(&make_key(i))
+                .expect("entry should exist");
             assert_eq!(e.record_offset, i * 100);
         }
     }
@@ -355,7 +358,9 @@ mod tests {
         assert_eq!(restored_unmined.len(), 1);
 
         for i in 0..30u64 {
-            let e = restored_primary.lookup(&make_key(i)).expect("entry should exist");
+            let e = restored_primary
+                .lookup(&make_key(i))
+                .expect("entry should exist");
             assert_eq!(e.record_offset, i * 100);
         }
     }

@@ -130,14 +130,8 @@ pub struct ReplicationManager {
 
 impl ReplicationManager {
     /// Create a new manager with the given configuration and replica transports.
-    pub fn new(
-        config: ReplicationConfig,
-        transports: Vec<Box<dyn ReplicaTransport>>,
-    ) -> Self {
-        let senders = transports
-            .into_iter()
-            .map(ReplicaSender::new)
-            .collect();
+    pub fn new(config: ReplicationConfig, transports: Vec<Box<dyn ReplicaTransport>>) -> Self {
+        let senders = transports.into_iter().map(ReplicaSender::new).collect();
         Self {
             senders,
             config,
@@ -154,10 +148,7 @@ impl ReplicationManager {
         transports: Vec<Box<dyn ReplicaTransport>>,
         initial_sequence: u64,
     ) -> Self {
-        let senders = transports
-            .into_iter()
-            .map(ReplicaSender::new)
-            .collect();
+        let senders = transports.into_iter().map(ReplicaSender::new).collect();
         Self {
             senders,
             config,
@@ -188,7 +179,11 @@ impl ReplicationManager {
         }
 
         let required = self.required_ack_count();
-        let live_count = self.senders.iter().filter(|s| *s.state() == ReplicaState::Live).count();
+        let live_count = self
+            .senders
+            .iter()
+            .filter(|s| *s.state() == ReplicaState::Live)
+            .count();
 
         if live_count < required {
             return Err(ReplicationError::InsufficientReplicas {
@@ -205,6 +200,7 @@ impl ReplicationManager {
             first_sequence: self.next_sequence,
             ops: ops.to_vec(),
             trace_ctx,
+            source_node_id: None,
         };
         self.next_sequence += ops.len() as u64;
 
@@ -271,9 +267,12 @@ impl ReplicationManager {
                 .collect();
             handles
                 .into_iter()
-                .map(|h| h.join().unwrap_or(Outcome::TransportErr(
-                    ReplicationError::Transport("replica worker panicked".into()),
-                )))
+                .map(|h| {
+                    h.join()
+                        .unwrap_or(Outcome::TransportErr(ReplicationError::Transport(
+                            "replica worker panicked".into(),
+                        )))
+                })
                 .collect()
         });
 
@@ -288,8 +287,11 @@ impl ReplicationManager {
         // matches `self.senders` so `first_error` is deterministic.
         let mut successes = 0usize;
         let mut first_error: Option<ReplicationError> = None;
-        for (idx, (sender, outcome)) in
-            self.senders.iter_mut().zip(outcomes.into_iter()).enumerate()
+        for (idx, (sender, outcome)) in self
+            .senders
+            .iter_mut()
+            .zip(outcomes.into_iter())
+            .enumerate()
         {
             match outcome {
                 Outcome::Ok { through_sequence } => {
@@ -305,10 +307,7 @@ impl ReplicationManager {
                         m.record_failure(idx);
                     }
                     if first_error.is_none() {
-                        first_error = Some(ReplicationError::ReplicaError {
-                            sequence,
-                            message,
-                        });
+                        first_error = Some(ReplicationError::ReplicaError { sequence, message });
                     }
                 }
                 Outcome::TransportErr(e) => {
@@ -329,20 +328,24 @@ impl ReplicationManager {
                 if successes == live_count {
                     Ok(())
                 } else {
-                    Err(first_error.unwrap_or(ReplicationError::InsufficientReplicas {
-                        available: successes,
-                        required: live_count,
-                    }))
+                    Err(
+                        first_error.unwrap_or(ReplicationError::InsufficientReplicas {
+                            available: successes,
+                            required: live_count,
+                        }),
+                    )
                 }
             }
             AckPolicy::WriteMajority => {
                 if successes >= required {
                     Ok(())
                 } else {
-                    Err(first_error.unwrap_or(ReplicationError::InsufficientReplicas {
-                        available: successes,
-                        required,
-                    }))
+                    Err(
+                        first_error.unwrap_or(ReplicationError::InsufficientReplicas {
+                            available: successes,
+                            required,
+                        }),
+                    )
                 }
             }
         }
@@ -362,7 +365,10 @@ impl ReplicationManager {
 
     /// Number of live replicas.
     pub fn live_count(&self) -> usize {
-        self.senders.iter().filter(|s| *s.state() == ReplicaState::Live).count()
+        self.senders
+            .iter()
+            .filter(|s| *s.state() == ReplicaState::Live)
+            .count()
     }
 
     /// Current master sequence (next to be assigned).
@@ -438,6 +444,7 @@ impl ReplicationManager {
                     first_sequence: chunk_seq,
                     ops: chunk.to_vec(),
                     trace_ctx: WireTraceContext::from_current_span(),
+                    source_node_id: None,
                 };
                 if let Err(_e) = sender.transport.send_batch(&batch) {
                     sender.state = ReplicaState::Down;
@@ -490,31 +497,38 @@ impl InMemoryTransport {
     }
 
     /// Receive a batch (replica side).
-    pub fn recv_batch(&self, timeout: Duration) -> std::result::Result<ReplicaBatch, ReplicationError> {
-        let data = self.rx.recv_timeout(timeout)
+    pub fn recv_batch(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<ReplicaBatch, ReplicationError> {
+        let data = self
+            .rx
+            .recv_timeout(timeout)
             .map_err(|_| ReplicationError::Timeout(timeout))?;
-        ReplicaBatch::deserialize(&data)
-            .map_err(|e| ReplicationError::Transport(format!("{e}")))
+        ReplicaBatch::deserialize(&data).map_err(|e| ReplicationError::Transport(format!("{e}")))
     }
 
     /// Send an ack (replica side).
     pub fn send_ack(&self, ack: &ReplicaAck) -> std::result::Result<(), ReplicationError> {
-        self.tx.send(ack.serialize())
+        self.tx
+            .send(ack.serialize())
             .map_err(|e| ReplicationError::Transport(format!("{e}")))
     }
 }
 
 impl ReplicaTransport for InMemoryTransport {
     fn send_batch(&mut self, batch: &ReplicaBatch) -> std::result::Result<(), ReplicationError> {
-        self.tx.send(batch.serialize())
+        self.tx
+            .send(batch.serialize())
             .map_err(|e| ReplicationError::Transport(format!("{e}")))
     }
 
     fn recv_ack(&mut self, timeout: Duration) -> std::result::Result<ReplicaAck, ReplicationError> {
-        let data = self.rx.recv_timeout(timeout)
+        let data = self
+            .rx
+            .recv_timeout(timeout)
             .map_err(|_| ReplicationError::Timeout(timeout))?;
-        ReplicaAck::deserialize(&data)
-            .map_err(|e| ReplicationError::Transport(format!("{e}")))
+        ReplicaAck::deserialize(&data).map_err(|e| ReplicationError::Transport(format!("{e}")))
     }
 
     fn is_connected(&self) -> bool {
@@ -532,7 +546,9 @@ mod tests {
     use crate::index::TxKey;
 
     fn key(n: u8) -> TxKey {
-        let mut txid = [0u8; 32]; txid[0] = n; TxKey { txid }
+        let mut txid = [0u8; 32];
+        txid[0] = n;
+        TxKey { txid }
     }
 
     /// Simulate a replica that auto-ACKs every batch it receives.
@@ -542,7 +558,9 @@ mod tests {
         std::thread::spawn(move || {
             let mut received = Vec::new();
             while let Ok(batch) = replica_transport.recv_batch(Duration::from_secs(1)) {
-                let ack = ReplicaAck::Ok { through_sequence: batch.last_sequence() };
+                let ack = ReplicaAck::Ok {
+                    through_sequence: batch.last_sequence(),
+                };
                 replica_transport.send_ack(&ack).unwrap();
                 received.push(batch);
             }
@@ -556,11 +574,19 @@ mod tests {
         let handle = spawn_auto_ack_replica(replica_t);
 
         let mut mgr = ReplicationManager::new(
-            ReplicationConfig { ack_policy: AckPolicy::WriteAll, ..Default::default() },
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteAll,
+                ..Default::default()
+            },
             vec![Box::new(master_t)],
         );
 
-        let ops = vec![ReplicaOp::Spend { tx_key: key(1), offset: 0, spending_data: [0xAB; 36], master_generation: 0 }];
+        let ops = vec![ReplicaOp::Spend {
+            tx_key: key(1),
+            offset: 0,
+            spending_data: [0xAB; 36],
+            master_generation: 0,
+        }];
         mgr.replicate_batch(&ops).unwrap();
 
         drop(mgr); // Close channels
@@ -574,13 +600,16 @@ mod tests {
         let (master_t, replica_t) = InMemoryTransport::pair();
         let handle = spawn_auto_ack_replica(replica_t);
 
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(master_t)],
-        );
+        let mut mgr =
+            ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(master_t)]);
 
         let ops: Vec<ReplicaOp> = (0..50u8)
-            .map(|i| ReplicaOp::Spend { tx_key: key(i), offset: i as u32, spending_data: [i; 36], master_generation: 0 })
+            .map(|i| ReplicaOp::Spend {
+                tx_key: key(i),
+                offset: i as u32,
+                spending_data: [i; 36],
+                master_generation: 0,
+            })
             .collect();
         mgr.replicate_batch(&ops).unwrap();
 
@@ -598,11 +627,18 @@ mod tests {
         let h2 = spawn_auto_ack_replica(rt2);
 
         let mut mgr = ReplicationManager::new(
-            ReplicationConfig { ack_policy: AckPolicy::WriteAll, ..Default::default() },
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteAll,
+                ..Default::default()
+            },
             vec![Box::new(mt1), Box::new(mt2)],
         );
 
-        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }];
         mgr.replicate_batch(&ops).unwrap();
 
         drop(mgr);
@@ -629,7 +665,11 @@ mod tests {
             vec![Box::new(mt1), Box::new(mt2)],
         );
 
-        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }];
         let result = mgr.replicate_batch(&ops);
         assert!(result.is_err());
     }
@@ -650,7 +690,11 @@ mod tests {
         );
 
         // WriteMajority with RF=3: need 1 replica ACK (master + 1 = majority of 3)
-        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }];
         mgr.replicate_batch(&ops).unwrap();
     }
 
@@ -668,7 +712,11 @@ mod tests {
             vec![Box::new(mt1), Box::new(mt2)],
         );
 
-        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }];
         assert!(mgr.replicate_batch(&ops).is_err());
     }
 
@@ -677,16 +725,27 @@ mod tests {
         let (mt, rt) = InMemoryTransport::pair();
         let handle = spawn_auto_ack_replica(rt);
 
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
-        mgr.replicate_batch(&[ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }]).unwrap();
+        mgr.replicate_batch(&[ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }])
+        .unwrap();
         mgr.replicate_batch(&[
-            ReplicaOp::Freeze { tx_key: key(2), offset: 1, master_generation: 0 },
-            ReplicaOp::Freeze { tx_key: key(3), offset: 2, master_generation: 0 },
-        ]).unwrap();
+            ReplicaOp::Freeze {
+                tx_key: key(2),
+                offset: 1,
+                master_generation: 0,
+            },
+            ReplicaOp::Freeze {
+                tx_key: key(3),
+                offset: 2,
+                master_generation: 0,
+            },
+        ])
+        .unwrap();
 
         drop(mgr);
         let received = handle.join().unwrap();
@@ -701,15 +760,27 @@ mod tests {
         let (mt, rt) = InMemoryTransport::pair();
         let handle = spawn_auto_ack_replica(rt);
 
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
         let ops = vec![
-            ReplicaOp::Spend { tx_key: key(1), offset: 0, spending_data: [0x11; 36], master_generation: 0 },
-            ReplicaOp::SetMined { tx_key: key(2), block_id: 1, block_height: 100, subtree_idx: 0, on_longest_chain: true, master_generation: 0 },
-            ReplicaOp::PruneSlot { tx_key: key(3), offset: 5 },
+            ReplicaOp::Spend {
+                tx_key: key(1),
+                offset: 0,
+                spending_data: [0x11; 36],
+                master_generation: 0,
+            },
+            ReplicaOp::SetMined {
+                tx_key: key(2),
+                block_id: 1,
+                block_height: 100,
+                subtree_idx: 0,
+                on_longest_chain: true,
+                master_generation: 0,
+            },
+            ReplicaOp::PruneSlot {
+                tx_key: key(3),
+                offset: 5,
+            },
         ];
         mgr.replicate_batch(&ops).unwrap();
 
@@ -723,10 +794,7 @@ mod tests {
         let (mt, rt) = InMemoryTransport::pair();
         let _handle = spawn_auto_ack_replica(rt);
 
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
         mgr.replicate_batch(&[]).unwrap();
     }
@@ -735,28 +803,46 @@ mod tests {
     fn required_ack_count_calculations() {
         // RF=2 (1 replica), WriteAll: need 1 ACK
         let mgr = ReplicationManager::new(
-            ReplicationConfig { ack_policy: AckPolicy::WriteAll, ..Default::default() },
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteAll,
+                ..Default::default()
+            },
             vec![Box::new(InMemoryTransport::pair().0)],
         );
         assert_eq!(mgr.required_ack_count(), 1);
 
         // RF=3 (2 replicas), WriteAll: need 2 ACKs
         let mgr = ReplicationManager::new(
-            ReplicationConfig { ack_policy: AckPolicy::WriteAll, ..Default::default() },
-            vec![Box::new(InMemoryTransport::pair().0), Box::new(InMemoryTransport::pair().0)],
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteAll,
+                ..Default::default()
+            },
+            vec![
+                Box::new(InMemoryTransport::pair().0),
+                Box::new(InMemoryTransport::pair().0),
+            ],
         );
         assert_eq!(mgr.required_ack_count(), 2);
 
         // RF=3, WriteMajority: need 1 ACK (master + 1 = majority of 3)
         let mgr = ReplicationManager::new(
-            ReplicationConfig { ack_policy: AckPolicy::WriteMajority, ..Default::default() },
-            vec![Box::new(InMemoryTransport::pair().0), Box::new(InMemoryTransport::pair().0)],
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteMajority,
+                ..Default::default()
+            },
+            vec![
+                Box::new(InMemoryTransport::pair().0),
+                Box::new(InMemoryTransport::pair().0),
+            ],
         );
         assert_eq!(mgr.required_ack_count(), 1);
 
         // RF=2, WriteMajority: need 1 ACK (master + 1 = majority of 2)
         let mgr = ReplicationManager::new(
-            ReplicationConfig { ack_policy: AckPolicy::WriteMajority, ..Default::default() },
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteMajority,
+                ..Default::default()
+            },
             vec![Box::new(InMemoryTransport::pair().0)],
         );
         assert_eq!(mgr.required_ack_count(), 1);
@@ -769,10 +855,7 @@ mod tests {
         let (mt, rt) = InMemoryTransport::pair();
         let handle = spawn_auto_ack_replica(rt);
 
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
         let ops = vec![ReplicaOp::Create {
             tx_key: key(1),
@@ -793,10 +876,7 @@ mod tests {
         let (mt, rt) = InMemoryTransport::pair();
         let handle = spawn_auto_ack_replica(rt);
 
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
         let ops = vec![ReplicaOp::Delete { tx_key: key(1) }];
         mgr.replicate_batch(&ops).unwrap();
@@ -811,14 +891,19 @@ mod tests {
         let (mt, rt) = InMemoryTransport::pair();
         let handle = spawn_auto_ack_replica(rt);
 
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
         let ops = vec![
-            ReplicaOp::Freeze { tx_key: key(1), offset: 3, master_generation: 0 },
-            ReplicaOp::Unfreeze { tx_key: key(1), offset: 3, master_generation: 0 },
+            ReplicaOp::Freeze {
+                tx_key: key(1),
+                offset: 3,
+                master_generation: 0,
+            },
+            ReplicaOp::Unfreeze {
+                tx_key: key(1),
+                offset: 3,
+                master_generation: 0,
+            },
         ];
         mgr.replicate_batch(&ops).unwrap();
 
@@ -832,10 +917,7 @@ mod tests {
         let (mt, rt) = InMemoryTransport::pair();
         let handle = spawn_auto_ack_replica(rt);
 
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
         let ops = vec![ReplicaOp::Reassign {
             tx_key: key(1),
@@ -857,15 +939,26 @@ mod tests {
         let (mt, rt) = InMemoryTransport::pair();
         let handle = spawn_auto_ack_replica(rt);
 
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
         let ops = vec![
-            ReplicaOp::SetConflicting { tx_key: key(1), value: true, current_block_height: 1000, retention: 288, master_generation: 0 },
-            ReplicaOp::SetLocked { tx_key: key(2), value: true, master_generation: 0 },
-            ReplicaOp::PreserveUntil { tx_key: key(3), block_height: 5000, master_generation: 0 },
+            ReplicaOp::SetConflicting {
+                tx_key: key(1),
+                value: true,
+                current_block_height: 1000,
+                retention: 288,
+                master_generation: 0,
+            },
+            ReplicaOp::SetLocked {
+                tx_key: key(2),
+                value: true,
+                master_generation: 0,
+            },
+            ReplicaOp::PreserveUntil {
+                tx_key: key(3),
+                block_height: 5000,
+                master_generation: 0,
+            },
         ];
         mgr.replicate_batch(&ops).unwrap();
 
@@ -888,18 +981,21 @@ mod tests {
             let expected_through = batch.last_sequence();
             assert_eq!(expected_through, 10); // first_sequence(1) + 10 - 1
 
-            let ack = ReplicaAck::Ok { through_sequence: expected_through };
+            let ack = ReplicaAck::Ok {
+                through_sequence: expected_through,
+            };
             rt.send_ack(&ack).unwrap();
             expected_through
         });
 
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
         let ops: Vec<ReplicaOp> = (0..10u8)
-            .map(|i| ReplicaOp::Freeze { tx_key: key(i), offset: i as u32, master_generation: 0 })
+            .map(|i| ReplicaOp::Freeze {
+                tx_key: key(i),
+                offset: i as u32,
+                master_generation: 0,
+            })
             .collect();
         mgr.replicate_batch(&ops).unwrap();
 
@@ -915,13 +1011,13 @@ mod tests {
         let (mt, rt) = InMemoryTransport::pair();
         let handle = spawn_auto_ack_replica(rt);
 
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
         let ops = vec![ReplicaOp::Spend {
-            tx_key: key(1), offset: 0, spending_data: [0xAB; 36], master_generation: 0,
+            tx_key: key(1),
+            offset: 0,
+            spending_data: [0xAB; 36],
+            master_generation: 0,
         }];
         // Send same ops twice
         mgr.replicate_batch(&ops).unwrap();
@@ -950,7 +1046,11 @@ mod tests {
         );
 
         // RF=2: need 1 replica ACK (majority of 2 = 1 + master)
-        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }];
         mgr.replicate_batch(&ops).unwrap();
     }
 
@@ -959,14 +1059,15 @@ mod tests {
         let (mt, rt) = InMemoryTransport::pair();
         let _handle = spawn_auto_ack_replica(rt);
 
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
         // Send 5 ops normally
         for i in 0..5 {
-            let ops = vec![ReplicaOp::Freeze { tx_key: key(i), offset: 0, master_generation: 0 }];
+            let ops = vec![ReplicaOp::Freeze {
+                tx_key: key(i),
+                offset: 0,
+                master_generation: 0,
+            }];
             mgr.replicate_batch(&ops).unwrap();
         }
         assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
@@ -981,14 +1082,22 @@ mod tests {
 
         // Simulate reconnect: the transport is still connected
         mgr.check_reconnected();
-        assert!(matches!(mgr.sender(0).state(), ReplicaState::CatchingUp { from_sequence: 6 }));
+        assert!(matches!(
+            mgr.sender(0).state(),
+            ReplicaState::CatchingUp { from_sequence: 6 }
+        ));
 
         // Run catch-up with mock ops
         mgr.run_catchup(|from_seq| {
             (from_seq..11)
-                .map(|i| ReplicaOp::Freeze { tx_key: key(i as u8), offset: 0, master_generation: 0 })
+                .map(|i| ReplicaOp::Freeze {
+                    tx_key: key(i as u8),
+                    offset: 0,
+                    master_generation: 0,
+                })
                 .collect()
-        }).unwrap();
+        })
+        .unwrap();
 
         assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
     }
@@ -1023,7 +1132,9 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let batch = rt.recv_batch(Duration::from_secs(5)).unwrap();
             std::thread::sleep(Duration::from_millis(200)); // slow but alive
-            let ack = ReplicaAck::Ok { through_sequence: batch.last_sequence() };
+            let ack = ReplicaAck::Ok {
+                through_sequence: batch.last_sequence(),
+            };
             rt.send_ack(&ack).unwrap();
         });
 
@@ -1035,7 +1146,11 @@ mod tests {
             vec![Box::new(mt)],
         );
 
-        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }];
         let result = mgr.replicate_batch(&ops);
         assert!(result.is_ok(), "slow replica within timeout should succeed");
 
@@ -1054,7 +1169,9 @@ mod tests {
         let _handle = std::thread::spawn(move || {
             if let Ok(batch) = rt.recv_batch(Duration::from_secs(5)) {
                 std::thread::sleep(Duration::from_millis(500)); // too slow
-                let ack = ReplicaAck::Ok { through_sequence: batch.last_sequence() };
+                let ack = ReplicaAck::Ok {
+                    through_sequence: batch.last_sequence(),
+                };
                 let _ = rt.send_ack(&ack);
             }
         });
@@ -1068,7 +1185,11 @@ mod tests {
             vec![Box::new(mt)],
         );
 
-        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }];
         let result = mgr.replicate_batch(&ops);
         assert!(result.is_err(), "replica timeout should return error");
 
@@ -1092,12 +1213,19 @@ mod tests {
             100,
         );
 
-        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }];
         mgr.replicate_batch(&ops).unwrap();
 
         drop(mgr);
         let received = handle.join().unwrap();
-        assert_eq!(received[0].first_sequence, 100, "should start from redo log sequence");
+        assert_eq!(
+            received[0].first_sequence, 100,
+            "should start from redo log sequence"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1120,14 +1248,25 @@ mod tests {
         );
 
         // First batch: one replica fails
-        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }];
         mgr.replicate_batch(&ops).unwrap(); // succeeds with majority
 
         // Second batch: down replica excluded, live replica handles it
-        let ops2 = vec![ReplicaOp::Freeze { tx_key: key(2), offset: 0, master_generation: 0 }];
+        let ops2 = vec![ReplicaOp::Freeze {
+            tx_key: key(2),
+            offset: 0,
+            master_generation: 0,
+        }];
         let result = mgr.replicate_batch(&ops2);
         // With WriteMajority RF=3, need 1 ACK. 1 live replica → should succeed.
-        assert!(result.is_ok(), "should succeed with 1 live replica and WriteMajority");
+        assert!(
+            result.is_ok(),
+            "should succeed with 1 live replica and WriteMajority"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1139,14 +1278,15 @@ mod tests {
         let (mt, rt) = InMemoryTransport::pair();
         let handle = spawn_auto_ack_replica(rt);
 
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
         // Send 100 operations in rapid succession
         for i in 0..100u8 {
-            let ops = vec![ReplicaOp::Freeze { tx_key: key(i), offset: i as u32, master_generation: 0 }];
+            let ops = vec![ReplicaOp::Freeze {
+                tx_key: key(i),
+                offset: i as u32,
+                master_generation: 0,
+            }];
             mgr.replicate_batch(&ops).unwrap();
         }
 
@@ -1156,9 +1296,13 @@ mod tests {
 
         // Verify ordering: first_sequence must increase monotonically
         for i in 1..received.len() {
-            assert!(received[i].first_sequence > received[i-1].first_sequence,
+            assert!(
+                received[i].first_sequence > received[i - 1].first_sequence,
                 "batch {i} sequence {} should be > batch {} sequence {}",
-                received[i].first_sequence, i-1, received[i-1].first_sequence);
+                received[i].first_sequence,
+                i - 1,
+                received[i - 1].first_sequence
+            );
         }
 
         // Verify each batch has the expected key
@@ -1196,23 +1340,37 @@ mod tests {
 
         // First catchup: succeeds, transitions to Live
         mgr.run_catchup(|from_seq| {
-            (from_seq..11).map(|i| ReplicaOp::Freeze {
-                tx_key: key(i as u8), offset: 0, master_generation: 0,
-            }).collect()
-        }).unwrap();
+            (from_seq..11)
+                .map(|i| ReplicaOp::Freeze {
+                    tx_key: key(i as u8),
+                    offset: 0,
+                    master_generation: 0,
+                })
+                .collect()
+        })
+        .unwrap();
         assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
 
         // Simulate: replica goes down and comes back
-        mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: mgr.sender(0).last_acked() + 1 };
+        mgr.senders[0].state = ReplicaState::CatchingUp {
+            from_sequence: mgr.sender(0).last_acked() + 1,
+        };
         mgr.next_sequence = 11; // same sequence
 
         // Second catchup from last acked: should be a no-op (already caught up)
         mgr.run_catchup(|from_seq| {
-            if from_seq >= 11 { return Vec::new(); }
-            (from_seq..11).map(|i| ReplicaOp::Freeze {
-                tx_key: key(i as u8), offset: 0, master_generation: 0,
-            }).collect()
-        }).unwrap();
+            if from_seq >= 11 {
+                return Vec::new();
+            }
+            (from_seq..11)
+                .map(|i| ReplicaOp::Freeze {
+                    tx_key: key(i as u8),
+                    offset: 0,
+                    master_generation: 0,
+                })
+                .collect()
+        })
+        .unwrap();
         assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
 
         drop(mgr);
@@ -1236,15 +1394,22 @@ mod tests {
         mgr.next_sequence = 60;
 
         mgr.run_catchup(|from_seq| {
-            (from_seq..60).map(|i| ReplicaOp::Freeze {
-                tx_key: key(i as u8), offset: 0, master_generation: 0,
-            }).collect()
-        }).unwrap();
+            (from_seq..60)
+                .map(|i| ReplicaOp::Freeze {
+                    tx_key: key(i as u8),
+                    offset: 0,
+                    master_generation: 0,
+                })
+                .collect()
+        })
+        .unwrap();
 
         // After catchup: last_acked should be at the end of the range
         assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
-        assert!(mgr.sender(0).last_acked() >= 59,
-            "last_acked should be >= 59 after catching up to seq 60");
+        assert!(
+            mgr.sender(0).last_acked() >= 59,
+            "last_acked should be >= 59 after catching up to seq 60"
+        );
 
         drop(mgr);
         let _ = handle.join();
@@ -1258,10 +1423,7 @@ mod tests {
     fn check_reconnected_transitions_down_to_catchup() {
         let (mt, _rt) = InMemoryTransport::pair();
 
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
         // Simulate: replica was sending, got to seq 50, then went down
         mgr.senders[0].last_acked = 50;
@@ -1269,18 +1431,17 @@ mod tests {
 
         // InMemoryTransport always reports connected
         mgr.check_reconnected();
-        assert_eq!(*mgr.sender(0).state(),
+        assert_eq!(
+            *mgr.sender(0).state(),
             ReplicaState::CatchingUp { from_sequence: 51 },
-            "should transition to CatchingUp from last_acked + 1");
+            "should transition to CatchingUp from last_acked + 1"
+        );
     }
 
     #[test]
     fn lag_calculation() {
         let (mt, _rt) = InMemoryTransport::pair();
-        let mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
         // last_acked = 0, master seq = 1
         assert_eq!(mgr.sender(0).lag(100), 100);
         assert_eq!(mgr.sender(0).lag(0), 0);
@@ -1298,7 +1459,11 @@ mod tests {
             vec![], // no replicas
         );
 
-        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }];
         // WriteAll with 0 replicas: 0 required ACKs → should succeed
         mgr.replicate_batch(&ops).unwrap();
     }
@@ -1338,7 +1503,11 @@ mod tests {
 
         drop(mgr);
         let received = handle.join().unwrap();
-        assert_eq!(received.len(), 3, "5 ops at batch_size=2 should produce 3 batches");
+        assert_eq!(
+            received.len(),
+            3,
+            "5 ops at batch_size=2 should produce 3 batches"
+        );
 
         // Verify each chunk has the correct first_sequence
         assert_eq!(received[0].first_sequence, 100);
@@ -1363,10 +1532,7 @@ mod tests {
     #[test]
     fn catchup_already_caught_up_transitions_to_live() {
         let (mt, _rt) = InMemoryTransport::pair();
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
         mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 100 };
         mgr.senders[0].last_acked = 99;
@@ -1374,7 +1540,8 @@ mod tests {
 
         mgr.run_catchup(|_| {
             panic!("should not be called when already caught up");
-        }).unwrap();
+        })
+        .unwrap();
 
         assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
     }
@@ -1399,10 +1566,15 @@ mod tests {
 
         mgr.run_catchup(|from_seq| {
             assert_eq!(from_seq, 50);
-            (0..3).map(|i| ReplicaOp::Freeze {
-                tx_key: key(i), offset: 0, master_generation: 0,
-            }).collect()
-        }).unwrap();
+            (0..3)
+                .map(|i| ReplicaOp::Freeze {
+                    tx_key: key(i),
+                    offset: 0,
+                    master_generation: 0,
+                })
+                .collect()
+        })
+        .unwrap();
 
         assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
 
@@ -1432,13 +1604,21 @@ mod tests {
         mgr.next_sequence = 10;
 
         mgr.run_catchup(|_| {
-            (0..9).map(|i| ReplicaOp::Freeze {
-                tx_key: key(i as u8), offset: 0, master_generation: 0,
-            }).collect()
-        }).unwrap();
+            (0..9)
+                .map(|i| ReplicaOp::Freeze {
+                    tx_key: key(i as u8),
+                    offset: 0,
+                    master_generation: 0,
+                })
+                .collect()
+        })
+        .unwrap();
 
-        assert_eq!(*mgr.sender(0).state(), ReplicaState::Down,
-            "transport failure during catchup should mark Down");
+        assert_eq!(
+            *mgr.sender(0).state(),
+            ReplicaState::Down,
+            "transport failure during catchup should mark Down"
+        );
     }
 
     /// check_reconnected on a NeedsResync replica: should stay NeedsResync
@@ -1446,10 +1626,7 @@ mod tests {
     #[test]
     fn check_reconnected_does_not_clear_needs_resync() {
         let (mt, _rt) = InMemoryTransport::pair();
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
         mgr.senders[0].state = ReplicaState::NeedsResync;
         mgr.check_reconnected();
@@ -1462,7 +1639,10 @@ mod tests {
     #[test]
     fn required_ack_count_rf5_write_majority() {
         let mgr = ReplicationManager::new(
-            ReplicationConfig { ack_policy: AckPolicy::WriteMajority, ..Default::default() },
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteMajority,
+                ..Default::default()
+            },
             vec![
                 Box::new(InMemoryTransport::pair().0),
                 Box::new(InMemoryTransport::pair().0),
@@ -1478,7 +1658,10 @@ mod tests {
     #[test]
     fn required_ack_count_rf5_write_all() {
         let mgr = ReplicationManager::new(
-            ReplicationConfig { ack_policy: AckPolicy::WriteAll, ..Default::default() },
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteAll,
+                ..Default::default()
+            },
             vec![
                 Box::new(InMemoryTransport::pair().0),
                 Box::new(InMemoryTransport::pair().0),
@@ -1492,11 +1675,8 @@ mod tests {
     /// with_initial_sequence(0) clamps to 1.
     #[test]
     fn with_initial_sequence_zero_clamps() {
-        let mgr = ReplicationManager::with_initial_sequence(
-            ReplicationConfig::default(),
-            vec![],
-            0,
-        );
+        let mgr =
+            ReplicationManager::with_initial_sequence(ReplicationConfig::default(), vec![], 0);
         assert_eq!(mgr.current_sequence(), 1);
     }
 
@@ -1651,11 +1831,10 @@ mod tests {
     /// absolute counts.
     #[test]
     fn replication_records_batch_latency_and_lag() {
-        use crate::metrics::{init_replication_metrics, replication_metrics, ReplicationMetrics};
+        use crate::metrics::{ReplicationMetrics, init_replication_metrics, replication_metrics};
         use std::sync::OnceLock;
         static TEST_METRICS: OnceLock<ReplicationMetrics> = OnceLock::new();
-        let m_ref: &'static ReplicationMetrics =
-            TEST_METRICS.get_or_init(ReplicationMetrics::new);
+        let m_ref: &'static ReplicationMetrics = TEST_METRICS.get_or_init(ReplicationMetrics::new);
         init_replication_metrics(m_ref);
         // Use the real installed metrics for observation (may be the one we
         // just tried to install, or an earlier one from another test).
@@ -1745,12 +1924,13 @@ mod tests {
             }
         });
 
-        let mut mgr = ReplicationManager::new(
-            ReplicationConfig::default(),
-            vec![Box::new(mt)],
-        );
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
-        let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }];
         let result = mgr.replicate_batch(&ops);
         assert!(result.is_err());
         assert_eq!(*mgr.sender(0).state(), ReplicaState::Down);

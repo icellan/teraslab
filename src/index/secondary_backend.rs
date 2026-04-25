@@ -6,12 +6,12 @@
 //! backends have no on-disk state to protect and accept a `None` redo log —
 //! a crash rebuilds them from the primary redo log replay plus device scan.
 
+use crate::index::IndexError;
 use crate::index::dah_index::{DahIndex, DahRedoEntry};
 use crate::index::hashtable::TxKey;
 use crate::index::redb_dah::RedbDahIndex;
 use crate::index::redb_unmined::RedbUnminedIndex;
 use crate::index::unmined_index::{UnminedIndex, UnminedRedoEntry};
-use crate::index::IndexError;
 use crate::redo::RedoLog;
 use parking_lot::Mutex;
 
@@ -103,7 +103,7 @@ impl DahBackend {
     /// Insert a transaction into the DAH index with two-phase durability.
     ///
     /// For on-disk backends, the redo log (if provided) receives a
-    /// [`RedoOp::SecondaryDahUpdate`] entry that is fsynced BEFORE the redb
+    /// [`crate::redo::RedoOp::SecondaryDahUpdate`] entry that is fsynced BEFORE the redb
     /// commit. For in-memory backends, the redo log is ignored — a crash
     /// rebuilds in-memory state from the primary redo replay + device scan.
     ///
@@ -235,7 +235,7 @@ impl UnminedBackend {
     /// Insert a transaction into the unmined index with two-phase durability.
     ///
     /// For on-disk backends, the redo log (if provided) receives a
-    /// [`RedoOp::SecondaryUnminedUpdate`] entry that is fsynced BEFORE the
+    /// [`crate::redo::RedoOp::SecondaryUnminedUpdate`] entry that is fsynced BEFORE the
     /// redb commit. For in-memory backends, the redo log is ignored.
     ///
     /// Returns an error only if the redo log flush or the redb commit fails.
@@ -360,7 +360,8 @@ mod tests {
 
         // On-disk
         let dir = tempfile::tempdir().unwrap();
-        let redb = RedbDahIndex::open(dir.path().join("dah.redb").as_path(), 16 * 1024 * 1024).unwrap();
+        let redb =
+            RedbDahIndex::open(dir.path().join("dah.redb").as_path(), 16 * 1024 * 1024).unwrap();
         let mut disk = DahBackend::OnDisk(redb);
         f(&mut disk);
     }
@@ -373,7 +374,9 @@ mod tests {
 
         // On-disk
         let dir = tempfile::tempdir().unwrap();
-        let redb = RedbUnminedIndex::open(dir.path().join("unmined.redb").as_path(), 16 * 1024 * 1024).unwrap();
+        let redb =
+            RedbUnminedIndex::open(dir.path().join("unmined.redb").as_path(), 16 * 1024 * 1024)
+                .unwrap();
         let mut disk = UnminedBackend::OnDisk(redb);
         f(&mut disk);
     }
@@ -479,7 +482,8 @@ mod tests {
         assert!(format!("{mem:?}").contains("InMemory"));
 
         let dir = tempfile::tempdir().unwrap();
-        let redb = RedbDahIndex::open(dir.path().join("dah.redb").as_path(), 16 * 1024 * 1024).unwrap();
+        let redb =
+            RedbDahIndex::open(dir.path().join("dah.redb").as_path(), 16 * 1024 * 1024).unwrap();
         let disk = DahBackend::OnDisk(redb);
         assert!(format!("{disk:?}").contains("OnDisk"));
     }
@@ -608,7 +612,8 @@ mod tests {
     fn dah_iter_size_hint() {
         // On-disk (Collected variant) gives exact bounds
         let dir = tempfile::tempdir().unwrap();
-        let mut redb = RedbDahIndex::open(dir.path().join("dah.redb").as_path(), 16 * 1024 * 1024).unwrap();
+        let mut redb =
+            RedbDahIndex::open(dir.path().join("dah.redb").as_path(), 16 * 1024 * 1024).unwrap();
         redb.insert(100, key(1), None).unwrap();
         redb.insert(200, key(2), None).unwrap();
         redb.insert(300, key(3), None).unwrap();
@@ -623,7 +628,9 @@ mod tests {
     fn unmined_iter_size_hint() {
         // On-disk (Collected variant) gives exact bounds
         let dir = tempfile::tempdir().unwrap();
-        let mut redb = RedbUnminedIndex::open(dir.path().join("unmined.redb").as_path(), 16 * 1024 * 1024).unwrap();
+        let mut redb =
+            RedbUnminedIndex::open(dir.path().join("unmined.redb").as_path(), 16 * 1024 * 1024)
+                .unwrap();
         redb.insert(100, key(1), None).unwrap();
         redb.insert(200, key(2), None).unwrap();
         let disk = UnminedBackend::OnDisk(redb);
@@ -639,7 +646,9 @@ mod tests {
         assert!(format!("{mem:?}").contains("InMemory"));
 
         let dir = tempfile::tempdir().unwrap();
-        let redb = RedbUnminedIndex::open(dir.path().join("unmined.redb").as_path(), 16 * 1024 * 1024).unwrap();
+        let redb =
+            RedbUnminedIndex::open(dir.path().join("unmined.redb").as_path(), 16 * 1024 * 1024)
+                .unwrap();
         let disk = UnminedBackend::OnDisk(redb);
         assert!(format!("{disk:?}").contains("OnDisk"));
     }

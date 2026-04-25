@@ -30,9 +30,7 @@ use teraslab::fault_injection::{FaultMode, SyncPoint, arm, current, disarm};
 use teraslab::index::hashtable::HashTable;
 use teraslab::index::redb_dah::RedbDahIndex;
 use teraslab::index::redb_unmined::RedbUnminedIndex;
-use teraslab::index::{
-    DahBackend, PrimaryBackend, TxIndexEntry, TxKey, UnminedBackend,
-};
+use teraslab::index::{DahBackend, PrimaryBackend, TxIndexEntry, TxKey, UnminedBackend};
 use teraslab::redo::{RedoLog, RedoOp};
 
 // ---------------------------------------------------------------------------
@@ -105,8 +103,7 @@ fn kill_after_redo_fsync_before_data_pwrite_recovers_slot() {
     meta.tx_id = key.txid;
     let slot_hash = [0x42u8; 32];
     let slot = teraslab::record::UtxoSlot::new_unspent(slot_hash);
-    teraslab::io::write_full_record(&*data_dev, record_offset, &meta, &[slot])
-        .unwrap();
+    teraslab::io::write_full_record(&*data_dev, record_offset, &meta, &[slot]).unwrap();
 
     primary
         .register(key, make_entry(record_offset, 0, 0))
@@ -143,8 +140,7 @@ fn kill_after_redo_fsync_before_data_pwrite_recovers_slot() {
 
     // Sanity: the slot on the data device is STILL unspent — no
     // post-fsync work ran.
-    let pre_recovery_slot =
-        teraslab::io::read_utxo_slot(&*data_dev, record_offset, 0).unwrap();
+    let pre_recovery_slot = teraslab::io::read_utxo_slot(&*data_dev, record_offset, 0).unwrap();
     assert!(
         pre_recovery_slot.is_unspent(),
         "pre-recovery slot must still be unspent (panic fired before pwrite)"
@@ -158,17 +154,21 @@ fn kill_after_redo_fsync_before_data_pwrite_recovers_slot() {
     let redo_reopened = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
     let mut dah = DahBackend::new_in_memory();
     let mut unmined = UnminedBackend::new_in_memory();
-    let stats =
-        teraslab::recovery::recover_all(&*data_dev, &redo_reopened, &mut primary, &mut dah, &mut unmined)
-            .unwrap();
+    let stats = teraslab::recovery::recover_all(
+        &*data_dev,
+        &redo_reopened,
+        &mut primary,
+        &mut dah,
+        &mut unmined,
+    )
+    .unwrap();
     assert_eq!(
         stats.entries_replayed, 1,
         "exactly one Spend redo entry must be replayed"
     );
     assert_eq!(stats.entries_failed, 0, "no replay must fail");
 
-    let recovered_slot =
-        teraslab::io::read_utxo_slot(&*data_dev, record_offset, 0).unwrap();
+    let recovered_slot = teraslab::io::read_utxo_slot(&*data_dev, record_offset, 0).unwrap();
     assert!(
         !recovered_slot.is_unspent(),
         "post-recovery slot must be spent"
@@ -178,9 +178,14 @@ fn kill_after_redo_fsync_before_data_pwrite_recovers_slot() {
         "spending_data must match the journaled intent"
     );
     // Idempotency: a second recovery run must be a no-op (entries_skipped > 0).
-    let stats2 =
-        teraslab::recovery::recover_all(&*data_dev, &redo_reopened, &mut primary, &mut dah, &mut unmined)
-            .unwrap();
+    let stats2 = teraslab::recovery::recover_all(
+        &*data_dev,
+        &redo_reopened,
+        &mut primary,
+        &mut dah,
+        &mut unmined,
+    )
+    .unwrap();
     assert_eq!(
         stats2.entries_replayed, 0,
         "second recovery must not re-apply (idempotent)"
@@ -289,9 +294,9 @@ fn kill_between_rename_and_dir_fsync_recovers_hashtable() {
     // present and unchanged.
     let recovered = HashTable::open_file_backed(&idx_path, 16).unwrap();
     for (k, expected) in &entries {
-        let actual = recovered.get_entry(k).unwrap_or_else(|| {
-            panic!("missing entry for key {:?} after recovery", k.txid[0])
-        });
+        let actual = recovered
+            .get_entry(k)
+            .unwrap_or_else(|| panic!("missing entry for key {:?} after recovery", k.txid[0]));
         assert_eq!(
             actual.record_offset, expected.record_offset,
             "record_offset mismatch for key {}",
@@ -348,8 +353,7 @@ fn kill_after_free_redo_fsync_before_freelist_mutation_reconstructs_freelist() {
     let mut recovered_alloc = SlotAllocator::new(data_dev.clone()).unwrap();
     // Re-allocate up to pre_free_next_offset so the allocator's
     // high-water mark aligns with the pre-crash state.
-    let catchup = pre_free_next_offset
-        - teraslab::allocator::DATA_REGION_OFFSET;
+    let catchup = pre_free_next_offset - teraslab::allocator::DATA_REGION_OFFSET;
     if catchup > 0 {
         let _ = recovered_alloc.allocate(catchup).unwrap();
     }
@@ -421,16 +425,13 @@ fn kill_before_secondary_redb_commit_reconciles_via_redo() {
     // Primary with an authoritative unmined_since=500 entry.
     let mut primary = PrimaryBackend::new_in_memory(100).unwrap();
     let key = make_key(3);
-    primary
-        .register(key, make_entry(4096, 500, 0))
-        .unwrap();
+    primary.register(key, make_entry(4096, 500, 0)).unwrap();
 
     // Arm the panic at BeforeSecondaryRedbCommit, then call insert on
     // the on-disk unmined backend. The redo flush completes, the
     // panic fires BEFORE `txn.commit()` runs.
     {
-        let mut unmined =
-            RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap();
+        let mut unmined = RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap();
         let redo_for_panic = redo_log.clone();
         let panicked = armed(
             FaultMode::PanicAt(SyncPoint::BeforeSecondaryRedbCommit),
@@ -444,8 +445,7 @@ fn kill_before_secondary_redb_commit_reconciles_via_redo() {
     // Post-panic: reopen the redb file. It must not contain the entry
     // (commit never ran).
     {
-        let unmined =
-            RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap();
+        let unmined = RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap();
         let result = unmined.range_query(500);
         assert!(
             result.is_empty(),
@@ -458,12 +458,10 @@ fn kill_before_secondary_redb_commit_reconciles_via_redo() {
 
     // Reopen and run recovery with both secondary backends.
     let redo_reopened = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
-    let mut dah_backend = DahBackend::OnDisk(
-        RedbDahIndex::open(&dah_path, 16 * 1024 * 1024).unwrap(),
-    );
-    let mut unmined_backend = UnminedBackend::OnDisk(
-        RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap(),
-    );
+    let mut dah_backend =
+        DahBackend::OnDisk(RedbDahIndex::open(&dah_path, 16 * 1024 * 1024).unwrap());
+    let mut unmined_backend =
+        UnminedBackend::OnDisk(RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap());
 
     // Throwaway data device — the SecondaryUnminedUpdate replay doesn't
     // touch it.

@@ -62,10 +62,7 @@ impl TxKey {
 
 impl std::fmt::Debug for TxKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let hex: String = self.txid[..8]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let hex: String = self.txid[..8].iter().map(|b| format!("{b:02x}")).collect();
         write!(f, "TxKey({hex}...)")
     }
 }
@@ -140,7 +137,10 @@ struct Bucket {
 /// Actual size of one bucket in bytes.
 pub const BUCKET_SIZE: usize = std::mem::size_of::<Bucket>();
 
-const _: () = assert!(BUCKET_SIZE == 64, "Bucket must be exactly 64 bytes (1 cache line)");
+const _: () = assert!(
+    BUCKET_SIZE == 64,
+    "Bucket must be exactly 64 bytes (1 cache line)"
+);
 
 impl Bucket {
     fn empty() -> Self {
@@ -223,17 +223,13 @@ fn txid_fingerprint(txid: &[u8; 32]) -> u64 {
 /// On macOS, uses regular pages directly.
 ///
 /// Returns `(pointer, mmap_byte_length, hugepage_used)`.
-fn alloc_mmap_buckets(
-    capacity: usize,
-) -> Result<(*mut Bucket, usize, bool)> {
+fn alloc_mmap_buckets(capacity: usize) -> Result<(*mut Bucket, usize, bool)> {
     let byte_len = capacity
         .checked_mul(std::mem::size_of::<Bucket>())
         .ok_or_else(|| HashTableError::AllocFailed("capacity overflow".into()))?;
 
     if byte_len == 0 {
-        return Err(HashTableError::AllocFailed(
-            "zero-size allocation".into(),
-        ));
+        return Err(HashTableError::AllocFailed("zero-size allocation".into()));
     }
 
     // On Linux, try hugepages first.
@@ -349,10 +345,7 @@ fn fsync_parent_dir(path: &std::path::Path) -> Result<()> {
         HashTableError::ResizeIo(format!("open parent dir {}: {e}", parent.display()))
     })?;
     dir.sync_all().map_err(|e| {
-        HashTableError::ResizeIo(format!(
-            "fsync parent dir {}: {e}",
-            parent.display()
-        ))
+        HashTableError::ResizeIo(format!("fsync parent dir {}: {e}", parent.display()))
     })?;
     Ok(())
 }
@@ -410,10 +403,7 @@ fn alloc_file_backed_buckets(
 
     // Only set_len if the file isn't already the right size. This avoids
     // truncating an existing file that was resized to a larger capacity.
-    let current_len = file
-        .metadata()
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let current_len = file.metadata().map(|m| m.len()).unwrap_or(0);
     if current_len != byte_len as u64 {
         file.set_len(byte_len as u64)
             .map_err(|e| HashTableError::AllocFailed(format!("ftruncate: {e}")))?;
@@ -492,10 +482,13 @@ impl std::fmt::Debug for HashTable {
             .field("count", &self.count)
             .field("hugepage", &self.hugepage)
             .field("max_probe", &self.max_probe)
-            .field("backing", &match &self.backing {
-                Backing::Anonymous => "anonymous",
-                Backing::FileBacked { .. } => "file_backed",
-            })
+            .field(
+                "backing",
+                &match &self.backing {
+                    Backing::Anonymous => "anonymous",
+                    Backing::FileBacked { .. } => "file_backed",
+                },
+            )
             .finish()
     }
 }
@@ -696,11 +689,7 @@ impl HashTable {
     }
 
     /// Insert or update an entry. Returns the previous entry if the key existed.
-    pub fn insert(
-        &mut self,
-        key: TxKey,
-        entry: TxIndexEntry,
-    ) -> Result<Option<TxIndexEntry>> {
+    pub fn insert(&mut self, key: TxKey, entry: TxIndexEntry) -> Result<Option<TxIndexEntry>> {
         // Check for update of existing key first.
         let fp = txid_fingerprint(&key.txid);
         {
@@ -719,7 +708,8 @@ impl HashTable {
                     }
                     if txid_fingerprint(&bucket.txid) == fp && bucket.txid == key.txid {
                         let old = bucket.entry();
-                        self.bucket_mut(idx).set_entry(&key, &entry, cap_probe(dist));
+                        self.bucket_mut(idx)
+                            .set_entry(&key, &entry, cap_probe(dist));
                         return Ok(Some(old));
                     }
                 }
@@ -751,9 +741,7 @@ impl HashTable {
 
             // Robin Hood: if our displacement is greater, swap.
             if bucket.is_occupied() && dist > bucket.probe_distance as u16 {
-                let displaced_key = TxKey {
-                    txid: bucket.txid,
-                };
+                let displaced_key = TxKey { txid: bucket.txid };
                 let displaced_entry = bucket.entry();
                 let displaced_dist: u16 = bucket.probe_distance as u16;
 
@@ -816,9 +804,7 @@ impl HashTable {
         loop {
             let next_idx = (empty_idx + 1) & self.mask;
             let next = self.bucket(next_idx);
-            if next.is_empty()
-                || (next.is_occupied() && next.probe_distance == 0)
-            {
+            if next.is_empty() || (next.is_occupied() && next.probe_distance == 0) {
                 break;
             }
             // Shift this entry back.
@@ -1052,9 +1038,7 @@ impl HashTable {
         // rename but BEFORE the parent-directory fsync. Post-recovery
         // the orphan cleanup path (see `recovery::recover_all_with_allocator`)
         // must leave the index consistent.
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::MidHashtableResize,
-        );
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::MidHashtableResize);
 
         // Step 5: fsync the parent directory so the rename is durable.
         fsync_parent_dir(&old_path)?;
@@ -1125,10 +1109,7 @@ impl<'a> Iterator for HashTableIter<'a> {
             let bucket = self.table.bucket(self.pos);
             self.pos += 1;
             if bucket.is_occupied() {
-                return Some((
-                    TxKey { txid: bucket.txid },
-                    bucket.entry(),
-                ));
+                return Some((TxKey { txid: bucket.txid }, bucket.entry()));
             }
         }
         None
@@ -1148,9 +1129,7 @@ mod tests {
         let mut txid = [0u8; 32];
         txid[0..8].copy_from_slice(&n.to_le_bytes());
         // Put something in bytes 8-16 for fingerprint variation
-        txid[8..16].copy_from_slice(
-            &(n.wrapping_mul(0x9E3779B97F4A7C15)).to_le_bytes(),
-        );
+        txid[8..16].copy_from_slice(&(n.wrapping_mul(0x9E3779B97F4A7C15)).to_le_bytes());
         TxKey { txid }
     }
 
@@ -1169,11 +1148,7 @@ mod tests {
     }
 
     /// Create a key that hashes to a specific bucket (for collision testing).
-    fn make_colliding_key(
-        bucket_target: usize,
-        sequence: u64,
-        mask: usize,
-    ) -> TxKey {
+    fn make_colliding_key(bucket_target: usize, sequence: u64, mask: usize) -> TxKey {
         let mut txid = [0u8; 32];
         // Set bytes 0-7 so bucket_index == bucket_target
         let base = (bucket_target & mask) as u64;
@@ -1181,8 +1156,7 @@ mod tests {
         // Set bytes 8-16 uniquely per sequence for different fingerprints
         txid[8..16].copy_from_slice(&sequence.to_le_bytes());
         // Set bytes 16+ for additional uniqueness
-        txid[16..24]
-            .copy_from_slice(&(sequence.wrapping_mul(7)).to_le_bytes());
+        txid[16..24].copy_from_slice(&(sequence.wrapping_mul(7)).to_le_bytes());
         TxKey { txid }
     }
 
@@ -1349,10 +1323,7 @@ mod tests {
         }
         t.resize(32).unwrap();
         t.insert(make_key(100), make_entry(100)).unwrap();
-        assert_eq!(
-            t.get_entry(&make_key(100)).unwrap().record_offset,
-            100
-        );
+        assert_eq!(t.get_entry(&make_key(100)).unwrap().record_offset, 100);
     }
 
     #[test]
@@ -1362,10 +1333,7 @@ mod tests {
             t.insert(make_key(i), make_entry(i)).unwrap();
         }
         for i in 0..716u64 {
-            assert!(
-                t.get_entry(&make_key(i)).is_some(),
-                "missing key {i}"
-            );
+            assert!(t.get_entry(&make_key(i)).is_some(), "missing key {i}");
         }
     }
 
@@ -1376,10 +1344,7 @@ mod tests {
             t.insert(make_key(i), make_entry(i)).unwrap();
         }
         for i in 0..921u64 {
-            assert!(
-                t.get_entry(&make_key(i)).is_some(),
-                "missing key {i}"
-            );
+            assert!(t.get_entry(&make_key(i)).is_some(), "missing key {i}");
         }
     }
 
@@ -1389,17 +1354,14 @@ mod tests {
     fn collisions_all_found() {
         let mut t = HashTable::new(64).unwrap();
         let mask = t.capacity() - 1;
-        let keys: Vec<_> = (0..10)
-            .map(|i| make_colliding_key(0, i, mask))
-            .collect();
+        let keys: Vec<_> = (0..10).map(|i| make_colliding_key(0, i, mask)).collect();
 
         for (i, k) in keys.iter().enumerate() {
             t.insert(*k, make_entry(i as u64 * 100)).unwrap();
         }
 
         for (i, k) in keys.iter().enumerate() {
-            let e =
-                t.get_entry(k).expect("colliding key should be found");
+            let e = t.get_entry(k).expect("colliding key should be found");
             assert_eq!(e.record_offset, i as u64 * 100);
         }
     }
@@ -1408,18 +1370,16 @@ mod tests {
     fn adversarial_1000_all_same_bucket() {
         let mut t = HashTable::new(2048).unwrap();
         let mask = t.capacity() - 1;
-        let keys: Vec<_> = (0..1000)
-            .map(|i| make_colliding_key(0, i, mask))
-            .collect();
+        let keys: Vec<_> = (0..1000).map(|i| make_colliding_key(0, i, mask)).collect();
 
         for (i, k) in keys.iter().enumerate() {
             t.insert(*k, make_entry(i as u64)).unwrap();
         }
 
         for (i, k) in keys.iter().enumerate() {
-            let e = t.get_entry(k).unwrap_or_else(|| {
-                panic!("adversarial key {i} not found")
-            });
+            let e = t
+                .get_entry(k)
+                .unwrap_or_else(|| panic!("adversarial key {i} not found"));
             assert_eq!(e.record_offset, i as u64);
         }
     }
@@ -1557,9 +1517,9 @@ mod tests {
         assert_eq!(t.len(), 1_000_000);
 
         for i in 0..1_000_000u64 {
-            let e = t.get_entry(&make_key(i)).unwrap_or_else(|| {
-                panic!("key {i} not found at 1M scale")
-            });
+            let e = t
+                .get_entry(&make_key(i))
+                .unwrap_or_else(|| panic!("key {i} not found at 1M scale"));
             assert_eq!(e.record_offset, i * 8);
         }
     }
@@ -1583,9 +1543,9 @@ mod tests {
 
         // Spot check a sample of entries
         for i in (0..10_000_000u64).step_by(1000) {
-            let e = t.get_entry(&make_key(i)).unwrap_or_else(|| {
-                panic!("key {i} not found at 10M scale")
-            });
+            let e = t
+                .get_entry(&make_key(i))
+                .unwrap_or_else(|| panic!("key {i} not found at 10M scale"));
             assert_eq!(e.record_offset, i);
         }
     }
@@ -1726,7 +1686,9 @@ mod tests {
         assert_eq!(t.len(), 10);
 
         for i in 0..10u64 {
-            let e = t.get_entry(&make_key(i)).expect("entry should survive resize");
+            let e = t
+                .get_entry(&make_key(i))
+                .expect("entry should survive resize");
             assert_eq!(e.record_offset, i * 100);
         }
 
@@ -1751,7 +1713,9 @@ mod tests {
         let t = HashTable::open_file_backed(&path, new_cap).unwrap();
         assert_eq!(t.len(), 10);
         for i in 0..10u64 {
-            let e = t.get_entry(&make_key(i)).expect("should survive resize + reopen");
+            let e = t
+                .get_entry(&make_key(i))
+                .expect("should survive resize + reopen");
             assert_eq!(e.record_offset, i * 100);
         }
     }
@@ -1814,9 +1778,7 @@ mod tests {
         std::sync::Arc<crate::device::MemoryDevice>,
         std::sync::Arc<parking_lot::Mutex<crate::redo::RedoLog>>,
     ) {
-        let dev = std::sync::Arc::new(
-            crate::device::MemoryDevice::new(1024 * 1024, 4096).unwrap(),
-        );
+        let dev = std::sync::Arc::new(crate::device::MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let log = crate::redo::RedoLog::open(dev.clone(), 0, 1024 * 1024).unwrap();
         (dev, std::sync::Arc::new(parking_lot::Mutex::new(log)))
     }
@@ -1842,11 +1804,13 @@ mod tests {
 
         let resize_entries: Vec<_> = entries
             .iter()
-            .filter(|e| matches!(
-                e.op,
-                crate::redo::RedoOp::HashtableResizeBegin { .. }
-                    | crate::redo::RedoOp::HashtableResizeCommit { .. }
-            ))
+            .filter(|e| {
+                matches!(
+                    e.op,
+                    crate::redo::RedoOp::HashtableResizeBegin { .. }
+                        | crate::redo::RedoOp::HashtableResizeCommit { .. }
+                )
+            })
             .collect();
         assert_eq!(
             resize_entries.len(),
@@ -1898,16 +1862,16 @@ mod tests {
         // HashtableResizeBegin and the rename.
         {
             let mut f = std::fs::File::create(&tmp_path).unwrap();
-            f.write_all(b"partial contents from crashed resize").unwrap();
+            f.write_all(b"partial contents from crashed resize")
+                .unwrap();
             f.sync_all().unwrap();
         }
         assert!(tmp_path.exists(), "tmp file should exist before recovery");
 
         // Build a redo log that contains ONLY the Begin (no Commit) and run
         // recovery. The orphan tmp file must be removed.
-        let redo_dev = std::sync::Arc::new(
-            crate::device::MemoryDevice::new(1024 * 1024, 4096).unwrap(),
-        );
+        let redo_dev =
+            std::sync::Arc::new(crate::device::MemoryDevice::new(1024 * 1024, 4096).unwrap());
         {
             let mut log = crate::redo::RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
             use std::os::unix::ffi::OsStrExt;
@@ -1918,16 +1882,14 @@ mod tests {
             .unwrap();
         }
 
-        let data_dev = std::sync::Arc::new(
-            crate::device::MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap(),
-        );
+        let data_dev =
+            std::sync::Arc::new(crate::device::MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let mut alloc = crate::allocator::SlotAllocator::new(data_dev.clone()).unwrap();
         let mut index = crate::index::PrimaryBackend::new_in_memory(1000).unwrap();
         let mut dah = crate::index::DahBackend::new_in_memory();
         let mut unmined = crate::index::UnminedBackend::new_in_memory();
 
-        let redo_log =
-            crate::redo::RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
+        let redo_log = crate::redo::RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
         let stats = crate::recovery::recover_all_with_allocator(
             &*data_dev,
             &redo_log,
@@ -1947,7 +1909,10 @@ mod tests {
             "orphan resize tmp file must be removed by recovery"
         );
         // The original index file is untouched and still valid.
-        assert!(idx_path.exists(), "primary index file must survive recovery");
+        assert!(
+            idx_path.exists(),
+            "primary index file must survive recovery"
+        );
     }
 
     #[test]
@@ -1978,16 +1943,27 @@ mod tests {
 
         // Reopen — the on-disk file should have the new capacity and all keys.
         let t2 = HashTable::open_file_backed(&path, 16).unwrap();
-        assert_eq!(t2.capacity(), new_cap, "reopened capacity must match post-resize");
+        assert_eq!(
+            t2.capacity(),
+            new_cap,
+            "reopened capacity must match post-resize"
+        );
         assert_eq!(t2.len(), 14, "all entries must survive resize + reopen");
         for i in 0..14u64 {
             let e = t2
                 .get_entry(&make_key(i))
                 .unwrap_or_else(|| panic!("key {i} lost after resize + reopen"));
-            assert_eq!(e.record_offset, i * 7 + 1, "record_offset mismatch at key {i}");
+            assert_eq!(
+                e.record_offset,
+                i * 7 + 1,
+                "record_offset mismatch at key {i}"
+            );
         }
 
         // No orphan tmp file left behind.
-        assert!(!path.with_extension("tmp").exists(), "tmp file must not leak");
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "tmp file must not leak"
+        );
     }
 }

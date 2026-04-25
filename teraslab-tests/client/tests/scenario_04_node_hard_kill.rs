@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use teraslab_test_client::ClientError;
-use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::types::*;
+use teraslab_test_client::verifier::StateVerifier;
 
 macro_rules! tlog {
     ($t0:expr, $($arg:tt)*) => {
@@ -28,7 +28,10 @@ const SID: u16 = 4;
 
 /// Format a txid as a short hex prefix for assertion messages.
 fn txid_hex(txid: &[u8; 32]) -> String {
-    txid.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
+    txid.iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -76,18 +79,24 @@ async fn run_scenario() -> Result<(), ClientError> {
     };
 
     for chunk in txids[..2000].chunks(50) {
-        let items: Vec<SpendItem> = chunk.iter().map(|txid| {
-            let rec = verifier.get_record(txid)
-                .expect("record should exist in verifier");
-            SpendItem {
-                txid: *txid,
-                vout: 0,
-                utxo_hash: rec.utxo_hashes[0],
-                spending_data: [0u8; 36],
-            }
-        }).collect();
+        let items: Vec<SpendItem> = chunk
+            .iter()
+            .map(|txid| {
+                let rec = verifier
+                    .get_record(txid)
+                    .expect("record should exist in verifier");
+                SpendItem {
+                    txid: *txid,
+                    vout: 0,
+                    utxo_hash: rec.utxo_hashes[0],
+                    spending_data: [0u8; 36],
+                }
+            })
+            .collect();
 
-        client.spend_batch(&spend_params, &items).await
+        client
+            .spend_batch(&spend_params, &items)
+            .await
             .unwrap_or_else(|e| panic!("[4.0] spend batch failed: {e}"));
 
         for item in &items {
@@ -107,7 +116,9 @@ async fn run_scenario() -> Result<(), ClientError> {
     };
 
     for chunk in txids[..1000].chunks(100) {
-        client.set_mined_batch(&set_mined_params, chunk).await
+        client
+            .set_mined_batch(&set_mined_params, chunk)
+            .await
             .unwrap_or_else(|e| panic!("[4.0] set_mined batch failed: {e}"));
         for txid in chunk {
             verifier.record_set_mined(*txid);
@@ -136,7 +147,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     docker.kill_node("node2").await?;
 
     // Wait for BOTH surviving nodes to detect node2's departure
-    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(30)).await
+    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(30))
+        .await
         .map_err(|e| {
             eprintln!("Test 4.1: surviving nodes did not converge to cluster_size=2: {e}");
             e
@@ -158,22 +170,27 @@ async fn run_scenario() -> Result<(), ClientError> {
     let status_n1 = common::http_status(&docker, 1).await?;
     let status_n3 = common::http_status(&docker, 3).await?;
 
-    let master_n1 = status_n1["master_shard_count"].as_u64()
+    let master_n1 = status_n1["master_shard_count"]
+        .as_u64()
         .expect("Test 4.2: node1 should report master_shard_count");
-    let master_n3 = status_n3["master_shard_count"].as_u64()
+    let master_n3 = status_n3["master_shard_count"]
+        .as_u64()
         .expect("Test 4.2: node3 should report master_shard_count");
     let total_masters = master_n1 + master_n3;
 
-    assert_eq!(total_masters, 4096,
+    assert_eq!(
+        total_masters, 4096,
         "Test 4.2: master shard sum across node1 ({master_n1}) + node3 ({master_n3}) \
-         is {total_masters}, expected 4096");
+         is {total_masters}, expected 4096"
+    );
     eprintln!("[4.2] OK -- node1={master_n1}, node3={master_n3}, total={total_masters}");
     tlog!(t0, "test 4.2 done");
 
     client.refresh_routing().await?;
 
     // Wait for migrations to complete on surviving nodes ONLY (1 and 3).
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(60)).await
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(60))
+        .await
         .unwrap_or_else(|e| eprintln!("[4.2b] migration wait timed out: {e}"));
     // Wait for replication to settle after migration completes — migrated
     // records need time to propagate between the two surviving nodes.
@@ -196,7 +213,8 @@ async fn run_scenario() -> Result<(), ClientError> {
                 if read_failures <= 5 {
                     eprintln!(
                         "[4.3] read failure: txid {} returned status {}",
-                        txid_hex(&chunk[i]), result.status(),
+                        txid_hex(&chunk[i]),
+                        result.status(),
                     );
                 }
             }
@@ -205,7 +223,9 @@ async fn run_scenario() -> Result<(), ClientError> {
     // Retry failed reads after a routing refresh — stale partition maps
     // can route reads to the wrong surviving node.
     if read_failures > 0 {
-        eprintln!("[4.3] {read_failures} reads failed on first pass, retrying after routing refresh...");
+        eprintln!(
+            "[4.3] {read_failures} reads failed on first pass, retrying after routing refresh..."
+        );
         client.refresh_routing().await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
         client.refresh_routing().await?;
@@ -220,8 +240,10 @@ async fn run_scenario() -> Result<(), ClientError> {
         }
         read_failures = still_missing;
     }
-    assert_eq!(read_failures, 0,
-        "Test 4.3: {read_failures}/5000 reads failed -- with RF=2, all data must survive a single node failure");
+    assert_eq!(
+        read_failures, 0,
+        "Test 4.3: {read_failures}/5000 reads failed -- with RF=2, all data must survive a single node failure"
+    );
     eprintln!("[4.3] OK -- all 5000 reads succeeded");
     tlog!(t0, "test 4.3 done");
 
@@ -245,16 +267,20 @@ async fn run_scenario() -> Result<(), ClientError> {
     let spend_after_kill: Vec<[u8; 32]> = txids[2000..2200].to_vec();
     let mut spend_errors = 0u32;
     for chunk in spend_after_kill.chunks(50) {
-        let items: Vec<SpendItem> = chunk.iter().map(|txid| {
-            let rec = verifier.get_record(txid)
-                .expect("record should exist in verifier");
-            SpendItem {
-                txid: *txid,
-                vout: 0,
-                utxo_hash: rec.utxo_hashes[0],
-                spending_data: [0u8; 36],
-            }
-        }).collect();
+        let items: Vec<SpendItem> = chunk
+            .iter()
+            .map(|txid| {
+                let rec = verifier
+                    .get_record(txid)
+                    .expect("record should exist in verifier");
+                SpendItem {
+                    txid: *txid,
+                    vout: 0,
+                    utxo_hash: rec.utxo_hashes[0],
+                    spending_data: [0u8; 36],
+                }
+            })
+            .collect();
 
         match client.spend_batch(&spend_params, &items).await {
             Ok(resp) => {
@@ -281,8 +307,10 @@ async fn run_scenario() -> Result<(), ClientError> {
             }
         }
     }
-    assert_eq!(spend_errors, 0,
-        "Test 4.5: {spend_errors}/200 spends failed on 2-node cluster");
+    assert_eq!(
+        spend_errors, 0,
+        "Test 4.5: {spend_errors}/200 spends failed on 2-node cluster"
+    );
     eprintln!("[4.5] OK -- all 200 spends succeeded on 2-node cluster");
     tlog!(t0, "test 4.5 done");
 
@@ -303,7 +331,9 @@ async fn run_scenario() -> Result<(), ClientError> {
     };
 
     for chunk in mined_after_kill.chunks(50) {
-        client.set_mined_batch(&mined_params, chunk).await
+        client
+            .set_mined_batch(&mined_params, chunk)
+            .await
             .unwrap_or_else(|e| panic!("Test 4.6: set_mined batch failed: {e}"));
         for txid in chunk {
             verifier.record_set_mined(*txid);
@@ -312,9 +342,18 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // Verify ALL 100 mined records are readable with block entries
     for txid in mined_after_kill.iter() {
-        let results = client.get_batch(FIELD_ALL_METADATA | FIELD_BLOCK_ENTRIES, std::slice::from_ref(txid)).await
+        let results = client
+            .get_batch(
+                FIELD_ALL_METADATA | FIELD_BLOCK_ENTRIES,
+                std::slice::from_ref(txid),
+            )
+            .await
             .unwrap_or_else(|e| panic!("Test 4.6 read-back failed: {e}"));
-        assert!(results.found(0), "Test 4.6: mined txid {} should be readable", txid_hex(txid));
+        assert!(
+            results.found(0),
+            "Test 4.6: mined txid {} should be readable",
+            txid_hex(txid)
+        );
     }
 
     eprintln!("[4.6] OK -- SetMined on 100 records succeeded");
@@ -332,7 +371,10 @@ async fn run_scenario() -> Result<(), ClientError> {
             for mm in mismatches.iter().take(10) {
                 eprintln!(
                     "Test 4.7 MISMATCH: txid {} field={} expected={} actual={}",
-                    txid_hex(&mm.txid), mm.field, mm.expected, mm.actual,
+                    txid_hex(&mm.txid),
+                    mm.field,
+                    mm.expected,
+                    mm.actual,
                 );
             }
         }
@@ -369,7 +411,10 @@ async fn run_scenario() -> Result<(), ClientError> {
     let mut bg_txids = Vec::new();
     for attempt in 0..5 {
         match common::seed_records(&client, &bg_verifier, 500, 5).await {
-            Ok(txids) => { bg_txids = txids; break; }
+            Ok(txids) => {
+                bg_txids = txids;
+                break;
+            }
             Err(e) if attempt < 4 => {
                 eprintln!("[4.8] seed attempt {attempt} failed: {e}, retrying...");
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -408,7 +453,7 @@ async fn run_scenario() -> Result<(), ClientError> {
             total_clone.fetch_add(1, Ordering::Relaxed);
 
             // Alternate between creates and reads
-            if op_idx % 3 == 0 {
+            if op_idx.is_multiple_of(3) {
                 // Create a new record
                 let mut new_txid = [0u8; 32];
                 new_txid[0] = 0xB6;
@@ -572,7 +617,10 @@ async fn run_scenario() -> Result<(), ClientError> {
                 failed_txids.len(),
             );
         } else {
-            eprintln!("[4.8] OK -- {} failed creates verified as not partially applied", failed_txids.len());
+            eprintln!(
+                "[4.8] OK -- {} failed creates verified as not partially applied",
+                failed_txids.len()
+            );
         }
     }
 

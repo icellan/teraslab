@@ -47,7 +47,12 @@ impl TopologyTerm {
     /// Create a new term with auto-computed digest.
     pub fn new(term: u64, members: Vec<NodeId>, proposer: NodeId) -> Self {
         let digest = Self::compute_digest(term, &members);
-        Self { term, members, proposer, digest }
+        Self {
+            term,
+            members,
+            proposer,
+            digest,
+        }
     }
 
     /// Compute the canonical digest for a (term, members) pair.
@@ -78,20 +83,31 @@ impl TopologyTerm {
 
     /// Deserialize from the wire.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        if data.len() < 20 { return None; }
+        if data.len() < 20 {
+            return None;
+        }
         let term = u64::from_le_bytes(data[0..8].try_into().ok()?);
         let proposer = NodeId(u64::from_le_bytes(data[8..16].try_into().ok()?));
         let count = u32::from_le_bytes(data[16..20].try_into().ok()?) as usize;
         let members_end = 20 + count * 8;
-        if data.len() < members_end + 32 { return None; }
+        if data.len() < members_end + 32 {
+            return None;
+        }
         let mut members = Vec::with_capacity(count);
         for i in 0..count {
             let off = 20 + i * 8;
-            members.push(NodeId(u64::from_le_bytes(data[off..off+8].try_into().ok()?)));
+            members.push(NodeId(u64::from_le_bytes(
+                data[off..off + 8].try_into().ok()?,
+            )));
         }
         let mut digest = [0u8; 32];
         digest.copy_from_slice(&data[members_end..members_end + 32]);
-        Some(Self { term, members, proposer, digest })
+        Some(Self {
+            term,
+            members,
+            proposer,
+            digest,
+        })
     }
 }
 
@@ -126,14 +142,22 @@ impl TopologyVote {
 
     /// Deserialize from the wire.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        if data.len() < 57 { return None; }
+        if data.len() < 57 {
+            return None;
+        }
         let term = u64::from_le_bytes(data[0..8].try_into().ok()?);
         let voter = NodeId(u64::from_le_bytes(data[8..16].try_into().ok()?));
         let mut digest = [0u8; 32];
         digest.copy_from_slice(&data[16..48]);
         let accepted = data[48] != 0;
         let voter_current_term = u64::from_le_bytes(data[49..57].try_into().ok()?);
-        Some(Self { term, digest, voter, accepted, voter_current_term })
+        Some(Self {
+            term,
+            digest,
+            voter,
+            accepted,
+            voter_current_term,
+        })
     }
 }
 
@@ -225,18 +249,30 @@ impl PersistedTopologyState {
             for i in 0..count {
                 let off = 28 + i * 8;
                 if off + 8 <= data.len() {
-                    members.push(NodeId(u64::from_le_bytes(data[off..off+8].try_into().unwrap_or([0; 8]))));
+                    members.push(NodeId(u64::from_le_bytes(
+                        data[off..off + 8].try_into().unwrap_or([0; 8]),
+                    )));
                 }
             }
             // Incarnation lives after the member list. If there aren't
             // enough bytes (old format without incarnation), default to 0.
             let incarnation_off = 28 + count * 8;
             let incarnation = if incarnation_off + 8 <= data.len() {
-                u64::from_le_bytes(data[incarnation_off..incarnation_off + 8].try_into().unwrap_or([0; 8]))
+                u64::from_le_bytes(
+                    data[incarnation_off..incarnation_off + 8]
+                        .try_into()
+                        .unwrap_or([0; 8]),
+                )
             } else {
                 0
             };
-            Self { peak_cluster_size: peak.max(1), committed_term, committed_members: members, voted_term, incarnation }
+            Self {
+                peak_cluster_size: peak.max(1),
+                committed_term,
+                committed_members: members,
+                voted_term,
+                incarnation,
+            }
         } else if data.len() >= 16 {
             // Old format: [peak:8][epoch:8]
             let peak = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0; 8]));
@@ -259,7 +295,13 @@ impl PersistedTopologyState {
                 incarnation: 0,
             }
         } else {
-            Self { peak_cluster_size: 1, committed_term: 0, committed_members: Vec::new(), voted_term: 0, incarnation: 0 }
+            Self {
+                peak_cluster_size: 1,
+                committed_term: 0,
+                committed_members: Vec::new(),
+                voted_term: 0,
+                incarnation: 0,
+            }
         }
     }
 }
@@ -330,7 +372,8 @@ impl TopologyAuthority {
 
     /// Restore from persisted state on startup.
     pub fn restore(&self, state: &PersistedTopologyState) {
-        self.committed_term.store(state.committed_term, Ordering::Relaxed);
+        self.committed_term
+            .store(state.committed_term, Ordering::Relaxed);
         self.voted_term.store(state.voted_term, Ordering::Relaxed);
         *self.committed_members.write().unwrap() = state.committed_members.clone();
         *self.observed_membership.lock().unwrap() = state.committed_members.clone();
@@ -387,7 +430,10 @@ impl TopologyAuthority {
         {
             let committed_members = self.committed_members.read().unwrap();
             if committed_members.len() == members.len()
-                && committed_members.iter().zip(members.iter()).all(|(a, b)| a == b)
+                && committed_members
+                    .iter()
+                    .zip(members.iter())
+                    .all(|(a, b)| a == b)
             {
                 return None;
             }
@@ -430,12 +476,11 @@ impl TopologyAuthority {
         let committed = self.committed_term.load(Ordering::Relaxed);
         let voted = self.voted_term.load(Ordering::Relaxed);
 
-        let valid_digest = propose.digest == TopologyTerm::compute_digest(propose.term, &propose.members);
+        let valid_digest =
+            propose.digest == TopologyTerm::compute_digest(propose.term, &propose.members);
 
         // Accept if the term is strictly higher than anything we've seen.
-        let mut accepted = propose.term > committed
-            && propose.term > voted
-            && valid_digest;
+        let mut accepted = propose.term > committed && propose.term > voted && valid_digest;
 
         // Cluster formation recovery: when a node is in a single-node cluster
         // (either from fresh start or after losing all peers), a multi-node
@@ -459,9 +504,7 @@ impl TopologyAuthority {
             let committed_members = self.committed_members.read().unwrap();
             let our_cluster_is_single_node = committed > 0 && committed_members.len() <= 1;
             let proposal_subsumes_us = propose.members.contains(&self.self_id);
-            if our_cluster_is_single_node && proposal_subsumes_us
-                && propose.term > voted
-            {
+            if our_cluster_is_single_node && proposal_subsumes_us && propose.term > voted {
                 accepted = true;
             }
         }
@@ -568,7 +611,10 @@ impl TopologyAuthority {
         {
             let committed_members = self.committed_members.read().unwrap();
             if committed_members.len() == target_members.len()
-                && committed_members.iter().zip(target_members.iter()).all(|(a, b)| a == b)
+                && committed_members
+                    .iter()
+                    .zip(target_members.iter())
+                    .all(|(a, b)| a == b)
             {
                 return None;
             }
@@ -625,7 +671,10 @@ impl TopologyAuthority {
         {
             let committed_members = self.committed_members.read().unwrap();
             if committed_members.len() == target_members.len()
-                && committed_members.iter().zip(target_members.iter()).all(|(a, b)| a == b)
+                && committed_members
+                    .iter()
+                    .zip(target_members.iter())
+                    .all(|(a, b)| a == b)
             {
                 return None;
             }
@@ -746,7 +795,9 @@ mod tests {
     #[test]
     fn quorum_not_reached_without_enough_votes() {
         let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
-        let _term = auth.on_membership_changed(&members(&[1, 2, 3, 4, 5])).unwrap();
+        let _term = auth
+            .on_membership_changed(&members(&[1, 2, 3, 4, 5]))
+            .unwrap();
 
         // 5 members, quorum = 3. Self-vote = 1. Need 2 more.
         let vote1 = TopologyVote {
@@ -822,7 +873,10 @@ mod tests {
 
         // Second commit with same term is rejected
         let result2 = auth.handle_commit(&commit);
-        assert!(result2.is_none(), "duplicate commit for same term should be rejected");
+        assert!(
+            result2.is_none(),
+            "duplicate commit for same term should be rejected"
+        );
         // Term should still be 5 — not advanced
         assert_eq!(auth.committed_term(), 5);
     }
@@ -884,8 +938,11 @@ mod tests {
         assert_eq!(restored.digest, term.digest);
 
         let vote = TopologyVote {
-            term: 42, digest: term.digest, voter: NodeId(2),
-            accepted: true, voter_current_term: 41,
+            term: 42,
+            digest: term.digest,
+            voter: NodeId(2),
+            accepted: true,
+            voter_current_term: 41,
         };
         let vdata = vote.serialize();
         let rv = TopologyVote::deserialize(&vdata).unwrap();
@@ -1024,8 +1081,10 @@ mod tests {
         let wrong_digest = TopologyTerm::compute_digest(5, &wrong_members);
 
         // The digests MUST differ.
-        assert_ne!(original_digest, wrong_digest,
-            "digest must differ when member lists differ");
+        assert_ne!(
+            original_digest, wrong_digest,
+            "digest must differ when member lists differ"
+        );
 
         // Applying the wrong-members commit should fail.
         let wrong_commit = TopologyCommit {
@@ -1040,7 +1099,10 @@ mod tests {
         // originally agreed on. This is why catch-up must use
         // committed_members, not SWIM-alive nodes.
         let result = auth.handle_commit(&wrong_commit);
-        assert!(result.is_some(), "commit with self-consistent digest should apply");
+        assert!(
+            result.is_some(),
+            "commit with self-consistent digest should apply"
+        );
         assert_eq!(auth.committed_members(), members(&[1, 2, 3]));
 
         // The correct commit uses the ORIGINAL members.
@@ -1053,8 +1115,11 @@ mod tests {
         };
         let result2 = auth2.handle_commit(&correct_commit);
         assert!(result2.is_some());
-        assert_eq!(auth2.committed_members(), original_members,
-            "correct catch-up should use the original committed members");
+        assert_eq!(
+            auth2.committed_members(),
+            original_members,
+            "correct catch-up should use the original committed members"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1083,7 +1148,10 @@ mod tests {
             voter_current_term: 0,
         };
         let commit = auth.handle_vote(&stale_vote);
-        assert!(commit.is_none(), "stale vote for superseded term should not produce commit");
+        assert!(
+            commit.is_none(),
+            "stale vote for superseded term should not produce commit"
+        );
     }
 
     #[test]
@@ -1109,7 +1177,10 @@ mod tests {
             voter_current_term: 0,
         };
         let result = auth.handle_vote(&stale_vote);
-        assert!(result.is_none(), "pending proposal should be cleared by commit");
+        assert!(
+            result.is_none(),
+            "pending proposal should be cleared by commit"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1125,7 +1196,10 @@ mod tests {
         let t2 = a2.on_membership_changed(&members(&[1, 2, 3])).unwrap();
 
         assert_eq!(t1.term, t2.term);
-        assert_eq!(t1.digest, t2.digest, "same term+members must produce same digest");
+        assert_eq!(
+            t1.digest, t2.digest,
+            "same term+members must produce same digest"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1136,7 +1210,9 @@ mod tests {
     fn minority_cannot_commit_independently() {
         // In a 5-node cluster, 2 nodes can't reach quorum (need 3)
         let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
-        let t = auth.on_membership_changed(&members(&[1, 2, 3, 4, 5])).unwrap();
+        let t = auth
+            .on_membership_changed(&members(&[1, 2, 3, 4, 5]))
+            .unwrap();
         // Quorum = 3. Self-vote = 1. Need 2 more.
 
         // Only 1 additional vote → no commit
@@ -1191,8 +1267,10 @@ mod tests {
         // (committed membership == proposed membership)
         std::thread::sleep(Duration::from_millis(15));
         let result = auth.check_timeout(&mems);
-        assert!(result.is_none(),
-            "should not fallback-propose when committed membership matches");
+        assert!(
+            result.is_none(),
+            "should not fallback-propose when committed membership matches"
+        );
     }
 
     #[test]
@@ -1336,7 +1414,10 @@ mod tests {
             digest: TopologyTerm::compute_digest(1, &mems),
         });
         *auth.observed_membership.lock().unwrap() = mems;
-        assert!(auth.retry_proposal().is_none(), "nothing to do — already committed");
+        assert!(
+            auth.retry_proposal().is_none(),
+            "nothing to do — already committed"
+        );
     }
 
     #[test]
@@ -1414,8 +1495,10 @@ mod tests {
         // Truncate at various points — all should return None.
         for len in [0, 1, 8, 15, 19, 20, 27, 28] {
             if len < data.len() {
-                assert!(TopologyTerm::deserialize(&data[..len]).is_none(),
-                    "truncation at {len} bytes should fail");
+                assert!(
+                    TopologyTerm::deserialize(&data[..len]).is_none(),
+                    "truncation at {len} bytes should fail"
+                );
             }
         }
 
@@ -1435,8 +1518,10 @@ mod tests {
         };
         let data = state.serialize();
         let restored = PersistedTopologyState::deserialize(&data);
-        assert_eq!(restored.peak_cluster_size, 1,
-            "zero peak should be clamped to 1");
+        assert_eq!(
+            restored.peak_cluster_size, 1,
+            "zero peak should be clamped to 1"
+        );
     }
 
     /// handle_propose: cluster formation recovery with proposal term EQUAL
@@ -1462,7 +1547,9 @@ mod tests {
         // = (0 <= 1) = true. propose.term >= committed = (1 >= 1) = true.
         let proposal = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1));
         let v = auth.handle_propose(&proposal);
-        assert!(v.accepted,
-            "formation recovery should accept equal-term multi-node proposal");
+        assert!(
+            v.accepted,
+            "formation recovery should accept equal-term multi-node proposal"
+        );
     }
 }

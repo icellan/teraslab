@@ -4,7 +4,7 @@
 //! codecs (sparse errors, partial-with-signals, get response, get-spend
 //! response, stream chunk/end).
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use teraslab::protocol::codec::*;
 
@@ -45,22 +45,14 @@ fn bench_spend_batch_codec(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(count as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("encode", count),
-            &count,
-            |b, _| {
-                b.iter(|| encode_spend_batch(&params, &items))
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("encode", count), &count, |b, _| {
+            b.iter(|| encode_spend_batch(&params, &items))
+        });
 
         let encoded = encode_spend_batch(&params, &items);
-        group.bench_with_input(
-            BenchmarkId::new("decode", count),
-            &count,
-            |b, _| {
-                b.iter(|| decode_spend_batch(&encoded))
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("decode", count), &count, |b, _| {
+            b.iter(|| decode_spend_batch(&encoded))
+        });
     }
 
     group.finish();
@@ -87,18 +79,14 @@ fn bench_set_mined_batch_codec(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(count as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("encode", count),
-            &count,
-            |b, _| b.iter(|| encode_set_mined_batch(&params, &txids)),
-        );
+        group.bench_with_input(BenchmarkId::new("encode", count), &count, |b, _| {
+            b.iter(|| encode_set_mined_batch(&params, &txids))
+        });
 
         let encoded = encode_set_mined_batch(&params, &txids);
-        group.bench_with_input(
-            BenchmarkId::new("decode", count),
-            &count,
-            |b, _| b.iter(|| decode_set_mined_batch(&encoded)),
-        );
+        group.bench_with_input(BenchmarkId::new("decode", count), &count, |b, _| {
+            b.iter(|| decode_set_mined_batch(&encoded))
+        });
     }
 
     group.finish();
@@ -146,18 +134,14 @@ fn bench_slot_item_batch_codec(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(count as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("encode", count),
-            &count,
-            |b, _| b.iter(|| encode_slot_item_batch(&items)),
-        );
+        group.bench_with_input(BenchmarkId::new("encode", count), &count, |b, _| {
+            b.iter(|| encode_slot_item_batch(&items))
+        });
 
         let encoded = encode_slot_item_batch(&items);
-        group.bench_with_input(
-            BenchmarkId::new("decode", count),
-            &count,
-            |b, _| b.iter(|| decode_slot_item_batch(&encoded)),
-        );
+        group.bench_with_input(BenchmarkId::new("decode", count), &count, |b, _| {
+            b.iter(|| decode_slot_item_batch(&encoded))
+        });
     }
 
     group.finish();
@@ -191,9 +175,7 @@ fn bench_reassign_batch_codec(c: &mut Criterion) {
     });
 
     let encoded = encode_reassign_batch(&params, &items);
-    group.bench_function("decode_100", |b| {
-        b.iter(|| decode_reassign_batch(&encoded))
-    });
+    group.bench_function("decode_100", |b| b.iter(|| decode_reassign_batch(&encoded)));
 
     group.finish();
 }
@@ -225,9 +207,7 @@ fn bench_unspend_batch_codec(c: &mut Criterion) {
     });
 
     let encoded = encode_unspend_batch(&params, &items);
-    group.bench_function("decode_256", |b| {
-        b.iter(|| decode_unspend_batch(&encoded))
-    });
+    group.bench_function("decode_256", |b| b.iter(|| decode_unspend_batch(&encoded)));
 
     group.finish();
 }
@@ -264,18 +244,14 @@ fn bench_create_batch_codec(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(count as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("encode", count),
-            &count,
-            |b, _| b.iter(|| encode_create_batch(&items)),
-        );
+        group.bench_with_input(BenchmarkId::new("encode", count), &count, |b, _| {
+            b.iter(|| encode_create_batch(&items))
+        });
 
         let encoded = encode_create_batch(&items);
-        group.bench_with_input(
-            BenchmarkId::new("decode", count),
-            &count,
-            |b, _| b.iter(|| decode_create_batch(&encoded)),
-        );
+        group.bench_with_input(BenchmarkId::new("decode", count), &count, |b, _| {
+            b.iter(|| decode_create_batch(&encoded))
+        });
     }
 
     group.finish();
@@ -298,9 +274,7 @@ fn bench_get_batch_codec(c: &mut Criterion) {
     });
 
     let encoded = encode_get_batch(FieldMask::ALL, &txids);
-    group.bench_function("decode_1024", |b| {
-        b.iter(|| decode_get_batch(&encoded))
-    });
+    group.bench_function("decode_1024", |b| b.iter(|| decode_get_batch(&encoded)));
 
     group.finish();
 }
@@ -322,14 +296,10 @@ fn bench_get_response_codec(c: &mut Criterion) {
 
     group.throughput(Throughput::Elements(count as u64));
 
-    group.bench_function("encode_100", |b| {
-        b.iter(|| encode_get_response(&items))
-    });
+    group.bench_function("encode_100", |b| b.iter(|| encode_get_response(&items)));
 
     let encoded = encode_get_response(&items);
-    group.bench_function("decode_100", |b| {
-        b.iter(|| decode_get_response(&encoded))
-    });
+    group.bench_function("decode_100", |b| b.iter(|| decode_get_response(&encoded)));
 
     group.finish();
 }
@@ -351,9 +321,7 @@ fn bench_get_spend_batch_codec(c: &mut Criterion) {
 
     group.throughput(Throughput::Elements(count as u64));
 
-    group.bench_function("encode_1024", |b| {
-        b.iter(|| encode_get_spend_batch(&items))
-    });
+    group.bench_function("encode_1024", |b| b.iter(|| encode_get_spend_batch(&items)));
 
     let encoded = encode_get_spend_batch(&items);
     group.bench_function("decode_1024", |b| {
@@ -411,14 +379,10 @@ fn bench_sparse_errors_codec(c: &mut Criterion) {
 
     group.throughput(Throughput::Elements(50));
 
-    group.bench_function("encode_50", |b| {
-        b.iter(|| encode_sparse_errors(&errors))
-    });
+    group.bench_function("encode_50", |b| b.iter(|| encode_sparse_errors(&errors)));
 
     let encoded = encode_sparse_errors(&errors);
-    group.bench_function("decode_50", |b| {
-        b.iter(|| decode_sparse_errors(&encoded))
-    });
+    group.bench_function("decode_50", |b| b.iter(|| decode_sparse_errors(&encoded)));
 
     group.finish();
 }
@@ -477,9 +441,7 @@ fn bench_stream_chunk_codec(c: &mut Criterion) {
     });
 
     let encoded = encode_stream_chunk(&txid, 0, &data);
-    group.bench_function("decode_64k", |b| {
-        b.iter(|| decode_stream_chunk(&encoded))
-    });
+    group.bench_function("decode_64k", |b| b.iter(|| decode_stream_chunk(&encoded)));
 
     group.finish();
 }
@@ -495,14 +457,10 @@ fn bench_stream_end_codec(c: &mut Criterion) {
 
     group.throughput(Throughput::Elements(1));
 
-    group.bench_function("encode", |b| {
-        b.iter(|| encode_stream_end(&txid, 1_048_576))
-    });
+    group.bench_function("encode", |b| b.iter(|| encode_stream_end(&txid, 1_048_576)));
 
     let encoded = encode_stream_end(&txid, 1_048_576);
-    group.bench_function("decode", |b| {
-        b.iter(|| decode_stream_end(&encoded))
-    });
+    group.bench_function("decode", |b| b.iter(|| decode_stream_end(&encoded)));
 
     group.finish();
 }

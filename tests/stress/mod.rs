@@ -17,8 +17,7 @@ use teraslab::ops::set_mined::*;
 use teraslab::ops::spend::*;
 
 fn create_engine(size: u64) -> Arc<Engine> {
-    let dev: Arc<dyn BlockDevice> =
-        Arc::new(MemoryDevice::new(size, 4096).unwrap());
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(size, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(200_000).unwrap();
     Arc::new(Engine::new(
@@ -99,7 +98,9 @@ pub fn stress_random_operations() {
                 let mut ops = 0u32;
 
                 for i in start..end {
-                    let key = TxKey { txid: make_tx_id(i as u32) };
+                    let key = TxKey {
+                        txid: make_tx_id(i as u32),
+                    };
 
                     // Spend 5 UTXOs
                     for v in 0..5u32 {
@@ -159,7 +160,9 @@ pub fn stress_random_operations() {
 
     // Final verification
     for i in 0..total_txs as u32 {
-        let key = TxKey { txid: make_tx_id(i) };
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.spent_utxos }, 5);
         assert_eq!(meta.block_entry_count, 1);
@@ -212,7 +215,9 @@ pub fn stress_device_fill_and_churn() {
     // Phase 2: Churn — delete half, re-create
     let half = initial_count / 2;
     for &i in &created_ids[..half] {
-        let key = TxKey { txid: make_tx_id(i) };
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
         engine.delete(&DeleteRequest { tx_key: key }).unwrap();
     }
 

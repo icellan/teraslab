@@ -5,7 +5,7 @@
 //!
 //! - 17.1: Migration rollback on target kill — old master resumes serving
 //! - 17.2: Inbound state persistence — crash target mid-migration, shard
-//!         stays blocked on restart until re-migration completes
+//!   stays blocked on restart until re-migration completes
 //! - 17.3: Repeated kill/restart during migrations — zero data loss
 //! - 17.4: Full consistency after cascading failures during rebalance
 //! - 17.5: Writes during migration recovery — no silent data loss
@@ -14,11 +14,10 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
-use teraslab_test_client::{Client, ClientConfig, ClientError, PoolConfig};
-use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::types::*;
+use teraslab_test_client::verifier::StateVerifier;
+use teraslab_test_client::{Client, ClientConfig, ClientError, PoolConfig};
 
 macro_rules! tlog {
     ($t0:expr, $($arg:tt)*) => {
@@ -33,12 +32,15 @@ const SID: u16 = 17;
 
 /// Format a txid as a short hex prefix for assertion messages.
 fn txid_hex(txid: &[u8; 32]) -> String {
-    txid.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
+    txid.iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_17_failure_recovery_hardening() {
-    let result = tokio::time::timeout(Duration::from_secs(600), run_scenario()).await;
+    let result = tokio::time::timeout(Duration::from_secs(1200), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -47,7 +49,7 @@ async fn scenario_17_failure_recovery_hardening() {
         }
         Err(_) => {
             common::teardown_all(SID).await;
-            panic!("scenario timed out after 600s");
+            panic!("scenario timed out after 1200s");
         }
     }
 }
@@ -145,12 +147,21 @@ async fn test_migration_rollback_on_target_kill() -> Result<(), ClientError> {
     docker.start_node("node2").await?;
 
     common::wait_specific_nodes_ready(&docker, &[1, 2], 2, Duration::from_secs(30)).await?;
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(30)).await
-        .unwrap_or_else(|e| eprintln!("[17.1] migration wait: {e}"));
-    common::wait_specific_replication_settled(&docker, &[1, 3], Duration::from_secs(5)).await?;
+    common::wait_specific_migrations_complete(&docker, &[1, 2], Duration::from_secs(120)).await?;
+    common::wait_specific_replication_settled(&docker, &[1, 2], Duration::from_secs(5)).await?;
 
     let client = common::create_client(&docker, 2).await?;
     client.refresh_routing().await?;
+    common::wait_for_migration_reads_ready(
+        &client,
+        &docker,
+        &txids,
+        &[1, 2],
+        2,
+        50,
+        Duration::from_secs(60),
+    )
+    .await?;
 
     // Verify ALL 3000 records are accessible.
     let mut read_failures = 0u32;
@@ -166,28 +177,23 @@ async fn test_migration_rollback_on_target_kill() -> Result<(), ClientError> {
         }
     }
 
-    // With node3 dead and node2 killed mid-migration then restarted, some
-    // records that existed only on node2+node3 (not node1) may be inaccessible
-    // if node2's restart state doesn't include records that were being migrated
-    // to node2 when it was killed. Tolerate up to 15% loss — the critical
-    // property is that records on node1 (the sole survivor) are NOT lost.
-    let tolerance = (txids.len() as f64 * 0.40) as u32;
-    assert!(
-        read_failures <= tolerance,
+    assert_eq!(
+        read_failures, 0,
         "Test 17.1: {read_failures}/3000 reads failed after migration target kill — \
-         expected at most {tolerance} (records only on dead node pair)"
+         every acknowledged write must remain readable"
     );
-    if read_failures > 0 {
-        eprintln!("[17.1] WARNING: {read_failures}/{} reads failed (within {tolerance} tolerance)", txids.len());
-    }
-    eprintln!("[17.1] OK — {}/{} reads succeeded after migration target kill",
-        txids.len() as u32 - read_failures, txids.len());
+    eprintln!(
+        "[17.1] OK — {}/{} reads succeeded after migration target kill",
+        txids.len() as u32 - read_failures,
+        txids.len()
+    );
 
     // Restart node3, verify full cluster recovers.
     eprintln!("[17.1] Restarting node3 for full recovery");
     docker.start_node("node3").await?;
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+        .await
         .unwrap_or_else(|e| eprintln!("[17.1] final migration: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
@@ -230,7 +236,8 @@ async fn test_inbound_state_survives_restart() -> Result<(), ClientError> {
 
     // Wait briefly, then kill node1 (one of the migration targets) before
     // the migration can complete.
-    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(30)).await
+    common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(30))
+        .await
         .unwrap_or_else(|e| eprintln!("[17.2] node convergence: {e}"));
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -249,27 +256,33 @@ async fn test_inbound_state_survives_restart() -> Result<(), ClientError> {
     docker.start_node("node2").await?;
 
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
-        .unwrap_or_else(|e| eprintln!("[17.2] migration wait: {e}"));
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
     let client = common::create_client(&docker, 3).await?;
     client.refresh_routing().await?;
+    common::wait_for_migration_reads_ready(
+        &client,
+        &docker,
+        &txids,
+        &[1, 2, 3],
+        2,
+        50,
+        Duration::from_secs(60),
+    )
+    .await?;
 
-    // Full consistency check. Allow up to 1% mismatches — records in-flight
-    // when the migration target was killed may be lost.
+    // Full consistency check.
     let mismatches = common::verify_consistency(&client, &verifier).await?;
-    let max_allowed = std::cmp::max(5, (verifier.record_count() as f64 * 0.01).ceil() as usize);
     assert!(
-        mismatches.len() <= max_allowed,
-        "Test 17.2: {} mismatches (max {max_allowed}) after target crash+restart",
-        mismatches.len()
+        mismatches.is_empty(),
+        "Test 17.2: {} mismatches after target crash+restart: {:?}",
+        mismatches.len(),
+        mismatches.iter().take(5).collect::<Vec<_>>()
     );
-    if mismatches.is_empty() {
-        eprintln!("[17.2] OK — full consistency after target crash and restart");
-    } else {
-        eprintln!("[17.2] {} mismatches within tolerance (max {max_allowed})", mismatches.len());
-    }
+    let non_deleted = verifier.non_deleted_txids();
+    common::assert_rf2_replication_exact(&client, &docker, 3, &non_deleted, "17.2").await?;
+    eprintln!("[17.2] OK — full consistency after target crash and restart");
 
     Ok(())
 }
@@ -305,7 +318,8 @@ async fn test_repeated_kills_during_migration() -> Result<(), ClientError> {
         eprintln!("[17.3] Round {}: killing {kill_target}", round + 1);
         docker.kill_node(kill_target).await?;
 
-        common::wait_specific_nodes_ready(&docker, survivors, 2, Duration::from_secs(30)).await
+        common::wait_specific_nodes_ready(&docker, survivors, 2, Duration::from_secs(30))
+            .await
             .unwrap_or_else(|e| eprintln!("[17.3] convergence round {}: {e}", round + 1));
 
         // Wait briefly for migration to start, then add records while migrating.
@@ -316,10 +330,7 @@ async fn test_repeated_kills_during_migration() -> Result<(), ClientError> {
         let port_b = docker.client_port(survivors[1]);
         let config_2node = ClientConfig {
             addr: None,
-            seeds: vec![
-                format!("127.0.0.1:{port_a}"),
-                format!("127.0.0.1:{port_b}"),
-            ],
+            seeds: vec![format!("127.0.0.1:{port_a}"), format!("127.0.0.1:{port_b}")],
             pool: PoolConfig::default(),
             cluster_refresh_interval: Duration::from_secs(30),
             max_redirects: 3,
@@ -329,23 +340,27 @@ async fn test_repeated_kills_during_migration() -> Result<(), ClientError> {
         client_2.refresh_routing().await?;
 
         // Wait for migrations to settle before adding new records.
-        common::wait_specific_migrations_complete(&docker, survivors, Duration::from_secs(120)).await
-            .unwrap_or_else(|e| eprintln!("[17.3] migration settle round {}: {e}", round + 1));
+        common::wait_specific_migrations_complete(&docker, survivors, Duration::from_secs(120))
+            .await?;
+        common::wait_specific_replication_settled(&docker, survivors, Duration::from_secs(10))
+            .await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
         client_2.refresh_routing().await?;
 
         // Add 200 records during degraded state.
         let new_txids = common::seed_records(&client_2, &verifier, 200, 3).await?;
         assert_eq!(new_txids.len(), 200);
-        eprintln!("[17.3] Round {}: added 200 records on 2-node cluster", round + 1);
+        eprintln!(
+            "[17.3] Round {}: added 200 records on 2-node cluster",
+            round + 1
+        );
 
         // Restart the killed node.
         tokio::time::sleep(Duration::from_millis(500)).await;
         docker.start_node(kill_target).await?;
 
         common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
-            .unwrap_or_else(|e| eprintln!("[17.3] recovery round {}: {e}", round + 1));
+        common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
         common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
     }
 
@@ -354,19 +369,14 @@ async fn test_repeated_kills_during_migration() -> Result<(), ClientError> {
     client.refresh_routing().await?;
 
     let mismatches = common::verify_consistency(&client, &verifier).await?;
-    let non_spend: Vec<_> = mismatches.iter()
-        .filter(|m| m.field != "spent_utxos")
-        .collect();
     assert!(
-        non_spend.is_empty(),
-        "Test 17.3: {} non-spend mismatches after 3 kill/restart rounds: {:?}",
-        non_spend.len(),
-        non_spend.iter().take(5).collect::<Vec<_>>()
+        mismatches.is_empty(),
+        "Test 17.3: {} mismatches after 3 kill/restart rounds: {:?}",
+        mismatches.len(),
+        mismatches.iter().take(5).collect::<Vec<_>>()
     );
-    if !mismatches.is_empty() {
-        eprintln!("[17.3] WARNING: {} spent_utxos mismatches (partial-apply during kills)",
-            mismatches.len());
-    }
+    let non_deleted = verifier.non_deleted_txids();
+    common::assert_rf2_replication_exact(&client, &docker, 3, &non_deleted, "17.3").await?;
 
     let expected = verifier.non_deleted_txids().len();
     eprintln!("[17.3] OK — {expected} records verified across 3 kill/restart rounds");
@@ -411,15 +421,13 @@ async fn test_cascading_failure_during_rebalance() -> Result<(), ClientError> {
     eprintln!("[17.4] Restarting node1");
     docker.start_node("node1").await?;
     common::wait_specific_nodes_ready(&docker, &[1, 2], 2, Duration::from_secs(30)).await?;
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(30)).await
-        .unwrap_or_else(|e| eprintln!("[17.4] migration wait node1+2: {e}"));
+    common::wait_specific_migrations_complete(&docker, &[1, 2], Duration::from_secs(120)).await?;
 
     // Now restart node3.
     eprintln!("[17.4] Restarting node3");
     docker.start_node("node3").await?;
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
-        .unwrap_or_else(|e| eprintln!("[17.4] final migration: {e}"));
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
     let client = common::create_client(&docker, 3).await?;
@@ -464,8 +472,7 @@ async fn test_writes_during_migration_recovery() -> Result<(), ClientError> {
     common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(30)).await?;
 
     // Wait for migration to start settling.
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(30)).await
-        .unwrap_or_else(|e| eprintln!("[17.5] migration settle: {e}"));
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(120)).await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Write 500 new records on the 2-node cluster during/after migration.
@@ -473,10 +480,7 @@ async fn test_writes_during_migration_recovery() -> Result<(), ClientError> {
     let port3 = docker.client_port(3);
     let config_2node = ClientConfig {
         addr: None,
-        seeds: vec![
-            format!("127.0.0.1:{port1}"),
-            format!("127.0.0.1:{port3}"),
-        ],
+        seeds: vec![format!("127.0.0.1:{port1}"), format!("127.0.0.1:{port3}")],
         pool: PoolConfig::default(),
         cluster_refresh_interval: Duration::from_secs(30),
         max_redirects: 3,
@@ -500,15 +504,18 @@ async fn test_writes_during_migration_recovery() -> Result<(), ClientError> {
 
     let mut spend_errors = 0u32;
     for chunk in txids[..200].chunks(50) {
-        let items: Vec<SpendItem> = chunk.iter().filter_map(|txid| {
-            let rec = verifier.get_record(txid)?;
-            Some(SpendItem {
-                txid: *txid,
-                vout: 0,
-                utxo_hash: rec.utxo_hashes[0],
-                spending_data: [0u8; 36],
+        let items: Vec<SpendItem> = chunk
+            .iter()
+            .filter_map(|txid| {
+                let rec = verifier.get_record(txid)?;
+                Some(SpendItem {
+                    txid: *txid,
+                    vout: 0,
+                    utxo_hash: rec.utxo_hashes[0],
+                    spending_data: [0u8; 36],
+                })
             })
-        }).collect();
+            .collect();
 
         match client_2.spend_batch(&spend_params, &items).await {
             Ok(resp) => {
@@ -546,12 +553,22 @@ async fn test_writes_during_migration_recovery() -> Result<(), ClientError> {
     eprintln!("[17.5] Restarting node2 for full recovery");
     docker.start_node("node2").await?;
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
-        .unwrap_or_else(|e| eprintln!("[17.5] final migration: {e}"));
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
 
     let client = common::create_client(&docker, 3).await?;
     client.refresh_routing().await?;
+    let all_txids: Vec<[u8; 32]> = txids.iter().chain(new_txids.iter()).copied().collect();
+    common::wait_for_migration_reads_ready(
+        &client,
+        &docker,
+        &all_txids,
+        &[1, 2, 3],
+        2,
+        50,
+        Duration::from_secs(60),
+    )
+    .await?;
 
     // Full consistency — 1000 original + 500 new, with 200 spends.
     let mismatches = common::verify_consistency(&client, &verifier).await?;
@@ -559,28 +576,22 @@ async fn test_writes_during_migration_recovery() -> Result<(), ClientError> {
         for mm in mismatches.iter().take(10) {
             eprintln!(
                 "Test 17.5 MISMATCH: txid {} field={} expected={} actual={}",
-                txid_hex(&mm.txid), mm.field, mm.expected, mm.actual,
+                txid_hex(&mm.txid),
+                mm.field,
+                mm.expected,
+                mm.actual,
             );
         }
     }
-    // During migration recovery with node kills, partial-apply mismatches
-    // (spent_utxos) are expected: a spend applies locally but replication
-    // fails during the kill, then the stale spent state propagates via
-    // migration. Tolerate spent_utxos mismatches; flag non-spend issues.
-    let non_spend: Vec<_> = mismatches.iter()
-        .filter(|m| m.field != "spent_utxos")
-        .collect();
     assert!(
-        non_spend.is_empty(),
-        "Test 17.5: {} non-spend mismatches — writes during migration window were lost: {:?}",
-        non_spend.len(),
-        non_spend.iter().take(5).collect::<Vec<_>>()
+        mismatches.is_empty(),
+        "Test 17.5: {} mismatches — writes during migration window were lost: {:?}",
+        mismatches.len(),
+        mismatches.iter().take(5).collect::<Vec<_>>()
     );
-    if !mismatches.is_empty() {
-        eprintln!("[17.5] WARNING: {} spent_utxos mismatches (partial-apply during kills)",
-            mismatches.len());
-    }
-    eprintln!("[17.5] OK — consistency verified (spent_utxos tolerance applied)");
+    let non_deleted = verifier.non_deleted_txids();
+    common::assert_rf2_replication_exact(&client, &docker, 3, &non_deleted, "17.5").await?;
+    eprintln!("[17.5] OK — consistency verified with zero mismatches");
 
     Ok(())
 }

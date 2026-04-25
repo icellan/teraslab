@@ -9,7 +9,7 @@ use crate::index::{DahBackend, PrimaryBackend, TxIndexEntry, TxKey, UnminedBacke
 use crate::io;
 use crate::locks::StripedLocks;
 use crate::ops::create::*;
-use crate::ops::delete_eval::{evaluate_delete_at_height, DahPatch};
+use crate::ops::delete_eval::{DahPatch, evaluate_delete_at_height};
 use crate::ops::error::SpendError;
 use crate::ops::mark_longest_chain::*;
 use crate::ops::remaining::*;
@@ -147,14 +147,16 @@ impl Engine {
         let log_ref = log_arc.as_deref();
         let mut dah = self.dah_index.lock();
         if old_height != 0 {
-            dah.remove(key, log_ref).map_err(|e| SpendError::StorageError {
-                detail: format!("dah secondary remove: {e}"),
-            })?;
+            dah.remove(key, log_ref)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("dah secondary remove: {e}"),
+                })?;
         }
         if new_height != 0 {
-            dah.insert(new_height, *key, log_ref).map_err(|e| SpendError::StorageError {
-                detail: format!("dah secondary insert: {e}"),
-            })?;
+            dah.insert(new_height, *key, log_ref)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("dah secondary insert: {e}"),
+                })?;
         }
         Ok(())
     }
@@ -173,14 +175,18 @@ impl Engine {
         let log_ref = log_arc.as_deref();
         let mut unmined = self.unmined_index.lock();
         if old_height != 0 {
-            unmined.remove(key, log_ref).map_err(|e| SpendError::StorageError {
-                detail: format!("unmined secondary remove: {e}"),
-            })?;
+            unmined
+                .remove(key, log_ref)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("unmined secondary remove: {e}"),
+                })?;
         }
         if new_height != 0 {
-            unmined.insert(new_height, *key, log_ref).map_err(|e| SpendError::StorageError {
-                detail: format!("unmined secondary insert: {e}"),
-            })?;
+            unmined
+                .insert(new_height, *key, log_ref)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("unmined secondary insert: {e}"),
+                })?;
         }
         Ok(())
     }
@@ -225,11 +231,11 @@ impl Engine {
                 });
             }
             let mut guard = log.lock();
-            guard.append_batch_and_flush(&ops).map_err(|e| {
-                SpendError::StorageError {
+            guard
+                .append_batch_and_flush(&ops)
+                .map_err(|e| SpendError::StorageError {
                     detail: format!("secondary batch append_and_flush: {e}"),
-                }
-            })?;
+                })?;
         }
 
         // Phase 2: commit both redb transactions. The redo log already has the
@@ -237,27 +243,33 @@ impl Engine {
         if dah_changed {
             let mut dah = self.dah_index.lock();
             if old_dah != 0 {
-                dah.remove(key, None).map_err(|e| SpendError::StorageError {
-                    detail: format!("dah secondary remove (post-fsync): {e}"),
-                })?;
+                dah.remove(key, None)
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("dah secondary remove (post-fsync): {e}"),
+                    })?;
             }
             if new_dah != 0 {
-                dah.insert(new_dah, *key, None).map_err(|e| SpendError::StorageError {
-                    detail: format!("dah secondary insert (post-fsync): {e}"),
-                })?;
+                dah.insert(new_dah, *key, None)
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("dah secondary insert (post-fsync): {e}"),
+                    })?;
             }
         }
         if unmined_changed {
             let mut unmined = self.unmined_index.lock();
             if old_unmined != 0 {
-                unmined.remove(key, None).map_err(|e| SpendError::StorageError {
-                    detail: format!("unmined secondary remove (post-fsync): {e}"),
-                })?;
+                unmined
+                    .remove(key, None)
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("unmined secondary remove (post-fsync): {e}"),
+                    })?;
             }
             if new_unmined != 0 {
-                unmined.insert(new_unmined, *key, None).map_err(|e| SpendError::StorageError {
-                    detail: format!("unmined secondary insert (post-fsync): {e}"),
-                })?;
+                unmined
+                    .insert(new_unmined, *key, None)
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("unmined secondary insert (post-fsync): {e}"),
+                    })?;
             }
         }
         Ok(())
@@ -324,13 +336,11 @@ impl Engine {
             }
             if let Some(ref log) = log_arc {
                 let mut guard = log.lock();
-                guard.append_batch_and_flush(&ops).map_err(|e| {
-                    SpendError::StorageError {
-                        detail: format!(
-                            "atomic primary+secondary batch append_and_flush: {e}"
-                        ),
-                    }
-                })?;
+                guard
+                    .append_batch_and_flush(&ops)
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("atomic primary+secondary batch append_and_flush: {e}"),
+                    })?;
             }
         }
 
@@ -372,31 +382,33 @@ impl Engine {
 
         if dah_changed {
             if old_dah != 0 {
-                dah.remove(key, None).map_err(|e| SpendError::StorageError {
-                    detail: format!("atomic dah remove: {e}"),
-                })?;
+                dah.remove(key, None)
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("atomic dah remove: {e}"),
+                    })?;
             }
             if new_dah != 0 {
-                dah.insert(new_dah, *key, None).map_err(|e| {
-                    SpendError::StorageError {
+                dah.insert(new_dah, *key, None)
+                    .map_err(|e| SpendError::StorageError {
                         detail: format!("atomic dah insert: {e}"),
-                    }
-                })?;
+                    })?;
             }
         }
 
         if unmined_changed {
             if old_unmined != 0 {
-                unmined.remove(key, None).map_err(|e| SpendError::StorageError {
-                    detail: format!("atomic unmined remove: {e}"),
-                })?;
+                unmined
+                    .remove(key, None)
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("atomic unmined remove: {e}"),
+                    })?;
             }
             if new_unmined != 0 {
-                unmined.insert(new_unmined, *key, None).map_err(|e| {
-                    SpendError::StorageError {
+                unmined
+                    .insert(new_unmined, *key, None)
+                    .map_err(|e| SpendError::StorageError {
                         detail: format!("atomic unmined insert: {e}"),
-                    }
-                })?;
+                    })?;
             }
         }
 
@@ -413,12 +425,14 @@ impl Engine {
     /// operations within the batch share the same timestamp without
     /// issuing individual `clock_gettime` syscalls.
     pub fn refresh_clock(&self) {
-        self.cached_millis.store(sys_millis(), std::sync::atomic::Ordering::Relaxed);
+        self.cached_millis
+            .store(sys_millis(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Read the cached wall-clock time (milliseconds since Unix epoch).
     fn now_millis(&self) -> u64 {
-        self.cached_millis.load(std::sync::atomic::Ordering::Relaxed)
+        self.cached_millis
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Set the blobstore for external cold data storage.
@@ -436,7 +450,7 @@ impl Engine {
     /// Get a reference to the allocator mutex.
     ///
     /// Used by the dispatch layer to free pre-allocated space when a redo
-    /// flush fails after [`pre_allocate_create`] succeeded.
+    /// flush fails after [`Self::pre_allocate_create`] succeeded.
     pub fn allocator(&self) -> &parking_lot::Mutex<SlotAllocator> {
         &self.allocator
     }
@@ -518,48 +532,77 @@ impl Engine {
 
     /// Read metadata from device, using direct memory access when available.
     #[inline(always)]
-    fn read_metadata_fast(&self, record_offset: u64) -> std::result::Result<TxMetadata, SpendError> {
+    fn read_metadata_fast(
+        &self,
+        record_offset: u64,
+    ) -> std::result::Result<TxMetadata, SpendError> {
         if !self.device_ptr.is_null() {
-            unsafe { io::read_metadata_direct(self.device_ptr, record_offset) }
-                .map_err(|e| SpendError::StorageError { detail: format!("{e}") })
+            unsafe { io::read_metadata_direct(self.device_ptr, record_offset) }.map_err(|e| {
+                SpendError::StorageError {
+                    detail: format!("{e}"),
+                }
+            })
         } else {
-            io::read_metadata(&*self.device, record_offset)
-                .map_err(|e| SpendError::StorageError { detail: format!("{e}") })
+            io::read_metadata(&*self.device, record_offset).map_err(|e| SpendError::StorageError {
+                detail: format!("{e}"),
+            })
         }
     }
 
     /// Write metadata to device, using direct memory access when available.
     #[inline(always)]
-    fn write_metadata_fast(&self, record_offset: u64, metadata: &TxMetadata) -> std::result::Result<(), SpendError> {
+    fn write_metadata_fast(
+        &self,
+        record_offset: u64,
+        metadata: &TxMetadata,
+    ) -> std::result::Result<(), SpendError> {
         if !self.device_ptr.is_null() {
             unsafe { io::write_metadata_direct(self.device_ptr, record_offset, metadata) };
             Ok(())
         } else {
-            io::write_metadata(&*self.device, record_offset, metadata)
-                .map_err(|e| SpendError::StorageError { detail: format!("{e}") })
+            io::write_metadata(&*self.device, record_offset, metadata).map_err(|e| {
+                SpendError::StorageError {
+                    detail: format!("{e}"),
+                }
+            })
         }
     }
 
     /// Read a UTXO slot, using direct memory access when available.
     #[inline(always)]
-    fn read_slot_fast(&self, record_offset: u64, slot_index: u32) -> std::result::Result<UtxoSlot, SpendError> {
+    fn read_slot_fast(
+        &self,
+        record_offset: u64,
+        slot_index: u32,
+    ) -> std::result::Result<UtxoSlot, SpendError> {
         if !self.device_ptr.is_null() {
             Ok(unsafe { io::read_utxo_slot_direct(self.device_ptr, record_offset, slot_index) })
         } else {
-            io::read_utxo_slot(&*self.device, record_offset, slot_index)
-                .map_err(|e| SpendError::StorageError { detail: format!("{e}") })
+            io::read_utxo_slot(&*self.device, record_offset, slot_index).map_err(|e| {
+                SpendError::StorageError {
+                    detail: format!("{e}"),
+                }
+            })
         }
     }
 
     /// Write a UTXO slot, using direct memory access when available.
     #[inline(always)]
-    fn write_slot_fast(&self, record_offset: u64, slot_index: u32, slot: &UtxoSlot) -> std::result::Result<(), SpendError> {
+    fn write_slot_fast(
+        &self,
+        record_offset: u64,
+        slot_index: u32,
+        slot: &UtxoSlot,
+    ) -> std::result::Result<(), SpendError> {
         if !self.device_ptr.is_null() {
             unsafe { io::write_utxo_slot_direct(self.device_ptr, record_offset, slot_index, slot) };
             Ok(())
         } else {
-            io::write_utxo_slot(&*self.device, record_offset, slot_index, slot)
-                .map_err(|e| SpendError::StorageError { detail: format!("{e}") })
+            io::write_utxo_slot(&*self.device, record_offset, slot_index, slot).map_err(|e| {
+                SpendError::StorageError {
+                    detail: format!("{e}"),
+                }
+            })
         }
     }
 
@@ -575,11 +618,7 @@ impl Engine {
     /// durability-critical fields (DAH, `unmined_since`, `generation`) out of
     /// sync with the on-device metadata footer.
     #[inline]
-    fn sync_index_cache(
-        &self,
-        key: &TxKey,
-        metadata: &TxMetadata,
-    ) -> Result<(), SpendError> {
+    fn sync_index_cache(&self, key: &TxKey, metadata: &TxMetadata) -> Result<(), SpendError> {
         let preserve = { metadata.preserve_until };
         let dah = { metadata.delete_at_height };
         let has_preserve = preserve != 0;
@@ -610,7 +649,7 @@ impl Engine {
     /// Register a transaction in the index (for test setup).
     ///
     /// Also increments the matching shard count atomically with the
-    /// primary-index insert — see [`Self::register_with_shard_count`] —
+    /// primary-index insert — see `register_with_shard_count` —
     /// so callers that use this helper to seed data still observe
     /// consistent `shard_record_count` values afterwards.
     pub fn register(&self, key: TxKey, entry: TxIndexEntry) -> Result<(), SpendError> {
@@ -639,7 +678,9 @@ impl Engine {
     /// a subset of shards is needed. Acquires the index read lock once
     /// and filters inline, avoiding a full clone + filter pass.
     pub fn keys_for_shard(&self, shard: u16) -> Vec<TxKey> {
-        self.index.read().iter()
+        self.index
+            .read()
+            .iter()
             .filter_map(|(k, _)| {
                 if crate::cluster::shards::ShardTable::shard_for_key(&k) == shard {
                     Some(k)
@@ -656,7 +697,8 @@ impl Engine {
     /// where N is the total number of index entries, compared to O(N * S)
     /// if calling `keys_for_shard` for each shard S.
     pub fn keys_by_shard(&self) -> std::collections::HashMap<u16, Vec<TxKey>> {
-        let mut result: std::collections::HashMap<u16, Vec<TxKey>> = std::collections::HashMap::new();
+        let mut result: std::collections::HashMap<u16, Vec<TxKey>> =
+            std::collections::HashMap::new();
         for (k, _) in self.index.read().iter() {
             let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
             result.entry(shard).or_default().push(k);
@@ -673,7 +715,8 @@ impl Engine {
         &self,
         shard_filter: &std::collections::HashSet<u16>,
     ) -> std::collections::HashMap<u16, Vec<TxKey>> {
-        let mut result: std::collections::HashMap<u16, Vec<TxKey>> = std::collections::HashMap::new();
+        let mut result: std::collections::HashMap<u16, Vec<TxKey>> =
+            std::collections::HashMap::new();
         for (k, _) in self.index.read().iter() {
             let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
             if shard_filter.contains(&shard) {
@@ -694,10 +737,7 @@ impl Engine {
     /// [`validate_spend_multi`](Engine::validate_spend_multi) followed by
     /// [`ValidatedSpend::apply`].
     #[tracing::instrument(level = "debug", skip_all)]
-    pub fn spend_multi(
-        &self,
-        req: &SpendMultiRequest,
-    ) -> Result<SpendMultiResponse, SpendError> {
+    pub fn spend_multi(&self, req: &SpendMultiRequest) -> Result<SpendMultiResponse, SpendError> {
         let validated = self.validate_spend_multi(req)?;
         validated.apply(self)
     }
@@ -777,13 +817,22 @@ impl Engine {
 
         for item in &req.spends {
             if item.offset >= utxo_count {
-                errors.insert(item.idx, SpendError::UtxoNotFound { offset: item.offset });
+                errors.insert(
+                    item.idx,
+                    SpendError::UtxoNotFound {
+                        offset: item.offset,
+                    },
+                );
                 continue;
             }
 
             // Check if this vout was already spent earlier in this batch.
             // This handles duplicate offsets without a HashMap lookup table.
-            let slot = if let Some((_, prev)) = valid_spends.iter().rev().find(|(off, _)| *off == item.offset) {
+            let slot = if let Some((_, prev)) = valid_spends
+                .iter()
+                .rev()
+                .find(|(off, _)| *off == item.offset)
+            {
                 *prev
             } else {
                 self.read_slot_fast(record_offset, item.offset)?
@@ -792,7 +841,9 @@ impl Engine {
             if slot.hash != item.utxo_hash {
                 errors.insert(
                     item.idx,
-                    SpendError::UtxoHashMismatch { offset: item.offset },
+                    SpendError::UtxoHashMismatch {
+                        offset: item.offset,
+                    },
                 );
                 continue;
             }
@@ -801,9 +852,7 @@ impl Engine {
                 UTXO_UNSPENT => {
                     let spendable_height =
                         u32::from_le_bytes(slot.spending_data[0..4].try_into().unwrap());
-                    if spendable_height != 0
-                        && spendable_height >= req.current_block_height
-                    {
+                    if spendable_height != 0 && spendable_height >= req.current_block_height {
                         errors.insert(
                             item.idx,
                             SpendError::FrozenUntil {
@@ -825,7 +874,9 @@ impl Engine {
                     if slot.spending_data == [FROZEN_BYTE; 36] {
                         errors.insert(
                             item.idx,
-                            SpendError::Frozen { offset: item.offset },
+                            SpendError::Frozen {
+                                offset: item.offset,
+                            },
                         );
                         continue;
                     }
@@ -840,13 +891,17 @@ impl Engine {
                 UTXO_PRUNED => {
                     errors.insert(
                         item.idx,
-                        SpendError::Pruned { offset: item.offset },
+                        SpendError::Pruned {
+                            offset: item.offset,
+                        },
                     );
                 }
                 UTXO_FROZEN => {
                     errors.insert(
                         item.idx,
-                        SpendError::Frozen { offset: item.offset },
+                        SpendError::Frozen {
+                            offset: item.offset,
+                        },
                     );
                 }
                 _ => {
@@ -928,9 +983,7 @@ impl Engine {
             UTXO_UNSPENT => {
                 let spendable_height =
                     u32::from_le_bytes(slot.spending_data[0..4].try_into().unwrap());
-                if spendable_height != 0
-                    && spendable_height >= req.current_block_height
-                {
+                if spendable_height != 0 && spendable_height >= req.current_block_height {
                     return Err(SpendError::FrozenUntil {
                         offset: req.offset,
                         spendable_at_height: spendable_height,
@@ -944,7 +997,9 @@ impl Engine {
                     metadata.generation = { metadata.generation }.wrapping_add(1);
                     metadata.updated_at = self.now_millis();
                     if !self.device_ptr.is_null() {
-                        unsafe { io::write_metadata_direct(self.device_ptr, record_offset, &metadata) };
+                        unsafe {
+                            io::write_metadata_direct(self.device_ptr, record_offset, &metadata)
+                        };
                     } else if let Err(e) = self.write_metadata_fast(record_offset, &metadata) {
                         tracing::warn!(err = ?e, "engine: write_metadata failed");
                     }
@@ -1010,10 +1065,7 @@ impl Engine {
 
         let block_ids = collect_block_ids(&metadata).to_vec();
 
-        Ok(SpendResponse {
-            signal,
-            block_ids,
-        })
+        Ok(SpendResponse { signal, block_ids })
     }
 
     /// Unspend a UTXO — reverse a previous spend.
@@ -1051,7 +1103,10 @@ impl Engine {
         match slot.status {
             UTXO_UNSPENT => {
                 // Already unspent — no-op, no counter change, no generation bump
-                return Ok(UnspendResponse { signal: Signal::None, generation: { metadata.generation } });
+                return Ok(UnspendResponse {
+                    signal: Signal::None,
+                    generation: { metadata.generation },
+                });
             }
             UTXO_SPENT => {
                 // Check if frozen (spending_data all 0xFF)
@@ -1109,7 +1164,10 @@ impl Engine {
         let new_dah = { metadata.delete_at_height };
         self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
 
-        Ok(UnspendResponse { signal, generation: { metadata.generation } })
+        Ok(UnspendResponse {
+            signal,
+            generation: { metadata.generation },
+        })
     }
 
     /// Set or unset the mined state of a transaction.
@@ -1157,10 +1215,7 @@ impl Engine {
         // return, DAH evaluation runs from cached index fields.
         // ---------------------------------------------------------------
         let cached_count = entry.block_entry_count;
-        if !req.unset_mined
-            && cached_count == 0
-            && !self.device_ptr.is_null()
-        {
+        if !req.unset_mined && cached_count == 0 && !self.device_ptr.is_null() {
             let new_count = cached_count + 1;
             let new_entry = BlockEntry {
                 block_id: req.block_id,
@@ -1171,10 +1226,18 @@ impl Engine {
             // Compute new field values from cached state
             let mut tf = TxFlags::from_bits_truncate(entry.tx_flags);
             tf.remove(TxFlags::LOCKED); // setMined clears LOCKED
-            let new_unmined = if req.on_longest_chain { 0u32 } else { entry.unmined_since };
+            let new_unmined = if req.on_longest_chain {
+                0u32
+            } else {
+                entry.unmined_since
+            };
             let old_unmined = entry.unmined_since;
             let has_preserve = tf.contains(TxFlags::HAS_PRESERVE_UNTIL);
-            let old_dah = if has_preserve { 0 } else { entry.dah_or_preserve };
+            let old_dah = if has_preserve {
+                0
+            } else {
+                entry.dah_or_preserve
+            };
 
             // DAH evaluation from cached fields
             let (signal, dah_patch) = crate::ops::delete_eval::evaluate_dah_cached(
@@ -1201,8 +1264,12 @@ impl Engine {
             // Read-modify-write so CRC covers the full post-state
             // (block-entry-count, inline entry, and footer fields).
             unsafe {
-                let mut meta = io::read_metadata_direct(self.device_ptr, record_offset)
-                    .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+                let mut meta =
+                    io::read_metadata_direct(self.device_ptr, record_offset).map_err(|e| {
+                        SpendError::StorageError {
+                            detail: format!("{e}"),
+                        }
+                    })?;
                 meta.flags = tf;
                 meta.generation = generation;
                 meta.updated_at = updated_at;
@@ -1214,7 +1281,11 @@ impl Engine {
             }
 
             // Sync all cached fields to index
-            let dah_or_preserve = if has_preserve { entry.dah_or_preserve } else { new_dah };
+            let dah_or_preserve = if has_preserve {
+                entry.dah_or_preserve
+            } else {
+                new_dah
+            };
             let mut sync_tf = tf;
             if has_preserve {
                 sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
@@ -1236,9 +1307,7 @@ impl Engine {
 
             // Update secondary indexes with two-phase durability. Batched
             // into a single redo fsync when both change.
-            self.update_both_secondary_indexes(
-                tx_key, old_dah, new_dah, old_unmined, new_unmined,
-            )?;
+            self.update_both_secondary_indexes(tx_key, old_dah, new_dah, old_unmined, new_unmined)?;
 
             return Ok(SetMinedResponse {
                 signal,
@@ -1270,11 +1339,10 @@ impl Engine {
                     // Swap with last entry (may be inline or from overflow)
                     if count > INLINE_BLOCK_ENTRIES {
                         // Last entry is in overflow — pull it into the inline slot
-                        let mut overflow =
-                            read_overflow_entries(&*self.device, &metadata)
-                                .map_err(|e| SpendError::StorageError {
-                                    detail: format!("{e}"),
-                                })?;
+                        let mut overflow = read_overflow_entries(&*self.device, &metadata)
+                            .map_err(|e| SpendError::StorageError {
+                                detail: format!("{e}"),
+                            })?;
                         let last = overflow.pop().unwrap();
                         metadata.block_entries_inline[i] = last;
                         write_overflow_entries(
@@ -1307,10 +1375,11 @@ impl Engine {
             // Check overflow entries if not found inline
             if !found && count > INLINE_BLOCK_ENTRIES {
                 let mut overflow =
-                    read_overflow_entries(&*self.device, &metadata)
-                        .map_err(|e| SpendError::StorageError {
+                    read_overflow_entries(&*self.device, &metadata).map_err(|e| {
+                        SpendError::StorageError {
                             detail: format!("{e}"),
-                        })?;
+                        }
+                    })?;
                 if let Some(pos) = overflow.iter().position(|e| e.block_id == req.block_id) {
                     overflow.swap_remove(pos);
                     write_overflow_entries(
@@ -1339,11 +1408,11 @@ impl Engine {
             }
 
             if !exists && count > INLINE_BLOCK_ENTRIES {
-                let overflow =
-                    read_overflow_entries(&*self.device, &metadata)
-                        .map_err(|e| SpendError::StorageError {
-                            detail: format!("{e}"),
-                        })?;
+                let overflow = read_overflow_entries(&*self.device, &metadata).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("{e}"),
+                    }
+                })?;
                 if overflow.iter().any(|e| e.block_id == req.block_id) {
                     exists = true;
                 }
@@ -1358,10 +1427,11 @@ impl Engine {
                     };
                 } else {
                     let mut overflow =
-                        read_overflow_entries(&*self.device, &metadata)
-                            .map_err(|e| SpendError::StorageError {
+                        read_overflow_entries(&*self.device, &metadata).map_err(|e| {
+                            SpendError::StorageError {
                                 detail: format!("{e}"),
-                            })?;
+                            }
+                        })?;
                     overflow.push(BlockEntry {
                         block_id: req.block_id,
                         block_height: req.block_height,
@@ -1415,9 +1485,7 @@ impl Engine {
         // Update secondary indexes with two-phase durability, batched.
         let new_dah = { metadata.delete_at_height };
         let new_unmined = { metadata.unmined_since };
-        self.update_both_secondary_indexes(
-            tx_key, old_dah, new_dah, old_unmined, new_unmined,
-        )?;
+        self.update_both_secondary_indexes(tx_key, old_dah, new_dah, old_unmined, new_unmined)?;
 
         let block_ids = if (metadata.block_entry_count as usize) <= INLINE_BLOCK_ENTRIES {
             collect_block_ids(&metadata).to_vec()
@@ -1516,7 +1584,10 @@ impl Engine {
             new_unmined,
         )?;
 
-        Ok(MarkOnLongestChainResponse { signal, generation: { metadata.generation } })
+        Ok(MarkOnLongestChainResponse {
+            signal,
+            generation: { metadata.generation },
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1679,7 +1750,7 @@ impl Engine {
     ///
     /// Validates the request, computes the record size, and allocates device
     /// space. Returns `(record_offset, utxo_count)` on success. The caller
-    /// must subsequently call [`create_at_offset`] with the same request and
+    /// must subsequently call [`Self::create_at_offset`] with the same request and
     /// the returned `record_offset` to finalize the create.
     ///
     /// If the caller decides not to finalize (e.g., redo flush fails), it
@@ -1719,11 +1790,15 @@ impl Engine {
 
     /// Create a transaction record at a pre-allocated device offset.
     ///
-    /// Same as [`create`] but skips allocation — the caller provides the
-    /// `record_offset` obtained from [`pre_allocate_create`]. Used by the
+    /// Same as [`Self::create`] but skips allocation — the caller provides the
+    /// `record_offset` obtained from [`Self::pre_allocate_create`]. Used by the
     /// WAL-first write path where the redo entry must be fsynced before
     /// the engine mutation.
-    pub fn create_at_offset(&self, req: &CreateRequest, record_offset: u64) -> Result<CreateResponse, CreateError> {
+    pub fn create_at_offset(
+        &self,
+        req: &CreateRequest,
+        record_offset: u64,
+    ) -> Result<CreateResponse, CreateError> {
         let utxo_count = req.utxo_hashes.len() as u32;
         if utxo_count == 0 {
             return Err(CreateError::InvalidUtxoCount);
@@ -1758,10 +1833,18 @@ impl Engine {
         meta.record_size = (base_size + cold_data.len() as u64) as u32;
 
         let mut flags = TxFlags::empty();
-        if req.is_coinbase { flags |= TxFlags::IS_COINBASE; }
-        if req.is_external { flags |= TxFlags::EXTERNAL; }
-        if req.conflicting { flags |= TxFlags::CONFLICTING; }
-        if req.locked { flags |= TxFlags::LOCKED; }
+        if req.is_coinbase {
+            flags |= TxFlags::IS_COINBASE;
+        }
+        if req.is_external {
+            flags |= TxFlags::EXTERNAL;
+        }
+        if req.conflicting {
+            flags |= TxFlags::CONFLICTING;
+        }
+        if req.locked {
+            flags |= TxFlags::LOCKED;
+        }
         meta.flags = flags;
 
         if req.is_external {
@@ -1915,14 +1998,15 @@ impl Engine {
                 Err(e) => {
                     return Err(SpendError::StorageError {
                         detail: format!("blobstore read: {e}"),
-                    })
+                    });
                 }
             }
         }
 
         // Read metadata to determine record_size, then compute inline cold offset.
         let meta = self.read_metadata_fast(entry.record_offset)?;
-        let cold_intra = crate::storage::manager::StorageManager::inline_cold_offset(entry.utxo_count);
+        let cold_intra =
+            crate::storage::manager::StorageManager::inline_cold_offset(entry.utxo_count);
         let cold_size = (meta.record_size as u64).saturating_sub(cold_intra);
         if cold_size == 0 {
             return Ok(vec![]);
@@ -1953,7 +2037,11 @@ impl Engine {
     /// Does NOT modify metadata counters — frozen does not count as "spent".
     pub fn freeze(&self, req: &FreezeRequest) -> Result<u32, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
-        let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
+        let entry = self
+            .index
+            .read()
+            .lookup(&req.tx_key)
+            .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
         let meta = self.read_metadata_fast(ro)?;
@@ -1990,7 +2078,11 @@ impl Engine {
     /// Unfreeze a UTXO (set status to UNSPENT, spending_data zeroed).
     pub fn unfreeze(&self, req: &UnfreezeRequest) -> Result<u32, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
-        let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
+        let entry = self
+            .index
+            .read()
+            .lookup(&req.tx_key)
+            .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
         let meta = self.read_metadata_fast(ro)?;
@@ -2015,7 +2107,11 @@ impl Engine {
     /// Reassign a frozen UTXO to a new hash with a spendable-after cooldown.
     pub fn reassign(&self, req: &ReassignRequest) -> Result<u32, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
-        let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
+        let entry = self
+            .index
+            .read()
+            .lookup(&req.tx_key)
+            .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
         let mut meta = self.read_metadata_fast(ro)?;
@@ -2077,8 +2173,11 @@ impl Engine {
             let intra = (offset - aligned_base) as usize;
             let read_len = (intra + count * 32).div_ceil(align) * align;
             let mut buf = crate::device::AlignedBuf::new(read_len, align);
-            self.device.pread(&mut buf, aligned_base)
-                .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+            self.device
+                .pread(&mut buf, aligned_base)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("{e}"),
+                })?;
             for i in 0..count {
                 let start = intra + i * 32;
                 let mut txid = [0u8; 32];
@@ -2100,21 +2199,32 @@ impl Engine {
 
         // Allocate and write new block
         let new_size = (children.len() * 32) as u64;
-        let new_offset = self.allocator.lock().allocate(new_size)
-            .map_err(|_| SpendError::StorageError { detail: "device full for conflicting children".into() })?;
+        let new_offset =
+            self.allocator
+                .lock()
+                .allocate(new_size)
+                .map_err(|_| SpendError::StorageError {
+                    detail: "device full for conflicting children".into(),
+                })?;
 
         let align = self.device.alignment();
         let aligned_base = new_offset / align as u64 * align as u64;
         let intra = (new_offset - aligned_base) as usize;
         let write_len = (intra + children.len() * 32).div_ceil(align) * align;
         let mut wbuf = crate::device::AlignedBuf::new(write_len, align);
-        self.device.pread(&mut wbuf, aligned_base)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        self.device
+            .pread(&mut wbuf, aligned_base)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("{e}"),
+            })?;
         for (i, child) in children.iter().enumerate() {
             wbuf[intra + i * 32..intra + (i + 1) * 32].copy_from_slice(child);
         }
-        self.device.pwrite(&wbuf, aligned_base)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        self.device
+            .pwrite(&wbuf, aligned_base)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("{e}"),
+            })?;
 
         // Update metadata
         meta.conflicting_children_count = children.len() as u8;
@@ -2127,11 +2237,12 @@ impl Engine {
     }
 
     /// Read all conflicting children txids for a transaction.
-    pub fn read_conflicting_children(
-        &self,
-        key: &TxKey,
-    ) -> Result<Vec<[u8; 32]>, SpendError> {
-        let entry = self.index.read().lookup(key).ok_or(SpendError::TxNotFound)?;
+    pub fn read_conflicting_children(&self, key: &TxKey) -> Result<Vec<[u8; 32]>, SpendError> {
+        let entry = self
+            .index
+            .read()
+            .lookup(key)
+            .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
         let meta = self.read_metadata_fast(ro)?;
 
@@ -2146,8 +2257,11 @@ impl Engine {
         let intra = (offset - aligned_base) as usize;
         let read_len = (intra + count * 32).div_ceil(align) * align;
         let mut buf = crate::device::AlignedBuf::new(read_len, align);
-        self.device.pread(&mut buf, aligned_base)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+        self.device
+            .pread(&mut buf, aligned_base)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("{e}"),
+            })?;
 
         let mut result = Vec::with_capacity(count);
         for i in 0..count {
@@ -2165,14 +2279,22 @@ impl Engine {
         req: &SetConflictingRequest,
     ) -> Result<SetConflictingResponse, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
-        let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
+        let entry = self
+            .index
+            .read()
+            .lookup(&req.tx_key)
+            .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
         // Fast path: DAH evaluation from cached fields, no metadata read.
         if !self.device_ptr.is_null() {
             let mut tf = TxFlags::from_bits_truncate(entry.tx_flags);
             let has_preserve = tf.contains(TxFlags::HAS_PRESERVE_UNTIL);
-            let old_dah = if has_preserve { 0 } else { entry.dah_or_preserve };
+            let old_dah = if has_preserve {
+                0
+            } else {
+                entry.dah_or_preserve
+            };
 
             if req.value {
                 tf.insert(TxFlags::CONFLICTING);
@@ -2181,10 +2303,15 @@ impl Engine {
             }
 
             let (signal, dah_patch) = crate::ops::delete_eval::evaluate_dah_cached(
-                tf, entry.spent_utxos, entry.utxo_count,
-                entry.block_entry_count, entry.unmined_since,
-                has_preserve, entry.dah_or_preserve,
-                req.current_block_height, req.block_height_retention,
+                tf,
+                entry.spent_utxos,
+                entry.utxo_count,
+                entry.block_entry_count,
+                entry.unmined_since,
+                has_preserve,
+                entry.dah_or_preserve,
+                req.current_block_height,
+                req.block_height_retention,
             )?;
             let mut new_dah = old_dah;
             if let Some(ref patch) = dah_patch {
@@ -2199,8 +2326,11 @@ impl Engine {
             // Read-modify-write so CRC is computed over the complete
             // post-state. One mmap memcpy for the 320-byte header.
             unsafe {
-                let mut meta = io::read_metadata_direct(self.device_ptr, ro)
-                    .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+                let mut meta = io::read_metadata_direct(self.device_ptr, ro).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("{e}"),
+                    }
+                })?;
                 meta.flags = tf;
                 meta.generation = generation;
                 meta.updated_at = updated_at;
@@ -2209,14 +2339,24 @@ impl Engine {
             }
 
             // Sync index cache
-            let dah_or_preserve = if has_preserve { entry.dah_or_preserve } else { new_dah };
+            let dah_or_preserve = if has_preserve {
+                entry.dah_or_preserve
+            } else {
+                new_dah
+            };
             let mut sync_tf = tf;
-            if has_preserve { sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL); }
+            if has_preserve {
+                sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
+            }
             self.index
                 .write()
                 .update_cached_fields(
-                    &req.tx_key, sync_tf.bits(), entry.block_entry_count,
-                    entry.spent_utxos, dah_or_preserve, entry.unmined_since,
+                    &req.tx_key,
+                    sync_tf.bits(),
+                    entry.block_entry_count,
+                    entry.spent_utxos,
+                    dah_or_preserve,
+                    entry.unmined_since,
                     generation,
                 )
                 .map_err(|e| SpendError::StorageError {
@@ -2242,11 +2382,8 @@ impl Engine {
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = self.now_millis();
 
-        let (signal, dah_patch) = evaluate_delete_at_height(
-            &meta,
-            req.current_block_height,
-            req.block_height_retention,
-        )?;
+        let (signal, dah_patch) =
+            evaluate_delete_at_height(&meta, req.current_block_height, req.block_height_retention)?;
         if let Some(ref patch) = dah_patch {
             apply_dah_patch(&mut meta, patch);
         }
@@ -2271,20 +2408,31 @@ impl Engine {
             }
         }
 
-        Ok(SetConflictingResponse { signal, generation: { meta.generation } })
+        Ok(SetConflictingResponse {
+            signal,
+            generation: { meta.generation },
+        })
     }
 
     /// Set or clear the locked flag on a transaction.
     pub fn set_locked(&self, req: &SetLockedRequest) -> Result<u32, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
-        let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
+        let entry = self
+            .index
+            .read()
+            .lookup(&req.tx_key)
+            .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
         // Fast path: all needed state is in the index cache + 4-byte generation read.
         if !self.device_ptr.is_null() {
             let mut tf = TxFlags::from_bits_truncate(entry.tx_flags);
             let has_preserve = tf.contains(TxFlags::HAS_PRESERVE_UNTIL);
-            let old_dah = if has_preserve { 0 } else { entry.dah_or_preserve };
+            let old_dah = if has_preserve {
+                0
+            } else {
+                entry.dah_or_preserve
+            };
 
             let new_dah = if req.value {
                 tf.insert(TxFlags::LOCKED);
@@ -2301,8 +2449,11 @@ impl Engine {
             // Read-modify-write so CRC is computed over the complete
             // post-state. One mmap memcpy for the 320-byte header.
             unsafe {
-                let mut meta = io::read_metadata_direct(self.device_ptr, ro)
-                    .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+                let mut meta = io::read_metadata_direct(self.device_ptr, ro).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("{e}"),
+                    }
+                })?;
                 meta.flags = tf;
                 meta.generation = generation;
                 meta.updated_at = updated_at;
@@ -2311,14 +2462,24 @@ impl Engine {
             }
 
             // Sync index cache
-            let dah_or_preserve = if has_preserve { entry.dah_or_preserve } else { new_dah };
+            let dah_or_preserve = if has_preserve {
+                entry.dah_or_preserve
+            } else {
+                new_dah
+            };
             let mut sync_tf = tf;
-            if has_preserve { sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL); }
+            if has_preserve {
+                sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
+            }
             self.index
                 .write()
                 .update_cached_fields(
-                    &req.tx_key, sync_tf.bits(), entry.block_entry_count,
-                    entry.spent_utxos, dah_or_preserve, entry.unmined_since,
+                    &req.tx_key,
+                    sync_tf.bits(),
+                    entry.block_entry_count,
+                    entry.spent_utxos,
+                    dah_or_preserve,
+                    entry.unmined_since,
                     generation,
                 )
                 .map_err(|e| SpendError::StorageError {
@@ -2337,7 +2498,9 @@ impl Engine {
 
         if req.value {
             meta.flags |= TxFlags::LOCKED;
-            if old_dah != 0 { meta.delete_at_height = 0; }
+            if old_dah != 0 {
+                meta.delete_at_height = 0;
+            }
         } else {
             meta.flags -= meta.flags & TxFlags::LOCKED;
         }
@@ -2363,7 +2526,11 @@ impl Engine {
         req: &PreserveUntilRequest,
     ) -> Result<PreserveUntilResponse, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
-        let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
+        let entry = self
+            .index
+            .read()
+            .lookup(&req.tx_key)
+            .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
         let mut meta = self.read_metadata_fast(ro)?;
@@ -2385,7 +2552,10 @@ impl Engine {
         } else {
             Signal::None
         };
-        Ok(PreserveUntilResponse { signal, generation: { meta.generation } })
+        Ok(PreserveUntilResponse {
+            signal,
+            generation: { meta.generation },
+        })
     }
 
     /// Delete a transaction record.
@@ -2405,11 +2575,20 @@ impl Engine {
             ({ meta.record_size }) as u64
         };
 
+        // Tombstone the metadata before freeing the region so crash-time index
+        // rebuilds cannot resurrect this record from stale bytes in freed space.
+        let mut tombstone = self.read_metadata_fast(entry.record_offset)?;
+        tombstone.magic = 0;
+        tombstone.record_size = 0;
+        self.write_metadata_fast(entry.record_offset, &tombstone)?;
+
         // Free device space
         self.allocator
             .lock()
             .free(entry.record_offset, record_size)
-            .map_err(|e| SpendError::StorageError { detail: format!("{e}") })?;
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("{e}"),
+            })?;
 
         // Remove from primary index AND decrement shard_counts in the same
         // critical section so the two can never drift (H2 correctness fix).
@@ -2422,9 +2601,13 @@ impl Engine {
         // The cached entry captured before unregister carries the heights we
         // must transition from. Whether or not each was set, `update_*_index`
         // is a no-op when old == new.
-        let has_preserve = TxFlags::from_bits_truncate(entry.tx_flags)
-            .contains(TxFlags::HAS_PRESERVE_UNTIL);
-        let old_dah = if has_preserve { 0 } else { entry.dah_or_preserve };
+        let has_preserve =
+            TxFlags::from_bits_truncate(entry.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL);
+        let old_dah = if has_preserve {
+            0
+        } else {
+            entry.dah_or_preserve
+        };
         let old_unmined = entry.unmined_since;
         if old_dah != 0 {
             self.update_dah_index(&req.tx_key, old_dah, 0)?;
@@ -2438,7 +2621,11 @@ impl Engine {
 
     /// Read spending data for a specific UTXO (point read, no lock needed).
     pub fn get_spend(&self, req: &GetSpendRequest) -> Result<GetSpendResponse, SpendError> {
-        let entry = self.index.read().lookup(&req.tx_key).ok_or(SpendError::TxNotFound)?;
+        let entry = self
+            .index
+            .read()
+            .lookup(&req.tx_key)
+            .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
         let meta = self.read_metadata_fast(ro)?;
@@ -2488,7 +2675,7 @@ impl Engine {
     /// mutation via `sync_index_cache`.
     ///
     /// Use this for GET requests where the field mask only covers cached fields
-    /// (see [`FieldMask::fully_cached`]).
+    /// (see [`crate::protocol::codec::FieldMask::fully_cached`]).
     pub fn lookup_cached(&self, key: &TxKey) -> Option<TxIndexEntry> {
         self.index.read().lookup(key)
     }
@@ -2604,9 +2791,7 @@ impl<'a> ValidatedSpend<'a> {
         // Fault-injection: simulate a crash AFTER redo fsync but BEFORE
         // any data-region pwrite. Recovery must replay the redo entries
         // and produce the final slot bytes.
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::BeforeDataPwrite,
-        );
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeDataPwrite);
 
         // 6. Batch write all valid slot mutations (zero-alloc when direct)
         for &(offset, ref new_slot) in &valid_spends {
@@ -2615,9 +2800,7 @@ impl<'a> ValidatedSpend<'a> {
             }
         }
 
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::AfterDataPwrite,
-        );
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterDataPwrite);
 
         // 7. Update metadata
         let old_dah = { metadata.delete_at_height };
@@ -2629,11 +2812,8 @@ impl<'a> ValidatedSpend<'a> {
         // misconfiguration (current_height + retention > u32::MAX) and
         // surfaces to the caller as SpendError::DahOverflow — we never
         // silently clamp, which would pin UTXOs as unprunable forever.
-        let (signal, dah_patch) = evaluate_delete_at_height(
-            &metadata,
-            current_block_height,
-            block_height_retention,
-        )?;
+        let (signal, dah_patch) =
+            evaluate_delete_at_height(&metadata, current_block_height, block_height_retention)?;
 
         if let Some(ref patch) = dah_patch {
             apply_dah_patch(&mut metadata, patch);
@@ -2681,7 +2861,8 @@ fn extract_parent_txids_from_cold_data(cold_bytes: &[u8]) -> Vec<[u8; 32]> {
         return Vec::new();
     }
     // Outer wrapper: [inputs_blob_len:4][inputs_blob][...]
-    let inputs_blob_len = u32::from_le_bytes(cold_bytes[0..4].try_into().unwrap_or([0; 4])) as usize;
+    let inputs_blob_len =
+        u32::from_le_bytes(cold_bytes[0..4].try_into().unwrap_or([0; 4])) as usize;
     if inputs_blob_len == 0 || 4 + inputs_blob_len > cold_bytes.len() {
         return Vec::new();
     }
@@ -2699,7 +2880,8 @@ fn extract_parent_txids_from_cold_data(cold_bytes: &[u8]) -> Vec<[u8; 32]> {
         if pos + 4 > inputs_blob.len() {
             break;
         }
-        let entry_len = u32::from_le_bytes(inputs_blob[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
+        let entry_len =
+            u32::from_le_bytes(inputs_blob[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
         pos += 4;
         if entry_len < 32 || pos + entry_len > inputs_blob.len() {
             break;
@@ -2770,10 +2952,16 @@ fn collect_block_ids(metadata: &TxMetadata) -> InlineBlockIds {
     let count = metadata.block_entry_count as usize;
     let inline = count.min(INLINE_BLOCK_ENTRIES);
     let mut ids = [0u32; INLINE_BLOCK_ENTRIES];
-    for (id_slot, entry) in ids.iter_mut().zip(metadata.block_entries_inline[..inline].iter()) {
+    for (id_slot, entry) in ids
+        .iter_mut()
+        .zip(metadata.block_entries_inline[..inline].iter())
+    {
         *id_slot = entry.block_id;
     }
-    InlineBlockIds { ids, len: inline as u8 }
+    InlineBlockIds {
+        ids,
+        len: inline as u8,
+    }
 }
 
 /// Collect all block IDs including overflow entries read from device.
@@ -2785,7 +2973,7 @@ fn collect_all_block_ids(
     let inline = count.min(INLINE_BLOCK_ENTRIES);
     let mut ids: Vec<u32> = metadata.block_entries_inline[..inline]
         .iter()
-        .map(|e| { e.block_id })
+        .map(|e| e.block_id)
         .collect();
     if count > INLINE_BLOCK_ENTRIES {
         let overflow = read_overflow_entries(device, metadata)?;
@@ -2818,7 +3006,9 @@ fn read_overflow_entries(
     let mut entries = Vec::with_capacity(overflow_count);
     for i in 0..overflow_count {
         let start = i * BLOCK_ENTRY_SIZE;
-        entries.push(BlockEntry::from_bytes(&buf[start..start + BLOCK_ENTRY_SIZE]));
+        entries.push(BlockEntry::from_bytes(
+            &buf[start..start + BLOCK_ENTRY_SIZE],
+        ));
     }
     Ok(entries)
 }
@@ -2852,12 +3042,9 @@ fn write_overflow_entries(
     let offset = if old_offset != 0 {
         old_offset
     } else {
-        allocator
-            .lock()
-            .allocate(block_size as u64)
-            .map_err(|e| crate::device::DeviceError::Io(std::io::Error::other(
-                format!("allocator: {e}"),
-            )))?
+        allocator.lock().allocate(block_size as u64).map_err(|e| {
+            crate::device::DeviceError::Io(std::io::Error::other(format!("allocator: {e}")))
+        })?
     };
 
     let mut buf = AlignedBuf::new(block_size, alignment);
@@ -3497,7 +3684,10 @@ mod tests {
 
         // No writes: slot still unspent, metadata unchanged.
         let slot = h.engine.read_slot(&h.key, 4).unwrap();
-        assert!(!slot.is_spent(), "slot must not have been mutated when apply was skipped");
+        assert!(
+            !slot.is_spent(),
+            "slot must not have been mutated when apply was skipped"
+        );
         let meta_after = h.engine.read_metadata(&h.key).unwrap();
         assert_eq!({ meta_after.generation }, gen_before);
         assert_eq!({ meta_after.spent_utxos }, spent_before);
@@ -3675,7 +3865,9 @@ mod tests {
         let h = TestHarness::with_metadata(10, TxFlags::empty(), |m| {
             m.block_entry_count = 1;
             m.block_entries_inline[0] = BlockEntry {
-                block_id: 1, block_height: 900, subtree_idx: 0,
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
             };
         });
 
@@ -3707,7 +3899,9 @@ mod tests {
         let h = TestHarness::with_metadata(2, TxFlags::empty(), |m| {
             m.block_entry_count = 1;
             m.block_entries_inline[0] = BlockEntry {
-                block_id: 1, block_height: 900, subtree_idx: 0,
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
             };
         });
 
@@ -3737,7 +3931,9 @@ mod tests {
         let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
             m.block_entry_count = 1;
             m.block_entries_inline[0] = BlockEntry {
-                block_id: 1, block_height: 900, subtree_idx: 0,
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
             };
         });
 
@@ -3754,7 +3950,9 @@ mod tests {
         let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
             m.block_entry_count = 1;
             m.block_entries_inline[0] = BlockEntry {
-                block_id: 1, block_height: 900, subtree_idx: 0,
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
             };
             m.preserve_until = 5000;
         });
@@ -3917,17 +4115,22 @@ mod tests {
                 .collect();
             io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
 
-            index.register(key, TxIndexEntry {
-                device_id: 0,
-                record_offset: offset,
-                utxo_count: 10,
-                block_entry_count: 0,
-                tx_flags: 0,
-                spent_utxos: 0,
-                dah_or_preserve: 0,
-                unmined_since: 0,
-                generation: 0,
-            }).unwrap();
+            index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: offset,
+                        utxo_count: 10,
+                        block_entry_count: 0,
+                        tx_flags: 0,
+                        spent_utxos: 0,
+                        dah_or_preserve: 0,
+                        unmined_since: 0,
+                        generation: 0,
+                    },
+                )
+                .unwrap();
         }
 
         let engine = Arc::new(Engine::new(
@@ -4031,8 +4234,14 @@ mod tests {
         assert_eq!(resp.errors.len(), 3);
         assert_eq!(resp.spent_count, 1); // Only slot 0 succeeded
         assert!(matches!(resp.errors[&1], SpendError::Frozen { offset: 2 }));
-        assert!(matches!(resp.errors[&2], SpendError::AlreadySpent { offset: 4, .. }));
-        assert!(matches!(resp.errors[&3], SpendError::UtxoHashMismatch { offset: 6 }));
+        assert!(matches!(
+            resp.errors[&2],
+            SpendError::AlreadySpent { offset: 4, .. }
+        ));
+        assert!(matches!(
+            resp.errors[&3],
+            SpendError::UtxoHashMismatch { offset: 6 }
+        ));
     }
 
     #[test]
@@ -4127,7 +4336,10 @@ mod tests {
         let resp = h.engine.spend_multi(&req).unwrap();
         assert_eq!(resp.errors.len(), 1);
         assert!(resp.errors.contains_key(&1)); // Second one fails
-        assert!(matches!(resp.errors[&1], SpendError::AlreadySpent { offset: 5, .. }));
+        assert!(matches!(
+            resp.errors[&1],
+            SpendError::AlreadySpent { offset: 5, .. }
+        ));
         assert_eq!(resp.spent_count, 1);
     }
 
@@ -4136,10 +4348,14 @@ mod tests {
         let h = TestHarness::with_metadata(10, TxFlags::empty(), |m| {
             m.block_entry_count = 2;
             m.block_entries_inline[0] = BlockEntry {
-                block_id: 42, block_height: 900, subtree_idx: 0,
+                block_id: 42,
+                block_height: 900,
+                subtree_idx: 0,
             };
             m.block_entries_inline[1] = BlockEntry {
-                block_id: 99, block_height: 901, subtree_idx: 1,
+                block_id: 99,
+                block_height: 901,
+                subtree_idx: 1,
             };
         });
 
@@ -4218,7 +4434,9 @@ mod tests {
         let h = TestHarness::with_metadata(5, TxFlags::empty(), |m| {
             m.block_entry_count = 1;
             m.block_entries_inline[0] = BlockEntry {
-                block_id: 1, block_height: 900, subtree_idx: 0,
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
             };
         });
 
@@ -4231,7 +4449,9 @@ mod tests {
         let h = TestHarness::with_metadata(2, TxFlags::empty(), |m| {
             m.block_entry_count = 1;
             m.block_entries_inline[0] = BlockEntry {
-                block_id: 1, block_height: 900, subtree_idx: 0,
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
             };
         });
 
@@ -4258,7 +4478,9 @@ mod tests {
         let h = TestHarness::with_metadata(5, TxFlags::empty(), |m| {
             m.block_entry_count = 1;
             m.block_entries_inline[0] = BlockEntry {
-                block_id: 1, block_height: 900, subtree_idx: 0,
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
             };
         });
 
@@ -4274,7 +4496,9 @@ mod tests {
         let h = TestHarness::with_metadata(2, TxFlags::empty(), |m| {
             m.block_entry_count = 1;
             m.block_entries_inline[0] = BlockEntry {
-                block_id: 1, block_height: 900, subtree_idx: 0,
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
             };
         });
 
@@ -4336,7 +4560,9 @@ mod tests {
         let h = TestHarness::with_metadata(1, TxFlags::EXTERNAL, |m| {
             m.block_entry_count = 1;
             m.block_entries_inline[0] = BlockEntry {
-                block_id: 1, block_height: 900, subtree_idx: 0,
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
             };
         });
 
@@ -4349,7 +4575,9 @@ mod tests {
         let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
             m.block_entry_count = 1;
             m.block_entries_inline[0] = BlockEntry {
-                block_id: 1, block_height: 900, subtree_idx: 0,
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
             };
         });
 
@@ -4369,7 +4597,9 @@ mod tests {
         let h = TestHarness::with_metadata(2, TxFlags::empty(), |m| {
             m.block_entry_count = 1;
             m.block_entries_inline[0] = BlockEntry {
-                block_id: 1, block_height: 900, subtree_idx: 0,
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
             };
         });
 
@@ -4395,7 +4625,9 @@ mod tests {
         let h = TestHarness::with_metadata(2, TxFlags::empty(), |m| {
             m.block_entry_count = 1;
             m.block_entries_inline[0] = BlockEntry {
-                block_id: 1, block_height: 900, subtree_idx: 0,
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
             };
         });
 
@@ -4804,7 +5036,9 @@ mod tests {
         let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
             m.block_entry_count = 1;
             m.block_entries_inline[0] = BlockEntry {
-                block_id: 1, block_height: 900, subtree_idx: 0,
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
             };
         });
 
@@ -4941,9 +5175,17 @@ mod tests {
         let results = engine.set_mined_batch(&params, &keys);
         assert_eq!(results.len(), 3);
         for (i, r) in results.iter().enumerate() {
-            let resp = r.as_ref().unwrap_or_else(|e| panic!("item {i} failed: {e}"));
-            assert!(resp.block_ids.contains(&42), "item {i} should have block_id 42");
-            assert!(resp.generation > 0, "item {i} should have incremented generation");
+            let resp = r
+                .as_ref()
+                .unwrap_or_else(|e| panic!("item {i} failed: {e}"));
+            assert!(
+                resp.block_ids.contains(&42),
+                "item {i} should have block_id 42"
+            );
+            assert!(
+                resp.generation > 0,
+                "item {i} should have incremented generation"
+            );
         }
 
         // Verify all three txs have the block entry.
@@ -4959,9 +5201,13 @@ mod tests {
         let h = TestHarness::new(5, TxFlags::empty());
         let missing_key = TxKey { txid: [0xFF; 32] };
         let params = SetMinedSharedParams {
-            block_id: 1, block_height: 100, subtree_idx: 0,
-            current_block_height: 100, block_height_retention: 288,
-            on_longest_chain: true, unset_mined: false,
+            block_id: 1,
+            block_height: 100,
+            subtree_idx: 0,
+            current_block_height: 100,
+            block_height_retention: 288,
+            on_longest_chain: true,
+            unset_mined: false,
         };
 
         let results = h.engine.set_mined_batch(&params, &[h.key, missing_key]);
@@ -5052,7 +5298,8 @@ mod tests {
         let meta = h.engine.read_metadata(&h.key).unwrap();
         assert_eq!(meta.block_entry_count, 3);
 
-        let resp = h.engine
+        let resp = h
+            .engine
             .set_mined(&SetMinedRequest {
                 tx_key: h.key,
                 block_id: 99,
@@ -5240,7 +5487,7 @@ mod tests {
         let meta = h.engine.read_metadata(&h.key).unwrap();
         assert_eq!(meta.block_entry_count, 2);
         let ids: Vec<u32> = (0..2)
-            .map(|i| { meta.block_entries_inline[i].block_id })
+            .map(|i| meta.block_entries_inline[i].block_id)
             .collect();
         assert!(ids.contains(&10));
         assert!(ids.contains(&30));
@@ -5371,7 +5618,8 @@ mod tests {
         h.engine.spend(&h.spend_req(0)).unwrap();
         h.engine.spend(&h.spend_req(1)).unwrap();
 
-        let resp = h.engine
+        let resp = h
+            .engine
             .set_mined(&SetMinedRequest {
                 tx_key: h.key,
                 block_id: 1,
@@ -5419,7 +5667,8 @@ mod tests {
         h.engine.spend(&h.spend_req(0)).unwrap();
         h.engine.spend(&h.spend_req(1)).unwrap();
 
-        let resp = h.engine
+        let resp = h
+            .engine
             .set_mined(&SetMinedRequest {
                 tx_key: h.key,
                 block_id: 1,
@@ -5638,10 +5887,9 @@ mod tests {
 
         // Block entries unchanged
         assert_eq!(meta_before.block_entry_count, meta_after.block_entry_count);
-        assert_eq!(
-            { meta_before.block_entries_inline[0].block_id },
-            { meta_after.block_entries_inline[0].block_id }
-        );
+        assert_eq!({ meta_before.block_entries_inline[0].block_id }, {
+            meta_after.block_entries_inline[0].block_id
+        });
         // Slots unchanged
         assert_eq!(slot_before, slot_after);
     }
@@ -5652,7 +5900,9 @@ mod tests {
             m.unmined_since = 500;
             m.block_entry_count = 1;
             m.block_entries_inline[0] = BlockEntry {
-                block_id: 1, block_height: 100, subtree_idx: 0,
+                block_id: 1,
+                block_height: 100,
+                subtree_idx: 0,
             };
         });
 
@@ -5679,7 +5929,9 @@ mod tests {
         let h = TestHarness::with_metadata(2, TxFlags::empty(), |m| {
             m.block_entry_count = 1;
             m.block_entries_inline[0] = BlockEntry {
-                block_id: 1, block_height: 100, subtree_idx: 0,
+                block_id: 1,
+                block_height: 100,
+                subtree_idx: 0,
             };
         });
 
@@ -5752,7 +6004,8 @@ mod tests {
     fn set_mined_overflow_four_entries() {
         let h = TestHarness::new(10, TxFlags::empty());
         for bid in 1..=4u32 {
-            let resp = h.engine
+            let resp = h
+                .engine
                 .set_mined(&SetMinedRequest {
                     tx_key: h.key,
                     block_id: bid,
@@ -5791,7 +6044,8 @@ mod tests {
         }
 
         // Read back all entries via a dummy set_mined (idempotent)
-        let resp = h.engine
+        let resp = h
+            .engine
             .set_mined(&SetMinedRequest {
                 tx_key: h.key,
                 block_id: 10, // Already exists
@@ -5863,7 +6117,7 @@ mod tests {
         assert_eq!(meta.block_entry_count, 3);
         // Should only have inline entries now
         let ids: Vec<u32> = (0..3)
-            .map(|i| { meta.block_entries_inline[i].block_id })
+            .map(|i| meta.block_entries_inline[i].block_id)
             .collect();
         assert!(ids.contains(&1));
         assert!(ids.contains(&2));
@@ -6112,7 +6366,12 @@ mod tests {
         // SAFETY: We leak the Vec to get a 'static lifetime for test convenience.
         // This is fine in tests — the memory is small and the process exits after tests.
         let hashes: Vec<[u8; 32]> = (0..utxo_count)
-            .map(|i| { let mut h = [0u8; 32]; h[0] = i as u8; h[1] = (i >> 8) as u8; h })
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i as u8;
+                h[1] = (i >> 8) as u8;
+                h
+            })
             .collect();
         let hashes_ref: &'static [[u8; 32]] = Box::leak(hashes.clone().into_boxed_slice());
         let mut tx_id = [0u8; 32];
@@ -6369,7 +6628,10 @@ mod tests {
         let _entry = engine.lookup(&key).unwrap();
         // Without cold data, read_cold_data should return empty
         let cold = engine.read_cold_data(&key).unwrap();
-        assert!(cold.is_empty(), "cold data should be empty when not provided");
+        assert!(
+            cold.is_empty(),
+            "cold data should be empty when not provided"
+        );
     }
 
     #[test]
@@ -6411,9 +6673,7 @@ mod tests {
     #[test]
     fn batch_create_10() {
         let engine = create_engine();
-        let requests: Vec<CreateRequest> = (30..40u8)
-            .map(|n| make_create_req(n, 5).1)
-            .collect();
+        let requests: Vec<CreateRequest> = (30..40u8).map(|n| make_create_req(n, 5).1).collect();
         let results = engine.create_batch(&requests);
 
         assert_eq!(results.len(), 10);
@@ -6425,9 +6685,8 @@ mod tests {
     #[test]
     fn batch_create_with_duplicate() {
         let engine = create_engine();
-        let mut requests: Vec<CreateRequest> = (40..50u8)
-            .map(|n| make_create_req(n, 5).1)
-            .collect();
+        let mut requests: Vec<CreateRequest> =
+            (40..50u8).map(|n| make_create_req(n, 5).1).collect();
         // Duplicate the 5th entry
         requests[5] = requests[4].clone();
 
@@ -6545,9 +6804,7 @@ mod tests {
         let key = req.tx_key();
 
         engine.create(&req).unwrap();
-        engine
-            .delete(&DeleteRequest { tx_key: key })
-            .unwrap();
+        engine.delete(&DeleteRequest { tx_key: key }).unwrap();
 
         // Should succeed — txid can be reused after deletion
         engine.create(&req).unwrap();
@@ -6602,8 +6859,7 @@ mod tests {
         // Each record with 5 UTXOs needs ~1 block (4KB).
         let data_blocks = 20;
         let total_size = 1024 * 1024 + data_blocks * 4096; // 1MiB header + 80KB data
-        let dev: Arc<dyn BlockDevice> =
-            Arc::new(MemoryDevice::new(total_size, 4096).unwrap());
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(total_size, 4096).unwrap());
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(1000).unwrap();
         let engine = Arc::new(Engine::new(
@@ -6675,7 +6931,13 @@ mod tests {
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
-        engine.freeze(&FreezeRequest { tx_key: key, offset: 2, utxo_hash: req.utxo_hashes[2] }).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 2,
+                utxo_hash: req.utxo_hashes[2],
+            })
+            .unwrap();
         let slot = engine.read_slot(&key, 2).unwrap();
         assert!(slot.is_frozen());
         assert_eq!(slot.spending_data, [0xFF; 36]);
@@ -6687,9 +6949,19 @@ mod tests {
         let (_, req) = make_create_req(61, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
 
-        match engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }) {
+        match engine.freeze(&FreezeRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: req.utxo_hashes[0],
+        }) {
             Err(SpendError::AlreadyFrozen { offset: 0 }) => {}
             other => panic!("expected AlreadyFrozen, got {other:?}"),
         }
@@ -6701,14 +6973,26 @@ mod tests {
         let (_, req) = make_create_req(62, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        let mut sd = [0u8; 36]; sd[0] = 0xAB;
-        engine.spend(&SpendRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0], spending_data: sd,
-            ignore_conflicting: false, ignore_locked: false,
-            current_block_height: 1000, block_height_retention: 288,
-        }).unwrap();
+        let mut sd = [0u8; 36];
+        sd[0] = 0xAB;
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
 
-        match engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }) {
+        match engine.freeze(&FreezeRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: req.utxo_hashes[0],
+        }) {
             Err(SpendError::AlreadySpent { offset: 0, .. }) => {}
             other => panic!("expected AlreadySpent, got {other:?}"),
         }
@@ -6717,7 +7001,11 @@ mod tests {
     #[test]
     fn freeze_nonexistent_tx() {
         let engine = create_engine();
-        match engine.freeze(&FreezeRequest { tx_key: TxKey { txid: [0xFF; 32] }, offset: 0, utxo_hash: [0; 32] }) {
+        match engine.freeze(&FreezeRequest {
+            tx_key: TxKey { txid: [0xFF; 32] },
+            offset: 0,
+            utxo_hash: [0; 32],
+        }) {
             Err(SpendError::TxNotFound) => {}
             other => panic!("expected TxNotFound, got {other:?}"),
         }
@@ -6730,7 +7018,11 @@ mod tests {
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
-        match engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: [0xFF; 32] }) {
+        match engine.freeze(&FreezeRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: [0xFF; 32],
+        }) {
             Err(SpendError::UtxoHashMismatch { .. }) => {}
             other => panic!("expected UtxoHashMismatch, got {other:?}"),
         }
@@ -6742,7 +7034,13 @@ mod tests {
         let (_, req) = make_create_req(64, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
 
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.spent_utxos }, 0);
@@ -6754,13 +7052,25 @@ mod tests {
         let (_, req) = make_create_req(65, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
 
-        let mut sd = [0u8; 36]; sd[0] = 0xAB;
+        let mut sd = [0u8; 36];
+        sd[0] = 0xAB;
         match engine.spend(&SpendRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0], spending_data: sd,
-            ignore_conflicting: false, ignore_locked: false,
-            current_block_height: 1000, block_height_retention: 288,
+            tx_key: key,
+            offset: 0,
+            utxo_hash: req.utxo_hashes[0],
+            spending_data: sd,
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
         }) {
             Err(SpendError::Frozen { offset: 0 }) => {}
             other => panic!("expected Frozen, got {other:?}"),
@@ -6775,8 +7085,20 @@ mod tests {
         let (_, req) = make_create_req(70, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.freeze(&FreezeRequest { tx_key: key, offset: 1, utxo_hash: req.utxo_hashes[1] }).unwrap();
-        engine.unfreeze(&UnfreezeRequest { tx_key: key, offset: 1, utxo_hash: req.utxo_hashes[1] }).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 1,
+                utxo_hash: req.utxo_hashes[1],
+            })
+            .unwrap();
+        engine
+            .unfreeze(&UnfreezeRequest {
+                tx_key: key,
+                offset: 1,
+                utxo_hash: req.utxo_hashes[1],
+            })
+            .unwrap();
 
         let slot = engine.read_slot(&key, 1).unwrap();
         assert!(slot.is_unspent());
@@ -6790,7 +7112,11 @@ mod tests {
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
-        match engine.unfreeze(&UnfreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }) {
+        match engine.unfreeze(&UnfreezeRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: req.utxo_hashes[0],
+        }) {
             Err(SpendError::NotFrozen { offset: 0 }) => {}
             other => panic!("expected NotFrozen, got {other:?}"),
         }
@@ -6802,15 +7128,35 @@ mod tests {
         let (_, req) = make_create_req(72, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
-        engine.unfreeze(&UnfreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
+        engine
+            .unfreeze(&UnfreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
 
-        let mut sd = [0u8; 36]; sd[0] = 0xAB;
-        engine.spend(&SpendRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0], spending_data: sd,
-            ignore_conflicting: false, ignore_locked: false,
-            current_block_height: 1000, block_height_retention: 288,
-        }).unwrap();
+        let mut sd = [0u8; 36];
+        sd[0] = 0xAB;
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
         assert!(engine.read_slot(&key, 0).unwrap().is_spent());
     }
 
@@ -6822,13 +7168,25 @@ mod tests {
         let (_, req) = make_create_req(80, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
 
         let new_hash = [0xBBu8; 32];
-        engine.reassign(&ReassignRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
-            new_utxo_hash: new_hash, block_height: 1000, spendable_after: 100,
-        }).unwrap();
+        engine
+            .reassign(&ReassignRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+                new_utxo_hash: new_hash,
+                block_height: 1000,
+                spendable_after: 100,
+            })
+            .unwrap();
 
         let slot = engine.read_slot(&key, 0).unwrap();
         assert!(slot.is_unspent());
@@ -6845,8 +7203,12 @@ mod tests {
         engine.create(&req).unwrap();
 
         match engine.reassign(&ReassignRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
-            new_utxo_hash: [0xBB; 32], block_height: 1000, spendable_after: 100,
+            tx_key: key,
+            offset: 0,
+            utxo_hash: req.utxo_hashes[0],
+            new_utxo_hash: [0xBB; 32],
+            block_height: 1000,
+            spendable_after: 100,
         }) {
             Err(SpendError::NotFrozen { .. }) => {}
             other => panic!("expected NotFrozen, got {other:?}"),
@@ -6859,11 +7221,21 @@ mod tests {
         let (_, req) = make_create_req(82, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
 
         match engine.reassign(&ReassignRequest {
-            tx_key: key, offset: 0, utxo_hash: [0xFF; 32],
-            new_utxo_hash: [0xBB; 32], block_height: 1000, spendable_after: 100,
+            tx_key: key,
+            offset: 0,
+            utxo_hash: [0xFF; 32],
+            new_utxo_hash: [0xBB; 32],
+            block_height: 1000,
+            spendable_after: 100,
         }) {
             Err(SpendError::UtxoHashMismatch { .. }) => {}
             other => panic!("expected UtxoHashMismatch, got {other:?}"),
@@ -6876,20 +7248,38 @@ mod tests {
         let (_, req) = make_create_req(83, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
 
         let new_hash = [0xCC; 32];
-        engine.reassign(&ReassignRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
-            new_utxo_hash: new_hash, block_height: 1000, spendable_after: 100,
-        }).unwrap();
+        engine
+            .reassign(&ReassignRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+                new_utxo_hash: new_hash,
+                block_height: 1000,
+                spendable_after: 100,
+            })
+            .unwrap();
 
         // Not spendable at block 1099
-        let mut sd = [0u8; 36]; sd[0] = 0xDD;
+        let mut sd = [0u8; 36];
+        sd[0] = 0xDD;
         match engine.spend(&SpendRequest {
-            tx_key: key, offset: 0, utxo_hash: new_hash, spending_data: sd,
-            ignore_conflicting: false, ignore_locked: false,
-            current_block_height: 1099, block_height_retention: 288,
+            tx_key: key,
+            offset: 0,
+            utxo_hash: new_hash,
+            spending_data: sd,
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1099,
+            block_height_retention: 288,
         }) {
             Err(SpendError::FrozenUntil { .. }) => {}
             other => panic!("expected FrozenUntil, got {other:?}"),
@@ -6902,21 +7292,41 @@ mod tests {
         let (_, req) = make_create_req(84, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
 
         let new_hash = [0xDD; 32];
-        engine.reassign(&ReassignRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
-            new_utxo_hash: new_hash, block_height: 1000, spendable_after: 100,
-        }).unwrap();
+        engine
+            .reassign(&ReassignRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+                new_utxo_hash: new_hash,
+                block_height: 1000,
+                spendable_after: 100,
+            })
+            .unwrap();
 
         // Spendable at block 1101 (> 1100)
-        let mut sd = [0u8; 36]; sd[0] = 0xEE;
-        engine.spend(&SpendRequest {
-            tx_key: key, offset: 0, utxo_hash: new_hash, spending_data: sd,
-            ignore_conflicting: false, ignore_locked: false,
-            current_block_height: 1101, block_height_retention: 288,
-        }).unwrap();
+        let mut sd = [0u8; 36];
+        sd[0] = 0xEE;
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: new_hash,
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1101,
+                block_height_retention: 288,
+            })
+            .unwrap();
         assert!(engine.read_slot(&key, 0).unwrap().is_spent());
     }
 
@@ -6926,17 +7336,35 @@ mod tests {
         let (_, req) = make_create_req(85, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
-        engine.reassign(&ReassignRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
-            new_utxo_hash: [0xEE; 32], block_height: 1000, spendable_after: 100,
-        }).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
+        engine
+            .reassign(&ReassignRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+                new_utxo_hash: [0xEE; 32],
+                block_height: 1000,
+                spendable_after: 100,
+            })
+            .unwrap();
 
-        let mut sd = [0u8; 36]; sd[0] = 0xFF;
+        let mut sd = [0u8; 36];
+        sd[0] = 0xFF;
         match engine.spend(&SpendRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0], spending_data: sd,
-            ignore_conflicting: false, ignore_locked: false,
-            current_block_height: 2000, block_height_retention: 288,
+            tx_key: key,
+            offset: 0,
+            utxo_hash: req.utxo_hashes[0],
+            spending_data: sd,
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 2000,
+            block_height_retention: 288,
         }) {
             Err(SpendError::UtxoHashMismatch { .. }) => {}
             other => panic!("expected UtxoHashMismatch, got {other:?}"),
@@ -6952,9 +7380,14 @@ mod tests {
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
-        engine.set_conflicting(&SetConflictingRequest {
-            tx_key: key, value: true, current_block_height: 1000, block_height_retention: 288,
-        }).unwrap();
+        engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
 
         let meta = engine.read_metadata(&key).unwrap();
         assert!(meta.flags.contains(TxFlags::CONFLICTING));
@@ -6969,9 +7402,14 @@ mod tests {
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
-        engine.set_conflicting(&SetConflictingRequest {
-            tx_key: key, value: false, current_block_height: 1000, block_height_retention: 288,
-        }).unwrap();
+        engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
 
         let meta = engine.read_metadata(&key).unwrap();
         assert!(!meta.flags.contains(TxFlags::CONFLICTING));
@@ -6983,15 +7421,26 @@ mod tests {
         let (_, req) = make_create_req(92, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.set_conflicting(&SetConflictingRequest {
-            tx_key: key, value: true, current_block_height: 1000, block_height_retention: 288,
-        }).unwrap();
+        engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
 
-        let mut sd = [0u8; 36]; sd[0] = 0xAA;
+        let mut sd = [0u8; 36];
+        sd[0] = 0xAA;
         match engine.spend(&SpendRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0], spending_data: sd,
-            ignore_conflicting: false, ignore_locked: false,
-            current_block_height: 1000, block_height_retention: 288,
+            tx_key: key,
+            offset: 0,
+            utxo_hash: req.utxo_hashes[0],
+            spending_data: sd,
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
         }) {
             Err(SpendError::Conflicting) => {}
             other => panic!("expected Conflicting, got {other:?}"),
@@ -7006,7 +7455,12 @@ mod tests {
         let (_, req) = make_create_req(100, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.set_locked(&SetLockedRequest { tx_key: key, value: true }).unwrap();
+        engine
+            .set_locked(&SetLockedRequest {
+                tx_key: key,
+                value: true,
+            })
+            .unwrap();
 
         let meta = engine.read_metadata(&key).unwrap();
         assert!(meta.flags.contains(TxFlags::LOCKED));
@@ -7019,14 +7473,24 @@ mod tests {
         let key = req.tx_key();
         engine.create(&req).unwrap();
         // Set conflicting to get a DAH
-        engine.set_conflicting(&SetConflictingRequest {
-            tx_key: key, value: true, current_block_height: 1000, block_height_retention: 288,
-        }).unwrap();
+        engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
         let meta = engine.read_metadata(&key).unwrap();
         assert_ne!({ meta.delete_at_height }, 0);
 
         // Lock clears DAH
-        engine.set_locked(&SetLockedRequest { tx_key: key, value: true }).unwrap();
+        engine
+            .set_locked(&SetLockedRequest {
+                tx_key: key,
+                value: true,
+            })
+            .unwrap();
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.delete_at_height }, 0);
     }
@@ -7038,7 +7502,12 @@ mod tests {
         req.locked = true;
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.set_locked(&SetLockedRequest { tx_key: key, value: false }).unwrap();
+        engine
+            .set_locked(&SetLockedRequest {
+                tx_key: key,
+                value: false,
+            })
+            .unwrap();
 
         let meta = engine.read_metadata(&key).unwrap();
         assert!(!meta.flags.contains(TxFlags::LOCKED));
@@ -7050,13 +7519,24 @@ mod tests {
         let (_, req) = make_create_req(103, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.set_locked(&SetLockedRequest { tx_key: key, value: true }).unwrap();
+        engine
+            .set_locked(&SetLockedRequest {
+                tx_key: key,
+                value: true,
+            })
+            .unwrap();
 
-        let mut sd = [0u8; 36]; sd[0] = 0xAA;
+        let mut sd = [0u8; 36];
+        sd[0] = 0xAA;
         match engine.spend(&SpendRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0], spending_data: sd,
-            ignore_conflicting: false, ignore_locked: false,
-            current_block_height: 1000, block_height_retention: 288,
+            tx_key: key,
+            offset: 0,
+            utxo_hash: req.utxo_hashes[0],
+            spending_data: sd,
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
         }) {
             Err(SpendError::Locked) => {}
             other => panic!("expected Locked, got {other:?}"),
@@ -7072,11 +7552,21 @@ mod tests {
         let key = req.tx_key();
         engine.create(&req).unwrap();
         // Set a DAH first
-        engine.set_conflicting(&SetConflictingRequest {
-            tx_key: key, value: true, current_block_height: 1000, block_height_retention: 288,
-        }).unwrap();
+        engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
 
-        engine.preserve_until(&PreserveUntilRequest { tx_key: key, block_height: 5000 }).unwrap();
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 5000,
+            })
+            .unwrap();
 
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.preserve_until }, 5000);
@@ -7087,25 +7577,49 @@ mod tests {
     fn preserve_until_blocks_dah_on_spend() {
         let engine = create_engine();
         let (_, mut req) = make_create_req(111, 2);
-        let infos = vec![MinedBlockInfo { block_id: 1, block_height: 900, subtree_idx: 0 }];
+        let infos = vec![MinedBlockInfo {
+            block_id: 1,
+            block_height: 900,
+            subtree_idx: 0,
+        }];
         req.mined_block_infos = &infos;
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.preserve_until(&PreserveUntilRequest { tx_key: key, block_height: 5000 }).unwrap();
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 5000,
+            })
+            .unwrap();
 
         // Spend all — DAH should NOT be set because preserve_until is active
-        let mut sd = [0u8; 36]; sd[0] = 0xAA;
-        engine.spend(&SpendRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0], spending_data: sd,
-            ignore_conflicting: false, ignore_locked: false,
-            current_block_height: 1000, block_height_retention: 288,
-        }).unwrap();
+        let mut sd = [0u8; 36];
+        sd[0] = 0xAA;
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
         sd[0] = 0xBB;
-        engine.spend(&SpendRequest {
-            tx_key: key, offset: 1, utxo_hash: req.utxo_hashes[1], spending_data: sd,
-            ignore_conflicting: false, ignore_locked: false,
-            current_block_height: 1000, block_height_retention: 288,
-        }).unwrap();
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 1,
+                utxo_hash: req.utxo_hashes[1],
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
 
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.delete_at_height }, 0);
@@ -7119,7 +7633,12 @@ mod tests {
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
-        let resp = engine.preserve_until(&PreserveUntilRequest { tx_key: key, block_height: 5000 }).unwrap();
+        let resp = engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 5000,
+            })
+            .unwrap();
         assert_eq!(resp.signal, Signal::Preserve);
     }
 
@@ -7153,7 +7672,9 @@ mod tests {
     #[test]
     fn delete_nonexistent() {
         let engine = create_engine();
-        match engine.delete(&DeleteRequest { tx_key: TxKey { txid: [0xFF; 32] } }) {
+        match engine.delete(&DeleteRequest {
+            tx_key: TxKey { txid: [0xFF; 32] },
+        }) {
             Err(SpendError::TxNotFound) => {}
             other => panic!("expected TxNotFound, got {other:?}"),
         }
@@ -7176,6 +7697,21 @@ mod tests {
         assert_eq!(resp2.record_offset, offset1);
     }
 
+    #[test]
+    fn delete_tombstone_prevents_rebuild_resurrection() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(124, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+
+        let rebuilt = PrimaryBackend::rebuild(&*engine.device, &engine.allocator.lock()).unwrap();
+        assert!(
+            rebuilt.lookup(&key).is_none(),
+            "rebuild must ignore freed records whose metadata was tombstoned",
+        );
+    }
+
     // -- GetSpend tests --
 
     #[test]
@@ -7186,9 +7722,13 @@ mod tests {
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
-        let resp = engine.get_spend(&GetSpendRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
-        }).unwrap();
+        let resp = engine
+            .get_spend(&GetSpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
         assert_eq!(resp.status, UTXO_UNSPENT);
         assert!(resp.spending_data.is_none());
         assert_eq!(resp.locktime, 42_000);
@@ -7200,16 +7740,28 @@ mod tests {
         let (_, req) = make_create_req(131, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        let mut sd = [0u8; 36]; sd[0] = 0xAB;
-        engine.spend(&SpendRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0], spending_data: sd,
-            ignore_conflicting: false, ignore_locked: false,
-            current_block_height: 1000, block_height_retention: 288,
-        }).unwrap();
+        let mut sd = [0u8; 36];
+        sd[0] = 0xAB;
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
 
-        let resp = engine.get_spend(&GetSpendRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
-        }).unwrap();
+        let resp = engine
+            .get_spend(&GetSpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
         assert_eq!(resp.status, UTXO_SPENT);
         assert_eq!(resp.spending_data, Some(sd));
     }
@@ -7220,11 +7772,21 @@ mod tests {
         let (_, req) = make_create_req(132, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.freeze(&FreezeRequest { tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0] }).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
 
-        let resp = engine.get_spend(&GetSpendRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
-        }).unwrap();
+        let resp = engine
+            .get_spend(&GetSpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
         assert_eq!(resp.status, UTXO_FROZEN);
         assert_eq!(resp.spending_data, Some([0xFF; 36]));
     }
@@ -7233,7 +7795,9 @@ mod tests {
     fn get_spend_nonexistent_tx() {
         let engine = create_engine();
         match engine.get_spend(&GetSpendRequest {
-            tx_key: TxKey { txid: [0xFF; 32] }, offset: 0, utxo_hash: [0; 32],
+            tx_key: TxKey { txid: [0xFF; 32] },
+            offset: 0,
+            utxo_hash: [0; 32],
         }) {
             Err(SpendError::TxNotFound) => {}
             other => panic!("expected TxNotFound, got {other:?}"),
@@ -7248,7 +7812,9 @@ mod tests {
         engine.create(&req).unwrap();
 
         match engine.get_spend(&GetSpendRequest {
-            tx_key: key, offset: 0, utxo_hash: [0xFF; 32],
+            tx_key: key,
+            offset: 0,
+            utxo_hash: [0xFF; 32],
         }) {
             Err(SpendError::UtxoHashMismatch { .. }) => {}
             other => panic!("expected UtxoHashMismatch, got {other:?}"),
@@ -7263,7 +7829,9 @@ mod tests {
         engine.create(&req).unwrap();
 
         match engine.get_spend(&GetSpendRequest {
-            tx_key: key, offset: 99, utxo_hash: [0; 32],
+            tx_key: key,
+            offset: 99,
+            utxo_hash: [0; 32],
         }) {
             Err(SpendError::UtxoNotFound { offset: 99 }) => {}
             other => panic!("expected UtxoNotFound, got {other:?}"),
@@ -7278,9 +7846,13 @@ mod tests {
         engine.create(&req).unwrap();
 
         let meta_before = engine.read_metadata(&key).unwrap();
-        engine.get_spend(&GetSpendRequest {
-            tx_key: key, offset: 0, utxo_hash: req.utxo_hashes[0],
-        }).unwrap();
+        engine
+            .get_spend(&GetSpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
         let meta_after = engine.read_metadata(&key).unwrap();
 
         assert_eq!({ meta_before.generation }, { meta_after.generation });
@@ -7358,9 +7930,7 @@ mod tests {
         let e1 = engine.clone();
         let hash0 = req.utxo_hashes[0];
 
-        let h1 = std::thread::spawn(move || {
-            e1.delete(&DeleteRequest { tx_key: key })
-        });
+        let h1 = std::thread::spawn(move || e1.delete(&DeleteRequest { tx_key: key }));
 
         let e2 = engine.clone();
         let h2 = std::thread::spawn(move || {
@@ -7718,11 +8288,7 @@ mod tests {
         });
 
         let meta = engine.read_metadata(&key).unwrap();
-        assert_eq!(
-            { meta.spent_utxos },
-            100,
-            "all 100 UTXOs should be spent"
-        );
+        assert_eq!({ meta.spent_utxos }, 100, "all 100 UTXOs should be spent");
 
         // Verify all slots are actually spent
         for i in 0..100u32 {
@@ -7923,21 +8489,33 @@ mod tests {
     #[test]
     fn cached_clock_initialized_on_construction() {
         let h = TestHarness::new(2, TxFlags::empty());
-        let cached = h.engine.cached_millis.load(std::sync::atomic::Ordering::Relaxed);
+        let cached = h
+            .engine
+            .cached_millis
+            .load(std::sync::atomic::Ordering::Relaxed);
         // Should be close to current time (within 2 seconds).
         let now = sys_millis();
         assert!(cached > 0, "cached clock should be initialized");
-        assert!(now.abs_diff(cached) < 2000, "cached clock should be near current time");
+        assert!(
+            now.abs_diff(cached) < 2000,
+            "cached clock should be near current time"
+        );
     }
 
     #[test]
     fn refresh_clock_updates_cached_value() {
         let h = TestHarness::new(2, TxFlags::empty());
-        let before = h.engine.cached_millis.load(std::sync::atomic::Ordering::Relaxed);
+        let before = h
+            .engine
+            .cached_millis
+            .load(std::sync::atomic::Ordering::Relaxed);
         // Sleep briefly so the clock advances.
         std::thread::sleep(std::time::Duration::from_millis(5));
         h.engine.refresh_clock();
-        let after = h.engine.cached_millis.load(std::sync::atomic::Ordering::Relaxed);
+        let after = h
+            .engine
+            .cached_millis
+            .load(std::sync::atomic::Ordering::Relaxed);
         assert!(after >= before, "refresh_clock should advance cached time");
     }
 
@@ -7946,7 +8524,10 @@ mod tests {
         let h = TestHarness::new(5, TxFlags::empty());
         // Refresh the clock so cached value is current.
         h.engine.refresh_clock();
-        let cached = h.engine.cached_millis.load(std::sync::atomic::Ordering::Relaxed);
+        let cached = h
+            .engine
+            .cached_millis
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         // Perform a mutation.
         h.engine.spend(&h.spend_req(0)).unwrap();
@@ -7954,8 +8535,11 @@ mod tests {
 
         // The updated_at should equal the cached clock value exactly
         // (since we refreshed just before and the method reads cached).
-        assert_eq!({ meta.updated_at }, cached,
-            "mutation should use the cached clock value");
+        assert_eq!(
+            { meta.updated_at },
+            cached,
+            "mutation should use the cached clock value"
+        );
     }
 
     // -- H2: atomic shard-count update tests --
@@ -8050,16 +8634,16 @@ mod tests {
                         continue;
                     }
                     let (_, req) = make_create_req(n, 1);
-                    let del = DeleteRequest { tx_key: req.tx_key() };
+                    let del = DeleteRequest {
+                        tx_key: req.tx_key(),
+                    };
                     match engine.delete(&del) {
                         Ok(()) => {}
                         Err(SpendError::TxNotFound) => {
                             // Another thread may not yet have inserted this
                             // slot if tx_ids collided, but our encoding is
                             // unique per (t, i) so this must not happen.
-                            panic!(
-                                "unexpected TxNotFound for distinct key t={t} i={i}"
-                            );
+                            panic!("unexpected TxNotFound for distinct key t={t} i={i}");
                         }
                         Err(e) => panic!("unexpected delete error: {e:?}"),
                     }
@@ -8095,10 +8679,10 @@ mod tests {
         // Seed with a successful create so there's a concrete shard that
         // we can check both before and after the failed call.
         let (_, seed_req) = make_create_req(1, 1);
-        engine.create(&seed_req).expect("seed create should succeed");
-        let seed_shard = crate::cluster::shards::ShardTable::shard_for_key(
-            &seed_req.tx_key(),
-        );
+        engine
+            .create(&seed_req)
+            .expect("seed create should succeed");
+        let seed_shard = crate::cluster::shards::ShardTable::shard_for_key(&seed_req.tx_key());
         let seed_count = engine.shard_record_count(seed_shard);
         assert_eq!(seed_count, 1, "seed record should set shard count to 1");
 
@@ -8109,9 +8693,8 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
         let (_, failing_req) = make_create_req(2, 1);
-        let failing_shard = crate::cluster::shards::ShardTable::shard_for_key(
-            &failing_req.tx_key(),
-        );
+        let failing_shard =
+            crate::cluster::shards::ShardTable::shard_for_key(&failing_req.tx_key());
         let before_failing = engine.shard_record_count(failing_shard);
 
         match engine.create(&failing_req) {

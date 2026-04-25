@@ -4,6 +4,7 @@
 //! operations to the local engine using idempotent mutation methods.
 //! Each incoming batch is acknowledged with a `ReplicaAck` response frame.
 
+use crate::index::TxKey;
 use crate::io;
 use crate::ops::create::*;
 use crate::ops::engine::Engine;
@@ -18,8 +19,8 @@ use crate::replication::durable::ReplicaAppliedTracker;
 use crate::replication::protocol::{ReplicaAck, ReplicaBatch, ReplicaOp};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Default stream key used when a receiver has not been told to
 /// discriminate by peer address. Chosen as a short literal so the
@@ -75,8 +76,8 @@ impl ReplicationReceiver {
         engine: Arc<Engine>,
         path: std::path::PathBuf,
     ) -> std::result::Result<Self, String> {
-        let tracker = ReplicaAppliedTracker::load(path)
-            .map_err(|e| format!("load applied tracker: {e}"))?;
+        let tracker =
+            ReplicaAppliedTracker::load(path).map_err(|e| format!("load applied tracker: {e}"))?;
         // Initial last_applied_sequence is the max across all streams
         // so the public API keeps its monotonic "latest seq" semantics.
         let initial_seq = tracker.snapshot().values().copied().max().unwrap_or(0);
@@ -317,13 +318,18 @@ pub fn handle_replica_batch_with_tracker(
         }
     };
 
+    let effective_stream_key = batch
+        .source_node_id
+        .map(|id| format!("node:{id}"))
+        .unwrap_or_else(|| stream_key.to_string());
+
     // Phase 4: attach the incoming trace context as a remote parent so
     // the receiver's span is stitched into the sender's trace.
     use opentelemetry::trace::TraceContextExt;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
     let recv_span = tracing::debug_span!(
         "handle_replica_batch",
-        stream_key = %stream_key,
+        stream_key = %effective_stream_key,
         first_sequence = batch.first_sequence,
         ops_len = batch.ops.len(),
         is_migration = request.flags & FLAG_MIGRATION_BATCH != 0,
@@ -340,7 +346,7 @@ pub fn handle_replica_batch_with_tracker(
     let _entered = recv_span.enter();
 
     let through = batch.last_sequence();
-    let already_applied = applied.get(stream_key);
+    let already_applied = applied.get(&effective_stream_key);
 
     // Migration batches are coordinated out-of-band by the migration
     // pipeline (see `stream_shard_baseline`) and always start at
@@ -420,7 +426,7 @@ pub fn handle_replica_batch_with_tracker(
         // Persist the new high-water mark BEFORE ACKing. A flush failure
         // becomes a batch-level error so the master treats the replica
         // as not-yet-durable and will retry.
-        applied.set(stream_key, through);
+        applied.set(&effective_stream_key, through);
         if let Err(e) = applied.flush() {
             let ack = ReplicaAck::Error {
                 failed_sequence: through,
@@ -441,13 +447,121 @@ pub fn handle_replica_batch_with_tracker(
     }
 
     let ack = ReplicaAck::Ok {
-        through_sequence: if is_migration { already_applied } else { through },
+        through_sequence: if is_migration {
+            already_applied
+        } else {
+            through
+        },
     };
     ResponseFrame {
         request_id: request.request_id,
         status: STATUS_OK,
         payload: ack.serialize(),
     }
+}
+
+fn existing_create_payload_matches(
+    engine: &Engine,
+    req: &CreateRequest<'_>,
+    compare_metadata: bool,
+) -> bool {
+    let tx_key = req.tx_key();
+    let Ok(meta) = engine.read_metadata(&tx_key) else {
+        return false;
+    };
+
+    if meta.utxo_count != req.utxo_hashes.len() as u32 {
+        return false;
+    }
+
+    if compare_metadata
+        && (meta.tx_version != req.tx_version
+            || meta.locktime != req.locktime
+            || meta.fee != req.fee
+            || meta.size_in_bytes != req.size_in_bytes
+            || meta.extended_size != req.extended_size
+            || meta.spending_height != req.spending_height
+            || meta.created_at != req.created_at
+            || meta.flags.contains(TxFlags::IS_COINBASE) != req.is_coinbase
+            || meta.flags.contains(TxFlags::EXTERNAL) != req.is_external
+            || meta.flags.contains(TxFlags::CONFLICTING) != req.conflicting
+            || meta.flags.contains(TxFlags::LOCKED) != req.locked)
+    {
+        return false;
+    }
+
+    for (offset, expected_hash) in req.utxo_hashes.iter().enumerate() {
+        let Ok(slot) = engine.read_slot(&tx_key, offset as u32) else {
+            return false;
+        };
+        if slot.hash != *expected_hash {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn apply_create_replica(
+    engine: &Engine,
+    tx_key: &TxKey,
+    create_req: &CreateRequest<'_>,
+    metadata_bytes: &[u8],
+    cold_data: &Option<Vec<u8>>,
+) -> std::result::Result<(), String> {
+    match engine.create(create_req) {
+        Ok(_) => {}
+        Err(CreateError::DuplicateTxId)
+            if existing_create_payload_matches(engine, create_req, metadata_bytes.len() >= 46) => {}
+        Err(CreateError::DuplicateTxId) => {
+            match engine.delete(&DeleteRequest { tx_key: *tx_key }) {
+                Ok(()) | Err(crate::ops::error::SpendError::TxNotFound) => {}
+                Err(e) => return Err(format!("replace duplicate create delete: {e}")),
+            }
+            engine
+                .create(create_req)
+                .map_err(|e| format!("replace duplicate create: {e}"))?;
+        }
+        Err(e) => return Err(format!("create: {e}")),
+    }
+
+    apply_create_lifecycle_and_blob(engine, tx_key, metadata_bytes, cold_data)
+}
+
+fn apply_create_lifecycle_and_blob(
+    engine: &Engine,
+    tx_key: &TxKey,
+    metadata_bytes: &[u8],
+    cold_data: &Option<Vec<u8>>,
+) -> std::result::Result<(), String> {
+    // Apply extended lifecycle metadata if present. Layout after the core
+    // 46 bytes: generation(4) + updated_at(8) + unmined_since(4) +
+    // delete_at_height(4) + preserve_until(4) = 24 bytes (total 70).
+    if metadata_bytes.len() >= 70
+        && let Ok(mut meta) = engine.read_metadata(tx_key)
+    {
+        meta.generation = u32::from_le_bytes(metadata_bytes[46..50].try_into().unwrap());
+        meta.updated_at = u64::from_le_bytes(metadata_bytes[50..58].try_into().unwrap());
+        meta.unmined_since = u32::from_le_bytes(metadata_bytes[58..62].try_into().unwrap());
+        meta.delete_at_height = u32::from_le_bytes(metadata_bytes[62..66].try_into().unwrap());
+        meta.preserve_until = u32::from_le_bytes(metadata_bytes[66..70].try_into().unwrap());
+        if let Some(entry) = engine.lookup(tx_key) {
+            let _ = crate::io::write_metadata(engine.device(), entry.record_offset, &meta);
+        }
+    }
+
+    // Store cold data in the blobstore if provided. Blob persistence is part
+    // of the durability contract: failing to store cold data must fail the ACK
+    // so the master knows this replica is not a complete copy.
+    if let Some(data) = cold_data
+        && !data.is_empty()
+        && let Some(bs) = engine.blob_store()
+        && let Err(e) = bs.put(&tx_key.txid, data)
+    {
+        return Err(format!("cold data write failed for {:?}: {e}", tx_key));
+    }
+
+    Ok(())
 }
 
 /// Apply a single `ReplicaOp` to the engine.
@@ -563,7 +677,9 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 Err(e) => Err(format!("set_mined: {e}")),
             }
         }
-        ReplicaOp::UnsetMined { tx_key, block_id, .. } => {
+        ReplicaOp::UnsetMined {
+            tx_key, block_id, ..
+        } => {
             let req = SetMinedRequest {
                 tx_key: *tx_key,
                 block_id: *block_id,
@@ -698,33 +814,52 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             // The metadata_bytes contains: tx_version(4) + locktime(4) + fee(8) +
             // size_in_bytes(8) + extended_size(8) + is_coinbase(1) + spending_height(4) +
             // created_at(8) + flags(1) = 46 bytes.
-            let (tx_version, locktime, fee, size_in_bytes, extended_size,
-                 is_coinbase, spending_height, created_at) =
-                if metadata_bytes.len() >= 46 {
-                    let m = metadata_bytes.as_slice();
-                    (
-                        u32::from_le_bytes(m[0..4].try_into().unwrap()),
-                        u32::from_le_bytes(m[4..8].try_into().unwrap()),
-                        u64::from_le_bytes(m[8..16].try_into().unwrap()),
-                        u64::from_le_bytes(m[16..24].try_into().unwrap()),
-                        u64::from_le_bytes(m[24..32].try_into().unwrap()),
-                        m[32] != 0,
-                        u32::from_le_bytes(m[33..37].try_into().unwrap()),
-                        u64::from_le_bytes(m[37..45].try_into().unwrap()),
-                    )
-                } else {
-                    (1, 0, 0, 0, 0, false, 0,
-                     std::time::SystemTime::now()
+            let (
+                tx_version,
+                locktime,
+                fee,
+                size_in_bytes,
+                extended_size,
+                is_coinbase,
+                spending_height,
+                created_at,
+            ) = if metadata_bytes.len() >= 46 {
+                let m = metadata_bytes.as_slice();
+                (
+                    u32::from_le_bytes(m[0..4].try_into().unwrap()),
+                    u32::from_le_bytes(m[4..8].try_into().unwrap()),
+                    u64::from_le_bytes(m[8..16].try_into().unwrap()),
+                    u64::from_le_bytes(m[16..24].try_into().unwrap()),
+                    u64::from_le_bytes(m[24..32].try_into().unwrap()),
+                    m[32] != 0,
+                    u32::from_le_bytes(m[33..37].try_into().unwrap()),
+                    u64::from_le_bytes(m[37..45].try_into().unwrap()),
+                )
+            } else {
+                (
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    0,
+                    std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
-                        .as_millis() as u64)
-                };
+                        .as_millis() as u64,
+                )
+            };
 
             // Extract frozen/conflicting/locked from the wire flags byte
             // at offset 45 (locked=0x01, conflicting=0x02, frozen=0x04).
             let (frozen, conflicting, locked) = if metadata_bytes.len() >= 46 {
                 let wire_flags = metadata_bytes[45];
-                (wire_flags & 0x04 != 0, wire_flags & 0x02 != 0, wire_flags & 0x01 != 0)
+                (
+                    wire_flags & 0x04 != 0,
+                    wire_flags & 0x02 != 0,
+                    wire_flags & 0x01 != 0,
+                )
             } else {
                 (false, false, false)
             };
@@ -741,7 +876,9 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 let block_count = m[74] as usize;
                 let mut pos = 75;
                 for _ in 0..block_count {
-                    if pos + 12 > m.len() { break; }
+                    if pos + 12 > m.len() {
+                        break;
+                    }
                     mined_block_infos.push(crate::ops::create::MinedBlockInfo {
                         block_id: u32::from_le_bytes(m[pos..pos + 4].try_into().unwrap()),
                         block_height: u32::from_le_bytes(m[pos + 4..pos + 8].try_into().unwrap()),
@@ -750,10 +887,13 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                     pos += 12;
                 }
                 if pos + 2 <= m.len() {
-                    let ptx_count = u16::from_le_bytes(m[pos..pos + 2].try_into().unwrap()) as usize;
+                    let ptx_count =
+                        u16::from_le_bytes(m[pos..pos + 2].try_into().unwrap()) as usize;
                     pos += 2;
                     for _ in 0..ptx_count {
-                        if pos + 32 > m.len() { break; }
+                        if pos + 32 > m.len() {
+                            break;
+                        }
                         let mut ptx = [0u8; 32];
                         ptx.copy_from_slice(&m[pos..pos + 32]);
                         parent_txids.push(ptx);
@@ -784,45 +924,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 locked,
                 parent_txids: &parent_txids,
             };
-            match engine.create(&create_req) {
-                Ok(_) | Err(CreateError::DuplicateTxId) => {
-                    // Apply extended lifecycle metadata if present.
-                    // Layout after the core 46 bytes: generation(4) +
-                    // updated_at(8) + unmined_since(4) + delete_at_height(4) +
-                    // preserve_until(4) = 24 bytes (total 70).
-                    if metadata_bytes.len() >= 70
-                        && let Ok(mut meta) = engine.read_metadata(tx_key)
-                    {
-                        let m = metadata_bytes.as_slice();
-                        meta.generation = u32::from_le_bytes(m[46..50].try_into().unwrap());
-                        meta.updated_at = u64::from_le_bytes(m[50..58].try_into().unwrap());
-                        meta.unmined_since = u32::from_le_bytes(m[58..62].try_into().unwrap());
-                        meta.delete_at_height = u32::from_le_bytes(m[62..66].try_into().unwrap());
-                        meta.preserve_until = u32::from_le_bytes(m[66..70].try_into().unwrap());
-                        if let Some(entry) = engine.lookup(tx_key) {
-                            let _ = crate::io::write_metadata(
-                                engine.device(),
-                                entry.record_offset,
-                                &meta,
-                            );
-                        }
-                    }
-
-                    // Store cold data in the blobstore if provided.
-                    // Blob persistence is part of the durability contract:
-                    // failing to store cold data must fail the ACK so the
-                    // master knows this replica is not a complete copy.
-                    if let Some(data) = cold_data
-                        && !data.is_empty()
-                        && let Some(bs) = engine.blob_store()
-                        && let Err(e) = bs.put(&tx_key.txid, data)
-                    {
-                        return Err(format!("cold data write failed for {:?}: {e}", tx_key));
-                    }
-                    Ok(())
-                }
-                Err(e) => Err(format!("create: {e}")),
-            }
+            apply_create_replica(engine, tx_key, &create_req, metadata_bytes, cold_data)
         }
         ReplicaOp::Delete { tx_key } => {
             let req = DeleteRequest { tx_key: *tx_key };
@@ -1014,6 +1116,30 @@ mod tests {
         };
         apply_op(&engine, &op).unwrap();
         apply_op(&engine, &op).unwrap(); // duplicate — should be ok
+    }
+
+    #[test]
+    fn apply_create_replaces_divergent_duplicate() {
+        let engine = make_engine();
+        let k = key(12);
+        create_record(&engine, k, 2);
+
+        let hashes = vec![[0xCC; 32]; 5];
+        let op = ReplicaOp::Create {
+            tx_key: k,
+            metadata_bytes: vec![],
+            utxo_hashes: hashes,
+            cold_data: None,
+            is_external: false,
+        };
+        apply_op(&engine, &op).unwrap();
+
+        let meta = engine.read_metadata(&k).unwrap();
+        // `meta.utxo_count` is a packed-struct field — force a copy first
+        // to avoid creating an unaligned reference inside `assert_eq!`.
+        assert_eq!({ meta.utxo_count }, 5);
+        let slot = engine.read_slot(&k, 4).unwrap();
+        assert_eq!(slot.hash, [0xCC; 32]);
     }
 
     #[test]
@@ -1218,26 +1344,26 @@ mod tests {
         wire_flags: u8,
         generation: u32,
         block_height: u32,
-        block_infos: &[(u32, u32, u32)],   // (block_id, block_height, subtree_idx)
+        block_infos: &[(u32, u32, u32)], // (block_id, block_height, subtree_idx)
         parent_txids: &[[u8; 32]],
     ) -> Vec<u8> {
         let mut buf = Vec::with_capacity(128);
         // Core 46 bytes
         buf.extend_from_slice(&tx_version.to_le_bytes()); // tx_version
-        buf.extend_from_slice(&0u32.to_le_bytes());       // locktime
-        buf.extend_from_slice(&0u64.to_le_bytes());       // fee
-        buf.extend_from_slice(&0u64.to_le_bytes());       // size_in_bytes
-        buf.extend_from_slice(&0u64.to_le_bytes());       // extended_size
-        buf.push(if is_coinbase { 1 } else { 0 });        // is_coinbase
-        buf.extend_from_slice(&0u32.to_le_bytes());       // spending_height
-        buf.extend_from_slice(&0u64.to_le_bytes());       // created_at
-        buf.push(wire_flags);                              // flags
+        buf.extend_from_slice(&0u32.to_le_bytes()); // locktime
+        buf.extend_from_slice(&0u64.to_le_bytes()); // fee
+        buf.extend_from_slice(&0u64.to_le_bytes()); // size_in_bytes
+        buf.extend_from_slice(&0u64.to_le_bytes()); // extended_size
+        buf.push(if is_coinbase { 1 } else { 0 }); // is_coinbase
+        buf.extend_from_slice(&0u32.to_le_bytes()); // spending_height
+        buf.extend_from_slice(&0u64.to_le_bytes()); // created_at
+        buf.push(wire_flags); // flags
         // Lifecycle 24 bytes
-        buf.extend_from_slice(&generation.to_le_bytes());  // generation
-        buf.extend_from_slice(&0u64.to_le_bytes());        // updated_at
-        buf.extend_from_slice(&0u32.to_le_bytes());        // unmined_since
-        buf.extend_from_slice(&0u32.to_le_bytes());        // delete_at_height
-        buf.extend_from_slice(&0u32.to_le_bytes());        // preserve_until
+        buf.extend_from_slice(&generation.to_le_bytes()); // generation
+        buf.extend_from_slice(&0u64.to_le_bytes()); // updated_at
+        buf.extend_from_slice(&0u32.to_le_bytes()); // unmined_since
+        buf.extend_from_slice(&0u32.to_le_bytes()); // delete_at_height
+        buf.extend_from_slice(&0u32.to_le_bytes()); // preserve_until
         // Extended: block_height + block_infos + parent_txids
         buf.extend_from_slice(&block_height.to_le_bytes());
         buf.push(block_infos.len() as u8);
@@ -1262,13 +1388,13 @@ mod tests {
         // Build metadata with mined_block_info, frozen flag, and parent_txids.
         let parent = [0xBBu8; 32];
         let meta_bytes = build_full_metadata(
-            2,           // tx_version
-            false,       // is_coinbase
-            0x04,        // frozen=0x04
-            5,           // generation
-            1000,        // block_height
-            &[(42, 1000, 7)],  // one block entry
-            &[parent],         // one parent_txid
+            2,                // tx_version
+            false,            // is_coinbase
+            0x04,             // frozen=0x04
+            5,                // generation
+            1000,             // block_height
+            &[(42, 1000, 7)], // one block entry
+            &[parent],        // one parent_txid
         );
 
         let op = ReplicaOp::Create {
@@ -1337,9 +1463,7 @@ mod tests {
         let k = key(112);
         let hashes = vec![[0xDD; 32]; 1];
 
-        let mut meta_bytes = build_full_metadata(
-            1, false, 0, 10, 0, &[], &[],
-        );
+        let mut meta_bytes = build_full_metadata(1, false, 0, 10, 0, &[], &[]);
         // Patch lifecycle fields: set delete_at_height=500 and preserve_until=700
         // Offsets: generation(46-49), updated_at(50-57), unmined_since(58-61),
         //          delete_at_height(62-65), preserve_until(66-69)
@@ -1396,20 +1520,20 @@ mod tests {
                 },
             ],
             trace_ctx: None,
+            source_node_id: None,
         };
 
         // Batch B: sequence range 5..6 (lower)
         let batch_b = ReplicaBatch {
             first_sequence: 5,
-            ops: vec![
-                ReplicaOp::Spend {
-                    tx_key: key(201),
-                    offset: 0,
-                    spending_data: [0xCC; 36],
-                    master_generation: 1,
-                },
-            ],
+            ops: vec![ReplicaOp::Spend {
+                tx_key: key(201),
+                offset: 0,
+                spending_data: [0xCC; 36],
+                master_generation: 1,
+            }],
             trace_ctx: None,
+            source_node_id: None,
         };
 
         // Simulate: batch A completes first, then batch B completes.
@@ -1461,6 +1585,7 @@ mod tests {
                 master_generation: 1,
             }],
             trace_ctx: None,
+            source_node_id: None,
         };
         let req_1 = RequestFrame {
             op_code: OP_REPLICA_BATCH,
@@ -1481,6 +1606,7 @@ mod tests {
                 master_generation: 1,
             }],
             trace_ctx: None,
+            source_node_id: None,
         };
         let req_2 = RequestFrame {
             op_code: OP_REPLICA_BATCH,
@@ -1517,6 +1643,7 @@ mod tests {
             first_sequence,
             ops,
             trace_ctx: None,
+            source_node_id: None,
         }
     }
 
@@ -1555,7 +1682,12 @@ mod tests {
         );
         assert_eq!(resp_1.status, STATUS_OK);
         let ack_1 = ReplicaAck::deserialize(&resp_1.payload).unwrap();
-        assert_eq!(ack_1, ReplicaAck::Ok { through_sequence: 12 });
+        assert_eq!(
+            ack_1,
+            ReplicaAck::Ok {
+                through_sequence: 12
+            }
+        );
 
         // Slot 0 is now SPENT.
         let slot0_after_first = engine.read_slot(&key(42), 0).unwrap();
@@ -1586,7 +1718,12 @@ mod tests {
         assert_eq!(resp_2.status, STATUS_OK);
         let ack_2 = ReplicaAck::deserialize(&resp_2.payload).unwrap();
         // Skipped batches still ACK with the existing high-water mark.
-        assert_eq!(ack_2, ReplicaAck::Ok { through_sequence: 12 });
+        assert_eq!(
+            ack_2,
+            ReplicaAck::Ok {
+                through_sequence: 12
+            }
+        );
 
         // Generation must NOT have moved on the resend — proof the
         // engine was not touched a second time.
@@ -1649,12 +1786,72 @@ mod tests {
             stream_key,
         );
         let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
-        assert_eq!(ack, ReplicaAck::Ok { through_sequence: 101 });
+        assert_eq!(
+            ack,
+            ReplicaAck::Ok {
+                through_sequence: 101
+            }
+        );
 
         // Engine generation unchanged across the restart — proof the
         // resend did not touch the engine.
         let gen_after_resend = { engine.read_metadata(&key(43)).unwrap().generation };
         assert_eq!(gen_before_resend, gen_after_resend);
+    }
+
+    #[test]
+    fn replica_source_node_id_dedupes_across_fallback_stream_keys_after_restart() {
+        let engine = make_engine();
+        create_record(&engine, key(46), 2);
+
+        let dir = tempfile::tempdir().unwrap();
+        let tracker_path = dir.path().join("applied.dat");
+        let last_applied = Arc::new(AtomicU64::new(0));
+
+        {
+            let tracker = ReplicaAppliedTracker::load(tracker_path.clone()).unwrap();
+            let mut batch = make_spend_batch(500, key(46), 0..2, 1);
+            batch.source_node_id = Some(7);
+            let resp = handle_replica_batch_with_tracker(
+                &batch_request(&batch, 1),
+                &engine,
+                &last_applied,
+                &tracker,
+                "127.0.0.1:41000",
+            );
+            assert_eq!(resp.status, STATUS_OK);
+            assert_eq!(tracker.get("node:7"), 501);
+            assert_eq!(tracker.get("127.0.0.1:41000"), 0);
+        }
+
+        let tracker = ReplicaAppliedTracker::load(tracker_path).unwrap();
+        assert_eq!(tracker.get("node:7"), 501);
+        let gen_before_resend = { engine.read_metadata(&key(46)).unwrap().generation };
+
+        let mut batch = make_spend_batch(500, key(46), 0..2, 1);
+        batch.source_node_id = Some(7);
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 2),
+            &engine,
+            &Arc::new(AtomicU64::new(0)),
+            &tracker,
+            "127.0.0.1:42000",
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
+        assert_eq!(
+            ack,
+            ReplicaAck::Ok {
+                through_sequence: 501
+            }
+        );
+        let gen_after_resend = { engine.read_metadata(&key(46)).unwrap().generation };
+        assert_eq!(
+            gen_after_resend, gen_before_resend,
+            "same source_node_id must skip duplicate resend even if TCP peer key changes",
+        );
+        assert_eq!(tracker.get("node:7"), 501);
+        assert_eq!(tracker.get("127.0.0.1:42000"), 0);
     }
 
     /// `replica_applies_new_seqs_after_restart`: after reloading the
@@ -1702,7 +1899,12 @@ mod tests {
             stream_key,
         );
         let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
-        assert_eq!(ack, ReplicaAck::Ok { through_sequence: 203 });
+        assert_eq!(
+            ack,
+            ReplicaAck::Ok {
+                through_sequence: 203
+            }
+        );
 
         // The new ops actually applied.
         assert_eq!(engine.read_slot(&key(44), 2).unwrap().status, UTXO_SPENT);
@@ -1751,7 +1953,12 @@ mod tests {
             stream_key,
         );
         let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
-        assert_eq!(ack, ReplicaAck::Ok { through_sequence: 304 });
+        assert_eq!(
+            ack,
+            ReplicaAck::Ok {
+                through_sequence: 304
+            }
+        );
 
         // Slots 3 and 4 are now spent.
         assert_eq!(engine.read_slot(&key(45), 3).unwrap().status, UTXO_SPENT);
@@ -1891,8 +2098,8 @@ mod tests {
 
         let wire_ctx = WireTraceContext {
             trace_id: [
-                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
-                0xEE, 0xFF, 0x01,
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+                0xFF, 0x01,
             ],
             span_id: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11],
         };
@@ -1905,6 +2112,7 @@ mod tests {
                 master_generation: 1,
             }],
             trace_ctx: Some(wire_ctx),
+            source_node_id: None,
         };
         let req = RequestFrame {
             op_code: OP_REPLICA_BATCH,

@@ -19,9 +19,7 @@ impl StripedLocks {
     /// Create a lock table with `stripe_count` stripes (rounded up to power of 2).
     pub fn new(stripe_count: usize) -> Self {
         let count = stripe_count.next_power_of_two().max(16);
-        let locks = (0..count)
-            .map(|_| parking_lot::Mutex::new(()))
-            .collect();
+        let locks = (0..count).map(|_| parking_lot::Mutex::new(())).collect();
         Self {
             locks,
             mask: count - 1,
@@ -110,7 +108,11 @@ mod tests {
             seen.insert(locks.stripe_index(&key));
         }
         // With 1000 distinct keys, should hit many different stripes
-        assert!(seen.len() > 500, "poor stripe distribution: only {} distinct", seen.len());
+        assert!(
+            seen.len() > 500,
+            "poor stripe distribution: only {} distinct",
+            seen.len()
+        );
     }
 
     #[test]

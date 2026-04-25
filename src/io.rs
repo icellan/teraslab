@@ -12,7 +12,9 @@
 //!   the device does not expose direct memory access.
 
 use crate::device::{AlignedBuf, BlockDevice, DeviceError};
-use crate::record::{BlockEntry, TxMetadata, UtxoSlot, BLOCK_ENTRY_SIZE, CRC32_OFFSET, METADATA_SIZE, UTXO_SLOT_SIZE};
+use crate::record::{
+    BLOCK_ENTRY_SIZE, BlockEntry, CRC32_OFFSET, METADATA_SIZE, TxMetadata, UTXO_SLOT_SIZE, UtxoSlot,
+};
 
 /// Result type for I/O helper operations.
 pub type Result<T> = std::result::Result<T, DeviceError>;
@@ -45,10 +47,13 @@ const _: () = assert!(std::mem::offset_of!(TxMetadata, flags) == META_OFF_FLAGS)
 const _: () = assert!(std::mem::offset_of!(TxMetadata, spent_utxos) == META_OFF_SPENT_UTXOS);
 const _: () = assert!(std::mem::offset_of!(TxMetadata, generation) == META_OFF_GENERATION);
 const _: () = assert!(std::mem::offset_of!(TxMetadata, updated_at) == META_OFF_UPDATED_AT);
-const _: () = assert!(std::mem::offset_of!(TxMetadata, block_entry_count) == META_OFF_BLOCK_ENTRY_COUNT);
-const _: () = assert!(std::mem::offset_of!(TxMetadata, block_entries_inline) == META_OFF_BLOCK_ENTRIES);
+const _: () =
+    assert!(std::mem::offset_of!(TxMetadata, block_entry_count) == META_OFF_BLOCK_ENTRY_COUNT);
+const _: () =
+    assert!(std::mem::offset_of!(TxMetadata, block_entries_inline) == META_OFF_BLOCK_ENTRIES);
 const _: () = assert!(std::mem::offset_of!(TxMetadata, unmined_since) == META_OFF_UNMINED_SINCE);
-const _: () = assert!(std::mem::offset_of!(TxMetadata, delete_at_height) == META_OFF_DELETE_AT_HEIGHT);
+const _: () =
+    assert!(std::mem::offset_of!(TxMetadata, delete_at_height) == META_OFF_DELETE_AT_HEIGHT);
 const _: () = assert!(std::mem::offset_of!(TxMetadata, preserve_until) == META_OFF_PRESERVE_UNTIL);
 
 // ===========================================================================
@@ -105,11 +110,7 @@ pub unsafe fn write_mutation_footer_direct(
 ///
 /// Same as [`write_mutation_footer_direct`].
 #[inline]
-pub unsafe fn write_spend_footer_direct(
-    base_ptr: *mut u8,
-    record_offset: u64,
-    meta: &TxMetadata,
-) {
+pub unsafe fn write_spend_footer_direct(base_ptr: *mut u8, record_offset: u64, meta: &TxMetadata) {
     unsafe {
         write_mutation_footer_direct(base_ptr, record_offset, meta);
         let p = base_ptr.add(record_offset as usize);
@@ -127,11 +128,7 @@ pub unsafe fn write_spend_footer_direct(
 ///
 /// Same as [`write_mutation_footer_direct`].
 #[inline]
-pub unsafe fn write_mined_footer_direct(
-    base_ptr: *mut u8,
-    record_offset: u64,
-    meta: &TxMetadata,
-) {
+pub unsafe fn write_mined_footer_direct(base_ptr: *mut u8, record_offset: u64, meta: &TxMetadata) {
     unsafe {
         write_mutation_footer_direct(base_ptr, record_offset, meta);
         let p = base_ptr.add(record_offset as usize);
@@ -187,11 +184,7 @@ pub unsafe fn write_crc_direct(base_ptr: *mut u8, record_offset: u64, meta: &TxM
     unsafe {
         let p = base_ptr.add(record_offset as usize);
         let crc = meta.compute_crc();
-        std::ptr::copy_nonoverlapping(
-            crc.to_le_bytes().as_ptr(),
-            p.add(CRC32_OFFSET),
-            4,
-        );
+        std::ptr::copy_nonoverlapping(crc.to_le_bytes().as_ptr(), p.add(CRC32_OFFSET), 4);
     }
 }
 
@@ -291,10 +284,7 @@ pub unsafe fn write_utxo_slot_direct(
 ///
 /// Reads the first `METADATA_SIZE` bytes from the device at the given
 /// record offset. The read is rounded up to the device alignment.
-pub fn read_metadata(
-    device: &dyn BlockDevice,
-    record_offset: u64,
-) -> Result<TxMetadata> {
+pub fn read_metadata(device: &dyn BlockDevice, record_offset: u64) -> Result<TxMetadata> {
     let align = device.alignment();
     let read_size = align_up(METADATA_SIZE, align);
     let mut buf = AlignedBuf::new(read_size, align);
@@ -307,8 +297,7 @@ pub fn read_metadata(
     let mut read_buf = AlignedBuf::new(total_read, align);
     device.pread(&mut read_buf, aligned_base)?;
 
-    buf[..METADATA_SIZE]
-        .copy_from_slice(&read_buf[intra_offset..intra_offset + METADATA_SIZE]);
+    buf[..METADATA_SIZE].copy_from_slice(&read_buf[intra_offset..intra_offset + METADATA_SIZE]);
 
     Ok(TxMetadata::from_bytes(&buf[..METADATA_SIZE])?)
 }
@@ -336,8 +325,7 @@ pub fn write_metadata(
 
     let mut meta_bytes = [0u8; METADATA_SIZE];
     metadata.to_bytes(&mut meta_bytes);
-    buf[intra_offset..intra_offset + METADATA_SIZE]
-        .copy_from_slice(&meta_bytes);
+    buf[intra_offset..intra_offset + METADATA_SIZE].copy_from_slice(&meta_bytes);
 
     device.pwrite(&buf, aligned_base)?;
     Ok(())
@@ -352,8 +340,7 @@ pub fn read_utxo_slot(
     slot_index: u32,
 ) -> Result<UtxoSlot> {
     let align = device.alignment();
-    let slot_offset =
-        record_offset + TxMetadata::utxo_slot_offset(slot_index);
+    let slot_offset = record_offset + TxMetadata::utxo_slot_offset(slot_index);
     let aligned_base = slot_offset / align as u64 * align as u64;
     let intra_offset = (slot_offset - aligned_base) as usize;
     let total_read = align_up(intra_offset + UTXO_SLOT_SIZE, align);
@@ -377,8 +364,7 @@ pub fn write_utxo_slot(
     slot: &UtxoSlot,
 ) -> Result<()> {
     let align = device.alignment();
-    let slot_offset =
-        record_offset + TxMetadata::utxo_slot_offset(slot_index);
+    let slot_offset = record_offset + TxMetadata::utxo_slot_offset(slot_index);
     let aligned_base = slot_offset / align as u64 * align as u64;
     let intra_offset = (slot_offset - aligned_base) as usize;
     let total_size = align_up(intra_offset + UTXO_SLOT_SIZE, align);
@@ -389,8 +375,7 @@ pub fn write_utxo_slot(
 
     let mut slot_bytes = [0u8; UTXO_SLOT_SIZE];
     slot.to_bytes(&mut slot_bytes);
-    buf[intra_offset..intra_offset + UTXO_SLOT_SIZE]
-        .copy_from_slice(&slot_bytes);
+    buf[intra_offset..intra_offset + UTXO_SLOT_SIZE].copy_from_slice(&slot_bytes);
 
     device.pwrite(&buf, aligned_base)?;
     Ok(())
@@ -513,10 +498,7 @@ mod tests {
 
         for (i, expected) in slots.iter().enumerate() {
             let actual = read_utxo_slot(&*dev, 0, i as u32).unwrap();
-            assert_eq!(
-                actual, *expected,
-                "slot {i} mismatch"
-            );
+            assert_eq!(actual, *expected, "slot {i} mismatch");
         }
     }
 
@@ -529,9 +511,13 @@ mod tests {
         let mut sd = [0u8; 36];
         sd[..32].copy_from_slice(&[0xDE; 32]);
         sd[32..36].copy_from_slice(&1u32.to_le_bytes());
-        let new_slot = UtxoSlot::new_spent([0x05, 0x00, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0], sd);
+        let new_slot = UtxoSlot::new_spent(
+            [
+                0x05, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0,
+            ],
+            sd,
+        );
 
         write_utxo_slot(&*dev, 0, 5, &new_slot).unwrap();
 
@@ -631,7 +617,7 @@ mod tests {
 
     #[test]
     fn full_lifecycle() {
-        use crate::allocator::{SlotAllocator, DATA_REGION_OFFSET};
+        use crate::allocator::{DATA_REGION_OFFSET, SlotAllocator};
 
         // 1. Create allocator on MemoryDevice (64 MB to fit 1000-slot records)
         let dev: Arc<dyn BlockDevice> =
@@ -715,8 +701,7 @@ mod tests {
                 UtxoSlot::new_unspent(h)
             })
             .collect();
-        write_full_record(&*dev, new_offset, &new_meta, &new_slots)
-            .unwrap();
+        write_full_record(&*dev, new_offset, &new_meta, &new_slots).unwrap();
 
         let check_meta = read_metadata(&*dev, new_offset).unwrap();
         assert_eq!({ check_meta.utxo_count }, 50);

@@ -261,7 +261,10 @@ mod tests {
         });
         // Restore state BEFORE any early-return path can leak the arm.
         let cleared = disarm();
-        assert!(matches!(cleared, FaultMode::PanicAt(SyncPoint::BeforeRedoFsync)));
+        assert!(matches!(
+            cleared,
+            FaultMode::PanicAt(SyncPoint::BeforeRedoFsync)
+        ));
         let err = result.expect_err("expected panic at BeforeRedoFsync");
         let msg = panic_message(&err);
         assert!(
@@ -278,7 +281,10 @@ mod tests {
         check(SyncPoint::AfterRedoFsync);
         check(SyncPoint::BeforeDataPwrite);
         let cleared = disarm();
-        assert!(matches!(cleared, FaultMode::PanicAt(SyncPoint::BeforeRedoFsync)));
+        assert!(matches!(
+            cleared,
+            FaultMode::PanicAt(SyncPoint::BeforeRedoFsync)
+        ));
     }
 
     #[test]

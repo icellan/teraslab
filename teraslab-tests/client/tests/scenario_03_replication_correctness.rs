@@ -3,8 +3,8 @@ mod common;
 
 use std::time::Duration;
 use teraslab_test_client::ClientError;
-use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::types::*;
+use teraslab_test_client::verifier::StateVerifier;
 
 macro_rules! tlog {
     ($t0:expr, $($arg:tt)*) => {
@@ -19,7 +19,10 @@ const SID: u16 = 3;
 
 /// Format a txid as a short hex prefix for assertion messages.
 fn txid_hex(txid: &[u8; 32]) -> String {
-    txid.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
+    txid.iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 
 // Use batch helpers from common
@@ -27,8 +30,7 @@ use common::{batch_verify_replication, direct_get, find_holders};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_03_replication_correctness() {
-    let result =
-        tokio::time::timeout(Duration::from_secs(300), run_scenario()).await;
+    let result = tokio::time::timeout(Duration::from_secs(300), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -98,8 +100,7 @@ async fn run_scenario() -> Result<(), ClientError> {
         let spend_count = 500;
         let mut spent_txids = Vec::with_capacity(spend_count);
 
-        for i in 0..spend_count {
-            let txid = txids[i];
+        for &txid in &txids[..spend_count] {
             let rec = verifier
                 .get_record(&txid)
                 .expect("Test 3.2: seeded record should exist in verifier");
@@ -131,7 +132,8 @@ async fn run_scenario() -> Result<(), ClientError> {
                 Err(ClientError::Partial(pe)) => {
                     panic!(
                         "Test 3.2: spend on txid {} partial: {} errors",
-                        txid_hex(&txid), pe.errors.len(),
+                        txid_hex(&txid),
+                        pe.errors.len(),
                     );
                 }
                 Err(e) => {
@@ -219,14 +221,17 @@ async fn run_scenario() -> Result<(), ClientError> {
         // Freeze vout=0 on 50 records
         for i in 0..50 {
             let txid = txids[freeze_start + i];
-            let rec = verifier.get_record(&txid)
+            let rec = verifier
+                .get_record(&txid)
                 .expect("Test 3.4: record should exist in verifier");
             let freeze_item = FreezeItem {
                 txid,
                 vout: 0,
                 utxo_hash: rec.utxo_hashes[0],
             };
-            client.freeze_batch(&[freeze_item]).await
+            client
+                .freeze_batch(&[freeze_item])
+                .await
                 .unwrap_or_else(|e| panic!("Test 3.4: freeze failed on index {i}: {e}"));
             verifier.record_freeze(txid, 0);
             affected_txids.push(txid);
@@ -235,14 +240,17 @@ async fn run_scenario() -> Result<(), ClientError> {
         // Unfreeze vout=0 on the first 20 of those frozen records
         for i in 0..20 {
             let txid = txids[freeze_start + i];
-            let rec = verifier.get_record(&txid)
+            let rec = verifier
+                .get_record(&txid)
                 .expect("Test 3.4: record should exist in verifier");
             let freeze_item = FreezeItem {
                 txid,
                 vout: 0,
                 utxo_hash: rec.utxo_hashes[0],
             };
-            client.unfreeze_batch(&[freeze_item]).await
+            client
+                .unfreeze_batch(&[freeze_item])
+                .await
                 .unwrap_or_else(|e| panic!("Test 3.4: unfreeze failed on index {i}: {e}"));
             verifier.record_unfreeze(txid, 0);
         }
@@ -250,7 +258,8 @@ async fn run_scenario() -> Result<(), ClientError> {
         // Reassign vout=0 on 10 still-frozen records (indices 20-29)
         for i in 20..30 {
             let txid = txids[freeze_start + i];
-            let rec = verifier.get_record(&txid)
+            let rec = verifier
+                .get_record(&txid)
                 .expect("Test 3.4: record should exist in verifier");
             let mut new_hash = [0u8; 32];
             new_hash[0] = 0xDE;
@@ -266,7 +275,9 @@ async fn run_scenario() -> Result<(), ClientError> {
                 utxo_hash: rec.utxo_hashes[0],
                 new_utxo_hash: new_hash,
             };
-            client.reassign_batch(&reassign_params, &[reassign_item]).await
+            client
+                .reassign_batch(&reassign_params, &[reassign_item])
+                .await
                 .unwrap_or_else(|e| panic!("Test 3.4: reassign failed on index {i}: {e}"));
             verifier.record_reassign(txid, 0, new_hash);
             verifier.record_unfreeze(txid, 0);
@@ -358,11 +369,14 @@ async fn run_scenario() -> Result<(), ClientError> {
     {
         // Pick a record that hasn't been spent yet
         let idempotent_txid = txids[1500];
-        let rec = verifier.get_record(&idempotent_txid)
+        let rec = verifier
+            .get_record(&idempotent_txid)
             .expect("Test 3.7: record should exist");
 
         // Read initial counter
-        let pre_results = client.get_batch(FIELD_ALL_METADATA, &[idempotent_txid]).await?;
+        let pre_results = client
+            .get_batch(FIELD_ALL_METADATA, &[idempotent_txid])
+            .await?;
         let (pre_meta, _) = TxMetadata::decode(FIELD_ALL_METADATA, &pre_results.item(0).data)?;
         let pre_spent = pre_meta.spent_utxos;
 
@@ -380,7 +394,9 @@ async fn run_scenario() -> Result<(), ClientError> {
         };
 
         // First spend -- should succeed
-        client.spend_batch(&spend_params, &[spend_item.clone()]).await
+        client
+            .spend_batch(&spend_params, std::slice::from_ref(&spend_item))
+            .await
             .unwrap_or_else(|e| panic!("Test 3.7: first spend failed: {e}"));
         verifier.record_spend(idempotent_txid, 0);
 
@@ -389,7 +405,9 @@ async fn run_scenario() -> Result<(), ClientError> {
         match &second_result {
             Err(ClientError::Partial(pe)) => {
                 assert!(
-                    pe.errors.iter().any(|e| e.code == teraslab::protocol::opcodes::ERR_ALREADY_SPENT),
+                    pe.errors
+                        .iter()
+                        .any(|e| e.code == teraslab::protocol::opcodes::ERR_ALREADY_SPENT),
                     "Test 3.7: second spend should return ERR_ALREADY_SPENT"
                 );
             }
@@ -423,9 +441,11 @@ async fn run_scenario() -> Result<(), ClientError> {
                 if payload.len() >= 9 + data_len && data_len >= ALL_METADATA_SIZE {
                     let (meta, _) = TxMetadata::decode(FIELD_ALL, &payload[9..9 + data_len])?;
                     assert_eq!(
-                        meta.spent_utxos, pre_spent + 1,
+                        meta.spent_utxos,
+                        pre_spent + 1,
                         "Test 3.7: node {h} counter should be {} (incremented once), got {}",
-                        pre_spent + 1, meta.spent_utxos,
+                        pre_spent + 1,
+                        meta.spent_utxos,
                     );
                 }
             }
@@ -454,7 +474,10 @@ async fn run_scenario() -> Result<(), ClientError> {
             for mm in mismatches.iter().take(10) {
                 eprintln!(
                     "Test 3.8 MISMATCH: txid {} field={} expected={} actual={}",
-                    txid_hex(&mm.txid), mm.field, mm.expected, mm.actual,
+                    txid_hex(&mm.txid),
+                    mm.field,
+                    mm.expected,
+                    mm.actual,
                 );
             }
         }

@@ -158,6 +158,12 @@ pub const FLAG_LOCAL_READ: u16 = 0x0001;
 /// actively receiving inbound migration data.
 pub const FLAG_MIGRATION_BATCH: u16 = 0x0002;
 
+/// Request flag on `OP_MIGRATION_COMPLETE`: verify the shard manifest but
+/// leave inbound migration state pending. Sources use this before a batched
+/// `OP_MIGRATION_BATCH_COMPLETE` so data-bearing migrations still get exact
+/// verification without forcing one durable inbound-state write per shard.
+pub const FLAG_MIGRATION_VERIFY_ONLY: u16 = 0x0004;
+
 /// Maximum frame payload size (512 MiB).
 ///
 /// BSV mainnet already has transactions exceeding 300 MB. The wire format

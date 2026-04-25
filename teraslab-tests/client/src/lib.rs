@@ -6,15 +6,15 @@
 
 // Test-specific modules
 pub mod helpers;
-pub mod verifier;
 pub mod reporter;
+pub mod verifier;
 pub mod workload;
 
 // Re-export the production client for convenient use in tests
 pub use teraslab_client as client;
-pub use teraslab_client::{Client, ClientConfig, ClientError, PartialError, PoolConfig};
-pub use teraslab_client::types;
 pub use teraslab_client::errors;
+pub use teraslab_client::types;
+pub use teraslab_client::{Client, ClientConfig, ClientError, PartialError, PoolConfig};
 
 // Legacy re-exports for backwards compatibility with existing test scenarios.
 // These map the old test client API to the new production client.

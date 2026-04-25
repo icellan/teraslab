@@ -36,11 +36,11 @@
 //! | `trace_sampling_ratio`  | `TERASLAB_TRACE_SAMPLING_RATIO` |
 //! | `service_name`          | `TERASLAB_SERVICE_NAME`         |
 
-use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 use tracing_subscriber::layer::SubscriberExt;
@@ -151,11 +151,7 @@ impl ObservabilityConfig {
 ///
 /// Callers pass `node_id` and `shard_count` because those are owned by
 /// the cluster/engine, not the observability module itself.
-pub fn build_resource(
-    cfg: &ObservabilityConfig,
-    node_id: u64,
-    shard_count: u32,
-) -> Resource {
+pub fn build_resource(cfg: &ObservabilityConfig, node_id: u64, shard_count: u32) -> Resource {
     Resource::builder()
         .with_attributes([
             KeyValue::new("service.name", cfg.effective_service_name().to_string()),
@@ -311,7 +307,11 @@ impl WireTraceContext {
     /// Panics only if `buf.len() != 24`; callers are expected to slice the
     /// fixed region out of the batch header before calling.
     pub fn read_from(buf: &[u8]) -> Option<Self> {
-        assert_eq!(buf.len(), Self::SIZE, "WireTraceContext::read_from needs 24 bytes");
+        assert_eq!(
+            buf.len(),
+            Self::SIZE,
+            "WireTraceContext::read_from needs 24 bytes"
+        );
         let mut trace_id = [0u8; 16];
         trace_id.copy_from_slice(&buf[..16]);
         let mut span_id = [0u8; 8];
@@ -448,8 +448,8 @@ mod tests {
     fn wire_trace_context_to_span_context_sets_remote_and_sampled() {
         let ctx = WireTraceContext {
             trace_id: [
-                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
-                0x1D, 0x1E, 0x1F,
+                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
+                0x1E, 0x1F,
             ],
             span_id: [0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27],
         };
@@ -481,10 +481,7 @@ mod tests {
         // *this* call doesn't advance it when endpoint is absent.
         let before = OTLP_EXPORTER_STARTED.load(Ordering::SeqCst);
         let provider = init_subscriber(&cfg, 1, 16).expect("init succeeds");
-        assert!(
-            provider.is_none(),
-            "no provider when endpoint is absent",
-        );
+        assert!(provider.is_none(), "no provider when endpoint is absent",);
         let after = OTLP_EXPORTER_STARTED.load(Ordering::SeqCst);
         assert_eq!(
             before, after,
@@ -531,7 +528,10 @@ mod tests {
             .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOn)
             .with_resource(
                 opentelemetry_sdk::Resource::builder_empty()
-                    .with_attributes([opentelemetry::KeyValue::new("service.name", "teraslab-test")])
+                    .with_attributes([opentelemetry::KeyValue::new(
+                        "service.name",
+                        "teraslab-test",
+                    )])
                     .build(),
             )
             .build();
@@ -555,4 +555,3 @@ mod tests {
         );
     }
 }
-

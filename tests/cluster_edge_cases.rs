@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use teraslab::cluster::membership::{ClusterEvent, Membership, NodeState};
 use teraslab::cluster::migration::{AtomicShardBitmap, MigrationManager};
-use teraslab::cluster::shards::{MigrationTask, NodeId, ShardTable, NUM_SHARDS};
+use teraslab::cluster::shards::{MigrationTask, NUM_SHARDS, NodeId, ShardTable};
 use teraslab::cluster::topology::{TopologyAuthority, TopologyVote};
 use teraslab::replication::manager::*;
 use teraslab::replication::protocol::*;
@@ -31,19 +31,30 @@ fn invariant_shard_coverage_and_no_self_replica() {
         for rf in 1..=std::cmp::min(n, 4) as u8 {
             let table = ShardTable::compute_with_epoch(&members, rf, 1);
             let total: usize = table.shard_counts().values().sum();
-            assert_eq!(total, NUM_SHARDS,
-                "n={n} rf={rf}: total mastered shards must be {NUM_SHARDS}");
+            assert_eq!(
+                total, NUM_SHARDS,
+                "n={n} rf={rf}: total mastered shards must be {NUM_SHARDS}"
+            );
 
             for shard in 0..NUM_SHARDS {
                 let a = &table.target_assignment(shard as u16);
-                assert!(members.contains(&a.master),
-                    "n={n} rf={rf} shard {shard}: master {:?} not in members", a.master);
-                assert!(!a.replicas.contains(&a.master),
-                    "n={n} rf={rf} shard {shard}: master {:?} in replicas", a.master);
+                assert!(
+                    members.contains(&a.master),
+                    "n={n} rf={rf} shard {shard}: master {:?} not in members",
+                    a.master
+                );
+                assert!(
+                    !a.replicas.contains(&a.master),
+                    "n={n} rf={rf} shard {shard}: master {:?} in replicas",
+                    a.master
+                );
                 // No duplicate replicas
                 let unique: HashSet<_> = a.replicas.iter().collect();
-                assert_eq!(unique.len(), a.replicas.len(),
-                    "n={n} rf={rf} shard {shard}: duplicate replicas");
+                assert_eq!(
+                    unique.len(),
+                    a.replicas.len(),
+                    "n={n} rf={rf} shard {shard}: duplicate replicas"
+                );
             }
         }
     }
@@ -54,17 +65,17 @@ fn invariant_shard_coverage_and_no_self_replica() {
 #[test]
 fn invariant_shard_table_path_independent() {
     // Path A: start with 3 → add 4 → remove 2
-    let t_a = ShardTable::compute_with_epoch(
-        &[NodeId(1), NodeId(3), NodeId(4)].to_vec(), 2, 1);
+    let t_a = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3), NodeId(4)], 2, 1);
 
     // Path B: start with 5 → remove 2 → remove 5
-    let t_b = ShardTable::compute_with_epoch(
-        &[NodeId(1), NodeId(3), NodeId(4)].to_vec(), 2, 1);
+    let t_b = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3), NodeId(4)], 2, 1);
 
     for shard in 0..NUM_SHARDS {
-        assert_eq!(t_a.target_assignment(shard as u16).master,
-                   t_b.target_assignment(shard as u16).master,
-                   "shard {shard} master differs between paths");
+        assert_eq!(
+            t_a.target_assignment(shard as u16).master,
+            t_b.target_assignment(shard as u16).master,
+            "shard {shard} master differs between paths"
+        );
     }
 }
 
@@ -77,7 +88,10 @@ fn invariant_shard_table_path_independent() {
 /// list and event stream must remain consistent.
 #[test]
 fn stress_concurrent_membership_mutations() {
-    let m = Arc::new(Mutex::new(Membership::new(NodeId(0), Duration::from_millis(50))));
+    let m = Arc::new(Mutex::new(Membership::new(
+        NodeId(0),
+        Duration::from_millis(50),
+    )));
     let all_events = Arc::new(Mutex::new(Vec::<ClusterEvent>::new()));
 
     let addr = |port: u16| std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -88,7 +102,10 @@ fn stress_concurrent_membership_mutations() {
         let e1 = all_events.clone();
         s.spawn(move || {
             for i in 1..=50u64 {
-                let events = m1.lock().unwrap().mark_alive(NodeId(i), addr(3000 + i as u16), 1, true);
+                let events =
+                    m1.lock()
+                        .unwrap()
+                        .mark_alive(NodeId(i), addr(3000 + i as u16), 1, true);
                 e1.lock().unwrap().extend(events);
                 std::thread::sleep(Duration::from_micros(100));
             }
@@ -130,10 +147,16 @@ fn stress_concurrent_membership_mutations() {
 
     // Verify no alive member is also suspect or dead
     for &id in &alive {
-        if id == NodeId(0) { continue; } // self
+        if id == NodeId(0) {
+            continue;
+        } // self
         if let Some(info) = mem.member_info(&id) {
-            assert_eq!(info.state, NodeState::Alive,
-                "node {id:?} in alive list but state is {:?}", info.state);
+            assert_eq!(
+                info.state,
+                NodeState::Alive,
+                "node {id:?} in alive list but state is {:?}",
+                info.state
+            );
         }
     }
 
@@ -141,11 +164,11 @@ fn stress_concurrent_membership_mutations() {
     let events = all_events.lock().unwrap();
     for event in events.iter() {
         match event {
-            ClusterEvent::NodeJoined(_, _) |
-            ClusterEvent::NodeSuspect(_) |
-            ClusterEvent::NodeLeft(_) |
-            ClusterEvent::MembershipChanged(_) |
-            ClusterEvent::TopologyStale(_) => {}
+            ClusterEvent::NodeJoined(_, _)
+            | ClusterEvent::NodeSuspect(_)
+            | ClusterEvent::NodeLeft(_)
+            | ClusterEvent::MembershipChanged(_)
+            | ClusterEvent::TopologyStale(_) => {}
         }
     }
 }
@@ -213,30 +236,31 @@ fn stress_replication_100_sequential_batches() {
     let handle = std::thread::spawn(move || {
         let mut received = Vec::new();
         while let Ok(batch) = rt.recv_batch(Duration::from_secs(2)) {
-            let ack = ReplicaAck::Ok { through_sequence: batch.last_sequence() };
+            let ack = ReplicaAck::Ok {
+                through_sequence: batch.last_sequence(),
+            };
             rt.send_ack(&ack).unwrap();
             received.push(batch);
         }
         received
     });
 
-    let mut mgr = ReplicationManager::new(
-        ReplicationConfig::default(),
-        vec![Box::new(mt)],
-    );
+    let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
     // Send 100 batches, each with 10 ops
     for batch_idx in 0..100u32 {
-        let ops: Vec<ReplicaOp> = (0..10u8).map(|i| {
-            let mut txid = [0u8; 32];
-            txid[0..4].copy_from_slice(&batch_idx.to_le_bytes());
-            txid[4] = i;
-            ReplicaOp::Freeze {
-                tx_key: teraslab::index::TxKey { txid },
-                offset: i as u32,
-                master_generation: 0,
-            }
-        }).collect();
+        let ops: Vec<ReplicaOp> = (0..10u8)
+            .map(|i| {
+                let mut txid = [0u8; 32];
+                txid[0..4].copy_from_slice(&batch_idx.to_le_bytes());
+                txid[4] = i;
+                ReplicaOp::Freeze {
+                    tx_key: teraslab::index::TxKey { txid },
+                    offset: i as u32,
+                    master_generation: 0,
+                }
+            })
+            .collect();
         mgr.replicate_batch(&ops).unwrap();
     }
 
@@ -247,8 +271,11 @@ fn stress_replication_100_sequential_batches() {
     // Verify sequence numbers are contiguous
     let mut expected_seq = 1u64;
     for batch in &received {
-        assert_eq!(batch.first_sequence, expected_seq,
-            "sequence gap: expected {expected_seq}, got {}", batch.first_sequence);
+        assert_eq!(
+            batch.first_sequence, expected_seq,
+            "sequence gap: expected {expected_seq}, got {}",
+            batch.first_sequence
+        );
         expected_seq += batch.ops.len() as u64;
     }
     // Total ops: 100 * 10 = 1000
@@ -265,24 +292,36 @@ fn sequence_never_goes_backward() {
     let handle = std::thread::spawn(move || {
         let mut last_seq = 0u64;
         while let Ok(batch) = rt.recv_batch(Duration::from_secs(2)) {
-            assert!(batch.first_sequence > last_seq,
-                "sequence went backward: {} <= {}", batch.first_sequence, last_seq);
+            assert!(
+                batch.first_sequence > last_seq,
+                "sequence went backward: {} <= {}",
+                batch.first_sequence,
+                last_seq
+            );
             last_seq = batch.last_sequence();
-            let ack = ReplicaAck::Ok { through_sequence: last_seq };
+            let ack = ReplicaAck::Ok {
+                through_sequence: last_seq,
+            };
             rt.send_ack(&ack).unwrap();
         }
         last_seq
     });
 
-    let mut mgr = ReplicationManager::new(
-        ReplicationConfig::default(),
-        vec![Box::new(mt)],
-    );
+    let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
     for i in 0..50u8 {
         let ops = vec![
-            ReplicaOp::Spend { tx_key: key(i), offset: 0, spending_data: [i; 36], master_generation: 0 },
-            ReplicaOp::Freeze { tx_key: key(i), offset: 1, master_generation: 0 },
+            ReplicaOp::Spend {
+                tx_key: key(i),
+                offset: 0,
+                spending_data: [i; 36],
+                master_generation: 0,
+            },
+            ReplicaOp::Freeze {
+                tx_key: key(i),
+                offset: 1,
+                master_generation: 0,
+            },
         ];
         mgr.replicate_batch(&ops).unwrap();
     }
@@ -307,12 +346,16 @@ fn shard_table_deterministic_across_100_configurations() {
             let t2 = ShardTable::compute_with_epoch(&members, rf, 1);
 
             for shard in 0..NUM_SHARDS {
-                assert_eq!(t1.target_assignment(shard as u16).master,
-                           t2.target_assignment(shard as u16).master,
-                           "n={n} rf={rf} shard {shard}: master differs");
-                assert_eq!(t1.target_assignment(shard as u16).replicas,
-                           t2.target_assignment(shard as u16).replicas,
-                           "n={n} rf={rf} shard {shard}: replicas differ");
+                assert_eq!(
+                    t1.target_assignment(shard as u16).master,
+                    t2.target_assignment(shard as u16).master,
+                    "n={n} rf={rf} shard {shard}: master differs"
+                );
+                assert_eq!(
+                    t1.target_assignment(shard as u16).replicas,
+                    t2.target_assignment(shard as u16).replicas,
+                    "n={n} rf={rf} shard {shard}: replicas differ"
+                );
             }
         }
     }
@@ -325,18 +368,16 @@ fn shard_table_deterministic_across_100_configurations() {
 #[test]
 fn migration_plan_minimal_moves() {
     // Adding one node to a 3-node cluster should move ~25% of shards.
-    let old = ShardTable::compute_with_epoch(
-        &[NodeId(1), NodeId(2), NodeId(3)].to_vec(), 2, 1);
-    let new = ShardTable::compute_with_epoch(
-        &[NodeId(1), NodeId(2), NodeId(3), NodeId(4)].to_vec(), 2, 2);
+    let old = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 1);
+    let new = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)], 2, 2);
 
     let plan = ShardTable::migration_plan(&old, &new);
 
     // Count how many shards actually changed master
     let mut changed = 0;
     for shard in 0..NUM_SHARDS {
-        if old.target_assignment(shard as u16).master !=
-           new.target_assignment(shard as u16).master {
+        if old.target_assignment(shard as u16).master != new.target_assignment(shard as u16).master
+        {
             changed += 1;
         }
     }
@@ -346,15 +387,20 @@ fn migration_plan_minimal_moves() {
 
     // Master moves remain minimal: exactly one master migration per shard
     // whose master changed.
-    assert_eq!(master_tasks, changed,
+    assert_eq!(
+        master_tasks, changed,
         "migration plan has {} master tasks but {} shards changed master",
-        master_tasks, changed);
+        master_tasks, changed
+    );
     // Additional tasks are allowed only as non-master repair backfills.
     assert_eq!(plan.len(), master_tasks + repair_tasks);
-    assert!(repair_tasks <= changed,
+    assert!(
+        repair_tasks <= changed,
         "migration plan has {} repair tasks but only {} shards changed master",
-        repair_tasks, changed);
-    assert!(plan.len() > 0, "adding a node should require migrations");
+        repair_tasks,
+        changed
+    );
+    assert!(!plan.is_empty(), "adding a node should require migrations");
 }
 
 // ---------------------------------------------------------------------------
@@ -366,11 +412,18 @@ fn migration_fence_bitmap_parallel_consistency() {
     let mgr = Arc::new(Mutex::new(MigrationManager::new()));
 
     // Create 50 outbound tasks
-    let tasks: Vec<MigrationTask> = (0..50u16).map(|i| {
-        MigrationTask { shard: i, from_node: NodeId(1), to_node: NodeId(2), is_master: true }
-    }).collect();
+    let tasks: Vec<MigrationTask> = (0..50u16)
+        .map(|i| MigrationTask {
+            shard: i,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        })
+        .collect();
 
-    mgr.lock().unwrap().start_outbound(&tasks, NodeId(1), &HashSet::new());
+    mgr.lock()
+        .unwrap()
+        .start_outbound(&tasks, NodeId(1), &HashSet::new());
 
     // Thread 1: fence shards 0-24
     // Thread 2: fence shards 25-49
@@ -378,14 +431,24 @@ fn migration_fence_bitmap_parallel_consistency() {
         let mgr1 = mgr.clone();
         s.spawn(move || {
             for i in 0..25u16 {
-                let t = MigrationTask { shard: i, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+                let t = MigrationTask {
+                    shard: i,
+                    from_node: NodeId(1),
+                    to_node: NodeId(2),
+                    is_master: true,
+                };
                 mgr1.lock().unwrap().mark_fenced(&t, 100);
             }
         });
         let mgr2 = mgr.clone();
         s.spawn(move || {
             for i in 25..50u16 {
-                let t = MigrationTask { shard: i, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
+                let t = MigrationTask {
+                    shard: i,
+                    from_node: NodeId(1),
+                    to_node: NodeId(2),
+                    is_master: true,
+                };
                 mgr2.lock().unwrap().mark_fenced(&t, 100);
             }
         });
@@ -419,7 +482,9 @@ fn topology_quorum_sizes() {
 
             let mut commit = None;
             for (i, &voter) in members.iter().enumerate().skip(1) {
-                if i > additional_needed { break; }
+                if i > additional_needed {
+                    break;
+                }
                 let vote = TopologyVote {
                     term: term.term,
                     digest: term.digest,
@@ -428,7 +493,9 @@ fn topology_quorum_sizes() {
                     voter_current_term: 0,
                 };
                 commit = auth.handle_vote(&vote);
-                if commit.is_some() { break; }
+                if commit.is_some() {
+                    break;
+                }
             }
 
             if n == 1 {
@@ -444,12 +511,18 @@ fn topology_quorum_sizes() {
                 // on_membership_changed... Let's verify the pending proposal.
             } else if n == 2 {
                 // 2 nodes: quorum = 2, need 1 more vote → commit on first vote
-                assert!(commit.is_some(), "n=2: 1 additional vote should reach quorum");
+                assert!(
+                    commit.is_some(),
+                    "n=2: 1 additional vote should reach quorum"
+                );
             } else {
                 // For n >= 3, verify quorum is correct
                 // We sent exactly quorum-1 additional votes
                 if (additional_needed + 1) >= expected_quorum {
-                    assert!(commit.is_some(), "n={n}: {additional_needed}+1 votes should reach quorum {expected_quorum}");
+                    assert!(
+                        commit.is_some(),
+                        "n={n}: {additional_needed}+1 votes should reach quorum {expected_quorum}"
+                    );
                 }
             }
         }
@@ -467,7 +540,9 @@ fn replication_initial_sequence_boundary() {
     let handle = std::thread::spawn(move || {
         let mut received = Vec::new();
         while let Ok(batch) = rt.recv_batch(Duration::from_secs(1)) {
-            let ack = ReplicaAck::Ok { through_sequence: batch.last_sequence() };
+            let ack = ReplicaAck::Ok {
+                through_sequence: batch.last_sequence(),
+            };
             rt.send_ack(&ack).unwrap();
             received.push(batch);
         }
@@ -480,12 +555,19 @@ fn replication_initial_sequence_boundary() {
         0, // should clamp to 1
     );
 
-    let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+    let ops = vec![ReplicaOp::Freeze {
+        tx_key: key(1),
+        offset: 0,
+        master_generation: 0,
+    }];
     mgr.replicate_batch(&ops).unwrap();
 
     drop(mgr);
     let received = handle.join().unwrap();
-    assert_eq!(received[0].first_sequence, 1, "sequence 0 should clamp to 1");
+    assert_eq!(
+        received[0].first_sequence, 1,
+        "sequence 0 should clamp to 1"
+    );
 }
 
 // ===========================================================================
@@ -520,7 +602,10 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
     // must be rejected: term 5 is not > committed_term 10.
     let stale = TopologyTerm::new(5, vec![NodeId(1), NodeId(2)], NodeId(2));
     let v = auth.handle_propose(&stale);
-    assert!(!v.accepted, "proposal for term 5 should be rejected when committed_term=10");
+    assert!(
+        !v.accepted,
+        "proposal for term 5 should be rejected when committed_term=10"
+    );
 
     // A proposal for term 11 should be accepted (> committed=10, > voted=3).
     let fresh = TopologyTerm::new(11, vec![NodeId(1), NodeId(2), NodeId(3)], NodeId(2));
@@ -557,11 +642,15 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
     std::thread::sleep(Duration::from_millis(5));
 
     // First timeout fires → proposes term 2
-    let t1 = auth.check_timeout(&mems).expect("first timeout should propose");
+    let t1 = auth
+        .check_timeout(&mems)
+        .expect("first timeout should propose");
     assert_eq!(t1.term, 2);
 
     // Second timeout fires → overwrites pending with term 3
-    let t2 = auth.check_timeout(&mems).expect("second timeout should propose");
+    let t2 = auth
+        .check_timeout(&mems)
+        .expect("second timeout should propose");
     assert_eq!(t2.term, 3);
 
     // Votes for term 2 should NOT match the pending proposal (which is now term 3)
@@ -573,7 +662,10 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
         voter_current_term: 1,
     };
     let commit = auth.handle_vote(&vote_for_t1);
-    assert!(commit.is_none(), "vote for superseded term 2 should not produce commit");
+    assert!(
+        commit.is_none(),
+        "vote for superseded term 2 should not produce commit"
+    );
 
     // Votes for term 3 should work
     let vote_for_t2 = TopologyVote {
@@ -584,7 +676,10 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
         voter_current_term: 1,
     };
     let commit = auth.handle_vote(&vote_for_t2);
-    assert!(commit.is_some(), "vote for current term 3 should produce commit");
+    assert!(
+        commit.is_some(),
+        "vote for current term 3 should produce commit"
+    );
 }
 
 /// Cluster formation recovery: three nodes start simultaneously, each commits
@@ -613,19 +708,24 @@ fn topology_cluster_formation_three_simultaneous_starts() {
 
     // Node 1 (lowest ID) proposes term 2 with all three members.
     let full_members = vec![NodeId(1), NodeId(2), NodeId(3)];
-    let proposal = a1.on_membership_changed(&full_members)
+    let proposal = a1
+        .on_membership_changed(&full_members)
         .expect("node 1 should propose for 3-node cluster");
     assert_eq!(proposal.term, 2);
 
     // Nodes 2 and 3 should accept (cluster formation recovery path).
     let v2 = a2.handle_propose(&proposal);
-    assert!(v2.accepted,
+    assert!(
+        v2.accepted,
         "node 2 should accept via cluster formation recovery: single-node committed, \
-         proposal subsumes self, no outstanding vote beyond committed");
+         proposal subsumes self, no outstanding vote beyond committed"
+    );
 
     let v3 = a3.handle_propose(&proposal);
-    assert!(v3.accepted,
-        "node 3 should accept via cluster formation recovery");
+    assert!(
+        v3.accepted,
+        "node 3 should accept via cluster formation recovery"
+    );
 }
 
 /// Cluster formation recovery should NOT fire when the node has an outstanding
@@ -655,8 +755,10 @@ fn topology_formation_recovery_blocked_by_outstanding_vote() {
     // because voted_term(2) > committed_term(1).
     let recovery_proposal = TopologyTerm::new(2, vec![NodeId(1), NodeId(2), NodeId(3)], NodeId(1));
     let v2 = auth.handle_propose(&recovery_proposal);
-    assert!(!v2.accepted,
-        "formation recovery should be blocked when voted_term > committed_term");
+    assert!(
+        !v2.accepted,
+        "formation recovery should be blocked when voted_term > committed_term"
+    );
 }
 
 // ===========================================================================
@@ -680,7 +782,9 @@ fn shard_table_double_handoff_preserves_routing() {
 
     // Some shards are in Copying state for v2.
     let copying_count = (0..NUM_SHARDS as u16)
-        .filter(|&s| table.shard_handoff_state(s) == teraslab::cluster::shards::ShardHandoff::Copying)
+        .filter(|&s| {
+            table.shard_handoff_state(s) == teraslab::cluster::shards::ShardHandoff::Copying
+        })
         .count();
     assert!(copying_count > 0, "should have some shards in Copying");
 
@@ -696,7 +800,8 @@ fn shard_table_double_handoff_preserves_routing() {
         // (for shards still in handoff).
         assert!(
             eff.master == NodeId(1) || eff.master == NodeId(2) || eff.master == NodeId(3),
-            "shard {shard}: effective master {:?} is not in any member set", eff.master
+            "shard {shard}: effective master {:?} is not in any member set",
+            eff.master
         );
     }
 
@@ -708,7 +813,8 @@ fn shard_table_double_handoff_preserves_routing() {
         let target = table.target_assignment(shard);
         assert!(
             target.master == NodeId(1) || target.master == NodeId(3),
-            "shard {shard}: after full commit, master {:?} should be in v3 members", target.master
+            "shard {shard}: after full commit, master {:?} should be in v3 members",
+            target.master
         );
     }
 }
@@ -726,8 +832,9 @@ fn shard_table_rollback_then_new_handoff() {
     table.begin_handoff(&new_table);
 
     // Find a shard in Copying, rollback it.
-    let copying_shard = (0..NUM_SHARDS as u16)
-        .find(|&s| table.shard_handoff_state(s) == teraslab::cluster::shards::ShardHandoff::Copying);
+    let copying_shard = (0..NUM_SHARDS as u16).find(|&s| {
+        table.shard_handoff_state(s) == teraslab::cluster::shards::ShardHandoff::Copying
+    });
     if let Some(shard) = copying_shard {
         let old_master = table.effective_assignment(shard).master;
         table.rollback_shard(shard);
@@ -755,10 +862,17 @@ fn shard_table_rollback_then_new_handoff() {
 // Deep edge case analysis: migration manager fence consistency
 // ===========================================================================
 
-/// mark_complete always calls unfence_shard, even if find_task_mut returns None
-/// (task already cleaned up). This test verifies the behavior is at least safe.
+/// `mark_complete` for an unknown task must NOT lift the fence. A stale
+/// migration worker can report completion after a newer topology has installed
+/// a fresh fence on the same shard; clearing that fence on the strength of an
+/// orphaned task ID would expose the shard to writes the new master has not
+/// yet accepted. The unit test
+/// `mark_complete_does_not_unfence_when_task_not_found` in
+/// `src/cluster/migration.rs` documents the same invariant for the manager
+/// in isolation; this integration test asserts the same guarantee surfaces
+/// at the public API used by the migration coordinator.
 #[test]
-fn migration_complete_on_unknown_task_still_unfences() {
+fn migration_complete_on_unknown_task_does_not_unfence() {
     let mut mgr = MigrationManager::new();
     let task = MigrationTask {
         shard: 42,
@@ -767,14 +881,17 @@ fn migration_complete_on_unknown_task_still_unfences() {
         is_master: true,
     };
 
-    // Manually fence shard 42 without any active task.
+    // Manually fence shard 42 without any active task — simulates a fresh
+    // fence installed by a newer topology after the original task was cleaned up.
     mgr.fence_shard(42);
     assert!(mgr.is_shard_fenced(42));
 
-    // mark_complete on a non-existent task still unfences.
+    // mark_complete for the now-untracked task must leave the fence in place.
     mgr.mark_complete(&task);
-    assert!(!mgr.is_shard_fenced(42),
-        "mark_complete should unfence even for unknown tasks");
+    assert!(
+        mgr.is_shard_fenced(42),
+        "mark_complete on an untracked task must not clear an active fence"
+    );
 }
 
 /// Two tasks for the same shard: fencing both, then completing one keeps the
@@ -783,8 +900,18 @@ fn migration_complete_on_unknown_task_still_unfences() {
 #[test]
 fn migration_two_tasks_same_shard_fence_interaction() {
     let mut mgr = MigrationManager::new();
-    let t1 = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(2), is_master: true };
-    let t2 = MigrationTask { shard: 5, from_node: NodeId(1), to_node: NodeId(3), is_master: false };
+    let t1 = MigrationTask {
+        shard: 5,
+        from_node: NodeId(1),
+        to_node: NodeId(2),
+        is_master: true,
+    };
+    let t2 = MigrationTask {
+        shard: 5,
+        from_node: NodeId(1),
+        to_node: NodeId(3),
+        is_master: false,
+    };
 
     mgr.start_outbound(&[t1.clone(), t2.clone()], NodeId(1), &HashSet::new());
 
@@ -794,19 +921,28 @@ fn migration_two_tasks_same_shard_fence_interaction() {
 
     // Complete t1 → shard 5 STAYS fenced because t2 is still Fenced.
     mgr.mark_complete(&t1);
-    assert!(mgr.is_shard_fenced(5),
-        "shard should remain fenced while another task is in Fenced state");
+    assert!(
+        mgr.is_shard_fenced(5),
+        "shard should remain fenced while another task is in Fenced state"
+    );
 
     // t2 is still in Fenced state in the task list.
-    let t2_state = mgr.active_migrations().iter()
+    let t2_state = mgr
+        .active_migrations()
+        .iter()
         .find(|p| p.to_node == NodeId(3))
         .map(|p| p.state.clone());
-    assert_eq!(t2_state, Some(teraslab::cluster::migration::MigrationState::Fenced));
+    assert_eq!(
+        t2_state,
+        Some(teraslab::cluster::migration::MigrationState::Fenced)
+    );
 
     // Complete t2 → NOW the shard is unfenced.
     mgr.mark_complete(&t2);
-    assert!(!mgr.is_shard_fenced(5),
-        "shard should unfence once all fenced tasks are done");
+    assert!(
+        !mgr.is_shard_fenced(5),
+        "shard should unfence once all fenced tasks are done"
+    );
 }
 
 /// After cleanup_completed, the inbound bitmap must be rebuilt to exclude
@@ -842,7 +978,10 @@ fn migration_inbound_bitmap_rebuild_after_cleanup() {
     mgr.cleanup_completed();
     assert_eq!(mgr.inbound_count(), 0);
     for s in 0..NUM_SHARDS as u16 {
-        assert!(!mgr.has_pending_inbound(s), "shard {s} should have no pending inbound");
+        assert!(
+            !mgr.has_pending_inbound(s),
+            "shard {s} should have no pending inbound"
+        );
     }
 }
 
@@ -856,7 +995,7 @@ fn migration_serialize_outbound_preserves_fenced_state() {
         to_node: NodeId(2),
         is_master: true,
     };
-    mgr.start_outbound(&[t.clone()], NodeId(1), &HashSet::new());
+    mgr.start_outbound(std::slice::from_ref(&t), NodeId(1), &HashSet::new());
     mgr.set_snapshot_sequence(&t, 50);
     mgr.mark_fenced(&t, 100);
 
@@ -864,10 +1003,15 @@ fn migration_serialize_outbound_preserves_fenced_state() {
     let mut restored = MigrationManager::new();
     restored.restore_outbound(&data);
 
-    let p = restored.active_migrations().iter()
+    let p = restored
+        .active_migrations()
+        .iter()
         .find(|p| p.shard == 7)
         .expect("shard 7 should be restored");
-    assert_eq!(p.state, teraslab::cluster::migration::MigrationState::Fenced);
+    assert_eq!(
+        p.state,
+        teraslab::cluster::migration::MigrationState::Fenced
+    );
     assert_eq!(p.snapshot_sequence, 50);
     assert_eq!(p.fence_sequence, 100);
 }
@@ -889,17 +1033,33 @@ fn membership_suspect_alive_cycle_events() {
 
     // Suspect: alive_count drops but no MembershipChanged
     let suspect_events = m.mark_suspect(NodeId(2), 1);
-    assert_eq!(m.alive_count(), 1, "suspect node should be removed from alive list");
-    assert!(!suspect_events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
-        "mark_suspect should NOT emit MembershipChanged");
-    assert!(suspect_events.iter().any(|e| matches!(e, ClusterEvent::NodeSuspect(_))));
+    assert_eq!(
+        m.alive_count(),
+        1,
+        "suspect node should be removed from alive list"
+    );
+    assert!(
+        !suspect_events
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
+        "mark_suspect should NOT emit MembershipChanged"
+    );
+    assert!(
+        suspect_events
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeSuspect(_)))
+    );
 
     // Recovery: alive_count restored AND MembershipChanged emitted
     // Direct probe ACK: clears Suspect even at same incarnation.
     let recover_events = m.mark_alive(NodeId(2), addr, 1, true);
     assert_eq!(m.alive_count(), 2);
-    assert!(recover_events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
-        "suspect recovery should emit MembershipChanged");
+    assert!(
+        recover_events
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
+        "suspect recovery should emit MembershipChanged"
+    );
 }
 
 /// A node that is Dead can rejoin with the same incarnation (partition recovery).
@@ -918,10 +1078,18 @@ fn membership_dead_rejoin_same_incarnation() {
     let events = m.mark_alive(NodeId(2), addr, 5, true);
     assert_eq!(m.alive_count(), 2);
     assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive);
-    assert!(events.iter().any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(2), _))),
-        "Dead→Alive should emit NodeJoined");
-    assert!(events.iter().any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
-        "Dead→Alive should emit MembershipChanged");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(2), _))),
+        "Dead→Alive should emit NodeJoined"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
+        "Dead→Alive should emit MembershipChanged"
+    );
 }
 
 /// Stale incarnation alive on a Dead node: must be ignored (the node
@@ -939,7 +1107,10 @@ fn membership_stale_alive_on_dead_node_ignored() {
     // direct=false here because stale gossip from an uninformed peer is the
     // realistic source of a below-current-incarnation alive message.
     let events = m.mark_alive(NodeId(2), addr, 5, false);
-    assert!(events.is_empty(), "stale alive should be ignored on dead node");
+    assert!(
+        events.is_empty(),
+        "stale alive should be ignored on dead node"
+    );
     assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Dead);
 }
 
@@ -1004,7 +1175,10 @@ fn topology_persisted_state_pre_incarnation_compat() {
     assert_eq!(restored.committed_term, 5);
     assert_eq!(restored.voted_term, 6);
     assert_eq!(restored.committed_members.len(), 3);
-    assert_eq!(restored.incarnation, 0, "missing incarnation should default to 0");
+    assert_eq!(
+        restored.incarnation, 0,
+        "missing incarnation should default to 0"
+    );
 }
 
 /// Restore topology state, then verify the authority rejects stale proposals.
@@ -1026,7 +1200,10 @@ fn topology_restore_then_vote_safety() {
     // Proposal for term 11: > committed(10) but NOT > voted(12) → reject.
     let p1 = TopologyTerm::new(11, vec![NodeId(1), NodeId(2), NodeId(3)], NodeId(1));
     let v1 = auth.handle_propose(&p1);
-    assert!(!v1.accepted, "term 11 should be rejected: 11 <= voted_term 12");
+    assert!(
+        !v1.accepted,
+        "term 11 should be rejected: 11 <= voted_term 12"
+    );
 
     // Proposal for term 13: > committed(10) AND > voted(12) → accept.
     let p2 = TopologyTerm::new(13, vec![NodeId(1), NodeId(2), NodeId(3)], NodeId(1));
@@ -1046,7 +1223,9 @@ fn replication_catchup_full_lifecycle() {
     let (mt, rt) = InMemoryTransport::pair();
     let handle = std::thread::spawn(move || {
         while let Ok(batch) = rt.recv_batch(Duration::from_secs(2)) {
-            let ack = ReplicaAck::Ok { through_sequence: batch.last_sequence() };
+            let ack = ReplicaAck::Ok {
+                through_sequence: batch.last_sequence(),
+            };
             rt.send_ack(&ack).unwrap();
         }
     });
@@ -1065,7 +1244,8 @@ fn replication_catchup_full_lifecycle() {
             tx_key: key(i),
             offset: 0,
             master_generation: 0,
-        }]).unwrap();
+        }])
+        .unwrap();
     }
     assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
     assert_eq!(mgr.sender(0).last_acked(), 3);
@@ -1090,13 +1270,17 @@ fn replication_write_majority_rf5_exact_boundary() {
 
     let _h1 = std::thread::spawn(move || {
         while let Ok(batch) = rt1.recv_batch(Duration::from_secs(1)) {
-            let ack = ReplicaAck::Ok { through_sequence: batch.last_sequence() };
+            let ack = ReplicaAck::Ok {
+                through_sequence: batch.last_sequence(),
+            };
             rt1.send_ack(&ack).unwrap();
         }
     });
     let _h2 = std::thread::spawn(move || {
         while let Ok(batch) = rt2.recv_batch(Duration::from_secs(1)) {
-            let ack = ReplicaAck::Ok { through_sequence: batch.last_sequence() };
+            let ack = ReplicaAck::Ok {
+                through_sequence: batch.last_sequence(),
+            };
             rt2.send_ack(&ack).unwrap();
         }
     });
@@ -1110,12 +1294,23 @@ fn replication_write_majority_rf5_exact_boundary() {
         vec![Box::new(mt1), Box::new(mt2), Box::new(mt3), Box::new(mt4)],
     );
 
-    assert_eq!(mgr.required_ack_count(), 2, "RF=5 majority needs 2 replica ACKs");
+    assert_eq!(
+        mgr.required_ack_count(),
+        2,
+        "RF=5 majority needs 2 replica ACKs"
+    );
 
     // 2 replicas respond → should succeed
-    let ops = vec![ReplicaOp::Freeze { tx_key: key(1), offset: 0, master_generation: 0 }];
+    let ops = vec![ReplicaOp::Freeze {
+        tx_key: key(1),
+        offset: 0,
+        master_generation: 0,
+    }];
     let result = mgr.replicate_batch(&ops);
-    assert!(result.is_ok(), "2 ACKs should satisfy WriteMajority for RF=5");
+    assert!(
+        result.is_ok(),
+        "2 ACKs should satisfy WriteMajority for RF=5"
+    );
 }
 
 /// Replication lag calculation: after normal replication, lag should be 0
@@ -1125,28 +1320,31 @@ fn replication_lag_zero_when_caught_up() {
     let (mt, rt) = InMemoryTransport::pair();
     let handle = std::thread::spawn(move || {
         while let Ok(batch) = rt.recv_batch(Duration::from_secs(1)) {
-            let ack = ReplicaAck::Ok { through_sequence: batch.last_sequence() };
+            let ack = ReplicaAck::Ok {
+                through_sequence: batch.last_sequence(),
+            };
             rt.send_ack(&ack).unwrap();
         }
     });
 
-    let mut mgr = ReplicationManager::new(
-        ReplicationConfig::default(),
-        vec![Box::new(mt)],
-    );
+    let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
 
     for i in 0..10 {
         mgr.replicate_batch(&[ReplicaOp::Freeze {
             tx_key: key(i),
             offset: 0,
             master_generation: 0,
-        }]).unwrap();
+        }])
+        .unwrap();
     }
 
     let master_seq = mgr.current_sequence();
     // master_seq is the NEXT sequence, so last sent = master_seq - 1 = 10
-    assert_eq!(mgr.sender(0).lag(master_seq - 1), 0,
-        "caught-up replica should have zero lag");
+    assert_eq!(
+        mgr.sender(0).lag(master_seq - 1),
+        0,
+        "caught-up replica should have zero lag"
+    );
 
     drop(mgr);
     let _ = handle.join();
@@ -1165,8 +1363,11 @@ fn shard_table_handoff_identical_tables() {
     let same = ShardTable::compute_with_epoch(&members, 2, 2);
 
     table.begin_handoff(&same);
-    assert_eq!(table.pending_handoff_count(), 0,
-        "identical tables should have no shards in handoff");
+    assert_eq!(
+        table.pending_handoff_count(),
+        0,
+        "identical tables should have no shards in handoff"
+    );
 
     for shard in 0..NUM_SHARDS as u16 {
         assert_eq!(
@@ -1188,8 +1389,9 @@ fn shard_table_mark_commit_ready_on_serving_new_is_noop() {
     table.begin_handoff_with(&new_table, |_| true);
 
     // Find a shard that's already ServingNew (no master change).
-    let serving_shard = (0..NUM_SHARDS as u16)
-        .find(|&s| table.shard_handoff_state(s) == teraslab::cluster::shards::ShardHandoff::ServingNew);
+    let serving_shard = (0..NUM_SHARDS as u16).find(|&s| {
+        table.shard_handoff_state(s) == teraslab::cluster::shards::ShardHandoff::ServingNew
+    });
     if let Some(shard) = serving_shard {
         // mark_commit_ready on ServingNew should be no-op.
         table.mark_commit_ready(shard);
@@ -1211,30 +1413,35 @@ fn shard_table_mark_commit_ready_on_serving_new_is_noop() {
 #[test]
 fn migration_plan_dead_master_no_surviving_replica() {
     // RF=1: only master, no replicas. If master dies, data is lost.
-    let old = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)].to_vec(), 1, 1);
-    let new = ShardTable::compute_with_epoch(&[NodeId(1)].to_vec(), 1, 2);
+    let old = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 1, 1);
+    let new = ShardTable::compute_with_epoch(&[NodeId(1)], 1, 2);
 
     let plan = ShardTable::migration_plan(&old, &new);
 
     // Shards that were on node 2 have no source — they should NOT appear
     // in the migration plan (can't migrate what doesn't exist anywhere).
     for task in &plan {
-        assert_ne!(task.from_node, NodeId(2),
-            "dead node 2 should not be a migration source");
+        assert_ne!(
+            task.from_node,
+            NodeId(2),
+            "dead node 2 should not be a migration source"
+        );
         // With RF=1, there are no replicas, so no surviving source.
         // These shards are simply unmigrated (data loss).
     }
     // With RF=1, node 2's shards (~2048) have no source. Plan should be empty.
-    assert!(plan.is_empty(),
-        "RF=1, dead master with no replicas: no migration possible");
+    assert!(
+        plan.is_empty(),
+        "RF=1, dead master with no replicas: no migration possible"
+    );
 }
 
 /// With RF=2 and 3 nodes, if the old master dies, the new master should be
 /// the old replica (data already in place → no migration task needed).
 #[test]
 fn migration_plan_dead_master_replica_has_data() {
-    let old = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)].to_vec(), 2, 1);
-    let new = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3)].to_vec(), 2, 2);
+    let old = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 1);
+    let new = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3)], 2, 2);
 
     let plan = ShardTable::migration_plan(&old, &new);
 
@@ -1242,8 +1449,11 @@ fn migration_plan_dead_master_replica_has_data() {
     // - Old replica is the next node in round-robin.
     // - If the new master == old replica, data is already there → no task.
     for task in &plan {
-        assert_ne!(task.from_node, NodeId(2),
-            "dead node 2 should never be a source");
+        assert_ne!(
+            task.from_node,
+            NodeId(2),
+            "dead node 2 should never be a source"
+        );
     }
 
     // Count shards where node 2 was master.
@@ -1264,16 +1474,21 @@ fn migration_plan_dead_master_replica_has_data() {
         }
     }
 
-    let migration_from_dead_master = plan.iter()
+    let migration_from_dead_master = plan
+        .iter()
         .filter(|t| node2_shards.contains(&(t.shard as usize)))
         .count();
-    assert_eq!(migration_from_dead_master, needs_migration,
-        "migrations should only exist for shards where new master != old replica");
+    assert_eq!(
+        migration_from_dead_master, needs_migration,
+        "migrations should only exist for shards where new master != old replica"
+    );
 
     // Sanity: with 3 nodes RF=2, most shards' replica IS the surviving node,
     // so most need no migration.
-    assert!(already_placed > needs_migration,
-        "with RF=2, most shards should already be on the surviving node");
+    assert!(
+        already_placed > needs_migration,
+        "with RF=2, most shards should already be on the surviving node"
+    );
 }
 
 // ===========================================================================
@@ -1292,7 +1507,8 @@ fn topology_full_5_node_quorum_cycle() {
     let members: Vec<NodeId> = (1..=5u64).map(NodeId).collect();
 
     // Node 1 (lowest) proposes.
-    let proposal = nodes[0].on_membership_changed(&members)
+    let proposal = nodes[0]
+        .on_membership_changed(&members)
         .expect("node 1 should propose");
     assert_eq!(proposal.term, 1);
 
@@ -1327,10 +1543,18 @@ fn topology_full_5_node_quorum_cycle() {
 
     // All 5 nodes should agree on the same committed term.
     for (i, node) in nodes.iter().enumerate() {
-        assert_eq!(node.committed_term(), 1,
-            "node {} should be at committed term 1", i + 1);
-        assert_eq!(node.committed_members(), members,
-            "node {} should have all 5 members", i + 1);
+        assert_eq!(
+            node.committed_term(),
+            1,
+            "node {} should be at committed term 1",
+            i + 1
+        );
+        assert_eq!(
+            node.committed_members(),
+            members,
+            "node {} should have all 5 members",
+            i + 1
+        );
     }
 }
 
@@ -1410,8 +1634,10 @@ fn topology_duplicate_votes_not_inflated() {
     auth2.handle_vote(&vote2); // count: self(1) + node2(1) = 2
     auth2.handle_vote(&vote2); // duplicate: still 2
     let commit2 = auth2.handle_vote(&vote2); // still 2, not 4
-    assert!(commit2.is_none(),
-        "duplicate votes should not inflate accept count to reach quorum");
+    assert!(
+        commit2.is_none(),
+        "duplicate votes should not inflate accept count to reach quorum"
+    );
 
     // One more from a different node should reach quorum.
     let vote3 = TopologyVote {

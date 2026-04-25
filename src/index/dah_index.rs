@@ -118,7 +118,10 @@ impl DahIndex {
                 self.remove_from_height_vec(old_h, &key);
             }
             self.by_txid.insert(key, entry.new_height);
-            self.by_height.entry(entry.new_height).or_default().push(key);
+            self.by_height
+                .entry(entry.new_height)
+                .or_default()
+                .push(key);
         }
     }
 

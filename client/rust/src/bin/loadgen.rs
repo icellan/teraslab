@@ -7,16 +7,24 @@
 //!   teraslab-loadgen --addr localhost:3300 --rate 500 --duration 300
 //!   teraslab-loadgen --seeds localhost:3300,localhost:3310 --workers 8 --rate 2000
 
+// CLI binary: stderr/stdout output is the user-facing reporting channel, so
+// the workspace-level `disallowed_macros` ban on eprintln!/println! does not
+// apply here.
+#![allow(clippy::disallowed_macros)]
+
 use clap::Parser;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use teraslab_client::*;
 
 /// TeraSlab load generator.
 #[derive(Parser)]
-#[command(name = "teraslab-loadgen", about = "Generate mixed load against a TeraSlab server")]
+#[command(
+    name = "teraslab-loadgen",
+    about = "Generate mixed load against a TeraSlab server"
+)]
 struct Args {
     /// Server address for single-node mode (host:port).
     #[arg(long)]
@@ -50,7 +58,9 @@ async fn main() {
 
     let cfg = ClientConfig {
         addr: args.addr.clone(),
-        seeds: args.seeds.as_ref()
+        seeds: args
+            .seeds
+            .as_ref()
             .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
             .unwrap_or_default(),
         pool: PoolConfig {
@@ -95,8 +105,10 @@ async fn main() {
     let err_other = Arc::new(AtomicU64::new(0));
     let err_logged = Arc::new(AtomicU64::new(0)); // cap detail logging
 
-    let tx_queue: Arc<tokio::sync::Mutex<std::collections::VecDeque<([u8; 32], [u8; 32])>>> =
-        Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::with_capacity(100_000)));
+    type TxQueue = Arc<tokio::sync::Mutex<std::collections::VecDeque<([u8; 32], [u8; 32])>>>;
+    let tx_queue: TxQueue = Arc::new(tokio::sync::Mutex::new(
+        std::collections::VecDeque::with_capacity(100_000),
+    ));
 
     let interval_us = if args.rate > 0 {
         (1_000_000u64 * args.workers as u64) / args.rate
@@ -115,13 +127,19 @@ async fn main() {
     // Stats printer.
     let shutdown_s = shutdown.clone();
     let (c_s, s_s, r_s, m_s, e_s) = (
-        creates.clone(), spends.clone(), reads.clone(), mined_count.clone(), errors.clone(),
+        creates.clone(),
+        spends.clone(),
+        reads.clone(),
+        mined_count.clone(),
+        errors.clone(),
     );
     let stats = tokio::spawn(async move {
         let mut last = (0u64, 0u64, 0u64, 0u64);
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            if shutdown_s.load(Ordering::Relaxed) { break; }
+            if shutdown_s.load(Ordering::Relaxed) {
+                break;
+            }
             let c = c_s.load(Ordering::Relaxed);
             let s = s_s.load(Ordering::Relaxed);
             let r = r_s.load(Ordering::Relaxed);
@@ -130,7 +148,10 @@ async fn main() {
             let rate = ((c - last.0) + (s - last.1) + (r - last.2) + (m - last.3)) / 2;
             eprintln!(
                 "  {rate} ops/s | creates={} spends={} reads={} mined={} errors={e} (totals: {c}/{s}/{r}/{m})",
-                (c - last.0) / 2, (s - last.1) / 2, (r - last.2) / 2, (m - last.3) / 2,
+                (c - last.0) / 2,
+                (s - last.1) / 2,
+                (r - last.2) / 2,
+                (m - last.3) / 2,
             );
             last = (c, s, r, m);
         }
@@ -157,10 +178,12 @@ async fn main() {
         handles.push(tokio::spawn(async move {
             let mut block_height: u32 = 800_000 + wid as u32 * 100_000;
             let mut rng: u64 = wid as u64 ^ 0xDEAD_BEEF_CAFE_1234;
-            let now_ms = || std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let now_ms = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64
+            };
 
             let log_err = |op: &str, e: &ClientError| {
                 errors.fetch_add(1, Ordering::Relaxed);
@@ -168,18 +191,36 @@ async fn main() {
                     ClientError::Partial(pe) => {
                         err_partial.fetch_add(1, Ordering::Relaxed);
                         if err_logged.fetch_add(1, Ordering::Relaxed) < 20 {
-                            let codes: Vec<String> = pe.errors.iter()
-                                .map(|ie| format!("item{}={}", ie.item_index, teraslab_client::error_code_string(ie.code)))
+                            let codes: Vec<String> = pe
+                                .errors
+                                .iter()
+                                .map(|ie| {
+                                    format!(
+                                        "item{}={}",
+                                        ie.item_index,
+                                        teraslab_client::error_code_string(ie.code)
+                                    )
+                                })
                                 .collect();
                             eprintln!("  ERR [{op}]: partial [{}]", codes.join(", "));
                         }
                     }
-                    ClientError::Redirect(_) => { err_redirect.fetch_add(1, Ordering::Relaxed); }
-                    ClientError::Connection(_) => { err_connection.fetch_add(1, Ordering::Relaxed); }
-                    ClientError::Server { .. } => { err_server.fetch_add(1, Ordering::Relaxed); }
-                    _ => { err_other.fetch_add(1, Ordering::Relaxed); }
+                    ClientError::Redirect(_) => {
+                        err_redirect.fetch_add(1, Ordering::Relaxed);
+                    }
+                    ClientError::Connection(_) => {
+                        err_connection.fetch_add(1, Ordering::Relaxed);
+                    }
+                    ClientError::Server { .. } => {
+                        err_server.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {
+                        err_other.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-                if !matches!(e, ClientError::Partial(_)) && err_logged.fetch_add(1, Ordering::Relaxed) < 20 {
+                if !matches!(e, ClientError::Partial(_))
+                    && err_logged.fetch_add(1, Ordering::Relaxed) < 20
+                {
                     eprintln!("  ERR [{op}]: {e}");
                 }
             };
@@ -195,7 +236,9 @@ async fn main() {
                 }
 
                 block_height = block_height.wrapping_add(1);
-                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
 
                 let op = (rng % 10) as u8;
                 match op {
@@ -235,7 +278,9 @@ async fn main() {
                                 creates.fetch_add(1, Ordering::Relaxed);
                                 tx_queue.lock().await.push_back((txid, first));
                             }
-                            Err(ref e) => { log_err("create", e); }
+                            Err(ref e) => {
+                                log_err("create", e);
+                            }
                         }
                     }
                     4..7 => {
@@ -250,10 +295,17 @@ async fn main() {
                                 current_block_height: block_height,
                                 block_height_retention: 288,
                             };
-                            let items = [SpendItem { txid, vout: 0, utxo_hash, spending_data: sd }];
+                            let items = [SpendItem {
+                                txid,
+                                vout: 0,
+                                utxo_hash,
+                                spending_data: sd,
+                            }];
 
                             match client.spend_batch(&params, &items).await {
-                                Ok(_) => { spends.fetch_add(1, Ordering::Relaxed); }
+                                Ok(_) => {
+                                    spends.fetch_add(1, Ordering::Relaxed);
+                                }
                                 Err(ref e) => {
                                     log_err("spend", e);
                                     tx_queue.lock().await.push_back((txid, utxo_hash));
@@ -287,7 +339,9 @@ async fn main() {
                                     creates.fetch_add(1, Ordering::Relaxed);
                                     tx_queue.lock().await.push_back((txid, h));
                                 }
-                                Err(ref e) => { log_err("create", e); }
+                                Err(ref e) => {
+                                    log_err("create", e);
+                                }
                             }
                         }
                     }
@@ -296,8 +350,12 @@ async fn main() {
                         if let Some((txid, hash)) = entry {
                             let mask = teraslab::protocol::codec::FieldMask::ALL_METADATA;
                             match client.get_batch(mask, &[txid]).await {
-                                Ok(_) => { reads.fetch_add(1, Ordering::Relaxed); }
-                                Err(ref e) => { log_err("get", e); }
+                                Ok(_) => {
+                                    reads.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(ref e) => {
+                                    log_err("get", e);
+                                }
                             }
                             tx_queue.lock().await.push_back((txid, hash));
                         }
@@ -315,8 +373,12 @@ async fn main() {
                                 block_height_retention: 288,
                             };
                             match client.set_mined_batch(&params, &[txid]).await {
-                                Ok(_) => { mined_count.fetch_add(1, Ordering::Relaxed); }
-                                Err(ref e) => { log_err("set_mined", e); }
+                                Ok(_) => {
+                                    mined_count.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(ref e) => {
+                                    log_err("set_mined", e);
+                                }
                             }
                             tx_queue.lock().await.push_back((txid, hash));
                         }
@@ -339,12 +401,20 @@ async fn main() {
     let m = mined_count.load(Ordering::Relaxed);
     let e = errors.load(Ordering::Relaxed);
     let total = c + s + r + m;
-    let ops = if elapsed.as_secs_f64() > 0.0 { total as f64 / elapsed.as_secs_f64() } else { 0.0 };
+    let ops = if elapsed.as_secs_f64() > 0.0 {
+        total as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
 
-    eprintln!("\nDone in {:.1}s: {total} total ops ({ops:.0} ops/s)", elapsed.as_secs_f64());
+    eprintln!(
+        "\nDone in {:.1}s: {total} total ops ({ops:.0} ops/s)",
+        elapsed.as_secs_f64()
+    );
     eprintln!("  creates={c} spends={s} reads={r} mined={m} errors={e}");
     if e > 0 {
-        eprintln!("  error breakdown: partial={} redirect={} connection={} server={} other={}",
+        eprintln!(
+            "  error breakdown: partial={} redirect={} connection={} server={} other={}",
             err_partial.load(Ordering::Relaxed),
             err_redirect.load(Ordering::Relaxed),
             err_connection.load(Ordering::Relaxed),

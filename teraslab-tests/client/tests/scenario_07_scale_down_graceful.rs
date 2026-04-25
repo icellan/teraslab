@@ -6,9 +6,9 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 use teraslab_test_client::ClientError;
-use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::reporter::MetricsReporter;
 use teraslab_test_client::types::*;
+use teraslab_test_client::verifier::StateVerifier;
 
 macro_rules! tlog {
     ($t0:expr, $($arg:tt)*) => {
@@ -23,7 +23,10 @@ const SID: u16 = 7;
 
 /// Format a txid as a short hex prefix for assertion messages.
 fn txid_hex(txid: &[u8; 32]) -> String {
-    txid.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
+    txid.iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -62,8 +65,10 @@ async fn run_scenario() -> Result<(), ClientError> {
     for node_num in 1..=4u32 {
         let status = common::http_status(&docker5, node_num).await?;
         let size = status["cluster_size"].as_u64().unwrap_or(0);
-        assert_eq!(size, 4,
-            "Test 7.0: node {node_num} reports cluster_size={size}, expected 4");
+        assert_eq!(
+            size, 4,
+            "Test 7.0: node {node_num} reports cluster_size={size}, expected 4"
+        );
     }
 
     let verifier = StateVerifier::new();
@@ -205,14 +210,17 @@ async fn run_scenario() -> Result<(), ClientError> {
     for node_num in 1..=3u32 {
         let status = common::http_status(&docker5, node_num).await?;
         let size = status["cluster_size"].as_u64().unwrap_or(0);
-        assert_eq!(size, 3,
-            "Test 7.3: node {node_num} reports cluster_size={size}, expected 3");
+        assert_eq!(
+            size, 3,
+            "Test 7.3: node {node_num} reports cluster_size={size}, expected 3"
+        );
     }
     eprintln!("[7.3] OK -- cluster stabilized at size 3");
 
     // Wait for migrations to complete after topology change. Scale-down
     // migrations are heavier (data from departed node must be redistributed).
-    common::wait_migrations_complete(&docker5, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker5, 3, Duration::from_secs(120))
+        .await
         .map_err(|e| {
             eprintln!("[7.3] ERROR: migrations did not complete: {e}");
             e
@@ -221,13 +229,17 @@ async fn run_scenario() -> Result<(), ClientError> {
     common::wait_replication_settled(&docker5, 3, Duration::from_secs(5)).await?;
     // Second migration wait: handoffs that were "orphaned" on first pass
     // may have completed now.
-    common::wait_migrations_complete(&docker5, 3, Duration::from_secs(120)).await.ok();
+    common::wait_migrations_complete(&docker5, 3, Duration::from_secs(120))
+        .await
+        .ok();
     client.refresh_routing().await?;
 
     // Evaluate background workload results (test 7.6)
     let bg_write_errors = workload_write_errors.load(std::sync::atomic::Ordering::Relaxed);
     let bg_total_ops = workload_ops.load(std::sync::atomic::Ordering::Relaxed);
-    eprintln!("[7.6] Background workload during drain: {bg_total_ops} ops, {bg_write_errors} write failures");
+    eprintln!(
+        "[7.6] Background workload during drain: {bg_total_ops} ops, {bg_write_errors} write failures"
+    );
     eprintln!("[7.6] {}", reporter.format_summary());
     // Log transient errors during drain. These are NOT data loss — writes that
     // failed were rejected before being applied (routing staleness during shard
@@ -242,19 +254,23 @@ async fn run_scenario() -> Result<(), ClientError> {
     }
 
     // Wait for shard rebalance to fully settle after workload stops.
-    common::wait_migrations_complete(&docker5, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker5, 3, Duration::from_secs(120))
+        .await
         .unwrap_or_else(|e| eprintln!("[7.3b] migration wait: {e}"));
     client.refresh_routing().await?;
 
     let mut total_masters: u64 = 0;
     for node_num in 1..=3u32 {
         let status = common::http_status(&docker5, node_num).await?;
-        let master_count = status["master_shard_count"].as_u64()
+        let master_count = status["master_shard_count"]
+            .as_u64()
             .expect("Test 7.3: master_shard_count should be present");
         total_masters += master_count;
     }
-    assert!(total_masters >= 4096 && total_masters <= 4128,
-        "[7.3] total_masters={total_masters}, expected 4096 (±32 for in-flight handoffs)");
+    assert!(
+        (4096..=4128).contains(&total_masters),
+        "[7.3] total_masters={total_masters}, expected 4096 (±32 for in-flight handoffs)"
+    );
 
     tlog!(t0, "test 7.3: done");
 
@@ -264,14 +280,16 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // After force-removing node4 the client's routing may still point at
     // it for a moment; settle and refresh before the first read pass.
-    common::wait_specific_replication_settled(&docker5, &[1, 2, 3], Duration::from_secs(10)).await?;
+    common::wait_specific_replication_settled(&docker5, &[1, 2, 3], Duration::from_secs(10))
+        .await?;
     client.refresh_routing().await?;
 
     let mut read_failures = 0u32;
     for attempt in 0..3u32 {
         if attempt > 0 {
             eprintln!("[7.4] retry {attempt} after settle");
-            common::wait_specific_replication_settled(&docker5, &[1, 2, 3], Duration::from_secs(5)).await?;
+            common::wait_specific_replication_settled(&docker5, &[1, 2, 3], Duration::from_secs(5))
+                .await?;
             tokio::time::sleep(Duration::from_millis(500)).await;
             client.refresh_routing().await?;
         }
@@ -304,9 +322,16 @@ async fn run_scenario() -> Result<(), ClientError> {
             break;
         }
     }
-    assert_eq!(read_failures, 0,
-        "Test 7.4: {read_failures}/{} reads failed after drain", txids.len());
-    eprintln!("[7.4] OK -- all {} records accessible, zero loss", txids.len());
+    assert_eq!(
+        read_failures,
+        0,
+        "Test 7.4: {read_failures}/{} reads failed after drain",
+        txids.len()
+    );
+    eprintln!(
+        "[7.4] OK -- all {} records accessible, zero loss",
+        txids.len()
+    );
 
     tlog!(t0, "test 7.4: done");
 
@@ -314,10 +339,12 @@ async fn run_scenario() -> Result<(), ClientError> {
     tlog!(t0, "test 7.5: consistency check");
     eprintln!("[7.5] Running full consistency check via verify_consistency()");
     let mismatches = common::verify_consistency(&client, &verifier).await?;
-    assert!(mismatches.is_empty(),
+    assert!(
+        mismatches.is_empty(),
         "Test 7.5: verify_consistency found {} mismatches: {:?}",
         mismatches.len(),
-        mismatches.iter().take(5).collect::<Vec<_>>());
+        mismatches.iter().take(5).collect::<Vec<_>>()
+    );
     eprintln!("[7.5] OK -- full consistency check passed, zero mismatches");
 
     tlog!(t0, "test 7.5: done");

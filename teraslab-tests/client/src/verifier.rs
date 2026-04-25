@@ -144,6 +144,12 @@ pub struct StateVerifier {
     records: RwLock<HashMap<[u8; 32], ExpectedRecord>>,
 }
 
+impl Default for StateVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StateVerifier {
     /// Create a new, empty verifier.
     pub fn new() -> Self {
@@ -723,7 +729,11 @@ mod tests {
     fn multiple_operations_on_same_record() {
         let v = StateVerifier::new();
         let txid = make_txid(12);
-        v.record_create(txid, 4, vec![make_hash(1), make_hash(2), make_hash(3), make_hash(4)]);
+        v.record_create(
+            txid,
+            4,
+            vec![make_hash(1), make_hash(2), make_hash(3), make_hash(4)],
+        );
 
         v.record_spend(txid, 0);
         v.record_spend(txid, 2);

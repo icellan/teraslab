@@ -3,7 +3,7 @@
 //! Provides structured types for serving the shard table to clients,
 //! so they can route requests directly to the correct master node.
 
-use crate::cluster::shards::{NodeId, NUM_SHARDS};
+use crate::cluster::shards::{NUM_SHARDS, NodeId};
 use std::net::SocketAddr;
 
 /// Complete routing information for the cluster.
@@ -109,8 +109,7 @@ impl RoutingInfo {
                 return None;
             }
             let id = NodeId(u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?));
-            let addr_len =
-                u16::from_le_bytes(data[pos + 8..pos + 10].try_into().ok()?) as usize;
+            let addr_len = u16::from_le_bytes(data[pos + 8..pos + 10].try_into().ok()?) as usize;
             pos += 10;
             if pos + addr_len + 1 > data.len() {
                 return None;
@@ -137,7 +136,8 @@ impl RoutingInfo {
         // Backward compatible: if not present, committed_members is empty.
         let mut committed_members = Vec::new();
         if pos + 4 <= data.len() {
-            let cm_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
+            let cm_count =
+                u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
             pos += 4;
             for _ in 0..cm_count {
                 if pos + 8 > data.len() {
@@ -218,8 +218,10 @@ mod tests {
         );
         let encoded = info.encode();
         let decoded = RoutingInfo::decode(&encoded).unwrap();
-        assert!(decoded.committed_members.is_empty(),
-            "old format should have empty committed_members");
+        assert!(
+            decoded.committed_members.is_empty(),
+            "old format should have empty committed_members"
+        );
     }
 
     #[test]
@@ -229,9 +231,21 @@ mod tests {
         let info = RoutingInfo::new(
             5,
             vec![
-                NodeInfo { id: NodeId(1), addr: "127.0.0.1:3000".parse().unwrap(), is_alive: true },
-                NodeInfo { id: NodeId(2), addr: "127.0.0.1:3001".parse().unwrap(), is_alive: true },
-                NodeInfo { id: NodeId(3), addr: "127.0.0.1:3002".parse().unwrap(), is_alive: false },
+                NodeInfo {
+                    id: NodeId(1),
+                    addr: "127.0.0.1:3000".parse().unwrap(),
+                    is_alive: true,
+                },
+                NodeInfo {
+                    id: NodeId(2),
+                    addr: "127.0.0.1:3001".parse().unwrap(),
+                    is_alive: true,
+                },
+                NodeInfo {
+                    id: NodeId(3),
+                    addr: "127.0.0.1:3002".parse().unwrap(),
+                    is_alive: false,
+                },
             ],
             (0..NUM_SHARDS as u16).map(|s| (s, NodeId(1))).collect(),
         );
@@ -259,9 +273,7 @@ mod tests {
                 addr: "10.0.0.1:5000".parse().unwrap(),
                 is_alive: true,
             }],
-            (0..NUM_SHARDS as u16)
-                .map(|s| (s, NodeId(100)))
-                .collect(),
+            (0..NUM_SHARDS as u16).map(|s| (s, NodeId(100))).collect(),
         );
 
         let encoded = info.encode();
@@ -306,19 +318,24 @@ mod tests {
         let assignments: Vec<(u16, NodeId)> = (0..NUM_SHARDS as u16)
             .map(|s| (s, table.target_assignment(s).master))
             .collect();
-        let nodes = members.iter().map(|&id| NodeInfo {
-            id,
-            addr: format!("127.0.0.1:{}", 3000 + id.0).parse().unwrap(),
-            is_alive: true,
-        }).collect();
+        let nodes = members
+            .iter()
+            .map(|&id| NodeInfo {
+                id,
+                addr: format!("127.0.0.1:{}", 3000 + id.0).parse().unwrap(),
+                is_alive: true,
+            })
+            .collect();
 
         let info = RoutingInfo::new(5, nodes, assignments);
         let decoded = RoutingInfo::decode(&info.encode()).unwrap();
 
         assert_eq!(decoded.shard_assignments.len(), NUM_SHARDS);
         for (shard, master) in &decoded.shard_assignments {
-            assert!(members.contains(master),
-                "shard {shard} has master {master:?} not in member list");
+            assert!(
+                members.contains(master),
+                "shard {shard} has master {master:?} not in member list"
+            );
         }
     }
 
@@ -328,11 +345,13 @@ mod tests {
 
     #[test]
     fn routing_info_10_nodes_round_trip() {
-        let nodes: Vec<NodeInfo> = (1..=10u64).map(|id| NodeInfo {
-            id: NodeId(id),
-            addr: format!("127.0.0.1:{}", 3000 + id).parse().unwrap(),
-            is_alive: id % 3 != 0, // some dead
-        }).collect();
+        let nodes: Vec<NodeInfo> = (1..=10u64)
+            .map(|id| NodeInfo {
+                id: NodeId(id),
+                addr: format!("127.0.0.1:{}", 3000 + id).parse().unwrap(),
+                is_alive: id % 3 != 0, // some dead
+            })
+            .collect();
         let assignments: Vec<(u16, NodeId)> = (0..NUM_SHARDS as u16)
             .map(|s| (s, NodeId((s as u64 % 10) + 1)))
             .collect();

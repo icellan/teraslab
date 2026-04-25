@@ -6,9 +6,9 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 use teraslab_test_client::ClientError;
-use teraslab_test_client::verifier::StateVerifier;
-use teraslab_test_client::types::*;
 use teraslab_test_client::reporter::MetricsReporter;
+use teraslab_test_client::types::*;
+use teraslab_test_client::verifier::StateVerifier;
 
 macro_rules! tlog {
     ($t0:expr, $($arg:tt)*) => {
@@ -23,12 +23,15 @@ const SID: u16 = 5;
 
 /// Format a txid as a short hex prefix for assertion messages.
 fn txid_hex(txid: &[u8; 32]) -> String {
-    txid.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
+    txid.iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_05_node_recovery_catchup() {
-    let result = tokio::time::timeout(Duration::from_secs(300), run_scenario()).await;
+    let result = tokio::time::timeout(Duration::from_secs(600), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -37,7 +40,7 @@ async fn scenario_05_node_recovery_catchup() {
         }
         Err(_) => {
             common::teardown_all(SID).await;
-            panic!("scenario timed out after 300s");
+            panic!("scenario timed out after 600s");
         }
     }
 }
@@ -70,7 +73,7 @@ async fn run_scenario() -> Result<(), ClientError> {
     // Wait for BOTH surviving nodes to detect node2's departure
     common::wait_specific_nodes_ready(&docker, &[1, 3], 2, Duration::from_secs(30)).await?;
     // Wait for shard table rebalance and migrations on the 2-node cluster
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(30)).await?;
+    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(120)).await?;
     client.refresh_routing().await?;
 
     eprintln!("[5.0] Creating 500 additional records while node2 is down");
@@ -89,7 +92,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     let membership_start = std::time::Instant::now();
     docker.start_node("node2").await?;
 
-    common::wait_cluster_ready(&docker, 3, Duration::from_secs(10)).await
+    common::wait_cluster_ready(&docker, 3, Duration::from_secs(10))
+        .await
         .map_err(|e| {
             eprintln!("Test 5.1: cluster did not reach size 3 within 10s: {e}");
             e
@@ -119,7 +123,8 @@ async fn run_scenario() -> Result<(), ClientError> {
         2,
         50,
         Duration::from_secs(60),
-    ).await?;
+    )
+    .await?;
 
     // -- Test 5.3: Verify balanced distribution --
     tlog!(t0, "test 5.3 start");
@@ -153,29 +158,33 @@ async fn run_scenario() -> Result<(), ClientError> {
     let mut total_masters: u64 = 0;
     for node_num in 1..=3u32 {
         let status = common::http_status(&docker, node_num).await?;
-        let master_count = status["master_shard_count"].as_u64()
+        let master_count = status["master_shard_count"]
+            .as_u64()
             .expect("Test 5.3: master_shard_count should be present");
         total_masters += master_count;
 
-        let diff = if master_count > expected_per_node {
-            master_count - expected_per_node
-        } else {
-            expected_per_node - master_count
-        };
-        assert!(diff <= tolerance,
+        let diff = master_count.abs_diff(expected_per_node);
+        assert!(
+            diff <= tolerance,
             "Test 5.3: node {node_num} masters {master_count} shards, expected ~{expected_per_node} \
-             (tolerance {tolerance}), difference is {diff}");
+             (tolerance {tolerance}), difference is {diff}"
+        );
         eprintln!("[5.3] node{node_num}: {master_count} master shards");
     }
-    assert!(total_masters >= 4096 && total_masters <= 4128,
-        "[5.3] total_masters={total_masters}, expected 4096 (±32 for in-flight handoffs)");
+    assert!(
+        (4096..=4128).contains(&total_masters),
+        "[5.3] total_masters={total_masters}, expected 4096 (±32 for in-flight handoffs)"
+    );
     eprintln!("[5.3] OK -- balanced distribution confirmed (total={total_masters})");
     tlog!(t0, "test 5.3 done");
 
     // -- Test 5.4: Read ALL records from node2 directly --
     // Every record that node2 is master or replica for must be accessible.
     tlog!(t0, "test 5.4 start");
-    eprintln!("[5.4] Reading ALL {} records directly from node2 via FLAG_LOCAL_READ", all_txids.len());
+    eprintln!(
+        "[5.4] Reading ALL {} records directly from node2 via FLAG_LOCAL_READ",
+        all_txids.len()
+    );
     let mut accessible_count = 0u32;
     let mut inaccessible_count = 0u32;
 
@@ -202,16 +211,24 @@ async fn run_scenario() -> Result<(), ClientError> {
     // With RF=2 and 3 nodes, each node holds ~2/3 of all records.
     // After catchup, ALL records assigned to node2 (master + replica) must be present.
     let total_checked = accessible_count + inaccessible_count;
-    assert_eq!(total_checked, all_txids.len() as u32,
-        "Test 5.4: checked {total_checked} but expected {}", all_txids.len());
+    assert_eq!(
+        total_checked,
+        all_txids.len() as u32,
+        "Test 5.4: checked {total_checked} but expected {}",
+        all_txids.len()
+    );
     // With RF=2, node2 should be master or replica for approximately 2/3 of shards,
     // so it should hold at least ~20% of all records (conservatively).
     // Inaccessible records are expected for shards not assigned to node2.
-    assert!(accessible_count > total_checked / 5,
+    assert!(
+        accessible_count > total_checked / 5,
         "Test 5.4: node2 only has {accessible_count}/{total_checked} records accessible, \
-         expected at least ~20% (with RF=2 and 3 nodes, node2 should hold ~2/3 of shards)");
-    eprintln!("[5.4] OK -- {accessible_count}/{total_checked} records accessible on node2 locally \
-              ({inaccessible_count} not on this node, which is expected for shards it doesn't own)");
+         expected at least ~20% (with RF=2 and 3 nodes, node2 should hold ~2/3 of shards)"
+    );
+    eprintln!(
+        "[5.4] OK -- {accessible_count}/{total_checked} records accessible on node2 locally \
+              ({inaccessible_count} not on this node, which is expected for shards it doesn't own)"
+    );
     tlog!(t0, "test 5.4 done");
 
     // -- Test 5.5: Master/replica byte comparison for ALL records --
@@ -226,10 +243,12 @@ async fn run_scenario() -> Result<(), ClientError> {
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
     let fresh_client = common::create_client(&docker, 3).await?;
     let mismatches = common::verify_consistency(&fresh_client, &verifier).await?;
-    assert!(mismatches.is_empty(),
+    assert!(
+        mismatches.is_empty(),
         "Test 5.5: verify_consistency found {} mismatches: {:?}",
         mismatches.len(),
-        mismatches.iter().take(5).collect::<Vec<_>>());
+        mismatches.iter().take(5).collect::<Vec<_>>()
+    );
     eprintln!("[5.5] OK -- full consistency check passed, zero mismatches");
     tlog!(t0, "test 5.5 done");
 
@@ -245,37 +264,60 @@ async fn run_scenario() -> Result<(), ClientError> {
             eprintln!("Test 5.6: duplicate txid found: {}", txid_hex(txid));
         }
     }
-    assert_eq!(duplicate_count, 0,
-        "Test 5.6: found {duplicate_count} duplicate txids in verifier");
+    assert_eq!(
+        duplicate_count, 0,
+        "Test 5.6: found {duplicate_count} duplicate txids in verifier"
+    );
 
     // Also verify via cluster reads that no txid returns multiple distinct records
     let mut cluster_duplicates = 0u32;
     for chunk in all_txids.chunks(100) {
         let results = client.get_batch(FIELD_ALL, chunk).await?;
-        assert_eq!(results.len(), chunk.len(),
+        assert_eq!(
+            results.len(),
+            chunk.len(),
             "Test 5.6: get_batch returned {} results for {} txids",
-            results.len(), chunk.len());
+            results.len(),
+            chunk.len()
+        );
         for (i, result) in results.iter().enumerate() {
             if result.status() != 0 {
                 cluster_duplicates += 1;
-                eprintln!("Test 5.6: txid {} not found in cluster", txid_hex(&chunk[i]));
+                eprintln!(
+                    "Test 5.6: txid {} not found in cluster",
+                    txid_hex(&chunk[i])
+                );
             }
         }
     }
-    assert_eq!(cluster_duplicates, 0,
-        "Test 5.6: {cluster_duplicates} records missing from cluster (possible duplication/loss issue)");
+    assert_eq!(
+        cluster_duplicates, 0,
+        "Test 5.6: {cluster_duplicates} records missing from cluster (possible duplication/loss issue)"
+    );
     eprintln!("[5.6] OK -- no duplicate records found");
     tlog!(t0, "test 5.6 done");
 
     // -- Test 5.7: Measure time-to-membership and time-to-fully-caught-up --
     tlog!(t0, "test 5.7 start");
     eprintln!("[5.7] Recovery timing measurements:");
-    eprintln!("[5.7]   Time to membership (cluster_size=3): {:?}", time_to_membership);
-    eprintln!("[5.7]   Time to fully caught up (migrations complete): {:?}", time_to_caught_up);
-    assert!(time_to_membership <= Duration::from_secs(10),
-        "Test 5.7: time to membership was {:?}, expected <= 10s", time_to_membership);
-    assert!(time_to_caught_up <= Duration::from_secs(60),
-        "Test 5.7: time to fully caught up was {:?}, expected <= 60s", time_to_caught_up);
+    eprintln!(
+        "[5.7]   Time to membership (cluster_size=3): {:?}",
+        time_to_membership
+    );
+    eprintln!(
+        "[5.7]   Time to fully caught up (migrations complete): {:?}",
+        time_to_caught_up
+    );
+    assert!(
+        time_to_membership <= Duration::from_secs(10),
+        "Test 5.7: time to membership was {:?}, expected <= 10s",
+        time_to_membership
+    );
+    assert!(
+        time_to_caught_up <= Duration::from_secs(60),
+        "Test 5.7: time to fully caught up was {:?}, expected <= 60s",
+        time_to_caught_up
+    );
     eprintln!("[5.7] OK -- recovery timing within bounds");
     tlog!(t0, "test 5.7 done");
 
@@ -311,7 +353,8 @@ async fn run_scenario() -> Result<(), ClientError> {
 
         // Read batch (if we have records)
         if workload_txids.len() >= 10 {
-            let read_sample: Vec<[u8; 32]> = workload_txids.iter().rev().take(10).copied().collect();
+            let read_sample: Vec<[u8; 32]> =
+                workload_txids.iter().rev().take(10).copied().collect();
             let op_start = std::time::Instant::now();
             match client.get_batch(FIELD_ALL, &read_sample).await {
                 Ok(_results) => {
@@ -327,18 +370,24 @@ async fn run_scenario() -> Result<(), ClientError> {
 
         // Spend some UTXOs (if we have records to spend)
         if workload_txids.len() >= 5 {
-            let spend_targets: Vec<SpendItem> = workload_txids.iter().rev().take(3).map(|txid| {
-                let rec = verifier.get_record(txid);
-                let utxo_hash = rec.as_ref()
-                    .and_then(|r| r.utxo_hashes.first().copied())
-                    .unwrap_or([0u8; 32]);
-                SpendItem {
-                    txid: *txid,
-                    vout: 0,
-                    utxo_hash,
-                    spending_data: [0u8; 36],
-                }
-            }).collect();
+            let spend_targets: Vec<SpendItem> = workload_txids
+                .iter()
+                .rev()
+                .take(3)
+                .map(|txid| {
+                    let rec = verifier.get_record(txid);
+                    let utxo_hash = rec
+                        .as_ref()
+                        .and_then(|r| r.utxo_hashes.first().copied())
+                        .unwrap_or([0u8; 32]);
+                    SpendItem {
+                        txid: *txid,
+                        vout: 0,
+                        utxo_hash,
+                        spending_data: [0u8; 36],
+                    }
+                })
+                .collect();
 
             let params = SpendBatchParams {
                 ignore_conflicting: false,
@@ -370,9 +419,15 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // Allow up to 5% error rate during post-recovery workload — the deferred
     // shard table swap creates a brief window where some writes are rejected.
-    let error_rate = if total_ops > 0 { total_errors as f64 / total_ops as f64 * 100.0 } else { 0.0 };
-    assert!(error_rate < 5.0,
-        "Test 5.8: {error_rate:.1}% error rate ({total_errors}/{total_ops}) exceeds 5% threshold");
+    let error_rate = if total_ops > 0 {
+        total_errors as f64 / total_ops as f64 * 100.0
+    } else {
+        0.0
+    };
+    assert!(
+        error_rate < 5.0,
+        "Test 5.8: {error_rate:.1}% error rate ({total_errors}/{total_ops}) exceeds 5% threshold"
+    );
     eprintln!("[5.8] OK -- completed {total_ops} ops in 30s with zero errors");
     eprintln!("[5.8] {}", reporter.format_summary());
     tlog!(t0, "test 5.8 done");

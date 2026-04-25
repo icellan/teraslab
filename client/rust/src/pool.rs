@@ -5,8 +5,8 @@
 //! maintains a minimum number of idle connections via a background health
 //! check task.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -205,11 +205,7 @@ async fn health_loop(
 }
 
 /// Remove dead connections and replenish to min_conns.
-async fn check_health(
-    addr: &str,
-    config: &PoolConfig,
-    conns: &Arc<Mutex<Vec<Arc<PipeConn>>>>,
-) {
+async fn check_health(addr: &str, config: &PoolConfig, conns: &Arc<Mutex<Vec<Arc<PipeConn>>>>) {
     let deficit = {
         let mut guard = conns.lock();
         // Remove dead connections.

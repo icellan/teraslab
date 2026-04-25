@@ -100,7 +100,9 @@ impl StateVerifier {
                     parent_txids: &[],
                 };
 
-                engine.create(&req).map_err(|e| format!("create failed: {e}"))?;
+                engine
+                    .create(&req)
+                    .map_err(|e| format!("create failed: {e}"))?;
 
                 let key = TxKey { txid: *tx_id };
                 let utxo_count = utxo_hashes.len() as u32;
@@ -219,7 +221,9 @@ impl StateVerifier {
                         Ok(())
                     }
                     Err(e) => match &e {
-                        SpendError::Conflicting | SpendError::Locked | SpendError::CoinbaseImmature { .. } => Ok(()),
+                        SpendError::Conflicting
+                        | SpendError::Locked
+                        | SpendError::CoinbaseImmature { .. } => Ok(()),
                         _ => Err(format!("unexpected spend_multi error: {e}")),
                     },
                 }
@@ -242,7 +246,9 @@ impl StateVerifier {
                     unset_mined: false,
                 };
 
-                engine.set_mined(&req).map_err(|e| format!("set_mined failed: {e}"))?;
+                engine
+                    .set_mined(&req)
+                    .map_err(|e| format!("set_mined failed: {e}"))?;
 
                 if let Some(rec) = self.records.get_mut(tx_key) {
                     if !rec.mined_block_ids.contains(block_id) {
@@ -270,7 +276,9 @@ impl StateVerifier {
                     unset_mined: true,
                 };
 
-                engine.set_mined(&req).map_err(|e| format!("unset_mined failed: {e}"))?;
+                engine
+                    .set_mined(&req)
+                    .map_err(|e| format!("unset_mined failed: {e}"))?;
 
                 if let Some(rec) = self.records.get_mut(tx_key) {
                     rec.mined_block_ids.retain(|&id| id != *block_id);
@@ -293,19 +301,17 @@ impl StateVerifier {
                 }
             }
 
-            WorkloadOp::ReadSlot { tx_key, offset } => {
-                match engine.read_slot(tx_key, *offset) {
-                    Ok(_) => Ok(()),
-                    Err(SpendError::TxNotFound) => {
-                        if self.records.contains_key(tx_key) {
-                            Err(format!("tx {:?} expected to exist but not found", tx_key))
-                        } else {
-                            Ok(())
-                        }
+            WorkloadOp::ReadSlot { tx_key, offset } => match engine.read_slot(tx_key, *offset) {
+                Ok(_) => Ok(()),
+                Err(SpendError::TxNotFound) => {
+                    if self.records.contains_key(tx_key) {
+                        Err(format!("tx {:?} expected to exist but not found", tx_key))
+                    } else {
+                        Ok(())
                     }
-                    Err(e) => Err(format!("read_slot error: {e}")),
                 }
-            }
+                Err(e) => Err(format!("read_slot error: {e}")),
+            },
 
             WorkloadOp::Freeze {
                 tx_key,
@@ -477,10 +483,7 @@ impl StateVerifier {
                                 }
                                 if actual.hash != exp_slot.hash {
                                     mismatches.push(Mismatch {
-                                        detail: format!(
-                                            "tx {:?} slot {}: hash mismatch",
-                                            key, i
-                                        ),
+                                        detail: format!("tx {:?} slot {}: hash mismatch", key, i),
                                     });
                                 }
                                 if actual.spending_data != exp_slot.spending_data {
@@ -494,10 +497,7 @@ impl StateVerifier {
                             }
                             Err(e) => {
                                 mismatches.push(Mismatch {
-                                    detail: format!(
-                                        "tx {:?} slot {}: read error: {}",
-                                        key, i, e
-                                    ),
+                                    detail: format!("tx {:?} slot {}: read error: {}", key, i, e),
                                 });
                             }
                         }

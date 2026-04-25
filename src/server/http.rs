@@ -4,25 +4,25 @@
 //! for routing. Does not block or slow the binary protocol path.
 
 use crate::cluster::coordinator::RunningCluster;
-use crate::cluster::shards::{NodeId, ShardTable, NUM_SHARDS};
+use crate::cluster::shards::{NUM_SHARDS, NodeId, ShardTable};
 use crate::index::TxKey;
 use crate::metrics::{
-    allocator_metrics, io_uring_metrics, migration_metrics, redo_metrics, replication_metrics,
-    swim_metrics, LatencyHistogram, MigrationLabel, OpCode, OpOutcomeCounters, Outcome,
-    SwimChurnKind, ThreadHistograms, ThreadMetrics, UringErrClass, MAX_REPLICAS,
+    LatencyHistogram, MAX_REPLICAS, MigrationLabel, OpCode, OpOutcomeCounters, Outcome,
+    SwimChurnKind, ThreadHistograms, ThreadMetrics, UringErrClass, allocator_metrics,
+    io_uring_metrics, migration_metrics, redo_metrics, replication_metrics, swim_metrics,
 };
 use crate::observability::WireTraceContext;
 use crate::ops::engine::Engine;
 use crate::redo::RedoLog;
+use axum::Router;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, put};
-use axum::Router;
 use rust_embed::Embed;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Log levels for the runtime log level endpoint.
@@ -63,10 +63,7 @@ pub struct HttpState {
 ///
 /// This spawns a tokio runtime and blocks until shutdown.
 /// Call this from a dedicated thread.
-pub fn start_http_server(
-    bind_addr: String,
-    state: Arc<HttpState>,
-) {
+pub fn start_http_server(bind_addr: String, state: Arc<HttpState>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -81,7 +78,10 @@ pub fn start_http_server(
             .route("/status", get(handle_status))
             // Admin
             .route("/admin/quiesce", put(handle_admin_quiesce))
-            .route("/admin/migration_status", get(handle_admin_migration_status))
+            .route(
+                "/admin/migration_status",
+                get(handle_admin_migration_status),
+            )
             .route("/admin/nodes", get(handle_admin_nodes))
             .route("/admin/memory", get(handle_admin_memory))
             .route("/admin/records", get(handle_admin_records))
@@ -163,67 +163,291 @@ pub(crate) fn render_metrics_text(
     let mut out = String::with_capacity(8192);
 
     // Spend counters
-    prom_counter(&mut out, "teraslab_spends_attempted_total", m.spends_attempted.get());
-    prom_counter(&mut out, "teraslab_spends_succeeded_total", m.spends_succeeded.get());
-    prom_counter(&mut out, "teraslab_spends_idempotent_total", m.spends_idempotent.get());
-    prom_counter(&mut out, "teraslab_spends_failed_total", m.spends_failed.get());
-    prom_counter(&mut out, "teraslab_unspends_attempted_total", m.unspends_attempted.get());
-    prom_counter(&mut out, "teraslab_unspends_succeeded_total", m.unspends_succeeded.get());
-    prom_counter(&mut out, "teraslab_unspends_noop_total", m.unspends_noop.get());
-    prom_counter(&mut out, "teraslab_unspends_failed_total", m.unspends_failed.get());
-    prom_counter(&mut out, "teraslab_spend_multi_batches_total", m.spend_multi_batches.get());
-    prom_counter(&mut out, "teraslab_spend_multi_items_attempted_total", m.spend_multi_items_attempted.get());
-    prom_counter(&mut out, "teraslab_spend_multi_items_succeeded_total", m.spend_multi_items_succeeded.get());
-    prom_counter(&mut out, "teraslab_spend_multi_items_idempotent_total", m.spend_multi_items_idempotent.get());
-    prom_counter(&mut out, "teraslab_spend_multi_items_failed_total", m.spend_multi_items_failed.get());
-    prom_counter(&mut out, "teraslab_unspend_multi_batches_total", m.unspend_multi_batches.get());
-    prom_counter(&mut out, "teraslab_unspend_multi_items_attempted_total", m.unspend_multi_items_attempted.get());
-    prom_counter(&mut out, "teraslab_unspend_multi_items_succeeded_total", m.unspend_multi_items_succeeded.get());
-    prom_counter(&mut out, "teraslab_unspend_multi_items_idempotent_total", m.unspend_multi_items_idempotent.get());
-    prom_counter(&mut out, "teraslab_unspend_multi_items_failed_total", m.unspend_multi_items_failed.get());
+    prom_counter(
+        &mut out,
+        "teraslab_spends_attempted_total",
+        m.spends_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_spends_succeeded_total",
+        m.spends_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_spends_idempotent_total",
+        m.spends_idempotent.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_spends_failed_total",
+        m.spends_failed.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_unspends_attempted_total",
+        m.unspends_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_unspends_succeeded_total",
+        m.unspends_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_unspends_noop_total",
+        m.unspends_noop.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_unspends_failed_total",
+        m.unspends_failed.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_spend_multi_batches_total",
+        m.spend_multi_batches.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_spend_multi_items_attempted_total",
+        m.spend_multi_items_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_spend_multi_items_succeeded_total",
+        m.spend_multi_items_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_spend_multi_items_idempotent_total",
+        m.spend_multi_items_idempotent.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_spend_multi_items_failed_total",
+        m.spend_multi_items_failed.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_unspend_multi_batches_total",
+        m.unspend_multi_batches.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_unspend_multi_items_attempted_total",
+        m.unspend_multi_items_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_unspend_multi_items_succeeded_total",
+        m.unspend_multi_items_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_unspend_multi_items_idempotent_total",
+        m.unspend_multi_items_idempotent.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_unspend_multi_items_failed_total",
+        m.unspend_multi_items_failed.get(),
+    );
     prom_counter(&mut out, "teraslab_dah_inserts_total", m.dah_inserts.get());
     prom_counter(&mut out, "teraslab_dah_removes_total", m.dah_removes.get());
 
     // Operation counters (per-op batch counters + per-item outcomes).
-    prom_counter(&mut out, "teraslab_creates_attempted_total", m.creates_attempted.get());
-    prom_counter(&mut out, "teraslab_creates_succeeded_total", m.creates_succeeded.get());
-    prom_counter(&mut out, "teraslab_creates_failed_total", m.creates_failed.get());
-    prom_counter(&mut out, "teraslab_set_mined_attempted_total", m.set_mined_attempted.get());
-    prom_counter(&mut out, "teraslab_set_mined_succeeded_total", m.set_mined_succeeded.get());
-    prom_counter(&mut out, "teraslab_set_mined_items_attempted_total", m.set_mined_items_attempted.get());
-    prom_counter(&mut out, "teraslab_set_mined_items_succeeded_total", m.set_mined_items_succeeded.get());
-    prom_counter(&mut out, "teraslab_set_mined_items_failed_total", m.set_mined_items_failed.get());
-    prom_counter(&mut out, "teraslab_gets_attempted_total", m.gets_attempted.get());
-    prom_counter(&mut out, "teraslab_gets_succeeded_total", m.gets_succeeded.get());
-    prom_counter(&mut out, "teraslab_gets_not_found_total", m.gets_not_found.get());
+    prom_counter(
+        &mut out,
+        "teraslab_creates_attempted_total",
+        m.creates_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_creates_succeeded_total",
+        m.creates_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_creates_failed_total",
+        m.creates_failed.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_set_mined_attempted_total",
+        m.set_mined_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_set_mined_succeeded_total",
+        m.set_mined_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_set_mined_items_attempted_total",
+        m.set_mined_items_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_set_mined_items_succeeded_total",
+        m.set_mined_items_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_set_mined_items_failed_total",
+        m.set_mined_items_failed.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_gets_attempted_total",
+        m.gets_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_gets_succeeded_total",
+        m.gets_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_gets_not_found_total",
+        m.gets_not_found.get(),
+    );
     prom_counter(&mut out, "teraslab_gets_failed_total", m.gets_failed.get());
-    prom_counter(&mut out, "teraslab_freezes_attempted_total", m.freezes_attempted.get());
-    prom_counter(&mut out, "teraslab_freezes_succeeded_total", m.freezes_succeeded.get());
-    prom_counter(&mut out, "teraslab_freezes_failed_total", m.freezes_failed.get());
-    prom_counter(&mut out, "teraslab_unfreezes_attempted_total", m.unfreezes_attempted.get());
-    prom_counter(&mut out, "teraslab_unfreezes_succeeded_total", m.unfreezes_succeeded.get());
-    prom_counter(&mut out, "teraslab_unfreezes_failed_total", m.unfreezes_failed.get());
-    prom_counter(&mut out, "teraslab_deletes_attempted_total", m.deletes_attempted.get());
-    prom_counter(&mut out, "teraslab_deletes_succeeded_total", m.deletes_succeeded.get());
-    prom_counter(&mut out, "teraslab_deletes_failed_total", m.deletes_failed.get());
-    prom_counter(&mut out, "teraslab_preserve_until_attempted_total", m.preserve_until_attempted.get());
-    prom_counter(&mut out, "teraslab_preserve_until_succeeded_total", m.preserve_until_succeeded.get());
-    prom_counter(&mut out, "teraslab_preserve_until_failed_total", m.preserve_until_failed.get());
-    prom_counter(&mut out, "teraslab_mark_longest_chain_attempted_total", m.mark_longest_chain_attempted.get());
-    prom_counter(&mut out, "teraslab_mark_longest_chain_succeeded_total", m.mark_longest_chain_succeeded.get());
-    prom_counter(&mut out, "teraslab_mark_longest_chain_failed_total", m.mark_longest_chain_failed.get());
-    prom_counter(&mut out, "teraslab_reassign_attempted_total", m.reassign_attempted.get());
-    prom_counter(&mut out, "teraslab_reassign_succeeded_total", m.reassign_succeeded.get());
-    prom_counter(&mut out, "teraslab_reassign_failed_total", m.reassign_failed.get());
-    prom_counter(&mut out, "teraslab_set_conflicting_attempted_total", m.set_conflicting_attempted.get());
-    prom_counter(&mut out, "teraslab_set_conflicting_succeeded_total", m.set_conflicting_succeeded.get());
-    prom_counter(&mut out, "teraslab_set_conflicting_failed_total", m.set_conflicting_failed.get());
-    prom_counter(&mut out, "teraslab_set_locked_attempted_total", m.set_locked_attempted.get());
-    prom_counter(&mut out, "teraslab_set_locked_succeeded_total", m.set_locked_succeeded.get());
-    prom_counter(&mut out, "teraslab_set_locked_failed_total", m.set_locked_failed.get());
-    prom_counter(&mut out, "teraslab_replication_degraded_acks_total", m.replication_degraded_acks.get());
-    prom_counter(&mut out, "teraslab_repl_degraded_durability_total", m.repl_degraded_durability.get());
-    prom_counter(&mut out, "teraslab_stale_routing_request_total", m.stale_routing_request_total.get());
+    prom_counter(
+        &mut out,
+        "teraslab_freezes_attempted_total",
+        m.freezes_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_freezes_succeeded_total",
+        m.freezes_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_freezes_failed_total",
+        m.freezes_failed.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_unfreezes_attempted_total",
+        m.unfreezes_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_unfreezes_succeeded_total",
+        m.unfreezes_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_unfreezes_failed_total",
+        m.unfreezes_failed.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_deletes_attempted_total",
+        m.deletes_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_deletes_succeeded_total",
+        m.deletes_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_deletes_failed_total",
+        m.deletes_failed.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_preserve_until_attempted_total",
+        m.preserve_until_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_preserve_until_succeeded_total",
+        m.preserve_until_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_preserve_until_failed_total",
+        m.preserve_until_failed.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_mark_longest_chain_attempted_total",
+        m.mark_longest_chain_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_mark_longest_chain_succeeded_total",
+        m.mark_longest_chain_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_mark_longest_chain_failed_total",
+        m.mark_longest_chain_failed.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_reassign_attempted_total",
+        m.reassign_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_reassign_succeeded_total",
+        m.reassign_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_reassign_failed_total",
+        m.reassign_failed.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_set_conflicting_attempted_total",
+        m.set_conflicting_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_set_conflicting_succeeded_total",
+        m.set_conflicting_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_set_conflicting_failed_total",
+        m.set_conflicting_failed.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_set_locked_attempted_total",
+        m.set_locked_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_set_locked_succeeded_total",
+        m.set_locked_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_set_locked_failed_total",
+        m.set_locked_failed.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_replication_degraded_acks_total",
+        m.replication_degraded_acks.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_repl_degraded_durability_total",
+        m.repl_degraded_durability.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_stale_routing_request_total",
+        m.stale_routing_request_total.get(),
+    );
 
     // Labeled {op, outcome} counters — the new Phase 2 surface. Dual-emitted
     // alongside the scalar counters above; existing dashboards stay intact
@@ -234,16 +458,44 @@ pub(crate) fn render_metrics_text(
     prom_histogram_ns(&mut out, "teraslab_spend_latency_ns", &h.spend_latency);
     prom_histogram_ns(&mut out, "teraslab_unspend_latency_ns", &h.unspend_latency);
     prom_histogram_ns(&mut out, "teraslab_create_latency_ns", &h.create_latency);
-    prom_histogram_ns(&mut out, "teraslab_set_mined_latency_ns", &h.set_mined_latency);
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_set_mined_latency_ns",
+        &h.set_mined_latency,
+    );
     prom_histogram_ns(&mut out, "teraslab_freeze_latency_ns", &h.freeze_latency);
-    prom_histogram_ns(&mut out, "teraslab_unfreeze_latency_ns", &h.unfreeze_latency);
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_unfreeze_latency_ns",
+        &h.unfreeze_latency,
+    );
     prom_histogram_ns(&mut out, "teraslab_delete_latency_ns", &h.delete_latency);
     prom_histogram_ns(&mut out, "teraslab_get_latency_ns", &h.get_latency);
-    prom_histogram_ns(&mut out, "teraslab_mark_longest_chain_latency_ns", &h.mark_longest_chain_latency);
-    prom_histogram_ns(&mut out, "teraslab_reassign_latency_ns", &h.reassign_latency);
-    prom_histogram_ns(&mut out, "teraslab_set_conflicting_latency_ns", &h.set_conflicting_latency);
-    prom_histogram_ns(&mut out, "teraslab_set_locked_latency_ns", &h.set_locked_latency);
-    prom_histogram_ns(&mut out, "teraslab_preserve_until_latency_ns", &h.preserve_until_latency);
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_mark_longest_chain_latency_ns",
+        &h.mark_longest_chain_latency,
+    );
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_reassign_latency_ns",
+        &h.reassign_latency,
+    );
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_set_conflicting_latency_ns",
+        &h.set_conflicting_latency,
+    );
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_set_locked_latency_ns",
+        &h.set_locked_latency,
+    );
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_preserve_until_latency_ns",
+        &h.preserve_until_latency,
+    );
     prom_histogram_ns(&mut out, "teraslab_lock_wait_ns", &h.lock_wait);
 
     // Index gauges
@@ -269,16 +521,12 @@ pub(crate) fn render_metrics_text(
             "teraslab_repl_bytes_sent_total",
             r.repl_bytes_sent_total.get(),
         );
-        prom_labeled_replica_counter(
-            &mut out,
-            "teraslab_repl_batches_acked_total",
-            |i| r.repl_batches_acked_total.get(i),
-        );
-        prom_labeled_replica_counter(
-            &mut out,
-            "teraslab_repl_batches_failed_total",
-            |i| r.repl_batches_failed_total.get(i),
-        );
+        prom_labeled_replica_counter(&mut out, "teraslab_repl_batches_acked_total", |i| {
+            r.repl_batches_acked_total.get(i)
+        });
+        prom_labeled_replica_counter(&mut out, "teraslab_repl_batches_failed_total", |i| {
+            r.repl_batches_failed_total.get(i)
+        });
         prom_histogram_ns(
             &mut out,
             "teraslab_repl_batch_latency_ns",
@@ -691,13 +939,17 @@ async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> i
             let inbound = cluster.inbound_pending_count();
             let inbound_entries = cluster.pending_inbound_entries();
             let fenced = cluster.fenced_shard_count();
-            let active_count = migrations.iter().filter(|m| {
-                m.state != crate::cluster::migration::MigrationState::Complete
-                    && m.state != crate::cluster::migration::MigrationState::Failed
-            }).count();
-            let failed_count = migrations.iter().filter(|m| {
-                m.state == crate::cluster::migration::MigrationState::Failed
-            }).count();
+            let active_count = migrations
+                .iter()
+                .filter(|m| {
+                    m.state != crate::cluster::migration::MigrationState::Complete
+                        && m.state != crate::cluster::migration::MigrationState::Failed
+                })
+                .count();
+            let failed_count = migrations
+                .iter()
+                .filter(|m| m.state == crate::cluster::migration::MigrationState::Failed)
+                .count();
             let body = serde_json::json!({
                 "active_count": active_count,
                 "failed_count": failed_count,
@@ -721,10 +973,7 @@ async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> i
                     })
                 }).collect::<Vec<_>>(),
             });
-            (
-                StatusCode::OK,
-                body.to_string(),
-            )
+            (StatusCode::OK, body.to_string())
         }
         None => (
             StatusCode::OK,
@@ -842,12 +1091,18 @@ async fn handle_admin_drain(
         Some(ref cluster) => {
             if cluster.self_id().0 == node_id {
                 cluster.quiesce();
-                (StatusCode::OK, format!("drain initiated for node {node_id}"))
+                (
+                    StatusCode::OK,
+                    format!("drain initiated for node {node_id}"),
+                )
             } else {
-                (StatusCode::BAD_REQUEST, format!(
-                    "can only drain local node ({}), use --addr to target node {node_id} directly",
-                    cluster.self_id().0
-                ))
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "can only drain local node ({}), use --addr to target node {node_id} directly",
+                        cluster.self_id().0
+                    ),
+                )
             }
         }
         None => (StatusCode::BAD_REQUEST, "not in cluster mode".to_string()),
@@ -865,9 +1120,7 @@ fn build_local_top_snapshot(state: &HttpState) -> serde_json::Value {
     let index_stats = state.engine.index_stats();
     let alloc_stats = state.engine.allocator_stats();
 
-    let node_id = state.cluster.as_ref()
-        .map(|c| c.self_id().0)
-        .unwrap_or(0);
+    let node_id = state.cluster.as_ref().map(|c| c.self_id().0).unwrap_or(0);
 
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -879,7 +1132,11 @@ fn build_local_top_snapshot(state: &HttpState) -> serde_json::Value {
         let avail = log.available_space();
         let pos = log.write_position();
         let total = pos + avail;
-        let utilization = if total > 0 { pos as f64 / total as f64 } else { 0.0 };
+        let utilization = if total > 0 {
+            pos as f64 / total as f64
+        } else {
+            0.0
+        };
         serde_json::json!({
             "current_sequence": log.current_sequence(),
             "write_position": pos,
@@ -1035,11 +1292,16 @@ fn migration_metrics_json(state: &HttpState) -> serde_json::Value {
         for &label in MigrationLabel::all() {
             bytes.insert(
                 label.as_str().to_string(),
-                serde_json::json!(m.migration_bytes_transferred_total.get(label as u8 as usize)),
+                serde_json::json!(
+                    m.migration_bytes_transferred_total
+                        .get(label as u8 as usize)
+                ),
             );
         }
     }
-    let entries_applied = mm.map(|m| m.migration_entries_applied_total.get()).unwrap_or(0);
+    let entries_applied = mm
+        .map(|m| m.migration_entries_applied_total.get())
+        .unwrap_or(0);
     let active = mm
         .map(|m| m.migration_active.load(Ordering::Relaxed) as u64)
         .unwrap_or(0);
@@ -1210,7 +1472,9 @@ async fn build_cluster_top_snapshot(state: &HttpState) -> serde_json::Value {
                     .build()
                     .ok()?;
                 let resp = client.get(&url).send().await.ok()?;
-                if !resp.status().is_success() { return None; }
+                if !resp.status().is_success() {
+                    return None;
+                }
                 resp.json::<serde_json::Value>().await.ok()
             }));
         }
@@ -1233,24 +1497,36 @@ async fn build_cluster_top_snapshot(state: &HttpState) -> serde_json::Value {
 
 /// Sum counters and system stats across all node snapshots.
 fn aggregate_snapshots(nodes: &[serde_json::Value]) -> serde_json::Value {
-    let timestamp_ms = nodes.iter()
+    let timestamp_ms = nodes
+        .iter()
         .filter_map(|n| n["timestamp_ms"].as_u64())
         .max()
         .unwrap_or(0);
 
     let counter_keys = [
-        "spends_attempted", "spends_succeeded", "spends_idempotent", "spends_failed",
-        "unspends_attempted", "unspends_succeeded", "unspends_noop", "unspends_failed",
+        "spends_attempted",
+        "spends_succeeded",
+        "spends_idempotent",
+        "spends_failed",
+        "unspends_attempted",
+        "unspends_succeeded",
+        "unspends_noop",
+        "unspends_failed",
         "spend_multi_batches",
-        "creates_attempted", "creates_succeeded",
-        "set_mined_attempted", "set_mined_succeeded",
-        "gets_attempted", "gets_succeeded",
-        "freezes_attempted", "deletes_attempted",
+        "creates_attempted",
+        "creates_succeeded",
+        "set_mined_attempted",
+        "set_mined_succeeded",
+        "gets_attempted",
+        "gets_succeeded",
+        "freezes_attempted",
+        "deletes_attempted",
     ];
 
     let mut counters = serde_json::Map::new();
     for key in &counter_keys {
-        let sum: u64 = nodes.iter()
+        let sum: u64 = nodes
+            .iter()
             .filter_map(|n| n["counters"][*key].as_u64())
             .sum();
         counters.insert(key.to_string(), serde_json::json!(sum));
@@ -1260,11 +1536,13 @@ fn aggregate_snapshots(nodes: &[serde_json::Value]) -> serde_json::Value {
     let latency_keys = ["spend", "spend_multi", "unspend", "lock_wait"];
     let mut latency = serde_json::Map::new();
     for lk in &latency_keys {
-        let total_count: u64 = nodes.iter()
+        let total_count: u64 = nodes
+            .iter()
             .filter_map(|n| n["latency"][*lk]["count"].as_u64())
             .sum();
         let weighted_mean: u64 = if total_count > 0 {
-            let sum: u64 = nodes.iter()
+            let sum: u64 = nodes
+                .iter()
                 .map(|n| {
                     let c = n["latency"][*lk]["count"].as_u64().unwrap_or(0);
                     let m = n["latency"][*lk]["mean_ns"].as_u64().unwrap_or(0);
@@ -1272,43 +1550,93 @@ fn aggregate_snapshots(nodes: &[serde_json::Value]) -> serde_json::Value {
                 })
                 .sum();
             sum / total_count
-        } else { 0 };
-        let max_p50: u64 = nodes.iter()
+        } else {
+            0
+        };
+        let max_p50: u64 = nodes
+            .iter()
             .filter_map(|n| n["latency"][*lk]["p50_ns"].as_u64())
-            .max().unwrap_or(0);
-        let max_p95: u64 = nodes.iter()
+            .max()
+            .unwrap_or(0);
+        let max_p95: u64 = nodes
+            .iter()
             .filter_map(|n| n["latency"][*lk]["p95_ns"].as_u64())
-            .max().unwrap_or(0);
-        let max_p99: u64 = nodes.iter()
+            .max()
+            .unwrap_or(0);
+        let max_p99: u64 = nodes
+            .iter()
             .filter_map(|n| n["latency"][*lk]["p99_ns"].as_u64())
-            .max().unwrap_or(0);
-        latency.insert(lk.to_string(), serde_json::json!({
-            "count": total_count,
-            "mean_ns": weighted_mean,
-            "p50_ns": max_p50,
-            "p95_ns": max_p95,
-            "p99_ns": max_p99,
-        }));
+            .max()
+            .unwrap_or(0);
+        latency.insert(
+            lk.to_string(),
+            serde_json::json!({
+                "count": total_count,
+                "mean_ns": weighted_mean,
+                "p50_ns": max_p50,
+                "p95_ns": max_p95,
+                "p99_ns": max_p99,
+            }),
+        );
     }
 
     // Index: sum entries/capacity/memory, weighted avg load factor
-    let index_entries: u64 = nodes.iter().filter_map(|n| n["index"]["entries"].as_u64()).sum();
-    let index_capacity: u64 = nodes.iter().filter_map(|n| n["index"]["capacity"].as_u64()).sum();
-    let index_memory: u64 = nodes.iter().filter_map(|n| n["index"]["memory_bytes"].as_u64()).sum();
-    let index_lf = if index_capacity > 0 { index_entries as f64 / index_capacity as f64 } else { 0.0 };
+    let index_entries: u64 = nodes
+        .iter()
+        .filter_map(|n| n["index"]["entries"].as_u64())
+        .sum();
+    let index_capacity: u64 = nodes
+        .iter()
+        .filter_map(|n| n["index"]["capacity"].as_u64())
+        .sum();
+    let index_memory: u64 = nodes
+        .iter()
+        .filter_map(|n| n["index"]["memory_bytes"].as_u64())
+        .sum();
+    let index_lf = if index_capacity > 0 {
+        index_entries as f64 / index_capacity as f64
+    } else {
+        0.0
+    };
 
     // Storage: sum used/total, compute aggregate utilization
-    let storage_used: u64 = nodes.iter().filter_map(|n| n["storage"]["used_bytes"].as_u64()).sum();
-    let storage_total: u64 = nodes.iter().filter_map(|n| n["storage"]["total_bytes"].as_u64()).sum();
-    let storage_util = if storage_total > 0 { storage_used as f64 / storage_total as f64 } else { 0.0 };
-    let storage_free_regions: u64 = nodes.iter().filter_map(|n| n["storage"]["free_regions"].as_u64()).sum();
+    let storage_used: u64 = nodes
+        .iter()
+        .filter_map(|n| n["storage"]["used_bytes"].as_u64())
+        .sum();
+    let storage_total: u64 = nodes
+        .iter()
+        .filter_map(|n| n["storage"]["total_bytes"].as_u64())
+        .sum();
+    let storage_util = if storage_total > 0 {
+        storage_used as f64 / storage_total as f64
+    } else {
+        0.0
+    };
+    let storage_free_regions: u64 = nodes
+        .iter()
+        .filter_map(|n| n["storage"]["free_regions"].as_u64())
+        .sum();
 
     // Redo: sum
-    let redo_seq: u64 = nodes.iter().filter_map(|n| n["redo"]["current_sequence"].as_u64()).sum();
-    let redo_avail: u64 = nodes.iter().filter_map(|n| n["redo"]["available_space"].as_u64()).sum();
-    let redo_pos: u64 = nodes.iter().filter_map(|n| n["redo"]["write_position"].as_u64()).sum();
+    let redo_seq: u64 = nodes
+        .iter()
+        .filter_map(|n| n["redo"]["current_sequence"].as_u64())
+        .sum();
+    let redo_avail: u64 = nodes
+        .iter()
+        .filter_map(|n| n["redo"]["available_space"].as_u64())
+        .sum();
+    let redo_pos: u64 = nodes
+        .iter()
+        .filter_map(|n| n["redo"]["write_position"].as_u64())
+        .sum();
     let redo_total = redo_pos + redo_avail;
-    let redo_util = if redo_total > 0 { redo_pos as f64 / redo_total as f64 } else { 0.0 };
+    let redo_util = if redo_total > 0 {
+        redo_pos as f64 / redo_total as f64
+    } else {
+        0.0
+    };
 
     let connections: u64 = nodes.iter().filter_map(|n| n["connections"].as_u64()).sum();
     let all_ready = nodes.iter().all(|n| n["ready"].as_bool().unwrap_or(false));
@@ -1411,10 +1739,8 @@ async fn ws_top_loop(mut socket: WebSocket, state: Arc<HttpState>) {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         // Drain any incoming messages (pings, close frames)
-        while let Ok(Some(_)) = tokio::time::timeout(
-            Duration::from_millis(1),
-            socket.recv(),
-        ).await {
+        while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(1), socket.recv()).await
+        {
             // Just consume; we don't process client messages
         }
     }
@@ -1465,7 +1791,11 @@ async fn handle_debug_redo(State(state): State<Arc<HttpState>>) -> impl IntoResp
         let avail = log.available_space();
         let pos = log.write_position();
         let total = pos + avail;
-        let utilization = if total > 0 { pos as f64 / total as f64 } else { 0.0 };
+        let utilization = if total > 0 {
+            pos as f64 / total as f64
+        } else {
+            0.0
+        };
         serde_json::json!({
             "available": true,
             "current_sequence": log.current_sequence(),
@@ -1584,11 +1914,13 @@ fn serve_embedded_file(path: &str) -> (StatusCode, [(axum::http::HeaderName, Str
             // SPA fallback: serve index.html for unrecognized paths
             match UiAssets::get("index.html") {
                 Some(content) => (content.data.to_vec(), "text/html".to_string()),
-                None => return (
-                    StatusCode::NOT_FOUND,
-                    [(axum::http::header::CONTENT_TYPE, "text/plain".to_string())],
-                    b"UI not found".to_vec(),
-                ),
+                None => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        [(axum::http::header::CONTENT_TYPE, "text/plain".to_string())],
+                        b"UI not found".to_vec(),
+                    );
+                }
             }
         }
     };
@@ -1604,7 +1936,13 @@ fn serve_embedded_file(path: &str) -> (StatusCode, [(axum::http::HeaderName, Str
 // ---------------------------------------------------------------------------
 
 /// Convenience wrapper for JSON responses.
-fn json_response(body: serde_json::Value) -> (StatusCode, [(axum::http::HeaderName, &'static str); 1], String) {
+fn json_response(
+    body: serde_json::Value,
+) -> (
+    StatusCode,
+    [(axum::http::HeaderName, &'static str); 1],
+    String,
+) {
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -1731,17 +2069,11 @@ pub(crate) fn traceparent_for_span(span: &tracing::Span) -> Option<String> {
 
 /// Attach a `traceparent` response header derived from the given span.
 /// No-op when the span has no valid OTel context.
-pub(crate) fn attach_traceparent_response(
-    headers: &mut HeaderMap,
-    span: &tracing::Span,
-) {
+pub(crate) fn attach_traceparent_response(headers: &mut HeaderMap, span: &tracing::Span) {
     if let Some(v) = traceparent_for_span(span)
         && let Ok(header_val) = HeaderValue::from_str(&v)
     {
-        headers.insert(
-            HeaderName::from_static("traceparent"),
-            header_val,
-        );
+        headers.insert(HeaderName::from_static("traceparent"), header_val);
     }
 }
 
@@ -1899,7 +2231,8 @@ mod tests {
 
         // Seed a few cells with distinct values.
         m.operations.inc_by(OpCode::Spend, Outcome::Ok, 123);
-        m.operations.inc_by(OpCode::Spend, Outcome::ErrConflicting, 4);
+        m.operations
+            .inc_by(OpCode::Spend, Outcome::ErrConflicting, 4);
         m.operations.inc_by(OpCode::Create, Outcome::ErrStorage, 7);
 
         let text = render_metrics_text(&m, &h, 0, 0, 0, 0);
@@ -1971,7 +2304,8 @@ mod tests {
     fn admin_top_json_includes_operations_table() {
         let m = ThreadMetrics::new();
         m.operations.inc_by(OpCode::Spend, Outcome::Ok, 17);
-        m.operations.inc_by(OpCode::Spend, Outcome::ErrConflicting, 3);
+        m.operations
+            .inc_by(OpCode::Spend, Outcome::ErrConflicting, 3);
         m.operations.inc_by(OpCode::Delete, Outcome::ErrFrozen, 9);
 
         let js = operations_json(&m.operations);
@@ -1980,10 +2314,7 @@ mod tests {
         assert_eq!(root.len(), OpCode::all().len(), "one key per opcode");
 
         // Spend/ok must equal 17.
-        assert_eq!(
-            root["spend"]["ok"].as_u64().expect("spend.ok is u64"),
-            17
-        );
+        assert_eq!(root["spend"]["ok"].as_u64().expect("spend.ok is u64"), 17);
         // Spend/err_conflicting must equal 3.
         assert_eq!(
             root["spend"]["err_conflicting"]
@@ -1998,16 +2329,13 @@ mod tests {
             "zero cells must be emitted, not omitted"
         );
         // Delete/err_frozen must equal 9.
-        assert_eq!(
-            root["delete"]["err_frozen"].as_u64().unwrap(),
-            9
-        );
+        assert_eq!(root["delete"]["err_frozen"].as_u64().unwrap(), 9);
 
         // Every opcode must carry the full set of outcomes.
         for &op in OpCode::all() {
-            let inner = root[op.as_str()].as_object().unwrap_or_else(|| {
-                panic!("op {} must map to an object", op.as_str())
-            });
+            let inner = root[op.as_str()]
+                .as_object()
+                .unwrap_or_else(|| panic!("op {} must map to an object", op.as_str()));
             assert_eq!(
                 inner.len(),
                 Outcome::all().len(),
@@ -2020,7 +2348,13 @@ mod tests {
                     panic!("({}, {}) must be u64", op.as_str(), outcome.as_str())
                 });
                 let expected = m.operations.get(op, outcome);
-                assert_eq!(v, expected, "({}, {}) mismatch", op.as_str(), outcome.as_str());
+                assert_eq!(
+                    v,
+                    expected,
+                    "({}, {}) mismatch",
+                    op.as_str(),
+                    outcome.as_str()
+                );
             }
         }
     }
@@ -2059,7 +2393,9 @@ mod tests {
 
         let metrics: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
         metrics.operations.inc_by(OpCode::Unspend, Outcome::Ok, 42);
-        metrics.operations.inc_by(OpCode::Unspend, Outcome::Idempotent, 5);
+        metrics
+            .operations
+            .inc_by(OpCode::Unspend, Outcome::Idempotent, 5);
 
         let histograms: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
 
@@ -2081,17 +2417,18 @@ mod tests {
             .as_object()
             .expect("top snapshot must include operations object");
         assert_eq!(ops.len(), OpCode::all().len());
+        assert_eq!(snap["operations"]["unspend"]["ok"].as_u64().unwrap(), 42,);
         assert_eq!(
-            snap["operations"]["unspend"]["ok"].as_u64().unwrap(),
-            42,
-        );
-        assert_eq!(
-            snap["operations"]["unspend"]["idempotent"].as_u64().unwrap(),
+            snap["operations"]["unspend"]["idempotent"]
+                .as_u64()
+                .unwrap(),
             5,
         );
         // Untouched cell is zero, not missing.
         assert_eq!(
-            snap["operations"]["unspend"]["err_storage"].as_u64().unwrap(),
+            snap["operations"]["unspend"]["err_storage"]
+                .as_u64()
+                .unwrap(),
             0,
         );
     }
@@ -2125,10 +2462,9 @@ mod tests {
     #[test]
     fn prometheus_emits_all_new_metrics() {
         use crate::metrics::{
-            init_allocator_metrics, init_io_uring_metrics, init_migration_metrics,
+            AllocatorMetrics, IoUringMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
+            SwimMetrics, init_allocator_metrics, init_io_uring_metrics, init_migration_metrics,
             init_redo_metrics, init_replication_metrics, init_swim_metrics,
-            AllocatorMetrics, IoUringMetrics, MigrationMetrics, RedoMetrics,
-            ReplicationMetrics, SwimMetrics,
         };
         use std::sync::OnceLock;
 
@@ -2204,14 +2540,13 @@ mod tests {
         use crate::index::{DahIndex, Index, UnminedIndex};
         use crate::locks::StripedLocks;
         use crate::metrics::{
-            init_allocator_metrics, init_io_uring_metrics, init_migration_metrics,
+            AllocatorMetrics, IoUringMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
+            SwimMetrics, init_allocator_metrics, init_io_uring_metrics, init_migration_metrics,
             init_redo_metrics, init_replication_metrics, init_swim_metrics,
-            AllocatorMetrics, IoUringMetrics, MigrationMetrics, RedoMetrics,
-            ReplicationMetrics, SwimMetrics,
         };
         use crate::ops::engine::Engine;
-        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
         use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 
         static REPL: OnceLock<ReplicationMetrics> = OnceLock::new();
         static URING: OnceLock<IoUringMetrics> = OnceLock::new();
@@ -2240,8 +2575,7 @@ mod tests {
             UnminedIndex::new(),
         ));
         let metrics: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
-        let histograms: &'static ThreadHistograms =
-            Box::leak(Box::new(ThreadHistograms::new()));
+        let histograms: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
         let state = HttpState {
             engine,
             metrics,
@@ -2295,14 +2629,13 @@ mod tests {
         use crate::index::{DahIndex, Index, UnminedIndex};
         use crate::locks::StripedLocks;
         use crate::metrics::{
-            init_allocator_metrics, init_io_uring_metrics, init_migration_metrics,
+            AllocatorMetrics, IoUringMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
+            SwimMetrics, init_allocator_metrics, init_io_uring_metrics, init_migration_metrics,
             init_redo_metrics, init_replication_metrics, init_swim_metrics,
-            AllocatorMetrics, IoUringMetrics, MigrationMetrics, RedoMetrics,
-            ReplicationMetrics, SwimMetrics,
         };
         use crate::ops::engine::Engine;
-        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
         use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 
         static REPL: OnceLock<ReplicationMetrics> = OnceLock::new();
         static URING: OnceLock<IoUringMetrics> = OnceLock::new();
@@ -2331,8 +2664,7 @@ mod tests {
             UnminedIndex::new(),
         ));
         let metrics: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
-        let histograms: &'static ThreadHistograms =
-            Box::leak(Box::new(ThreadHistograms::new()));
+        let histograms: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
         let state = HttpState {
             engine,
             metrics,
@@ -2411,15 +2743,20 @@ mod tests {
         let ctx = parse_traceparent(raw).expect("valid traceparent parses");
         assert_eq!(ctx.trace_id[0], 0x4B);
         assert_eq!(ctx.trace_id[15], 0x36);
-        assert_eq!(ctx.span_id, [0x00, 0xF0, 0x67, 0xAA, 0x0B, 0xA9, 0x02, 0xB7]);
+        assert_eq!(
+            ctx.span_id,
+            [0x00, 0xF0, 0x67, 0xAA, 0x0B, 0xA9, 0x02, 0xB7]
+        );
     }
 
     #[test]
     fn parse_traceparent_malformed_returns_none() {
         assert!(parse_traceparent("not a traceparent").is_none());
         assert!(parse_traceparent("00-only-three-parts").is_none());
-        assert!(parse_traceparent("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").is_none(),
-            "future versions must not be accepted");
+        assert!(
+            parse_traceparent("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").is_none(),
+            "future versions must not be accepted"
+        );
         // Bad trace_id length
         assert!(parse_traceparent("00-short-00f067aa0ba902b7-01").is_none());
     }
@@ -2460,9 +2797,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             HeaderName::from_static("traceparent"),
-            HeaderValue::from_static(
-                "00-0102030405060708090a0b0c0d0e0f10-1112131415161718-01",
-            ),
+            HeaderValue::from_static("00-0102030405060708090a0b0c0d0e0f10-1112131415161718-01"),
         );
         let expected_trace = parse_traceparent(incoming).unwrap().trace_id;
 

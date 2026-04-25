@@ -19,8 +19,8 @@
 
 use std::io::{Read, Write as IoWrite};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 
 use prometheus_parse::{Sample, Scrape, Value};
 
@@ -29,18 +29,17 @@ use teraslab::device::{BlockDevice, MemoryDevice};
 use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{
-    allocator_metrics, init_allocator_metrics, init_io_uring_metrics, init_migration_metrics,
-    init_redo_metrics, init_replication_metrics, init_swim_metrics, migration_metrics,
-    redo_metrics, replication_metrics, swim_metrics, AllocatorMetrics, IoUringMetrics,
-    MigrationMetrics, RedoMetrics, ReplicationMetrics, SwimMetrics, ThreadHistograms,
-    ThreadMetrics,
+    AllocatorMetrics, IoUringMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
+    SwimMetrics, ThreadHistograms, ThreadMetrics, allocator_metrics, init_allocator_metrics,
+    init_io_uring_metrics, init_migration_metrics, init_redo_metrics, init_replication_metrics,
+    init_swim_metrics, migration_metrics, redo_metrics, replication_metrics, swim_metrics,
 };
 use teraslab::ops::create::CreateRequest;
 use teraslab::ops::engine::Engine;
 use teraslab::ops::remaining::{DeleteRequest, FreezeRequest};
 use teraslab::ops::set_mined::SetMinedRequest;
 use teraslab::ops::spend::SpendRequest;
-use teraslab::server::http::{start_http_server, HttpState};
+use teraslab::server::http::{HttpState, start_http_server};
 
 static TEST_METRICS: ThreadMetrics = ThreadMetrics::new();
 static TEST_HISTOGRAMS: ThreadHistograms = ThreadHistograms::new();
@@ -70,11 +69,26 @@ fn install_phase5_metric_surfaces() {
     init_swim_metrics(&SWIMM_METRICS);
     init_allocator_metrics(&ALLOCM_METRICS);
 
-    assert!(replication_metrics().is_some(), "replication_metrics() must be Some after install");
-    assert!(redo_metrics().is_some(), "redo_metrics() must be Some after install");
-    assert!(migration_metrics().is_some(), "migration_metrics() must be Some after install");
-    assert!(swim_metrics().is_some(), "swim_metrics() must be Some after install");
-    assert!(allocator_metrics().is_some(), "allocator_metrics() must be Some after install");
+    assert!(
+        replication_metrics().is_some(),
+        "replication_metrics() must be Some after install"
+    );
+    assert!(
+        redo_metrics().is_some(),
+        "redo_metrics() must be Some after install"
+    );
+    assert!(
+        migration_metrics().is_some(),
+        "migration_metrics() must be Some after install"
+    );
+    assert!(
+        swim_metrics().is_some(),
+        "swim_metrics() must be Some after install"
+    );
+    assert!(
+        allocator_metrics().is_some(),
+        "allocator_metrics() must be Some after install"
+    );
 }
 
 /// Seed concrete values into each Phase-5 metric block so the rendered
@@ -121,8 +135,7 @@ fn seed_phase5_metric_surfaces() {
 /// spawned thread and lives until the process exits (this mirrors the
 /// pattern used by `tests/http_observability.rs`).
 fn start_test_http_server() -> (u16, Arc<HttpState>) {
-    let dev: Arc<dyn BlockDevice> =
-        Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(10_000).unwrap();
     let engine = Arc::new(Engine::new(
@@ -168,18 +181,12 @@ fn http_get(port: u16, path: &str) -> String {
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .unwrap();
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    );
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).unwrap();
 
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
-    response
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .to_string()
+    response.split("\r\n\r\n").nth(1).unwrap_or("").to_string()
 }
 
 /// Build a deterministic synthetic txid from a seed byte.
@@ -333,12 +340,24 @@ fn drive_workload(engine: &Engine) {
     // Populate the {op, outcome} grid directly so the test asserts on
     // exact counts, matching what the dispatch layer would do.
     use teraslab::metrics::{OpCode, Outcome};
-    TEST_METRICS.operations.inc_by(OpCode::Spend, Outcome::Ok, 3);
-    TEST_METRICS.operations.inc_by(OpCode::Spend, Outcome::ErrNotFound, 1);
-    TEST_METRICS.operations.inc_by(OpCode::Create, Outcome::Ok, 3);
-    TEST_METRICS.operations.inc_by(OpCode::SetMined, Outcome::Ok, 1);
-    TEST_METRICS.operations.inc_by(OpCode::Freeze, Outcome::Ok, 1);
-    TEST_METRICS.operations.inc_by(OpCode::Delete, Outcome::Ok, 1);
+    TEST_METRICS
+        .operations
+        .inc_by(OpCode::Spend, Outcome::Ok, 3);
+    TEST_METRICS
+        .operations
+        .inc_by(OpCode::Spend, Outcome::ErrNotFound, 1);
+    TEST_METRICS
+        .operations
+        .inc_by(OpCode::Create, Outcome::Ok, 3);
+    TEST_METRICS
+        .operations
+        .inc_by(OpCode::SetMined, Outcome::Ok, 1);
+    TEST_METRICS
+        .operations
+        .inc_by(OpCode::Freeze, Outcome::Ok, 1);
+    TEST_METRICS
+        .operations
+        .inc_by(OpCode::Delete, Outcome::Ok, 1);
 
     // Record some latency observations so histogram bucket lines are
     // populated with non-zero cumulative counts.
@@ -361,7 +380,10 @@ fn drive_workload(engine: &Engine) {
 /// name appears there are treated as histogram samples — this avoids
 /// misclassifying a gauge like `teraslab_freelist_region_count` as a
 /// histogram `_count` series just because the name ends in `_count`.
-fn assert_histograms_well_formed(scrape: &Scrape, histogram_bases: &std::collections::HashSet<String>) {
+fn assert_histograms_well_formed(
+    scrape: &Scrape,
+    histogram_bases: &std::collections::HashSet<String>,
+) {
     use std::collections::BTreeMap;
 
     #[derive(Default)]
@@ -393,29 +415,28 @@ fn assert_histograms_well_formed(scrape: &Scrape, histogram_bases: &std::collect
         // base that is declared as `# TYPE <base> histogram`. This rules
         // out misreads like gauges named `*_count` (e.g.
         // `teraslab_freelist_region_count`).
-        let (base, suffix_is_bucket, suffix_is_sum, suffix_is_count) = if let Some(stripped) =
-            sample.metric.strip_suffix("_sum")
-        {
-            if histogram_bases.contains(stripped) {
-                (stripped.to_string(), false, true, false)
+        let (base, suffix_is_bucket, suffix_is_sum, suffix_is_count) =
+            if let Some(stripped) = sample.metric.strip_suffix("_sum") {
+                if histogram_bases.contains(stripped) {
+                    (stripped.to_string(), false, true, false)
+                } else {
+                    continue;
+                }
+            } else if let Some(stripped) = sample.metric.strip_suffix("_count") {
+                if histogram_bases.contains(stripped) {
+                    (stripped.to_string(), false, false, true)
+                } else {
+                    continue;
+                }
+            } else if histogram_bases.contains(&sample.metric) {
+                // Bucket lines share the base metric name; `prometheus_parse`
+                // folds them into a `Value::Histogram` on the base sample, or
+                // (for parsers that do not classify) emits each `_bucket`
+                // line with an `le` label.
+                (sample.metric.clone(), true, false, false)
             } else {
                 continue;
-            }
-        } else if let Some(stripped) = sample.metric.strip_suffix("_count") {
-            if histogram_bases.contains(stripped) {
-                (stripped.to_string(), false, false, true)
-            } else {
-                continue;
-            }
-        } else if histogram_bases.contains(&sample.metric) {
-            // Bucket lines share the base metric name; `prometheus_parse`
-            // folds them into a `Value::Histogram` on the base sample, or
-            // (for parsers that do not classify) emits each `_bucket`
-            // line with an `le` label.
-            (sample.metric.clone(), true, false, false)
-        } else {
-            continue;
-        };
+            };
 
         // Ensure the value matches an expected variant for this class.
         // Counters, gauges, and summaries should never reach this branch
@@ -467,10 +488,7 @@ fn assert_histograms_well_formed(scrape: &Scrape, histogram_bases: &std::collect
                 } else if suffix_is_bucket {
                     // Fallback: the parser treated this histogram as
                     // untyped — parse the `le` label manually.
-                    let le = sample
-                        .labels
-                        .get("le")
-                        .expect("bucket without le");
+                    let le = sample.labels.get("le").expect("bucket without le");
                     if le == "+Inf" {
                         entry.buckets.insert(HistKey::PlusInf, *v as u64);
                         entry.saw_plus_inf = true;
@@ -525,10 +543,9 @@ fn assert_histograms_well_formed(scrape: &Scrape, histogram_bases: &std::collect
         }
 
         // Final cumulative (+Inf) must equal the emitted _count.
-        if let (Some(&final_count), Some(reported_count)) = (
-            agg.buckets.get(&HistKey::PlusInf),
-            agg.count,
-        ) {
+        if let (Some(&final_count), Some(reported_count)) =
+            (agg.buckets.get(&HistKey::PlusInf), agg.count)
+        {
             assert_eq!(
                 final_count, reported_count,
                 "histogram {base}{labels:?} +Inf cumulative ({final_count}) must equal _count ({reported_count})"
@@ -652,7 +669,10 @@ fn metrics_scrape_parses_under_prometheus_parse() {
         {
             // Validate TYPE kind is one of the Prometheus-standard set.
             assert!(
-                matches!(kind, "counter" | "gauge" | "histogram" | "summary" | "untyped"),
+                matches!(
+                    kind,
+                    "counter" | "gauge" | "histogram" | "summary" | "untyped"
+                ),
                 "unknown Prometheus TYPE `{kind}` on line: {line}"
             );
             declared_types.insert(name.to_string());

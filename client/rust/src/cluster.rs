@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 
 use crate::errors::ClientError;
 use crate::pool::{ConnPool, PoolConfig};
-use crate::types::{NodeInfo, PartitionMap, TxID, NUM_SHARDS};
+use crate::types::{NUM_SHARDS, NodeInfo, PartitionMap, TxID};
 
 /// Configuration for cluster-aware routing.
 #[derive(Debug, Clone)]
@@ -179,10 +179,7 @@ impl Cluster {
                 }
             };
 
-            let resp = match conn
-                .round_trip(OP_GET_PARTITION_MAP, 0, Vec::new())
-                .await
-            {
+            let resp = match conn.round_trip(OP_GET_PARTITION_MAP, 0, Vec::new()).await {
                 Ok(r) => r,
                 Err(e) => {
                     pool.close().await;
@@ -216,10 +213,7 @@ impl Cluster {
                 for node in &pm.nodes {
                     let resolved = self.config.resolve_addr(&node.addr).to_string();
                     pools.entry(node.id).or_insert_with(|| {
-                        Arc::new(ConnPool::new(
-                            resolved,
-                            self.config.pool_config.clone(),
-                        ))
+                        Arc::new(ConnPool::new(resolved, self.config.pool_config.clone()))
                     });
                     atn.insert(node.addr.clone(), node.id);
                 }
@@ -281,9 +275,7 @@ impl Cluster {
         let node_id = self.part_map.read().as_ref().and_then(|pm| {
             pm.nodes
                 .iter()
-                .find(|node| {
-                    node.addr == addr || self.config.resolve_addr(&node.addr) == resolved
-                })
+                .find(|node| node.addr == addr || self.config.resolve_addr(&node.addr) == resolved)
                 .map(|node| node.id)
         });
 
@@ -332,15 +324,9 @@ impl Cluster {
 
         let node_id = pm.assignments[shard as usize];
         let pools = self.pools.read();
-        pools
-            .get(&node_id)
-            .cloned()
-            .ok_or_else(|| {
-                ClientError::Connection(format!(
-                    "no pool for node {} (shard {})",
-                    node_id, shard
-                ))
-            })
+        pools.get(&node_id).cloned().ok_or_else(|| {
+            ClientError::Connection(format!("no pool for node {} (shard {})", node_id, shard))
+        })
     }
 
     /// Refresh the partition map by querying any known node.
@@ -365,10 +351,7 @@ impl Cluster {
                 }
             };
 
-            let resp = match conn
-                .round_trip(OP_GET_PARTITION_MAP, 0, Vec::new())
-                .await
-            {
+            let resp = match conn.round_trip(OP_GET_PARTITION_MAP, 0, Vec::new()).await {
                 Ok(r) => r,
                 Err(e) => {
                     last_err = Some(e);
@@ -399,10 +382,7 @@ impl Cluster {
                 for node in &pm.nodes {
                     let resolved = self.config.resolve_addr(&node.addr).to_string();
                     pools_map.entry(node.id).or_insert_with(|| {
-                        Arc::new(ConnPool::new(
-                            resolved,
-                            self.config.pool_config.clone(),
-                        ))
+                        Arc::new(ConnPool::new(resolved, self.config.pool_config.clone()))
                     });
                     atn.insert(node.addr.clone(), node.id);
                 }
@@ -418,13 +398,13 @@ impl Cluster {
                 .copied()
                 .filter(|master| !node_ids.contains(master))
                 .collect();
-            eprintln!(
-                "client: refreshed partition map: version={}, nodes={}, node_ids={:?}, unique_masters={:?}, dangling_masters={:?}",
-                pm.version,
-                pm.nodes.len(),
-                node_ids,
-                unique_masters,
-                dangling_masters
+            tracing::debug!(
+                version = pm.version,
+                nodes = pm.nodes.len(),
+                ?node_ids,
+                ?unique_masters,
+                ?dangling_masters,
+                "client: refreshed partition map",
             );
 
             *self.part_map.write() = Some(pm);
@@ -444,10 +424,7 @@ impl Cluster {
                     continue;
                 }
             };
-            let resp = match conn
-                .round_trip(OP_GET_PARTITION_MAP, 0, Vec::new())
-                .await
-            {
+            let resp = match conn.round_trip(OP_GET_PARTITION_MAP, 0, Vec::new()).await {
                 Ok(r) => r,
                 Err(e) => {
                     pool.close().await;
@@ -473,10 +450,7 @@ impl Cluster {
                 for node in &pm.nodes {
                     let resolved = self.config.resolve_addr(&node.addr).to_string();
                     pools_map.entry(node.id).or_insert_with(|| {
-                        Arc::new(ConnPool::new(
-                            resolved,
-                            self.config.pool_config.clone(),
-                        ))
+                        Arc::new(ConnPool::new(resolved, self.config.pool_config.clone()))
                     });
                     atn.insert(node.addr.clone(), node.id);
                 }
@@ -540,8 +514,7 @@ pub(crate) fn decode_partition_map(data: &[u8]) -> Result<PartitionMap, ClientEr
             )));
         }
         let node_id = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-        let addr_len =
-            u16::from_le_bytes(data[pos + 8..pos + 10].try_into().unwrap()) as usize;
+        let addr_len = u16::from_le_bytes(data[pos + 8..pos + 10].try_into().unwrap()) as usize;
         pos += 10;
         if pos + addr_len > data.len() {
             return Err(ClientError::Protocol(format!(
@@ -565,9 +538,7 @@ pub(crate) fn decode_partition_map(data: &[u8]) -> Result<PartitionMap, ClientEr
     }
     let mut assignments = Vec::with_capacity(NUM_SHARDS);
     for _ in 0..NUM_SHARDS {
-        assignments.push(u64::from_le_bytes(
-            data[pos..pos + 8].try_into().unwrap(),
-        ));
+        assignments.push(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
         pos += 8;
     }
 

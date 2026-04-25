@@ -40,16 +40,16 @@
 //! All batch operations are async and safe for concurrent use from multiple
 //! Tokio tasks. The [`Client`] is `Send + Sync`.
 
-pub mod types;
-pub mod errors;
-mod conn;
-mod pool;
 mod cluster;
+mod conn;
+pub mod errors;
+mod pool;
+pub mod types;
 
-pub use types::*;
+pub use cluster::ClusterConfig;
 pub use errors::*;
 pub use pool::PoolConfig;
-pub use cluster::ClusterConfig;
+pub use types::*;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -181,9 +181,7 @@ impl Client {
     /// In single-node mode, uses the single pool.
     /// In cluster mode, picks any available node's pool (for non-routed ops
     /// like ping, health, get_partition_map).
-    async fn get_conn(
-        &self,
-    ) -> Result<Arc<crate::conn::PipeConn>, ClientError> {
+    async fn get_conn(&self) -> Result<Arc<crate::conn::PipeConn>, ClientError> {
         if let Some(pool) = &self.pool {
             return pool.get().await;
         }
@@ -191,9 +189,7 @@ impl Client {
             let pool = cl.any_pool()?;
             return pool.get().await;
         }
-        Err(ClientError::Connection(
-            "no pool available".to_string(),
-        ))
+        Err(ClientError::Connection("no pool available".to_string()))
     }
 
     /// Get a connection routed by txid shard.
@@ -229,15 +225,10 @@ impl Client {
         resp: &teraslab::protocol::frame::ResponseFrame,
     ) -> Result<BatchResult, ClientError> {
         match resp.status {
-            STATUS_OK => Ok(BatchResult {
-                errors: Vec::new(),
-            }),
+            STATUS_OK => Ok(BatchResult { errors: Vec::new() }),
             STATUS_ERROR => {
                 let (code, msg) = decode_error_payload(&resp.payload)?;
-                Err(ClientError::Server {
-                    code,
-                    message: msg,
-                })
+                Err(ClientError::Server { code, message: msg })
             }
             STATUS_NOT_FOUND => Err(ClientError::NotFound),
             STATUS_REDIRECT => {
@@ -251,10 +242,7 @@ impl Client {
                     errors: errs,
                 }))
             }
-            other => Err(ClientError::Protocol(format!(
-                "unknown status: {}",
-                other
-            ))),
+            other => Err(ClientError::Protocol(format!("unknown status: {}", other))),
         }
     }
 
@@ -278,15 +266,17 @@ impl Client {
         match resp.status {
             STATUS_OK => {
                 if !resp.payload.is_empty() {
-                    let (successes, errs) =
-                        decode_partial_with_signals(&resp.payload)?;
+                    let (successes, errs) = decode_partial_with_signals(&resp.payload)?;
                     if !errs.is_empty() {
                         return Err(ClientError::Partial(PartialError {
                             successes,
                             errors: errs,
                         }));
                     }
-                    Ok(SpendBatchResponse { successes, errors: Vec::new() })
+                    Ok(SpendBatchResponse {
+                        successes,
+                        errors: Vec::new(),
+                    })
                 } else {
                     // Server convention: empty payload on STATUS_OK means
                     // every request item succeeded and there are no
@@ -300,15 +290,15 @@ impl Client {
                             block_ids: Vec::new(),
                         })
                         .collect();
-                    Ok(SpendBatchResponse { successes, errors: Vec::new() })
+                    Ok(SpendBatchResponse {
+                        successes,
+                        errors: Vec::new(),
+                    })
                 }
             }
             STATUS_ERROR => {
                 let (code, msg) = decode_error_payload(&resp.payload)?;
-                Err(ClientError::Server {
-                    code,
-                    message: msg,
-                })
+                Err(ClientError::Server { code, message: msg })
             }
             STATUS_NOT_FOUND => Err(ClientError::NotFound),
             STATUS_REDIRECT => {
@@ -336,10 +326,7 @@ impl Client {
                     errors: errs,
                 }))
             }
-            other => Err(ClientError::Protocol(format!(
-                "unknown status: {}",
-                other
-            ))),
+            other => Err(ClientError::Protocol(format!("unknown status: {}", other))),
         }
     }
 
@@ -383,7 +370,12 @@ impl Client {
                 .await;
         }
         let payload = encode_payload(txids);
-        let conn = self.pool.as_ref().ok_or(ClientError::PoolClosed)?.get().await?;
+        let conn = self
+            .pool
+            .as_ref()
+            .ok_or(ClientError::PoolClosed)?
+            .get()
+            .await?;
         let resp = conn.round_trip(op_code, 0, payload).await?;
         Self::handle_mutation_response(&resp)
     }
@@ -468,13 +460,19 @@ impl Client {
                         // retry the redirected items. Single retry — if it fails
                         // again, propagate the error.
                         let _ = self.refresh_routing().await;
-                        let retry_txids: Vec<TxID> = redirected_indices.iter().map(|&i| txids[i]).collect();
+                        let retry_txids: Vec<TxID> =
+                            redirected_indices.iter().map(|&i| txids[i]).collect();
                         let retry_payload = encode_payload(&retry_txids);
                         if let Ok(conn) = self.get_conn_for_txid(&retry_txids[0]).await {
                             match conn.round_trip(op_code, 0, retry_payload).await {
                                 Ok(retry_resp) => {
-                                    if let Err(ClientError::Partial(retry_pe)) = Self::handle_mutation_response(&retry_resp) {
-                                        let retry_remapped = remap_batch_errors(retry_pe.errors, &redirected_indices);
+                                    if let Err(ClientError::Partial(retry_pe)) =
+                                        Self::handle_mutation_response(&retry_resp)
+                                    {
+                                        let retry_remapped = remap_batch_errors(
+                                            retry_pe.errors,
+                                            &redirected_indices,
+                                        );
                                         all_errors.extend(retry_remapped);
                                     }
                                     // If Ok or the retry succeeded, no errors to add
@@ -493,7 +491,9 @@ impl Client {
                         }
                     }
                 }
-                Err(ClientError::Server { code, ref message }) if code == 15 || message.contains("no quorum") => {
+                Err(ClientError::Server { code, ref message })
+                    if code == 15 || message.contains("no quorum") =>
+                {
                     got_no_quorum = true;
                 }
                 Err(e) => return Err(e),
@@ -515,9 +515,7 @@ impl Client {
             }));
         }
 
-        Ok(BatchResult {
-            errors: Vec::new(),
-        })
+        Ok(BatchResult { errors: Vec::new() })
     }
 
     // -----------------------------------------------------------------------
@@ -607,34 +605,36 @@ impl Client {
                                 .map(|p| p as u32)
                         })
                         .collect();
-                    pe.successes.retain(|s| !retry_src_indices.contains(&s.item_index));
+                    pe.successes
+                        .retain(|s| !retry_src_indices.contains(&s.item_index));
                     if !redirect_items.is_empty() {
                         let _ = self.refresh_routing().await;
                         for (orig_idx, spend_item) in redirect_items {
                             let retry_payload = encode_spend_batch_payload(params, &[spend_item]);
-                            if let Ok(retry_pool) = cluster.pool_for_txid(&items[orig_idx].txid) {
-                                if let Ok(retry_conn) = retry_pool.get().await {
-                                    if let Ok(retry_resp) = retry_conn.round_trip(OP_SPEND_BATCH, 0, retry_payload).await {
-                                        match Self::handle_signal_response(&retry_resp, 1) {
-                                            Ok(r) => {
-                                                for mut s in r.successes {
-                                                    s.item_index = orig_idx as u32;
-                                                    pe.successes.push(s);
-                                                }
-                                            }
-                                            Err(ClientError::Partial(retry_pe)) => {
-                                                for mut s in retry_pe.successes {
-                                                    s.item_index = orig_idx as u32;
-                                                    pe.successes.push(s);
-                                                }
-                                                for mut e in retry_pe.errors {
-                                                    e.item_index = orig_idx as u32;
-                                                    pe.errors.push(e);
-                                                }
-                                            }
-                                            _ => {}
+                            if let Ok(retry_pool) = cluster.pool_for_txid(&items[orig_idx].txid)
+                                && let Ok(retry_conn) = retry_pool.get().await
+                                && let Ok(retry_resp) = retry_conn
+                                    .round_trip(OP_SPEND_BATCH, 0, retry_payload)
+                                    .await
+                            {
+                                match Self::handle_signal_response(&retry_resp, 1) {
+                                    Ok(r) => {
+                                        for mut s in r.successes {
+                                            s.item_index = orig_idx as u32;
+                                            pe.successes.push(s);
                                         }
                                     }
+                                    Err(ClientError::Partial(retry_pe)) => {
+                                        for mut s in retry_pe.successes {
+                                            s.item_index = orig_idx as u32;
+                                            pe.successes.push(s);
+                                        }
+                                        for mut e in retry_pe.errors {
+                                            e.item_index = orig_idx as u32;
+                                            pe.errors.push(e);
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -658,8 +658,7 @@ impl Client {
         let mut handles = Vec::with_capacity(groups.len());
 
         for (_, (pool, idx_map)) in groups {
-            let sub_items: Vec<SpendItem> =
-                idx_map.iter().map(|&i| items[i].clone()).collect();
+            let sub_items: Vec<SpendItem> = idx_map.iter().map(|&i| items[i].clone()).collect();
             let payload = encode_spend_batch_payload(params, &sub_items);
 
             let sub_len = sub_items.len();
@@ -700,7 +699,8 @@ impl Client {
                     // about to be retried do not appear in `merged.successes`
                     // twice.
                     let mut redirect_items: Vec<(usize, SpendItem)> = Vec::new();
-                    let mut retry_sub_indices: std::collections::HashSet<u32> = std::collections::HashSet::new();
+                    let mut retry_sub_indices: std::collections::HashSet<u32> =
+                        std::collections::HashSet::new();
                     for e in pe.errors {
                         if e.code == ERR_REDIRECT && (e.item_index as usize) < idx_map.len() {
                             let orig_idx = idx_map[e.item_index as usize];
@@ -728,34 +728,34 @@ impl Client {
                         let _ = self.refresh_routing().await;
                         for (orig_idx, spend_item) in redirect_items {
                             let retry_payload = encode_spend_batch_payload(params, &[spend_item]);
-                            if let Ok(pool) = cluster.pool_for_txid(&items[orig_idx].txid) {
-                                if let Ok(conn) = pool.get().await {
-                                    if let Ok(retry_resp) = conn.round_trip(OP_SPEND_BATCH, 0, retry_payload).await {
-                                        match Self::handle_signal_response(&retry_resp, 1) {
-                                            Ok(r) => {
-                                                for mut s in r.successes {
-                                                    s.item_index = orig_idx as u32;
-                                                    merged.successes.push(s);
-                                                }
-                                            }
-                                            Err(ClientError::Partial(retry_pe)) => {
-                                                for mut s in retry_pe.successes {
-                                                    s.item_index = orig_idx as u32;
-                                                    merged.successes.push(s);
-                                                }
-                                                for mut e in retry_pe.errors {
-                                                    e.item_index = orig_idx as u32;
-                                                    all_errors.push(e);
-                                                }
-                                            }
-                                            Err(_) => {
-                                                all_errors.push(BatchItemError {
-                                                    item_index: orig_idx as u32,
-                                                    code: ERR_REDIRECT,
-                                                    data: vec![],
-                                                });
-                                            }
+                            if let Ok(pool) = cluster.pool_for_txid(&items[orig_idx].txid)
+                                && let Ok(conn) = pool.get().await
+                                && let Ok(retry_resp) =
+                                    conn.round_trip(OP_SPEND_BATCH, 0, retry_payload).await
+                            {
+                                match Self::handle_signal_response(&retry_resp, 1) {
+                                    Ok(r) => {
+                                        for mut s in r.successes {
+                                            s.item_index = orig_idx as u32;
+                                            merged.successes.push(s);
                                         }
+                                    }
+                                    Err(ClientError::Partial(retry_pe)) => {
+                                        for mut s in retry_pe.successes {
+                                            s.item_index = orig_idx as u32;
+                                            merged.successes.push(s);
+                                        }
+                                        for mut e in retry_pe.errors {
+                                            e.item_index = orig_idx as u32;
+                                            all_errors.push(e);
+                                        }
+                                    }
+                                    Err(_) => {
+                                        all_errors.push(BatchItemError {
+                                            item_index: orig_idx as u32,
+                                            code: ERR_REDIRECT,
+                                            data: vec![],
+                                        });
                                     }
                                 }
                             }
@@ -842,27 +842,26 @@ impl Client {
         }
 
         let encode_sub_arc = Arc::new(encode_sub);
-        let transient_retry_delays_ms = [10u64, 25, 50, 100, 200, 400, 800, 1600, 3200];
 
         // Retry once on transient errors (dead node / replication failure)
         // after routing refresh.
-        for attempt in 0..=(transient_retry_delays_ms.len() as u32) {
-            let result = self.send_item_batch_cluster_inner(
-                op_code, items, &get_txid, &encode_sub_arc,
-            ).await;
+        for attempt in 0..=(TRANSIENT_MUTATION_RETRY_DELAYS_MS.len() as u32) {
+            let result = self
+                .send_item_batch_cluster_inner(op_code, items, &get_txid, &encode_sub_arc)
+                .await;
             match result {
                 Err(ClientError::Connection(msg)) if attempt == 0 => {
-                    eprintln!("client: retry after connection error: {msg}");
+                    tracing::warn!(error = %msg, "client: retry after connection error");
                     let _ = self.refresh_routing().await;
                     continue;
                 }
                 Err(ClientError::Partial(pe))
                     if pe.errors.len() == items.len()
                         && all_errors_have_code(&pe.errors, ERR_MIGRATION_IN_PROGRESS)
-                        && (attempt as usize) < transient_retry_delays_ms.len() =>
+                        && (attempt as usize) < TRANSIENT_MUTATION_RETRY_DELAYS_MS.len() =>
                 {
                     tokio::time::sleep(Duration::from_millis(
-                        transient_retry_delays_ms[attempt as usize],
+                        TRANSIENT_MUTATION_RETRY_DELAYS_MS[attempt as usize],
                     ))
                     .await;
                     let _ = self.refresh_routing().await;
@@ -871,7 +870,7 @@ impl Client {
                 Err(ClientError::Partial(pe))
                     if pe.errors.len() == items.len()
                         && all_errors_have_code(&pe.errors, ERR_REDIRECT)
-                        && (attempt as usize) < transient_retry_delays_ms.len() =>
+                        && (attempt as usize) < TRANSIENT_MUTATION_RETRY_DELAYS_MS.len() =>
                 {
                     if let Some(redirect_groups) =
                         collect_redirect_groups(&pe.errors, &(0..items.len()).collect::<Vec<_>>())
@@ -895,15 +894,13 @@ impl Client {
                         }
                     }
                     tokio::time::sleep(Duration::from_millis(
-                        transient_retry_delays_ms[attempt as usize],
+                        TRANSIENT_MUTATION_RETRY_DELAYS_MS[attempt as usize],
                     ))
                     .await;
                     let _ = self.refresh_routing().await;
                     continue;
                 }
-                Err(ClientError::Partial(pe)) if attempt == 0
-                    && pe.errors.len() == items.len() =>
-                {
+                Err(ClientError::Partial(pe)) if attempt == 0 && pe.errors.len() == items.len() => {
                     let code_summary = summarize_error_codes(&pe.errors);
                     if let Some(redirect_groups) =
                         collect_redirect_groups(&pe.errors, &(0..items.len()).collect::<Vec<_>>())
@@ -926,7 +923,7 @@ impl Client {
                             Err(_) => {}
                         }
                     }
-                    eprintln!("client: retry after all-items-failed partial error [{code_summary}]");
+                    tracing::warn!(codes = %code_summary, "client: retry after all-items-failed partial error");
                     let _ = self.refresh_routing().await;
                     continue;
                 }
@@ -1004,9 +1001,7 @@ impl Client {
                 let conn = pool.get().await?;
                 let resp = conn.round_trip(op_code, 0, payload).await?;
                 let result = Self::handle_mutation_response(&resp);
-                Ok::<(Result<BatchResult, ClientError>, Vec<usize>), ClientError>((
-                    result, idx_map,
-                ))
+                Ok::<(Result<BatchResult, ClientError>, Vec<usize>), ClientError>((result, idx_map))
             }));
         }
 
@@ -1018,18 +1013,18 @@ impl Client {
                 .await
                 .map_err(|e| ClientError::Connection(format!("join: {e}")))?;
             match join_result {
-                Ok((result, idx_map)) => {
-                    match result {
-                        Ok(_) => {}
-                        Err(ClientError::Partial(pe)) => {
-                            all_errors.extend(remap_batch_errors(pe.errors, &idx_map));
-                        }
-                        Err(ClientError::Server { code, ref message }) if code == 15 || message.contains("no quorum") => {
-                            got_no_quorum = true;
-                        }
-                        Err(e) => return Err(e),
+                Ok((result, idx_map)) => match result {
+                    Ok(_) => {}
+                    Err(ClientError::Partial(pe)) => {
+                        all_errors.extend(remap_batch_errors(pe.errors, &idx_map));
                     }
-                }
+                    Err(ClientError::Server { code, ref message })
+                        if code == 15 || message.contains("no quorum") =>
+                    {
+                        got_no_quorum = true;
+                    }
+                    Err(e) => return Err(e),
+                },
                 Err(ClientError::Connection(_)) => {
                     had_connection_error = true;
                 }
@@ -1084,9 +1079,7 @@ impl Client {
                 let conn = pool.get().await?;
                 let resp = conn.round_trip(op_code, 0, payload).await?;
                 let result = Self::handle_mutation_response(&resp);
-                Ok::<(Result<BatchResult, ClientError>, Vec<usize>), ClientError>((
-                    result, idx_map,
-                ))
+                Ok::<(Result<BatchResult, ClientError>, Vec<usize>), ClientError>((result, idx_map))
             }));
         }
 
@@ -1162,11 +1155,7 @@ impl Client {
     ///
     /// Returns [`ClientError::Server`] if any chunk or finalize request fails,
     /// or [`ClientError::Connection`] on I/O failure.
-    pub async fn upload_blob(
-        &self,
-        txid: &[u8; 32],
-        data: &[u8],
-    ) -> Result<(), ClientError> {
+    pub async fn upload_blob(&self, txid: &[u8; 32], data: &[u8]) -> Result<(), ClientError> {
         // All chunks must go to the SAME TCP connection because the server
         // tracks stream sessions per-connection. Acquire once and reuse.
         let conn = self.get_conn_for_txid(txid).await?;
@@ -1220,25 +1209,26 @@ impl Client {
     ///
     /// Returns [`ClientError::Server`] on global error, [`ClientError::Partial`]
     /// on mixed success/failure, or [`ClientError::Connection`] on I/O failure.
-    pub async fn create_batch(
-        &self,
-        items: &[CreateItem],
-    ) -> Result<BatchResult, ClientError> {
+    pub async fn create_batch(&self, items: &[CreateItem]) -> Result<BatchResult, ClientError> {
         // Check if any items need blob upload.
-        let has_large_blobs = items.iter().any(|i| i.cold_data.len() > BLOB_UPLOAD_THRESHOLD);
+        let has_large_blobs = items
+            .iter()
+            .any(|i| i.cold_data.len() > BLOB_UPLOAD_THRESHOLD);
 
         if !has_large_blobs {
             // Fast path: no large blobs, send directly.
-            return self.send_item_batch_cluster(
-                OP_CREATE_BATCH,
-                items,
-                |item| &item.txid,
-                |items, indices| {
-                    let sub: Vec<CreateItem> = indices.iter().map(|&i| items[i].clone()).collect();
-                    encode_create_batch_payload(&sub)
-                },
-            )
-            .await;
+            return self
+                .send_item_batch_cluster(
+                    OP_CREATE_BATCH,
+                    items,
+                    |item| &item.txid,
+                    |items, indices| {
+                        let sub: Vec<CreateItem> =
+                            indices.iter().map(|&i| items[i].clone()).collect();
+                        encode_create_batch_payload(&sub)
+                    },
+                )
+                .await;
         }
 
         // Slow path: upload large blobs first, then send modified items.
@@ -1274,10 +1264,7 @@ impl Client {
     ///
     /// Returns [`ClientError::Server`] on global error, [`ClientError::Partial`]
     /// on mixed success/failure.
-    pub async fn freeze_batch(
-        &self,
-        items: &[FreezeItem],
-    ) -> Result<BatchResult, ClientError> {
+    pub async fn freeze_batch(&self, items: &[FreezeItem]) -> Result<BatchResult, ClientError> {
         self.send_item_batch_cluster(
             OP_FREEZE_BATCH,
             items,
@@ -1298,10 +1285,7 @@ impl Client {
     ///
     /// Returns [`ClientError::Server`] on global error, [`ClientError::Partial`]
     /// on mixed success/failure.
-    pub async fn unfreeze_batch(
-        &self,
-        items: &[FreezeItem],
-    ) -> Result<BatchResult, ClientError> {
+    pub async fn unfreeze_batch(&self, items: &[FreezeItem]) -> Result<BatchResult, ClientError> {
         self.send_item_batch_cluster(
             OP_UNFREEZE_BATCH,
             items,
@@ -1397,14 +1381,9 @@ impl Client {
     ///
     /// Returns [`ClientError::Server`] on global error, [`ClientError::Partial`]
     /// on mixed success/failure.
-    pub async fn delete_batch(
-        &self,
-        txids: &[TxID],
-    ) -> Result<BatchResult, ClientError> {
-        self.send_txid_batch(OP_DELETE_BATCH, txids, &|t| {
-            encode_delete_payload(t)
-        })
-        .await
+    pub async fn delete_batch(&self, txids: &[TxID]) -> Result<BatchResult, ClientError> {
+        self.send_txid_batch(OP_DELETE_BATCH, txids, &|t| encode_delete_payload(t))
+            .await
     }
 
     /// Update longest-chain status for transactions.
@@ -1448,7 +1427,7 @@ impl Client {
             match self.get_batch_inner(field_mask, txids).await {
                 Ok(result) => return Ok(result),
                 Err(ClientError::Connection(ref msg)) if attempt == 0 => {
-                    eprintln!("client: get_batch retry after connection error: {msg}");
+                    tracing::warn!(error = %msg, "client: get_batch retry after connection error");
                     let _ = self.refresh_routing().await;
                     continue;
                 }
@@ -1552,7 +1531,12 @@ impl Client {
 
         let items = merged
             .into_iter()
-            .map(|r| r.unwrap_or(GetResult { status: 1, data: Vec::new() }))
+            .map(|r| {
+                r.unwrap_or(GetResult {
+                    status: 1,
+                    data: Vec::new(),
+                })
+            })
             .collect();
         Ok(GetBatchResult { field_mask, items })
     }
@@ -1577,10 +1561,7 @@ impl Client {
             STATUS_OK => decode_get_spend_response(&resp.payload),
             STATUS_ERROR => {
                 let (code, msg) = decode_error_payload(&resp.payload)?;
-                Err(ClientError::Server {
-                    code,
-                    message: msg,
-                })
+                Err(ClientError::Server { code, message: msg })
             }
             other => Err(ClientError::Protocol(format!(
                 "unexpected status: {}",
@@ -1598,22 +1579,14 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`ClientError::Server`] on error.
-    pub async fn query_old_unmined(
-        &self,
-        cutoff_height: u32,
-    ) -> Result<Vec<TxID>, ClientError> {
+    pub async fn query_old_unmined(&self, cutoff_height: u32) -> Result<Vec<TxID>, ClientError> {
         let payload = cutoff_height.to_le_bytes().to_vec();
         let conn = self.get_conn().await?;
-        let resp = conn
-            .round_trip(OP_QUERY_OLD_UNMINED, 0, payload)
-            .await?;
+        let resp = conn.round_trip(OP_QUERY_OLD_UNMINED, 0, payload).await?;
         if resp.status != STATUS_OK {
             if resp.status == STATUS_ERROR {
                 let (code, msg) = decode_error_payload(&resp.payload)?;
-                return Err(ClientError::Server {
-                    code,
-                    message: msg,
-                });
+                return Err(ClientError::Server { code, message: msg });
             }
             return Err(ClientError::Protocol(format!(
                 "unexpected status: {}",
@@ -1659,10 +1632,7 @@ impl Client {
         if resp.status != STATUS_OK {
             if resp.status == STATUS_ERROR {
                 let (code, msg) = decode_error_payload(&resp.payload)?;
-                return Err(ClientError::Server {
-                    code,
-                    message: msg,
-                });
+                return Err(ClientError::Server { code, message: msg });
             }
             return Err(ClientError::Protocol(format!(
                 "unexpected status: {}",
@@ -1726,16 +1696,11 @@ impl Client {
 
         // Single-node mode: fetch from the server.
         let conn = self.get_conn().await?;
-        let resp = conn
-            .round_trip(OP_GET_PARTITION_MAP, 0, Vec::new())
-            .await?;
+        let resp = conn.round_trip(OP_GET_PARTITION_MAP, 0, Vec::new()).await?;
         if resp.status != STATUS_OK {
             if resp.status == STATUS_ERROR {
                 let (code, msg) = decode_error_payload(&resp.payload)?;
-                return Err(ClientError::Server {
-                    code,
-                    message: msg,
-                });
+                return Err(ClientError::Server { code, message: msg });
             }
             return Err(ClientError::Protocol(format!(
                 "partition map: status {}",
@@ -1888,10 +1853,7 @@ fn encode_freeze_batch_payload(items: &[FreezeItem]) -> Vec<u8> {
 }
 
 /// Encode a ReassignBatch request payload from client types.
-fn encode_reassign_batch_payload(
-    params: &ReassignBatchParams,
-    items: &[ReassignItem],
-) -> Vec<u8> {
+fn encode_reassign_batch_payload(params: &ReassignBatchParams, items: &[ReassignItem]) -> Vec<u8> {
     let wire_params = codec::ReassignBatchParams {
         block_height: params.block_height,
         spendable_after: params.spendable_after,
@@ -1935,10 +1897,7 @@ fn encode_delete_payload(txids: &[TxID]) -> Vec<u8> {
 }
 
 /// Encode a MarkLongestChain batch request payload.
-fn encode_mark_longest_chain_payload(
-    params: &MarkLongestChainParams,
-    txids: &[TxID],
-) -> Vec<u8> {
+fn encode_mark_longest_chain_payload(params: &MarkLongestChainParams, txids: &[TxID]) -> Vec<u8> {
     let mut shared = Vec::with_capacity(9);
     shared.push(u8::from(params.on_longest_chain));
     shared.extend_from_slice(&params.current_block_height.to_le_bytes());
@@ -2178,6 +2137,10 @@ fn all_errors_have_code(errors: &[BatchItemError], code: u16) -> bool {
     !errors.is_empty() && errors.iter().all(|err| err.code == code)
 }
 
+const TRANSIENT_MUTATION_RETRY_DELAYS_MS: &[u64] = &[
+    10, 25, 50, 100, 200, 400, 800, 1600, 3200, 5000, 5000, 5000, 5000, 5000,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2214,7 +2177,32 @@ mod tests {
         port
     }
 
-    fn create_node(node_id: u64, tcp_port: u16, swim_port: u16, seed_swim_ports: &[u16]) -> TestNode {
+    #[test]
+    fn transient_mutation_retry_budget_covers_live_rebalance_window() {
+        let total_ms: u64 = TRANSIENT_MUTATION_RETRY_DELAYS_MS.iter().sum();
+        assert!(
+            total_ms >= 30_000,
+            "migration fences during Docker scale-up can exceed the old 6.4s retry window"
+        );
+        assert_eq!(TRANSIENT_MUTATION_RETRY_DELAYS_MS.last(), Some(&5000));
+    }
+
+    fn create_node(
+        node_id: u64,
+        tcp_port: u16,
+        swim_port: u16,
+        seed_swim_ports: &[u16],
+    ) -> TestNode {
+        create_node_with_rf(node_id, tcp_port, swim_port, seed_swim_ports, 2)
+    }
+
+    fn create_node_with_rf(
+        node_id: u64,
+        tcp_port: u16,
+        swim_port: u16,
+        seed_swim_ports: &[u16],
+        replication_factor: u8,
+    ) -> TestNode {
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(32 * 1024 * 1024, 4096).unwrap());
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
@@ -2238,7 +2226,7 @@ mod tests {
             self_addr: format!("127.0.0.1:{tcp_port}").parse().unwrap(),
             swim_bind: format!("127.0.0.1:{swim_port}").parse().unwrap(),
             seed_nodes: seeds,
-            replication_factor: 2,
+            replication_factor,
             probe_interval: Duration::from_millis(100),
             suspicion_timeout: Duration::from_secs(2),
             cluster_secret: None,
@@ -2250,7 +2238,14 @@ mod tests {
         };
 
         let coordinator = ClusterCoordinator::new(cluster_config, 1);
-        let running = Arc::new(coordinator.start(engine.clone(), None, None, None, true));
+        let running = Arc::new(coordinator.start(
+            engine.clone(),
+            None,
+            None,
+            None,
+            true,
+            Duration::from_secs(3),
+        ));
 
         let config = ServerConfig {
             listen_addr: format!("127.0.0.1:{tcp_port}"),
@@ -2300,8 +2295,10 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         let current_table = node2.cluster.shard_table().read().clone();
-        let stale_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3), NodeId(2)], 2, 999);
-        let (shard, actual_master, stale_master) = (0..teraslab::cluster::shards::NUM_SHARDS as u16)
+        let stale_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3), NodeId(2)], 2, 999);
+        let (shard, actual_master, stale_master) = (0..teraslab::cluster::shards::NUM_SHARDS
+            as u16)
             .find_map(|shard| {
                 let actual = current_table.target_assignment(shard).master;
                 let stale = stale_table.target_assignment(shard).master;
@@ -2371,7 +2368,7 @@ mod tests {
     async fn create_batch_retries_migration_in_progress_until_fence_clears() {
         let tcp1 = reserve_tcp_port();
         let swim1 = reserve_udp_port();
-        let node1 = create_node(1, tcp1, swim1, &[]);
+        let node1 = create_node_with_rf(1, tcp1, swim1, &[], 1);
 
         let client = Client::new(ClientConfig {
             seeds: vec![format!("127.0.0.1:{tcp1}")],
@@ -2427,7 +2424,7 @@ mod tests {
     async fn create_batch_retries_migration_in_progress_for_long_rebalance_window() {
         let tcp1 = reserve_tcp_port();
         let swim1 = reserve_udp_port();
-        let node1 = create_node(1, tcp1, swim1, &[]);
+        let node1 = create_node_with_rf(1, tcp1, swim1, &[], 1);
 
         let client = Client::new(ClientConfig {
             seeds: vec![format!("127.0.0.1:{tcp1}")],
@@ -2491,7 +2488,7 @@ mod tests {
     async fn spend_batch_populates_successes_on_full_success() {
         let tcp1 = reserve_tcp_port();
         let swim1 = reserve_udp_port();
-        let node1 = create_node(1, tcp1, swim1, &[]);
+        let node1 = create_node_with_rf(1, tcp1, swim1, &[], 1);
 
         let client = Client::new(ClientConfig {
             seeds: vec![format!("127.0.0.1:{tcp1}")],
@@ -2570,7 +2567,11 @@ mod tests {
         );
         let mut idxs: Vec<u32> = resp.successes.iter().map(|s| s.item_index).collect();
         idxs.sort_unstable();
-        assert_eq!(idxs, vec![0, 1], "success entries should reference each input index");
+        assert_eq!(
+            idxs,
+            vec![0, 1],
+            "success entries should reference each input index"
+        );
 
         client.close().await;
         shutdown_node(&node1);

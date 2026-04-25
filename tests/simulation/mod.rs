@@ -248,7 +248,8 @@ impl Simulation {
         };
 
         // Reference model: txid -> (utxo_count, spent_count, utxo_hashes)
-        let mut reference: HashMap<[u8; 32], (u32, u32, Vec<[u8; 32]>)> = HashMap::new();
+        type ReferenceMap = HashMap<[u8; 32], (u32, u32, Vec<[u8; 32]>)>;
+        let mut reference: ReferenceMap = HashMap::new();
         // Track which txids exist in the engine (for re-registration after crash)
         let mut committed_txids: Vec<[u8; 32]> = Vec::new();
 
@@ -375,31 +376,31 @@ impl Simulation {
                     .map(|(id, _)| *id)
                     .collect();
 
-                if let Some(&txid) = txids.get(self.rng.next_u32() as usize % txids.len().max(1)) {
-                    if let Some((count, spent, hashes)) = reference.get(&txid) {
-                        let offset = *spent;
-                        if offset < *count {
-                            let utxo_hash = hashes[offset as usize];
-                            let mut spending_data = [0u8; 36];
-                            let sd_val = self.rng.next_u64().to_le_bytes();
-                            spending_data[..8].copy_from_slice(&sd_val);
-                            spending_data[32..36].copy_from_slice(&offset.to_le_bytes());
+                if let Some(&txid) = txids.get(self.rng.next_u32() as usize % txids.len().max(1))
+                    && let Some((count, spent, hashes)) = reference.get(&txid)
+                {
+                    let offset = *spent;
+                    if offset < *count {
+                        let utxo_hash = hashes[offset as usize];
+                        let mut spending_data = [0u8; 36];
+                        let sd_val = self.rng.next_u64().to_le_bytes();
+                        spending_data[..8].copy_from_slice(&sd_val);
+                        spending_data[32..36].copy_from_slice(&offset.to_le_bytes());
 
-                            let req = SpendRequest {
-                                tx_key: TxKey { txid },
-                                offset,
-                                utxo_hash,
-                                spending_data,
-                                ignore_conflicting: false,
-                                ignore_locked: false,
-                                current_block_height,
-                                block_height_retention: 288,
-                            };
+                        let req = SpendRequest {
+                            tx_key: TxKey { txid },
+                            offset,
+                            utxo_hash,
+                            spending_data,
+                            ignore_conflicting: false,
+                            ignore_locked: false,
+                            current_block_height,
+                            block_height_retention: 288,
+                        };
 
-                            if engine.spend(&req).is_ok() {
-                                reference.get_mut(&txid).unwrap().1 += 1;
-                                result.operations_completed += 1;
-                            }
+                        if engine.spend(&req).is_ok() {
+                            reference.get_mut(&txid).unwrap().1 += 1;
+                            result.operations_completed += 1;
                         }
                     }
                 }
@@ -481,10 +482,9 @@ impl Simulation {
                         }
                     }
                     Err(_) => {
-                        result.inconsistencies_found.push(format!(
-                            "final: tx {:?} not found",
-                            txid
-                        ));
+                        result
+                            .inconsistencies_found
+                            .push(format!("final: tx {:?} not found", txid));
                         result.data_loss_detected = true;
                     }
                 }

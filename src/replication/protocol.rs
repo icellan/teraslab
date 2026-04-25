@@ -8,11 +8,14 @@
 //! so receivers can tolerate older senders during a rolling upgrade.
 //!
 //! * [`BATCH_PROTOCOL_V1`] — legacy layout (no trace context).
-//! * [`BATCH_PROTOCOL_V2`] — **current**. Adds a fixed 24-byte trace context
+//! * [`BATCH_PROTOCOL_V2`] — legacy layout with a fixed 24-byte trace context
 //!   trailer immediately after `[first_sequence:8][count:4]`. See
 //!   [`crate::observability::WireTraceContext`] for the byte layout.
 //!   When the caller has no active/sampled span, the 24 bytes are zero
 //!   and the receiver treats the context as absent.
+//! * [`BATCH_PROTOCOL_V3`] — **current**. Adds `[source_node_id:8]` after
+//!   the trace context so receiver-side high-water marks can survive TCP
+//!   reconnects and process restarts by source node identity.
 //!
 //! The version byte is new in V2. V1 frames never included one, so
 //! receivers only interpret the leading byte as a version tag when its
@@ -27,8 +30,11 @@ use thiserror::Error;
 /// backward-compatible receiver reads only — this crate never produces V1.
 pub const BATCH_PROTOCOL_V1: u8 = 1;
 
-/// Current batch wire layout with a 24-byte W3C trace context trailer.
+/// Legacy batch wire layout with a 24-byte W3C trace context trailer.
 pub const BATCH_PROTOCOL_V2: u8 = 2;
+
+/// Current batch wire layout with trace context and stable source node id.
+pub const BATCH_PROTOCOL_V3: u8 = 3;
 
 #[derive(Error, Debug)]
 pub enum ProtocolError {
@@ -41,6 +47,28 @@ pub enum ProtocolError {
 }
 
 pub type Result<T> = std::result::Result<T, ProtocolError>;
+
+/// Convert persisted transaction flags into the create-replication metadata
+/// layout consumed by the replica receiver.
+///
+/// Offset 32 in create metadata is the standalone `is_coinbase` boolean.
+/// Offset 45 is the client create flags byte (locked=0x01,
+/// conflicting=0x02, frozen=0x04, external=0x08). Frozen is a per-slot state
+/// during migration replay, so this helper never sets it.
+pub fn create_metadata_flag_bytes(flags: crate::record::TxFlags) -> (u8, u8) {
+    let is_coinbase = u8::from(flags.contains(crate::record::TxFlags::IS_COINBASE));
+    let mut wire_flags = 0u8;
+    if flags.contains(crate::record::TxFlags::LOCKED) {
+        wire_flags |= 0x01;
+    }
+    if flags.contains(crate::record::TxFlags::CONFLICTING) {
+        wire_flags |= 0x02;
+    }
+    if flags.contains(crate::record::TxFlags::EXTERNAL) {
+        wire_flags |= crate::protocol::opcodes::FLAG_EXTERNAL_BLOB;
+    }
+    (is_coinbase, wire_flags)
+}
 
 // -- Op type tags --
 const OP_SPEND: u8 = 1;
@@ -169,16 +197,36 @@ impl ReplicaOp {
     /// Create sets it via metadata_bytes and Delete/PruneSlot remove data.
     pub fn master_generation(&self) -> Option<u32> {
         match self {
-            Self::Spend { master_generation, .. }
-            | Self::Unspend { master_generation, .. }
-            | Self::SetMined { master_generation, .. }
-            | Self::UnsetMined { master_generation, .. }
-            | Self::Freeze { master_generation, .. }
-            | Self::Unfreeze { master_generation, .. }
-            | Self::Reassign { master_generation, .. }
-            | Self::SetConflicting { master_generation, .. }
-            | Self::SetLocked { master_generation, .. }
-            | Self::PreserveUntil { master_generation, .. } => Some(*master_generation),
+            Self::Spend {
+                master_generation, ..
+            }
+            | Self::Unspend {
+                master_generation, ..
+            }
+            | Self::SetMined {
+                master_generation, ..
+            }
+            | Self::UnsetMined {
+                master_generation, ..
+            }
+            | Self::Freeze {
+                master_generation, ..
+            }
+            | Self::Unfreeze {
+                master_generation, ..
+            }
+            | Self::Reassign {
+                master_generation, ..
+            }
+            | Self::SetConflicting {
+                master_generation, ..
+            }
+            | Self::SetLocked {
+                master_generation, ..
+            }
+            | Self::PreserveUntil {
+                master_generation, ..
+            } => Some(*master_generation),
             Self::Create { .. } | Self::Delete { .. } | Self::PruneSlot { .. } => None,
         }
     }
@@ -192,20 +240,36 @@ impl ReplicaOp {
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(80);
         match self {
-            ReplicaOp::Spend { tx_key, offset, spending_data, master_generation } => {
+            ReplicaOp::Spend {
+                tx_key,
+                offset,
+                spending_data,
+                master_generation,
+            } => {
                 buf.push(OP_SPEND);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
                 buf.extend_from_slice(spending_data);
                 buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::Unspend { tx_key, offset, master_generation } => {
+            ReplicaOp::Unspend {
+                tx_key,
+                offset,
+                master_generation,
+            } => {
                 buf.push(OP_UNSPEND);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
                 buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::SetMined { tx_key, block_id, block_height, subtree_idx, on_longest_chain, master_generation } => {
+            ReplicaOp::SetMined {
+                tx_key,
+                block_id,
+                block_height,
+                subtree_idx,
+                on_longest_chain,
+                master_generation,
+            } => {
                 buf.push(OP_SET_MINED);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&block_id.to_le_bytes());
@@ -214,25 +278,44 @@ impl ReplicaOp {
                 buf.push(u8::from(*on_longest_chain));
                 buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::UnsetMined { tx_key, block_id, master_generation } => {
+            ReplicaOp::UnsetMined {
+                tx_key,
+                block_id,
+                master_generation,
+            } => {
                 buf.push(OP_UNSET_MINED);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&block_id.to_le_bytes());
                 buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::Freeze { tx_key, offset, master_generation } => {
+            ReplicaOp::Freeze {
+                tx_key,
+                offset,
+                master_generation,
+            } => {
                 buf.push(OP_FREEZE);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
                 buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::Unfreeze { tx_key, offset, master_generation } => {
+            ReplicaOp::Unfreeze {
+                tx_key,
+                offset,
+                master_generation,
+            } => {
                 buf.push(OP_UNFREEZE);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
                 buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::Reassign { tx_key, offset, new_hash, block_height, spendable_after, master_generation } => {
+            ReplicaOp::Reassign {
+                tx_key,
+                offset,
+                new_hash,
+                block_height,
+                spendable_after,
+                master_generation,
+            } => {
                 buf.push(OP_REASSIGN);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
@@ -241,7 +324,13 @@ impl ReplicaOp {
                 buf.extend_from_slice(&spendable_after.to_le_bytes());
                 buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::SetConflicting { tx_key, value, current_block_height, retention, master_generation } => {
+            ReplicaOp::SetConflicting {
+                tx_key,
+                value,
+                current_block_height,
+                retention,
+                master_generation,
+            } => {
                 buf.push(OP_SET_CONFLICTING);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.push(u8::from(*value));
@@ -249,19 +338,33 @@ impl ReplicaOp {
                 buf.extend_from_slice(&retention.to_le_bytes());
                 buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::SetLocked { tx_key, value, master_generation } => {
+            ReplicaOp::SetLocked {
+                tx_key,
+                value,
+                master_generation,
+            } => {
                 buf.push(OP_SET_LOCKED);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.push(u8::from(*value));
                 buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::PreserveUntil { tx_key, block_height, master_generation } => {
+            ReplicaOp::PreserveUntil {
+                tx_key,
+                block_height,
+                master_generation,
+            } => {
                 buf.push(OP_PRESERVE_UNTIL);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&block_height.to_le_bytes());
                 buf.extend_from_slice(&master_generation.to_le_bytes());
             }
-            ReplicaOp::Create { tx_key, metadata_bytes, utxo_hashes, cold_data, is_external } => {
+            ReplicaOp::Create {
+                tx_key,
+                metadata_bytes,
+                utxo_hashes,
+                cold_data,
+                is_external,
+            } => {
                 buf.push(OP_CREATE);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&(metadata_bytes.len() as u32).to_le_bytes());
@@ -308,78 +411,124 @@ impl ReplicaOp {
                 let mut sd = [0u8; 36];
                 sd.copy_from_slice(&rest[36..72]);
                 let master_generation = r_u32(rest, 72);
-                Ok((ReplicaOp::Spend { tx_key: key, offset, spending_data: sd, master_generation }, 77))
+                Ok((
+                    ReplicaOp::Spend {
+                        tx_key: key,
+                        offset,
+                        spending_data: sd,
+                        master_generation,
+                    },
+                    77,
+                ))
             }
             OP_UNSPEND => {
                 need(rest, 40)?; // 32 + 4 + 4(gen)
-                Ok((ReplicaOp::Unspend {
-                    tx_key: read_key(rest), offset: r_u32(rest, 32),
-                    master_generation: r_u32(rest, 36),
-                }, 41))
+                Ok((
+                    ReplicaOp::Unspend {
+                        tx_key: read_key(rest),
+                        offset: r_u32(rest, 32),
+                        master_generation: r_u32(rest, 36),
+                    },
+                    41,
+                ))
             }
             OP_SET_MINED => {
                 need(rest, 49)?; // 32 + 4 + 4 + 4 + 1 + 4(gen)
-                Ok((ReplicaOp::SetMined {
-                    tx_key: read_key(rest),
-                    block_id: r_u32(rest, 32),
-                    block_height: r_u32(rest, 36),
-                    subtree_idx: r_u32(rest, 40),
-                    on_longest_chain: rest[44] != 0,
-                    master_generation: r_u32(rest, 45),
-                }, 50))
+                Ok((
+                    ReplicaOp::SetMined {
+                        tx_key: read_key(rest),
+                        block_id: r_u32(rest, 32),
+                        block_height: r_u32(rest, 36),
+                        subtree_idx: r_u32(rest, 40),
+                        on_longest_chain: rest[44] != 0,
+                        master_generation: r_u32(rest, 45),
+                    },
+                    50,
+                ))
             }
             OP_UNSET_MINED => {
                 need(rest, 40)?; // 32 + 4 + 4(gen)
-                Ok((ReplicaOp::UnsetMined {
-                    tx_key: read_key(rest), block_id: r_u32(rest, 32),
-                    master_generation: r_u32(rest, 36),
-                }, 41))
+                Ok((
+                    ReplicaOp::UnsetMined {
+                        tx_key: read_key(rest),
+                        block_id: r_u32(rest, 32),
+                        master_generation: r_u32(rest, 36),
+                    },
+                    41,
+                ))
             }
             OP_FREEZE => {
                 need(rest, 40)?; // 32 + 4 + 4(gen)
-                Ok((ReplicaOp::Freeze {
-                    tx_key: read_key(rest), offset: r_u32(rest, 32),
-                    master_generation: r_u32(rest, 36),
-                }, 41))
+                Ok((
+                    ReplicaOp::Freeze {
+                        tx_key: read_key(rest),
+                        offset: r_u32(rest, 32),
+                        master_generation: r_u32(rest, 36),
+                    },
+                    41,
+                ))
             }
             OP_UNFREEZE => {
                 need(rest, 40)?; // 32 + 4 + 4(gen)
-                Ok((ReplicaOp::Unfreeze {
-                    tx_key: read_key(rest), offset: r_u32(rest, 32),
-                    master_generation: r_u32(rest, 36),
-                }, 41))
+                Ok((
+                    ReplicaOp::Unfreeze {
+                        tx_key: read_key(rest),
+                        offset: r_u32(rest, 32),
+                        master_generation: r_u32(rest, 36),
+                    },
+                    41,
+                ))
             }
             OP_REASSIGN => {
                 need(rest, 80)?; // 32 + 4 + 32 + 4 + 4 + 4(gen)
                 let mut nh = [0u8; 32];
                 nh.copy_from_slice(&rest[36..68]);
-                Ok((ReplicaOp::Reassign {
-                    tx_key: read_key(rest), offset: r_u32(rest, 32),
-                    new_hash: nh, block_height: r_u32(rest, 68), spendable_after: r_u32(rest, 72),
-                    master_generation: r_u32(rest, 76),
-                }, 81))
+                Ok((
+                    ReplicaOp::Reassign {
+                        tx_key: read_key(rest),
+                        offset: r_u32(rest, 32),
+                        new_hash: nh,
+                        block_height: r_u32(rest, 68),
+                        spendable_after: r_u32(rest, 72),
+                        master_generation: r_u32(rest, 76),
+                    },
+                    81,
+                ))
             }
             OP_SET_CONFLICTING => {
                 need(rest, 45)?; // 32 + 1 + 4 + 4 + 4(gen)
-                Ok((ReplicaOp::SetConflicting {
-                    tx_key: read_key(rest), value: rest[32] != 0,
-                    current_block_height: r_u32(rest, 33), retention: r_u32(rest, 37),
-                    master_generation: r_u32(rest, 41),
-                }, 46))
+                Ok((
+                    ReplicaOp::SetConflicting {
+                        tx_key: read_key(rest),
+                        value: rest[32] != 0,
+                        current_block_height: r_u32(rest, 33),
+                        retention: r_u32(rest, 37),
+                        master_generation: r_u32(rest, 41),
+                    },
+                    46,
+                ))
             }
             OP_SET_LOCKED => {
                 need(rest, 37)?; // 32 + 1 + 4(gen)
-                Ok((ReplicaOp::SetLocked {
-                    tx_key: read_key(rest), value: rest[32] != 0,
-                    master_generation: r_u32(rest, 33),
-                }, 38))
+                Ok((
+                    ReplicaOp::SetLocked {
+                        tx_key: read_key(rest),
+                        value: rest[32] != 0,
+                        master_generation: r_u32(rest, 33),
+                    },
+                    38,
+                ))
             }
             OP_PRESERVE_UNTIL => {
                 need(rest, 40)?; // 32 + 4 + 4(gen)
-                Ok((ReplicaOp::PreserveUntil {
-                    tx_key: read_key(rest), block_height: r_u32(rest, 32),
-                    master_generation: r_u32(rest, 36),
-                }, 41))
+                Ok((
+                    ReplicaOp::PreserveUntil {
+                        tx_key: read_key(rest),
+                        block_height: r_u32(rest, 32),
+                        master_generation: r_u32(rest, 36),
+                    },
+                    41,
+                ))
             }
             OP_CREATE => {
                 need(rest, 36)?; // key + meta_len
@@ -421,15 +570,35 @@ impl ReplicaOp {
                 } else {
                     false
                 };
-                Ok((ReplicaOp::Create { tx_key: key, metadata_bytes, utxo_hashes, cold_data, is_external }, 1 + pos))
+                Ok((
+                    ReplicaOp::Create {
+                        tx_key: key,
+                        metadata_bytes,
+                        utxo_hashes,
+                        cold_data,
+                        is_external,
+                    },
+                    1 + pos,
+                ))
             }
             OP_DELETE => {
                 need(rest, 32)?;
-                Ok((ReplicaOp::Delete { tx_key: read_key(rest) }, 33))
+                Ok((
+                    ReplicaOp::Delete {
+                        tx_key: read_key(rest),
+                    },
+                    33,
+                ))
             }
             OP_PRUNE_SLOT => {
                 need(rest, 36)?;
-                Ok((ReplicaOp::PruneSlot { tx_key: read_key(rest), offset: r_u32(rest, 32) }, 37))
+                Ok((
+                    ReplicaOp::PruneSlot {
+                        tx_key: read_key(rest),
+                        offset: r_u32(rest, 32),
+                    },
+                    37,
+                ))
             }
             _ => Err(ProtocolError::UnknownOp(op_type)),
         }
@@ -438,7 +607,10 @@ impl ReplicaOp {
 
 fn need(data: &[u8], n: usize) -> Result<()> {
     if data.len() < n {
-        Err(ProtocolError::BufferTooShort { need: n, have: data.len() })
+        Err(ProtocolError::BufferTooShort {
+            need: n,
+            have: data.len(),
+        })
     } else {
         Ok(())
     }
@@ -474,6 +646,10 @@ pub struct ReplicaBatch {
     /// Optional W3C trace context propagated from the sender's current
     /// span. `None` when the sender had no active/sampled span.
     pub trace_ctx: Option<WireTraceContext>,
+    /// Stable sender node id used to key receiver-side idempotency state.
+    ///
+    /// `None` is kept for legacy frames and non-clustered tests.
+    pub source_node_id: Option<u64>,
 }
 
 /// Acknowledgment from a replica.
@@ -482,7 +658,10 @@ pub enum ReplicaAck {
     /// All ops through this sequence have been applied.
     Ok { through_sequence: u64 },
     /// An error occurred at the given sequence.
-    Error { failed_sequence: u64, message: String },
+    Error {
+        failed_sequence: u64,
+        message: String,
+    },
 }
 
 /// Sent by a replica to request catchup from the master.
@@ -493,7 +672,7 @@ pub struct CatchupRequest {
 }
 
 impl CatchupRequest {
-    /// Serialize to bytes: [last_ack_sequence:8].
+    /// Serialize to bytes: `[last_ack_sequence:8]`.
     pub fn serialize(&self) -> Vec<u8> {
         self.last_ack_sequence.to_le_bytes().to_vec()
     }
@@ -510,13 +689,14 @@ impl CatchupRequest {
 impl ReplicaBatch {
     /// Serialize to bytes.
     ///
-    /// Layout (protocol V2):
-    /// `[version:1][first_seq:8][count:4][trace_id:16][span_id:8][op0][op1]...`
+    /// Layout (protocol V3):
+    /// `[version:1][first_seq:8][count:4][trace_id:16][span_id:8][source_node_id:8][op0][op1]...`
     ///
     /// When `trace_ctx` is `None`, the 24 trace-context bytes are zero.
+    /// When `source_node_id` is `None`, the source field is zero.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::HEADER_SIZE + self.ops.len() * 64);
-        buf.push(BATCH_PROTOCOL_V2);
+        buf.push(BATCH_PROTOCOL_V3);
         buf.extend_from_slice(&self.first_sequence.to_le_bytes());
         buf.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
         let mut tc = [0u8; WireTraceContext::SIZE];
@@ -524,6 +704,7 @@ impl ReplicaBatch {
             ctx.write_to(&mut tc);
         }
         buf.extend_from_slice(&tc);
+        buf.extend_from_slice(&self.source_node_id.unwrap_or(0).to_le_bytes());
         for op in &self.ops {
             let ob = op.serialize();
             buf.extend_from_slice(&(ob.len() as u32).to_le_bytes());
@@ -534,19 +715,25 @@ impl ReplicaBatch {
 
     /// Deserialize from bytes.
     ///
-    /// Tolerates legacy V1 frames (`[first_seq:8][count:4][op...]`) by
-    /// inspecting the first byte: if it equals [`BATCH_PROTOCOL_V2`] the
-    /// V2 layout is read (with trace context); otherwise the V1 layout
-    /// is assumed and `trace_ctx` is `None`. V1 is only read to keep a
-    /// rolling-upgrade path alive; new senders always produce V2.
+    /// Tolerates legacy V1 frames (`[first_seq:8][count:4][op...]`) and
+    /// V2 frames (trace context but no source node id). V1/V2 frames decode
+    /// with `source_node_id = None`; new senders always produce V3.
     pub fn deserialize(data: &[u8]) -> Result<Self> {
         need(data, 1)?;
-        if data[0] == BATCH_PROTOCOL_V2 {
-            // V2: [version(1) + first_seq(8) + count(4) + trace_ctx(24)] = 37 bytes
+        if data[0] == BATCH_PROTOCOL_V3 {
+            // V3: [version(1) + first_seq(8) + count(4) + trace_ctx(24) + source_node_id(8)]
             need(data, Self::HEADER_SIZE)?;
             let first_sequence = u64::from_le_bytes(data[1..9].try_into().unwrap());
             let count = u32::from_le_bytes(data[9..13].try_into().unwrap()) as usize;
             let trace_ctx = WireTraceContext::read_from(&data[13..13 + WireTraceContext::SIZE]);
+            let source_off = 13 + WireTraceContext::SIZE;
+            let raw_source =
+                u64::from_le_bytes(data[source_off..source_off + 8].try_into().unwrap());
+            let source_node_id = if raw_source == 0 {
+                None
+            } else {
+                Some(raw_source)
+            };
             let mut pos = Self::HEADER_SIZE;
             let mut ops = Vec::with_capacity(count);
             for _ in 0..count {
@@ -562,6 +749,31 @@ impl ReplicaBatch {
                 first_sequence,
                 ops,
                 trace_ctx,
+                source_node_id,
+            })
+        } else if data[0] == BATCH_PROTOCOL_V2 {
+            // V2: [version(1) + first_seq(8) + count(4) + trace_ctx(24)] = 37 bytes
+            let header_size = 1 + 8 + 4 + WireTraceContext::SIZE;
+            need(data, header_size)?;
+            let first_sequence = u64::from_le_bytes(data[1..9].try_into().unwrap());
+            let count = u32::from_le_bytes(data[9..13].try_into().unwrap()) as usize;
+            let trace_ctx = WireTraceContext::read_from(&data[13..13 + WireTraceContext::SIZE]);
+            let mut pos = header_size;
+            let mut ops = Vec::with_capacity(count);
+            for _ in 0..count {
+                need(&data[pos..], 4)?;
+                let op_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                need(&data[pos..], op_len)?;
+                let (op, _) = ReplicaOp::deserialize(&data[pos..pos + op_len])?;
+                ops.push(op);
+                pos += op_len;
+            }
+            Ok(ReplicaBatch {
+                first_sequence,
+                ops,
+                trace_ctx,
+                source_node_id: None,
             })
         } else {
             // Legacy V1: no version byte. `data[0]` is the low byte of
@@ -584,6 +796,7 @@ impl ReplicaBatch {
                 first_sequence,
                 ops,
                 trace_ctx: None,
+                source_node_id: None,
             })
         }
     }
@@ -595,8 +808,8 @@ impl ReplicaBatch {
 
     /// Batch header overhead in bytes.
     ///
-    /// Protocol V2 layout: `version(1) + first_sequence(8) + count(4) + trace_ctx(24) = 37`.
-    pub const HEADER_SIZE: usize = 1 + 8 + 4 + WireTraceContext::SIZE;
+    /// Protocol V3 layout: `version(1) + first_sequence(8) + count(4) + trace_ctx(24) + source_node_id(8) = 45`.
+    pub const HEADER_SIZE: usize = 1 + 8 + 4 + WireTraceContext::SIZE + 8;
 
     /// Byte offset of the trace_id field in the V2 serialized frame.
     /// Exposed for the test suite that inspects exact byte layout.
@@ -615,7 +828,10 @@ impl ReplicaAck {
                 buf.push(0);
                 buf.extend_from_slice(&through_sequence.to_le_bytes());
             }
-            ReplicaAck::Error { failed_sequence, message } => {
+            ReplicaAck::Error {
+                failed_sequence,
+                message,
+            } => {
                 buf.push(1);
                 buf.extend_from_slice(&failed_sequence.to_le_bytes());
                 buf.extend_from_slice(&(message.len() as u32).to_le_bytes());
@@ -641,7 +857,10 @@ impl ReplicaAck {
                 let len = u32::from_le_bytes(data[9..13].try_into().unwrap()) as usize;
                 need(data, 13 + len)?;
                 let msg = String::from_utf8_lossy(&data[13..13 + len]).into_owned();
-                Ok(ReplicaAck::Error { failed_sequence: seq, message: msg })
+                Ok(ReplicaAck::Error {
+                    failed_sequence: seq,
+                    message: msg,
+                })
             }
             _ => Err(ProtocolError::UnknownOp(data[0])),
         }
@@ -655,16 +874,45 @@ impl ReplicaAck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::TxFlags;
 
     fn key(n: u8) -> TxKey {
-        let mut txid = [0u8; 32]; txid[0] = n; TxKey { txid }
+        let mut txid = [0u8; 32];
+        txid[0] = n;
+        TxKey { txid }
+    }
+
+    #[test]
+    fn create_metadata_flag_bytes_use_replica_create_layout() {
+        let flags =
+            TxFlags::IS_COINBASE | TxFlags::LOCKED | TxFlags::CONFLICTING | TxFlags::EXTERNAL;
+
+        let (is_coinbase, wire_flags) = create_metadata_flag_bytes(flags);
+
+        assert_eq!(is_coinbase, 1);
+        assert_eq!(wire_flags & 0x01, 0x01, "locked is wire bit 0");
+        assert_eq!(wire_flags & 0x02, 0x02, "conflicting is wire bit 1");
+        assert_eq!(
+            wire_flags & crate::protocol::opcodes::FLAG_EXTERNAL_BLOB,
+            crate::protocol::opcodes::FLAG_EXTERNAL_BLOB,
+        );
+        assert_eq!(wire_flags & 0x04, 0, "frozen is not a persisted tx flag");
     }
 
     #[test]
     fn spend_round_trip() {
-        let op = ReplicaOp::Spend { tx_key: key(1), offset: 5, spending_data: [0xAB; 36], master_generation: 0 };
+        let op = ReplicaOp::Spend {
+            tx_key: key(1),
+            offset: 5,
+            spending_data: [0xAB; 36],
+            master_generation: 0,
+        };
         let bytes = op.serialize();
-        assert!(bytes.len() < 80, "spend serialized to {} bytes", bytes.len());
+        assert!(
+            bytes.len() < 80,
+            "spend serialized to {} bytes",
+            bytes.len()
+        );
         let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
         assert_eq!(decoded, op);
         assert_eq!(consumed, bytes.len());
@@ -672,9 +920,16 @@ mod tests {
 
     #[test]
     fn prune_slot_round_trip() {
-        let op = ReplicaOp::PruneSlot { tx_key: key(2), offset: 42 };
+        let op = ReplicaOp::PruneSlot {
+            tx_key: key(2),
+            offset: 42,
+        };
         let bytes = op.serialize();
-        assert!(bytes.len() < 44, "prune serialized to {} bytes", bytes.len());
+        assert!(
+            bytes.len() < 44,
+            "prune serialized to {} bytes",
+            bytes.len()
+        );
         let (decoded, _) = ReplicaOp::deserialize(&bytes).unwrap();
         assert_eq!(decoded, op);
     }
@@ -682,16 +937,65 @@ mod tests {
     #[test]
     fn all_variants_round_trip() {
         let ops = vec![
-            ReplicaOp::Spend { tx_key: key(1), offset: 0, spending_data: [0x11; 36], master_generation: 0 },
-            ReplicaOp::Unspend { tx_key: key(2), offset: 1, master_generation: 0 },
-            ReplicaOp::SetMined { tx_key: key(3), block_id: 100, block_height: 800000, subtree_idx: 7, on_longest_chain: true, master_generation: 0 },
-            ReplicaOp::UnsetMined { tx_key: key(4), block_id: 200, master_generation: 0 },
-            ReplicaOp::Freeze { tx_key: key(5), offset: 3, master_generation: 0 },
-            ReplicaOp::Unfreeze { tx_key: key(6), offset: 4, master_generation: 0 },
-            ReplicaOp::Reassign { tx_key: key(7), offset: 5, new_hash: [0xCC; 32], block_height: 1000, spendable_after: 100, master_generation: 0 },
-            ReplicaOp::SetConflicting { tx_key: key(8), value: true, current_block_height: 500, retention: 288, master_generation: 0 },
-            ReplicaOp::SetLocked { tx_key: key(9), value: false, master_generation: 0 },
-            ReplicaOp::PreserveUntil { tx_key: key(10), block_height: 5000, master_generation: 0 },
+            ReplicaOp::Spend {
+                tx_key: key(1),
+                offset: 0,
+                spending_data: [0x11; 36],
+                master_generation: 0,
+            },
+            ReplicaOp::Unspend {
+                tx_key: key(2),
+                offset: 1,
+                master_generation: 0,
+            },
+            ReplicaOp::SetMined {
+                tx_key: key(3),
+                block_id: 100,
+                block_height: 800000,
+                subtree_idx: 7,
+                on_longest_chain: true,
+                master_generation: 0,
+            },
+            ReplicaOp::UnsetMined {
+                tx_key: key(4),
+                block_id: 200,
+                master_generation: 0,
+            },
+            ReplicaOp::Freeze {
+                tx_key: key(5),
+                offset: 3,
+                master_generation: 0,
+            },
+            ReplicaOp::Unfreeze {
+                tx_key: key(6),
+                offset: 4,
+                master_generation: 0,
+            },
+            ReplicaOp::Reassign {
+                tx_key: key(7),
+                offset: 5,
+                new_hash: [0xCC; 32],
+                block_height: 1000,
+                spendable_after: 100,
+                master_generation: 0,
+            },
+            ReplicaOp::SetConflicting {
+                tx_key: key(8),
+                value: true,
+                current_block_height: 500,
+                retention: 288,
+                master_generation: 0,
+            },
+            ReplicaOp::SetLocked {
+                tx_key: key(9),
+                value: false,
+                master_generation: 0,
+            },
+            ReplicaOp::PreserveUntil {
+                tx_key: key(10),
+                block_height: 5000,
+                master_generation: 0,
+            },
             ReplicaOp::Create {
                 tx_key: key(11),
                 metadata_bytes: vec![0x42; 100],
@@ -700,7 +1004,10 @@ mod tests {
                 is_external: false,
             },
             ReplicaOp::Delete { tx_key: key(12) },
-            ReplicaOp::PruneSlot { tx_key: key(13), offset: 99 },
+            ReplicaOp::PruneSlot {
+                tx_key: key(13),
+                offset: 99,
+            },
         ];
 
         for op in &ops {
@@ -713,7 +1020,13 @@ mod tests {
 
     #[test]
     fn create_with_100_utxos_round_trip() {
-        let hashes: Vec<[u8; 32]> = (0..100).map(|i| { let mut h = [0u8; 32]; h[0] = i; h }).collect();
+        let hashes: Vec<[u8; 32]> = (0..100)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i;
+                h
+            })
+            .collect();
         let op = ReplicaOp::Create {
             tx_key: key(1),
             metadata_bytes: vec![0; 256],
@@ -731,11 +1044,24 @@ mod tests {
         let batch = ReplicaBatch {
             first_sequence: 100,
             ops: vec![
-                ReplicaOp::Spend { tx_key: key(1), offset: 0, spending_data: [0x11; 36], master_generation: 0 },
-                ReplicaOp::Freeze { tx_key: key(2), offset: 1, master_generation: 0 },
-                ReplicaOp::PruneSlot { tx_key: key(3), offset: 2 },
+                ReplicaOp::Spend {
+                    tx_key: key(1),
+                    offset: 0,
+                    spending_data: [0x11; 36],
+                    master_generation: 0,
+                },
+                ReplicaOp::Freeze {
+                    tx_key: key(2),
+                    offset: 1,
+                    master_generation: 0,
+                },
+                ReplicaOp::PruneSlot {
+                    tx_key: key(3),
+                    offset: 2,
+                },
             ],
             trace_ctx: None,
+            source_node_id: None,
         };
         let bytes = batch.serialize();
         let decoded = ReplicaBatch::deserialize(&bytes).unwrap();
@@ -746,9 +1072,19 @@ mod tests {
     #[test]
     fn batch_100_ops_round_trip() {
         let ops: Vec<ReplicaOp> = (0..100u8)
-            .map(|i| ReplicaOp::Spend { tx_key: key(i), offset: i as u32, spending_data: [i; 36], master_generation: 0 })
+            .map(|i| ReplicaOp::Spend {
+                tx_key: key(i),
+                offset: i as u32,
+                spending_data: [i; 36],
+                master_generation: 0,
+            })
             .collect();
-        let batch = ReplicaBatch { first_sequence: 1000, ops, trace_ctx: None };
+        let batch = ReplicaBatch {
+            first_sequence: 1000,
+            ops,
+            trace_ctx: None,
+            source_node_id: None,
+        };
         let bytes = batch.serialize();
         let decoded = ReplicaBatch::deserialize(&bytes).unwrap();
         assert_eq!(decoded.ops.len(), 100);
@@ -758,8 +1094,8 @@ mod tests {
 
     #[test]
     fn batch_header_overhead() {
-        // V2: version(1) + first_sequence(8) + count(4) + trace_ctx(24) = 37 bytes.
-        assert_eq!(ReplicaBatch::HEADER_SIZE, 37);
+        // V3: version(1) + first_sequence(8) + count(4) + trace_ctx(24) + source_node_id(8) = 45 bytes.
+        assert_eq!(ReplicaBatch::HEADER_SIZE, 45);
         assert_eq!(ReplicaBatch::TRACE_ID_OFFSET, 13);
         assert_eq!(ReplicaBatch::SPAN_ID_OFFSET, 29);
     }
@@ -768,8 +1104,8 @@ mod tests {
     fn replication_batch_header_roundtrips_trace_context() {
         let ctx = WireTraceContext {
             trace_id: [
-                0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
-                0xAE, 0xAF, 0xB0,
+                0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE,
+                0xAF, 0xB0,
             ],
             span_id: [0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8],
         };
@@ -781,10 +1117,11 @@ mod tests {
                 master_generation: 1,
             }],
             trace_ctx: Some(ctx),
+            source_node_id: Some(9),
         };
         let bytes = batch.serialize();
         // Version byte.
-        assert_eq!(bytes[0], BATCH_PROTOCOL_V2);
+        assert_eq!(bytes[0], BATCH_PROTOCOL_V3);
         // Exact trace_id bytes at declared offset.
         assert_eq!(
             &bytes[ReplicaBatch::TRACE_ID_OFFSET..ReplicaBatch::TRACE_ID_OFFSET + 16],
@@ -801,11 +1138,32 @@ mod tests {
     }
 
     #[test]
+    fn replication_batch_source_node_id_roundtrips() {
+        let batch = ReplicaBatch {
+            first_sequence: 88,
+            ops: vec![ReplicaOp::Delete { tx_key: key(8) }],
+            trace_ctx: None,
+            source_node_id: Some(42),
+        };
+        let bytes = batch.serialize();
+        let source_offset = ReplicaBatch::SPAN_ID_OFFSET + 8;
+        assert_eq!(
+            u64::from_le_bytes(bytes[source_offset..source_offset + 8].try_into().unwrap()),
+            42,
+        );
+
+        let decoded = ReplicaBatch::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.source_node_id, Some(42));
+        assert_eq!(decoded, batch);
+    }
+
+    #[test]
     fn replication_batch_without_trace_context_roundtrips_zero_bytes() {
         let batch = ReplicaBatch {
             first_sequence: 7,
             ops: vec![ReplicaOp::Delete { tx_key: key(1) }],
             trace_ctx: None,
+            source_node_id: None,
         };
         let bytes = batch.serialize();
         // 24 bytes at the trace_ctx offset must be all zero.
@@ -840,8 +1198,40 @@ mod tests {
     }
 
     #[test]
+    fn replication_batch_v2_legacy_frame_decodes_without_source_node_id() {
+        let ctx = WireTraceContext {
+            trace_id: [0x44; 16],
+            span_id: [0x55; 8],
+        };
+        let op = ReplicaOp::Freeze {
+            tx_key: key(3),
+            offset: 1,
+            master_generation: 7,
+        };
+        let ob = op.serialize();
+        let first_seq = 123u64;
+        let mut v2 = Vec::new();
+        v2.push(BATCH_PROTOCOL_V2);
+        v2.extend_from_slice(&first_seq.to_le_bytes());
+        v2.extend_from_slice(&1u32.to_le_bytes());
+        let mut tc = [0u8; WireTraceContext::SIZE];
+        ctx.write_to(&mut tc);
+        v2.extend_from_slice(&tc);
+        v2.extend_from_slice(&(ob.len() as u32).to_le_bytes());
+        v2.extend_from_slice(&ob);
+
+        let decoded = ReplicaBatch::deserialize(&v2).expect("v2 frame decodes");
+        assert_eq!(decoded.first_sequence, first_seq);
+        assert_eq!(decoded.ops, vec![op]);
+        assert_eq!(decoded.trace_ctx, Some(ctx));
+        assert_eq!(decoded.source_node_id, None);
+    }
+
+    #[test]
     fn ack_ok_round_trip() {
-        let ack = ReplicaAck::Ok { through_sequence: 42 };
+        let ack = ReplicaAck::Ok {
+            through_sequence: 42,
+        };
         let bytes = ack.serialize();
         let decoded = ReplicaAck::deserialize(&bytes).unwrap();
         assert_eq!(decoded, ack);
@@ -849,7 +1239,10 @@ mod tests {
 
     #[test]
     fn ack_error_round_trip() {
-        let ack = ReplicaAck::Error { failed_sequence: 99, message: "test error".into() };
+        let ack = ReplicaAck::Error {
+            failed_sequence: 99,
+            message: "test error".into(),
+        };
         let bytes = ack.serialize();
         let decoded = ReplicaAck::deserialize(&bytes).unwrap();
         assert_eq!(decoded, ack);
@@ -857,7 +1250,9 @@ mod tests {
 
     #[test]
     fn catchup_request_round_trip() {
-        let req = CatchupRequest { last_ack_sequence: 12345 };
+        let req = CatchupRequest {
+            last_ack_sequence: 12345,
+        };
         let bytes = req.serialize();
         assert_eq!(bytes.len(), 8);
         let decoded = CatchupRequest::deserialize(&bytes).unwrap();

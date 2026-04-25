@@ -11,14 +11,14 @@
 //! 8. On shutdown: snapshot index, sync device
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 
 use parking_lot::Mutex;
 use teraslab::allocator::SlotAllocator;
+use teraslab::config::IndexBackendMode;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, DirectDevice};
-use teraslab::config::IndexBackendMode;
 use teraslab::index::{DahBackend, DahIndex, PrimaryBackend, UnminedBackend, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{
@@ -27,8 +27,8 @@ use teraslab::metrics::{
 };
 use teraslab::ops::engine::Engine;
 use teraslab::redo::RedoLog;
-use teraslab::server::http::{HttpState, start_http_server};
 use teraslab::server::Server;
+use teraslab::server::http::{HttpState, start_http_server};
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
 
 /// Detect the first non-loopback IPv4 address on this host.
@@ -77,7 +77,9 @@ fn main() {
             // effectively useful — keep it as a direct stderr write so
             // operators always see it on bad invocation.
             #[allow(clippy::disallowed_macros)]
-            { eprintln!("Usage: teraslab-server --config <path.toml>"); }
+            {
+                eprintln!("Usage: teraslab-server --config <path.toml>");
+            }
             std::process::exit(1);
         }
         match ServerConfig::load(std::path::Path::new(&args[2])) {
@@ -96,10 +98,10 @@ fn main() {
     let used_defaults = !(args.len() > 1 && args[1] == "--config");
 
     // Apply TERASLAB_* env overrides on top of TOML values. If env vars
-    // contain malformed values (e.g. a non-numeric sampling ratio) fail
-    // fast with a plain-stderr message so operators see the root cause
-    // even before the subscriber is installed.
-    if let Err(e) = config.apply_observability_env_overrides() {
+    // contain malformed values (e.g. a non-numeric tuning value) fail fast
+    // with a plain-stderr message so operators see the root cause even before
+    // the subscriber is installed.
+    if let Err(e) = config.apply_env_overrides() {
         init_tracing_subscriber_fallback();
         tracing::error!(err = %e, "FATAL: invalid TERASLAB_* env override");
         std::process::exit(1);
@@ -161,20 +163,17 @@ fn main() {
 
     // 1. Open device
     let device_path = &config.device_paths[0];
-    let device: Arc<dyn BlockDevice> = match DirectDevice::open(
-        device_path,
-        config.device_size,
-        config.device_alignment,
-    ) {
-        Ok(d) => {
-            tracing::info!(path = %device_path.display(), "device opened");
-            Arc::new(d)
-        }
-        Err(e) => {
-            tracing::error!(path = %device_path.display(), err = %e, "failed to open device");
-            std::process::exit(1);
-        }
-    };
+    let device: Arc<dyn BlockDevice> =
+        match DirectDevice::open(device_path, config.device_size, config.device_alignment) {
+            Ok(d) => {
+                tracing::info!(path = %device_path.display(), "device opened");
+                Arc::new(d)
+            }
+            Err(e) => {
+                tracing::error!(path = %device_path.display(), err = %e, "failed to open device");
+                std::process::exit(1);
+            }
+        };
 
     // Validate device_id config format before using it.
     if let Err(e) = config.validate_device_id() {
@@ -211,20 +210,18 @@ fn main() {
 
             alloc
         }
-        Err(_) => {
-            match SlotAllocator::new(device.clone()) {
-                Ok(fresh) => {
-                    let device_id_hex = fresh.device_id_hex();
-                    tracing::info!("allocator: fresh (no persisted state found)");
-                    tracing::info!(device_id = %device_id_hex, "device identity (copy to config device_id to enable verification)");
-                    fresh
-                }
-                Err(e) => {
-                    tracing::error!(err = %e, "failed to create allocator");
-                    std::process::exit(1);
-                }
+        Err(_) => match SlotAllocator::new(device.clone()) {
+            Ok(fresh) => {
+                let device_id_hex = fresh.device_id_hex();
+                tracing::info!("allocator: fresh (no persisted state found)");
+                tracing::info!(device_id = %device_id_hex, "device identity (copy to config device_id to enable verification)");
+                fresh
             }
-        }
+            Err(e) => {
+                tracing::error!(err = %e, "failed to create allocator");
+                std::process::exit(1);
+            }
+        },
     };
 
     // 3. Load or rebuild index (backend selected by config)
@@ -235,145 +232,153 @@ fn main() {
     };
     tracing::info!(backend = %index_backend_name, "index backend");
 
-    let (mut index, mut dah_index, mut unmined_index): (PrimaryBackend, DahBackend, UnminedBackend) =
-        if config.index.backend == IndexBackendMode::Redb {
-            // ReDB on-disk backend
-            let primary = match PrimaryBackend::restore_redb(&config.index) {
-                Ok(idx) => {
-                    tracing::info!(entries = idx.len(), "redb primary index opened");
-                    idx
-                }
-                Err(_) => {
-                    tracing::info!("redb primary index not found, rebuilding from device");
-                    match PrimaryBackend::rebuild_redb(&config.index, &*device, &allocator) {
-                        Ok(idx) => idx,
-                        Err(e) => {
-                            tracing::warn!(err = %e, "redb rebuild failed, removing stale file and creating empty");
-                            let _ = std::fs::remove_file(&config.index.redb_path);
-                            PrimaryBackend::new_on_disk(&config.index).unwrap()
-                        }
-                    }
-                }
-            };
-            let dah = match teraslab::index::redb_dah::RedbDahIndex::open(
-                &config.index.redb_dah_path,
-                config.index.redb_cache_size,
-            ) {
-                Ok(idx) => DahBackend::OnDisk(idx),
-                Err(e) => {
-                    tracing::warn!(err = %e, "redb DAH index error, removing corrupt file and retrying");
-                    let _ = std::fs::remove_file(&config.index.redb_dah_path);
-                    match teraslab::index::redb_dah::RedbDahIndex::open(
-                        &config.index.redb_dah_path,
-                        config.index.redb_cache_size,
-                    ) {
-                        Ok(idx) => {
-                            tracing::info!("redb DAH index: fresh database created");
-                            DahBackend::OnDisk(idx)
-                        }
-                        Err(e2) => {
-                            tracing::warn!(err = %e2, "redb DAH index: fresh creation also failed, falling back to in-memory");
-                            DahBackend::new_in_memory()
-                        }
-                    }
-                }
-            };
-            let unmined = match teraslab::index::redb_unmined::RedbUnminedIndex::open(
-                &config.index.redb_unmined_path,
-                config.index.redb_cache_size,
-            ) {
-                Ok(idx) => UnminedBackend::OnDisk(idx),
-                Err(e) => {
-                    tracing::warn!(err = %e, "redb unmined index error, removing corrupt file and retrying");
-                    let _ = std::fs::remove_file(&config.index.redb_unmined_path);
-                    match teraslab::index::redb_unmined::RedbUnminedIndex::open(
-                        &config.index.redb_unmined_path,
-                        config.index.redb_cache_size,
-                    ) {
-                        Ok(idx) => {
-                            tracing::info!("redb unmined index: fresh database created");
-                            UnminedBackend::OnDisk(idx)
-                        }
-                        Err(e2) => {
-                            tracing::warn!(err = %e2, "redb unmined index: fresh creation also failed, falling back to in-memory");
-                            UnminedBackend::new_in_memory()
-                        }
-                    }
-                }
-            };
-            (primary, dah, unmined)
-        } else if config.index.backend == IndexBackendMode::FileBacked {
-            // File-backed mmap backend
-            let fb_path = &config.index.file_backed_path;
-            let primary = if fb_path.exists() {
-                match PrimaryBackend::restore_file_backed(fb_path, config.expected_records) {
-                    Ok(idx) => {
-                        tracing::info!(entries = idx.len(), "file-backed index opened");
-                        idx
-                    }
-                    Err(e) => {
-                        tracing::warn!(err = %e, "file-backed index corrupt, rebuilding from device");
-                        match PrimaryBackend::rebuild_file_backed(fb_path, &*device, &allocator) {
-                            Ok(idx) => idx,
-                            Err(e2) => {
-                                tracing::warn!(err = %e2, "file-backed rebuild failed, removing stale file and creating empty");
-                                let _ = std::fs::remove_file(fb_path);
-                                PrimaryBackend::new_file_backed(fb_path, config.expected_records).unwrap()
-                            }
-                        }
-                    }
-                }
-            } else {
-                tracing::info!("no file-backed index found, rebuilding from device");
-                match PrimaryBackend::rebuild_file_backed(fb_path, &*device, &allocator) {
+    let (mut index, mut dah_index, mut unmined_index): (
+        PrimaryBackend,
+        DahBackend,
+        UnminedBackend,
+    ) = if config.index.backend == IndexBackendMode::Redb {
+        // ReDB on-disk backend
+        let primary = match PrimaryBackend::restore_redb(&config.index) {
+            Ok(idx) => {
+                tracing::info!(entries = idx.len(), "redb primary index opened");
+                idx
+            }
+            Err(_) => {
+                tracing::info!("redb primary index not found, rebuilding from device");
+                match PrimaryBackend::rebuild_redb(&config.index, &*device, &allocator) {
                     Ok(idx) => idx,
                     Err(e) => {
-                        tracing::warn!(err = %e, "file-backed rebuild failed, creating empty");
-                        PrimaryBackend::new_file_backed(fb_path, config.expected_records).unwrap()
+                        tracing::warn!(err = %e, "redb rebuild failed, removing stale file and creating empty");
+                        let _ = std::fs::remove_file(&config.index.redb_path);
+                        PrimaryBackend::new_on_disk(&config.index).unwrap()
                     }
                 }
-            };
-            // File-backed mode: secondary indexes stay in-memory
-            let (dah, unmined) = match PrimaryBackend::rebuild_secondary(&*device, &allocator) {
-                Ok((d, u)) => (d, u),
-                Err(e) => {
-                    tracing::warn!(err = %e, "secondary index rebuild failed, starting empty");
-                    (DahIndex::new(), UnminedIndex::new())
-                }
-            };
-            (primary, DahBackend::from(dah), UnminedBackend::from(unmined))
-        } else {
-            // In-memory backend (default)
-            let snap_path = &config.index_snapshot_path;
-            let (idx, dah, unmined) = if snap_path.exists() {
-                match PrimaryBackend::restore_all(snap_path) {
-                    Ok((idx, dah, unmined, flags)) => {
-                        tracing::info!(entries = idx.len(), "index restored from snapshot");
-                        let dah = if flags.dah_needs_rebuild {
-                            tracing::warn!("DAH index needs rebuild (snapshot corrupt)");
-                            rebuild_dah(&*device, &allocator)
-                        } else {
-                            dah
-                        };
-                        let unmined = if flags.unmined_needs_rebuild {
-                            tracing::warn!("unmined index needs rebuild (snapshot corrupt)");
-                            rebuild_unmined(&*device, &allocator)
-                        } else {
-                            unmined
-                        };
-                        (idx, dah, unmined)
-                    }
-                    Err(e) => {
-                        tracing::warn!(err = %e, "index snapshot corrupt, rebuilding from device");
-                        rebuild_all(&*device, &allocator, config.expected_records)
-                    }
-                }
-            } else {
-                tracing::info!("no index snapshot found, rebuilding from device");
-                rebuild_all(&*device, &allocator, config.expected_records)
-            };
-            (idx, DahBackend::from(dah), UnminedBackend::from(unmined))
+            }
         };
+        let dah = match teraslab::index::redb_dah::RedbDahIndex::open(
+            &config.index.redb_dah_path,
+            config.index.redb_cache_size,
+        ) {
+            Ok(idx) => DahBackend::OnDisk(idx),
+            Err(e) => {
+                tracing::warn!(err = %e, "redb DAH index error, removing corrupt file and retrying");
+                let _ = std::fs::remove_file(&config.index.redb_dah_path);
+                match teraslab::index::redb_dah::RedbDahIndex::open(
+                    &config.index.redb_dah_path,
+                    config.index.redb_cache_size,
+                ) {
+                    Ok(idx) => {
+                        tracing::info!("redb DAH index: fresh database created");
+                        DahBackend::OnDisk(idx)
+                    }
+                    Err(e2) => {
+                        tracing::warn!(err = %e2, "redb DAH index: fresh creation also failed, falling back to in-memory");
+                        DahBackend::new_in_memory()
+                    }
+                }
+            }
+        };
+        let unmined = match teraslab::index::redb_unmined::RedbUnminedIndex::open(
+            &config.index.redb_unmined_path,
+            config.index.redb_cache_size,
+        ) {
+            Ok(idx) => UnminedBackend::OnDisk(idx),
+            Err(e) => {
+                tracing::warn!(err = %e, "redb unmined index error, removing corrupt file and retrying");
+                let _ = std::fs::remove_file(&config.index.redb_unmined_path);
+                match teraslab::index::redb_unmined::RedbUnminedIndex::open(
+                    &config.index.redb_unmined_path,
+                    config.index.redb_cache_size,
+                ) {
+                    Ok(idx) => {
+                        tracing::info!("redb unmined index: fresh database created");
+                        UnminedBackend::OnDisk(idx)
+                    }
+                    Err(e2) => {
+                        tracing::warn!(err = %e2, "redb unmined index: fresh creation also failed, falling back to in-memory");
+                        UnminedBackend::new_in_memory()
+                    }
+                }
+            }
+        };
+        (primary, dah, unmined)
+    } else if config.index.backend == IndexBackendMode::FileBacked {
+        // File-backed mmap backend
+        let fb_path = &config.index.file_backed_path;
+        let primary = if fb_path.exists() {
+            match PrimaryBackend::restore_file_backed(fb_path, config.expected_records) {
+                Ok(idx) => {
+                    tracing::info!(entries = idx.len(), "file-backed index opened");
+                    idx
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "file-backed index corrupt, rebuilding from device");
+                    match PrimaryBackend::rebuild_file_backed(fb_path, &*device, &allocator) {
+                        Ok(idx) => idx,
+                        Err(e2) => {
+                            tracing::warn!(err = %e2, "file-backed rebuild failed, removing stale file and creating empty");
+                            let _ = std::fs::remove_file(fb_path);
+                            PrimaryBackend::new_file_backed(fb_path, config.expected_records)
+                                .unwrap()
+                        }
+                    }
+                }
+            }
+        } else {
+            tracing::info!("no file-backed index found, rebuilding from device");
+            match PrimaryBackend::rebuild_file_backed(fb_path, &*device, &allocator) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    tracing::warn!(err = %e, "file-backed rebuild failed, creating empty");
+                    PrimaryBackend::new_file_backed(fb_path, config.expected_records).unwrap()
+                }
+            }
+        };
+        // File-backed mode: secondary indexes stay in-memory
+        let (dah, unmined) = match PrimaryBackend::rebuild_secondary(&*device, &allocator) {
+            Ok((d, u)) => (d, u),
+            Err(e) => {
+                tracing::warn!(err = %e, "secondary index rebuild failed, starting empty");
+                (DahIndex::new(), UnminedIndex::new())
+            }
+        };
+        (
+            primary,
+            DahBackend::from(dah),
+            UnminedBackend::from(unmined),
+        )
+    } else {
+        // In-memory backend (default)
+        let snap_path = &config.index_snapshot_path;
+        let (idx, dah, unmined) = if snap_path.exists() {
+            match PrimaryBackend::restore_all(snap_path) {
+                Ok((idx, dah, unmined, flags)) => {
+                    tracing::info!(entries = idx.len(), "index restored from snapshot");
+                    let dah = if flags.dah_needs_rebuild {
+                        tracing::warn!("DAH index needs rebuild (snapshot corrupt)");
+                        rebuild_dah(&*device, &allocator)
+                    } else {
+                        dah
+                    };
+                    let unmined = if flags.unmined_needs_rebuild {
+                        tracing::warn!("unmined index needs rebuild (snapshot corrupt)");
+                        rebuild_unmined(&*device, &allocator)
+                    } else {
+                        unmined
+                    };
+                    (idx, dah, unmined)
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "index snapshot corrupt, rebuilding from device");
+                    rebuild_all(&*device, &allocator, config.expected_records)
+                }
+            }
+        } else {
+            tracing::info!("no index snapshot found, rebuilding from device");
+            rebuild_all(&*device, &allocator, config.expected_records)
+        };
+        (idx, DahBackend::from(dah), UnminedBackend::from(unmined))
+    };
 
     tracing::info!(
         entries = index.len(),
@@ -406,8 +411,13 @@ fn main() {
                     tracing::warn!(err = %e2, "redo log device create failed, proceeding without redo log");
                     // Proceed without redo log — it's an enhancement, not a hard requirement
                     // for startup to succeed.
-                    Arc::new(teraslab::device::MemoryDevice::new(config.redo_log_size, config.device_alignment)
-                        .expect("failed to create fallback redo log device"))
+                    Arc::new(
+                        teraslab::device::MemoryDevice::new(
+                            config.redo_log_size,
+                            config.device_alignment,
+                        )
+                        .expect("failed to create fallback redo log device"),
+                    )
                 }
             }
         }
@@ -415,7 +425,10 @@ fn main() {
 
     let redo_log = match RedoLog::open(redo_log_device.clone(), 0, config.redo_log_size) {
         Ok(log) => {
-            tracing::info!(size_mib = config.redo_log_size / (1024 * 1024), "redo log opened");
+            tracing::info!(
+                size_mib = config.redo_log_size / (1024 * 1024),
+                "redo log opened"
+            );
             Some(log)
         }
         Err(e) => {
@@ -433,7 +446,11 @@ fn main() {
     let mut allocator = allocator;
     if let Some(ref redo) = redo_log {
         match teraslab::recovery::recover_all_with_allocator(
-            &*device, redo, &mut index, &mut dah_index, &mut unmined_index,
+            &*device,
+            redo,
+            &mut index,
+            &mut dah_index,
+            &mut unmined_index,
             Some(&mut allocator),
         ) {
             Ok(stats) => {
@@ -509,9 +526,8 @@ fn main() {
     }
 
     // 4b. Initialize blobstore from config and attach to engine
-    let blob_store: Arc<dyn BlobStore> = Arc::new(
-        FileBlobStore::new(Path::new(&config.blobstore_path), 2),
-    );
+    let blob_store: Arc<dyn BlobStore> =
+        Arc::new(FileBlobStore::new(Path::new(&config.blobstore_path), 2));
     engine.set_blob_store(blob_store.clone());
     tracing::info!(path = %config.blobstore_path, "blobstore configured");
 
@@ -522,8 +538,8 @@ fn main() {
         use teraslab::cluster::coordinator::{ClusterConfig, ClusterCoordinator};
         use teraslab::cluster::shards::NodeId;
 
-        let bind_addr: std::net::SocketAddr = config.listen_addr.parse()
-            .expect("invalid listen_addr");
+        let bind_addr: std::net::SocketAddr =
+            config.listen_addr.parse().expect("invalid listen_addr");
         // Determine the address to advertise to other nodes.
         // If advertise_addr is set, use it. Otherwise, if listen_addr uses
         // 0.0.0.0 (common in Docker), auto-detect a non-loopback IP.
@@ -539,9 +555,10 @@ fn main() {
         // not `0.0.0.0` from a wildcard `listen_addr`. On multi-interface containers
         // (several Docker bridges), binding UDP to 0.0.0.0 can produce probes whose
         // source address does not match membership gossip, breaking convergence.
-        let swim_bind =
-            std::net::SocketAddr::new(self_addr.ip(), config.swim_port);
-        let seed_addrs: Vec<std::net::SocketAddr> = config.seed_nodes.iter()
+        let swim_bind = std::net::SocketAddr::new(self_addr.ip(), config.swim_port);
+        let seed_addrs: Vec<std::net::SocketAddr> = config
+            .seed_nodes
+            .iter()
             .filter_map(|s| {
                 // Try direct parse first (IP:port), then fall back to DNS resolution.
                 s.parse().ok().or_else(|| {
@@ -567,7 +584,10 @@ fn main() {
             replication_factor: config.replication_factor,
             probe_interval,
             suspicion_timeout: std::time::Duration::from_millis(config.swim_suspicion_timeout_ms),
-            cluster_secret: config.cluster_secret.as_ref().map(|s| s.as_bytes().to_vec()),
+            cluster_secret: config
+                .cluster_secret
+                .as_ref()
+                .map(|s| s.as_bytes().to_vec()),
             max_migration_threads: config.max_migration_threads,
             topology_propose_timeout: probe_interval * 3,
             migration_pool_size: config.migration_pool_size,
@@ -584,7 +604,9 @@ fn main() {
         }
         let coordinator = ClusterCoordinator::new(cluster_config, initial_peak);
         // Restore topology state so new terms/epochs are strictly higher.
-        coordinator.topology_epoch.store(initial_epoch, std::sync::atomic::Ordering::Relaxed);
+        coordinator
+            .topology_epoch
+            .store(initial_epoch, std::sync::atomic::Ordering::Relaxed);
         coordinator.topology_authority.restore(&topo_state);
         if initial_epoch > 0 {
             coordinator.shard_table.write().version = initial_epoch;
@@ -595,6 +617,7 @@ fn main() {
             redo_log.clone(),
             config.resolved_ack_policy(),
             config.is_replication_best_effort(),
+            std::time::Duration::from_millis(config.replication_timeout_ms.max(1)),
         );
         // Restore migration state from a previous run so shards that were
         // mid-migration remain blocked (inbound) or tracked (outbound).
@@ -607,6 +630,51 @@ fn main() {
             std::path::PathBuf::from(p)
         };
         teraslab::server::dispatch::init_ack_tracker(ack_path.clone());
+        let applied_path = {
+            let mut p = config.resolved_cluster_state_path().into_os_string();
+            p.push(".repl-applied");
+            std::path::PathBuf::from(p)
+        };
+        if let Err(e) = teraslab::server::dispatch::init_replica_applied_tracker(applied_path) {
+            tracing::error!(err = %e, "replication receiver applied tracker init failed — aborting startup");
+            std::process::exit(1);
+        }
+        let intent_path = {
+            let mut p = config.resolved_cluster_state_path().into_os_string();
+            p.push(".repl-intent");
+            std::path::PathBuf::from(p)
+        };
+        if let Err(e) = teraslab::server::dispatch::init_replication_intent_tracker(intent_path) {
+            tracing::error!(err = %e, "replication intent tracker init failed — aborting startup");
+            std::process::exit(1);
+        }
+
+        if config.replication_factor > 1 {
+            let start = std::time::Instant::now();
+            loop {
+                match teraslab::server::dispatch::recover_pending_replication_intents(
+                    &running,
+                    redo_log.as_deref(),
+                    &engine,
+                ) {
+                    Ok(()) => break,
+                    Err(e) if start.elapsed() < std::time::Duration::from_secs(60) => {
+                        tracing::warn!(
+                            err = %e,
+                            "replication intent recovery pending; retrying before serving",
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            err = %e,
+                            "replication intent recovery failed — aborting startup",
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
 
         // Spawn background catch-up for replicas that are behind.
         // Reads persisted last_acked per replica and streams missing redo
@@ -621,7 +689,8 @@ fn main() {
                     return; // No known replicas yet
                 }
 
-                let current_seq = redo_for_catchup.as_ref()
+                let current_seq = redo_for_catchup
+                    .as_ref()
                     .map(|rl| rl.lock().current_sequence())
                     .unwrap_or(0);
 
@@ -644,9 +713,9 @@ fn main() {
                     // truncation detection. If the redo log has wrapped past
                     // the replica's last-acked position, catch-up is impossible
                     // and the replica needs a full resync.
-                    let first_avail_seq = redo_ref.as_ref().and_then(|rl| {
-                        rl.lock().earliest_sequence().ok().flatten()
-                    });
+                    let first_avail_seq = redo_ref
+                        .as_ref()
+                        .and_then(|rl| rl.lock().earliest_sequence().ok().flatten());
 
                     let result = teraslab::replication::durable::run_catchup_for_replica(
                         addr,
@@ -665,11 +734,17 @@ fn main() {
                             // Convert redo entries to ReplicaOps. Each entry's shard
                             // is derived from its tx_key. The replica applies all
                             // ops idempotently, gracefully skipping unknown records.
-                            entries.iter()
+                            entries
+                                .iter()
                                 .filter_map(|e| {
                                     let tx_key = e.op.tx_key()?;
-                                    let shard = teraslab::cluster::shards::ShardTable::shard_for_key(tx_key);
-                                    teraslab::cluster::coordinator::redo_entry_to_replica_op(e, shard, &eng_ref)
+                                    let shard =
+                                        teraslab::cluster::shards::ShardTable::shard_for_key(
+                                            tx_key,
+                                        );
+                                    teraslab::cluster::coordinator::redo_entry_to_replica_op(
+                                        e, shard, &eng_ref,
+                                    )
                                 })
                                 .collect()
                         },
@@ -703,7 +778,8 @@ fn main() {
 
     // 6. Start HTTP observability server
     let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let http_port: u16 = config.http_listen_addr
+    let http_port: u16 = config
+        .http_listen_addr
         .rsplit_once(':')
         .and_then(|(_, p)| p.parse().ok())
         .unwrap_or(9100);
@@ -724,8 +800,8 @@ fn main() {
     });
 
     // 7. Setup TCP server
-    let mut server = Server::new(engine.clone(), config.clone())
-        .with_active_connections(active_connections);
+    let mut server =
+        Server::new(engine.clone(), config.clone()).with_active_connections(active_connections);
     if let Some(ref c) = cluster {
         server = server.with_cluster(c.clone());
     }
@@ -807,17 +883,18 @@ impl ServerWithShutdown {
         // Flush the OTLP span pipeline last. Any later span would arrive
         // after the provider shuts down and be silently dropped.
         if let Some(ref provider) = self.otlp_provider {
-            teraslab::observability::shutdown(
-                provider,
-                std::time::Duration::from_secs(5),
-            );
+            teraslab::observability::shutdown(provider, std::time::Duration::from_secs(5));
         }
 
         result
     }
 }
 
-fn rebuild_all(device: &dyn BlockDevice, allocator: &SlotAllocator, expected_records: usize) -> (PrimaryBackend, DahIndex, UnminedIndex) {
+fn rebuild_all(
+    device: &dyn BlockDevice,
+    allocator: &SlotAllocator,
+    expected_records: usize,
+) -> (PrimaryBackend, DahIndex, UnminedIndex) {
     let index = match PrimaryBackend::rebuild(device, allocator) {
         Ok(idx) => idx,
         Err(e) => {
@@ -864,17 +941,14 @@ fn ctrlc_handler<F: Fn() + Send + 'static>(handler: F) {
 /// [`teraslab::observability::init_subscriber`] which composes the same
 /// fmt layer with an optional OTLP exporter.
 fn init_tracing_subscriber_fallback() {
-    use tracing_subscriber::{fmt, prelude::*, EnvFilter, Registry};
+    use tracing_subscriber::{EnvFilter, Registry, fmt, prelude::*};
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let fmt_layer = fmt::Layer::new()
         .json()
         .with_current_span(true)
         .with_span_list(false);
-    let subscriber = Registry::default()
-        .with(filter)
-        .with(fmt_layer);
+    let subscriber = Registry::default().with(filter).with(fmt_layer);
     // Best-effort: if a subscriber was already installed (e.g. by a test
     // harness in the same process), we simply keep the existing one.
     let _ = tracing::subscriber::set_global_default(subscriber);

@@ -121,6 +121,12 @@ pub struct MetricsReporter {
     latencies: Mutex<HashMap<String, LatencyTracker>>,
 }
 
+impl Default for MetricsReporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MetricsReporter {
     /// Create a new, empty reporter.
     pub fn new() -> Self {
@@ -403,7 +409,9 @@ mod tests {
         r.reset();
         r.record("create", Duration::from_millis(15));
 
-        let s = r.stats("create").expect("should have stats after reset+record");
+        let s = r
+            .stats("create")
+            .expect("should have stats after reset+record");
         assert_eq!(s.count, 1);
         assert_eq!(s.p50, Duration::from_millis(15));
     }

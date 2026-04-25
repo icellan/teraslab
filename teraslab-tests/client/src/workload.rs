@@ -6,8 +6,8 @@
 //! methods on it and the client. This keeps the module simple and avoids
 //! circular dependency issues.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rand::Rng;
@@ -66,6 +66,12 @@ pub struct WorkloadMetrics {
     pub total_ops: AtomicU64,
     /// Total errors across all operation types.
     pub total_errors: AtomicU64,
+}
+
+impl Default for WorkloadMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WorkloadMetrics {

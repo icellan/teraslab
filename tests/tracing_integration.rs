@@ -23,13 +23,13 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tracing::Subscriber;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id};
-use tracing::Subscriber;
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::Layer;
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
@@ -71,7 +71,8 @@ struct FieldVisitor<'a>(&'a mut HashMap<String, String>);
 
 impl<'a> Visit for FieldVisitor<'a> {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.0.insert(field.name().to_string(), format!("{value:?}"));
+        self.0
+            .insert(field.name().to_string(), format!("{value:?}"));
     }
     fn record_str(&mut self, field: &Field, value: &str) {
         self.0.insert(field.name().to_string(), value.to_string());
@@ -141,8 +142,7 @@ fn mkhash(tx_n: u32, vout: u32) -> [u8; 32] {
 }
 
 fn make_engine() -> Arc<Engine> {
-    let dev: Arc<dyn BlockDevice> =
-        Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(10_000).unwrap();
     Arc::new(Engine::new(
@@ -203,11 +203,8 @@ fn spend_multi_emits_debug_level_child_spans() {
         // Stand-in parent span representing the `handle_request` dispatch
         // site. We parent the spend_multi call under it to verify the
         // full grandparent → parent → child chain.
-        let parent_span = tracing::debug_span!(
-            "dispatch_proxy",
-            op = "spend",
-            request_id = 99_001_u64
-        );
+        let parent_span =
+            tracing::debug_span!("dispatch_proxy", op = "spend", request_id = 99_001_u64);
         let _p = parent_span.enter();
 
         // Drive one batch of 3 spends.
@@ -340,6 +337,7 @@ fn replication_receiver_inherits_wire_trace_context() {
             master_generation: 1,
         }],
         trace_ctx: Some(wire_ctx),
+        source_node_id: None,
     };
     let req = RequestFrame {
         op_code: OP_REPLICA_BATCH,

@@ -4,8 +4,8 @@
 
 use std::io::{Read, Write as IoWrite};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
@@ -13,14 +13,13 @@ use teraslab::index::{DahIndex, Index, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{ThreadHistograms, ThreadMetrics};
 use teraslab::ops::engine::Engine;
-use teraslab::server::http::{start_http_server, HttpState};
+use teraslab::server::http::{HttpState, start_http_server};
 
 static TEST_METRICS: ThreadMetrics = ThreadMetrics::new();
 static TEST_HISTOGRAMS: ThreadHistograms = ThreadHistograms::new();
 
 fn start_test_http_server() -> (u16, Arc<HttpState>) {
-    let dev: Arc<dyn BlockDevice> =
-        Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(1_000).unwrap();
     let engine = Arc::new(Engine::new(
@@ -66,7 +65,9 @@ fn start_test_http_server() -> (u16, Arc<HttpState>) {
 /// Simple HTTP GET request over raw TCP.
 fn http_get(port: u16, path: &str) -> (u16, String, String) {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
 
     let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).unwrap();
@@ -83,11 +84,7 @@ fn http_get(port: u16, path: &str) -> (u16, String, String) {
         .unwrap_or(0);
 
     // Find body (after \r\n\r\n)
-    let body = response
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .to_string();
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
 
     // Get content-type
     let content_type = response
@@ -102,7 +99,9 @@ fn http_get(port: u16, path: &str) -> (u16, String, String) {
 /// Simple HTTP PUT request over raw TCP.
 fn http_put(port: u16, path: &str, body: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
 
     let req = format!(
         "PUT {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -119,11 +118,7 @@ fn http_put(port: u16, path: &str, body: &str) -> (u16, String) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let resp_body = response
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .to_string();
+    let resp_body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
 
     (status_code, resp_body)
 }
@@ -134,7 +129,10 @@ fn metrics_returns_prometheus_text_format() {
     let (status, content_type, body) = http_get(port, "/metrics");
 
     assert_eq!(status, 200);
-    assert!(content_type.contains("text/plain"), "expected text/plain, got {content_type}");
+    assert!(
+        content_type.contains("text/plain"),
+        "expected text/plain, got {content_type}"
+    );
     assert!(body.contains("teraslab_spends_attempted_total"));
     assert!(body.contains("teraslab_spends_succeeded_total"));
     assert!(body.contains("teraslab_index_entries"));
@@ -231,7 +229,8 @@ fn debug_records_returns_json_for_existing_record() {
     use teraslab::ops::create::CreateRequest;
     let txid = {
         let mut t = [0u8; 32];
-        t[0] = 0xAB; t[1] = 0xCD;
+        t[0] = 0xAB;
+        t[1] = 0xCD;
         t
     };
     let utxo_hashes = [[1u8; 32]];
@@ -279,7 +278,10 @@ fn metrics_scrape_does_not_block() {
         assert_eq!(status, 200);
     }
     let elapsed = start.elapsed();
-    assert!(elapsed.as_secs() < 5, "metrics scrapes took too long: {elapsed:?}");
+    assert!(
+        elapsed.as_secs() < 5,
+        "metrics scrapes took too long: {elapsed:?}"
+    );
 }
 
 #[test]
@@ -395,8 +397,14 @@ fn ui_root_returns_html() {
     let (port, _state) = start_test_http_server();
     let (status, content_type, body) = http_get(port, "/ui/");
     assert_eq!(status, 200);
-    assert!(content_type.contains("text/html"), "expected text/html, got {content_type}");
-    assert!(body.contains("TeraSlab"), "HTML should contain TeraSlab title");
+    assert!(
+        content_type.contains("text/html"),
+        "expected text/html, got {content_type}"
+    );
+    assert!(
+        body.contains("TeraSlab"),
+        "HTML should contain TeraSlab title"
+    );
     assert!(body.contains("<script"), "HTML should include script tag");
 }
 
@@ -405,8 +413,14 @@ fn ui_static_css_embedded() {
     let (port, _state) = start_test_http_server();
     let (status, content_type, body) = http_get(port, "/ui/style.css");
     assert_eq!(status, 200);
-    assert!(content_type.contains("text/css"), "expected text/css, got {content_type}");
-    assert!(body.contains("--bg:"), "CSS should contain custom properties");
+    assert!(
+        content_type.contains("text/css"),
+        "expected text/css, got {content_type}"
+    );
+    assert!(
+        body.contains("--bg:"),
+        "CSS should contain custom properties"
+    );
 }
 
 #[test]
@@ -414,8 +428,14 @@ fn ui_static_js_embedded() {
     let (port, _state) = start_test_http_server();
     let (status, content_type, body) = http_get(port, "/ui/app.js");
     assert_eq!(status, 200);
-    assert!(content_type.contains("javascript"), "expected javascript, got {content_type}");
-    assert!(body.contains("TeraSlab"), "JS should contain TeraSlab references");
+    assert!(
+        content_type.contains("javascript"),
+        "expected javascript, got {content_type}"
+    );
+    assert!(
+        body.contains("TeraSlab"),
+        "JS should contain TeraSlab references"
+    );
 }
 
 #[test]

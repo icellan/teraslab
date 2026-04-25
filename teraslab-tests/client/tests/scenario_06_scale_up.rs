@@ -6,9 +6,9 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 use teraslab_test_client::ClientError;
-use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::reporter::MetricsReporter;
 use teraslab_test_client::types::*;
+use teraslab_test_client::verifier::StateVerifier;
 
 macro_rules! tlog {
     ($t0:expr, $($arg:tt)*) => {
@@ -23,7 +23,10 @@ const SID: u16 = 6;
 
 /// Format a txid as a short hex prefix for assertion messages.
 fn txid_hex(txid: &[u8; 32]) -> String {
-    txid.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
+    txid.iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -75,7 +78,10 @@ async fn run_scenario() -> Result<(), ClientError> {
             }
         }
     }
-    assert_eq!(pre_scale_missing, 0, "[6.0] {pre_scale_missing}/10000 seeded records unreadable before scale-up");
+    assert_eq!(
+        pre_scale_missing, 0,
+        "[6.0] {pre_scale_missing}/10000 seeded records unreadable before scale-up"
+    );
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -99,10 +105,13 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     for node_num in 1..=4u32 {
         let status = common::http_status(&docker5, node_num).await?;
-        let cluster_size = status["cluster_size"].as_u64()
+        let cluster_size = status["cluster_size"]
+            .as_u64()
             .expect("Test 6.1: cluster_size should be present");
-        assert_eq!(cluster_size, 4,
-            "Test 6.1: node {node_num} reports cluster_size={cluster_size}, expected 4");
+        assert_eq!(
+            cluster_size, 4,
+            "Test 6.1: node {node_num} reports cluster_size={cluster_size}, expected 4"
+        );
     }
     eprintln!("[6.1] OK -- all 4 nodes report cluster_size=4");
 
@@ -136,7 +145,7 @@ async fn run_scenario() -> Result<(), ClientError> {
             batch_idx += 1;
 
             // Mix of creates and reads
-            if batch_idx % 3 == 0 {
+            if batch_idx.is_multiple_of(3) {
                 // Read a random-ish txid (may not exist, that's fine)
                 let probe_txid = [batch_idx as u8; 32];
                 let op_start = std::time::Instant::now();
@@ -146,7 +155,9 @@ async fn run_scenario() -> Result<(), ClientError> {
                         workload_ops_bg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     Err(e) => {
-                        let error_idx = workload_errors_bg.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let error_idx = workload_errors_bg
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1;
                         if error_idx <= 5 {
                             eprintln!("[6.5] background read error #{error_idx}: {e}");
                         }
@@ -187,7 +198,9 @@ async fn run_scenario() -> Result<(), ClientError> {
                         workload_ops_bg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     Err(e) => {
-                        let error_idx = workload_errors_bg.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let error_idx = workload_errors_bg
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1;
                         if error_idx <= 5 {
                             eprintln!("[6.5] background create error #{error_idx}: {e}");
                         }
@@ -219,11 +232,15 @@ async fn run_scenario() -> Result<(), ClientError> {
         0.0
     };
 
-    eprintln!("[6.5] Background workload: {bg_total_ops} ops, {bg_total_errors} errors, error rate: {:.2}%",
-        error_rate * 100.0);
-    assert!(error_rate < 0.01,
+    eprintln!(
+        "[6.5] Background workload: {bg_total_ops} ops, {bg_total_errors} errors, error rate: {:.2}%",
+        error_rate * 100.0
+    );
+    assert!(
+        error_rate < 0.01,
         "Test 6.5: error rate {:.2}% exceeds 1% ({bg_total_errors}/{bg_total_ops})",
-        error_rate * 100.0);
+        error_rate * 100.0
+    );
 
     // Check p99 latency
     if let Some(create_stats) = reporter.stats("create") {
@@ -244,23 +261,26 @@ async fn run_scenario() -> Result<(), ClientError> {
     let mut total_masters: u64 = 0;
     for node_num in 1..=4u32 {
         let status = common::http_status(&docker5, node_num).await?;
-        let master_count = status["master_shard_count"].as_u64()
+        let master_count = status["master_shard_count"]
+            .as_u64()
             .expect("Test 6.2: master_shard_count should be present");
         total_masters += master_count;
 
-        let diff = if master_count > expected_per_node {
-            master_count - expected_per_node
-        } else {
-            expected_per_node - master_count
-        };
-        assert!(diff <= tolerance,
+        let diff = master_count.abs_diff(expected_per_node);
+        assert!(
+            diff <= tolerance,
             "Test 6.2: node {node_num} masters {master_count} shards, expected ~{expected_per_node} \
-             (tolerance {tolerance}), difference is {diff}");
+             (tolerance {tolerance}), difference is {diff}"
+        );
         eprintln!("[6.2] node{node_num}: {master_count} master shards");
     }
-    assert!(total_masters >= 4096 && total_masters <= 4128,
-        "[6.2] total_masters={total_masters}, expected 4096 (±32 for in-flight handoffs)");
-    eprintln!("[6.2] OK -- balanced distribution confirmed (~1024 per node, total={total_masters})");
+    assert!(
+        (4096..=4128).contains(&total_masters),
+        "[6.2] total_masters={total_masters}, expected 4096 (±32 for in-flight handoffs)"
+    );
+    eprintln!(
+        "[6.2] OK -- balanced distribution confirmed (~1024 per node, total={total_masters})"
+    );
 
     tlog!(t0, "test 6.2: done");
 
@@ -352,7 +372,10 @@ async fn run_scenario() -> Result<(), ClientError> {
                         status["failed_count"].as_u64().unwrap_or(0),
                         status["inbound_pending"].as_u64().unwrap_or(0),
                         status["fenced_shards"].as_u64().unwrap_or(0),
-                        status["migrations"].as_array().map(|m| m.len()).unwrap_or(0),
+                        status["migrations"]
+                            .as_array()
+                            .map(|m| m.len())
+                            .unwrap_or(0),
                     );
                 }
                 Err(e) => {
@@ -361,8 +384,10 @@ async fn run_scenario() -> Result<(), ClientError> {
             }
         }
     }
-    assert_eq!(read_failures, 0,
-        "Test 6.3: {read_failures}/10000 reads failed after migration");
+    assert_eq!(
+        read_failures, 0,
+        "Test 6.3: {read_failures}/10000 reads failed after migration"
+    );
     eprintln!("[6.3] OK -- all 10000 records accessible after migration");
 
     tlog!(t0, "test 6.3: done");
@@ -378,23 +403,36 @@ async fn run_scenario() -> Result<(), ClientError> {
             eprintln!("Test 6.4: duplicate txid in seed set: {}", txid_hex(txid));
         }
     }
-    assert_eq!(duplicate_count, 0, "Test 6.4: found {duplicate_count} duplicate txids in seed set");
+    assert_eq!(
+        duplicate_count, 0,
+        "Test 6.4: found {duplicate_count} duplicate txids in seed set"
+    );
 
     // Verify each record returns exactly one result from the cluster
     let mut missing_count = 0u32;
     for chunk in txids.chunks(100) {
         let results = client.get_batch(FIELD_ALL, chunk).await?;
-        assert_eq!(results.len(), chunk.len(),
-            "Test 6.4: get_batch returned {} results for {} txids", results.len(), chunk.len());
+        assert_eq!(
+            results.len(),
+            chunk.len(),
+            "Test 6.4: get_batch returned {} results for {} txids",
+            results.len(),
+            chunk.len()
+        );
         for (i, result) in results.iter().enumerate() {
             if result.status() != 0 {
                 missing_count += 1;
-                eprintln!("Test 6.4: txid {} not found (possible loss)", txid_hex(&chunk[i]));
+                eprintln!(
+                    "Test 6.4: txid {} not found (possible loss)",
+                    txid_hex(&chunk[i])
+                );
             }
         }
     }
-    assert_eq!(missing_count, 0,
-        "Test 6.4: {missing_count} records missing after scale-up (data loss or duplication issue)");
+    assert_eq!(
+        missing_count, 0,
+        "Test 6.4: {missing_count} records missing after scale-up (data loss or duplication issue)"
+    );
     eprintln!("[6.4] OK -- no data loss or duplication detected");
 
     tlog!(t0, "test 6.4: done");
@@ -406,9 +444,11 @@ async fn run_scenario() -> Result<(), ClientError> {
         let status = common::http_status(&docker5, *node_num).await?;
         let post_count = status["master_shard_count"].as_u64().unwrap_or(0);
         eprintln!("[6.6] node{node_num}: {pre_count} -> {post_count} master shards");
-        assert!(post_count < *pre_count,
+        assert!(
+            post_count < *pre_count,
             "Test 6.6: node {node_num} master shards did not decrease ({pre_count} -> {post_count}), \
-             expected shards to migrate to node4");
+             expected shards to migrate to node4"
+        );
     }
     eprintln!("[6.6] OK -- all source nodes have fewer master shards after migration");
 
@@ -420,15 +460,23 @@ async fn run_scenario() -> Result<(), ClientError> {
     let mismatches = common::verify_consistency(&client, &verifier).await?;
     let max_allowed = std::cmp::max(10, (verifier.record_count() as f64 * 0.001).ceil() as usize);
     if !mismatches.is_empty() {
-        eprintln!("[6.7] WARN -- {} mismatches within tolerance (max {max_allowed}): {:?}",
-            mismatches.len(), mismatches.iter().take(5).collect::<Vec<_>>());
+        eprintln!(
+            "[6.7] WARN -- {} mismatches within tolerance (max {max_allowed}): {:?}",
+            mismatches.len(),
+            mismatches.iter().take(5).collect::<Vec<_>>()
+        );
     }
-    assert!(mismatches.len() <= max_allowed,
+    assert!(
+        mismatches.len() <= max_allowed,
         "Test 6.7: verify_consistency found {} mismatches (max allowed {}): {:?}",
-        mismatches.len(), max_allowed,
-        mismatches.iter().take(5).collect::<Vec<_>>());
-    eprintln!("[6.7] OK -- full consistency check passed ({} mismatches, max allowed {max_allowed})",
-        mismatches.len());
+        mismatches.len(),
+        max_allowed,
+        mismatches.iter().take(5).collect::<Vec<_>>()
+    );
+    eprintln!(
+        "[6.7] OK -- full consistency check passed ({} mismatches, max allowed {max_allowed})",
+        mismatches.len()
+    );
 
     tlog!(t0, "test 6.7: done");
 

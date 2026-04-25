@@ -10,21 +10,19 @@
 //! `unmined_since` from the primary index and only reapplies the secondary
 //! update when the current state is stale.
 
+use crate::index::IndexError;
 use crate::index::hashtable::TxKey;
 use crate::index::unmined_index::UnminedRedoEntry;
-use crate::index::IndexError;
 use crate::redo::{RedoLog, RedoOp};
 use parking_lot::Mutex;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::path::Path;
 
 /// Forward table: `[height_be(4) || txid(32)]` -> `()`
-const UNMINED_FORWARD: TableDefinition<[u8; 36], ()> =
-    TableDefinition::new("unmined_forward");
+const UNMINED_FORWARD: TableDefinition<[u8; 36], ()> = TableDefinition::new("unmined_forward");
 
 /// Reverse table: `txid(32)` -> `height_le(4)`
-const UNMINED_REVERSE: TableDefinition<[u8; 32], [u8; 4]> =
-    TableDefinition::new("unmined_reverse");
+const UNMINED_REVERSE: TableDefinition<[u8; 32], [u8; 4]> = TableDefinition::new("unmined_reverse");
 
 /// ReDB-backed unmined secondary index.
 pub struct RedbUnminedIndex {
@@ -123,9 +121,10 @@ impl RedbUnminedIndex {
                 new_height: height,
             };
             let mut log = redo.lock();
-            log.append_and_flush(op).map_err(|e| IndexError::FormatError {
-                detail: format!("redo append_and_flush (unmined insert): {e}"),
-            })?;
+            log.append_and_flush(op)
+                .map_err(|e| IndexError::FormatError {
+                    detail: format!("redo append_and_flush (unmined insert): {e}"),
+                })?;
         }
 
         // Phase 2: commit redb. At this point the redo log (if any) has a
@@ -149,25 +148,19 @@ impl RedbUnminedIndex {
                 }
             }
 
-            rev.insert(key.txid, height.to_le_bytes()).map_err(map_storage_err)?;
-            fwd.insert(make_forward_key(height, &key), ()).map_err(map_storage_err)?;
+            rev.insert(key.txid, height.to_le_bytes())
+                .map_err(map_storage_err)?;
+            fwd.insert(make_forward_key(height, &key), ())
+                .map_err(map_storage_err)?;
         }
         // Fault-injection: crash between durable redo intent and the redb
         // commit. Post-recovery, the secondary index MUST be reconciled
         // from the durable redo entry (C4 two-phase durability contract).
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::BeforeSecondaryRedbCommit,
-        );
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::BeforeIndexCommit,
-        );
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeSecondaryRedbCommit);
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeIndexCommit);
         txn.commit().map_err(map_commit_err)?;
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::AfterSecondaryRedbCommit,
-        );
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::AfterIndexCommit,
-        );
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterSecondaryRedbCommit);
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterIndexCommit);
         if was_new {
             self.count += 1;
         }
@@ -176,9 +169,9 @@ impl RedbUnminedIndex {
 
     /// Remove a transaction from the unmined index with two-phase durability.
     ///
-    /// Steps are analogous to [`insert`]: read old_height, redo-first
+    /// Steps are analogous to [`Self::insert`]: read old_height, redo-first
     /// fsync (if a log is provided), then commit the redb transaction.
-    /// See [`insert`] for the durability ordering rationale.
+    /// See [`Self::insert`] for the durability ordering rationale.
     pub fn remove(
         &mut self,
         key: &TxKey,
@@ -196,9 +189,10 @@ impl RedbUnminedIndex {
                 new_height: 0,
             };
             let mut log = redo.lock();
-            log.append_and_flush(op).map_err(|e| IndexError::FormatError {
-                detail: format!("redo append_and_flush (unmined remove): {e}"),
-            })?;
+            log.append_and_flush(op)
+                .map_err(|e| IndexError::FormatError {
+                    detail: format!("redo append_and_flush (unmined remove): {e}"),
+                })?;
         }
 
         let txn = self.begin_write().map_err(map_txn_err)?;
@@ -210,19 +204,16 @@ impl RedbUnminedIndex {
             had_entry = match rev.remove(key.txid).map_err(map_storage_err)? {
                 Some(guard) => {
                     let h = u32::from_le_bytes(guard.value());
-                    fwd.remove(make_forward_key(h, key)).map_err(map_storage_err)?;
+                    fwd.remove(make_forward_key(h, key))
+                        .map_err(map_storage_err)?;
                     true
                 }
                 None => false,
             };
         }
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::BeforeSecondaryRedbCommit,
-        );
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeSecondaryRedbCommit);
         txn.commit().map_err(map_commit_err)?;
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::AfterSecondaryRedbCommit,
-        );
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterSecondaryRedbCommit);
         if had_entry {
             self.count -= 1;
         }
@@ -237,22 +228,15 @@ impl RedbUnminedIndex {
     /// matching [`RedoOp::SecondaryUnminedUpdate`] is already durable before
     /// calling this function. Recovery replay handles any inconsistency if
     /// this redb commit fails after the fsync.
-    pub fn commit_insert_post_fsync(
-        &mut self,
-        height: u32,
-        key: TxKey,
-    ) -> Result<(), IndexError> {
+    pub fn commit_insert_post_fsync(&mut self, height: u32, key: TxKey) -> Result<(), IndexError> {
         // Delegate to insert with no redo log: the caller has already done
         // redo-first durability, so this just performs the redb commit.
         self.insert(height, key, None)
     }
 
     /// Commit the redb remove for an already-fsynced redo entry.
-    /// See [`commit_insert_post_fsync`] for the caller contract.
-    pub fn commit_remove_post_fsync(
-        &mut self,
-        key: &TxKey,
-    ) -> Result<(), IndexError> {
+    /// See [`Self::commit_insert_post_fsync`] for the caller contract.
+    pub fn commit_remove_post_fsync(&mut self, key: &TxKey) -> Result<(), IndexError> {
         self.remove(key, None)
     }
 
@@ -414,7 +398,6 @@ impl RedbUnminedIndex {
             self.insert(entry.new_height, key, None)
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -429,19 +412,27 @@ fn make_forward_key(height: u32, key: &TxKey) -> [u8; 36] {
 }
 
 fn map_txn_err(e: redb::TransactionError) -> IndexError {
-    IndexError::FormatError { detail: format!("redb txn error (unmined): {e}") }
+    IndexError::FormatError {
+        detail: format!("redb txn error (unmined): {e}"),
+    }
 }
 
 fn map_table_err(e: redb::TableError) -> IndexError {
-    IndexError::FormatError { detail: format!("redb table error (unmined): {e}") }
+    IndexError::FormatError {
+        detail: format!("redb table error (unmined): {e}"),
+    }
 }
 
 fn map_commit_err(e: redb::CommitError) -> IndexError {
-    IndexError::FormatError { detail: format!("redb commit error (unmined): {e}") }
+    IndexError::FormatError {
+        detail: format!("redb commit error (unmined): {e}"),
+    }
 }
 
 fn map_storage_err(e: redb::StorageError) -> IndexError {
-    IndexError::FormatError { detail: format!("redb storage error (unmined): {e}") }
+    IndexError::FormatError {
+        detail: format!("redb storage error (unmined): {e}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -632,14 +623,18 @@ mod tests {
     fn insert_batch_matches_individual() {
         // Individual inserts
         let dir1 = tempfile::tempdir().unwrap();
-        let mut idx1 = RedbUnminedIndex::open(dir1.path().join("unmined.redb").as_path(), 16 * 1024 * 1024).unwrap();
+        let mut idx1 =
+            RedbUnminedIndex::open(dir1.path().join("unmined.redb").as_path(), 16 * 1024 * 1024)
+                .unwrap();
         for n in 1..=20u8 {
             idx1.insert(n as u32 * 100, key(n), None).unwrap();
         }
 
         // Batch insert
         let dir2 = tempfile::tempdir().unwrap();
-        let mut idx2 = RedbUnminedIndex::open(dir2.path().join("unmined.redb").as_path(), 16 * 1024 * 1024).unwrap();
+        let mut idx2 =
+            RedbUnminedIndex::open(dir2.path().join("unmined.redb").as_path(), 16 * 1024 * 1024)
+                .unwrap();
         let entries: Vec<_> = (1..=20u8).map(|n| (n as u32 * 100, key(n))).collect();
         idx2.insert_batch(&entries);
 
@@ -875,7 +870,11 @@ mod tests {
         let entries = log.recover().unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0].op {
-            RedoOp::SecondaryUnminedUpdate { tx_key, old_height, new_height } => {
+            RedoOp::SecondaryUnminedUpdate {
+                tx_key,
+                old_height,
+                new_height,
+            } => {
                 assert_eq!(tx_key.txid, key(1).txid);
                 assert_eq!(*old_height, 0);
                 assert_eq!(*new_height, 500);
@@ -899,7 +898,11 @@ mod tests {
         let entries = log.recover().unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0].op {
-            RedoOp::SecondaryUnminedUpdate { old_height, new_height, .. } => {
+            RedoOp::SecondaryUnminedUpdate {
+                old_height,
+                new_height,
+                ..
+            } => {
                 assert_eq!(*old_height, 100);
                 assert_eq!(*new_height, 200);
             }
@@ -920,7 +923,11 @@ mod tests {
         let entries = log.recover().unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0].op {
-            RedoOp::SecondaryUnminedUpdate { old_height, new_height, .. } => {
+            RedoOp::SecondaryUnminedUpdate {
+                old_height,
+                new_height,
+                ..
+            } => {
                 assert_eq!(*old_height, 500);
                 assert_eq!(*new_height, 0);
             }
@@ -966,8 +973,10 @@ mod tests {
                 Ok(_) => next += 1,
                 Err(e) => {
                     // Expect a redo-related error
-                    assert!(format!("{e}").contains("redo append_and_flush"),
-                            "expected redo error, got: {e}");
+                    assert!(
+                        format!("{e}").contains("redo append_and_flush"),
+                        "expected redo error, got: {e}"
+                    );
                     break;
                 }
             }

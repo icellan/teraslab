@@ -4,8 +4,8 @@
 //! verifying output format and exit codes.
 
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
@@ -13,19 +13,22 @@ use teraslab::index::{DahIndex, Index, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{ThreadHistograms, ThreadMetrics};
 use teraslab::ops::engine::Engine;
-use teraslab::server::http::{start_http_server, HttpState};
+use teraslab::server::http::{HttpState, start_http_server};
 
 static CLI_METRICS: ThreadMetrics = ThreadMetrics::new();
 static CLI_HISTOGRAMS: ThreadHistograms = ThreadHistograms::new();
 
 fn start_test_server() -> u16 {
-    let dev: Arc<dyn BlockDevice> =
-        Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(1_000).unwrap();
     let engine = Arc::new(Engine::new(
-        dev, index, alloc, StripedLocks::new(256),
-        DahIndex::new(), UnminedIndex::new(),
+        dev,
+        index,
+        alloc,
+        StripedLocks::new(256),
+        DahIndex::new(),
+        UnminedIndex::new(),
     ));
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -45,7 +48,9 @@ fn start_test_server() -> u16 {
     });
 
     let addr = format!("127.0.0.1:{port}");
-    std::thread::spawn(move || { start_http_server(addr, state); });
+    std::thread::spawn(move || {
+        start_http_server(addr, state);
+    });
     std::thread::sleep(std::time::Duration::from_millis(200));
     port
 }
@@ -79,7 +84,10 @@ fn cli_status_returns_overview() {
     let port = start_test_server();
     let (stdout, _, code) = run_cli(port, &["status"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("TeraSlab Cluster Status"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("TeraSlab Cluster Status"),
+        "stdout: {stdout}"
+    );
     assert!(stdout.contains("Records:"), "stdout: {stdout}");
 }
 
@@ -99,7 +107,10 @@ fn cli_nodes_lists_nodes() {
     let port = start_test_server();
     let (stdout, _, code) = run_cli(port, &["nodes"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("Node ID") || stdout.contains("node_id"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Node ID") || stdout.contains("node_id"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -107,7 +118,10 @@ fn cli_storage_shows_utilization() {
     let port = start_test_server();
     let (stdout, _, code) = run_cli(port, &["storage"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("Device size") || stdout.contains("device_size"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Device size") || stdout.contains("device_size"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -115,7 +129,10 @@ fn cli_memory_shows_breakdown() {
     let port = start_test_server();
     let (stdout, _, code) = run_cli(port, &["memory"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("Index memory") || stdout.contains("index_bytes"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Index memory") || stdout.contains("index_bytes"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -123,7 +140,10 @@ fn cli_records_shows_inventory() {
     let port = start_test_server();
     let (stdout, _, code) = run_cli(port, &["records"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("Total records") || stdout.contains("total_records"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Total records") || stdout.contains("total_records"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -132,7 +152,10 @@ fn cli_record_not_found() {
     let txid = "0000000000000000000000000000000000000000000000000000000000000000";
     let (_, stderr, code) = run_cli(port, &["record", txid]);
     assert_ne!(code, 0);
-    assert!(stderr.contains("not found") || stderr.contains("404"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("not found") || stderr.contains("404"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -140,8 +163,14 @@ fn cli_index_shows_stats() {
     let port = start_test_server();
     let (stdout, _, code) = run_cli(port, &["index"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("Entries") || stdout.contains("entries"), "stdout: {stdout}");
-    assert!(stdout.contains("Load factor") || stdout.contains("load_factor"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Entries") || stdout.contains("entries"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Load factor") || stdout.contains("load_factor"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -149,7 +178,10 @@ fn cli_replication_shows_status() {
     let port = start_test_server();
     let (stdout, _, code) = run_cli(port, &["replication"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("Enabled") || stdout.contains("enabled"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Enabled") || stdout.contains("enabled"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -157,7 +189,10 @@ fn cli_redo_shows_info() {
     let port = start_test_server();
     let (stdout, _, code) = run_cli(port, &["redo"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("Available") || stdout.contains("available"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Available") || stdout.contains("available"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -216,8 +251,16 @@ fn cli_all_commands_json_valid() {
         let mut args = vec!["--json"];
         args.extend(cmd.iter());
         let (stdout, stderr, code) = run_cli(port, &args);
-        assert_eq!(code, 0, "command {:?} failed (exit {}): stderr={stderr}", cmd, code);
+        assert_eq!(
+            code, 0,
+            "command {:?} failed (exit {}): stderr={stderr}",
+            cmd, code
+        );
         let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
-        assert!(parsed.is_ok(), "command {:?} returned invalid JSON: {stdout}", cmd);
+        assert!(
+            parsed.is_ok(),
+            "command {:?} returned invalid JSON: {stdout}",
+            cmd
+        );
     }
 }

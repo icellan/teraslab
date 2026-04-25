@@ -1,6 +1,6 @@
 //! Criterion benchmarks for spend throughput under various conditions.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::sync::Arc;
 
 use teraslab::allocator::SlotAllocator;
@@ -51,8 +51,7 @@ fn setup_engine_with_txs(count: u32, utxos_per_tx: u32) -> Arc<Engine> {
     let engine = create_engine();
     for i in 0..count {
         let tx_id = make_tx_id(i);
-        let utxo_hashes: Vec<[u8; 32]> =
-            (0..utxos_per_tx).map(|v| make_utxo_hash(i, v)).collect();
+        let utxo_hashes: Vec<[u8; 32]> = (0..utxos_per_tx).map(|v| make_utxo_hash(i, v)).collect();
         let req = CreateRequest {
             tx_id,
             tx_version: 1,
@@ -221,13 +220,24 @@ fn bench_set_mined(c: &mut Criterion) {
             let utxo_hashes = [make_utxo_hash(fresh_idx, 0)];
             let req = CreateRequest {
                 tx_id,
-                tx_version: 1, locktime: 0, fee: 500, size_in_bytes: 250,
-                extended_size: 0, is_coinbase: false, spending_height: 0,
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
                 utxo_hashes: &utxo_hashes,
-                inputs: None, outputs: None, inpoints: None,
-                is_external: false, created_at: 1710000000000,
-                block_height: 1000, mined_block_infos: &[],
-                frozen: false, conflicting: false, locked: false,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 1710000000000,
+                block_height: 1000,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
                 parent_txids: &[],
             };
             let _ = fresh_engine.create(&req);
@@ -268,14 +278,15 @@ fn bench_spend_threaded(c: &mut Criterion) {
                 let counters: Vec<AtomicU32> = (0..threads).map(|_| AtomicU32::new(0)).collect();
                 b.iter(|| {
                     std::thread::scope(|s| {
-                        for t in 0..threads {
+                        for (t, ctr) in counters.iter().enumerate().take(threads) {
                             let eng = &engine;
-                            let ctr = &counters[t];
                             let offset = t as u32 * txs_per_thread;
                             s.spawn(move || {
                                 let i = ctr.fetch_add(1, Ordering::Relaxed);
                                 let tx_idx = offset + (i % txs_per_thread);
-                                let key = TxKey { txid: make_tx_id(tx_idx) };
+                                let key = TxKey {
+                                    txid: make_tx_id(tx_idx),
+                                };
                                 let slot = i % 10;
                                 let mut sd = [0u8; 36];
                                 sd[0..4].copy_from_slice(&(tx_idx + 10000).to_le_bytes());

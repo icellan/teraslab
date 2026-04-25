@@ -37,7 +37,9 @@ pub enum RedoError {
     /// The requested log region (`log_offset + log_size`) does not fit
     /// within the backing device. Rejected at open-time so callers never
     /// perform an I/O past the end of the device.
-    #[error("redo log region out of bounds: offset {log_offset} + size {log_size} > device size {device_size}")]
+    #[error(
+        "redo log region out of bounds: offset {log_offset} + size {log_size} > device size {device_size}"
+    )]
     OutOfBounds {
         log_offset: u64,
         log_size: u64,
@@ -290,47 +292,82 @@ impl RedoOp {
     /// Serialize op-specific data (without type byte, sequence, or length).
     fn serialize_data(&self, buf: &mut Vec<u8>) {
         match self {
-            RedoOp::Spend { tx_key, offset, spending_data, new_spent_count } => {
+            RedoOp::Spend {
+                tx_key,
+                offset,
+                spending_data,
+                new_spent_count,
+            } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
                 buf.extend_from_slice(spending_data);
                 buf.extend_from_slice(&new_spent_count.to_le_bytes());
             }
-            RedoOp::Unspend { tx_key, offset, new_spent_count } => {
+            RedoOp::Unspend {
+                tx_key,
+                offset,
+                new_spent_count,
+            } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
                 buf.extend_from_slice(&new_spent_count.to_le_bytes());
             }
-            RedoOp::SetMined { tx_key, block_id, block_height, subtree_idx, unset } => {
+            RedoOp::SetMined {
+                tx_key,
+                block_id,
+                block_height,
+                subtree_idx,
+                unset,
+            } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&block_id.to_le_bytes());
                 buf.extend_from_slice(&block_height.to_le_bytes());
                 buf.extend_from_slice(&subtree_idx.to_le_bytes());
                 buf.push(if *unset { 1 } else { 0 });
             }
-            RedoOp::Freeze { tx_key, offset } | RedoOp::Unfreeze { tx_key, offset }
+            RedoOp::Freeze { tx_key, offset }
+            | RedoOp::Unfreeze { tx_key, offset }
             | RedoOp::PruneSlot { tx_key, offset } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
             }
-            RedoOp::Reassign { tx_key, offset, new_hash, block_height, spendable_after } => {
+            RedoOp::Reassign {
+                tx_key,
+                offset,
+                new_hash,
+                block_height,
+                spendable_after,
+            } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
                 buf.extend_from_slice(new_hash);
                 buf.extend_from_slice(&block_height.to_le_bytes());
                 buf.extend_from_slice(&spendable_after.to_le_bytes());
             }
-            RedoOp::Create { tx_key, record_offset, utxo_count } => {
+            RedoOp::Create {
+                tx_key,
+                record_offset,
+                utxo_count,
+            } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&record_offset.to_le_bytes());
                 buf.extend_from_slice(&utxo_count.to_le_bytes());
             }
-            RedoOp::Delete { tx_key, record_offset, record_size } => {
+            RedoOp::Delete {
+                tx_key,
+                record_offset,
+                record_size,
+            } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&record_offset.to_le_bytes());
                 buf.extend_from_slice(&record_size.to_le_bytes());
             }
-            RedoOp::SetConflicting { tx_key, value, current_block_height, block_height_retention } => {
+            RedoOp::SetConflicting {
+                tx_key,
+                value,
+                current_block_height,
+                block_height_retention,
+            } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.push(if *value { 1 } else { 0 });
                 buf.extend_from_slice(&current_block_height.to_le_bytes());
@@ -340,30 +377,58 @@ impl RedoOp {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.push(if *value { 1 } else { 0 });
             }
-            RedoOp::PreserveUntil { tx_key, block_height } => {
+            RedoOp::PreserveUntil {
+                tx_key,
+                block_height,
+            } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&block_height.to_le_bytes());
             }
-            RedoOp::MarkOnLongestChain { tx_key, on_longest_chain, current_block_height, block_height_retention, generation } => {
+            RedoOp::MarkOnLongestChain {
+                tx_key,
+                on_longest_chain,
+                current_block_height,
+                block_height_retention,
+                generation,
+            } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.push(if *on_longest_chain { 1 } else { 0 });
                 buf.extend_from_slice(&current_block_height.to_le_bytes());
                 buf.extend_from_slice(&block_height_retention.to_le_bytes());
                 buf.extend_from_slice(&generation.to_le_bytes());
             }
-            RedoOp::SecondaryUnminedUpdate { tx_key, old_height, new_height }
-            | RedoOp::SecondaryDahUpdate { tx_key, old_height, new_height } => {
+            RedoOp::SecondaryUnminedUpdate {
+                tx_key,
+                old_height,
+                new_height,
+            }
+            | RedoOp::SecondaryDahUpdate {
+                tx_key,
+                old_height,
+                new_height,
+            } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&old_height.to_le_bytes());
                 buf.extend_from_slice(&new_height.to_le_bytes());
             }
-            RedoOp::AllocateRegion { offset, size, device_id }
-            | RedoOp::FreeRegion { offset, size, device_id } => {
+            RedoOp::AllocateRegion {
+                offset,
+                size,
+                device_id,
+            }
+            | RedoOp::FreeRegion {
+                offset,
+                size,
+                device_id,
+            } => {
                 buf.extend_from_slice(&offset.to_le_bytes());
                 buf.extend_from_slice(&size.to_le_bytes());
                 buf.push(*device_id);
             }
-            RedoOp::HashtableResizeBegin { tmp_path_bytes, new_capacity } => {
+            RedoOp::HashtableResizeBegin {
+                tmp_path_bytes,
+                new_capacity,
+            } => {
                 // [new_capacity:8][path_len:4][path_bytes:N]
                 buf.extend_from_slice(&new_capacity.to_le_bytes());
                 let path_len = tmp_path_bytes.len() as u32;
@@ -381,20 +446,33 @@ impl RedoOp {
     fn deserialize(op_type: u8, data: &[u8]) -> Option<Self> {
         match op_type {
             OP_SPEND if data.len() >= 76 => {
-                let mut txid = [0u8; 32]; txid.copy_from_slice(&data[..32]);
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
                 let offset = u32::from_le_bytes(data[32..36].try_into().unwrap());
-                let mut sd = [0u8; 36]; sd.copy_from_slice(&data[36..72]);
+                let mut sd = [0u8; 36];
+                sd.copy_from_slice(&data[36..72]);
                 let cnt = u32::from_le_bytes(data[72..76].try_into().unwrap());
-                Some(RedoOp::Spend { tx_key: TxKey { txid }, offset, spending_data: sd, new_spent_count: cnt })
+                Some(RedoOp::Spend {
+                    tx_key: TxKey { txid },
+                    offset,
+                    spending_data: sd,
+                    new_spent_count: cnt,
+                })
             }
             OP_UNSPEND if data.len() >= 40 => {
-                let mut txid = [0u8; 32]; txid.copy_from_slice(&data[..32]);
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
                 let offset = u32::from_le_bytes(data[32..36].try_into().unwrap());
                 let cnt = u32::from_le_bytes(data[36..40].try_into().unwrap());
-                Some(RedoOp::Unspend { tx_key: TxKey { txid }, offset, new_spent_count: cnt })
+                Some(RedoOp::Unspend {
+                    tx_key: TxKey { txid },
+                    offset,
+                    new_spent_count: cnt,
+                })
             }
             OP_SET_MINED if data.len() >= 45 => {
-                let mut txid = [0u8; 32]; txid.copy_from_slice(&data[..32]);
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
                 Some(RedoOp::SetMined {
                     tx_key: TxKey { txid },
                     block_id: u32::from_le_bytes(data[32..36].try_into().unwrap()),
@@ -404,28 +482,43 @@ impl RedoOp {
                 })
             }
             OP_FREEZE | OP_UNFREEZE | OP_PRUNE_SLOT if data.len() >= 36 => {
-                let mut txid = [0u8; 32]; txid.copy_from_slice(&data[..32]);
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
                 let offset = u32::from_le_bytes(data[32..36].try_into().unwrap());
                 let key = TxKey { txid };
                 match op_type {
-                    OP_FREEZE => Some(RedoOp::Freeze { tx_key: key, offset }),
-                    OP_UNFREEZE => Some(RedoOp::Unfreeze { tx_key: key, offset }),
-                    OP_PRUNE_SLOT => Some(RedoOp::PruneSlot { tx_key: key, offset }),
+                    OP_FREEZE => Some(RedoOp::Freeze {
+                        tx_key: key,
+                        offset,
+                    }),
+                    OP_UNFREEZE => Some(RedoOp::Unfreeze {
+                        tx_key: key,
+                        offset,
+                    }),
+                    OP_PRUNE_SLOT => Some(RedoOp::PruneSlot {
+                        tx_key: key,
+                        offset,
+                    }),
                     _ => None,
                 }
             }
             OP_REASSIGN if data.len() >= 76 => {
-                let mut txid = [0u8; 32]; txid.copy_from_slice(&data[..32]);
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
                 let offset = u32::from_le_bytes(data[32..36].try_into().unwrap());
-                let mut nh = [0u8; 32]; nh.copy_from_slice(&data[36..68]);
+                let mut nh = [0u8; 32];
+                nh.copy_from_slice(&data[36..68]);
                 Some(RedoOp::Reassign {
-                    tx_key: TxKey { txid }, offset, new_hash: nh,
+                    tx_key: TxKey { txid },
+                    offset,
+                    new_hash: nh,
                     block_height: u32::from_le_bytes(data[68..72].try_into().unwrap()),
                     spendable_after: u32::from_le_bytes(data[72..76].try_into().unwrap()),
                 })
             }
             OP_CREATE if data.len() >= 44 => {
-                let mut txid = [0u8; 32]; txid.copy_from_slice(&data[..32]);
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
                 Some(RedoOp::Create {
                     tx_key: TxKey { txid },
                     record_offset: u64::from_le_bytes(data[32..40].try_into().unwrap()),
@@ -433,7 +526,8 @@ impl RedoOp {
                 })
             }
             OP_DELETE if data.len() >= 48 => {
-                let mut txid = [0u8; 32]; txid.copy_from_slice(&data[..32]);
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
                 Some(RedoOp::Delete {
                     tx_key: TxKey { txid },
                     record_offset: u64::from_le_bytes(data[32..40].try_into().unwrap()),
@@ -441,35 +535,45 @@ impl RedoOp {
                 })
             }
             OP_SET_CONFLICTING if data.len() >= 41 => {
-                let mut txid = [0u8; 32]; txid.copy_from_slice(&data[..32]);
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
                 Some(RedoOp::SetConflicting {
-                    tx_key: TxKey { txid }, value: data[32] != 0,
+                    tx_key: TxKey { txid },
+                    value: data[32] != 0,
                     current_block_height: u32::from_le_bytes(data[33..37].try_into().unwrap()),
                     block_height_retention: u32::from_le_bytes(data[37..41].try_into().unwrap()),
                 })
             }
             OP_SET_LOCKED if data.len() >= 33 => {
-                let mut txid = [0u8; 32]; txid.copy_from_slice(&data[..32]);
-                Some(RedoOp::SetLocked { tx_key: TxKey { txid }, value: data[32] != 0 })
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                Some(RedoOp::SetLocked {
+                    tx_key: TxKey { txid },
+                    value: data[32] != 0,
+                })
             }
             OP_PRESERVE_UNTIL if data.len() >= 36 => {
-                let mut txid = [0u8; 32]; txid.copy_from_slice(&data[..32]);
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
                 Some(RedoOp::PreserveUntil {
                     tx_key: TxKey { txid },
                     block_height: u32::from_le_bytes(data[32..36].try_into().unwrap()),
                 })
             }
             OP_MARK_LONGEST_CHAIN if data.len() >= 45 => {
-                let mut txid = [0u8; 32]; txid.copy_from_slice(&data[..32]);
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
                 Some(RedoOp::MarkOnLongestChain {
-                    tx_key: TxKey { txid }, on_longest_chain: data[32] != 0,
+                    tx_key: TxKey { txid },
+                    on_longest_chain: data[32] != 0,
                     current_block_height: u32::from_le_bytes(data[33..37].try_into().unwrap()),
                     block_height_retention: u32::from_le_bytes(data[37..41].try_into().unwrap()),
                     generation: u32::from_le_bytes(data[41..45].try_into().unwrap()),
                 })
             }
             OP_SECONDARY_UNMINED_UPDATE if data.len() >= 40 => {
-                let mut txid = [0u8; 32]; txid.copy_from_slice(&data[..32]);
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
                 Some(RedoOp::SecondaryUnminedUpdate {
                     tx_key: TxKey { txid },
                     old_height: u32::from_le_bytes(data[32..36].try_into().unwrap()),
@@ -477,7 +581,8 @@ impl RedoOp {
                 })
             }
             OP_SECONDARY_DAH_UPDATE if data.len() >= 40 => {
-                let mut txid = [0u8; 32]; txid.copy_from_slice(&data[..32]);
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
                 Some(RedoOp::SecondaryDahUpdate {
                     tx_key: TxKey { txid },
                     old_height: u32::from_le_bytes(data[32..36].try_into().unwrap()),
@@ -488,13 +593,21 @@ impl RedoOp {
                 let offset = u64::from_le_bytes(data[0..8].try_into().unwrap());
                 let size = u64::from_le_bytes(data[8..16].try_into().unwrap());
                 let device_id = data[16];
-                Some(RedoOp::AllocateRegion { offset, size, device_id })
+                Some(RedoOp::AllocateRegion {
+                    offset,
+                    size,
+                    device_id,
+                })
             }
             OP_FREE_REGION if data.len() >= 17 => {
                 let offset = u64::from_le_bytes(data[0..8].try_into().unwrap());
                 let size = u64::from_le_bytes(data[8..16].try_into().unwrap());
                 let device_id = data[16];
-                Some(RedoOp::FreeRegion { offset, size, device_id })
+                Some(RedoOp::FreeRegion {
+                    offset,
+                    size,
+                    device_id,
+                })
             }
             OP_HASHTABLE_RESIZE_BEGIN if data.len() >= 12 => {
                 let new_capacity = u64::from_le_bytes(data[0..8].try_into().unwrap());
@@ -503,7 +616,10 @@ impl RedoOp {
                     return None;
                 }
                 let tmp_path_bytes = data[12..12 + path_len].to_vec();
-                Some(RedoOp::HashtableResizeBegin { tmp_path_bytes, new_capacity })
+                Some(RedoOp::HashtableResizeBegin {
+                    tmp_path_bytes,
+                    new_capacity,
+                })
             }
             OP_HASHTABLE_RESIZE_COMMIT if data.len() >= 8 => {
                 let new_capacity = u64::from_le_bytes(data[0..8].try_into().unwrap());
@@ -570,9 +686,8 @@ impl RedoEntry {
 
         let payload = &data[ENTRY_HEADER_SIZE..total];
         let content_len = length - ENTRY_CHECKSUM_SIZE;
-        let stored_checksum = u32::from_le_bytes(
-            payload[content_len..content_len + 4].try_into().unwrap(),
-        );
+        let stored_checksum =
+            u32::from_le_bytes(payload[content_len..content_len + 4].try_into().unwrap());
         let computed = crc32fast::hash(&payload[..content_len]);
         if stored_checksum != computed {
             return None;
@@ -625,11 +740,13 @@ impl RedoLog {
     /// failures from `pread`/`pwrite`.
     pub fn open(device: Arc<dyn BlockDevice>, log_offset: u64, log_size: u64) -> Result<Self> {
         let device_size = device.size();
-        let end = log_offset.checked_add(log_size).ok_or(RedoError::OutOfBounds {
-            log_offset,
-            log_size,
-            device_size,
-        })?;
+        let end = log_offset
+            .checked_add(log_size)
+            .ok_or(RedoError::OutOfBounds {
+                log_offset,
+                log_size,
+                device_size,
+            })?;
         if end > device_size {
             return Err(RedoError::OutOfBounds {
                 log_offset,
@@ -709,7 +826,8 @@ impl RedoLog {
 
         // Read existing data if we're not block-aligned
         if intra > 0 || !total.is_multiple_of(align) {
-            let read_len = aligned_total.min((self.log_size - (aligned_offset - self.log_offset)) as usize);
+            let read_len =
+                aligned_total.min((self.log_size - (aligned_offset - self.log_offset)) as usize);
             let read_aligned = read_len.div_ceil(align) * align;
             if read_aligned <= buf.len() {
                 let _ = self.device.pread(&mut buf[..read_aligned], aligned_offset);
@@ -723,9 +841,7 @@ impl RedoLog {
             }
             return Err(e.into());
         }
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::BeforeRedoFsync,
-        );
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeRedoFsync);
         // Scope the sync call tightly so the latency histogram reflects only
         // the fsync wall time, not the buffer-assembly / pwrite preamble.
         let sync_start = Instant::now();
@@ -739,9 +855,7 @@ impl RedoLog {
             }
             return Err(e.into());
         }
-        crate::fault_injection::check(
-            crate::fault_injection::SyncPoint::AfterRedoFsync,
-        );
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterRedoFsync);
 
         let flushed_bytes = self.buffer.len() as u64;
         let flushed_entries = self.buffered_entries;
@@ -856,7 +970,8 @@ impl RedoLog {
 
     /// Space remaining in the log.
     pub fn available_space(&self) -> u64 {
-        self.log_size.saturating_sub(self.write_pos + self.buffer.len() as u64)
+        self.log_size
+            .saturating_sub(self.write_pos + self.buffer.len() as u64)
     }
 
     /// Reset the log (after checkpoint + reclaim). Dangerous — only call
@@ -926,13 +1041,16 @@ mod tests {
     #[test]
     fn open_with_out_of_bounds_log_region_fails() {
         // Device is 64 KiB; attempt to open a log that extends past it.
-        let dev: Arc<dyn BlockDevice> =
-            Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
         let log_offset = 32 * 1024;
         let log_size = 64 * 1024; // end = 96 KiB > device size (64 KiB)
         match RedoLog::open(dev.clone(), log_offset, log_size) {
             Ok(_) => panic!("expected OutOfBounds, got Ok"),
-            Err(RedoError::OutOfBounds { log_offset: lo, log_size: ls, device_size }) => {
+            Err(RedoError::OutOfBounds {
+                log_offset: lo,
+                log_size: ls,
+                device_size,
+            }) => {
                 assert_eq!(lo, log_offset);
                 assert_eq!(ls, log_size);
                 assert_eq!(device_size, 64 * 1024);
@@ -952,13 +1070,22 @@ mod tests {
     fn append_flush_recover() {
         let (_, mut log) = make_log(1024 * 1024);
         log.append_and_flush(RedoOp::Spend {
-            tx_key: test_key(1), offset: 5, spending_data: [0xAB; 36], new_spent_count: 1,
-        }).unwrap();
+            tx_key: test_key(1),
+            offset: 5,
+            spending_data: [0xAB; 36],
+            new_spent_count: 1,
+        })
+        .unwrap();
 
         let entries = log.recover().unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0].op {
-            RedoOp::Spend { tx_key, offset, spending_data, new_spent_count } => {
+            RedoOp::Spend {
+                tx_key,
+                offset,
+                spending_data,
+                new_spent_count,
+            } => {
                 assert_eq!(tx_key.txid[0], 1);
                 assert_eq!(*offset, 5);
                 assert_eq!(*spending_data, [0xAB; 36]);
@@ -972,7 +1099,11 @@ mod tests {
     fn append_100_flush_recover_all() {
         let (_, mut log) = make_log(1024 * 1024);
         for i in 0..100u8 {
-            log.append(RedoOp::Freeze { tx_key: test_key(i), offset: i as u32 }).unwrap();
+            log.append(RedoOp::Freeze {
+                tx_key: test_key(i),
+                offset: i as u32,
+            })
+            .unwrap();
         }
         log.flush().unwrap();
 
@@ -986,7 +1117,11 @@ mod tests {
     #[test]
     fn no_flush_not_recovered() {
         let (dev, mut log) = make_log(1024 * 1024);
-        log.append(RedoOp::Freeze { tx_key: test_key(1), offset: 0 }).unwrap();
+        log.append(RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        })
+        .unwrap();
         // Don't flush
 
         // Simulate crash — reopen
@@ -998,7 +1133,11 @@ mod tests {
     #[test]
     fn checkpoint_clears_entries() {
         let (_, mut log) = make_log(1024 * 1024);
-        log.append_and_flush(RedoOp::Freeze { tx_key: test_key(1), offset: 0 }).unwrap();
+        log.append_and_flush(RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        })
+        .unwrap();
         log.checkpoint().unwrap();
 
         let entries = log.recover().unwrap();
@@ -1008,9 +1147,17 @@ mod tests {
     #[test]
     fn checkpoint_only_returns_after() {
         let (_, mut log) = make_log(1024 * 1024);
-        log.append_and_flush(RedoOp::Freeze { tx_key: test_key(1), offset: 0 }).unwrap();
+        log.append_and_flush(RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        })
+        .unwrap();
         log.checkpoint().unwrap();
-        log.append_and_flush(RedoOp::Unfreeze { tx_key: test_key(2), offset: 1 }).unwrap();
+        log.append_and_flush(RedoOp::Unfreeze {
+            tx_key: test_key(2),
+            offset: 1,
+        })
+        .unwrap();
 
         let entries = log.recover().unwrap();
         assert_eq!(entries.len(), 1);
@@ -1026,8 +1173,16 @@ mod tests {
     #[test]
     fn corrupted_entry_stops_recovery() {
         let (dev, mut log) = make_log(1024 * 1024);
-        log.append_and_flush(RedoOp::Freeze { tx_key: test_key(1), offset: 0 }).unwrap();
-        log.append_and_flush(RedoOp::Freeze { tx_key: test_key(2), offset: 1 }).unwrap();
+        log.append_and_flush(RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        })
+        .unwrap();
+        log.append_and_flush(RedoOp::Freeze {
+            tx_key: test_key(2),
+            offset: 1,
+        })
+        .unwrap();
 
         // Corrupt byte in the second entry
         let align = dev.alignment();
@@ -1048,22 +1203,91 @@ mod tests {
     #[test]
     fn round_trip_all_variants() {
         let ops = vec![
-            RedoOp::Spend { tx_key: test_key(1), offset: 5, spending_data: [0xAB; 36], new_spent_count: 42 },
-            RedoOp::Unspend { tx_key: test_key(2), offset: 3, new_spent_count: 10 },
-            RedoOp::SetMined { tx_key: test_key(3), block_id: 100, block_height: 800000, subtree_idx: 7, unset: false },
-            RedoOp::SetMined { tx_key: test_key(4), block_id: 200, block_height: 900000, subtree_idx: 3, unset: true },
-            RedoOp::Freeze { tx_key: test_key(5), offset: 0 },
-            RedoOp::Unfreeze { tx_key: test_key(6), offset: 1 },
-            RedoOp::Reassign { tx_key: test_key(7), offset: 2, new_hash: [0xCC; 32], block_height: 1000, spendable_after: 100 },
-            RedoOp::PruneSlot { tx_key: test_key(8), offset: 4 },
-            RedoOp::Create { tx_key: test_key(9), record_offset: 4096, utxo_count: 10 },
-            RedoOp::Delete { tx_key: test_key(10), record_offset: 8192, record_size: 1024 },
-            RedoOp::SetConflicting { tx_key: test_key(11), value: true, current_block_height: 500, block_height_retention: 288 },
-            RedoOp::SetLocked { tx_key: test_key(12), value: false },
-            RedoOp::PreserveUntil { tx_key: test_key(13), block_height: 5000 },
-            RedoOp::MarkOnLongestChain { tx_key: test_key(14), on_longest_chain: true, current_block_height: 600, block_height_retention: 288, generation: 1 },
-            RedoOp::SecondaryUnminedUpdate { tx_key: test_key(15), old_height: 0, new_height: 500 },
-            RedoOp::SecondaryDahUpdate { tx_key: test_key(16), old_height: 100, new_height: 600 },
+            RedoOp::Spend {
+                tx_key: test_key(1),
+                offset: 5,
+                spending_data: [0xAB; 36],
+                new_spent_count: 42,
+            },
+            RedoOp::Unspend {
+                tx_key: test_key(2),
+                offset: 3,
+                new_spent_count: 10,
+            },
+            RedoOp::SetMined {
+                tx_key: test_key(3),
+                block_id: 100,
+                block_height: 800000,
+                subtree_idx: 7,
+                unset: false,
+            },
+            RedoOp::SetMined {
+                tx_key: test_key(4),
+                block_id: 200,
+                block_height: 900000,
+                subtree_idx: 3,
+                unset: true,
+            },
+            RedoOp::Freeze {
+                tx_key: test_key(5),
+                offset: 0,
+            },
+            RedoOp::Unfreeze {
+                tx_key: test_key(6),
+                offset: 1,
+            },
+            RedoOp::Reassign {
+                tx_key: test_key(7),
+                offset: 2,
+                new_hash: [0xCC; 32],
+                block_height: 1000,
+                spendable_after: 100,
+            },
+            RedoOp::PruneSlot {
+                tx_key: test_key(8),
+                offset: 4,
+            },
+            RedoOp::Create {
+                tx_key: test_key(9),
+                record_offset: 4096,
+                utxo_count: 10,
+            },
+            RedoOp::Delete {
+                tx_key: test_key(10),
+                record_offset: 8192,
+                record_size: 1024,
+            },
+            RedoOp::SetConflicting {
+                tx_key: test_key(11),
+                value: true,
+                current_block_height: 500,
+                block_height_retention: 288,
+            },
+            RedoOp::SetLocked {
+                tx_key: test_key(12),
+                value: false,
+            },
+            RedoOp::PreserveUntil {
+                tx_key: test_key(13),
+                block_height: 5000,
+            },
+            RedoOp::MarkOnLongestChain {
+                tx_key: test_key(14),
+                on_longest_chain: true,
+                current_block_height: 600,
+                block_height_retention: 288,
+                generation: 1,
+            },
+            RedoOp::SecondaryUnminedUpdate {
+                tx_key: test_key(15),
+                old_height: 0,
+                new_height: 500,
+            },
+            RedoOp::SecondaryDahUpdate {
+                tx_key: test_key(16),
+                old_height: 100,
+                new_height: 600,
+            },
             RedoOp::Checkpoint,
         ];
 
@@ -1089,8 +1313,13 @@ mod tests {
         let (_, mut log) = make_log(8192);
         let mut count = 0;
         loop {
-            match log.append(RedoOp::Freeze { tx_key: test_key(count as u8), offset: 0 }) {
-                Ok(_) => { count += 1; }
+            match log.append(RedoOp::Freeze {
+                tx_key: test_key(count as u8),
+                offset: 0,
+            }) {
+                Ok(_) => {
+                    count += 1;
+                }
                 Err(RedoError::LogFull { .. }) => break,
                 Err(e) => panic!("unexpected error: {e}"),
             }
@@ -1103,7 +1332,11 @@ mod tests {
         let (_, mut log) = make_log(8192);
         // Fill most of the log
         for i in 0..50u8 {
-            log.append(RedoOp::Freeze { tx_key: test_key(i), offset: 0 }).unwrap();
+            log.append(RedoOp::Freeze {
+                tx_key: test_key(i),
+                offset: 0,
+            })
+            .unwrap();
         }
         log.flush().unwrap();
         log.checkpoint().unwrap();
@@ -1112,7 +1345,11 @@ mod tests {
         log.reset().unwrap();
 
         // Should be able to write again
-        log.append_and_flush(RedoOp::Freeze { tx_key: test_key(99), offset: 0 }).unwrap();
+        log.append_and_flush(RedoOp::Freeze {
+            tx_key: test_key(99),
+            offset: 0,
+        })
+        .unwrap();
         let entries = log.recover().unwrap();
         assert_eq!(entries.len(), 1);
     }
@@ -1121,7 +1358,11 @@ mod tests {
     fn available_space_decreases() {
         let (_, mut log) = make_log(1024 * 1024);
         let initial = log.available_space();
-        log.append(RedoOp::Freeze { tx_key: test_key(1), offset: 0 }).unwrap();
+        log.append(RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        })
+        .unwrap();
         assert!(log.available_space() < initial);
     }
 
@@ -1130,8 +1371,16 @@ mod tests {
     #[test]
     fn reopen_sees_flushed_entries() {
         let (dev, mut log) = make_log(1024 * 1024);
-        log.append_and_flush(RedoOp::Freeze { tx_key: test_key(1), offset: 0 }).unwrap();
-        log.append_and_flush(RedoOp::Freeze { tx_key: test_key(2), offset: 1 }).unwrap();
+        log.append_and_flush(RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        })
+        .unwrap();
+        log.append_and_flush(RedoOp::Freeze {
+            tx_key: test_key(2),
+            offset: 1,
+        })
+        .unwrap();
         drop(log);
 
         let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
@@ -1142,9 +1391,17 @@ mod tests {
     #[test]
     fn reopen_after_checkpoint() {
         let (dev, mut log) = make_log(1024 * 1024);
-        log.append_and_flush(RedoOp::Freeze { tx_key: test_key(1), offset: 0 }).unwrap();
+        log.append_and_flush(RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        })
+        .unwrap();
         log.checkpoint().unwrap();
-        log.append_and_flush(RedoOp::Freeze { tx_key: test_key(2), offset: 1 }).unwrap();
+        log.append_and_flush(RedoOp::Freeze {
+            tx_key: test_key(2),
+            offset: 1,
+        })
+        .unwrap();
         drop(log);
 
         let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
@@ -1155,8 +1412,16 @@ mod tests {
     #[test]
     fn truncated_entry_stops_recovery() {
         let (dev, mut log) = make_log(1024 * 1024);
-        log.append_and_flush(RedoOp::Freeze { tx_key: test_key(1), offset: 0 }).unwrap();
-        log.append_and_flush(RedoOp::Freeze { tx_key: test_key(2), offset: 1 }).unwrap();
+        log.append_and_flush(RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        })
+        .unwrap();
+        log.append_and_flush(RedoOp::Freeze {
+            tx_key: test_key(2),
+            offset: 1,
+        })
+        .unwrap();
 
         // Simulate truncation: zero out most of the second entry
         let align = dev.alignment();
@@ -1194,7 +1459,10 @@ mod tests {
 
             // Verify only entries after the most recent checkpoint are returned
             let entries = log.recover().unwrap();
-            assert!(entries.is_empty(), "cycle {cycle}: should have 0 entries after checkpoint");
+            assert!(
+                entries.is_empty(),
+                "cycle {cycle}: should have 0 entries after checkpoint"
+            );
         }
 
         // After all cycles, total space used should not leak
@@ -1204,7 +1472,11 @@ mod tests {
     #[test]
     fn zero_length_marks_end_of_valid_data() {
         let (dev, mut log) = make_log(1024 * 1024);
-        log.append_and_flush(RedoOp::Freeze { tx_key: test_key(1), offset: 0 }).unwrap();
+        log.append_and_flush(RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        })
+        .unwrap();
 
         // The area after the last entry should have zero bytes (marking end)
         // This is implicitly tested by recovery stopping at the right place
@@ -1227,7 +1499,11 @@ mod tests {
         // Recovery should always succeed (possibly with fewer entries)
         let (dev, mut log) = make_log(1024 * 1024);
         for i in 0..10u8 {
-            log.append_and_flush(RedoOp::Freeze { tx_key: test_key(i), offset: i as u32 }).unwrap();
+            log.append_and_flush(RedoOp::Freeze {
+                tx_key: test_key(i),
+                offset: i as u32,
+            })
+            .unwrap();
         }
 
         // Try 50 different corruption points
@@ -1250,7 +1526,10 @@ mod tests {
             // Recovery should not panic or error
             let log2 = RedoLog::open(dev2, 0, 1024 * 1024).unwrap();
             let result = log2.recover();
-            assert!(result.is_ok(), "recovery failed at corruption offset {corrupt_offset}");
+            assert!(
+                result.is_ok(),
+                "recovery failed at corruption offset {corrupt_offset}"
+            );
         }
     }
 
@@ -1273,7 +1552,10 @@ mod tests {
         log.append_and_flush(op.clone()).unwrap();
         let entries = log.recover().unwrap();
         assert_eq!(entries.len(), 1, "expected exactly 1 recovered entry");
-        assert_eq!(entries[0].op, op, "round-tripped op does not match original");
+        assert_eq!(
+            entries[0].op, op,
+            "round-tripped op does not match original"
+        );
     }
 
     #[test]
@@ -1481,8 +1763,16 @@ mod tests {
     fn append_batch_and_flush_assigns_contiguous_sequences() {
         let (_, mut log) = make_log(1024 * 1024);
         let ops = vec![
-            RedoOp::SecondaryDahUpdate { tx_key: test_key(1), old_height: 0, new_height: 100 },
-            RedoOp::SecondaryUnminedUpdate { tx_key: test_key(1), old_height: 0, new_height: 500 },
+            RedoOp::SecondaryDahUpdate {
+                tx_key: test_key(1),
+                old_height: 0,
+                new_height: 100,
+            },
+            RedoOp::SecondaryUnminedUpdate {
+                tx_key: test_key(1),
+                old_height: 0,
+                new_height: 500,
+            },
         ];
         let (first, last) = log.append_batch_and_flush(&ops).unwrap();
         assert_eq!(first, 1);
@@ -1595,9 +1885,17 @@ mod tests {
         // Simulate restart: reopen the log from the same device
         let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
         let entries = log2.recover().unwrap();
-        assert_eq!(entries.len(), 5, "expected 5 recovered entries after reopen");
+        assert_eq!(
+            entries.len(),
+            5,
+            "expected 5 recovered entries after reopen"
+        );
         for (i, entry) in entries.iter().enumerate() {
-            assert_eq!(entry.sequence, (i + 1) as u64, "sequence mismatch at index {i}");
+            assert_eq!(
+                entry.sequence,
+                (i + 1) as u64,
+                "sequence mismatch at index {i}"
+            );
             assert_eq!(entry.op, ops[i], "op mismatch at index {i}");
         }
     }
@@ -1627,7 +1925,10 @@ mod tests {
                 Err(e) => panic!("expected LogFull, got: {e}"),
             }
         }
-        assert!(appended > 0, "should have appended at least one entry before LogFull");
+        assert!(
+            appended > 0,
+            "should have appended at least one entry before LogFull"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1640,7 +1941,10 @@ mod tests {
 
         // Write 5 entries
         let ops: Vec<RedoOp> = (0..5u8)
-            .map(|i| RedoOp::Freeze { tx_key: make_txid(i), offset: i as u32 })
+            .map(|i| RedoOp::Freeze {
+                tx_key: make_txid(i),
+                offset: i as u32,
+            })
             .collect();
         for op in &ops {
             log.append_and_flush(op.clone()).unwrap();
@@ -1677,9 +1981,18 @@ mod tests {
 
         // Append 3 pre-checkpoint ops
         let pre_ops = vec![
-            RedoOp::Freeze { tx_key: make_txid(0x10), offset: 0 },
-            RedoOp::Unfreeze { tx_key: make_txid(0x11), offset: 1 },
-            RedoOp::PruneSlot { tx_key: make_txid(0x12), offset: 2 },
+            RedoOp::Freeze {
+                tx_key: make_txid(0x10),
+                offset: 0,
+            },
+            RedoOp::Unfreeze {
+                tx_key: make_txid(0x11),
+                offset: 1,
+            },
+            RedoOp::PruneSlot {
+                tx_key: make_txid(0x12),
+                offset: 2,
+            },
         ];
         for op in &pre_ops {
             log.append(op.clone()).unwrap();
@@ -1689,8 +2002,14 @@ mod tests {
 
         // Append 2 post-checkpoint ops
         let post_ops = vec![
-            RedoOp::SetLocked { tx_key: make_txid(0x20), value: true },
-            RedoOp::PreserveUntil { tx_key: make_txid(0x21), block_height: 12345 },
+            RedoOp::SetLocked {
+                tx_key: make_txid(0x20),
+                value: true,
+            },
+            RedoOp::PreserveUntil {
+                tx_key: make_txid(0x21),
+                block_height: 12345,
+            },
         ];
         for op in &post_ops {
             log.append(op.clone()).unwrap();
@@ -1702,8 +2021,14 @@ mod tests {
         let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
         let entries = log2.recover().unwrap();
         assert_eq!(entries.len(), 2, "expected 2 post-checkpoint entries");
-        assert_eq!(entries[0].op, post_ops[0], "first post-checkpoint op mismatch");
-        assert_eq!(entries[1].op, post_ops[1], "second post-checkpoint op mismatch");
+        assert_eq!(
+            entries[0].op, post_ops[0],
+            "first post-checkpoint op mismatch"
+        );
+        assert_eq!(
+            entries[1].op, post_ops[1],
+            "second post-checkpoint op mismatch"
+        );
     }
 
     /// Phase 5: appending 100 entries and flushing records non-zero
@@ -1711,7 +2036,7 @@ mod tests {
     /// distribution buckets.
     #[test]
     fn redo_flush_records_latency_and_bytes() {
-        use crate::metrics::{init_redo_metrics, redo_metrics, RedoMetrics};
+        use crate::metrics::{RedoMetrics, init_redo_metrics, redo_metrics};
         use std::sync::OnceLock;
 
         static TEST_METRICS: OnceLock<RedoMetrics> = OnceLock::new();

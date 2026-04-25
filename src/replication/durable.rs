@@ -4,11 +4,26 @@
 //! a master restart, the master knows where each replica left off and can
 //! stream the missing redo entries instead of requiring a full resync.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
+
+fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+fn durable_tmp_path(path: &Path) -> PathBuf {
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    PathBuf::from(tmp)
+}
 
 /// Manages persistent per-replica ACK tracking.
 ///
@@ -97,10 +112,8 @@ impl AckTracker {
     /// Serialize and write the ACK state to disk.
     ///
     /// Format: `[entry_count:4 LE]([addr_len:2 LE][addr_bytes][last_acked:8 LE])*`
-    fn write_to_disk(
-        path: &Path,
-        state: &HashMap<SocketAddr, u64>,
-    ) -> std::io::Result<()> {
+    fn write_to_disk(path: &Path, state: &HashMap<SocketAddr, u64>) -> std::io::Result<()> {
+        ensure_parent_dir(path)?;
         let mut buf = Vec::with_capacity(4 + state.len() * 30);
         buf.extend_from_slice(&(state.len() as u32).to_le_bytes());
         for (addr, &seq) in state {
@@ -111,7 +124,7 @@ impl AckTracker {
             buf.extend_from_slice(&seq.to_le_bytes());
         }
         // Atomic write: write to temp, then rename.
-        let tmp = path.with_extension("tmp");
+        let tmp = durable_tmp_path(path);
         std::fs::write(&tmp, &buf)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
@@ -144,8 +157,7 @@ impl AckTracker {
             if pos + addr_len + 8 > data.len() {
                 break;
             }
-            let addr_str = std::str::from_utf8(&data[pos..pos + addr_len])
-                .unwrap_or("");
+            let addr_str = std::str::from_utf8(&data[pos..pos + addr_len]).unwrap_or("");
             pos += addr_len;
             let seq = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
@@ -156,6 +168,168 @@ impl AckTracker {
         }
 
         Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Master-side pending replication intent tracker
+// ---------------------------------------------------------------------------
+
+/// A durable redo sequence range that has been applied locally but has not
+/// yet been proven replicated to the required holders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReplicationIntentRange {
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+}
+
+/// Errors emitted by [`ReplicationIntentTracker`] persistence operations.
+#[derive(thiserror::Error, Debug)]
+pub enum ReplicationIntentError {
+    #[error("replication intent tracker io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("replication intent tracker state corrupt: {0}")]
+    Corrupt(String),
+}
+
+/// Persistent master-side journal of pending replication ranges.
+///
+/// The dispatcher records a range before attempting replica fan-out and removes
+/// it only after the configured ACK policy is satisfied (or after a failed
+/// client mutation has been durably compensated). On restart, any range left in
+/// this file must be replicated to current holders before the node serves.
+#[derive(Debug)]
+pub struct ReplicationIntentTracker {
+    path: PathBuf,
+    inner: Mutex<BTreeSet<ReplicationIntentRange>>,
+}
+
+impl ReplicationIntentTracker {
+    pub fn load(path: PathBuf) -> std::result::Result<Self, ReplicationIntentError> {
+        ensure_parent_dir(&path).map_err(ReplicationIntentError::Io)?;
+        let pending = Self::read_from_disk(&path)?;
+        Ok(Self {
+            path,
+            inner: Mutex::new(pending),
+        })
+    }
+
+    pub fn in_memory() -> Self {
+        Self {
+            path: PathBuf::new(),
+            inner: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    pub fn begin(
+        &self,
+        first_sequence: u64,
+        last_sequence: u64,
+    ) -> std::result::Result<(), ReplicationIntentError> {
+        if first_sequence == 0 || last_sequence < first_sequence {
+            return Ok(());
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = inner.insert(ReplicationIntentRange {
+            first_sequence,
+            last_sequence,
+        });
+        if changed {
+            self.write_locked(&inner)?;
+        }
+        Ok(())
+    }
+
+    pub fn commit(
+        &self,
+        first_sequence: u64,
+        last_sequence: u64,
+    ) -> std::result::Result<(), ReplicationIntentError> {
+        if first_sequence == 0 || last_sequence < first_sequence {
+            return Ok(());
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = inner.remove(&ReplicationIntentRange {
+            first_sequence,
+            last_sequence,
+        });
+        if changed {
+            self.write_locked(&inner)?;
+        }
+        Ok(())
+    }
+
+    pub fn pending(&self) -> Vec<ReplicationIntentRange> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.iter().copied().collect()
+    }
+
+    fn write_locked(
+        &self,
+        pending: &BTreeSet<ReplicationIntentRange>,
+    ) -> std::result::Result<(), ReplicationIntentError> {
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        Self::write_to_disk(&self.path, pending)
+    }
+
+    fn write_to_disk(
+        path: &Path,
+        pending: &BTreeSet<ReplicationIntentRange>,
+    ) -> std::result::Result<(), ReplicationIntentError> {
+        let mut buf = Vec::with_capacity(4 + pending.len() * 16);
+        buf.extend_from_slice(&(pending.len() as u32).to_le_bytes());
+        for range in pending {
+            buf.extend_from_slice(&range.first_sequence.to_le_bytes());
+            buf.extend_from_slice(&range.last_sequence.to_le_bytes());
+        }
+        ensure_parent_dir(path)?;
+        let tmp = durable_tmp_path(path);
+        std::fs::write(&tmp, &buf)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    fn read_from_disk(
+        path: &Path,
+    ) -> std::result::Result<BTreeSet<ReplicationIntentRange>, ReplicationIntentError> {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeSet::new());
+            }
+            Err(e) => return Err(ReplicationIntentError::Io(e)),
+        };
+        if data.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        if data.len() < 4 {
+            return Err(ReplicationIntentError::Corrupt("truncated header".into()));
+        }
+        let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let expected = 4 + count * 16;
+        if data.len() < expected {
+            return Err(ReplicationIntentError::Corrupt("truncated ranges".into()));
+        }
+        let mut pending = BTreeSet::new();
+        let mut pos = 4;
+        for _ in 0..count {
+            let first_sequence = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let last_sequence = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            if first_sequence == 0 || last_sequence < first_sequence {
+                return Err(ReplicationIntentError::Corrupt(format!(
+                    "invalid range {first_sequence}..{last_sequence}",
+                )));
+            }
+            pending.insert(ReplicationIntentRange {
+                first_sequence,
+                last_sequence,
+            });
+        }
+        Ok(pending)
     }
 }
 
@@ -207,6 +381,7 @@ impl ReplicaAppliedTracker {
     /// [`ReplicaAppliedError::Corrupt`]. A missing file is NOT an
     /// error; the tracker starts empty.
     pub fn load(path: PathBuf) -> std::result::Result<Self, ReplicaAppliedError> {
+        ensure_parent_dir(&path).map_err(ReplicaAppliedError::Io)?;
         let last_applied = Self::read_from_disk(&path)?;
         Ok(Self {
             path,
@@ -292,7 +467,8 @@ impl ReplicaAppliedTracker {
             buf.extend_from_slice(bytes);
             buf.extend_from_slice(&seq.to_le_bytes());
         }
-        let tmp = path.with_extension("tmp");
+        ensure_parent_dir(path)?;
+        let tmp = durable_tmp_path(path);
         std::fs::write(&tmp, &buf)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
@@ -325,11 +501,8 @@ impl ReplicaAppliedTracker {
                     "truncated entry length".into(),
                 ));
             }
-            let id_len = u16::from_le_bytes(
-                data[pos..pos + 2]
-                    .try_into()
-                    .unwrap_or([0; 2]),
-            ) as usize;
+            let id_len =
+                u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap_or([0; 2])) as usize;
             pos += 2;
             if pos + id_len + 8 > data.len() {
                 return Err(ReplicaAppliedError::Corrupt("truncated entry body".into()));
@@ -338,11 +511,7 @@ impl ReplicaAppliedTracker {
                 .map_err(|e| ReplicaAppliedError::Corrupt(format!("invalid utf8: {e}")))?
                 .to_string();
             pos += id_len;
-            let seq = u64::from_le_bytes(
-                data[pos..pos + 8]
-                    .try_into()
-                    .unwrap_or([0; 8]),
-            );
+            let seq = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap_or([0; 8]));
             pos += 8;
             result.insert(id, seq);
         }
@@ -417,10 +586,9 @@ pub fn run_catchup_for_replica(
         return Err("redo entries reclaimed; full resync required".to_string());
     }
 
-    let mut transport = TcpReplicaTransport::connect(
-        &addr.to_string(),
-        std::time::Duration::from_secs(5),
-    ).map_err(|e| format!("catchup connect to {addr}: {e}"))?;
+    let mut transport =
+        TcpReplicaTransport::connect(&addr.to_string(), std::time::Duration::from_secs(5))
+            .map_err(|e| format!("catchup connect to {addr}: {e}"))?;
 
     let mut last_acked = from_seq;
     for chunk in ops.chunks(batch_size) {
@@ -428,8 +596,10 @@ pub fn run_catchup_for_replica(
             first_sequence: last_acked,
             ops: chunk.to_vec(),
             trace_ctx: crate::observability::WireTraceContext::from_current_span(),
+            source_node_id: None,
         };
-        transport.send_batch(&batch)
+        transport
+            .send_batch(&batch)
             .map_err(|e| format!("catchup send to {addr}: {e}"))?;
         match transport.recv_ack(std::time::Duration::from_secs(5)) {
             Ok(crate::replication::protocol::ReplicaAck::Ok { through_sequence }) => {
@@ -564,6 +734,152 @@ mod tests {
         assert_eq!(tracker.all_acked().len(), 0);
     }
 
+    #[test]
+    fn durable_tmp_path_appends_instead_of_replacing_suffix() {
+        let base = PathBuf::from("/tmp/cluster.state.repl-applied");
+        assert_eq!(
+            durable_tmp_path(&base),
+            PathBuf::from("/tmp/cluster.state.repl-applied.tmp")
+        );
+
+        let ack = PathBuf::from("/tmp/cluster.state.repl-ack");
+        let intent = PathBuf::from("/tmp/cluster.state.repl-intent");
+        assert_ne!(durable_tmp_path(&base), durable_tmp_path(&ack));
+        assert_ne!(durable_tmp_path(&base), durable_tmp_path(&intent));
+        assert_ne!(durable_tmp_path(&ack), durable_tmp_path(&intent));
+    }
+
+    #[test]
+    fn ack_tracker_flush_creates_missing_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("ack.dat");
+        let tracker = AckTracker::new(path.clone());
+
+        tracker.record_ack(test_addr(5000), 42);
+        tracker.flush();
+
+        let reopened = AckTracker::new(path);
+        assert_eq!(reopened.last_acked(&test_addr(5000)), 42);
+    }
+
+    // -------------------------------------------------------------------
+    // ReplicationIntentTracker
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn replication_intent_tracker_persistence_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.dat");
+
+        {
+            let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
+            tracker.begin(10, 12).unwrap();
+            tracker.begin(20, 20).unwrap();
+            tracker.begin(0, 2).unwrap();
+            assert_eq!(
+                tracker.pending(),
+                vec![
+                    ReplicationIntentRange {
+                        first_sequence: 10,
+                        last_sequence: 12
+                    },
+                    ReplicationIntentRange {
+                        first_sequence: 20,
+                        last_sequence: 20
+                    },
+                ],
+            );
+        }
+
+        let reopened = ReplicationIntentTracker::load(path.clone()).unwrap();
+        assert_eq!(
+            reopened.pending(),
+            vec![
+                ReplicationIntentRange {
+                    first_sequence: 10,
+                    last_sequence: 12
+                },
+                ReplicationIntentRange {
+                    first_sequence: 20,
+                    last_sequence: 20
+                },
+            ],
+        );
+
+        reopened.commit(10, 12).unwrap();
+        assert_eq!(
+            reopened.pending(),
+            vec![ReplicationIntentRange {
+                first_sequence: 20,
+                last_sequence: 20
+            }],
+        );
+
+        let reopened_again = ReplicationIntentTracker::load(path).unwrap();
+        assert_eq!(
+            reopened_again.pending(),
+            vec![ReplicationIntentRange {
+                first_sequence: 20,
+                last_sequence: 20
+            }],
+        );
+    }
+
+    #[test]
+    fn replication_intent_tracker_begin_is_idempotent_and_commit_removes_range() {
+        let tracker = ReplicationIntentTracker::in_memory();
+
+        tracker.begin(5, 7).unwrap();
+        tracker.begin(5, 7).unwrap();
+        tracker.begin(8, 7).unwrap();
+        assert_eq!(
+            tracker.pending(),
+            vec![ReplicationIntentRange {
+                first_sequence: 5,
+                last_sequence: 7
+            }],
+        );
+
+        tracker.commit(5, 7).unwrap();
+        tracker.commit(5, 7).unwrap();
+        assert!(tracker.pending().is_empty());
+    }
+
+    #[test]
+    fn replication_intent_tracker_creates_missing_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("intent.dat");
+        let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
+
+        tracker.begin(5, 7).unwrap();
+
+        let reopened = ReplicationIntentTracker::load(path).unwrap();
+        assert_eq!(
+            reopened.pending(),
+            vec![ReplicationIntentRange {
+                first_sequence: 5,
+                last_sequence: 7
+            }],
+        );
+    }
+
+    #[test]
+    fn replication_intent_tracker_corrupt_range_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.dat");
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&9u64.to_le_bytes());
+        data.extend_from_slice(&8u64.to_le_bytes());
+        std::fs::write(&path, data).unwrap();
+
+        let err = ReplicationIntentTracker::load(path).expect_err("invalid range should reject");
+        match err {
+            ReplicationIntentError::Corrupt(msg) => assert!(msg.contains("invalid range")),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
+
     // -------------------------------------------------------------------
     // ReplicaAppliedTracker
     // -------------------------------------------------------------------
@@ -620,6 +936,19 @@ mod tests {
         // Reload verifies the flush actually persisted the value.
         let t2 = ReplicaAppliedTracker::load(path).unwrap();
         assert_eq!(t2.get("s"), 5);
+    }
+
+    #[test]
+    fn applied_tracker_flush_creates_missing_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("applied.dat");
+        let tracker = ReplicaAppliedTracker::load(path.clone()).unwrap();
+
+        tracker.set("source", 9);
+        tracker.flush().unwrap();
+
+        let reopened = ReplicaAppliedTracker::load(path).unwrap();
+        assert_eq!(reopened.get("source"), 9);
     }
 
     #[test]

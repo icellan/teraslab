@@ -6,19 +6,18 @@ use std::time::Duration;
 /// Returns true when `TERASLAB_TEST_TIMING=1` is set, enabling detailed
 /// timing logs on stderr for every major phase of the test.
 pub fn timing_enabled() -> bool {
-    std::env::var("TERASLAB_TEST_TIMING").map_or(false, |v| v == "1")
+    std::env::var("TERASLAB_TEST_TIMING").is_ok_and(|v| v == "1")
 }
-use teraslab_test_client::{Client, ClientConfig, ClientError, PoolConfig};
-use teraslab_test_client::helpers::DockerHelpers;
-use teraslab_test_client::verifier::{Mismatch, StateVerifier, parse_metadata_fields};
-use teraslab_test_client::types::{CreateItem, FIELD_ALL, FIELD_ALL_METADATA};
 use teraslab::protocol::codec::encode_get_batch;
 use teraslab::protocol::opcodes::{FLAG_LOCAL_READ, OP_GET_BATCH, STATUS_OK};
+use teraslab_test_client::helpers::DockerHelpers;
+use teraslab_test_client::types::{CreateItem, FIELD_ALL, FIELD_ALL_METADATA};
+use teraslab_test_client::verifier::{Mismatch, StateVerifier, parse_metadata_fields};
+use teraslab_test_client::{Client, ClientConfig, ClientError, PoolConfig};
 
 /// Path to the docker compose directory.
 pub fn compose_dir() -> String {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR")
-        .unwrap_or_else(|_| ".".to_string());
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     format!("{manifest}/../docker")
 }
 
@@ -63,7 +62,10 @@ pub fn docker_5node(scenario_id: u16) -> DockerHelpers {
 
 /// Create a Client connected to N nodes via host port mapping, using ports
 /// derived from the given DockerHelpers instance.
-pub async fn create_client(docker: &DockerHelpers, node_count: usize) -> Result<Client, ClientError> {
+pub async fn create_client(
+    docker: &DockerHelpers,
+    node_count: usize,
+) -> Result<Client, ClientError> {
     let config = ClientConfig {
         addr: None,
         seeds: docker.host_client_addrs(node_count),
@@ -124,15 +126,10 @@ pub async fn wait_client_excludes_nodes(
 ) -> Result<(), ClientError> {
     let start = std::time::Instant::now();
     let mut backoff = Duration::from_millis(100);
-    let mut last_overlap: Vec<u64> = excluded.to_vec();
-    let mut last_version = 0u64;
-    let mut last_masters: std::collections::BTreeSet<u64> =
-        std::collections::BTreeSet::new();
     loop {
         let _ = client.refresh_routing().await;
         let pm = client.get_partition_map().await?;
-        let masters: std::collections::BTreeSet<u64> =
-            pm.assignments.iter().copied().collect();
+        let masters: std::collections::BTreeSet<u64> = pm.assignments.iter().copied().collect();
         let overlap: Vec<u64> = excluded
             .iter()
             .copied()
@@ -141,14 +138,12 @@ pub async fn wait_client_excludes_nodes(
         if overlap.is_empty() {
             return Ok(());
         }
-        last_overlap = overlap;
-        last_version = pm.version;
-        last_masters = masters;
         if start.elapsed() >= timeout {
             return Err(ClientError::Connection(format!(
                 "client partition map still routes shards to isolated node(s) \
-                 {last_overlap:?} after {timeout:?}: version={last_version}, \
-                 unique_masters={last_masters:?} — client would route to minority side",
+                 {overlap:?} after {timeout:?}: version={}, \
+                 unique_masters={masters:?} — client would route to minority side",
+                pm.version,
             )));
         }
         tokio::time::sleep(backoff).await;
@@ -158,7 +153,10 @@ pub async fn wait_client_excludes_nodes(
 
 /// Fetch the HTTP /status JSON for a given node number, using ports from the
 /// provided DockerHelpers.
-pub async fn http_status(docker: &DockerHelpers, node_num: u32) -> Result<serde_json::Value, ClientError> {
+pub async fn http_status(
+    docker: &DockerHelpers,
+    node_num: u32,
+) -> Result<serde_json::Value, ClientError> {
     let port = docker.http_port(node_num);
     let url = format!("http://127.0.0.1:{port}/status");
     poll_json(&url).await
@@ -169,7 +167,8 @@ pub async fn http_quiesce(docker: &DockerHelpers, node_num: u32) -> Result<(), C
     let port = docker.http_port(node_num);
     let url = format!("http://127.0.0.1:{port}/admin/quiesce");
     let client = reqwest::Client::new();
-    let resp = client.put(&url)
+    let resp = client
+        .put(&url)
         .send()
         .await
         .map_err(|e| ClientError::Connection(format!("PUT {url} failed: {e}")))?;
@@ -183,14 +182,21 @@ pub async fn http_quiesce(docker: &DockerHelpers, node_num: u32) -> Result<(), C
 }
 
 /// Fetch the HTTP /admin/migration_status JSON for a given node number.
-pub async fn http_migration_status(docker: &DockerHelpers, node_num: u32) -> Result<serde_json::Value, ClientError> {
+pub async fn http_migration_status(
+    docker: &DockerHelpers,
+    node_num: u32,
+) -> Result<serde_json::Value, ClientError> {
     let port = docker.http_port(node_num);
     let url = format!("http://127.0.0.1:{port}/admin/migration_status");
     poll_json(&url).await
 }
 
 /// Wait until all nodes report the expected cluster size via HTTP /status.
-pub async fn wait_cluster_ready(docker: &DockerHelpers, node_count: u32, timeout: Duration) -> Result<(), ClientError> {
+pub async fn wait_cluster_ready(
+    docker: &DockerHelpers,
+    node_count: u32,
+    timeout: Duration,
+) -> Result<(), ClientError> {
     let start = std::time::Instant::now();
     let mut last_log = std::time::Instant::now();
     loop {
@@ -199,14 +205,13 @@ pub async fn wait_cluster_ready(docker: &DockerHelpers, node_count: u32, timeout
         for i in 1..=node_count {
             let port = docker.http_port(i);
             let url = format!("http://127.0.0.1:{port}/status");
-            if let Ok(json) = poll_json(&url).await {
-                if let Some(size) = json["cluster_size"].as_u64() {
-                    if size == node_count as u64 {
-                        ready += 1;
-                        if let Some(v) = json["shard_table_version"].as_u64() {
-                            versions.push(v);
-                        }
-                    }
+            if let Ok(json) = poll_json(&url).await
+                && let Some(size) = json["cluster_size"].as_u64()
+                && size == node_count as u64
+            {
+                ready += 1;
+                if let Some(v) = json["shard_table_version"].as_u64() {
+                    versions.push(v);
                 }
             }
         }
@@ -220,10 +225,10 @@ pub async fn wait_cluster_ready(docker: &DockerHelpers, node_count: u32, timeout
         for i in 1..=node_count {
             let port = docker.http_port(i);
             let url = format!("http://127.0.0.1:{port}/status");
-            if let Ok(json) = poll_json(&url).await {
-                if let Some(m) = json["master_shard_count"].as_u64() {
-                    min_masters = min_masters.min(m);
-                }
+            if let Ok(json) = poll_json(&url).await
+                && let Some(m) = json["master_shard_count"].as_u64()
+            {
+                min_masters = min_masters.min(m);
             }
         }
         let balanced = node_count <= 1 || min_masters > 0;
@@ -233,18 +238,25 @@ pub async fn wait_cluster_ready(docker: &DockerHelpers, node_count: u32, timeout
             && balanced
         {
             if timing_enabled() {
-                eprintln!("  wait_cluster_ready: {node_count} nodes converged in {:.1}ms (version={})", start.elapsed().as_secs_f64() * 1000.0, versions[0]);
+                eprintln!(
+                    "  wait_cluster_ready: {node_count} nodes converged in {:.1}ms (version={})",
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    versions[0]
+                );
             }
             return Ok(());
         }
         if timing_enabled() && last_log.elapsed() >= Duration::from_secs(2) {
-            eprintln!("  wait_cluster_ready: {ready}/{node_count} ready, versions={versions:?} ({:.1}s)", start.elapsed().as_secs_f64());
+            eprintln!(
+                "  wait_cluster_ready: {ready}/{node_count} ready, versions={versions:?} ({:.1}s)",
+                start.elapsed().as_secs_f64()
+            );
             last_log = std::time::Instant::now();
         }
         if start.elapsed() >= timeout {
-            return Err(ClientError::Connection(
-                format!("{ready}/{node_count} nodes ready (versions: {versions:?}) after {timeout:?}"),
-            ));
+            return Err(ClientError::Connection(format!(
+                "{ready}/{node_count} nodes ready (versions: {versions:?}) after {timeout:?}"
+            )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -261,17 +273,16 @@ pub async fn wait_node_cluster_size(
     let start = std::time::Instant::now();
     loop {
         let url = format!("http://127.0.0.1:{port}/status");
-        if let Ok(json) = poll_json(&url).await {
-            if let Some(size) = json["cluster_size"].as_u64() {
-                if size == expected_size as u64 {
-                    return Ok(());
-                }
-            }
+        if let Ok(json) = poll_json(&url).await
+            && let Some(size) = json["cluster_size"].as_u64()
+            && size == expected_size as u64
+        {
+            return Ok(());
         }
         if start.elapsed() >= timeout {
-            return Err(ClientError::Connection(
-                format!("node {node_num}: cluster_size != {expected_size} after {timeout:?}"),
-            ));
+            return Err(ClientError::Connection(format!(
+                "node {node_num}: cluster_size != {expected_size} after {timeout:?}"
+            )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -305,21 +316,22 @@ pub async fn wait_specific_nodes_ready(
             return Ok(());
         }
         if timing_enabled() && last_log.elapsed() >= Duration::from_secs(2) {
-            let detail: Vec<String> = sizes.iter()
-                .map(|(n, s)| format!("node{n}={s}"))
-                .collect();
-            eprintln!("  wait_specific_nodes: {ready}/{} ready, sizes=[{}] ({:.1}s)",
-                node_nums.len(), detail.join(", "), start.elapsed().as_secs_f64());
+            let detail: Vec<String> = sizes.iter().map(|(n, s)| format!("node{n}={s}")).collect();
+            eprintln!(
+                "  wait_specific_nodes: {ready}/{} ready, sizes=[{}] ({:.1}s)",
+                node_nums.len(),
+                detail.join(", "),
+                start.elapsed().as_secs_f64()
+            );
             last_log = std::time::Instant::now();
         }
         if start.elapsed() >= timeout {
-            let detail: Vec<String> = sizes.iter()
-                .map(|(n, s)| format!("node{n}={s}"))
-                .collect();
-            return Err(ClientError::Connection(
-                format!("{ready}/{} specific nodes ready after {timeout:?} [{}]",
-                    node_nums.len(), detail.join(", ")),
-            ));
+            let detail: Vec<String> = sizes.iter().map(|(n, s)| format!("node{n}={s}")).collect();
+            return Err(ClientError::Connection(format!(
+                "{ready}/{} specific nodes ready after {timeout:?} [{}]",
+                node_nums.len(),
+                detail.join(", ")
+            )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -332,10 +344,12 @@ pub async fn wait_specific_migrations_complete(
     timeout: Duration,
 ) -> Result<(), ClientError> {
     let start = std::time::Instant::now();
+    let mut ready_polls = 0u32;
     loop {
         let mut all_idle = true;
         let mut total_masters: u64 = 0;
         let mut total_inbound_pending: u64 = 0;
+        let mut total_pending_handoffs: u64 = 0;
         let mut status_details = Vec::new();
         for &n in node_nums {
             let port = docker.http_port(n);
@@ -358,6 +372,7 @@ pub async fn wait_specific_migrations_complete(
                 let shard_table_version = json["shard_table_version"].as_u64().unwrap_or(0);
                 let topology_term = json["topology_term"].as_u64().unwrap_or(0);
                 let pending_handoffs = json["pending_handoff_shards"].as_u64().unwrap_or(0);
+                total_pending_handoffs += pending_handoffs;
                 if let Some(m) = json["master_shard_count"].as_u64() {
                     total_masters += m;
                     status_details.push(format!(
@@ -372,9 +387,16 @@ pub async fn wait_specific_migrations_complete(
                 ));
             }
         }
-        // During handoff, shards may be counted on both old and new masters,
-        // causing total_masters to briefly exceed 4096. Accept >= 4096.
-        if total_masters >= 4096 && all_idle {
+        if total_masters == 4096
+            && total_pending_handoffs == 0
+            && total_inbound_pending == 0
+            && all_idle
+        {
+            ready_polls += 1;
+            if ready_polls < 3 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
             if timing_enabled() {
                 eprintln!(
                     "  wait_specific_migrations: complete in {:.1}ms [{}]",
@@ -384,13 +406,12 @@ pub async fn wait_specific_migrations_complete(
             }
             return Ok(());
         }
+        ready_polls = 0;
         if start.elapsed() >= timeout {
-            return Err(ClientError::Connection(
-                format!(
-                    "migrations still active on specific nodes after {timeout:?} [masters={total_masters}/4096, inbound={total_inbound_pending}] [{}]",
-                    status_details.join(", ")
-                ),
-            ));
+            return Err(ClientError::Connection(format!(
+                "migrations still active on specific nodes after {timeout:?} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}] [{}]",
+                status_details.join(", ")
+            )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -408,8 +429,7 @@ pub async fn wait_migrations_complete(
     let mig_start = std::time::Instant::now();
     let mut mig_last_log = std::time::Instant::now();
     let start = std::time::Instant::now();
-    // Track when handoff count stopped decreasing, for orphan detection.
-    let mut last_handoff_snapshot: Option<(u64, Duration)> = None;
+    let mut ready_polls = 0u32;
     loop {
         let mut all_idle = true;
         let mut total_masters: u64 = 0;
@@ -422,11 +442,11 @@ pub async fn wait_migrations_complete(
             if let Ok(json) = poll_json(&url).await {
                 let inbound_pending = json["inbound_pending"].as_u64().unwrap_or(0);
                 total_inbound_pending += inbound_pending;
-                if let Some(count) = json["active_count"].as_u64() {
-                    if count > 0 {
-                        all_idle = false;
-                        node_details.push(format!("node{i}:mig={count}"));
-                    }
+                if let Some(count) = json["active_count"].as_u64()
+                    && count > 0
+                {
+                    all_idle = false;
+                    node_details.push(format!("node{i}:mig={count}"));
                 }
                 if inbound_pending > 0 {
                     node_details.push(format!("node{i}:inbound={inbound_pending}"));
@@ -445,54 +465,41 @@ pub async fn wait_migrations_complete(
                 }
             }
         }
-        // Accept masters within ±128 of 4096. The pipelined migration
-        // causes temporary double-counting while handoff commits propagate
-        // across batched sub-groups.
-        let masters_ok = total_masters >= 3968 && total_masters <= 4224;
+        let masters_ok = total_masters == 4096;
         if masters_ok && total_pending_handoffs == 0 && total_inbound_pending == 0 && all_idle {
+            ready_polls += 1;
+            if ready_polls < 3 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
             if timing_enabled() {
-                eprintln!("  wait_migrations: complete in {:.1}ms", mig_start.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "  wait_migrations: complete in {:.1}ms",
+                    mig_start.elapsed().as_secs_f64() * 1000.0
+                );
             }
             return Ok(());
         }
-        // Fallback: if all masters are assigned and no active migrations,
-        // accept the cluster even with pending handoffs IF the handoff
-        // count has stopped decreasing (stuck for >= 3 seconds). This
-        // catches genuinely orphaned handoffs (dead source node) without
-        // accepting prematurely during live-node scenarios where handoffs
-        // are still completing.
-        if masters_ok && all_idle && total_pending_handoffs > 0 && total_inbound_pending == 0 {
-            if let Some((prev_h, prev_t)) = last_handoff_snapshot {
-                if total_pending_handoffs >= prev_h
-                    && start.elapsed().saturating_sub(prev_t) >= Duration::from_secs(3)
-                {
-                    if timing_enabled() {
-                        eprintln!("  wait_migrations: accepting with {total_pending_handoffs} orphaned handoffs after {:.1}s",
-                            mig_start.elapsed().as_secs_f64());
-                    }
-                    return Ok(());
-                }
-            }
-            if last_handoff_snapshot.is_none()
-                || last_handoff_snapshot.map_or(false, |(h, _)| total_pending_handoffs < h)
-            {
-                last_handoff_snapshot = Some((total_pending_handoffs, start.elapsed()));
-            }
-        }
+        ready_polls = 0;
         if timing_enabled() && mig_last_log.elapsed() >= Duration::from_secs(2) {
-            eprintln!("  wait_migrations: masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}, idle={all_idle} ({:.1}s) [{}]",
-                mig_start.elapsed().as_secs_f64(), node_details.join(", "));
+            eprintln!(
+                "  wait_migrations: masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}, idle={all_idle} ({:.1}s) [{}]",
+                mig_start.elapsed().as_secs_f64(),
+                node_details.join(", ")
+            );
             mig_last_log = std::time::Instant::now();
         }
         if start.elapsed() >= timeout {
             let detail = if !node_details.is_empty() {
                 format!(" [{}]", node_details.join(", "))
             } else {
-                format!(" [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}]")
+                format!(
+                    " [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}]"
+                )
             };
-            return Err(ClientError::Connection(
-                format!("migrations still active after {timeout:?}{detail}"),
-            ));
+            return Err(ClientError::Connection(format!(
+                "migrations still active after {timeout:?}{detail}"
+            )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -607,26 +614,10 @@ pub async fn wait_for_migration_reads_ready(
             .count();
         let master_failed = master_failed_idx.len();
 
-        // Gate on the master-route check — this is the exact path the
-        // downstream test reads will use and the primary correctness
-        // signal. `under_replicated` is reported as a warning: a record
-        // may be briefly under-replicated while replica backfill catches
-        // up after a migration, but as long as the master serves it the
-        // test's reads succeed. Keeping `under_replicated` blocking here
-        // would entangle the barrier with replica-lag concerns that are
-        // separate from pattern A's master-miss failure mode.
-        if master_failed == 0 {
+        if master_failed == 0 && under_replicated == 0 {
             if timing_enabled() {
-                let under_repl_note = if under_replicated > 0 {
-                    format!(
-                        " (info: {under_replicated}/{} sampled txids under-replicated)",
-                        sample_indices.len(),
-                    )
-                } else {
-                    String::new()
-                };
                 eprintln!(
-                    "  wait_for_migration_reads_ready: {} txids verified ({} sampled for replicas) in {:.1}ms{under_repl_note}",
+                    "  wait_for_migration_reads_ready: {} txids verified ({} sampled for replicas) in {:.1}ms",
                     txids.len(),
                     sample_indices.len(),
                     start.elapsed().as_secs_f64() * 1000.0,
@@ -657,8 +648,7 @@ pub async fn wait_for_migration_reads_ready(
                 let prefix: String = txid[..6].iter().map(|b| format!("{b:02x}")).collect();
                 let mut holders = 0usize;
                 for addr in &node_addrs {
-                    let payload =
-                        encode_get_batch(FIELD_ALL_METADATA, std::slice::from_ref(&txid));
+                    let payload = encode_get_batch(FIELD_ALL_METADATA, std::slice::from_ref(&txid));
                     let ok = match client
                         .send_to_addr(addr, OP_GET_BATCH, FLAG_LOCAL_READ, payload)
                         .await
@@ -715,10 +705,10 @@ pub async fn wait_replication_settled(
         for i in 1..=node_count {
             let port = docker.http_port(i);
             let url = format!("http://127.0.0.1:{port}/debug/redo");
-            if let Ok(json) = poll_json(&url).await {
-                if let Some(seq) = json["current_sequence"].as_u64() {
-                    seqs.push(seq);
-                }
+            if let Ok(json) = poll_json(&url).await
+                && let Some(seq) = json["current_sequence"].as_u64()
+            {
+                seqs.push(seq);
             }
         }
 
@@ -734,7 +724,9 @@ pub async fn wait_replication_settled(
         prev_seqs = seqs;
 
         if start.elapsed() >= timeout {
-            return Ok(()); // Best-effort: don't fail the test over lag.
+            return Err(ClientError::Connection(format!(
+                "replication did not settle on {node_count} nodes after {timeout:?}; last redo sequences: {prev_seqs:?}",
+            )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -756,10 +748,10 @@ pub async fn wait_specific_replication_settled(
         for &n in node_nums {
             let port = docker.http_port(n);
             let url = format!("http://127.0.0.1:{port}/debug/redo");
-            if let Ok(json) = poll_json(&url).await {
-                if let Some(seq) = json["current_sequence"].as_u64() {
-                    seqs.push(seq);
-                }
+            if let Ok(json) = poll_json(&url).await
+                && let Some(seq) = json["current_sequence"].as_u64()
+            {
+                seqs.push(seq);
             }
         }
 
@@ -774,7 +766,9 @@ pub async fn wait_specific_replication_settled(
         prev_seqs = seqs;
 
         if start.elapsed() >= timeout {
-            return Ok(());
+            return Err(ClientError::Connection(format!(
+                "replication did not settle on nodes {node_nums:?} after {timeout:?}; last redo sequences: {prev_seqs:?}",
+            )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -792,7 +786,9 @@ pub async fn start_3node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Cli
 
     for attempt in 1..=MAX_ATTEMPTS {
         if timing_enabled() {
-            eprintln!("  start_3node_cluster[{scenario_id}]: compose_up (attempt {attempt}/{MAX_ATTEMPTS})");
+            eprintln!(
+                "  start_3node_cluster[{scenario_id}]: compose_up (attempt {attempt}/{MAX_ATTEMPTS})"
+            );
         }
         docker.compose_up().await?;
         if timing_enabled() {
@@ -811,7 +807,7 @@ pub async fn start_3node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Cli
                     );
                     eprintln!("  start_3node_cluster[{scenario_id}]: wait_migrations_complete");
                 }
-                wait_migrations_complete(&docker, 3, Duration::from_secs(30)).await?;
+                wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
                 if timing_enabled() {
                     eprintln!(
                         "  start_3node_cluster[{scenario_id}]: migrations complete in {:.1}ms",
@@ -867,7 +863,9 @@ pub async fn start_5node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Cli
 
     for attempt in 1..=MAX_ATTEMPTS {
         if timing_enabled() {
-            eprintln!("  start_5node_cluster[{scenario_id}]: compose_up (attempt {attempt}/{MAX_ATTEMPTS})");
+            eprintln!(
+                "  start_5node_cluster[{scenario_id}]: compose_up (attempt {attempt}/{MAX_ATTEMPTS})"
+            );
         }
         docker.compose_up().await?;
         if timing_enabled() {
@@ -886,7 +884,7 @@ pub async fn start_5node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Cli
                     );
                     eprintln!("  start_5node_cluster[{scenario_id}]: wait_migrations_complete");
                 }
-                wait_migrations_complete(&docker, 5, Duration::from_secs(30)).await?;
+                wait_migrations_complete(&docker, 5, Duration::from_secs(120)).await?;
                 if timing_enabled() {
                     eprintln!(
                         "  start_5node_cluster[{scenario_id}]: migrations complete in {:.1}ms",
@@ -935,6 +933,48 @@ pub async fn start_5node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Cli
 
 /// Seed N records with the given UTXO count each.
 /// Returns the list of txids created.
+type SeedMeta = ([u8; 32], Vec<[u8; 32]>);
+
+async fn reconcile_existing_seed_records(
+    client: &Client,
+    remaining_items: &mut Vec<CreateItem>,
+    remaining_meta: &mut Vec<SeedMeta>,
+    succeeded_meta: &mut Vec<SeedMeta>,
+) -> usize {
+    if remaining_items.is_empty() {
+        return 0;
+    }
+
+    let txids: Vec<[u8; 32]> = remaining_meta.iter().map(|(txid, _)| *txid).collect();
+    let results = match client.get_batch(FIELD_ALL_METADATA, &txids).await {
+        Ok(results) => results,
+        Err(_) => {
+            let _ = client.refresh_routing().await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            match client.get_batch(FIELD_ALL_METADATA, &txids).await {
+                Ok(results) => results,
+                Err(_) => return 0,
+            }
+        }
+    };
+
+    let old_items = std::mem::take(remaining_items);
+    let old_meta = std::mem::take(remaining_meta);
+    let mut reconciled = 0usize;
+
+    for (idx, (item, meta)) in old_items.into_iter().zip(old_meta.into_iter()).enumerate() {
+        if idx < results.len() && results.found(idx) {
+            succeeded_meta.push(meta);
+            reconciled += 1;
+        } else {
+            remaining_items.push(item);
+            remaining_meta.push(meta);
+        }
+    }
+
+    reconciled
+}
+
 pub async fn seed_records(
     client: &Client,
     verifier: &StateVerifier,
@@ -1001,7 +1041,7 @@ pub async fn seed_records(
             match client.create_batch(&remaining_items).await {
                 Ok(_) => {
                     // All remaining items succeeded.
-                    succeeded_meta.extend(remaining_meta.drain(..));
+                    succeeded_meta.append(&mut remaining_meta);
                     remaining_items.clear();
                     break;
                 }
@@ -1027,8 +1067,10 @@ pub async fn seed_records(
                             pe.errors.iter().map(|e| e.item_index as usize).collect();
                         let mut retry_items = Vec::new();
                         let mut retry_meta = Vec::new();
-                        for (i, (item, meta)) in remaining_items.drain(..)
-                            .zip(remaining_meta.drain(..)).enumerate()
+                        for (i, (item, meta)) in remaining_items
+                            .drain(..)
+                            .zip(remaining_meta.drain(..))
+                            .enumerate()
                         {
                             if failed_indices.contains(&i) {
                                 retry_items.push(item);
@@ -1044,12 +1086,27 @@ pub async fn seed_records(
                             failed_indices.len()
                         );
                     }
+                    let reconciled = reconcile_existing_seed_records(
+                        client,
+                        &mut remaining_items,
+                        &mut remaining_meta,
+                        &mut succeeded_meta,
+                    )
+                    .await;
+                    if reconciled > 0 {
+                        eprintln!(
+                            "seed_records: reconciled {reconciled} ambiguous existing record(s) after attempt {attempt}"
+                        );
+                    }
                     if remaining_items.is_empty() {
                         break;
                     }
                     if attempt == 0 {
-                        eprintln!("seed_records: transient error on attempt {attempt}, \
-                            retrying {} items: {e}", remaining_items.len());
+                        eprintln!(
+                            "seed_records: transient error on attempt {attempt}, \
+                            retrying {} items: {e}",
+                            remaining_items.len()
+                        );
                     }
                     let delay = Duration::from_millis(500 * (1 << attempt.min(3)));
                     tokio::time::sleep(delay).await;
@@ -1062,9 +1119,10 @@ pub async fn seed_records(
             }
         }
         if !remaining_items.is_empty() {
-            return Err(ClientError::Connection(
-                format!("create_batch: {} items still failing after retries", remaining_items.len())
-            ));
+            return Err(ClientError::Connection(format!(
+                "create_batch: {} items still failing after retries",
+                remaining_items.len()
+            )));
         }
         for (txid, utxo_hashes) in succeeded_meta {
             verifier.record_create(txid, utxos_per_tx, utxo_hashes);
@@ -1078,7 +1136,12 @@ pub async fn seed_records(
 /// Tear down the Docker cluster for a specific scenario and wait for cleanup.
 pub async fn teardown(docker: &mut DockerHelpers) {
     force_cleanup(docker.scenario_id()).await;
-    wait_ports_free(docker.http_port(1), docker.scenario_id(), docker.node_count()).await;
+    wait_ports_free(
+        docker.http_port(1),
+        docker.scenario_id(),
+        docker.node_count(),
+    )
+    .await;
 }
 
 /// Batch-read a set of txids and return how many were NOT found (status != 0).
@@ -1094,11 +1157,18 @@ pub async fn count_accessible(
     for chunk in txids.chunks(500) {
         let results = client.get_batch(FIELD_ALL_METADATA, chunk).await?;
         for result in results.iter() {
-            if result.status() == 0 { found += 1; } else { not_found += 1; }
+            if result.status() == 0 {
+                found += 1;
+            } else {
+                not_found += 1;
+            }
         }
     }
     if timing_enabled() {
-        eprintln!("  count_accessible: {found}/{total} found in {:.1}ms", start.elapsed().as_secs_f64() * 1000.0);
+        eprintln!(
+            "  count_accessible: {found}/{total} found in {:.1}ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
     }
     Ok((found, not_found))
 }
@@ -1129,7 +1199,10 @@ pub async fn verify_consistency(
             let mut res = None;
             for _retry in 0..3 {
                 match client.get_batch(FIELD_ALL_METADATA, chunk).await {
-                    Ok(r) => { res = Some(r); break; }
+                    Ok(r) => {
+                        res = Some(r);
+                        break;
+                    }
                     Err(e) => {
                         let _ = client.refresh_routing().await;
                         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1171,24 +1244,22 @@ pub async fn verify_consistency(
     // Retry NotFound records after refreshing routing — the partition map may
     // have been stale for shards that recently migrated.
     if !not_found_txids.is_empty() {
-        eprintln!("verify_consistency: {} records NotFound on first pass, retrying after routing refresh...",
-            not_found_txids.len());
+        eprintln!(
+            "verify_consistency: {} records NotFound on first pass, retrying after routing refresh...",
+            not_found_txids.len()
+        );
         let _ = client.refresh_routing().await;
         tokio::time::sleep(Duration::from_millis(500)).await;
         let _ = client.refresh_routing().await;
 
         for chunk in not_found_txids.chunks(500) {
-            let results = client
-                .get_batch(FIELD_ALL_METADATA, chunk)
-                .await?;
+            let results = client.get_batch(FIELD_ALL_METADATA, chunk).await?;
 
             for (i, result) in results.iter().enumerate() {
                 let txid = &chunk[i];
 
                 if result.status() != 0 {
-                    let mm = verifier.verify_record(
-                        txid, 0, false, false, false, true,
-                    );
+                    let mm = verifier.verify_record(txid, 0, false, false, false, true);
                     all_mismatches.extend(mm);
                     continue;
                 }
@@ -1224,9 +1295,7 @@ pub async fn verify_consistency(
         if chunk.is_empty() {
             break;
         }
-        let results = client
-            .get_batch(FIELD_ALL_METADATA, chunk)
-            .await?;
+        let results = client.get_batch(FIELD_ALL_METADATA, chunk).await?;
         for (i, result) in results.iter().enumerate() {
             if result.status() == 0 {
                 // Record found but should be deleted
@@ -1269,19 +1338,23 @@ async fn force_cleanup(scenario_id: u16) {
     let container_filter = format!("name={sid}-node");
     let container_deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
-        let ids = docker_output_timeout(&vec![
-            "ps".to_string(),
-            "-aq".to_string(),
-            "--filter".to_string(),
-            container_filter.clone(),
-        ], Duration::from_secs(5)).await
-            .map(|out| {
-                String::from_utf8_lossy(&out.stdout)
-                    .split_whitespace()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<String>>()
-            })
-            .unwrap_or_default();
+        let ids = docker_output_timeout(
+            &[
+                "ps".to_string(),
+                "-aq".to_string(),
+                "--filter".to_string(),
+                container_filter.clone(),
+            ],
+            Duration::from_secs(5),
+        )
+        .await
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
         if ids.is_empty() || std::time::Instant::now() >= container_deadline {
             break;
         }
@@ -1295,20 +1368,24 @@ async fn force_cleanup(scenario_id: u16) {
     let volume_filter = format!("name={sid}");
     let vol_handle = tokio::spawn(async move {
         loop {
-            let vols = docker_output_timeout(&vec![
-                "volume".to_string(),
-                "ls".to_string(),
-                "-q".to_string(),
-                "--filter".to_string(),
-                volume_filter.clone(),
-            ], Duration::from_secs(5)).await
-                .map(|out| {
-                    String::from_utf8_lossy(&out.stdout)
-                        .split_whitespace()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<String>>()
-                })
-                .unwrap_or_default();
+            let vols = docker_output_timeout(
+                &[
+                    "volume".to_string(),
+                    "ls".to_string(),
+                    "-q".to_string(),
+                    "--filter".to_string(),
+                    volume_filter.clone(),
+                ],
+                Duration::from_secs(5),
+            )
+            .await
+            .map(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
             if vols.is_empty() || std::time::Instant::now() >= volume_deadline {
                 break;
             }
@@ -1323,20 +1400,24 @@ async fn force_cleanup(scenario_id: u16) {
     let network_filter = format!("name={sid}");
     let net_handle = tokio::spawn(async move {
         loop {
-            let nets = docker_output_timeout(&vec![
-                "network".to_string(),
-                "ls".to_string(),
-                "-q".to_string(),
-                "--filter".to_string(),
-                network_filter.clone(),
-            ], Duration::from_secs(5)).await
-                .map(|out| {
-                    String::from_utf8_lossy(&out.stdout)
-                        .split_whitespace()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<String>>()
-                })
-                .unwrap_or_default();
+            let nets = docker_output_timeout(
+                &[
+                    "network".to_string(),
+                    "ls".to_string(),
+                    "-q".to_string(),
+                    "--filter".to_string(),
+                    network_filter.clone(),
+                ],
+                Duration::from_secs(5),
+            )
+            .await
+            .map(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
             if nets.is_empty() || std::time::Instant::now() >= network_deadline {
                 break;
             }
@@ -1354,20 +1435,24 @@ async fn force_cleanup(scenario_id: u16) {
 /// Wait until a single node's HTTP health endpoint responds.
 /// Polls `GET /health/live` every 100ms, returns as soon as it gets a 200,
 /// or after `timeout` elapses.
-pub async fn wait_node_healthy(docker: &DockerHelpers, node_num: u32, timeout: Duration) -> Result<(), ClientError> {
+pub async fn wait_node_healthy(
+    docker: &DockerHelpers,
+    node_num: u32,
+    timeout: Duration,
+) -> Result<(), ClientError> {
     let port = docker.http_port(node_num);
     let url = format!("http://127.0.0.1:{port}/health/live");
     let start = std::time::Instant::now();
     loop {
-        if let Ok(resp) = poll_http_client().get(&url).send().await {
-            if resp.status().is_success() {
-                return Ok(());
-            }
+        if let Ok(resp) = poll_http_client().get(&url).send().await
+            && resp.status().is_success()
+        {
+            return Ok(());
         }
         if start.elapsed() >= timeout {
-            return Err(ClientError::Connection(
-                format!("node {node_num} not healthy after {timeout:?}"),
-            ));
+            return Err(ClientError::Connection(format!(
+                "node {node_num} not healthy after {timeout:?}"
+            )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -1381,37 +1466,82 @@ pub async fn direct_get(
     txids: &[[u8; 32]],
 ) -> Result<(u8, Vec<u8>), ClientError> {
     let payload = encode_get_batch(FIELD_ALL, txids);
-    client.send_to_addr(node_addr, OP_GET_BATCH, FLAG_LOCAL_READ, payload).await
+    client
+        .send_to_addr(node_addr, OP_GET_BATCH, FLAG_LOCAL_READ, payload)
+        .await
 }
 
 /// Parse a batch get response into per-item (status, data) pairs.
 pub fn parse_batch_response(payload: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    parse_batch_response_exact(payload, None).unwrap_or_default()
+}
+
+fn parse_batch_response_exact(
+    payload: &[u8],
+    expected_count: Option<usize>,
+) -> Option<Vec<(u8, Vec<u8>)>> {
     let mut items = Vec::new();
     if payload.len() < 4 {
-        return items;
+        return None;
     }
     let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    if let Some(expected) = expected_count
+        && count != expected
+    {
+        return None;
+    }
     let mut offset = 4;
     for _ in 0..count {
         if offset >= payload.len() {
-            break;
+            return None;
         }
         let status = payload[offset];
         offset += 1;
         if offset + 4 > payload.len() {
-            break;
+            return None;
         }
         let data_len = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
-        let data = if data_len > 0 && offset + data_len <= payload.len() {
-            payload[offset..offset + data_len].to_vec()
-        } else {
-            vec![]
-        };
+        if offset + data_len > payload.len() {
+            return None;
+        }
+        let data = payload[offset..offset + data_len].to_vec();
         offset += data_len;
         items.push((status, data));
     }
-    items
+    if offset != payload.len() {
+        return None;
+    }
+    Some(items)
+}
+
+async fn direct_get_items(
+    client: &Client,
+    addr: &str,
+    txids: &[[u8; 32]],
+) -> Result<Vec<(u8, Vec<u8>)>, ClientError> {
+    let (frame_status, payload) = direct_get(client, addr, txids).await?;
+    if frame_status != STATUS_OK {
+        return Ok(vec![(1, vec![]); txids.len()]);
+    }
+    if let Some(items) = parse_batch_response_exact(&payload, Some(txids.len())) {
+        return Ok(items);
+    }
+
+    let mut items = Vec::with_capacity(txids.len());
+    for txid in txids {
+        let (single_status, single_payload) =
+            direct_get(client, addr, std::slice::from_ref(txid)).await?;
+        if single_status != STATUS_OK {
+            items.push((1, vec![]));
+            continue;
+        }
+        match parse_batch_response_exact(&single_payload, Some(1)) {
+            Some(mut parsed) => items.push(parsed.remove(0)),
+            None => items.push((1, vec![])),
+        }
+    }
+    Ok(items)
 }
 
 /// Compare two per-item data payloads ignoring the `updated_at` timestamp field.
@@ -1436,6 +1566,88 @@ pub fn payloads_match(a: &[u8], b: &[u8]) -> bool {
     a_copy == b_copy
 }
 
+#[derive(Debug, Default)]
+struct ReplicationCheckReport {
+    mismatches: u32,
+    holder_errors: u32,
+    holder_count_histogram: Vec<u32>,
+    holder_examples: Vec<String>,
+    mismatch_examples: Vec<String>,
+}
+
+impl ReplicationCheckReport {
+    fn new(node_count: usize) -> Self {
+        Self {
+            holder_count_histogram: vec![0; node_count + 1],
+            ..Self::default()
+        }
+    }
+
+    fn record_holder_error(&mut self, txid: &[u8; 32], holder_indices: &[usize]) {
+        self.holder_errors += 1;
+        let count = holder_indices.len();
+        if count >= self.holder_count_histogram.len() {
+            self.holder_count_histogram.resize(count + 1, 0);
+        }
+        self.holder_count_histogram[count] += 1;
+        if self.holder_examples.len() < 8 {
+            self.holder_examples.push(format!(
+                "{} holders={:?}",
+                txid_prefix(txid),
+                holder_indices
+            ));
+        }
+    }
+
+    fn record_mismatch(&mut self, txid: &[u8; 32], holder_indices: &[usize], a: &[u8], b: &[u8]) {
+        self.mismatches += 1;
+        if self.mismatch_examples.len() < 8 {
+            let diffs = first_payload_diffs(a, b, 4);
+            self.mismatch_examples.push(format!(
+                "{} holders={:?} diffs={}",
+                txid_prefix(txid),
+                holder_indices,
+                diffs,
+            ));
+        }
+    }
+
+    fn holder_diagnostics(&self) -> String {
+        let histogram = self
+            .holder_count_histogram
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count > 0)
+            .map(|(holders, count)| format!("{holders}:{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let examples = if self.holder_examples.is_empty() {
+            "none".to_string()
+        } else {
+            self.holder_examples.join("; ")
+        };
+        format!("holder_count_histogram=[{histogram}], examples=[{examples}]")
+    }
+
+    fn mismatch_diagnostics(&self) -> String {
+        if self.mismatch_examples.is_empty() {
+            "examples=[none]".to_string()
+        } else {
+            format!("examples=[{}]", self.mismatch_examples.join("; "))
+        }
+    }
+}
+
+fn txid_prefix(txid: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(16);
+    for byte in txid.iter().take(8) {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 /// Batch replication check: fetch all txids from all nodes in bulk
 /// requests (chunked), then cross-compare in memory.
 ///
@@ -1449,28 +1661,30 @@ pub async fn batch_verify_replication(
     txids: &[[u8; 32]],
     expect_present: bool,
 ) -> Result<(u32, u32), ClientError> {
+    let report = batch_verify_replication_report(client, node_addrs, txids, expect_present).await?;
+    Ok((report.mismatches, report.holder_errors))
+}
+
+async fn batch_verify_replication_report(
+    client: &Client,
+    node_addrs: &[String],
+    txids: &[[u8; 32]],
+    expect_present: bool,
+) -> Result<ReplicationCheckReport, ClientError> {
     const CHUNK_SIZE: usize = 500;
 
     let mut node_items: Vec<Vec<(u8, Vec<u8>)>> = Vec::new();
     for addr in node_addrs {
         let mut all_items = Vec::with_capacity(txids.len());
         for chunk in txids.chunks(CHUNK_SIZE) {
-            let (frame_status, payload) = direct_get(client, addr, chunk).await?;
-            if frame_status == STATUS_OK {
-                all_items.extend(parse_batch_response(&payload));
-            } else {
-                for _ in 0..chunk.len() {
-                    all_items.push((1, vec![]));
-                }
-            }
+            all_items.extend(direct_get_items(client, addr, chunk).await?);
         }
         node_items.push(all_items);
     }
 
-    let mut mismatches = 0u32;
-    let mut holder_errors = 0u32;
+    let mut report = ReplicationCheckReport::new(node_addrs.len());
 
-    for (idx, _txid) in txids.iter().enumerate() {
+    for (idx, txid) in txids.iter().enumerate() {
         let mut holder_indices = Vec::new();
         for (node_idx, items) in node_items.iter().enumerate() {
             if idx < items.len() && items[idx].0 == 0 {
@@ -1480,22 +1694,100 @@ pub async fn batch_verify_replication(
 
         if expect_present {
             if holder_indices.len() != 2 {
-                holder_errors += 1;
+                report.record_holder_error(txid, &holder_indices);
                 continue;
             }
             let a = &node_items[holder_indices[0]][idx].1;
             let b = &node_items[holder_indices[1]][idx].1;
             if !payloads_match(a, b) {
-                mismatches += 1;
+                let precise_a = direct_get_items(
+                    client,
+                    node_addrs[holder_indices[0]].as_str(),
+                    std::slice::from_ref(txid),
+                )
+                .await?
+                .into_iter()
+                .next()
+                .unwrap_or((1, vec![]));
+                let precise_b = direct_get_items(
+                    client,
+                    node_addrs[holder_indices[1]].as_str(),
+                    std::slice::from_ref(txid),
+                )
+                .await?
+                .into_iter()
+                .next()
+                .unwrap_or((1, vec![]));
+                if precise_a.0 != STATUS_OK || precise_b.0 != STATUS_OK {
+                    report.record_holder_error(txid, &holder_indices);
+                } else if !payloads_match(&precise_a.1, &precise_b.1) {
+                    report.record_mismatch(txid, &holder_indices, &precise_a.1, &precise_b.1);
+                }
             }
         } else {
             if !holder_indices.is_empty() {
-                holder_errors += 1;
+                report.record_holder_error(txid, &holder_indices);
             }
         }
     }
 
-    Ok((mismatches, holder_errors))
+    Ok(report)
+}
+
+fn first_payload_diffs(a: &[u8], b: &[u8], limit: usize) -> String {
+    let mut diffs = Vec::new();
+    for i in 0..a.len().min(b.len()) {
+        if (61..69).contains(&i) {
+            continue;
+        }
+        if a[i] != b[i] {
+            diffs.push(format!("{i}:{}!={}", a[i], b[i]));
+            if diffs.len() >= limit {
+                break;
+            }
+        }
+    }
+    if a.len() != b.len() {
+        diffs.push(format!("len:{}!={}", a.len(), b.len()));
+    }
+    if diffs.is_empty() {
+        "none-after-ignored-fields".to_string()
+    } else {
+        diffs.join(",")
+    }
+}
+
+/// Assert that every present record has exactly the RF=2 holder count and
+/// byte-identical local-read payloads across its holders.
+pub async fn assert_rf2_replication_exact(
+    client: &Client,
+    docker: &DockerHelpers,
+    node_count: usize,
+    txids: &[[u8; 32]],
+    label: &str,
+) -> Result<(), ClientError> {
+    if txids.is_empty() {
+        return Ok(());
+    }
+    let node_addrs = docker.host_client_addrs(node_count);
+    let report = batch_verify_replication_report(client, &node_addrs, txids, true).await?;
+    assert_eq!(
+        report.holder_errors,
+        0,
+        "{label}: {}/{} records did not have exactly RF=2 local holders ({})",
+        report.holder_errors,
+        txids.len(),
+        report.holder_diagnostics(),
+    );
+    assert_eq!(
+        report.mismatches,
+        0,
+        "{label}: {}/{} records had non-identical local holder payloads ({})",
+        report.mismatches,
+        txids.len(),
+        report.mismatch_diagnostics(),
+    );
+    Ok(())
 }
 
 /// For a given txid, determine which nodes hold the record via FLAG_LOCAL_READ.
@@ -1509,15 +1801,13 @@ pub async fn find_holders(
     let mut non_holders = Vec::new();
     for (i, addr) in node_addrs.iter().enumerate() {
         let (frame_status, payload) = direct_get(client, addr, &[*txid]).await?;
-        if frame_status == STATUS_OK && !payload.is_empty() {
-            if payload.len() >= 4 {
-                let count = u32::from_le_bytes(payload[0..4].try_into().unwrap());
-                if count >= 1 && payload.len() >= 5 {
-                    let item_status = payload[4];
-                    if item_status == 0 {
-                        holders.push(i);
-                        continue;
-                    }
+        if frame_status == STATUS_OK && !payload.is_empty() && payload.len() >= 4 {
+            let count = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+            if count >= 1 && payload.len() >= 5 {
+                let item_status = payload[4];
+                if item_status == 0 {
+                    holders.push(i);
+                    continue;
                 }
             }
         }
@@ -1529,18 +1819,75 @@ pub async fn find_holders(
 /// Poll until all HTTP ports for a scenario are free (connection refused).
 /// Returns immediately once no port accepts connections, or after 10s at most.
 async fn wait_ports_free(first_http_port: u16, _scenario_id: u16, node_count: u32) {
-    let ports: Vec<u16> = (0..node_count).map(|i| first_http_port + i as u16).collect();
+    let ports: Vec<u16> = (0..node_count)
+        .map(|i| first_http_port + i as u16)
+        .collect();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let all_free = ports.iter().all(|&p| {
             std::net::TcpStream::connect_timeout(
                 &std::net::SocketAddr::from(([127, 0, 0, 1], p)),
                 Duration::from_millis(50),
-            ).is_err()
+            )
+            .is_err()
         });
         if all_free || std::time::Instant::now() >= deadline {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(test)]
+mod replication_report_tests {
+    use super::*;
+
+    #[test]
+    fn replication_report_records_holder_distribution_examples() {
+        let txid = [0xab; 32];
+        let mut report = ReplicationCheckReport::new(3);
+
+        report.record_holder_error(&txid, &[0, 1, 2]);
+        report.record_holder_error(&txid, &[1]);
+
+        assert_eq!(report.holder_errors, 2);
+        assert_eq!(report.holder_count_histogram[1], 1);
+        assert_eq!(report.holder_count_histogram[3], 1);
+        assert!(report.holder_diagnostics().contains("1:1"));
+        assert!(report.holder_diagnostics().contains("3:1"));
+        assert!(report.holder_diagnostics().contains("abababababababab"));
+    }
+
+    #[test]
+    fn txid_prefix_uses_first_eight_bytes() {
+        let mut txid = [0u8; 32];
+        txid[..9].copy_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xff]);
+
+        assert_eq!(txid_prefix(&txid), "0123456789abcdef");
+    }
+
+    #[test]
+    fn parse_batch_response_exact_rejects_truncated_item() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u32.to_le_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(7);
+
+        assert!(parse_batch_response_exact(&payload, Some(2)).is_none());
+        assert!(parse_batch_response_exact(&payload, Some(1)).is_none());
+    }
+
+    #[test]
+    fn parse_batch_response_exact_requires_expected_count() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(&[1, 2, 3]);
+
+        let parsed = parse_batch_response_exact(&payload, Some(1)).unwrap();
+        assert_eq!(parsed, vec![(0, vec![1, 2, 3])]);
+        assert!(parse_batch_response_exact(&payload, Some(2)).is_none());
     }
 }

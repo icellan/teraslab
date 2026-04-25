@@ -122,13 +122,17 @@ impl IoUringBackend {
     /// empty (e.g. because a collision overwrote it) so the caller can
     /// skip recording a nonsensical latency.
     #[inline(always)]
-    fn consume_submit_ts(&self, user_data: u64) -> Option<u64> {
+    fn consume_submit_ts_from(
+        ts_ring: &[AtomicU64; RING_SIZE],
+        ts_base: Instant,
+        user_data: u64,
+    ) -> Option<u64> {
         let idx = (user_data & RING_MASK) as usize;
-        let stored = self.ts_ring[idx].swap(0, Ordering::Relaxed);
+        let stored = ts_ring[idx].swap(0, Ordering::Relaxed);
         if stored == 0 {
             return None;
         }
-        let now = self.now_ns();
+        let now = ts_base.elapsed().as_nanos() as u64;
         Some(now.saturating_sub(stored))
     }
 
@@ -139,6 +143,8 @@ impl IoUringBackend {
     /// entries are ready).
     fn drain_completions(&mut self, out: &mut Vec<Completion>) -> usize {
         let metrics = io_uring_metrics();
+        let ts_ring = &self.ts_ring;
+        let ts_base = self.ts_base;
         let mut cq = self.ring.completion();
         cq.sync();
         let mut drained = 0usize;
@@ -146,7 +152,8 @@ impl IoUringBackend {
             let user_data = cqe.user_data();
             let result = cqe.result();
             if let Some(m) = metrics {
-                if let Some(elapsed_ns) = self.consume_submit_ts(user_data) {
+                if let Some(elapsed_ns) = Self::consume_submit_ts_from(ts_ring, ts_base, user_data)
+                {
                     m.uring_completion_latency_ns.record_ns(elapsed_ns);
                 }
                 if result < 0 {
@@ -155,19 +162,17 @@ impl IoUringBackend {
             } else {
                 // Drain the timestamp slot even when metrics aren't installed
                 // so stale timestamps don't linger across resets.
-                let _ = self.consume_submit_ts(user_data);
+                let _ = Self::consume_submit_ts_from(ts_ring, ts_base, user_data);
             }
-            out.push(Completion {
-                user_data,
-                result,
-            });
+            out.push(Completion { user_data, result });
             drained += 1;
         }
         // When `cq` is dropped, the updated head is stored back to the ring,
         // releasing the slots for the kernel to fill again.
         self.pending = self.pending.saturating_sub(drained);
         if let Some(m) = metrics {
-            m.uring_pending.store(self.pending as u32, Ordering::Relaxed);
+            m.uring_pending
+                .store(self.pending as u32, Ordering::Relaxed);
         }
         drained
     }
@@ -188,7 +193,8 @@ impl IoUringBackend {
             Ok(()) => {
                 self.pending += 1;
                 if let Some(m) = io_uring_metrics() {
-                    m.uring_pending.store(self.pending as u32, Ordering::Relaxed);
+                    m.uring_pending
+                        .store(self.pending as u32, Ordering::Relaxed);
                 }
                 Ok(())
             }
@@ -316,9 +322,7 @@ mod tests {
         match IoUringBackend::new(depth) {
             Ok(b) => Some(b),
             Err(e) => {
-                eprintln!(
-                    "io_uring unavailable on this host ({e}) — skipping test body"
-                );
+                eprintln!("io_uring unavailable on this host ({e}) — skipping test body");
                 None
             }
         }
@@ -330,6 +334,26 @@ mod tests {
         f.write_all(&data).expect("write zero fill");
         f.flush().expect("flush");
         f
+    }
+
+    #[test]
+    fn submit_timestamp_consume_is_one_shot() {
+        let ts_ring: Box<[AtomicU64; RING_SIZE]> = {
+            let v: Vec<AtomicU64> = (0..RING_SIZE).map(|_| AtomicU64::new(0)).collect();
+            let boxed_slice: Box<[AtomicU64]> = v.into_boxed_slice();
+            let ptr = Box::into_raw(boxed_slice) as *mut [AtomicU64; RING_SIZE];
+            unsafe { Box::from_raw(ptr) }
+        };
+        let ts_base = Instant::now();
+        let user_data = 0x1ff;
+        ts_ring[(user_data & RING_MASK) as usize].store(1, Ordering::Relaxed);
+
+        assert!(IoUringBackend::consume_submit_ts_from(&ts_ring, ts_base, user_data).is_some());
+        assert_eq!(
+            IoUringBackend::consume_submit_ts_from(&ts_ring, ts_base, user_data),
+            None,
+            "completion timestamp slots must be cleared after the first consume",
+        );
     }
 
     #[test]
@@ -351,8 +375,7 @@ mod tests {
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].user_data, 0xA5A5);
         assert_eq!(
-            completions[0].result,
-            ALIGNMENT as i32,
+            completions[0].result, ALIGNMENT as i32,
             "full buffer should have been written"
         );
         assert_eq!(io.pending(), 0);
@@ -361,7 +384,8 @@ mod tests {
 
         // Read it back and compare.
         let mut rbuf = AlignedBuf::new(ALIGNMENT, ALIGNMENT);
-        io.submit_read(fd, &mut rbuf, 0, 0x5A5A).expect("submit read");
+        io.submit_read(fd, &mut rbuf, 0, 0x5A5A)
+            .expect("submit read");
         let completions = io.submit_and_wait(1).expect("submit_and_wait read");
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].user_data, 0x5A5A);
@@ -512,12 +536,11 @@ mod tests {
     /// one sample recorded.
     #[test]
     fn uring_submit_latency_recorded_on_linux() {
-        use crate::metrics::{init_io_uring_metrics, io_uring_metrics, IoUringMetrics};
+        use crate::metrics::{IoUringMetrics, init_io_uring_metrics, io_uring_metrics};
         use std::sync::OnceLock;
 
         static TEST_METRICS: OnceLock<IoUringMetrics> = OnceLock::new();
-        let m_ref: &'static IoUringMetrics =
-            TEST_METRICS.get_or_init(IoUringMetrics::new);
+        let m_ref: &'static IoUringMetrics = TEST_METRICS.get_or_init(IoUringMetrics::new);
         init_io_uring_metrics(m_ref);
         let metrics = io_uring_metrics().expect("metrics installed");
 
@@ -532,7 +555,8 @@ mod tests {
         let before_complete = metrics.uring_completion_latency_ns.count();
 
         let mut rbuf = AlignedBuf::new(ALIGNMENT, ALIGNMENT);
-        io.submit_read(fd, &mut rbuf, 0, 0xBEEF).expect("submit read");
+        io.submit_read(fd, &mut rbuf, 0, 0xBEEF)
+            .expect("submit read");
         let comps = io.submit_and_wait(1).expect("wait");
         assert_eq!(comps.len(), 1);
 

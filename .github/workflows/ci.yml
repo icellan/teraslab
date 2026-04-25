@@ -22,11 +22,39 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Clippy (workspace)
-        # The sibling crates (`client/rust/`, `teraslab-tests/client/`)
-        # are not subject to the main crate's disallowed-macros lint since
-        # their CLI/test-harness code legitimately uses eprintln!/println!.
-        run: cargo clippy --all -- -D warnings
+      - name: Rustfmt (main crate)
+        run: cargo fmt --all -- --check
+
+      - name: Rustfmt (Rust client crate)
+        run: cargo fmt --manifest-path client/rust/Cargo.toml -- --check
+
+      - name: Rustfmt (teraslab-tests client crate)
+        run: cargo fmt --manifest-path teraslab-tests/client/Cargo.toml -- --check
+
+      - name: Clippy (main crate, all targets)
+        # Covers lib, bins, integration tests, and Criterion benches.
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (Rust client crate)
+        # The CLI binary `teraslab-loadgen` legitimately uses eprintln!/println!
+        # for user-facing output; that file opts out of the disallowed-macros
+        # ban via a file-level `#[allow]`. Library code uses tracing.
+        run: cargo clippy --manifest-path client/rust/Cargo.toml --all-targets -- -D warnings
+
+      - name: Clippy (teraslab-tests client crate)
+        # The integration scenarios under tests/ are the test-harness reporting
+        # channel for CI logs; the crate's clippy.toml drops eprintln!/println!
+        # from the disallow list for that reason. Library code in src/ does
+        # not use those macros.
+        run: cargo clippy --manifest-path teraslab-tests/client/Cargo.toml --all-targets -- -D warnings
+
+      - name: Rustdoc (main crate, deny warnings)
+        # Catches broken intra-doc links, references to private items, and
+        # malformed code blocks. Sibling crates have no public-API docs to
+        # police, so they're exempt.
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --all
 
   test:
     name: Test (${{ matrix.os }})
@@ -62,6 +90,12 @@ jobs:
         # require a Docker cluster and are exercised in the nightly E2E job.
         run: cargo test --manifest-path teraslab-tests/client/Cargo.toml --lib
 
+      - name: Compile benches (no run)
+        # Ensure all Criterion benches under benches/ still compile. The
+        # nightly workflow actually runs them; here we just guard against
+        # bench bitrot on every PR.
+        run: cargo bench --no-run --all
+
       - name: Build release binary
         run: cargo build --release
 
@@ -87,3 +121,42 @@ jobs:
 
       - name: Benchmark (smoke)
         run: go test -bench=. -benchmem -benchtime=1x -timeout 60s ./...
+
+  docker-e2e-pr:
+    name: Docker cluster E2E (PR tier)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Docker image
+        run: docker build -t teraslab:test -f teraslab-tests/docker/Dockerfile .
+
+      - name: Build test client
+        working-directory: teraslab-tests/client
+        run: cargo build --release
+
+      - name: Run PR-tier scenarios (01, 02, 03)
+        working-directory: teraslab-tests
+        run: ./run_all.sh --tier pr
+
+      - name: Collect logs on failure
+        if: failure()
+        working-directory: teraslab-tests
+        run: |
+          mkdir -p ci-logs
+          for dir in results/*/; do
+            cp -r "$dir" ci-logs/ 2>/dev/null || true
+          done
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-e2e-pr-logs
+          path: teraslab-tests/ci-logs/
+          if-no-files-found: ignore

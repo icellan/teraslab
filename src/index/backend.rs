@@ -61,7 +61,10 @@ impl PrimaryBackend {
         path: &std::path::Path,
         expected_records: usize,
     ) -> Result<Self, IndexError> {
-        Ok(Self::FileBacked(Index::open_file_backed(path, expected_records)?))
+        Ok(Self::FileBacked(Index::open_file_backed(
+            path,
+            expected_records,
+        )?))
     }
 
     /// Restore a file-backed index by reopening the existing file.
@@ -394,19 +397,18 @@ impl PrimaryBackend {
                 continue;
             }
 
-            let meta = match crate::record::TxMetadata::from_bytes(
-                &buf[..crate::record::METADATA_SIZE],
-            ) {
-                Ok(m) => m,
-                Err(_) => {
-                    // CRC mismatch during a rebuild scan is indistinguishable
-                    // from unformatted region or partial write — skip like an
-                    // invalid magic.
-                    skipped += 1;
-                    offset += align as u64;
-                    continue;
-                }
-            };
+            let meta =
+                match crate::record::TxMetadata::from_bytes(&buf[..crate::record::METADATA_SIZE]) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        // CRC mismatch during a rebuild scan is indistinguishable
+                        // from unformatted region or partial write — skip like an
+                        // invalid magic.
+                        skipped += 1;
+                        offset += align as u64;
+                        continue;
+                    }
+                };
             if { meta.magic } != crate::record::METADATA_MAGIC {
                 offset += align as u64;
                 continue;
@@ -490,16 +492,15 @@ impl PrimaryBackend {
                 continue;
             }
 
-            let meta = match crate::record::TxMetadata::from_bytes(
-                &buf[..crate::record::METADATA_SIZE],
-            ) {
-                Ok(m) => m,
-                Err(_) => {
-                    skipped += 1;
-                    offset += align as u64;
-                    continue;
-                }
-            };
+            let meta =
+                match crate::record::TxMetadata::from_bytes(&buf[..crate::record::METADATA_SIZE]) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        skipped += 1;
+                        offset += align as u64;
+                        continue;
+                    }
+                };
             if { meta.magic } != crate::record::METADATA_MAGIC {
                 offset += align as u64;
                 continue;
@@ -680,7 +681,9 @@ mod tests {
             assert!(backend.lookup(&make_key(999)).is_none());
 
             // Unregister
-            let removed = backend.unregister(&make_key(1)).expect("should return entry");
+            let removed = backend
+                .unregister(&make_key(1))
+                .expect("should return entry");
             assert_eq!(removed.record_offset, 4096);
             assert!(backend.is_empty());
 
@@ -793,7 +796,9 @@ mod tests {
         assert_eq!(restored.len(), 50);
         assert_eq!(restored.backend_name(), "redb");
         for i in 0..50u64 {
-            let e = restored.lookup(&make_key(i)).expect("entry should survive reopen");
+            let e = restored
+                .lookup(&make_key(i))
+                .expect("entry should survive reopen");
             assert_eq!(e.record_offset, i * 100);
         }
     }
@@ -883,9 +888,8 @@ mod tests {
             let mut meta = TxMetadata::new(5);
             let mut txid = [0u8; 32];
             txid[0..8].copy_from_slice(&(i as u64).to_le_bytes());
-            txid[8..16].copy_from_slice(
-                &((i as u64).wrapping_mul(0x9E3779B97F4A7C15)).to_le_bytes(),
-            );
+            txid[8..16]
+                .copy_from_slice(&((i as u64).wrapping_mul(0x9E3779B97F4A7C15)).to_le_bytes());
             meta.tx_id = txid;
 
             let record_size = TxMetadata::record_size_for(5);
@@ -1001,7 +1005,9 @@ mod tests {
         assert_eq!(restored.backend_name(), "memory");
 
         for i in 0..50u64 {
-            let e = restored.lookup(&make_key(i)).expect("entry should survive snapshot");
+            let e = restored
+                .lookup(&make_key(i))
+                .expect("entry should survive snapshot");
             assert_eq!(e.record_offset, i * 100);
         }
     }
@@ -1041,7 +1047,9 @@ mod tests {
 
         // Verify primary data
         for i in 0..20u64 {
-            let e = restored.lookup(&make_key(i)).expect("entry should survive snapshot_all");
+            let e = restored
+                .lookup(&make_key(i))
+                .expect("entry should survive snapshot_all");
             assert_eq!(e.record_offset, i * 100);
         }
 
@@ -1214,7 +1222,9 @@ mod tests {
         assert_eq!(restored.len(), 50);
         assert_eq!(restored.backend_name(), "file_backed");
         for i in 0..50u64 {
-            let e = restored.lookup(&make_key(i)).expect("should survive reopen");
+            let e = restored
+                .lookup(&make_key(i))
+                .expect("should survive reopen");
             assert_eq!(e.record_offset, i * 100);
         }
     }

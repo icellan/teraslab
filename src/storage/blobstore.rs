@@ -27,8 +27,8 @@ fn hex_key(key: &[u8; 32]) -> String {
 /// Trait for streaming large blob writes in chunks.
 ///
 /// Created by [`BlobStore::begin_stream`]. The caller appends data via
-/// [`write_chunk`] and finalizes with [`finish`]. If the stream is dropped
-/// without finishing, [`abort`] cleans up any partial data.
+/// [`Self::write_chunk`] and finalizes with [`Self::finish`]. If the stream is dropped
+/// without finishing, [`Self::abort`] cleans up any partial data.
 pub trait BlobStreamWriter: Send {
     /// Append a chunk of data to the stream.
     fn write_chunk(&mut self, data: &[u8]) -> Result<()>;
@@ -324,7 +324,9 @@ mod tests {
     use super::*;
 
     fn test_key(n: u8) -> [u8; 32] {
-        let mut k = [0u8; 32]; k[0] = n; k
+        let mut k = [0u8; 32];
+        k[0] = n;
+        k
     }
 
     // -- File blob store tests --
@@ -371,8 +373,14 @@ mod tests {
     fn file_same_prefix_different_keys() {
         let dir = tempfile::tempdir().unwrap();
         let store = FileBlobStore::new(dir.path(), 2);
-        let mut k1 = [0u8; 32]; k1[0] = 0xAB; k1[1] = 0xCD; k1[2] = 1;
-        let mut k2 = [0u8; 32]; k2[0] = 0xAB; k2[1] = 0xCD; k2[2] = 2;
+        let mut k1 = [0u8; 32];
+        k1[0] = 0xAB;
+        k1[1] = 0xCD;
+        k1[2] = 1;
+        let mut k2 = [0u8; 32];
+        k2[0] = 0xAB;
+        k2[1] = 0xCD;
+        k2[2] = 2;
         store.put(&k1, b"data1").unwrap();
         store.put(&k2, b"data2").unwrap();
         assert_eq!(store.get(&k1).unwrap().unwrap(), b"data1");

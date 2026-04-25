@@ -70,27 +70,43 @@ impl ColdData {
 
     /// Deserialize cold data from length-prefixed bytes.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        if data.len() < 12 { return None; }
+        if data.len() < 12 {
+            return None;
+        }
         let inputs_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
         let mut pos = 4;
-        if pos + inputs_len > data.len() { return None; }
+        if pos + inputs_len > data.len() {
+            return None;
+        }
         let inputs = data[pos..pos + inputs_len].to_vec();
         pos += inputs_len;
 
-        if pos + 4 > data.len() { return None; }
+        if pos + 4 > data.len() {
+            return None;
+        }
         let outputs_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
-        if pos + outputs_len > data.len() { return None; }
+        if pos + outputs_len > data.len() {
+            return None;
+        }
         let outputs = data[pos..pos + outputs_len].to_vec();
         pos += outputs_len;
 
-        if pos + 4 > data.len() { return None; }
+        if pos + 4 > data.len() {
+            return None;
+        }
         let inpoints_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
-        if pos + inpoints_len > data.len() { return None; }
+        if pos + inpoints_len > data.len() {
+            return None;
+        }
         let inpoints = data[pos..pos + inpoints_len].to_vec();
 
-        Some(Self { inputs, outputs, inpoints })
+        Some(Self {
+            inputs,
+            outputs,
+            inpoints,
+        })
     }
 
     /// Total serialized size including length prefixes.
@@ -117,7 +133,10 @@ mod tests {
 
     #[test]
     fn tier_separate() {
-        assert_eq!(tier_for_size(INLINE_THRESHOLD + 1), StorageTier::SeparateNvme);
+        assert_eq!(
+            tier_for_size(INLINE_THRESHOLD + 1),
+            StorageTier::SeparateNvme
+        );
         assert_eq!(tier_for_size(500 * 1024), StorageTier::SeparateNvme);
         assert_eq!(tier_for_size(SEPARATE_THRESHOLD), StorageTier::SeparateNvme);
     }
@@ -142,7 +161,11 @@ mod tests {
 
     #[test]
     fn cold_data_empty() {
-        let cd = ColdData { inputs: vec![], outputs: vec![], inpoints: vec![] };
+        let cd = ColdData {
+            inputs: vec![],
+            outputs: vec![],
+            inpoints: vec![],
+        };
         assert!(cd.is_empty());
         let bytes = cd.serialize();
         assert_eq!(bytes.len(), 12);

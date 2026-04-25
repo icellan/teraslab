@@ -36,8 +36,7 @@ const HEADER_CRC_OFFSET: usize = 44;
 const FREELIST_OFFSET: usize = 48;
 
 /// Maximum number of free regions that can be serialized to the device header.
-const MAX_PERSISTED_FREE_REGIONS: usize =
-    (DATA_REGION_OFFSET as usize - FREELIST_OFFSET) / 16;
+const MAX_PERSISTED_FREE_REGIONS: usize = (DATA_REGION_OFFSET as usize - FREELIST_OFFSET) / 16;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -47,7 +46,9 @@ const MAX_PERSISTED_FREE_REGIONS: usize =
 #[derive(Error, Debug)]
 pub enum AllocatorError {
     /// The device has no free space large enough for the requested allocation.
-    #[error("device full: requested {requested} bytes, largest free region is {largest_free} bytes")]
+    #[error(
+        "device full: requested {requested} bytes, largest free region is {largest_free} bytes"
+    )]
     DeviceFull { requested: u64, largest_free: u64 },
 
     /// A device I/O error occurred.
@@ -240,7 +241,9 @@ impl FreelistBackend {
                         if waste < best_waste {
                             best_waste = waste;
                             best_idx = Some(i);
-                            if waste == 0 { break; }
+                            if waste == 0 {
+                                break;
+                            }
                         }
                     }
                 }
@@ -257,8 +260,7 @@ impl FreelistBackend {
                 Some((region.offset, region.size))
             }
             Self::Large { by_offset, by_size } => {
-                let &(region_size, region_offset) =
-                    by_size.range((aligned_size, 0)..).next()?;
+                let &(region_size, region_offset) = by_size.range((aligned_size, 0)..).next()?;
                 by_size.remove(&(region_size, region_offset));
                 by_offset.remove(&region_offset);
                 if region_size > aligned_size {
@@ -467,34 +469,35 @@ impl SlotAllocator {
             },
         }
 
-        let (offset, reservation) = if let Some((region_offset, region_size)) =
-            self.freelist.best_fit(aligned_size)
-        {
-            // best_fit already removed/split the region in the freelist.
-            self.freelist.maybe_demote();
-            (
-                region_offset,
-                Reservation::FromFreelist {
-                    alloc_offset: region_offset,
-                    region_size,
-                },
-            )
-        } else {
-            // No suitable free region — extend at the append point.
-            let offset = self.next_offset;
-            if offset + aligned_size > self.device_size {
-                return Err(AllocatorError::DeviceFull {
-                    requested: aligned_size,
-                    largest_free: self.freelist.largest(),
-                });
-            }
-            let previous_next_offset = self.next_offset;
-            self.next_offset = offset + aligned_size;
-            (
-                offset,
-                Reservation::FromHighWater { previous_next_offset },
-            )
-        };
+        let (offset, reservation) =
+            if let Some((region_offset, region_size)) = self.freelist.best_fit(aligned_size) {
+                // best_fit already removed/split the region in the freelist.
+                self.freelist.maybe_demote();
+                (
+                    region_offset,
+                    Reservation::FromFreelist {
+                        alloc_offset: region_offset,
+                        region_size,
+                    },
+                )
+            } else {
+                // No suitable free region — extend at the append point.
+                let offset = self.next_offset;
+                if offset + aligned_size > self.device_size {
+                    return Err(AllocatorError::DeviceFull {
+                        requested: aligned_size,
+                        largest_free: self.freelist.largest(),
+                    });
+                }
+                let previous_next_offset = self.next_offset;
+                self.next_offset = offset + aligned_size;
+                (
+                    offset,
+                    Reservation::FromHighWater {
+                        previous_next_offset,
+                    },
+                )
+            };
 
         // Journal the reservation BEFORE returning — ensures the allocation
         // survives a crash between this point and the next `persist()`.
@@ -512,7 +515,10 @@ impl SlotAllocator {
                 // Roll back the in-memory reservation so callers never
                 // observe an allocation that is not durably journaled.
                 match reservation {
-                    Reservation::FromFreelist { alloc_offset, region_size } => {
+                    Reservation::FromFreelist {
+                        alloc_offset,
+                        region_size,
+                    } => {
                         // Re-insert the original region. The returned
                         // `region_size` matches the size we took out in
                         // `best_fit` (which internally split if needed).
@@ -532,7 +538,9 @@ impl SlotAllocator {
                         self.freelist.insert(alloc_offset, region_size);
                         self.freelist.maybe_promote();
                     }
-                    Reservation::FromHighWater { previous_next_offset } => {
+                    Reservation::FromHighWater {
+                        previous_next_offset,
+                    } => {
                         self.next_offset = previous_next_offset;
                     }
                 }
@@ -543,9 +551,7 @@ impl SlotAllocator {
             // Fault-injection sync point: the redo entry is durable but
             // the caller has not yet received the offset. Simulates the
             // C6 window "AllocateRegion fsynced, caller unaware."
-            crate::fault_injection::check(
-                crate::fault_injection::SyncPoint::MidAllocatorPersist,
-            );
+            crate::fault_injection::check(crate::fault_injection::SyncPoint::MidAllocatorPersist);
         }
 
         if let Some(m) = allocator_metrics() {
@@ -568,9 +574,7 @@ impl SlotAllocator {
     pub fn free(&mut self, offset: u64, size: u64) -> Result<()> {
         let aligned_size = self.align_up(size);
 
-        if offset < self.data_region_start
-            || offset + aligned_size > self.device_size
-        {
+        if offset < self.data_region_start || offset + aligned_size > self.device_size {
             return Err(AllocatorError::InvalidFree {
                 offset,
                 size: aligned_size,
@@ -597,9 +601,7 @@ impl SlotAllocator {
             }
             // Fault-injection sync point: "redo durable, freelist not yet
             // mutated." Simulates a crash in the exact C6 window.
-            crate::fault_injection::check(
-                crate::fault_injection::SyncPoint::MidAllocatorPersist,
-            );
+            crate::fault_injection::check(crate::fault_injection::SyncPoint::MidAllocatorPersist);
         }
 
         let mut final_offset = offset;
@@ -651,7 +653,8 @@ impl SlotAllocator {
             }
         }
         m.freelist_region_count.store(count, Ordering::Relaxed);
-        m.freelist_largest_region_bytes.store(largest, Ordering::Relaxed);
+        m.freelist_largest_region_bytes
+            .store(largest, Ordering::Relaxed);
     }
 
     /// Apply a redo-log entry during crash recovery.
@@ -668,19 +671,27 @@ impl SlotAllocator {
     ///   `next_offset` is bumped past the region if necessary.
     /// - `FreeRegion`: if the exact region is already in the freelist
     ///   (or fully covered by an existing free region), no-op. Otherwise
-    ///   the region is inserted (with coalescing, same as [`free`]).
+    ///   the region is inserted (with coalescing, same as [`Self::free`]).
     ///
     /// Returns `true` if the replay changed allocator state,
     /// `false` on an idempotent no-op.
     pub fn replay_redo(&mut self, op: &RedoOp) -> bool {
         match op {
-            RedoOp::AllocateRegion { offset, size, device_id } => {
+            RedoOp::AllocateRegion {
+                offset,
+                size,
+                device_id,
+            } => {
                 if *device_id != self.redo_device_id {
                     return false;
                 }
                 self.replay_allocate(*offset, *size)
             }
-            RedoOp::FreeRegion { offset, size, device_id } => {
+            RedoOp::FreeRegion {
+                offset,
+                size,
+                device_id,
+            } => {
                 if *device_id != self.redo_device_id {
                     return false;
                 }
@@ -765,8 +776,7 @@ impl SlotAllocator {
         // Safety: reject frees outside the valid data region silently —
         // a corrupt redo entry must not bring the allocator to an
         // inconsistent state.
-        if offset < self.data_region_start
-            || offset.saturating_add(aligned_size) > self.device_size
+        if offset < self.data_region_start || offset.saturating_add(aligned_size) > self.device_size
         {
             return false;
         }
@@ -843,8 +853,7 @@ impl SlotAllocator {
             hasher.update(&buf[..covered_end]);
             hasher.finalize()
         };
-        buf[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4]
-            .copy_from_slice(&crc.to_le_bytes());
+        buf[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 
         self.device.pwrite(&buf, 0)?;
         Ok(())
@@ -979,16 +988,24 @@ impl SlotAllocator {
     }
 
     /// Start of the data region on device.
-    pub fn data_region_start(&self) -> u64 { self.data_region_start }
+    pub fn data_region_start(&self) -> u64 {
+        self.data_region_start
+    }
 
     /// Current high-water mark — all allocations are below this offset.
-    pub fn next_offset(&self) -> u64 { self.next_offset }
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
 
     /// Device alignment in bytes.
-    pub fn device_alignment(&self) -> usize { self.alignment }
+    pub fn device_alignment(&self) -> usize {
+        self.alignment
+    }
 
     /// The 128-bit device identity stored in the superblock.
-    pub fn device_id(&self) -> [u8; 16] { self.device_id }
+    pub fn device_id(&self) -> [u8; 16] {
+        self.device_id
+    }
 
     /// The device identity formatted as a 32-character lowercase hex string.
     pub fn device_id_hex(&self) -> String {
@@ -1007,7 +1024,9 @@ impl SlotAllocator {
         let mut largest: u64 = 0;
         for (_, size) in self.freelist.iter_offset_order() {
             total_free += size;
-            if size > largest { largest = size; }
+            if size > largest {
+                largest = size;
+            }
         }
         let data_capacity = self.device_size.saturating_sub(self.data_region_start);
         let high_water = self.next_offset.saturating_sub(self.data_region_start);
@@ -1041,9 +1060,7 @@ mod tests {
     use crate::device::MemoryDevice;
 
     fn test_device(size_mb: u64) -> Arc<MemoryDevice> {
-        Arc::new(
-            MemoryDevice::new(size_mb * 1024 * 1024, 4096).unwrap(),
-        )
+        Arc::new(MemoryDevice::new(size_mb * 1024 * 1024, 4096).unwrap())
     }
 
     #[test]
@@ -1267,7 +1284,8 @@ mod tests {
         let hex = alloc.device_id_hex();
         assert_eq!(hex.len(), 32, "device ID hex must be exactly 32 characters");
         assert!(
-            hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
             "device ID hex must be lowercase hex digits, got: {hex}"
         );
     }
@@ -1285,7 +1303,10 @@ mod tests {
         let mut buf = crate::device::AlignedBuf::new(4096, 4096);
         dev.pread(&mut buf, 0).unwrap();
         let version = u32::from_le_bytes(buf[40..44].try_into().unwrap());
-        assert_eq!(version, HEADER_VERSION, "persisted header version must be {HEADER_VERSION}");
+        assert_eq!(
+            version, HEADER_VERSION,
+            "persisted header version must be {HEADER_VERSION}"
+        );
     }
 
     #[test]
@@ -1327,7 +1348,10 @@ mod tests {
 
         // The recovered allocator must see the freed region and reuse it.
         let reused = recovered.allocate(4096).unwrap();
-        assert_eq!(reused, o1, "recovered freelist should offer the freed region first");
+        assert_eq!(
+            reused, o1,
+            "recovered freelist should offer the freed region first"
+        );
 
         // A subsequent allocation must not overlap with o2.
         let next = recovered.allocate(4096).unwrap();
@@ -1343,9 +1367,9 @@ mod tests {
         let mut alloc = SlotAllocator::new(dev).unwrap();
 
         // Allocate three blocks, free them to create regions of different sizes.
-        let o1 = alloc.allocate(4096).unwrap();  // 4K
+        let o1 = alloc.allocate(4096).unwrap(); // 4K
         let _o2 = alloc.allocate(4096).unwrap(); // 4K (spacer, kept)
-        let o3 = alloc.allocate(8192).unwrap();  // 8K
+        let o3 = alloc.allocate(8192).unwrap(); // 8K
         let _o4 = alloc.allocate(4096).unwrap(); // 4K (spacer, kept)
         let o5 = alloc.allocate(16384).unwrap(); // 16K
 
@@ -1385,12 +1409,21 @@ mod tests {
         assert!(count > 0, "should have free regions");
 
         // If Large backend, verify dual-index consistency.
-        if let FreelistBackend::Large { ref by_offset, ref by_size } = alloc.freelist {
-            assert_eq!(by_offset.len(), by_size.len(),
-                "dual indexes must stay in sync");
+        if let FreelistBackend::Large {
+            ref by_offset,
+            ref by_size,
+        } = alloc.freelist
+        {
+            assert_eq!(
+                by_offset.len(),
+                by_size.len(),
+                "dual indexes must stay in sync"
+            );
             for (&off, &sz) in by_offset {
-                assert!(by_size.contains(&(sz, off)),
-                    "by_size missing entry ({sz}, {off})");
+                assert!(
+                    by_size.contains(&(sz, off)),
+                    "by_size missing entry ({sz}, {off})"
+                );
             }
         }
 
@@ -1447,16 +1480,20 @@ mod tests {
             alloc.free(offsets[i], 4096).unwrap();
         }
         // Should have promoted to Large (100 entries > 64 threshold).
-        assert!(matches!(alloc.freelist, FreelistBackend::Large { .. }),
-            "should promote to Large after 100 free regions");
+        assert!(
+            matches!(alloc.freelist, FreelistBackend::Large { .. }),
+            "should promote to Large after 100 free regions"
+        );
 
         // Allocate back most of the free regions to shrink below demote threshold.
         for _ in 0..75 {
             alloc.allocate(4096).unwrap();
         }
         // Should have demoted back to Small (25 entries < 32 threshold).
-        assert!(matches!(alloc.freelist, FreelistBackend::Small(_)),
-            "should demote to Small after allocating most free regions back");
+        assert!(
+            matches!(alloc.freelist, FreelistBackend::Small(_)),
+            "should demote to Small after allocating most free regions back"
+        );
 
         // The remaining entries should still be correct.
         let remaining = alloc.free_region_count();
@@ -1500,13 +1537,17 @@ mod tests {
         }
         fn pwrite(&self, buf: &[u8], offset: u64) -> std::result::Result<usize, DeviceError> {
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(DeviceError::Io(std::io::Error::other("injected pwrite failure")));
+                return Err(DeviceError::Io(std::io::Error::other(
+                    "injected pwrite failure",
+                )));
             }
             self.inner.pwrite(buf, offset)
         }
         fn sync(&self) -> std::result::Result<(), DeviceError> {
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(DeviceError::Io(std::io::Error::other("injected sync failure")));
+                return Err(DeviceError::Io(std::io::Error::other(
+                    "injected sync failure",
+                )));
             }
             self.inner.sync()
         }
@@ -1524,9 +1565,7 @@ mod tests {
         (dev, Arc::new(Mutex::new(log)))
     }
 
-    fn make_failable_redo_log(
-        size: u64,
-    ) -> (Arc<FailableDevice>, Arc<Mutex<RedoLog>>) {
+    fn make_failable_redo_log(size: u64) -> (Arc<FailableDevice>, Arc<Mutex<RedoLog>>) {
         let inner = Arc::new(MemoryDevice::new(size, 4096).unwrap());
         let dev = Arc::new(FailableDevice::new(inner));
         let log = RedoLog::open(dev.clone(), 0, size).unwrap();
@@ -1546,9 +1585,17 @@ mod tests {
         // The redo log must contain exactly one AllocateRegion entry
         // referencing the returned offset.
         let entries = redo.lock().recover().unwrap();
-        assert_eq!(entries.len(), 1, "expected exactly 1 redo entry after allocate");
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected exactly 1 redo entry after allocate"
+        );
         match &entries[0].op {
-            RedoOp::AllocateRegion { offset: redo_offset, size, device_id } => {
+            RedoOp::AllocateRegion {
+                offset: redo_offset,
+                size,
+                device_id,
+            } => {
                 assert_eq!(*redo_offset, offset);
                 assert_eq!(*size, 8192);
                 assert_eq!(*device_id, 0);
@@ -1569,9 +1616,17 @@ mod tests {
         alloc.free(offset, 4096).unwrap();
 
         let entries = redo.lock().recover().unwrap();
-        assert_eq!(entries.len(), 2, "expected 2 redo entries (allocate + free)");
+        assert_eq!(
+            entries.len(),
+            2,
+            "expected 2 redo entries (allocate + free)"
+        );
         match &entries[1].op {
-            RedoOp::FreeRegion { offset: redo_offset, size, device_id } => {
+            RedoOp::FreeRegion {
+                offset: redo_offset,
+                size,
+                device_id,
+            } => {
                 assert_eq!(*redo_offset, offset);
                 assert_eq!(*size, 4096);
                 assert_eq!(*device_id, 0);
@@ -1649,7 +1704,11 @@ mod tests {
             before_count,
             "freelist entry count must be restored on redo flush failure"
         );
-        assert_eq!(alloc.next_offset(), before_next, "next_offset must be unchanged");
+        assert_eq!(
+            alloc.next_offset(),
+            before_next,
+            "next_offset must be unchanged"
+        );
 
         // The original 8KB region must still be allocatable atomically
         // (no fragmentation left over from the failed split).
@@ -1738,9 +1797,21 @@ mod tests {
         let dev = test_device(16);
 
         let ops = vec![
-            RedoOp::AllocateRegion { offset: DATA_REGION_OFFSET, size: 4096, device_id: 0 },
-            RedoOp::AllocateRegion { offset: DATA_REGION_OFFSET + 4096, size: 8192, device_id: 0 },
-            RedoOp::FreeRegion { offset: DATA_REGION_OFFSET, size: 4096, device_id: 0 },
+            RedoOp::AllocateRegion {
+                offset: DATA_REGION_OFFSET,
+                size: 4096,
+                device_id: 0,
+            },
+            RedoOp::AllocateRegion {
+                offset: DATA_REGION_OFFSET + 4096,
+                size: 8192,
+                device_id: 0,
+            },
+            RedoOp::FreeRegion {
+                offset: DATA_REGION_OFFSET,
+                size: 4096,
+                device_id: 0,
+            },
         ];
 
         let mut once = SlotAllocator::new(dev.clone()).unwrap();
@@ -1755,7 +1826,11 @@ mod tests {
             }
         }
 
-        assert_eq!(once.next_offset(), twice.next_offset(), "next_offset must match");
+        assert_eq!(
+            once.next_offset(),
+            twice.next_offset(),
+            "next_offset must match"
+        );
         assert_eq!(
             once.free_region_count(),
             twice.free_region_count(),
@@ -1804,7 +1879,10 @@ mod tests {
             size: 4096,
             device_id: 0,
         });
-        assert!(!applied, "replay of a free already in freelist must be a no-op");
+        assert!(
+            !applied,
+            "replay of a free already in freelist must be a no-op"
+        );
         assert_eq!(
             alloc.free_region_count(),
             before_count,
@@ -1860,8 +1938,12 @@ mod tests {
         // but AllocateRegion replays are idempotent no-ops because the
         // recovered allocator's next_offset already covers them.
         let entries = redo.lock().recover().unwrap();
-        assert!(entries.iter().any(|e| matches!(e.op, RedoOp::FreeRegion { .. })),
-            "redo log must contain a FreeRegion entry");
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e.op, RedoOp::FreeRegion { .. })),
+            "redo log must contain a FreeRegion entry"
+        );
         for e in &entries {
             recovered.replay_redo(&e.op);
         }
@@ -1873,7 +1955,10 @@ mod tests {
             "after replay, freelist should have the free region"
         );
         let reused = recovered.allocate(8192).unwrap();
-        assert_eq!(reused, o1, "recovered allocator must reuse the freed region");
+        assert_eq!(
+            reused, o1,
+            "recovered allocator must reuse the freed region"
+        );
 
         // Allocations after o2 must not overlap with o2.
         let next = recovered.allocate(4096).unwrap();
@@ -1927,9 +2012,7 @@ mod tests {
             let count = u64::from_le_bytes(raw[16..24].try_into().unwrap()) as usize;
             let covered_end = FREELIST_OFFSET + count * 16;
             let mut crc_input: Vec<u8> = raw[..covered_end].to_vec();
-            for b in
-                &mut crc_input[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4]
-            {
+            for b in &mut crc_input[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4] {
                 *b = 0;
             }
             expected_crc = {
@@ -2086,12 +2169,11 @@ mod tests {
     /// also install and tick the metrics.
     #[test]
     fn allocator_ticks_alloc_and_free_counters() {
-        use crate::metrics::{init_allocator_metrics, allocator_metrics, AllocatorMetrics};
+        use crate::metrics::{AllocatorMetrics, allocator_metrics, init_allocator_metrics};
         use std::sync::OnceLock;
 
         static TEST_METRICS: OnceLock<AllocatorMetrics> = OnceLock::new();
-        let m_ref: &'static AllocatorMetrics =
-            TEST_METRICS.get_or_init(AllocatorMetrics::new);
+        let m_ref: &'static AllocatorMetrics = TEST_METRICS.get_or_init(AllocatorMetrics::new);
         init_allocator_metrics(m_ref);
         let metrics = allocator_metrics().expect("metrics installed");
 

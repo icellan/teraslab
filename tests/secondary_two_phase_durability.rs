@@ -55,12 +55,10 @@ fn crash_after_unmined_redo_fsync_before_redb_commit() {
     // Open on-disk DAH and unmined indexes.
     let dah_path = dir.path().join("dah.redb");
     let unmined_path = dir.path().join("unmined.redb");
-    let mut dah_backend = DahBackend::OnDisk(
-        RedbDahIndex::open(&dah_path, 16 * 1024 * 1024).unwrap(),
-    );
-    let mut unmined_backend = UnminedBackend::OnDisk(
-        RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap(),
-    );
+    let mut dah_backend =
+        DahBackend::OnDisk(RedbDahIndex::open(&dah_path, 16 * 1024 * 1024).unwrap());
+    let mut unmined_backend =
+        UnminedBackend::OnDisk(RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap());
 
     // Open redo log.
     let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
@@ -132,12 +130,10 @@ fn crash_after_dah_redo_fsync_before_redb_commit() {
 
     let dah_path = dir.path().join("dah.redb");
     let unmined_path = dir.path().join("unmined.redb");
-    let mut dah_backend = DahBackend::OnDisk(
-        RedbDahIndex::open(&dah_path, 16 * 1024 * 1024).unwrap(),
-    );
-    let mut unmined_backend = UnminedBackend::OnDisk(
-        RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap(),
-    );
+    let mut dah_backend =
+        DahBackend::OnDisk(RedbDahIndex::open(&dah_path, 16 * 1024 * 1024).unwrap());
+    let mut unmined_backend =
+        UnminedBackend::OnDisk(RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap());
 
     let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
     let redo_log = Arc::new(Mutex::new(
@@ -159,10 +155,8 @@ fn crash_after_dah_redo_fsync_before_redb_commit() {
 
     let redo_log_reopened = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
     let data_dev = MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap();
-    let alloc = SlotAllocator::new(Arc::new(
-        MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap(),
-    ))
-    .unwrap();
+    let alloc =
+        SlotAllocator::new(Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap())).unwrap();
     let _ = alloc; // keep variable to ensure SlotAllocator is exercised in scope
 
     let stats = teraslab::recovery::recover_all(
@@ -196,12 +190,10 @@ fn crash_after_batched_redo_fsync_before_both_redb_commits() {
 
     let dah_path = dir.path().join("dah.redb");
     let unmined_path = dir.path().join("unmined.redb");
-    let mut dah_backend = DahBackend::OnDisk(
-        RedbDahIndex::open(&dah_path, 16 * 1024 * 1024).unwrap(),
-    );
-    let mut unmined_backend = UnminedBackend::OnDisk(
-        RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap(),
-    );
+    let mut dah_backend =
+        DahBackend::OnDisk(RedbDahIndex::open(&dah_path, 16 * 1024 * 1024).unwrap());
+    let mut unmined_backend =
+        UnminedBackend::OnDisk(RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap());
 
     let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
     let redo_log = Arc::new(Mutex::new(
@@ -264,9 +256,8 @@ fn recover_skips_stale_redo_relative_to_primary() {
     primary.register(key, make_entry(4096, 0, 0)).unwrap();
 
     let unmined_path = dir.path().join("unmined.redb");
-    let mut unmined_backend = UnminedBackend::OnDisk(
-        RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap(),
-    );
+    let mut unmined_backend =
+        UnminedBackend::OnDisk(RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap());
     let mut dah_backend = DahBackend::new_in_memory();
 
     // Stale redo intent: claims unmined_since should become 500. Primary
@@ -321,9 +312,8 @@ fn recover_dah_respects_has_preserve_until_flag() {
     primary.register(key, entry).unwrap();
 
     let dah_path = dir.path().join("dah.redb");
-    let mut dah_backend = DahBackend::OnDisk(
-        RedbDahIndex::open(&dah_path, 16 * 1024 * 1024).unwrap(),
-    );
+    let mut dah_backend =
+        DahBackend::OnDisk(RedbDahIndex::open(&dah_path, 16 * 1024 * 1024).unwrap());
     let mut unmined_backend = UnminedBackend::new_in_memory();
 
     let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());

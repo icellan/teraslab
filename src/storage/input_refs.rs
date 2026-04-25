@@ -41,14 +41,20 @@ impl InputRef {
         let mut prev_txid = [0u8; 32];
         prev_txid.copy_from_slice(&src[..32]);
         let prev_vout = u32::from_le_bytes(src[32..36].try_into().unwrap());
-        Self { prev_txid, prev_vout }
+        Self {
+            prev_txid,
+            prev_vout,
+        }
     }
 }
 
 impl std::fmt::Debug for InputRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InputRef")
-            .field("prev_txid", &format_args!("{:02x}{:02x}...", self.prev_txid[0], self.prev_txid[1]))
+            .field(
+                "prev_txid",
+                &format_args!("{:02x}{:02x}...", self.prev_txid[0], self.prev_txid[1]),
+            )
             .field("prev_vout", &{ self.prev_vout })
             .finish()
     }
@@ -142,7 +148,7 @@ pub fn read_input_ref_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allocator::{SlotAllocator, DATA_REGION_OFFSET};
+    use crate::allocator::{DATA_REGION_OFFSET, SlotAllocator};
     use crate::device::MemoryDevice;
     use std::sync::Arc;
 
@@ -154,7 +160,10 @@ mod tests {
         let mut prev_txid = [0u8; 32];
         prev_txid[0] = n;
         prev_txid[31] = n.wrapping_mul(7);
-        InputRef { prev_txid, prev_vout: vout }
+        InputRef {
+            prev_txid,
+            prev_vout: vout,
+        }
     }
 
     #[test]
@@ -178,9 +187,7 @@ mod tests {
         let size = 100 * INPUT_REF_SIZE as u64;
         let offset = alloc.allocate(size).unwrap();
 
-        let refs: Vec<InputRef> = (0..100u8)
-            .map(|i| make_ref(i, i as u32 * 10))
-            .collect();
+        let refs: Vec<InputRef> = (0..100u8).map(|i| make_ref(i, i as u32 * 10)).collect();
 
         write_input_refs(&*dev, offset, &refs).unwrap();
         let read = read_input_refs(&*dev, offset, 100).unwrap();
@@ -195,9 +202,7 @@ mod tests {
         let dev = test_device();
         let offset = DATA_REGION_OFFSET;
 
-        let refs: Vec<InputRef> = (0..10u8)
-            .map(|i| make_ref(i, i as u32 + 100))
-            .collect();
+        let refs: Vec<InputRef> = (0..10u8).map(|i| make_ref(i, i as u32 + 100)).collect();
 
         write_input_refs(&*dev, offset, &refs).unwrap();
 
@@ -234,7 +239,10 @@ mod tests {
         // Input refs should be unaffected
         let read = read_input_refs(&*dev, refs_offset, 10).unwrap();
         for (i, (original, restored)) in refs.iter().zip(read.iter()).enumerate() {
-            assert_eq!(original, restored, "input ref {i} corrupted after cold data overwrite");
+            assert_eq!(
+                original, restored,
+                "input ref {i} corrupted after cold data overwrite"
+            );
         }
     }
 

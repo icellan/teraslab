@@ -3,12 +3,12 @@
 #[allow(dead_code)]
 mod common;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use teraslab_test_client::ClientError;
-use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::types::*;
+use teraslab_test_client::verifier::StateVerifier;
 
 use parking_lot::Mutex;
 use rand::{Rng, SeedableRng};
@@ -142,8 +142,13 @@ async fn run_scenario() -> Result<(), ClientError> {
                     if !orig.is_empty() {
                         let idx = rng.gen_range(0..orig.len());
                         let txid = orig[idx];
-                        match bg_client.get_batch(FIELD_ALL_METADATA, std::slice::from_ref(&txid)).await {
-                            Ok(_) => { bg_r_ok.fetch_add(1, Ordering::Relaxed); }
+                        match bg_client
+                            .get_batch(FIELD_ALL_METADATA, std::slice::from_ref(&txid))
+                            .await
+                        {
+                            Ok(_) => {
+                                bg_r_ok.fetch_add(1, Ordering::Relaxed);
+                            }
                             Err(_) => {
                                 bg_r_err.fetch_add(1, Ordering::Relaxed);
                                 let _ = bg_client.refresh_routing().await;
@@ -179,7 +184,9 @@ async fn run_scenario() -> Result<(), ClientError> {
                             block_height_retention: 288,
                         };
                         match bg_client.spend_batch(&spend_params, &[spend]).await {
-                            Ok(_) => { bg_s_ok.fetch_add(1, Ordering::Relaxed); }
+                            Ok(_) => {
+                                bg_s_ok.fetch_add(1, Ordering::Relaxed);
+                            }
                             Err(_) => {
                                 bg_s_err.fetch_add(1, Ordering::Relaxed);
                                 let _ = bg_client.refresh_routing().await;
@@ -207,7 +214,10 @@ async fn run_scenario() -> Result<(), ClientError> {
     eprintln!("[13.2] Waiting for migrations to complete on 4 nodes");
     common::wait_migrations_complete(&docker_5, 4, Duration::from_secs(120)).await?;
     let migration_duration = migration_start.elapsed();
-    eprintln!("[13.2] Migrations complete in {:.1}s", migration_duration.as_secs_f64());
+    eprintln!(
+        "[13.2] Migrations complete in {:.1}s",
+        migration_duration.as_secs_f64()
+    );
 
     // Probe end-to-end read readiness before consistency check (pattern A).
     // Use the verifier's tracked txids as the sample source — this covers
@@ -222,7 +232,8 @@ async fn run_scenario() -> Result<(), ClientError> {
             2,
             50,
             Duration::from_secs(60),
-        ).await?;
+        )
+        .await?;
     }
 
     // Stop the background workload
@@ -252,10 +263,16 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // -- 13.3: Verify writes to migrating shards succeeded (proxied) --
     eprintln!("[13.3] Verifying writes during migration succeeded");
-    assert!(total_ops > 0, "Background workload should have executed operations");
+    assert!(
+        total_ops > 0,
+        "Background workload should have executed operations"
+    );
     // Non-migrating shards should be unaffected, and migrating shards
     // should proxy writes. Verify that background creates are readable.
-    eprintln!("[13.3] Background task created {} records during migration", background_txids.len());
+    eprintln!(
+        "[13.3] Background task created {} records during migration",
+        background_txids.len()
+    );
 
     // -- 13.4: Full consistency check using verify_consistency --
     eprintln!("[13.4] Full consistency check using verifier (all seeded + background records)");
@@ -264,18 +281,27 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     let mismatches = common::verify_consistency(&fresh_client, &verifier).await?;
     let max_allowed = std::cmp::max(3, (verifier.record_count() as f64 * 0.001).ceil() as usize);
-    assert!(mismatches.len() <= max_allowed,
+    assert!(
+        mismatches.len() <= max_allowed,
         "13.4: {} mismatches after migration (max {max_allowed}): {:?}",
         mismatches.len(),
-        mismatches.iter().take(5).collect::<Vec<_>>());
+        mismatches.iter().take(5).collect::<Vec<_>>()
+    );
     if !mismatches.is_empty() {
-        eprintln!("[13.4] WARNING: {} mismatches (within tolerance of {max_allowed})", mismatches.len());
+        eprintln!(
+            "[13.4] WARNING: {} mismatches (within tolerance of {max_allowed})",
+            mismatches.len()
+        );
     }
-    eprintln!("[13.4] Consistency check passed: 0 mismatches across all {} tracked records",
-        verifier.record_count());
+    eprintln!(
+        "[13.4] Consistency check passed: 0 mismatches across all {} tracked records",
+        verifier.record_count()
+    );
 
     // -- 13.5: Verify records created during migration are on correct node per new shard table --
-    eprintln!("[13.5] Verifying records created during migration are on correct node per new shard table");
+    eprintln!(
+        "[13.5] Verifying records created during migration are on correct node per new shard table"
+    );
     let partition_map = fresh_client.get_partition_map().await?;
 
     let mut misrouted = 0u32;
@@ -284,7 +310,10 @@ async fn run_scenario() -> Result<(), ClientError> {
     for txid in &background_txids {
         let shard = u16::from_le_bytes([txid[0], txid[1]]) % NUM_SHARDS as u16;
         let assigned_node_id = partition_map.assignments[shard as usize];
-        let node_info = partition_map.nodes.iter().find(|n| n.id == assigned_node_id);
+        let node_info = partition_map
+            .nodes
+            .iter()
+            .find(|n| n.id == assigned_node_id);
         if node_info.is_none() {
             eprintln!("[13.5] Shard {shard} assigned to unknown node_id {assigned_node_id}");
             misrouted += 1;
@@ -297,12 +326,18 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     let max_misrouted: u32 = 5;
     if misrouted > 0 {
-        eprintln!("[13.5] WARN -- {misrouted} misrouted records within tolerance (max {max_misrouted})");
+        eprintln!(
+            "[13.5] WARN -- {misrouted} misrouted records within tolerance (max {max_misrouted})"
+        );
     }
-    assert!(misrouted <= max_misrouted,
-        "13.5: {misrouted} records created during migration are not on the correct node (max allowed {max_misrouted})");
-    eprintln!("[13.5] {} background-created records verified ({misrouted} misrouted, max allowed {max_misrouted})",
-        background_txids.len());
+    assert!(
+        misrouted <= max_misrouted,
+        "13.5: {misrouted} records created during migration are not on the correct node (max allowed {max_misrouted})"
+    );
+    eprintln!(
+        "[13.5] {} background-created records verified ({misrouted} misrouted, max allowed {max_misrouted})",
+        background_txids.len()
+    );
 
     // -- 13.6: Verify writes to migrating shards are applied and not lost --
     eprintln!("[13.6] Verifying writes to migrating shards are applied and not lost");
@@ -353,7 +388,10 @@ async fn run_scenario() -> Result<(), ClientError> {
             }
         }
     }
-    assert_eq!(write_losses, 0, "13.6: {write_losses} writes to post-migration cluster were lost");
+    assert_eq!(
+        write_losses, 0,
+        "13.6: {write_losses} writes to post-migration cluster were lost"
+    );
     eprintln!("[13.6] All 100 post-migration writes applied and readable");
 
     // -- 13.5 (plan numbering): Verify balanced 4-node shard distribution --
@@ -363,27 +401,28 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     for node_num in 1u32..=4 {
         let status = common::http_status(&docker_5, node_num).await?;
-        let master_count = status["master_shard_count"].as_u64()
+        let master_count = status["master_shard_count"]
+            .as_u64()
             .expect("master_shard_count should be present");
         total_master_shards += master_count;
         node_master_counts.push((node_num, master_count));
         eprintln!("[13.5b] node{node_num}: {master_count} master shards");
     }
 
-    assert!(total_master_shards >= 4096 && total_master_shards <= 4128,
-        "[13.5b] total_master_shards={total_master_shards}, expected 4096 (±32 for in-flight handoffs)");
+    assert!(
+        (4096..=4128).contains(&total_master_shards),
+        "[13.5b] total_master_shards={total_master_shards}, expected 4096 (±32 for in-flight handoffs)"
+    );
 
     let expected_per_node: u64 = 4096 / 4;
     let tolerance: u64 = 100;
     for (node_num, count) in &node_master_counts {
-        let diff = if *count > expected_per_node {
-            *count - expected_per_node
-        } else {
-            expected_per_node - *count
-        };
-        assert!(diff <= tolerance,
+        let diff = (*count).abs_diff(expected_per_node);
+        assert!(
+            diff <= tolerance,
             "13.5b: node{node_num} masters {count} shards, expected ~{expected_per_node} \
-             (tolerance {tolerance}), difference is {diff}");
+             (tolerance {tolerance}), difference is {diff}"
+        );
     }
     eprintln!("[13.5b] Shard distribution balanced: ~1024 per node");
 
@@ -401,13 +440,21 @@ async fn run_scenario() -> Result<(), ClientError> {
         0.0
     };
 
-    eprintln!("  Migration duration: {:.1}s", migration_duration.as_secs_f64());
+    eprintln!(
+        "  Migration duration: {:.1}s",
+        migration_duration.as_secs_f64()
+    );
     eprintln!("  Records migrated: ~20000");
     eprintln!("  Migration records/sec: {records_per_sec:.0}");
     eprintln!("  Workload total ops during migration: {total_ops}");
-    eprintln!("  Workload ops/sec: {:.0}", if migration_duration.as_secs_f64() > 0.0 {
-        total_ops as f64 / migration_duration.as_secs_f64()
-    } else { 0.0 });
+    eprintln!(
+        "  Workload ops/sec: {:.0}",
+        if migration_duration.as_secs_f64() > 0.0 {
+            total_ops as f64 / migration_duration.as_secs_f64()
+        } else {
+            0.0
+        }
+    );
     eprintln!("  Workload error rate: {error_rate:.2}%");
     eprintln!("  Creates: {creates_ok} ok, {creates_err} err");
     eprintln!("  Reads: {reads_ok} ok, {reads_err} err");

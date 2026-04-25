@@ -70,7 +70,9 @@ fn validate_alignment(alignment: usize) -> Result<()> {
 
 impl From<crate::record::RecordError> for DeviceError {
     fn from(e: crate::record::RecordError) -> Self {
-        DeviceError::RecordCorruption { detail: e.to_string() }
+        DeviceError::RecordCorruption {
+            detail: e.to_string(),
+        }
     }
 }
 
@@ -157,8 +159,9 @@ impl AlignedBuf {
             return Self {
                 ptr: std::ptr::NonNull::dangling().as_ptr(),
                 len: 0,
-                layout: Layout::from_size_align(0, alignment)
-                    .expect("invariant: alignment must be a non-zero power of two (caller's contract)"),
+                layout: Layout::from_size_align(0, alignment).expect(
+                    "invariant: alignment must be a non-zero power of two (caller's contract)",
+                ),
             };
         }
         let layout = Layout::from_size_align(len, alignment)
@@ -269,18 +272,12 @@ impl MemoryDevice {
     fn check_alignment(&self, offset: u64, len: usize) -> Result<()> {
         if !(offset as usize).is_multiple_of(self.alignment) {
             return Err(DeviceError::AlignmentViolation {
-                detail: format!(
-                    "offset {offset} not aligned to {}",
-                    self.alignment
-                ),
+                detail: format!("offset {offset} not aligned to {}", self.alignment),
             });
         }
         if !len.is_multiple_of(self.alignment) {
             return Err(DeviceError::AlignmentViolation {
-                detail: format!(
-                    "buffer length {len} not aligned to {}",
-                    self.alignment
-                ),
+                detail: format!("buffer length {len} not aligned to {}", self.alignment),
             });
         }
         Ok(())
@@ -377,11 +374,7 @@ impl DirectDevice {
     /// cannot be queried, or pre-allocation fails.
     /// Returns [`DeviceError::InvalidAlignment`] if `alignment` is not a
     /// power-of-two or is below [`MIN_ALIGNMENT`] (512).
-    pub fn open(
-        path: &std::path::Path,
-        size: u64,
-        alignment: usize,
-    ) -> Result<Self> {
+    pub fn open(path: &std::path::Path, size: u64, alignment: usize) -> Result<Self> {
         validate_alignment(alignment)?;
         use std::fs::OpenOptions;
 
@@ -425,9 +418,7 @@ impl DirectDevice {
                 // BLKGETSIZE64 = 0x80081272 — returns byte count as u64.
                 // Safety: fd is a valid open block device; dev_size is a
                 // properly-sized output variable for this ioctl.
-                let rc = unsafe {
-                    libc::ioctl(fd, 0x8008_1272 as libc::c_ulong, &mut dev_size)
-                };
+                let rc = unsafe { libc::ioctl(fd, 0x8008_1272 as libc::c_ulong, &mut dev_size) };
                 if rc != 0 {
                     return Err(DeviceError::Io(std::io::Error::last_os_error()));
                 }
@@ -443,15 +434,11 @@ impl DirectDevice {
                 let mut block_size: u32 = 0;
                 // Safety: fd is a valid open block device; the output
                 // variables are correctly sized for the respective ioctls.
-                let rc = unsafe {
-                    libc::ioctl(fd, 0x4008_6419 as libc::c_ulong, &mut block_count)
-                };
+                let rc = unsafe { libc::ioctl(fd, 0x4008_6419 as libc::c_ulong, &mut block_count) };
                 if rc != 0 {
                     return Err(DeviceError::Io(std::io::Error::last_os_error()));
                 }
-                let rc = unsafe {
-                    libc::ioctl(fd, 0x4004_6418 as libc::c_ulong, &mut block_size)
-                };
+                let rc = unsafe { libc::ioctl(fd, 0x4004_6418 as libc::c_ulong, &mut block_size) };
                 if rc != 0 {
                     return Err(DeviceError::Io(std::io::Error::last_os_error()));
                 }
@@ -496,18 +483,12 @@ impl DirectDevice {
     fn check_alignment(&self, offset: u64, len: usize) -> Result<()> {
         if !(offset as usize).is_multiple_of(self.alignment) {
             return Err(DeviceError::AlignmentViolation {
-                detail: format!(
-                    "offset {offset} not aligned to {}",
-                    self.alignment
-                ),
+                detail: format!("offset {offset} not aligned to {}", self.alignment),
             });
         }
         if !len.is_multiple_of(self.alignment) {
             return Err(DeviceError::AlignmentViolation {
-                detail: format!(
-                    "buffer length {len} not aligned to {}",
-                    self.alignment
-                ),
+                detail: format!("buffer length {len} not aligned to {}", self.alignment),
             });
         }
         Ok(())
@@ -566,14 +547,8 @@ impl BlockDevice for DirectDevice {
             use std::os::unix::io::AsRawFd;
             let fd = self.file.as_raw_fd();
             // Safety: fd is valid, buf is valid for buf.len() bytes.
-            let n = unsafe {
-                libc::pwrite(
-                    fd,
-                    buf.as_ptr().cast(),
-                    buf.len(),
-                    offset as libc::off_t,
-                )
-            };
+            let n =
+                unsafe { libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), offset as libc::off_t) };
             if n < 0 {
                 return Err(DeviceError::Io(std::io::Error::last_os_error()));
             }
@@ -991,8 +966,7 @@ mod tests {
         // To exercise during-guard, we use a second lock of the same
         // type. If a panicking thread holds a parking_lot::RwLock write
         // guard, subsequent acquirers on the main thread must succeed.
-        let gate: Arc<parking_lot::RwLock<u32>> =
-            Arc::new(parking_lot::RwLock::new(0));
+        let gate: Arc<parking_lot::RwLock<u32>> = Arc::new(parking_lot::RwLock::new(0));
         let gate_clone = Arc::clone(&gate);
 
         let handle = std::thread::spawn(move || {
@@ -1001,7 +975,9 @@ mod tests {
             // from the panicking thread too.
             let mut buf = AlignedBuf::new(4096, 4096);
             buf[0] = 0x77;
-            dev_clone.pwrite(&buf, 0).expect("pwrite in worker must succeed");
+            dev_clone
+                .pwrite(&buf, 0)
+                .expect("pwrite in worker must succeed");
             // Now panic while holding the gate's write lock.
             drop(guard); // parking_lot would not poison either way, but
             // we explicitly drop before panic so this test passes on
@@ -1029,7 +1005,8 @@ mod tests {
         // guaranteed only because the write guard was dropped before
         // the panic — with parking_lot it is guaranteed unconditionally.
         let mut read_buf = AlignedBuf::new(4096, 4096);
-        dev.pread(&mut read_buf, 0).expect("pread after panic must succeed");
+        dev.pread(&mut read_buf, 0)
+            .expect("pread after panic must succeed");
         assert_eq!(read_buf[0], 0x77, "data written by worker must be readable");
 
         let mut write_buf = AlignedBuf::new(4096, 4096);
@@ -1074,8 +1051,7 @@ mod tests {
                 // we can't reach `dev_clone.data` from tests (private
                 // field) we use a separate instance that shares the
                 // same semantics.
-                let side: parking_lot::RwLock<Vec<u8>> =
-                    parking_lot::RwLock::new(vec![0; 32]);
+                let side: parking_lot::RwLock<Vec<u8>> = parking_lot::RwLock::new(vec![0; 32]);
                 let guard = side.write();
                 // While holding the guard, mutate the MemoryDevice as
                 // well so both locks are exercised in this scope.

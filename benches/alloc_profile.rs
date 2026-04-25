@@ -7,8 +7,8 @@
 #![allow(clippy::disallowed_macros)] // bench tool emits to stdout by design
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Counting allocator
@@ -112,8 +112,7 @@ fn make_utxo_hash(tx_n: u32, vout: u32) -> [u8; 32] {
 }
 
 fn create_engine() -> Arc<Engine> {
-    let dev: Arc<dyn BlockDevice> =
-        Arc::new(MemoryDevice::new(512 * 1024 * 1024, 4096).unwrap());
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(512 * 1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(200_000).unwrap();
     Arc::new(Engine::new(
@@ -128,8 +127,7 @@ fn create_engine() -> Arc<Engine> {
 
 fn create_tx(engine: &Engine, tx_idx: u32, utxo_count: u32) {
     let tx_id = make_tx_id(tx_idx);
-    let utxo_hashes: Vec<[u8; 32]> =
-        (0..utxo_count).map(|v| make_utxo_hash(tx_idx, v)).collect();
+    let utxo_hashes: Vec<[u8; 32]> = (0..utxo_count).map(|v| make_utxo_hash(tx_idx, v)).collect();
     let req = CreateRequest {
         tx_id,
         tx_version: 1,
@@ -182,16 +180,29 @@ fn main() {
     let mut tx_i = 0u32;
     measure("engine::create (5 UTXOs)", n, || {
         let tx_id = make_tx_id(tx_i + 1_000_000);
-        let utxo_hashes: Vec<[u8; 32]> =
-            (0..5u32).map(|v| make_utxo_hash(tx_i + 1_000_000, v)).collect();
+        let utxo_hashes: Vec<[u8; 32]> = (0..5u32)
+            .map(|v| make_utxo_hash(tx_i + 1_000_000, v))
+            .collect();
         let req = CreateRequest {
             tx_id,
-            tx_version: 1, locktime: 0, fee: 500, size_in_bytes: 250,
-            extended_size: 0, is_coinbase: false, spending_height: 0,
-            utxo_hashes: &utxo_hashes, inputs: None, outputs: None, inpoints: None,
-            is_external: false, created_at: 1710000000000,
-            block_height: 1000, mined_block_infos: &[],
-            frozen: false, conflicting: false, locked: false,
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: &utxo_hashes,
+            inputs: None,
+            outputs: None,
+            inpoints: None,
+            is_external: false,
+            created_at: 1710000000000,
+            block_height: 1000,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
             parent_txids: &[],
         };
         let _ = engine.create(&req);
@@ -200,126 +211,188 @@ fn main() {
 
     let mut tx_i = 0u32;
     measure("engine::spend", n, || {
-        let key = TxKey { txid: make_tx_id(tx_i) };
+        let key = TxKey {
+            txid: make_tx_id(tx_i),
+        };
         let mut sd = [0u8; 36];
         sd[0..4].copy_from_slice(&(tx_i + 10000).to_le_bytes());
         let _ = engine.spend(&SpendRequest {
-            tx_key: key, offset: (tx_i % 5),
+            tx_key: key,
+            offset: (tx_i % 5),
             utxo_hash: make_utxo_hash(tx_i, tx_i % 5),
             spending_data: sd,
-            ignore_conflicting: false, ignore_locked: false,
-            current_block_height: 2000, block_height_retention: 288,
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 2000,
+            block_height_retention: 288,
         });
         tx_i += 1;
-        if tx_i >= 50_000 { tx_i = 0; }
+        if tx_i >= 50_000 {
+            tx_i = 0;
+        }
     });
 
     let mut tx_i = 0u32;
     measure("engine::unspend", n, || {
-        let key = TxKey { txid: make_tx_id(tx_i) };
+        let key = TxKey {
+            txid: make_tx_id(tx_i),
+        };
         let _ = engine.unspend(&UnspendRequest {
-            tx_key: key, offset: (tx_i % 5),
+            tx_key: key,
+            offset: (tx_i % 5),
             utxo_hash: make_utxo_hash(tx_i, tx_i % 5),
-            current_block_height: 2000, block_height_retention: 288,
+            current_block_height: 2000,
+            block_height_retention: 288,
         });
         tx_i += 1;
-        if tx_i >= 50_000 { tx_i = 0; }
+        if tx_i >= 50_000 {
+            tx_i = 0;
+        }
     });
 
     let mut tx_i = 0u32;
     measure("engine::set_mined", n, || {
-        let key = TxKey { txid: make_tx_id(tx_i) };
+        let key = TxKey {
+            txid: make_tx_id(tx_i),
+        };
         let _ = engine.set_mined(&SetMinedRequest {
-            tx_key: key, block_id: tx_i + 100, block_height: 2000,
-            subtree_idx: 0, current_block_height: 2000,
-            block_height_retention: 288, on_longest_chain: true,
+            tx_key: key,
+            block_id: tx_i + 100,
+            block_height: 2000,
+            subtree_idx: 0,
+            current_block_height: 2000,
+            block_height_retention: 288,
+            on_longest_chain: true,
             unset_mined: false,
         });
         tx_i += 1;
-        if tx_i >= 50_000 { tx_i = 0; }
+        if tx_i >= 50_000 {
+            tx_i = 0;
+        }
     });
 
     let mut tx_i = 0u32;
     measure("engine::read_metadata", n, || {
-        let key = TxKey { txid: make_tx_id(tx_i) };
+        let key = TxKey {
+            txid: make_tx_id(tx_i),
+        };
         let _ = engine.read_metadata(&key);
         tx_i += 1;
-        if tx_i >= 50_000 { tx_i = 0; }
+        if tx_i >= 50_000 {
+            tx_i = 0;
+        }
     });
 
     let mut tx_i = 0u32;
     measure("engine::get_spend", n, || {
-        let key = TxKey { txid: make_tx_id(tx_i) };
+        let key = TxKey {
+            txid: make_tx_id(tx_i),
+        };
         let _ = engine.get_spend(&GetSpendRequest {
-            tx_key: key, offset: 0,
+            tx_key: key,
+            offset: 0,
             utxo_hash: make_utxo_hash(tx_i, 0),
         });
         tx_i += 1;
-        if tx_i >= 50_000 { tx_i = 0; }
+        if tx_i >= 50_000 {
+            tx_i = 0;
+        }
     });
 
     let mut tx_i = 0u32;
     measure("engine::freeze", n, || {
-        let key = TxKey { txid: make_tx_id(tx_i) };
+        let key = TxKey {
+            txid: make_tx_id(tx_i),
+        };
         let _ = engine.freeze(&FreezeRequest {
-            tx_key: key, offset: 1,
+            tx_key: key,
+            offset: 1,
             utxo_hash: make_utxo_hash(tx_i, 1),
         });
         tx_i += 1;
-        if tx_i >= 50_000 { tx_i = 0; }
+        if tx_i >= 50_000 {
+            tx_i = 0;
+        }
     });
 
     let mut tx_i = 0u32;
     measure("engine::unfreeze", n, || {
-        let key = TxKey { txid: make_tx_id(tx_i) };
+        let key = TxKey {
+            txid: make_tx_id(tx_i),
+        };
         let _ = engine.unfreeze(&UnfreezeRequest {
-            tx_key: key, offset: 1,
+            tx_key: key,
+            offset: 1,
             utxo_hash: make_utxo_hash(tx_i, 1),
         });
         tx_i += 1;
-        if tx_i >= 50_000 { tx_i = 0; }
+        if tx_i >= 50_000 {
+            tx_i = 0;
+        }
     });
 
     let mut tx_i = 0u32;
     measure("engine::set_conflicting", n, || {
-        let key = TxKey { txid: make_tx_id(tx_i) };
+        let key = TxKey {
+            txid: make_tx_id(tx_i),
+        };
         let _ = engine.set_conflicting(&SetConflictingRequest {
-            tx_key: key, value: true,
-            current_block_height: 2000, block_height_retention: 288,
+            tx_key: key,
+            value: true,
+            current_block_height: 2000,
+            block_height_retention: 288,
         });
         tx_i += 1;
-        if tx_i >= 50_000 { tx_i = 0; }
+        if tx_i >= 50_000 {
+            tx_i = 0;
+        }
     });
 
     let mut tx_i = 0u32;
     measure("engine::set_locked", n, || {
-        let key = TxKey { txid: make_tx_id(tx_i) };
+        let key = TxKey {
+            txid: make_tx_id(tx_i),
+        };
         let _ = engine.set_locked(&SetLockedRequest {
-            tx_key: key, value: true,
+            tx_key: key,
+            value: true,
         });
         tx_i += 1;
-        if tx_i >= 50_000 { tx_i = 0; }
+        if tx_i >= 50_000 {
+            tx_i = 0;
+        }
     });
 
     let mut tx_i = 0u32;
     measure("engine::preserve_until", n, || {
-        let key = TxKey { txid: make_tx_id(tx_i) };
+        let key = TxKey {
+            txid: make_tx_id(tx_i),
+        };
         let _ = engine.preserve_until(&PreserveUntilRequest {
-            tx_key: key, block_height: 5000,
+            tx_key: key,
+            block_height: 5000,
         });
         tx_i += 1;
-        if tx_i >= 50_000 { tx_i = 0; }
+        if tx_i >= 50_000 {
+            tx_i = 0;
+        }
     });
 
     let mut tx_i = 0u32;
     measure("engine::mark_on_longest_chain", n, || {
-        let key = TxKey { txid: make_tx_id(tx_i) };
+        let key = TxKey {
+            txid: make_tx_id(tx_i),
+        };
         let _ = engine.mark_on_longest_chain(&MarkOnLongestChainRequest {
-            tx_key: key, on_longest_chain: true,
-            current_block_height: 2000, block_height_retention: 288,
+            tx_key: key,
+            on_longest_chain: true,
+            current_block_height: 2000,
+            block_height_retention: 288,
         });
         tx_i += 1;
-        if tx_i >= 50_000 { tx_i = 0; }
+        if tx_i >= 50_000 {
+            tx_i = 0;
+        }
     });
 
     drop(engine);
@@ -330,7 +403,9 @@ fn main() {
     let engine = setup_engine(20_000, 5);
     let mut tx_i = 0u32;
     measure("engine::delete", 5_000, || {
-        let key = TxKey { txid: make_tx_id(tx_i) };
+        let key = TxKey {
+            txid: make_tx_id(tx_i),
+        };
         let _ = engine.delete(&DeleteRequest { tx_key: key });
         tx_i += 1;
     });
@@ -344,11 +419,18 @@ fn main() {
 
     let mut index = Index::new(200_000).unwrap();
     for i in 0..100_000u32 {
-        let key = TxKey { txid: make_tx_id(i) };
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
         let entry = teraslab::index::TxIndexEntry {
-            device_id: 0, record_offset: (i as u64) * 4096,
-            utxo_count: 5, block_entry_count: 1, tx_flags: 0,
-            spent_utxos: 0, dah_or_preserve: 0, unmined_since: 0,
+            device_id: 0,
+            record_offset: (i as u64) * 4096,
+            utxo_count: 5,
+            block_entry_count: 1,
+            tx_flags: 0,
+            spent_utxos: 0,
+            dah_or_preserve: 0,
+            unmined_since: 0,
             generation: 0,
         };
         index.register(key, entry).unwrap();
@@ -356,26 +438,39 @@ fn main() {
 
     let mut tx_i = 0u32;
     measure("index::lookup (hit)", n, || {
-        let key = TxKey { txid: make_tx_id(tx_i) };
+        let key = TxKey {
+            txid: make_tx_id(tx_i),
+        };
         let _ = index.lookup(&key);
         tx_i += 1;
-        if tx_i >= 100_000 { tx_i = 0; }
+        if tx_i >= 100_000 {
+            tx_i = 0;
+        }
     });
 
     let mut tx_i = 500_000u32;
     measure("index::lookup (miss)", n, || {
-        let key = TxKey { txid: make_tx_id(tx_i) };
+        let key = TxKey {
+            txid: make_tx_id(tx_i),
+        };
         let _ = index.lookup(&key);
         tx_i += 1;
     });
 
     let mut tx_i = 200_000u32;
     measure("index::register", n, || {
-        let key = TxKey { txid: make_tx_id(tx_i) };
+        let key = TxKey {
+            txid: make_tx_id(tx_i),
+        };
         let entry = teraslab::index::TxIndexEntry {
-            device_id: 0, record_offset: (tx_i as u64) * 4096,
-            utxo_count: 5, block_entry_count: 1, tx_flags: 0,
-            spent_utxos: 0, dah_or_preserve: 0, unmined_since: 0,
+            device_id: 0,
+            record_offset: (tx_i as u64) * 4096,
+            utxo_count: 5,
+            block_entry_count: 1,
+            tx_flags: 0,
+            spent_utxos: 0,
+            dah_or_preserve: 0,
+            unmined_since: 0,
             generation: 0,
         };
         let _ = index.register(key, entry);
@@ -384,10 +479,14 @@ fn main() {
 
     let mut tx_i = 0u32;
     measure("index::update_cached_fields", n, || {
-        let key = TxKey { txid: make_tx_id(tx_i) };
+        let key = TxKey {
+            txid: make_tx_id(tx_i),
+        };
         index.update_cached_fields(&key, 0x01, 2, tx_i, 0, 0, tx_i + 1);
         tx_i += 1;
-        if tx_i >= 100_000 { tx_i = 0; }
+        if tx_i >= 100_000 {
+            tx_i = 0;
+        }
     });
 
     drop(index);
@@ -398,16 +497,14 @@ fn main() {
     println!();
     println!("--- Allocator Operations ---");
 
-    let dev: Arc<dyn BlockDevice> =
-        Arc::new(MemoryDevice::new(512 * 1024 * 1024, 4096).unwrap());
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(512 * 1024 * 1024, 4096).unwrap());
     let mut alloc = SlotAllocator::new(dev).unwrap();
     measure("allocator::allocate (4096)", n, || {
         let _ = alloc.allocate(4096);
     });
 
     // Re-create with fragmentation.
-    let dev: Arc<dyn BlockDevice> =
-        Arc::new(MemoryDevice::new(512 * 1024 * 1024, 4096).unwrap());
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(512 * 1024 * 1024, 4096).unwrap());
     let mut alloc = SlotAllocator::new(dev).unwrap();
     let offsets: Vec<u64> = (0..20_000).map(|_| alloc.allocate(4096).unwrap()).collect();
     for i in (0..20_000).step_by(2) {
@@ -425,12 +522,15 @@ fn main() {
     println!("--- Wire Codec (encode+decode round-trips, 1024 items) ---");
 
     let spend_params = SpendBatchParams {
-        ignore_conflicting: false, ignore_locked: false,
-        current_block_height: 1000, block_height_retention: 288,
+        ignore_conflicting: false,
+        ignore_locked: false,
+        current_block_height: 1000,
+        block_height_retention: 288,
     };
     let spend_items: Vec<WireSpendItem> = (0..1024u32)
         .map(|i| WireSpendItem {
-            txid: make_tx_id(i), vout: i,
+            txid: make_tx_id(i),
+            vout: i,
             utxo_hash: make_utxo_hash(i, 0),
             spending_data: [0xAB; 36],
         })
@@ -444,9 +544,13 @@ fn main() {
     });
 
     let mined_params = SetMinedBatchParams {
-        block_id: 42, block_height: 800_000, subtree_idx: 7,
-        on_longest_chain: true, unset_mined: false,
-        current_block_height: 800_000, block_height_retention: 288,
+        block_id: 42,
+        block_height: 800_000,
+        subtree_idx: 7,
+        on_longest_chain: true,
+        unset_mined: false,
+        current_block_height: 800_000,
+        block_height_retention: 288,
     };
     let txids: Vec<[u8; 32]> = (0..1024u32).map(make_tx_id).collect();
     measure("codec::set_mined_batch (encode 1024)", n, || {
@@ -459,13 +563,23 @@ fn main() {
 
     let create_items: Vec<WireCreateItem> = (0..100u32)
         .map(|i| WireCreateItem {
-            txid: make_tx_id(i), tx_version: 2, locktime: 0, fee: 500,
-            size_in_bytes: 250, extended_size: 0, is_coinbase: false,
-            spending_height: 0, created_at: 1710000000000, flags: 0,
+            txid: make_tx_id(i),
+            tx_version: 2,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1710000000000,
+            flags: 0,
             utxo_hashes: (0..5).map(|v| make_utxo_hash(i, v)).collect(),
-            cold_data: vec![], block_height: 1000,
-            mined_block_id: None, mined_block_height: None,
-            mined_subtree_idx: None, parent_txids: vec![],
+            cold_data: vec![],
+            block_height: 1000,
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
         })
         .collect();
     measure("codec::create_batch (encode 100)", n, || {
@@ -478,7 +592,8 @@ fn main() {
 
     let slot_items: Vec<WireSlotItem> = (0..256u32)
         .map(|i| WireSlotItem {
-            txid: make_tx_id(i), vout: i,
+            txid: make_tx_id(i),
+            vout: i,
             utxo_hash: make_utxo_hash(i, 0),
         })
         .collect();
@@ -491,7 +606,10 @@ fn main() {
     });
 
     let get_items: Vec<WireGetResult> = (0..100)
-        .map(|_| WireGetResult { status: 0, data: vec![0u8; 100] })
+        .map(|_| WireGetResult {
+            status: 0,
+            data: vec![0u8; 100],
+        })
         .collect();
     measure("codec::get_response (encode 100)", n, || {
         let _ = encode_get_response(&get_items);
@@ -503,7 +621,9 @@ fn main() {
 
     let errors: Vec<BatchItemError> = (0..50u32)
         .map(|i| BatchItemError {
-            item_index: i, error_code: 1, error_data: vec![],
+            item_index: i,
+            error_code: 1,
+            error_data: vec![],
         })
         .collect();
     measure("codec::sparse_errors (encode 50)", n, || {

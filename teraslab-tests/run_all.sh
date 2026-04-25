@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Note: deliberately no `set -e` — a flaky diagnostic helper must never
 # abort the 17-scenario run. Individual commands use explicit `|| true`.
+set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -49,8 +50,8 @@ scenario_name() {
 }
 scenario_timeout() {
     case "$1" in
-        01) echo 120 ;;  10) echo 900 ;;  14|15) echo 1200 ;;
-        08|16) echo 900 ;;  17) echo 600 ;;  *) echo 300 ;;
+        01) echo 120 ;;  05) echo 600 ;;  10) echo 900 ;;  12) echo 900 ;;
+        14|15|17) echo 1200 ;;  08|16) echo 900 ;;  *) echo 300 ;;
     esac
 }
 

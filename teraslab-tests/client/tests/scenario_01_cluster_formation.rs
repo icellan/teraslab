@@ -82,7 +82,11 @@ async fn test_simultaneous_start() -> Result<(), ClientError> {
     tlog!(t0, "  [simul] start_3node_cluster...");
     let (docker, client) = common::start_3node_cluster(SID).await?;
     let formation_time = t0.elapsed();
-    tlog!(t0, "  [simul] cluster ready in {:.1}s", formation_time.as_secs_f64());
+    tlog!(
+        t0,
+        "  [simul] cluster ready in {:.1}s",
+        formation_time.as_secs_f64()
+    );
     assert!(
         formation_time <= Duration::from_secs(120),
         "cluster formed in {:?}, max 120s (includes Docker retry overhead)",
@@ -162,7 +166,9 @@ async fn test_simultaneous_start() -> Result<(), ClientError> {
     // With RF=2 on 3 nodes, we verify that each node's total slots (master + replica)
     // is consistent: if any node were master AND replica for the same shard,
     // the total slot count across the cluster would be less than 8192.
-    let total_shard_slots: u64 = master_counts.iter().zip(replica_counts.iter())
+    let total_shard_slots: u64 = master_counts
+        .iter()
+        .zip(replica_counts.iter())
         .map(|(m, r)| m + r)
         .sum();
     assert_eq!(
@@ -188,7 +194,8 @@ async fn test_simultaneous_start() -> Result<(), ClientError> {
     // assignment arrays to confirm they agree.
     let node_addrs = docker.host_client_addrs(3);
     assert_eq!(
-        node_addrs.len(), 3,
+        node_addrs.len(),
+        3,
         "Test 1.5: expected 3 node addresses, got {}",
         node_addrs.len()
     );
@@ -221,14 +228,18 @@ async fn test_simultaneous_start() -> Result<(), ClientError> {
         );
     }
 
-    fn get_shard_tail(p: &[u8]) -> &[u8] { &p[p.len() - 4096 * 8..] }
+    fn get_shard_tail(p: &[u8]) -> &[u8] {
+        &p[p.len() - 4096 * 8..]
+    }
 
     // Verify shard assignment arrays are identical across all nodes.
     for i in 1..partition_maps.len() {
         assert_eq!(
-            get_shard_tail(&partition_maps[0]), get_shard_tail(&partition_maps[i]),
+            get_shard_tail(&partition_maps[0]),
+            get_shard_tail(&partition_maps[i]),
             "Test 1.5: shard assignments from {} differ from {}",
-            node_addrs[0], node_addrs[i]
+            node_addrs[0],
+            node_addrs[i]
         );
     }
 
@@ -237,12 +248,9 @@ async fn test_simultaneous_start() -> Result<(), ClientError> {
     let shard_data = get_shard_tail(&partition_maps[0]);
     for shard_idx in 0..4096usize {
         let offset = shard_idx * 8;
-        let master_node = u32::from_le_bytes(
-            shard_data[offset..offset + 4].try_into().unwrap()
-        );
-        let replica_node = u32::from_le_bytes(
-            shard_data[offset + 4..offset + 8].try_into().unwrap()
-        );
+        let master_node = u32::from_le_bytes(shard_data[offset..offset + 4].try_into().unwrap());
+        let replica_node =
+            u32::from_le_bytes(shard_data[offset + 4..offset + 8].try_into().unwrap());
         assert_ne!(
             master_node, replica_node,
             "Test 1.5: shard {shard_idx} has master={master_node} and replica={replica_node} \
@@ -255,11 +263,7 @@ async fn test_simultaneous_start() -> Result<(), ClientError> {
     let tolerance: u64 = 50;
     for (i, &count) in master_counts.iter().enumerate() {
         let node_num = i as u32 + 1;
-        let diff = if count > expected_per_node {
-            count - expected_per_node
-        } else {
-            expected_per_node - count
-        };
+        let diff = count.abs_diff(expected_per_node);
         assert!(
             diff <= tolerance,
             "Test 1.6: node {node_num} masters {count} shards, expected ~{expected_per_node} \
@@ -274,9 +278,11 @@ async fn test_simultaneous_start() -> Result<(), ClientError> {
 
     for i in 1..partition_maps.len() {
         assert_eq!(
-            get_version(&partition_maps[0]), get_version(&partition_maps[i]),
+            get_version(&partition_maps[0]),
+            get_version(&partition_maps[i]),
             "Test 1.7: shard_table_version from {} differs from {}",
-            node_addrs[0], node_addrs[i]
+            node_addrs[0],
+            node_addrs[i]
         );
     }
 
@@ -368,11 +374,7 @@ async fn test_staggered_start() -> Result<(), ClientError> {
             .as_u64()
             .expect("Test 1.8: master_shard_count should be present in /status response");
         total_master_shards += master_count;
-        let diff = if master_count > expected_per_node {
-            master_count - expected_per_node
-        } else {
-            expected_per_node - master_count
-        };
+        let diff = master_count.abs_diff(expected_per_node);
         assert!(
             diff <= tolerance,
             "Test 1.8: after staggered start, node {node_num} masters {master_count} shards, \
@@ -426,7 +428,10 @@ async fn test_late_join() -> Result<(), ClientError> {
     tlog!(t0, "  [late] wait_cluster_ready (3 nodes)...");
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
     tlog!(t0, "  [late] cluster ready");
-    tlog!(t0, "  [late] wait_migrations_complete (3 nodes, 180s timeout)...");
+    tlog!(
+        t0,
+        "  [late] wait_migrations_complete (3 nodes, 180s timeout)..."
+    );
     common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
     tlog!(t0, "  [late] migrations done");
     // Wait for shard rebalance to fully propagate.
@@ -465,11 +470,7 @@ async fn test_late_join() -> Result<(), ClientError> {
             .as_u64()
             .expect("Test 1.9: master_shard_count should be present in /status response");
         total_master_shards_3node += master_count;
-        let diff = if master_count > expected_per_node {
-            master_count - expected_per_node
-        } else {
-            expected_per_node - master_count
-        };
+        let diff = master_count.abs_diff(expected_per_node);
         assert!(
             diff <= tolerance,
             "Test 1.9: after late join, node {node_num} masters {master_count} shards, \
@@ -513,7 +514,10 @@ async fn test_wrong_config_rejected() -> Result<(), ClientError> {
     let mut docker_wrong = common::docker_5node(wrong_sid);
     tlog!(t0, "  [wrong] compose_up rogue node4...");
     let _ = docker_wrong.compose_up_nodes(&["node4"]).await;
-    tlog!(t0, "  [wrong] rogue node up, waiting for discovery attempt...");
+    tlog!(
+        t0,
+        "  [wrong] rogue node up, waiting for discovery attempt..."
+    );
 
     // Wait long enough for the rogue node to attempt discovery.
     // SWIM probe interval is 150ms, so 3s covers ~20 probe cycles.

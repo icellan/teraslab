@@ -431,7 +431,11 @@ mod tests {
 
     #[test]
     fn external_clear_dah_signals_unset() {
-        let mut m = with_blocks(make_meta(10, 5, TxFlags::EXTERNAL | TxFlags::LAST_SPENT_ALL));
+        let mut m = with_blocks(make_meta(
+            10,
+            5,
+            TxFlags::EXTERNAL | TxFlags::LAST_SPENT_ALL,
+        ));
         m.delete_at_height = 500;
         let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288).expect("no overflow");
         assert_eq!(sig, Signal::DeleteAtHeightUnset);
@@ -475,8 +479,8 @@ mod tests {
         // Sanity guard: for realistic BSV heights, checked_add matches
         // the documented behavior exactly.
         let m = with_blocks(make_meta(10, 10, TxFlags::empty()));
-        let (_sig, patch) = evaluate_delete_at_height(&m, 800_000, 1000)
-            .expect("no overflow at normal heights");
+        let (_sig, patch) =
+            evaluate_delete_at_height(&m, 800_000, 1000).expect("no overflow at normal heights");
         let p = patch.expect("all-spent on-chain tx with blocks produces patch");
         assert_eq!(p.new_delete_at_height, 801_000);
     }
@@ -485,8 +489,8 @@ mod tests {
     fn dah_overflow_boundary_exact_u32_max() {
         // current + retention == u32::MAX exactly is the last legal value.
         let m = with_blocks(make_meta(10, 10, TxFlags::empty()));
-        let (_sig, patch) = evaluate_delete_at_height(&m, u32::MAX - 1000, 1000)
-            .expect("equal to u32::MAX is OK");
+        let (_sig, patch) =
+            evaluate_delete_at_height(&m, u32::MAX - 1000, 1000).expect("equal to u32::MAX is OK");
         let p = patch.unwrap();
         assert_eq!(p.new_delete_at_height, u32::MAX);
     }
@@ -502,28 +506,16 @@ mod tests {
     #[test]
     fn dah_cached_overflow_errors() {
         // Cached-fields path must also enforce overflow detection.
-        let err = evaluate_dah_cached(
-            TxFlags::empty(),
-            10,
-            10,
-            1,
-            0,
-            false,
-            0,
-            u32::MAX - 5,
-            10,
-        )
-        .unwrap_err();
+        let err = evaluate_dah_cached(TxFlags::empty(), 10, 10, 1, 0, false, 0, u32::MAX - 5, 10)
+            .unwrap_err();
         assert!(matches!(err, SpendError::DahOverflow { .. }));
     }
 
     #[test]
     fn dah_cached_normal_height_ok() {
-        let (_sig, patch) = evaluate_dah_cached(
-            TxFlags::empty(),
-            10, 10, 1, 0, false, 0, 800_000, 1000,
-        )
-        .expect("no overflow at normal heights");
+        let (_sig, patch) =
+            evaluate_dah_cached(TxFlags::empty(), 10, 10, 1, 0, false, 0, 800_000, 1000)
+                .expect("no overflow at normal heights");
         let p = patch.unwrap();
         assert_eq!(p.new_delete_at_height, 801_000);
     }

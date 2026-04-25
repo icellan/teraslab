@@ -9,8 +9,8 @@ mod common;
 
 use std::time::Duration;
 use teraslab_test_client::ClientError;
-use teraslab_test_client::verifier::StateVerifier;
 use teraslab_test_client::types::*;
+use teraslab_test_client::verifier::StateVerifier;
 
 use rand::Rng;
 
@@ -146,14 +146,12 @@ async fn test_kill_two_of_three() -> Result<(), ClientError> {
     // Try the write multiple times -- should fail (no quorum)
     let mut write_ever_failed = false;
     for attempt in 0..3u32 {
-        let create_result = client.create_batch(&[test_item.clone()]).await;
+        let create_result = client.create_batch(std::slice::from_ref(&test_item)).await;
         if create_result.is_err() {
             write_ever_failed = true;
             break;
         }
-        eprintln!(
-            "[12.1] Write attempt {attempt} unexpectedly succeeded, retrying after delay..."
-        );
+        eprintln!("[12.1] Write attempt {attempt} unexpectedly succeeded, retrying after delay...");
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     assert!(
@@ -167,7 +165,8 @@ async fn test_kill_two_of_three() -> Result<(), ClientError> {
     docker.start_node("node3").await?;
 
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+        .await
         .unwrap_or_else(|e| eprintln!("[12.1] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
     client.refresh_routing().await?;
@@ -178,8 +177,10 @@ async fn test_kill_two_of_three() -> Result<(), ClientError> {
     let step = txids.len() / sample_size;
     let sample: Vec<[u8; 32]> = (0..sample_size).map(|i| txids[i * step]).collect();
     let (found, not_found) = common::count_accessible(&client, &sample).await?;
-    assert_eq!(not_found, 0,
-        "12.1: {not_found}/{sample_size} post-recovery sampled records are inaccessible");
+    assert_eq!(
+        not_found, 0,
+        "12.1: {not_found}/{sample_size} post-recovery sampled records are inaccessible"
+    );
     eprintln!("[12.1] All {found} sampled records accessible after recovery");
 
     // Full consistency check against verifier state
@@ -229,7 +230,11 @@ async fn test_sequential_kills() -> Result<(), ClientError> {
     let write_item = make_test_create_item();
     let mut write_ever_failed = false;
     for _ in 0..3u32 {
-        if client.create_batch(&[write_item.clone()]).await.is_err() {
+        if client
+            .create_batch(std::slice::from_ref(&write_item))
+            .await
+            .is_err()
+        {
             write_ever_failed = true;
             break;
         }
@@ -259,42 +264,56 @@ async fn test_sequential_kills() -> Result<(), ClientError> {
     eprintln!("[12.2] Restarting node2 -- full cluster restored");
     docker.start_node("node2").await?;
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+        .await
         .unwrap_or_else(|e| eprintln!("[12.2] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
     client.refresh_routing().await?;
     eprintln!("[12.2] Full 3-node cluster restored");
 
+    let non_deleted = verifier.non_deleted_txids();
+    common::wait_for_migration_reads_ready(
+        &client,
+        &docker,
+        &non_deleted,
+        &[1, 2, 3],
+        2,
+        256,
+        Duration::from_secs(30),
+    )
+    .await?;
+
     // Verify original records (batch read)
     let sample: Vec<[u8; 32]> = (0..100).map(|i| txids[i * (txids.len() / 100)]).collect();
     let (found, not_found) = common::count_accessible(&client, &sample).await?;
-    // After sequential kills (node2→node3→restart), some records may be lost
-    // if both master and replica were on the killed nodes. Allow up to 50%.
-    assert!(not_found <= 50, "12.2: {not_found}/100 original records not accessible (max 50)");
+    assert_eq!(
+        not_found, 0,
+        "12.2: {not_found}/100 original records not accessible"
+    );
 
     // Verify new records (batch read)
     let (found_new, not_found_new) = common::count_accessible(&client, &new_txids).await?;
-    let max_new_lost = std::cmp::max(5, new_txids.len() / 2);
-    assert!(not_found_new <= max_new_lost,
-        "12.2: {not_found_new}/{} new records not accessible (max {max_new_lost})", new_txids.len());
-    eprintln!("[12.2] Data accessible after full recovery ({found}/100 + {found_new}/{} records)",
-        new_txids.len());
+    assert_eq!(
+        not_found_new,
+        0,
+        "12.2: {not_found_new}/{} new records not accessible",
+        new_txids.len()
+    );
+    eprintln!(
+        "[12.2] Data accessible after full recovery ({found}/100 + {found_new}/{} records)",
+        new_txids.len()
+    );
 
     // Full consistency check against verifier state
     let mismatches = common::verify_consistency(&client, &verifier).await?;
-    let max_allowed = std::cmp::max(50, (verifier.record_count() as f64 * 0.01).ceil() as usize);
-    if !mismatches.is_empty() {
-        eprintln!("[12.2] WARN -- {} mismatches within tolerance (max {max_allowed}): {:?}",
-            mismatches.len(), mismatches.iter().take(10).collect::<Vec<_>>());
-    }
     assert!(
-        mismatches.len() <= max_allowed,
-        "12.2: {} consistency mismatches after sequential kills recovery (max allowed {}): {:?}",
-        mismatches.len(), max_allowed,
+        mismatches.is_empty(),
+        "12.2: {} consistency mismatches after sequential kills recovery: {:?}",
+        mismatches.len(),
         mismatches.iter().take(10).collect::<Vec<_>>()
     );
-    eprintln!("[12.2] Full consistency check passed ({} mismatches, max allowed {max_allowed})",
-        mismatches.len());
+    common::assert_rf2_replication_exact(&client, &docker, 3, &non_deleted, "12.2").await?;
+    eprintln!("[12.2] Full consistency check passed with zero mismatches");
 
     eprintln!("[12.2] PASSED");
 
@@ -341,14 +360,21 @@ async fn test_partition_plus_kill() -> Result<(), ClientError> {
     let test_item = make_test_create_item();
     let mut write_failed = false;
     for _ in 0..3 {
-        if client.create_batch(&[test_item.clone()]).await.is_err() {
+        if client
+            .create_batch(std::slice::from_ref(&test_item))
+            .await
+            .is_err()
+        {
             write_failed = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     // node1 alone should fail writes (peak_size=3, alive=1)
-    assert!(write_failed, "writes should fail when only node1 remains (no quorum)");
+    assert!(
+        write_failed,
+        "writes should fail when only node1 remains (no quorum)"
+    );
     eprintln!("[12.3] Confirmed writes fail with node1 alone (no quorum)");
 
     // Heal partition and restart node2
@@ -357,11 +383,14 @@ async fn test_partition_plus_kill() -> Result<(), ClientError> {
     docker.start_node("node2").await?;
 
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+        .await
         .unwrap_or_else(|e| eprintln!("[12.3] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(30)).await?;
     // Second migration pass: catch any lagging migrations.
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await.ok();
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+        .await
+        .ok();
     client.refresh_routing().await?;
     eprintln!("[12.3] Cluster restored to 3 nodes");
 
@@ -453,18 +482,25 @@ async fn test_kill_during_migration() -> Result<(), ClientError> {
     };
 
     let wait_nodes: Vec<u32> = (1..=cluster_size).collect();
-    common::wait_specific_migrations_complete(
-        &docker_5,
-        &wait_nodes,
-        Duration::from_secs(120),
-    )
-    .await
-    .unwrap_or_else(|e| eprintln!("[12.4] final migration wait: {e}"));
+    common::wait_specific_migrations_complete(&docker_5, &wait_nodes, Duration::from_secs(120))
+        .await
+        .unwrap_or_else(|e| eprintln!("[12.4] final migration wait: {e}"));
 
     common::wait_replication_settled(&docker_5, cluster_size, Duration::from_secs(30)).await?;
     let fresh_client = common::create_client(&docker_5, cluster_size as usize).await?;
     fresh_client.refresh_routing().await?;
     eprintln!("[12.4] Cluster restored to {cluster_size} nodes");
+
+    common::wait_for_migration_reads_ready(
+        &fresh_client,
+        &docker_5,
+        &txids,
+        &wait_nodes,
+        2,
+        512,
+        Duration::from_secs(30),
+    )
+    .await?;
 
     // Verify no data loss: all 10000 original records should be accessible.
     // Use fresh client to avoid stale connections from the kill phase.
@@ -483,51 +519,37 @@ async fn test_kill_during_migration() -> Result<(), ClientError> {
             break;
         }
         if attempt < 4 {
-            eprintln!("[12.4] attempt {attempt}: {failures} reads failed, retrying after settle...");
+            eprintln!(
+                "[12.4] attempt {attempt}: {failures} reads failed, retrying after settle..."
+            );
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
     let (_, failures) = common::count_accessible(&fresh_client, &sample).await?;
-    // Allow up to 5% sample loss during kill-during-migration.
-    let max_sample_loss = (sample_size as f64 * 0.05) as usize;
     assert!(
-        failures <= max_sample_loss,
-        "12.4: {failures}/{sample_size} sampled records lost after kill-during-migration (max {max_sample_loss})"
+        failures == 0,
+        "12.4: {failures}/{sample_size} sampled records lost after kill-during-migration"
     );
-    if failures > 0 {
-        eprintln!("[12.4] {failures}/{sample_size} records lost during migration kill (within tolerance)");
-    } else {
-        eprintln!("[12.4] All {sample_size} sampled records accessible: no data loss");
-    }
+    eprintln!("[12.4] All {sample_size} sampled records accessible: no data loss");
 
-    // Full consistency check. During kill-during-active-migration, a small
-    // number of records may be lost if the master dies after ACKing a write
-    // but before the migration transfers the data and the replica receives it.
-    // With RF=2, this is at most a handful of records per concurrent failure.
+    // Full consistency check.
     let mismatches = common::verify_consistency(&fresh_client, &verifier).await?;
-    let not_found_count = mismatches.iter()
-        .filter(|m| m.actual.contains("NotFound"))
-        .count();
-    let other_mismatches: Vec<_> = mismatches.iter()
-        .filter(|m| !m.actual.contains("NotFound"))
-        .collect();
     assert!(
-        other_mismatches.is_empty(),
-        "12.4: {} non-NotFound consistency mismatches: {:?}",
-        other_mismatches.len(),
-        other_mismatches.iter().take(10).collect::<Vec<_>>()
-    );
-    // Allow up to 0.1% data loss during kill-during-migration (10/10000).
-    assert!(
-        not_found_count <= 10,
-        "12.4: {} records lost during kill-during-migration (max 10 allowed): {:?}",
-        not_found_count,
+        mismatches.is_empty(),
+        "12.4: {} consistency mismatches after kill-during-migration: {:?}",
+        mismatches.len(),
         mismatches.iter().take(10).collect::<Vec<_>>()
     );
-    if not_found_count > 0 {
-        eprintln!("[12.4] {not_found_count} records lost during kill-during-migration (acceptable for concurrent failure)");
-    }
-    eprintln!("[12.4] Consistency check passed ({not_found_count} records lost during active migration)");
+    let non_deleted = verifier.non_deleted_txids();
+    common::assert_rf2_replication_exact(
+        &fresh_client,
+        &docker_5,
+        cluster_size as usize,
+        &non_deleted,
+        "12.4",
+    )
+    .await?;
+    eprintln!("[12.4] Consistency check passed with zero mismatches");
 
     eprintln!("[12.4] PASSED");
 
@@ -606,7 +628,8 @@ async fn test_rolling_restart_plus_partition() -> Result<(), ClientError> {
 
     // Wait for full cluster to reform
     common::wait_cluster_ready(&docker, 3, Duration::from_secs(30)).await?;
-    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+    common::wait_migrations_complete(&docker, 3, Duration::from_secs(120))
+        .await
         .unwrap_or_else(|e| eprintln!("[12.5] migration wait: {e}"));
     common::wait_replication_settled(&docker, 3, Duration::from_secs(5)).await?;
     client.refresh_routing().await?;
@@ -644,10 +667,11 @@ async fn test_rolling_restart_plus_partition() -> Result<(), ClientError> {
         total_master_shards += master_count;
     }
     // During topology transitions, handoff shards may be counted on both
-    // old and new masters briefly. Allow ±10 tolerance.
+    // old and new masters briefly; this is a routing-count overlap check,
+    // not a record-loss allowance.
     assert!(
-        total_master_shards >= 4096 && total_master_shards <= 4196,
-        "12.5: total_master_shards={total_master_shards}, expected 4096 (±10)"
+        (4096..=4196).contains(&total_master_shards),
+        "12.5: total_master_shards={total_master_shards}, expected near 4096 during handoff overlap"
     );
     eprintln!("[12.5] Total master shards = {total_master_shards} (expected ~4096)");
     eprintln!("[12.5] PASSED");

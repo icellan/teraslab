@@ -14,16 +14,16 @@
 mod common;
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use rand::{Rng, SeedableRng};
-use teraslab_test_client::{Client, ClientError};
 use teraslab_test_client::helpers::DockerHelpers;
-use teraslab_test_client::verifier::{StateVerifier, parse_metadata_fields};
 use teraslab_test_client::types::*;
+use teraslab_test_client::verifier::{StateVerifier, parse_metadata_fields};
+use teraslab_test_client::{Client, ClientError};
 
 use teraslab::protocol::codec::encode_get_batch;
 use teraslab::protocol::opcodes::{FLAG_LOCAL_READ, OP_GET_BATCH, STATUS_OK};
@@ -49,18 +49,21 @@ enum ChaosEvent {
     RestartNode(String),
     PartitionNode(String),
     HealNode(String),
-    InjectLatency(String, u32),       // node, latency_ms
+    InjectLatency(String, u32), // node, latency_ms
     ClearLatency(String),
-    InjectPacketLoss(String, f32),    // node, loss_pct
+    InjectPacketLoss(String, f32), // node, loss_pct
     ClearPacketLoss(String),
-    PauseNode(String, u64),           // node, auto-unpause after N seconds
+    PauseNode(String, u64), // node, auto-unpause after N seconds
 }
 
 const ALL_NODES: [&str; 5] = ["node1", "node2", "node3", "node4", "node5"];
 
 #[allow(dead_code)]
 fn txid_hex(txid: &[u8; 32]) -> String {
-    txid.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
+    txid.iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 
 // ---------------------------------------------------------------------------
@@ -102,8 +105,9 @@ impl ChaosState {
     }
 
     fn alive_count(&self) -> usize {
-        ALL_NODES.iter()
-            .filter(|n| !self.dead_nodes.contains(&n.to_string()))
+        ALL_NODES
+            .iter()
+            .filter(|n| !self.dead_nodes.contains(**n))
             .count()
     }
 
@@ -149,7 +153,7 @@ impl ChaosState {
 
             if would_remain >= 2 {
                 // Can do destructive things
-                if self.alive_count() - 1 >= 2 {
+                if self.alive_count() > 2 {
                     candidates.push(ChaosEvent::KillNode(name.clone()));
                 }
                 candidates.push(ChaosEvent::PartitionNode(name.clone()));
@@ -206,7 +210,8 @@ async fn apply_event(
             state.dead_nodes.remove(name);
         }
         ChaosEvent::PartitionNode(name) => {
-            let targets: Vec<String> = ALL_NODES.iter()
+            let targets: Vec<String> = ALL_NODES
+                .iter()
                 .map(|n| n.to_string())
                 .filter(|n| n != name && !state.dead_nodes.contains(n))
                 .collect();
@@ -301,13 +306,31 @@ fn refresh_paused_state(state: &mut ChaosState) {
 // Workload: 1000 mixed ops/sec (creates + spends + reads + setMined + deletes)
 // ---------------------------------------------------------------------------
 
+type ConfirmedTxids = Arc<Mutex<Vec<([u8; 32], Vec<[u8; 32]>)>>>;
+type TimeoutTxids = Arc<Mutex<Vec<([u8; 32], String)>>>;
+
 struct ChaosWorkloadState {
     /// All confirmed created (txid, utxo_hashes) pairs (can be read/spent/mined/deleted).
-    confirmed_txids: Arc<Mutex<Vec<([u8; 32], Vec<[u8; 32]>)>>>,
+    confirmed_txids: ConfirmedTxids,
     /// Txids that have been successfully deleted
     deleted_txids: Arc<Mutex<HashSet<[u8; 32]>>>,
     /// Txids pending timeout verification
-    timeout_txids: Arc<Mutex<Vec<([u8; 32], String)>>>, // (txid, op_type)
+    timeout_txids: TimeoutTxids,
+}
+
+struct ChaosMetrics<'a> {
+    creates_ok: &'a AtomicU64,
+    creates_err: &'a AtomicU64,
+    reads_ok: &'a AtomicU64,
+    reads_err: &'a AtomicU64,
+    spends_ok: &'a AtomicU64,
+    spends_err: &'a AtomicU64,
+    set_mined_ok: &'a AtomicU64,
+    set_mined_err: &'a AtomicU64,
+    deletes_ok: &'a AtomicU64,
+    deletes_err: &'a AtomicU64,
+    total_ops: &'a AtomicU64,
+    total_errors: &'a AtomicU64,
 }
 
 async fn run_workload_tick(
@@ -315,19 +338,20 @@ async fn run_workload_tick(
     verifier: &StateVerifier,
     ws: &ChaosWorkloadState,
     rng: &mut impl Rng,
-    metrics_creates_ok: &AtomicU64,
-    metrics_creates_err: &AtomicU64,
-    metrics_reads_ok: &AtomicU64,
-    metrics_reads_err: &AtomicU64,
-    metrics_spends_ok: &AtomicU64,
-    metrics_spends_err: &AtomicU64,
-    metrics_set_mined_ok: &AtomicU64,
-    metrics_set_mined_err: &AtomicU64,
-    metrics_deletes_ok: &AtomicU64,
-    metrics_deletes_err: &AtomicU64,
-    metrics_total_ops: &AtomicU64,
-    metrics_total_errors: &AtomicU64,
+    m: &ChaosMetrics<'_>,
 ) {
+    let metrics_creates_ok = m.creates_ok;
+    let metrics_creates_err = m.creates_err;
+    let metrics_reads_ok = m.reads_ok;
+    let metrics_reads_err = m.reads_err;
+    let metrics_spends_ok = m.spends_ok;
+    let metrics_spends_err = m.spends_err;
+    let metrics_set_mined_ok = m.set_mined_ok;
+    let metrics_set_mined_err = m.set_mined_err;
+    let metrics_deletes_ok = m.deletes_ok;
+    let metrics_deletes_err = m.deletes_err;
+    let metrics_total_ops = m.total_ops;
+    let metrics_total_errors = m.total_errors;
     // Distribution: 30% creates, 25% reads, 20% spends, 15% setMined, 10% deletes
     let roll = rng.gen_range(0..100u32);
 
@@ -341,7 +365,11 @@ async fn run_workload_tick(
 
             // 1% chance of large tx with 5 MiB cold data
             let is_large = rng.gen_range(0..100u32) == 0;
-            let cold_data = if is_large { vec![0xABu8; 5 * 1024 * 1024] } else { vec![] };
+            let cold_data = if is_large {
+                vec![0xABu8; 5 * 1024 * 1024]
+            } else {
+                vec![]
+            };
 
             let item = CreateItem {
                 txid,
@@ -370,7 +398,10 @@ async fn run_workload_tick(
                 }
                 Ok(Err(_)) => {
                     // Failed write: confirm NOT applied by reading back
-                    if let Ok(results) = client.get_batch(FIELD_ALL_METADATA, std::slice::from_ref(&txid)).await {
+                    if let Ok(results) = client
+                        .get_batch(FIELD_ALL_METADATA, std::slice::from_ref(&txid))
+                        .await
+                    {
                         if !results.is_empty() && results.item(0).status == 0 {
                             // Unexpectedly applied despite error! Record it anyway.
                             verifier.record_create(txid, 1, vec![utxo_hash]);
@@ -399,10 +430,15 @@ async fn run_workload_tick(
             if !entries.is_empty() {
                 let idx = rng.gen_range(0..entries.len());
                 let txid = entries[idx].0;
-                match tokio::time::timeout(Duration::from_secs(5),
-                    client.get_batch(FIELD_ALL_METADATA, std::slice::from_ref(&txid))).await
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.get_batch(FIELD_ALL_METADATA, std::slice::from_ref(&txid)),
+                )
+                .await
                 {
-                    Ok(Ok(_)) => { metrics_reads_ok.fetch_add(1, Ordering::Relaxed); }
+                    Ok(Ok(_)) => {
+                        metrics_reads_ok.fetch_add(1, Ordering::Relaxed);
+                    }
                     _ => {
                         metrics_reads_err.fetch_add(1, Ordering::Relaxed);
                         metrics_total_errors.fetch_add(1, Ordering::Relaxed);
@@ -433,8 +469,11 @@ async fn run_workload_tick(
                     current_block_height: 200,
                     block_height_retention: 288,
                 };
-                match tokio::time::timeout(Duration::from_secs(5),
-                    client.spend_batch(&spend_params, &[spend])).await
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.spend_batch(&spend_params, &[spend]),
+                )
+                .await
                 {
                     Ok(Ok(resp)) => {
                         if !resp.successes.is_empty() {
@@ -480,21 +519,28 @@ async fn run_workload_tick(
                     current_block_height: 200,
                     block_height_retention: 288,
                 };
-                match tokio::time::timeout(Duration::from_secs(5),
-                    client.set_mined_batch(&params, std::slice::from_ref(&txid))).await
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.set_mined_batch(&params, std::slice::from_ref(&txid)),
+                )
+                .await
                 {
                     Ok(Ok(_)) => {
                         verifier.record_set_mined(txid);
                         metrics_set_mined_ok.fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(Err(_)) => {
-                        ws.timeout_txids.lock().push((txid, "set_mined".to_string()));
+                        ws.timeout_txids
+                            .lock()
+                            .push((txid, "set_mined".to_string()));
                         metrics_set_mined_err.fetch_add(1, Ordering::Relaxed);
                         metrics_total_errors.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(_) => {
                         // Timeout -- resolve later by reading back
-                        ws.timeout_txids.lock().push((txid, "set_mined".to_string()));
+                        ws.timeout_txids
+                            .lock()
+                            .push((txid, "set_mined".to_string()));
                         metrics_set_mined_err.fetch_add(1, Ordering::Relaxed);
                         metrics_total_errors.fetch_add(1, Ordering::Relaxed);
                     }
@@ -506,13 +552,17 @@ async fn run_workload_tick(
             let entries = ws.confirmed_txids.lock().clone();
             let deleted = ws.deleted_txids.lock().clone();
             // Find a non-deleted txid
-            let candidate: Option<[u8; 32]> = entries.iter()
+            let candidate: Option<[u8; 32]> = entries
+                .iter()
                 .map(|(txid, _)| *txid)
                 .find(|t| !deleted.contains(t));
 
             if let Some(txid) = candidate {
-                match tokio::time::timeout(Duration::from_secs(5),
-                    client.delete_batch(std::slice::from_ref(&txid))).await
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.delete_batch(std::slice::from_ref(&txid)),
+                )
+                .await
                 {
                     Ok(Ok(_)) => {
                         verifier.record_delete(txid);
@@ -554,7 +604,10 @@ async fn resolve_timeouts(
     for (txid, op_type) in &timeout_list {
         let mut resolved = false;
         for attempt in 0..3 {
-            match check_client.get_batch(FIELD_ALL_METADATA, std::slice::from_ref(txid)).await {
+            match check_client
+                .get_batch(FIELD_ALL_METADATA, std::slice::from_ref(txid))
+                .await
+            {
                 Ok(results) if !results.is_empty() && results.item(0).status == 0 => {
                     match op_type.as_str() {
                         "create" => {
@@ -568,7 +621,9 @@ async fn resolve_timeouts(
                         }
                         "spend" => {
                             let data = &results.item(0).data;
-                            if let Some((spent, _is_mined, _conflicting, _locked)) = parse_metadata_fields(data) {
+                            if let Some((spent, _is_mined, _conflicting, _locked)) =
+                                parse_metadata_fields(data)
+                            {
                                 if spent > 0 {
                                     verifier.record_spend(*txid, 0);
                                 }
@@ -577,7 +632,9 @@ async fn resolve_timeouts(
                         }
                         "set_mined" => {
                             let data = &results.item(0).data;
-                            if let Some((_spent, is_mined, _conflicting, _locked)) = parse_metadata_fields(data) {
+                            if let Some((_spent, is_mined, _conflicting, _locked)) =
+                                parse_metadata_fields(data)
+                            {
                                 if is_mined {
                                     verifier.record_set_mined(*txid);
                                 }
@@ -592,19 +649,17 @@ async fn resolve_timeouts(
                         }
                     }
                 }
-                Ok(results) if !results.is_empty() => {
-                    match op_type.as_str() {
-                        "delete" => {
-                            verifier.record_delete(*txid);
-                            ws.deleted_txids.lock().insert(*txid);
-                            resolved = true;
-                        }
-                        "create" => {
-                            resolved = true;
-                        }
-                        _ => {}
+                Ok(results) if !results.is_empty() => match op_type.as_str() {
+                    "delete" => {
+                        verifier.record_delete(*txid);
+                        ws.deleted_txids.lock().insert(*txid);
+                        resolved = true;
                     }
-                }
+                    "create" => {
+                        resolved = true;
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
 
@@ -655,7 +710,8 @@ async fn verify_replication_sample(
             let j = rng.gen_range(i..non_deleted.len());
             indices.swap(i, j);
         }
-        indices[..count].iter()
+        indices[..count]
+            .iter()
             .map(|&i| non_deleted[i])
             .filter(|t| !deleted_txids.contains(t))
             .collect()
@@ -673,11 +729,17 @@ async fn verify_replication_sample(
         let payload = encode_get_batch(FIELD_ALL_METADATA, std::slice::from_ref(txid));
 
         for addr in &node_addrs {
-            match client.send_to_addr(addr, OP_GET_BATCH, FLAG_LOCAL_READ, payload.clone()).await {
-                Ok((status, ref resp_payload)) if status == STATUS_OK && resp_payload.len() >= 5 => {
+            match client
+                .send_to_addr(addr, OP_GET_BATCH, FLAG_LOCAL_READ, payload.clone())
+                .await
+            {
+                Ok((status, ref resp_payload))
+                    if status == STATUS_OK && resp_payload.len() >= 5 =>
+                {
                     // Parse per-item result: [count:4][status:1][...]
                     if resp_payload.len() >= 5 {
-                        let count = u32::from_le_bytes(resp_payload[0..4].try_into().unwrap_or([0; 4]));
+                        let count =
+                            u32::from_le_bytes(resp_payload[0..4].try_into().unwrap_or([0; 4]));
                         if count >= 1 && resp_payload[4] == 0 {
                             holders += 1;
                         }
@@ -694,20 +756,17 @@ async fn verify_replication_sample(
         }
     }
 
-    // During chaos, some records may temporarily have fewer replicas due to
-    // concurrent kills/pauses. Allow up to 50% degraded replication.
-    let max_degraded = (sample.len() as f64 * 0.50).max(5.0) as u32;
     assert!(
-        low_replica_count <= max_degraded,
-        "Replication check: {low_replica_count}/{} sampled records on < 2 nodes (max {max_degraded})",
+        low_replica_count == 0,
+        "Replication check: {low_replica_count}/{} sampled records on < 2 nodes",
         sample.len(),
     );
-    if low_replica_count > 0 {
-        eprintln!("[16]   {low_replica_count}/{} records temporarily under-replicated (chaos)", sample.len());
-    }
 
-    eprintln!("[16]   Replication sample: {}/{} records verified on >= 2 nodes",
-        sample.len(), sample.len());
+    eprintln!(
+        "[16]   Replication sample: {}/{} records verified on >= 2 nodes",
+        sample.len(),
+        sample.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -765,15 +824,23 @@ async fn run_scenario() -> Result<(), ClientError> {
 
     // Initial consistency check
     let mismatches = common::verify_consistency(&client, &verifier).await?;
-    assert!(mismatches.is_empty(),
-        "Baseline consistency check failed with {} mismatches", mismatches.len());
+    assert!(
+        mismatches.is_empty(),
+        "Baseline consistency check failed with {} mismatches",
+        mismatches.len()
+    );
     eprintln!("[16] Baseline consistency verified: 0 mismatches");
 
     // Build initial confirmed_txids with utxo_hashes from the verifier
-    let seed_entries: Vec<([u8; 32], Vec<[u8; 32]>)> = seed_txids.iter().map(|txid| {
-        let rec = verifier.get_record(txid).expect("seed record must exist in verifier");
-        (*txid, rec.utxo_hashes.clone())
-    }).collect();
+    let seed_entries: Vec<([u8; 32], Vec<[u8; 32]>)> = seed_txids
+        .iter()
+        .map(|txid| {
+            let rec = verifier
+                .get_record(txid)
+                .expect("seed record must exist in verifier");
+            (*txid, rec.utxo_hashes.clone())
+        })
+        .collect();
 
     // Workload state
     let ws = Arc::new(ChaosWorkloadState {
@@ -830,12 +897,21 @@ async fn run_scenario() -> Result<(), ClientError> {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 }
-                run_workload_tick(
-                    &client, &verifier, &ws, &mut rng,
-                    &m_creates_ok, &m_creates_err, &m_reads_ok, &m_reads_err,
-                    &m_spends_ok, &m_spends_err, &m_set_mined_ok, &m_set_mined_err,
-                    &m_deletes_ok, &m_deletes_err, &m_total_ops, &m_total_errors,
-                ).await;
+                let metrics = ChaosMetrics {
+                    creates_ok: &m_creates_ok,
+                    creates_err: &m_creates_err,
+                    reads_ok: &m_reads_ok,
+                    reads_err: &m_reads_err,
+                    spends_ok: &m_spends_ok,
+                    spends_err: &m_spends_err,
+                    set_mined_ok: &m_set_mined_ok,
+                    set_mined_err: &m_set_mined_err,
+                    deletes_ok: &m_deletes_ok,
+                    deletes_err: &m_deletes_err,
+                    total_ops: &m_total_ops,
+                    total_errors: &m_total_errors,
+                };
+                run_workload_tick(&client, &verifier, &ws, &mut rng, &metrics).await;
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
@@ -856,8 +932,10 @@ async fn run_scenario() -> Result<(), ClientError> {
         // -- Checkpoint every 60 seconds --
         if checkpoint_timer.elapsed() >= Duration::from_secs(60) {
             checkpoint_count += 1;
-            eprintln!("[16] Checkpoint {checkpoint_count} at {:.0}s: healing everything",
-                chaos_start.elapsed().as_secs_f64());
+            eprintln!(
+                "[16] Checkpoint {checkpoint_count} at {:.0}s: healing everything",
+                chaos_start.elapsed().as_secs_f64()
+            );
 
             // Pause workload and wait for it to settle
             pause_flag.store(true, Ordering::Relaxed);
@@ -875,7 +953,10 @@ async fn run_scenario() -> Result<(), ClientError> {
             let mut cluster_ready_err = None;
             for attempt in 0..3u32 {
                 match common::wait_cluster_ready(&docker, 5, Duration::from_secs(120)).await {
-                    Ok(()) => { cluster_ready_err = None; break; }
+                    Ok(()) => {
+                        cluster_ready_err = None;
+                        break;
+                    }
                     Err(e) => {
                         eprintln!("[16] checkpoint cluster_ready attempt {attempt}: {e}");
                         cluster_ready_err = Some(e);
@@ -888,7 +969,8 @@ async fn run_scenario() -> Result<(), ClientError> {
             if let Some(e) = cluster_ready_err {
                 return Err(e);
             }
-            common::wait_migrations_complete(&docker, 5, Duration::from_secs(180)).await
+            common::wait_migrations_complete(&docker, 5, Duration::from_secs(180))
+                .await
                 .unwrap_or_else(|e| eprintln!("[16] checkpoint migration wait: {e}"));
             common::wait_replication_settled(&docker, 5, Duration::from_secs(10)).await?;
 
@@ -909,37 +991,35 @@ async fn run_scenario() -> Result<(), ClientError> {
             let creates_ok_now = m_creates_ok.load(Ordering::Relaxed);
             let record_count = verifier.record_count();
 
-            // During chaos, the verifier's expected state may drift from the
-            // cluster's actual state due to ops that errored on the client side
-            // but succeeded on the server (retries, partitions, etc.). Only
-            // check for NotFound mismatches (data loss), not state mismatches.
-            let not_found: Vec<_> = mismatches.iter()
+            let not_found: Vec<_> = mismatches
+                .iter()
                 .filter(|m| m.actual.contains("NotFound"))
                 .collect();
             let state_mismatches = mismatches.len() - not_found.len();
             if state_mismatches > 0 {
-                eprintln!("[16] Checkpoint {checkpoint_count}: {state_mismatches} state mismatches \
-                     (verifier drift, expected during chaos)");
+                eprintln!(
+                    "[16] Checkpoint {checkpoint_count}: {state_mismatches} state mismatches \
+                     (verifier drift, expected during chaos)"
+                );
             }
-            // Mid-chaos: nodes may be killed/paused/partitioned, causing high
-            // NotFound rates. During aggressive 60s-window chaos with multiple
-            // node kills + partitions, migrations may still be draining when
-            // the checkpoint runs, leaving up to ~30% of records unreachable.
-            // The final checkpoint after the chaos loop applies a stricter bound.
-            let max_not_found = (verifier.record_count() as f64 * 0.30).max(10.0) as usize;
-            assert!(not_found.len() <= max_not_found,
-                "Checkpoint {checkpoint_count}: {} records NotFound (max {max_not_found}). \
+            assert!(
+                not_found.is_empty(),
+                "Checkpoint {checkpoint_count}: {} records NotFound. \
                  First 5: {:?}",
                 not_found.len(),
-                not_found.iter().take(5).collect::<Vec<_>>());
+                not_found.iter().take(5).collect::<Vec<_>>()
+            );
 
             // Replication sample check (50 random non-deleted txids across all 5 nodes)
             let deleted_snapshot = ws.deleted_txids.lock().clone();
-            verify_replication_sample(&check_client, &verifier, &docker, &deleted_snapshot, 50).await;
+            verify_replication_sample(&check_client, &verifier, &docker, &deleted_snapshot, 50)
+                .await;
 
-            eprintln!("[16] Checkpoint {checkpoint_count} passed: 0 mismatches, \
+            eprintln!(
+                "[16] Checkpoint {checkpoint_count} passed: 0 mismatches, \
                  {total_chaos_events} events, {total_ops_now} ops, {total_errors_now} errors, \
-                 {creates_ok_now} creates, {record_count} records tracked. Resuming chaos.");
+                 {creates_ok_now} creates, {record_count} records tracked. Resuming chaos."
+            );
 
             // Resume workload
             pause_flag.store(false, Ordering::Relaxed);
@@ -963,8 +1043,10 @@ async fn run_scenario() -> Result<(), ClientError> {
             }
 
             if let Some(event) = state.pick_event(&mut rng) {
-                eprintln!("[16] Event #{total_chaos_events} at {:.0}s: {event:?}",
-                    chaos_start.elapsed().as_secs_f64());
+                eprintln!(
+                    "[16] Event #{total_chaos_events} at {:.0}s: {event:?}",
+                    chaos_start.elapsed().as_secs_f64()
+                );
 
                 match apply_event(&docker, &mut state, &event).await {
                     Ok(()) => {
@@ -975,9 +1057,9 @@ async fn run_scenario() -> Result<(), ClientError> {
                         let is_topology_change = matches!(
                             event,
                             ChaosEvent::KillNode(_)
-                            | ChaosEvent::RestartNode(_)
-                            | ChaosEvent::PartitionNode(_)
-                            | ChaosEvent::HealNode(_)
+                                | ChaosEvent::RestartNode(_)
+                                | ChaosEvent::PartitionNode(_)
+                                | ChaosEvent::HealNode(_)
                         );
                         if is_topology_change {
                             let _ = client.refresh_routing().await;
@@ -1000,9 +1082,11 @@ async fn run_scenario() -> Result<(), ClientError> {
     let _ = workload_handle.await;
 
     // -- Final cleanup and verification --
-    eprintln!("[16] Chaos loop complete after {:.0}s. Total events: {total_chaos_events}. \
+    eprintln!(
+        "[16] Chaos loop complete after {:.0}s. Total events: {total_chaos_events}. \
          Healing everything for final verification.",
-        chaos_start.elapsed().as_secs_f64());
+        chaos_start.elapsed().as_secs_f64()
+    );
 
     heal_everything(&docker, &mut state).await?;
 
@@ -1015,7 +1099,10 @@ async fn run_scenario() -> Result<(), ClientError> {
     let mut final_ready_err = None;
     for attempt in 0..3u32 {
         match common::wait_cluster_ready(&docker, 5, Duration::from_secs(120)).await {
-            Ok(()) => { final_ready_err = None; break; }
+            Ok(()) => {
+                final_ready_err = None;
+                break;
+            }
             Err(e) => {
                 eprintln!("[16] final cluster_ready attempt {attempt}: {e}");
                 final_ready_err = Some(e);
@@ -1027,7 +1114,8 @@ async fn run_scenario() -> Result<(), ClientError> {
     if let Some(e) = final_ready_err {
         return Err(e);
     }
-    common::wait_migrations_complete(&docker, 5, Duration::from_secs(180)).await
+    common::wait_migrations_complete(&docker, 5, Duration::from_secs(180))
+        .await
         .unwrap_or_else(|e| eprintln!("[16] final migration wait: {e}"));
     common::wait_replication_settled(&docker, 5, Duration::from_secs(10)).await?;
 
@@ -1061,27 +1149,18 @@ async fn run_scenario() -> Result<(), ClientError> {
     let deletes_err_final = m_deletes_err.load(Ordering::Relaxed);
     let record_count = verifier.record_count();
 
-    // After chaos, the verifier's expected state may have drifted from the
-    // cluster because some operations errored on the client but succeeded on
-    // the server. Only data loss (NotFound) is a real problem; state
-    // mismatches (is_mined, spent_utxos) are expected verifier drift.
-    let final_not_found: Vec<_> = final_mismatches.iter()
-        .filter(|m| m.actual.contains("NotFound"))
-        .collect();
-    let final_state_drift = final_mismatches.len() - final_not_found.len();
-    if final_state_drift > 0 {
-        eprintln!("[16] Final: {final_state_drift} state mismatches (verifier drift from chaos)");
-    }
-    // Allow up to 20% data loss after chaos — this test applies extreme
-    // concurrent failures (simultaneous kills + pauses + partitions) that
-    // can exceed RF=2 redundancy on some shards.
-    let max_final_loss = (record_count as f64 * 0.25).max(10.0) as usize;
-    assert!(final_not_found.len() <= max_final_loss,
-        "Final verification: {} records lost (max {max_final_loss}). First 10: {:?}",
-        final_not_found.len(),
-        final_not_found.iter().take(10).collect::<Vec<_>>());
+    assert!(
+        final_mismatches.is_empty(),
+        "Final verification: {} mismatches after chaos recovery. First 10: {:?}",
+        final_mismatches.len(),
+        final_mismatches.iter().take(10).collect::<Vec<_>>()
+    );
+    let non_deleted = verifier.non_deleted_txids();
+    common::assert_rf2_replication_exact(&final_client, &docker, 5, &non_deleted, "16.final")
+        .await?;
 
-    eprintln!("[16] FINAL RESULTS:\n\
+    eprintln!(
+        "[16] FINAL RESULTS:\n\
          - Chaos duration: {chaos_duration_secs}s\n\
          - Total chaos events: {total_chaos_events}\n\
          - Checkpoints passed: {checkpoint_count}\n\
@@ -1094,7 +1173,8 @@ async fn run_scenario() -> Result<(), ClientError> {
          - Deletes: {deletes_ok_final} ok, {deletes_err_final} err\n\
          - Records tracked: {record_count}\n\
          - Final consistency mismatches: 0\n\
-         - PASS");
+         - PASS"
+    );
 
     tlog!(t0, "teardown_all");
     common::teardown_all(SID).await;

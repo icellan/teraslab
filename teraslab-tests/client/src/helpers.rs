@@ -1,6 +1,83 @@
 use crate::ClientError;
 use std::collections::HashMap;
 
+const DEFAULT_DOCKER_MIGRATION_POOL_SIZE: usize = 128;
+const DEFAULT_DOCKER_MIGRATION_BATCH_SIZE: usize = 1000;
+const ENV_DOCKER_MIGRATION_POOL_SIZE: &str = "TERASLAB_DOCKER_MIGRATION_POOL_SIZE";
+const ENV_DOCKER_MIGRATION_BATCH_SIZE: &str = "TERASLAB_DOCKER_MIGRATION_BATCH_SIZE";
+
+fn parse_docker_migration_pool_size(raw: &str) -> Result<usize, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_DOCKER_MIGRATION_POOL_SIZE);
+    }
+    trimmed.parse::<usize>().map_err(|e| {
+        format!("{ENV_DOCKER_MIGRATION_POOL_SIZE} must be a non-negative integer: {e}")
+    })
+}
+
+fn docker_migration_pool_size_from_env() -> Result<usize, ClientError> {
+    match std::env::var(ENV_DOCKER_MIGRATION_POOL_SIZE) {
+        Ok(raw) => parse_docker_migration_pool_size(&raw).map_err(ClientError::Connection),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_DOCKER_MIGRATION_POOL_SIZE),
+        Err(e) => Err(ClientError::Connection(format!(
+            "{ENV_DOCKER_MIGRATION_POOL_SIZE} could not be read: {e}"
+        ))),
+    }
+}
+
+fn parse_docker_migration_batch_size(raw: &str) -> Result<usize, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_DOCKER_MIGRATION_BATCH_SIZE);
+    }
+    trimmed.parse::<usize>().map_err(|e| {
+        format!("{ENV_DOCKER_MIGRATION_BATCH_SIZE} must be a non-negative integer: {e}")
+    })
+}
+
+fn docker_migration_batch_size_from_env() -> Result<usize, ClientError> {
+    match std::env::var(ENV_DOCKER_MIGRATION_BATCH_SIZE) {
+        Ok(raw) => parse_docker_migration_batch_size(&raw).map_err(ClientError::Connection),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_DOCKER_MIGRATION_BATCH_SIZE),
+        Err(e) => Err(ClientError::Connection(format!(
+            "{ENV_DOCKER_MIGRATION_BATCH_SIZE} could not be read: {e}"
+        ))),
+    }
+}
+
+fn render_node_config(
+    node_id: u32,
+    node_ip: &str,
+    seeds_str: &str,
+    migration_pool_size: usize,
+    migration_batch_size: usize,
+) -> String {
+    format!(
+        r#"node_id = {node_id}
+listen_addr = "{node_ip}:3300"
+http_listen_addr = "0.0.0.0:9100"
+swim_port = 3301
+seed_nodes = [{seeds_str}]
+replication_factor = 2
+migration_pool_size = {migration_pool_size}
+migration_batch_size = {migration_batch_size}
+swim_probe_interval_ms = 150
+swim_suspicion_timeout_ms = 1000
+device_paths = ["/data/teraslab.dat"]
+device_size = 2147483648
+device_alignment = 4096
+redo_log_size = 67108864
+index_snapshot_path = "/data/index.snap"
+expected_records = 1000000
+lock_stripes = 65536
+max_batch_size = 8192
+max_connections = 1024
+block_height_retention = 288
+"#
+    )
+}
+
 /// Docker control helpers for cluster tests.
 ///
 /// Provides methods to manage Docker containers and network conditions
@@ -55,11 +132,26 @@ impl DockerHelpers {
         // Each scenario gets a unique /24 subnet to avoid Docker network conflicts.
         let subnet_second_octet = 30 + scenario_id;
         let mut node_ips = HashMap::new();
-        node_ips.insert("node1".to_string(), format!("172.{subnet_second_octet}.0.11"));
-        node_ips.insert("node2".to_string(), format!("172.{subnet_second_octet}.0.12"));
-        node_ips.insert("node3".to_string(), format!("172.{subnet_second_octet}.0.13"));
-        node_ips.insert("node4".to_string(), format!("172.{subnet_second_octet}.0.14"));
-        node_ips.insert("node5".to_string(), format!("172.{subnet_second_octet}.0.15"));
+        node_ips.insert(
+            "node1".to_string(),
+            format!("172.{subnet_second_octet}.0.11"),
+        );
+        node_ips.insert(
+            "node2".to_string(),
+            format!("172.{subnet_second_octet}.0.12"),
+        );
+        node_ips.insert(
+            "node3".to_string(),
+            format!("172.{subnet_second_octet}.0.13"),
+        );
+        node_ips.insert(
+            "node4".to_string(),
+            format!("172.{subnet_second_octet}.0.14"),
+        );
+        node_ips.insert(
+            "node5".to_string(),
+            format!("172.{subnet_second_octet}.0.15"),
+        );
 
         Self {
             compose_dir: compose_dir.to_string(),
@@ -119,9 +211,10 @@ impl DockerHelpers {
     /// # Errors
     /// Returns `ClientError::Connection` if the node name is not in the IP mapping.
     fn node_ip(&self, name: &str) -> Result<&str, ClientError> {
-        self.node_ips.get(name).map(|s| s.as_str()).ok_or_else(|| {
-            ClientError::Connection(format!("unknown node: {name}"))
-        })
+        self.node_ips
+            .get(name)
+            .map(|s| s.as_str())
+            .ok_or_else(|| ClientError::Connection(format!("unknown node: {name}")))
     }
 
     /// Returns the docker container name for a given node name, prefixed
@@ -173,7 +266,7 @@ volumes:
         yaml.push_str(&format!("  ts{sid:02}-blobstore:\n"));
 
         // Common config anchor
-        yaml.push_str(&format!(
+        yaml.push_str(
             r#"
 x-teraslab-common: &teraslab-common
   image: teraslab:test
@@ -186,8 +279,8 @@ x-teraslab-common: &teraslab-common
       hard: -1
 
 services:
-"#
-        ));
+"#,
+        );
 
         // Service definitions
         for n in 1..=self.node_count {
@@ -234,11 +327,16 @@ services:
         self.generate_node_configs().await?;
 
         let yaml = self.generate_compose_yaml();
-        let path = format!("{}/docker-compose.ts{:02}.yml", self.compose_dir, self.scenario_id);
+        let path = format!(
+            "{}/docker-compose.ts{:02}.yml",
+            self.compose_dir, self.scenario_id
+        );
 
-        tokio::fs::write(&path, yaml.as_bytes()).await.map_err(|e| {
-            ClientError::Connection(format!("failed to write compose file {path}: {e}"))
-        })?;
+        tokio::fs::write(&path, yaml.as_bytes())
+            .await
+            .map_err(|e| {
+                ClientError::Connection(format!("failed to write compose file {path}: {e}"))
+            })?;
 
         self.generated_compose_path = Some(path.clone());
         Ok(path)
@@ -248,6 +346,8 @@ services:
     async fn generate_node_configs(&self) -> Result<(), ClientError> {
         let subnet = 30 + self.scenario_id;
         let config_dir = format!("{}/config", self.compose_dir);
+        let migration_pool_size = docker_migration_pool_size_from_env()?;
+        let migration_batch_size = docker_migration_batch_size_from_env()?;
 
         // Create config directory if it doesn't exist
         let _ = tokio::fs::create_dir_all(&config_dir).await;
@@ -260,31 +360,20 @@ services:
                 .collect();
             let seeds_str = seed_nodes.join(", ");
 
-            let config = format!(
-                r#"node_id = {n}
-listen_addr = "{node_ip}:3300"
-http_listen_addr = "0.0.0.0:9100"
-swim_port = 3301
-seed_nodes = [{seeds_str}]
-replication_factor = 2
-swim_probe_interval_ms = 150
-swim_suspicion_timeout_ms = 1000
-device_paths = ["/data/teraslab.dat"]
-device_size = 2147483648
-device_alignment = 4096
-redo_log_size = 67108864
-index_snapshot_path = "/data/index.snap"
-expected_records = 1000000
-lock_stripes = 65536
-max_batch_size = 8192
-max_connections = 1024
-block_height_retention = 288
-"#);
+            let config = render_node_config(
+                n,
+                &node_ip,
+                &seeds_str,
+                migration_pool_size,
+                migration_batch_size,
+            );
 
             let path = format!("{config_dir}/ts{:02}-node{n}.toml", self.scenario_id);
-            tokio::fs::write(&path, config.as_bytes()).await.map_err(|e| {
-                ClientError::Connection(format!("failed to write config {path}: {e}"))
-            })?;
+            tokio::fs::write(&path, config.as_bytes())
+                .await
+                .map_err(|e| {
+                    ClientError::Connection(format!("failed to write config {path}: {e}"))
+                })?;
         }
 
         Ok(())
@@ -399,23 +488,55 @@ block_height_retention = 288
 
             // Block traffic from target on source node
             let _ = run_docker_cmd(&[
-                "exec", &source_container,
-                "iptables", "-A", "INPUT", "-s", &target_ip, "-j", "DROP",
-            ]).await;
+                "exec",
+                &source_container,
+                "iptables",
+                "-A",
+                "INPUT",
+                "-s",
+                &target_ip,
+                "-j",
+                "DROP",
+            ])
+            .await;
             let _ = run_docker_cmd(&[
-                "exec", &source_container,
-                "iptables", "-A", "OUTPUT", "-d", &target_ip, "-j", "DROP",
-            ]).await;
+                "exec",
+                &source_container,
+                "iptables",
+                "-A",
+                "OUTPUT",
+                "-d",
+                &target_ip,
+                "-j",
+                "DROP",
+            ])
+            .await;
 
             // Block traffic from source on target node
             let _ = run_docker_cmd(&[
-                "exec", &target_container,
-                "iptables", "-A", "INPUT", "-s", &source_ip, "-j", "DROP",
-            ]).await;
+                "exec",
+                &target_container,
+                "iptables",
+                "-A",
+                "INPUT",
+                "-s",
+                &source_ip,
+                "-j",
+                "DROP",
+            ])
+            .await;
             let _ = run_docker_cmd(&[
-                "exec", &target_container,
-                "iptables", "-A", "OUTPUT", "-d", &source_ip, "-j", "DROP",
-            ]).await;
+                "exec",
+                &target_container,
+                "iptables",
+                "-A",
+                "OUTPUT",
+                "-d",
+                &source_ip,
+                "-j",
+                "DROP",
+            ])
+            .await;
         }
 
         Ok(())
@@ -464,17 +585,17 @@ block_height_retention = 288
 
         // Remove existing qdisc (ignore errors if none exists)
         let _ = run_docker_cmd(&[
-            "exec", &container,
-            "tc", "qdisc", "del", "dev", "eth0", "root",
-        ]).await;
+            "exec", &container, "tc", "qdisc", "del", "dev", "eth0", "root",
+        ])
+        .await;
 
         let delay_arg = format!("{latency_ms}ms");
         let loss_arg = format!("{loss_pct}%");
         run_docker_cmd(&[
-            "exec", &container,
-            "tc", "qdisc", "add", "dev", "eth0", "root",
-            "netem", "delay", &delay_arg, "loss", &loss_arg,
-        ]).await?;
+            "exec", &container, "tc", "qdisc", "add", "dev", "eth0", "root", "netem", "delay",
+            &delay_arg, "loss", &loss_arg,
+        ])
+        .await?;
 
         Ok(())
     }
@@ -492,9 +613,9 @@ block_height_retention = 288
     pub async fn clear_network(&self, name: &str) -> Result<(), ClientError> {
         let container = self.container_name(name);
         let _ = run_docker_cmd(&[
-            "exec", &container,
-            "tc", "qdisc", "del", "dev", "eth0", "root",
-        ]).await;
+            "exec", &container, "tc", "qdisc", "del", "dev", "eth0", "root",
+        ])
+        .await;
         Ok(())
     }
 
@@ -589,17 +710,23 @@ block_height_retention = 288
     /// or if the output directory cannot be created.
     pub async fn collect_logs(&self, output_dir: &str) -> Result<(), ClientError> {
         tokio::fs::create_dir_all(output_dir).await.map_err(|e| {
-            ClientError::Connection(format!("{output_dir}: failed to create log output directory: {e}"))
+            ClientError::Connection(format!(
+                "{output_dir}: failed to create log output directory: {e}"
+            ))
         })?;
 
         for i in 1..=5 {
             let name = format!("node{i}");
             let container = self.container_name(&name);
-            let log_output = run_docker_cmd(&["logs", &container]).await.unwrap_or_default();
+            let log_output = run_docker_cmd(&["logs", &container])
+                .await
+                .unwrap_or_default();
             let log_path = format!("{output_dir}/{container}.log");
-            tokio::fs::write(&log_path, log_output.as_bytes()).await.map_err(|e| {
-                ClientError::Connection(format!("{log_path}: failed to write log file: {e}"))
-            })?;
+            tokio::fs::write(&log_path, log_output.as_bytes())
+                .await
+                .map_err(|e| {
+                    ClientError::Connection(format!("{log_path}: failed to write log file: {e}"))
+                })?;
         }
 
         Ok(())
@@ -627,4 +754,78 @@ async fn run_docker_cmd(args: &[&str]) -> Result<String, ClientError> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn docker_migration_pool_parse_defaults_on_empty() {
+        assert_eq!(
+            parse_docker_migration_pool_size("").unwrap(),
+            DEFAULT_DOCKER_MIGRATION_POOL_SIZE,
+        );
+        assert_eq!(
+            parse_docker_migration_pool_size("   ").unwrap(),
+            DEFAULT_DOCKER_MIGRATION_POOL_SIZE,
+        );
+    }
+
+    #[test]
+    fn docker_migration_pool_parse_accepts_higher_values() {
+        assert_eq!(parse_docker_migration_pool_size("256").unwrap(), 256);
+    }
+
+    #[test]
+    fn docker_migration_pool_parse_rejects_invalid_values() {
+        let err = parse_docker_migration_pool_size("wide").unwrap_err();
+        assert!(
+            err.contains(ENV_DOCKER_MIGRATION_POOL_SIZE),
+            "err was: {err}",
+        );
+    }
+
+    #[test]
+    fn docker_migration_batch_parse_defaults_on_empty() {
+        assert_eq!(
+            parse_docker_migration_batch_size("").unwrap(),
+            DEFAULT_DOCKER_MIGRATION_BATCH_SIZE,
+        );
+        assert_eq!(
+            parse_docker_migration_batch_size("   ").unwrap(),
+            DEFAULT_DOCKER_MIGRATION_BATCH_SIZE,
+        );
+    }
+
+    #[test]
+    fn docker_migration_batch_parse_accepts_higher_values() {
+        assert_eq!(parse_docker_migration_batch_size("4096").unwrap(), 4096);
+    }
+
+    #[test]
+    fn docker_migration_batch_parse_rejects_invalid_values() {
+        let err = parse_docker_migration_batch_size("wide").unwrap_err();
+        assert!(
+            err.contains(ENV_DOCKER_MIGRATION_BATCH_SIZE),
+            "err was: {err}",
+        );
+    }
+
+    #[test]
+    fn node_config_contains_configured_migration_tuning() {
+        let config = render_node_config(
+            2,
+            "172.38.0.12",
+            "\"172.38.0.11:3301\", \"172.38.0.13:3301\"",
+            96,
+            2048,
+        );
+
+        assert!(config.contains("node_id = 2"));
+        assert!(config.contains("listen_addr = \"172.38.0.12:3300\""));
+        assert!(config.contains("migration_pool_size = 96"));
+        assert!(config.contains("migration_batch_size = 2048"));
+        assert!(config.contains("seed_nodes = [\"172.38.0.11:3301\", \"172.38.0.13:3301\"]"));
+    }
 }
