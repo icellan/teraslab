@@ -9,7 +9,9 @@ pub fn timing_enabled() -> bool {
     std::env::var("TERASLAB_TEST_TIMING").is_ok_and(|v| v == "1")
 }
 use teraslab::protocol::codec::encode_get_batch;
-use teraslab::protocol::opcodes::{FLAG_LOCAL_READ, OP_GET_BATCH, STATUS_OK};
+use teraslab::protocol::opcodes::{
+    ADMIN_DIAGNOSE_KEY_MAX_TXIDS, FLAG_LOCAL_READ, OP_ADMIN_DIAGNOSE_KEY, OP_GET_BATCH, STATUS_OK,
+};
 use teraslab_test_client::helpers::DockerHelpers;
 use teraslab_test_client::types::{CreateItem, FIELD_ALL, FIELD_ALL_METADATA};
 use teraslab_test_client::verifier::{Mismatch, StateVerifier, parse_metadata_fields};
@@ -530,8 +532,10 @@ pub async fn wait_migrations_complete(
 /// 1s), refreshing routing between iterations, until every record satisfies
 /// both conditions or `timeout` elapses. On timeout returns
 /// `ClientError::Connection` prefixed with `migration read verify timeout`
-/// and carrying the first few failing-record prefixes with their observed
-/// local-read holder counts for diagnosis.
+/// and carrying — via [`format_master_failed_diagnostic`] — a per-record /
+/// per-node breakdown derived from `OP_ADMIN_DIAGNOSE_KEY` (shard, master,
+/// holder, inbound, fenced, migrating, topology_epoch) for the first 32
+/// failing txids.
 ///
 /// `node_nums` must list nodes known to be alive post-migration; dead nodes
 /// will fail `direct_get` and count against `min_replicas`.
@@ -639,43 +643,50 @@ pub async fn wait_for_migration_reads_ready(
         }
 
         if start.elapsed() >= timeout {
-            // Diagnose the first few master-route failures by reading from
-            // each node directly so the error tells us whether the data is
-            // missing everywhere or only on the route's master.
-            let mut diag = Vec::new();
-            for &idx in master_failed_idx.iter().take(3) {
-                let txid = txids[idx];
-                let prefix: String = txid[..6].iter().map(|b| format!("{b:02x}")).collect();
-                let mut holders = 0usize;
-                for addr in &node_addrs {
-                    let payload = encode_get_batch(FIELD_ALL_METADATA, std::slice::from_ref(&txid));
-                    let ok = match client
-                        .send_to_addr(addr, OP_GET_BATCH, FLAG_LOCAL_READ, payload)
-                        .await
-                    {
-                        Ok((frame_status, body)) => {
-                            frame_status == STATUS_OK && body.len() >= 5 && body[4] == 0
+            // Diagnose the first 32 master-route failures via the
+            // OP_ADMIN_DIAGNOSE_KEY admin op, which returns each
+            // node's per-shard state (shard, master, holder, inbound,
+            // fenced, migrating, topology epoch) for every txid in a
+            // single batched call.
+            let cap = (ADMIN_DIAGNOSE_KEY_MAX_TXIDS as usize).min(32);
+            let failing_txids: Vec<[u8; 32]> = master_failed_idx
+                .iter()
+                .take(cap)
+                .map(|&i| txids[i])
+                .collect();
+
+            let mut per_node_responses: Vec<
+                Result<Vec<teraslab::cluster::migration::KeyDiagnosis>, String>,
+            > = Vec::with_capacity(node_addrs.len());
+            for addr in &node_addrs {
+                let payload = encode_admin_diagnose_key(&failing_txids);
+                let result = match client
+                    .send_to_addr(addr, OP_ADMIN_DIAGNOSE_KEY, 0, payload)
+                    .await
+                {
+                    Ok((frame_status, body)) => {
+                        if frame_status == STATUS_OK {
+                            decode_admin_diagnose_key(&body)
+                        } else {
+                            Err(format!("admin op returned status={frame_status}"))
                         }
-                        Err(_) => false,
-                    };
-                    if ok {
-                        holders += 1;
                     }
-                }
-                diag.push(format!(
-                    "txid_prefix={prefix} holders_via_local_read={}/{}",
-                    holders,
-                    node_nums.len(),
-                ));
+                    Err(e) => Err(e.to_string()),
+                };
+                per_node_responses.push(result);
             }
+
+            let dump =
+                format_master_failed_diagnostic(&failing_txids, node_nums, &per_node_responses);
+
             return Err(ClientError::Connection(format!(
                 "migration read verify timeout after {timeout:?}: \
                  master_failed={master_failed}/{}, under_replicated={under_replicated}/{} \
                  (min_replicas={min_replicas}, nodes={node_nums:?}); \
-                 first_failures=[{}]",
+                 first_failures (rich, n={}):{dump}",
                 txids.len(),
                 sample_indices.len(),
-                diag.join(" | "),
+                failing_txids.len(),
             )));
         }
 
@@ -1816,6 +1827,133 @@ pub async fn find_holders(
     Ok((holders, non_holders))
 }
 
+/// Format a per-record / per-node diagnostic dump for the
+/// `wait_for_migration_reads_ready` timeout path.
+///
+/// `failing_txids[i]` is the i-th failing txid; the result contains one
+/// line per failing txid (joined by `\n  ` with a leading `\n  `). Each
+/// line summarizes — across every surveyed node — the
+/// `(shard, master, holder, inbound, fenced, migrating, topology_epoch)`
+/// state derived from `OP_ADMIN_DIAGNOSE_KEY`.
+///
+/// `node_nums[j]` is the cluster node number of the j-th surveyed node,
+/// `per_node_responses[j]` is its response:
+///
+/// - `Ok(diagnoses)`: `diagnoses[i]` corresponds to `failing_txids[i]`,
+///   in the same order. A length mismatch is surfaced inline as an
+///   `ERR(...)` value rather than panicking, so callers always get a
+///   useful dump.
+/// - `Err(s)`: that node could not be reached. Every column for that
+///   node renders as `n<num>:ERR(<s>)`.
+///
+/// If two nodes disagree on the shard for a given txid, the line is
+/// suffixed with ` (SHARD_MISMATCH)`. The shown shard is the first
+/// successful response's shard.
+///
+/// This is a pure function so it can be unit-tested without a live
+/// cluster — see the `format_master_failed_diagnostic_*` tests in the
+/// same module.
+pub fn format_master_failed_diagnostic(
+    failing_txids: &[[u8; 32]],
+    node_nums: &[u32],
+    per_node_responses: &[Result<Vec<teraslab::cluster::migration::KeyDiagnosis>, String>],
+) -> String {
+    use teraslab::cluster::migration::KeyDiagnosis;
+
+    debug_assert_eq!(node_nums.len(), per_node_responses.len());
+
+    // Per-node lookup of the i-th diagnosis, or an Err describing why
+    // it is unavailable for this node. Cloning the error string per
+    // call keeps the function pure and easy to reason about for tests.
+    let lookup = |node_idx: usize, txid_idx: usize| -> Result<&KeyDiagnosis, String> {
+        match &per_node_responses[node_idx] {
+            Err(e) => Err(e.clone()),
+            Ok(v) => v.get(txid_idx).ok_or_else(|| {
+                format!(
+                    "missing entry: node returned {} of {}",
+                    v.len(),
+                    failing_txids.len()
+                )
+            }),
+        }
+    };
+
+    // Render `[n1:Y, n2:N, n3:ERR(...)]` for one boolean column.
+    let render_bool_row = |txid_idx: usize, pick: &dyn Fn(&KeyDiagnosis) -> bool| -> String {
+        let cells: Vec<String> = node_nums
+            .iter()
+            .enumerate()
+            .map(|(j, n)| match lookup(j, txid_idx) {
+                Ok(d) => format!("n{n}:{}", if pick(d) { 'Y' } else { 'N' }),
+                Err(e) => format!("n{n}:ERR({e})"),
+            })
+            .collect();
+        format!("[{}]", cells.join(", "))
+    };
+
+    // Same shape but renders the topology epoch (a u64) per node.
+    let render_epoch_row = |txid_idx: usize| -> String {
+        let cells: Vec<String> = node_nums
+            .iter()
+            .enumerate()
+            .map(|(j, n)| match lookup(j, txid_idx) {
+                Ok(d) => format!("n{n}:{}", d.topology_epoch),
+                Err(e) => format!("n{n}:ERR({e})"),
+            })
+            .collect();
+        format!("[{}]", cells.join(", "))
+    };
+
+    let mut lines: Vec<String> = Vec::with_capacity(failing_txids.len());
+    for (i, txid) in failing_txids.iter().enumerate() {
+        let prefix: String = txid[..6].iter().map(|b| format!("{b:02x}")).collect();
+
+        // Shard agreement: pick the first successful response's shard
+        // and check all other successful responses against it. If none
+        // succeed (every node erred), fall back to a literal `?`.
+        let mut shard_repr = String::from("?");
+        let mut shard_seen: Option<u16> = None;
+        let mut shard_mismatch = false;
+        for j in 0..node_nums.len() {
+            if let Ok(d) = lookup(j, i) {
+                match shard_seen {
+                    None => {
+                        shard_seen = Some(d.shard);
+                        shard_repr = d.shard.to_string();
+                    }
+                    Some(s) if s != d.shard => {
+                        shard_mismatch = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let masters = render_bool_row(i, &|d| d.is_local_master_of_shard);
+        let holders = render_bool_row(i, &|d| d.has_local_data);
+        let inbound = render_bool_row(i, &|d| d.has_pending_inbound);
+        let fenced = render_bool_row(i, &|d| d.is_shard_fenced);
+        let migrating = render_bool_row(i, &|d| d.is_migrating_shard);
+        let epoch = render_epoch_row(i);
+
+        let suffix = if shard_mismatch {
+            " (SHARD_MISMATCH)"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "txid={prefix} shard={shard_repr} masters_per_node={masters} holders={holders} \
+             inbound={inbound} fenced={fenced} migrating={migrating} topo_epoch={epoch}{suffix}",
+        ));
+    }
+
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n  {}", lines.join("\n  "))
+    }
+}
+
 /// Encode a request payload for `OP_ADMIN_DIAGNOSE_KEY`.
 ///
 /// Layout: `[count: u32 LE][txid: 32B] * count`. The server enforces
@@ -2029,5 +2167,316 @@ mod replication_report_tests {
         let parsed = parse_batch_response_exact(&payload, Some(1)).unwrap();
         assert_eq!(parsed, vec![(0, vec![1, 2, 3])]);
         assert!(parse_batch_response_exact(&payload, Some(2)).is_none());
+    }
+
+    /// Bundled inputs for `diag()`, kept compact to satisfy
+    /// `clippy::too_many_arguments` while staying readable in tests.
+    struct DiagSpec {
+        shard: u16,
+        this_node_id: u64,
+        master_id: u64,
+        has_local_data: bool,
+        is_local_master: bool,
+        has_pending_inbound: bool,
+        is_fenced: bool,
+        is_migrating: bool,
+        epoch: u64,
+    }
+
+    /// Build a `KeyDiagnosis` from a `DiagSpec`. All fields are
+    /// explicit so each test can focus on the dimensions it cares
+    /// about.
+    fn diag(s: DiagSpec) -> teraslab::cluster::migration::KeyDiagnosis {
+        teraslab::cluster::migration::KeyDiagnosis {
+            shard: s.shard,
+            this_node_id: s.this_node_id,
+            local_view_canonical_master_id: s.master_id,
+            has_local_data: s.has_local_data,
+            is_local_master_of_shard: s.is_local_master,
+            has_pending_inbound: s.has_pending_inbound,
+            is_shard_fenced: s.is_fenced,
+            is_migrating_shard: s.is_migrating,
+            topology_epoch: s.epoch,
+        }
+    }
+
+    /// Two failing txids surveyed across three nodes (1, 2, 3): node 1
+    /// is the master of shard 7 for txid_a; only node 1 currently
+    /// holds the data; node 2 has it inbound; node 3 is fenced; and
+    /// txid_b is in a different state with a different shard. The
+    /// dump must surface every one of those columns per-node.
+    #[test]
+    fn format_master_failed_diagnostic_includes_per_node_state() {
+        let txid_a = [0xAAu8; 32];
+        let txid_b = [0x42u8; 32];
+        let node_nums = vec![1u32, 2, 3];
+
+        // For txid_a (shard 7): node 1 is master AND holder; node 2
+        // has it pending inbound; node 3 is fenced and on an older
+        // epoch. For txid_b (shard 9): node 2 is master AND holder.
+        let n1 = vec![
+            diag(DiagSpec {
+                shard: 7,
+                this_node_id: 1,
+                master_id: 1,
+                has_local_data: true,
+                is_local_master: true,
+                has_pending_inbound: false,
+                is_fenced: false,
+                is_migrating: true,
+                epoch: 42,
+            }),
+            diag(DiagSpec {
+                shard: 9,
+                this_node_id: 1,
+                master_id: 2,
+                has_local_data: false,
+                is_local_master: false,
+                has_pending_inbound: false,
+                is_fenced: false,
+                is_migrating: false,
+                epoch: 42,
+            }),
+        ];
+        let n2 = vec![
+            diag(DiagSpec {
+                shard: 7,
+                this_node_id: 2,
+                master_id: 1,
+                has_local_data: false,
+                is_local_master: false,
+                has_pending_inbound: true,
+                is_fenced: false,
+                is_migrating: false,
+                epoch: 42,
+            }),
+            diag(DiagSpec {
+                shard: 9,
+                this_node_id: 2,
+                master_id: 2,
+                has_local_data: true,
+                is_local_master: true,
+                has_pending_inbound: false,
+                is_fenced: false,
+                is_migrating: false,
+                epoch: 42,
+            }),
+        ];
+        let n3 = vec![
+            diag(DiagSpec {
+                shard: 7,
+                this_node_id: 3,
+                master_id: 1,
+                has_local_data: false,
+                is_local_master: false,
+                has_pending_inbound: false,
+                is_fenced: true,
+                is_migrating: false,
+                epoch: 41,
+            }),
+            diag(DiagSpec {
+                shard: 9,
+                this_node_id: 3,
+                master_id: 2,
+                has_local_data: false,
+                is_local_master: false,
+                has_pending_inbound: true,
+                is_fenced: false,
+                is_migrating: false,
+                epoch: 41,
+            }),
+        ];
+        let responses = vec![Ok(n1), Ok(n2), Ok(n3)];
+
+        let dump = format_master_failed_diagnostic(&[txid_a, txid_b], &node_nums, &responses);
+
+        // One line per failing txid, each prefixed with `\n  `.
+        assert!(
+            dump.starts_with("\n  "),
+            "dump should start with newline+indent: {dump:?}"
+        );
+        let lines: Vec<&str> = dump.split("\n  ").filter(|s| !s.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "expected 2 lines, got: {dump}");
+
+        // Both txid prefixes appear.
+        assert!(
+            dump.contains("txid=aaaaaaaaaaaa"),
+            "missing txid_a prefix: {dump}"
+        );
+        assert!(
+            dump.contains("txid=424242424242"),
+            "missing txid_b prefix: {dump}"
+        );
+
+        // Shard rendered for each (no mismatch in this case).
+        assert!(
+            lines[0].contains("shard=7"),
+            "missing shard=7 on line 0: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("shard=9"),
+            "missing shard=9 on line 1: {}",
+            lines[1]
+        );
+        assert!(
+            !dump.contains("SHARD_MISMATCH"),
+            "unexpected SHARD_MISMATCH: {dump}"
+        );
+
+        // For txid_a, node 1 is master, nodes 2/3 are not.
+        assert!(
+            lines[0].contains("masters_per_node=[n1:Y, n2:N, n3:N]"),
+            "wrong masters row: {}",
+            lines[0]
+        );
+        // For txid_a, only n1 holds data.
+        assert!(
+            lines[0].contains("holders=[n1:Y, n2:N, n3:N]"),
+            "wrong holders row: {}",
+            lines[0]
+        );
+        // n2 has inbound for txid_a.
+        assert!(
+            lines[0].contains("inbound=[n1:N, n2:Y, n3:N]"),
+            "wrong inbound row: {}",
+            lines[0]
+        );
+        // n3 is fenced for txid_a.
+        assert!(
+            lines[0].contains("fenced=[n1:N, n2:N, n3:Y]"),
+            "wrong fenced row: {}",
+            lines[0]
+        );
+        // n1 is migrating shard for txid_a.
+        assert!(
+            lines[0].contains("migrating=[n1:Y, n2:N, n3:N]"),
+            "wrong migrating row: {}",
+            lines[0]
+        );
+        // topo_epoch carries each node's number.
+        assert!(
+            lines[0].contains("topo_epoch=[n1:42, n2:42, n3:41]"),
+            "wrong topo_epoch row: {}",
+            lines[0]
+        );
+
+        // Sanity: txid_b's master shifted to n2.
+        assert!(
+            lines[1].contains("masters_per_node=[n1:N, n2:Y, n3:N]"),
+            "wrong masters row for txid_b: {}",
+            lines[1]
+        );
+    }
+
+    /// One node returns an admin-call error; the dump must surface
+    /// `n2:ERR(connect refused)` in EVERY column for that node and
+    /// not abort the whole dump.
+    #[test]
+    fn format_master_failed_diagnostic_handles_node_error() {
+        let txid_a = [0x11u8; 32];
+        let node_nums = vec![1u32, 2, 3];
+        let n1 = vec![diag(DiagSpec {
+            shard: 3,
+            this_node_id: 1,
+            master_id: 1,
+            has_local_data: true,
+            is_local_master: true,
+            has_pending_inbound: false,
+            is_fenced: false,
+            is_migrating: false,
+            epoch: 5,
+        })];
+        let n3 = vec![diag(DiagSpec {
+            shard: 3,
+            this_node_id: 3,
+            master_id: 1,
+            has_local_data: false,
+            is_local_master: false,
+            has_pending_inbound: false,
+            is_fenced: false,
+            is_migrating: false,
+            epoch: 5,
+        })];
+        let responses: Vec<Result<Vec<teraslab::cluster::migration::KeyDiagnosis>, String>> =
+            vec![Ok(n1), Err("connect refused".to_string()), Ok(n3)];
+
+        let dump = format_master_failed_diagnostic(&[txid_a], &node_nums, &responses);
+
+        // Single failing line.
+        let lines: Vec<&str> = dump.split("\n  ").filter(|s| !s.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "expected 1 line, got: {dump}");
+        let line = lines[0];
+
+        // n2 must show ERR(connect refused) in every per-node column.
+        // We verify each column substring directly so a regression in
+        // any single column is pinpointed.
+        let needle = "n2:ERR(connect refused)";
+        for col in [
+            "masters_per_node",
+            "holders",
+            "inbound",
+            "fenced",
+            "migrating",
+            "topo_epoch",
+        ] {
+            // Look for the column name immediately followed (eventually)
+            // by an ERR cell for n2.
+            assert!(line.contains(col), "column {col} missing in line: {line}",);
+            assert!(
+                line.contains(needle),
+                "column {col} missing n2 error in line: {line}",
+            );
+        }
+
+        // n1 and n3 still rendered with their booleans.
+        assert!(line.contains("n1:Y"), "missing n1:Y data in line: {line}");
+        assert!(line.contains("n3:N"), "missing n3:N data in line: {line}");
+        // Shard known via at least one healthy node.
+        assert!(line.contains("shard=3"), "missing shard=3 in line: {line}");
+    }
+
+    /// Two nodes disagree on the shard for a given txid (e.g. one is
+    /// pre-rebalance, one is post). The line must be flagged with
+    /// `SHARD_MISMATCH` so triage spots topology divergence.
+    #[test]
+    fn format_master_failed_diagnostic_flags_shard_mismatch() {
+        let txid_a = [0x77u8; 32];
+        let node_nums = vec![1u32, 2];
+        let n1 = vec![diag(DiagSpec {
+            shard: 7,
+            this_node_id: 1,
+            master_id: 1,
+            has_local_data: true,
+            is_local_master: true,
+            has_pending_inbound: false,
+            is_fenced: false,
+            is_migrating: false,
+            epoch: 10,
+        })];
+        let n2 = vec![diag(DiagSpec {
+            shard: 8,
+            this_node_id: 2,
+            master_id: 2,
+            has_local_data: true,
+            is_local_master: true,
+            has_pending_inbound: false,
+            is_fenced: false,
+            is_migrating: false,
+            epoch: 11,
+        })];
+        let responses = vec![Ok(n1), Ok(n2)];
+
+        let dump = format_master_failed_diagnostic(&[txid_a], &node_nums, &responses);
+
+        assert!(
+            dump.contains("SHARD_MISMATCH"),
+            "expected SHARD_MISMATCH flag: {dump}"
+        );
+        // The first successful node's shard should be reported.
+        assert!(
+            dump.contains("shard=7"),
+            "expected shard=7 (first response): {dump}"
+        );
     }
 }
