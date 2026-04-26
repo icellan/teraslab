@@ -827,6 +827,12 @@ pub struct ReplicationMetrics {
     /// Leader's current sequence, updated on every batch so lag gauges can
     /// compute `leader - last_acked` per replica without locking the manager.
     pub leader_sequence: AtomicU64,
+    /// Receiver-side counter — incremented every time the local node
+    /// rejects an inbound `OP_REPLICA_BATCH` because the batch's
+    /// `cluster_key` does not match the local cluster epoch (Phase B2
+    /// stale-epoch gate). A non-zero value means a master is sending
+    /// from a stale epoch and should re-discover the cluster topology.
+    pub replica_rejected_stale_cluster_key: PaddedCounter,
 }
 
 /// Per-replica drill-down state exposed on `/admin/top`.
@@ -876,6 +882,7 @@ impl ReplicationMetrics {
             repl_bytes_sent_total: PaddedCounter::new(),
             per_replica: [ZERO_CELL; MAX_REPLICAS],
             leader_sequence: AtomicU64::new(0),
+            replica_rejected_stale_cluster_key: PaddedCounter::new(),
         }
     }
 

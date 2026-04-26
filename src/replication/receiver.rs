@@ -49,18 +49,39 @@ pub struct ReplicationReceiver {
     /// Per-stream applied-sequence journal. Always present; when the
     /// receiver was constructed with [`Self::new`] it is memory-only.
     applied: Arc<ReplicaAppliedTracker>,
+    /// Coordinator-owned cluster epoch handle. Phase B2 gate compares
+    /// each inbound batch's `cluster_key` against this value (when
+    /// non-zero) to fence stale-epoch masters before any engine work.
+    /// `0` means "unknown" — accept unconditionally (V1-compat).
+    local_cluster_key: Arc<AtomicU64>,
 }
 
 impl ReplicationReceiver {
     /// Create a new receiver backed by the given engine and an
     /// in-memory idempotency journal. Useful for tests and for
     /// deployments that don't need restart-crash recovery.
+    ///
+    /// The cluster_key handle defaults to a fresh atomic at `0`
+    /// (unknown — V1-compat). Production callers wire the
+    /// coordinator-owned handle via
+    /// [`with_cluster_key`](Self::with_cluster_key).
     pub fn new(engine: Arc<Engine>) -> Self {
+        Self::with_cluster_key(engine, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Create a receiver wired to a coordinator-owned cluster_key handle.
+    ///
+    /// The same handle is shared with the local
+    /// [`ReplicationManager`](crate::replication::manager::ReplicationManager)
+    /// so leader-side stamping and replica-side gating observe a
+    /// single source of truth for the cluster epoch.
+    pub fn with_cluster_key(engine: Arc<Engine>, local_cluster_key: Arc<AtomicU64>) -> Self {
         Self {
             engine,
             last_applied_sequence: Arc::new(AtomicU64::new(0)),
             running: Arc::new(AtomicBool::new(true)),
             applied: Arc::new(ReplicaAppliedTracker::in_memory()),
+            local_cluster_key,
         }
     }
 
@@ -86,7 +107,24 @@ impl ReplicationReceiver {
             last_applied_sequence: Arc::new(AtomicU64::new(initial_seq)),
             running: Arc::new(AtomicBool::new(true)),
             applied: Arc::new(tracker),
+            local_cluster_key: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Install a coordinator-owned cluster_key handle on a receiver
+    /// that was constructed via [`Self::new`] or [`Self::with_ack_state`].
+    ///
+    /// Used by the coordinator (Phase B3) to share the same epoch
+    /// atomic between the local
+    /// [`ReplicationManager`](crate::replication::manager::ReplicationManager)
+    /// and this receiver after both have been constructed.
+    pub fn set_cluster_key_handle(&mut self, local_cluster_key: Arc<AtomicU64>) {
+        self.local_cluster_key = local_cluster_key;
+    }
+
+    /// Access the receiver's cluster_key handle.
+    pub fn cluster_key_handle(&self) -> Arc<AtomicU64> {
+        self.local_cluster_key.clone()
     }
 
     /// Access the underlying applied-sequence tracker. Exposed so
@@ -112,6 +150,7 @@ impl ReplicationReceiver {
         let running = self.running.clone();
         let last_applied = self.last_applied_sequence.clone();
         let applied = self.applied.clone();
+        let cluster_key = self.local_cluster_key.clone();
 
         std::thread::spawn(move || {
             while running.load(Ordering::Relaxed) {
@@ -121,8 +160,9 @@ impl ReplicationReceiver {
                         let run = running.clone();
                         let la = last_applied.clone();
                         let ap = applied.clone();
+                        let ck = cluster_key.clone();
                         std::thread::spawn(move || {
-                            handle_connection(&eng, stream, peer_addr, &run, &la, ap);
+                            handle_connection(&eng, stream, peer_addr, &run, &la, ap, ck);
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -171,6 +211,7 @@ fn handle_connection(
     running: &AtomicBool,
     last_applied: &AtomicU64,
     applied: Arc<ReplicaAppliedTracker>,
+    local_cluster_key: Arc<AtomicU64>,
 ) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
@@ -229,6 +270,7 @@ fn handle_connection(
                 last_applied,
                 applied.as_ref(),
                 &stream_key,
+                local_cluster_key.load(Ordering::Acquire),
             )
         } else {
             // Unknown opcode for replication receiver
@@ -251,7 +293,10 @@ fn handle_connection(
 ///
 /// Thin wrapper around [`handle_replica_batch_with_tracker`]
 /// preserved for call sites and tests that do not need
-/// multi-stream deduplication or durable state.
+/// multi-stream deduplication or durable state. The cluster_key
+/// gate is bypassed (`local_cluster_key = 0`, treated as "unknown")
+/// because this entry point predates the gate; production paths
+/// always go through `handle_replica_batch_with_tracker` directly.
 pub fn handle_replica_batch(
     request: &RequestFrame,
     engine: &Engine,
@@ -277,6 +322,7 @@ pub fn handle_replica_batch(
         last_applied,
         tracker.as_ref(),
         DEFAULT_STREAM_KEY,
+        /* local_cluster_key */ 0,
     )
 }
 
@@ -284,6 +330,13 @@ pub fn handle_replica_batch(
 /// idempotency tracking.
 ///
 /// Steps:
+/// 0. Phase B2 cluster-key gate. If the batch's `cluster_key` is
+///    non-zero AND does not match `local_cluster_key`, reject
+///    immediately with [`STATUS_ERROR`] / [`ERR_STALE_EPOCH`] before
+///    touching the engine, the dedup tracker, or the migration-batch
+///    bypass. `cluster_key == 0` retains V1-compat semantics: accept
+///    unconditionally so older masters that pre-date the wire-V2
+///    field still interoperate.
 /// 1. Deserialize the [`ReplicaBatch`] payload.
 /// 2. If the batch carried a W3C trace context (Phase 4), attach it as a
 ///    remote parent to the span created around this handler so the replica's
@@ -296,12 +349,18 @@ pub fn handle_replica_batch(
 /// 4. Apply the surviving ops via [`apply_op`].
 /// 5. `applied.set(stream_key, through_sequence)` and `applied.flush()`
 ///    BEFORE ACK, so durability is guaranteed on the wire.
+///
+/// `local_cluster_key` is the receiver's view of the current cluster
+/// epoch (typically loaded from the coordinator-owned atomic shared
+/// with the local
+/// [`ReplicationManager`](crate::replication::manager::ReplicationManager)).
 pub fn handle_replica_batch_with_tracker(
     request: &RequestFrame,
     engine: &Engine,
     last_applied: &AtomicU64,
     applied: &ReplicaAppliedTracker,
     stream_key: &str,
+    local_cluster_key: u64,
 ) -> ResponseFrame {
     let batch = match ReplicaBatch::deserialize(&request.payload) {
         Ok(b) => b,
@@ -317,6 +376,34 @@ pub fn handle_replica_batch_with_tracker(
             };
         }
     };
+
+    // Phase B2 stale-epoch gate. Runs BEFORE the migration-batch
+    // bypass and BEFORE any tracker/engine work so a stale-epoch
+    // master (including one sending migration batches) cannot mutate
+    // local state.
+    if batch.cluster_key != 0 && batch.cluster_key != local_cluster_key {
+        if let Some(m) = crate::metrics::replication_metrics() {
+            m.replica_rejected_stale_cluster_key.inc();
+        }
+        tracing::warn!(
+            batch_cluster_key = batch.cluster_key,
+            local_cluster_key,
+            first_sequence = batch.first_sequence,
+            ops_len = batch.ops.len(),
+            is_migration = request.flags & FLAG_MIGRATION_BATCH != 0,
+            "replica rejected batch: stale cluster_key"
+        );
+        let mut payload = Vec::with_capacity(4);
+        payload.extend_from_slice(&ERR_STALE_EPOCH.to_le_bytes());
+        // Empty diagnostic message — the master logs the reject and
+        // re-discovers cluster topology on the next handshake.
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        return ResponseFrame {
+            request_id: request.request_id,
+            status: STATUS_ERROR,
+            payload,
+        };
+    }
 
     let effective_stream_key = batch
         .source_node_id
@@ -1684,6 +1771,7 @@ mod tests {
             &last_applied,
             &tracker,
             stream_key,
+            0,
         );
         assert_eq!(resp_1.status, STATUS_OK);
         let ack_1 = ReplicaAck::deserialize(&resp_1.payload).unwrap();
@@ -1719,6 +1807,7 @@ mod tests {
             &last_applied,
             &tracker,
             stream_key,
+            0,
         );
         assert_eq!(resp_2.status, STATUS_OK);
         let ack_2 = ReplicaAck::deserialize(&resp_2.payload).unwrap();
@@ -1765,6 +1854,7 @@ mod tests {
                 &last_applied,
                 &tracker,
                 stream_key,
+                0,
             );
             assert_eq!(resp.status, STATUS_OK);
             assert_eq!(tracker.get(stream_key), 101);
@@ -1789,6 +1879,7 @@ mod tests {
             &new_last_applied,
             &reopened_tracker,
             stream_key,
+            0,
         );
         let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
         assert_eq!(
@@ -1823,6 +1914,7 @@ mod tests {
                 &last_applied,
                 &tracker,
                 "127.0.0.1:41000",
+                0,
             );
             assert_eq!(resp.status, STATUS_OK);
             assert_eq!(tracker.get("node:7"), 501);
@@ -1841,6 +1933,7 @@ mod tests {
             &Arc::new(AtomicU64::new(0)),
             &tracker,
             "127.0.0.1:42000",
+            0,
         );
         assert_eq!(resp.status, STATUS_OK);
         let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
@@ -1882,6 +1975,7 @@ mod tests {
                 &last_applied,
                 &tracker,
                 stream_key,
+                0,
             );
             assert_eq!(tracker.get(stream_key), 201);
         }
@@ -1902,6 +1996,7 @@ mod tests {
             &new_last_applied,
             &tracker,
             stream_key,
+            0,
         );
         let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
         assert_eq!(
@@ -1939,6 +2034,7 @@ mod tests {
             &last_applied,
             &tracker,
             stream_key,
+            0,
         );
         assert_eq!(tracker.get(stream_key), 302);
 
@@ -1956,6 +2052,7 @@ mod tests {
             &last_applied,
             &tracker,
             stream_key,
+            0,
         );
         let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
         assert_eq!(
@@ -2015,6 +2112,7 @@ mod tests {
             &last_applied,
             &tracker,
             stream_key,
+            0,
         );
         assert_eq!(resp.status, STATUS_OK);
         assert_eq!(tracker.get(stream_key), 100);
@@ -2039,6 +2137,7 @@ mod tests {
             &last_applied,
             &tracker,
             stream_key,
+            0,
         );
         assert_eq!(resp.status, STATUS_OK);
         // The ops in the migration batch must have been applied. Slot 2
@@ -2141,6 +2240,7 @@ mod tests {
                 &last_applied,
                 &applied,
                 "test-stream",
+                0,
             );
             assert_eq!(resp.status, STATUS_OK);
 
@@ -2166,6 +2266,287 @@ mod tests {
             *seen,
             Some(wire_ctx.trace_id),
             "receiver's span context must match the wire trace_id",
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase B2 — cluster_key gating
+    //
+    // The receiver rejects any batch whose `cluster_key` is non-zero AND
+    // does not match the local cluster epoch. `cluster_key == 0` retains
+    // V1-compat semantics (unknown — accept unconditionally). The gate runs
+    // BEFORE the `FLAG_MIGRATION_BATCH` bypass so a stale-epoch migration
+    // batch is also rejected.
+    // ----------------------------------------------------------------------
+
+    /// Decode the `[error_code:2 LE][msg_len:2 LE][msg]` payload that the
+    /// dispatch layer uses for `STATUS_ERROR` responses, returning the
+    /// `error_code` so tests can assert on the reject reason.
+    fn decode_error_code(payload: &[u8]) -> u16 {
+        assert!(
+            payload.len() >= 2,
+            "STATUS_ERROR payload must carry an error_code prefix",
+        );
+        u16::from_le_bytes([payload[0], payload[1]])
+    }
+
+    /// Build a Spend-only batch for cluster-key tests. Mirrors the
+    /// `make_spend_batch` helper above but lets the caller stamp the
+    /// `cluster_key` field directly.
+    fn batch_with_cluster_key(
+        first_sequence: u64,
+        tx_key: TxKey,
+        offsets: std::ops::Range<u32>,
+        generation: u32,
+        cluster_key: u64,
+    ) -> ReplicaBatch {
+        let mut b = make_spend_batch(first_sequence, tx_key, offsets, generation);
+        b.cluster_key = cluster_key;
+        b
+    }
+
+    #[test]
+    fn stale_cluster_key_batch_rejected() {
+        let engine = make_engine();
+        // Pre-existing record so we can detect mutation by reading slot status.
+        create_record(&engine, key(70), 4);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let local_cluster_key: u64 = 7;
+
+        // Snapshot the witness state before the call.
+        let gen_before = { engine.read_metadata(&key(70)).unwrap().generation };
+        let slot0_before = engine.read_slot(&key(70), 0).unwrap().status;
+
+        let batch = batch_with_cluster_key(10, key(70), 0..2, 1, /* stale */ 5);
+        let req = batch_request(&batch, 1);
+
+        let resp = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            &tracker,
+            DEFAULT_STREAM_KEY,
+            local_cluster_key,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "stale cluster_key batch must be rejected with STATUS_ERROR",
+        );
+        assert_eq!(
+            decode_error_code(&resp.payload),
+            ERR_STALE_EPOCH,
+            "rejection error_code must be ERR_STALE_EPOCH",
+        );
+
+        // Witnesses: engine untouched, tracker not advanced, last_applied untouched.
+        let gen_after = { engine.read_metadata(&key(70)).unwrap().generation };
+        let slot0_after = engine.read_slot(&key(70), 0).unwrap().status;
+        assert_eq!(
+            gen_before, gen_after,
+            "rejected batch must not advance engine generation",
+        );
+        assert_eq!(
+            slot0_before, slot0_after,
+            "rejected batch must not mutate slot status",
+        );
+        assert_eq!(
+            tracker.get(DEFAULT_STREAM_KEY),
+            0,
+            "rejected batch must not advance tracker high-water mark",
+        );
+        assert_eq!(
+            last_applied.load(Ordering::Relaxed),
+            0,
+            "rejected batch must not advance last_applied",
+        );
+    }
+
+    #[test]
+    fn current_cluster_key_batch_applied() {
+        let engine = make_engine();
+        create_record(&engine, key(71), 3);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let local_cluster_key: u64 = 7;
+
+        let batch = batch_with_cluster_key(20, key(71), 0..2, 1, /* matching */ 7);
+        let through = batch.last_sequence();
+        let req = batch_request(&batch, 1);
+
+        let resp = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            &tracker,
+            DEFAULT_STREAM_KEY,
+            local_cluster_key,
+        );
+
+        assert_eq!(resp.status, STATUS_OK, "current-epoch batch must apply");
+        let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
+        assert_eq!(
+            ack,
+            ReplicaAck::Ok {
+                through_sequence: through,
+            },
+        );
+        // Tracker advanced for normal-replication batches.
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), through);
+        assert_eq!(last_applied.load(Ordering::Relaxed), through);
+        assert_eq!(engine.read_slot(&key(71), 0).unwrap().status, UTXO_SPENT);
+    }
+
+    #[test]
+    fn future_cluster_key_batch_rejected() {
+        let engine = make_engine();
+        create_record(&engine, key(72), 3);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let local_cluster_key: u64 = 7;
+
+        // A future epoch (9 > 7) is treated as a strict mismatch: the
+        // receiver does NOT buffer ahead-of-the-cluster batches.
+        let batch = batch_with_cluster_key(30, key(72), 0..1, 1, /* future */ 9);
+        let req = batch_request(&batch, 1);
+
+        let resp = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            &tracker,
+            DEFAULT_STREAM_KEY,
+            local_cluster_key,
+        );
+
+        assert_eq!(resp.status, STATUS_ERROR);
+        assert_eq!(decode_error_code(&resp.payload), ERR_STALE_EPOCH);
+        assert_eq!(engine.read_slot(&key(72), 0).unwrap().status, UTXO_UNSPENT);
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), 0);
+    }
+
+    #[test]
+    fn unknown_cluster_key_batch_applied() {
+        // V1-compat: a `cluster_key == 0` batch (e.g. produced by an older
+        // master that did not emit the field) must apply unconditionally.
+        let engine = make_engine();
+        create_record(&engine, key(73), 3);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let local_cluster_key: u64 = 7;
+
+        let batch = batch_with_cluster_key(40, key(73), 0..1, 1, /* unknown */ 0);
+        let through = batch.last_sequence();
+        let req = batch_request(&batch, 1);
+
+        let resp = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            &tracker,
+            DEFAULT_STREAM_KEY,
+            local_cluster_key,
+        );
+
+        assert_eq!(resp.status, STATUS_OK);
+        let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
+        assert_eq!(
+            ack,
+            ReplicaAck::Ok {
+                through_sequence: through,
+            },
+        );
+        assert_eq!(engine.read_slot(&key(73), 0).unwrap().status, UTXO_SPENT);
+    }
+
+    #[test]
+    fn stale_cluster_key_migration_batch_also_rejected() {
+        // The cluster_key gate runs BEFORE the migration-batch bypass.
+        // Even a `FLAG_MIGRATION_BATCH` payload must be rejected when its
+        // stamped cluster_key does not match local_cluster_key.
+        let engine = make_engine();
+        create_record(&engine, key(74), 4);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let local_cluster_key: u64 = 7;
+
+        let slot2_before = engine.read_slot(&key(74), 2).unwrap().status;
+        let migration_batch = batch_with_cluster_key(0, key(74), 2..3, 1, /* stale */ 5);
+        let req = RequestFrame {
+            op_code: OP_REPLICA_BATCH,
+            request_id: 9,
+            flags: FLAG_MIGRATION_BATCH,
+            payload: migration_batch.serialize(),
+        };
+
+        let resp = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            &tracker,
+            DEFAULT_STREAM_KEY,
+            local_cluster_key,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "stale-epoch migration batch must be rejected before bypass logic",
+        );
+        assert_eq!(decode_error_code(&resp.payload), ERR_STALE_EPOCH);
+        let slot2_after = engine.read_slot(&key(74), 2).unwrap().status;
+        assert_eq!(
+            slot2_before, slot2_after,
+            "rejected migration batch must not mutate engine state",
+        );
+    }
+
+    #[test]
+    fn replica_rejected_stale_cluster_key_metric_increments() {
+        // The metric is process-wide via `replication_metrics()`. We make
+        // sure it is initialized (idempotent) and snapshot the counter
+        // before/after to assert exactly one increment per reject.
+        let engine = make_engine();
+        create_record(&engine, key(75), 2);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let local_cluster_key: u64 = 7;
+
+        // Ensure the process-wide replication metrics are installed so the
+        // counter has somewhere to live. Idempotent: any earlier test that
+        // installed it wins; the leak is acceptable for the test binary.
+        static TEST_METRICS: std::sync::OnceLock<&'static crate::metrics::ReplicationMetrics> =
+            std::sync::OnceLock::new();
+        let metrics_ref = *TEST_METRICS
+            .get_or_init(|| Box::leak(Box::new(crate::metrics::ReplicationMetrics::new())));
+        crate::metrics::init_replication_metrics(metrics_ref);
+        let metrics =
+            crate::metrics::replication_metrics().expect("replication metrics installed for test");
+        let before = metrics.replica_rejected_stale_cluster_key.get();
+
+        let batch = batch_with_cluster_key(50, key(75), 0..1, 1, /* stale */ 3);
+        let req = batch_request(&batch, 1);
+        let resp = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            &tracker,
+            DEFAULT_STREAM_KEY,
+            local_cluster_key,
+        );
+        assert_eq!(resp.status, STATUS_ERROR);
+
+        let after = metrics.replica_rejected_stale_cluster_key.get();
+        assert_eq!(
+            after,
+            before + 1,
+            "replica_rejected_stale_cluster_key must increment exactly once per reject",
         );
     }
 }

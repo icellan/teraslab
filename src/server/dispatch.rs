@@ -106,6 +106,28 @@ static REPLICATION_INTENT_TRACKER: std::sync::OnceLock<
 /// Monotonic diagnostic high-water mark across all source streams.
 static DISPATCH_REPLICA_LAST_APPLIED: AtomicU64 = AtomicU64::new(0);
 
+/// Receiver-side cluster epoch handle for dispatch-routed
+/// `OP_REPLICA_BATCH` frames. Initialized at coordinator startup
+/// (Phase B3) and shared with the local
+/// [`ReplicationManager`](crate::replication::manager::ReplicationManager).
+/// A value of `0` (the default) means "unknown" — the cluster-key gate
+/// in [`handle_replica_batch_with_tracker`](crate::replication::receiver::handle_replica_batch_with_tracker)
+/// accepts all batches, preserving V1-compat behavior.
+static DISPATCH_LOCAL_CLUSTER_KEY: AtomicU64 = AtomicU64::new(0);
+
+/// Install the dispatch-routed receiver's view of the cluster epoch.
+///
+/// Idempotent. Coordinator (Phase B3) calls this once at startup and
+/// updates the same atomic on every cluster-key bump.
+pub fn set_dispatch_local_cluster_key(cluster_key: u64) {
+    DISPATCH_LOCAL_CLUSTER_KEY.store(cluster_key, std::sync::atomic::Ordering::Release);
+}
+
+/// Read the dispatch-routed receiver's current view of the cluster epoch.
+pub fn dispatch_local_cluster_key() -> u64 {
+    DISPATCH_LOCAL_CLUSTER_KEY.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Global metrics reference. Initialized during server startup via
 /// `init_dispatch_metrics()`. Used to increment operation counters
 /// without threading metrics through every handler function.
@@ -324,6 +346,7 @@ pub(crate) fn handle_request(
                     &DISPATCH_REPLICA_LAST_APPLIED,
                     applied,
                     DEFAULT_STREAM_KEY,
+                    dispatch_local_cluster_key(),
                 )
             } else {
                 handle_replica_batch(request, engine, &DISPATCH_REPLICA_LAST_APPLIED)
