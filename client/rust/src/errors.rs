@@ -103,6 +103,7 @@ pub fn error_code_string(code: u16) -> &'static str {
         ERR_INTERNAL => "INTERNAL",
         ERR_MIGRATION_IN_PROGRESS => "MIGRATION_IN_PROGRESS",
         ERR_REPLICATION_FAILED => "REPLICATION_FAILED",
+        ERR_STALE_EPOCH => "STALE_EPOCH",
         _ => "UNKNOWN",
     }
 }

@@ -855,9 +855,13 @@ impl Client {
                     let _ = self.refresh_routing().await;
                     continue;
                 }
+                // Retryable-transient arm. Every per-item error must be
+                // a transient code (ERR_MIGRATION_IN_PROGRESS or
+                // ERR_STALE_EPOCH) — both are same-target retryable;
+                // ERR_REDIRECT is handled by the dedicated arm below.
                 Err(ClientError::Partial(pe))
                     if pe.errors.len() == items.len()
-                        && all_errors_have_code(&pe.errors, ERR_MIGRATION_IN_PROGRESS)
+                        && all_errors_are_retryable(&pe.errors)
                         && (attempt as usize) < TRANSIENT_MUTATION_RETRY_DELAYS_MS.len() =>
                 {
                     tokio::time::sleep(Duration::from_millis(
@@ -2137,6 +2141,28 @@ fn all_errors_have_code(errors: &[BatchItemError], code: u16) -> bool {
     !errors.is_empty() && errors.iter().all(|err| err.code == code)
 }
 
+/// Returns `true` for server error codes that indicate a *transient*,
+/// retryable condition for the **same** target node. The client should
+/// back off and retry rather than reroute (which `ERR_REDIRECT` triggers
+/// instead).
+///
+/// Currently:
+/// - [`ERR_MIGRATION_IN_PROGRESS`] — shard handoff in flight; the new
+///   master will accept once migration completes (or `Transitioning`
+///   topology gap closes).
+/// - [`ERR_STALE_EPOCH`] — the target's local cluster epoch differs
+///   from the requester's view; same-target retry succeeds once both
+///   sides observe the new committed term.
+pub(crate) fn is_retryable_error_code(code: u16) -> bool {
+    matches!(code, ERR_MIGRATION_IN_PROGRESS | ERR_STALE_EPOCH)
+}
+
+/// Returns `true` when every per-item error in `errors` is one of the
+/// retryable transient codes recognized by [`is_retryable_error_code`].
+pub(crate) fn all_errors_are_retryable(errors: &[BatchItemError]) -> bool {
+    !errors.is_empty() && errors.iter().all(|err| is_retryable_error_code(err.code))
+}
+
 const TRANSIENT_MUTATION_RETRY_DELAYS_MS: &[u64] = &[
     10, 25, 50, 100, 200, 400, 800, 1600, 3200, 5000, 5000, 5000, 5000, 5000,
 ];
@@ -2575,5 +2601,84 @@ mod tests {
 
         client.close().await;
         shutdown_node(&node1);
+    }
+
+    // ── Phase B4: retry classifier ────────────────────────────────
+
+    #[test]
+    fn migration_in_progress_is_retryable() {
+        assert!(
+            is_retryable_error_code(ERR_MIGRATION_IN_PROGRESS),
+            "ERR_MIGRATION_IN_PROGRESS must be classified as retryable"
+        );
+    }
+
+    #[test]
+    fn stale_epoch_is_retryable() {
+        assert!(
+            is_retryable_error_code(ERR_STALE_EPOCH),
+            "ERR_STALE_EPOCH must be classified as retryable so clients re-issue \
+             the request once the local cluster_key catches up to the master's"
+        );
+    }
+
+    #[test]
+    fn redirect_is_not_retryable_against_same_target() {
+        // ERR_REDIRECT is handled separately (route to a different node)
+        // and must NOT be lumped in with same-target transient retries —
+        // otherwise a stale-routed mutation would loop forever.
+        assert!(
+            !is_retryable_error_code(ERR_REDIRECT),
+            "ERR_REDIRECT must not be treated as same-target retryable"
+        );
+    }
+
+    #[test]
+    fn all_errors_are_retryable_accepts_mixed_retryable_codes() {
+        let errors = vec![
+            BatchItemError {
+                item_index: 0,
+                code: ERR_MIGRATION_IN_PROGRESS,
+                data: vec![],
+            },
+            BatchItemError {
+                item_index: 1,
+                code: ERR_STALE_EPOCH,
+                data: vec![],
+            },
+        ];
+        assert!(
+            all_errors_are_retryable(&errors),
+            "a batch where every item is one of the retryable codes \
+             (mixed MIGRATION_IN_PROGRESS + STALE_EPOCH) must be retried"
+        );
+    }
+
+    #[test]
+    fn all_errors_are_retryable_rejects_empty() {
+        assert!(
+            !all_errors_are_retryable(&[]),
+            "empty error vec must not be reported retryable",
+        );
+    }
+
+    #[test]
+    fn all_errors_are_retryable_rejects_mixed_with_redirect() {
+        let errors = vec![
+            BatchItemError {
+                item_index: 0,
+                code: ERR_MIGRATION_IN_PROGRESS,
+                data: vec![],
+            },
+            BatchItemError {
+                item_index: 1,
+                code: ERR_REDIRECT,
+                data: vec![],
+            },
+        ];
+        assert!(
+            !all_errors_are_retryable(&errors),
+            "presence of any non-retryable code must veto same-target retry",
+        );
     }
 }

@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use teraslab::allocator::SlotAllocator;
-use teraslab::cluster::coordinator::{ClusterConfig, ClusterCoordinator, RunningCluster};
+use teraslab::cluster::coordinator::{
+    ClusterConfig, ClusterCoordinator, MasterQueryResult, RunningCluster,
+};
 use teraslab::cluster::shards::{NUM_SHARDS, NodeId, ShardTable};
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, MemoryDevice};
@@ -258,7 +260,7 @@ fn single_node_cluster_owns_all_shards() {
         txid[0] = i;
         let key = teraslab::index::TxKey { txid };
         assert!(
-            node.cluster.is_master(&key),
+            matches!(node.cluster.is_master(&key), MasterQueryResult::Yes),
             "single node should own all shards, but shard for key[0]={i} is not owned"
         );
     }
@@ -386,7 +388,7 @@ fn wait_for_shard_split(node: &TestNode, timeout: Duration) -> [u8; 32] {
         for i in 0..4096u32 {
             let txid = make_txid(i + last_attempt);
             let key = TxKey { txid };
-            if !node.cluster.is_master(&key) {
+            if !matches!(node.cluster.is_master(&key), MasterQueryResult::Yes) {
                 return txid;
             }
         }
@@ -544,7 +546,7 @@ fn route_or_handle_coordinator_level() {
     for i in 0..4096u32 {
         let txid = make_txid(i);
         let key = TxKey { txid };
-        if node1.cluster.is_master(&key) {
+        if matches!(node1.cluster.is_master(&key), MasterQueryResult::Yes) {
             found_local = true;
             let route = node1.cluster.route(&key);
             assert_eq!(
@@ -816,7 +818,7 @@ fn after_migration_complete_all_ops_go_to_new_node() {
     for i in 0..1000u32 {
         let txid = make_txid(i + 70000);
         let key = TxKey { txid };
-        if node2.cluster.is_master(&key) {
+        if matches!(node2.cluster.is_master(&key), MasterQueryResult::Yes) {
             node2_key = Some(txid);
             break;
         }
@@ -888,9 +890,9 @@ fn no_records_lost_during_migration() {
 
     for txid in &created_txids {
         let key = TxKey { txid: *txid };
-        if node1.cluster.is_master(&key) {
+        if matches!(node1.cluster.is_master(&key), MasterQueryResult::Yes) {
             n1_accessible += 1;
-        } else if node2.cluster.is_master(&key) {
+        } else if matches!(node2.cluster.is_master(&key), MasterQueryResult::Yes) {
             n2_accessible += 1;
         }
     }
@@ -1104,7 +1106,7 @@ fn spend_routed_to_correct_master() {
     for i in 0..1000u32 {
         let txid = make_txid(i + 500000);
         let key = TxKey { txid };
-        if node1.cluster.is_master(&key) {
+        if matches!(node1.cluster.is_master(&key), MasterQueryResult::Yes) {
             local_txid = Some(txid);
             break;
         }
@@ -1205,7 +1207,9 @@ fn add_node_all_records_still_accessible() {
     let mut accessible = 0;
     for txid in &txids {
         let key = TxKey { txid: *txid };
-        if node1.cluster.is_master(&key) || node2.cluster.is_master(&key) {
+        if matches!(node1.cluster.is_master(&key), MasterQueryResult::Yes)
+            || matches!(node2.cluster.is_master(&key), MasterQueryResult::Yes)
+        {
             accessible += 1;
         }
     }

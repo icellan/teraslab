@@ -1756,64 +1756,83 @@ fn check_shard_ownership(
 ) -> Option<BatchItemError> {
     let cluster = cluster?;
     let key = TxKey { txid: *txid };
-    if cluster.is_master(&key) {
-        // If we're the new master but still waiting for inbound migration
-        // data, reject mutations so clients retry after migration completes.
-        // Reads are handled separately with a wait loop.
-        if !allow_if_migrating && cluster.has_pending_inbound(&key) {
-            let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
-            tracing::debug!(
-                shard,
-                "dispatch: write rejected — pending inbound migration"
-            );
-            return Some(BatchItemError {
-                item_index,
-                error_code: ERR_MIGRATION_IN_PROGRESS,
-                error_data: Vec::new(),
-            });
-        }
-        if !allow_if_migrating && cluster.is_shard_write_fenced(&key) {
-            let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
-            tracing::debug!(
-                shard,
-                "dispatch: write rejected — write-fenced (delta streaming)"
-            );
-            return Some(BatchItemError {
-                item_index,
-                error_code: ERR_MIGRATION_IN_PROGRESS,
-                error_data: Vec::new(),
-            });
-        }
-        return None;
-    }
-    // During outbound migration, reads can still be served locally
-    // because the data hasn't been removed yet.
-    if allow_if_migrating && cluster.is_migrating_outbound(&key) {
-        return None;
-    }
-    // Determine the target node address for the redirect
-    let route = cluster.route(&key);
-    let error_data = match route {
-        crate::cluster::shards::RouteDecision::RedirectTo { node, .. } => {
-            match cluster.node_addr(&node) {
-                Some(addr) => addr.to_string().into_bytes(),
-                None => Vec::new(),
+    match cluster.is_master(&key) {
+        crate::cluster::coordinator::MasterQueryResult::Yes => {
+            // If we're the new master but still waiting for inbound migration
+            // data, reject mutations so clients retry after migration completes.
+            // Reads are handled separately with a wait loop.
+            if !allow_if_migrating && cluster.has_pending_inbound(&key) {
+                let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+                tracing::debug!(
+                    shard,
+                    "dispatch: write rejected — pending inbound migration"
+                );
+                Some(BatchItemError {
+                    item_index,
+                    error_code: ERR_MIGRATION_IN_PROGRESS,
+                    error_data: Vec::new(),
+                })
+            } else if !allow_if_migrating && cluster.is_shard_write_fenced(&key) {
+                let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+                tracing::debug!(
+                    shard,
+                    "dispatch: write rejected — write-fenced (delta streaming)"
+                );
+                Some(BatchItemError {
+                    item_index,
+                    error_code: ERR_MIGRATION_IN_PROGRESS,
+                    error_data: Vec::new(),
+                })
+            } else {
+                None
             }
         }
-        crate::cluster::shards::RouteDecision::HandleLocally => return None,
-    };
-    // M10: count every stale-routed request so operators can alert on
-    // persistent stale-routing storms (indicates clients are not
-    // refreshing the partition map). Best-effort: no-op if metrics
-    // haven't been initialized (e.g. unit tests).
-    if let Some(m) = DISPATCH_METRICS.get() {
-        m.stale_routing_request_total.inc();
+        crate::cluster::coordinator::MasterQueryResult::Transitioning { last_known_term } => {
+            // Topology proposal in flight but not yet quorum-committed.
+            // Don't redirect (the redirect target may itself be wrong).
+            // Tell the client to retry; once the gap closes the next
+            // attempt resolves to Yes or No deterministically.
+            tracing::debug!(
+                last_known_term,
+                "dispatch: deferring request — topology in transition"
+            );
+            Some(BatchItemError {
+                item_index,
+                error_code: ERR_MIGRATION_IN_PROGRESS,
+                error_data: Vec::new(),
+            })
+        }
+        crate::cluster::coordinator::MasterQueryResult::No => {
+            // During outbound migration, reads can still be served locally
+            // because the data hasn't been removed yet.
+            if allow_if_migrating && cluster.is_migrating_outbound(&key) {
+                return None;
+            }
+            // Determine the target node address for the redirect
+            let route = cluster.route(&key);
+            let error_data = match route {
+                crate::cluster::shards::RouteDecision::RedirectTo { node, .. } => {
+                    match cluster.node_addr(&node) {
+                        Some(addr) => addr.to_string().into_bytes(),
+                        None => Vec::new(),
+                    }
+                }
+                crate::cluster::shards::RouteDecision::HandleLocally => return None,
+            };
+            // M10: count every stale-routed request so operators can alert on
+            // persistent stale-routing storms (indicates clients are not
+            // refreshing the partition map). Best-effort: no-op if metrics
+            // haven't been initialized (e.g. unit tests).
+            if let Some(m) = DISPATCH_METRICS.get() {
+                m.stale_routing_request_total.inc();
+            }
+            Some(BatchItemError {
+                item_index,
+                error_code: ERR_REDIRECT,
+                error_data,
+            })
+        }
     }
-    Some(BatchItemError {
-        item_index,
-        error_code: ERR_REDIRECT,
-        error_data,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3591,8 +3610,30 @@ fn handle_get_batch(
         // available locally (handles the migration window where shard tables
         // may be inconsistent across nodes).
         if !local_read && let Some(cluster) = cluster {
-            let is_master = cluster.is_master(&key);
+            let mastership = cluster.is_master(&key);
             let is_migrating_out = cluster.is_migrating_outbound(&key);
+
+            // Distinguish three cases explicitly:
+            //   - Yes        → serve locally (subject to inbound-migration check below)
+            //   - No         → REDIRECT (or serve during outbound migration)
+            //   - Transitioning → MIGRATION_IN_PROGRESS (retryable)
+            let is_master = match mastership {
+                crate::cluster::coordinator::MasterQueryResult::Yes => true,
+                crate::cluster::coordinator::MasterQueryResult::Transitioning {
+                    last_known_term,
+                } => {
+                    tracing::debug!(
+                        last_known_term,
+                        "dispatch: get deferring — topology in transition"
+                    );
+                    results.push(WireGetResult {
+                        status: ERR_MIGRATION_IN_PROGRESS as u8,
+                        data: vec![],
+                    });
+                    continue;
+                }
+                crate::cluster::coordinator::MasterQueryResult::No => false,
+            };
 
             if !is_master && !is_migrating_out {
                 let route = cluster.route(&key);
@@ -4064,18 +4105,40 @@ fn handle_get_spend_batch(
         // FLAG_LOCAL_READ bypasses this check for replication verification.
         if !local_read && let Some(cluster) = cluster {
             let key = TxKey { txid: item.txid };
-            if !cluster.is_master(&key) && !cluster.is_migrating_outbound(&key) {
-                // M10: count the stale-routed GetSpend.
-                if let Some(m) = DISPATCH_METRICS.get() {
-                    m.stale_routing_request_total.inc();
+            match cluster.is_master(&key) {
+                crate::cluster::coordinator::MasterQueryResult::Yes => {}
+                crate::cluster::coordinator::MasterQueryResult::Transitioning {
+                    last_known_term,
+                } => {
+                    tracing::debug!(
+                        last_known_term,
+                        "dispatch: get_spend deferring — topology in transition"
+                    );
+                    results.push(WireGetSpendResult {
+                        status: 1,
+                        error_code: ERR_MIGRATION_IN_PROGRESS,
+                        slot_status: 0,
+                        spending_data: [0; 36],
+                    });
+                    continue;
                 }
-                results.push(WireGetSpendResult {
-                    status: 1,
-                    error_code: ERR_REDIRECT,
-                    slot_status: 0,
-                    spending_data: [0; 36],
-                });
-                continue;
+                crate::cluster::coordinator::MasterQueryResult::No => {
+                    if cluster.is_migrating_outbound(&key) {
+                        // Outbound migration: data still present locally.
+                    } else {
+                        // M10: count the stale-routed GetSpend.
+                        if let Some(m) = DISPATCH_METRICS.get() {
+                            m.stale_routing_request_total.inc();
+                        }
+                        results.push(WireGetSpendResult {
+                            status: 1,
+                            error_code: ERR_REDIRECT,
+                            slot_status: 0,
+                            spending_data: [0; 36],
+                        });
+                        continue;
+                    }
+                }
             }
         }
 
@@ -5488,6 +5551,54 @@ mod tests {
         let results = crate::protocol::codec::decode_get_response(&resp.payload).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, ERR_REDIRECT as u8);
+    }
+
+    #[test]
+    fn dispatch_returns_migration_in_progress_for_transitioning_state() {
+        // Phase B4: when the local topology_epoch is ahead of the
+        // committed term (membership change proposed but not quorum-
+        // committed), GET_BATCH must return ERR_MIGRATION_IN_PROGRESS
+        // (retryable) rather than ERR_REDIRECT (non-retryable to a
+        // possibly-wrong target).
+        let h = DispatchTestHarness::new();
+        let shard = 33u16;
+        let mut txid = [0u8; 32];
+        txid[..2].copy_from_slice(&shard.to_le_bytes());
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 7);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4901".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        // Drive the cluster into the "Transitioning" gap: local
+        // topology_epoch = 8, committed_term still = 7.
+        cluster
+            .cluster_key_handle()
+            .store(8, std::sync::atomic::Ordering::Release);
+
+        let resp = h.request_with_cluster(
+            OP_GET_BATCH,
+            crate::protocol::codec::encode_get_batch(FieldMask::ALL_METADATA, &[txid]),
+            &cluster,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let results = crate::protocol::codec::decode_get_response(&resp.payload).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].status, ERR_MIGRATION_IN_PROGRESS as u8,
+            "Transitioning state must yield ERR_MIGRATION_IN_PROGRESS, not ERR_REDIRECT \
+             (so the client retries instead of chasing a possibly-wrong redirect target)",
+        );
     }
 
     #[test]

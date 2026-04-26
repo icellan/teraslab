@@ -4368,6 +4368,41 @@ pub fn load_peak_cluster_size(path: &std::path::Path) -> usize {
 }
 
 /// A running cluster instance with all background threads active.
+/// Result of a `RunningCluster::is_master` query.
+///
+/// Returned in place of a bare `bool` so that callers (specifically the
+/// dispatcher) can distinguish a cleanly-known non-master answer from the
+/// transient *gap* between a topology proposal/membership change and its
+/// quorum-committed activation. During that gap the local view of who owns
+/// a shard is unreliable: the dispatcher must steer clients away from
+/// following a possibly-wrong `REDIRECT` and toward retrying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MasterQueryResult {
+    /// This node is the authoritative master for the queried shard, in the
+    /// currently quorum-committed topology. The dispatcher handles the
+    /// request locally.
+    Yes,
+    /// Some other live node is the authoritative master for the queried
+    /// shard. The dispatcher returns `ERR_REDIRECT` with that node's
+    /// address.
+    No,
+    /// Topology is in flux: the local `topology_epoch` (peak observed
+    /// proposed term) is ahead of the last quorum-committed term, so the
+    /// shard table consulted to derive ownership is not yet authoritative.
+    /// The dispatcher returns `ERR_MIGRATION_IN_PROGRESS` to instruct
+    /// clients to retry rather than chase a stale redirect.
+    ///
+    /// `last_known_term` reports the most recent quorum-committed term —
+    /// useful for diagnostics, metrics, and (eventually) hinting clients
+    /// to refresh their partition map past that point.
+    Transitioning {
+        /// The most recent quorum-committed topology term observed by this
+        /// node. The shard table at that term is the last authoritative
+        /// view; anything bumped on top of it is in-flight.
+        last_known_term: u64,
+    },
+}
+
 pub struct RunningCluster {
     self_id: NodeId,
     shard_table: Arc<ShardTableLock<ShardTable>>,
@@ -4456,15 +4491,43 @@ impl RunningCluster {
         self.shard_table.clone()
     }
 
-    /// Check if this node is the master for the given key.
+    /// Determine whether this node is the master for the given key.
     ///
-    /// Returns false if the local shard table is behind the committed
-    /// topology term (e.g., after a node rejoins from Dead state before
-    /// its shard table has been updated). This prevents serving stale
-    /// reads/writes from an outdated ownership view.
-    pub fn is_master(&self, key: &TxKey) -> bool {
+    /// Returns:
+    /// - [`MasterQueryResult::Yes`] when this node is the authoritative
+    ///   master for the key's shard in the currently quorum-committed
+    ///   topology.
+    /// - [`MasterQueryResult::No`] when another node holds authoritative
+    ///   ownership.
+    /// - [`MasterQueryResult::Transitioning`] when the local
+    ///   `topology_epoch` (peak observed proposed term) is ahead of the
+    ///   last quorum-committed term — i.e. a membership change has been
+    ///   proposed/observed but not yet quorum-committed locally. In that
+    ///   window the local shard-table view of ownership is unreliable
+    ///   and the caller must surface a *retryable* error rather than a
+    ///   redirect to a possibly-wrong target.
+    ///
+    /// Note: when the local shard table is *behind* the committed topology
+    /// term (e.g. a freshly-rejoined node), this still returns
+    /// [`MasterQueryResult::No`]. That case is handled inside
+    /// [`Self::authoritative_master_for_shard`], which returns `NodeId(0)`
+    /// (a sentinel that never matches `self_id`) so the dispatcher
+    /// redirects with `NodeId(0)` and the client refetches its partition
+    /// map.
+    pub fn is_master(&self, key: &TxKey) -> MasterQueryResult {
+        let committed = self.topology_authority.committed_term();
+        let observed = self.topology_epoch.load(Ordering::Acquire);
+        if observed > committed {
+            return MasterQueryResult::Transitioning {
+                last_known_term: committed,
+            };
+        }
         let shard = ShardTable::shard_for_key(key);
-        self.authoritative_master_for_shard(shard) == self.self_id
+        if self.authoritative_master_for_shard(shard) == self.self_id {
+            MasterQueryResult::Yes
+        } else {
+            MasterQueryResult::No
+        }
     }
 
     /// Determine how to route a request for the given key.
@@ -6909,7 +6972,7 @@ mod tests {
         );
 
         let key = key_for_shard(shard);
-        assert!(!cluster.is_master(&key));
+        assert_eq!(cluster.is_master(&key), MasterQueryResult::No);
         assert_eq!(
             cluster.route(&key),
             RouteDecision::RedirectTo {
@@ -6956,7 +7019,7 @@ mod tests {
         );
 
         let key = key_for_shard(shard);
-        assert!(cluster.is_master(&key));
+        assert_eq!(cluster.is_master(&key), MasterQueryResult::Yes);
         assert_eq!(cluster.route(&key), RouteDecision::HandleLocally);
     }
 
@@ -7434,5 +7497,98 @@ mod tests {
             "the post-bump batch must carry the new cluster_key (123) — \
              proving the manager reads the live shared Arc, not a snapshot",
         );
+    }
+
+    // ── Phase B4: MasterQueryResult ────────────────────────────────
+
+    /// Build a single-node test cluster where this node owns every shard
+    /// (single-node committed term == shard table version, no epoch gap).
+    fn single_node_cluster_for_master_query_tests() -> RunningCluster {
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 7);
+        new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4801".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        )
+    }
+
+    #[test]
+    fn is_master_returns_yes_when_local_master() {
+        let cluster = single_node_cluster_for_master_query_tests();
+        let key = key_for_shard(0);
+        match cluster.is_master(&key) {
+            MasterQueryResult::Yes => {}
+            other => panic!("expected MasterQueryResult::Yes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_master_returns_no_when_remote_master() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 5);
+        // Find a shard whose target master is NodeId(2), then run as NodeId(1).
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == NodeId(2))
+            .expect("at least one shard owned by NodeId(2)");
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4811".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4812".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        let key = key_for_shard(shard);
+        match cluster.is_master(&key) {
+            MasterQueryResult::No => {}
+            other => panic!("expected MasterQueryResult::No, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_master_query_returns_transitioning_during_epoch_gap() {
+        // Single-node committed-term=5 cluster, then bump topology_epoch to 6
+        // (simulating a membership change that has been proposed/observed
+        // locally but has not yet quorum-committed).
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4821".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        // Sanity: committed term is 5 (set by new_test_running_cluster).
+        assert_eq!(cluster.topology_authority.committed_term(), 5);
+        // Bump the local peak/proposed epoch ahead of the committed term.
+        cluster.topology_epoch.store(6, Ordering::Release);
+
+        let key = key_for_shard(0);
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { last_known_term } => {
+                assert_eq!(
+                    last_known_term, 5,
+                    "Transitioning must report the last quorum-committed term",
+                );
+            }
+            other => panic!(
+                "expected MasterQueryResult::Transitioning {{ last_known_term: 5 }}, got {other:?}"
+            ),
+        }
     }
 }
