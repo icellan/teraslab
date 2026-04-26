@@ -682,6 +682,13 @@ fn main() {
         if config.replication_factor > 1 {
             let redo_for_catchup = redo_log.clone();
             let engine_for_catchup = engine.clone();
+            // Phase B3: each catch-up batch must carry the master's live
+            // topology epoch so the receiver-side ERR_STALE_EPOCH gate
+            // accepts it. We clone the shared `Arc<AtomicU64>` so the
+            // background thread always reads the current epoch (and not a
+            // start-time snapshot that could go stale before the first
+            // batch is sent).
+            let cluster_key_handle = running.cluster_key_handle();
             std::thread::spawn(move || {
                 let tracker = teraslab::replication::durable::AckTracker::new(ack_path);
                 let all_acked = tracker.all_acked();
@@ -717,6 +724,9 @@ fn main() {
                         .as_ref()
                         .and_then(|rl| rl.lock().earliest_sequence().ok().flatten());
 
+                    let local_cluster_key =
+                        cluster_key_handle.load(std::sync::atomic::Ordering::Acquire);
+
                     let result = teraslab::replication::durable::run_catchup_for_replica(
                         addr,
                         last_acked + 1,
@@ -749,6 +759,7 @@ fn main() {
                                 .collect()
                         },
                         first_avail_seq,
+                        local_cluster_key,
                     );
 
                     match result {
