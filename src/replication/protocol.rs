@@ -2,39 +2,30 @@
 //!
 //! Compact binary serialization — a Spend op is under 80 bytes on the wire.
 //!
-//! # Protocol versioning
+//! # Wire layout
 //!
-//! The `ReplicaBatch` frame on the wire starts with a 1-byte version tag
-//! so receivers can tolerate older senders during a rolling upgrade.
+//! Each `ReplicaBatch` frame begins with the protocol version byte
+//! [`BATCH_PROTOCOL_V1`] followed by:
 //!
-//! * [`BATCH_PROTOCOL_V1`] — legacy layout (no trace context).
-//! * [`BATCH_PROTOCOL_V2`] — legacy layout with a fixed 24-byte trace context
-//!   trailer immediately after `[first_sequence:8][count:4]`. See
-//!   [`crate::observability::WireTraceContext`] for the byte layout.
-//!   When the caller has no active/sampled span, the 24 bytes are zero
-//!   and the receiver treats the context as absent.
-//! * [`BATCH_PROTOCOL_V3`] — **current**. Adds `[source_node_id:8]` after
-//!   the trace context so receiver-side high-water marks can survive TCP
-//!   reconnects and process restarts by source node identity.
+//! `[version:1][first_seq:8][count:4][trace_id:16][span_id:8][source_node_id:8][op0_len:4][op0]…`
 //!
-//! The version byte is new in V2. V1 frames never included one, so
-//! receivers only interpret the leading byte as a version tag when its
-//! value equals a known version; any other value is treated as a V1
-//! frame whose first byte is the low byte of `first_sequence`.
+//! The 24-byte trace-context region (see [`crate::observability::WireTraceContext`])
+//! is zero when the sender has no active/sampled span; receivers treat
+//! all-zero as "absent". The 8-byte `source_node_id` is zero when no
+//! stable sender id is available; receivers treat zero as "unknown" and
+//! fall back to TCP peer keying.
+//!
+//! Decoders reject any other version byte with [`ProtocolError::UnknownVersion`].
+//! There is no backward-compatible legacy decode path: this project is
+//! pre-release and a wire-format change is a flat upgrade, not a rollout.
 
 use crate::index::TxKey;
 use crate::observability::WireTraceContext;
 use thiserror::Error;
 
-/// Legacy batch wire layout (no trace context). Deprecated; kept for
-/// backward-compatible receiver reads only — this crate never produces V1.
+/// Current (and only) batch wire layout. Carries trace context and a
+/// stable source node id alongside the sequenced op stream.
 pub const BATCH_PROTOCOL_V1: u8 = 1;
-
-/// Legacy batch wire layout with a 24-byte W3C trace context trailer.
-pub const BATCH_PROTOCOL_V2: u8 = 2;
-
-/// Current batch wire layout with trace context and stable source node id.
-pub const BATCH_PROTOCOL_V3: u8 = 3;
 
 #[derive(Error, Debug)]
 pub enum ProtocolError {
@@ -42,6 +33,8 @@ pub enum ProtocolError {
     BufferTooShort { need: usize, have: usize },
     #[error("unknown op type: {0}")]
     UnknownOp(u8),
+    #[error("unknown batch protocol version: {0}")]
+    UnknownVersion(u8),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -632,11 +625,10 @@ fn r_u32(data: &[u8], offset: usize) -> u32 {
 
 /// A batch of operations with contiguous sequence numbers.
 ///
-/// Since protocol V2 (see [`BATCH_PROTOCOL_V2`]) each batch carries an
-/// optional W3C trace context (`trace_id`, `span_id`) so replicas can
-/// stitch their `handle_replica_batch` span into the sender's trace.
-/// When `trace_ctx` is `None` the on-wire bytes are zero and receivers
-/// treat the absence as "start a new root span."
+/// Each batch carries an optional W3C trace context (`trace_id`, `span_id`)
+/// so replicas can stitch their `handle_replica_batch` span into the
+/// sender's trace. When `trace_ctx` is `None` the on-wire bytes are zero
+/// and receivers treat the absence as "start a new root span."
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplicaBatch {
     /// Sequence number of the first op.
@@ -648,7 +640,8 @@ pub struct ReplicaBatch {
     pub trace_ctx: Option<WireTraceContext>,
     /// Stable sender node id used to key receiver-side idempotency state.
     ///
-    /// `None` is kept for legacy frames and non-clustered tests.
+    /// `None` for non-clustered tests; receivers fall back to TCP peer
+    /// keying when absent.
     pub source_node_id: Option<u64>,
 }
 
@@ -689,14 +682,14 @@ impl CatchupRequest {
 impl ReplicaBatch {
     /// Serialize to bytes.
     ///
-    /// Layout (protocol V3):
-    /// `[version:1][first_seq:8][count:4][trace_id:16][span_id:8][source_node_id:8][op0][op1]...`
+    /// Layout:
+    /// `[version:1][first_seq:8][count:4][trace_id:16][span_id:8][source_node_id:8][op0_len:4][op0]…`
     ///
     /// When `trace_ctx` is `None`, the 24 trace-context bytes are zero.
     /// When `source_node_id` is `None`, the source field is zero.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::HEADER_SIZE + self.ops.len() * 64);
-        buf.push(BATCH_PROTOCOL_V3);
+        buf.push(BATCH_PROTOCOL_V1);
         buf.extend_from_slice(&self.first_sequence.to_le_bytes());
         buf.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
         let mut tc = [0u8; WireTraceContext::SIZE];
@@ -713,92 +706,41 @@ impl ReplicaBatch {
         buf
     }
 
-    /// Deserialize from bytes.
-    ///
-    /// Tolerates legacy V1 frames (`[first_seq:8][count:4][op...]`) and
-    /// V2 frames (trace context but no source node id). V1/V2 frames decode
-    /// with `source_node_id = None`; new senders always produce V3.
+    /// Deserialize from bytes. Strict: rejects any frame whose leading
+    /// byte is not [`BATCH_PROTOCOL_V1`].
     pub fn deserialize(data: &[u8]) -> Result<Self> {
         need(data, 1)?;
-        if data[0] == BATCH_PROTOCOL_V3 {
-            // V3: [version(1) + first_seq(8) + count(4) + trace_ctx(24) + source_node_id(8)]
-            need(data, Self::HEADER_SIZE)?;
-            let first_sequence = u64::from_le_bytes(data[1..9].try_into().unwrap());
-            let count = u32::from_le_bytes(data[9..13].try_into().unwrap()) as usize;
-            let trace_ctx = WireTraceContext::read_from(&data[13..13 + WireTraceContext::SIZE]);
-            let source_off = 13 + WireTraceContext::SIZE;
-            let raw_source =
-                u64::from_le_bytes(data[source_off..source_off + 8].try_into().unwrap());
-            let source_node_id = if raw_source == 0 {
-                None
-            } else {
-                Some(raw_source)
-            };
-            let mut pos = Self::HEADER_SIZE;
-            let mut ops = Vec::with_capacity(count);
-            for _ in 0..count {
-                need(&data[pos..], 4)?;
-                let op_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4;
-                need(&data[pos..], op_len)?;
-                let (op, _) = ReplicaOp::deserialize(&data[pos..pos + op_len])?;
-                ops.push(op);
-                pos += op_len;
-            }
-            Ok(ReplicaBatch {
-                first_sequence,
-                ops,
-                trace_ctx,
-                source_node_id,
-            })
-        } else if data[0] == BATCH_PROTOCOL_V2 {
-            // V2: [version(1) + first_seq(8) + count(4) + trace_ctx(24)] = 37 bytes
-            let header_size = 1 + 8 + 4 + WireTraceContext::SIZE;
-            need(data, header_size)?;
-            let first_sequence = u64::from_le_bytes(data[1..9].try_into().unwrap());
-            let count = u32::from_le_bytes(data[9..13].try_into().unwrap()) as usize;
-            let trace_ctx = WireTraceContext::read_from(&data[13..13 + WireTraceContext::SIZE]);
-            let mut pos = header_size;
-            let mut ops = Vec::with_capacity(count);
-            for _ in 0..count {
-                need(&data[pos..], 4)?;
-                let op_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4;
-                need(&data[pos..], op_len)?;
-                let (op, _) = ReplicaOp::deserialize(&data[pos..pos + op_len])?;
-                ops.push(op);
-                pos += op_len;
-            }
-            Ok(ReplicaBatch {
-                first_sequence,
-                ops,
-                trace_ctx,
-                source_node_id: None,
-            })
-        } else {
-            // Legacy V1: no version byte. `data[0]` is the low byte of
-            // first_sequence.
-            need(data, 12)?;
-            let first_sequence = u64::from_le_bytes(data[..8].try_into().unwrap());
-            let count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
-            let mut ops = Vec::with_capacity(count);
-            let mut pos = 12;
-            for _ in 0..count {
-                need(&data[pos..], 4)?;
-                let op_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4;
-                need(&data[pos..], op_len)?;
-                let (op, _) = ReplicaOp::deserialize(&data[pos..pos + op_len])?;
-                ops.push(op);
-                pos += op_len;
-            }
-            Ok(ReplicaBatch {
-                first_sequence,
-                ops,
-                trace_ctx: None,
-                source_node_id: None,
-            })
+        if data[0] != BATCH_PROTOCOL_V1 {
+            return Err(ProtocolError::UnknownVersion(data[0]));
         }
+        need(data, Self::HEADER_SIZE)?;
+        let first_sequence = u64::from_le_bytes(data[1..9].try_into().unwrap());
+        let count = u32::from_le_bytes(data[9..13].try_into().unwrap()) as usize;
+        let trace_ctx = WireTraceContext::read_from(&data[13..13 + WireTraceContext::SIZE]);
+        let source_off = 13 + WireTraceContext::SIZE;
+        let raw_source = u64::from_le_bytes(data[source_off..source_off + 8].try_into().unwrap());
+        let source_node_id = if raw_source == 0 {
+            None
+        } else {
+            Some(raw_source)
+        };
+        let mut pos = Self::HEADER_SIZE;
+        let mut ops = Vec::with_capacity(count);
+        for _ in 0..count {
+            need(&data[pos..], 4)?;
+            let op_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            need(&data[pos..], op_len)?;
+            let (op, _) = ReplicaOp::deserialize(&data[pos..pos + op_len])?;
+            ops.push(op);
+            pos += op_len;
+        }
+        Ok(ReplicaBatch {
+            first_sequence,
+            ops,
+            trace_ctx,
+            source_node_id,
+        })
     }
 
     /// The last sequence number in this batch.
@@ -808,14 +750,14 @@ impl ReplicaBatch {
 
     /// Batch header overhead in bytes.
     ///
-    /// Protocol V3 layout: `version(1) + first_sequence(8) + count(4) + trace_ctx(24) + source_node_id(8) = 45`.
+    /// Layout: `version(1) + first_sequence(8) + count(4) + trace_ctx(24) + source_node_id(8) = 45`.
     pub const HEADER_SIZE: usize = 1 + 8 + 4 + WireTraceContext::SIZE + 8;
 
-    /// Byte offset of the trace_id field in the V2 serialized frame.
+    /// Byte offset of the `trace_id` field in the serialized frame.
     /// Exposed for the test suite that inspects exact byte layout.
     pub const TRACE_ID_OFFSET: usize = 1 + 8 + 4;
 
-    /// Byte offset of the span_id field in the V2 serialized frame.
+    /// Byte offset of the `span_id` field in the serialized frame.
     pub const SPAN_ID_OFFSET: usize = Self::TRACE_ID_OFFSET + 16;
 }
 
@@ -1094,7 +1036,7 @@ mod tests {
 
     #[test]
     fn batch_header_overhead() {
-        // V3: version(1) + first_sequence(8) + count(4) + trace_ctx(24) + source_node_id(8) = 45 bytes.
+        // version(1) + first_sequence(8) + count(4) + trace_ctx(24) + source_node_id(8) = 45 bytes.
         assert_eq!(ReplicaBatch::HEADER_SIZE, 45);
         assert_eq!(ReplicaBatch::TRACE_ID_OFFSET, 13);
         assert_eq!(ReplicaBatch::SPAN_ID_OFFSET, 29);
@@ -1121,7 +1063,7 @@ mod tests {
         };
         let bytes = batch.serialize();
         // Version byte.
-        assert_eq!(bytes[0], BATCH_PROTOCOL_V3);
+        assert_eq!(bytes[0], BATCH_PROTOCOL_V1);
         // Exact trace_id bytes at declared offset.
         assert_eq!(
             &bytes[ReplicaBatch::TRACE_ID_OFFSET..ReplicaBatch::TRACE_ID_OFFSET + 16],
@@ -1178,53 +1120,26 @@ mod tests {
     }
 
     #[test]
-    fn replication_batch_v1_legacy_frame_decodes_without_trace_context() {
-        // Manually craft a V1 frame: [first_seq:8][count:4][op_len:4][op_bytes]
-        // The first byte is the low byte of first_sequence, which we pick
-        // to NOT collide with BATCH_PROTOCOL_V2.
-        let op = ReplicaOp::Delete { tx_key: key(2) };
+    fn replication_batch_rejects_unknown_version_byte() {
+        // Any leading byte other than BATCH_PROTOCOL_V1 must error. We
+        // construct a frame whose body would otherwise be valid for the
+        // current layout.
+        let op = ReplicaOp::Delete { tx_key: key(4) };
         let ob = op.serialize();
-        let first_seq: u64 = 0x1000; // low byte = 0x00, not the V2 tag
-        let mut v1 = Vec::new();
-        v1.extend_from_slice(&first_seq.to_le_bytes());
-        v1.extend_from_slice(&1u32.to_le_bytes());
-        v1.extend_from_slice(&(ob.len() as u32).to_le_bytes());
-        v1.extend_from_slice(&ob);
-        let decoded = ReplicaBatch::deserialize(&v1).expect("v1 frame decodes");
-        assert_eq!(decoded.first_sequence, first_seq);
-        assert_eq!(decoded.ops.len(), 1);
-        assert_eq!(decoded.ops[0], op);
-        assert!(decoded.trace_ctx.is_none());
-    }
+        let mut frame = Vec::new();
+        frame.push(0xFE); // not V1
+        frame.extend_from_slice(&7u64.to_le_bytes());
+        frame.extend_from_slice(&1u32.to_le_bytes());
+        frame.extend_from_slice(&[0u8; WireTraceContext::SIZE]);
+        frame.extend_from_slice(&0u64.to_le_bytes());
+        frame.extend_from_slice(&(ob.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&ob);
 
-    #[test]
-    fn replication_batch_v2_legacy_frame_decodes_without_source_node_id() {
-        let ctx = WireTraceContext {
-            trace_id: [0x44; 16],
-            span_id: [0x55; 8],
-        };
-        let op = ReplicaOp::Freeze {
-            tx_key: key(3),
-            offset: 1,
-            master_generation: 7,
-        };
-        let ob = op.serialize();
-        let first_seq = 123u64;
-        let mut v2 = Vec::new();
-        v2.push(BATCH_PROTOCOL_V2);
-        v2.extend_from_slice(&first_seq.to_le_bytes());
-        v2.extend_from_slice(&1u32.to_le_bytes());
-        let mut tc = [0u8; WireTraceContext::SIZE];
-        ctx.write_to(&mut tc);
-        v2.extend_from_slice(&tc);
-        v2.extend_from_slice(&(ob.len() as u32).to_le_bytes());
-        v2.extend_from_slice(&ob);
-
-        let decoded = ReplicaBatch::deserialize(&v2).expect("v2 frame decodes");
-        assert_eq!(decoded.first_sequence, first_seq);
-        assert_eq!(decoded.ops, vec![op]);
-        assert_eq!(decoded.trace_ctx, Some(ctx));
-        assert_eq!(decoded.source_node_id, None);
+        let err = ReplicaBatch::deserialize(&frame).expect_err("must reject unknown version");
+        match err {
+            ProtocolError::UnknownVersion(v) => assert_eq!(v, 0xFE),
+            other => panic!("expected UnknownVersion, got {other:?}"),
+        }
     }
 
     #[test]
