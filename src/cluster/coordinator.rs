@@ -82,6 +82,16 @@ fn sync_atomic_migration_bitmaps(
     }
 }
 
+/// Decide whether a migration task scheduled at `topology_epoch` is still
+/// current.
+///
+/// This deliberately compares the **per-node** `topology_epoch` (the local
+/// shard-table version) — NOT the quorum-committed cluster_key. Migration
+/// tasks are local lifecycle objects: a task scheduled at the local epoch
+/// must complete (or fail) against that same local epoch, otherwise it is
+/// stale and must be discarded. The cluster_key gate (used by
+/// cross-node replication) is a separate concept — see
+/// `RunningCluster::local_cluster_key`.
 fn migration_epoch_current(
     shard_table: &Arc<ShardTableLock<ShardTable>>,
     topology_epoch: u64,
@@ -291,6 +301,19 @@ pub struct ClusterCoordinator {
     pub topology_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Topology authority for quorum-committed term management.
     pub topology_authority: Arc<crate::cluster::topology::TopologyAuthority>,
+    /// Atomic mirror of `topology_authority.committed_term()` — the
+    /// cluster_key value stamped on outbound `OP_REPLICA_BATCH` traffic and
+    /// gated on inbound traffic.
+    ///
+    /// Sourced directly from `topology_authority.committed_term_shared()`,
+    /// so every successful `handle_commit` advance is observable here
+    /// without an explicit setter. This is intentionally NOT
+    /// `topology_epoch`: `topology_epoch` is per-node and starts diverged
+    /// across the cluster (initialized from the local member-list view),
+    /// which would break cross-node replication batches with
+    /// `ERR_STALE_EPOCH`. The committed term, in contrast, converges on
+    /// the same value across all peers after each `OP_TOPOLOGY_COMMIT`.
+    pub committed_cluster_key: Arc<std::sync::atomic::AtomicU64>,
     /// Members corresponding to the currently activated shard table.
     active_topology_members: Arc<RwLock<Vec<NodeId>>>,
     /// Parallel connections per migration target.
@@ -355,6 +378,10 @@ impl ClusterCoordinator {
             // `compute_with_epoch` call — that's unrelated to this
             // counter.
             topology_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // Mirror the topology authority's committed-term atomic so the
+            // cluster_key gate observes every quorum-committed advance
+            // without an explicit setter call.
+            committed_cluster_key: topology_authority.committed_term_shared(),
             topology_authority,
             active_topology_members,
             migration_pool_size: config.migration_pool_size.max(1),
@@ -795,6 +822,7 @@ impl ClusterCoordinator {
             repl_best_effort,
             repl_timeout: repl_timeout.max(Duration::from_millis(1)),
             last_migration_pressure_ms: Arc::new(AtomicU64::new(0)),
+            committed_cluster_key: self.committed_cluster_key.clone(),
             topology_authority: self.topology_authority.clone(),
             active_topology_members: active_topology_members_for_cluster,
             inbound_state_path,
@@ -4424,6 +4452,18 @@ pub struct RunningCluster {
     last_migration_pressure_ms: Arc<AtomicU64>,
     /// Topology authority for quorum-committed term management.
     topology_authority: Arc<crate::cluster::topology::TopologyAuthority>,
+    /// Atomic mirror of `topology_authority.committed_term()` — the
+    /// cluster_key value stamped on outbound `OP_REPLICA_BATCH` traffic and
+    /// gated on inbound traffic.
+    ///
+    /// Sourced directly from `topology_authority.committed_term_shared()`,
+    /// so every successful `handle_commit` advance is observable here
+    /// without an explicit setter. Intentionally NOT `topology_epoch`:
+    /// per-node `topology_epoch` values diverge at startup, which would
+    /// reject legitimate cross-node replication batches with
+    /// `ERR_STALE_EPOCH`. The committed term converges on the same value
+    /// across all peers after each `OP_TOPOLOGY_COMMIT`.
+    committed_cluster_key: Arc<std::sync::atomic::AtomicU64>,
     /// Members corresponding to the currently activated shard table.
     active_topology_members: Arc<RwLock<Vec<NodeId>>>,
     /// Path for persisting inbound migration state across restarts.
@@ -4815,27 +4855,49 @@ impl RunningCluster {
         self.topology_epoch.load(Ordering::Relaxed)
     }
 
+    /// Shared handle to the per-node monotonic topology epoch.
+    ///
+    /// Distinct from [`cluster_key_handle`](Self::cluster_key_handle):
+    /// the topology epoch is per-node and used for local fencing (e.g.
+    /// `is_master`'s Transitioning check), whereas `cluster_key_handle`
+    /// returns the quorum-committed term used for cross-node replication
+    /// gating. Tests use this accessor to simulate a local epoch bump
+    /// without affecting the committed term.
+    pub fn topology_epoch_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.topology_epoch.clone()
+    }
+
     /// Receiver-side cluster epoch for replication batch gating
     /// ([Phase B3](crate::replication::receiver::handle_replica_batch_with_tracker)).
     ///
-    /// Returns the same value as [`topology_epoch`](Self::topology_epoch);
-    /// the alias name reflects the role this view plays on the wire — every
-    /// inbound `OP_REPLICA_BATCH` is rejected with `ERR_STALE_EPOCH` unless
-    /// its `cluster_key` either matches this value or is `0` (unknown,
-    /// V1-compat).
+    /// Returns the **quorum-committed term** — i.e. the value advanced by
+    /// every successful `topology_authority.handle_commit` (an applied
+    /// `OP_TOPOLOGY_COMMIT`). All peers converge on the same value after a
+    /// commit, so cross-node `OP_REPLICA_BATCH` traffic carries a
+    /// cluster_key that matches the receiver's view.
+    ///
+    /// This is **not** `topology_epoch`: per-node `topology_epoch` values
+    /// are seeded from the local member-list snapshot at startup and so
+    /// diverge across the cluster, which would reject legitimate
+    /// cross-node batches with `ERR_STALE_EPOCH`. Until the first quorum
+    /// commit lands, this value is `0` (V1-compat / unknown — gating is
+    /// effectively a no-op).
     pub fn local_cluster_key(&self) -> u64 {
-        self.topology_epoch.load(Ordering::Acquire)
+        self.committed_cluster_key.load(Ordering::Acquire)
     }
 
-    /// Shared `Arc<AtomicU64>` handle backing the local cluster epoch.
+    /// Shared `Arc<AtomicU64>` handle backing the local cluster_key.
     ///
     /// The coordinator passes this clone into the local
     /// [`ReplicationManager`](crate::replication::manager::ReplicationManager)
-    /// (so every outbound batch is stamped with the live epoch) and into the
-    /// local [`ReplicationReceiver`](crate::replication::receiver::ReplicationReceiver)
-    /// (so the gate sees epoch bumps without a setter call).
+    /// (so every outbound batch is stamped with the live committed term)
+    /// and into the local
+    /// [`ReplicationReceiver`](crate::replication::receiver::ReplicationReceiver)
+    /// (so the gate sees commits without a setter call). The atomic is
+    /// the same instance as `topology_authority.committed_term_shared()`,
+    /// so any `handle_commit` advance is visible here lock-free.
     pub fn cluster_key_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
-        self.topology_epoch.clone()
+        self.committed_cluster_key.clone()
     }
 
     /// Resolved replication ACK policy. None means best-effort (no enforcement).
@@ -5226,6 +5288,7 @@ pub(crate) fn new_test_running_cluster(
         repl_best_effort: false,
         repl_timeout: Duration::from_secs(3),
         last_migration_pressure_ms: Arc::new(AtomicU64::new(0)),
+        committed_cluster_key: topology_authority.committed_term_shared(),
         topology_authority,
         active_topology_members,
         inbound_state_path: None,
@@ -7590,5 +7653,114 @@ mod tests {
                 "expected MasterQueryResult::Transitioning {{ last_known_term: 5 }}, got {other:?}"
             ),
         }
+    }
+
+    // ── Phase B fixup: cluster_key sourced from quorum-committed term ──
+
+    /// `local_cluster_key()` MUST return the quorum-committed term, NOT the
+    /// per-node `topology_epoch`. Each node initializes `topology_epoch`
+    /// from its local member-list snapshot, so values diverge across the
+    /// cluster at startup; routing the cluster_key through the committed
+    /// term ensures all nodes converge on the same value (initially 0)
+    /// until the first quorum commit lands. Without this, cross-node
+    /// `OP_REPLICA_BATCH` traffic is rejected with `ERR_STALE_EPOCH`
+    /// during legitimate operation.
+    #[test]
+    fn local_cluster_key_returns_committed_term_not_topology_epoch() {
+        // Build a cluster where the per-node `topology_epoch` is 10 but
+        // the quorum-committed term is 7. Without the fix,
+        // `local_cluster_key()` would return 10; with the fix it returns 7.
+        let members = vec![NodeId(1)];
+        // Shard table version 7 → handle_commit(term=7) inside the helper
+        // sets committed_term to 7.
+        let table = ShardTable::compute_with_epoch(&members, 1, 7);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4801".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        // Force the per-node topology_epoch ahead of the committed term to
+        // simulate the divergence seen in multi-node startup.
+        cluster.topology_epoch.store(10, Ordering::Release);
+
+        assert_eq!(
+            cluster.topology_authority.committed_term(),
+            7,
+            "precondition: committed_term must be 7",
+        );
+        assert_eq!(
+            cluster.topology_epoch.load(Ordering::Acquire),
+            10,
+            "precondition: topology_epoch must be 10 (different from committed_term)",
+        );
+        assert_eq!(
+            cluster.local_cluster_key(),
+            7,
+            "local_cluster_key() must surface the quorum-committed term (7), \
+             NOT the per-node topology_epoch (10)",
+        );
+        assert_eq!(
+            cluster.cluster_key_handle().load(Ordering::Acquire),
+            7,
+            "cluster_key_handle() must back the same value (7) so manager \
+             and receiver observe the committed term, not topology_epoch",
+        );
+    }
+
+    /// Applying an `OP_TOPOLOGY_COMMIT` (via `topology_authority.handle_commit`)
+    /// must advance `local_cluster_key()` synchronously, so all nodes
+    /// converge on the same key after each quorum-committed term.
+    #[test]
+    fn committed_cluster_key_advances_on_topology_commit() {
+        // Start with no committed term (fresh node, before any quorum).
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4801".parse().unwrap())],
+            // Empty committed_members → helper does NOT call handle_commit.
+            &[],
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        assert_eq!(
+            cluster.local_cluster_key(),
+            0,
+            "before any quorum commit, local_cluster_key must be 0 \
+             (V1-compat / unknown — gating becomes a no-op)",
+        );
+
+        // Trigger application of an OP_TOPOLOGY_COMMIT for term 5.
+        let commit_members = vec![NodeId(1), NodeId(2)];
+        let commit = crate::cluster::topology::TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: commit_members.clone(),
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(5, &commit_members),
+        };
+        let applied = cluster.topology_authority.handle_commit(&commit);
+        assert_eq!(applied, Some(5), "commit must be accepted");
+
+        assert_eq!(
+            cluster.local_cluster_key(),
+            5,
+            "after OP_TOPOLOGY_COMMIT for term 5, local_cluster_key must \
+             advance to 5 — proving the cluster_key handle tracks the \
+             quorum-committed term in lock-step",
+        );
+        assert_eq!(
+            cluster.cluster_key_handle().load(Ordering::Acquire),
+            5,
+            "cluster_key_handle() must observe the same advance (5) so \
+             downstream manager/receiver readers see the new term",
+        );
     }
 }

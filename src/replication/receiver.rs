@@ -302,9 +302,36 @@ pub fn handle_replica_batch(
     engine: &Engine,
     last_applied: &AtomicU64,
 ) -> ResponseFrame {
+    handle_replica_batch_with_cluster_key(
+        request,
+        engine,
+        last_applied,
+        /* local_cluster_key */ 0,
+    )
+}
+
+/// Same as [`handle_replica_batch`] but lets the caller pass the
+/// receiver's `local_cluster_key` so the cluster-key gate is honored
+/// even when no persistent applied tracker is available.
+///
+/// Used by [`crate::server::dispatch`] when
+/// [`init_replica_applied_tracker`] has not been called (e.g. test
+/// harnesses, single-stream setups). The tracker remains thread-local
+/// (so parallel tests do not collide on a process-wide high-water
+/// mark) but the cluster-key view propagates from the
+/// `RunningCluster::local_cluster_key()` accessor.
+pub fn handle_replica_batch_with_cluster_key(
+    request: &RequestFrame,
+    engine: &Engine,
+    last_applied: &AtomicU64,
+    local_cluster_key: u64,
+) -> ResponseFrame {
     // Lazily construct an in-memory tracker — this path is used by
     // synchronous tests and single-stream setups where crossing-restart
-    // persistence is not required.
+    // persistence is not required. Per-thread isolation is required
+    // here because cargo runs unit tests in parallel; a shared tracker
+    // would silently skip "already applied" sequences across unrelated
+    // tests and break their assertions.
     thread_local! {
         static IN_MEMORY_TRACKER: std::cell::RefCell<Option<Arc<ReplicaAppliedTracker>>> =
             const { std::cell::RefCell::new(None) };
@@ -322,7 +349,7 @@ pub fn handle_replica_batch(
         last_applied,
         tracker.as_ref(),
         DEFAULT_STREAM_KEY,
-        /* local_cluster_key */ 0,
+        local_cluster_key,
     )
 }
 
@@ -377,11 +404,32 @@ pub fn handle_replica_batch_with_tracker(
         }
     };
 
-    // Phase B2 stale-epoch gate. Runs BEFORE the migration-batch
-    // bypass and BEFORE any tracker/engine work so a stale-epoch
-    // master (including one sending migration batches) cannot mutate
-    // local state.
-    if batch.cluster_key != 0 && batch.cluster_key != local_cluster_key {
+    // Phase B2 stale-epoch gate, refined in the Phase B fixup. The
+    // gate runs BEFORE the migration-batch bypass and BEFORE any
+    // tracker/engine work so a stale-epoch master (including one
+    // sending migration batches) cannot mutate local state.
+    //
+    // Semantics:
+    // * `batch.cluster_key == 0`           → V1-compat sender; accept.
+    // * `local_cluster_key == 0`           → receiver has not yet seen
+    //   any quorum-committed term (post-restart, pre-bootstrap, or in
+    //   the gap between SWIM discovery and the first multi-node
+    //   commit). The sender has a quorum-committed view that we don't,
+    //   so it is strictly more authoritative — accept and let the
+    //   subsequent OP_TOPOLOGY_COMMIT bring our local view in line.
+    // * `batch.cluster_key < local_cluster_key`
+    //                                       → STALE master; reject.
+    // * `batch.cluster_key > local_cluster_key`
+    //                                       → newer-than-local sender.
+    //   Same reasoning as the bootstrap case: the sender's term has
+    //   already been quorum-committed elsewhere; our OP_TOPOLOGY_COMMIT
+    //   is in flight or about to arrive. Accept rather than reject —
+    //   strict-equality rejection caused legitimate cross-node
+    //   replication to fail with `ERR_STALE_EPOCH` whenever commits
+    //   propagated unevenly across the cluster (Phase B regression).
+    // * `batch.cluster_key == local_cluster_key`
+    //                                       → in lock-step; accept.
+    if batch.cluster_key != 0 && local_cluster_key != 0 && batch.cluster_key < local_cluster_key {
         if let Some(m) = crate::metrics::replication_metrics() {
             m.replica_rejected_stale_cluster_key.inc();
         }
@@ -2401,7 +2449,16 @@ mod tests {
     }
 
     #[test]
-    fn future_cluster_key_batch_rejected() {
+    fn future_cluster_key_batch_applied() {
+        // Phase B fixup: a sender carrying a future cluster_key has a
+        // quorum-committed view ahead of ours — its OP_TOPOLOGY_COMMIT
+        // is in flight (or already broadcast and our copy is queued).
+        // The strict-equality reject of the original B2 design rejected
+        // legitimate cross-node batches whenever commits propagated
+        // unevenly, so the gate now accepts ahead-of-local batches and
+        // lets the topology layer reconcile via OP_TOPOLOGY_COMMIT. The
+        // tracker / last_applied / engine still advance because the
+        // batch's data is authoritative.
         let engine = make_engine();
         create_record(&engine, key(72), 3);
 
@@ -2409,9 +2466,8 @@ mod tests {
         let tracker = ReplicaAppliedTracker::in_memory();
         let local_cluster_key: u64 = 7;
 
-        // A future epoch (9 > 7) is treated as a strict mismatch: the
-        // receiver does NOT buffer ahead-of-the-cluster batches.
         let batch = batch_with_cluster_key(30, key(72), 0..1, 1, /* future */ 9);
+        let through = batch.last_sequence();
         let req = batch_request(&batch, 1);
 
         let resp = handle_replica_batch_with_tracker(
@@ -2423,10 +2479,22 @@ mod tests {
             local_cluster_key,
         );
 
-        assert_eq!(resp.status, STATUS_ERROR);
-        assert_eq!(decode_error_code(&resp.payload), ERR_STALE_EPOCH);
-        assert_eq!(engine.read_slot(&key(72), 0).unwrap().status, UTXO_UNSPENT);
-        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), 0);
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "future cluster_key (9 > 7) must apply — sender has the \
+             ahead-of-local quorum-committed view; OP_TOPOLOGY_COMMIT \
+             will reconcile our local view shortly",
+        );
+        let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
+        assert_eq!(
+            ack,
+            ReplicaAck::Ok {
+                through_sequence: through,
+            },
+        );
+        assert_eq!(engine.read_slot(&key(72), 0).unwrap().status, UTXO_SPENT);
+        assert_eq!(tracker.get(DEFAULT_STREAM_KEY), through);
+        assert_eq!(last_applied.load(Ordering::Relaxed), through);
     }
 
     #[test]

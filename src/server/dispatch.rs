@@ -333,7 +333,17 @@ pub(crate) fn handle_request(
                     local_cluster_key,
                 )
             } else {
-                handle_replica_batch(request, engine, &DISPATCH_REPLICA_LAST_APPLIED)
+                // Test harness / single-stream path: route through the
+                // cluster-key-aware variant so the gate honors the
+                // coordinator's view even without a persistent tracker.
+                // The receiver still uses a thread-local in-memory
+                // tracker internally, so parallel tests stay isolated.
+                crate::replication::receiver::handle_replica_batch_with_cluster_key(
+                    request,
+                    engine,
+                    &DISPATCH_REPLICA_LAST_APPLIED,
+                    local_cluster_key,
+                )
             }
             // NOTE: We do NOT mark inbound shards as complete here.
             // Only the OP_MIGRATION_COMPLETE handshake clears the
@@ -5581,9 +5591,13 @@ mod tests {
             1,
         );
         // Drive the cluster into the "Transitioning" gap: local
-        // topology_epoch = 8, committed_term still = 7.
+        // topology_epoch = 8, committed_term still = 7. We bump
+        // `topology_epoch` directly because `cluster_key_handle()` now
+        // exposes the quorum-committed term (see `RunningCluster::
+        // local_cluster_key`), which is precisely the value that must
+        // *not* advance to trigger the Transitioning gap here.
         cluster
-            .cluster_key_handle()
+            .topology_epoch_handle()
             .store(8, std::sync::atomic::Ordering::Release);
 
         let resp = h.request_with_cluster(
