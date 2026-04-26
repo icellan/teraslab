@@ -1816,6 +1816,78 @@ pub async fn find_holders(
     Ok((holders, non_holders))
 }
 
+/// Encode a request payload for `OP_ADMIN_DIAGNOSE_KEY`.
+///
+/// Layout: `[count: u32 LE][txid: 32B] * count`. The server enforces
+/// `count <= ADMIN_DIAGNOSE_KEY_MAX_TXIDS` (currently 64) — passing more
+/// will be rejected with `STATUS_ERROR` / `ERR_INTERNAL`.
+pub fn encode_admin_diagnose_key(txids: &[[u8; 32]]) -> Vec<u8> {
+    let count = txids.len() as u32;
+    let mut payload = Vec::with_capacity(4 + txids.len() * 32);
+    payload.extend_from_slice(&count.to_le_bytes());
+    for txid in txids {
+        payload.extend_from_slice(txid);
+    }
+    payload
+}
+
+/// Decode an `OP_ADMIN_DIAGNOSE_KEY` response payload (the body of a
+/// `STATUS_OK` reply) into a `Vec<KeyDiagnosis>`.
+///
+/// Returns `Err(String)` describing the parse failure if the body is
+/// truncated or its declared count does not match the byte length.
+/// See [`teraslab::protocol::opcodes::OP_ADMIN_DIAGNOSE_KEY`] for the
+/// per-entry layout.
+pub fn decode_admin_diagnose_key(
+    body: &[u8],
+) -> Result<Vec<teraslab::cluster::migration::KeyDiagnosis>, String> {
+    use teraslab::cluster::migration::KeyDiagnosis;
+    use teraslab::protocol::opcodes::KEY_DIAGNOSIS_ENCODED_SIZE;
+
+    if body.len() < 4 {
+        return Err(format!(
+            "diagnose response too short: {} bytes (need >=4)",
+            body.len()
+        ));
+    }
+    let count = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let expected = 4 + count * KEY_DIAGNOSIS_ENCODED_SIZE;
+    if body.len() != expected {
+        return Err(format!(
+            "diagnose response length {} != expected {} (count={})",
+            body.len(),
+            expected,
+            count,
+        ));
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = 4 + i * KEY_DIAGNOSIS_ENCODED_SIZE;
+        let entry = &body[off..off + KEY_DIAGNOSIS_ENCODED_SIZE];
+        let shard = u16::from_le_bytes(entry[0..2].try_into().unwrap());
+        let this_node_id = u64::from_le_bytes(entry[2..10].try_into().unwrap());
+        let local_view_canonical_master_id = u64::from_le_bytes(entry[10..18].try_into().unwrap());
+        let has_local_data = entry[18] != 0;
+        let is_local_master_of_shard = entry[19] != 0;
+        let has_pending_inbound = entry[20] != 0;
+        let is_shard_fenced = entry[21] != 0;
+        let is_migrating_shard = entry[22] != 0;
+        let topology_epoch = u64::from_le_bytes(entry[23..31].try_into().unwrap());
+        out.push(KeyDiagnosis {
+            shard,
+            this_node_id,
+            local_view_canonical_master_id,
+            has_local_data,
+            is_local_master_of_shard,
+            has_pending_inbound,
+            is_shard_fenced,
+            is_migrating_shard,
+            topology_epoch,
+        });
+    }
+    Ok(out)
+}
+
 /// Poll until all HTTP ports for a scenario are free (connection refused).
 /// Returns immediately once no port accepts connections, or after 10s at most.
 async fn wait_ports_free(first_http_port: u16, _scenario_id: u16, node_count: u32) {
@@ -1876,6 +1948,74 @@ mod replication_report_tests {
 
         assert!(parse_batch_response_exact(&payload, Some(2)).is_none());
         assert!(parse_batch_response_exact(&payload, Some(1)).is_none());
+    }
+
+    /// Encoding two txids into an `OP_ADMIN_DIAGNOSE_KEY` request and
+    /// decoding a synthetic response round-trips every field. This is
+    /// pure-helper coverage — server behavior is asserted by
+    /// `dispatch_admin_diagnose_key_returns_per_txid_state` in the
+    /// teraslab crate.
+    #[test]
+    fn encode_decode_admin_diagnose_key_round_trip() {
+        use teraslab::cluster::migration::KeyDiagnosis;
+        use teraslab::protocol::opcodes::KEY_DIAGNOSIS_ENCODED_SIZE;
+
+        let txid_a = [0xAAu8; 32];
+        let txid_b = [0x42u8; 32];
+        let req = encode_admin_diagnose_key(&[txid_a, txid_b]);
+        // 4 bytes count + 2 * 32 bytes txids
+        assert_eq!(req.len(), 4 + 64);
+        assert_eq!(u32::from_le_bytes(req[0..4].try_into().unwrap()), 2);
+        assert_eq!(&req[4..36], &txid_a);
+        assert_eq!(&req[36..68], &txid_b);
+
+        let entries = vec![
+            KeyDiagnosis {
+                shard: 5,
+                this_node_id: 7,
+                local_view_canonical_master_id: 7,
+                has_local_data: true,
+                is_local_master_of_shard: true,
+                has_pending_inbound: false,
+                is_shard_fenced: true,
+                is_migrating_shard: false,
+                topology_epoch: 42,
+            },
+            KeyDiagnosis {
+                shard: 4095,
+                this_node_id: 7,
+                local_view_canonical_master_id: 9,
+                has_local_data: false,
+                is_local_master_of_shard: false,
+                has_pending_inbound: true,
+                is_shard_fenced: false,
+                is_migrating_shard: true,
+                topology_epoch: 42,
+            },
+        ];
+
+        // Build a synthetic STATUS_OK body using the documented layout.
+        let mut body = Vec::with_capacity(4 + 2 * KEY_DIAGNOSIS_ENCODED_SIZE);
+        body.extend_from_slice(&2u32.to_le_bytes());
+        for d in &entries {
+            body.extend_from_slice(&d.shard.to_le_bytes());
+            body.extend_from_slice(&d.this_node_id.to_le_bytes());
+            body.extend_from_slice(&d.local_view_canonical_master_id.to_le_bytes());
+            body.push(u8::from(d.has_local_data));
+            body.push(u8::from(d.is_local_master_of_shard));
+            body.push(u8::from(d.has_pending_inbound));
+            body.push(u8::from(d.is_shard_fenced));
+            body.push(u8::from(d.is_migrating_shard));
+            body.extend_from_slice(&d.topology_epoch.to_le_bytes());
+        }
+        let decoded = decode_admin_diagnose_key(&body).unwrap();
+        assert_eq!(decoded, entries);
+
+        // Truncated body → error (claim 2 entries, supply 1).
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&2u32.to_le_bytes());
+        bad.extend_from_slice(&body[4..4 + KEY_DIAGNOSIS_ENCODED_SIZE]);
+        assert!(decode_admin_diagnose_key(&bad).is_err());
     }
 
     #[test]

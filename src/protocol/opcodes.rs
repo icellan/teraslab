@@ -30,6 +30,50 @@ pub const OP_GET_PARTITION_MAP: u16 = 100;
 pub const OP_HEALTH: u16 = 101;
 pub const OP_PING: u16 = 102;
 pub const OP_GET_COMMITTED_TOPOLOGY: u16 = 103;
+/// Per-record migration / routing diagnosis (Phase A diagnostic foundation).
+///
+/// Wire layout:
+///
+/// Request payload (from client):
+/// ```text
+///   count: u32 LE                        // number of txids, 1..=64
+///   txid:  [u8; 32]  *  count            // raw txid bytes, no hex
+/// ```
+///
+/// Response payload (STATUS_OK):
+/// ```text
+///   count: u32 LE                        // echoes request count
+///   entry: [u8; KEY_DIAGNOSIS_ENCODED_SIZE] * count
+///
+///   each entry, in declaration order:
+///     shard:                          u16 LE   (offset  0,  2 bytes)
+///     this_node_id:                   u64 LE   (offset  2,  8 bytes)
+///     local_view_canonical_master_id: u64 LE   (offset 10,  8 bytes)
+///     has_local_data:                 u8       (offset 18,  1 byte; 0|1)
+///     is_local_master_of_shard:       u8       (offset 19,  1 byte; 0|1)
+///     has_pending_inbound:            u8       (offset 20,  1 byte; 0|1)
+///     is_shard_fenced:                u8       (offset 21,  1 byte; 0|1)
+///     is_migrating_shard:             u8       (offset 22,  1 byte; 0|1)
+///     topology_epoch:                 u64 LE   (offset 23,  8 bytes)
+/// ```
+///
+/// Total entry width is `KEY_DIAGNOSIS_ENCODED_SIZE = 31` bytes. All
+/// widths are fixed (no varints) so callers can index entries by stride.
+///
+/// Malformed requests (count > 64, or insufficient trailing bytes) are
+/// rejected with `STATUS_ERROR` + `ERR_INTERNAL`.
+pub const OP_ADMIN_DIAGNOSE_KEY: u16 = 104;
+
+/// Maximum number of txids accepted in a single `OP_ADMIN_DIAGNOSE_KEY`
+/// request. The barrier in integration tests only ever inspects the
+/// first ~32 failing records, so 64 is comfortably above expected use
+/// while bounding worst-case CPU and response size.
+pub const ADMIN_DIAGNOSE_KEY_MAX_TXIDS: u32 = 64;
+
+/// Encoded width of a single `KeyDiagnosis` entry in the response payload
+/// of `OP_ADMIN_DIAGNOSE_KEY`. See the opcode's doc comment for the
+/// per-field layout.
+pub const KEY_DIAGNOSIS_ENCODED_SIZE: usize = 2 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 8;
 
 // Streaming
 pub const OP_STREAM_CHUNK: u16 = 200;

@@ -4716,6 +4716,26 @@ impl RunningCluster {
         self.topology_epoch.load(Ordering::Relaxed)
     }
 
+    /// Build a [`crate::cluster::migration::KeyDiagnosis`] for `shard` from
+    /// this node's point of view, filling in the routing/shard-table /
+    /// epoch fields. The dispatcher then completes `has_local_data` from
+    /// the index before emitting the response.
+    ///
+    /// Used by `OP_ADMIN_DIAGNOSE_KEY`. The returned struct's
+    /// `has_local_data` is always `false`; callers must overwrite it.
+    pub fn diagnose_key_routing(&self, shard: u16) -> crate::cluster::migration::KeyDiagnosis {
+        // Tracker-side fields (inbound, fenced, migrating).
+        let mut diag = self.migration.lock().unwrap().diagnose_key_routing(shard);
+        // Routing fields from the local shard table.
+        let table = self.shard_table.read();
+        let local_master = table.target_assignment(shard).master;
+        diag.this_node_id = self.self_id.0;
+        diag.local_view_canonical_master_id = local_master.0;
+        diag.is_local_master_of_shard = local_master == self.self_id;
+        diag.topology_epoch = self.topology_epoch();
+        diag
+    }
+
     /// Resolved replication ACK policy. None means best-effort (no enforcement).
     pub fn ack_policy(&self) -> Option<crate::replication::manager::AckPolicy> {
         self.repl_ack_policy
