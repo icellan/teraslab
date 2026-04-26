@@ -827,6 +827,12 @@ pub struct ReplicationMetrics {
     /// Leader's current sequence, updated on every batch so lag gauges can
     /// compute `leader - last_acked` per replica without locking the manager.
     pub leader_sequence: AtomicU64,
+    /// Receiver-side counter — incremented every time the local node
+    /// rejects an inbound `OP_REPLICA_BATCH` because the batch's
+    /// `cluster_key` does not match the local cluster epoch (Phase B2
+    /// stale-epoch gate). A non-zero value means a master is sending
+    /// from a stale epoch and should re-discover the cluster topology.
+    pub replica_rejected_stale_cluster_key: PaddedCounter,
 }
 
 /// Per-replica drill-down state exposed on `/admin/top`.
@@ -876,6 +882,7 @@ impl ReplicationMetrics {
             repl_bytes_sent_total: PaddedCounter::new(),
             per_replica: [ZERO_CELL; MAX_REPLICAS],
             leader_sequence: AtomicU64::new(0),
+            replica_rejected_stale_cluster_key: PaddedCounter::new(),
         }
     }
 
@@ -1115,6 +1122,14 @@ pub struct MigrationMetrics {
     pub migration_phase_delta: AtomicU32,
     /// Shards that have completed handoff and are now serving on the new owner.
     pub migration_phase_serving_new: AtomicU32,
+    /// Number of times a migration completion or failure was rejected because
+    /// the bookkeeping task's `topology_epoch` did not match the live
+    /// epoch on the coordinator.
+    ///
+    /// A non-zero counter usually indicates that a topology change (membership
+    /// add/remove) raced an in-flight migration — the operator-visible
+    /// signal that stale-epoch gating did its job.
+    pub topology_epoch_mismatch: PaddedCounter,
 }
 
 /// Number of {direction, role} buckets for migration byte counters.
@@ -1173,6 +1188,7 @@ impl MigrationMetrics {
             migration_phase_copying: AtomicU32::new(0),
             migration_phase_delta: AtomicU32::new(0),
             migration_phase_serving_new: AtomicU32::new(0),
+            topology_epoch_mismatch: PaddedCounter::new(),
         }
     }
 

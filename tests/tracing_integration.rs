@@ -338,6 +338,7 @@ fn replication_receiver_inherits_wire_trace_context() {
         }],
         trace_ctx: Some(wire_ctx),
         source_node_id: None,
+        cluster_key: 0,
     };
     let req = RequestFrame {
         op_code: OP_REPLICA_BATCH,
@@ -364,6 +365,7 @@ fn replication_receiver_inherits_wire_trace_context() {
             &last_applied,
             &tracker,
             "tracing-integration-test",
+            /* local_cluster_key */ 0,
         );
         assert_eq!(
             resp.status, STATUS_OK,

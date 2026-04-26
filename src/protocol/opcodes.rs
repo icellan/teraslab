@@ -151,6 +151,17 @@ pub const ERR_MIGRATION_MANIFEST_MISMATCH: u16 = 22;
 /// could lose across a crash.
 pub const ERR_TOPOLOGY_PERSIST_FAILED: u16 = 23;
 
+/// Returned by a replica when an incoming `ReplicaBatch`'s `cluster_key`
+/// does not match the receiver's current cluster epoch (e.g. the sender
+/// is operating against a stale topology view after a master change or
+/// migration boundary). The caller should refresh its routing — query
+/// `OP_GET_COMMITTED_TOPOLOGY` / `OP_GET_PARTITION_MAP` — and retry the
+/// request against the new master. Distinct from
+/// `ERR_MIGRATION_IN_PROGRESS` (transient, same epoch) and
+/// `ERR_REDIRECT` (per-key routing miss): a stale-epoch error means the
+/// sender's whole view of cluster ownership is out of date.
+pub const ERR_STALE_EPOCH: u16 = 24;
+
 // Streaming errors
 /// Blob stream not found for the given txid on this connection.
 pub const ERR_STREAM_NOT_FOUND: u16 = 16;

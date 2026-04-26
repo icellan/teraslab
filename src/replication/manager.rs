@@ -4,6 +4,8 @@
 use crate::metrics::replication_metrics;
 use crate::observability::WireTraceContext;
 use crate::replication::protocol::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -126,34 +128,89 @@ pub struct ReplicationManager {
     senders: Vec<ReplicaSender>,
     config: ReplicationConfig,
     next_sequence: u64,
+    /// Shared cluster epoch handle. Every constructed [`ReplicaBatch`]
+    /// is stamped with `current_cluster_key.load(Ordering::Acquire)` so
+    /// receivers can reject stale-epoch batches (Phase B2 gate).
+    ///
+    /// A value of `0` means "unknown" and is preserved on the wire as
+    /// V1-compat: the receiver accepts those batches unconditionally.
+    /// Production wiring (Phase B3) installs a coordinator-owned atomic
+    /// that bumps on every `migration_complete` to fence stale masters.
+    current_cluster_key: Arc<AtomicU64>,
 }
 
 impl ReplicationManager {
     /// Create a new manager with the given configuration and replica transports.
+    ///
+    /// The cluster_key handle defaults to a freshly allocated atomic
+    /// initialized to `0` (unknown — V1-compat). Production callers
+    /// that need to participate in the cluster-key gate must instead use
+    /// [`with_cluster_key`](Self::with_cluster_key) so the manager and
+    /// the receiver share the same coordinator-owned epoch handle.
     pub fn new(config: ReplicationConfig, transports: Vec<Box<dyn ReplicaTransport>>) -> Self {
-        let senders = transports.into_iter().map(ReplicaSender::new).collect();
-        Self {
-            senders,
-            config,
-            next_sequence: 1,
-        }
+        Self::with_cluster_key(config, transports, Arc::new(AtomicU64::new(0)))
     }
 
     /// Create a manager with sequence state recovered from the redo log.
     ///
     /// `initial_sequence` should be `redo_log.current_sequence()` so that
     /// replication sequence numbers are contiguous with the durable log.
+    /// The cluster_key handle defaults to `0` (unknown); use
+    /// [`with_initial_sequence_and_cluster_key`](Self::with_initial_sequence_and_cluster_key)
+    /// to install a real epoch atomic.
     pub fn with_initial_sequence(
         config: ReplicationConfig,
         transports: Vec<Box<dyn ReplicaTransport>>,
         initial_sequence: u64,
+    ) -> Self {
+        Self::with_initial_sequence_and_cluster_key(
+            config,
+            transports,
+            initial_sequence,
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    /// Create a manager wired to a coordinator-owned cluster_key handle.
+    ///
+    /// The shared `Arc<AtomicU64>` is stamped onto every constructed
+    /// [`ReplicaBatch`] via an `Acquire` load on the hot path.
+    pub fn with_cluster_key(
+        config: ReplicationConfig,
+        transports: Vec<Box<dyn ReplicaTransport>>,
+        current_cluster_key: Arc<AtomicU64>,
+    ) -> Self {
+        let senders = transports.into_iter().map(ReplicaSender::new).collect();
+        Self {
+            senders,
+            config,
+            next_sequence: 1,
+            current_cluster_key,
+        }
+    }
+
+    /// Create a manager with both an initial sequence (recovered from
+    /// the redo log) and a coordinator-owned cluster_key handle.
+    pub fn with_initial_sequence_and_cluster_key(
+        config: ReplicationConfig,
+        transports: Vec<Box<dyn ReplicaTransport>>,
+        initial_sequence: u64,
+        current_cluster_key: Arc<AtomicU64>,
     ) -> Self {
         let senders = transports.into_iter().map(ReplicaSender::new).collect();
         Self {
             senders,
             config,
             next_sequence: initial_sequence.max(1),
+            current_cluster_key,
         }
+    }
+
+    /// Access the shared cluster_key handle so the coordinator can
+    /// bump the epoch (Phase B3) or share it with the local
+    /// [`ReplicationReceiver`](crate::replication::ReplicationReceiver).
+    pub fn cluster_key_handle(&self) -> Arc<AtomicU64> {
+        self.current_cluster_key.clone()
     }
 
     /// Replicate a batch of operations to all live replicas.
@@ -201,6 +258,10 @@ impl ReplicationManager {
             ops: ops.to_vec(),
             trace_ctx,
             source_node_id: None,
+            // Phase B2: stamp every batch with the current cluster epoch
+            // from the shared coordinator-owned atomic so the receiver
+            // can fence stale-epoch masters.
+            cluster_key: self.current_cluster_key.load(Ordering::Acquire),
         };
         self.next_sequence += ops.len() as u64;
 
@@ -445,6 +506,11 @@ impl ReplicationManager {
                     ops: chunk.to_vec(),
                     trace_ctx: WireTraceContext::from_current_span(),
                     source_node_id: None,
+                    // Phase B2: stamp catch-up chunks with the current
+                    // cluster_key — a recovering replica that has rolled
+                    // over to a new epoch must not silently apply old
+                    // chunks from a stale leader.
+                    cluster_key: self.current_cluster_key.load(Ordering::Acquire),
                 };
                 if let Err(_e) = sender.transport.send_batch(&batch) {
                     sender.state = ReplicaState::Down;
@@ -1934,5 +2000,57 @@ mod tests {
         let result = mgr.replicate_batch(&ops);
         assert!(result.is_err());
         assert_eq!(*mgr.sender(0).state(), ReplicaState::Down);
+    }
+
+    /// Phase B2: every batch the manager constructs must carry the
+    /// current cluster_key from its shared `Arc<AtomicU64>`. With the
+    /// epoch handle holding 42, the receiver-side observer must see
+    /// `cluster_key: 42` on the deserialized batch.
+    #[test]
+    fn manager_attaches_current_cluster_key() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+
+        let (mt, rt) = InMemoryTransport::pair();
+        let handle = spawn_auto_ack_replica(rt);
+
+        let cluster_key = Arc::new(AtomicU64::new(42));
+        let mut mgr = ReplicationManager::with_cluster_key(
+            ReplicationConfig::default(),
+            vec![Box::new(mt)],
+            cluster_key.clone(),
+        );
+
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }];
+        mgr.replicate_batch(&ops).unwrap();
+
+        drop(mgr);
+        let received = handle.join().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(
+            received[0].cluster_key, 42,
+            "manager must stamp every batch with the current cluster_key",
+        );
+
+        // A subsequent epoch bump propagates to the next batch.
+        cluster_key.store(99, std::sync::atomic::Ordering::Release);
+        let (mt2, rt2) = InMemoryTransport::pair();
+        let handle2 = spawn_auto_ack_replica(rt2);
+        let mut mgr2 = ReplicationManager::with_cluster_key(
+            ReplicationConfig::default(),
+            vec![Box::new(mt2)],
+            cluster_key.clone(),
+        );
+        mgr2.replicate_batch(&ops).unwrap();
+        drop(mgr2);
+        let received2 = handle2.join().unwrap();
+        assert_eq!(
+            received2[0].cluster_key, 99,
+            "epoch bumps via the shared Arc must be visible on the next batch",
+        );
     }
 }

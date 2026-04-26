@@ -550,11 +550,47 @@ pub fn check_redo_truncation(
     Ok(())
 }
 
+/// Build a single catch-up `ReplicaBatch` stamped with the caller-supplied
+/// `local_cluster_key`.
+///
+/// Extracted from [`run_catchup_for_replica`] so the cluster-epoch tagging
+/// can be unit-tested without spinning up a TCP transport. The receiver-side
+/// gate added in Phase B2 (see [`ERR_STALE_EPOCH`]) rejects any batch whose
+/// `cluster_key` neither matches the local epoch nor is the V1-compat
+/// sentinel `0`, so catch-up batches must carry the master's live epoch
+/// just like the steady-state path.
+///
+/// `first_sequence` is the sequence number of the first op in `chunk`;
+/// `chunk` is non-empty (an empty chunk would still produce a valid batch
+/// but the catch-up loop never builds one).
+///
+/// [`ERR_STALE_EPOCH`]: crate::replication::protocol::ERR_STALE_EPOCH
+pub fn build_catchup_batch(
+    first_sequence: u64,
+    chunk: &[ReplicaOp],
+    local_cluster_key: u64,
+) -> ReplicaBatch {
+    ReplicaBatch {
+        first_sequence,
+        ops: chunk.to_vec(),
+        trace_ctx: crate::observability::WireTraceContext::from_current_span(),
+        source_node_id: None,
+        cluster_key: local_cluster_key,
+    }
+}
+
 /// Run catch-up replication for a single replica, streaming redo-derived
 /// ops from `from_seq` to the current master sequence.
 ///
 /// Returns `Ok(through_seq)` on success with the final ACKed sequence,
 /// `Err(msg)` if the catch-up fails (transport error, reclaimed redo, etc.).
+///
+/// `local_cluster_key` is the master's current topology epoch (snapshot of
+/// [`RunningCluster::local_cluster_key`]); every batch is stamped with it so
+/// the receiver's epoch gate (Phase B2) accepts the catch-up the same way
+/// it accepts steady-state batches. Pass `0` only from test fixtures where
+/// the receiver-side gate is intentionally bypassed via the V1-compat
+/// sentinel.
 ///
 /// The `ops_from_seq` callback should read redo entries starting at the
 /// given sequence and convert them to `ReplicaOp`s. It returns an empty
@@ -564,6 +600,8 @@ pub fn check_redo_truncation(
 /// earliest available redo entry, or `None` if the log is empty. Used to
 /// detect redo log truncation: if the earliest entry is beyond `from_seq`,
 /// the log has wrapped and a full resync is required instead.
+///
+/// [`RunningCluster::local_cluster_key`]: crate::cluster::coordinator::RunningCluster::local_cluster_key
 pub fn run_catchup_for_replica(
     addr: &std::net::SocketAddr,
     from_seq: u64,
@@ -571,6 +609,7 @@ pub fn run_catchup_for_replica(
     batch_size: usize,
     ops_from_seq: &dyn Fn(u64) -> Vec<ReplicaOp>,
     first_available_seq: Option<u64>,
+    local_cluster_key: u64,
 ) -> std::result::Result<u64, String> {
     if from_seq >= current_seq {
         return Ok(from_seq); // already caught up
@@ -592,12 +631,7 @@ pub fn run_catchup_for_replica(
 
     let mut last_acked = from_seq;
     for chunk in ops.chunks(batch_size) {
-        let batch = ReplicaBatch {
-            first_sequence: last_acked,
-            ops: chunk.to_vec(),
-            trace_ctx: crate::observability::WireTraceContext::from_current_span(),
-            source_node_id: None,
-        };
+        let batch = build_catchup_batch(last_acked, chunk, local_cluster_key);
         transport
             .send_batch(&batch)
             .map_err(|e| format!("catchup send to {addr}: {e}"))?;
@@ -962,5 +996,51 @@ mod tests {
             ReplicaAppliedError::Corrupt(_) => {}
             other => panic!("expected Corrupt, got {other:?}"),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Catch-up batch construction — Phase B3 cluster_key wiring
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn catchup_batch_attaches_caller_supplied_cluster_key() {
+        // Phase B3 fixup: catch-up batches must carry the master's live
+        // topology epoch so the receiver-side ERR_STALE_EPOCH gate accepts
+        // them. Previously the catch-up path hard-coded cluster_key: 0,
+        // which only worked while the receiver still treated 0 as the
+        // V1-compat "unknown" sentinel.
+        use crate::index::TxKey;
+
+        let tx_key = TxKey::from_bytes([7u8; 32]);
+        let ops = vec![ReplicaOp::Delete { tx_key }];
+
+        let batch = build_catchup_batch(123, &ops, 42);
+
+        assert_eq!(
+            batch.cluster_key, 42,
+            "catch-up batch must propagate caller-supplied local_cluster_key",
+        );
+        assert_eq!(batch.first_sequence, 123);
+        assert_eq!(batch.ops.len(), 1);
+        assert!(
+            batch.source_node_id.is_none(),
+            "catch-up batches do not stamp a source node id",
+        );
+    }
+
+    #[test]
+    fn catchup_batch_zero_cluster_key_is_v1_compat_path() {
+        // Tests are still permitted to construct cluster_key: 0 batches —
+        // the receiver-side gate treats 0 as the V1-compat sentinel. This
+        // test pins that the helper does not silently rewrite 0 to some
+        // other value (e.g. a default epoch).
+        use crate::index::TxKey;
+
+        let tx_key = TxKey::from_bytes([0u8; 32]);
+        let ops = vec![ReplicaOp::Delete { tx_key }];
+
+        let batch = build_catchup_batch(1, &ops, 0);
+
+        assert_eq!(batch.cluster_key, 0);
     }
 }

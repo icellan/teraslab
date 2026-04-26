@@ -212,6 +212,7 @@ fn tcp_replicate_spend() {
         }],
         trace_ctx: None,
         source_node_id: None,
+        cluster_key: 0,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch);
     assert_eq!(
@@ -254,6 +255,7 @@ fn tcp_replicate_create_and_spend_lifecycle() {
         }],
         trace_ctx: None,
         source_node_id: None,
+        cluster_key: 0,
     };
     let ack = send_replica_batch_tcp(replica_port, &create_batch);
     assert_eq!(
@@ -293,6 +295,7 @@ fn tcp_replicate_create_and_spend_lifecycle() {
         }],
         trace_ctx: None,
         source_node_id: None,
+        cluster_key: 0,
     };
     let ack = send_replica_batch_tcp(replica_port, &spend_batch);
     assert_eq!(
@@ -355,6 +358,7 @@ fn tcp_replicate_batch_50_ops() {
         ops,
         trace_ctx: None,
         source_node_id: None,
+        cluster_key: 0,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch);
     assert_eq!(
@@ -465,6 +469,7 @@ fn tcp_replicate_mixed_ops() {
         ],
         trace_ctx: None,
         source_node_id: None,
+        cluster_key: 0,
     };
 
     let ack = send_replica_batch_tcp(replica_port, &batch);
@@ -545,6 +550,7 @@ fn tcp_catchup_missed_ops() {
         ops: all_ops[0..5].to_vec(),
         trace_ctx: None,
         source_node_id: None,
+        cluster_key: 0,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch1);
     assert_eq!(
@@ -560,6 +566,7 @@ fn tcp_catchup_missed_ops() {
         ops: all_ops[5..10].to_vec(),
         trace_ctx: None,
         source_node_id: None,
+        cluster_key: 0,
     };
     let ack = send_replica_batch_tcp(replica_port, &catchup_batch);
     assert_eq!(
@@ -667,6 +674,7 @@ fn tcp_concurrent_replicate_and_client() {
             ops,
             trace_ctx: None,
             source_node_id: None,
+            cluster_key: 0,
         };
         transport.send_batch(&batch).unwrap();
         let ack = transport.recv_ack(Duration::from_secs(5)).unwrap();
@@ -728,6 +736,7 @@ fn tcp_replica_timeout() {
         }],
         trace_ctx: None,
         source_node_id: None,
+        cluster_key: 0,
     };
     transport.send_batch(&batch).unwrap();
 
@@ -853,6 +862,7 @@ fn tcp_consistency_verification() {
         ops: ops.clone(),
         trace_ctx: None,
         source_node_id: None,
+        cluster_key: 0,
     };
     let ack = send_replica_batch_tcp(replica_port, &batch);
     let expected_through = ops.len() as u64;

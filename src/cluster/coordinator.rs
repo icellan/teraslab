@@ -82,6 +82,16 @@ fn sync_atomic_migration_bitmaps(
     }
 }
 
+/// Decide whether a migration task scheduled at `topology_epoch` is still
+/// current.
+///
+/// This deliberately compares the **per-node** `topology_epoch` (the local
+/// shard-table version) — NOT the quorum-committed cluster_key. Migration
+/// tasks are local lifecycle objects: a task scheduled at the local epoch
+/// must complete (or fail) against that same local epoch, otherwise it is
+/// stale and must be discarded. The cluster_key gate (used by
+/// cross-node replication) is a separate concept — see
+/// `RunningCluster::local_cluster_key`.
 fn migration_epoch_current(
     shard_table: &Arc<ShardTableLock<ShardTable>>,
     topology_epoch: u64,
@@ -99,6 +109,9 @@ fn fail_migration_task_current_epoch(
     rollback: bool,
 ) -> bool {
     if !migration_epoch_current(shard_table, topology_epoch) {
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.topology_epoch_mismatch.inc();
+        }
         tracing::info!(
             shard = task.shard,
             task_epoch = topology_epoch,
@@ -145,6 +158,9 @@ fn complete_migration_task_current_epoch(
     commit: bool,
 ) -> bool {
     if !migration_epoch_current(shard_table, topology_epoch) {
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.topology_epoch_mismatch.inc();
+        }
         tracing::info!(
             shard = task.shard,
             task_epoch = topology_epoch,
@@ -285,6 +301,19 @@ pub struct ClusterCoordinator {
     pub topology_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Topology authority for quorum-committed term management.
     pub topology_authority: Arc<crate::cluster::topology::TopologyAuthority>,
+    /// Atomic mirror of `topology_authority.committed_term()` — the
+    /// cluster_key value stamped on outbound `OP_REPLICA_BATCH` traffic and
+    /// gated on inbound traffic.
+    ///
+    /// Sourced directly from `topology_authority.committed_term_shared()`,
+    /// so every successful `handle_commit` advance is observable here
+    /// without an explicit setter. This is intentionally NOT
+    /// `topology_epoch`: `topology_epoch` is per-node and starts diverged
+    /// across the cluster (initialized from the local member-list view),
+    /// which would break cross-node replication batches with
+    /// `ERR_STALE_EPOCH`. The committed term, in contrast, converges on
+    /// the same value across all peers after each `OP_TOPOLOGY_COMMIT`.
+    pub committed_cluster_key: Arc<std::sync::atomic::AtomicU64>,
     /// Members corresponding to the currently activated shard table.
     active_topology_members: Arc<RwLock<Vec<NodeId>>>,
     /// Parallel connections per migration target.
@@ -349,6 +378,10 @@ impl ClusterCoordinator {
             // `compute_with_epoch` call — that's unrelated to this
             // counter.
             topology_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // Mirror the topology authority's committed-term atomic so the
+            // cluster_key gate observes every quorum-committed advance
+            // without an explicit setter call.
+            committed_cluster_key: topology_authority.committed_term_shared(),
             topology_authority,
             active_topology_members,
             migration_pool_size: config.migration_pool_size.max(1),
@@ -789,6 +822,7 @@ impl ClusterCoordinator {
             repl_best_effort,
             repl_timeout: repl_timeout.max(Duration::from_millis(1)),
             last_migration_pressure_ms: Arc::new(AtomicU64::new(0)),
+            committed_cluster_key: self.committed_cluster_key.clone(),
             topology_authority: self.topology_authority.clone(),
             active_topology_members: active_topology_members_for_cluster,
             inbound_state_path,
@@ -2486,7 +2520,7 @@ fn run_migration_batch(
                         }
                         snapshot_seqs.push(snapshot_seq);
                         let shard_keys = keys_ref.get(&task.shard).unwrap_or(&empty_keys);
-                        let ok = match stream_shard_baseline(task, shard_keys, &engine, &mut stream, batch_size) {
+                        let ok = match stream_shard_baseline(task, shard_keys, &engine, &mut stream, batch_size, topology_epoch) {
                             Ok(_) => true,
                             Err(e) => {
                                 tracing::warn!(shard = task.shard, err = %e, "cluster: shard baseline failed");
@@ -2576,7 +2610,7 @@ fn run_migration_batch(
                         if !late_keys.is_empty() {
                             let late_refs: Vec<&TxKey> = late_keys.iter().collect();
                             if let Err(e) = stream_shard_baseline(
-                                task, &late_refs, &engine, &mut stream, batch_size,
+                                task, &late_refs, &engine, &mut stream, batch_size, topology_epoch,
                             ) {
                                 tracing::warn!(
                                     shard = task.shard,
@@ -2609,8 +2643,12 @@ fn run_migration_batch(
                         ) {
                             Ok(delta_ops) => {
                                 if !delta_ops.is_empty()
-                                    && let Err(e) =
-                                        send_delta_ops(&mut stream, task.shard, &delta_ops)
+                                    && let Err(e) = send_delta_ops(
+                                        &mut stream,
+                                        task.shard,
+                                        &delta_ops,
+                                        topology_epoch,
+                                    )
                                 {
                                     tracing::warn!(
                                         shard = task.shard,
@@ -3061,7 +3099,7 @@ fn migrate_single_shard(
     addr: SocketAddr,
     completed: &Arc<std::sync::atomic::AtomicU32>,
     failed: &Arc<std::sync::atomic::AtomicU32>,
-    _topology_epoch: u64,
+    topology_epoch: u64,
     batch_size: usize,
     fenced_bm: &crate::cluster::migration::AtomicShardBitmap,
     migrating_bm: &crate::cluster::migration::AtomicShardBitmap,
@@ -3151,7 +3189,12 @@ fn migrate_single_shard(
 
         // Phase 1: baseline
         let _baseline_manifest = match stream_shard_baseline(
-            task, shard_keys, engine, stream, batch_size,
+            task,
+            shard_keys,
+            engine,
+            stream,
+            batch_size,
+            topology_epoch,
         ) {
             Ok(m) => m,
             Err(e) => {
@@ -3260,8 +3303,14 @@ fn migrate_single_shard(
                 "cluster: shard fenced re-scan found missing pre-snapshot keys",
             );
             let late_key_refs: Vec<&TxKey> = late_keys.iter().collect();
-            if let Err(e) = stream_shard_baseline(task, &late_key_refs, engine, stream, batch_size)
-            {
+            if let Err(e) = stream_shard_baseline(
+                task,
+                &late_key_refs,
+                engine,
+                stream,
+                batch_size,
+                topology_epoch,
+            ) {
                 last_err = format!("late baseline: {e}");
                 if attempt < 2 {
                     continue;
@@ -3297,7 +3346,7 @@ fn migrate_single_shard(
                         fence_seq,
                         "cluster: shard streaming delta ops",
                     );
-                    if let Err(e) = send_delta_ops(stream, task.shard, &delta_ops) {
+                    if let Err(e) = send_delta_ops(stream, task.shard, &delta_ops, topology_epoch) {
                         tracing::warn!(shard = task.shard, err = %e, "cluster: shard delta streaming failed");
                         last_err = e;
                         delta_failed = true;
@@ -3349,8 +3398,14 @@ fn migrate_single_shard(
                 "cluster: shard post-delta stabilization found newly appeared keys",
             );
             let late_key_refs: Vec<&TxKey> = post_delta_late_keys.iter().collect();
-            if let Err(e) = stream_shard_baseline(task, &late_key_refs, engine, stream, batch_size)
-            {
+            if let Err(e) = stream_shard_baseline(
+                task,
+                &late_key_refs,
+                engine,
+                stream,
+                batch_size,
+                topology_epoch,
+            ) {
                 last_err = format!("post-delta baseline: {e}");
                 if attempt < 2 {
                     continue;
@@ -3425,7 +3480,7 @@ fn migrate_single_shard(
                 fence_seq,
                 manifest_entries.len(),
                 manifest_entries.len(),
-                _topology_epoch,
+                topology_epoch,
             ),
         );
         if let Err(e) = send_migration_complete(
@@ -3434,7 +3489,7 @@ fn migrate_single_shard(
             task.from_node,
             manifest_entries.len() as u64,
             fence_seq,
-            _topology_epoch,
+            topology_epoch,
             Some(stream),
             &manifest_hash,
             &manifest_entries,
@@ -3490,12 +3545,14 @@ fn migrate_single_shard(
 /// Returns the manifest hash accumulated over all streamed records
 /// (txid XOR generation for each record). The hash is order-independent
 /// so the target can verify content equality regardless of apply order.
+#[allow(clippy::too_many_arguments)]
 fn stream_shard_baseline(
     task: &MigrationTask,
     shard_keys: &[&TxKey],
     engine: &Engine,
     stream: &mut TcpStream,
     batch_size: usize,
+    cluster_key: u64,
 ) -> std::result::Result<ManifestHasher, String> {
     use crate::record::{UTXO_FROZEN, UTXO_SPENT};
     use crate::replication::protocol::{ReplicaBatch, ReplicaOp};
@@ -3641,6 +3698,10 @@ fn stream_shard_baseline(
             ops,
             trace_ctx: crate::observability::WireTraceContext::from_current_span(),
             source_node_id: Some(task.from_node.0),
+            // Phase B3: stamped with the source's live coordinator epoch
+            // so a topology-change race aborts the migration via the
+            // receiver's stale-epoch gate instead of corrupting state.
+            cluster_key,
         };
 
         // Send as OP_REPLICA_BATCH with FLAG_MIGRATION_BATCH so the
@@ -4178,6 +4239,7 @@ fn send_delta_ops(
     stream: &mut TcpStream,
     shard: u16,
     ops: &[crate::replication::protocol::ReplicaOp],
+    cluster_key: u64,
 ) -> std::result::Result<(), String> {
     use crate::replication::protocol::{ReplicaAck, ReplicaBatch};
 
@@ -4186,6 +4248,8 @@ fn send_delta_ops(
         ops: ops.to_vec(),
         trace_ctx: crate::observability::WireTraceContext::from_current_span(),
         source_node_id: None,
+        // Phase B3: stamped with the source's live coordinator epoch.
+        cluster_key,
     };
     let request = RequestFrame {
         request_id: shard as u64,
@@ -4332,6 +4396,41 @@ pub fn load_peak_cluster_size(path: &std::path::Path) -> usize {
 }
 
 /// A running cluster instance with all background threads active.
+/// Result of a `RunningCluster::is_master` query.
+///
+/// Returned in place of a bare `bool` so that callers (specifically the
+/// dispatcher) can distinguish a cleanly-known non-master answer from the
+/// transient *gap* between a topology proposal/membership change and its
+/// quorum-committed activation. During that gap the local view of who owns
+/// a shard is unreliable: the dispatcher must steer clients away from
+/// following a possibly-wrong `REDIRECT` and toward retrying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MasterQueryResult {
+    /// This node is the authoritative master for the queried shard, in the
+    /// currently quorum-committed topology. The dispatcher handles the
+    /// request locally.
+    Yes,
+    /// Some other live node is the authoritative master for the queried
+    /// shard. The dispatcher returns `ERR_REDIRECT` with that node's
+    /// address.
+    No,
+    /// Topology is in flux: the local `topology_epoch` (peak observed
+    /// proposed term) is ahead of the last quorum-committed term, so the
+    /// shard table consulted to derive ownership is not yet authoritative.
+    /// The dispatcher returns `ERR_MIGRATION_IN_PROGRESS` to instruct
+    /// clients to retry rather than chase a stale redirect.
+    ///
+    /// `last_known_term` reports the most recent quorum-committed term —
+    /// useful for diagnostics, metrics, and (eventually) hinting clients
+    /// to refresh their partition map past that point.
+    Transitioning {
+        /// The most recent quorum-committed topology term observed by this
+        /// node. The shard table at that term is the last authoritative
+        /// view; anything bumped on top of it is in-flight.
+        last_known_term: u64,
+    },
+}
+
 pub struct RunningCluster {
     self_id: NodeId,
     shard_table: Arc<ShardTableLock<ShardTable>>,
@@ -4353,6 +4452,18 @@ pub struct RunningCluster {
     last_migration_pressure_ms: Arc<AtomicU64>,
     /// Topology authority for quorum-committed term management.
     topology_authority: Arc<crate::cluster::topology::TopologyAuthority>,
+    /// Atomic mirror of `topology_authority.committed_term()` — the
+    /// cluster_key value stamped on outbound `OP_REPLICA_BATCH` traffic and
+    /// gated on inbound traffic.
+    ///
+    /// Sourced directly from `topology_authority.committed_term_shared()`,
+    /// so every successful `handle_commit` advance is observable here
+    /// without an explicit setter. Intentionally NOT `topology_epoch`:
+    /// per-node `topology_epoch` values diverge at startup, which would
+    /// reject legitimate cross-node replication batches with
+    /// `ERR_STALE_EPOCH`. The committed term converges on the same value
+    /// across all peers after each `OP_TOPOLOGY_COMMIT`.
+    committed_cluster_key: Arc<std::sync::atomic::AtomicU64>,
     /// Members corresponding to the currently activated shard table.
     active_topology_members: Arc<RwLock<Vec<NodeId>>>,
     /// Path for persisting inbound migration state across restarts.
@@ -4420,15 +4531,43 @@ impl RunningCluster {
         self.shard_table.clone()
     }
 
-    /// Check if this node is the master for the given key.
+    /// Determine whether this node is the master for the given key.
     ///
-    /// Returns false if the local shard table is behind the committed
-    /// topology term (e.g., after a node rejoins from Dead state before
-    /// its shard table has been updated). This prevents serving stale
-    /// reads/writes from an outdated ownership view.
-    pub fn is_master(&self, key: &TxKey) -> bool {
+    /// Returns:
+    /// - [`MasterQueryResult::Yes`] when this node is the authoritative
+    ///   master for the key's shard in the currently quorum-committed
+    ///   topology.
+    /// - [`MasterQueryResult::No`] when another node holds authoritative
+    ///   ownership.
+    /// - [`MasterQueryResult::Transitioning`] when the local
+    ///   `topology_epoch` (peak observed proposed term) is ahead of the
+    ///   last quorum-committed term — i.e. a membership change has been
+    ///   proposed/observed but not yet quorum-committed locally. In that
+    ///   window the local shard-table view of ownership is unreliable
+    ///   and the caller must surface a *retryable* error rather than a
+    ///   redirect to a possibly-wrong target.
+    ///
+    /// Note: when the local shard table is *behind* the committed topology
+    /// term (e.g. a freshly-rejoined node), this still returns
+    /// [`MasterQueryResult::No`]. That case is handled inside
+    /// [`Self::authoritative_master_for_shard`], which returns `NodeId(0)`
+    /// (a sentinel that never matches `self_id`) so the dispatcher
+    /// redirects with `NodeId(0)` and the client refetches its partition
+    /// map.
+    pub fn is_master(&self, key: &TxKey) -> MasterQueryResult {
+        let committed = self.topology_authority.committed_term();
+        let observed = self.topology_epoch.load(Ordering::Acquire);
+        if observed > committed {
+            return MasterQueryResult::Transitioning {
+                last_known_term: committed,
+            };
+        }
         let shard = ShardTable::shard_for_key(key);
-        self.authoritative_master_for_shard(shard) == self.self_id
+        if self.authoritative_master_for_shard(shard) == self.self_id {
+            MasterQueryResult::Yes
+        } else {
+            MasterQueryResult::No
+        }
     }
 
     /// Determine how to route a request for the given key.
@@ -4734,6 +4873,51 @@ impl RunningCluster {
         diag.is_local_master_of_shard = local_master == self.self_id;
         diag.topology_epoch = self.topology_epoch();
         diag
+    }
+
+    /// Shared handle to the per-node monotonic topology epoch.
+    ///
+    /// Distinct from [`cluster_key_handle`](Self::cluster_key_handle):
+    /// the topology epoch is per-node and used for local fencing (e.g.
+    /// `is_master`'s Transitioning check), whereas `cluster_key_handle`
+    /// returns the quorum-committed term used for cross-node replication
+    /// gating. Tests use this accessor to simulate a local epoch bump
+    /// without affecting the committed term.
+    pub fn topology_epoch_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.topology_epoch.clone()
+    }
+
+    /// Receiver-side cluster epoch for replication batch gating
+    /// ([Phase B3](crate::replication::receiver::handle_replica_batch_with_tracker)).
+    ///
+    /// Returns the **quorum-committed term** — i.e. the value advanced by
+    /// every successful `topology_authority.handle_commit` (an applied
+    /// `OP_TOPOLOGY_COMMIT`). All peers converge on the same value after a
+    /// commit, so cross-node `OP_REPLICA_BATCH` traffic carries a
+    /// cluster_key that matches the receiver's view.
+    ///
+    /// This is **not** `topology_epoch`: per-node `topology_epoch` values
+    /// are seeded from the local member-list snapshot at startup and so
+    /// diverge across the cluster, which would reject legitimate
+    /// cross-node batches with `ERR_STALE_EPOCH`. Until the first quorum
+    /// commit lands, this value is `0` (V1-compat / unknown — gating is
+    /// effectively a no-op).
+    pub fn local_cluster_key(&self) -> u64 {
+        self.committed_cluster_key.load(Ordering::Acquire)
+    }
+
+    /// Shared `Arc<AtomicU64>` handle backing the local cluster_key.
+    ///
+    /// The coordinator passes this clone into the local
+    /// [`ReplicationManager`](crate::replication::manager::ReplicationManager)
+    /// (so every outbound batch is stamped with the live committed term)
+    /// and into the local
+    /// [`ReplicationReceiver`](crate::replication::receiver::ReplicationReceiver)
+    /// (so the gate sees commits without a setter call). The atomic is
+    /// the same instance as `topology_authority.committed_term_shared()`,
+    /// so any `handle_commit` advance is visible here lock-free.
+    pub fn cluster_key_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.committed_cluster_key.clone()
     }
 
     /// Resolved replication ACK policy. None means best-effort (no enforcement).
@@ -5124,6 +5308,7 @@ pub(crate) fn new_test_running_cluster(
         repl_best_effort: false,
         repl_timeout: Duration::from_secs(3),
         last_migration_pressure_ms: Arc::new(AtomicU64::new(0)),
+        committed_cluster_key: topology_authority.committed_term_shared(),
         topology_authority,
         active_topology_members,
         inbound_state_path: None,
@@ -5266,7 +5451,15 @@ mod tests {
             to_node: NodeId(2),
             is_master: true,
         };
-        stream_shard_baseline(&task, &[&live_key, &deleted_key], &engine, &mut stream, 64).unwrap();
+        stream_shard_baseline(
+            &task,
+            &[&live_key, &deleted_key],
+            &engine,
+            &mut stream,
+            64,
+            /* cluster_key */ 0,
+        )
+        .unwrap();
 
         let (request, batch) = receiver.join().unwrap();
         assert_eq!(request.op_code, crate::protocol::opcodes::OP_REPLICA_BATCH);
@@ -6862,7 +7055,7 @@ mod tests {
         );
 
         let key = key_for_shard(shard);
-        assert!(!cluster.is_master(&key));
+        assert_eq!(cluster.is_master(&key), MasterQueryResult::No);
         assert_eq!(
             cluster.route(&key),
             RouteDecision::RedirectTo {
@@ -6909,7 +7102,7 @@ mod tests {
         );
 
         let key = key_for_shard(shard);
-        assert!(cluster.is_master(&key));
+        assert_eq!(cluster.is_master(&key), MasterQueryResult::Yes);
         assert_eq!(cluster.route(&key), RouteDecision::HandleLocally);
     }
 
@@ -7095,5 +7288,499 @@ mod tests {
         );
 
         assert_eq!(cluster.alive_node_count(), 2);
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase B3 — migration completion gating + dispatch cluster_key plumbing
+    //
+    // 1. `complete_migration_task_current_epoch` must reject a task whose
+    //    epoch does not match the live `shard_table.version` (i.e. the
+    //    coordinator's `topology_epoch`) and bump the
+    //    `topology_epoch_mismatch` metric.
+    // 2. The same call with a matching epoch must succeed and leave the
+    //    metric untouched.
+    // 3. Dispatch's `OP_REPLICA_BATCH` handler must read the receiver's
+    //    cluster_key view from `RunningCluster::local_cluster_key()` rather
+    //    than the removed B2 global, observable as an `ERR_STALE_EPOCH`
+    //    rejection of an off-epoch batch.
+    // 4. The local `ReplicationManager` constructed via the coordinator's
+    //    `cluster_key_handle()` must stamp every outbound batch with the
+    //    live epoch (proves the source-side leg of the same Arc).
+    // ----------------------------------------------------------------------
+
+    fn install_test_migration_metrics() -> &'static crate::metrics::MigrationMetrics {
+        use crate::metrics::{MigrationMetrics, init_migration_metrics, migration_metrics};
+        use std::sync::OnceLock;
+        static TEST_METRICS: OnceLock<MigrationMetrics> = OnceLock::new();
+        let m_ref: &'static MigrationMetrics = TEST_METRICS.get_or_init(MigrationMetrics::new);
+        init_migration_metrics(m_ref);
+        migration_metrics().expect("metrics installed")
+    }
+
+    fn make_outbound_master_task(shard: u16, from: NodeId, to: NodeId) -> MigrationTask {
+        MigrationTask {
+            shard,
+            from_node: from,
+            to_node: to,
+            is_master: true,
+        }
+    }
+
+    /// `complete_migration_task_current_epoch` returns `false` and increments
+    /// `topology_epoch_mismatch` when the caller's epoch does not match the
+    /// live shard-table version.
+    #[test]
+    fn migration_complete_rejected_with_stale_epoch() {
+        let metrics = install_test_migration_metrics();
+        // Live shard table is at epoch 10; the migration task carries epoch 9.
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 10);
+        let shard_table: Arc<ShardTableLock<ShardTable>> = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let task = make_outbound_master_task(123, NodeId(1), NodeId(2));
+        // Pre-register the task so the "untracked" guard is not what
+        // returns false — we want the *epoch* guard to fire.
+        {
+            let mut mgr = migration.lock().unwrap();
+            mgr.start_outbound(
+                std::slice::from_ref(&task),
+                NodeId(1),
+                &std::collections::HashSet::new(),
+            );
+        }
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let before = metrics.topology_epoch_mismatch.get();
+        let accepted = complete_migration_task_current_epoch(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            /* task_epoch */ 9,
+            /* commit */ false,
+        );
+        let after = metrics.topology_epoch_mismatch.get();
+
+        assert!(
+            !accepted,
+            "stale-epoch completion (task=9, live=10) must be rejected",
+        );
+        assert_eq!(
+            after - before,
+            1,
+            "stale-epoch rejection must bump `topology_epoch_mismatch`",
+        );
+    }
+
+    /// `complete_migration_task_current_epoch` accepts the call when the
+    /// task's epoch matches the live shard-table version, and leaves
+    /// `topology_epoch_mismatch` untouched.
+    #[test]
+    fn migration_complete_accepted_with_current_epoch() {
+        let metrics = install_test_migration_metrics();
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 10);
+        let shard_table: Arc<ShardTableLock<ShardTable>> = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let task = make_outbound_master_task(124, NodeId(1), NodeId(2));
+        {
+            let mut mgr = migration.lock().unwrap();
+            mgr.start_outbound(
+                std::slice::from_ref(&task),
+                NodeId(1),
+                &std::collections::HashSet::new(),
+            );
+        }
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let before = metrics.topology_epoch_mismatch.get();
+        let accepted = complete_migration_task_current_epoch(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            /* task_epoch */ 10,
+            /* commit */ false,
+        );
+        let after = metrics.topology_epoch_mismatch.get();
+
+        assert!(
+            accepted,
+            "current-epoch completion (task=10, live=10) must be accepted",
+        );
+        assert_eq!(
+            after, before,
+            "matching-epoch completion must NOT bump `topology_epoch_mismatch`",
+        );
+    }
+
+    /// `RunningCluster::local_cluster_key()` returns the live `topology_epoch`,
+    /// and the dispatch `OP_REPLICA_BATCH` handler reads it through the
+    /// `cluster: &RunningCluster` parameter — proving the B2 global has
+    /// been replaced by coordinator-driven plumbing. We verify by sending
+    /// a stale-epoch batch and asserting the dispatch handler returns
+    /// `STATUS_ERROR + ERR_STALE_EPOCH`, which is only possible if the
+    /// receiver gate sees the cluster's live epoch (not 0).
+    #[test]
+    fn dispatch_routes_local_cluster_key_from_running_cluster() {
+        use crate::protocol::frame::RequestFrame;
+        use crate::protocol::opcodes::{ERR_STALE_EPOCH, OP_REPLICA_BATCH, STATUS_ERROR};
+        use crate::replication::protocol::ReplicaBatch;
+
+        let members = vec![NodeId(1)];
+        // Build a shard table at epoch 42 so cluster.local_cluster_key() == 42.
+        let table = ShardTable::compute_with_epoch(&members, 1, 42);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4801".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+
+        assert_eq!(
+            cluster.local_cluster_key(),
+            42,
+            "cluster.local_cluster_key() must surface the live topology epoch",
+        );
+        assert_eq!(
+            cluster.cluster_key_handle().load(Ordering::Acquire),
+            42,
+            "shared Arc must carry the same value as the accessor",
+        );
+
+        // Deliberately stamp the wire batch with a stale epoch (5 != 42).
+        let batch = ReplicaBatch {
+            first_sequence: 100,
+            ops: vec![],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 5,
+        };
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_REPLICA_BATCH,
+            flags: 0,
+            payload: batch.serialize(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = crate::server::dispatch::handle_request(
+            &req,
+            &test_engine(),
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "dispatch must reject a stale-epoch batch — proving the gate \
+             reads cluster.local_cluster_key() (=42), not the removed global (=0)",
+        );
+        assert!(
+            resp.payload.len() >= 2,
+            "STATUS_ERROR payload must carry an error_code prefix",
+        );
+        let err_code = u16::from_le_bytes([resp.payload[0], resp.payload[1]]);
+        assert_eq!(
+            err_code, ERR_STALE_EPOCH,
+            "dispatch must surface the cluster-key gate's ERR_STALE_EPOCH",
+        );
+    }
+
+    /// The local `ReplicationManager` constructed with the coordinator's
+    /// `cluster_key_handle()` stamps every outbound batch with the live
+    /// `topology_epoch`. Mirrors the pattern of
+    /// `replication::manager::tests::manager_attaches_current_cluster_key`
+    /// but drives the handle from a `RunningCluster` so the coordinator
+    /// wiring (Phase B3) is proven end-to-end: the manager sees epoch
+    /// bumps to the same `Arc<AtomicU64>` the coordinator owns.
+    #[test]
+    fn manager_attaches_cluster_key_from_topology_epoch() {
+        use crate::replication::manager::{
+            InMemoryTransport, ReplicationConfig, ReplicationManager,
+        };
+        use crate::replication::protocol::{ReplicaAck, ReplicaOp};
+
+        // Mirror `spawn_auto_ack_replica`: a replica thread that recv's,
+        // ACKs `Ok { through_sequence }`, and returns the captured batches.
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 99);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4901".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4902".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        assert_eq!(cluster.local_cluster_key(), 99);
+
+        let (master_t, replica_t) = InMemoryTransport::pair();
+        let handle = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            while let Ok(batch) = replica_t.recv_batch(Duration::from_secs(1)) {
+                let ack = ReplicaAck::Ok {
+                    through_sequence: batch.last_sequence(),
+                };
+                replica_t.send_ack(&ack).unwrap();
+                received.push(batch);
+            }
+            received
+        });
+
+        let mut mgr = ReplicationManager::with_cluster_key(
+            ReplicationConfig::default(),
+            vec![Box::new(master_t)],
+            cluster.cluster_key_handle(),
+        );
+
+        let mut txid = [0u8; 32];
+        txid[0] = 1;
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: TxKey { txid },
+            offset: 0,
+            master_generation: 1,
+        }];
+        mgr.replicate_batch(&ops).expect("replicate batch");
+
+        // Drive an in-place epoch bump on the shared Arc. The manager
+        // must observe it on the very next batch, proving it reads the
+        // live atomic on every send (not a snapshot at construction).
+        cluster.cluster_key_handle().store(123, Ordering::Release);
+        mgr.replicate_batch(&ops)
+            .expect("replicate batch (post-bump)");
+
+        // Drop the manager so the replica's `recv_batch` returns Err and
+        // the thread joins. Without this, the test would block forever
+        // because the spawned reader is still listening on the channel.
+        drop(mgr);
+        let received = handle.join().expect("replica thread joined");
+        assert_eq!(received.len(), 2, "manager should send exactly two batches");
+        assert_eq!(
+            received[0].cluster_key, 99,
+            "first batch must be stamped with the coordinator's initial cluster_key (99)",
+        );
+        assert_eq!(
+            received[1].cluster_key, 123,
+            "the post-bump batch must carry the new cluster_key (123) — \
+             proving the manager reads the live shared Arc, not a snapshot",
+        );
+    }
+
+    // ── Phase B4: MasterQueryResult ────────────────────────────────
+
+    /// Build a single-node test cluster where this node owns every shard
+    /// (single-node committed term == shard table version, no epoch gap).
+    fn single_node_cluster_for_master_query_tests() -> RunningCluster {
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 7);
+        new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4801".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        )
+    }
+
+    #[test]
+    fn is_master_returns_yes_when_local_master() {
+        let cluster = single_node_cluster_for_master_query_tests();
+        let key = key_for_shard(0);
+        match cluster.is_master(&key) {
+            MasterQueryResult::Yes => {}
+            other => panic!("expected MasterQueryResult::Yes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_master_returns_no_when_remote_master() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 5);
+        // Find a shard whose target master is NodeId(2), then run as NodeId(1).
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == NodeId(2))
+            .expect("at least one shard owned by NodeId(2)");
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4811".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4812".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        let key = key_for_shard(shard);
+        match cluster.is_master(&key) {
+            MasterQueryResult::No => {}
+            other => panic!("expected MasterQueryResult::No, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_master_query_returns_transitioning_during_epoch_gap() {
+        // Single-node committed-term=5 cluster, then bump topology_epoch to 6
+        // (simulating a membership change that has been proposed/observed
+        // locally but has not yet quorum-committed).
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4821".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        // Sanity: committed term is 5 (set by new_test_running_cluster).
+        assert_eq!(cluster.topology_authority.committed_term(), 5);
+        // Bump the local peak/proposed epoch ahead of the committed term.
+        cluster.topology_epoch.store(6, Ordering::Release);
+
+        let key = key_for_shard(0);
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { last_known_term } => {
+                assert_eq!(
+                    last_known_term, 5,
+                    "Transitioning must report the last quorum-committed term",
+                );
+            }
+            other => panic!(
+                "expected MasterQueryResult::Transitioning {{ last_known_term: 5 }}, got {other:?}"
+            ),
+        }
+    }
+
+    // ── Phase B fixup: cluster_key sourced from quorum-committed term ──
+
+    /// `local_cluster_key()` MUST return the quorum-committed term, NOT the
+    /// per-node `topology_epoch`. Each node initializes `topology_epoch`
+    /// from its local member-list snapshot, so values diverge across the
+    /// cluster at startup; routing the cluster_key through the committed
+    /// term ensures all nodes converge on the same value (initially 0)
+    /// until the first quorum commit lands. Without this, cross-node
+    /// `OP_REPLICA_BATCH` traffic is rejected with `ERR_STALE_EPOCH`
+    /// during legitimate operation.
+    #[test]
+    fn local_cluster_key_returns_committed_term_not_topology_epoch() {
+        // Build a cluster where the per-node `topology_epoch` is 10 but
+        // the quorum-committed term is 7. Without the fix,
+        // `local_cluster_key()` would return 10; with the fix it returns 7.
+        let members = vec![NodeId(1)];
+        // Shard table version 7 → handle_commit(term=7) inside the helper
+        // sets committed_term to 7.
+        let table = ShardTable::compute_with_epoch(&members, 1, 7);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4801".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        // Force the per-node topology_epoch ahead of the committed term to
+        // simulate the divergence seen in multi-node startup.
+        cluster.topology_epoch.store(10, Ordering::Release);
+
+        assert_eq!(
+            cluster.topology_authority.committed_term(),
+            7,
+            "precondition: committed_term must be 7",
+        );
+        assert_eq!(
+            cluster.topology_epoch.load(Ordering::Acquire),
+            10,
+            "precondition: topology_epoch must be 10 (different from committed_term)",
+        );
+        assert_eq!(
+            cluster.local_cluster_key(),
+            7,
+            "local_cluster_key() must surface the quorum-committed term (7), \
+             NOT the per-node topology_epoch (10)",
+        );
+        assert_eq!(
+            cluster.cluster_key_handle().load(Ordering::Acquire),
+            7,
+            "cluster_key_handle() must back the same value (7) so manager \
+             and receiver observe the committed term, not topology_epoch",
+        );
+    }
+
+    /// Applying an `OP_TOPOLOGY_COMMIT` (via `topology_authority.handle_commit`)
+    /// must advance `local_cluster_key()` synchronously, so all nodes
+    /// converge on the same key after each quorum-committed term.
+    #[test]
+    fn committed_cluster_key_advances_on_topology_commit() {
+        // Start with no committed term (fresh node, before any quorum).
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4801".parse().unwrap())],
+            // Empty committed_members → helper does NOT call handle_commit.
+            &[],
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        assert_eq!(
+            cluster.local_cluster_key(),
+            0,
+            "before any quorum commit, local_cluster_key must be 0 \
+             (V1-compat / unknown — gating becomes a no-op)",
+        );
+
+        // Trigger application of an OP_TOPOLOGY_COMMIT for term 5.
+        let commit_members = vec![NodeId(1), NodeId(2)];
+        let commit = crate::cluster::topology::TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: commit_members.clone(),
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(5, &commit_members),
+        };
+        let applied = cluster.topology_authority.handle_commit(&commit);
+        assert_eq!(applied, Some(5), "commit must be accepted");
+
+        assert_eq!(
+            cluster.local_cluster_key(),
+            5,
+            "after OP_TOPOLOGY_COMMIT for term 5, local_cluster_key must \
+             advance to 5 — proving the cluster_key handle tracks the \
+             quorum-committed term in lock-step",
+        );
+        assert_eq!(
+            cluster.cluster_key_handle().load(Ordering::Acquire),
+            5,
+            "cluster_key_handle() must observe the same advance (5) so \
+             downstream manager/receiver readers see the new term",
+        );
     }
 }

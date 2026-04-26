@@ -278,6 +278,7 @@ mod tests {
             }],
             trace_ctx: None,
             source_node_id: None,
+            cluster_key: 0,
         };
 
         let batch_clone = batch.clone();
@@ -355,6 +356,7 @@ mod tests {
             }],
             trace_ctx: None,
             source_node_id: None,
+            cluster_key: 0,
         };
         transport.send_batch(&batch).unwrap();
 
@@ -586,6 +588,7 @@ mod tests {
                 }],
                 trace_ctx: None,
                 source_node_id: None,
+                cluster_key: 0,
             };
             transport.send_batch(&batch).unwrap();
         });
