@@ -597,6 +597,8 @@ pub fn run_catchup_for_replica(
             ops: chunk.to_vec(),
             trace_ctx: crate::observability::WireTraceContext::from_current_span(),
             source_node_id: None,
+            // Phase B1: epoch threading lands in B2/B3.
+            cluster_key: 0,
         };
         transport
             .send_batch(&batch)

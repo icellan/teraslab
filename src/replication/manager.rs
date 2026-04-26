@@ -201,6 +201,8 @@ impl ReplicationManager {
             ops: ops.to_vec(),
             trace_ctx,
             source_node_id: None,
+            // Phase B1: cluster_key plumbing lands in B2 (manager-owned epoch handle).
+            cluster_key: 0,
         };
         self.next_sequence += ops.len() as u64;
 
@@ -445,6 +447,8 @@ impl ReplicationManager {
                     ops: chunk.to_vec(),
                     trace_ctx: WireTraceContext::from_current_span(),
                     source_node_id: None,
+                    // Phase B1: cluster_key plumbing lands in B2.
+                    cluster_key: 0,
                 };
                 if let Err(_e) = sender.transport.send_batch(&batch) {
                     sender.state = ReplicaState::Down;

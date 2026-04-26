@@ -1521,6 +1521,7 @@ mod tests {
             ],
             trace_ctx: None,
             source_node_id: None,
+            cluster_key: 0,
         };
 
         // Batch B: sequence range 5..6 (lower)
@@ -1534,6 +1535,7 @@ mod tests {
             }],
             trace_ctx: None,
             source_node_id: None,
+            cluster_key: 0,
         };
 
         // Simulate: batch A completes first, then batch B completes.
@@ -1586,6 +1588,7 @@ mod tests {
             }],
             trace_ctx: None,
             source_node_id: None,
+            cluster_key: 0,
         };
         let req_1 = RequestFrame {
             op_code: OP_REPLICA_BATCH,
@@ -1607,6 +1610,7 @@ mod tests {
             }],
             trace_ctx: None,
             source_node_id: None,
+            cluster_key: 0,
         };
         let req_2 = RequestFrame {
             op_code: OP_REPLICA_BATCH,
@@ -1644,6 +1648,7 @@ mod tests {
             ops,
             trace_ctx: None,
             source_node_id: None,
+            cluster_key: 0,
         }
     }
 
@@ -2113,6 +2118,7 @@ mod tests {
             }],
             trace_ctx: Some(wire_ctx),
             source_node_id: None,
+            cluster_key: 0,
         };
         let req = RequestFrame {
             op_code: OP_REPLICA_BATCH,

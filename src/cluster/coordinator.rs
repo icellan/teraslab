@@ -3641,6 +3641,10 @@ fn stream_shard_baseline(
             ops,
             trace_ctx: crate::observability::WireTraceContext::from_current_span(),
             source_node_id: Some(task.from_node.0),
+            // Phase B1: cluster_key plumbing comes in B2/B3. Coordinator
+            // currently has no epoch handle; 0 = "not set", which the
+            // receiver treats as wildcard until B2 wires gating.
+            cluster_key: 0,
         };
 
         // Send as OP_REPLICA_BATCH with FLAG_MIGRATION_BATCH so the
@@ -4186,6 +4190,8 @@ fn send_delta_ops(
         ops: ops.to_vec(),
         trace_ctx: crate::observability::WireTraceContext::from_current_span(),
         source_node_id: None,
+        // Phase B1: epoch threading lands in B2/B3.
+        cluster_key: 0,
     };
     let request = RequestFrame {
         request_id: shard as u64,

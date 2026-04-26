@@ -1071,6 +1071,8 @@ fn replicate_all_ops(
                     ops,
                     trace_ctx: crate::observability::WireTraceContext::from_current_span(),
                     source_node_id: Some(source_node_id),
+                    // Phase B1: cluster_key plumbing lands in B2.
+                    cluster_key: 0,
                 };
                 send_replica_batch_to(addr, &batch, ack_timeout)
             }));
@@ -3392,6 +3394,8 @@ fn handle_delete_batch(
                         ops: vec![create_op],
                         trace_ctx: None,
                         source_node_id: None,
+                        // Phase B1: cluster_key plumbing lands in B2/B3.
+                        cluster_key: 0,
                     }
                     .serialize(),
                 };
@@ -5651,6 +5655,7 @@ mod tests {
                 ops: vec![],
                 trace_ctx: None,
                 source_node_id: None,
+                cluster_key: 0,
             }
             .serialize(),
         };
