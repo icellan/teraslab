@@ -162,6 +162,45 @@ impl Default for AtomicShardBitmap {
     }
 }
 
+/// Per-record diagnostic snapshot of a node's view of one txid's shard.
+///
+/// Returned (one per requested txid, in the same order) by
+/// `OP_ADMIN_DIAGNOSE_KEY` so integration tests can dump rich diagnostic
+/// information when the migration-reads barrier times out and figure out
+/// *why* a record is unreadable on a given node (e.g., shard still
+/// inbound-pending vs. fenced vs. owned by a different master).
+///
+/// The migration tracker can answer the migration-related fields on its
+/// own; the dispatch handler fills in the routing and storage fields
+/// from the shard table, this node's id, the index, and the
+/// coordinator's topology epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyDiagnosis {
+    /// Shard the txid maps to (`ShardTable::shard_for_key`).
+    pub shard: u16,
+    /// The id of the node producing this diagnosis (the responder).
+    pub this_node_id: u64,
+    /// The master id this node *believes* owns the shard, per its local
+    /// shard table. May differ from the canonical / committed master
+    /// during topology activation.
+    pub local_view_canonical_master_id: u64,
+    /// True iff this node's index has an entry for the txid.
+    pub has_local_data: bool,
+    /// True iff this node's local shard table assigns it as master of
+    /// the shard.
+    pub is_local_master_of_shard: bool,
+    /// True iff this node is still expecting inbound migration data for
+    /// the shard.
+    pub has_pending_inbound: bool,
+    /// True iff outbound writes for the shard are fenced on this node.
+    pub is_shard_fenced: bool,
+    /// True iff there is an outbound migration actively in progress for
+    /// the shard from this node.
+    pub is_migrating_shard: bool,
+    /// Current monotonic topology epoch on the responding node.
+    pub topology_epoch: u64,
+}
+
 /// State of an active shard migration.
 ///
 /// The lifecycle follows an explicit handoff protocol:
@@ -698,6 +737,27 @@ impl MigrationManager {
         self.active
             .iter()
             .any(|p| p.shard == shard && !p.is_complete() && p.state != MigrationState::Failed)
+    }
+
+    /// Project the per-shard fields this tracker can answer into a
+    /// [`KeyDiagnosis`]. The remaining fields (node id, shard-table view,
+    /// has_local_data, topology epoch) are filled in by the caller because
+    /// they live outside this struct.
+    ///
+    /// Used by `OP_ADMIN_DIAGNOSE_KEY` to dump per-record migration state
+    /// when the integration-test migration-reads barrier times out.
+    pub fn diagnose_key_routing(&self, shard: u16) -> KeyDiagnosis {
+        KeyDiagnosis {
+            shard,
+            this_node_id: 0,
+            local_view_canonical_master_id: 0,
+            has_local_data: false,
+            is_local_master_of_shard: false,
+            has_pending_inbound: self.has_pending_inbound(shard),
+            is_shard_fenced: self.is_shard_fenced(shard),
+            is_migrating_shard: self.is_migrating_shard(shard),
+            topology_epoch: 0,
+        }
     }
 
     /// Number of in-progress migrations (excludes Complete and Failed).
@@ -2740,5 +2800,55 @@ mod tests {
             metrics.migration_entries_applied_total.get() - before_entries >= 10,
             "migration_entries_applied_total must advance by ≥ records migrated"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // KeyDiagnosis: per-shard tracker projection used by OP_ADMIN_DIAGNOSE_KEY
+    // -----------------------------------------------------------------------
+
+    /// `diagnose_key_routing` must reflect inbound and fence state for the
+    /// requested shard, and must report cleanly for shards the tracker has
+    /// never heard of.
+    #[test]
+    fn diagnose_key_routing_returns_tracker_state() {
+        let mut mgr = MigrationManager::new();
+
+        // Shard 5: pending inbound from some source.
+        mgr.mark_inbound_active(5);
+        // Shard 7: writes fenced (we are the source, baseline complete).
+        mgr.fence_shard(7);
+        // Also drive `is_migrating_shard` so we can verify it: start an
+        // outbound active migration for shard 7 from this node's view.
+        let task = MigrationTask {
+            shard: 7,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+
+        let d5 = mgr.diagnose_key_routing(5);
+        assert_eq!(d5.shard, 5);
+        assert!(d5.has_pending_inbound, "shard 5 should be pending inbound");
+        assert!(!d5.is_shard_fenced, "shard 5 should not be fenced");
+
+        let d7 = mgr.diagnose_key_routing(7);
+        assert_eq!(d7.shard, 7);
+        assert!(d7.is_shard_fenced, "shard 7 should be fenced");
+        assert!(
+            d7.is_migrating_shard,
+            "shard 7 should be reported as actively migrating"
+        );
+
+        // Shard the tracker has never seen — every flag must be false.
+        let d99 = mgr.diagnose_key_routing(99);
+        assert_eq!(d99.shard, 99);
+        assert!(!d99.has_pending_inbound);
+        assert!(!d99.is_shard_fenced);
+        assert!(!d99.is_migrating_shard);
     }
 }

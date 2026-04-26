@@ -279,6 +279,7 @@ pub(crate) fn handle_request(
         OP_PROCESS_EXPIRED_PRESERVATIONS => handle_process_expired(request, engine, redo_log),
         OP_GET_PARTITION_MAP => handle_get_partition_map(request, cluster),
         OP_GET_COMMITTED_TOPOLOGY => handle_get_committed_topology(request, cluster),
+        OP_ADMIN_DIAGNOSE_KEY => handle_admin_diagnose_key(request, engine, cluster),
         OP_PING => ResponseFrame {
             request_id: request.request_id,
             status: STATUS_OK,
@@ -4454,6 +4455,110 @@ fn handle_get_committed_topology(
     }
 }
 
+/// Handle `OP_ADMIN_DIAGNOSE_KEY`: return per-record diagnostic info for a
+/// list of txids.
+///
+/// See the doc comment on [`OP_ADMIN_DIAGNOSE_KEY`] for the exact wire
+/// layout. This handler:
+///
+/// 1. Parses `[count: u32 LE][txid: 32B] * count` from the request.
+/// 2. Rejects malformed payloads (no count prefix, length mismatch, or
+///    `count > ADMIN_DIAGNOSE_KEY_MAX_TXIDS`) with `STATUS_ERROR` /
+///    `ERR_INTERNAL`.
+/// 3. For each txid, queries the migration tracker (via
+///    `MigrationManager::diagnose_key_routing`) and the local shard
+///    table / index to produce one [`KeyDiagnosis`] entry, then encodes
+///    them in declaration order.
+///
+/// Works in single-node mode (no cluster) by returning a defaulted
+/// diagnosis where shard-table / migration fields are zero/false.
+fn handle_admin_diagnose_key(
+    req: &RequestFrame,
+    engine: &Engine,
+    cluster: Option<&RunningCluster>,
+) -> ResponseFrame {
+    let payload = &req.payload;
+    if payload.len() < 4 {
+        return error_response(
+            req.request_id,
+            ERR_INTERNAL,
+            "malformed admin diagnose: missing count",
+        );
+    }
+    let count = u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes")) as usize;
+    if count as u32 > ADMIN_DIAGNOSE_KEY_MAX_TXIDS {
+        return error_response(
+            req.request_id,
+            ERR_INTERNAL,
+            "malformed admin diagnose: count exceeds cap",
+        );
+    }
+    let expected_len = 4usize + count.saturating_mul(32);
+    if payload.len() != expected_len {
+        return error_response(
+            req.request_id,
+            ERR_INTERNAL,
+            "malformed admin diagnose: length mismatch",
+        );
+    }
+
+    let mut response = Vec::with_capacity(4 + count * KEY_DIAGNOSIS_ENCODED_SIZE);
+    response.extend_from_slice(&(count as u32).to_le_bytes());
+
+    for i in 0..count {
+        let off = 4 + i * 32;
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&payload[off..off + 32]);
+        let key = TxKey { txid };
+        let shard = ShardTable::shard_for_key(&key);
+
+        // Migration tracker fields.
+        let mut diag = match cluster {
+            Some(c) => c.diagnose_key_routing(shard),
+            None => crate::cluster::migration::KeyDiagnosis {
+                shard,
+                this_node_id: 0,
+                local_view_canonical_master_id: 0,
+                has_local_data: false,
+                is_local_master_of_shard: false,
+                has_pending_inbound: false,
+                is_shard_fenced: false,
+                is_migrating_shard: false,
+                topology_epoch: 0,
+            },
+        };
+
+        // Index lookup is in-memory and cheap; no async needed.
+        diag.has_local_data = engine.lookup_cached(&key).is_some();
+
+        encode_key_diagnosis(&diag, &mut response);
+    }
+
+    ResponseFrame {
+        request_id: req.request_id,
+        status: STATUS_OK,
+        payload: response,
+    }
+}
+
+/// Append the on-the-wire encoding of a [`KeyDiagnosis`] to `out`.
+///
+/// Layout matches the doc comment on [`OP_ADMIN_DIAGNOSE_KEY`] and
+/// writes exactly [`KEY_DIAGNOSIS_ENCODED_SIZE`] bytes.
+fn encode_key_diagnosis(d: &crate::cluster::migration::KeyDiagnosis, out: &mut Vec<u8>) {
+    let start = out.len();
+    out.extend_from_slice(&d.shard.to_le_bytes());
+    out.extend_from_slice(&d.this_node_id.to_le_bytes());
+    out.extend_from_slice(&d.local_view_canonical_master_id.to_le_bytes());
+    out.push(u8::from(d.has_local_data));
+    out.push(u8::from(d.is_local_master_of_shard));
+    out.push(u8::from(d.has_pending_inbound));
+    out.push(u8::from(d.is_shard_fenced));
+    out.push(u8::from(d.is_migrating_shard));
+    out.extend_from_slice(&d.topology_epoch.to_le_bytes());
+    debug_assert_eq!(out.len() - start, KEY_DIAGNOSIS_ENCODED_SIZE);
+}
+
 // ---------------------------------------------------------------------------
 // Tests — Layer 1 dispatch tests (no TCP, no Docker)
 // ---------------------------------------------------------------------------
@@ -7870,5 +7975,149 @@ mod tests {
             Some(sm.id),
             "direct spend_multi should parent its inner apply span",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // OP_ADMIN_DIAGNOSE_KEY: per-txid diagnostic dump (Phase A diagnostic).
+    // -----------------------------------------------------------------------
+
+    /// `OP_ADMIN_DIAGNOSE_KEY` returns one fixed-width entry per requested
+    /// txid, in order, with the responding node's view of routing/migration
+    /// state for that key's shard. The shard field must match
+    /// `ShardTable::shard_for_key`.
+    #[test]
+    fn dispatch_admin_diagnose_key_returns_per_txid_state() {
+        let h = DispatchTestHarness::new();
+
+        // Two txids that fall in distinct shards (low 12 bits of LE u16).
+        let mut txid_a = [0u8; 32];
+        txid_a[0] = 0xAB;
+        txid_a[1] = 0x00;
+        let mut txid_b = [0u8; 32];
+        txid_b[0] = 0x42;
+        txid_b[1] = 0x01;
+
+        // Pre-populate txid_a so has_local_data is true for it.
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+
+        let shard_a = crate::cluster::shards::ShardTable::shard_for_key(&TxKey { txid: txid_a });
+        let shard_b = crate::cluster::shards::ShardTable::shard_for_key(&TxKey { txid: txid_b });
+        assert_ne!(
+            shard_a, shard_b,
+            "test depends on txids landing in distinct shards"
+        );
+
+        // Cluster harness with self_id=1 mastering all shards. Mark shard_b
+        // as having pending inbound, and shard_a as fenced — so each diag
+        // entry exercises a distinct flag.
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 12);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4801".parse().unwrap(),
+            )],
+            &members,
+            &[shard_b], // inbound_shards
+            &[],        // migrating_shards
+            &[shard_a], // fenced_shards
+            1,
+        );
+
+        // Encode payload: [count: u32 LE][txid: 32B] * count
+        let mut payload = Vec::with_capacity(4 + 64);
+        payload.extend_from_slice(&2u32.to_le_bytes());
+        payload.extend_from_slice(&txid_a);
+        payload.extend_from_slice(&txid_b);
+
+        let resp = h.request_with_cluster(OP_ADMIN_DIAGNOSE_KEY, payload, &cluster);
+        assert_eq!(resp.status, STATUS_OK, "diagnose_key should succeed");
+
+        // Response: [count: u32 LE][entry: KEY_DIAGNOSIS_ENCODED_SIZE bytes] * count
+        let body = &resp.payload;
+        assert!(body.len() >= 4, "response too short");
+        let count = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+        assert_eq!(count, 2, "expected 2 entries");
+
+        let entry_size = KEY_DIAGNOSIS_ENCODED_SIZE;
+        assert_eq!(
+            body.len(),
+            4 + count * entry_size,
+            "response length must match count * entry_size"
+        );
+
+        // Decode entry 0 (txid_a).
+        let off_a = 4;
+        let shard_field_a = u16::from_le_bytes(body[off_a..off_a + 2].try_into().unwrap());
+        assert_eq!(shard_field_a, shard_a, "entry 0 shard mismatch");
+        let this_node_a = u64::from_le_bytes(body[off_a + 2..off_a + 10].try_into().unwrap());
+        assert_eq!(this_node_a, 1, "this_node_id should be self_id=1");
+        let canonical_master_a =
+            u64::from_le_bytes(body[off_a + 10..off_a + 18].try_into().unwrap());
+        assert_eq!(canonical_master_a, 1, "canonical master should be 1");
+        let has_local_data_a = body[off_a + 18];
+        assert_eq!(has_local_data_a, 1, "txid_a was created → has_local_data");
+        let is_local_master_a = body[off_a + 19];
+        assert_eq!(is_local_master_a, 1, "self_id is master of every shard");
+        let has_pending_inbound_a = body[off_a + 20];
+        assert_eq!(has_pending_inbound_a, 0, "shard_a is not in inbound_shards");
+        let is_shard_fenced_a = body[off_a + 21];
+        assert_eq!(is_shard_fenced_a, 1, "shard_a was fenced");
+        let is_migrating_shard_a = body[off_a + 22];
+        assert_eq!(is_migrating_shard_a, 0, "no active migration for shard_a");
+        let topology_epoch_a = u64::from_le_bytes(body[off_a + 23..off_a + 31].try_into().unwrap());
+        assert_eq!(
+            topology_epoch_a,
+            cluster.topology_epoch(),
+            "topology_epoch must match coordinator"
+        );
+
+        // Decode entry 1 (txid_b).
+        let off_b = 4 + entry_size;
+        let shard_field_b = u16::from_le_bytes(body[off_b..off_b + 2].try_into().unwrap());
+        assert_eq!(shard_field_b, shard_b, "entry 1 shard mismatch");
+        let has_local_data_b = body[off_b + 18];
+        assert_eq!(
+            has_local_data_b, 0,
+            "txid_b was never created → no local data"
+        );
+        let has_pending_inbound_b = body[off_b + 20];
+        assert_eq!(has_pending_inbound_b, 1, "shard_b is in inbound_shards");
+        let is_shard_fenced_b = body[off_b + 21];
+        assert_eq!(is_shard_fenced_b, 0, "shard_b was not fenced");
+    }
+
+    /// Truncated payloads (count claims more txids than bytes provide) and
+    /// counts above the documented cap (64) must be rejected with
+    /// STATUS_ERROR / ERR_INTERNAL.
+    #[test]
+    fn dispatch_admin_diagnose_key_malformed_payload() {
+        let h = DispatchTestHarness::new();
+
+        // Empty payload — no count prefix.
+        let resp = h.request(OP_ADMIN_DIAGNOSE_KEY, vec![]);
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, _msg) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_INTERNAL);
+
+        // Count says 2 but only 1 txid worth of bytes follows.
+        let mut short = Vec::new();
+        short.extend_from_slice(&2u32.to_le_bytes());
+        short.extend_from_slice(&[0u8; 32]);
+        let resp = h.request(OP_ADMIN_DIAGNOSE_KEY, short);
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, _msg) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_INTERNAL);
+
+        // Count above cap (65 > 64).
+        let mut too_many = Vec::new();
+        too_many.extend_from_slice(&65u32.to_le_bytes());
+        too_many.extend_from_slice(&vec![0u8; 65 * 32]);
+        let resp = h.request(OP_ADMIN_DIAGNOSE_KEY, too_many);
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, _msg) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_INTERNAL);
     }
 }
