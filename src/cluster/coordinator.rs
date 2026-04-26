@@ -99,6 +99,9 @@ fn fail_migration_task_current_epoch(
     rollback: bool,
 ) -> bool {
     if !migration_epoch_current(shard_table, topology_epoch) {
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.topology_epoch_mismatch.inc();
+        }
         tracing::info!(
             shard = task.shard,
             task_epoch = topology_epoch,
@@ -145,6 +148,9 @@ fn complete_migration_task_current_epoch(
     commit: bool,
 ) -> bool {
     if !migration_epoch_current(shard_table, topology_epoch) {
+        if let Some(m) = crate::metrics::migration_metrics() {
+            m.topology_epoch_mismatch.inc();
+        }
         tracing::info!(
             shard = task.shard,
             task_epoch = topology_epoch,
@@ -2486,7 +2492,7 @@ fn run_migration_batch(
                         }
                         snapshot_seqs.push(snapshot_seq);
                         let shard_keys = keys_ref.get(&task.shard).unwrap_or(&empty_keys);
-                        let ok = match stream_shard_baseline(task, shard_keys, &engine, &mut stream, batch_size) {
+                        let ok = match stream_shard_baseline(task, shard_keys, &engine, &mut stream, batch_size, topology_epoch) {
                             Ok(_) => true,
                             Err(e) => {
                                 tracing::warn!(shard = task.shard, err = %e, "cluster: shard baseline failed");
@@ -2576,7 +2582,7 @@ fn run_migration_batch(
                         if !late_keys.is_empty() {
                             let late_refs: Vec<&TxKey> = late_keys.iter().collect();
                             if let Err(e) = stream_shard_baseline(
-                                task, &late_refs, &engine, &mut stream, batch_size,
+                                task, &late_refs, &engine, &mut stream, batch_size, topology_epoch,
                             ) {
                                 tracing::warn!(
                                     shard = task.shard,
@@ -2609,8 +2615,12 @@ fn run_migration_batch(
                         ) {
                             Ok(delta_ops) => {
                                 if !delta_ops.is_empty()
-                                    && let Err(e) =
-                                        send_delta_ops(&mut stream, task.shard, &delta_ops)
+                                    && let Err(e) = send_delta_ops(
+                                        &mut stream,
+                                        task.shard,
+                                        &delta_ops,
+                                        topology_epoch,
+                                    )
                                 {
                                     tracing::warn!(
                                         shard = task.shard,
@@ -3061,7 +3071,7 @@ fn migrate_single_shard(
     addr: SocketAddr,
     completed: &Arc<std::sync::atomic::AtomicU32>,
     failed: &Arc<std::sync::atomic::AtomicU32>,
-    _topology_epoch: u64,
+    topology_epoch: u64,
     batch_size: usize,
     fenced_bm: &crate::cluster::migration::AtomicShardBitmap,
     migrating_bm: &crate::cluster::migration::AtomicShardBitmap,
@@ -3151,7 +3161,12 @@ fn migrate_single_shard(
 
         // Phase 1: baseline
         let _baseline_manifest = match stream_shard_baseline(
-            task, shard_keys, engine, stream, batch_size,
+            task,
+            shard_keys,
+            engine,
+            stream,
+            batch_size,
+            topology_epoch,
         ) {
             Ok(m) => m,
             Err(e) => {
@@ -3260,8 +3275,14 @@ fn migrate_single_shard(
                 "cluster: shard fenced re-scan found missing pre-snapshot keys",
             );
             let late_key_refs: Vec<&TxKey> = late_keys.iter().collect();
-            if let Err(e) = stream_shard_baseline(task, &late_key_refs, engine, stream, batch_size)
-            {
+            if let Err(e) = stream_shard_baseline(
+                task,
+                &late_key_refs,
+                engine,
+                stream,
+                batch_size,
+                topology_epoch,
+            ) {
                 last_err = format!("late baseline: {e}");
                 if attempt < 2 {
                     continue;
@@ -3297,7 +3318,7 @@ fn migrate_single_shard(
                         fence_seq,
                         "cluster: shard streaming delta ops",
                     );
-                    if let Err(e) = send_delta_ops(stream, task.shard, &delta_ops) {
+                    if let Err(e) = send_delta_ops(stream, task.shard, &delta_ops, topology_epoch) {
                         tracing::warn!(shard = task.shard, err = %e, "cluster: shard delta streaming failed");
                         last_err = e;
                         delta_failed = true;
@@ -3349,8 +3370,14 @@ fn migrate_single_shard(
                 "cluster: shard post-delta stabilization found newly appeared keys",
             );
             let late_key_refs: Vec<&TxKey> = post_delta_late_keys.iter().collect();
-            if let Err(e) = stream_shard_baseline(task, &late_key_refs, engine, stream, batch_size)
-            {
+            if let Err(e) = stream_shard_baseline(
+                task,
+                &late_key_refs,
+                engine,
+                stream,
+                batch_size,
+                topology_epoch,
+            ) {
                 last_err = format!("post-delta baseline: {e}");
                 if attempt < 2 {
                     continue;
@@ -3425,7 +3452,7 @@ fn migrate_single_shard(
                 fence_seq,
                 manifest_entries.len(),
                 manifest_entries.len(),
-                _topology_epoch,
+                topology_epoch,
             ),
         );
         if let Err(e) = send_migration_complete(
@@ -3434,7 +3461,7 @@ fn migrate_single_shard(
             task.from_node,
             manifest_entries.len() as u64,
             fence_seq,
-            _topology_epoch,
+            topology_epoch,
             Some(stream),
             &manifest_hash,
             &manifest_entries,
@@ -3490,12 +3517,14 @@ fn migrate_single_shard(
 /// Returns the manifest hash accumulated over all streamed records
 /// (txid XOR generation for each record). The hash is order-independent
 /// so the target can verify content equality regardless of apply order.
+#[allow(clippy::too_many_arguments)]
 fn stream_shard_baseline(
     task: &MigrationTask,
     shard_keys: &[&TxKey],
     engine: &Engine,
     stream: &mut TcpStream,
     batch_size: usize,
+    cluster_key: u64,
 ) -> std::result::Result<ManifestHasher, String> {
     use crate::record::{UTXO_FROZEN, UTXO_SPENT};
     use crate::replication::protocol::{ReplicaBatch, ReplicaOp};
@@ -3641,10 +3670,10 @@ fn stream_shard_baseline(
             ops,
             trace_ctx: crate::observability::WireTraceContext::from_current_span(),
             source_node_id: Some(task.from_node.0),
-            // Phase B1: cluster_key plumbing comes in B2/B3. Coordinator
-            // currently has no epoch handle; 0 = "not set", which the
-            // receiver treats as wildcard until B2 wires gating.
-            cluster_key: 0,
+            // Phase B3: stamped with the source's live coordinator epoch
+            // so a topology-change race aborts the migration via the
+            // receiver's stale-epoch gate instead of corrupting state.
+            cluster_key,
         };
 
         // Send as OP_REPLICA_BATCH with FLAG_MIGRATION_BATCH so the
@@ -4182,6 +4211,7 @@ fn send_delta_ops(
     stream: &mut TcpStream,
     shard: u16,
     ops: &[crate::replication::protocol::ReplicaOp],
+    cluster_key: u64,
 ) -> std::result::Result<(), String> {
     use crate::replication::protocol::{ReplicaAck, ReplicaBatch};
 
@@ -4190,8 +4220,8 @@ fn send_delta_ops(
         ops: ops.to_vec(),
         trace_ctx: crate::observability::WireTraceContext::from_current_span(),
         source_node_id: None,
-        // Phase B1: epoch threading lands in B2/B3.
-        cluster_key: 0,
+        // Phase B3: stamped with the source's live coordinator epoch.
+        cluster_key,
     };
     let request = RequestFrame {
         request_id: shard as u64,
@@ -4720,6 +4750,29 @@ impl RunningCluster {
     /// fencing token for ownership validation.
     pub fn topology_epoch(&self) -> u64 {
         self.topology_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Receiver-side cluster epoch for replication batch gating
+    /// ([Phase B3](crate::replication::receiver::handle_replica_batch_with_tracker)).
+    ///
+    /// Returns the same value as [`topology_epoch`](Self::topology_epoch);
+    /// the alias name reflects the role this view plays on the wire — every
+    /// inbound `OP_REPLICA_BATCH` is rejected with `ERR_STALE_EPOCH` unless
+    /// its `cluster_key` either matches this value or is `0` (unknown,
+    /// V1-compat).
+    pub fn local_cluster_key(&self) -> u64 {
+        self.topology_epoch.load(Ordering::Acquire)
+    }
+
+    /// Shared `Arc<AtomicU64>` handle backing the local cluster epoch.
+    ///
+    /// The coordinator passes this clone into the local
+    /// [`ReplicationManager`](crate::replication::manager::ReplicationManager)
+    /// (so every outbound batch is stamped with the live epoch) and into the
+    /// local [`ReplicationReceiver`](crate::replication::receiver::ReplicationReceiver)
+    /// (so the gate sees epoch bumps without a setter call).
+    pub fn cluster_key_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.topology_epoch.clone()
     }
 
     /// Resolved replication ACK policy. None means best-effort (no enforcement).
@@ -5252,7 +5305,15 @@ mod tests {
             to_node: NodeId(2),
             is_master: true,
         };
-        stream_shard_baseline(&task, &[&live_key, &deleted_key], &engine, &mut stream, 64).unwrap();
+        stream_shard_baseline(
+            &task,
+            &[&live_key, &deleted_key],
+            &engine,
+            &mut stream,
+            64,
+            /* cluster_key */ 0,
+        )
+        .unwrap();
 
         let (request, batch) = receiver.join().unwrap();
         assert_eq!(request.op_code, crate::protocol::opcodes::OP_REPLICA_BATCH);
@@ -7081,5 +7142,297 @@ mod tests {
         );
 
         assert_eq!(cluster.alive_node_count(), 2);
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase B3 — migration completion gating + dispatch cluster_key plumbing
+    //
+    // 1. `complete_migration_task_current_epoch` must reject a task whose
+    //    epoch does not match the live `shard_table.version` (i.e. the
+    //    coordinator's `topology_epoch`) and bump the
+    //    `topology_epoch_mismatch` metric.
+    // 2. The same call with a matching epoch must succeed and leave the
+    //    metric untouched.
+    // 3. Dispatch's `OP_REPLICA_BATCH` handler must read the receiver's
+    //    cluster_key view from `RunningCluster::local_cluster_key()` rather
+    //    than the removed B2 global, observable as an `ERR_STALE_EPOCH`
+    //    rejection of an off-epoch batch.
+    // 4. The local `ReplicationManager` constructed via the coordinator's
+    //    `cluster_key_handle()` must stamp every outbound batch with the
+    //    live epoch (proves the source-side leg of the same Arc).
+    // ----------------------------------------------------------------------
+
+    fn install_test_migration_metrics() -> &'static crate::metrics::MigrationMetrics {
+        use crate::metrics::{MigrationMetrics, init_migration_metrics, migration_metrics};
+        use std::sync::OnceLock;
+        static TEST_METRICS: OnceLock<MigrationMetrics> = OnceLock::new();
+        let m_ref: &'static MigrationMetrics = TEST_METRICS.get_or_init(MigrationMetrics::new);
+        init_migration_metrics(m_ref);
+        migration_metrics().expect("metrics installed")
+    }
+
+    fn make_outbound_master_task(shard: u16, from: NodeId, to: NodeId) -> MigrationTask {
+        MigrationTask {
+            shard,
+            from_node: from,
+            to_node: to,
+            is_master: true,
+        }
+    }
+
+    /// `complete_migration_task_current_epoch` returns `false` and increments
+    /// `topology_epoch_mismatch` when the caller's epoch does not match the
+    /// live shard-table version.
+    #[test]
+    fn migration_complete_rejected_with_stale_epoch() {
+        let metrics = install_test_migration_metrics();
+        // Live shard table is at epoch 10; the migration task carries epoch 9.
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 10);
+        let shard_table: Arc<ShardTableLock<ShardTable>> = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let task = make_outbound_master_task(123, NodeId(1), NodeId(2));
+        // Pre-register the task so the "untracked" guard is not what
+        // returns false — we want the *epoch* guard to fire.
+        {
+            let mut mgr = migration.lock().unwrap();
+            mgr.start_outbound(
+                std::slice::from_ref(&task),
+                NodeId(1),
+                &std::collections::HashSet::new(),
+            );
+        }
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let before = metrics.topology_epoch_mismatch.get();
+        let accepted = complete_migration_task_current_epoch(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            /* task_epoch */ 9,
+            /* commit */ false,
+        );
+        let after = metrics.topology_epoch_mismatch.get();
+
+        assert!(
+            !accepted,
+            "stale-epoch completion (task=9, live=10) must be rejected",
+        );
+        assert_eq!(
+            after - before,
+            1,
+            "stale-epoch rejection must bump `topology_epoch_mismatch`",
+        );
+    }
+
+    /// `complete_migration_task_current_epoch` accepts the call when the
+    /// task's epoch matches the live shard-table version, and leaves
+    /// `topology_epoch_mismatch` untouched.
+    #[test]
+    fn migration_complete_accepted_with_current_epoch() {
+        let metrics = install_test_migration_metrics();
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 10);
+        let shard_table: Arc<ShardTableLock<ShardTable>> = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let task = make_outbound_master_task(124, NodeId(1), NodeId(2));
+        {
+            let mut mgr = migration.lock().unwrap();
+            mgr.start_outbound(
+                std::slice::from_ref(&task),
+                NodeId(1),
+                &std::collections::HashSet::new(),
+            );
+        }
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let before = metrics.topology_epoch_mismatch.get();
+        let accepted = complete_migration_task_current_epoch(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            /* task_epoch */ 10,
+            /* commit */ false,
+        );
+        let after = metrics.topology_epoch_mismatch.get();
+
+        assert!(
+            accepted,
+            "current-epoch completion (task=10, live=10) must be accepted",
+        );
+        assert_eq!(
+            after, before,
+            "matching-epoch completion must NOT bump `topology_epoch_mismatch`",
+        );
+    }
+
+    /// `RunningCluster::local_cluster_key()` returns the live `topology_epoch`,
+    /// and the dispatch `OP_REPLICA_BATCH` handler reads it through the
+    /// `cluster: &RunningCluster` parameter — proving the B2 global has
+    /// been replaced by coordinator-driven plumbing. We verify by sending
+    /// a stale-epoch batch and asserting the dispatch handler returns
+    /// `STATUS_ERROR + ERR_STALE_EPOCH`, which is only possible if the
+    /// receiver gate sees the cluster's live epoch (not 0).
+    #[test]
+    fn dispatch_routes_local_cluster_key_from_running_cluster() {
+        use crate::protocol::frame::RequestFrame;
+        use crate::protocol::opcodes::{ERR_STALE_EPOCH, OP_REPLICA_BATCH, STATUS_ERROR};
+        use crate::replication::protocol::ReplicaBatch;
+
+        let members = vec![NodeId(1)];
+        // Build a shard table at epoch 42 so cluster.local_cluster_key() == 42.
+        let table = ShardTable::compute_with_epoch(&members, 1, 42);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4801".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+
+        assert_eq!(
+            cluster.local_cluster_key(),
+            42,
+            "cluster.local_cluster_key() must surface the live topology epoch",
+        );
+        assert_eq!(
+            cluster.cluster_key_handle().load(Ordering::Acquire),
+            42,
+            "shared Arc must carry the same value as the accessor",
+        );
+
+        // Deliberately stamp the wire batch with a stale epoch (5 != 42).
+        let batch = ReplicaBatch {
+            first_sequence: 100,
+            ops: vec![],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 5,
+        };
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_REPLICA_BATCH,
+            flags: 0,
+            payload: batch.serialize(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = crate::server::dispatch::handle_request(
+            &req,
+            &test_engine(),
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "dispatch must reject a stale-epoch batch — proving the gate \
+             reads cluster.local_cluster_key() (=42), not the removed global (=0)",
+        );
+        assert!(
+            resp.payload.len() >= 2,
+            "STATUS_ERROR payload must carry an error_code prefix",
+        );
+        let err_code = u16::from_le_bytes([resp.payload[0], resp.payload[1]]);
+        assert_eq!(
+            err_code, ERR_STALE_EPOCH,
+            "dispatch must surface the cluster-key gate's ERR_STALE_EPOCH",
+        );
+    }
+
+    /// The local `ReplicationManager` constructed with the coordinator's
+    /// `cluster_key_handle()` stamps every outbound batch with the live
+    /// `topology_epoch`. Mirrors the pattern of
+    /// `replication::manager::tests::manager_attaches_current_cluster_key`
+    /// but drives the handle from a `RunningCluster` so the coordinator
+    /// wiring (Phase B3) is proven end-to-end: the manager sees epoch
+    /// bumps to the same `Arc<AtomicU64>` the coordinator owns.
+    #[test]
+    fn manager_attaches_cluster_key_from_topology_epoch() {
+        use crate::replication::manager::{
+            InMemoryTransport, ReplicationConfig, ReplicationManager,
+        };
+        use crate::replication::protocol::{ReplicaAck, ReplicaOp};
+
+        // Mirror `spawn_auto_ack_replica`: a replica thread that recv's,
+        // ACKs `Ok { through_sequence }`, and returns the captured batches.
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 99);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4901".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4902".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        assert_eq!(cluster.local_cluster_key(), 99);
+
+        let (master_t, replica_t) = InMemoryTransport::pair();
+        let handle = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            while let Ok(batch) = replica_t.recv_batch(Duration::from_secs(1)) {
+                let ack = ReplicaAck::Ok {
+                    through_sequence: batch.last_sequence(),
+                };
+                replica_t.send_ack(&ack).unwrap();
+                received.push(batch);
+            }
+            received
+        });
+
+        let mut mgr = ReplicationManager::with_cluster_key(
+            ReplicationConfig::default(),
+            vec![Box::new(master_t)],
+            cluster.cluster_key_handle(),
+        );
+
+        let mut txid = [0u8; 32];
+        txid[0] = 1;
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: TxKey { txid },
+            offset: 0,
+            master_generation: 1,
+        }];
+        mgr.replicate_batch(&ops).expect("replicate batch");
+
+        // Drive an in-place epoch bump on the shared Arc. The manager
+        // must observe it on the very next batch, proving it reads the
+        // live atomic on every send (not a snapshot at construction).
+        cluster.cluster_key_handle().store(123, Ordering::Release);
+        mgr.replicate_batch(&ops)
+            .expect("replicate batch (post-bump)");
+
+        // Drop the manager so the replica's `recv_batch` returns Err and
+        // the thread joins. Without this, the test would block forever
+        // because the spawned reader is still listening on the channel.
+        drop(mgr);
+        let received = handle.join().expect("replica thread joined");
+        assert_eq!(received.len(), 2, "manager should send exactly two batches");
+        assert_eq!(
+            received[0].cluster_key, 99,
+            "first batch must be stamped with the coordinator's initial cluster_key (99)",
+        );
+        assert_eq!(
+            received[1].cluster_key, 123,
+            "the post-bump batch must carry the new cluster_key (123) — \
+             proving the manager reads the live shared Arc, not a snapshot",
+        );
     }
 }

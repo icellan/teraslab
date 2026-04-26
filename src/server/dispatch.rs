@@ -106,28 +106,6 @@ static REPLICATION_INTENT_TRACKER: std::sync::OnceLock<
 /// Monotonic diagnostic high-water mark across all source streams.
 static DISPATCH_REPLICA_LAST_APPLIED: AtomicU64 = AtomicU64::new(0);
 
-/// Receiver-side cluster epoch handle for dispatch-routed
-/// `OP_REPLICA_BATCH` frames. Initialized at coordinator startup
-/// (Phase B3) and shared with the local
-/// [`ReplicationManager`](crate::replication::manager::ReplicationManager).
-/// A value of `0` (the default) means "unknown" — the cluster-key gate
-/// in [`handle_replica_batch_with_tracker`](crate::replication::receiver::handle_replica_batch_with_tracker)
-/// accepts all batches, preserving V1-compat behavior.
-static DISPATCH_LOCAL_CLUSTER_KEY: AtomicU64 = AtomicU64::new(0);
-
-/// Install the dispatch-routed receiver's view of the cluster epoch.
-///
-/// Idempotent. Coordinator (Phase B3) calls this once at startup and
-/// updates the same atomic on every cluster-key bump.
-pub fn set_dispatch_local_cluster_key(cluster_key: u64) {
-    DISPATCH_LOCAL_CLUSTER_KEY.store(cluster_key, std::sync::atomic::Ordering::Release);
-}
-
-/// Read the dispatch-routed receiver's current view of the cluster epoch.
-pub fn dispatch_local_cluster_key() -> u64 {
-    DISPATCH_LOCAL_CLUSTER_KEY.load(std::sync::atomic::Ordering::Acquire)
-}
-
 /// Global metrics reference. Initialized during server startup via
 /// `init_dispatch_metrics()`. Used to increment operation counters
 /// without threading metrics through every handler function.
@@ -339,6 +317,12 @@ pub(crate) fn handle_request(
                     cluster.mark_inbound_active(shard);
                 }
             }
+            // Phase B3: route the receiver's local cluster_key view through
+            // the coordinator-owned `RunningCluster` accessor instead of a
+            // global atomic. When dispatch is invoked without a cluster
+            // (single-node tests, non-clustered mode) the gate falls back to
+            // `0` which preserves the V1-compat "accept all" behavior.
+            let local_cluster_key = cluster.map(|c| c.local_cluster_key()).unwrap_or(0);
             if let Some(applied) = REPLICA_APPLIED_TRACKER.get() {
                 handle_replica_batch_with_tracker(
                     request,
@@ -346,7 +330,7 @@ pub(crate) fn handle_request(
                     &DISPATCH_REPLICA_LAST_APPLIED,
                     applied,
                     DEFAULT_STREAM_KEY,
-                    dispatch_local_cluster_key(),
+                    local_cluster_key,
                 )
             } else {
                 handle_replica_batch(request, engine, &DISPATCH_REPLICA_LAST_APPLIED)
@@ -1082,6 +1066,9 @@ fn replicate_all_ops(
         cluster.replication_timeout(),
         cluster.migration_pressure_active(),
     );
+    // Phase B3: stamp every outbound batch with the live coordinator
+    // epoch so the receiver's gate can reject stale-cluster writes.
+    let cluster_key = cluster.local_cluster_key();
     let results: Vec<std::result::Result<(), String>> = REPL_RUNTIME.block_on(async {
         let mut handles = Vec::with_capacity(by_addr.len());
         for (addr, ops) in by_addr {
@@ -1094,8 +1081,7 @@ fn replicate_all_ops(
                     ops,
                     trace_ctx: crate::observability::WireTraceContext::from_current_span(),
                     source_node_id: Some(source_node_id),
-                    // Phase B1: cluster_key plumbing lands in B2.
-                    cluster_key: 0,
+                    cluster_key,
                 };
                 send_replica_batch_to(addr, &batch, ack_timeout)
             }));
@@ -3417,7 +3403,10 @@ fn handle_delete_batch(
                         ops: vec![create_op],
                         trace_ctx: None,
                         source_node_id: None,
-                        // Phase B1: cluster_key plumbing lands in B2/B3.
+                        // Self-compensation path: applies through the
+                        // ungated `handle_replica_batch` so cluster_key
+                        // gating does not apply. The wire field is
+                        // therefore left as the V1-compat sentinel `0`.
                         cluster_key: 0,
                     }
                     .serialize(),

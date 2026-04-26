@@ -1122,6 +1122,14 @@ pub struct MigrationMetrics {
     pub migration_phase_delta: AtomicU32,
     /// Shards that have completed handoff and are now serving on the new owner.
     pub migration_phase_serving_new: AtomicU32,
+    /// Number of times a migration completion or failure was rejected because
+    /// the bookkeeping task's `topology_epoch` did not match the live
+    /// epoch on the coordinator.
+    ///
+    /// A non-zero counter usually indicates that a topology change (membership
+    /// add/remove) raced an in-flight migration — the operator-visible
+    /// signal that stale-epoch gating did its job.
+    pub topology_epoch_mismatch: PaddedCounter,
 }
 
 /// Number of {direction, role} buckets for migration byte counters.
@@ -1180,6 +1188,7 @@ impl MigrationMetrics {
             migration_phase_copying: AtomicU32::new(0),
             migration_phase_delta: AtomicU32::new(0),
             migration_phase_serving_new: AtomicU32::new(0),
+            topology_epoch_mismatch: PaddedCounter::new(),
         }
     }
 

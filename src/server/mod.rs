@@ -35,7 +35,7 @@ pub(crate) struct ActiveStream {
 }
 
 impl ConnectionState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             streams: HashMap::new(),
         }

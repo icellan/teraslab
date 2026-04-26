@@ -650,6 +650,11 @@ pub(crate) fn render_metrics_text(
             "teraslab_migration_phase_serving_new",
             mm.migration_phase_serving_new.load(Ordering::Relaxed) as u64,
         );
+        prom_counter(
+            &mut out,
+            "teraslab_topology_epoch_mismatch_total",
+            mm.topology_epoch_mismatch.get(),
+        );
     }
     if let Some(sw) = swim_metrics() {
         prom_counter(
