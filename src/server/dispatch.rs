@@ -4656,7 +4656,7 @@ fn handle_partition_version_report(
             "malformed partition version report: missing cluster_key",
         );
     }
-    let request_cluster_key = u64::from_le_bytes(req.payload[0..8].try_into().expect("8 bytes"));
+    let request_cluster_key = u64::from_le_bytes(req.payload[0..8].try_into().unwrap_or([0u8; 8]));
 
     let (self_id, local_cluster_key) = match cluster {
         Some(c) => (c.self_id().0, c.local_cluster_key()),

@@ -1475,7 +1475,6 @@ impl ClusterCoordinator {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// Activate a new topology without a collected partition view.
     ///
     /// Preserved as a thin wrapper for callers that bypass the exchange phase
@@ -1899,7 +1898,7 @@ impl ClusterCoordinator {
         inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
         total_timeout: std::time::Duration,
     ) -> std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> {
-        let mut phase = ExchangePhase::new(0, members.len(), total_timeout);
+        let mut phase = ExchangePhase::new(cluster_key, members.len(), total_timeout);
 
         // Self-report (no TCP).
         let self_entries =
