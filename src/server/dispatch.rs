@@ -280,6 +280,7 @@ pub(crate) fn handle_request(
         OP_GET_PARTITION_MAP => handle_get_partition_map(request, cluster),
         OP_GET_COMMITTED_TOPOLOGY => handle_get_committed_topology(request, cluster),
         OP_ADMIN_DIAGNOSE_KEY => handle_admin_diagnose_key(request, engine, cluster),
+        OP_PARTITION_VERSION_REPORT => handle_partition_version_report(request, engine, cluster),
         OP_PING => ResponseFrame {
             request_id: request.request_id,
             status: STATUS_OK,
@@ -4627,6 +4628,99 @@ fn handle_admin_diagnose_key(
         request_id: req.request_id,
         status: STATUS_OK,
         payload: response,
+    }
+}
+
+/// Handle `OP_PARTITION_VERSION_REPORT`: return this node's per-shard data
+/// state so the coordinator can build a migration plan that reflects the
+/// actual on-disk distribution.
+///
+/// See the doc comment on [`OP_PARTITION_VERSION_REPORT`] for the wire layout.
+///
+/// `last_applied_seq` is reported as `engine.shard_record_count(shard)` —
+/// the engine does not currently track per-shard replication sequence numbers,
+/// and a non-zero record count is a safe proxy for "this node holds data for
+/// this shard". The migration-plan refinement only fires when the value is
+/// strictly greater than zero, so the proxy never causes a wrong skip.
+fn handle_partition_version_report(
+    req: &RequestFrame,
+    engine: &Engine,
+    cluster: Option<&RunningCluster>,
+) -> ResponseFrame {
+    // Reject mismatched cluster_key — a stale coordinator must not influence
+    // this node's view of the partition map.
+    if req.payload.len() < 8 {
+        return error_response(
+            req.request_id,
+            ERR_INTERNAL,
+            "malformed partition version report: missing cluster_key",
+        );
+    }
+    let request_cluster_key = u64::from_le_bytes(req.payload[0..8].try_into().expect("8 bytes"));
+
+    let (self_id, local_cluster_key) = match cluster {
+        Some(c) => (c.self_id().0, c.local_cluster_key()),
+        // Single-node mode: respond with empty entries and zero ids.
+        None => (0u64, 0u64),
+    };
+
+    if cluster.is_some() && request_cluster_key != local_cluster_key {
+        return error_response(
+            req.request_id,
+            ERR_STALE_EPOCH,
+            "partition version report: cluster_key mismatch",
+        );
+    }
+
+    let entries: Vec<(u16, u8, u8, u64)> = match cluster {
+        Some(c) => {
+            let table = c.shard_table();
+            let table_guard = table.read();
+            let inbound_bm = c.inbound_bitmap();
+            (0..crate::cluster::shards::NUM_SHARDS as u16)
+                .filter_map(|shard| {
+                    let count = engine.shard_record_count(shard);
+                    let assignment = table_guard.target_assignment(shard);
+                    let is_master = assignment.master == c.self_id();
+                    let is_subset = inbound_bm.test(shard);
+                    let is_replica = assignment.replicas.contains(&c.self_id());
+                    // Only emit entries where this node has any role or any data —
+                    // shards we neither own nor hold are uninteresting to the
+                    // coordinator and would just bloat the response.
+                    if !is_master && !is_replica && !is_subset && count == 0 {
+                        return None;
+                    }
+                    let mut flags = 0u8;
+                    if is_master {
+                        flags |= 0b01;
+                    }
+                    if is_subset {
+                        flags |= 0b10;
+                    }
+                    let replica_count =
+                        u8::try_from(assignment.replicas.len().min(255)).unwrap_or(255);
+                    Some((shard, flags, replica_count, count))
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+
+    let mut payload = Vec::with_capacity(20 + entries.len() * PARTITION_VERSION_ENTRY_SIZE);
+    payload.extend_from_slice(&self_id.to_le_bytes());
+    payload.extend_from_slice(&local_cluster_key.to_le_bytes());
+    payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (shard, flags, replica_count, last_applied_seq) in entries {
+        payload.extend_from_slice(&shard.to_le_bytes());
+        payload.push(flags);
+        payload.push(replica_count);
+        payload.extend_from_slice(&last_applied_seq.to_le_bytes());
+    }
+
+    ResponseFrame {
+        request_id: req.request_id,
+        status: STATUS_OK,
+        payload,
     }
 }
 

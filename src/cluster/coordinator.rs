@@ -259,6 +259,168 @@ fn old_master_available_for_handoff(
     committed_members.contains(&old_master) && live_addrs.contains_key(&old_master)
 }
 
+// ---------------------------------------------------------------------------
+// Phase D: exchange phase before migration
+// ---------------------------------------------------------------------------
+
+/// One node's view of a single shard's local data state.
+///
+/// Reported by every alive peer during the post-commit exchange phase so the
+/// coordinator can build a migration plan that reflects the *actual* on-disk
+/// distribution rather than a topology-derived guess.
+///
+/// `flags` packs two booleans:
+/// - bit 0 (`0b01`): this node believes it is the master of `shard` in the
+///   currently active shard table.
+/// - bit 1 (`0b10`): this node has a pending inbound migration for `shard`
+///   (i.e. is a subset master receiving data).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartitionVersionEntry {
+    /// Shard number (0..NUM_SHARDS).
+    pub shard: u16,
+    /// Bit-packed flags. See struct doc-comment for layout.
+    pub flags: u8,
+    /// Number of holders this node sees locally for the shard.
+    pub replica_count: u8,
+    /// Last replication sequence applied for this shard (0 if unknown).
+    pub last_applied_seq: u64,
+}
+
+/// In-progress collection of `PartitionVersionEntry` reports from cluster
+/// peers, anchored to a specific topology term.
+///
+/// Pure state with no I/O — fully unit-testable. The owning event loop is
+/// responsible for both recording reports and detecting timeout.
+#[derive(Debug)]
+pub struct ExchangePhase {
+    /// Topology term this exchange is anchored to.
+    pub term: u64,
+    expected: usize,
+    deadline: std::time::Instant,
+    received: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+}
+
+impl ExchangePhase {
+    /// Begin a new exchange for `term` expecting `expected_nodes` reports
+    /// (typically `members.len()`), with a wall-clock `timeout`.
+    pub fn new(term: u64, expected_nodes: usize, timeout: std::time::Duration) -> Self {
+        Self {
+            term,
+            expected: expected_nodes,
+            deadline: std::time::Instant::now() + timeout,
+            received: std::collections::HashMap::with_capacity(expected_nodes),
+        }
+    }
+
+    /// Record a report from `node`. Returns `true` once `expected` distinct
+    /// reports have been collected. Duplicate reports for the same node
+    /// overwrite the previous entry but never advance the count beyond
+    /// `expected`.
+    pub fn record(&mut self, node: NodeId, entries: Vec<PartitionVersionEntry>) -> bool {
+        self.received.insert(node, entries);
+        self.is_complete()
+    }
+
+    /// `true` once `expected` distinct reports have arrived.
+    pub fn is_complete(&self) -> bool {
+        self.received.len() >= self.expected
+    }
+
+    /// `true` once the configured deadline has elapsed.
+    pub fn is_timed_out(&self) -> bool {
+        std::time::Instant::now() >= self.deadline
+    }
+
+    /// Borrow the collected per-node partition view.
+    pub fn partition_view(&self) -> &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> {
+        &self.received
+    }
+}
+
+/// Build a migration plan that takes the collected partition view into
+/// account.
+///
+/// Starts from the topology-derived `ShardTable::migration_plan(old, new)`
+/// and refines it:
+///
+/// - If the partition view shows the *new master* already has data for a
+///   shard (`last_applied_seq > 0` reported by the new master itself), the
+///   migration task for that shard is skipped — the data is already in
+///   place.
+/// - If the partition view shows the planned source has no data
+///   (`last_applied_seq == 0`) but a replica reports `last_applied_seq > 0`,
+///   the source is rewritten to the replica.
+/// - If `partition_view` is empty (e.g. the exchange timed out), the
+///   topology-derived plan is returned unchanged.
+pub fn build_plan_from_partition_view(
+    old_table: &ShardTable,
+    new_table: &ShardTable,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+    _self_id: NodeId,
+) -> Vec<MigrationTask> {
+    let base = ShardTable::migration_plan(old_table, new_table);
+    if partition_view.is_empty() {
+        return base;
+    }
+
+    // Index: (node, shard) -> last_applied_seq.
+    let mut seq_by_node_shard: std::collections::HashMap<(NodeId, u16), u64> =
+        std::collections::HashMap::new();
+    for (node, entries) in partition_view {
+        for e in entries {
+            seq_by_node_shard.insert((*node, e.shard), e.last_applied_seq);
+        }
+    }
+
+    let mut refined = Vec::with_capacity(base.len());
+    for task in base {
+        // Skip migration if the new master itself already reports data for this shard.
+        let new_master_has_data = seq_by_node_shard
+            .get(&(task.to_node, task.shard))
+            .copied()
+            .unwrap_or(0)
+            > 0;
+        if new_master_has_data {
+            continue;
+        }
+
+        // If the planned source reports no data but a known replica reports data,
+        // rewrite the source to that replica.
+        let source_has_data = seq_by_node_shard
+            .get(&(task.from_node, task.shard))
+            .copied()
+            .unwrap_or(0)
+            > 0;
+        if !source_has_data {
+            let old_assignment = old_table.target_assignment(task.shard);
+            let mut better_source: Option<NodeId> = None;
+            for r in &old_assignment.replicas {
+                if seq_by_node_shard
+                    .get(&(*r, task.shard))
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+                {
+                    better_source = Some(*r);
+                    break;
+                }
+            }
+            if let Some(src) = better_source {
+                refined.push(MigrationTask {
+                    shard: task.shard,
+                    from_node: src,
+                    to_node: task.to_node,
+                    is_master: task.is_master,
+                });
+                continue;
+            }
+        }
+
+        refined.push(task);
+    }
+    refined
+}
+
 /// Cluster coordinator configuration.
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
@@ -434,6 +596,18 @@ impl ClusterCoordinator {
         let inbound_bm_event = inbound_atomic.clone();
         let (topology_commit_tx, topology_commit_rx) = std::sync::mpsc::channel();
         let topology_commit_tx_event = topology_commit_tx.clone();
+        // Phase D: exchange phase channel.
+        // After every multi-node topology commit, an exchange thread collects
+        // OP_PARTITION_VERSION_REPORT from peers, then signals back here so
+        // the event loop can build the migration plan against the actual
+        // distribution rather than a topology-derived guess.
+        type ExchangeResult = (
+            Vec<NodeId>,
+            u64,
+            std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+        );
+        let (exchange_complete_tx, exchange_complete_rx) =
+            std::sync::mpsc::channel::<ExchangeResult>();
 
         // Derive inbound/topology state paths before cluster_state_path is moved into the closure.
         let inbound_state_path = cluster_state_path.as_ref().map(|p| {
@@ -769,12 +943,44 @@ impl ClusterCoordinator {
                         );
                         continue;
                     }
+
+                    // Phase D: for multi-node clusters, run the exchange phase
+                    // before activating. The activation itself happens later
+                    // when the exchange thread reports results into
+                    // `exchange_complete_rx`. Single-node clusters skip the
+                    // exchange entirely — there are no peers to query and no
+                    // data distribution to discover.
+                    if members.len() > 1 {
+                        let exchange_tx = exchange_complete_tx.clone();
+                        let node_addrs_x = node_addrs.clone();
+                        let engine_x = engine.clone();
+                        let shard_table_x = shard_table.clone();
+                        let inbound_bm_x = inbound_bm_event.clone();
+                        let cluster_key = term;
+                        let members_x = members.clone();
+                        std::thread::spawn(move || {
+                            let view = Self::run_exchange_phase(
+                                &members_x,
+                                self_id,
+                                cluster_key,
+                                &node_addrs_x,
+                                &engine_x,
+                                &shard_table_x,
+                                &inbound_bm_x,
+                                std::time::Duration::from_millis(2000),
+                            );
+                            let _ = exchange_tx.send((members_x, term, view));
+                        });
+                        continue;
+                    }
+
+                    // Single-node cluster: activate immediately.
                     last_activated_term = term;
                     topology_epoch.store(term, Ordering::Relaxed);
                     tracing::info!(
                         term,
                         epoch = term,
-                        "cluster: activating topology from commit signal"
+                        "cluster: activating topology from commit signal (single-node, no exchange)",
                     );
                     Self::activate_topology(
                         &members,
@@ -793,6 +999,66 @@ impl ClusterCoordinator {
                         &migrating_bm_event,
                         &inbound_bm_event,
                         &active_topology_members_event,
+                    );
+                    last_activation_at = std::time::Instant::now();
+                    if let Some(ref path) = cluster_state_path {
+                        let peak = peak_size_event.load(Ordering::Relaxed) as u64;
+                        persist_cluster_state(path, peak, term);
+                    }
+                    if let Some(ref path) = outbound_state_path_event {
+                        crate::cluster::migration::persist_outbound_state(
+                            path,
+                            &migration.lock().unwrap(),
+                        );
+                    }
+                }
+
+                // Phase D: poll exchange-phase results. When the exchange
+                // thread completes (or times out, returning a partial view),
+                // build the migration plan against the collected partition
+                // view and activate.
+                while let Ok((members, term, partition_view)) = exchange_complete_rx.try_recv() {
+                    let active_members = active_topology_members_event.read().unwrap().clone();
+                    if topology_commit_already_activated(
+                        term,
+                        last_activated_term,
+                        &active_members,
+                        &members,
+                    ) {
+                        tracing::debug!(
+                            term,
+                            last_activated_term,
+                            members = members.len(),
+                            "cluster: skipping duplicate exchange-phase activation",
+                        );
+                        continue;
+                    }
+                    last_activated_term = term;
+                    topology_epoch.store(term, Ordering::Relaxed);
+                    tracing::info!(
+                        term,
+                        epoch = term,
+                        view_size = partition_view.len(),
+                        "cluster: activating topology after exchange phase",
+                    );
+                    Self::activate_topology_with_view(
+                        &members,
+                        term,
+                        self_id,
+                        rf,
+                        &shard_table,
+                        &migration,
+                        &node_addrs,
+                        &engine,
+                        &redo_for_events,
+                        max_migration_threads,
+                        migration_pool_size,
+                        migration_batch_size,
+                        &fenced_bm_event,
+                        &migrating_bm_event,
+                        &inbound_bm_event,
+                        &active_topology_members_event,
+                        &partition_view,
                     );
                     last_activation_at = std::time::Instant::now();
                     if let Some(ref path) = cluster_state_path {
@@ -1210,6 +1476,15 @@ impl ClusterCoordinator {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Activate a new topology without a collected partition view.
+    ///
+    /// Preserved as a thin wrapper for callers that bypass the exchange phase
+    /// (e.g. single-node bootstrap, fast-path activation, fallback proposer
+    /// self-vote). Equivalent to calling `activate_topology_with_view` with
+    /// an empty `partition_view`, which causes
+    /// [`build_plan_from_partition_view`] to fall back to the
+    /// topology-derived plan.
+    #[allow(clippy::too_many_arguments)]
     fn activate_topology(
         members: &[NodeId],
         epoch: u64,
@@ -1227,6 +1502,58 @@ impl ClusterCoordinator {
         migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
         inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
         active_topology_members: &Arc<RwLock<Vec<NodeId>>>,
+    ) {
+        let empty_view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        Self::activate_topology_with_view(
+            members,
+            epoch,
+            self_id,
+            rf,
+            shard_table,
+            migration,
+            node_addrs,
+            engine,
+            redo_for_events,
+            max_parallel_migrations,
+            migration_pool_size,
+            migration_batch_size,
+            fenced_bm,
+            migrating_bm,
+            inbound_bm,
+            active_topology_members,
+            &empty_view,
+        );
+    }
+
+    /// Activate a new topology, refining the migration plan with the supplied
+    /// partition view (collected during the post-commit exchange phase).
+    ///
+    /// When `partition_view` is empty, behaves identically to the legacy
+    /// pre-Phase-D logic — the migration plan is computed solely from the
+    /// topology diff. When populated, [`build_plan_from_partition_view`]
+    /// uses the per-node `last_applied_seq` data to skip migrations whose
+    /// destination already has the data, and to retarget the source onto a
+    /// replica when the planned source has none.
+    #[allow(clippy::too_many_arguments)]
+    fn activate_topology_with_view(
+        members: &[NodeId],
+        epoch: u64,
+        self_id: NodeId,
+        rf: u8,
+        shard_table: &Arc<ShardTableLock<ShardTable>>,
+        migration: &Arc<Mutex<MigrationManager>>,
+        node_addrs: &Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
+        engine: &Arc<Engine>,
+        redo_for_events: &Option<Arc<ParkingMutex<RedoLog>>>,
+        max_parallel_migrations: usize,
+        migration_pool_size: usize,
+        migration_batch_size: usize,
+        fenced_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+        migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+        inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+        active_topology_members: &Arc<RwLock<Vec<NodeId>>>,
+        partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
     ) {
         *active_topology_members.write().unwrap() = members.to_vec();
 
@@ -1272,7 +1599,13 @@ impl ClusterCoordinator {
         let old_table_snap = shard_table.read().clone();
         let old_epoch = old_table_snap.version;
         let new_table = ShardTable::compute_with_epoch(members, rf, epoch);
-        let new_plan = ShardTable::migration_plan(&old_table_snap, &new_table);
+        // Phase D: when a partition view is available, use it to skip
+        // migrations whose destination already has the data and to redirect
+        // the source onto a replica when the planned source has none.
+        // An empty view (e.g. exchange skipped or timed out) reduces to the
+        // legacy topology-derived plan.
+        let new_plan =
+            build_plan_from_partition_view(&old_table_snap, &new_table, partition_view, self_id);
         let new_replica_plan = ShardTable::replica_migration_plan(&old_table_snap, &new_table);
         drop(old_table_snap);
 
@@ -1546,6 +1879,85 @@ impl ClusterCoordinator {
                 );
             });
         }
+    }
+
+    /// Phase D: collect `OP_PARTITION_VERSION_REPORT` from every alive peer
+    /// (and the local node) and return the per-node partition view.
+    ///
+    /// Self-report is computed locally without TCP. Peers are queried in
+    /// parallel; an unreachable peer is treated as "no data" rather than
+    /// blocking the full per-peer timeout. The total wall-clock budget is
+    /// bounded by `total_timeout`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_exchange_phase(
+        members: &[NodeId],
+        self_id: NodeId,
+        cluster_key: u64,
+        node_addrs: &Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
+        engine: &Arc<Engine>,
+        shard_table: &Arc<ShardTableLock<ShardTable>>,
+        inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+        total_timeout: std::time::Duration,
+    ) -> std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> {
+        let mut phase = ExchangePhase::new(0, members.len(), total_timeout);
+
+        // Self-report (no TCP).
+        let self_entries =
+            build_self_partition_version_entries(self_id, engine.as_ref(), shard_table, inbound_bm);
+        phase.record(self_id, self_entries);
+
+        // Snapshot peer addresses up front.
+        let peer_addrs: Vec<(NodeId, SocketAddr)> = {
+            let addrs = node_addrs.read().unwrap();
+            members
+                .iter()
+                .filter(|n| **n != self_id)
+                .filter_map(|n| addrs.get(n).copied().map(|a| (*n, a)))
+                .collect()
+        };
+
+        if peer_addrs.is_empty() {
+            return phase.partition_view().clone();
+        }
+
+        // Query peers in parallel. Each peer thread sends its result over a
+        // shared channel; the collecting loop drains the channel until the
+        // total deadline elapses or every expected reply has arrived.
+        type PeerResult = (NodeId, Vec<PartitionVersionEntry>);
+        let (tx, rx) = std::sync::mpsc::channel::<PeerResult>();
+        for (peer, addr) in &peer_addrs {
+            let tx = tx.clone();
+            let peer = *peer;
+            let addr = *addr;
+            std::thread::spawn(move || {
+                let entries = match send_topology_frame(
+                    addr,
+                    OP_PARTITION_VERSION_REPORT,
+                    &cluster_key.to_le_bytes(),
+                ) {
+                    Ok(payload) => parse_partition_version_response(&payload).unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                };
+                let _ = tx.send((peer, entries));
+            });
+        }
+        drop(tx);
+
+        let deadline = std::time::Instant::now() + total_timeout;
+        for _ in 0..peer_addrs.len() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remaining) {
+                Ok((peer, entries)) => {
+                    phase.record(peer, entries);
+                }
+                Err(_) => break,
+            }
+        }
+
+        phase.partition_view().clone()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2014,6 +2426,80 @@ fn send_topology_frame(addr: SocketAddr, op_code: u16, payload: &[u8]) -> Result
     };
     let response = exchange_frame(&mut stream, &request)?;
     Ok(response.payload)
+}
+
+/// Phase D: build this node's `PartitionVersionEntry` list by reading the
+/// local shard table and engine state.
+///
+/// Mirrors the logic in the `OP_PARTITION_VERSION_REPORT` dispatch handler so
+/// the in-process self-report is byte-equivalent to what a peer would receive
+/// over the wire. Empty shards on which this node has no role are excluded
+/// to keep the view compact.
+fn build_self_partition_version_entries(
+    self_id: NodeId,
+    engine: &Engine,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+) -> Vec<PartitionVersionEntry> {
+    let table = shard_table.read();
+    let mut out = Vec::with_capacity(NUM_SHARDS);
+    for shard in 0..NUM_SHARDS as u16 {
+        let count = engine.shard_record_count(shard);
+        let assignment = table.target_assignment(shard);
+        let is_master = assignment.master == self_id;
+        let is_subset = inbound_bm.test(shard);
+        let is_replica = assignment.replicas.contains(&self_id);
+        if !is_master && !is_replica && !is_subset && count == 0 {
+            continue;
+        }
+        let mut flags = 0u8;
+        if is_master {
+            flags |= 0b01;
+        }
+        if is_subset {
+            flags |= 0b10;
+        }
+        let replica_count = u8::try_from(assignment.replicas.len().min(255)).unwrap_or(255);
+        out.push(PartitionVersionEntry {
+            shard,
+            flags,
+            replica_count,
+            last_applied_seq: count,
+        });
+    }
+    out
+}
+
+/// Phase D: parse an `OP_PARTITION_VERSION_REPORT` response payload into a
+/// list of [`PartitionVersionEntry`].
+///
+/// Returns `None` if the payload is truncated or `entry_count * 12` does not
+/// match the trailing bytes — callers treat this as "no data" so a malformed
+/// peer does not corrupt the partition view.
+fn parse_partition_version_response(payload: &[u8]) -> Option<Vec<PartitionVersionEntry>> {
+    if payload.len() < 20 {
+        return None;
+    }
+    let entry_count = u32::from_le_bytes(payload[16..20].try_into().ok()?) as usize;
+    let expected = 20 + entry_count * PARTITION_VERSION_ENTRY_SIZE;
+    if payload.len() != expected {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(entry_count);
+    for i in 0..entry_count {
+        let off = 20 + i * PARTITION_VERSION_ENTRY_SIZE;
+        let shard = u16::from_le_bytes(payload[off..off + 2].try_into().ok()?);
+        let flags = payload[off + 2];
+        let replica_count = payload[off + 3];
+        let last_applied_seq = u64::from_le_bytes(payload[off + 4..off + 12].try_into().ok()?);
+        entries.push(PartitionVersionEntry {
+            shard,
+            flags,
+            replica_count,
+            last_applied_seq,
+        });
+    }
+    Some(entries)
 }
 
 // ---------------------------------------------------------------------------
@@ -7860,6 +8346,116 @@ mod tests {
             rank_master_candidate(NodeId(4), NodeId(1), false, true),
             0,
             "evicted node must score 0"
+        );
+    }
+
+    // ── Phase D: exchange phase before migration ───────────────────────────
+
+    #[test]
+    fn no_migration_plan_until_exchange_complete() {
+        let members = [NodeId(1), NodeId(2), NodeId(3)];
+        let mut phase = ExchangePhase::new(5, members.len(), std::time::Duration::from_secs(2));
+        assert!(
+            !phase.is_complete(),
+            "should not be complete before any reports"
+        );
+        phase.record(NodeId(1), vec![]);
+        assert!(
+            !phase.is_complete(),
+            "should not be complete with 1/3 reports"
+        );
+        phase.record(NodeId(2), vec![]);
+        assert!(
+            !phase.is_complete(),
+            "should not be complete with 2/3 reports"
+        );
+        // Duplicate report from NodeId(2) must not double-count toward completion.
+        phase.record(NodeId(2), vec![]);
+        assert!(
+            !phase.is_complete(),
+            "duplicate report must not count toward completion"
+        );
+        phase.record(NodeId(3), vec![]);
+        assert!(
+            phase.is_complete(),
+            "should be complete with 3/3 unique reports"
+        );
+    }
+
+    #[test]
+    fn exchange_phase_collects_per_shard_versions() {
+        let mut phase = ExchangePhase::new(1, 2, std::time::Duration::from_secs(2));
+        let entries1 = vec![
+            PartitionVersionEntry {
+                shard: 0,
+                flags: 0b01,
+                replica_count: 1,
+                last_applied_seq: 100,
+            },
+            PartitionVersionEntry {
+                shard: 1,
+                flags: 0b00,
+                replica_count: 1,
+                last_applied_seq: 50,
+            },
+        ];
+        let entries2 = vec![PartitionVersionEntry {
+            shard: 0,
+            flags: 0b00,
+            replica_count: 1,
+            last_applied_seq: 90,
+        }];
+        phase.record(NodeId(10), entries1.clone());
+        phase.record(NodeId(20), entries2.clone());
+        let view = phase.partition_view();
+        assert_eq!(view.get(&NodeId(10)).unwrap(), &entries1);
+        assert_eq!(view.get(&NodeId(20)).unwrap(), &entries2);
+    }
+
+    #[test]
+    fn exchange_timeout_is_detected() {
+        let phase = ExchangePhase::new(1, 3, std::time::Duration::from_millis(0));
+        // Tick a moment to ensure the deadline has passed.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(
+            phase.is_timed_out(),
+            "zero-duration exchange must report timed out immediately"
+        );
+        assert!(
+            !phase.is_complete(),
+            "timed out exchange must not report complete"
+        );
+    }
+
+    #[test]
+    fn build_plan_uses_partition_view_to_skip_migration() {
+        use std::collections::HashMap;
+        let members_a = vec![NodeId(1), NodeId(2)];
+        let members_b = vec![NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&members_a, 2, 1);
+        let new_table = ShardTable::compute_with_epoch(&members_b, 2, 2);
+        let changed_shard = (0..4096u16)
+            .find(|&s| {
+                old_table.target_assignment(s).master != new_table.target_assignment(s).master
+            })
+            .expect("membership change must shift at least one shard");
+        let new_master = new_table.target_assignment(changed_shard).master;
+        let mut partition_view: HashMap<NodeId, Vec<PartitionVersionEntry>> = HashMap::new();
+        partition_view.insert(
+            new_master,
+            vec![PartitionVersionEntry {
+                shard: changed_shard,
+                flags: 0b01,
+                replica_count: 1,
+                last_applied_seq: 42,
+            }],
+        );
+        let tasks =
+            build_plan_from_partition_view(&old_table, &new_table, &partition_view, NodeId(1));
+        let task_for_shard = tasks.iter().find(|t| t.shard == changed_shard);
+        assert!(
+            task_for_shard.is_none(),
+            "must skip migration for shard {changed_shard} when new master already has data",
         );
     }
 }

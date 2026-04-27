@@ -1524,6 +1524,25 @@ mod tests {
         );
     }
 
+    /// Phase D invariant: `committed_term` (which serves as the cluster_key)
+    /// must NOT advance during the exchange phase. The exchange runs between
+    /// `on_membership_changed` (proposal) and quorum `handle_commit`. Since
+    /// only `handle_commit` advances `committed_term`, calling
+    /// `on_membership_changed` alone must leave it unchanged.
+    #[test]
+    fn cluster_key_unchanged_during_exchange() {
+        let ta = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let mems = vec![NodeId(1), NodeId(2)];
+        let initial_term = ta.committed_term();
+        let proposal = ta.on_membership_changed(&mems);
+        assert!(proposal.is_some(), "should produce a proposal");
+        assert_eq!(
+            ta.committed_term(),
+            initial_term,
+            "committed_term (cluster_key) must not advance during exchange phase — only after quorum commit",
+        );
+    }
+
     /// handle_propose: cluster formation recovery with proposal term EQUAL
     /// to committed term (not just greater). This is the boundary condition.
     #[test]

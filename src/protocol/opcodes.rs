@@ -75,6 +75,40 @@ pub const ADMIN_DIAGNOSE_KEY_MAX_TXIDS: u32 = 64;
 /// per-field layout.
 pub const KEY_DIAGNOSIS_ENCODED_SIZE: usize = 2 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 8;
 
+/// Per-shard partition version report exchanged during the post-commit
+/// exchange phase before a migration plan is built.
+///
+/// After every topology commit, the coordinator collects these reports from
+/// every alive peer to discover which nodes already hold which shards' data.
+/// The migration plan is then computed against this *actual* distribution
+/// instead of a derived-from-topology guess, eliminating master overallocation
+/// (`total_masters > 4096`) and stuck migrations.
+///
+/// Request payload (coordinator → peer):
+/// ```text
+///   cluster_key: u64 LE   (8 bytes)
+/// ```
+///
+/// Response payload (peer → coordinator):
+/// ```text
+///   node_id:     u64 LE   (8 bytes)
+///   cluster_key: u64 LE   (8 bytes)
+///   entry_count: u32 LE   (4 bytes)
+///   entries: PartitionVersionEntry * count    // entry_count entries, each 12 bytes
+/// ```
+///
+/// Each entry layout (12 bytes):
+/// ```text
+///   shard:            u16 LE   (2 bytes)
+///   flags:            u8       (1 byte; bit0=is_master, bit1=is_subset)
+///   replica_count:    u8       (1 byte)
+///   last_applied_seq: u64 LE   (8 bytes)
+/// ```
+pub const OP_PARTITION_VERSION_REPORT: u16 = 105;
+
+/// Encoded width of a single `PartitionVersionEntry` on the wire.
+pub const PARTITION_VERSION_ENTRY_SIZE: usize = 2 + 1 + 1 + 8;
+
 // Streaming
 pub const OP_STREAM_CHUNK: u16 = 200;
 pub const OP_STREAM_END: u16 = 201;
