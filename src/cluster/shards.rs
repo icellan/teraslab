@@ -171,9 +171,13 @@ impl ShardTable {
         self.version = new_table.version;
 
         // If no shards need copying, clear handoff state immediately.
+        // Also clear master_subset: no inbound migration will run, so these
+        // shards are never in a "receiving data" state regardless of ownership
+        // change.
         if all_serving {
             self.prev_assignments = None;
             self.handoff_state = None;
+            self.master_subset = vec![false; NUM_SHARDS];
         }
     }
 
@@ -1427,6 +1431,26 @@ mod tests {
         assert!(
             !active.is_subset_master(changed_shard),
             "shard {changed_shard} should not be subset after commit"
+        );
+    }
+
+    #[test]
+    fn partition_version_cleared_when_no_data_to_copy() {
+        // When shard_has_data returns false for all shards, begin_handoff_with
+        // takes the all_serving fast path and must clear master_subset even
+        // for shards whose master changed — no inbound migration will run.
+        let members_a = vec![NodeId(1), NodeId(2)];
+        let members_b = vec![NodeId(2), NodeId(3)];
+        let table_a = ShardTable::compute_with_epoch(&members_a, 2, 1);
+        let table_b = ShardTable::compute_with_epoch(&members_b, 2, 2);
+        let changed_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table_a.target_assignment(s).master != table_b.target_assignment(s).master)
+            .expect("membership change must move at least one shard");
+        let mut active = table_a.clone();
+        active.begin_handoff_with(&table_b, |_| false); // no data to copy
+        assert!(
+            !active.is_subset_master(changed_shard),
+            "shard {changed_shard} must not be subset when no inbound migration runs"
         );
     }
 }

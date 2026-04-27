@@ -4395,8 +4395,6 @@ pub fn load_peak_cluster_size(path: &std::path::Path) -> usize {
     load_cluster_state(path).0
 }
 
-/// A running cluster instance with all background threads active.
-/// Result of a `RunningCluster::is_master` query.
 /// Aerospike-style scoring for master election candidates.
 ///
 /// Scores: previous_master = 3, full_replica = 3, subset = 2, evicted = 0.
@@ -4406,6 +4404,8 @@ pub fn load_peak_cluster_size(path: &std::path::Path) -> usize {
 /// data) scores 2 so that the previous master or any full replica is
 /// preferred over it. An evicted node always scores 0 and must not be
 /// elected master under any circumstances.
+///
+/// Not yet wired into the coordinator election driver — that is Phase F.
 pub fn rank_master_candidate(
     node_id: NodeId,
     prev_master: NodeId,
@@ -4421,6 +4421,7 @@ pub fn rank_master_candidate(
     if is_subset { 2 } else { 3 }
 }
 
+/// Result of a [`RunningCluster::is_master`] query.
 ///
 /// Returned in place of a bare `bool` so that callers (specifically the
 /// dispatcher) can distinguish a cleanly-known non-master answer from the
@@ -4587,17 +4588,16 @@ impl RunningCluster {
             };
         }
         let shard = ShardTable::shard_for_key(key);
+        let auth_master = self.authoritative_master_for_shard(shard);
         // A node that is the authoritative master for a shard but still has
         // pending inbound migration data is a subset master: it must not
         // serve requests until migration completes.
-        if self.inbound_atomic.test(shard)
-            && self.authoritative_master_for_shard(shard) == self.self_id
-        {
+        if self.inbound_atomic.test(shard) && auth_master == self.self_id {
             return MasterQueryResult::Transitioning {
                 last_known_term: committed,
             };
         }
-        if self.authoritative_master_for_shard(shard) == self.self_id {
+        if auth_master == self.self_id {
             MasterQueryResult::Yes
         } else {
             MasterQueryResult::No
