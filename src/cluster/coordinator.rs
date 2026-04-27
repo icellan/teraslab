@@ -4397,6 +4397,30 @@ pub fn load_peak_cluster_size(path: &std::path::Path) -> usize {
 
 /// A running cluster instance with all background threads active.
 /// Result of a `RunningCluster::is_master` query.
+/// Aerospike-style scoring for master election candidates.
+///
+/// Scores: previous_master = 3, full_replica = 3, subset = 2, evicted = 0.
+/// The caller breaks ties by preferring the lower `NodeId`.
+///
+/// A node that is `is_subset` (new master still receiving inbound migration
+/// data) scores 2 so that the previous master or any full replica is
+/// preferred over it. An evicted node always scores 0 and must not be
+/// elected master under any circumstances.
+pub fn rank_master_candidate(
+    node_id: NodeId,
+    prev_master: NodeId,
+    is_subset: bool,
+    was_evicted: bool,
+) -> u8 {
+    if was_evicted {
+        return 0;
+    }
+    if node_id == prev_master {
+        return 3;
+    }
+    if is_subset { 2 } else { 3 }
+}
+
 ///
 /// Returned in place of a bare `bool` so that callers (specifically the
 /// dispatcher) can distinguish a cleanly-known non-master answer from the
@@ -4563,6 +4587,16 @@ impl RunningCluster {
             };
         }
         let shard = ShardTable::shard_for_key(key);
+        // A node that is the authoritative master for a shard but still has
+        // pending inbound migration data is a subset master: it must not
+        // serve requests until migration completes.
+        if self.inbound_atomic.test(shard)
+            && self.authoritative_master_for_shard(shard) == self.self_id
+        {
+            return MasterQueryResult::Transitioning {
+                last_known_term: committed,
+            };
+        }
         if self.authoritative_master_for_shard(shard) == self.self_id {
             MasterQueryResult::Yes
         } else {
@@ -7781,6 +7815,51 @@ mod tests {
             5,
             "cluster_key_handle() must observe the same advance (5) so \
              downstream manager/receiver readers see the new term",
+        );
+    }
+
+    // ── Phase C: subset master tracking ────────────────────────────────────
+
+    #[test]
+    fn election_skips_subset_master() {
+        let members = vec![NodeId(1)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 5);
+        let shard = 0u16;
+        let key = key_for_shard(shard);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:4841".parse().unwrap())],
+            &[NodeId(1)],
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+        match cluster.is_master(&key) {
+            MasterQueryResult::Transitioning { .. } => {}
+            other => {
+                panic!("subset master (has inbound) should return Transitioning, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn rank_master_candidate_scoring() {
+        assert!(
+            rank_master_candidate(NodeId(1), NodeId(1), false, false)
+                > rank_master_candidate(NodeId(2), NodeId(1), true, false),
+            "previous master must outscore subset candidate"
+        );
+        assert!(
+            rank_master_candidate(NodeId(2), NodeId(1), false, false)
+                > rank_master_candidate(NodeId(3), NodeId(1), true, false),
+            "full replica must outscore subset candidate"
+        );
+        assert_eq!(
+            rank_master_candidate(NodeId(4), NodeId(1), false, true),
+            0,
+            "evicted node must score 0"
         );
     }
 }

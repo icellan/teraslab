@@ -2851,4 +2851,22 @@ mod tests {
         assert!(!d99.is_shard_fenced);
         assert!(!d99.is_migrating_shard);
     }
+
+    // ── Phase C: subset/inbound tracking ───────────────────────────────────
+
+    #[test]
+    fn mark_inbound_complete_clears_subset() {
+        let mut mgr = MigrationManager::new();
+        let shard = 42u16;
+        assert!(mgr.mark_inbound_active(shard));
+        assert!(
+            mgr.has_pending_inbound(shard),
+            "inbound should be active before completion"
+        );
+        mgr.mark_inbound_complete_all(shard);
+        assert!(
+            !mgr.has_pending_inbound(shard),
+            "inbound (subset proxy) must be cleared after mark_inbound_complete_all"
+        );
+    }
 }

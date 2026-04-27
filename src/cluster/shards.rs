@@ -76,6 +76,10 @@ pub struct ShardTable {
     pub version: u64,
     /// Replication factor used to compute this table.
     rf: u8,
+    /// Tracks shards where the new master is still receiving inbound migration
+    /// data. A subset master must not be treated as authoritative until
+    /// migration completes — `is_master()` returns `Transitioning` for these.
+    master_subset: Vec<bool>,
 }
 
 impl ShardTable {
@@ -125,6 +129,7 @@ impl ShardTable {
             handoff_state: None,
             version: epoch,
             rf: replication_factor,
+            master_subset: vec![false; NUM_SHARDS],
         }
     }
 
@@ -147,17 +152,22 @@ impl ShardTable {
         shard_has_data: impl Fn(u16) -> bool,
     ) {
         let mut handoff = vec![ShardHandoff::ServingNew; NUM_SHARDS];
+        let mut master_subset = vec![false; NUM_SHARDS];
         for (shard, h_state) in handoff.iter_mut().enumerate() {
             let old_master = self.assignments[shard].master;
             let new_master = new_table.assignments[shard].master;
-            if old_master != new_master && shard_has_data(shard as u16) {
-                *h_state = ShardHandoff::Copying;
+            if old_master != new_master {
+                master_subset[shard] = true;
+                if shard_has_data(shard as u16) {
+                    *h_state = ShardHandoff::Copying;
+                }
             }
         }
         let all_serving = handoff.iter().all(|s| *s == ShardHandoff::ServingNew);
         self.prev_assignments = Some(self.assignments.clone());
         self.assignments = new_table.assignments.clone();
         self.handoff_state = Some(handoff);
+        self.master_subset = master_subset;
         self.version = new_table.version;
 
         // If no shards need copying, clear handoff state immediately.
@@ -170,6 +180,7 @@ impl ShardTable {
     /// Commit the handoff for a single shard — it now serves from the
     /// new assignment.
     pub fn commit_shard(&mut self, shard: u16) {
+        self.master_subset[shard as usize] = false;
         if let Some(ref mut hs) = self.handoff_state {
             hs[shard as usize] = ShardHandoff::ServingNew;
             // If all shards are now ServingNew, clear the handoff state.
@@ -239,6 +250,8 @@ impl ShardTable {
                 | ShardHandoff::ServingCurrent => {
                     self.assignments[shard as usize] = old_assignment;
                     hs[shard as usize] = ShardHandoff::ServingNew;
+                    // Rolled back to old master — no longer a subset master.
+                    self.master_subset[shard as usize] = false;
                 }
                 ShardHandoff::ServingNew => {
                     // Already committed to the new assignment — don't rollback.
@@ -263,6 +276,17 @@ impl ShardTable {
                 .count(),
             None => 0,
         }
+    }
+
+    /// Returns `true` if the new master for `shard` is still in the subset
+    /// state — i.e. ownership changed in the last topology activation and
+    /// migration data has not yet been committed for this shard.
+    ///
+    /// A subset master must not serve requests as authoritative until it
+    /// receives all migration data. `is_master()` in the coordinator
+    /// returns `Transitioning` for subset masters so callers retry.
+    pub fn is_subset_master(&self, shard: u16) -> bool {
+        self.master_subset[shard as usize]
     }
 
     /// Compute a shard table with a hash-based version (legacy).
@@ -1365,5 +1389,44 @@ mod tests {
             table.commit_shard(shard);
             assert_eq!(table.shard_handoff_state(shard), ShardHandoff::ServingNew);
         }
+    }
+
+    // ── Phase C: subset/version tracking ───────────────────────────────────
+
+    #[test]
+    fn partition_version_starts_full_for_unchanged_shard() {
+        let members_a = vec![NodeId(1), NodeId(2)];
+        let table_a = ShardTable::compute_with_epoch(&members_a, 2, 1);
+        let table_b = ShardTable::compute_with_epoch(&members_a, 2, 2);
+        let mut active = table_a.clone();
+        active.begin_handoff_with(&table_b, |_| true);
+        for shard in 0..NUM_SHARDS as u16 {
+            assert!(
+                !active.is_subset_master(shard),
+                "shard {shard} should not be subset when master didn't change"
+            );
+        }
+    }
+
+    #[test]
+    fn partition_version_starts_subset_for_inbound_master() {
+        let members_a = vec![NodeId(1), NodeId(2)];
+        let members_b = vec![NodeId(2), NodeId(3)];
+        let table_a = ShardTable::compute_with_epoch(&members_a, 2, 1);
+        let table_b = ShardTable::compute_with_epoch(&members_b, 2, 2);
+        let mut active = table_a.clone();
+        active.begin_handoff_with(&table_b, |_| true);
+        let changed_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table_a.target_assignment(s).master != table_b.target_assignment(s).master)
+            .expect("membership change must move at least one shard");
+        assert!(
+            active.is_subset_master(changed_shard),
+            "shard {changed_shard} should be subset since its master changed"
+        );
+        active.commit_shard(changed_shard);
+        assert!(
+            !active.is_subset_master(changed_shard),
+            "shard {changed_shard} should not be subset after commit"
+        );
     }
 }
