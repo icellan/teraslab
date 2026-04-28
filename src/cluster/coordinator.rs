@@ -5567,6 +5567,45 @@ impl RunningCluster {
         self.migration.lock().unwrap().fenced_count()
     }
 
+    /// Phase E — additional NodeIds that should also receive replica
+    /// batches for `shard` while it is migrating outbound from this node.
+    /// Returns an empty Vec when no migration is in flight for the shard.
+    ///
+    /// Used by [`replicate_all_ops`](crate::server::dispatch) to fan
+    /// writes out to BOTH the old replica set (from the shard table) and
+    /// the new master / replica destinations (from the migration tracker)
+    /// during the migration window. This protects durability when the new
+    /// master is promoted before the migration has finished streaming.
+    pub fn dual_write_targets_for_shard(&self, shard: u16) -> Vec<NodeId> {
+        self.migration
+            .lock()
+            .unwrap()
+            .dual_write_targets_for_shard(shard)
+            .to_vec()
+    }
+
+    /// Test-only: register an outbound migration task on this cluster's
+    /// `MigrationManager` so the dual-write window opens for `shard` with
+    /// `dest` as the new master / destination node.
+    ///
+    /// Used by dispatch-level tests that need to verify replica fan-out
+    /// expands during migration without spinning up a full migration
+    /// pipeline.
+    #[cfg(test)]
+    pub(crate) fn test_open_dual_write_window(&self, shard: u16, dest: NodeId) {
+        let task = MigrationTask {
+            shard,
+            from_node: self.self_id,
+            to_node: dest,
+            is_master: true,
+        };
+        self.migration.lock().unwrap().start_outbound(
+            std::slice::from_ref(&task),
+            self.self_id,
+            &std::collections::HashSet::new(),
+        );
+    }
+
     /// Restore inbound migration state from a previous run.
     ///
     /// Call during startup BEFORE accepting client requests. Shards

@@ -997,27 +997,29 @@ fn clear_replication_intent_after_success(range: (u64, u64)) {
 /// best-effort mode suppresses the error. Returns `Err(message)` when the
 /// required number of replica ACKs was not received AND best-effort is
 /// disabled.
-fn replicate_all_ops(
-    cluster: Option<&RunningCluster>,
+/// Build the per-address fan-out map for an outbound replication batch.
+///
+/// Pure function (no I/O): consults the shard table for replica targets,
+/// the migration tracker for active dual-write windows, and the cluster's
+/// node-address map to produce the `addr → ops` plan that
+/// `replicate_all_ops` will actually send over the wire.
+///
+/// During an outbound migration of `shard` from this node, the dual-write
+/// window contains the destination NodeIds (new master + new replicas).
+/// Their addresses are added to the fan-out so writes that happen mid-
+/// migration land on both the old replica set (durability) and the new
+/// master / replica set (post-handoff consistency).
+pub(crate) fn build_replication_targets(
+    cluster: &RunningCluster,
     ops_by_key: &[(TxKey, Vec<ReplicaOp>)],
-    redo_seq_range: (u64, u64),
-) -> std::result::Result<ReplicationOutcome, String> {
-    let cluster = match cluster {
-        Some(c) => c,
-        None => return Ok(ReplicationOutcome::NotApplicable),
-    };
-    if ops_by_key.is_empty() {
-        return Ok(ReplicationOutcome::NotApplicable);
-    }
-    begin_replication_intent(redo_seq_range)?;
-
-    // Group all ops by target replica address
+) -> std::result::Result<HashMap<SocketAddr, Vec<ReplicaOp>>, String> {
     let table = cluster.shard_table();
     let table_guard = table.read();
     let rf = table_guard.replication_factor();
     let expected_replicas_per_key = rf.saturating_sub(1) as usize;
     let mut by_addr: HashMap<SocketAddr, Vec<ReplicaOp>> = HashMap::new();
-    let mut target_errors = Vec::new();
+    let mut target_errors: Vec<String> = Vec::new();
+    let self_id = cluster.self_id();
 
     for (key, ops) in ops_by_key {
         let shard = ShardTable::shard_for_key(key);
@@ -1033,6 +1035,18 @@ fn replicate_all_ops(
             ));
             continue;
         }
+        // Phase E: expand the replica set to include any active dual-write
+        // destinations (new master + new replicas of an in-flight outbound
+        // migration). This guarantees the new master observes writes that
+        // happen during the migration window, so the post-handoff record
+        // set is consistent with the pre-handoff durable state.
+        //
+        // Dual-write fan-out is best-effort with respect to address
+        // resolution: a brand-new destination that hasn't yet been gossiped
+        // is silently skipped rather than failing the write, because the
+        // migration stream itself will deliver baseline+deltas to the
+        // destination once the address is known.
+        let dual_write_extras = cluster.dual_write_targets_for_shard(shard);
         for replica_id in &assignment.replicas {
             match cluster.node_addr(replica_id) {
                 Some(addr) => {
@@ -1047,6 +1061,14 @@ fn replicate_all_ops(
                 None => {}
             }
         }
+        for extra in &dual_write_extras {
+            if *extra == self_id || assignment.replicas.contains(extra) {
+                continue;
+            }
+            if let Some(addr) = cluster.node_addr(extra) {
+                by_addr.entry(addr).or_default().extend(ops.clone());
+            }
+        }
     }
     drop(table_guard);
 
@@ -1058,6 +1080,28 @@ fn replicate_all_ops(
             target_errors.join("; "),
         ));
     }
+
+    Ok(by_addr)
+}
+
+fn replicate_all_ops(
+    cluster: Option<&RunningCluster>,
+    ops_by_key: &[(TxKey, Vec<ReplicaOp>)],
+    redo_seq_range: (u64, u64),
+) -> std::result::Result<ReplicationOutcome, String> {
+    let cluster = match cluster {
+        Some(c) => c,
+        None => return Ok(ReplicationOutcome::NotApplicable),
+    };
+    if ops_by_key.is_empty() {
+        return Ok(ReplicationOutcome::NotApplicable);
+    }
+    begin_replication_intent(redo_seq_range)?;
+
+    // Group all ops by target replica address — including any dual-write
+    // expansion for shards currently migrating outbound (Phase E).
+    let by_addr = build_replication_targets(cluster, ops_by_key)?;
+    let rf = cluster.shard_table().read().replication_factor();
 
     if by_addr.is_empty() {
         // No replicas configured or no replica addresses known.
@@ -6334,6 +6378,117 @@ mod tests {
             observed_ops[0].1.as_slice(),
             [ReplicaOp::Delete { tx_key: deleted }] if *deleted == tx_key
         ));
+    }
+
+    /// Phase E: while shard is migrating outbound from this node, the
+    /// build_replication_targets fan-out must include the dual-write
+    /// destination's address in addition to the regular replica targets.
+    #[test]
+    fn build_replication_targets_includes_dual_write_destination_during_migration() {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let n3 = crate::cluster::shards::NodeId(3);
+        let members = vec![n1, n2, n3];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 200);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == n1 && a.replicas.contains(&n2) && !a.replicas.contains(&n3)
+            })
+            .expect("expected shard mastered by n1 with n2 (not n3) as replica");
+
+        let n1_addr: SocketAddr = "127.0.0.1:8901".parse().unwrap();
+        let n2_addr: SocketAddr = "127.0.0.1:8902".parse().unwrap();
+        let n3_addr: SocketAddr = "127.0.0.1:8903".parse().unwrap();
+
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[(n1, n1_addr), (n2, n2_addr), (n3, n3_addr)],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        // Open dual-write window: this node (n1) is migrating shard out to n3.
+        cluster.test_open_dual_write_window(shard, n3);
+
+        let tx_key = TxKey {
+            txid: txid_for_shard(shard, 17),
+        };
+        let ops = vec![(
+            tx_key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+        )];
+
+        let by_addr = build_replication_targets(&cluster, &ops)
+            .expect("dual-write target resolution should succeed");
+
+        assert!(
+            by_addr.contains_key(&n2_addr),
+            "regular replica n2 must remain in fan-out: {by_addr:?}",
+        );
+        assert!(
+            by_addr.contains_key(&n3_addr),
+            "dual-write destination n3 must be added during migration window: {by_addr:?}",
+        );
+        assert!(
+            !by_addr.contains_key(&n1_addr),
+            "self (n1) must never be in replica fan-out: {by_addr:?}",
+        );
+    }
+
+    /// Phase E: outside an active migration, the dual-write window is empty
+    /// and the fan-out must NOT include the would-be destination address.
+    #[test]
+    fn build_replication_targets_excludes_dual_write_when_not_migrating() {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let n3 = crate::cluster::shards::NodeId(3);
+        let members = vec![n1, n2, n3];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 201);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == n1 && a.replicas.contains(&n2) && !a.replicas.contains(&n3)
+            })
+            .expect("expected shard mastered by n1 with n2 (not n3) as replica");
+
+        let n2_addr: SocketAddr = "127.0.0.1:8912".parse().unwrap();
+        let n3_addr: SocketAddr = "127.0.0.1:8913".parse().unwrap();
+
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[(n2, n2_addr), (n3, n3_addr)],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        // No migration started — dual-write window is empty.
+
+        let tx_key = TxKey {
+            txid: txid_for_shard(shard, 18),
+        };
+        let ops = vec![(
+            tx_key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+        )];
+
+        let by_addr = build_replication_targets(&cluster, &ops)
+            .expect("regular target resolution should succeed");
+
+        assert!(
+            by_addr.contains_key(&n2_addr),
+            "regular replica n2 must be in fan-out",
+        );
+        assert!(
+            !by_addr.contains_key(&n3_addr),
+            "n3 must NOT be in fan-out outside the migration window",
+        );
     }
 
     #[test]

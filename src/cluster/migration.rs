@@ -317,6 +317,11 @@ pub struct MigrationManager {
     /// Dispatch rejects mutations for these shards with ERR_MIGRATION_IN_PROGRESS.
     /// Reads continue to be served locally during the fence.
     fenced_shards: ShardBitmap,
+    /// Phase E — dual-write window: shards being migrated outbound from
+    /// this node, mapped to the destination NodeIds (new master and any
+    /// new replicas) that must also receive replica batches while the
+    /// migration is in flight. Cleared on `mark_complete` / `mark_failed`.
+    dual_write_targets: std::collections::HashMap<u16, Vec<NodeId>>,
 }
 
 impl MigrationManager {
@@ -327,7 +332,36 @@ impl MigrationManager {
             inbound_migrations: Vec::new(),
             inbound_bitmap: ShardBitmap::new(),
             fenced_shards: ShardBitmap::new(),
+            dual_write_targets: std::collections::HashMap::new(),
         }
+    }
+
+    /// Phase E: NodeIds (new master + new replicas) that must additionally
+    /// receive replica batches for `shard` while it is migrating outbound
+    /// from this node. Returns an empty slice when no dual-write window is
+    /// active for the shard.
+    pub fn dual_write_targets_for_shard(&self, shard: u16) -> &[NodeId] {
+        self.dual_write_targets
+            .get(&shard)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Snapshot of the entire dual-write map. Used by the coordinator /
+    /// dispatch to expand replica fan-out for migrating shards.
+    pub fn dual_write_map(&self) -> &std::collections::HashMap<u16, Vec<NodeId>> {
+        &self.dual_write_targets
+    }
+
+    fn dual_write_add(&mut self, shard: u16, node: NodeId) {
+        let entry = self.dual_write_targets.entry(shard).or_default();
+        if !entry.contains(&node) {
+            entry.push(node);
+        }
+    }
+
+    fn dual_write_remove(&mut self, shard: u16) {
+        self.dual_write_targets.remove(&shard);
     }
 
     /// Start migrations from a list of tasks.
@@ -346,6 +380,10 @@ impl MigrationManager {
         for task in tasks {
             if task.from_node == self_id {
                 self.active.push(MigrationProgress::from_task(task));
+                // Phase E: open dual-write window so writes during the
+                // migration land on the new master / replica destination
+                // as well as the old replica set.
+                self.dual_write_add(task.shard, task.to_node);
                 if let Some(m) = migration_metrics() {
                     m.migration_active.fetch_add(1, Ordering::Relaxed);
                     m.migration_phase_preparing.fetch_add(1, Ordering::Relaxed);
@@ -571,6 +609,13 @@ impl MigrationManager {
         if !self.has_other_fenced_task(task.shard, task) {
             self.unfence_shard(task.shard);
         }
+        // Phase E: close dual-write window once any active outbound task for
+        // this shard remains unresolved. We aggressively close on first
+        // completion — the new master is now authoritative and any straggler
+        // writes from the old master are no longer durability-critical.
+        if !self.has_other_active_outbound(task.shard, task) {
+            self.dual_write_remove(task.shard);
+        }
         if let Some(m) = migration_metrics() {
             if let Some(prev) = prev_state {
                 dec_phase_gauge(m, &prev);
@@ -597,6 +642,11 @@ impl MigrationManager {
         if !self.has_other_fenced_task(task.shard, task) {
             self.unfence_shard(task.shard);
         }
+        // Phase E: failure rolls back to old master; close the dual-write
+        // window so writes stop fanning out to the failed destination.
+        if !self.has_other_active_outbound(task.shard, task) {
+            self.dual_write_remove(task.shard);
+        }
         if let Some(m) = migration_metrics() {
             if let Some(prev) = prev_state {
                 dec_phase_gauge(m, &prev);
@@ -611,6 +661,21 @@ impl MigrationManager {
         self.active.iter().any(|p| {
             p.shard == shard
                 && p.state == MigrationState::Fenced
+                && !(p.from_node == exclude.from_node && p.to_node == exclude.to_node)
+        })
+    }
+
+    /// Check if any active migration task for the given shard (other than
+    /// `exclude`) is still in flight (not yet Complete or Failed).
+    ///
+    /// Used by `mark_complete` / `mark_failed` to decide whether the
+    /// dual-write window can be closed: we only retire the window once
+    /// every outbound task targeting this shard has resolved.
+    fn has_other_active_outbound(&self, shard: u16, exclude: &MigrationTask) -> bool {
+        self.active.iter().any(|p| {
+            p.shard == shard
+                && !p.is_complete()
+                && p.state != MigrationState::Failed
                 && !(p.from_node == exclude.from_node && p.to_node == exclude.to_node)
         })
     }
@@ -2867,6 +2932,111 @@ mod tests {
         assert!(
             !mgr.has_pending_inbound(shard),
             "inbound (subset proxy) must be cleared after mark_inbound_complete_all"
+        );
+    }
+
+    // ── Phase E: dual-write window during migration ──────────────────────
+
+    #[test]
+    fn dual_write_window_starts_when_migration_starts() {
+        let mut mgr = MigrationManager::new();
+        let task = MigrationTask {
+            shard: 42,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+
+        let targets = mgr.dual_write_targets_for_shard(42);
+        assert_eq!(
+            targets,
+            &[NodeId(2)],
+            "dual-write window should include the new master after start_outbound",
+        );
+
+        mgr.mark_complete(&task);
+        assert!(
+            mgr.dual_write_targets_for_shard(42).is_empty(),
+            "dual-write window must close on mark_complete",
+        );
+    }
+
+    #[test]
+    fn dual_write_window_collects_new_master_and_replicas() {
+        let mut mgr = MigrationManager::new();
+        let master_task = MigrationTask {
+            shard: 7,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        let replica_task = MigrationTask {
+            shard: 7,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: false,
+        };
+        mgr.start_outbound(
+            &[master_task.clone(), replica_task.clone()],
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+
+        let mut targets = mgr.dual_write_targets_for_shard(7).to_vec();
+        targets.sort_by_key(|n| n.0);
+        assert_eq!(
+            targets,
+            vec![NodeId(2), NodeId(3)],
+            "dual-write window must include both new master and new replica destinations",
+        );
+    }
+
+    #[test]
+    fn dual_write_window_clears_on_mark_failed() {
+        let mut mgr = MigrationManager::new();
+        let task = MigrationTask {
+            shard: 99,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: true,
+        };
+        mgr.start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(mgr.dual_write_targets_for_shard(99), &[NodeId(3)]);
+
+        mgr.mark_failed(&task);
+        assert!(
+            mgr.dual_write_targets_for_shard(99).is_empty(),
+            "dual-write window must close on mark_failed (failure rolls back to old master)",
+        );
+    }
+
+    #[test]
+    fn dual_write_window_ignores_inbound_only_tasks() {
+        let mut mgr = MigrationManager::new();
+        let inbound = MigrationTask {
+            shard: 11,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        // self_id == NodeId(2): this node is the destination, not source.
+        mgr.start_outbound(
+            std::slice::from_ref(&inbound),
+            NodeId(2),
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            mgr.dual_write_targets_for_shard(11).is_empty(),
+            "dual-write window only applies to outbound (source) side",
         );
     }
 }
