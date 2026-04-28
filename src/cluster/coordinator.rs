@@ -4964,6 +4964,51 @@ pub fn elect_master(_shard: u16, candidates: &[MasterCandidate]) -> Option<NodeI
         .map(|c| c.node_id)
 }
 
+/// Phase H — translate a [`ResyncRequest`](crate::replication::manager::ResyncRequest)
+/// from the local replication manager into one [`MigrationTask`] per
+/// shard that needs resync.
+///
+/// When `req.shards` is empty (the manager's "I don't know" signal),
+/// the helper falls back to "every shard `req.node_id` should hold per
+/// `shard_table`" — the canonical interpretation. All synthesized
+/// tasks are *replica backfills* (`is_master = false`) flowing from
+/// `self_id` (the resync source — typically the master serving
+/// authoritative reads) to `NodeId(req.node_id)` (the recovering
+/// replica).
+///
+/// The tasks plug into the existing migration pipeline so resync
+/// inherits Phase E dual-write protection, Phase G throttling, and
+/// the same retry / cleanup machinery as a topology-driven backfill.
+pub fn synthesize_resync_migration_tasks(
+    req: &crate::replication::manager::ResyncRequest,
+    self_id: NodeId,
+    shard_table: &ShardTable,
+) -> Vec<MigrationTask> {
+    let target = NodeId(req.node_id);
+    if target == self_id {
+        return Vec::new();
+    }
+    let shards: Vec<u16> = if req.shards.is_empty() {
+        let mut owned: Vec<u16> = shard_table.shards_owned_by(target).into_iter().collect();
+        owned.sort_unstable();
+        owned
+    } else {
+        let mut s = req.shards.clone();
+        s.sort_unstable();
+        s.dedup();
+        s
+    };
+    shards
+        .into_iter()
+        .map(|shard| MigrationTask {
+            shard,
+            from_node: self_id,
+            to_node: target,
+            is_master: false,
+        })
+        .collect()
+}
+
 /// Phase F — apply election scoring on top of the round-robin
 /// `compute_with_epoch` result.
 ///
@@ -8788,6 +8833,69 @@ mod tests {
             NodeId(1),
             "evicted node must never remain master after election",
         );
+    }
+
+    // ── Phase H: redo-truncation resync ──────────────────────────────────
+
+    #[test]
+    fn coordinator_handles_resync_request_with_explicit_shards() {
+        let req = crate::replication::manager::ResyncRequest {
+            node_id: 2,
+            shards: vec![42, 7, 42], // duplicate must be deduped
+        };
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 5);
+        let tasks = synthesize_resync_migration_tasks(&req, NodeId(1), &table);
+        assert_eq!(
+            tasks.len(),
+            2,
+            "duplicate shard ids must be deduped before tasks are synthesized",
+        );
+        for t in &tasks {
+            assert_eq!(t.from_node, NodeId(1), "tasks flow from self_id");
+            assert_eq!(t.to_node, NodeId(2), "tasks flow to the requesting replica");
+            assert!(
+                !t.is_master,
+                "resync tasks are replica backfills, never master migrations"
+            );
+        }
+        let shards: Vec<u16> = tasks.iter().map(|t| t.shard).collect();
+        assert_eq!(shards, vec![7, 42], "tasks listed in sorted shard order");
+    }
+
+    #[test]
+    fn coordinator_resync_request_empty_shards_uses_shard_table() {
+        // Empty shards = "all shards this replica should hold". Reuse
+        // shards_owned_by from the shard table to compute the set.
+        let req = crate::replication::manager::ResyncRequest {
+            node_id: 2,
+            shards: Vec::new(),
+        };
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 5);
+        let expected: std::collections::HashSet<u16> = table.shards_owned_by(NodeId(2));
+        let tasks = synthesize_resync_migration_tasks(&req, NodeId(1), &table);
+        let observed: std::collections::HashSet<u16> = tasks.iter().map(|t| t.shard).collect();
+        assert_eq!(
+            observed, expected,
+            "empty shards list must expand to every shard the replica owns",
+        );
+        assert!(
+            !tasks.is_empty(),
+            "in a 3-node cluster with RF=2 every member owns at least one shard",
+        );
+    }
+
+    #[test]
+    fn coordinator_resync_request_for_self_returns_no_tasks() {
+        // A ResyncRequest naming this node is a no-op; we never resync to
+        // ourselves. (Defensive — the manager only emits for peer
+        // senders, but the helper must be safe under any input.)
+        let req = crate::replication::manager::ResyncRequest {
+            node_id: 1,
+            shards: vec![1, 2, 3],
+        };
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 5);
+        let tasks = synthesize_resync_migration_tasks(&req, NodeId(1), &table);
+        assert!(tasks.is_empty());
     }
 
     // ── Phase G: concurrent migration throttling ──────────────────────────

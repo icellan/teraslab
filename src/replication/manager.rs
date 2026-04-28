@@ -90,11 +90,40 @@ pub enum ReplicaState {
     NeedsResync,
 }
 
+/// Phase H — published by the replication manager when a replica is
+/// found to need a full-shard resync (its redo entries have been
+/// reclaimed past `last_acked`).
+///
+/// `node_id` is the raw `NodeId.0` of the affected replica. `shards`
+/// lists the specific shards that require resync; an empty `shards` is
+/// the manager's "I don't know — coordinator should consult the shard
+/// table for every shard this replica should hold" signal.
+///
+/// The replication module deliberately uses a raw `u64` here so it
+/// stays free of a back-edge dependency on `crate::cluster::shards`.
+/// Coordinator-side handlers wrap this back into `NodeId(node_id)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResyncRequest {
+    /// `NodeId.0` of the replica that needs a full-shard resync.
+    pub node_id: u64,
+    /// Specific shards that require resync. Empty = "all shards this
+    /// replica should hold per the current shard table".
+    pub shards: Vec<u16>,
+}
+
 /// Manages a single replica's transport and state.
 pub struct ReplicaSender {
     transport: Box<dyn ReplicaTransport>,
     state: ReplicaState,
     last_acked: u64,
+    /// Phase H — replica's `NodeId.0`. Stored as raw `u64` to keep
+    /// `manager.rs` independent of `cluster::shards::NodeId`. Default
+    /// `0` means "unknown" (test fixtures and old call sites).
+    node_id: u64,
+    /// Phase H — has a `ResyncRequest` already been emitted for this
+    /// sender's current `NeedsResync` excursion? Reset when the sender
+    /// transitions back to `Live` so future truncations re-emit.
+    resync_emitted: bool,
 }
 
 impl ReplicaSender {
@@ -104,6 +133,8 @@ impl ReplicaSender {
             transport,
             state: ReplicaState::Live,
             last_acked: 0,
+            node_id: 0,
+            resync_emitted: false,
         }
     }
 
@@ -137,6 +168,13 @@ pub struct ReplicationManager {
     /// Production wiring (Phase B3) installs a coordinator-owned atomic
     /// that bumps on every `migration_complete` to fence stale masters.
     current_cluster_key: Arc<AtomicU64>,
+    /// Phase H — when a sender enters `NeedsResync` (its catch-up redo
+    /// is gone) the manager publishes a [`ResyncRequest`] on this
+    /// channel exactly once. The coordinator's event loop synthesizes
+    /// the corresponding full-shard migration tasks. `None` means the
+    /// caller hasn't installed a channel — `NeedsResync` still happens
+    /// but nothing is auto-published (legacy / test behaviour).
+    resync_request_tx: Option<std::sync::mpsc::Sender<ResyncRequest>>,
 }
 
 impl ReplicationManager {
@@ -186,6 +224,7 @@ impl ReplicationManager {
             config,
             next_sequence: 1,
             current_cluster_key,
+            resync_request_tx: None,
         }
     }
 
@@ -203,6 +242,38 @@ impl ReplicationManager {
             config,
             next_sequence: initial_sequence.max(1),
             current_cluster_key,
+            resync_request_tx: None,
+        }
+    }
+
+    /// Phase H — install a channel that receives a [`ResyncRequest`]
+    /// every time a sender transitions into `NeedsResync`. Re-installs
+    /// replace any existing channel.
+    pub fn install_resync_request_channel(&mut self, tx: std::sync::mpsc::Sender<ResyncRequest>) {
+        self.resync_request_tx = Some(tx);
+    }
+
+    /// Phase H — tag a sender with the replica's `NodeId.0` so emitted
+    /// [`ResyncRequest`]s name the right peer. Out-of-bounds indices
+    /// are silently ignored (defensive — sender list may be replaced
+    /// during topology activation).
+    pub fn set_replica_node_id(&mut self, sender_idx: usize, node_id: u64) {
+        if let Some(s) = self.senders.get_mut(sender_idx) {
+            s.node_id = node_id;
+        }
+    }
+
+    /// Phase H — coordinator-side notification that a full-shard resync
+    /// has completed for `sender_idx`. Transitions the sender from
+    /// `NeedsResync` back to `Live` and resets the resync-emitted gate
+    /// so a future truncation can re-publish. No-op if the index is
+    /// out of bounds or the sender is not currently `NeedsResync`.
+    pub fn mark_replica_live(&mut self, sender_idx: usize) {
+        if let Some(s) = self.senders.get_mut(sender_idx)
+            && s.state == ReplicaState::NeedsResync
+        {
+            s.state = ReplicaState::Live;
+            s.resync_emitted = false;
         }
     }
 
@@ -474,6 +545,9 @@ impl ReplicationManager {
         let batch_size = self.config.catchup_batch_size;
         let timeout = self.config.replication_timeout;
         let master_seq = self.next_sequence;
+        // Phase H — collect resync notifications inside the borrow loop;
+        // publish after the loop so we don't double-borrow `self`.
+        let mut resync_to_emit: Vec<ResyncRequest> = Vec::new();
 
         for sender in &mut self.senders {
             let from_seq = match sender.state {
@@ -484,6 +558,7 @@ impl ReplicationManager {
             if from_seq >= master_seq {
                 // Already caught up
                 sender.state = ReplicaState::Live;
+                sender.resync_emitted = false;
                 continue;
             }
 
@@ -493,6 +568,17 @@ impl ReplicationManager {
                 // Transition to NeedsResync so the caller knows a full
                 // shard copy is required.
                 sender.state = ReplicaState::NeedsResync;
+                // Phase H — emit a ResyncRequest exactly once per
+                // NeedsResync excursion so the coordinator can synthesize
+                // full-shard migration tasks without re-firing on every
+                // catch-up tick while resync is already pending.
+                if !sender.resync_emitted {
+                    resync_to_emit.push(ResyncRequest {
+                        node_id: sender.node_id,
+                        shards: Vec::new(),
+                    });
+                    sender.resync_emitted = true;
+                }
                 continue;
             }
 
@@ -532,6 +618,19 @@ impl ReplicationManager {
 
             if ok {
                 sender.state = ReplicaState::Live;
+                sender.resync_emitted = false;
+            }
+        }
+
+        // Phase H — publish the collected resync notifications. Send
+        // failures (channel disconnected) are tracked but not propagated;
+        // the resync_emitted flag stays set so we don't re-publish to a
+        // dropped receiver every tick.
+        if !resync_to_emit.is_empty()
+            && let Some(ref tx) = self.resync_request_tx
+        {
+            for req in resync_to_emit {
+                let _ = tx.send(req);
             }
         }
 
@@ -1184,6 +1283,65 @@ mod tests {
 
         // Should transition to NeedsResync, not stay in CatchingUp
         assert_eq!(*mgr.sender(0).state(), ReplicaState::NeedsResync);
+    }
+
+    // ── Phase H: redo-truncation resync ──────────────────────────────────
+
+    #[test]
+    fn needs_resync_emits_resync_request() {
+        let (master_tx, _replica_rx) = InMemoryTransport::pair();
+        let mut mgr =
+            ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(master_tx)]);
+        // Tag this sender with the replica's NodeId so the resync request
+        // names the right peer.
+        mgr.set_replica_node_id(0, 42);
+        let (tx, rx) = std::sync::mpsc::channel::<ResyncRequest>();
+        mgr.install_resync_request_channel(tx);
+
+        mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 1 };
+        mgr.next_sequence = 10;
+        mgr.run_catchup(|_from_seq| Vec::new()).unwrap();
+
+        let req = rx
+            .try_recv()
+            .expect("ResyncRequest must be published when sender hits NeedsResync");
+        assert_eq!(req.node_id, 42);
+        // Without explicit per-sender shard tracking the manager publishes
+        // an empty shard list — the coordinator interprets this as
+        // "every shard the replica should hold per the shard table".
+        assert!(req.shards.is_empty());
+
+        // Idempotent: a second call without state change does not re-emit.
+        mgr.run_catchup(|_| Vec::new()).unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "ResyncRequest must not re-fire once the sender is already in NeedsResync",
+        );
+    }
+
+    #[test]
+    fn needs_resync_clears_after_full_shard_apply() {
+        let (master_tx, _replica_rx) = InMemoryTransport::pair();
+        let mut mgr =
+            ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(master_tx)]);
+        mgr.senders[0].state = ReplicaState::NeedsResync;
+        mgr.mark_replica_live(0);
+        assert_eq!(
+            *mgr.sender(0).state(),
+            ReplicaState::Live,
+            "after full-shard resync the coordinator can transition the sender back to Live",
+        );
+    }
+
+    #[test]
+    fn mark_replica_live_is_no_op_for_unknown_index() {
+        // Out-of-bounds index must not panic — defensive guard since
+        // ResyncRequest may name a sender that has since been replaced.
+        let (master_tx, _replica_rx) = InMemoryTransport::pair();
+        let mut mgr =
+            ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(master_tx)]);
+        mgr.mark_replica_live(99); // far past the only sender
+        assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
     }
 
     // -----------------------------------------------------------------------
