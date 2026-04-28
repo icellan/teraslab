@@ -1597,7 +1597,18 @@ impl ClusterCoordinator {
         // migrations can be preserved (same source, target, and type).
         let old_table_snap = shard_table.read().clone();
         let old_epoch = old_table_snap.version;
-        let new_table = ShardTable::compute_with_epoch(members, rf, epoch);
+        let mut new_table = ShardTable::compute_with_epoch(members, rf, epoch);
+        // Phase F: refine the round-robin master picks using the partition
+        // view + previous topology so a peer that already holds the full
+        // data is preferred over an empty (subset) candidate, and so an
+        // evicted node never inherits ownership. Empty partition view (no
+        // exchange data) is a no-op — the round-robin pick is preserved.
+        //
+        // Eviction set is currently always empty pending Phase I wiring;
+        // computing election here still removes ghost-master scenarios
+        // when the partition view is populated.
+        let evicted: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+        apply_master_election(&mut new_table, &old_table_snap, partition_view, &evicted);
         // Phase D: when a partition view is available, use it to skip
         // migrations whose destination already has the data and to redirect
         // the source onto a replica when the planned source has none.
@@ -4882,28 +4893,159 @@ pub fn load_peak_cluster_size(path: &std::path::Path) -> usize {
 
 /// Aerospike-style scoring for master election candidates.
 ///
-/// Scores: previous_master = 3, full_replica = 3, subset = 2, evicted = 0.
-/// The caller breaks ties by preferring the lower `NodeId`.
+/// Scores: full = 3, subset = 2, evicted = 0. Sticky preference for the
+/// previous master is applied as a *tie-breaker* in
+/// [`elect_master`] rather than as a score bonus, so a previous master
+/// that is now missing data (subset) still loses to a full replica.
 ///
-/// A node that is `is_subset` (new master still receiving inbound migration
-/// data) scores 2 so that the previous master or any full replica is
-/// preferred over it. An evicted node always scores 0 and must not be
-/// elected master under any circumstances.
-///
-/// Not yet wired into the coordinator election driver — that is Phase F.
+/// `_prev_master` is accepted for symmetry with the call sites of
+/// previous phases but no longer participates in the score itself.
 pub fn rank_master_candidate(
-    node_id: NodeId,
-    prev_master: NodeId,
+    _node_id: NodeId,
+    _prev_master: NodeId,
     is_subset: bool,
     was_evicted: bool,
 ) -> u8 {
     if was_evicted {
         return 0;
     }
-    if node_id == prev_master {
-        return 3;
-    }
     if is_subset { 2 } else { 3 }
+}
+
+/// Phase F — a candidate node for master election of a single shard.
+///
+/// Each member of the new topology produces one [`MasterCandidate`] per
+/// shard, derived from:
+/// - the previous shard table (for `was_previous_master`)
+/// - the partition view exchanged during Phase D (for `is_subset` —
+///   indicating the candidate is still expecting inbound data)
+/// - the Phase F evicted-nodes set (for `was_evicted`)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MasterCandidate {
+    /// Identity of this candidate.
+    pub node_id: NodeId,
+    /// True iff this node held the master role for the shard in the prior
+    /// committed topology and is still alive in the new member list.
+    pub was_previous_master: bool,
+    /// True iff this node holds an incomplete copy of the shard's data
+    /// (e.g. a still-in-flight inbound migration). Subset candidates lose
+    /// to any non-subset, non-evicted candidate.
+    pub is_subset: bool,
+    /// True iff the prior exchange phase classified this node as evicted
+    /// (failed to report, persistent suspect). Evicted nodes are never
+    /// eligible for master.
+    pub was_evicted: bool,
+}
+
+/// Phase F — score every candidate via [`rank_master_candidate`] and return
+/// the highest-scored one, breaking ties by lowest `NodeId` for
+/// deterministic agreement across all peers running the same election.
+///
+/// Returns `None` when every candidate is evicted — the caller must surface
+/// this as an error so the shard is not silently left without a master.
+///
+/// `_shard` is accepted purely for diagnostics; the algorithm is shard-
+/// independent because all per-shard signals are already encoded in the
+/// candidate descriptors.
+pub fn elect_master(_shard: u16, candidates: &[MasterCandidate]) -> Option<NodeId> {
+    candidates
+        .iter()
+        .filter(|c| !c.was_evicted)
+        .max_by_key(|c| {
+            // Higher tuple wins. Tuple components in decreasing significance:
+            //   1. score: 3 = full, 2 = subset (data ownership trumps stickiness)
+            //   2. was_previous_master: 1 = sticky preference, 0 = otherwise
+            //   3. lower NodeId via Reverse so smaller NodeIds compare "larger"
+            let score = if c.is_subset { 2u8 } else { 3u8 };
+            let prev = u8::from(c.was_previous_master);
+            (score, prev, std::cmp::Reverse(c.node_id.0))
+        })
+        .map(|c| c.node_id)
+}
+
+/// Phase F — apply election scoring on top of the round-robin
+/// `compute_with_epoch` result.
+///
+/// For every shard, build the candidate set from the shard's target
+/// assignment (master + replicas), tag each candidate with:
+/// - `was_previous_master`: held the master role for this shard in
+///   `prev_table` and is still in the new member set.
+/// - `is_subset`: not yet observed to hold full data — either the
+///   partition view shows no entries for the candidate or the candidate
+///   reports `last_applied_seq == 0` for the shard.
+/// - `was_evicted`: present in the `evicted` set passed by the caller
+///   (collected from the prior exchange phase).
+///
+/// Run [`elect_master`] over the candidates and, when the elected master
+/// differs from the current round-robin pick, swap it into place via
+/// [`ShardTable::set_master_for_shard`]. Empty partition views (no
+/// information available) leave the round-robin pick unchanged so the
+/// behaviour reduces to the pre-Phase-F path.
+pub fn apply_master_election(
+    table: &mut ShardTable,
+    prev_table: &ShardTable,
+    partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+    evicted: &std::collections::HashSet<NodeId>,
+) {
+    // (node, shard) -> last_applied_seq, used to decide is_subset.
+    let mut seq_by_node_shard: std::collections::HashMap<(NodeId, u16), u64> =
+        std::collections::HashMap::new();
+    let mut nodes_with_view: std::collections::HashSet<NodeId> =
+        std::collections::HashSet::with_capacity(partition_view.len());
+    for (node, entries) in partition_view {
+        nodes_with_view.insert(*node);
+        for e in entries {
+            seq_by_node_shard.insert((*node, e.shard), e.last_applied_seq);
+        }
+    }
+
+    let view_empty = partition_view.is_empty();
+
+    for shard in 0..NUM_SHARDS as u16 {
+        let assignment = table.target_assignment(shard);
+        let prev_master = prev_table.target_assignment(shard).master;
+
+        let mut candidate_nodes: Vec<NodeId> = Vec::with_capacity(1 + assignment.replicas.len());
+        candidate_nodes.push(assignment.master);
+        for replica in &assignment.replicas {
+            if !candidate_nodes.contains(replica) {
+                candidate_nodes.push(*replica);
+            }
+        }
+
+        let candidates: Vec<MasterCandidate> = candidate_nodes
+            .iter()
+            .map(|&node_id| {
+                // A node is treated as "full" when:
+                //   (a) the partition view is empty (no info — fall back
+                //       to the pre-Phase-F path; round-robin pick stays);
+                //   (b) the partition view is non-empty AND this node
+                //       reports a non-zero last_applied_seq for the shard.
+                // Otherwise it is "subset".
+                let has_data = if view_empty {
+                    true
+                } else {
+                    seq_by_node_shard
+                        .get(&(node_id, shard))
+                        .copied()
+                        .unwrap_or(0)
+                        > 0
+                };
+                MasterCandidate {
+                    node_id,
+                    was_previous_master: node_id == prev_master,
+                    is_subset: !has_data,
+                    was_evicted: evicted.contains(&node_id),
+                }
+            })
+            .collect();
+
+        if let Some(elected) = elect_master(shard, &candidates)
+            && elected != assignment.master
+        {
+            table.set_master_for_shard(shard, elected);
+        }
+    }
 }
 
 /// Result of a [`RunningCluster::is_master`] query.
@@ -8384,6 +8526,250 @@ mod tests {
             rank_master_candidate(NodeId(4), NodeId(1), false, true),
             0,
             "evicted node must score 0"
+        );
+    }
+
+    // ── Phase F: master election scoring ─────────────────────────────────
+
+    #[test]
+    fn election_prefers_previous_master_over_full() {
+        // The previous master is alive and unevicted; a full replica with no
+        // sticky preference must lose despite higher NodeId ordering.
+        let candidates = [
+            MasterCandidate {
+                node_id: NodeId(7),
+                was_previous_master: false,
+                is_subset: false,
+                was_evicted: false,
+            },
+            MasterCandidate {
+                node_id: NodeId(3),
+                was_previous_master: true,
+                is_subset: false,
+                was_evicted: false,
+            },
+        ];
+        assert_eq!(
+            elect_master(0, &candidates),
+            Some(NodeId(3)),
+            "election must prefer the previous master over a full peer",
+        );
+    }
+
+    #[test]
+    fn election_prefers_full_over_subset() {
+        // Both candidates score the same as the previous master would (none
+        // is the previous master here), but only one is "full" — i.e. has
+        // the complete data. The full peer must win even if the subset
+        // peer has a lower NodeId.
+        let candidates = [
+            MasterCandidate {
+                node_id: NodeId(1),
+                was_previous_master: false,
+                is_subset: true,
+                was_evicted: false,
+            },
+            MasterCandidate {
+                node_id: NodeId(2),
+                was_previous_master: false,
+                is_subset: false,
+                was_evicted: false,
+            },
+        ];
+        assert_eq!(
+            elect_master(0, &candidates),
+            Some(NodeId(2)),
+            "election must prefer a full replica over a subset replica",
+        );
+    }
+
+    #[test]
+    fn election_excludes_evade() {
+        // The would-be winner (lowest NodeId, was previous master) is
+        // evicted by the prior exchange phase and must never be elected.
+        let candidates = [
+            MasterCandidate {
+                node_id: NodeId(1),
+                was_previous_master: true,
+                is_subset: false,
+                was_evicted: true,
+            },
+            MasterCandidate {
+                node_id: NodeId(2),
+                was_previous_master: false,
+                is_subset: false,
+                was_evicted: false,
+            },
+            MasterCandidate {
+                node_id: NodeId(3),
+                was_previous_master: false,
+                is_subset: true,
+                was_evicted: false,
+            },
+        ];
+        assert_eq!(
+            elect_master(0, &candidates),
+            Some(NodeId(2)),
+            "evicted nodes must never be elected master, even if they would otherwise score highest",
+        );
+    }
+
+    #[test]
+    fn election_deterministic_under_tie() {
+        // Two full replicas with identical scoring: tie must break by
+        // lowest NodeId so every node in the cluster makes the same
+        // choice deterministically.
+        let candidates = [
+            MasterCandidate {
+                node_id: NodeId(9),
+                was_previous_master: false,
+                is_subset: false,
+                was_evicted: false,
+            },
+            MasterCandidate {
+                node_id: NodeId(4),
+                was_previous_master: false,
+                is_subset: false,
+                was_evicted: false,
+            },
+            MasterCandidate {
+                node_id: NodeId(7),
+                was_previous_master: false,
+                is_subset: false,
+                was_evicted: false,
+            },
+        ];
+        assert_eq!(
+            elect_master(0, &candidates),
+            Some(NodeId(4)),
+            "ties must break by lowest NodeId for determinism across nodes",
+        );
+    }
+
+    #[test]
+    fn election_returns_none_when_all_candidates_evicted() {
+        let candidates = [
+            MasterCandidate {
+                node_id: NodeId(1),
+                was_previous_master: true,
+                is_subset: false,
+                was_evicted: true,
+            },
+            MasterCandidate {
+                node_id: NodeId(2),
+                was_previous_master: false,
+                is_subset: false,
+                was_evicted: true,
+            },
+        ];
+        assert_eq!(
+            elect_master(0, &candidates),
+            None,
+            "no eligible master when every candidate is evicted",
+        );
+    }
+
+    #[test]
+    fn apply_master_election_promotes_full_replica_over_subset_round_robin_pick() {
+        // Two members in the new topology. Round-robin picks N1 as master
+        // for some shards even though N2 already holds the full data and
+        // N1 is empty (subset). With a partition view in hand,
+        // apply_master_election must swap so N2 becomes master.
+        let prev_members = [NodeId(1), NodeId(2)];
+        let new_members = [NodeId(1), NodeId(2)];
+        let prev_table = ShardTable::compute_with_epoch(&prev_members, 2, 1);
+        let mut new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+
+        // Pick a shard where round-robin assigned N1 as the new master.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| new_table.target_assignment(s).master == NodeId(1))
+            .expect("at least one shard mastered by N1 in 2-member ring");
+
+        // Partition view says N1 has no data for this shard, N2 has data.
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(
+            NodeId(1),
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 0,
+            }],
+        );
+        view.insert(
+            NodeId(2),
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 9_999,
+            }],
+        );
+
+        apply_master_election(
+            &mut new_table,
+            &prev_table,
+            &view,
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(
+            new_table.target_assignment(shard).master,
+            NodeId(2),
+            "election must promote N2 (full data) over N1 (empty / subset) even when round-robin picked N1",
+        );
+        assert!(
+            new_table
+                .target_assignment(shard)
+                .replicas
+                .contains(&NodeId(1)),
+            "the previously-elected master must remain in the replica set",
+        );
+    }
+
+    #[test]
+    fn apply_master_election_keeps_round_robin_when_view_is_empty() {
+        let members = [NodeId(1), NodeId(2), NodeId(3)];
+        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1);
+        let mut table = ShardTable::compute_with_epoch(&members, 2, 2);
+        let baseline_assignment = table.target_assignment(7).clone();
+        let view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        apply_master_election(
+            &mut table,
+            &prev_table,
+            &view,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            table.target_assignment(7),
+            &baseline_assignment,
+            "with an empty partition view the round-robin assignment must be preserved",
+        );
+    }
+
+    #[test]
+    fn apply_master_election_skips_evicted_master_pick() {
+        let members = [NodeId(1), NodeId(2), NodeId(3)];
+        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1);
+        let mut table = ShardTable::compute_with_epoch(&members, 2, 2);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == NodeId(1))
+            .unwrap();
+
+        // Empty view but evict N1 — election must replace N1 with another
+        // candidate from the assigned set.
+        let view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        let mut evicted = std::collections::HashSet::new();
+        evicted.insert(NodeId(1));
+
+        apply_master_election(&mut table, &prev_table, &view, &evicted);
+        assert_ne!(
+            table.target_assignment(shard).master,
+            NodeId(1),
+            "evicted node must never remain master after election",
         );
     }
 

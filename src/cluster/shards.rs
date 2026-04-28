@@ -345,6 +345,34 @@ impl ShardTable {
         &self.assignments[shard as usize]
     }
 
+    /// Phase F — override the master for `shard` to `new_master`, demoting
+    /// the previous master into the replica set so the same node set is
+    /// preserved.
+    ///
+    /// Intended to run on a freshly built target table (e.g. immediately
+    /// after [`compute_with_epoch`]) BEFORE [`begin_handoff_with`] is
+    /// invoked, so the per-shard `master_subset` flag is computed against
+    /// the elected master rather than the round-robin master.
+    ///
+    /// `new_master` MUST be a member of the shard's current target
+    /// assignment (master or replica). Calling with an unrelated node is a
+    /// no-op so a stale partition-view entry cannot corrupt the table.
+    pub fn set_master_for_shard(&mut self, shard: u16, new_master: NodeId) {
+        let idx = shard as usize;
+        let current = &mut self.assignments[idx];
+        if current.master == new_master {
+            return;
+        }
+        let promote_idx = current.replicas.iter().position(|n| *n == new_master);
+        let Some(replica_idx) = promote_idx else {
+            // `new_master` is not in this shard's assignment — refuse to
+            // mutate so we don't fabricate an arbitrary cross-shard owner.
+            return;
+        };
+        let demoted = std::mem::replace(&mut current.master, new_master);
+        current.replicas[replica_idx] = demoted;
+    }
+
     /// Count how many shards each node masters.
     pub fn shard_counts(&self) -> std::collections::HashMap<NodeId, usize> {
         let mut counts = std::collections::HashMap::new();
