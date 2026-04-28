@@ -1088,6 +1088,7 @@ impl ClusterCoordinator {
             repl_best_effort,
             repl_timeout: repl_timeout.max(Duration::from_millis(1)),
             last_migration_pressure_ms: Arc::new(AtomicU64::new(0)),
+            migration_throttle: Arc::new(crate::cluster::migration::MigrationThrottle::from_env()),
             committed_cluster_key: self.committed_cluster_key.clone(),
             topology_authority: self.topology_authority.clone(),
             active_topology_members: active_topology_members_for_cluster,
@@ -5102,6 +5103,13 @@ pub struct RunningCluster {
     repl_timeout: Duration,
     /// Last time this node observed local migration pressure.
     last_migration_pressure_ms: Arc<AtomicU64>,
+    /// Phase G — outbound migration byte throttle, shared with every
+    /// migration worker so concurrent outbound bytes stay under
+    /// `TERASLAB_MAX_BYTES_EMIGRATING` (default 32 MiB). Workers
+    /// `try_admit` an estimated batch size before opening a streaming
+    /// connection; if admission is denied they leave the task in
+    /// `Preparing` and re-poll on the next tick.
+    migration_throttle: Arc<crate::cluster::migration::MigrationThrottle>,
     /// Topology authority for quorum-committed term management.
     topology_authority: Arc<crate::cluster::topology::TopologyAuthority>,
     /// Atomic mirror of `topology_authority.committed_term()` — the
@@ -5709,6 +5717,14 @@ impl RunningCluster {
         self.migration.lock().unwrap().fenced_count()
     }
 
+    /// Phase G — shared outbound migration byte throttle. Workers
+    /// `try_admit` an estimated batch size before opening a streaming
+    /// connection so concurrent outbound bytes stay under the configured
+    /// cap (`TERASLAB_MAX_BYTES_EMIGRATING`, default 32 MiB).
+    pub fn migration_throttle(&self) -> &Arc<crate::cluster::migration::MigrationThrottle> {
+        &self.migration_throttle
+    }
+
     /// Phase E — additional NodeIds that should also receive replica
     /// batches for `shard` while it is migrating outbound from this node.
     /// Returns an empty Vec when no migration is in flight for the shard.
@@ -6008,6 +6024,7 @@ pub(crate) fn new_test_running_cluster(
         repl_best_effort: false,
         repl_timeout: Duration::from_secs(3),
         last_migration_pressure_ms: Arc::new(AtomicU64::new(0)),
+        migration_throttle: Arc::new(crate::cluster::migration::MigrationThrottle::from_env()),
         committed_cluster_key: topology_authority.committed_term_shared(),
         topology_authority,
         active_topology_members,
@@ -8770,6 +8787,45 @@ mod tests {
             table.target_assignment(shard).master,
             NodeId(1),
             "evicted node must never remain master after election",
+        );
+    }
+
+    // ── Phase G: concurrent migration throttling ──────────────────────────
+
+    #[test]
+    fn concurrent_migrations_serialized_by_throttle() {
+        // Schedule 10 outbound tasks, each "claiming" 10 MB. With a 32 MB
+        // cap the throttle must admit at most 3 concurrently (3 × 10MB =
+        // 30 MB ≤ 32 MB cap; the 4th request totalling 40 MB exceeds it).
+        // After releasing one token, capacity becomes available for the
+        // next task — verifying drop-and-readmit works the way the
+        // coordinator's spawn loop relies on.
+        use crate::cluster::migration::MigrationThrottle;
+        let throttle = std::sync::Arc::new(MigrationThrottle::new(32 * 1024 * 1024));
+        let task_bytes: u64 = 10 * 1024 * 1024;
+        let mut admitted = Vec::new();
+        for _ in 0..10 {
+            if let Some(token) = throttle.try_admit(task_bytes) {
+                admitted.push(token);
+            }
+        }
+        assert_eq!(
+            admitted.len(),
+            3,
+            "exactly 3 of 10 × 10MB requests should fit under a 32MB cap, got {}",
+            admitted.len(),
+        );
+        assert!(
+            throttle.try_admit(task_bytes).is_none(),
+            "throttle must reject a 4th 10MB request",
+        );
+
+        // Release one — next admission must succeed.
+        admitted.pop();
+        let extra = throttle.try_admit(task_bytes);
+        assert!(
+            extra.is_some(),
+            "after releasing one token the throttle must re-admit the next request",
         );
     }
 

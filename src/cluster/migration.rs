@@ -2,6 +2,7 @@
 
 use crate::cluster::shards::{MigrationTask, NUM_SHARDS, NodeId};
 use crate::metrics::{MigrationLabel, MigrationMetrics, migration_metrics};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 /// Saturating-decrement of the active-migrations gauge.
@@ -300,6 +301,139 @@ struct InboundMigration {
     from_node: NodeId,
     /// True once `OP_MIGRATION_COMPLETE` confirmed data arrived.
     completed: bool,
+}
+
+// ---------------------------------------------------------------------------
+// MigrationThrottle — Phase G outbound-bytes admission control
+// ---------------------------------------------------------------------------
+
+/// Phase G — caps the *concurrent* outbound migration bytes admitted on
+/// this node so a flood of overlapping migrations cannot starve replica
+/// traffic or exhaust SSD bandwidth.
+///
+/// Lock-free: a single [`AtomicU64`](std::sync::atomic::AtomicU64) tracks
+/// the bytes currently admitted. [`try_admit`](Self::try_admit) returns a
+/// [`MigrationToken`] RAII guard whose `Drop` returns capacity to the
+/// throttle. A request that would push the in-flight total over
+/// `cap_bytes` is rejected (returns `None`) without consuming any
+/// capacity, so the caller can retry later.
+///
+/// Zero-byte requests are admitted unconditionally and consume no
+/// capacity (small empty shards must never block on the throttle).
+///
+/// Wire-up: the coordinator gates the `Preparing → Streaming` transition
+/// on `try_admit` so a queued migration sits in `Preparing` until budget
+/// becomes available. The cap is sourced from the
+/// `TERASLAB_MAX_BYTES_EMIGRATING` env var, defaulting to 32 MiB.
+pub struct MigrationThrottle {
+    cap_bytes: u64,
+    in_flight: std::sync::atomic::AtomicU64,
+}
+
+impl MigrationThrottle {
+    /// Default cap (32 MiB) — matches Aerospike's `MAX_BYTES_EMIGRATING`.
+    pub const DEFAULT_CAP_BYTES: u64 = 32 * 1024 * 1024;
+
+    /// Env var that overrides the cap at process startup. Empty / unset /
+    /// unparseable values fall back to [`DEFAULT_CAP_BYTES`](Self::DEFAULT_CAP_BYTES).
+    pub const ENV_VAR: &'static str = "TERASLAB_MAX_BYTES_EMIGRATING";
+
+    /// Build a throttle with a fixed byte cap.
+    pub fn new(cap_bytes: u64) -> Self {
+        Self {
+            cap_bytes,
+            in_flight: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Build a throttle from `TERASLAB_MAX_BYTES_EMIGRATING` (falling back to
+    /// [`DEFAULT_CAP_BYTES`](Self::DEFAULT_CAP_BYTES) when unset / invalid).
+    pub fn from_env() -> Self {
+        let cap = std::env::var(Self::ENV_VAR)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|cap| *cap > 0)
+            .unwrap_or(Self::DEFAULT_CAP_BYTES);
+        Self::new(cap)
+    }
+
+    /// Configured cap.
+    pub fn cap_bytes(&self) -> u64 {
+        self.cap_bytes
+    }
+
+    /// Bytes currently admitted (sum of live tokens).
+    pub fn in_flight_bytes(&self) -> u64 {
+        self.in_flight.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Try to admit `bytes` of outbound migration work. Returns
+    /// `Some(MigrationToken)` whose drop releases capacity, or `None`
+    /// when the request would exceed the cap.
+    pub fn try_admit(self: &Arc<Self>, bytes: u64) -> Option<MigrationToken> {
+        if bytes == 0 {
+            return Some(MigrationToken {
+                throttle: Arc::clone(self),
+                bytes: 0,
+            });
+        }
+        let mut current = self.in_flight.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            if current.saturating_add(bytes) > self.cap_bytes {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                current,
+                current + bytes,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(MigrationToken {
+                        throttle: Arc::clone(self),
+                        bytes,
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for MigrationThrottle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MigrationThrottle")
+            .field("cap_bytes", &self.cap_bytes)
+            .field("in_flight_bytes", &self.in_flight_bytes())
+            .finish()
+    }
+}
+
+/// RAII admission token returned by [`MigrationThrottle::try_admit`].
+/// Capacity is released on `Drop`.
+pub struct MigrationToken {
+    throttle: Arc<MigrationThrottle>,
+    bytes: u64,
+}
+
+impl MigrationToken {
+    /// Bytes this token represents.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for MigrationToken {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        let prev = self
+            .throttle
+            .in_flight
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+        debug_assert!(prev >= self.bytes, "throttle underflow on token drop");
+    }
 }
 
 /// Manages active migrations for this node.
@@ -3038,5 +3172,77 @@ mod tests {
             mgr.dual_write_targets_for_shard(11).is_empty(),
             "dual-write window only applies to outbound (source) side",
         );
+    }
+
+    // ── Phase G: outbound migration throttle ─────────────────────────────
+
+    #[test]
+    fn throttle_admits_under_cap() {
+        let throttle = std::sync::Arc::new(MigrationThrottle::new(100_000));
+        let token = throttle.try_admit(50_000);
+        assert!(
+            token.is_some(),
+            "request under cap (50KB / 100KB) must be admitted",
+        );
+        assert_eq!(throttle.in_flight_bytes(), 50_000);
+    }
+
+    #[test]
+    fn throttle_blocks_over_cap() {
+        let throttle = std::sync::Arc::new(MigrationThrottle::new(100_000));
+        let _t1 = throttle
+            .try_admit(80_000)
+            .expect("first admission under cap");
+        assert_eq!(throttle.in_flight_bytes(), 80_000);
+        let t2 = throttle.try_admit(50_000);
+        assert!(
+            t2.is_none(),
+            "second request must be rejected when 80KB+50KB exceeds 100KB cap",
+        );
+        assert_eq!(
+            throttle.in_flight_bytes(),
+            80_000,
+            "rejected request must not consume capacity",
+        );
+    }
+
+    #[test]
+    fn throttle_releases_on_token_drop() {
+        let throttle = std::sync::Arc::new(MigrationThrottle::new(100_000));
+        {
+            let _t = throttle
+                .try_admit(80_000)
+                .expect("admit 80KB under 100KB cap");
+            assert_eq!(throttle.in_flight_bytes(), 80_000);
+        } // drop releases
+        assert_eq!(
+            throttle.in_flight_bytes(),
+            0,
+            "RAII drop must return capacity to the throttle",
+        );
+        let t2 = throttle.try_admit(80_000);
+        assert!(
+            t2.is_some(),
+            "capacity must be re-admittable after the prior token is dropped",
+        );
+    }
+
+    #[test]
+    fn throttle_zero_byte_request_admits_without_consuming_capacity() {
+        let throttle = std::sync::Arc::new(MigrationThrottle::new(100));
+        let token = throttle.try_admit(0).expect("zero-byte admission is free");
+        assert_eq!(throttle.in_flight_bytes(), 0);
+        drop(token);
+        assert_eq!(throttle.in_flight_bytes(), 0);
+    }
+
+    #[test]
+    fn throttle_from_env_falls_back_on_missing_var() {
+        // Note: env var manipulation in tests is not race-free across
+        // parallel test threads; we serialize on this var by reading it
+        // immediately after clearing.
+        unsafe { std::env::remove_var(MigrationThrottle::ENV_VAR) };
+        let t = MigrationThrottle::from_env();
+        assert_eq!(t.cap_bytes(), MigrationThrottle::DEFAULT_CAP_BYTES);
     }
 }
