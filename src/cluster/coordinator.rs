@@ -484,6 +484,13 @@ pub struct ClusterCoordinator {
     migration_batch_size: usize,
     /// SWIM incarnation counter for persisting alongside topology state.
     swim_incarnation: Arc<std::sync::atomic::AtomicU64>,
+    /// Phase G — outbound migration byte throttle, shared with every
+    /// migration worker spawned from this coordinator. Built once at
+    /// startup from `TERASLAB_MAX_BYTES_EMIGRATING` (default 32 MiB).
+    /// The same `Arc` is handed to the resulting `RunningCluster` so
+    /// admin-side queries (e.g. metrics or future
+    /// `OP_ADMIN_CLUSTER_HEALTH` extensions) observe the same gauge.
+    migration_throttle: Arc<crate::cluster::migration::MigrationThrottle>,
 }
 
 impl ClusterCoordinator {
@@ -549,6 +556,7 @@ impl ClusterCoordinator {
             migration_pool_size: config.migration_pool_size.max(1),
             migration_batch_size: config.migration_batch_size.max(1),
             swim_incarnation,
+            migration_throttle: Arc::new(crate::cluster::migration::MigrationThrottle::from_env()),
         }
     }
 
@@ -586,6 +594,7 @@ impl ClusterCoordinator {
         let swim_incarnation_for_cluster = self.swim_incarnation.clone();
         let active_topology_members_event = self.active_topology_members.clone();
         let active_topology_members_for_cluster = self.active_topology_members.clone();
+        let migration_throttle = self.migration_throttle.clone();
 
         // Atomic bitmaps shared between event loop, migration threads, and hot path.
         let fenced_bitmap = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
@@ -634,6 +643,10 @@ impl ClusterCoordinator {
         // Topology authority and cluster secret for the event loop.
         let topo_authority_event = self.topology_authority.clone();
         let node_addrs_for_topo = self.node_addrs.clone();
+        // Phase G — clone the migration byte throttle into the event
+        // loop so every `activate_topology[_with_view]` call gates its
+        // outbound migration spawn on `try_admit`.
+        let migration_throttle_event = migration_throttle.clone();
 
         // Event processing thread
         let event_handle = std::thread::spawn(move || {
@@ -677,6 +690,7 @@ impl ClusterCoordinator {
                             &peak_size_event,
                             &swim_incarnation_event,
                             &active_topology_members_event,
+                            &migration_throttle_event,
                         );
                         let activated_term = topology_epoch.load(Ordering::Relaxed);
                         if activated_term > last_activated_term {
@@ -762,6 +776,7 @@ impl ClusterCoordinator {
                                         &migrating_bm_event,
                                         &inbound_bm_event,
                                         &active_topology_members_event,
+                                        &migration_throttle_event,
                                     );
                                     last_activation_at = std::time::Instant::now();
                                 }
@@ -917,6 +932,7 @@ impl ClusterCoordinator {
                                 &migrating_bm_event,
                                 &inbound_bm_event,
                                 &active_topology_members_event,
+                                &migration_throttle_event,
                             );
                         }
                     }
@@ -999,6 +1015,7 @@ impl ClusterCoordinator {
                         &migrating_bm_event,
                         &inbound_bm_event,
                         &active_topology_members_event,
+                        &migration_throttle_event,
                     );
                     last_activation_at = std::time::Instant::now();
                     if let Some(ref path) = cluster_state_path {
@@ -1059,6 +1076,7 @@ impl ClusterCoordinator {
                         &inbound_bm_event,
                         &active_topology_members_event,
                         &partition_view,
+                        &migration_throttle_event,
                     );
                     last_activation_at = std::time::Instant::now();
                     if let Some(ref path) = cluster_state_path {
@@ -1088,7 +1106,7 @@ impl ClusterCoordinator {
             repl_best_effort,
             repl_timeout: repl_timeout.max(Duration::from_millis(1)),
             last_migration_pressure_ms: Arc::new(AtomicU64::new(0)),
-            migration_throttle: Arc::new(crate::cluster::migration::MigrationThrottle::from_env()),
+            migration_throttle: self.migration_throttle.clone(),
             committed_cluster_key: self.committed_cluster_key.clone(),
             topology_authority: self.topology_authority.clone(),
             active_topology_members: active_topology_members_for_cluster,
@@ -1132,6 +1150,7 @@ impl ClusterCoordinator {
         peak_size: &Arc<std::sync::atomic::AtomicUsize>,
         swim_incarnation: &Arc<std::sync::atomic::AtomicU64>,
         active_topology_members: &Arc<RwLock<Vec<NodeId>>>,
+        migration_throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
     ) {
         match event {
             ClusterEvent::NodeJoined(node, addr) => {
@@ -1160,6 +1179,7 @@ impl ClusterCoordinator {
                     let fb = fenced_bm.clone();
                     let mb = migrating_bm.clone();
                     let ib = inbound_bm.clone();
+                    let throttle_ref = migration_throttle.clone();
                     std::thread::spawn(move || {
                         Self::run_migration_tasks_with_global_limit(
                             retry_tasks,
@@ -1177,6 +1197,7 @@ impl ClusterCoordinator {
                             mb,
                             ib,
                             self_id,
+                            throttle_ref,
                         );
                     });
                 }
@@ -1244,6 +1265,7 @@ impl ClusterCoordinator {
                             migrating_bm,
                             inbound_bm,
                             active_topology_members,
+                            migration_throttle,
                         );
                         if let Some(path) = topology_state_path {
                             let peak = peak_size.load(Ordering::Relaxed) as u64;
@@ -1485,6 +1507,7 @@ impl ClusterCoordinator {
     /// [`build_plan_from_partition_view`] to fall back to the
     /// topology-derived plan.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn activate_topology(
         members: &[NodeId],
         epoch: u64,
@@ -1502,6 +1525,7 @@ impl ClusterCoordinator {
         migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
         inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
         active_topology_members: &Arc<RwLock<Vec<NodeId>>>,
+        migration_throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
     ) {
         let empty_view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
             std::collections::HashMap::new();
@@ -1523,6 +1547,7 @@ impl ClusterCoordinator {
             inbound_bm,
             active_topology_members,
             &empty_view,
+            migration_throttle,
         );
     }
 
@@ -1554,6 +1579,7 @@ impl ClusterCoordinator {
         inbound_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
         active_topology_members: &Arc<RwLock<Vec<NodeId>>>,
         partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
+        migration_throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
     ) {
         *active_topology_members.write().unwrap() = members.to_vec();
 
@@ -1863,6 +1889,7 @@ impl ClusterCoordinator {
             let fenced_bm_w = fenced_bm.clone();
             let migrating_bm_w = migrating_bm.clone();
             let inbound_bm_w = inbound_bm.clone();
+            let throttle_w = migration_throttle.clone();
 
             std::thread::spawn(move || {
                 let pre_swap_keys_by_shard = engine_w.keys_by_shard_filtered(&outbound_shard_set);
@@ -1887,6 +1914,7 @@ impl ClusterCoordinator {
                     migrating_bm_w,
                     inbound_bm_w,
                     self_id,
+                    throttle_w,
                 );
             });
         }
@@ -1972,6 +2000,7 @@ impl ClusterCoordinator {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn run_migration_tasks_with_global_limit(
         tasks: Vec<MigrationTask>,
         all_keys: Vec<TxKey>,
@@ -1988,6 +2017,7 @@ impl ClusterCoordinator {
         migrating_bm: Arc<crate::cluster::migration::AtomicShardBitmap>,
         inbound_bm: Arc<crate::cluster::migration::AtomicShardBitmap>,
         self_id: NodeId,
+        throttle: Arc<crate::cluster::migration::MigrationThrottle>,
     ) {
         if tasks.is_empty() {
             return;
@@ -2021,6 +2051,34 @@ impl ClusterCoordinator {
         let migration_pool_size = migration_pool_size.max(1);
 
         for target_group in batches.chunks(max_parallel_migrations) {
+            // Phase G — bytes admission control. Estimate the outbound
+            // bytes for the entire `target_group` from the engine's
+            // per-shard record counts and a conservative per-record
+            // size, then wait until the throttle has capacity. The
+            // estimate is approximate: we don't track exact record
+            // sizes, so we use a fixed `~256 B/record` proxy (matches
+            // the typical UTXO record incl. metadata + utxo hashes).
+            // If the actual stream exceeds the estimate the worst case
+            // is a slightly over-budget burst, not a deadlock.
+            let estimated_bytes: u64 = target_group
+                .iter()
+                .flat_map(|(_, ts)| ts.iter())
+                .map(|t| {
+                    engine
+                        .shard_record_count(t.shard)
+                        .saturating_mul(EST_BYTES_PER_RECORD)
+                })
+                .sum();
+            let _admission_token =
+                acquire_throttle_or_block(&throttle, estimated_bytes, &shard_table, topology_epoch);
+            // If `_admission_token` is `None`, the topology epoch
+            // advanced while we were waiting — abort this group; the
+            // freshly-spawned migration cycle will pick up the new
+            // tasks.
+            if _admission_token.is_none() {
+                return;
+            }
+
             std::thread::scope(|scope| {
                 for (target_node, target_tasks) in target_group {
                     let target_addr = addrs.get(target_node).copied();
@@ -2061,7 +2119,44 @@ impl ClusterCoordinator {
                     });
                 }
             });
+            // Token drops here — capacity returns to the throttle.
         }
+    }
+}
+
+/// Phase G — conservative per-record size estimate used by
+/// `acquire_throttle_or_block` to size each migration target group's
+/// admission request. Tuned for the typical BSV UTXO record (txid +
+/// metadata + utxo hashes + cold-data refs). Approximate by design:
+/// a slightly over-budget batch only causes a brief over-admission
+/// burst, never a deadlock.
+const EST_BYTES_PER_RECORD: u64 = 256;
+
+/// Phase G — try to admit `bytes` of outbound migration work, blocking
+/// (with a short sleep) when the throttle is full. Aborts and returns
+/// `None` if the topology epoch advances while we wait, so a stale
+/// migration cycle does not consume capacity meant for the new one.
+fn acquire_throttle_or_block(
+    throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
+    bytes: u64,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    spawn_epoch: u64,
+) -> Option<crate::cluster::migration::MigrationToken> {
+    // A request larger than the cap can never be admitted. Clamp to
+    // the cap so it always fits — the override semantics match the
+    // existing `max_parallel_migrations` behaviour: the throttle
+    // tunes pacing, it does not refuse legitimate work.
+    let request = bytes.min(throttle.cap_bytes());
+    loop {
+        if let Some(token) = throttle.try_admit(request) {
+            return Some(token);
+        }
+        // Bail out if the topology has advanced — no point holding
+        // up the new cycle for an aborted plan.
+        if shard_table.read().version != spawn_epoch {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
