@@ -10,7 +10,8 @@ pub fn timing_enabled() -> bool {
 }
 use teraslab::protocol::codec::encode_get_batch;
 use teraslab::protocol::opcodes::{
-    ADMIN_DIAGNOSE_KEY_MAX_TXIDS, FLAG_LOCAL_READ, OP_ADMIN_DIAGNOSE_KEY, OP_GET_BATCH, STATUS_OK,
+    ADMIN_DIAGNOSE_KEY_MAX_TXIDS, FLAG_LOCAL_READ, OP_ADMIN_CLUSTER_HEALTH, OP_ADMIN_DIAGNOSE_KEY,
+    OP_GET_BATCH, STATUS_OK,
 };
 use teraslab_test_client::helpers::DockerHelpers;
 use teraslab_test_client::types::{CreateItem, FIELD_ALL, FIELD_ALL_METADATA};
@@ -335,6 +336,121 @@ pub async fn wait_specific_nodes_ready(
                 detail.join(", ")
             )));
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Phase I — wait until every node in `node_nums` reports `Alive` via
+/// `OP_ADMIN_CLUSTER_HEALTH` for at least `stability_window` of
+/// continuous time. Without the stability window, a transient
+/// flap (committed term advances and immediately gets superseded) can
+/// fool a "snap-poll" caller into seeding records against a half-formed
+/// cluster.
+///
+/// Returns `Ok(())` when all named nodes have been continuously
+/// `Alive` for `stability_window`. Returns
+/// `ClientError::Connection` on `timeout`, with a short snapshot of
+/// each node's last-observed state.
+///
+/// Pass `Duration::from_millis(500)` for `stability_window` to match
+/// the planned `STABILITY_WINDOW_MS` constant.
+pub async fn wait_specific_nodes_alive(
+    client: &Client,
+    docker: &DockerHelpers,
+    node_nums: &[u32],
+    stability_window: Duration,
+    timeout: Duration,
+) -> Result<(), ClientError> {
+    let start = std::time::Instant::now();
+    let mut last_log = std::time::Instant::now();
+    let mut alive_since: Option<std::time::Instant> = None;
+
+    loop {
+        let mut node_states: Vec<(u32, String)> = Vec::with_capacity(node_nums.len());
+        let mut all_alive = true;
+
+        for &n in node_nums {
+            let addr = format!("127.0.0.1:{}", docker.client_port(n));
+            let state = match client
+                .send_to_addr(&addr, OP_ADMIN_CLUSTER_HEALTH, 0, Vec::new())
+                .await
+            {
+                Ok((status, body)) if status == STATUS_OK && body.len() >= 17 => {
+                    // Wire layout (Phase I): byte 0 is the SWIM state
+                    // enum: 0=Joining, 1=Alive, 2=Suspect, 3=Dead.
+                    match body[0] {
+                        1 => "Alive".to_string(),
+                        0 => {
+                            all_alive = false;
+                            "Joining".to_string()
+                        }
+                        2 => {
+                            all_alive = false;
+                            "Suspect".to_string()
+                        }
+                        3 => {
+                            all_alive = false;
+                            "Dead".to_string()
+                        }
+                        other => {
+                            all_alive = false;
+                            format!("Unknown({other})")
+                        }
+                    }
+                }
+                Ok((status, _)) => {
+                    all_alive = false;
+                    format!("status={status}")
+                }
+                Err(e) => {
+                    all_alive = false;
+                    format!("ERR({e})")
+                }
+            };
+            node_states.push((n, state));
+        }
+
+        if all_alive {
+            let since = alive_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= stability_window {
+                if timing_enabled() {
+                    eprintln!(
+                        "  wait_specific_nodes_alive: {} nodes Alive for {:?} after {:.1}ms",
+                        node_nums.len(),
+                        stability_window,
+                        start.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
+                return Ok(());
+            }
+        } else {
+            alive_since = None;
+        }
+
+        if timing_enabled() && last_log.elapsed() >= Duration::from_secs(2) {
+            let detail: Vec<String> = node_states
+                .iter()
+                .map(|(n, s)| format!("node{n}={s}"))
+                .collect();
+            eprintln!(
+                "  wait_specific_nodes_alive: states=[{}] ({:.1}s)",
+                detail.join(", "),
+                start.elapsed().as_secs_f64()
+            );
+            last_log = std::time::Instant::now();
+        }
+
+        if start.elapsed() >= timeout {
+            let detail: Vec<String> = node_states
+                .iter()
+                .map(|(n, s)| format!("node{n}={s}"))
+                .collect();
+            return Err(ClientError::Connection(format!(
+                "wait_specific_nodes_alive: not all nodes Alive after {timeout:?} [{}]",
+                detail.join(", ")
+            )));
+        }
+
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
