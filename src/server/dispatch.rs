@@ -196,6 +196,31 @@ pub(crate) fn handle_request(
     conn_state: &mut super::ConnectionState,
     blob_store: Option<&dyn BlobStore>,
 ) -> ResponseFrame {
+    // Phase I — readiness gate (runs BEFORE the quorum check). A
+    // multi-node node that has joined SWIM membership but has not yet
+    // observed its first quorum-committed topology must reject
+    // client-facing reads/writes with `ERR_CLUSTER_NOT_READY` (retryable
+    // by the client) so a seeding client cannot drive data into a
+    // half-formed cluster. This is more diagnostic than the broader
+    // `ERR_NO_QUORUM` and lets clients discriminate "still booting"
+    // from "lost quorum after formation".
+    //
+    // The gate is intentionally narrow: cluster-bootstrap traffic
+    // (topology proposals/votes/commits, replica batches, admin
+    // health/diagnostics, ping) bypasses the check so a node can
+    // become Alive in the first place.
+    if needs_cluster_readiness(request.op_code)
+        && let Some(c) = cluster
+        && c.shard_table().read().replication_factor() > 1
+        && !c.cluster_health().is_ready()
+    {
+        return error_response(
+            request.request_id,
+            ERR_CLUSTER_NOT_READY,
+            "node has not yet observed first committed topology",
+        );
+    }
+
     // Reject mutations when the cluster lacks quorum to prevent split-brain.
     if is_mutation_opcode(request.op_code)
         && let Some(err_resp) = check_quorum(cluster, request.request_id)
@@ -1858,6 +1883,16 @@ fn is_mutation_opcode(op: u16) -> bool {
             | OP_PRESERVE_TRANSACTIONS
             | OP_PROCESS_EXPIRED_PRESERVATIONS
     )
+}
+
+/// Phase I — true if `op` is a client-facing read or write that must
+/// wait for the node to be `Alive` (its first committed topology
+/// observed). Bootstrap traffic — topology proposals/votes/commits,
+/// replica batches, ping/health, partition map, admin diagnostics —
+/// bypasses the gate so the node has an opportunity to become ready
+/// in the first place.
+fn needs_cluster_readiness(op: u16) -> bool {
+    is_mutation_opcode(op) || matches!(op, OP_GET_BATCH | OP_GET_SPEND_BATCH | OP_QUERY_OLD_UNMINED)
 }
 
 // ---------------------------------------------------------------------------
@@ -6482,6 +6517,81 @@ mod tests {
     /// Phase I — `OP_ADMIN_CLUSTER_HEALTH` returns the cluster health
     /// snapshot from `RunningCluster::cluster_health` and serializes it
     /// into the 17-byte payload defined by the opcode.
+    /// Phase I — multi-node node that hasn't observed its first
+    /// committed topology must reject reads/writes with
+    /// `ERR_CLUSTER_NOT_READY`. `OP_ADMIN_CLUSTER_HEALTH` and other
+    /// bootstrap traffic still flow so the node can become ready.
+    #[test]
+    fn err_cluster_not_ready_gates_writes_when_joining() {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        // Empty `committed_members` ⇒ `topology_authority.handle_commit`
+        // is never called ⇒ `committed_term == 0` ⇒ Joining.
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&[n1, n2], 2, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[(n1, "127.0.0.1:9501".parse().unwrap())],
+            &[], // <-- no committed topology
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        assert!(!cluster.cluster_health().is_ready());
+
+        // Send an OP_DELETE_BATCH (mutation). Should be rejected with
+        // ERR_CLUSTER_NOT_READY before the handler runs. Payload shape
+        // is irrelevant — the gate runs before parsing.
+        let mut payload = vec![1u8, 0, 0, 0];
+        payload.extend_from_slice(&[0xabu8; 32]);
+        let req = RequestFrame {
+            request_id: 7,
+            op_code: OP_DELETE_BATCH,
+            flags: 0,
+            payload,
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &DispatchTestHarness::new().engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_ERROR);
+        assert!(resp.payload.len() >= 2);
+        let err = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
+        assert_eq!(
+            err, ERR_CLUSTER_NOT_READY,
+            "Joining node must reject mutations with ERR_CLUSTER_NOT_READY",
+        );
+
+        // OP_ADMIN_CLUSTER_HEALTH must still respond OK so a client can
+        // diagnose the readiness state.
+        let admin_req = RequestFrame {
+            request_id: 8,
+            op_code: OP_ADMIN_CLUSTER_HEALTH,
+            flags: 0,
+            payload: Vec::new(),
+        };
+        let admin_resp = handle_request(
+            &admin_req,
+            &DispatchTestHarness::new().engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(
+            admin_resp.status, STATUS_OK,
+            "OP_ADMIN_CLUSTER_HEALTH must bypass the readiness gate",
+        );
+    }
+
     #[test]
     fn op_admin_cluster_health_returns_serialized_snapshot() {
         use crate::cluster::coordinator::{ClusterHealth, ClusterHealthSwimState};
