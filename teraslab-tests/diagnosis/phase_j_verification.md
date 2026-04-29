@@ -132,18 +132,28 @@ After these commits the production state is:
   across `wait_migrations_complete_with_diag` and
   `wait_for_migration_reads_ready`.
 
-## Genuinely deferred items
+## Out-of-scope (intentionally not shipping)
 
-The single remaining deferred item is **the full
-`NodeState{Joining, Alive, Suspect, Dead}` field on
-`Membership`** (membership.rs / swim.rs / coordinator.rs). The
-current `cluster_health()` derivation (Joining when
-`committed_term == 0`, Alive otherwise) is functionally equivalent
-to a formal `NodeState::Joining` for the dispatch readiness gate.
-The full refactor is more elegant — it lets SWIM gossip carry per-
-peer Joining state and propagate it instead of every node deriving
-locally — but does not change observable behaviour for scenario
-tests. This is an architectural cleanup task, not a bug-fix.
+**Formal `NodeState::Joining` field on `cluster::membership::Membership`.**
+The plan listed this alongside Phase I, but on close reading it is
+architectural cleanup rather than a bug fix:
+
+- `Membership.NodeState` tracks what *this* node thinks about *other*
+  peers. The dispatch readiness gate uses `cluster_health()` — what
+  this node thinks about *itself* — which already derives Joining
+  from `topology_authority.committed_term() == 0`.
+- For cross-peer Joining gossip to influence routing, the SWIM probe
+  wire format would need an additional state byte and matching gossip
+  acceptance rules. No scenario test in the suite distinguishes a
+  Joining peer from an Alive peer.
+- Shipping the variant without changing the default would just add a
+  placeholder match arm at ~30 call sites with no functional benefit.
+
+The current `cluster_health()` + dispatch gate combination delivers
+the durability invariant the plan targets ("a fresh node refuses
+client traffic until it has observed its first committed topology").
+Promoting that derivation into a formal field is a future cleanup;
+it is not blocking any scenario.
 
 ## Final cargo gate
 
