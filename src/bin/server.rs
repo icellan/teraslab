@@ -689,6 +689,13 @@ fn main() {
             // start-time snapshot that could go stale before the first
             // batch is sent).
             let cluster_key_handle = running.cluster_key_handle();
+            // Phase H — `Send`-able handle for posting `ResyncRequest`
+            // whenever catchup returns the truncation sentinel ("redo
+            // entries reclaimed; full resync required"). The handle
+            // wraps a clone of the coordinator's resync channel
+            // sender + the node-address map for addr → NodeId
+            // resolution; `RunningCluster` itself is not `Clone`.
+            let resync_handle = running.resync_sender_handle();
             std::thread::spawn(move || {
                 let tracker = teraslab::replication::durable::AckTracker::new(ack_path);
                 let all_acked = tracker.all_acked();
@@ -770,6 +777,25 @@ fn main() {
                         }
                         Err(e) => {
                             tracing::warn!(%addr, err = %e, "catchup: replica catch-up failed");
+                            // Phase H — when catchup returns the
+                            // truncation sentinel, post a resync
+                            // request so the coordinator synthesizes a
+                            // full-shard backfill. The error string
+                            // contract is fixed by `run_catchup_for_replica`.
+                            if e.contains("redo entries reclaimed") {
+                                let queued = resync_handle.signal_for_addr(addr, Vec::new());
+                                if queued {
+                                    tracing::info!(
+                                        %addr,
+                                        "catchup: posted full-shard resync request",
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        %addr,
+                                        "catchup: resync request dropped (unknown addr or coordinator stopped)",
+                                    );
+                                }
+                            }
                         }
                     }
                 }

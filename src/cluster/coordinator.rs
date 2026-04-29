@@ -605,6 +605,16 @@ impl ClusterCoordinator {
         let inbound_bm_event = inbound_atomic.clone();
         let (topology_commit_tx, topology_commit_rx) = std::sync::mpsc::channel();
         let topology_commit_tx_event = topology_commit_tx.clone();
+        // Phase H — resync request channel. The catchup loop in
+        // `bin/server.rs` posts a `ResyncRequest` every time it
+        // observes the truncation sentinel (`run_catchup_for_replica`
+        // returning the "redo entries reclaimed" error). The event
+        // loop drains this receiver each iteration and synthesizes
+        // full-shard backfill tasks via
+        // `synthesize_resync_migration_tasks`.
+        let (resync_request_tx, resync_request_rx) =
+            std::sync::mpsc::channel::<crate::replication::manager::ResyncRequest>();
+        let resync_request_tx_for_cluster = resync_request_tx.clone();
         // Phase D: exchange phase channel.
         // After every multi-node topology commit, an exchange thread collects
         // OP_PARTITION_VERSION_REPORT from peers, then signals back here so
@@ -1090,6 +1100,65 @@ impl ClusterCoordinator {
                         );
                     }
                 }
+
+                // Phase H — drain resync requests posted by the catchup
+                // loop in `bin/server.rs` after `run_catchup_for_replica`
+                // observed the truncation sentinel. Translate each
+                // request into a list of full-shard backfill tasks and
+                // run them through the standard migration pipeline so
+                // they inherit Phase E dual-write protection and Phase G
+                // throttling.
+                while let Ok(req) = resync_request_rx.try_recv() {
+                    let table = shard_table.read().clone();
+                    let tasks = synthesize_resync_migration_tasks(&req, self_id, &table);
+                    if tasks.is_empty() {
+                        tracing::debug!(
+                            target_node = req.node_id,
+                            "cluster: resync request resolved to no tasks (self-target or empty owned set)",
+                        );
+                        continue;
+                    }
+                    let target_shards: std::collections::HashSet<u16> =
+                        tasks.iter().map(|t| t.shard).collect();
+                    tracing::info!(
+                        target_node = req.node_id,
+                        shard_count = tasks.len(),
+                        "cluster: synthesizing full-shard resync tasks",
+                    );
+                    let keys_map = engine.keys_by_shard_filtered(&target_shards);
+                    let all_keys: Vec<TxKey> =
+                        keys_map.values().flat_map(|v| v.iter().copied()).collect();
+                    let epoch = topology_epoch.load(Ordering::Relaxed);
+                    let migration_ref = migration.clone();
+                    let node_addrs_ref = node_addrs.clone();
+                    let eng = engine.clone();
+                    let redo = redo_for_events.clone();
+                    let st = shard_table.clone();
+                    let fb = fenced_bm_event.clone();
+                    let mb = migrating_bm_event.clone();
+                    let ib = inbound_bm_event.clone();
+                    let throttle_ref = migration_throttle_event.clone();
+                    std::thread::spawn(move || {
+                        Self::run_migration_tasks_with_global_limit(
+                            tasks,
+                            all_keys,
+                            node_addrs_ref,
+                            eng,
+                            migration_ref,
+                            st,
+                            redo,
+                            epoch,
+                            max_migration_threads,
+                            migration_pool_size,
+                            migration_batch_size,
+                            fb,
+                            mb,
+                            ib,
+                            self_id,
+                            throttle_ref,
+                        );
+                    });
+                }
             }
         });
 
@@ -1116,6 +1185,7 @@ impl ClusterCoordinator {
             inbound_atomic,
             migrating_bitmap,
             topology_commit_tx,
+            resync_request_tx: resync_request_tx_for_cluster,
             topology_state_path,
             swim_incarnation: swim_incarnation_for_cluster,
             startup_reactivation_needed,
@@ -5189,6 +5259,37 @@ pub fn apply_master_election(
     }
 }
 
+/// Phase H — `Send`-able handle for posting resync requests from a
+/// background thread without holding a `&RunningCluster`. Returned by
+/// [`RunningCluster::resync_sender_handle`].
+#[derive(Clone)]
+pub struct ResyncSenderHandle {
+    tx: std::sync::mpsc::Sender<crate::replication::manager::ResyncRequest>,
+    node_addrs: Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
+}
+
+impl ResyncSenderHandle {
+    /// Resolve `addr` to a `NodeId` against the cluster's address map
+    /// and post a `ResyncRequest` for it. `shards` empty means "every
+    /// shard the named replica should hold per the current shard
+    /// table". Returns `true` on successful queue, `false` when the
+    /// address is unknown or the receiver has been dropped.
+    pub fn signal_for_addr(&self, addr: &SocketAddr, shards: Vec<u16>) -> bool {
+        let resolved = self
+            .node_addrs
+            .read()
+            .unwrap()
+            .iter()
+            .find_map(|(id, a)| if a == addr { Some(id.0) } else { None });
+        let Some(node_id) = resolved else {
+            return false;
+        };
+        self.tx
+            .send(crate::replication::manager::ResyncRequest { node_id, shards })
+            .is_ok()
+    }
+}
+
 /// Phase I — snapshot of this node's readiness for client traffic.
 ///
 /// Returned by [`RunningCluster::cluster_health`] and serialized over
@@ -5378,6 +5479,13 @@ pub struct RunningCluster {
     /// Channel for signaling topology commits from dispatch or proposer threads.
     /// The event loop receives these and activates the shard table.
     topology_commit_tx: std::sync::mpsc::Sender<(Vec<NodeId>, u64)>,
+    /// Phase H — resync request channel. Posted to by the catchup
+    /// loop in `bin/server.rs` whenever a replica's catch-up redo
+    /// entries have been reclaimed; the coordinator's event loop
+    /// drains the receiver and translates each request into one
+    /// full-shard backfill `MigrationTask` per shard the replica
+    /// should hold.
+    resync_request_tx: std::sync::mpsc::Sender<crate::replication::manager::ResyncRequest>,
     /// Path for persisting full topology state (voted_term, committed_members).
     topology_state_path: Option<std::path::PathBuf>,
     /// SWIM incarnation counter shared with the event loop for persistence.
@@ -5636,6 +5744,19 @@ impl RunningCluster {
     /// Get the address of a node.
     pub fn node_addr(&self, node: &NodeId) -> Option<SocketAddr> {
         self.node_addrs.read().unwrap().get(node).copied()
+    }
+
+    /// Phase H — reverse lookup: find the `NodeId` whose address
+    /// matches `addr`. Used by the catchup loop to resolve a replica
+    /// socket address into the `NodeId` carried in `ResyncRequest`.
+    /// Returns `None` when no member maps to the address (transient
+    /// during topology change).
+    pub fn node_id_for_addr(&self, addr: &SocketAddr) -> Option<NodeId> {
+        self.node_addrs
+            .read()
+            .unwrap()
+            .iter()
+            .find_map(|(id, a)| if a == addr { Some(*id) } else { None })
     }
 
     /// Get the current shard table version.
@@ -6121,6 +6242,34 @@ impl RunningCluster {
         let _ = self.topology_commit_tx.send((members, term));
     }
 
+    /// Phase H — post a resync request to the coordinator's event loop.
+    ///
+    /// Called from `bin/server.rs` whenever
+    /// `run_catchup_for_replica` returns the truncation sentinel
+    /// ("redo entries reclaimed; full resync required"). The event
+    /// loop translates each request into one full-shard backfill
+    /// `MigrationTask` per shard the named replica should hold, and
+    /// runs them through the standard migration pipeline.
+    ///
+    /// Returns `true` when the request was successfully queued. A
+    /// `false` return means the receiver has been dropped (the
+    /// coordinator is shutting down) and the caller should drop the
+    /// request silently.
+    pub fn signal_resync_request(&self, req: crate::replication::manager::ResyncRequest) -> bool {
+        self.resync_request_tx.send(req).is_ok()
+    }
+
+    /// Phase H — owned-by-thread handle that lets a background loop
+    /// post resync requests without holding a `&RunningCluster`.
+    /// Returns a small `Send`-able struct cloning only the channel
+    /// sender and the node-address map.
+    pub fn resync_sender_handle(&self) -> ResyncSenderHandle {
+        ResyncSenderHandle {
+            tx: self.resync_request_tx.clone(),
+            node_addrs: self.node_addrs.clone(),
+        }
+    }
+
     /// Persist the full topology state to disk.
     ///
     /// Writes `voted_term` and `committed_members` durably so that after a
@@ -6267,6 +6416,7 @@ pub(crate) fn new_test_running_cluster(
     }
 
     let (topology_commit_tx, _topology_commit_rx) = std::sync::mpsc::channel();
+    let (resync_request_tx, _resync_request_rx) = std::sync::mpsc::channel();
 
     RunningCluster {
         self_id,
@@ -6291,6 +6441,7 @@ pub(crate) fn new_test_running_cluster(
         inbound_atomic,
         migrating_bitmap,
         topology_commit_tx,
+        resync_request_tx,
         topology_state_path: None,
         swim_incarnation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         startup_reactivation_needed: Arc::new(AtomicBool::new(false)),
