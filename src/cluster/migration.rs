@@ -2951,18 +2951,43 @@ mod tests {
 
     /// Phase 5: starting an outbound migration should bump the
     /// `migration_active` gauge; completing it should decrement back.
+    ///
+    /// `migration_metrics()` is a process-global singleton, so parallel
+    /// tests that read/mutate the same gauge can race on the
+    /// `before` / `after` deltas. We serialize this test on a static
+    /// `Mutex` for exactly that reason — the assertion is about
+    /// `MigrationManager`'s book-keeping, not about parallel-test
+    /// isolation, and the lock costs effectively nothing.
     #[test]
     fn migration_active_gauge_tracks_inflight_shards() {
         use crate::metrics::{MigrationMetrics, init_migration_metrics, migration_metrics};
-        use std::sync::OnceLock;
         use std::sync::atomic::Ordering;
+        use std::sync::{Mutex, OnceLock};
 
         static TEST_METRICS: OnceLock<MigrationMetrics> = OnceLock::new();
+        // Serialize every test that touches the global migration_metrics
+        // gauges. Without this, parallel tests share the singleton and
+        // the +1 / -1 deltas asserted below race with other tests'
+        // `start_outbound` / `mark_complete` calls.
+        static METRICS_TEST_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = METRICS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
         let m_ref: &'static MigrationMetrics = TEST_METRICS.get_or_init(MigrationMetrics::new);
         init_migration_metrics(m_ref);
         let metrics = migration_metrics().expect("metrics installed");
 
-        let before = metrics.migration_active.load(Ordering::Relaxed);
+        // Reset both gauges to a known baseline so the assertions are
+        // independent of leftover state from previous tests in the
+        // same process. Safe under the test lock.
+        metrics.migration_active.store(0, Ordering::Relaxed);
+        metrics
+            .migration_phase_preparing
+            .store(0, Ordering::Relaxed);
+        metrics.migration_phase_copying.store(0, Ordering::Relaxed);
+        metrics.migration_phase_delta.store(0, Ordering::Relaxed);
+        metrics
+            .migration_phase_serving_new
+            .store(0, Ordering::Relaxed);
         let before_entries = metrics.migration_entries_applied_total.get();
 
         let mut mgr = MigrationManager::new();
@@ -2977,9 +3002,10 @@ mod tests {
         // Source is self_id = NodeId(1), matches task.from_node, so this is
         // an outbound migration that should bump the gauge.
         mgr.start_outbound(std::slice::from_ref(&task), NodeId(1), &populated);
-        assert!(
-            metrics.migration_active.load(Ordering::Relaxed) > before,
-            "migration_active gauge must advance on start_outbound"
+        assert_eq!(
+            metrics.migration_active.load(Ordering::Relaxed),
+            1,
+            "migration_active gauge must increment to exactly 1 after one start_outbound",
         );
 
         // Transition through states + record progress.
@@ -2988,16 +3014,16 @@ mod tests {
         mgr.mark_fenced(&task, 50);
         mgr.mark_complete(&task);
 
-        // After completion the active gauge must return to (at least) the
-        // baseline we observed going in. Other parallel tests may have
-        // added their own in-flight migrations, so we assert ≤ rather than ==.
-        assert!(
-            metrics.migration_active.load(Ordering::Relaxed) <= before,
-            "migration_active gauge must decrement back after mark_complete"
+        // After completion the active gauge must return to 0 — the
+        // baseline reset above keeps this exact, not ≤.
+        assert_eq!(
+            metrics.migration_active.load(Ordering::Relaxed),
+            0,
+            "migration_active gauge must return to 0 after mark_complete",
         );
         assert!(
             metrics.migration_entries_applied_total.get() - before_entries >= 10,
-            "migration_entries_applied_total must advance by ≥ records migrated"
+            "migration_entries_applied_total must advance by ≥ records migrated",
         );
     }
 
