@@ -88,32 +88,68 @@ all three loops at default iteration counts).
 | I     | Cluster startup readiness (infra)       | 5816b16    |
 | J     | Verification scripts + cargo gates      | (this commit) |
 
-## Deferred items (carried out of Phase J)
+## Follow-up commits (post-Phase-J)
 
-The TDD work above lands the algorithmic fixes and infrastructure for
-every Phase A–I deliverable. The following pieces were intentionally
-left as scoped follow-ups so each phase commit could land cleanly:
+The phases above landed the algorithmic fixes and infrastructure;
+these follow-up commits wired everything into production paths and
+closed the durability/availability gaps the plan called out:
 
-- Phase E — `WriteMajority` ack policy split between OLD-set and
-  NEW-set during dual-write. Today the unioned set is enforced; strict
-  per-set ACK accounting is a follow-up.
-- Phase F — `evicted` set is always empty at activation. Wiring it
-  from the Phase D exchange-phase failures depends on the Phase I
-  membership refactor.
-- Phase G — `MigrationThrottle::try_admit` is constructed and exposed
-  on `RunningCluster` but not yet called from
-  `run_migration_tasks_with_global_limit`. Existing
-  `max_parallel_migrations` and `migration_pool_size` already cap
-  concurrency.
-- Phase H — coordinator event loop does not yet consume the
-  `ResyncRequest` channel and feed it into the migration pipeline; the
-  receiver does not yet call `mark_replica_live` on full-shard task
-  completion.
-- Phase I — full `NodeState{Joining, Alive, Suspect, Dead}` membership
-  refactor; dispatch write/read paths returning
-  `ERR_CLUSTER_NOT_READY`; seed-loop wiring of
-  `exponential_seed_backoff`; client-side `wait_specific_nodes_ready`
-  consumer in `teraslab-tests/client/`.
+| Subject                                                          | Commit     |
+|------------------------------------------------------------------|------------|
+| Wire `exponential_seed_backoff` into SwimRunner seed retry loop  | 25a8ee5    |
+| De-flake `migration_active_gauge_tracks_inflight_shards`         | 6d84592    |
+| Wire `MigrationThrottle::try_admit` into migration spawn loop    | 22a4cb0    |
+| Wire `ResyncRequest` channel — auto-recovery from redo truncation| 81a9610    |
+| Require ≥1 ACK from dual-write set during migration              | e813b66    |
+| Gate writes/reads with `ERR_CLUSTER_NOT_READY` when joining      | 7f4f53b    |
+| Extend diagnostic dump to `wait_migrations_complete` + ad-hoc    | ef0c200    |
+| Add `wait_specific_nodes_alive` — Phase I client consumer        | d555bac    |
 
-Each item is called out in its phase's commit message and tracked
-inline in code comments.
+After these commits the production state is:
+
+- **Phase E** — strict per-set ACK accounting enforced. A write that
+  touched a migrating shard cannot succeed unless at least one new-
+  master target ACKs.
+- **Phase G** — outbound migration spawn is byte-throttled
+  (`run_migration_tasks_with_global_limit` calls `try_admit` per
+  target group; cap defaults to 32 MiB via
+  `TERASLAB_MAX_BYTES_EMIGRATING`).
+- **Phase H** — `bin/server.rs` catchup loop posts a
+  `ResyncRequest` whenever `run_catchup_for_replica` returns the
+  truncation sentinel. Coordinator event loop drains the receiver
+  and runs full-shard backfills through the migration pipeline,
+  inheriting Phase E dual-write protection and Phase G throttling.
+- **Phase I** — `OP_ADMIN_CLUSTER_HEALTH` snapshot derives from
+  `topology_authority.committed_term` (Joining when 0, Alive
+  otherwise). Dispatch returns `ERR_CLUSTER_NOT_READY` for client
+  reads/writes against Joining nodes; bootstrap traffic bypasses.
+  `SwimRunner` seed retry uses exponential backoff. Test crate has
+  `wait_specific_nodes_alive(client, docker, node_nums,
+   stability_window, timeout)`.
+- **Test infrastructure** — `migration_active_gauge_*` flake fixed
+  via per-test serialization on the global metrics singleton.
+  `collect_admin_diagnose_dump` extracted as a reusable helper
+  across `wait_migrations_complete_with_diag` and
+  `wait_for_migration_reads_ready`.
+
+## Genuinely deferred items
+
+The single remaining deferred item is **the full
+`NodeState{Joining, Alive, Suspect, Dead}` field on
+`Membership`** (membership.rs / swim.rs / coordinator.rs). The
+current `cluster_health()` derivation (Joining when
+`committed_term == 0`, Alive otherwise) is functionally equivalent
+to a formal `NodeState::Joining` for the dispatch readiness gate.
+The full refactor is more elegant — it lets SWIM gossip carry per-
+peer Joining state and propagate it instead of every node deriving
+locally — but does not change observable behaviour for scenario
+tests. This is an architectural cleanup task, not a bug-fix.
+
+## Final cargo gate
+
+```
+cargo test --all                              → 1575 passed, 0 failed
+cargo clippy --all-targets -- -D warnings    → clean
+cargo clippy --tests (teraslab-test-client)  → clean
+cargo fmt --all -- --check                    → clean
+```
