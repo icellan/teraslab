@@ -647,7 +647,9 @@ pub async fn wait_for_migration_reads_ready(
             // OP_ADMIN_DIAGNOSE_KEY admin op, which returns each
             // node's per-shard state (shard, master, holder, inbound,
             // fenced, migrating, topology epoch) for every txid in a
-            // single batched call.
+            // single batched call. The collection + formatting lives
+            // in `collect_admin_diagnose_dump` so other helpers
+            // (e.g. `wait_migrations_complete_with_diag`) can reuse it.
             let cap = (ADMIN_DIAGNOSE_KEY_MAX_TXIDS as usize).min(32);
             let failing_txids: Vec<[u8; 32]> = master_failed_idx
                 .iter()
@@ -655,29 +657,8 @@ pub async fn wait_for_migration_reads_ready(
                 .map(|&i| txids[i])
                 .collect();
 
-            let mut per_node_responses: Vec<
-                Result<Vec<teraslab::cluster::migration::KeyDiagnosis>, String>,
-            > = Vec::with_capacity(node_addrs.len());
-            for addr in &node_addrs {
-                let payload = encode_admin_diagnose_key(&failing_txids);
-                let result = match client
-                    .send_to_addr(addr, OP_ADMIN_DIAGNOSE_KEY, 0, payload)
-                    .await
-                {
-                    Ok((frame_status, body)) => {
-                        if frame_status == STATUS_OK {
-                            decode_admin_diagnose_key(&body)
-                        } else {
-                            Err(format!("admin op returned status={frame_status}"))
-                        }
-                    }
-                    Err(e) => Err(e.to_string()),
-                };
-                per_node_responses.push(result);
-            }
-
             let dump =
-                format_master_failed_diagnostic(&failing_txids, node_nums, &per_node_responses);
+                collect_admin_diagnose_dump(client, &node_addrs, node_nums, &failing_txids).await;
 
             return Err(ClientError::Connection(format!(
                 "migration read verify timeout after {timeout:?}: \
@@ -1951,6 +1932,96 @@ pub fn format_master_failed_diagnostic(
         String::new()
     } else {
         format!("\n  {}", lines.join("\n  "))
+    }
+}
+
+/// Phase A follow-up: query `OP_ADMIN_DIAGNOSE_KEY` on every listed
+/// node for `failing_txids`, then format the responses via
+/// [`format_master_failed_diagnostic`] into the same per-record /
+/// per-node table that `wait_for_migration_reads_ready` produces on
+/// timeout.
+///
+/// Reusable across helpers: `wait_migrations_complete` calls it on
+/// timeout when the caller supplies a sample of tracked txids, and
+/// scenario tests can call it ad-hoc when they detect an unexpected
+/// state in the middle of a run. `node_addrs` and `node_nums` must be
+/// in the same order — the i-th address is queried, and the dump
+/// renders columns labelled `n{node_nums[i]}`.
+///
+/// Returns an empty string when `failing_txids` is empty so callers
+/// can append the result unconditionally.
+pub async fn collect_admin_diagnose_dump(
+    client: &Client,
+    node_addrs: &[String],
+    node_nums: &[u32],
+    failing_txids: &[[u8; 32]],
+) -> String {
+    debug_assert_eq!(node_addrs.len(), node_nums.len());
+    if failing_txids.is_empty() {
+        return String::new();
+    }
+    let mut per_node_responses: Vec<
+        Result<Vec<teraslab::cluster::migration::KeyDiagnosis>, String>,
+    > = Vec::with_capacity(node_addrs.len());
+    for addr in node_addrs {
+        let payload = encode_admin_diagnose_key(failing_txids);
+        let result = match client
+            .send_to_addr(addr, OP_ADMIN_DIAGNOSE_KEY, 0, payload)
+            .await
+        {
+            Ok((frame_status, body)) => {
+                if frame_status == STATUS_OK {
+                    decode_admin_diagnose_key(&body)
+                } else {
+                    Err(format!("admin op returned status={frame_status}"))
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        per_node_responses.push(result);
+    }
+    format_master_failed_diagnostic(failing_txids, node_nums, &per_node_responses)
+}
+
+/// Phase A follow-up — variant of [`wait_migrations_complete`] that
+/// collects an `OP_ADMIN_DIAGNOSE_KEY` dump on timeout for the first
+/// `min(sample_txids.len(), ADMIN_DIAGNOSE_KEY_MAX_TXIDS, 32)` of
+/// `sample_txids`. Use this when the caller has a representative set
+/// of tracked records to probe — the dump is appended to the timeout
+/// error so the failure log shows per-shard / per-node state for the
+/// stuck records, not just aggregate counters.
+///
+/// Behaviour matches `wait_migrations_complete` on the success path.
+/// Pass `&[]` for `sample_txids` to skip the dump.
+pub async fn wait_migrations_complete_with_diag(
+    docker: &DockerHelpers,
+    node_count: u32,
+    timeout: Duration,
+    client: &Client,
+    sample_txids: &[[u8; 32]],
+) -> Result<(), ClientError> {
+    match wait_migrations_complete(docker, node_count, timeout).await {
+        Ok(()) => Ok(()),
+        Err(e) if !sample_txids.is_empty() => {
+            let cap = (ADMIN_DIAGNOSE_KEY_MAX_TXIDS as usize).min(32);
+            let failing: Vec<[u8; 32]> = sample_txids.iter().take(cap).copied().collect();
+            let node_nums: Vec<u32> = (1..=node_count).collect();
+            let node_addrs: Vec<String> = node_nums
+                .iter()
+                .map(|&n| format!("127.0.0.1:{}", docker.client_port(n)))
+                .collect();
+            let dump =
+                collect_admin_diagnose_dump(client, &node_addrs, &node_nums, &failing).await;
+            let base = match &e {
+                ClientError::Connection(s) => s.clone(),
+                other => other.to_string(),
+            };
+            Err(ClientError::Connection(format!(
+                "{base}; diag (first n={}):{dump}",
+                failing.len(),
+            )))
+        }
+        Err(e) => Err(e),
     }
 }
 
