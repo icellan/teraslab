@@ -109,6 +109,28 @@ pub const OP_PARTITION_VERSION_REPORT: u16 = 105;
 /// Encoded width of a single `PartitionVersionEntry` on the wire.
 pub const PARTITION_VERSION_ENTRY_SIZE: usize = 2 + 1 + 1 + 8;
 
+/// Phase I — admin opcode returning a snapshot of this node's cluster
+/// readiness. Designed for client / test pre-flight checks so callers
+/// only seed records once the cluster has settled.
+///
+/// Request payload: empty.
+///
+/// Response payload (`STATUS_OK`, fixed 17 bytes):
+/// ```text
+///   swim_state:                u8       (1 byte; 0=Joining, 1=Alive,
+///                                              2=Suspect, 3=Dead)
+///   last_committed_term:       u64 LE   (8 bytes)
+///   last_topology_commit_age:  u64 LE   (8 bytes; milliseconds since
+///                                       the most recent committed
+///                                       topology was applied locally,
+///                                       or `u64::MAX` when no commit
+///                                       has been observed yet)
+/// ```
+pub const OP_ADMIN_CLUSTER_HEALTH: u16 = 106;
+
+/// Encoded width of the `OP_ADMIN_CLUSTER_HEALTH` response payload.
+pub const ADMIN_CLUSTER_HEALTH_PAYLOAD_SIZE: usize = 1 + 8 + 8;
+
 // Streaming
 pub const OP_STREAM_CHUNK: u16 = 200;
 pub const OP_STREAM_END: u16 = 201;
@@ -195,6 +217,14 @@ pub const ERR_TOPOLOGY_PERSIST_FAILED: u16 = 23;
 /// `ERR_REDIRECT` (per-key routing miss): a stale-epoch error means the
 /// sender's whole view of cluster ownership is out of date.
 pub const ERR_STALE_EPOCH: u16 = 24;
+
+/// Phase I — this node is part of the cluster member set but has not yet
+/// observed its first quorum-committed topology. Writes and reads
+/// against a `Joining` node are rejected with this code so a client
+/// that seeds against a freshly-spawned peer cannot accidentally drive
+/// data into a half-formed cluster. Retryable: re-issue once the node
+/// has been promoted to `Alive` (signalled by `OP_ADMIN_CLUSTER_HEALTH`).
+pub const ERR_CLUSTER_NOT_READY: u16 = 25;
 
 // Streaming errors
 /// Blob stream not found for the given txid on this connection.

@@ -281,6 +281,7 @@ pub(crate) fn handle_request(
         OP_GET_COMMITTED_TOPOLOGY => handle_get_committed_topology(request, cluster),
         OP_ADMIN_DIAGNOSE_KEY => handle_admin_diagnose_key(request, engine, cluster),
         OP_PARTITION_VERSION_REPORT => handle_partition_version_report(request, engine, cluster),
+        OP_ADMIN_CLUSTER_HEALTH => handle_admin_cluster_health(request, cluster),
         OP_PING => ResponseFrame {
             request_id: request.request_id,
             status: STATUS_OK,
@@ -4681,6 +4682,36 @@ fn handle_admin_diagnose_key(
 ///
 /// See the doc comment on [`OP_PARTITION_VERSION_REPORT`] for the wire layout.
 ///
+/// Phase I — `OP_ADMIN_CLUSTER_HEALTH` handler.
+///
+/// Returns this node's [`ClusterHealth`](crate::cluster::coordinator::ClusterHealth)
+/// snapshot — used by clients (and `wait_specific_nodes_ready` in the
+/// integration harness) to refuse seeding against a node that has not
+/// yet observed its first quorum-committed topology.
+///
+/// In single-node / no-cluster mode (e.g. test fixtures without a
+/// `RunningCluster`), the handler returns `STATUS_OK` with the node
+/// reporting itself as `Joining` so callers consistently treat
+/// "no cluster" as "not yet ready".
+fn handle_admin_cluster_health(
+    req: &RequestFrame,
+    cluster: Option<&RunningCluster>,
+) -> ResponseFrame {
+    let snapshot = match cluster {
+        Some(c) => c.cluster_health(),
+        None => crate::cluster::coordinator::ClusterHealth {
+            swim_state: crate::cluster::coordinator::ClusterHealthSwimState::Joining,
+            last_committed_term: 0,
+            last_topology_commit_age_ms: u64::MAX,
+        },
+    };
+    ResponseFrame {
+        request_id: req.request_id,
+        status: STATUS_OK,
+        payload: snapshot.serialize().to_vec(),
+    }
+}
+
 /// `last_applied_seq` is reported as `engine.shard_record_count(shard)` —
 /// the engine does not currently track per-shard replication sequence numbers,
 /// and a non-zero record count is a safe proxy for "this node holds data for
@@ -6378,6 +6409,80 @@ mod tests {
             observed_ops[0].1.as_slice(),
             [ReplicaOp::Delete { tx_key: deleted }] if *deleted == tx_key
         ));
+    }
+
+    /// Phase I — `OP_ADMIN_CLUSTER_HEALTH` returns the cluster health
+    /// snapshot from `RunningCluster::cluster_health` and serializes it
+    /// into the 17-byte payload defined by the opcode.
+    #[test]
+    fn op_admin_cluster_health_returns_serialized_snapshot() {
+        use crate::cluster::coordinator::{ClusterHealth, ClusterHealthSwimState};
+        let n1 = crate::cluster::shards::NodeId(1);
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&[n1], 1, 3);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[(n1, "127.0.0.1:9001".parse().unwrap())],
+            &[n1],
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        let req = RequestFrame {
+            request_id: 17,
+            op_code: OP_ADMIN_CLUSTER_HEALTH,
+            flags: 0,
+            payload: Vec::new(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &DispatchTestHarness::new().engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(resp.request_id, 17);
+        let decoded =
+            ClusterHealth::deserialize(&resp.payload).expect("response decodes as ClusterHealth");
+        assert_eq!(
+            decoded.swim_state,
+            ClusterHealthSwimState::Alive,
+            "test cluster has a committed term so it must report Alive",
+        );
+        assert!(decoded.is_ready());
+    }
+
+    #[test]
+    fn op_admin_cluster_health_without_cluster_reports_joining() {
+        use crate::cluster::coordinator::{ClusterHealth, ClusterHealthSwimState};
+        let req = RequestFrame {
+            request_id: 99,
+            op_code: OP_ADMIN_CLUSTER_HEALTH,
+            flags: 0,
+            payload: Vec::new(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &DispatchTestHarness::new().engine,
+            8192,
+            None, // no RunningCluster wired in
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let decoded =
+            ClusterHealth::deserialize(&resp.payload).expect("response decodes as ClusterHealth");
+        assert_eq!(decoded.swim_state, ClusterHealthSwimState::Joining);
+        assert_eq!(decoded.last_committed_term, 0);
+        assert_eq!(decoded.last_topology_commit_age_ms, u64::MAX);
+        assert!(!decoded.is_ready());
     }
 
     /// Phase E: while shard is migrating outbound from this node, the

@@ -344,6 +344,13 @@ pub struct TopologyAuthority {
     /// current live socket map prevents graceful drain commits from
     /// being undone while the departing node is still reachable.
     observed_membership: Mutex<Vec<NodeId>>,
+    /// Phase I — wall-clock timestamp (millis since UNIX epoch) of the
+    /// most recently observed `OP_TOPOLOGY_COMMIT` apply. Stays at `0`
+    /// until the first commit lands so the
+    /// [`OP_ADMIN_CLUSTER_HEALTH`](crate::protocol::opcodes::OP_ADMIN_CLUSTER_HEALTH)
+    /// endpoint can distinguish a `Joining` node (no commit yet) from a
+    /// settled `Alive` one.
+    last_commit_at_unix_ms: AtomicU64,
 }
 
 impl TopologyAuthority {
@@ -358,6 +365,7 @@ impl TopologyAuthority {
             propose_timeout,
             last_membership_change: Mutex::new(Instant::now()),
             observed_membership: Mutex::new(Vec::new()),
+            last_commit_at_unix_ms: AtomicU64::new(0),
         }
     }
 
@@ -576,11 +584,40 @@ impl TopologyAuthority {
         self.committed_term.store(commit.term, Ordering::Relaxed);
         *self.committed_members.write().unwrap() = commit.members.clone();
         *self.observed_membership.lock().unwrap() = commit.members.clone();
+        // Phase I — stamp the wall-clock time so cluster_health can
+        // report `last_topology_commit_age_ms`. Best-effort: a system
+        // clock without UNIX_EPOCH access stays at the prior value.
+        if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            self.last_commit_at_unix_ms
+                .store(d.as_millis() as u64, Ordering::Relaxed);
+        }
 
         // Clear any pending proposal (superseded by this commit).
         *self.pending_proposal.lock().unwrap() = None;
 
         Some(commit.term)
+    }
+
+    /// Phase I — millis since UNIX epoch of the most recent observed
+    /// commit, or `0` when no commit has been applied yet on this node.
+    pub fn last_commit_at_unix_ms(&self) -> u64 {
+        self.last_commit_at_unix_ms.load(Ordering::Relaxed)
+    }
+
+    /// Phase I — milliseconds elapsed since the most recent commit on
+    /// this node. Returns `u64::MAX` when no commit has been observed
+    /// (the cluster_health endpoint reports this back to clients as
+    /// "not yet ready").
+    pub fn last_commit_age_ms(&self) -> u64 {
+        let stamp = self.last_commit_at_unix_ms();
+        if stamp == 0 {
+            return u64::MAX;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(stamp);
+        now.saturating_sub(stamp)
     }
 
     /// Retry a failed proposal as the deterministic proposer.
@@ -835,6 +872,45 @@ mod tests {
         assert_eq!(result, Some(5));
         assert_eq!(auth.committed_term(), 5);
         assert_eq!(auth.committed_members(), mems);
+    }
+
+    // ── Phase I: cluster-readiness (last commit timestamp) ─────────────────
+
+    #[test]
+    fn last_commit_age_is_max_before_first_commit() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        assert_eq!(
+            auth.last_commit_at_unix_ms(),
+            0,
+            "no commit yet → no timestamp",
+        );
+        assert_eq!(
+            auth.last_commit_age_ms(),
+            u64::MAX,
+            "absent commit must read as the largest possible age",
+        );
+    }
+
+    #[test]
+    fn last_commit_age_advances_after_handle_commit() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let mems = members(&[1, 2, 3]);
+        let commit = TopologyCommit {
+            term: 7,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            digest: TopologyTerm::compute_digest(7, &mems),
+        };
+        assert_eq!(auth.handle_commit(&commit), Some(7));
+        assert!(
+            auth.last_commit_at_unix_ms() > 0,
+            "handle_commit must stamp the wall-clock time",
+        );
+        // Age must be small (commit was just applied).
+        assert!(
+            auth.last_commit_age_ms() < 60_000,
+            "freshly committed term should have age << 1 minute",
+        );
     }
 
     #[test]

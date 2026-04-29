@@ -5094,6 +5094,98 @@ pub fn apply_master_election(
     }
 }
 
+/// Phase I — snapshot of this node's readiness for client traffic.
+///
+/// Returned by [`RunningCluster::cluster_health`] and serialized over
+/// the wire by the
+/// [`OP_ADMIN_CLUSTER_HEALTH`](crate::protocol::opcodes::OP_ADMIN_CLUSTER_HEALTH)
+/// dispatch handler. Clients (and the integration test harness) use it
+/// to refuse seeding against a node that is part of the SWIM
+/// membership but has not yet observed its first quorum-committed
+/// topology — the chronic source of "MIGRATION_IN_PROGRESS during
+/// seed" failures in scenario 12.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClusterHealth {
+    /// SWIM-style membership state. `Joining` until this node has
+    /// observed its first committed topology; `Alive` afterwards.
+    pub swim_state: ClusterHealthSwimState,
+    /// Most recent quorum-committed topology term observed by this
+    /// node (`0` when no commit has landed yet).
+    pub last_committed_term: u64,
+    /// Milliseconds elapsed since `last_committed_term` was applied
+    /// locally, or `u64::MAX` when no commit has been observed.
+    pub last_topology_commit_age_ms: u64,
+}
+
+/// Phase I — SWIM-style state byte encoded in the
+/// `OP_ADMIN_CLUSTER_HEALTH` response.
+///
+/// Until the full `NodeState{Joining,Alive,Suspect,Dead}` membership
+/// refactor lands, this enum maps directly to the wire byte and is
+/// derived from `last_committed_term`: `Joining` (0) before the first
+/// commit, `Alive` (1) afterwards. `Suspect` / `Dead` are reserved for
+/// future use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ClusterHealthSwimState {
+    /// Node is part of the cluster member set but has not yet observed
+    /// its first quorum-committed topology. Writes / reads against a
+    /// `Joining` node are rejected with `ERR_CLUSTER_NOT_READY`.
+    Joining = 0,
+    /// Node has observed at least one committed topology and is
+    /// serving traffic.
+    Alive = 1,
+    /// Reserved — peer probes have started failing but the node has
+    /// not yet been declared `Dead`.
+    Suspect = 2,
+    /// Reserved — peer has been declared dead and should be removed
+    /// from the alive set.
+    Dead = 3,
+}
+
+impl ClusterHealth {
+    /// Wire-encode the snapshot into the
+    /// [`ADMIN_CLUSTER_HEALTH_PAYLOAD_SIZE`](crate::protocol::opcodes::ADMIN_CLUSTER_HEALTH_PAYLOAD_SIZE)
+    /// byte payload returned by the
+    /// [`OP_ADMIN_CLUSTER_HEALTH`](crate::protocol::opcodes::OP_ADMIN_CLUSTER_HEALTH)
+    /// dispatch handler.
+    pub fn serialize(&self) -> [u8; 17] {
+        let mut buf = [0u8; 17];
+        buf[0] = self.swim_state as u8;
+        buf[1..9].copy_from_slice(&self.last_committed_term.to_le_bytes());
+        buf[9..17].copy_from_slice(&self.last_topology_commit_age_ms.to_le_bytes());
+        buf
+    }
+
+    /// Decode a snapshot from the wire payload. Returns `None` when the
+    /// buffer is too short or the state byte is unknown.
+    pub fn deserialize(data: &[u8]) -> Option<Self> {
+        if data.len() < 17 {
+            return None;
+        }
+        let swim_state = match data[0] {
+            0 => ClusterHealthSwimState::Joining,
+            1 => ClusterHealthSwimState::Alive,
+            2 => ClusterHealthSwimState::Suspect,
+            3 => ClusterHealthSwimState::Dead,
+            _ => return None,
+        };
+        let last_committed_term = u64::from_le_bytes(data[1..9].try_into().ok()?);
+        let last_topology_commit_age_ms = u64::from_le_bytes(data[9..17].try_into().ok()?);
+        Some(Self {
+            swim_state,
+            last_committed_term,
+            last_topology_commit_age_ms,
+        })
+    }
+
+    /// `true` once the node has observed at least one committed
+    /// topology — i.e. clients can safely send writes / reads here.
+    pub fn is_ready(&self) -> bool {
+        self.swim_state == ClusterHealthSwimState::Alive
+    }
+}
+
 /// Result of a [`RunningCluster::is_master`] query.
 ///
 /// Returned in place of a bare `bool` so that callers (specifically the
@@ -5768,6 +5860,31 @@ impl RunningCluster {
     /// cap (`TERASLAB_MAX_BYTES_EMIGRATING`, default 32 MiB).
     pub fn migration_throttle(&self) -> &Arc<crate::cluster::migration::MigrationThrottle> {
         &self.migration_throttle
+    }
+
+    /// Phase I — point-in-time snapshot of this node's readiness, used
+    /// by the
+    /// [`OP_ADMIN_CLUSTER_HEALTH`](crate::protocol::opcodes::OP_ADMIN_CLUSTER_HEALTH)
+    /// admin endpoint and by integration tests that pre-flight a node
+    /// before seeding records.
+    ///
+    /// `swim_state` derives from `topology_authority.committed_term()`:
+    /// `Joining` while `committed_term == 0` (no commit observed),
+    /// `Alive` afterwards. Once the full `NodeState` refactor lands the
+    /// derivation will move into the membership module.
+    pub fn cluster_health(&self) -> ClusterHealth {
+        let last_committed_term = self.topology_authority.committed_term();
+        let last_topology_commit_age_ms = self.topology_authority.last_commit_age_ms();
+        let swim_state = if last_committed_term == 0 {
+            ClusterHealthSwimState::Joining
+        } else {
+            ClusterHealthSwimState::Alive
+        };
+        ClusterHealth {
+            swim_state,
+            last_committed_term,
+            last_topology_commit_age_ms,
+        }
     }
 
     /// Phase E — additional NodeIds that should also receive replica
@@ -8833,6 +8950,85 @@ mod tests {
             NodeId(1),
             "evicted node must never remain master after election",
         );
+    }
+
+    // ── Phase I: cluster startup readiness ───────────────────────────────
+
+    #[test]
+    fn cluster_health_payload_round_trip() {
+        let h = ClusterHealth {
+            swim_state: ClusterHealthSwimState::Alive,
+            last_committed_term: 12345,
+            last_topology_commit_age_ms: 678,
+        };
+        let bytes = h.serialize();
+        assert_eq!(bytes.len(), 17, "wire payload must be exactly 17 bytes");
+        let decoded =
+            ClusterHealth::deserialize(&bytes).expect("valid 17-byte payload must decode back");
+        assert_eq!(h, decoded);
+    }
+
+    #[test]
+    fn cluster_health_deserialize_rejects_unknown_state_byte() {
+        let bad = [9u8; 17]; // unknown state
+        assert!(ClusterHealth::deserialize(&bad).is_none());
+    }
+
+    #[test]
+    fn cluster_health_deserialize_rejects_short_payload() {
+        let too_short = [0u8; 16];
+        assert!(ClusterHealth::deserialize(&too_short).is_none());
+    }
+
+    #[test]
+    fn cluster_health_is_joining_until_first_commit() {
+        // Build a test cluster with committed_members EMPTY → no commit
+        // applied → state must be Joining.
+        let table = ShardTable::compute_with_epoch(&[NodeId(1)], 1, 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:9990".parse().unwrap())],
+            &[], // no committed_members → handle_commit was never called
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        let h = cluster.cluster_health();
+        assert_eq!(
+            h.swim_state,
+            ClusterHealthSwimState::Joining,
+            "node without a committed term must report Joining",
+        );
+        assert_eq!(h.last_committed_term, 0);
+        assert_eq!(h.last_topology_commit_age_ms, u64::MAX);
+        assert!(!h.is_ready(), "Joining node must not be ready");
+    }
+
+    #[test]
+    fn cluster_health_is_alive_after_commit() {
+        // committed_members non-empty → handle_commit ran in the test
+        // builder → state must be Alive.
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 5);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), "127.0.0.1:9991".parse().unwrap())],
+            &[NodeId(1), NodeId(2)],
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        let h = cluster.cluster_health();
+        assert_eq!(h.swim_state, ClusterHealthSwimState::Alive);
+        assert!(h.last_committed_term > 0);
+        assert!(
+            h.last_topology_commit_age_ms < 60_000,
+            "freshly-built cluster should have a recent commit timestamp",
+        );
+        assert!(h.is_ready());
     }
 
     // ── Phase H: redo-truncation resync ──────────────────────────────────

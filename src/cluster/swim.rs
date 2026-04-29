@@ -115,6 +115,36 @@ fn suspect_backoff_delay(base: Duration, indirect_attempts: u32) -> Duration {
     Duration::from_nanos(clamped)
 }
 
+/// Phase I — exponential backoff for seed-node retry attempts.
+///
+/// During cluster bootstrap a node retries its configured seed peers
+/// when the initial join fails. A fixed retry interval either re-spams
+/// the network too aggressively (small interval) or stalls bootstrap
+/// for a long time (large interval). This helper computes the delay
+/// before retry attempt `attempt` (0-indexed) by doubling `initial`
+/// each step and clamping at `max`.
+///
+/// Examples (initial = 100ms, max = 5s):
+/// - attempt 0 → 100ms
+/// - attempt 1 → 200ms
+/// - attempt 2 → 400ms
+/// - …
+/// - attempt 6 → 5s   (clamped)
+/// - attempt N → 5s   (stays at the cap)
+pub fn exponential_seed_backoff(attempt: u32, initial: Duration, max: Duration) -> Duration {
+    if initial >= max {
+        return max;
+    }
+    let initial_ms = initial.as_millis() as u64;
+    if initial_ms == 0 {
+        return max.min(Duration::from_millis(1));
+    }
+    let shift = attempt.min(63);
+    let scaled = initial_ms.checked_shl(shift).unwrap_or(u64::MAX);
+    let max_ms = max.as_millis() as u64;
+    Duration::from_millis(scaled.min(max_ms))
+}
+
 /// A running SWIM protocol instance.
 pub struct SwimRunner {
     config: SwimConfig,
@@ -966,6 +996,65 @@ mod tests {
         pub fn collect_member_updates_for_test(&self) -> Vec<u8> {
             self.collect_member_updates()
         }
+    }
+
+    // ── Phase I: exponential seed backoff ────────────────────────────────
+
+    #[test]
+    fn seed_retry_uses_exponential_backoff() {
+        // 100ms doubling, capped at 5s — the curve specified in the plan.
+        let initial = Duration::from_millis(100);
+        let cap = Duration::from_secs(5);
+        assert_eq!(
+            exponential_seed_backoff(0, initial, cap),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            exponential_seed_backoff(1, initial, cap),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            exponential_seed_backoff(2, initial, cap),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            exponential_seed_backoff(3, initial, cap),
+            Duration::from_millis(800)
+        );
+        assert_eq!(
+            exponential_seed_backoff(4, initial, cap),
+            Duration::from_millis(1600)
+        );
+        assert_eq!(
+            exponential_seed_backoff(5, initial, cap),
+            Duration::from_millis(3200)
+        );
+        // Step 6 would be 6.4s but cap pins at 5s.
+        assert_eq!(exponential_seed_backoff(6, initial, cap), cap);
+        assert_eq!(exponential_seed_backoff(50, initial, cap), cap);
+    }
+
+    #[test]
+    fn seed_retry_backoff_initial_at_or_above_max_returns_max() {
+        // Defensive: when callers misconfigure initial >= max, the
+        // helper must not blow up — every attempt clamps to max.
+        let initial = Duration::from_secs(10);
+        let cap = Duration::from_secs(5);
+        assert_eq!(exponential_seed_backoff(0, initial, cap), cap);
+        assert_eq!(exponential_seed_backoff(50, initial, cap), cap);
+    }
+
+    #[test]
+    fn seed_retry_backoff_zero_initial_falls_back_to_min_step() {
+        // A zero initial would shift to zero forever; clamp the first
+        // step to 1ms so the loop still progresses, then stays at max.
+        let initial = Duration::from_millis(0);
+        let cap = Duration::from_secs(2);
+        let step = exponential_seed_backoff(0, initial, cap);
+        assert!(
+            step >= Duration::from_millis(1) && step <= cap,
+            "zero-initial fallback must be at least 1ms and never exceed max",
+        );
     }
 
     fn test_runner(bind: SocketAddr, self_addr: SocketAddr) -> SwimRunner {
