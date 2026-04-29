@@ -1010,15 +1010,38 @@ fn clear_replication_intent_after_success(range: (u64, u64)) {
 /// Their addresses are added to the fan-out so writes that happen mid-
 /// migration land on both the old replica set (durability) and the new
 /// master / replica set (post-handoff consistency).
+/// Phase E — replica fan-out plan returned by [`build_replication_targets`].
+///
+/// `by_addr` is the `addr → ops` map every targeted node receives.
+///
+/// `dual_write_only` is the subset of `by_addr` keys that exist
+/// *solely* because at least one shard in the batch is migrating
+/// outbound and the dual-write window names the target. Replicate
+/// callers use this to enforce the per-set ACK invariant: a write
+/// that touched a migrating shard cannot succeed unless at least one
+/// `dual_write_only` address ACKed, regardless of the configured
+/// `WriteAll` / `WriteMajority` policy. Without this, a `WriteMajority`
+/// fan-out over the unioned set could ACK on the OLD replicas alone
+/// and silently leave the new master with stale data, defeating the
+/// dual-write durability invariant.
+#[derive(Debug, Clone)]
+pub(crate) struct ReplicationPlan {
+    pub by_addr: HashMap<SocketAddr, Vec<ReplicaOp>>,
+    pub dual_write_only: std::collections::HashSet<SocketAddr>,
+}
+
 pub(crate) fn build_replication_targets(
     cluster: &RunningCluster,
     ops_by_key: &[(TxKey, Vec<ReplicaOp>)],
-) -> std::result::Result<HashMap<SocketAddr, Vec<ReplicaOp>>, String> {
+) -> std::result::Result<ReplicationPlan, String> {
     let table = cluster.shard_table();
     let table_guard = table.read();
     let rf = table_guard.replication_factor();
     let expected_replicas_per_key = rf.saturating_sub(1) as usize;
     let mut by_addr: HashMap<SocketAddr, Vec<ReplicaOp>> = HashMap::new();
+    let mut regular_addrs: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
+    let mut dual_write_addrs: std::collections::HashSet<SocketAddr> =
+        std::collections::HashSet::new();
     let mut target_errors: Vec<String> = Vec::new();
     let self_id = cluster.self_id();
 
@@ -1052,6 +1075,7 @@ pub(crate) fn build_replication_targets(
             match cluster.node_addr(replica_id) {
                 Some(addr) => {
                     by_addr.entry(addr).or_default().extend(ops.clone());
+                    regular_addrs.insert(addr);
                 }
                 None if rf > 1 => {
                     target_errors.push(format!(
@@ -1068,6 +1092,7 @@ pub(crate) fn build_replication_targets(
             }
             if let Some(addr) = cluster.node_addr(extra) {
                 by_addr.entry(addr).or_default().extend(ops.clone());
+                dual_write_addrs.insert(addr);
             }
         }
     }
@@ -1082,7 +1107,16 @@ pub(crate) fn build_replication_targets(
         ));
     }
 
-    Ok(by_addr)
+    // Subtract any addr that is *also* a regular replica for some
+    // other shard — a replica promoted to new master during migration
+    // satisfies the regular-set policy on its own and counts on both
+    // sides; we only want addrs that are exclusively dual-write.
+    dual_write_addrs.retain(|a| !regular_addrs.contains(a));
+
+    Ok(ReplicationPlan {
+        by_addr,
+        dual_write_only: dual_write_addrs,
+    })
 }
 
 fn replicate_all_ops(
@@ -1101,7 +1135,11 @@ fn replicate_all_ops(
 
     // Group all ops by target replica address — including any dual-write
     // expansion for shards currently migrating outbound (Phase E).
-    let by_addr = build_replication_targets(cluster, ops_by_key)?;
+    let plan = build_replication_targets(cluster, ops_by_key)?;
+    let ReplicationPlan {
+        by_addr,
+        dual_write_only,
+    } = plan;
     let rf = cluster.shard_table().read().replication_factor();
 
     if by_addr.is_empty() {
@@ -1126,40 +1164,49 @@ fn replicate_all_ops(
     // Phase B3: stamp every outbound batch with the live coordinator
     // epoch so the receiver's gate can reject stale-cluster writes.
     let cluster_key = cluster.local_cluster_key();
-    let results: Vec<std::result::Result<(), String>> = REPL_RUNTIME.block_on(async {
-        let mut handles = Vec::with_capacity(by_addr.len());
-        for (addr, ops) in by_addr {
-            handles.push(tokio::task::spawn_blocking(move || {
-                if ops.is_empty() {
-                    return Ok(());
-                }
-                let batch = ReplicaBatch {
-                    first_sequence: redo_seq_range.0,
-                    ops,
-                    trace_ctx: crate::observability::WireTraceContext::from_current_span(),
-                    source_node_id: Some(source_node_id),
-                    cluster_key,
-                };
-                send_replica_batch_to(addr, &batch, ack_timeout)
-            }));
-        }
-        let mut results = Vec::with_capacity(handles.len());
-        for handle in handles {
-            results.push(
-                handle
-                    .await
-                    .unwrap_or_else(|_| Err("task panicked".to_string())),
-            );
-        }
-        results
-    });
+    // Preserve the (addr, result) association so we can apply per-set
+    // ACK accounting (Phase E) after the parallel fan-out completes.
+    let results: Vec<(SocketAddr, std::result::Result<(), String>)> =
+        REPL_RUNTIME.block_on(async {
+            let mut handles = Vec::with_capacity(by_addr.len());
+            for (addr, ops) in by_addr {
+                handles.push(tokio::task::spawn_blocking(move || {
+                    if ops.is_empty() {
+                        return (addr, Ok(()));
+                    }
+                    let batch = ReplicaBatch {
+                        first_sequence: redo_seq_range.0,
+                        ops,
+                        trace_ctx: crate::observability::WireTraceContext::from_current_span(),
+                        source_node_id: Some(source_node_id),
+                        cluster_key,
+                    };
+                    let res = send_replica_batch_to(addr, &batch, ack_timeout);
+                    (addr, res)
+                }));
+            }
+            let mut results = Vec::with_capacity(handles.len());
+            for handle in handles {
+                results.push(handle.await.unwrap_or_else(|_| {
+                    (
+                        SocketAddr::from(([0u8, 0, 0, 0], 0)),
+                        Err("task panicked".to_string()),
+                    )
+                }));
+            }
+            results
+        });
 
     let mut ack_count: usize = 0;
     let mut last_error: Option<String> = None;
-    for result in &results {
+    let mut dual_write_acks: usize = 0;
+    for (addr, result) in &results {
         match result {
             Ok(()) => {
                 ack_count += 1;
+                if dual_write_only.contains(addr) {
+                    dual_write_acks += 1;
+                }
             }
             Err(e) => {
                 tracing::warn!(err = %e, "replication to replica failed");
@@ -1168,6 +1215,27 @@ fn replicate_all_ops(
         }
     }
     let total_targets = results.len();
+    let dual_write_total = dual_write_only.len();
+    // Phase E per-set ACK invariant: when at least one shard in this
+    // batch is migrating outbound, require ≥1 ACK from the dual-write
+    // set so the new master observes writes during the migration
+    // window. Otherwise a `WriteMajority` policy could ACK on the OLD
+    // replicas alone, leaving the post-handoff record set divergent.
+    if dual_write_total > 0 && dual_write_acks == 0 {
+        let best_effort_now = cluster.is_replication_best_effort();
+        if best_effort_now {
+            tracing::warn!(
+                dual_write_total,
+                "replication: dual-write set produced 0 ACKs (best_effort — write proceeds, new master may need full resync)",
+            );
+        } else {
+            return Err(format!(
+                "replication: dual-write set produced 0 ACKs of {dual_write_total} new-master target(s); \
+                 migration durability requires at least one new-master ACK: {}",
+                last_error.unwrap_or_default()
+            ));
+        }
+    }
 
     let ack_policy = cluster.ack_policy();
     let best_effort = cluster.is_replication_best_effort();
@@ -6527,20 +6595,38 @@ mod tests {
             vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
         )];
 
-        let by_addr = build_replication_targets(&cluster, &ops)
+        let plan = build_replication_targets(&cluster, &ops)
             .expect("dual-write target resolution should succeed");
 
         assert!(
-            by_addr.contains_key(&n2_addr),
-            "regular replica n2 must remain in fan-out: {by_addr:?}",
+            plan.by_addr.contains_key(&n2_addr),
+            "regular replica n2 must remain in fan-out: {:?}",
+            plan.by_addr,
         );
         assert!(
-            by_addr.contains_key(&n3_addr),
-            "dual-write destination n3 must be added during migration window: {by_addr:?}",
+            plan.by_addr.contains_key(&n3_addr),
+            "dual-write destination n3 must be added during migration window: {:?}",
+            plan.by_addr,
         );
         assert!(
-            !by_addr.contains_key(&n1_addr),
-            "self (n1) must never be in replica fan-out: {by_addr:?}",
+            !plan.by_addr.contains_key(&n1_addr),
+            "self (n1) must never be in replica fan-out: {:?}",
+            plan.by_addr,
+        );
+        // Phase E per-set tagging: n3 is exclusively a dual-write
+        // destination for this batch (not in any shard's regular
+        // replica list); the helper must surface it in
+        // `dual_write_only` so `replicate_all_ops` can enforce the
+        // ≥1-NEW-ACK invariant.
+        assert!(
+            plan.dual_write_only.contains(&n3_addr),
+            "n3 must be tagged as dual-write-only: {:?}",
+            plan.dual_write_only,
+        );
+        assert!(
+            !plan.dual_write_only.contains(&n2_addr),
+            "n2 is a regular replica; must not appear in dual_write_only: {:?}",
+            plan.dual_write_only,
         );
     }
 
@@ -6583,16 +6669,21 @@ mod tests {
             vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
         )];
 
-        let by_addr = build_replication_targets(&cluster, &ops)
+        let plan = build_replication_targets(&cluster, &ops)
             .expect("regular target resolution should succeed");
 
         assert!(
-            by_addr.contains_key(&n2_addr),
+            plan.by_addr.contains_key(&n2_addr),
             "regular replica n2 must be in fan-out",
         );
         assert!(
-            !by_addr.contains_key(&n3_addr),
+            !plan.by_addr.contains_key(&n3_addr),
             "n3 must NOT be in fan-out outside the migration window",
+        );
+        assert!(
+            plan.dual_write_only.is_empty(),
+            "no migration in flight ⇒ dual_write_only must be empty: {:?}",
+            plan.dual_write_only,
         );
     }
 
