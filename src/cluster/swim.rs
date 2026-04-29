@@ -272,6 +272,20 @@ impl SwimRunner {
         // breaks lockstep with peers and reduces collision on the network.
         let mut next_probe_delay = jittered_probe_interval(probe_interval);
         let mut last_seed_retry = Instant::now();
+        // Phase I — exponential seed-retry backoff. `seed_attempt` counts
+        // consecutive retries since the last "cluster looks healthy"
+        // observation; it resets to `0` whenever the alive-count check
+        // shows the cluster has settled. The initial healthy-check
+        // cadence stays at `probe_interval * 10` (≈1s with the default
+        // 100ms probe_interval) so we don't burn cycles polling alive
+        // state at 100ms when nothing is wrong; once the cluster
+        // *is* degraded, the backoff schedule is `100ms → 200ms → 400ms
+        // → … → 5s` from the helper.
+        let mut seed_attempt: u32 = 0;
+        let seed_backoff_initial = Duration::from_millis(100);
+        let seed_backoff_max = Duration::from_secs(5);
+        let healthy_seed_check_interval = probe_interval * 10;
+        let mut next_seed_retry_delay = healthy_seed_check_interval;
         let mut recv_buf = [0u8; MAX_MSG_SIZE];
 
         while !self.shutdown.load(Ordering::Relaxed) {
@@ -348,19 +362,37 @@ impl SwimRunner {
             // partitions heal or when the cluster is degraded. Without this,
             // nodes that were marked dead during a partition can never rejoin
             // because the SWIM probe cycle doesn't re-seed.
+            //
+            // Phase I — exponential backoff: when the cluster is healthy we
+            // wait `healthy_seed_check_interval` between checks; when the
+            // alive-count test shows degradation we retry on the curve from
+            // `exponential_seed_backoff` so the recovery is fast at first
+            // and gracefully backs off if seeds are unreachable.
             if !self.config.seed_nodes.is_empty()
-                && last_seed_retry.elapsed() >= probe_interval * 10
+                && last_seed_retry.elapsed() >= next_seed_retry_delay
             {
                 let alive_count = self.membership.lock().unwrap().alive_members().len();
                 let total_known = self.peer_addrs.lock().unwrap().len();
                 // Retry seeds if we have fewer alive members than known peers
                 // (some nodes are dead/suspect) or if we have no peers at all.
-                if alive_count < total_known + 1 || total_known == 0 {
+                let degraded = alive_count < total_known + 1 || total_known == 0;
+                if degraded {
                     for seed in &self.config.seed_nodes {
                         let updates = self.collect_member_updates();
                         let msg = self.encode_message(MSG_JOIN, &updates);
                         let _ = socket.send_to(&msg, seed);
                     }
+                    next_seed_retry_delay = exponential_seed_backoff(
+                        seed_attempt,
+                        seed_backoff_initial,
+                        seed_backoff_max,
+                    );
+                    seed_attempt = seed_attempt.saturating_add(1);
+                } else {
+                    // Cluster looks settled — reset the backoff and keep
+                    // checking at the healthy cadence.
+                    seed_attempt = 0;
+                    next_seed_retry_delay = healthy_seed_check_interval;
                 }
                 last_seed_retry = Instant::now();
 
