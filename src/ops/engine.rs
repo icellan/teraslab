@@ -1934,6 +1934,120 @@ impl Engine {
         requests.iter().map(|req| self.create(req)).collect()
     }
 
+    /// Build the exact byte buffer that [`Self::create_at_offset`] would
+    /// `pwrite` at `record_offset` (metadata header + UTXO slots + cold
+    /// data, no device-alignment padding).
+    ///
+    /// Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): the WAL-first
+    /// dispatch path captures these bytes inside `RedoOp::CreateV2` so
+    /// crash recovery can reconstruct the on-device record byte-for-
+    /// byte without re-running the engine's create logic. Mirrors
+    /// `create_at_offset`'s flag/metadata derivation exactly so the
+    /// captured bytes match the bytes the engine subsequently writes;
+    /// any divergence would cause replay to leave a different record
+    /// state than a successful create did, which is exactly the
+    /// behaviour the gap is asking us to eliminate.
+    ///
+    /// Returns `(bytes, utxo_count)`.
+    pub fn build_create_record_bytes(
+        &self,
+        req: &CreateRequest,
+    ) -> Result<(Vec<u8>, u32), CreateError> {
+        let utxo_count = req.utxo_hashes.len() as u32;
+        if utxo_count == 0 {
+            return Err(CreateError::InvalidUtxoCount);
+        }
+
+        // Mirror `create_at_offset` exactly. Any divergence here would
+        // create a redo entry that, on replay, leaves the record in a
+        // different state than a successful create did.
+        let cold_data = if req.is_external && req.inputs.is_none() {
+            vec![]
+        } else {
+            build_cold_data(req.inputs, req.outputs, req.inpoints)
+        };
+
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = req.tx_id;
+        meta.tx_version = req.tx_version;
+        meta.locktime = req.locktime;
+        meta.fee = req.fee;
+        meta.size_in_bytes = req.size_in_bytes;
+        meta.extended_size = req.extended_size;
+        meta.spending_height = req.spending_height;
+        meta.created_at = req.created_at;
+        let base_size = TxMetadata::record_size_for(utxo_count);
+        meta.record_size = (base_size + cold_data.len() as u64) as u32;
+
+        let mut flags = TxFlags::empty();
+        if req.is_coinbase {
+            flags |= TxFlags::IS_COINBASE;
+        }
+        if req.is_external {
+            flags |= TxFlags::EXTERNAL;
+        }
+        if req.conflicting {
+            flags |= TxFlags::CONFLICTING;
+        }
+        if req.locked {
+            flags |= TxFlags::LOCKED;
+        }
+        meta.flags = flags;
+
+        if req.is_external {
+            meta.external_ref = ExternalRef {
+                store_type: 1,
+                content_hash: req.tx_id,
+                total_size: req.size_in_bytes,
+                input_count: 0,
+                output_count: 0,
+                inputs_offset: 0,
+                outputs_offset: 0,
+            };
+        }
+
+        if req.mined_block_infos.is_empty() {
+            meta.unmined_since = req.block_height;
+        } else {
+            meta.unmined_since = 0;
+            let entries = req.block_entries();
+            let inline_count = entries.len().min(INLINE_BLOCK_ENTRIES);
+            for (i, entry) in entries.iter().take(inline_count).enumerate() {
+                meta.block_entries_inline[i] = *entry;
+            }
+            meta.block_entry_count = entries.len() as u8;
+        }
+
+        let slots: Vec<UtxoSlot> = req
+            .utxo_hashes
+            .iter()
+            .map(|hash| {
+                if req.frozen {
+                    UtxoSlot::new_frozen(*hash)
+                } else {
+                    UtxoSlot::new_unspent(*hash)
+                }
+            })
+            .collect();
+
+        // Serialize: METADATA_SIZE bytes of metadata, then each slot,
+        // then cold data — exactly the layout `write_full_record_with_cold`
+        // copies into the aligned buffer.
+        let total_len = METADATA_SIZE + slots.len() * UTXO_SLOT_SIZE + cold_data.len();
+        let mut out = Vec::with_capacity(total_len);
+        let mut meta_bytes = [0u8; METADATA_SIZE];
+        meta.to_bytes(&mut meta_bytes);
+        out.extend_from_slice(&meta_bytes);
+        for slot in &slots {
+            let mut slot_bytes = [0u8; UTXO_SLOT_SIZE];
+            slot.to_bytes(&mut slot_bytes);
+            out.extend_from_slice(&slot_bytes);
+        }
+        out.extend_from_slice(&cold_data);
+        debug_assert_eq!(out.len(), total_len);
+        Ok((out, utxo_count))
+    }
+
     /// Write a complete record including optional cold data.
     fn write_full_record_with_cold(
         &self,

@@ -176,6 +176,20 @@ pub fn check_replay_tolerance(stats: &RecoveryStats) -> Result<(), String> {
             n = stats.failed_logic
         ));
     }
+    if stats.failed_missing_record_bytes > 0 {
+        // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): a CreateV2
+        // replay could not write the full record bytes captured in the
+        // redo entry. Short I/O on the record area means the device is
+        // misbehaving — continuing would silently register an index
+        // entry pointing at incomplete bytes (the exact failure mode
+        // that motivated the full-payload redesign).
+        return Err(format!(
+            "recovery: {n} create-replay failure(s) — full record bytes \
+             could not be written to device; non-tolerable, the device \
+             returned short I/O; investigate before restarting",
+            n = stats.failed_missing_record_bytes
+        ));
+    }
     if stats.failed_missing_primary > MAX_TOLERATED_MISSING_PRIMARY {
         return Err(format!(
             "recovery: {n} missing-primary replay failure(s) exceed cap \
@@ -199,6 +213,7 @@ pub(crate) fn replay_cause_label(cause: ReplayCause) -> &'static str {
         ReplayCause::IoError => "io-error",
         ReplayCause::CorruptEntry => "corrupt-entry",
         ReplayCause::LogicError => "logic-error",
+        ReplayCause::MissingRecordBytes => "missing-record-bytes",
     }
 }
 
@@ -345,6 +360,95 @@ pub fn fallback_unmined_index(which: &str, err: IndexError) -> UnminedBackend {
          until the operator investigates and restarts (gap #5)",
     );
     UnminedBackend::new_in_memory()
+}
+
+// ---------------------------------------------------------------------------
+// Mandatory redo log open (gap #2)
+// ---------------------------------------------------------------------------
+
+/// Errors raised by [`open_mandatory_redo_log`] when the redo log cannot
+/// be made available at startup.
+///
+/// The redo log is mandatory under the WAL-first durability contract
+/// (gap #2 — TERANODE_PRODUCTION_READINESS_GAPS.md). A missing or
+/// unwritable log means every WAL fsync ack would be a lie, so we fail
+/// closed at startup and let the operator fix the underlying device or
+/// path before retrying.
+#[derive(Error, Debug)]
+pub enum RedoOpenError {
+    /// The configured redo-log path could not be opened or created as a
+    /// `DirectDevice`. The variant carries the path and a `Display`-
+    /// formatted reason so the operator can pinpoint the underlying
+    /// permission / disk / path issue.
+    #[error(
+        "redo log device unavailable at {path}: {reason}; mandatory WAL \
+         requires a writable path — fix permissions / disk / config and retry"
+    )]
+    Device {
+        /// Path the operator configured.
+        path: String,
+        /// `Display`-formatted [`crate::device::DeviceError`] from the open call.
+        /// Stored as a string (not `#[source]`) so the variant remains
+        /// constructible from any `Display` cause without coupling to the
+        /// device error type.
+        reason: String,
+    },
+
+    /// `DirectDevice::open` succeeded but [`crate::redo::RedoLog::open`]
+    /// returned an error (e.g. the configured size does not fit on the
+    /// device, or the existing log is corrupt). Both cases are fail-closed
+    /// because continuing without a working redo log silently downgrades
+    /// the durability contract.
+    #[error(
+        "redo log open failed at {path}: {reason}; mandatory WAL requires a \
+         valid log — investigate the underlying redo error and retry"
+    )]
+    Log {
+        /// Path the operator configured.
+        path: String,
+        /// `Display`-formatted [`crate::redo::RedoError`] from `RedoLog::open`.
+        reason: String,
+    },
+}
+
+/// Open or create the redo log at `path` and prepare a [`RedoLog`].
+///
+/// This is the gap #2 mandatory-redo entry point: any failure surfaces
+/// as a [`RedoOpenError`] that the binary turns into a non-zero exit.
+/// There is **no in-memory fallback** in production — that path was
+/// removed because it broke the WAL-first durability promise.
+///
+/// On success the caller receives the device handle (kept alive for the
+/// lifetime of the server so future replay/extension paths can share the
+/// same fd) and the open `RedoLog`. The caller is expected to wrap the
+/// log in `Arc<Mutex<RedoLog>>` for shared dispatch access.
+///
+/// # Errors
+///
+/// * [`RedoOpenError::Device`] — `DirectDevice::open` failed (path
+///   missing, permissions denied, parent dir not writable, alignment
+///   mismatch, etc.).
+/// * [`RedoOpenError::Log`] — the device opened but `RedoLog::open`
+///   could not establish a valid log (bounds, corrupt history, etc.).
+pub fn open_mandatory_redo_log(
+    path: &Path,
+    size: u64,
+    alignment: usize,
+) -> Result<(std::sync::Arc<dyn crate::device::BlockDevice>, crate::redo::RedoLog), RedoOpenError> {
+    let device = crate::device::DirectDevice::open(path, size, alignment).map_err(|e| {
+        RedoOpenError::Device {
+            path: path.display().to_string(),
+            reason: format!("{e}"),
+        }
+    })?;
+    let device: std::sync::Arc<dyn crate::device::BlockDevice> = std::sync::Arc::new(device);
+    let log = crate::redo::RedoLog::open(device.clone(), 0, size).map_err(|e| {
+        RedoOpenError::Log {
+            path: path.display().to_string(),
+            reason: format!("{e}"),
+        }
+    })?;
+    Ok((device, log))
 }
 
 // ---------------------------------------------------------------------------
@@ -591,5 +695,68 @@ mod tests {
         assert_eq!(replay_cause_label(ReplayCause::IoError), "io-error");
         assert_eq!(replay_cause_label(ReplayCause::CorruptEntry), "corrupt-entry");
         assert_eq!(replay_cause_label(ReplayCause::LogicError), "logic-error");
+    }
+
+    // -----------------------------------------------------------------------
+    // Mandatory redo log open (gap #2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mandatory_redo_open_succeeds_in_clean_dir() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("redo.log");
+        let result = super::open_mandatory_redo_log(&path, 1 << 20, 4096);
+        let (_dev, log) = match result {
+            Ok(parts) => parts,
+            Err(e) => panic!("clean tmp path must open: {e}"),
+        };
+        // Smoke check: a freshly opened log starts at sequence 1.
+        assert_eq!(log.current_sequence(), 1, "freshly opened redo log must start at seq 1");
+    }
+
+    #[test]
+    fn mandatory_redo_open_fails_on_unwritable_path() {
+        // Pointing at a parent directory that does not exist returns a
+        // `DeviceError` from `DirectDevice::open` — the gap #2 contract
+        // is that this propagates instead of falling back to memory.
+        let path = std::path::Path::new("/this/path/does/not/exist/redo.log");
+        let result = super::open_mandatory_redo_log(path, 1 << 20, 4096);
+        let err = match result {
+            Ok(_) => panic!("missing parent dir must fail closed (no in-memory fallback)"),
+            Err(e) => e,
+        };
+        match err {
+            super::RedoOpenError::Device { path: p, reason } => {
+                assert!(p.contains("does/not/exist"), "path in error: {p}");
+                assert!(!reason.is_empty(), "reason must carry underlying error: {reason}");
+            }
+            super::RedoOpenError::Log { .. } => {
+                panic!("missing parent dir should surface as Device error, not Log error");
+            }
+        }
+    }
+
+    #[test]
+    fn mandatory_redo_open_fails_on_path_pointing_at_existing_directory() {
+        // Pointing the redo log at a directory (not a file) is a config
+        // error that `DirectDevice::open` rejects. Verify that the gap #2
+        // contract — fail closed, no in-memory fallback — is honored.
+        let tmp = TempDir::new().unwrap();
+        // tmp.path() itself exists as a directory.
+        let dir_path = tmp.path().to_path_buf();
+        let result = super::open_mandatory_redo_log(&dir_path, 1 << 20, 4096);
+        let err = match result {
+            Ok(_) => panic!("a directory path must fail closed (no in-memory fallback)"),
+            Err(e) => e,
+        };
+        match err {
+            super::RedoOpenError::Device { path: p, reason } => {
+                assert_eq!(p, dir_path.display().to_string(), "path in error: {p}");
+                assert!(!reason.is_empty(), "reason must carry underlying error: {reason}");
+            }
+            super::RedoOpenError::Log { .. } => {
+                panic!("a directory path should surface as Device error, not Log error");
+            }
+        }
     }
 }

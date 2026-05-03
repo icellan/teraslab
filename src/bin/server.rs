@@ -33,7 +33,7 @@ use teraslab::server::http::{HttpState, start_http_server};
 use teraslab::server::startup::{
     SecondaryLoadOutcome, check_replay_tolerance, fallback_dah_index, fallback_unmined_index,
     load_primary_index_file_backed, load_primary_index_in_memory, load_primary_index_redb,
-    rebuild_in_memory_secondaries, secondaries_from_pair,
+    open_mandatory_redo_log, rebuild_in_memory_secondaries, secondaries_from_pair,
 };
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
 
@@ -466,54 +466,39 @@ fn main() {
     tracing::info!(entries = dah_index.len(), "DAH index loaded");
     tracing::info!(entries = unmined_index.len(), "unmined index loaded");
 
-    // 3b. Open redo log device (separate file) and run recovery
+    // 3b. Open redo log device (separate file) and run recovery.
+    //
+    // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): the redo log is
+    // mandatory. We MUST NOT fall back to an in-memory device when the
+    // configured path cannot be opened — that would make every WAL-fsync
+    // ack a lie (the bytes are in volatile memory and disappear at
+    // shutdown). On open or create failure we fail closed so the operator
+    // can fix permissions / disk / path and try again.
     let redo_log_path = config.resolved_redo_log_path();
-    let redo_log_device: Arc<dyn BlockDevice> = match DirectDevice::open(
+    let (redo_log_device, redo_log) = match open_mandatory_redo_log(
         &redo_log_path,
         config.redo_log_size,
         config.device_alignment,
     ) {
-        Ok(d) => {
-            tracing::info!(path = %redo_log_path.display(), "redo log device opened");
-            Arc::new(d)
-        }
+        Ok(parts) => parts,
         Err(e) => {
-            tracing::warn!(err = %e, "redo log device open failed, creating fresh");
-            match DirectDevice::open(
-                &redo_log_path,
-                config.redo_log_size,
-                config.device_alignment,
-            ) {
-                Ok(d) => Arc::new(d),
-                Err(e2) => {
-                    tracing::warn!(err = %e2, "redo log device create failed, proceeding without redo log");
-                    // Proceed without redo log — it's an enhancement, not a hard requirement
-                    // for startup to succeed.
-                    Arc::new(
-                        teraslab::device::MemoryDevice::new(
-                            config.redo_log_size,
-                            config.device_alignment,
-                        )
-                        .expect("failed to create fallback redo log device"),
-                    )
-                }
-            }
-        }
-    };
-
-    let redo_log = match RedoLog::open(redo_log_device.clone(), 0, config.redo_log_size) {
-        Ok(log) => {
-            tracing::info!(
-                size_mib = config.redo_log_size / (1024 * 1024),
-                "redo log opened"
+            tracing::error!(
+                path = %redo_log_path.display(),
+                err = %e,
+                "FATAL: redo log unavailable — cannot start with mandatory WAL disabled",
             );
-            Some(log)
-        }
-        Err(e) => {
-            tracing::warn!(err = %e, "redo log open failed, proceeding without redo log");
-            None
+            std::process::exit(1);
         }
     };
+    tracing::info!(
+        path = %redo_log_path.display(),
+        size_mib = config.redo_log_size / (1024 * 1024),
+        "redo log opened (mandatory)",
+    );
+    // Keep the device handle alive for the lifetime of the process so
+    // any future redo-log replay/extension paths share the same fd.
+    let _redo_log_device: Arc<dyn BlockDevice> = redo_log_device;
+    let redo_log: Option<RedoLog> = Some(redo_log);
 
     // Run recovery if we have a redo log, while indexes are still mutable.
     // Uses `recover_all_with_allocator` so the two-phase secondary
@@ -540,6 +525,7 @@ fn main() {
                     failed_io = stats.failed_io,
                     failed_corrupt = stats.failed_corrupt,
                     failed_logic = stats.failed_logic,
+                    failed_missing_record_bytes = stats.failed_missing_record_bytes,
                     "recovery complete",
                 );
                 // Gap #5 (TERANODE_PRODUCTION_READINESS_GAPS.md): replace
@@ -555,6 +541,7 @@ fn main() {
                         failed_io = stats.failed_io,
                         failed_corrupt = stats.failed_corrupt,
                         failed_logic = stats.failed_logic,
+                        failed_missing_record_bytes = stats.failed_missing_record_bytes,
                         "recovery: aborting startup — {msg}",
                     );
                     std::process::exit(1);

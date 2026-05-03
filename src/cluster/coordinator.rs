@@ -4774,7 +4774,7 @@ pub fn redo_entry_to_replica_op(
                 offset: *offset,
             })
         }
-        RedoOp::Create { tx_key, .. } => {
+        RedoOp::Create { tx_key, .. } | RedoOp::CreateV2 { tx_key, .. } => {
             // A record created after the baseline snapshot must be sent as a
             // delta, otherwise the target never receives it. We read the full
             // current record state from the engine (metadata, UTXOs, cold data)

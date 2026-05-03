@@ -235,12 +235,32 @@ pub fn init_dispatch_histograms(histograms: &'static crate::metrics::ThreadHisto
 /// If `cluster` is Some, shard ownership is checked for key-based operations.
 /// Requests for keys not owned by this node get a Redirect response.
 ///
-/// Mutation path (durability contract):
-/// 1. Engine applies the mutation (durable via O_DIRECT).
-/// 2. Redo log records the mutation and fsyncs (mandatory — failure fails
-///    the client request).
-/// 3. Replication sends to replicas with durable sequence numbers.
-/// 4. Client response is sent.
+/// # Mutation path (durability contract — WAL-first)
+///
+/// Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md) corrected the
+/// previously stated "engine-first" ordering — the actual implemented
+/// order is:
+///
+/// 1. **Validate under lock** — parse, check shard ownership, acquire
+///    the per-record lock. For multi-spend, snapshot the metadata.
+/// 2. **Append + fsync redo entry** — every authoritative WAL-first
+///    payload (full record bytes for `CreateV2`, real `new_spent_count`
+///    for spend/unspend) is captured BEFORE any device write so
+///    recovery can reconstruct the post-mutation state byte-for-byte.
+///    Redo open/create failure is fatal at startup; redo flush failure
+///    fails the client request.
+/// 3. **Apply to engine** — write UTXO slots / metadata to the block
+///    device via `pwrite_all_at` (durable on return for `DirectDevice`
+///    via `O_DIRECT`).
+/// 4. **Replicate** — fan out to replicas with the durable sequence
+///    numbers assigned in step 2. Best-effort under the current ack
+///    policy; degraded RF>1 modes are validated at config load time.
+/// 5. **Respond** — send the success/error response to the client.
+///
+/// Crash recovery walks the redo log after the last checkpoint and
+/// idempotently re-applies entries; CreateV2 fully reconstructs
+/// records, spend / unspend overwrite `meta.spent_utxos` with the
+/// correct value the dispatch path computed before the WAL flush.
 #[tracing::instrument(
     skip_all,
     level = "debug",
@@ -2238,15 +2258,40 @@ fn handle_spend_batch(
         let key = TxKey { txid: *txid };
         let post_generation = validated.pre_generation.wrapping_add(1);
 
+        // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): compute the real
+        // `new_spent_count` for every Spend redo entry BEFORE the redo
+        // flush. Recovery's `replay_spend` overwrites `meta.spent_utxos`
+        // with whatever the entry carries; previously we wrote `0`, so a
+        // crash in the WAL-before-data window would leave the counter
+        // wrong even though the slot transition was correctly replayed.
+        //
+        // Each redo entry receives the cumulative count AFTER its own
+        // application, computed as `pre_spent + running_transitions`.
+        // The running counter only advances for items that the validator
+        // marked as real UNSPENT→SPENT transitions (in `transitions()`);
+        // idempotent re-spends and validation errors do not bump the
+        // counter, matching what `apply()` will write.
+        let pre_spent_count = validated.pre_spent_count();
+        let transition_offsets: std::collections::HashSet<u32> = validated
+            .transitions()
+            .iter()
+            .map(|(off, _)| *off)
+            .collect();
+
         let mut redo_ops: Vec<RedoOp> = Vec::new();
         let mut key_repl_ops: Vec<ReplicaOp> = Vec::new();
+        let mut running_count = pre_spent_count;
         for &(i, item) in group {
             if !error_indices.contains(&(i as u32)) {
+                if transition_offsets.contains(&item.vout) {
+                    // Real UNSPENT → SPENT — counter advances by 1.
+                    running_count = running_count.wrapping_add(1);
+                }
                 redo_ops.push(RedoOp::Spend {
                     tx_key: key,
                     offset: item.vout,
                     spending_data: item.spending_data,
-                    new_spent_count: 0,
+                    new_spent_count: running_count,
                 });
                 key_repl_ops.push(ReplicaOp::Spend {
                     tx_key: key,
@@ -2404,6 +2449,18 @@ fn handle_unspend_batch(
         pre_generation: u32,
     }
     let mut valid_items: Vec<ValidUnspend> = Vec::new();
+    // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): per-txid running
+    // `spent_utxos` counter for redo entries. Recovery's `replay_unspend`
+    // overwrites `meta.spent_utxos = new_spent_count`; previously we
+    // wrote `0`, which corrupted the counter on crash-replay even when
+    // the slot transition was correct. Initialize each running counter
+    // from the index entry's cached `spent_utxos` (kept in sync with
+    // metadata under the per-record lock) and decrement (saturating at
+    // 0) for every entry — replay is idempotent against UTXO_UNSPENT
+    // slots so over-decrement on a re-played idempotent redo is
+    // harmless because replay skips before touching metadata.
+    let mut running_spent: std::collections::HashMap<TxKey, u32> =
+        std::collections::HashMap::new();
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
@@ -2413,11 +2470,19 @@ fn handle_unspend_batch(
         // Snapshot the generation BEFORE unspend so we can classify the
         // outcome as "real unspend" (gen bumped) vs "idempotent noop"
         // (gen unchanged — slot was already UNSPENT).
-        let pre_generation = engine.lookup(&key).map(|e| e.generation).unwrap_or(0);
+        let entry = engine.lookup(&key);
+        let pre_generation = entry.as_ref().map(|e| e.generation).unwrap_or(0);
+        let pre_spent = entry.as_ref().map(|e| e.spent_utxos).unwrap_or(0);
+        // Initialize the running counter with the current spent count
+        // (from index cache) the first time we see this txid in this
+        // batch. Subsequent items in the same batch decrement from
+        // there, modeling the per-item recovery state.
+        let counter = running_spent.entry(key).or_insert(pre_spent);
+        *counter = counter.saturating_sub(1);
         redo_ops.push(RedoOp::Unspend {
             tx_key: key,
             offset: item.vout,
-            new_spent_count: 0,
+            new_spent_count: *counter,
         });
         valid_items.push(ValidUnspend {
             idx: i,
@@ -2802,10 +2867,56 @@ fn handle_create_batch(
         match engine.pre_allocate_create(&create_req) {
             Ok((record_offset, utxo_count)) => {
                 let key = TxKey { txid: item.txid };
-                redo_ops.push(RedoOp::Create {
+                // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): build
+                // the full record bytes BEFORE the WAL flush so the redo
+                // entry contains everything recovery needs to
+                // reconstruct the on-device record byte-for-byte. Any
+                // failure here is internal (mirrors `create_at_offset`'s
+                // own validation surface).
+                let record_bytes = match engine.build_create_record_bytes(&create_req) {
+                    Ok((bytes, _)) => bytes,
+                    Err(_) => {
+                        // pre_allocate_create already accepted the
+                        // request, so a build failure here indicates a
+                        // logic-level inconsistency. Free the
+                        // pre-allocated space and report internal error.
+                        let utxo_count_for_free = create_req.utxo_hashes.len() as u32;
+                        let base_size =
+                            crate::record::TxMetadata::record_size_for(utxo_count_for_free);
+                        let cold_len = if create_req.is_external && create_req.inputs.is_none() {
+                            0u64
+                        } else {
+                            build_cold_data(
+                                create_req.inputs,
+                                create_req.outputs,
+                                create_req.inpoints,
+                            )
+                            .len() as u64
+                        };
+                        let _ = engine
+                            .allocator()
+                            .lock()
+                            .free(record_offset, base_size + cold_len);
+                        errors.push(BatchItemError {
+                            item_index: i as u32,
+                            error_code: ERR_INTERNAL,
+                            error_data: vec![],
+                        });
+                        continue;
+                    }
+                };
+                let parent_txids: Vec<[u8; 32]> = if create_req.conflicting {
+                    create_req.parent_txids.to_vec()
+                } else {
+                    Vec::new()
+                };
+                redo_ops.push(RedoOp::CreateV2 {
                     tx_key: key,
                     record_offset,
                     utxo_count,
+                    is_conflicting: create_req.conflicting,
+                    record_bytes,
+                    parent_txids,
                 });
                 valid_items.push(ValidCreate {
                     idx: i,
@@ -5964,6 +6075,257 @@ mod tests {
             "ACKed spends lost after crash: {}/{} not spent",
             lost,
             acked_spends.len()
+        );
+    }
+
+    /// Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): the spend redo entry
+    /// must carry the real `new_spent_count`, not `0`. Simulates the
+    /// crash-between-WAL-fsync-and-engine-apply window by spending three
+    /// slots, then *forcing* recovery to reapply the spend redo entries
+    /// against fresh on-device record bytes (reset by the test). After
+    /// recovery, `meta.spent_utxos` must equal 3 — the count the redo
+    /// entries actually carried — not 0.
+    #[test]
+    fn spend_redo_carries_real_new_spent_count_for_replay() {
+        let h = RedoDispatchHarness::new();
+        let txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0xAA;
+            t
+        };
+        assert_eq!(h.create_tx(txid, 3).status, STATUS_OK);
+        let key = TxKey { txid };
+
+        // Capture the original record offset and hashes BEFORE spending.
+        let entry = h.engine.lookup(&key).expect("create registered tx");
+        let record_offset = entry.record_offset;
+        let pre_meta = crate::io::read_metadata(
+            &*h.data_dev as &dyn crate::device::BlockDevice,
+            record_offset,
+        )
+        .expect("read pre-spend metadata");
+        let pre_spent: u32 = { pre_meta.spent_utxos };
+        assert_eq!(pre_spent, 0, "pre-state spent_utxos must be 0");
+        let original_slots: Vec<crate::record::UtxoSlot> = (0..3u32)
+            .map(|i| {
+                crate::io::read_utxo_slot(
+                    &*h.data_dev as &dyn crate::device::BlockDevice,
+                    record_offset,
+                    i,
+                )
+                .expect("read original slot")
+            })
+            .collect();
+
+        // Spend all three slots in a single batch.
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let items: Vec<WireSpendItem> = (0..3u32)
+            .map(|i| WireSpendItem {
+                txid,
+                vout: i,
+                utxo_hash: original_slots[i as usize].hash,
+                spending_data: [(0xC0 + i as u8); 36],
+            })
+            .collect();
+        assert_eq!(
+            h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &items))
+                .status,
+            STATUS_OK,
+            "spend batch must succeed",
+        );
+
+        // Verify the engine applied the count.
+        let post_meta = crate::io::read_metadata(
+            &*h.data_dev as &dyn crate::device::BlockDevice,
+            record_offset,
+        )
+        .expect("read post-spend metadata");
+        assert_eq!(
+            { post_meta.spent_utxos },
+            3,
+            "engine must have applied real spent_utxos = 3",
+        );
+
+        // Roll the on-device slots + counter back to the pre-spend state to
+        // simulate "redo fsynced but engine apply lost". The redo entries
+        // are still in the redo log device.
+        for (i, slot) in original_slots.iter().enumerate() {
+            crate::io::write_utxo_slot(
+                &*h.data_dev as &dyn crate::device::BlockDevice,
+                record_offset,
+                i as u32,
+                slot,
+            )
+            .expect("restore pre-spend slot");
+        }
+        let mut reset_meta = post_meta;
+        reset_meta.spent_utxos = pre_spent;
+        crate::io::write_metadata(
+            &*h.data_dev as &dyn crate::device::BlockDevice,
+            record_offset,
+            &reset_meta,
+        )
+        .expect("restore pre-spend metadata");
+
+        // CRASH and recover — replay must reconstruct counter to 3.
+        let h2 = h.crash_and_recover();
+        let recovered_meta = crate::io::read_metadata(
+            &*h2.data_dev as &dyn crate::device::BlockDevice,
+            record_offset,
+        )
+        .expect("read recovered metadata");
+        assert_eq!(
+            { recovered_meta.spent_utxos },
+            3,
+            "redo replay must restore spent_utxos = 3 (gap #2 — \
+             previously written as 0 in dispatch and applied verbatim)",
+        );
+        // And every slot must be SPENT after replay.
+        for i in 0..3u32 {
+            let slot = crate::io::read_utxo_slot(
+                &*h2.data_dev as &dyn crate::device::BlockDevice,
+                record_offset,
+                i,
+            )
+            .expect("recovered slot reads");
+            assert!(slot.is_spent(), "slot {i} must be SPENT after replay");
+        }
+    }
+
+    /// Companion test for unspend: the same `new_spent_count: 0`
+    /// placeholder bug existed in the unspend dispatch path. After
+    /// unspending one slot, simulate "redo fsynced but engine lost" by
+    /// rolling the slot + counter back, and verify replay restores the
+    /// post-unspend counter (decremented from the original).
+    #[test]
+    fn unspend_redo_carries_real_new_spent_count_for_replay() {
+        let h = RedoDispatchHarness::new();
+        let txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0xBB;
+            t
+        };
+        assert_eq!(h.create_tx(txid, 2).status, STATUS_OK);
+        let key = TxKey { txid };
+
+        // Spend both slots so the counter is 2 before the unspend.
+        let entry = h.engine.lookup(&key).expect("create registered tx");
+        let record_offset = entry.record_offset;
+        let original_slots: Vec<crate::record::UtxoSlot> = (0..2u32)
+            .map(|i| {
+                crate::io::read_utxo_slot(
+                    &*h.data_dev as &dyn crate::device::BlockDevice,
+                    record_offset,
+                    i,
+                )
+                .expect("read original slot")
+            })
+            .collect();
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let spend_items: Vec<WireSpendItem> = (0..2u32)
+            .map(|i| WireSpendItem {
+                txid,
+                vout: i,
+                utxo_hash: original_slots[i as usize].hash,
+                spending_data: [(0xC0 + i as u8); 36],
+            })
+            .collect();
+        assert_eq!(
+            h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &spend_items))
+                .status,
+            STATUS_OK,
+        );
+        let pre_unspend_meta = crate::io::read_metadata(
+            &*h.data_dev as &dyn crate::device::BlockDevice,
+            record_offset,
+        )
+        .expect("read pre-unspend metadata");
+        assert_eq!({ pre_unspend_meta.spent_utxos }, 2);
+
+        // Now unspend slot 0 only.
+        let unspend_items = vec![WireSlotItem {
+            txid,
+            vout: 0,
+            utxo_hash: original_slots[0].hash,
+        }];
+        let unspend_params = UnspendBatchParams {
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        assert_eq!(
+            h.request(
+                OP_UNSPEND_BATCH,
+                encode_unspend_batch(&unspend_params, &unspend_items),
+            )
+            .status,
+            STATUS_OK,
+        );
+
+        // Verify engine count went 2 → 1.
+        let post_unspend_meta = crate::io::read_metadata(
+            &*h.data_dev as &dyn crate::device::BlockDevice,
+            record_offset,
+        )
+        .expect("read post-unspend metadata");
+        assert_eq!(
+            { post_unspend_meta.spent_utxos },
+            1,
+            "engine must apply real spent_utxos = 1 after unspending one slot",
+        );
+
+        // Simulate "redo fsynced but engine lost": roll slot 0 back to
+        // SPENT and counter back to 2.
+        let spent_zero =
+            crate::record::UtxoSlot::new_spent(original_slots[0].hash, [0xC0; 36]);
+        crate::io::write_utxo_slot(
+            &*h.data_dev as &dyn crate::device::BlockDevice,
+            record_offset,
+            0,
+            &spent_zero,
+        )
+        .expect("restore SPENT slot 0");
+        let mut reset_meta = post_unspend_meta;
+        reset_meta.spent_utxos = 2;
+        crate::io::write_metadata(
+            &*h.data_dev as &dyn crate::device::BlockDevice,
+            record_offset,
+            &reset_meta,
+        )
+        .expect("restore pre-unspend metadata");
+
+        // CRASH and recover — replay_unspend must take counter 2 → 1
+        // by writing the redo's `new_spent_count`.
+        let h2 = h.crash_and_recover();
+        let recovered_meta = crate::io::read_metadata(
+            &*h2.data_dev as &dyn crate::device::BlockDevice,
+            record_offset,
+        )
+        .expect("read recovered metadata");
+        assert_eq!(
+            { recovered_meta.spent_utxos },
+            1,
+            "redo replay must decrement spent_utxos to 1 (gap #2 — \
+             previously written as 0 in dispatch)",
+        );
+        let recovered_slot0 = crate::io::read_utxo_slot(
+            &*h2.data_dev as &dyn crate::device::BlockDevice,
+            record_offset,
+            0,
+        )
+        .expect("recovered slot 0 reads");
+        assert!(
+            recovered_slot0.is_unspent(),
+            "slot 0 must be UNSPENT after replay",
         );
     }
 
