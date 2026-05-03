@@ -2,6 +2,98 @@
 //!
 //! Each batch follows the pattern:
 //! `[count:4][shared_params][items × count]`
+//!
+//! # Pre-allocation safety
+//!
+//! Every batch decoder validates the on-wire `count` field BEFORE calling
+//! `Vec::with_capacity(count)`. Two checks run, in order, against an
+//! attacker who advertises a huge `count` with a tiny payload:
+//!
+//! 1. `count <= max_batch`: the configured server-side per-request batch
+//!    limit (`ServerConfig::max_batch_size`). Plumbed through every
+//!    decoder so the dispatcher does not need to allocate first and
+//!    discard later.
+//! 2. `count * per_item_min_size <= remaining_payload`: a payload-fit
+//!    check using checked `usize` arithmetic. This catches malformed
+//!    frames whose declared count cannot possibly be backed by the
+//!    bytes that follow, regardless of `max_batch`.
+//!
+//! Both failures return [`CodecError`]. The legacy `Option`-returning
+//! wrappers (e.g. [`decode_spend_batch`]) remain for client-side and
+//! benchmark callers that do not have a server config in scope; they
+//! fall back to the absolute hard cap [`MAX_DECODE_BATCH`].
+
+use thiserror::Error;
+
+/// Errors returned by the new `*_checked` batch decoders.
+///
+/// All variants are explicitly enforced *before* any payload allocation
+/// so a malicious frame with a huge `count` cannot drive memory pressure.
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum CodecError {
+    /// Buffer is shorter than the minimum required for the batch header
+    /// (`count` and any shared params).
+    #[error("payload too short: need {need} header bytes, have {have}")]
+    HeaderTooShort {
+        /// Minimum number of bytes needed for the batch header.
+        need: usize,
+        /// Number of bytes actually present in the buffer.
+        have: usize,
+    },
+    /// On-wire `count` exceeds the configured `max_batch_size`. Enforced
+    /// BEFORE any per-item allocation so the decoder never reserves
+    /// capacity for an attacker-controlled count.
+    #[error("batch count {count} exceeds max_batch_size {max}")]
+    BatchTooLarge {
+        /// Number of items the frame claims to carry.
+        count: u32,
+        /// Configured maximum permitted by the server.
+        max: u32,
+    },
+    /// Declared `count` cannot fit into the remaining payload bytes given
+    /// each item's minimum on-wire width. This catches malformed frames
+    /// (e.g. `count = u32::MAX`, payload ~ a few hundred bytes) before
+    /// any `Vec::with_capacity(count)` call.
+    #[error(
+        "batch payload truncated: count={count} items each need >= {per_item_min} bytes, payload has {available} bytes available"
+    )]
+    TruncatedBatch {
+        /// Declared item count from the wire.
+        count: u32,
+        /// Minimum byte width of one item (lower bound; variable-size
+        /// items can be larger).
+        per_item_min: usize,
+        /// Bytes remaining in the payload after the batch header.
+        available: usize,
+    },
+    /// A variable-sized item (e.g. cold data, parent txids) declared a
+    /// length that does not fit in the remaining payload.
+    #[error("variable-length section truncated: need {need} bytes, have {have} bytes")]
+    SectionTruncated {
+        /// Bytes required by the declared length.
+        need: usize,
+        /// Bytes actually remaining in the payload.
+        have: usize,
+    },
+}
+
+/// Absolute hard cap on the `count` field of any batch decoder when no
+/// per-call `max_batch_size` is supplied.
+///
+/// Used by the legacy [`Option`]-returning wrappers ([`decode_spend_batch`]
+/// and friends) so client-side and benchmark callers — which do not have
+/// access to a server-side `ServerConfig` — still get a strict
+/// allocation-bounding check. Server dispatch plumbs the configured
+/// `max_batch_size` directly into the `*_checked` variants and ignores
+/// this constant.
+///
+/// 1 MiB items is well above any realistic batch we expect to encode
+/// (Teranode's adapter caps batches at 8192) but small enough that
+/// pre-allocating `Vec::with_capacity(MAX_DECODE_BATCH)` on the largest
+/// fixed-size item type (`WireSpendItem` = 104 bytes) is bounded to ~100
+/// MiB — well within the new 16 MiB `MAX_FRAME_SIZE` plus headroom for
+/// in-flight batch building.
+pub const MAX_DECODE_BATCH: u32 = 1 << 20;
 
 /// Helper: append a u32 LE.
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
@@ -15,6 +107,45 @@ fn get_u32(d: &[u8], o: usize) -> u32 {
 }
 fn get_u16(d: &[u8], o: usize) -> u16 {
     u16::from_le_bytes(d[o..o + 2].try_into().unwrap())
+}
+
+/// Validate a wire-supplied `count` against `max_batch` AND the available
+/// payload bytes for fixed-size items. MUST be called BEFORE any
+/// `Vec::with_capacity(count)` invocation so an attacker-supplied huge
+/// count cannot drive memory pressure.
+///
+/// `available` is the number of payload bytes remaining after the batch
+/// header (`count` + any shared params). `per_item_min` is the minimum
+/// on-wire width of a single item (use the fixed-size lower bound for
+/// variable-length items like CreateBatch entries).
+fn validate_batch_count(
+    count: u32,
+    max_batch: u32,
+    per_item_min: usize,
+    available: usize,
+) -> Result<(), CodecError> {
+    if count > max_batch {
+        return Err(CodecError::BatchTooLarge {
+            count,
+            max: max_batch,
+        });
+    }
+    let count_usize = count as usize;
+    let needed = count_usize
+        .checked_mul(per_item_min)
+        .ok_or(CodecError::TruncatedBatch {
+            count,
+            per_item_min,
+            available,
+        })?;
+    if needed > available {
+        return Err(CodecError::TruncatedBatch {
+            count,
+            per_item_min,
+            available,
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -57,23 +188,46 @@ pub fn encode_spend_batch(params: &SpendBatchParams, items: &[WireSpendItem]) ->
     buf
 }
 
-/// Decode a SpendBatch request payload.
-pub fn decode_spend_batch(data: &[u8]) -> Option<(SpendBatchParams, Vec<WireSpendItem>)> {
+/// Decode a SpendBatch request payload, validating counts and payload size
+/// before any per-item allocation.
+///
+/// `max_batch` is the configured server-side per-request batch cap
+/// ([`crate::config::ServerConfig::max_batch_size`]). The decoder rejects
+/// the frame with [`CodecError::BatchTooLarge`] BEFORE allocating the
+/// output `Vec` if the wire-supplied `count` exceeds this bound, and with
+/// [`CodecError::TruncatedBatch`] if `count * 104` bytes cannot fit in the
+/// remaining payload.
+pub fn decode_spend_batch_checked(
+    data: &[u8],
+    max_batch: u32,
+) -> Result<(SpendBatchParams, Vec<WireSpendItem>), CodecError> {
     if data.len() < 14 {
-        return None;
+        return Err(CodecError::HeaderTooShort {
+            need: 14,
+            have: data.len(),
+        });
     }
-    let count = get_u32(data, 0) as usize;
+    let count = get_u32(data, 0);
     let params = SpendBatchParams {
         ignore_conflicting: data[4] != 0,
         ignore_locked: data[5] != 0,
         current_block_height: get_u32(data, 6),
         block_height_retention: get_u32(data, 10),
     };
+    validate_batch_count(count, max_batch, 104, data.len() - 14)?;
+    let count = count as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 14;
     for _ in 0..count {
+        // Bounds were proven by validate_batch_count above; this is a
+        // belt-and-braces check that keeps the per-item indexing safe
+        // even if a future caller bypasses validation.
         if pos + 104 > data.len() {
-            return None;
+            return Err(CodecError::TruncatedBatch {
+                count: count as u32,
+                per_item_min: 104,
+                available: data.len().saturating_sub(14),
+            });
         }
         let mut txid = [0u8; 32];
         txid.copy_from_slice(&data[pos..pos + 32]);
@@ -90,7 +244,14 @@ pub fn decode_spend_batch(data: &[u8]) -> Option<(SpendBatchParams, Vec<WireSpen
         });
         pos += 104;
     }
-    Some((params, items))
+    Ok((params, items))
+}
+
+/// Decode a SpendBatch request payload using the absolute hard cap
+/// [`MAX_DECODE_BATCH`]. Server-side callers should prefer
+/// [`decode_spend_batch_checked`] with the configured `max_batch_size`.
+pub fn decode_spend_batch(data: &[u8]) -> Option<(SpendBatchParams, Vec<WireSpendItem>)> {
+    decode_spend_batch_checked(data, MAX_DECODE_BATCH).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -126,12 +287,20 @@ pub fn encode_set_mined_batch(params: &SetMinedBatchParams, txids: &[[u8; 32]]) 
     buf
 }
 
-/// Decode a SetMinedBatch request payload.
-pub fn decode_set_mined_batch(data: &[u8]) -> Option<(SetMinedBatchParams, Vec<[u8; 32]>)> {
+/// Decode a SetMinedBatch request payload, validating count before
+/// allocation. See [`decode_spend_batch_checked`] for the
+/// allocation-safety contract.
+pub fn decode_set_mined_batch_checked(
+    data: &[u8],
+    max_batch: u32,
+) -> Result<(SetMinedBatchParams, Vec<[u8; 32]>), CodecError> {
     if data.len() < 26 {
-        return None;
+        return Err(CodecError::HeaderTooShort {
+            need: 26,
+            have: data.len(),
+        });
     }
-    let count = get_u32(data, 0) as usize;
+    let count = get_u32(data, 0);
     let params = SetMinedBatchParams {
         block_id: get_u32(data, 4),
         block_height: get_u32(data, 8),
@@ -141,18 +310,29 @@ pub fn decode_set_mined_batch(data: &[u8]) -> Option<(SetMinedBatchParams, Vec<[
         current_block_height: get_u32(data, 18),
         block_height_retention: get_u32(data, 22),
     };
+    validate_batch_count(count, max_batch, 32, data.len() - 26)?;
+    let count = count as usize;
     let mut txids = Vec::with_capacity(count);
     let mut pos = 26;
     for _ in 0..count {
         if pos + 32 > data.len() {
-            return None;
+            return Err(CodecError::TruncatedBatch {
+                count: count as u32,
+                per_item_min: 32,
+                available: data.len().saturating_sub(26),
+            });
         }
         let mut txid = [0u8; 32];
         txid.copy_from_slice(&data[pos..pos + 32]);
         txids.push(txid);
         pos += 32;
     }
-    Some((params, txids))
+    Ok((params, txids))
+}
+
+/// Decode a SetMinedBatch request payload using [`MAX_DECODE_BATCH`].
+pub fn decode_set_mined_batch(data: &[u8]) -> Option<(SetMinedBatchParams, Vec<[u8; 32]>)> {
+    decode_set_mined_batch_checked(data, MAX_DECODE_BATCH).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -175,25 +355,47 @@ pub fn encode_txid_batch(txids: &[[u8; 32]], shared: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Decode a batch of txids with a given shared params size.
-pub fn decode_txid_batch(data: &[u8], shared_len: usize) -> Option<(Vec<u8>, Vec<[u8; 32]>)> {
-    if data.len() < 4 + shared_len {
-        return None;
+/// Decode a batch of txids with a given shared params size, validating
+/// count before allocation. See [`decode_spend_batch_checked`] for the
+/// allocation-safety contract.
+pub fn decode_txid_batch_checked(
+    data: &[u8],
+    shared_len: usize,
+    max_batch: u32,
+) -> Result<(Vec<u8>, Vec<[u8; 32]>), CodecError> {
+    let header = 4 + shared_len;
+    if data.len() < header {
+        return Err(CodecError::HeaderTooShort {
+            need: header,
+            have: data.len(),
+        });
     }
-    let count = get_u32(data, 0) as usize;
-    let shared = data[4..4 + shared_len].to_vec();
+    let count = get_u32(data, 0);
+    let shared = data[4..header].to_vec();
+    validate_batch_count(count, max_batch, 32, data.len() - header)?;
+    let count = count as usize;
     let mut txids = Vec::with_capacity(count);
-    let mut pos = 4 + shared_len;
+    let mut pos = header;
     for _ in 0..count {
         if pos + 32 > data.len() {
-            return None;
+            return Err(CodecError::TruncatedBatch {
+                count: count as u32,
+                per_item_min: 32,
+                available: data.len().saturating_sub(header),
+            });
         }
         let mut txid = [0u8; 32];
         txid.copy_from_slice(&data[pos..pos + 32]);
         txids.push(txid);
         pos += 32;
     }
-    Some((shared, txids))
+    Ok((shared, txids))
+}
+
+/// Decode a batch of txids with a given shared params size using
+/// [`MAX_DECODE_BATCH`].
+pub fn decode_txid_batch(data: &[u8], shared_len: usize) -> Option<(Vec<u8>, Vec<[u8; 32]>)> {
+    decode_txid_batch_checked(data, shared_len, MAX_DECODE_BATCH).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -220,17 +422,30 @@ pub fn encode_slot_item_batch(items: &[WireSlotItem]) -> Vec<u8> {
     buf
 }
 
-/// Decode a batch of slot items.
-pub fn decode_slot_item_batch(data: &[u8]) -> Option<Vec<WireSlotItem>> {
+/// Decode a batch of slot items, validating count before allocation. See
+/// [`decode_spend_batch_checked`] for the allocation-safety contract.
+pub fn decode_slot_item_batch_checked(
+    data: &[u8],
+    max_batch: u32,
+) -> Result<Vec<WireSlotItem>, CodecError> {
     if data.len() < 4 {
-        return None;
+        return Err(CodecError::HeaderTooShort {
+            need: 4,
+            have: data.len(),
+        });
     }
-    let count = get_u32(data, 0) as usize;
+    let count = get_u32(data, 0);
+    validate_batch_count(count, max_batch, 68, data.len() - 4)?;
+    let count = count as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 4;
     for _ in 0..count {
         if pos + 68 > data.len() {
-            return None;
+            return Err(CodecError::TruncatedBatch {
+                count: count as u32,
+                per_item_min: 68,
+                available: data.len().saturating_sub(4),
+            });
         }
         let mut txid = [0u8; 32];
         txid.copy_from_slice(&data[pos..pos + 32]);
@@ -244,7 +459,12 @@ pub fn decode_slot_item_batch(data: &[u8]) -> Option<Vec<WireSlotItem>> {
         });
         pos += 68;
     }
-    Some(items)
+    Ok(items)
+}
+
+/// Decode a batch of slot items using [`MAX_DECODE_BATCH`].
+pub fn decode_slot_item_batch(data: &[u8]) -> Option<Vec<WireSlotItem>> {
+    decode_slot_item_batch_checked(data, MAX_DECODE_BATCH).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -282,21 +502,35 @@ pub fn encode_reassign_batch(params: &ReassignBatchParams, items: &[WireReassign
     buf
 }
 
-/// Decode a ReassignBatch request payload.
-pub fn decode_reassign_batch(data: &[u8]) -> Option<(ReassignBatchParams, Vec<WireReassignItem>)> {
+/// Decode a ReassignBatch request payload, validating count before
+/// allocation. See [`decode_spend_batch_checked`] for the
+/// allocation-safety contract.
+pub fn decode_reassign_batch_checked(
+    data: &[u8],
+    max_batch: u32,
+) -> Result<(ReassignBatchParams, Vec<WireReassignItem>), CodecError> {
     if data.len() < 12 {
-        return None;
+        return Err(CodecError::HeaderTooShort {
+            need: 12,
+            have: data.len(),
+        });
     }
-    let count = get_u32(data, 0) as usize;
+    let count = get_u32(data, 0);
     let params = ReassignBatchParams {
         block_height: get_u32(data, 4),
         spendable_after: get_u32(data, 8),
     };
+    validate_batch_count(count, max_batch, 100, data.len() - 12)?;
+    let count = count as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 12;
     for _ in 0..count {
         if pos + 100 > data.len() {
-            return None;
+            return Err(CodecError::TruncatedBatch {
+                count: count as u32,
+                per_item_min: 100,
+                available: data.len().saturating_sub(12),
+            });
         }
         let mut txid = [0u8; 32];
         txid.copy_from_slice(&data[pos..pos + 32]);
@@ -313,7 +547,12 @@ pub fn decode_reassign_batch(data: &[u8]) -> Option<(ReassignBatchParams, Vec<Wi
         });
         pos += 100;
     }
-    Some((params, items))
+    Ok((params, items))
+}
+
+/// Decode a ReassignBatch request payload using [`MAX_DECODE_BATCH`].
+pub fn decode_reassign_batch(data: &[u8]) -> Option<(ReassignBatchParams, Vec<WireReassignItem>)> {
+    decode_reassign_batch_checked(data, MAX_DECODE_BATCH).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -343,21 +582,35 @@ pub fn encode_unspend_batch(params: &UnspendBatchParams, items: &[WireSlotItem])
     buf
 }
 
-/// Decode an UnspendBatch request payload.
-pub fn decode_unspend_batch(data: &[u8]) -> Option<(UnspendBatchParams, Vec<WireSlotItem>)> {
+/// Decode an UnspendBatch request payload, validating count before
+/// allocation. See [`decode_spend_batch_checked`] for the
+/// allocation-safety contract.
+pub fn decode_unspend_batch_checked(
+    data: &[u8],
+    max_batch: u32,
+) -> Result<(UnspendBatchParams, Vec<WireSlotItem>), CodecError> {
     if data.len() < 12 {
-        return None;
+        return Err(CodecError::HeaderTooShort {
+            need: 12,
+            have: data.len(),
+        });
     }
-    let count = get_u32(data, 0) as usize;
+    let count = get_u32(data, 0);
     let params = UnspendBatchParams {
         current_block_height: get_u32(data, 4),
         block_height_retention: get_u32(data, 8),
     };
+    validate_batch_count(count, max_batch, 68, data.len() - 12)?;
+    let count = count as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 12;
     for _ in 0..count {
         if pos + 68 > data.len() {
-            return None;
+            return Err(CodecError::TruncatedBatch {
+                count: count as u32,
+                per_item_min: 68,
+                available: data.len().saturating_sub(12),
+            });
         }
         let mut txid = [0u8; 32];
         txid.copy_from_slice(&data[pos..pos + 32]);
@@ -371,7 +624,12 @@ pub fn decode_unspend_batch(data: &[u8]) -> Option<(UnspendBatchParams, Vec<Wire
         });
         pos += 68;
     }
-    Some((params, items))
+    Ok((params, items))
+}
+
+/// Decode an UnspendBatch request payload using [`MAX_DECODE_BATCH`].
+pub fn decode_unspend_batch(data: &[u8]) -> Option<(UnspendBatchParams, Vec<WireSlotItem>)> {
+    decode_unspend_batch_checked(data, MAX_DECODE_BATCH).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -445,18 +703,39 @@ pub fn encode_create_batch(items: &[WireCreateItem]) -> Vec<u8> {
     buf
 }
 
-/// Decode a CreateBatch request payload.
-pub fn decode_create_batch(data: &[u8]) -> Option<Vec<WireCreateItem>> {
+/// Decode a CreateBatch request payload, validating count before
+/// allocation. See [`decode_spend_batch_checked`] for the
+/// allocation-safety contract.
+///
+/// Items are variable-length; the per-item minimum (96 bytes) is the
+/// lower bound used for the pre-allocation guard. Over-large variable
+/// sections (utxo_hashes, cold_data, parent_txids) are still rejected
+/// per-item via [`CodecError::SectionTruncated`].
+pub fn decode_create_batch_checked(
+    data: &[u8],
+    max_batch: u32,
+) -> Result<Vec<WireCreateItem>, CodecError> {
     if data.len() < 4 {
-        return None;
+        return Err(CodecError::HeaderTooShort {
+            need: 4,
+            have: data.len(),
+        });
     }
-    let count = get_u32(data, 0) as usize;
+    let count = get_u32(data, 0);
+    // Per-item minimum: txid(32)+version(4)+locktime(4)+fee(8)+size(8)+
+    // ext(8)+coinbase(1)+sh(4)+created(8)+flags(1)+utxo_count(4)+
+    // has_cold(1)+cold_len(4)+block_height(4)+has_mined(1)+parent_count(4) = 96.
+    validate_batch_count(count, max_batch, 96, data.len() - 4)?;
+    let count = count as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 4;
     for _ in 0..count {
         // Fixed fields: txid(32)+tx_version(4)+locktime(4)+fee(8)+size(8)+ext(8)+coinbase(1)+sh(4)+created(8)+flags(1)+utxo_count(4) = 82
         if pos + 82 > data.len() {
-            return None;
+            return Err(CodecError::SectionTruncated {
+                need: pos + 82,
+                have: data.len(),
+            });
         }
         let mut txid = [0u8; 32];
         txid.copy_from_slice(&data[pos..pos + 32]);
@@ -465,27 +744,66 @@ pub fn decode_create_batch(data: &[u8]) -> Option<Vec<WireCreateItem>> {
         pos += 4;
         let locktime = get_u32(data, pos);
         pos += 4;
-        let fee = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        let fee = u64::from_le_bytes(
+            data[pos..pos + 8]
+                .try_into()
+                .map_err(|_| CodecError::SectionTruncated {
+                    need: pos + 8,
+                    have: data.len(),
+                })?,
+        );
         pos += 8;
-        let size_in_bytes = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        let size_in_bytes = u64::from_le_bytes(
+            data[pos..pos + 8]
+                .try_into()
+                .map_err(|_| CodecError::SectionTruncated {
+                    need: pos + 8,
+                    have: data.len(),
+                })?,
+        );
         pos += 8;
-        let extended_size = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        let extended_size = u64::from_le_bytes(
+            data[pos..pos + 8]
+                .try_into()
+                .map_err(|_| CodecError::SectionTruncated {
+                    need: pos + 8,
+                    have: data.len(),
+                })?,
+        );
         pos += 8;
         let is_coinbase = data[pos] != 0;
         pos += 1;
         let spending_height = get_u32(data, pos);
         pos += 4;
-        let created_at = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        let created_at = u64::from_le_bytes(
+            data[pos..pos + 8]
+                .try_into()
+                .map_err(|_| CodecError::SectionTruncated {
+                    need: pos + 8,
+                    have: data.len(),
+                })?,
+        );
         pos += 8;
         let flags = data[pos];
         pos += 1;
-        let utxo_count = get_u32(data, pos) as usize;
+        let utxo_count = get_u32(data, pos);
         pos += 4;
 
-        if pos + utxo_count * 32 > data.len() {
-            return None;
+        // Validate utxo_count fits in remaining bytes BEFORE allocating
+        // the per-item Vec — protects against count = u32::MAX.
+        let utxo_bytes = (utxo_count as usize)
+            .checked_mul(32)
+            .ok_or(CodecError::SectionTruncated {
+                need: usize::MAX,
+                have: data.len() - pos,
+            })?;
+        if pos + utxo_bytes > data.len() {
+            return Err(CodecError::SectionTruncated {
+                need: pos + utxo_bytes,
+                have: data.len(),
+            });
         }
-        let mut utxo_hashes = Vec::with_capacity(utxo_count);
+        let mut utxo_hashes = Vec::with_capacity(utxo_count as usize);
         for _ in 0..utxo_count {
             let mut h = [0u8; 32];
             h.copy_from_slice(&data[pos..pos + 32]);
@@ -494,32 +812,47 @@ pub fn decode_create_batch(data: &[u8]) -> Option<Vec<WireCreateItem>> {
         }
 
         if pos + 5 > data.len() {
-            return None;
+            return Err(CodecError::SectionTruncated {
+                need: pos + 5,
+                have: data.len(),
+            });
         } // has_cold(1) + cold_len(4)
         let _has_cold = data[pos];
         pos += 1;
         let cold_len = get_u32(data, pos) as usize;
         pos += 4;
         if pos + cold_len > data.len() {
-            return None;
+            return Err(CodecError::SectionTruncated {
+                need: pos + cold_len,
+                have: data.len(),
+            });
         }
         let cold_data = data[pos..pos + cold_len].to_vec();
         pos += cold_len;
 
         if pos + 4 > data.len() {
-            return None;
+            return Err(CodecError::SectionTruncated {
+                need: pos + 4,
+                have: data.len(),
+            });
         }
         let block_height = get_u32(data, pos);
         pos += 4;
 
         if pos >= data.len() {
-            return None;
+            return Err(CodecError::SectionTruncated {
+                need: pos + 1,
+                have: data.len(),
+            });
         }
         let has_mined = data[pos] != 0;
         pos += 1;
         let (mined_block_id, mined_block_height, mined_subtree_idx) = if has_mined {
             if pos + 12 > data.len() {
-                return None;
+                return Err(CodecError::SectionTruncated {
+                    need: pos + 12,
+                    have: data.len(),
+                });
             }
             let bid = get_u32(data, pos);
             pos += 4;
@@ -533,14 +866,27 @@ pub fn decode_create_batch(data: &[u8]) -> Option<Vec<WireCreateItem>> {
         };
 
         if pos + 4 > data.len() {
-            return None;
+            return Err(CodecError::SectionTruncated {
+                need: pos + 4,
+                have: data.len(),
+            });
         }
-        let parent_count = get_u32(data, pos) as usize;
+        let parent_count = get_u32(data, pos);
         pos += 4;
-        if pos + parent_count * 32 > data.len() {
-            return None;
+        let parent_bytes =
+            (parent_count as usize)
+                .checked_mul(32)
+                .ok_or(CodecError::SectionTruncated {
+                    need: usize::MAX,
+                    have: data.len() - pos,
+                })?;
+        if pos + parent_bytes > data.len() {
+            return Err(CodecError::SectionTruncated {
+                need: pos + parent_bytes,
+                have: data.len(),
+            });
         }
-        let mut parent_txids = Vec::with_capacity(parent_count);
+        let mut parent_txids = Vec::with_capacity(parent_count as usize);
         for _ in 0..parent_count {
             let mut ptx = [0u8; 32];
             ptx.copy_from_slice(&data[pos..pos + 32]);
@@ -568,7 +914,12 @@ pub fn decode_create_batch(data: &[u8]) -> Option<Vec<WireCreateItem>> {
             parent_txids,
         });
     }
-    Some(items)
+    Ok(items)
+}
+
+/// Decode a CreateBatch request payload using [`MAX_DECODE_BATCH`].
+pub fn decode_create_batch(data: &[u8]) -> Option<Vec<WireCreateItem>> {
+    decode_create_batch_checked(data, MAX_DECODE_BATCH).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -679,25 +1030,44 @@ pub fn encode_get_batch(field_mask: u32, txids: &[[u8; 32]]) -> Vec<u8> {
     buf
 }
 
-/// Decode a GetBatch request payload.
-pub fn decode_get_batch(data: &[u8]) -> Option<(FieldMask, Vec<[u8; 32]>)> {
+/// Decode a GetBatch request payload, validating count before
+/// allocation. See [`decode_spend_batch_checked`] for the
+/// allocation-safety contract.
+pub fn decode_get_batch_checked(
+    data: &[u8],
+    max_batch: u32,
+) -> Result<(FieldMask, Vec<[u8; 32]>), CodecError> {
     if data.len() < 8 {
-        return None;
+        return Err(CodecError::HeaderTooShort {
+            need: 8,
+            have: data.len(),
+        });
     }
-    let count = get_u32(data, 0) as usize;
+    let count = get_u32(data, 0);
     let field_mask = FieldMask(get_u32(data, 4));
+    validate_batch_count(count, max_batch, 32, data.len() - 8)?;
+    let count = count as usize;
     let mut txids = Vec::with_capacity(count);
     let mut pos = 8;
     for _ in 0..count {
         if pos + 32 > data.len() {
-            return None;
+            return Err(CodecError::TruncatedBatch {
+                count: count as u32,
+                per_item_min: 32,
+                available: data.len().saturating_sub(8),
+            });
         }
         let mut txid = [0u8; 32];
         txid.copy_from_slice(&data[pos..pos + 32]);
         txids.push(txid);
         pos += 32;
     }
-    Some((field_mask, txids))
+    Ok((field_mask, txids))
+}
+
+/// Decode a GetBatch request payload using [`MAX_DECODE_BATCH`].
+pub fn decode_get_batch(data: &[u8]) -> Option<(FieldMask, Vec<[u8; 32]>)> {
+    decode_get_batch_checked(data, MAX_DECODE_BATCH).ok()
 }
 
 /// A single GetBatch response item.
@@ -722,24 +1092,42 @@ pub fn encode_get_response(items: &[WireGetResult]) -> Vec<u8> {
     buf
 }
 
-/// Decode GetBatch response items.
-pub fn decode_get_response(data: &[u8]) -> Option<Vec<WireGetResult>> {
+/// Decode GetBatch response items, validating count before allocation.
+/// See [`decode_spend_batch_checked`] for the allocation-safety contract.
+///
+/// Per-item minimum is 5 bytes (`status:1 + data_len:4`); variable
+/// `data` payloads are bounded by the remaining buffer.
+pub fn decode_get_response_checked(
+    data: &[u8],
+    max_batch: u32,
+) -> Result<Vec<WireGetResult>, CodecError> {
     if data.len() < 4 {
-        return None;
+        return Err(CodecError::HeaderTooShort {
+            need: 4,
+            have: data.len(),
+        });
     }
-    let count = get_u32(data, 0) as usize;
+    let count = get_u32(data, 0);
+    validate_batch_count(count, max_batch, 5, data.len() - 4)?;
+    let count = count as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 4;
     for _ in 0..count {
         if pos + 5 > data.len() {
-            return None;
+            return Err(CodecError::SectionTruncated {
+                need: pos + 5,
+                have: data.len(),
+            });
         } // status(1) + data_len(4)
         let status = data[pos];
         pos += 1;
         let data_len = get_u32(data, pos) as usize;
         pos += 4;
         if pos + data_len > data.len() {
-            return None;
+            return Err(CodecError::SectionTruncated {
+                need: pos + data_len,
+                have: data.len(),
+            });
         }
         let item_data = data[pos..pos + data_len].to_vec();
         pos += data_len;
@@ -748,7 +1136,12 @@ pub fn decode_get_response(data: &[u8]) -> Option<Vec<WireGetResult>> {
             data: item_data,
         });
     }
-    Some(items)
+    Ok(items)
+}
+
+/// Decode GetBatch response items using [`MAX_DECODE_BATCH`].
+pub fn decode_get_response(data: &[u8]) -> Option<Vec<WireGetResult>> {
+    decode_get_response_checked(data, MAX_DECODE_BATCH).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -798,21 +1191,35 @@ pub fn encode_partial_with_signals(
     buf
 }
 
-/// Decode a SpendBatch/SetMinedBatch PartialError response with both sections.
-pub fn decode_partial_with_signals(
+/// Decode a SpendBatch/SetMinedBatch PartialError response with both
+/// sections, validating each section's count before allocation. See
+/// [`decode_spend_batch_checked`] for the allocation-safety contract.
+///
+/// Per-success minimum is 6 bytes (`item_index:4 + signal:1 + bid_count:1`);
+/// per-error minimum is 8 bytes (`item_index:4 + error_code:2 + data_len:2`).
+pub fn decode_partial_with_signals_checked(
     data: &[u8],
-) -> Option<(Vec<BatchItemSuccess>, Vec<BatchItemError>)> {
+    max_batch: u32,
+) -> Result<(Vec<BatchItemSuccess>, Vec<BatchItemError>), CodecError> {
     if data.len() < 4 {
-        return None;
+        return Err(CodecError::HeaderTooShort {
+            need: 4,
+            have: data.len(),
+        });
     }
     let mut pos = 0;
 
-    let success_count = get_u32(data, pos) as usize;
+    let success_count = get_u32(data, pos);
     pos += 4;
+    validate_batch_count(success_count, max_batch, 6, data.len() - pos)?;
+    let success_count = success_count as usize;
     let mut successes = Vec::with_capacity(success_count);
     for _ in 0..success_count {
         if pos + 6 > data.len() {
-            return None;
+            return Err(CodecError::SectionTruncated {
+                need: pos + 6,
+                have: data.len(),
+            });
         } // item_index(4) + signal(1) + bid_count(1)
         let item_index = get_u32(data, pos);
         pos += 4;
@@ -820,8 +1227,12 @@ pub fn decode_partial_with_signals(
         pos += 1;
         let bid_count = data[pos] as usize;
         pos += 1;
+        // bid_count is u8, capped at 255, so bid_count*4 cannot overflow.
         if pos + bid_count * 4 > data.len() {
-            return None;
+            return Err(CodecError::SectionTruncated {
+                need: pos + bid_count * 4,
+                have: data.len(),
+            });
         }
         let mut block_ids = Vec::with_capacity(bid_count);
         for _ in 0..bid_count {
@@ -836,21 +1247,32 @@ pub fn decode_partial_with_signals(
     }
 
     if pos + 4 > data.len() {
-        return None;
+        return Err(CodecError::SectionTruncated {
+            need: pos + 4,
+            have: data.len(),
+        });
     }
-    let error_count = get_u32(data, pos) as usize;
+    let error_count = get_u32(data, pos);
     pos += 4;
+    validate_batch_count(error_count, max_batch, 8, data.len() - pos)?;
+    let error_count = error_count as usize;
     let mut errors = Vec::with_capacity(error_count);
     for _ in 0..error_count {
         if pos + 8 > data.len() {
-            return None;
+            return Err(CodecError::SectionTruncated {
+                need: pos + 8,
+                have: data.len(),
+            });
         }
         let item_index = get_u32(data, pos);
         let error_code = get_u16(data, pos + 4);
         let data_len = get_u16(data, pos + 6) as usize;
         pos += 8;
         if pos + data_len > data.len() {
-            return None;
+            return Err(CodecError::SectionTruncated {
+                need: pos + data_len,
+                have: data.len(),
+            });
         }
         let error_data = data[pos..pos + data_len].to_vec();
         pos += data_len;
@@ -861,7 +1283,15 @@ pub fn decode_partial_with_signals(
         });
     }
 
-    Some((successes, errors))
+    Ok((successes, errors))
+}
+
+/// Decode a SpendBatch/SetMinedBatch PartialError response using
+/// [`MAX_DECODE_BATCH`].
+pub fn decode_partial_with_signals(
+    data: &[u8],
+) -> Option<(Vec<BatchItemSuccess>, Vec<BatchItemError>)> {
+    decode_partial_with_signals_checked(data, MAX_DECODE_BATCH).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -948,24 +1378,41 @@ pub fn encode_sparse_errors(errors: &[BatchItemError]) -> Vec<u8> {
     buf
 }
 
-/// Decode a sparse error list.
-pub fn decode_sparse_errors(data: &[u8]) -> Option<Vec<BatchItemError>> {
+/// Decode a sparse error list, validating count before allocation. See
+/// [`decode_spend_batch_checked`] for the allocation-safety contract.
+///
+/// Per-item minimum is 8 bytes (`item_index:4 + error_code:2 + data_len:2`).
+pub fn decode_sparse_errors_checked(
+    data: &[u8],
+    max_batch: u32,
+) -> Result<Vec<BatchItemError>, CodecError> {
     if data.len() < 4 {
-        return None;
+        return Err(CodecError::HeaderTooShort {
+            need: 4,
+            have: data.len(),
+        });
     }
-    let count = get_u32(data, 0) as usize;
+    let count = get_u32(data, 0);
+    validate_batch_count(count, max_batch, 8, data.len() - 4)?;
+    let count = count as usize;
     let mut errors = Vec::with_capacity(count);
     let mut pos = 4;
     for _ in 0..count {
         if pos + 8 > data.len() {
-            return None;
+            return Err(CodecError::SectionTruncated {
+                need: pos + 8,
+                have: data.len(),
+            });
         }
         let item_index = get_u32(data, pos);
         let error_code = get_u16(data, pos + 4);
         let data_len = get_u16(data, pos + 6) as usize;
         pos += 8;
         if pos + data_len > data.len() {
-            return None;
+            return Err(CodecError::SectionTruncated {
+                need: pos + data_len,
+                have: data.len(),
+            });
         }
         let error_data = data[pos..pos + data_len].to_vec();
         pos += data_len;
@@ -975,7 +1422,12 @@ pub fn decode_sparse_errors(data: &[u8]) -> Option<Vec<BatchItemError>> {
             error_data,
         });
     }
-    Some(errors)
+    Ok(errors)
+}
+
+/// Decode a sparse error list using [`MAX_DECODE_BATCH`].
+pub fn decode_sparse_errors(data: &[u8]) -> Option<Vec<BatchItemError>> {
+    decode_sparse_errors_checked(data, MAX_DECODE_BATCH).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,17 +1452,31 @@ pub fn encode_get_spend_batch(items: &[WireGetSpendItem]) -> Vec<u8> {
     buf
 }
 
-/// Decode a GetSpendBatch request payload.
-pub fn decode_get_spend_batch(data: &[u8]) -> Option<Vec<WireGetSpendItem>> {
+/// Decode a GetSpendBatch request payload, validating count before
+/// allocation. See [`decode_spend_batch_checked`] for the
+/// allocation-safety contract.
+pub fn decode_get_spend_batch_checked(
+    data: &[u8],
+    max_batch: u32,
+) -> Result<Vec<WireGetSpendItem>, CodecError> {
     if data.len() < 4 {
-        return None;
+        return Err(CodecError::HeaderTooShort {
+            need: 4,
+            have: data.len(),
+        });
     }
-    let count = get_u32(data, 0) as usize;
+    let count = get_u32(data, 0);
+    validate_batch_count(count, max_batch, 36, data.len() - 4)?;
+    let count = count as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 4;
     for _ in 0..count {
         if pos + 36 > data.len() {
-            return None;
+            return Err(CodecError::TruncatedBatch {
+                count: count as u32,
+                per_item_min: 36,
+                available: data.len().saturating_sub(4),
+            });
         }
         let mut txid = [0u8; 32];
         txid.copy_from_slice(&data[pos..pos + 32]);
@@ -1018,7 +1484,12 @@ pub fn decode_get_spend_batch(data: &[u8]) -> Option<Vec<WireGetSpendItem>> {
         items.push(WireGetSpendItem { txid, vout });
         pos += 36;
     }
-    Some(items)
+    Ok(items)
+}
+
+/// Decode a GetSpendBatch request payload using [`MAX_DECODE_BATCH`].
+pub fn decode_get_spend_batch(data: &[u8]) -> Option<Vec<WireGetSpendItem>> {
+    decode_get_spend_batch_checked(data, MAX_DECODE_BATCH).ok()
 }
 
 /// A single GetSpend response item.
@@ -1043,17 +1514,31 @@ pub fn encode_get_spend_response(items: &[WireGetSpendResult]) -> Vec<u8> {
     buf
 }
 
-/// Decode GetSpendBatch response items.
-pub fn decode_get_spend_response(data: &[u8]) -> Option<Vec<WireGetSpendResult>> {
+/// Decode GetSpendBatch response items, validating count before
+/// allocation. See [`decode_spend_batch_checked`] for the
+/// allocation-safety contract.
+pub fn decode_get_spend_response_checked(
+    data: &[u8],
+    max_batch: u32,
+) -> Result<Vec<WireGetSpendResult>, CodecError> {
     if data.len() < 4 {
-        return None;
+        return Err(CodecError::HeaderTooShort {
+            need: 4,
+            have: data.len(),
+        });
     }
-    let count = get_u32(data, 0) as usize;
+    let count = get_u32(data, 0);
+    validate_batch_count(count, max_batch, 40, data.len() - 4)?;
+    let count = count as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 4;
     for _ in 0..count {
         if pos + 40 > data.len() {
-            return None;
+            return Err(CodecError::TruncatedBatch {
+                count: count as u32,
+                per_item_min: 40,
+                available: data.len().saturating_sub(4),
+            });
         }
         let status = data[pos];
         let error_code = get_u16(data, pos + 1);
@@ -1068,7 +1553,12 @@ pub fn decode_get_spend_response(data: &[u8]) -> Option<Vec<WireGetSpendResult>>
         });
         pos += 40;
     }
-    Some(items)
+    Ok(items)
+}
+
+/// Decode GetSpendBatch response items using [`MAX_DECODE_BATCH`].
+pub fn decode_get_spend_response(data: &[u8]) -> Option<Vec<WireGetSpendResult>> {
+    decode_get_spend_response_checked(data, MAX_DECODE_BATCH).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -2228,5 +2718,304 @@ mod tests {
             encoded.capacity(),
             encoded.len()
         );
+    }
+
+    // -- Pre-allocation safety tests (gap #10) --
+    //
+    // These verify that the `*_checked` decoders refuse adversarial frames
+    // BEFORE calling `Vec::with_capacity(count)`. The safety property we
+    // guarantee is: a malformed `count = u32::MAX` with a tiny payload must
+    // return `CodecError::TruncatedBatch` (or `BatchTooLarge`) instead of
+    // panicking on out-of-memory or driving multi-gigabyte allocations.
+
+    /// Build a SpendBatch payload with a poisoned `count` field.
+    ///
+    /// Returns a 14-byte header containing `count`, followed by no items.
+    /// This simulates a malicious frame that arrives wholly within
+    /// `MAX_FRAME_SIZE` but carries a fake count.
+    fn poisoned_spend_payload(fake_count: u32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(14);
+        buf.extend_from_slice(&fake_count.to_le_bytes());
+        buf.push(0); // ignore_conflicting
+        buf.push(0); // ignore_locked
+        buf.extend_from_slice(&0u32.to_le_bytes()); // current_block_height
+        buf.extend_from_slice(&0u32.to_le_bytes()); // block_height_retention
+        buf
+    }
+
+    #[test]
+    fn decode_spend_batch_checked_rejects_u32_max_count() {
+        // Adversarial: count = u32::MAX, payload only carries the 14-byte
+        // header. Without the pre-check we would call
+        // `Vec::with_capacity(u32::MAX as usize)` and either OOM or panic.
+        let payload = poisoned_spend_payload(u32::MAX);
+        let err = decode_spend_batch_checked(&payload, 8192).unwrap_err();
+        match err {
+            CodecError::BatchTooLarge { count, max } => {
+                assert_eq!(count, u32::MAX);
+                assert_eq!(max, 8192);
+            }
+            other => panic!("expected BatchTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_spend_batch_checked_rejects_truncated_payload() {
+        // count is within `max_batch` but there are zero item bytes after
+        // the 14-byte header. Should fail with TruncatedBatch BEFORE the
+        // per-item allocation.
+        let payload = poisoned_spend_payload(100);
+        let err = decode_spend_batch_checked(&payload, 8192).unwrap_err();
+        match err {
+            CodecError::TruncatedBatch {
+                count,
+                per_item_min,
+                available,
+            } => {
+                assert_eq!(count, 100);
+                assert_eq!(per_item_min, 104);
+                assert_eq!(available, 0);
+            }
+            other => panic!("expected TruncatedBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_spend_batch_checked_accepts_valid_frame() {
+        // Regression: a normally-shaped frame still decodes correctly
+        // through the new validation path.
+        let params = SpendBatchParams {
+            ignore_conflicting: true,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let items = vec![
+            WireSpendItem {
+                txid: test_txid(1),
+                vout: 0,
+                utxo_hash: test_txid(2),
+                spending_data: [0xAA; 36],
+            },
+            WireSpendItem {
+                txid: test_txid(3),
+                vout: 5,
+                utxo_hash: test_txid(4),
+                spending_data: [0xBB; 36],
+            },
+        ];
+        let encoded = encode_spend_batch(&params, &items);
+        let (dp, di) = decode_spend_batch_checked(&encoded, 8192).unwrap();
+        assert_eq!(dp, params);
+        assert_eq!(di, items);
+    }
+
+    #[test]
+    fn decode_spend_batch_checked_count_at_max_batch_succeeds() {
+        // Exactly equal to max_batch is permitted (boundary check).
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 0,
+            block_height_retention: 0,
+        };
+        let items = vec![
+            WireSpendItem {
+                txid: test_txid(1),
+                vout: 0,
+                utxo_hash: test_txid(2),
+                spending_data: [0; 36],
+            };
+            4
+        ];
+        let encoded = encode_spend_batch(&params, &items);
+        // max_batch = 4 (exact fit) — must not be rejected as too large.
+        let (_, di) = decode_spend_batch_checked(&encoded, 4).unwrap();
+        assert_eq!(di.len(), 4);
+
+        // max_batch = 3 (one less) — must be rejected.
+        let err = decode_spend_batch_checked(&encoded, 3).unwrap_err();
+        assert!(matches!(
+            err,
+            CodecError::BatchTooLarge { count: 4, max: 3 }
+        ));
+    }
+
+    #[test]
+    fn decode_set_mined_batch_checked_rejects_u32_max_count() {
+        // 26-byte header with poisoned count.
+        let mut payload = Vec::with_capacity(26);
+        payload.extend_from_slice(&u32::MAX.to_le_bytes()); // count
+        payload.extend_from_slice(&[0u8; 22]); // params
+        let err = decode_set_mined_batch_checked(&payload, 8192).unwrap_err();
+        assert!(matches!(err, CodecError::BatchTooLarge { .. }));
+    }
+
+    #[test]
+    fn decode_create_batch_checked_rejects_u32_max_count() {
+        // CreateBatch header is just count(4) — easy to poison.
+        let mut payload = Vec::with_capacity(4);
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = decode_create_batch_checked(&payload, 8192).unwrap_err();
+        assert!(matches!(err, CodecError::BatchTooLarge { .. }));
+    }
+
+    #[test]
+    fn decode_create_batch_checked_rejects_truncated_payload() {
+        // count = 1000 with 4-byte header — `count * 96 = 96_000` cannot
+        // fit in zero remaining bytes. Should fail with TruncatedBatch
+        // before allocating.
+        let mut payload = Vec::with_capacity(4);
+        payload.extend_from_slice(&1000u32.to_le_bytes());
+        let err = decode_create_batch_checked(&payload, 8192).unwrap_err();
+        match err {
+            CodecError::TruncatedBatch {
+                count,
+                per_item_min,
+                available,
+            } => {
+                assert_eq!(count, 1000);
+                assert_eq!(per_item_min, 96);
+                assert_eq!(available, 0);
+            }
+            other => panic!("expected TruncatedBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_txid_batch_checked_rejects_u32_max_count() {
+        let mut payload = Vec::with_capacity(8);
+        payload.extend_from_slice(&u32::MAX.to_le_bytes()); // count
+        payload.extend_from_slice(&[0u8; 4]); // shared
+        let err = decode_txid_batch_checked(&payload, 4, 8192).unwrap_err();
+        assert!(matches!(err, CodecError::BatchTooLarge { .. }));
+    }
+
+    #[test]
+    fn decode_txid_batch_checked_rejects_truncated() {
+        // count = 50, no item bytes -> truncated.
+        let mut payload = Vec::with_capacity(8);
+        payload.extend_from_slice(&50u32.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 4]);
+        let err = decode_txid_batch_checked(&payload, 4, 8192).unwrap_err();
+        assert!(matches!(
+            err,
+            CodecError::TruncatedBatch {
+                count: 50,
+                per_item_min: 32,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_get_batch_checked_rejects_u32_max_count() {
+        let mut payload = Vec::with_capacity(8);
+        payload.extend_from_slice(&u32::MAX.to_le_bytes()); // count
+        payload.extend_from_slice(&0u32.to_le_bytes()); // field_mask
+        let err = decode_get_batch_checked(&payload, 8192).unwrap_err();
+        assert!(matches!(err, CodecError::BatchTooLarge { .. }));
+    }
+
+    #[test]
+    fn decode_unspend_batch_checked_rejects_truncated() {
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&500u32.to_le_bytes()); // count
+        payload.extend_from_slice(&[0u8; 8]); // params
+        let err = decode_unspend_batch_checked(&payload, 8192).unwrap_err();
+        assert!(matches!(
+            err,
+            CodecError::TruncatedBatch {
+                count: 500,
+                per_item_min: 68,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_reassign_batch_checked_rejects_u32_max_count() {
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&u32::MAX.to_le_bytes()); // count
+        payload.extend_from_slice(&[0u8; 8]); // params
+        let err = decode_reassign_batch_checked(&payload, 8192).unwrap_err();
+        assert!(matches!(err, CodecError::BatchTooLarge { .. }));
+    }
+
+    #[test]
+    fn decode_slot_item_batch_checked_rejects_u32_max_count() {
+        let mut payload = Vec::with_capacity(4);
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = decode_slot_item_batch_checked(&payload, 8192).unwrap_err();
+        assert!(matches!(err, CodecError::BatchTooLarge { .. }));
+    }
+
+    #[test]
+    fn decode_get_spend_batch_checked_rejects_u32_max_count() {
+        let mut payload = Vec::with_capacity(4);
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = decode_get_spend_batch_checked(&payload, 8192).unwrap_err();
+        assert!(matches!(err, CodecError::BatchTooLarge { .. }));
+    }
+
+    #[test]
+    fn decode_sparse_errors_checked_rejects_u32_max_count() {
+        let mut payload = Vec::with_capacity(4);
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = decode_sparse_errors_checked(&payload, 8192).unwrap_err();
+        assert!(matches!(err, CodecError::BatchTooLarge { .. }));
+    }
+
+    #[test]
+    fn decode_partial_with_signals_checked_rejects_u32_max_count() {
+        // The first section's count is poisoned.
+        let mut payload = Vec::with_capacity(4);
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = decode_partial_with_signals_checked(&payload, 8192).unwrap_err();
+        assert!(matches!(err, CodecError::BatchTooLarge { .. }));
+    }
+
+    #[test]
+    fn decode_get_response_checked_rejects_u32_max_count() {
+        let mut payload = Vec::with_capacity(4);
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = decode_get_response_checked(&payload, 8192).unwrap_err();
+        assert!(matches!(err, CodecError::BatchTooLarge { .. }));
+    }
+
+    #[test]
+    fn decode_get_spend_response_checked_rejects_u32_max_count() {
+        let mut payload = Vec::with_capacity(4);
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = decode_get_spend_response_checked(&payload, 8192).unwrap_err();
+        assert!(matches!(err, CodecError::BatchTooLarge { .. }));
+    }
+
+    #[test]
+    fn legacy_option_decoder_uses_max_decode_batch_cap() {
+        // The Option-returning wrapper must reject `u32::MAX` via the
+        // hard cap MAX_DECODE_BATCH so client/bench callers also gain
+        // the protection.
+        let payload = poisoned_spend_payload(u32::MAX);
+        assert!(decode_spend_batch(&payload).is_none());
+    }
+
+    #[test]
+    fn legacy_option_decoder_accepts_count_up_to_hard_cap() {
+        // count = MAX_DECODE_BATCH must NOT be rejected as too large
+        // (it's exactly at the boundary), but is rejected as truncated
+        // because the payload doesn't contain any items. This documents
+        // the cap is checked before the truncation check.
+        let payload = poisoned_spend_payload(MAX_DECODE_BATCH);
+        // Truncated payload — wrapper returns None (via TruncatedBatch).
+        assert!(decode_spend_batch(&payload).is_none());
+
+        // count = MAX_DECODE_BATCH + 1 also returns None, but via
+        // BatchTooLarge. Both bucket into None for the legacy wrapper —
+        // we verify the underlying error path here using the _checked
+        // variant.
+        let too_big = poisoned_spend_payload(MAX_DECODE_BATCH + 1);
+        let err = decode_spend_batch_checked(&too_big, MAX_DECODE_BATCH).unwrap_err();
+        assert!(matches!(err, CodecError::BatchTooLarge { .. }));
     }
 }

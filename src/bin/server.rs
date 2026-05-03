@@ -202,8 +202,8 @@ fn main() {
         tracing::error!(err = %e, "FATAL: invalid block_height_retention");
         std::process::exit(1);
     }
-    if let Err(e) = config.validate_bind_addresses() {
-        tracing::error!(err = %e, "FATAL: unsafe bind configuration");
+    if let Err(e) = config.validate_safe_defaults() {
+        tracing::error!(err = %e, "FATAL: unsafe bind / cluster configuration");
         std::process::exit(1);
     }
     if config.enable_remote_bind {

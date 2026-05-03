@@ -226,6 +226,15 @@ pub const ERR_STALE_EPOCH: u16 = 24;
 /// has been promoted to `Alive` (signalled by `OP_ADMIN_CLUSTER_HEALTH`).
 pub const ERR_CLUSTER_NOT_READY: u16 = 25;
 
+/// Gap #5 — a secondary index (DAH or unmined) failed to rebuild during
+/// startup and the node is running with that index unavailable. Endpoints
+/// that depend on the missing index reject requests with this code; the
+/// regular spend / get / create / mutate paths still work because the
+/// primary index is intact. Recovery requires the operator to investigate
+/// the underlying I/O / device error and restart the node so the secondary
+/// rebuild can be re-attempted.
+pub const ERR_INDEX_DEGRADED: u16 = 26;
+
 // Streaming errors
 /// Blob stream not found for the given txid on this connection.
 pub const ERR_STREAM_NOT_FOUND: u16 = 16;
@@ -283,10 +292,33 @@ pub const FLAG_MIGRATION_BATCH: u16 = 0x0002;
 /// verification without forcing one durable inbound-state write per shard.
 pub const FLAG_MIGRATION_VERIFY_ONLY: u16 = 0x0004;
 
-/// Maximum frame payload size (512 MiB).
+/// Maximum frame payload size (16 MiB) for normal client/server traffic.
 ///
-/// BSV mainnet already has transactions exceeding 300 MB. The wire format
-/// uses a `u32` length prefix (max ~4 GB) so the encoding can handle any
-/// size up to the BSV block limit. We cap at 512 MiB to provide basic DoS
-/// protection while comfortably supporting the largest known transactions.
-pub const MAX_FRAME_SIZE: u32 = 512 * 1024 * 1024;
+/// BSV mainnet has transactions exceeding 300 MB, but those payloads are
+/// uploaded via the dedicated streaming path (`OP_STREAM_CHUNK` /
+/// `OP_STREAM_END`) which fragments large blobs into many small frames.
+/// All non-streaming operations — batched mutations, reads, admin queries,
+/// inter-node replication, and cluster control — fit comfortably below this
+/// cap: a fully-loaded `OP_GET_BATCH` of `max_batch_size = 8192` 32-byte
+/// txids is < 256 KiB, and an `OP_REPLICA_BATCH` carrying thousands of
+/// fixed-size ops is similarly bounded.
+///
+/// Lowering the cap from a permissive 512 MiB serves two purposes:
+///
+/// 1. **Memory-pressure DoS**. The TCP handler resizes a per-connection
+///    read buffer up to the advertised frame length (see
+///    `src/server/mod.rs`). With many concurrent connections, a high cap
+///    lets a small number of malicious clients reserve gigabytes of RAM by
+///    advertising large frames.
+/// 2. **Pre-allocation amplification**. Batch decoders read a `count`
+///    field and then call `Vec::with_capacity(count)`. A 16 MiB ceiling
+///    bounds the worst-case pre-allocation count to roughly
+///    `MAX_FRAME_SIZE / per_item_min_size` even before the per-decoder
+///    `max_batch_size` guard runs, capping any residual allocation
+///    amplification at hundreds of MB instead of tens of GB.
+///
+/// Streaming chunk frames are still bounded by this constant, which is
+/// fine: the streaming path is designed around small per-chunk payloads
+/// (typically 1–4 MiB) so the client can pipeline many chunks while the
+/// server maintains a stable memory budget.
+pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
