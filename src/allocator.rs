@@ -855,7 +855,7 @@ impl SlotAllocator {
         };
         buf[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 
-        self.device.pwrite(&buf, 0)?;
+        self.device.pwrite_all_at(&buf, 0)?;
         Ok(())
     }
 
@@ -872,7 +872,7 @@ impl SlotAllocator {
 
         let header_size = alignment.max(FREELIST_OFFSET);
         let mut header_buf = AlignedBuf::new(header_size, alignment);
-        device.pread(&mut header_buf, 0)?;
+        device.pread_exact_at(&mut header_buf, 0)?;
 
         let magic = u64::from_le_bytes(
             header_buf[0..8]
@@ -913,7 +913,7 @@ impl SlotAllocator {
         }
         let aligned_total = total_size.div_ceil(alignment) * alignment;
         let mut buf = AlignedBuf::new(aligned_total, alignment);
-        device.pread(&mut buf, 0)?;
+        device.pread_exact_at(&mut buf, 0)?;
 
         // CRC32 verification: the stored CRC was computed with the CRC
         // field zeroed. Read it out, zero the field in a local copy of

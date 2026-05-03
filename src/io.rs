@@ -295,7 +295,7 @@ pub fn read_metadata(device: &dyn BlockDevice, record_offset: u64) -> Result<TxM
 
     let total_read = align_up(intra_offset + METADATA_SIZE, align);
     let mut read_buf = AlignedBuf::new(total_read, align);
-    device.pread(&mut read_buf, aligned_base)?;
+    device.pread_exact_at(&mut read_buf, aligned_base)?;
 
     buf[..METADATA_SIZE].copy_from_slice(&read_buf[intra_offset..intra_offset + METADATA_SIZE]);
 
@@ -320,14 +320,14 @@ pub fn write_metadata(
 
     // If the write doesn't cover a full aligned block, read-modify-write.
     if intra_offset != 0 || !METADATA_SIZE.is_multiple_of(align) {
-        device.pread(&mut buf, aligned_base)?;
+        device.pread_exact_at(&mut buf, aligned_base)?;
     }
 
     let mut meta_bytes = [0u8; METADATA_SIZE];
     metadata.to_bytes(&mut meta_bytes);
     buf[intra_offset..intra_offset + METADATA_SIZE].copy_from_slice(&meta_bytes);
 
-    device.pwrite(&buf, aligned_base)?;
+    device.pwrite_all_at(&buf, aligned_base)?;
     Ok(())
 }
 
@@ -346,7 +346,7 @@ pub fn read_utxo_slot(
     let total_read = align_up(intra_offset + UTXO_SLOT_SIZE, align);
 
     let mut buf = AlignedBuf::new(total_read, align);
-    device.pread(&mut buf, aligned_base)?;
+    device.pread_exact_at(&mut buf, aligned_base)?;
 
     Ok(UtxoSlot::from_bytes(
         &buf[intra_offset..intra_offset + UTXO_SLOT_SIZE],
@@ -371,13 +371,13 @@ pub fn write_utxo_slot(
 
     let mut buf = AlignedBuf::new(total_size, align);
     // Read-modify-write: 69 bytes is always less than a 4096 block.
-    device.pread(&mut buf, aligned_base)?;
+    device.pread_exact_at(&mut buf, aligned_base)?;
 
     let mut slot_bytes = [0u8; UTXO_SLOT_SIZE];
     slot.to_bytes(&mut slot_bytes);
     buf[intra_offset..intra_offset + UTXO_SLOT_SIZE].copy_from_slice(&slot_bytes);
 
-    device.pwrite(&buf, aligned_base)?;
+    device.pwrite_all_at(&buf, aligned_base)?;
     Ok(())
 }
 
@@ -410,7 +410,7 @@ pub fn write_full_record(
         buf[offset..offset + UTXO_SLOT_SIZE].copy_from_slice(&slot_bytes);
     }
 
-    device.pwrite(&buf, record_offset)?;
+    device.pwrite_all_at(&buf, record_offset)?;
     Ok(())
 }
 

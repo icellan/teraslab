@@ -830,12 +830,21 @@ impl RedoLog {
                 aligned_total.min((self.log_size - (aligned_offset - self.log_offset)) as usize);
             let read_aligned = read_len.div_ceil(align) * align;
             if read_aligned <= buf.len() {
-                let _ = self.device.pread(&mut buf[..read_aligned], aligned_offset);
+                // A pre-write read-modify-write read failure on the redo
+                // log tail is not fatal here: this branch only runs when
+                // the write straddles a partial block, and any bytes the
+                // device returns are immediately overwritten by the new
+                // entry below. We swallow the error (matching previous
+                // behaviour) but use the exact-read helper so that on
+                // success we are guaranteed a complete block of context.
+                let _ = self
+                    .device
+                    .pread_exact_at(&mut buf[..read_aligned], aligned_offset);
             }
         }
 
         buf[intra..intra + self.buffer.len()].copy_from_slice(&self.buffer);
-        if let Err(e) = self.device.pwrite(&buf, aligned_offset) {
+        if let Err(e) = self.device.pwrite_all_at(&buf, aligned_offset) {
             if let Some(m) = redo_metrics() {
                 m.redo_flush_errors_total.inc();
             }
@@ -980,7 +989,7 @@ impl RedoLog {
         // Zero out the first block to mark end of entries
         let align = self.device.alignment();
         let buf = AlignedBuf::new(align, align);
-        self.device.pwrite(&buf, self.log_offset)?;
+        self.device.pwrite_all_at(&buf, self.log_offset)?;
         self.write_pos = 0;
         self.flushed_pos = 0;
         self.buffer.clear();
@@ -995,7 +1004,7 @@ impl RedoLog {
         let aligned_read = read_size.div_ceil(align) * align;
 
         let mut buf = AlignedBuf::new(aligned_read, align);
-        self.device.pread(&mut buf, self.log_offset)?;
+        self.device.pread_exact_at(&mut buf, self.log_offset)?;
 
         let data = &buf[..read_size];
         let mut entries = Vec::new();

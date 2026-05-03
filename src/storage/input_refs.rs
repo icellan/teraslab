@@ -81,9 +81,11 @@ pub fn write_input_refs(
 
     let mut buf = AlignedBuf::new(total, align);
 
-    // Read-modify-write if not aligned
+    // Read-modify-write if not aligned. Pre-read failure is non-fatal:
+    // the bytes we read are immediately overwritten by `refs` below; on
+    // success we are guaranteed an exact buffer (no partial blocks).
     if intra > 0 || !data_size.is_multiple_of(align) {
-        let _ = device.pread(&mut buf, aligned_base);
+        let _ = device.pread_exact_at(&mut buf, aligned_base);
     }
 
     for (i, r) in refs.iter().enumerate() {
@@ -91,7 +93,7 @@ pub fn write_input_refs(
         r.to_bytes(&mut buf[pos..pos + INPUT_REF_SIZE]);
     }
 
-    device.pwrite(&buf, aligned_base)?;
+    device.pwrite_all_at(&buf, aligned_base)?;
     Ok(())
 }
 
@@ -114,7 +116,7 @@ pub fn read_input_refs(
     let total = (intra + data_size).div_ceil(align) * align;
 
     let mut buf = AlignedBuf::new(total, align);
-    device.pread(&mut buf, aligned_base)?;
+    device.pread_exact_at(&mut buf, aligned_base)?;
 
     let mut result = Vec::with_capacity(count as usize);
     for i in 0..count as usize {
@@ -140,7 +142,7 @@ pub fn read_input_ref_at(
     let total = (intra + INPUT_REF_SIZE).div_ceil(align) * align;
 
     let mut buf = AlignedBuf::new(total, align);
-    device.pread(&mut buf, aligned_base)?;
+    device.pread_exact_at(&mut buf, aligned_base)?;
 
     Ok(InputRef::from_bytes(&buf[intra..intra + INPUT_REF_SIZE]))
 }

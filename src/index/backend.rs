@@ -391,7 +391,7 @@ impl PrimaryBackend {
         let mut offset = start;
         while offset + aligned_read as u64 <= end {
             let mut buf = crate::device::AlignedBuf::new(aligned_read, align);
-            if device.pread(&mut buf, offset).is_err() {
+            if device.pread_exact_at(&mut buf, offset).is_err() {
                 skipped += 1;
                 offset += align as u64;
                 continue;
@@ -486,7 +486,7 @@ impl PrimaryBackend {
         let mut offset = start;
         while offset + aligned_read as u64 <= end {
             let mut buf = crate::device::AlignedBuf::new(aligned_read, align);
-            if device.pread(&mut buf, offset).is_err() {
+            if device.pread_exact_at(&mut buf, offset).is_err() {
                 skipped += 1;
                 offset += align as u64;
                 continue;
