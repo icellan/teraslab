@@ -42,15 +42,73 @@ pub enum RecoveryError {
     Index(#[from] crate::index::IndexError),
 }
 
+/// Cause classification for a single entry that could not be replayed.
+///
+/// Gap #5: the previous recovery path treated all `entries_failed` as a
+/// single number and applied a blanket `MAX_TOLERATED_FAILURES = 32`
+/// tolerance. That bundled benign cases (an entry's primary-index
+/// reference disappeared because the record was pruned later in the log)
+/// with serious cases (a device read returned an I/O error, a record
+/// header was unparseable) and could mask real corruption. Classifying
+/// failures at the failure site lets the startup path apply a strict
+/// per-cause policy: tolerate only the benign class, fail closed on any
+/// other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayCause {
+    /// The redo entry references a `tx_key` that is not present in the
+    /// primary index. Benign during idempotent replay: a later entry in
+    /// the same log may delete the record, or the engine snapshot already
+    /// captured the post-delete state. Tolerable at startup.
+    MissingPrimary,
+    /// A device read or write call returned an error during replay. NOT
+    /// tolerable — the device is unreachable or returning corrupt blocks
+    /// and continuing to start would risk serving stale or wrong data.
+    IoError,
+    /// A record header / metadata block could not be parsed (checksum or
+    /// magic mismatch, decoded fields out of range). NOT tolerable.
+    CorruptEntry,
+    /// A logic-level inconsistency that does not fit the above classes
+    /// (unknown metadata version, secondary-index update returned an
+    /// error after the primary lookup succeeded, etc.). NOT tolerable.
+    LogicError,
+}
+
 /// Statistics from a recovery run.
-#[derive(Debug, Default)]
+///
+/// Gap #5: per-cause counters classify each replay failure at the failure
+/// site so startup can apply the correct policy. `entries_failed` is the
+/// sum of all per-cause counters and is preserved for back-compat with
+/// existing log lines and external dashboards.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryStats {
     /// Entries that were replayed (applied to device).
     pub entries_replayed: u64,
     /// Entries that were already applied (skipped).
     pub entries_skipped: u64,
-    /// Entries that could not be replayed (missing records, etc.).
+    /// Entries that could not be replayed (sum of `failed_*` counters).
     pub entries_failed: u64,
+    /// Failures whose cause was a missing primary-index entry (benign).
+    pub failed_missing_primary: u64,
+    /// Failures caused by a device I/O error (NOT tolerable).
+    pub failed_io: u64,
+    /// Failures caused by a corrupt redo / metadata record (NOT tolerable).
+    pub failed_corrupt: u64,
+    /// Failures from a logic-level inconsistency (NOT tolerable).
+    pub failed_logic: u64,
+}
+
+impl RecoveryStats {
+    /// Account for a per-entry [`ReplayCause`] failure. Updates both the
+    /// per-cause counter and the back-compat `entries_failed` total.
+    pub(crate) fn record_failure(&mut self, cause: ReplayCause) {
+        self.entries_failed += 1;
+        match cause {
+            ReplayCause::MissingPrimary => self.failed_missing_primary += 1,
+            ReplayCause::IoError => self.failed_io += 1,
+            ReplayCause::CorruptEntry => self.failed_corrupt += 1,
+            ReplayCause::LogicError => self.failed_logic += 1,
+        }
+    }
 }
 
 /// Replay redo log entries after the last checkpoint.
@@ -69,7 +127,7 @@ pub fn recover(
         match replay_entry(device, index, entry) {
             ReplayResult::Applied => stats.entries_replayed += 1,
             ReplayResult::Skipped => stats.entries_skipped += 1,
-            ReplayResult::Failed => stats.entries_failed += 1,
+            ReplayResult::Failed(cause) => stats.record_failure(cause),
         }
     }
 
@@ -172,7 +230,7 @@ pub fn recover_all_with_allocator(
         match outcome {
             ReplayResult::Applied => stats.entries_replayed += 1,
             ReplayResult::Skipped => stats.entries_skipped += 1,
-            ReplayResult::Failed => stats.entries_failed += 1,
+            ReplayResult::Failed(cause) => stats.record_failure(cause),
         }
     }
 
@@ -261,7 +319,11 @@ fn replay_secondary_unmined(
     };
     match unmined.replay_redo(&entry) {
         Ok(()) => ReplayResult::Applied,
-        Err(_) => ReplayResult::Failed,
+        // Secondary backend's `replay_redo` returned `Err`. The primary
+        // lookup already succeeded (so this isn't a missing-primary case),
+        // and the redo entry passed parsing — anything left is a
+        // logic-level inconsistency at the secondary backend.
+        Err(_) => ReplayResult::Failed(ReplayCause::LogicError),
     }
 }
 
@@ -292,7 +354,9 @@ fn replay_secondary_dah(
     };
     match dah.replay_redo(&entry) {
         Ok(()) => ReplayResult::Applied,
-        Err(_) => ReplayResult::Failed,
+        // Same reasoning as `replay_secondary_unmined`: a backend error
+        // after a successful primary lookup is a logic-level failure.
+        Err(_) => ReplayResult::Failed(ReplayCause::LogicError),
     }
 }
 
@@ -302,16 +366,14 @@ fn replay_secondary_dah(
 /// - `Skipped`: the entry was idempotent against current state, or
 ///   pointed to a record that was concurrently deleted between the
 ///   redo append and recovery (a benign, non-fatal condition).
-/// - `Failed`: a non-I/O failure we deliberately tolerate during
-///   recovery (e.g. `replay_metadata_op` fell through a match). Real
-///   `DeviceError` surfaces as `Err(RecoveryError::Device)` via the
-///   `Result` return type so the caller in `bin/server.rs` can decide
-///   whether to fail startup.
+/// - `Failed(cause)`: replay could not proceed; `cause` carries the
+///   classification used by the startup tolerance policy. See
+///   [`ReplayCause`] for the per-cause semantics.
 #[derive(Debug)]
 enum ReplayResult {
     Applied,
     Skipped,
-    Failed,
+    Failed(ReplayCause),
 }
 
 fn replay_entry(
@@ -399,12 +461,12 @@ fn replay_spend(
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
-        None => return ReplayResult::Failed,
+        None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
     };
 
     let slot = match io::read_utxo_slot(device, ie.record_offset, offset) {
         Ok(s) => s,
-        Err(_) => return ReplayResult::Failed,
+        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
     };
 
     // Idempotent check: already spent with same data?
@@ -415,7 +477,7 @@ fn replay_spend(
     // Apply: write spent slot
     let new_slot = UtxoSlot::new_spent(slot.hash, *spending_data);
     if io::write_utxo_slot(device, ie.record_offset, offset, &new_slot).is_err() {
-        return ReplayResult::Failed;
+        return ReplayResult::Failed(ReplayCause::IoError);
     }
 
     // Update metadata counter
@@ -436,12 +498,12 @@ fn replay_unspend(
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
-        None => return ReplayResult::Failed,
+        None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
     };
 
     let slot = match io::read_utxo_slot(device, ie.record_offset, offset) {
         Ok(s) => s,
-        Err(_) => return ReplayResult::Failed,
+        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
     };
 
     if slot.status == UTXO_UNSPENT {
@@ -450,7 +512,7 @@ fn replay_unspend(
 
     let new_slot = UtxoSlot::new_unspent(slot.hash);
     if io::write_utxo_slot(device, ie.record_offset, offset, &new_slot).is_err() {
-        return ReplayResult::Failed;
+        return ReplayResult::Failed(ReplayCause::IoError);
     }
 
     if let Ok(mut meta) = io::read_metadata(device, ie.record_offset) {
@@ -472,12 +534,16 @@ fn replay_set_mined(
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
-        None => return ReplayResult::Failed,
+        None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
     };
 
     let mut meta = match io::read_metadata(device, ie.record_offset) {
         Ok(m) => m,
-        Err(_) => return ReplayResult::Failed,
+        // `read_metadata` returns `Err` for both raw I/O failures and
+        // corrupt magic / version mismatches in the metadata block.
+        // Treat both as fatal — they indicate the record on device is
+        // unreadable, which is more severe than a missing-primary case.
+        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
     };
 
     let count = meta.block_entry_count as usize;
@@ -532,12 +598,12 @@ fn replay_freeze(
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
-        None => return ReplayResult::Failed,
+        None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
     };
 
     let slot = match io::read_utxo_slot(device, ie.record_offset, offset) {
         Ok(s) => s,
-        Err(_) => return ReplayResult::Failed,
+        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
     };
 
     if slot.status == UTXO_FROZEN {
@@ -546,7 +612,7 @@ fn replay_freeze(
 
     let frozen = UtxoSlot::new_frozen(slot.hash);
     if io::write_utxo_slot(device, ie.record_offset, offset, &frozen).is_err() {
-        return ReplayResult::Failed;
+        return ReplayResult::Failed(ReplayCause::IoError);
     }
     ReplayResult::Applied
 }
@@ -559,12 +625,12 @@ fn replay_unfreeze(
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
-        None => return ReplayResult::Failed,
+        None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
     };
 
     let slot = match io::read_utxo_slot(device, ie.record_offset, offset) {
         Ok(s) => s,
-        Err(_) => return ReplayResult::Failed,
+        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
     };
 
     if slot.status == UTXO_UNSPENT {
@@ -573,7 +639,7 @@ fn replay_unfreeze(
 
     let unspent = UtxoSlot::new_unspent(slot.hash);
     if io::write_utxo_slot(device, ie.record_offset, offset, &unspent).is_err() {
-        return ReplayResult::Failed;
+        return ReplayResult::Failed(ReplayCause::IoError);
     }
     ReplayResult::Applied
 }
@@ -602,7 +668,11 @@ fn replay_create(
     };
     match index.register(*tx_key, entry) {
         Ok(()) => ReplayResult::Applied,
-        Err(_) => ReplayResult::Failed,
+        // `index.register` returns `Err` for capacity / duplicate-key /
+        // structural problems — none of which are I/O against the device,
+        // so classify as logic-level so startup fails closed instead of
+        // silently dropping the create.
+        Err(_) => ReplayResult::Failed(ReplayCause::LogicError),
     }
 }
 
@@ -628,11 +698,11 @@ fn replay_metadata_op(
         } => {
             let ie = match index.lookup(tx_key) {
                 Some(e) => e,
-                None => return ReplayResult::Failed,
+                None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
             };
             let slot = match io::read_utxo_slot(device, ie.record_offset, *offset) {
                 Ok(s) => s,
-                Err(_) => return ReplayResult::Failed,
+                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
             };
             // Idempotent: already reassigned if hash matches new_hash and status is UNSPENT
             if slot.hash == *new_hash && slot.status == UTXO_UNSPENT {
@@ -642,18 +712,18 @@ fn replay_metadata_op(
             let mut new_slot = UtxoSlot::new_unspent(*new_hash);
             new_slot.spending_data[0..4].copy_from_slice(&spendable_height.to_le_bytes());
             if io::write_utxo_slot(device, ie.record_offset, *offset, &new_slot).is_err() {
-                return ReplayResult::Failed;
+                return ReplayResult::Failed(ReplayCause::IoError);
             }
             ReplayResult::Applied
         }
         RedoOp::PruneSlot { tx_key, offset } => {
             let ie = match index.lookup(tx_key) {
                 Some(e) => e,
-                None => return ReplayResult::Failed,
+                None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
             };
             let slot = match io::read_utxo_slot(device, ie.record_offset, *offset) {
                 Ok(s) => s,
-                Err(_) => return ReplayResult::Failed,
+                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
             };
             if slot.status == UTXO_PRUNED {
                 return ReplayResult::Skipped;
@@ -661,18 +731,18 @@ fn replay_metadata_op(
             let mut pruned = slot;
             pruned.status = UTXO_PRUNED;
             if io::write_utxo_slot(device, ie.record_offset, *offset, &pruned).is_err() {
-                return ReplayResult::Failed;
+                return ReplayResult::Failed(ReplayCause::IoError);
             }
             ReplayResult::Applied
         }
         RedoOp::SetConflicting { tx_key, value, .. } => {
             let ie = match index.lookup(tx_key) {
                 Some(e) => e,
-                None => return ReplayResult::Failed,
+                None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
             };
             let mut meta = match io::read_metadata(device, ie.record_offset) {
                 Ok(m) => m,
-                Err(_) => return ReplayResult::Failed,
+                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
             };
             let has_flag = meta.flags.contains(TxFlags::CONFLICTING);
             if has_flag == *value {
@@ -689,11 +759,11 @@ fn replay_metadata_op(
         RedoOp::SetLocked { tx_key, value } => {
             let ie = match index.lookup(tx_key) {
                 Some(e) => e,
-                None => return ReplayResult::Failed,
+                None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
             };
             let mut meta = match io::read_metadata(device, ie.record_offset) {
                 Ok(m) => m,
-                Err(_) => return ReplayResult::Failed,
+                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
             };
             let has_flag = meta.flags.contains(TxFlags::LOCKED);
             if has_flag == *value {
@@ -716,11 +786,11 @@ fn replay_metadata_op(
         } => {
             let ie = match index.lookup(tx_key) {
                 Some(e) => e,
-                None => return ReplayResult::Failed,
+                None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
             };
             let mut meta = match io::read_metadata(device, ie.record_offset) {
                 Ok(m) => m,
-                Err(_) => return ReplayResult::Failed,
+                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
             };
             if { meta.preserve_until } == *block_height {
                 return ReplayResult::Skipped;
@@ -739,11 +809,11 @@ fn replay_metadata_op(
         } => {
             let ie = match index.lookup(tx_key) {
                 Some(e) => e,
-                None => return ReplayResult::Failed,
+                None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
             };
             let mut meta = match io::read_metadata(device, ie.record_offset) {
                 Ok(m) => m,
-                Err(_) => return ReplayResult::Failed,
+                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
             };
             // H7: generation-based idempotency. The redo entry declares the
             // target generation after applying the op. Skip when the
@@ -1884,5 +1954,103 @@ mod tests {
 
         assert_eq!(dah_backend.range_query(900).len(), 1);
         assert_eq!(unmined_backend.range_query(500).len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Gap #5 — replay failure cause classification
+    //
+    // Each test seeds a redo log with entries whose primary references are
+    // missing or whose device reads fail, then verifies that
+    // [`RecoveryStats`] increments the correct per-cause counter.
+    // -----------------------------------------------------------------------
+
+    /// 100 redo entries that reference a primary key that does NOT exist in
+    /// the index must classify every failure as `MissingPrimary` (benign)
+    /// and the recovery call itself must succeed.
+    #[test]
+    fn replay_classifies_missing_primary_for_unknown_keys() {
+        let mut h = RecoveryTestHarness::new();
+        let mut redo = h.redo_log();
+
+        // Append 100 spend ops referencing keys that are not in the index.
+        let n = 100u8;
+        for i in 1..=n {
+            let mut txid = [0u8; 32];
+            txid[0] = i;
+            let key = TxKey { txid };
+            redo.append_and_flush(RedoOp::Spend {
+                tx_key: key,
+                offset: 0,
+                spending_data: [0xAB; 36],
+                new_spent_count: 1,
+            })
+            .unwrap();
+        }
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_failed, n as u64);
+        assert_eq!(stats.failed_missing_primary, n as u64);
+        assert_eq!(stats.failed_io, 0);
+        assert_eq!(stats.failed_corrupt, 0);
+        assert_eq!(stats.failed_logic, 0);
+    }
+
+    /// `MissingPrimary` accumulated below the cap passes the tolerance check.
+    #[test]
+    fn replay_tolerance_passes_high_missing_primary_count() {
+        let mut h = RecoveryTestHarness::new();
+        let mut redo = h.redo_log();
+
+        // 100 missing-primary entries — well below
+        // `MAX_TOLERATED_MISSING_PRIMARY`.
+        for i in 1..=100u8 {
+            let mut txid = [0u8; 32];
+            txid[0] = i;
+            redo.append_and_flush(RedoOp::Spend {
+                tx_key: TxKey { txid },
+                offset: 0,
+                spending_data: [0xAB; 36],
+                new_spent_count: 1,
+            })
+            .unwrap();
+        }
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        crate::server::startup::check_replay_tolerance(&stats)
+            .expect("100 missing-primary failures must be tolerated");
+    }
+
+    /// A single I/O-class failure during replay must trip the tolerance
+    /// check immediately. We construct the stats directly because forcing
+    /// a real device I/O error during replay through `MemoryDevice` is
+    /// impractical — the per-cause classification already lives at the
+    /// failure site, so the integration boundary we need to test is
+    /// "stats with `failed_io > 0` ⇒ tolerance returns Err".
+    #[test]
+    fn replay_tolerance_rejects_one_io_failure() {
+        let stats = RecoveryStats {
+            failed_io: 1,
+            entries_failed: 1,
+            ..RecoveryStats::default()
+        };
+        let err = crate::server::startup::check_replay_tolerance(&stats)
+            .expect_err("any I/O failure must abort startup");
+        assert!(err.contains("device I/O"), "msg: {err}");
+    }
+
+    /// Sanity: `record_failure` increments per-cause counters in lock step
+    /// with `entries_failed`, so the back-compat field stays consistent.
+    #[test]
+    fn recovery_stats_record_failure_increments_both_counters() {
+        let mut stats = RecoveryStats::default();
+        stats.record_failure(ReplayCause::MissingPrimary);
+        stats.record_failure(ReplayCause::IoError);
+        stats.record_failure(ReplayCause::CorruptEntry);
+        stats.record_failure(ReplayCause::LogicError);
+        assert_eq!(stats.entries_failed, 4);
+        assert_eq!(stats.failed_missing_primary, 1);
+        assert_eq!(stats.failed_io, 1);
+        assert_eq!(stats.failed_corrupt, 1);
+        assert_eq!(stats.failed_logic, 1);
     }
 }

@@ -106,6 +106,65 @@ static REPLICATION_INTENT_TRACKER: std::sync::OnceLock<
 /// Monotonic diagnostic high-water mark across all source streams.
 static DISPATCH_REPLICA_LAST_APPLIED: AtomicU64 = AtomicU64::new(0);
 
+/// Gap #5 — secondary-index readiness status.
+///
+/// Tracks whether each secondary index (DAH and unmined) was successfully
+/// (re)built at startup. When a secondary rebuild fails, the binary still
+/// starts (the primary index is intact and the node can serve regular
+/// spend/get/create traffic) but endpoints that depend on the missing
+/// secondary reject requests with [`crate::protocol::opcodes::ERR_INDEX_DEGRADED`]
+/// until the operator investigates and restarts. We deliberately do NOT
+/// silently start with an empty secondary index because that would silently
+/// break the pruner, unmined iterator, DAH-driven deletion, conflict, and
+/// mining workflows.
+///
+/// Both flags default to `true` (healthy) at process start so that test
+/// harnesses and code paths that never call [`set_secondary_status`] keep
+/// the historical "everything is ready" behavior.
+static SECONDARY_DAH_OK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+static SECONDARY_UNMINED_OK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Snapshot of secondary-index readiness flags at startup.
+///
+/// Returned by [`secondary_status`]. Both flags default to `true` (healthy);
+/// the server binary calls [`set_secondary_status`] after rebuild attempts
+/// to flip them to `false` if the corresponding rebuild failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecondaryStatus {
+    /// Whether the DAH index was successfully (re)built at startup.
+    pub dah_ok: bool,
+    /// Whether the unmined index was successfully (re)built at startup.
+    pub unmined_ok: bool,
+}
+
+impl SecondaryStatus {
+    /// True when both secondary indexes are healthy.
+    pub fn fully_ok(&self) -> bool {
+        self.dah_ok && self.unmined_ok
+    }
+}
+
+/// Set the global secondary-index readiness flags.
+///
+/// Called once during server startup after the index/secondary rebuild
+/// attempts complete. Subsequent reads via [`secondary_status`] observe the
+/// stored values with `Ordering::Relaxed` semantics — fine for a flag that
+/// is set once before the server begins accepting client requests.
+pub fn set_secondary_status(status: SecondaryStatus) {
+    SECONDARY_DAH_OK.store(status.dah_ok, std::sync::atomic::Ordering::Relaxed);
+    SECONDARY_UNMINED_OK.store(status.unmined_ok, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the current secondary-index readiness flags.
+pub fn secondary_status() -> SecondaryStatus {
+    SecondaryStatus {
+        dah_ok: SECONDARY_DAH_OK.load(std::sync::atomic::Ordering::Relaxed),
+        unmined_ok: SECONDARY_UNMINED_OK.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
 /// Global metrics reference. Initialized during server startup via
 /// `init_dispatch_metrics()`. Used to increment operation counters
 /// without threading metrics through every handler function.
@@ -219,6 +278,19 @@ pub(crate) fn handle_request(
             ERR_CLUSTER_NOT_READY,
             "node has not yet observed first committed topology",
         );
+    }
+
+    // Gap #5 — secondary-index readiness gate. When a secondary index
+    // (DAH or unmined) failed to rebuild at startup, the binary is still
+    // running so the primary index continues to serve regular spend/get/
+    // create traffic, but endpoints that depend on the missing secondary
+    // must reject requests with `ERR_INDEX_DEGRADED` instead of silently
+    // returning empty results (which would break pruner / unmined iterator /
+    // DAH-driven deletion / conflict / mining workflows). Recovery requires
+    // the operator to investigate the underlying I/O / device error and
+    // restart the node so the secondary rebuild can be re-attempted.
+    if let Some(err_resp) = check_secondary_readiness(request.op_code, request.request_id) {
+        return err_resp;
     }
 
     // Reject mutations when the cluster lacks quorum to prevent split-brain.
@@ -1895,6 +1967,85 @@ fn needs_cluster_readiness(op: u16) -> bool {
     is_mutation_opcode(op) || matches!(op, OP_GET_BATCH | OP_GET_SPEND_BATCH | OP_QUERY_OLD_UNMINED)
 }
 
+/// Gap #5 — return `Some(error_response)` when `op` depends on a secondary
+/// index that failed to rebuild at startup.
+///
+/// The mapping below identifies each opcode's secondary-index dependency:
+///
+/// - **Unmined index** (`SECONDARY_UNMINED_OK`): drives the pruner's
+///   "old unmined" iterator (`OP_QUERY_OLD_UNMINED`) and the
+///   mining/longest-chain workflow (`OP_MARK_LONGEST_CHAIN_BATCH`,
+///   which writes the secondary unmined entry on every transition).
+///   `OP_SET_MINED_BATCH` also touches the secondary by clearing
+///   `unmined_since`, so it's gated as well.
+///
+/// - **DAH index** (`SECONDARY_DAH_OK`): drives the DAH-based deletion
+///   sweep (`OP_PROCESS_EXPIRED_PRESERVATIONS`), the preservation override
+///   (`OP_PRESERVE_TRANSACTIONS`, `OP_PRESERVE_UNTIL_BATCH`), and the
+///   conflict workflow (`OP_SET_CONFLICTING_BATCH` schedules / clears DAH
+///   entries depending on `block_height_retention`).
+///
+/// - **Both indexes** (`OP_DELETE_BATCH`): a delete touches both
+///   secondaries to remove any tombstone entries.
+///
+/// Regular spend/get/create/freeze/unfreeze/unspend/reassign/set-locked
+/// paths do NOT depend on the secondary indexes, so they keep working even
+/// when a secondary is degraded — that's what the gap doc required.
+fn check_secondary_readiness(op: u16, request_id: u64) -> Option<ResponseFrame> {
+    secondary_readiness_verdict(op, secondary_status(), request_id)
+}
+
+/// Pure policy function: given an opcode and a [`SecondaryStatus`] snapshot,
+/// return `Some(error_response)` if the op depends on an unavailable
+/// secondary, or `None` otherwise.
+///
+/// Split out from [`check_secondary_readiness`] so tests can drive every
+/// branch deterministically without mutating the global readiness flags
+/// (which would race with other parallel tests).
+pub(crate) fn secondary_readiness_verdict(
+    op: u16,
+    status: SecondaryStatus,
+    request_id: u64,
+) -> Option<ResponseFrame> {
+    if status.fully_ok() {
+        return None;
+    }
+    let needs_unmined = matches!(
+        op,
+        OP_QUERY_OLD_UNMINED | OP_MARK_LONGEST_CHAIN_BATCH | OP_SET_MINED_BATCH
+    );
+    let needs_dah = matches!(
+        op,
+        OP_PROCESS_EXPIRED_PRESERVATIONS
+            | OP_PRESERVE_TRANSACTIONS
+            | OP_PRESERVE_UNTIL_BATCH
+            | OP_SET_CONFLICTING_BATCH
+    );
+    let needs_both = matches!(op, OP_DELETE_BATCH);
+    if needs_both && (!status.dah_ok || !status.unmined_ok) {
+        return Some(error_response(
+            request_id,
+            ERR_INDEX_DEGRADED,
+            "secondary index unavailable: delete requires both DAH and unmined indexes",
+        ));
+    }
+    if needs_unmined && !status.unmined_ok {
+        return Some(error_response(
+            request_id,
+            ERR_INDEX_DEGRADED,
+            "secondary index unavailable: unmined-secondary failed to rebuild at startup",
+        ));
+    }
+    if needs_dah && !status.dah_ok {
+        return Some(error_response(
+            request_id,
+            ERR_INDEX_DEGRADED,
+            "secondary index unavailable: DAH-secondary failed to rebuild at startup",
+        ));
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Shard ownership check
 // ---------------------------------------------------------------------------
@@ -2006,13 +2157,10 @@ fn handle_spend_batch(
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
 ) -> ResponseFrame {
-    let (params, items) = match decode_spend_batch(&req.payload) {
-        Some(r) => r,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed spend batch"),
+    let (params, items) = match decode_spend_batch_checked(&req.payload, max_batch) {
+        Ok(r) => r,
+        Err(e) => return codec_error_response(req.request_id, "spend batch", e),
     };
-    if items.len() as u32 > max_batch {
-        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
-    }
 
     // Tick entry counters: one batch, N attempted items.
     if let Some(m) = DISPATCH_METRICS.get() {
@@ -2233,13 +2381,10 @@ fn handle_unspend_batch(
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
 ) -> ResponseFrame {
-    let (params, items) = match decode_unspend_batch(&req.payload) {
-        Some(r) => r,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed unspend batch"),
+    let (params, items) = match decode_unspend_batch_checked(&req.payload, max_batch) {
+        Ok(r) => r,
+        Err(e) => return codec_error_response(req.request_id, "unspend batch", e),
     };
-    if items.len() as u32 > max_batch {
-        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
-    }
 
     // Tick entry counters: one batch, N attempted items.
     if let Some(m) = DISPATCH_METRICS.get() {
@@ -2365,13 +2510,10 @@ fn handle_set_mined_batch(
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
 ) -> ResponseFrame {
-    let (params, txids) = match decode_set_mined_batch(&req.payload) {
-        Some(r) => r,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed set_mined batch"),
+    let (params, txids) = match decode_set_mined_batch_checked(&req.payload, max_batch) {
+        Ok(r) => r,
+        Err(e) => return codec_error_response(req.request_id, "set_mined batch", e),
     };
-    if txids.len() as u32 > max_batch {
-        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
-    }
 
     if let Some(m) = DISPATCH_METRICS.get() {
         m.set_mined_items_attempted.inc_by(txids.len() as u64);
@@ -2565,13 +2707,10 @@ fn handle_create_batch(
     redo_log: Option<&Mutex<RedoLog>>,
     blob_store: Option<&dyn BlobStore>,
 ) -> ResponseFrame {
-    let items = match decode_create_batch(&req.payload) {
-        Some(r) => r,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed create batch"),
+    let items = match decode_create_batch_checked(&req.payload, max_batch) {
+        Ok(r) => r,
+        Err(e) => return codec_error_response(req.request_id, "create batch", e),
     };
-    if items.len() as u32 > max_batch {
-        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
-    }
 
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
@@ -2842,13 +2981,10 @@ fn handle_freeze_batch(
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
 ) -> ResponseFrame {
-    let items = match decode_slot_item_batch(&req.payload) {
-        Some(r) => r,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
+    let items = match decode_slot_item_batch_checked(&req.payload, max_batch) {
+        Ok(r) => r,
+        Err(e) => return codec_error_response(req.request_id, "freeze batch", e),
     };
-    if items.len() as u32 > max_batch {
-        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
-    }
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
@@ -2938,13 +3074,10 @@ fn handle_unfreeze_batch(
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
 ) -> ResponseFrame {
-    let items = match decode_slot_item_batch(&req.payload) {
-        Some(r) => r,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
+    let items = match decode_slot_item_batch_checked(&req.payload, max_batch) {
+        Ok(r) => r,
+        Err(e) => return codec_error_response(req.request_id, "unfreeze batch", e),
     };
-    if items.len() as u32 > max_batch {
-        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
-    }
     let total_items = items.len() as u64;
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
@@ -3034,13 +3167,10 @@ fn handle_reassign_batch(
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
 ) -> ResponseFrame {
-    let (params, items) = match decode_reassign_batch(&req.payload) {
-        Some(r) => r,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
+    let (params, items) = match decode_reassign_batch_checked(&req.payload, max_batch) {
+        Ok(r) => r,
+        Err(e) => return codec_error_response(req.request_id, "reassign batch", e),
     };
-    if items.len() as u32 > max_batch {
-        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
-    }
     let total_items = items.len() as u64;
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
@@ -3139,14 +3269,11 @@ fn handle_set_conflicting_batch(
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
 ) -> ResponseFrame {
-    let (shared, txids) = match decode_txid_batch(&req.payload, 9) {
+    let (shared, txids) = match decode_txid_batch_checked(&req.payload, 9, max_batch) {
         // value(1) + cbh(4) + bhr(4)
-        Some(r) => r,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
+        Ok(r) => r,
+        Err(e) => return codec_error_response(req.request_id, "set_conflicting batch", e),
     };
-    if txids.len() as u32 > max_batch {
-        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
-    }
     let value = shared[0] != 0;
     let cbh = u32::from_le_bytes(shared[1..5].try_into().unwrap());
     let bhr = u32::from_le_bytes(shared[5..9].try_into().unwrap());
@@ -3246,13 +3373,10 @@ fn handle_set_locked_batch(
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
 ) -> ResponseFrame {
-    let (shared, txids) = match decode_txid_batch(&req.payload, 1) {
-        Some(r) => r,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
+    let (shared, txids) = match decode_txid_batch_checked(&req.payload, 1, max_batch) {
+        Ok(r) => r,
+        Err(e) => return codec_error_response(req.request_id, "set_locked batch", e),
     };
-    if txids.len() as u32 > max_batch {
-        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
-    }
     let value = shared[0] != 0;
     let total_items = txids.len() as u64;
 
@@ -3339,13 +3463,10 @@ fn handle_preserve_until_batch(
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
 ) -> ResponseFrame {
-    let (shared, txids) = match decode_txid_batch(&req.payload, 4) {
-        Some(r) => r,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
+    let (shared, txids) = match decode_txid_batch_checked(&req.payload, 4, max_batch) {
+        Ok(r) => r,
+        Err(e) => return codec_error_response(req.request_id, "preserve_until batch", e),
     };
-    if txids.len() as u32 > max_batch {
-        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
-    }
     let height = u32::from_le_bytes(shared[0..4].try_into().unwrap());
     let total_items = txids.len() as u64;
 
@@ -3437,13 +3558,10 @@ fn handle_delete_batch(
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
 ) -> ResponseFrame {
-    let (_, txids) = match decode_txid_batch(&req.payload, 0) {
-        Some(r) => r,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
+    let (_, txids) = match decode_txid_batch_checked(&req.payload, 0, max_batch) {
+        Ok(r) => r,
+        Err(e) => return codec_error_response(req.request_id, "delete batch", e),
     };
-    if txids.len() as u32 > max_batch {
-        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
-    }
     let total_items = txids.len() as u64;
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
@@ -3646,13 +3764,10 @@ fn handle_mark_longest_chain_batch(
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
 ) -> ResponseFrame {
-    let (shared, txids) = match decode_txid_batch(&req.payload, 9) {
-        Some(r) => r,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
+    let (shared, txids) = match decode_txid_batch_checked(&req.payload, 9, max_batch) {
+        Ok(r) => r,
+        Err(e) => return codec_error_response(req.request_id, "mark_longest_chain batch", e),
     };
-    if txids.len() as u32 > max_batch {
-        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
-    }
     let on_longest_chain = shared[0] != 0;
     let cbh = u32::from_le_bytes(shared[1..5].try_into().unwrap());
     let bhr = u32::from_le_bytes(shared[5..9].try_into().unwrap());
@@ -3747,13 +3862,10 @@ fn handle_get_batch(
     max_batch: u32,
     cluster: Option<&RunningCluster>,
 ) -> ResponseFrame {
-    let (field_mask, txids) = match decode_get_batch(&req.payload) {
-        Some(r) => r,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed get batch"),
+    let (field_mask, txids) = match decode_get_batch_checked(&req.payload, max_batch) {
+        Ok(r) => r,
+        Err(e) => return codec_error_response(req.request_id, "get batch", e),
     };
-    if txids.len() as u32 > max_batch {
-        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
-    }
 
     let local_read = req.flags & FLAG_LOCAL_READ != 0;
 
@@ -4112,13 +4224,10 @@ fn handle_preserve_transactions(
     redo_log: Option<&Mutex<RedoLog>>,
 ) -> ResponseFrame {
     // Same format as PreserveUntilBatch: [count:4][block_height:4][txids]
-    let (shared, txids) = match decode_txid_batch(&req.payload, 4) {
-        Some(r) => r,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
+    let (shared, txids) = match decode_txid_batch_checked(&req.payload, 4, max_batch) {
+        Ok(r) => r,
+        Err(e) => return codec_error_response(req.request_id, "preserve_transactions batch", e),
     };
-    if txids.len() as u32 > max_batch {
-        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
-    }
     let height = u32::from_le_bytes(shared[0..4].try_into().unwrap());
 
     let mut errors = Vec::new();
@@ -4248,13 +4357,10 @@ fn handle_get_spend_batch(
     max_batch: u32,
     cluster: Option<&RunningCluster>,
 ) -> ResponseFrame {
-    let items = match decode_get_spend_batch(&req.payload) {
-        Some(r) => r,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed"),
+    let items = match decode_get_spend_batch_checked(&req.payload, max_batch) {
+        Ok(r) => r,
+        Err(e) => return codec_error_response(req.request_id, "get_spend batch", e),
     };
-    if items.len() as u32 > max_batch {
-        return error_response(req.request_id, ERR_INTERNAL, "batch too large");
-    }
 
     let local_read = req.flags & FLAG_LOCAL_READ != 0;
 
@@ -4519,6 +4625,29 @@ fn error_response(request_id: u64, code: u16, msg: &str) -> ResponseFrame {
         status: STATUS_ERROR,
         payload,
     }
+}
+
+/// Build an error response from a [`CodecError`] returned by one of the
+/// `decode_*_checked` decoders.
+///
+/// `op_label` is a human-readable label for the operation (e.g.
+/// `"spend batch"`) used in the error message. The response uses
+/// `STATUS_ERROR` and `ERR_INTERNAL`, matching the legacy behaviour of
+/// the pre-`_checked` handlers, so existing clients see no change in
+/// status code on malformed frames.
+///
+/// We deliberately use [`CodecError::Display`] so the wire payload
+/// records the specific failure (`HeaderTooShort`, `BatchTooLarge`,
+/// `TruncatedBatch`, or `SectionTruncated`) without leaking any
+/// server-side state. The handler logs at debug level for operator
+/// triage.
+fn codec_error_response(request_id: u64, op_label: &str, err: CodecError) -> ResponseFrame {
+    tracing::debug!(op = op_label, err = %err, "codec rejected request before allocation");
+    error_response(
+        request_id,
+        ERR_INTERNAL,
+        &format!("malformed {op_label}: {err}"),
+    )
 }
 
 fn batch_response(request_id: u64, errors: &[BatchItemError]) -> ResponseFrame {
@@ -5579,9 +5708,13 @@ mod tests {
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
         assert_eq!(code, ERR_INTERNAL);
+        // The decoder rejects the over-size batch BEFORE allocation, so the
+        // error message now identifies the configured limit explicitly. We
+        // verify both the count (20) and the configured cap (10) appear so
+        // a regression that loses either value would fail this assertion.
         assert!(
-            msg.contains("batch too large"),
-            "expected 'batch too large' in: {msg}"
+            msg.contains("exceeds max_batch_size 10") && msg.contains("20"),
+            "expected 'count 20 exceeds max_batch_size 10' in: {msg}"
         );
     }
 
@@ -8816,5 +8949,166 @@ mod tests {
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, _msg) = decode_error_payload(&resp.payload).unwrap();
         assert_eq!(code, ERR_INTERNAL);
+    }
+
+    // ---------------------------------------------------------------------
+    // Gap #5 — secondary readiness gate (pure policy)
+    //
+    // These tests drive `secondary_readiness_verdict` directly with explicit
+    // `SecondaryStatus` snapshots so they don't race with other tests on the
+    // global `SECONDARY_DAH_OK` / `SECONDARY_UNMINED_OK` flags.
+    // ---------------------------------------------------------------------
+
+    fn extract_err(resp: &ResponseFrame) -> u16 {
+        assert_eq!(resp.status, STATUS_ERROR);
+        decode_error_payload(&resp.payload).unwrap().0
+    }
+
+    #[test]
+    fn secondary_readiness_fully_ok_passes_every_op() {
+        let status = SecondaryStatus {
+            dah_ok: true,
+            unmined_ok: true,
+        };
+        for op in &[
+            OP_QUERY_OLD_UNMINED,
+            OP_MARK_LONGEST_CHAIN_BATCH,
+            OP_SET_MINED_BATCH,
+            OP_PROCESS_EXPIRED_PRESERVATIONS,
+            OP_PRESERVE_TRANSACTIONS,
+            OP_PRESERVE_UNTIL_BATCH,
+            OP_SET_CONFLICTING_BATCH,
+            OP_DELETE_BATCH,
+            OP_SPEND_BATCH,
+            OP_GET_BATCH,
+            OP_CREATE_BATCH,
+        ] {
+            assert!(
+                secondary_readiness_verdict(*op, status, 1).is_none(),
+                "op={op} must pass when both flags are ok",
+            );
+        }
+    }
+
+    #[test]
+    fn secondary_readiness_unmined_degraded_blocks_unmined_endpoints() {
+        let status = SecondaryStatus {
+            dah_ok: true,
+            unmined_ok: false,
+        };
+        for op in &[
+            OP_QUERY_OLD_UNMINED,
+            OP_MARK_LONGEST_CHAIN_BATCH,
+            OP_SET_MINED_BATCH,
+        ] {
+            let resp = secondary_readiness_verdict(*op, status, 1).expect("must reject");
+            assert_eq!(extract_err(&resp), ERR_INDEX_DEGRADED, "op={op}");
+        }
+    }
+
+    #[test]
+    fn secondary_readiness_dah_degraded_blocks_dah_endpoints() {
+        let status = SecondaryStatus {
+            dah_ok: false,
+            unmined_ok: true,
+        };
+        for op in &[
+            OP_PROCESS_EXPIRED_PRESERVATIONS,
+            OP_PRESERVE_TRANSACTIONS,
+            OP_PRESERVE_UNTIL_BATCH,
+            OP_SET_CONFLICTING_BATCH,
+        ] {
+            let resp = secondary_readiness_verdict(*op, status, 1).expect("must reject");
+            assert_eq!(extract_err(&resp), ERR_INDEX_DEGRADED, "op={op}");
+        }
+    }
+
+    #[test]
+    fn secondary_readiness_either_degraded_blocks_delete() {
+        for status in &[
+            SecondaryStatus {
+                dah_ok: false,
+                unmined_ok: true,
+            },
+            SecondaryStatus {
+                dah_ok: true,
+                unmined_ok: false,
+            },
+            SecondaryStatus {
+                dah_ok: false,
+                unmined_ok: false,
+            },
+        ] {
+            let resp = secondary_readiness_verdict(OP_DELETE_BATCH, *status, 1).expect("must reject");
+            assert_eq!(extract_err(&resp), ERR_INDEX_DEGRADED);
+        }
+    }
+
+    #[test]
+    fn secondary_readiness_keeps_spend_get_create_alive_when_degraded() {
+        // Gap #5 requirement: spend / get / create MUST keep working when
+        // a secondary index is degraded.
+        for status in &[
+            SecondaryStatus {
+                dah_ok: false,
+                unmined_ok: true,
+            },
+            SecondaryStatus {
+                dah_ok: true,
+                unmined_ok: false,
+            },
+            SecondaryStatus {
+                dah_ok: false,
+                unmined_ok: false,
+            },
+        ] {
+            for op in &[
+                OP_SPEND_BATCH,
+                OP_UNSPEND_BATCH,
+                OP_GET_BATCH,
+                OP_GET_SPEND_BATCH,
+                OP_CREATE_BATCH,
+                OP_FREEZE_BATCH,
+                OP_UNFREEZE_BATCH,
+                OP_REASSIGN_BATCH,
+                OP_SET_LOCKED_BATCH,
+            ] {
+                assert!(
+                    secondary_readiness_verdict(*op, *status, 1).is_none(),
+                    "op={op} must keep working with status={status:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn secondary_readiness_unmined_degraded_does_not_block_dah_only_ops() {
+        let status = SecondaryStatus {
+            dah_ok: true,
+            unmined_ok: false,
+        };
+        // DAH-only handlers must keep working when only unmined is down.
+        for op in &[
+            OP_PROCESS_EXPIRED_PRESERVATIONS,
+            OP_PRESERVE_TRANSACTIONS,
+            OP_PRESERVE_UNTIL_BATCH,
+            OP_SET_CONFLICTING_BATCH,
+        ] {
+            assert!(
+                secondary_readiness_verdict(*op, status, 1).is_none(),
+                "op={op} should pass when only unmined is degraded",
+            );
+        }
+    }
+
+    #[test]
+    fn secondary_readiness_request_id_propagates() {
+        let status = SecondaryStatus {
+            dah_ok: false,
+            unmined_ok: false,
+        };
+        let resp = secondary_readiness_verdict(OP_DELETE_BATCH, status, 0xDEAD_BEEF)
+            .expect("delete must be rejected");
+        assert_eq!(resp.request_id, 0xDEAD_BEEF);
     }
 }

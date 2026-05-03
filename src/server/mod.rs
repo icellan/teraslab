@@ -5,6 +5,7 @@
 
 pub mod dispatch;
 pub mod http;
+pub mod startup;
 
 use crate::cluster::coordinator::RunningCluster;
 use crate::config::ServerConfig;
@@ -229,19 +230,28 @@ fn handle_connection(
             Err(e) => return Err(format!("read length: {e}")),
         }
 
+        // Reject oversized frames BEFORE any per-connection buffer
+        // allocation. The advertised `total_length` is attacker-controlled
+        // up to 4 GiB; without this guard, a single hostile client could
+        // drive the per-connection `read_buf.resize(frame_len, ..)` up to
+        // multi-gigabyte allocations before any decoding occurs (gap #10
+        // in TERANODE_PRODUCTION_READINESS_GAPS.md).
         let total_length = u32::from_le_bytes(len_buf);
         if total_length > MAX_FRAME_SIZE {
-            // Reject oversized frame
             let resp = ResponseFrame {
                 request_id: 0,
                 status: STATUS_ERROR,
                 payload: b"frame too large".to_vec(),
             };
             let _ = stream.write_all(&resp.encode());
-            return Err(format!("frame too large: {total_length}"));
+            return Err(format!(
+                "frame too large: {total_length} > MAX_FRAME_SIZE {MAX_FRAME_SIZE}"
+            ));
         }
 
-        // Read the full frame
+        // Read the full frame. The `frame_len` is now guaranteed to be
+        // <= `MAX_FRAME_SIZE`, so the buffer growth is bounded regardless
+        // of how many concurrent connections advertise large frames.
         let frame_len = total_length as usize;
         if read_buf.len() < frame_len {
             read_buf.resize(frame_len, 0);

@@ -19,7 +19,7 @@ use teraslab::allocator::SlotAllocator;
 use teraslab::config::IndexBackendMode;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, DirectDevice};
-use teraslab::index::{DahBackend, DahIndex, PrimaryBackend, UnminedBackend, UnminedIndex};
+use teraslab::index::{DahBackend, PrimaryBackend, UnminedBackend};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{
     AllocatorMetrics, IoUringMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
@@ -28,7 +28,13 @@ use teraslab::metrics::{
 use teraslab::ops::engine::Engine;
 use teraslab::redo::RedoLog;
 use teraslab::server::Server;
+use teraslab::server::dispatch::{SecondaryStatus, set_secondary_status};
 use teraslab::server::http::{HttpState, start_http_server};
+use teraslab::server::startup::{
+    SecondaryLoadOutcome, check_replay_tolerance, fallback_dah_index, fallback_unmined_index,
+    load_primary_index_file_backed, load_primary_index_in_memory, load_primary_index_redb,
+    rebuild_in_memory_secondaries, secondaries_from_pair,
+};
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
 
 /// Detect the first non-loopback IPv4 address on this host.
@@ -188,6 +194,27 @@ fn main() {
         tracing::error!(err = %e, "FATAL: invalid block_height_retention");
         std::process::exit(1);
     }
+    if let Err(e) = config.validate_bind_addresses() {
+        tracing::error!(err = %e, "FATAL: unsafe bind configuration");
+        std::process::exit(1);
+    }
+    if config.enable_remote_bind {
+        tracing::warn!(
+            listen_addr = %config.listen_addr,
+            http_listen_addr = %config.http_listen_addr,
+            "enable_remote_bind = true: binding non-loopback addresses without mTLS — \
+             ensure network-level authentication/authorization is in place \
+             (see TERANODE_PRODUCTION_READINESS_GAPS.md gap #1)",
+        );
+    }
+    if config.enable_admin_endpoints {
+        tracing::warn!(
+            "enable_admin_endpoints = true: /admin/* and /debug/* HTTP routes are exposed \
+             without authentication — any client that can reach the HTTP port can \
+             quiesce, drain, rebalance, or read sensitive debug data \
+             (see TERANODE_PRODUCTION_READINESS_GAPS.md gap #1)",
+        );
+    }
 
     // 2. Recover or create allocator
     let allocator = match SlotAllocator::recover(device.clone()) {
@@ -232,153 +259,138 @@ fn main() {
     };
     tracing::info!(backend = %index_backend_name, "index backend");
 
-    let (mut index, mut dah_index, mut unmined_index): (
-        PrimaryBackend,
-        DahBackend,
-        UnminedBackend,
-    ) = if config.index.backend == IndexBackendMode::Redb {
+    // Gap #5 (TERANODE_PRODUCTION_READINESS_GAPS.md): rebuild paths must
+    // fail closed on primary index errors and surface secondary index
+    // failures as degraded readiness rather than silent empty-index starts.
+    // The on-disk redb / file-backed primary file is preserved untouched on
+    // rebuild failure so the operator can capture diagnostics and run an
+    // explicit rescan before restart.
+    let load_outcome = if config.index.backend == IndexBackendMode::Redb {
         // ReDB on-disk backend
-        let primary = match PrimaryBackend::restore_redb(&config.index) {
+        let primary = match load_primary_index_redb(&config.index, &*device, &allocator) {
             Ok(idx) => {
                 tracing::info!(entries = idx.len(), "redb primary index opened");
                 idx
             }
-            Err(_) => {
-                tracing::info!("redb primary index not found, rebuilding from device");
-                match PrimaryBackend::rebuild_redb(&config.index, &*device, &allocator) {
-                    Ok(idx) => idx,
-                    Err(e) => {
-                        tracing::warn!(err = %e, "redb rebuild failed, removing stale file and creating empty");
-                        let _ = std::fs::remove_file(&config.index.redb_path);
-                        PrimaryBackend::new_on_disk(&config.index).unwrap()
-                    }
-                }
+            Err(e) => {
+                tracing::error!(err = %e, "FATAL: primary index rebuild failed");
+                std::process::exit(1);
             }
         };
-        let dah = match teraslab::index::redb_dah::RedbDahIndex::open(
+        // Open the redb DAH index. Failure is degraded readiness, NOT an
+        // empty start: the dispatch readiness gate rejects DAH-dependent
+        // endpoints with ERR_INDEX_DEGRADED.
+        let (dah, dah_ok) = match teraslab::index::redb_dah::RedbDahIndex::open(
             &config.index.redb_dah_path,
             config.index.redb_cache_size,
         ) {
-            Ok(idx) => DahBackend::OnDisk(idx),
-            Err(e) => {
-                tracing::warn!(err = %e, "redb DAH index error, removing corrupt file and retrying");
-                let _ = std::fs::remove_file(&config.index.redb_dah_path);
-                match teraslab::index::redb_dah::RedbDahIndex::open(
-                    &config.index.redb_dah_path,
-                    config.index.redb_cache_size,
-                ) {
-                    Ok(idx) => {
-                        tracing::info!("redb DAH index: fresh database created");
-                        DahBackend::OnDisk(idx)
-                    }
-                    Err(e2) => {
-                        tracing::warn!(err = %e2, "redb DAH index: fresh creation also failed, falling back to in-memory");
-                        DahBackend::new_in_memory()
-                    }
-                }
-            }
+            Ok(idx) => (DahBackend::OnDisk(idx), true),
+            Err(e) => (fallback_dah_index("DAH", e), false),
         };
-        let unmined = match teraslab::index::redb_unmined::RedbUnminedIndex::open(
+        let (unmined, unmined_ok) = match teraslab::index::redb_unmined::RedbUnminedIndex::open(
             &config.index.redb_unmined_path,
             config.index.redb_cache_size,
         ) {
-            Ok(idx) => UnminedBackend::OnDisk(idx),
-            Err(e) => {
-                tracing::warn!(err = %e, "redb unmined index error, removing corrupt file and retrying");
-                let _ = std::fs::remove_file(&config.index.redb_unmined_path);
-                match teraslab::index::redb_unmined::RedbUnminedIndex::open(
-                    &config.index.redb_unmined_path,
-                    config.index.redb_cache_size,
-                ) {
-                    Ok(idx) => {
-                        tracing::info!("redb unmined index: fresh database created");
-                        UnminedBackend::OnDisk(idx)
-                    }
-                    Err(e2) => {
-                        tracing::warn!(err = %e2, "redb unmined index: fresh creation also failed, falling back to in-memory");
-                        UnminedBackend::new_in_memory()
-                    }
-                }
-            }
-        };
-        (primary, dah, unmined)
-    } else if config.index.backend == IndexBackendMode::FileBacked {
-        // File-backed mmap backend
-        let fb_path = &config.index.file_backed_path;
-        let primary = if fb_path.exists() {
-            match PrimaryBackend::restore_file_backed(fb_path, config.expected_records) {
-                Ok(idx) => {
-                    tracing::info!(entries = idx.len(), "file-backed index opened");
-                    idx
-                }
-                Err(e) => {
-                    tracing::warn!(err = %e, "file-backed index corrupt, rebuilding from device");
-                    match PrimaryBackend::rebuild_file_backed(fb_path, &*device, &allocator) {
-                        Ok(idx) => idx,
-                        Err(e2) => {
-                            tracing::warn!(err = %e2, "file-backed rebuild failed, removing stale file and creating empty");
-                            let _ = std::fs::remove_file(fb_path);
-                            PrimaryBackend::new_file_backed(fb_path, config.expected_records)
-                                .unwrap()
-                        }
-                    }
-                }
-            }
-        } else {
-            tracing::info!("no file-backed index found, rebuilding from device");
-            match PrimaryBackend::rebuild_file_backed(fb_path, &*device, &allocator) {
-                Ok(idx) => idx,
-                Err(e) => {
-                    tracing::warn!(err = %e, "file-backed rebuild failed, creating empty");
-                    PrimaryBackend::new_file_backed(fb_path, config.expected_records).unwrap()
-                }
-            }
-        };
-        // File-backed mode: secondary indexes stay in-memory
-        let (dah, unmined) = match PrimaryBackend::rebuild_secondary(&*device, &allocator) {
-            Ok((d, u)) => (d, u),
-            Err(e) => {
-                tracing::warn!(err = %e, "secondary index rebuild failed, starting empty");
-                (DahIndex::new(), UnminedIndex::new())
-            }
+            Ok(idx) => (UnminedBackend::OnDisk(idx), true),
+            Err(e) => (fallback_unmined_index("unmined", e), false),
         };
         (
             primary,
-            DahBackend::from(dah),
-            UnminedBackend::from(unmined),
+            SecondaryLoadOutcome {
+                dah,
+                unmined,
+                status: SecondaryStatus { dah_ok, unmined_ok },
+            },
         )
+    } else if config.index.backend == IndexBackendMode::FileBacked {
+        // File-backed mmap backend
+        let fb_path = &config.index.file_backed_path;
+        let primary = match load_primary_index_file_backed(
+            fb_path,
+            config.expected_records,
+            &*device,
+            &allocator,
+        ) {
+            Ok(idx) => {
+                tracing::info!(entries = idx.len(), "file-backed index opened");
+                idx
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "FATAL: primary index rebuild failed");
+                std::process::exit(1);
+            }
+        };
+        // File-backed mode: secondary indexes stay in-memory.
+        let secondaries = rebuild_in_memory_secondaries(&*device, &allocator);
+        (primary, secondaries)
     } else {
         // In-memory backend (default)
         let snap_path = &config.index_snapshot_path;
-        let (idx, dah, unmined) = if snap_path.exists() {
+        if snap_path.exists() {
             match PrimaryBackend::restore_all(snap_path) {
                 Ok((idx, dah, unmined, flags)) => {
                     tracing::info!(entries = idx.len(), "index restored from snapshot");
-                    let dah = if flags.dah_needs_rebuild {
-                        tracing::warn!("DAH index needs rebuild (snapshot corrupt)");
-                        rebuild_dah(&*device, &allocator)
+                    let secondaries = if flags.dah_needs_rebuild || flags.unmined_needs_rebuild {
+                        if flags.dah_needs_rebuild {
+                            tracing::warn!("DAH index needs rebuild (snapshot corrupt)");
+                        }
+                        if flags.unmined_needs_rebuild {
+                            tracing::warn!("unmined index needs rebuild (snapshot corrupt)");
+                        }
+                        rebuild_in_memory_secondaries(&*device, &allocator)
                     } else {
-                        dah
+                        secondaries_from_pair(dah, unmined)
                     };
-                    let unmined = if flags.unmined_needs_rebuild {
-                        tracing::warn!("unmined index needs rebuild (snapshot corrupt)");
-                        rebuild_unmined(&*device, &allocator)
-                    } else {
-                        unmined
-                    };
-                    (idx, dah, unmined)
+                    (idx, secondaries)
                 }
                 Err(e) => {
                     tracing::warn!(err = %e, "index snapshot corrupt, rebuilding from device");
-                    rebuild_all(&*device, &allocator, config.expected_records)
+                    let primary = match load_primary_index_in_memory(&*device, &allocator) {
+                        Ok(idx) => idx,
+                        Err(e) => {
+                            tracing::error!(err = %e, "FATAL: primary index rebuild failed");
+                            std::process::exit(1);
+                        }
+                    };
+                    let secondaries = rebuild_in_memory_secondaries(&*device, &allocator);
+                    (primary, secondaries)
                 }
             }
         } else {
             tracing::info!("no index snapshot found, rebuilding from device");
-            rebuild_all(&*device, &allocator, config.expected_records)
-        };
-        (idx, DahBackend::from(dah), UnminedBackend::from(unmined))
+            let primary = match load_primary_index_in_memory(&*device, &allocator) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    tracing::error!(err = %e, "FATAL: primary index rebuild failed");
+                    std::process::exit(1);
+                }
+            };
+            let secondaries = rebuild_in_memory_secondaries(&*device, &allocator);
+            (primary, secondaries)
+        }
     };
+    let (mut index, secondary_outcome) = load_outcome;
+    let SecondaryLoadOutcome {
+        dah: mut dah_index,
+        unmined: mut unmined_index,
+        status: secondary_status,
+    } = secondary_outcome;
+    // Install the global readiness flags BEFORE the server begins
+    // accepting client requests. Dispatch then gates handlers that
+    // depend on a missing secondary with ERR_INDEX_DEGRADED.
+    set_secondary_status(secondary_status);
+    if !secondary_status.dah_ok {
+        tracing::warn!(
+            "secondary readiness: DAH index unavailable — dependent endpoints \
+             will reject with ERR_INDEX_DEGRADED",
+        );
+    }
+    if !secondary_status.unmined_ok {
+        tracing::warn!(
+            "secondary readiness: unmined index unavailable — dependent endpoints \
+             will reject with ERR_INDEX_DEGRADED",
+        );
+    }
 
     tracing::info!(
         entries = index.len(),
@@ -458,22 +470,26 @@ fn main() {
                     replayed = stats.entries_replayed,
                     skipped = stats.entries_skipped,
                     failed = stats.entries_failed,
+                    failed_missing_primary = stats.failed_missing_primary,
+                    failed_io = stats.failed_io,
+                    failed_corrupt = stats.failed_corrupt,
+                    failed_logic = stats.failed_logic,
                     "recovery complete",
                 );
-                // M8: A non-zero `entries_failed` count indicates per-entry
-                // replay returned `ReplayResult::Failed` — either a missing
-                // primary-index entry (benign: the record was deleted between
-                // the redo append and recovery) or an I/O error against the
-                // device. We cannot distinguish the two from the stats alone,
-                // so treat a significant failure rate as a hard error. A few
-                // per run is expected during hot-shutdown recovery; a sustained
-                // cluster of failures is not.
-                const MAX_TOLERATED_FAILURES: u64 = 32;
-                if stats.entries_failed > MAX_TOLERATED_FAILURES {
+                // Gap #5 (TERANODE_PRODUCTION_READINESS_GAPS.md): replace
+                // the previous blanket `MAX_TOLERATED_FAILURES = 32` with
+                // per-cause classification. `MissingPrimary` is benign
+                // during idempotent replay and tolerated up to a high cap.
+                // Any I/O / corrupt-entry / logic-error failure is fatal
+                // regardless of count: those are storage-level corruption
+                // signals that must not be papered over.
+                if let Err(msg) = check_replay_tolerance(&stats) {
                     tracing::error!(
-                        failures = stats.entries_failed,
-                        tolerance = MAX_TOLERATED_FAILURES,
-                        "recovery: aborting startup — replay failures exceed tolerance",
+                        failed_missing_primary = stats.failed_missing_primary,
+                        failed_io = stats.failed_io,
+                        failed_corrupt = stats.failed_corrupt,
+                        failed_logic = stats.failed_logic,
+                        "recovery: aborting startup — {msg}",
                     );
                     std::process::exit(1);
                 }
@@ -832,8 +848,9 @@ fn main() {
         http_port,
     });
     let http_addr = config.http_listen_addr.clone();
+    let admin_endpoints_enabled = config.enable_admin_endpoints;
     std::thread::spawn(move || {
-        start_http_server(http_addr, http_state);
+        start_http_server(http_addr, http_state, admin_endpoints_enabled);
     });
 
     // 7. Setup TCP server
@@ -924,42 +941,6 @@ impl ServerWithShutdown {
         }
 
         result
-    }
-}
-
-fn rebuild_all(
-    device: &dyn BlockDevice,
-    allocator: &SlotAllocator,
-    expected_records: usize,
-) -> (PrimaryBackend, DahIndex, UnminedIndex) {
-    let index = match PrimaryBackend::rebuild(device, allocator) {
-        Ok(idx) => idx,
-        Err(e) => {
-            tracing::warn!(err = %e, "index rebuild failed, starting empty");
-            PrimaryBackend::new_in_memory(expected_records).unwrap()
-        }
-    };
-    let (dah, unmined) = match PrimaryBackend::rebuild_secondary(device, allocator) {
-        Ok((d, u)) => (d, u),
-        Err(e) => {
-            tracing::warn!(err = %e, "secondary index rebuild failed, starting empty");
-            (DahIndex::new(), UnminedIndex::new())
-        }
-    };
-    (index, dah, unmined)
-}
-
-fn rebuild_dah(device: &dyn BlockDevice, allocator: &SlotAllocator) -> DahIndex {
-    match PrimaryBackend::rebuild_secondary(device, allocator) {
-        Ok((dah, _)) => dah,
-        Err(_) => DahIndex::new(),
-    }
-}
-
-fn rebuild_unmined(device: &dyn BlockDevice, allocator: &SlotAllocator) -> UnminedIndex {
-    match PrimaryBackend::rebuild_secondary(device, allocator) {
-        Ok((_, unmined)) => unmined,
-        Err(_) => UnminedIndex::new(),
     }
 }
 
