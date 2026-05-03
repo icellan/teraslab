@@ -81,6 +81,18 @@ const OP_HASHTABLE_RESIZE_COMMIT: u8 = 21;
 /// successful create. The legacy [`OP_CREATE`] tag is retained for
 /// back-compat decoding of redo logs written before this change.
 const OP_CREATE_V2: u8 = 22;
+/// Gap #8: compensation intent for unset-mined. Carries the prior
+/// `block_height` + `subtree_idx` captured BEFORE the engine applied the
+/// unset, so a crash mid-rollback can restore the block entry exactly.
+const OP_COMPENSATE_UNSET_MINED: u8 = 23;
+/// Gap #8: compensation intent for reassign. Carries the prior
+/// `utxo_hash` of the slot before reassign so rollback restores the
+/// original hash instead of writing zeros.
+const OP_COMPENSATE_REASSIGN: u8 = 24;
+/// Gap #8: compensation intent for prune. Carries the prior status byte
+/// of the slot so rollback restores `UTXO_SPENT` / `UTXO_FROZEN` /
+/// `UTXO_UNSPENT` exactly instead of unconditionally restoring UNSPENT.
+const OP_COMPENSATE_PRUNE: u8 = 25;
 
 /// A redo log operation that can be serialized and replayed.
 #[derive(Debug, Clone, PartialEq)]
@@ -286,6 +298,77 @@ pub enum RedoOp {
         /// Target capacity in buckets — matches the paired `Begin`.
         new_capacity: u64,
     },
+    /// Gap #8 (TERANODE_PRODUCTION_READINESS_GAPS.md): compensation intent
+    /// for an unset-mined operation that needs to be rolled back after a
+    /// replication failure.
+    ///
+    /// Captures the `block_height` + `subtree_idx` that were paired with
+    /// `block_id` BEFORE the engine cleared the block entry. Recovery
+    /// replays this entry by re-adding the block entry with these exact
+    /// values, so a crash mid-rollback cannot produce a record whose
+    /// block entry has zeroed height/subtree fields.
+    ///
+    /// Wire layout (after the type byte):
+    /// ```text
+    /// [tx_key:32]
+    /// [block_id:4 LE]
+    /// [block_height:4 LE]
+    /// [subtree_idx:4 LE]
+    /// ```
+    CompensateUnsetMined {
+        /// Primary key of the affected transaction.
+        tx_key: TxKey,
+        /// Block id whose entry is being restored.
+        block_id: u32,
+        /// Original block height captured pre-apply.
+        block_height: u32,
+        /// Original subtree index captured pre-apply.
+        subtree_idx: u32,
+    },
+    /// Gap #8 (TERANODE_PRODUCTION_READINESS_GAPS.md): compensation intent
+    /// for a reassign operation that needs to be rolled back after a
+    /// replication failure.
+    ///
+    /// Captures the slot's prior `utxo_hash` BEFORE the reassign overwrote
+    /// it. Recovery replays this by restoring the slot to UNSPENT with the
+    /// original hash instead of zeros.
+    ///
+    /// Wire layout (after the type byte):
+    /// ```text
+    /// [tx_key:32]
+    /// [offset:4 LE]
+    /// [prior_utxo_hash:32]
+    /// ```
+    CompensateReassign {
+        /// Primary key of the affected transaction.
+        tx_key: TxKey,
+        /// Slot offset that was reassigned.
+        offset: u32,
+        /// The slot's `utxo_hash` before the reassign was applied.
+        prior_utxo_hash: [u8; 32],
+    },
+    /// Gap #8 (TERANODE_PRODUCTION_READINESS_GAPS.md): compensation intent
+    /// for a prune-slot operation that needs to be rolled back after a
+    /// replication failure.
+    ///
+    /// Captures the slot's prior status byte (UNSPENT / SPENT / FROZEN /
+    /// etc.) BEFORE the prune set it to PRUNED. Recovery replays this by
+    /// writing back the original status byte exactly.
+    ///
+    /// Wire layout (after the type byte):
+    /// ```text
+    /// [tx_key:32]
+    /// [offset:4 LE]
+    /// [prior_status:1]
+    /// ```
+    CompensatePrune {
+        /// Primary key of the affected transaction.
+        tx_key: TxKey,
+        /// Slot offset that was pruned.
+        offset: u32,
+        /// The slot's `status` byte before the prune was applied.
+        prior_status: u8,
+    },
     Checkpoint,
 }
 
@@ -312,6 +395,9 @@ impl RedoOp {
             RedoOp::FreeRegion { .. } => OP_FREE_REGION,
             RedoOp::HashtableResizeBegin { .. } => OP_HASHTABLE_RESIZE_BEGIN,
             RedoOp::HashtableResizeCommit { .. } => OP_HASHTABLE_RESIZE_COMMIT,
+            RedoOp::CompensateUnsetMined { .. } => OP_COMPENSATE_UNSET_MINED,
+            RedoOp::CompensateReassign { .. } => OP_COMPENSATE_REASSIGN,
+            RedoOp::CompensatePrune { .. } => OP_COMPENSATE_PRUNE,
             RedoOp::Checkpoint => OP_CHECKPOINT,
         }
     }
@@ -336,7 +422,10 @@ impl RedoOp {
             | RedoOp::PreserveUntil { tx_key, .. }
             | RedoOp::MarkOnLongestChain { tx_key, .. }
             | RedoOp::SecondaryUnminedUpdate { tx_key, .. }
-            | RedoOp::SecondaryDahUpdate { tx_key, .. } => Some(tx_key),
+            | RedoOp::SecondaryDahUpdate { tx_key, .. }
+            | RedoOp::CompensateUnsetMined { tx_key, .. }
+            | RedoOp::CompensateReassign { tx_key, .. }
+            | RedoOp::CompensatePrune { tx_key, .. } => Some(tx_key),
             RedoOp::AllocateRegion { .. }
             | RedoOp::FreeRegion { .. }
             | RedoOp::HashtableResizeBegin { .. }
@@ -514,6 +603,35 @@ impl RedoOp {
             }
             RedoOp::HashtableResizeCommit { new_capacity } => {
                 buf.extend_from_slice(&new_capacity.to_le_bytes());
+            }
+            RedoOp::CompensateUnsetMined {
+                tx_key,
+                block_id,
+                block_height,
+                subtree_idx,
+            } => {
+                buf.extend_from_slice(&tx_key.txid);
+                buf.extend_from_slice(&block_id.to_le_bytes());
+                buf.extend_from_slice(&block_height.to_le_bytes());
+                buf.extend_from_slice(&subtree_idx.to_le_bytes());
+            }
+            RedoOp::CompensateReassign {
+                tx_key,
+                offset,
+                prior_utxo_hash,
+            } => {
+                buf.extend_from_slice(&tx_key.txid);
+                buf.extend_from_slice(&offset.to_le_bytes());
+                buf.extend_from_slice(prior_utxo_hash);
+            }
+            RedoOp::CompensatePrune {
+                tx_key,
+                offset,
+                prior_status,
+            } => {
+                buf.extend_from_slice(&tx_key.txid);
+                buf.extend_from_slice(&offset.to_le_bytes());
+                buf.push(*prior_status);
             }
             RedoOp::Checkpoint => {}
         }
@@ -741,6 +859,42 @@ impl RedoOp {
             OP_HASHTABLE_RESIZE_COMMIT if data.len() >= 8 => {
                 let new_capacity = u64::from_le_bytes(data[0..8].try_into().unwrap());
                 Some(RedoOp::HashtableResizeCommit { new_capacity })
+            }
+            OP_COMPENSATE_UNSET_MINED if data.len() >= 44 => {
+                // [tx_key:32][block_id:4][block_height:4][subtree_idx:4]
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                Some(RedoOp::CompensateUnsetMined {
+                    tx_key: TxKey { txid },
+                    block_id: u32::from_le_bytes(data[32..36].try_into().unwrap()),
+                    block_height: u32::from_le_bytes(data[36..40].try_into().unwrap()),
+                    subtree_idx: u32::from_le_bytes(data[40..44].try_into().unwrap()),
+                })
+            }
+            OP_COMPENSATE_REASSIGN if data.len() >= 68 => {
+                // [tx_key:32][offset:4][prior_utxo_hash:32]
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                let offset = u32::from_le_bytes(data[32..36].try_into().unwrap());
+                let mut prior = [0u8; 32];
+                prior.copy_from_slice(&data[36..68]);
+                Some(RedoOp::CompensateReassign {
+                    tx_key: TxKey { txid },
+                    offset,
+                    prior_utxo_hash: prior,
+                })
+            }
+            OP_COMPENSATE_PRUNE if data.len() >= 37 => {
+                // [tx_key:32][offset:4][prior_status:1]
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                let offset = u32::from_le_bytes(data[32..36].try_into().unwrap());
+                let prior_status = data[36];
+                Some(RedoOp::CompensatePrune {
+                    tx_key: TxKey { txid },
+                    offset,
+                    prior_status,
+                })
             }
             OP_CHECKPOINT => Some(RedoOp::Checkpoint),
             _ => None,
@@ -1928,6 +2082,80 @@ mod tests {
             old_height: 900,
             new_height: 0,
         });
+    }
+
+    /// Gap #8 (TERANODE_PRODUCTION_READINESS_GAPS.md): compensation
+    /// intent variants must round-trip every captured before-image bit
+    /// so a crash-mid-rollback recovery can restore the original state
+    /// exactly. Cover edge cases: max-value u32 fields, non-zero block
+    /// height/subtree, all status-byte values that PruneSlot may have
+    /// overwritten.
+    #[test]
+    fn round_trip_compensate_unset_mined() {
+        assert_round_trip(RedoOp::CompensateUnsetMined {
+            tx_key: make_txid(0x80),
+            block_id: 12345,
+            block_height: 800_000,
+            subtree_idx: 3,
+        });
+        // Boundary: u32 max for each numeric field.
+        assert_round_trip(RedoOp::CompensateUnsetMined {
+            tx_key: make_txid(0x81),
+            block_id: u32::MAX,
+            block_height: u32::MAX,
+            subtree_idx: u32::MAX,
+        });
+        // Zero values are valid in their own right (low block heights).
+        assert_round_trip(RedoOp::CompensateUnsetMined {
+            tx_key: make_txid(0x82),
+            block_id: 0,
+            block_height: 0,
+            subtree_idx: 0,
+        });
+    }
+
+    #[test]
+    fn round_trip_compensate_reassign() {
+        let mut prior = [0u8; 32];
+        for (i, b) in prior.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(11);
+        }
+        assert_round_trip(RedoOp::CompensateReassign {
+            tx_key: make_txid(0x83),
+            offset: 7,
+            prior_utxo_hash: prior,
+        });
+        // Distinct hash, different offset.
+        assert_round_trip(RedoOp::CompensateReassign {
+            tx_key: make_txid(0x84),
+            offset: 0,
+            prior_utxo_hash: [0xAA; 32],
+        });
+        // All-zero prior hash is a legitimate edge case (the slot was
+        // historically zero-hashed before reassign).
+        assert_round_trip(RedoOp::CompensateReassign {
+            tx_key: make_txid(0x85),
+            offset: u32::MAX,
+            prior_utxo_hash: [0u8; 32],
+        });
+    }
+
+    #[test]
+    fn round_trip_compensate_prune() {
+        // Cover every status-byte value the prune path could be reversing.
+        for status in &[
+            crate::record::UTXO_UNSPENT,
+            crate::record::UTXO_SPENT,
+            crate::record::UTXO_FROZEN,
+            crate::record::UTXO_PRUNED,
+            0xFFu8, // sentinel: unknown/future status — must round-trip too.
+        ] {
+            assert_round_trip(RedoOp::CompensatePrune {
+                tx_key: make_txid(*status),
+                offset: 13,
+                prior_status: *status,
+            });
+        }
     }
 
     #[test]

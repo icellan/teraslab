@@ -4853,6 +4853,14 @@ pub fn redo_entry_to_replica_op(
         // allocate their own regions independently. HashtableResizeBegin /
         // HashtableResizeCommit are local file-backed-index durability
         // records — replicas resize their own indexes independently.
+        //
+        // Gap #8 compensation intents (CompensateUnsetMined / CompensateReassign
+        // / CompensatePrune) are local-only rollback records. The forward
+        // mutation they reverse never reached the target (replication failed
+        // before it could ack), so the target's state is already consistent
+        // with the post-rollback master state. Replicating the compensation
+        // would attempt to "undo" an op the target never received and produce
+        // divergence. Drop them from the migration delta.
         RedoOp::Checkpoint
         | RedoOp::MarkOnLongestChain { .. }
         | RedoOp::SecondaryUnminedUpdate { .. }
@@ -4860,7 +4868,10 @@ pub fn redo_entry_to_replica_op(
         | RedoOp::AllocateRegion { .. }
         | RedoOp::FreeRegion { .. }
         | RedoOp::HashtableResizeBegin { .. }
-        | RedoOp::HashtableResizeCommit { .. } => None,
+        | RedoOp::HashtableResizeCommit { .. }
+        | RedoOp::CompensateUnsetMined { .. }
+        | RedoOp::CompensateReassign { .. }
+        | RedoOp::CompensatePrune { .. } => None,
     }
 }
 
