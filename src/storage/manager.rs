@@ -114,7 +114,13 @@ impl StorageManager {
                 })
             }
             StorageTier::External => {
-                self.blob_store.put(tx_id, &serialized)?;
+                // The blob store returns the actual content digest and length;
+                // we discard them here because the synchronous write path in
+                // this manager does not currently maintain an `ExternalRef`.
+                // The async [`BlobUploader`](super::uploader::BlobUploader)
+                // path stamps the digest into the record's `ExternalRef` so
+                // subsequent reads can be integrity-checked end-to-end.
+                let _digest = self.blob_store.put(tx_id, &serialized)?;
                 Ok(ColdDataRef::External)
             }
         }
