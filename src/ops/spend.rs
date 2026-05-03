@@ -163,3 +163,34 @@ pub struct ValidatedSpend<'a> {
     /// Block height retention for DAH.
     pub(crate) block_height_retention: u32,
 }
+
+impl<'a> ValidatedSpend<'a> {
+    /// Record's `spent_utxos` counter BEFORE this mutation, as observed
+    /// during validation while the per-record lock was held.
+    ///
+    /// Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): the WAL-first
+    /// dispatch path needs this to compute the correct `new_spent_count`
+    /// for each [`crate::redo::RedoOp::Spend`] entry **before** the redo
+    /// flush, so recovery's overwrite of `meta.spent_utxos` lands on the
+    /// real post-spend count and not a stale `0`.
+    pub fn pre_spent_count(&self) -> u32 {
+        // Local binding forces a value copy out of the `#[repr(C, packed)]`
+        // metadata header — direct projection of a packed field is
+        // unsafe in modern Rust.
+        let count = self.metadata.spent_utxos;
+        count
+    }
+
+    /// Slice of `(slot_offset, new_slot)` transitions that passed
+    /// validation. Each entry corresponds to a slot that will move from
+    /// UNSPENT → SPENT (or other state changes the validator approves)
+    /// during [`Self::apply`]. Items that were idempotent re-spends or
+    /// failed validation are NOT in this list.
+    ///
+    /// Returns the offsets so the dispatch path can match items in the
+    /// caller's input batch against actual transitions, which is needed
+    /// to set per-redo-entry `new_spent_count` correctly.
+    pub fn transitions(&self) -> &[(u32, UtxoSlot)] {
+        &self.valid_spends
+    }
+}
