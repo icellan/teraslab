@@ -174,11 +174,16 @@ impl<'a> ValidatedSpend<'a> {
     /// flush, so recovery's overwrite of `meta.spent_utxos` lands on the
     /// real post-spend count and not a stale `0`.
     pub fn pre_spent_count(&self) -> u32 {
-        // Local binding forces a value copy out of the `#[repr(C, packed)]`
-        // metadata header — direct projection of a packed field is
-        // unsafe in modern Rust.
-        let count = self.metadata.spent_utxos;
-        count
+        // The `metadata` field's underlying type is `#[repr(C, packed)]`,
+        // so we read the field through a `let` binding which forces a
+        // value copy — projecting a reference to the packed field would
+        // be unsafe. The local binding is then returned without rebind
+        // gymnastics that clippy flags.
+        #[allow(clippy::let_and_return)]
+        {
+            let count = self.metadata.spent_utxos;
+            count
+        }
     }
 
     /// Slice of `(slot_offset, new_slot)` transitions that passed

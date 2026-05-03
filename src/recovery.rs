@@ -1,20 +1,33 @@
 //! Crash recovery by replaying redo log entries.
 //!
-//! ## Durability Contract
+//! ## Durability Contract (WAL-first)
 //!
-//! TeraSlab uses a durable-engine-first model: engine writes go to the
-//! block device via O_DIRECT (immediately durable), then a mandatory
-//! redo log entry is fsynced before the client is acknowledged.
+//! Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): TeraSlab uses a
+//! WAL-first commit model with a mandatory redo log. Every mutation
+//! that the dispatch path acknowledges to a client has the following
+//! ordering:
 //!
-//! On crash, the engine's UTXO slot bytes are already correct on disk.
-//! Recovery replays redo entries after the last checkpoint to fix up
-//! derived metadata (counters like `spent_utxos`, secondary index
-//! entries) that depend on read-modify-write sequences which may have
-//! been interrupted mid-flight.
+//! 1. Validate under lock.
+//! 2. Append the redo entry and fsync the log (`RedoLog::append` +
+//!    `flush`).
+//! 3. Apply the mutation to the block device via `pwrite_all_at`
+//!    (durable on return for `DirectDevice` via `O_DIRECT`).
+//! 4. Replicate.
 //!
-//! All operations are idempotent: replaying an already-applied operation
-//! is harmless. Each replay checks the current on-disk state before
-//! writing to avoid double-application.
+//! On crash, the redo log is the single durable source of truth for
+//! the post-checkpoint window: the on-device record bytes may be the
+//! pre-mutation state (steps 1-2 ran but step 3 didn't), the
+//! post-mutation state (step 3 ran), or torn (a write straddled the
+//! crash). Recovery replays every entry after the last checkpoint:
+//!
+//! * `RedoOp::CreateV2` carries the full record bytes (metadata header + UTXO slots + cold data) so replay can reconstruct the on-device record byte-for-byte. The legacy `RedoOp::Create` (logs predating gap #2) registers the index only — old logs continue to replay for back-compat.
+//! * `RedoOp::Spend` / `RedoOp::Unspend` carry the post-mutation `new_spent_count`. Recovery overwrites `meta.spent_utxos` with this value; previously the dispatcher wrote `0` here, corrupting the counter on crash-replay even when the slot transition was correct.
+//! * Other ops carry the same per-key payload they always did and replay against the on-device metadata header.
+//!
+//! All replays are idempotent: each entry reads the current device or
+//! index state before writing and skips when the post-state already
+//! matches. Replaying an already-applied operation is therefore safe
+//! across multiple recovery passes (e.g. crash mid-replay).
 
 use crate::allocator::SlotAllocator;
 use crate::device::BlockDevice;
@@ -734,6 +747,7 @@ fn replay_delete(index: &mut PrimaryBackend, tx_key: &TxKey) -> ReplayResult {
 /// previous run already applied this redo entry. Otherwise we always
 /// rewrite the record bytes (overwriting any partial bytes left from a
 /// crashed write) and then register.
+#[allow(clippy::too_many_arguments)]
 fn replay_create_v2(
     device: &dyn BlockDevice,
     index: &mut PrimaryBackend,

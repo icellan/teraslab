@@ -235,12 +235,32 @@ pub fn init_dispatch_histograms(histograms: &'static crate::metrics::ThreadHisto
 /// If `cluster` is Some, shard ownership is checked for key-based operations.
 /// Requests for keys not owned by this node get a Redirect response.
 ///
-/// Mutation path (durability contract):
-/// 1. Engine applies the mutation (durable via O_DIRECT).
-/// 2. Redo log records the mutation and fsyncs (mandatory — failure fails
-///    the client request).
-/// 3. Replication sends to replicas with durable sequence numbers.
-/// 4. Client response is sent.
+/// # Mutation path (durability contract — WAL-first)
+///
+/// Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md) corrected the
+/// previously stated "engine-first" ordering — the actual implemented
+/// order is:
+///
+/// 1. **Validate under lock** — parse, check shard ownership, acquire
+///    the per-record lock. For multi-spend, snapshot the metadata.
+/// 2. **Append + fsync redo entry** — every authoritative WAL-first
+///    payload (full record bytes for `CreateV2`, real `new_spent_count`
+///    for spend/unspend) is captured BEFORE any device write so
+///    recovery can reconstruct the post-mutation state byte-for-byte.
+///    Redo open/create failure is fatal at startup; redo flush failure
+///    fails the client request.
+/// 3. **Apply to engine** — write UTXO slots / metadata to the block
+///    device via `pwrite_all_at` (durable on return for `DirectDevice`
+///    via `O_DIRECT`).
+/// 4. **Replicate** — fan out to replicas with the durable sequence
+///    numbers assigned in step 2. Best-effort under the current ack
+///    policy; degraded RF>1 modes are validated at config load time.
+/// 5. **Respond** — send the success/error response to the client.
+///
+/// Crash recovery walks the redo log after the last checkpoint and
+/// idempotently re-applies entries; CreateV2 fully reconstructs
+/// records, spend / unspend overwrite `meta.spent_utxos` with the
+/// correct value the dispatch path computed before the WAL flush.
 #[tracing::instrument(
     skip_all,
     level = "debug",
