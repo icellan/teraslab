@@ -19,6 +19,10 @@ static TEST_METRICS: ThreadMetrics = ThreadMetrics::new();
 static TEST_HISTOGRAMS: ThreadHistograms = ThreadHistograms::new();
 
 fn start_test_http_server() -> (u16, Arc<HttpState>) {
+    start_test_http_server_with_admin(true)
+}
+
+fn start_test_http_server_with_admin(enable_admin_endpoints: bool) -> (u16, Arc<HttpState>) {
     let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(1_000).unwrap();
@@ -53,7 +57,7 @@ fn start_test_http_server() -> (u16, Arc<HttpState>) {
     let addr = format!("127.0.0.1:{port}");
     let state_clone = state.clone();
     std::thread::spawn(move || {
-        start_http_server(addr, state_clone);
+        start_http_server(addr, state_clone, enable_admin_endpoints);
     });
 
     // Wait for server to start
@@ -469,4 +473,97 @@ fn debug_record_nonexistent_returns_404() {
     let (status, _, body) = http_get(port, &format!("/debug/records/{txid_hex}"));
     assert_eq!(status, 404);
     assert!(body.contains("not found"));
+}
+
+// --------------------------------------------------------------------------
+// Gap #1 safe defaults: admin/debug gating
+// --------------------------------------------------------------------------
+
+/// When `enable_admin_endpoints = false`, mutating admin routes are not
+/// registered so axum returns 404 — even though the rest of the surface
+/// (metrics, health, read-only admin, /debug/freelist) keeps working.
+#[test]
+fn admin_quiesce_404_when_admin_disabled() {
+    let (port, _state) = start_test_http_server_with_admin(false);
+    let (status, _) = http_put(port, "/admin/quiesce", "");
+    assert_eq!(
+        status, 404,
+        "/admin/quiesce must be unrouted when admin endpoints are disabled"
+    );
+}
+
+#[test]
+fn admin_rebalance_404_when_admin_disabled() {
+    let (port, _state) = start_test_http_server_with_admin(false);
+    let (status, _) = http_put(port, "/admin/rebalance", "");
+    assert_eq!(status, 404);
+}
+
+#[test]
+fn admin_drain_404_when_admin_disabled() {
+    let (port, _state) = start_test_http_server_with_admin(false);
+    let (status, _) = http_put(port, "/admin/drain/1", "");
+    assert_eq!(status, 404);
+}
+
+#[test]
+fn debug_set_log_level_blocked_when_admin_disabled() {
+    let (port, _state) = start_test_http_server_with_admin(false);
+    // PUT /debug/log-level is the mutation route; the GET sibling stays on,
+    // so axum returns 405 Method Not Allowed (vs. 404 when no method matches).
+    // Either status proves the mutating handler is not registered.
+    let (status, _) = http_put(port, "/debug/log-level", "info");
+    assert!(
+        status == 404 || status == 405,
+        "PUT /debug/log-level must be unrouted (404) or method-not-allowed (405) when \
+         admin endpoints are disabled, got {status}",
+    );
+}
+
+#[test]
+fn debug_record_404_when_admin_disabled() {
+    let (port, _state) = start_test_http_server_with_admin(false);
+    let txid_hex = "0000000000000000000000000000000000000000000000000000000000000000";
+    let (status, _, _) = http_get(port, &format!("/debug/records/{txid_hex}"));
+    assert_eq!(status, 404);
+}
+
+#[test]
+fn debug_index_404_when_admin_disabled() {
+    let (port, _state) = start_test_http_server_with_admin(false);
+    let (status, _, _) = http_get(port, "/debug/index");
+    assert_eq!(status, 404);
+}
+
+#[test]
+fn debug_redo_404_when_admin_disabled() {
+    let (port, _state) = start_test_http_server_with_admin(false);
+    let (status, _, _) = http_get(port, "/debug/redo");
+    assert_eq!(status, 404);
+}
+
+/// Even with admin endpoints disabled, the always-on observability surface
+/// must keep working. This guards against accidentally over-gating.
+#[test]
+fn metrics_still_works_when_admin_disabled() {
+    let (port, _state) = start_test_http_server_with_admin(false);
+    let (status, _, body) = http_get(port, "/metrics");
+    assert_eq!(status, 200);
+    assert!(body.contains("teraslab_spends_attempted_total"));
+}
+
+#[test]
+fn health_live_still_works_when_admin_disabled() {
+    let (port, _state) = start_test_http_server_with_admin(false);
+    let (status, _, body) = http_get(port, "/health/live");
+    assert_eq!(status, 200);
+    assert_eq!(body, "ok");
+}
+
+#[test]
+fn read_only_debug_log_level_still_works_when_admin_disabled() {
+    // GET /debug/log-level is read-only; only the PUT sibling is gated.
+    let (port, _state) = start_test_http_server_with_admin(false);
+    let (status, _, _) = http_get(port, "/debug/log-level");
+    assert_eq!(status, 200);
 }

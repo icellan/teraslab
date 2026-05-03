@@ -63,45 +63,19 @@ pub struct HttpState {
 ///
 /// This spawns a tokio runtime and blocks until shutdown.
 /// Call this from a dedicated thread.
-pub fn start_http_server(bind_addr: String, state: Arc<HttpState>) {
+///
+/// `enable_admin_endpoints` gates registration of the `/admin/*` routes and
+/// the mutating `/debug/*` routes. When `false` (the default), those routes
+/// are not part of the router at all and any request to them returns 404.
+/// When `true`, a `tracing::warn!` line is emitted naming the risk.
+pub fn start_http_server(bind_addr: String, state: Arc<HttpState>, enable_admin_endpoints: bool) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("failed to create tokio runtime for HTTP server");
 
     rt.block_on(async move {
-        let app = Router::new()
-            // Metrics & health
-            .route("/metrics", get(handle_metrics))
-            .route("/health/live", get(handle_health_live))
-            .route("/health/ready", get(handle_health_ready))
-            .route("/status", get(handle_status))
-            // Admin
-            .route("/admin/quiesce", put(handle_admin_quiesce))
-            .route(
-                "/admin/migration_status",
-                get(handle_admin_migration_status),
-            )
-            .route("/admin/nodes", get(handle_admin_nodes))
-            .route("/admin/memory", get(handle_admin_memory))
-            .route("/admin/records", get(handle_admin_records))
-            .route("/admin/replication", get(handle_admin_replication))
-            .route("/admin/rebalance", put(handle_admin_rebalance))
-            .route("/admin/drain/{node_id}", put(handle_admin_drain))
-            .route("/admin/top", get(handle_admin_top))
-            // Debug
-            .route("/debug/index", get(handle_debug_index))
-            .route("/debug/freelist", get(handle_debug_freelist))
-            .route("/debug/redo", get(handle_debug_redo))
-            .route("/debug/log-level", put(handle_set_log_level))
-            .route("/debug/log-level", get(handle_get_log_level))
-            .route("/debug/records/{txid}", get(handle_debug_record))
-            // WebSocket
-            .route("/ws/top", get(handle_ws_top))
-            // Web UI
-            .route("/ui/", get(handle_ui_root))
-            .route("/ui/{*path}", get(handle_ui))
-            .with_state(state);
+        let app = build_http_router(state, enable_admin_endpoints);
 
         let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
             Ok(l) => l,
@@ -111,12 +85,74 @@ pub fn start_http_server(bind_addr: String, state: Arc<HttpState>) {
             }
         };
 
+        if enable_admin_endpoints {
+            tracing::warn!(
+                %bind_addr,
+                "/admin/* and mutating /debug/* endpoints ENABLED — these expose state \
+                 mutation and sensitive debug data on this HTTP listener with no \
+                 transport-level auth (gap #1, mTLS pending). Disable in production by \
+                 setting enable_admin_endpoints = false.",
+            );
+        }
         tracing::info!(%bind_addr, "HTTP observability server listening");
 
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!(err = %e, "HTTP server error");
         }
     });
+}
+
+/// Build the axum [`Router`] for the HTTP observability server.
+///
+/// Always registers metrics / health / status / read-only `/admin/top` /
+/// WebSocket / UI routes. When `enable_admin_endpoints` is `true`, also
+/// registers `/admin/*` mutation routes and the mutating `/debug/*` routes
+/// (`/debug/log-level` PUT, `/debug/records/{txid}`, `/debug/index`,
+/// `/debug/redo`). When `false`, those routes are not part of the router and
+/// requests to them return 404.
+///
+/// Split out from [`start_http_server`] so unit tests can construct the
+/// router without binding a TCP listener.
+pub(crate) fn build_http_router(state: Arc<HttpState>, enable_admin_endpoints: bool) -> Router {
+    // Always-on routes: metrics, health, status, and read-only WS/UI surface.
+    let mut router = Router::new()
+        .route("/metrics", get(handle_metrics))
+        .route("/health/live", get(handle_health_live))
+        .route("/health/ready", get(handle_health_ready))
+        .route("/status", get(handle_status))
+        // Read-only surface: gauge endpoints used by load balancers and the UI.
+        .route(
+            "/admin/migration_status",
+            get(handle_admin_migration_status),
+        )
+        .route("/admin/nodes", get(handle_admin_nodes))
+        .route("/admin/memory", get(handle_admin_memory))
+        .route("/admin/records", get(handle_admin_records))
+        .route("/admin/replication", get(handle_admin_replication))
+        .route("/admin/top", get(handle_admin_top))
+        // Read-only debug surface (no state mutation, no record contents).
+        .route("/debug/freelist", get(handle_debug_freelist))
+        .route("/debug/log-level", get(handle_get_log_level))
+        // WebSocket
+        .route("/ws/top", get(handle_ws_top))
+        // Web UI
+        .route("/ui/", get(handle_ui_root))
+        .route("/ui/{*path}", get(handle_ui));
+
+    if enable_admin_endpoints {
+        router = router
+            // Admin mutation
+            .route("/admin/quiesce", put(handle_admin_quiesce))
+            .route("/admin/rebalance", put(handle_admin_rebalance))
+            .route("/admin/drain/{node_id}", put(handle_admin_drain))
+            // Debug mutation / sensitive read
+            .route("/debug/index", get(handle_debug_index))
+            .route("/debug/redo", get(handle_debug_redo))
+            .route("/debug/log-level", put(handle_set_log_level))
+            .route("/debug/records/{txid}", get(handle_debug_record));
+    }
+
+    router.with_state(state)
 }
 
 // ---------------------------------------------------------------------------

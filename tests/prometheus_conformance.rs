@@ -166,7 +166,9 @@ fn start_test_http_server() -> (u16, Arc<HttpState>) {
     let state_clone = state.clone();
     let addr = format!("127.0.0.1:{port}");
     std::thread::spawn(move || {
-        start_http_server(addr, state_clone);
+        // Prom conformance tests do not touch /admin/* mutation paths,
+        // but enabling matches the existing public-surface coverage.
+        start_http_server(addr, state_clone, true);
     });
 
     // Give axum time to bind — matches the pattern in the sibling test file.

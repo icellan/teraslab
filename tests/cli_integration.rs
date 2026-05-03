@@ -49,7 +49,8 @@ fn start_test_server() -> u16 {
 
     let addr = format!("127.0.0.1:{port}");
     std::thread::spawn(move || {
-        start_http_server(addr, state);
+        // CLI integration covers /admin/* + /debug/* paths — register them.
+        start_http_server(addr, state, true);
     });
     std::thread::sleep(std::time::Duration::from_millis(200));
     port
