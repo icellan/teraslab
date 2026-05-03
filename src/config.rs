@@ -2,7 +2,83 @@
 
 use crate::observability::ObservabilityConfig;
 use serde::Deserialize;
+use std::net::IpAddr;
 use std::path::PathBuf;
+use thiserror::Error;
+
+/// Errors produced when validating a [`ServerConfig`] before startup.
+///
+/// Each variant carries the operator-actionable detail required to fix the
+/// configuration. Errors are returned by [`ServerConfig::validate_safe_defaults`]
+/// and surface as fatal startup failures from the binary entry point.
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    /// `listen_addr` does not parse as `host:port`.
+    #[error(
+        "listen_addr {addr:?} is not a valid host:port (parse error: {source}); use \
+         e.g. \"127.0.0.1:3300\" or \"0.0.0.0:3300\""
+    )]
+    InvalidListenAddr {
+        /// The raw address string that failed to parse.
+        addr: String,
+        /// Underlying parse error from the address parser.
+        source: std::net::AddrParseError,
+    },
+
+    /// `http_listen_addr` does not parse as `host:port`.
+    #[error(
+        "http_listen_addr {addr:?} is not a valid host:port (parse error: {source}); use \
+         e.g. \"127.0.0.1:9100\" or \"0.0.0.0:9100\""
+    )]
+    InvalidHttpListenAddr {
+        /// The raw address string that failed to parse.
+        addr: String,
+        /// Underlying parse error from the address parser.
+        source: std::net::AddrParseError,
+    },
+
+    /// A non-loopback bind was configured without `enable_remote_bind = true`.
+    ///
+    /// Until the mTLS wave lands, exposing `listen_addr` or `http_listen_addr`
+    /// on a non-loopback interface gives any network actor that can reach the
+    /// port the ability to mutate state or read sensitive debug data. See
+    /// gap #1 in `docs/TERANODE_PRODUCTION_READINESS_GAPS.md`.
+    #[error(
+        "{field} is bound to non-loopback address {addr:?} but enable_remote_bind = false; \
+         either set enable_remote_bind = true (only safe on a private network) or change \
+         the bind to a loopback address. Authenticated remote access (mTLS) is tracked as \
+         a follow-up to the safe-defaults slice of gap #1."
+    )]
+    RemoteBindRefused {
+        /// Which config field failed the check (e.g. `"listen_addr"`).
+        field: &'static str,
+        /// The non-loopback address the operator tried to bind.
+        addr: String,
+    },
+
+    /// Cluster mode was enabled (RF > 1) without a `cluster_secret`.
+    ///
+    /// With RF > 1 every replica/topology/migration frame is authority-bearing
+    /// inter-node traffic; without an HMAC secret any peer that can connect can
+    /// inject those frames.
+    #[error(
+        "replication_factor = {rf} (> 1) requires a non-empty cluster_secret to authenticate \
+         inter-node SWIM messages and cluster control frames; either set cluster_secret in \
+         config or lower replication_factor to 1"
+    )]
+    ClusterSecretRequired {
+        /// The configured replication factor.
+        rf: u8,
+    },
+}
+
+/// Parse the host portion of an `addr` string of the form `host:port`.
+///
+/// Returns the parsed [`IpAddr`] on success. Used to gate non-loopback binds.
+fn parse_bind_host(addr: &str) -> Result<IpAddr, std::net::AddrParseError> {
+    // SocketAddr accepts both IPv4 and bracketed IPv6 forms.
+    addr.parse::<std::net::SocketAddr>().map(|sa| sa.ip())
+}
 
 fn parse_usize_env(name: &str) -> std::result::Result<Option<usize>, String> {
     match std::env::var(name) {
@@ -177,6 +253,27 @@ pub struct ServerConfig {
     /// HTTP listen address for observability endpoints (metrics, health, debug).
     pub http_listen_addr: String,
 
+    /// Whether to allow `listen_addr` / `http_listen_addr` to bind a
+    /// non-loopback interface.
+    ///
+    /// Defaults to `false` so a fresh install only exposes ports on the
+    /// loopback interface. Operators that need remote access must explicitly
+    /// opt in by setting this to `true` *and* understand that until the mTLS
+    /// wave lands the binary protocol and HTTP server have no transport-level
+    /// authentication beyond `cluster_secret` for SWIM. See gap #1 in
+    /// `docs/TERANODE_PRODUCTION_READINESS_GAPS.md`.
+    pub enable_remote_bind: bool,
+
+    /// Whether to register the `/admin/*` and mutating `/debug/*` HTTP routes.
+    ///
+    /// Defaults to `false` so a fresh install never exposes
+    /// `/admin/quiesce`, `/admin/rebalance`, `/admin/drain/{node_id}`,
+    /// `/debug/log-level` (PUT), `/debug/records/{txid}`, `/debug/index`,
+    /// or `/debug/redo`. Operators that need these endpoints must explicitly
+    /// opt in. When enabled, the server emits a `tracing::warn!` line at
+    /// startup naming the risk so the choice is auditable.
+    pub enable_admin_endpoints: bool,
+
     /// Block height retention for DAH evaluation.
     pub block_height_retention: u32,
 
@@ -292,7 +389,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:3300".to_string(),
+            listen_addr: "127.0.0.1:3300".to_string(),
             advertise_addr: None,
             device_paths: vec![PathBuf::from("teraslab-data.dat")],
             device_size: 1024 * 1024 * 1024, // 1 GiB
@@ -304,7 +401,9 @@ impl Default for ServerConfig {
             lock_stripes: 65536,
             max_batch_size: 8192,
             max_connections: 1024,
-            http_listen_addr: "0.0.0.0:9100".to_string(),
+            http_listen_addr: "127.0.0.1:9100".to_string(),
+            enable_remote_bind: false,
+            enable_admin_endpoints: false,
             block_height_retention: 288,
             node_id: 0,
             swim_port: 3301,
@@ -489,6 +588,67 @@ impl ServerConfig {
     /// a config-time error, because DNS/TCP reachability is runtime-only.
     pub fn validate_observability(&self) -> std::result::Result<(), String> {
         self.observability.validate().map_err(|e| e.to_string())
+    }
+
+    /// Validate the bind/auth safe defaults that gate gap #1 of the
+    /// production-readiness review.
+    ///
+    /// Currently enforces:
+    ///
+    /// 1. `listen_addr` and `http_listen_addr` parse as `host:port`.
+    /// 2. Non-loopback bind requires `enable_remote_bind = true`. Until the
+    ///    mTLS wave lands, the binary protocol and HTTP admin endpoints have
+    ///    no per-connection authentication, so binding a routable interface
+    ///    is only safe on a private/audited network with the explicit opt-in.
+    /// 3. `replication_factor > 1` requires a non-empty `cluster_secret`.
+    ///    Cluster mode keys SWIM (and increasingly the other inter-node frames)
+    ///    on the shared secret; an empty secret means anyone reachable on the
+    ///    SWIM port can spoof membership/topology messages.
+    ///
+    /// Errors are returned as a [`ConfigError`] enum so callers can map them to
+    /// startup-fatal codes.
+    pub fn validate_safe_defaults(&self) -> std::result::Result<(), ConfigError> {
+        // (1) + (2): listen_addr.
+        let listen_ip =
+            parse_bind_host(&self.listen_addr).map_err(|e| ConfigError::InvalidListenAddr {
+                addr: self.listen_addr.clone(),
+                source: e,
+            })?;
+        if !listen_ip.is_loopback() && !self.enable_remote_bind {
+            return Err(ConfigError::RemoteBindRefused {
+                field: "listen_addr",
+                addr: self.listen_addr.clone(),
+            });
+        }
+
+        // (1) + (2): http_listen_addr.
+        let http_ip = parse_bind_host(&self.http_listen_addr).map_err(|e| {
+            ConfigError::InvalidHttpListenAddr {
+                addr: self.http_listen_addr.clone(),
+                source: e,
+            }
+        })?;
+        if !http_ip.is_loopback() && !self.enable_remote_bind {
+            return Err(ConfigError::RemoteBindRefused {
+                field: "http_listen_addr",
+                addr: self.http_listen_addr.clone(),
+            });
+        }
+
+        // (3) RF>1 requires a cluster_secret.
+        if self.replication_factor > 1
+            && self
+                .cluster_secret
+                .as_ref()
+                .map(|s| s.is_empty())
+                .unwrap_or(true)
+        {
+            return Err(ConfigError::ClusterSecretRequired {
+                rf: self.replication_factor,
+            });
+        }
+
+        Ok(())
     }
 
     /// Validate `block_height_retention` against the sanity bound.
@@ -958,6 +1118,159 @@ otlp_endpoint = "http://set-via-toml:4317"
         );
         unsafe {
             std::env::remove_var(ObservabilityConfig::ENV_SAMPLING_RATIO);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Safe defaults (gap #1): localhost bind + admin gating + RF>1 secret
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn default_listen_addrs_are_loopback() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.listen_addr, "127.0.0.1:3300");
+        assert_eq!(cfg.http_listen_addr, "127.0.0.1:9100");
+        assert!(!cfg.enable_remote_bind);
+        assert!(!cfg.enable_admin_endpoints);
+    }
+
+    #[test]
+    fn default_config_passes_safe_defaults() {
+        let cfg = ServerConfig::default();
+        cfg.validate_safe_defaults()
+            .expect("default config must pass safe-defaults validation");
+    }
+
+    #[test]
+    fn rf_gt_one_without_cluster_secret_is_rejected() {
+        // Default listen_addr is loopback so we isolate the RF>1 check.
+        let toml_str = r#"
+node_id = 1
+replication_factor = 3
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        let err = cfg
+            .validate_safe_defaults()
+            .expect_err("RF>1 with no cluster_secret must be rejected");
+        match err {
+            ConfigError::ClusterSecretRequired { rf } => assert_eq!(rf, 3),
+            other => panic!("expected ClusterSecretRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rf_gt_one_with_empty_cluster_secret_is_rejected() {
+        let toml_str = r#"
+node_id = 1
+replication_factor = 2
+cluster_secret = ""
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        let err = cfg
+            .validate_safe_defaults()
+            .expect_err("RF>1 with empty cluster_secret must be rejected");
+        match err {
+            ConfigError::ClusterSecretRequired { rf } => assert_eq!(rf, 2),
+            other => panic!("expected ClusterSecretRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rf_gt_one_with_cluster_secret_is_accepted() {
+        let toml_str = r#"
+node_id = 1
+replication_factor = 3
+cluster_secret = "0123456789abcdef"
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        cfg.validate_safe_defaults()
+            .expect("RF>1 with non-empty cluster_secret must pass");
+    }
+
+    #[test]
+    fn rf_one_without_cluster_secret_is_accepted() {
+        let toml_str = r#"
+node_id = 1
+replication_factor = 1
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        cfg.validate_safe_defaults()
+            .expect("RF=1 needs no cluster_secret");
+    }
+
+    #[test]
+    fn non_loopback_listen_without_remote_bind_is_rejected() {
+        let toml_str = r#"
+listen_addr = "0.0.0.0:3300"
+http_listen_addr = "127.0.0.1:9100"
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        let err = cfg
+            .validate_safe_defaults()
+            .expect_err("0.0.0.0 without enable_remote_bind must be rejected");
+        match err {
+            ConfigError::RemoteBindRefused { field, addr } => {
+                assert_eq!(field, "listen_addr");
+                assert_eq!(addr, "0.0.0.0:3300");
+            }
+            other => panic!("expected RemoteBindRefused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_loopback_http_listen_without_remote_bind_is_rejected() {
+        let toml_str = r#"
+listen_addr = "127.0.0.1:3300"
+http_listen_addr = "0.0.0.0:9100"
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        let err = cfg
+            .validate_safe_defaults()
+            .expect_err("0.0.0.0 http without enable_remote_bind must be rejected");
+        match err {
+            ConfigError::RemoteBindRefused { field, addr } => {
+                assert_eq!(field, "http_listen_addr");
+                assert_eq!(addr, "0.0.0.0:9100");
+            }
+            other => panic!("expected RemoteBindRefused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_loopback_listen_with_remote_bind_is_accepted() {
+        let toml_str = r#"
+listen_addr = "192.168.1.10:3300"
+http_listen_addr = "192.168.1.10:9100"
+enable_remote_bind = true
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        cfg.validate_safe_defaults()
+            .expect("non-loopback bind with explicit opt-in must validate");
+    }
+
+    #[test]
+    fn ipv6_loopback_is_treated_as_loopback() {
+        let toml_str = r#"
+listen_addr = "[::1]:3300"
+http_listen_addr = "[::1]:9100"
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        cfg.validate_safe_defaults()
+            .expect("[::1] (IPv6 loopback) must be treated as loopback");
+    }
+
+    #[test]
+    fn malformed_listen_addr_is_rejected() {
+        let toml_str = r#"
+listen_addr = "not-a-socket-addr"
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        let err = cfg.validate_safe_defaults().unwrap_err();
+        match err {
+            ConfigError::InvalidListenAddr { addr, .. } => {
+                assert_eq!(addr, "not-a-socket-addr");
+            }
+            other => panic!("expected InvalidListenAddr, got {other:?}"),
         }
     }
 }

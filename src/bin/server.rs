@@ -111,6 +111,14 @@ fn main() {
         tracing::error!(err = %e, "FATAL: invalid [observability] config");
         std::process::exit(1);
     }
+    // Gate gap #1 safe defaults (localhost binds, RF>1 needs cluster_secret)
+    // here too — these are config-only errors that should refuse startup
+    // before any device I/O.
+    if let Err(e) = config.validate_safe_defaults() {
+        init_tracing_subscriber_fallback();
+        tracing::error!(err = %e, "FATAL: unsafe bind/auth defaults (gap #1)");
+        std::process::exit(1);
+    }
 
     // Install the subscriber now that observability config is validated.
     let otlp_provider = match teraslab::observability::init_subscriber(
@@ -806,8 +814,9 @@ fn main() {
         http_port,
     });
     let http_addr = config.http_listen_addr.clone();
+    let enable_admin_endpoints = config.enable_admin_endpoints;
     std::thread::spawn(move || {
-        start_http_server(http_addr, http_state);
+        start_http_server(http_addr, http_state, enable_admin_endpoints);
     });
 
     // 7. Setup TCP server
