@@ -2847,10 +2847,56 @@ fn handle_create_batch(
         match engine.pre_allocate_create(&create_req) {
             Ok((record_offset, utxo_count)) => {
                 let key = TxKey { txid: item.txid };
-                redo_ops.push(RedoOp::Create {
+                // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): build
+                // the full record bytes BEFORE the WAL flush so the redo
+                // entry contains everything recovery needs to
+                // reconstruct the on-device record byte-for-byte. Any
+                // failure here is internal (mirrors `create_at_offset`'s
+                // own validation surface).
+                let record_bytes = match engine.build_create_record_bytes(&create_req) {
+                    Ok((bytes, _)) => bytes,
+                    Err(_) => {
+                        // pre_allocate_create already accepted the
+                        // request, so a build failure here indicates a
+                        // logic-level inconsistency. Free the
+                        // pre-allocated space and report internal error.
+                        let utxo_count_for_free = create_req.utxo_hashes.len() as u32;
+                        let base_size =
+                            crate::record::TxMetadata::record_size_for(utxo_count_for_free);
+                        let cold_len = if create_req.is_external && create_req.inputs.is_none() {
+                            0u64
+                        } else {
+                            build_cold_data(
+                                create_req.inputs,
+                                create_req.outputs,
+                                create_req.inpoints,
+                            )
+                            .len() as u64
+                        };
+                        let _ = engine
+                            .allocator()
+                            .lock()
+                            .free(record_offset, base_size + cold_len);
+                        errors.push(BatchItemError {
+                            item_index: i as u32,
+                            error_code: ERR_INTERNAL,
+                            error_data: vec![],
+                        });
+                        continue;
+                    }
+                };
+                let parent_txids: Vec<[u8; 32]> = if create_req.conflicting {
+                    create_req.parent_txids.to_vec()
+                } else {
+                    Vec::new()
+                };
+                redo_ops.push(RedoOp::CreateV2 {
                     tx_key: key,
                     record_offset,
                     utxo_count,
+                    is_conflicting: create_req.conflicting,
+                    record_bytes,
+                    parent_txids,
                 });
                 valid_items.push(ValidCreate {
                     idx: i,

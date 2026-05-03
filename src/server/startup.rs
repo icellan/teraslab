@@ -176,6 +176,20 @@ pub fn check_replay_tolerance(stats: &RecoveryStats) -> Result<(), String> {
             n = stats.failed_logic
         ));
     }
+    if stats.failed_missing_record_bytes > 0 {
+        // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): a CreateV2
+        // replay could not write the full record bytes captured in the
+        // redo entry. Short I/O on the record area means the device is
+        // misbehaving — continuing would silently register an index
+        // entry pointing at incomplete bytes (the exact failure mode
+        // that motivated the full-payload redesign).
+        return Err(format!(
+            "recovery: {n} create-replay failure(s) — full record bytes \
+             could not be written to device; non-tolerable, the device \
+             returned short I/O; investigate before restarting",
+            n = stats.failed_missing_record_bytes
+        ));
+    }
     if stats.failed_missing_primary > MAX_TOLERATED_MISSING_PRIMARY {
         return Err(format!(
             "recovery: {n} missing-primary replay failure(s) exceed cap \
@@ -199,6 +213,7 @@ pub(crate) fn replay_cause_label(cause: ReplayCause) -> &'static str {
         ReplayCause::IoError => "io-error",
         ReplayCause::CorruptEntry => "corrupt-entry",
         ReplayCause::LogicError => "logic-error",
+        ReplayCause::MissingRecordBytes => "missing-record-bytes",
     }
 }
 

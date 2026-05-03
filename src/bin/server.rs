@@ -525,6 +525,7 @@ fn main() {
                     failed_io = stats.failed_io,
                     failed_corrupt = stats.failed_corrupt,
                     failed_logic = stats.failed_logic,
+                    failed_missing_record_bytes = stats.failed_missing_record_bytes,
                     "recovery complete",
                 );
                 // Gap #5 (TERANODE_PRODUCTION_READINESS_GAPS.md): replace
@@ -540,6 +541,7 @@ fn main() {
                         failed_io = stats.failed_io,
                         failed_corrupt = stats.failed_corrupt,
                         failed_logic = stats.failed_logic,
+                        failed_missing_record_bytes = stats.failed_missing_record_bytes,
                         "recovery: aborting startup — {msg}",
                     );
                     std::process::exit(1);
