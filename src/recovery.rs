@@ -484,6 +484,33 @@ fn replay_entry(
         RedoOp::HashtableResizeBegin { .. } | RedoOp::HashtableResizeCommit { .. } => {
             ReplayResult::Skipped
         }
+        // Gap #8: compensation intents recorded mid-rollback. Replay
+        // restores the captured pre-apply state. Replay is idempotent —
+        // each handler reads the current device state and skips when it
+        // already matches the captured before-image.
+        RedoOp::CompensateUnsetMined {
+            tx_key,
+            block_id,
+            block_height,
+            subtree_idx,
+        } => replay_compensate_unset_mined(
+            device,
+            index,
+            tx_key,
+            *block_id,
+            *block_height,
+            *subtree_idx,
+        ),
+        RedoOp::CompensateReassign {
+            tx_key,
+            offset,
+            prior_utxo_hash,
+        } => replay_compensate_reassign(device, index, tx_key, *offset, prior_utxo_hash),
+        RedoOp::CompensatePrune {
+            tx_key,
+            offset,
+            prior_status,
+        } => replay_compensate_prune(device, index, tx_key, *offset, *prior_status),
         // Remaining ops (Reassign, PruneSlot, SetConflicting, SetLocked,
         // PreserveUntil, MarkOnLongestChain) are metadata-only writes.
         // They're idempotent: the metadata pwrite is atomic at the block
@@ -1018,6 +1045,156 @@ fn replay_metadata_op(
         }
         _ => ReplayResult::Skipped,
     }
+}
+
+/// Gap #8 (TERANODE_PRODUCTION_READINESS_GAPS.md): replay a
+/// `CompensateUnsetMined` redo entry recorded mid-rollback.
+///
+/// Re-adds the captured `block_id` / `block_height` / `subtree_idx` triple
+/// to the record's block-entry list, restoring the state that existed
+/// BEFORE the failed-replication unset-mined was applied. Idempotent: if
+/// the block entry is already present (with matching height/subtree),
+/// the call is a no-op.
+fn replay_compensate_unset_mined(
+    device: &dyn BlockDevice,
+    index: &PrimaryBackend,
+    tx_key: &TxKey,
+    block_id: u32,
+    block_height: u32,
+    subtree_idx: u32,
+) -> ReplayResult {
+    let ie = match index.lookup(tx_key) {
+        Some(e) => e,
+        // Compensation against a record that was deleted later in the log
+        // is benign — the record state we'd restore no longer exists.
+        // Use MissingPrimary which is the tolerable class.
+        None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
+    };
+
+    let mut meta = match io::read_metadata(device, ie.record_offset) {
+        Ok(m) => m,
+        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+    };
+
+    let count = meta.block_entry_count as usize;
+    let inline = count.min(INLINE_BLOCK_ENTRIES);
+
+    // Idempotency: if the entry is already present with matching values,
+    // skip. This handles re-replay of the same compensation entry.
+    for i in 0..inline {
+        if { meta.block_entries_inline[i].block_id } == block_id {
+            let existing = meta.block_entries_inline[i];
+            if { existing.block_height } == block_height
+                && { existing.subtree_idx } == subtree_idx
+            {
+                return ReplayResult::Skipped;
+            }
+            // A different height/subtree for the same block_id is an
+            // unexpected divergence — overwrite to the captured values.
+            meta.block_entries_inline[i] = BlockEntry {
+                block_id,
+                block_height,
+                subtree_idx,
+            };
+            if io::write_metadata(device, ie.record_offset, &meta).is_err() {
+                return ReplayResult::Failed(ReplayCause::IoError);
+            }
+            return ReplayResult::Applied;
+        }
+    }
+
+    // Not present — append to inline if room. If overflow would be needed,
+    // we can't reconstruct it from the redo log alone (overflow lives on
+    // device); fail closed since this signals divergent state.
+    if count < INLINE_BLOCK_ENTRIES {
+        meta.block_entries_inline[count] = BlockEntry {
+            block_id,
+            block_height,
+            subtree_idx,
+        };
+        meta.block_entry_count += 1;
+        if io::write_metadata(device, ie.record_offset, &meta).is_err() {
+            return ReplayResult::Failed(ReplayCause::IoError);
+        }
+        ReplayResult::Applied
+    } else {
+        // Full inline + overflow already exists. Restoring a block entry
+        // here would require allocating overflow space which is outside
+        // the recovery path's responsibility. Treat as logic-error so
+        // startup fails closed instead of silently dropping the entry.
+        ReplayResult::Failed(ReplayCause::LogicError)
+    }
+}
+
+/// Gap #8 (TERANODE_PRODUCTION_READINESS_GAPS.md): replay a
+/// `CompensateReassign` redo entry recorded mid-rollback.
+///
+/// Restores the slot's `utxo_hash` to the captured pre-reassign value
+/// and resets status to `UTXO_UNSPENT`. Idempotent: if the slot already
+/// has the prior hash and is UNSPENT, skip.
+fn replay_compensate_reassign(
+    device: &dyn BlockDevice,
+    index: &PrimaryBackend,
+    tx_key: &TxKey,
+    offset: u32,
+    prior_utxo_hash: &[u8; 32],
+) -> ReplayResult {
+    let ie = match index.lookup(tx_key) {
+        Some(e) => e,
+        None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
+    };
+
+    let slot = match io::read_utxo_slot(device, ie.record_offset, offset) {
+        Ok(s) => s,
+        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+    };
+
+    if slot.hash == *prior_utxo_hash && slot.status == UTXO_UNSPENT {
+        return ReplayResult::Skipped;
+    }
+
+    let restored = UtxoSlot::new_unspent(*prior_utxo_hash);
+    if io::write_utxo_slot(device, ie.record_offset, offset, &restored).is_err() {
+        return ReplayResult::Failed(ReplayCause::IoError);
+    }
+    ReplayResult::Applied
+}
+
+/// Gap #8 (TERANODE_PRODUCTION_READINESS_GAPS.md): replay a
+/// `CompensatePrune` redo entry recorded mid-rollback.
+///
+/// Restores the slot's `status` byte to the captured pre-prune value
+/// (UNSPENT, SPENT, FROZEN, etc.). The slot's hash and spending_data are
+/// preserved verbatim from the on-device bytes — the prune only mutates
+/// the status byte, so the rest of the slot is already what it was
+/// before. Idempotent: if `slot.status` already matches `prior_status`,
+/// skip.
+fn replay_compensate_prune(
+    device: &dyn BlockDevice,
+    index: &PrimaryBackend,
+    tx_key: &TxKey,
+    offset: u32,
+    prior_status: u8,
+) -> ReplayResult {
+    let ie = match index.lookup(tx_key) {
+        Some(e) => e,
+        None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
+    };
+
+    let mut slot = match io::read_utxo_slot(device, ie.record_offset, offset) {
+        Ok(s) => s,
+        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+    };
+
+    if slot.status == prior_status {
+        return ReplayResult::Skipped;
+    }
+
+    slot.status = prior_status;
+    if io::write_utxo_slot(device, ie.record_offset, offset, &slot).is_err() {
+        return ReplayResult::Failed(ReplayCause::IoError);
+    }
+    ReplayResult::Applied
 }
 
 // ---------------------------------------------------------------------------
