@@ -374,7 +374,7 @@ impl Index {
         let mut offset = start;
         while offset + aligned_read as u64 <= end {
             let mut buf = AlignedBuf::new(aligned_read, align);
-            if device.pread(&mut buf, offset).is_err() {
+            if device.pread_exact_at(&mut buf, offset).is_err() {
                 offset += align as u64;
                 continue;
             }
@@ -438,7 +438,7 @@ impl Index {
         let mut offset = start;
         while offset + aligned_read as u64 <= end {
             let mut buf = AlignedBuf::new(aligned_read, align);
-            if device.pread(&mut buf, offset).is_err() {
+            if device.pread_exact_at(&mut buf, offset).is_err() {
                 offset += align as u64;
                 continue;
             }

@@ -1968,7 +1968,7 @@ impl Engine {
         }
 
         self.device
-            .pwrite(&buf, record_offset)
+            .pwrite_all_at(&buf, record_offset)
             .map_err(|e| CreateError::StorageError {
                 detail: format!("{e}"),
             })?;
@@ -2020,7 +2020,7 @@ impl Engine {
 
         let mut buf = crate::device::AlignedBuf::new(read_len, align);
         self.device
-            .pread(&mut buf, aligned_base)
+            .pread_exact_at(&mut buf, aligned_base)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("{e}"),
             })?;
@@ -2174,7 +2174,7 @@ impl Engine {
             let read_len = (intra + count * 32).div_ceil(align) * align;
             let mut buf = crate::device::AlignedBuf::new(read_len, align);
             self.device
-                .pread(&mut buf, aligned_base)
+                .pread_exact_at(&mut buf, aligned_base)
                 .map_err(|e| SpendError::StorageError {
                     detail: format!("{e}"),
                 })?;
@@ -2213,7 +2213,7 @@ impl Engine {
         let write_len = (intra + children.len() * 32).div_ceil(align) * align;
         let mut wbuf = crate::device::AlignedBuf::new(write_len, align);
         self.device
-            .pread(&mut wbuf, aligned_base)
+            .pread_exact_at(&mut wbuf, aligned_base)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("{e}"),
             })?;
@@ -2221,7 +2221,7 @@ impl Engine {
             wbuf[intra + i * 32..intra + (i + 1) * 32].copy_from_slice(child);
         }
         self.device
-            .pwrite(&wbuf, aligned_base)
+            .pwrite_all_at(&wbuf, aligned_base)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("{e}"),
             })?;
@@ -2258,7 +2258,7 @@ impl Engine {
         let read_len = (intra + count * 32).div_ceil(align) * align;
         let mut buf = crate::device::AlignedBuf::new(read_len, align);
         self.device
-            .pread(&mut buf, aligned_base)
+            .pread_exact_at(&mut buf, aligned_base)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("{e}"),
             })?;
@@ -3001,7 +3001,7 @@ fn read_overflow_entries(
     let data_size = overflow_count * BLOCK_ENTRY_SIZE;
     let read_size = io::align_up(data_size, alignment);
     let mut buf = AlignedBuf::new(read_size, alignment);
-    device.pread(&mut buf, overflow_offset)?;
+    device.pread_exact_at(&mut buf, overflow_offset)?;
 
     let mut entries = Vec::with_capacity(overflow_count);
     for i in 0..overflow_count {
@@ -3052,7 +3052,7 @@ fn write_overflow_entries(
         let start = i * BLOCK_ENTRY_SIZE;
         entry.to_bytes(&mut buf[start..start + BLOCK_ENTRY_SIZE]);
     }
-    device.pwrite(&buf, offset)?;
+    device.pwrite_all_at(&buf, offset)?;
     metadata.block_overflow_offset = offset;
     Ok(())
 }

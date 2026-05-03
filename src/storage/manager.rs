@@ -306,10 +306,14 @@ impl StorageManager {
 
         let mut buf = AlignedBuf::new(total, align);
         if intra > 0 || !data.len().is_multiple_of(align) {
-            let _ = self.device.pread(&mut buf, aligned_base);
+            // Pre-read for read-modify-write. A failure here is non-fatal
+            // because the bytes we read are immediately overwritten by
+            // `data` below; on success we are guaranteed an exact buffer
+            // (no partial blocks).
+            let _ = self.device.pread_exact_at(&mut buf, aligned_base);
         }
         buf[intra..intra + data.len()].copy_from_slice(data);
-        self.device.pwrite(&buf, aligned_base)?;
+        self.device.pwrite_all_at(&buf, aligned_base)?;
         Ok(())
     }
 
@@ -321,7 +325,7 @@ impl StorageManager {
         let total = (intra + len).div_ceil(align) * align;
 
         let mut buf = AlignedBuf::new(total, align);
-        self.device.pread(&mut buf, aligned_base)?;
+        self.device.pread_exact_at(&mut buf, aligned_base)?;
         Ok(buf[intra..intra + len].to_vec())
     }
 }

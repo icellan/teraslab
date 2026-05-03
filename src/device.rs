@@ -45,6 +45,30 @@ pub enum DeviceError {
     /// mismatch on the [`TxMetadata`](crate::record::TxMetadata) header).
     #[error("record corruption: {detail}")]
     RecordCorruption { detail: String },
+
+    /// A `pread_exact_at` could not deliver the full requested byte range:
+    /// the device returned 0 bytes (EOF) before `expected` bytes had been
+    /// transferred. `got` is the number of bytes successfully read before
+    /// the short return; `offset` is the original starting offset of the
+    /// exact-read request. Treated as fatal corruption by callers.
+    #[error(
+        "short read at offset {offset}: expected {expected} bytes, got {got} before EOF"
+    )]
+    ShortRead {
+        expected: usize,
+        got: usize,
+        offset: u64,
+    },
+
+    /// A `pwrite_all_at` made no forward progress: the underlying `pwrite`
+    /// returned 0 bytes written even though the request still had bytes to
+    /// transfer. Per the production-readiness gap document, any short
+    /// write is treated as fatal corruption — there is no clean way to
+    /// recover without risking partial-write torn state.
+    #[error(
+        "write stalled at offset {offset}: 0 bytes written with {remaining} bytes still pending"
+    )]
+    WriteStalled { offset: u64, remaining: usize },
 }
 
 /// Minimum supported I/O alignment for block-device-backed storage.
@@ -127,6 +151,85 @@ pub trait BlockDevice: Send + Sync {
     /// device (`S_IFBLK`), or `false` for regular files and in-memory devices.
     fn is_block_device(&self) -> bool {
         false
+    }
+
+    /// Read exactly `buf.len()` bytes starting at `offset`, looping until the
+    /// buffer is fully populated.
+    ///
+    /// On platforms where the underlying [`pread`](Self::pread) can return a
+    /// short count (POSIX is allowed to return any non-negative byte count
+    /// shorter than the request), this method continues to issue further
+    /// reads at the appropriate offset until the buffer is filled.
+    ///
+    /// # Errors
+    ///
+    /// - [`DeviceError::ShortRead`] — the underlying `pread` returned `0`
+    ///   bytes (EOF) before the requested range had been fully transferred.
+    /// - Any error returned by the underlying [`pread`](Self::pread)
+    ///   (alignment violations, out-of-bounds, libc errors, etc.) is
+    ///   propagated unchanged.
+    ///
+    /// # Behaviour vs. `pread`
+    ///
+    /// Callers in production code must use this helper instead of `pread`
+    /// directly: gap-doc requirement is that all reads are full-or-fail.
+    /// `pread` itself remains available for the rare callers that genuinely
+    /// want the byte-count return (and currently only test code does).
+    fn pread_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+        let total = buf.len();
+        let mut done = 0usize;
+        while done < total {
+            // Safety on slicing: `done < total` and `total == buf.len()` so
+            // the slice is non-empty and in-bounds.
+            let n = self.pread(&mut buf[done..], offset + done as u64)?;
+            if n == 0 {
+                return Err(DeviceError::ShortRead {
+                    expected: total,
+                    got: done,
+                    offset,
+                });
+            }
+            // Defence in depth: a buggy implementation that returned more
+            // than the requested length would let `done` overshoot. Saturate
+            // on debug; on release this is bounded by the next loop check.
+            debug_assert!(n <= total - done, "pread returned more than requested");
+            done = done.saturating_add(n).min(total);
+        }
+        Ok(())
+    }
+
+    /// Write all of `buf` starting at `offset`, looping until every byte has
+    /// been accepted by the underlying device.
+    ///
+    /// Per the production-readiness gap document, any short write that
+    /// fails to make forward progress is treated as fatal corruption: this
+    /// method returns [`DeviceError::WriteStalled`] if the underlying
+    /// [`pwrite`](Self::pwrite) returns `0` bytes with bytes still pending.
+    /// Short writes that *do* make forward progress are simply retried at
+    /// the new offset until the buffer is fully written.
+    ///
+    /// # Errors
+    ///
+    /// - [`DeviceError::WriteStalled`] — the underlying `pwrite` returned
+    ///   `0` bytes with bytes still pending; recovery is unsafe because
+    ///   the write may already be partially applied (torn).
+    /// - Any error returned by the underlying [`pwrite`](Self::pwrite) is
+    ///   propagated unchanged.
+    fn pwrite_all_at(&self, buf: &[u8], offset: u64) -> Result<()> {
+        let total = buf.len();
+        let mut done = 0usize;
+        while done < total {
+            let n = self.pwrite(&buf[done..], offset + done as u64)?;
+            if n == 0 {
+                return Err(DeviceError::WriteStalled {
+                    offset,
+                    remaining: total - done,
+                });
+            }
+            debug_assert!(n <= total - done, "pwrite returned more than requested");
+            done = done.saturating_add(n).min(total);
+        }
+        Ok(())
     }
 }
 
@@ -509,19 +612,28 @@ impl BlockDevice for DirectDevice {
         {
             use std::os::unix::io::AsRawFd;
             let fd = self.file.as_raw_fd();
-            // Safety: fd is valid, buf is valid for buf.len() bytes.
-            let n = unsafe {
-                libc::pread(
-                    fd,
-                    buf.as_mut_ptr().cast(),
-                    buf.len(),
-                    offset as libc::off_t,
-                )
-            };
-            if n < 0 {
-                return Err(DeviceError::Io(std::io::Error::last_os_error()));
+            // POSIX permits `pread` to return -1 with errno EINTR if a
+            // signal is delivered before any data is read. Retry until we
+            // either get data, hit EOF (n == 0), or see a real error.
+            loop {
+                // Safety: fd is valid, buf is valid for buf.len() bytes.
+                let n = unsafe {
+                    libc::pread(
+                        fd,
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                        offset as libc::off_t,
+                    )
+                };
+                if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return Err(DeviceError::Io(err));
+                }
+                return Ok(n as usize);
             }
-            Ok(n as usize)
         }
         #[cfg(not(unix))]
         {
@@ -546,13 +658,23 @@ impl BlockDevice for DirectDevice {
         {
             use std::os::unix::io::AsRawFd;
             let fd = self.file.as_raw_fd();
-            // Safety: fd is valid, buf is valid for buf.len() bytes.
-            let n =
-                unsafe { libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), offset as libc::off_t) };
-            if n < 0 {
-                return Err(DeviceError::Io(std::io::Error::last_os_error()));
+            // POSIX permits `pwrite` to return -1 with errno EINTR if a
+            // signal is delivered before any data is written. Retry until
+            // we get a non-EINTR result.
+            loop {
+                // Safety: fd is valid, buf is valid for buf.len() bytes.
+                let n = unsafe {
+                    libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), offset as libc::off_t)
+                };
+                if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return Err(DeviceError::Io(err));
+                }
+                return Ok(n as usize);
             }
-            Ok(n as usize)
         }
         #[cfg(not(unix))]
         {
@@ -1082,5 +1204,220 @@ mod tests {
             verify[0], 0x99,
             "post-panic pwrite must be durably readable — lock did not poison"
         );
+    }
+
+    // -- Exact-loop helper tests (gap #4: partial I/O is fatal) --
+
+    /// Synthetic device that returns short counts on `pread`/`pwrite` so
+    /// the default trait helpers can be exercised against the multi-call
+    /// path. All writes/reads are recorded against the inner Vec for the
+    /// final-state assertions.
+    struct ChunkyDevice {
+        data: parking_lot::Mutex<Vec<u8>>,
+        chunk: usize,
+        read_eof_at: Option<usize>,
+        zero_write_at: Option<usize>,
+        // Use Mutex over Cell so the device can stay Send + Sync without
+        // unsafe impls.
+        progress: parking_lot::Mutex<usize>,
+    }
+
+    impl ChunkyDevice {
+        fn new(size: usize, chunk: usize) -> Self {
+            Self {
+                data: parking_lot::Mutex::new(vec![0u8; size]),
+                chunk,
+                read_eof_at: None,
+                zero_write_at: None,
+                progress: parking_lot::Mutex::new(0),
+            }
+        }
+        fn with_read_eof_at(mut self, n: usize) -> Self {
+            self.read_eof_at = Some(n);
+            self
+        }
+        fn with_zero_write_at(mut self, n: usize) -> Self {
+            self.zero_write_at = Some(n);
+            self
+        }
+    }
+
+    impl BlockDevice for ChunkyDevice {
+        fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+            let mut p = self.progress.lock();
+            if let Some(eof_at) = self.read_eof_at {
+                if *p >= eof_at {
+                    return Ok(0);
+                }
+            }
+            let take = self.chunk.min(buf.len());
+            let data = self.data.lock();
+            let off = offset as usize;
+            if off + take > data.len() {
+                return Err(DeviceError::OutOfBounds {
+                    offset,
+                    len: take as u64,
+                    device_size: data.len() as u64,
+                });
+            }
+            buf[..take].copy_from_slice(&data[off..off + take]);
+            *p += take;
+            Ok(take)
+        }
+
+        fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize> {
+            let mut p = self.progress.lock();
+            if let Some(zero_at) = self.zero_write_at {
+                if *p >= zero_at {
+                    return Ok(0);
+                }
+            }
+            let take = self.chunk.min(buf.len());
+            let mut data = self.data.lock();
+            let off = offset as usize;
+            if off + take > data.len() {
+                return Err(DeviceError::OutOfBounds {
+                    offset,
+                    len: take as u64,
+                    device_size: data.len() as u64,
+                });
+            }
+            data[off..off + take].copy_from_slice(&buf[..take]);
+            *p += take;
+            Ok(take)
+        }
+
+        fn alignment(&self) -> usize {
+            // Tests use unaligned-friendly byte ranges; alignment is unused
+            // by the helpers directly (the underlying pread/pwrite enforces
+            // it on real devices).
+            1
+        }
+
+        fn size(&self) -> u64 {
+            self.data.lock().len() as u64
+        }
+
+        fn sync(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pwrite_all_at_loops_over_short_writes() {
+        // 4-byte chunk, 17-byte buffer ⇒ 5 underlying pwrite calls.
+        let dev = ChunkyDevice::new(64, 4);
+        let buf: Vec<u8> = (0..17).collect();
+        dev.pwrite_all_at(&buf, 0).unwrap();
+        let stored = dev.data.lock();
+        assert_eq!(&stored[..17], &buf[..]);
+        // Untouched tail must remain zero.
+        assert!(stored[17..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn pread_exact_at_loops_over_short_reads() {
+        // Pre-populate the device, then read it back with a short-chunk
+        // device so pread_exact_at must call pread multiple times.
+        let dev = ChunkyDevice::new(64, 5);
+        {
+            let mut d = dev.data.lock();
+            for (i, b) in d.iter_mut().enumerate() {
+                *b = (i * 3) as u8;
+            }
+        }
+        let mut out = vec![0u8; 23];
+        dev.pread_exact_at(&mut out, 0).unwrap();
+        for (i, b) in out.iter().enumerate() {
+            assert_eq!(*b, (i * 3) as u8, "byte {i} mismatch");
+        }
+    }
+
+    #[test]
+    fn pread_exact_at_returns_short_read_on_mid_buffer_eof() {
+        // Configure the device to return EOF (0 bytes) after 7 bytes so
+        // pread_exact_at hits a short-read partway through a 32-byte
+        // request.
+        let dev = ChunkyDevice::new(64, 4).with_read_eof_at(7);
+        let mut out = vec![0u8; 32];
+        match dev.pread_exact_at(&mut out, 0) {
+            Err(DeviceError::ShortRead {
+                expected,
+                got,
+                offset,
+            }) => {
+                assert_eq!(expected, 32, "expected reflects total request");
+                // The chunk size is 4, so progress lands on a multiple of 4
+                // — the first 4-byte read brings progress to 4, the next to
+                // 8 (which is past eof_at=7), so the third call returns 0
+                // with `got == 8`.
+                assert_eq!(got, 8, "got reflects bytes read before EOF");
+                assert_eq!(offset, 0, "offset reflects original starting offset");
+            }
+            other => panic!("expected ShortRead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pwrite_all_at_returns_write_stalled_on_zero_progress() {
+        // Configure the device to make 0 forward progress immediately —
+        // the first pwrite returns 0 bytes so pwrite_all_at must fail
+        // fatally without any data having been written.
+        let dev = ChunkyDevice::new(64, 4).with_zero_write_at(0);
+        let buf = vec![0xABu8; 16];
+        match dev.pwrite_all_at(&buf, 0) {
+            Err(DeviceError::WriteStalled { offset, remaining }) => {
+                assert_eq!(offset, 0);
+                assert_eq!(remaining, 16);
+            }
+            other => panic!("expected WriteStalled, got {other:?}"),
+        }
+        // Nothing must have been written.
+        assert!(dev.data.lock().iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn pwrite_all_at_returns_write_stalled_on_mid_buffer_zero() {
+        // Make forward progress for 6 bytes, then pwrite returns 0. The
+        // fatal error must report the still-pending byte count, not 0.
+        let dev = ChunkyDevice::new(64, 4).with_zero_write_at(6);
+        let buf = vec![0xCDu8; 20];
+        match dev.pwrite_all_at(&buf, 0) {
+            Err(DeviceError::WriteStalled { offset, remaining }) => {
+                assert_eq!(offset, 0);
+                // Two 4-byte writes succeed (progress = 8 >= zero_at = 6
+                // after second write), so remaining = 20 - 8 = 12.
+                assert_eq!(remaining, 12, "remaining must reflect pending bytes");
+            }
+            other => panic!("expected WriteStalled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pwrite_all_at_then_pread_exact_at_round_trip_on_memory_device() {
+        // The default helpers must work over the production MemoryDevice
+        // (which never returns short counts) — they should complete in a
+        // single underlying call.
+        let dev = MemoryDevice::new(8192, 4096).unwrap();
+        let mut write_buf = AlignedBuf::new(4096, 4096);
+        for (i, b) in write_buf.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        dev.pwrite_all_at(&write_buf, 0).unwrap();
+
+        let mut read_buf = AlignedBuf::new(4096, 4096);
+        dev.pread_exact_at(&mut read_buf, 0).unwrap();
+        assert_eq!(&*write_buf, &*read_buf);
+    }
+
+    #[test]
+    fn pread_exact_at_propagates_alignment_error_from_inner_pread() {
+        // The default helper must surface the inner pread error verbatim.
+        let dev = MemoryDevice::new(8192, 4096).unwrap();
+        let mut buf = AlignedBuf::new(4096, 4096);
+        match dev.pread_exact_at(&mut buf, 1) {
+            Err(DeviceError::AlignmentViolation { .. }) => {}
+            other => panic!("expected AlignmentViolation, got {other:?}"),
+        }
     }
 }
