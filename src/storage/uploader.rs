@@ -115,22 +115,26 @@ impl BlobUploader {
     }
 
     /// Process a single upload task: upload blob, then pwrite ExternalRef.
+    ///
+    /// The blob store computes the content SHA-256 and length as part of
+    /// its atomic write path; we record both in the on-device `ExternalRef`
+    /// so subsequent reads (or audit tooling) can integrity-verify the blob
+    /// against the record metadata.
     fn process_task(
         task: &UploadTask,
         blob_store: &dyn BlobStore,
         device: &dyn BlockDevice,
     ) -> std::result::Result<(), BlobError> {
-        // Upload the blob
-        blob_store.put(&task.tx_id, &task.data)?;
+        // Upload the blob and capture the durable content digest.
+        let digest = blob_store.put(&task.tx_id, &task.data)?;
 
-        // Compute a simple content hash (CRC32 of the data, stored in content_hash field)
-        let crc = crc32fast::hash(&task.data);
-
-        // Build ExternalRef
+        // Build ExternalRef. `content_hash` is the SHA-256 of the actual
+        // blob payload — not the txid — so that bit rot or replacement of
+        // the on-disk blob is detectable from the device record alone.
         let ext_ref = ExternalRef {
-            store_type: 1,            // 1 = file/object store
-            content_hash: task.tx_id, // Use txid as content key
-            total_size: task.data.len() as u64,
+            store_type: 1, // 1 = file/object store
+            content_hash: digest.sha256,
+            total_size: digest.length,
             input_count: task.inputs_len,
             output_count: task.outputs_len,
             inputs_offset: 0,
@@ -138,7 +142,7 @@ impl BlobUploader {
         };
 
         // pwrite the ExternalRef into the metadata region
-        Self::write_external_ref(device, task.record_offset, &ext_ref, crc).map_err(|e| {
+        Self::write_external_ref(device, task.record_offset, &ext_ref).map_err(|e| {
             BlobError::Io(std::io::Error::other(format!("device write failed: {e}")))
         })?;
 
@@ -153,7 +157,6 @@ impl BlobUploader {
         device: &dyn BlockDevice,
         record_offset: u64,
         ext_ref: &ExternalRef,
-        _content_crc: u32,
     ) -> std::result::Result<(), crate::device::DeviceError> {
         let mut meta = crate::io::read_metadata(device, record_offset)?;
         meta.external_ref = *ext_ref;
@@ -263,6 +266,18 @@ mod tests {
         assert_eq!({ ext.total_size }, data.len() as u64);
         assert_eq!({ ext.input_count }, 10);
         assert_eq!({ ext.output_count }, 5);
+        // content_hash must be the actual SHA-256 of the blob payload, not the txid.
+        let expected = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&data);
+            let out = h.finalize();
+            let mut d = [0u8; 32];
+            d.copy_from_slice(&out);
+            d
+        };
+        assert_eq!(ext.content_hash, expected);
+        assert_ne!(ext.content_hash, tx_id);
     }
 
     #[test]

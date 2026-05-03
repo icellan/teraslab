@@ -36,6 +36,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time"] }
 toml = "0.8"
