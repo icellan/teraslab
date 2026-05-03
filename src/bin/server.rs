@@ -330,14 +330,72 @@ fn main() {
             match PrimaryBackend::restore_all(snap_path) {
                 Ok((idx, dah, unmined, flags)) => {
                     tracing::info!(entries = idx.len(), "index restored from snapshot");
-                    let secondaries = if flags.dah_needs_rebuild || flags.unmined_needs_rebuild {
-                        if flags.dah_needs_rebuild {
-                            tracing::warn!("DAH index needs rebuild (snapshot corrupt)");
-                        }
-                        if flags.unmined_needs_rebuild {
-                            tracing::warn!("unmined index needs rebuild (snapshot corrupt)");
-                        }
+                    let secondaries = if flags.dah_needs_rebuild && flags.unmined_needs_rebuild {
+                        tracing::warn!("both secondary indexes need rebuild (snapshot corrupt)");
                         rebuild_in_memory_secondaries(&*device, &allocator)
+                    } else if flags.dah_needs_rebuild {
+                        tracing::warn!("DAH index needs rebuild (snapshot corrupt)");
+                        // Preserve the intact unmined from the snapshot;
+                        // rebuild only DAH from the device scan. Failure
+                        // marks DAH as degraded but keeps unmined healthy.
+                        match teraslab::index::PrimaryBackend::rebuild_secondary(
+                            &*device, &allocator,
+                        ) {
+                            Ok((rebuilt_dah, _)) => SecondaryLoadOutcome {
+                                dah: DahBackend::from(rebuilt_dah),
+                                unmined: UnminedBackend::from(unmined),
+                                status: SecondaryStatus {
+                                    dah_ok: true,
+                                    unmined_ok: true,
+                                },
+                            },
+                            Err(e) => {
+                                tracing::error!(
+                                    err = %e,
+                                    "DAH rebuild failed — degraded readiness",
+                                );
+                                SecondaryLoadOutcome {
+                                    dah: DahBackend::from(
+                                        teraslab::index::DahIndex::new(),
+                                    ),
+                                    unmined: UnminedBackend::from(unmined),
+                                    status: SecondaryStatus {
+                                        dah_ok: false,
+                                        unmined_ok: true,
+                                    },
+                                }
+                            }
+                        }
+                    } else if flags.unmined_needs_rebuild {
+                        tracing::warn!("unmined index needs rebuild (snapshot corrupt)");
+                        match teraslab::index::PrimaryBackend::rebuild_secondary(
+                            &*device, &allocator,
+                        ) {
+                            Ok((_, rebuilt_unmined)) => SecondaryLoadOutcome {
+                                dah: DahBackend::from(dah),
+                                unmined: UnminedBackend::from(rebuilt_unmined),
+                                status: SecondaryStatus {
+                                    dah_ok: true,
+                                    unmined_ok: true,
+                                },
+                            },
+                            Err(e) => {
+                                tracing::error!(
+                                    err = %e,
+                                    "unmined rebuild failed — degraded readiness",
+                                );
+                                SecondaryLoadOutcome {
+                                    dah: DahBackend::from(dah),
+                                    unmined: UnminedBackend::from(
+                                        teraslab::index::UnminedIndex::new(),
+                                    ),
+                                    status: SecondaryStatus {
+                                        dah_ok: true,
+                                        unmined_ok: false,
+                                    },
+                                }
+                            }
+                        }
                     } else {
                         secondaries_from_pair(dah, unmined)
                     };
