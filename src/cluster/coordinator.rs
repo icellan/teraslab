@@ -5859,14 +5859,40 @@ impl RunningCluster {
     /// topology has been committed.
     pub fn alive_node_count(&self) -> usize {
         let committed = self.topology_authority.committed_members();
+        let addrs = self.node_addrs.read().unwrap();
         if committed.is_empty() {
-            self.node_addrs.read().unwrap().len()
+            // Falling back to SWIM addrs during single-node startup.
+            // R-039 (EF-02): the local node always counts as alive
+            // even when `node_addrs` doesn't list it (production SWIM
+            // returns before peer-registering self at swim.rs:454).
+            // Test harnesses sometimes inject self into node_addrs
+            // explicitly; check first to avoid double-counting.
+            if addrs.contains_key(&self.self_id) {
+                addrs.len()
+            } else {
+                addrs.len() + 1
+            }
         } else {
-            let addrs = self.node_addrs.read().unwrap();
-            committed
+            // R-039 (EF-02): `node_addrs` does NOT contain self in
+            // production. Pre-fix this `filter().count()` therefore
+            // excluded the local node from "alive", so a 3-node
+            // cluster that lost a single peer dropped to a 1-node
+            // count and rejected its OWN majority writes with
+            // NO_QUORUM. Count addrs-known committed members AND add
+            // 1 for self if self is in committed but not addrs (the
+            // production case); skip the +1 when test harnesses have
+            // explicitly put self in `node_addrs`.
+            let peers = committed
                 .iter()
                 .filter(|node| addrs.contains_key(node))
-                .count()
+                .count();
+            let self_committed = committed.contains(&self.self_id);
+            let self_in_addrs = addrs.contains_key(&self.self_id);
+            if self_committed && !self_in_addrs {
+                peers + 1
+            } else {
+                peers
+            }
         }
     }
 
@@ -8654,6 +8680,37 @@ mod tests {
         );
 
         assert_eq!(cluster.alive_node_count(), 2);
+    }
+
+    /// R-039 (EF-02): production SWIM does NOT register self in
+    /// `node_addrs` (see `swim.rs:454`). When a 3-node cluster loses
+    /// one peer, the surviving 2-node majority must report
+    /// `alive_node_count() == 2` so its writes are accepted.
+    /// Pre-fix `node_addrs.filter(...).count()` returned 1
+    /// (the surviving peer) and dispatch rejected with NO_QUORUM
+    /// even though the cluster was healthy from a quorum perspective.
+    #[test]
+    fn alive_node_count_includes_self_when_not_in_node_addrs() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 9);
+        // Production-shape harness: only the surviving peer is in
+        // node_addrs; self (NodeId(1)) is NOT — exactly the case the
+        // audit calls out.
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(2), "127.0.0.1:4302".parse().unwrap())],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        assert_eq!(
+            cluster.alive_node_count(),
+            2,
+            "self must count as alive even when SWIM omits it from node_addrs"
+        );
     }
 
     // ----------------------------------------------------------------------

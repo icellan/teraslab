@@ -404,11 +404,11 @@
 ### R-039 — [quorum] `alive_node_count` excludes self → false NO_QUORUM in healthy clusters
 - **Source:** AUDIT.md EF-02
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/cluster/coordinator.rs:5860-5871, src/server/dispatch.rs:2084-2104
+- **Status:** RESOLVED
+- **Files:** src/cluster/coordinator.rs (`alive_node_count`)
 - **Cluster:** quorum
-- **Notes:** One-line fix: `addrs.len() + 1` in committed-members branch when `committed_members.contains(self_id)`. Or add self entry to `node_addrs` at coordinator startup and keep it there (also fixes EF-05).
-- **Test:** `three_node_cluster_tolerates_loss_of_one_peer` (was missing — EF-03)
+- **Resolution:** Production SWIM (`swim.rs:454`) returns BEFORE peer-registering self, so `node_addrs` excludes the local node. The pre-fix `committed.iter().filter(|node| addrs.contains_key(node)).count()` therefore reported one-less-than-actual; in a 3-node cluster losing 1 peer it returned 1 and dispatch rejected with NO_QUORUM despite the surviving 2-node majority. New logic: count addrs-known committed peers + 1 if self is committed but absent from `node_addrs`. Test harnesses that explicitly inject self into `node_addrs` are handled correctly via the `!self_in_addrs` check, so the existing `alive_node_count_only_counts_live_committed_members` test still passes. Added EF-03 regression `alive_node_count_includes_self_when_not_in_node_addrs` that sets up the production-shape (self absent from addrs, surviving peer present, 3-node committed) and asserts count==2.
+- **Verification:** `cargo test --all` 1501 passed (was 1500, +1 net — added 1 new test, fixed nothing else). Clippy + fmt clean. R-040 (EF-03 integration test) is partially covered by this unit test; the full multi-node TCP variant is still tracked under R-040.
 
 ### R-040 — [quorum] No integration coverage for isolated 1-node remnant rejecting writes
 - **Source:** AUDIT.md EF-03
