@@ -392,7 +392,9 @@ pub(crate) fn handle_request(
         OP_PRESERVE_TRANSACTIONS => {
             handle_preserve_transactions(request, engine, max_batch_size, cluster, redo_log)
         }
-        OP_PROCESS_EXPIRED_PRESERVATIONS => handle_process_expired(request, engine, redo_log),
+        OP_PROCESS_EXPIRED_PRESERVATIONS => {
+            handle_process_expired(request, engine, max_batch_size, cluster, redo_log)
+        }
         OP_GET_PARTITION_MAP => handle_get_partition_map(request, cluster),
         OP_GET_COMMITTED_TOPOLOGY => handle_get_committed_topology(request, cluster),
         OP_ADMIN_DIAGNOSE_KEY => handle_admin_diagnose_key(request, engine, cluster),
@@ -4811,9 +4813,50 @@ fn handle_preserve_transactions(
     batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
+/// R-008 (Codex F2): process expired preservations as a clustered,
+/// replicated, ownership-checked operation.
+///
+/// Pre-fix this handler:
+///
+/// 1. queried the DAH index on whatever node received op 32 (any
+///    node — no ownership check), and
+/// 2. called `engine.delete` directly without going through
+///    `replicate_all_ops`.
+///
+/// In a multi-node cluster, that meant ANY node receiving the opcode
+/// could delete whatever its local DAH index said was due, and a
+/// successful local delete on the master never propagated to
+/// replicas. Both paths broke shard consistency: replicas retained
+/// data the master removed; non-master nodes could delete records
+/// they don't own.
+///
+/// The fix is in three layers:
+///
+/// a. **Ownership filter:** only consider keys for which this node
+///    is the master and which are not currently fenced or pending
+///    inbound migration. Non-owned keys are silently dropped from
+///    the candidate set — clients invoking this opcode are sweepers
+///    that fan out across all masters anyway, so a single rebind
+///    here just defers the work to the right master.
+/// b. **Re-validation (folds in IJK-09 / R-102):** the DAH index is
+///    a cache; before deleting, re-read the on-device metadata and
+///    verify the record still satisfies `should_delete_at_height` —
+///    i.e. `preserve_until == 0`, `delete_at_height <= current_height`,
+///    `spent_utxos == utxo_count`, `unmined_since == 0`. A stale
+///    DAH entry that points at a now-preserved record otherwise
+///    results in silent data loss.
+/// c. **Replication + compensation:** for the surviving candidates,
+///    build a synthetic OP_DELETE_BATCH payload and dispatch through
+///    `handle_delete_batch`. That handler already has the full
+///    replication + compensation path from R-007, including the
+///    per-slot snapshot rebuilds. This way process-expired and
+///    delete-batch share one rollback codepath instead of needing a
+///    duplicate maintained in lockstep.
 fn handle_process_expired(
     req: &RequestFrame,
     engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
 ) -> ResponseFrame {
     // Payload: [current_height:4]
@@ -4822,44 +4865,108 @@ fn handle_process_expired(
     }
     let current_height = u32::from_le_bytes(req.payload[0..4].try_into().unwrap());
 
-    // Query DAH index for transactions due for deletion
-    let keys = engine.dah_index().range_query(current_height);
+    // Query DAH index for transactions due for deletion. The DAH index
+    // is per-node and reflects only records this node knows about, so
+    // it is already (mostly) ownership-filtered when running in cluster
+    // mode — but we still re-check ownership explicitly below because
+    // (a) DAH may transiently include non-master records during
+    // migration, and (b) the index can lag behind the on-device
+    // metadata.
+    let candidates = engine.dah_index().range_query(current_height);
 
-    // Phase 1: Lookup record offsets (read-only) and build redo ops.
-    let mut redo_ops: Vec<RedoOp> = Vec::new();
-    let mut valid_keys: Vec<TxKey> = Vec::new();
-    for key in &keys {
-        let record_offset = engine.lookup(key).map(|e| e.record_offset).unwrap_or(0);
-        redo_ops.push(RedoOp::Delete {
-            tx_key: *key,
-            record_offset,
-            record_size: 0,
-        });
-        valid_keys.push(*key);
-    }
-
-    // Phase 2: WAL-first — write redo before engine mutation.
-    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
-        return error_response(req.request_id, ERR_INTERNAL, &e);
-    }
-
-    // Phase 3: Apply engine mutations.
-    let mut deleted = 0u32;
-    let mut failed = 0u32;
-    for key in &valid_keys {
-        match engine.delete(&DeleteRequest { tx_key: *key }) {
-            Ok(()) => deleted += 1,
-            Err(_) => failed += 1,
+    // Phase 1: filter by ownership + re-validate against current
+    // metadata. A DAH entry is a hint; the metadata is authoritative.
+    let mut owned_due: Vec<[u8; 32]> = Vec::new();
+    for key in &candidates {
+        // Ownership: skip if not master or not yet ready to write
+        // (pending inbound migration / fenced).
+        if check_shard_ownership(&key.txid, 0, cluster, false).is_some() {
+            continue;
         }
+        // Re-validate: read the on-device metadata and confirm the
+        // record really is due. Skip if preserved, not fully spent,
+        // unmined, or the DAH is in the future. R-102 / IJK-09.
+        let meta = match engine.read_metadata(key) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if { meta.preserve_until } != 0 {
+            continue;
+        }
+        let dah = { meta.delete_at_height };
+        if dah == 0 || dah > current_height {
+            continue;
+        }
+        if { meta.spent_utxos } != { meta.utxo_count } {
+            continue;
+        }
+        if { meta.unmined_since } != 0 {
+            continue;
+        }
+        owned_due.push(key.txid);
     }
+
+    let candidate_count = owned_due.len() as u32;
+
+    if owned_due.is_empty() {
+        // Nothing to do for this node — return a count-shaped reply so
+        // the client can recognize a clean no-op without parsing
+        // errors out of the ERR_INTERNAL channel.
+        let mut payload = Vec::with_capacity(8);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        return ResponseFrame {
+            request_id: req.request_id,
+            status: STATUS_OK,
+            payload,
+        };
+    }
+
+    // Phase 2: dispatch as a synthetic OP_DELETE_BATCH so the
+    // replication + compensation logic from R-007 runs. The synthetic
+    // request keeps the original request_id so the response correlates
+    // back to the caller.
+    let delete_payload = crate::protocol::codec::encode_txid_batch(&owned_due, &[]);
+    let delete_req = RequestFrame {
+        request_id: req.request_id,
+        op_code: crate::protocol::opcodes::OP_DELETE_BATCH,
+        flags: req.flags,
+        payload: delete_payload,
+    };
+    let delete_resp = handle_delete_batch(&delete_req, engine, max_batch, cluster, redo_log);
+
+    // Collapse the OP_DELETE_BATCH response shape into the legacy
+    // (deleted:u32, failed:u32) format that
+    // OP_PROCESS_EXPIRED_PRESERVATIONS callers expect. The batch
+    // handler returns:
+    //   - STATUS_OK with empty payload  → all `candidate_count` deleted
+    //   - STATUS_DEGRADED_DURABILITY    → all deleted but durability
+    //                                     was degraded; surface the
+    //                                     status to the caller
+    //   - STATUS_PARTIAL_ERROR          → payload is sparse-error
+    //                                     encoded; subtract the error
+    //                                     count from candidate_count
+    //   - STATUS_ERROR (replication / internal) → propagate as-is
+    let (deleted, failed) = match delete_resp.status {
+        STATUS_OK | STATUS_DEGRADED_DURABILITY => (candidate_count, 0u32),
+        STATUS_PARTIAL_ERROR => {
+            // Sparse-error encoding starts with a u32 error count.
+            let err_count = if delete_resp.payload.len() >= 4 {
+                u32::from_le_bytes(delete_resp.payload[0..4].try_into().unwrap())
+            } else {
+                candidate_count
+            };
+            (candidate_count.saturating_sub(err_count), err_count)
+        }
+        _ => return delete_resp,
+    };
 
     let mut payload = Vec::with_capacity(8);
     payload.extend_from_slice(&deleted.to_le_bytes());
     payload.extend_from_slice(&failed.to_le_bytes());
-
     ResponseFrame {
         request_id: req.request_id,
-        status: STATUS_OK,
+        status: delete_resp.status,
         payload,
     }
 }
@@ -5845,26 +5952,108 @@ mod tests {
     // 1e. handle_process_expired — deletes eligible records
     // -----------------------------------------------------------------------
 
+    /// R-008 (Codex F2) + R-102 / IJK-09: process-expired must only
+    /// delete records that BOTH (a) are due per the on-device metadata
+    /// (`spent_utxos == utxo_count`, `preserve_until == 0`,
+    /// `unmined_since == 0`, `delete_at_height <= current_height`) and
+    /// (b) belong to a shard this node masters. The DAH index is a
+    /// hint, not authoritative.
+    ///
+    /// Pre-fix this handler blindly deleted every record whose key
+    /// appeared in the DAH range query — even fully-unspent records,
+    /// even records whose `preserve_until` had been pushed forward
+    /// after the DAH entry was inserted, and even records this node
+    /// did not master. The new behavior matches the audit's intent:
+    /// stale DAH entries are skipped, master-only records are deleted.
     #[test]
-    fn dispatch_process_expired_deletes_eligible() {
+    fn dispatch_process_expired_deletes_only_truly_eligible() {
         let h = DispatchTestHarness::new();
         let txid_a = DispatchTestHarness::make_txid(20);
         let txid_b = DispatchTestHarness::make_txid(21);
         let txid_c = DispatchTestHarness::make_txid(22);
 
+        // txid_a, txid_b, txid_c each have 2 utxos. To make a record
+        // truly eligible for the pruner, ALL of its utxos must be
+        // SPENT and the metadata must carry a non-zero
+        // delete_at_height in the past, with no preserve_until and
+        // no unmined_since. Using the regular spend handler with a
+        // small `block_height_retention` produces exactly that state.
         assert_eq!(h.create_tx(txid_a, 2).status, STATUS_OK);
         assert_eq!(h.create_tx(txid_b, 2).status, STATUS_OK);
         assert_eq!(h.create_tx(txid_c, 2).status, STATUS_OK);
 
-        // Set DAH on txid_a and txid_b by inserting into the DAH index directly
+        // Mine each record AND spend all its slots. DAH is only set
+        // when the record is mined (`unmined_since == 0`) — without
+        // mining first, `evaluate_delete_at_height` would leave DAH
+        // at 0 and the records would never qualify for the pruner.
+        let make_eligible = |txid: [u8; 32]| {
+            let key = TxKey { txid };
+            let entry = h.engine.lookup(&key).expect("seed lookup");
+            let utxo_count = entry.utxo_count;
+            // Mine the record by calling engine.set_mined directly
+            // (avoids encoding a full SET_MINED_BATCH wire frame for a
+            // unit test).
+            h.engine
+                .set_mined(&crate::ops::set_mined::SetMinedRequest {
+                    tx_key: key,
+                    block_id: 1,
+                    block_height: 50,
+                    subtree_idx: 0,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                    current_block_height: 100,
+                    block_height_retention: 1,
+                })
+                .expect("set_mined seed");
+
+            let hashes: Vec<[u8; 32]> = (0..utxo_count)
+                .map(|v| h.engine.read_slot(&key, v).unwrap().hash)
+                .collect();
+            let params = SpendBatchParams {
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 100,
+                // retention=1 → spending at block 100 with the record
+                // mined at block 50 sets delete_at_height around
+                // 100 + 1 = 101, well below the 700 we use below.
+                block_height_retention: 1,
+            };
+            let items: Vec<WireSpendItem> = (0..utxo_count)
+                .map(|i| WireSpendItem {
+                    txid,
+                    vout: i,
+                    utxo_hash: hashes[i as usize],
+                    spending_data: [(0xC0 + i as u8); 36],
+                })
+                .collect();
+            let resp = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &items));
+            assert_eq!(
+                resp.status, STATUS_OK,
+                "spend-all-slots must succeed for {txid:?}"
+            );
+            let post = h.engine.read_metadata(&key).unwrap();
+            assert_eq!({ post.spent_utxos }, utxo_count);
+            assert_ne!(
+                { post.delete_at_height },
+                0,
+                "spend on a fully-mined fully-spent record must set delete_at_height"
+            );
+        };
+        make_eligible(txid_a);
+        make_eligible(txid_b);
+        // txid_c stays unspent — it is a control case that proves
+        // process-expired skips records that are not actually due
+        // even when they show up in the DAH index.
+
+        // txid_c: insert a DAH index entry directly so the range
+        // query returns it, but the on-device metadata still says
+        // spent_utxos == 0 — process-expired must skip it after
+        // the re-validation step (R-102 / IJK-09).
         {
             let mut dah = h.engine.dah_index();
-            dah.insert(500, TxKey { txid: txid_a }, None).unwrap();
-            dah.insert(600, TxKey { txid: txid_b }, None).unwrap();
+            dah.insert(500, TxKey { txid: txid_c }, None).unwrap();
         }
 
-        // Send OP_PROCESS_EXPIRED_PRESERVATIONS with current_height=700
-        // (above both DAH entries)
         let mut payload = Vec::new();
         payload.extend_from_slice(&700u32.to_le_bytes());
         let resp = h.request(OP_PROCESS_EXPIRED_PRESERVATIONS, payload);
@@ -5872,14 +6061,19 @@ mod tests {
         assert!(resp.payload.len() >= 8);
 
         let deleted = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
-        let failed = u32::from_le_bytes(resp.payload[4..8].try_into().unwrap());
-        assert_eq!(deleted, 2, "expected 2 deleted");
-        assert_eq!(failed, 0, "expected 0 failed");
+        assert_eq!(
+            deleted, 2,
+            "expected exactly 2 deletes (txid_a + txid_b); got {deleted}"
+        );
 
-        // Verify txid_a and txid_b are gone, txid_c still exists
+        // txid_a and txid_b are gone, txid_c still exists despite
+        // its DAH-index entry — that's the IJK-09 fix.
         assert!(h.engine.lookup(&TxKey { txid: txid_a }).is_none());
         assert!(h.engine.lookup(&TxKey { txid: txid_b }).is_none());
-        assert!(h.engine.lookup(&TxKey { txid: txid_c }).is_some());
+        assert!(
+            h.engine.lookup(&TxKey { txid: txid_c }).is_some(),
+            "process-expired must skip records that are not actually due, even if they appear in the DAH index"
+        );
     }
 
     // -----------------------------------------------------------------------

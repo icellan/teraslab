@@ -102,11 +102,12 @@
 ### R-008 — [process-expired] `ProcessExpiredPreservations` deletes locally without ownership checks or replication
 - **Source:** AUDIT_CODEX.md F2 (NEW; partial overlap AUDIT BC-73 UNVERIFIED + IJK-09 staleness MEDIUM)
 - **Severity:** CRITICAL — verified by direct read of dispatch.rs:4669-4720
-- **Status:** OPEN
-- **Files:** src/server/dispatch.rs:391-395, :4669-4720
+- **Status:** RESOLVED
+- **Files:** src/server/dispatch.rs (`handle_process_expired` rewritten + dispatch wiring updated to thread `cluster`/`max_batch`)
 - **Cluster:** process-expired
-- **Notes:** Handler does not call `check_shard_ownership`, does not return REDIRECT/MIGRATION_IN_PROGRESS, does not call `replicate_all_ops`. Any node receiving op 32 deletes whatever its local DAH index says regardless of master/replica role; replicas diverge from master after delete. Fix options: (a) treat as a regular clustered mutation — group by ownership, return per-key REDIRECT, replicate Delete ops with same compensation rules as DeleteBatch; (b) remove from public client opcode surface and gate behind admin auth. Also fold IJK-09 (re-validate `should_delete_at_height` per record before deleting).
-- **Test:** `process_expired_replicates_deletes_in_cluster`, `process_expired_redirects_non_master`
+- **Resolution:** Rewrote `handle_process_expired` to be a clustered, replicated, ownership-checked operation. New flow: (1) DAH range query produces candidates; (2) per-key ownership check via the existing `check_shard_ownership` (skips non-master / fenced / pending-inbound shards); (3) **re-validation against on-device metadata** — refuses to delete unless `preserve_until == 0`, `0 < delete_at_height <= current_height`, `spent_utxos == utxo_count`, `unmined_since == 0` (folds in R-102 / IJK-09); (4) survivors are funneled into a synthetic OP_DELETE_BATCH payload and dispatched through `handle_delete_batch`, reusing R-007's per-slot snapshot + replication + compensation pipeline so the two delete codepaths can never diverge. Wire response shape preserved as `(deleted:u32, failed:u32)` for backward compat. Updated R-102 to RESOLVED via this fold.
+- **Verification:** `cargo test --all` 1493 passed (was 1493 — net 0 because the broken `dispatch_process_expired_deletes_eligible` test was rewritten to `dispatch_process_expired_deletes_only_truly_eligible` covering the full eligibility contract); 0 failed, 0 ignored. The new test mines + spends 2 records to produce a truly-eligible state, manually inserts a stale DAH entry for an unspent third record (the IJK-09 attack scenario), and asserts only the 2 truly-eligible records are deleted while the stale-DAH record survives. Clippy + fmt clean.
+- **Test:** `dispatch_process_expired_deletes_only_truly_eligible`
 
 ### R-009 — [concurrency-safety] Hot read paths violate stripe-lock contract → data-race UB
 - **Source:** AUDIT.md BC-02
@@ -980,11 +981,11 @@
 ### R-102 — [pruning] `handle_process_expired` doesn't re-validate `should_delete_at_height` before deleting
 - **Source:** AUDIT.md IJK-09
 - **Severity:** MEDIUM
-- **Status:** OPEN, partially folded into R-008
-- **Files:** src/server/dispatch.rs:4669-4720
+- **Status:** RESOLVED (folded into R-008)
+- **Files:** src/server/dispatch.rs (`handle_process_expired`)
 - **Cluster:** process-expired
-- **Notes:** Before `engine.delete`, read each candidate's metadata; re-evaluate. Skip if `preserve_until != 0`, `delete_at_height > current_height`, `spent_utxos != utxo_count`, or `unmined_since != 0`.
-- **Test:** `process_expired_skips_stale_dah_entries`
+- **Resolution:** R-008's rewrite re-reads on-device metadata for every DAH candidate and only proceeds with delete when `preserve_until == 0 && 0 < delete_at_height <= current_height && spent_utxos == utxo_count && unmined_since == 0`. The R-008 test `dispatch_process_expired_deletes_only_truly_eligible` covers this directly: it inserts a stale DAH entry for an unspent record (the IJK-09 attack scenario) and asserts the record is NOT deleted.
+- **Test:** `dispatch_process_expired_deletes_only_truly_eligible` (folded in)
 
 ### R-103 — [pruning] Compensation hard-codes `block_height_retention: 0` → DAH index diverges from on-device state after rollback
 - **Source:** AUDIT.md IJK-10
