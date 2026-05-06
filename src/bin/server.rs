@@ -363,9 +363,7 @@ fn main() {
                                     "DAH rebuild failed — degraded readiness",
                                 );
                                 SecondaryLoadOutcome {
-                                    dah: DahBackend::from(
-                                        teraslab::index::DahIndex::new(),
-                                    ),
+                                    dah: DahBackend::from(teraslab::index::DahIndex::new()),
                                     unmined: UnminedBackend::from(unmined),
                                     status: SecondaryStatus {
                                         dah_ok: false,
@@ -921,6 +919,24 @@ fn main() {
     ctrlc_handler(move || {
         tracing::info!("shutdown signal received");
         shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    // R-003: spawn the redo-log checkpoint task. Without a periodic
+    // snapshot+reset, the redo log fills (~750k mutations at the 64 MiB
+    // default + ~85 B/entry) and the master bricks: every subsequent
+    // mutation returns ERR_INTERNAL once `RedoLog::append` returns
+    // `LogFull`. The task wakes every 100 ms; when usage_fraction
+    // crosses 0.5 it takes a snapshot, persists the allocator, writes a
+    // checkpoint marker, and resets the log so future appends start
+    // from offset 0.
+    let _checkpoint_handle = redo_log.as_ref().map(|log| {
+        let cfg = teraslab::checkpoint::CheckpointConfig::new(config.index_snapshot_path.clone());
+        teraslab::checkpoint::spawn_checkpoint_task(
+            cfg,
+            engine.clone(),
+            log.clone(),
+            shutdown_flag.clone(),
+        )
     });
 
     let server = ServerWithShutdown {

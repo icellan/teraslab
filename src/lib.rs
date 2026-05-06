@@ -1,6 +1,7 @@
 #![warn(clippy::disallowed_macros)]
 
 pub mod allocator;
+pub mod checkpoint;
 pub mod cluster;
 pub mod config;
 pub mod device;

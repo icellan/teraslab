@@ -729,8 +729,7 @@ impl RedoOp {
                 let record_offset = u64::from_le_bytes(data[32..40].try_into().unwrap());
                 let utxo_count = u32::from_le_bytes(data[40..44].try_into().unwrap());
                 let is_conflicting = data[44] != 0;
-                let record_len =
-                    u32::from_le_bytes(data[45..49].try_into().unwrap()) as usize;
+                let record_len = u32::from_le_bytes(data[45..49].try_into().unwrap()) as usize;
                 let record_end = 49usize.checked_add(record_len)?;
                 if data.len() < record_end + 2 {
                     return None;
@@ -1252,6 +1251,26 @@ impl RedoLog {
     pub fn available_space(&self) -> u64 {
         self.log_size
             .saturating_sub(self.write_pos + self.buffer.len() as u64)
+    }
+
+    /// Fraction of the log's capacity currently used (0.0 .. 1.0).
+    ///
+    /// Used by the background checkpoint task to decide when to roll the
+    /// log: when this exceeds the configured threshold the task takes a
+    /// snapshot of the rest of the durability state, writes a checkpoint
+    /// marker, and `reset()`s the log so future appends write from offset
+    /// 0 again.
+    pub fn usage_fraction(&self) -> f64 {
+        if self.log_size == 0 {
+            return 1.0;
+        }
+        let used = self.write_pos + self.buffer.len() as u64;
+        used as f64 / self.log_size as f64
+    }
+
+    /// Total capacity of the log in bytes.
+    pub fn capacity(&self) -> u64 {
+        self.log_size
     }
 
     /// Reset the log (after checkpoint + reclaim). Dangerous — only call

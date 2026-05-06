@@ -47,11 +47,13 @@
 ### R-003 — [redo-log] No production redo-log checkpointing — log fills, master bricked
 - **Source:** AUDIT.md BC-01, gap #3
 - **Severity:** CRITICAL
-- **Status:** OPEN
-- **Files:** src/redo.rs:1185, src/redo.rs:1238, src/redo.rs:1258, src/server/dispatch.rs:2466,2645,2763, src/config.rs:418
+- **Status:** RESOLVED
+- **Files:** src/checkpoint.rs (new), src/redo.rs (`usage_fraction`, `capacity` helpers), src/lib.rs, src/bin/server.rs (spawn task)
 - **Cluster:** redo-log
-- **Notes:** `RedoLog::checkpoint()` / `advance_checkpoint()` / `reset()` have zero callers outside tests. Default 64 MiB → ~750k mutations to fill at 85 B/entry. Wire background task: when `write_pos / log_size > 0.5`, snapshot index + persist allocator + DAH/unmined → `checkpoint()` → `reset()`. Reject mutations cleanly with a backoff status when watermark exceeded. Foundational for everything else.
-- **Test:** `test_redo_log_auto_checkpoint_prevents_full`
+- **Resolution:** New `teraslab::checkpoint` module with `spawn_checkpoint_task` and `perform_checkpoint`. Background thread wakes every 100 ms; when `redo.usage_fraction() >= 0.5` it acquires the redo mutex (blocking new appends) and: snapshots primary+DAH+unmined via `Engine::snapshot_index` (tempfile + rename), persists allocator state via `Engine::persist_allocator`, writes a `RedoOp::Checkpoint` marker, and calls `RedoLog::reset()` so future appends start at offset 0. Crash safety relies on each step's effects being durable independently — recovery either replays uncheckpointed entries on top of the most recent snapshot (idempotent) or, if `reset()` already ran, observes an empty log and trusts the snapshot directly. Sequence numbers continue monotonically across resets so replication catch-up still works for replicas whose ack high-water predates the reset. Wired into `bin/server.rs` after engine + redo_log Arc construction; shares the existing `shutdown_flag` for graceful exit.
+- **Verification:** `cargo test --all` 1490 passed (was 1488), 0 failed, 0 ignored; new tests `perform_checkpoint_resets_log_and_writes_snapshot` + `perform_checkpoint_preserves_sequence_continuity`. Clippy + fmt clean.
+- **Limits / follow-ups:** The checkpoint holds the redo mutex during snapshot — for very large indexes this stalls writers for the snapshot duration. R-215 (new) tracks moving snapshotting off the redo-mutex hot path via copy-on-write or epoch reads. R-216 (new) tracks coordinating reset with replication catch-up so replicas whose last-acked seq predates the new reset get a clean "needs-resync" signal instead of finding a sequence gap.
+- **Test:** `perform_checkpoint_resets_log_and_writes_snapshot`, `perform_checkpoint_preserves_sequence_continuity`
 
 ### R-004 — [spend-op] `Engine::spend` swallows on-disk write errors at 5 sites; client sees Ok while UTXO remains UNSPENT
 - **Source:** AUDIT.md A-01
@@ -2030,7 +2032,7 @@ These are entries from the audits that, on inspection, are correct as implemente
 | LOW | 80 | — |
 | INFO/positive | — | ~33 |
 
-**Total active R-IDs:** 214 (R-001..R-214; R-212/R-213/R-214 discovered during remediation).
+**Total active R-IDs:** 216 (R-001..R-216; R-212..R-216 discovered during remediation).
 
 ---
 
@@ -2047,7 +2049,9 @@ These are entries from the audits that, on inspection, are correct as implemente
 - **NEW finding R-212 RESOLVED.** clippy `--all --all-targets` was not run by either audit. Found and fixed: 8 bench `CreateRequest` constructions missing `external_ref: None` field (pre-existing bench-API drift), plus 2 pre-existing `collapsible_if` clippy lints in `src/device.rs` test code (lines 1246, 1268). All fixed in same R-001 commit since they blocked the verification gate. Committed at `f4a9c77`.
 - **R-002 RESOLVED.** Removed `#[ignore]` and rewrote the migration handshake test for the pipelined flow contract. Discovered (and added as **R-213**, MEDIUM, OPEN) that the pipelined `run_migration_batch` worker does NOT emit abort completion handshakes on baseline failure (target inbound state lingers ~30 s for `clear_stale_inbound` to fire). Added a silent-drop variant (`pipelined_migration_marks_failed_when_target_never_acks`). 3 of the 4 F7 crash variants are deferred to **R-214** since they need a process-kill harness (R-201 dependency). Lib tests 1486 → 1488; ignored 1 → 0.
 - IDs touched: R-001 (RESOLVED), R-002 (RESOLVED), R-212 (RESOLVED — new), R-213 (OPEN — new), R-214 (DEFERRED — new).
-- Next session entry point: R-003 (BC-01 redo-log checkpoint, first foundational CRITICAL). Note R-213 is a MEDIUM-severity gap discovered here; pick up alongside other MEDIUM cluster work.
+- **R-003 RESOLVED.** New `teraslab::checkpoint` module + background task spawned in `bin/server.rs` performs snapshot+persist+checkpoint+reset when redo log usage exceeds 0.5. Lib tests 1488 → 1490. Two follow-ups discovered: **R-215** (move snapshot off redo-mutex hot path) and **R-216** (coordinate reset with replication catch-up watermarks), both MEDIUM/OPEN.
+- IDs touched (additional): R-003 (RESOLVED), R-215 (OPEN — new), R-216 (OPEN — new).
+- Next session entry point: R-004 (A-01 spend swallows write errors — CRITICAL).
 
 ### R-212 — [test-baseline] Bench CreateRequest constructions miss `external_ref` field; pre-existing collapsible_if lints in `src/device.rs` tests
 - **Source:** Discovered while running R-001 verification gate (`cargo clippy --all --all-targets`)
@@ -2066,6 +2070,24 @@ These are entries from the audits that, on inspection, are correct as implemente
 - **Cluster:** migration-handshake
 - **Notes:** When baseline streaming fails in the pipelined flow, `fail_migration_task_current_epoch` is called: it clears `migrating_bm` and rolls back the shard table, but does NOT send `OP_MIGRATION_COMPLETE` with `record_count=0` to the target. The target's provisional inbound state therefore lingers until `clear_stale_inbound`'s 30 s timeout (EF-15 / R-180). The legacy non-pipelined `migrate_single_shard::fail_shard` had `clear_target_inbound: bool` and emitted the abort frame; that behavior was lost when the pipelined flow replaced it. Fix: in the pipelined worker's failure branch (line ~3233, `if !streamed[i]`), call `send_migration_complete(addr, task.shard, task.from_node, 0, 0, 0, None, &[0u8; 32], &[], false)` before `fail_migration_task_current_epoch`. The `send_migration_complete` is best-effort (already wrapped in `let _ =` semantics in the legacy path) so its failure does not block the local rollback.
 - **Test required:** `failed_pipelined_migration_emits_abort_completion_handshake` — drive baseline failure, assert at least one `OP_MIGRATION_COMPLETE` with `record_count=0, request_id=shard` arrives at the target.
+
+### R-215 — [redo-log] Move checkpoint snapshot off the redo-mutex hot path
+- **Source:** Discovered while implementing R-003
+- **Severity:** MEDIUM (perf/availability — checkpoint stalls writers)
+- **Status:** OPEN
+- **Files:** src/checkpoint.rs (`perform_checkpoint`)
+- **Cluster:** redo-log
+- **Notes:** `perform_checkpoint` holds the redo log mutex for the duration of `engine.snapshot_index` + `engine.persist_allocator`. The snapshot reads index/dah/unmined under their own locks, but the redo mutex blocks ALL new mutation appends until the snapshot+persist+marker+reset completes. For a 100M-entry index this can stall writers for seconds. Two design options: (a) use a copy-on-write snapshot where `snapshot_all` returns an immutable view captured under brief locks, then writes to disk without holding any locks; (b) use epoch-based reads with a generation counter, snapshotting via the latest committed epoch with a deferred reset.
+- **Test required:** `checkpoint_does_not_block_writers_for_more_than_N_ms`
+
+### R-216 — [redo-log] Coordinate redo reset with replication catch-up watermarks
+- **Source:** Discovered while implementing R-003
+- **Severity:** MEDIUM (replication availability)
+- **Status:** OPEN
+- **Files:** src/checkpoint.rs (`perform_checkpoint`), src/replication/manager.rs (`run_catchup`)
+- **Cluster:** redo-log
+- **Notes:** When `RedoLog::reset()` runs, all entries before the most recent checkpoint are wiped. Replicas whose `last_acked_sequence` predates the new checkpoint will need a full resync; the catch-up path's `read_from_sequence` returns an empty Vec for those replicas which the manager currently treats as "all caught up" instead of "needs resync." Fix: have `perform_checkpoint` query `min(replica.last_acked_sequence)` across all live replicas before resetting; if the threshold is below that, skip reset (let the log fill briefly) OR signal replicas to resync. Add a `catchup_watermark_lag_seconds` metric so operators can detect when this defers checkpointing.
+- **Test required:** `replica_resync_signal_after_redo_reset`
 
 ### R-214 — [test-baseline] Migration crash variants requiring process-kill harness (deferred subset of F7)
 - **Source:** Discovered while resolving R-002
