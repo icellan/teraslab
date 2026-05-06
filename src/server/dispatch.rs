@@ -3271,6 +3271,26 @@ fn handle_create_batch(
                 ));
             }
             Err(CreateError::DuplicateTxId) => {
+                // R-014 (A-05): create_at_offset detected the duplicate
+                // AFTER pre_allocate_create reserved space — free the
+                // reserved region so the allocator does not leak under
+                // concurrent create races on the same txid.
+                let utxo_count = v.create_req.utxo_hashes.len() as u32;
+                let base_size = crate::record::TxMetadata::record_size_for(utxo_count);
+                let cold_len = if v.create_req.is_external && v.create_req.inputs.is_none() {
+                    0u64
+                } else {
+                    build_cold_data(
+                        v.create_req.inputs,
+                        v.create_req.outputs,
+                        v.create_req.inpoints,
+                    )
+                    .len() as u64
+                };
+                let _ = engine
+                    .allocator()
+                    .lock()
+                    .free(v.record_offset, base_size + cold_len);
                 errors.push(BatchItemError {
                     item_index: v.idx as u32,
                     error_code: ERR_ALREADY_EXISTS,
@@ -3278,6 +3298,25 @@ fn handle_create_batch(
                 });
             }
             Err(_) => {
+                // R-014 (A-05): same fix for the catch-all error path —
+                // any failure after pre_allocate_create must release
+                // the reserved region.
+                let utxo_count = v.create_req.utxo_hashes.len() as u32;
+                let base_size = crate::record::TxMetadata::record_size_for(utxo_count);
+                let cold_len = if v.create_req.is_external && v.create_req.inputs.is_none() {
+                    0u64
+                } else {
+                    build_cold_data(
+                        v.create_req.inputs,
+                        v.create_req.outputs,
+                        v.create_req.inpoints,
+                    )
+                    .len() as u64
+                };
+                let _ = engine
+                    .allocator()
+                    .lock()
+                    .free(v.record_offset, base_size + cold_len);
                 errors.push(BatchItemError {
                     item_index: v.idx as u32,
                     error_code: ERR_INTERNAL,

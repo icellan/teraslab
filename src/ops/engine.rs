@@ -2268,6 +2268,35 @@ impl Engine {
             return Err(SpendError::UtxoNotFound { offset: req.offset });
         }
 
+        // R-017 (A-09): a reassign IS a spend-equivalent state
+        // transition (it produces a new spendable UTXO under a fresh
+        // hash, with a cooldown). The same record-level guards that
+        // protect Spend must therefore also guard Reassign — pre-fix
+        // a record marked LOCKED, CONFLICTING, or IS_COINBASE-immature
+        // could still be reassigned, bypassing the protections those
+        // flags exist to enforce. Coinbase maturity uses the request's
+        // `block_height` as the "current height" of the reassign — the
+        // request lacks a separate `current_block_height` field, but
+        // `block_height` is the block in which the reassign is being
+        // committed, which serves the same purpose for the maturity
+        // comparison.
+        if meta.flags.contains(TxFlags::CONFLICTING) {
+            return Err(SpendError::Conflicting);
+        }
+        if meta.flags.contains(TxFlags::LOCKED) {
+            return Err(SpendError::Locked);
+        }
+        let spending_height = { meta.spending_height };
+        if meta.flags.contains(TxFlags::IS_COINBASE)
+            && spending_height > 0
+            && spending_height > req.block_height
+        {
+            return Err(SpendError::CoinbaseImmature {
+                spending_height,
+                current_height: req.block_height,
+            });
+        }
+
         let slot = self.read_slot_fast(ro, req.offset)?;
         if slot.hash != req.utxo_hash {
             return Err(SpendError::UtxoHashMismatch { offset: req.offset });
@@ -7635,6 +7664,103 @@ mod tests {
     }
 
     // -- Reassign tests --
+
+    /// R-017 (A-09): reassign must reject LOCKED records — the LOCKED
+    /// flag exists to prevent ANY further state change on the record,
+    /// not just spends. Pre-fix the reassign skipped this check, so
+    /// a record marked LOCKED could still be reassigned, bypassing
+    /// the flag's purpose.
+    #[test]
+    fn reassign_rejects_locked() {
+        let engine = create_engine();
+        let mut create = make_create_req(0xA0, 5).1;
+        create.locked = true;
+        let key = create.tx_key();
+        engine.create(&create).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: create.utxo_hashes[0],
+            })
+            .unwrap();
+
+        let result = engine.reassign(&ReassignRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: create.utxo_hashes[0],
+            new_utxo_hash: [0xCC; 32],
+            block_height: 1000,
+            spendable_after: 100,
+        });
+        assert!(
+            matches!(result, Err(SpendError::Locked)),
+            "reassign on LOCKED record must return Locked, got {result:?}"
+        );
+    }
+
+    /// R-017 (A-09): reassign must reject CONFLICTING records.
+    #[test]
+    fn reassign_rejects_conflicting() {
+        let engine = create_engine();
+        let mut create = make_create_req(0xA1, 5).1;
+        create.conflicting = true;
+        let key = create.tx_key();
+        engine.create(&create).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: create.utxo_hashes[0],
+            })
+            .unwrap();
+
+        let result = engine.reassign(&ReassignRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: create.utxo_hashes[0],
+            new_utxo_hash: [0xDD; 32],
+            block_height: 1000,
+            spendable_after: 100,
+        });
+        assert!(
+            matches!(result, Err(SpendError::Conflicting)),
+            "reassign on CONFLICTING record must return Conflicting, got {result:?}"
+        );
+    }
+
+    /// R-017 (A-09): reassign must reject coinbase records that have
+    /// not yet matured.
+    #[test]
+    fn reassign_rejects_immature_coinbase() {
+        let engine = create_engine();
+        let mut create = make_create_req(0xA2, 5).1;
+        create.is_coinbase = true;
+        create.spending_height = 2000; // matures at block 2000
+        let key = create.tx_key();
+        engine.create(&create).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: create.utxo_hashes[0],
+            })
+            .unwrap();
+
+        // Try to reassign at block 1500 — before maturity.
+        let result = engine.reassign(&ReassignRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: create.utxo_hashes[0],
+            new_utxo_hash: [0xEE; 32],
+            block_height: 1500,
+            spendable_after: 100,
+        });
+        assert!(
+            matches!(result, Err(SpendError::CoinbaseImmature { .. })),
+            "reassign on immature coinbase must return CoinbaseImmature, got {result:?}"
+        );
+    }
 
     #[test]
     fn reassign_frozen() {

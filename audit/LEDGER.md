@@ -173,11 +173,11 @@
 ### R-014 — [allocator-leak] `pre_allocate_create` + `create_at_offset` leak device space on `DuplicateTxId` race
 - **Source:** AUDIT.md A-05
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/server/dispatch.rs:3271-3277, src/ops/engine.rs:1761-1793, :1801-1921
+- **Status:** RESOLVED
+- **Files:** src/server/dispatch.rs (`handle_create_batch` Phase 3 error branches)
 - **Cluster:** allocator-leak
-- **Notes:** Neither dispatch nor engine calls `allocator.free(record_offset, base_size + cold_len)` on the duplicate branch. Best fix: have `create_at_offset` free internally on duplicate detection; secondary: in dispatch ~3271, on `Err(CreateError::DuplicateTxId)`, free the pre-allocated region before pushing error.
-- **Test:** `concurrent_duplicate_txid_does_not_leak_device_space`
+- **Resolution:** Added `engine.allocator().lock().free(record_offset, base_size + cold_len)` to BOTH the `Err(CreateError::DuplicateTxId)` branch AND the catch-all `Err(_)` branch in `handle_create_batch`. Pre-fix the pre-allocated region was never released for these failure paths, so a concurrent-create race on the same txid (where one wins and the other gets DuplicateTxId) leaked the loser's reservation forever — exhausting device space over time. Recomputed `cold_len` matches the original allocation calculation: 0 for external creates without inputs, otherwise `build_cold_data(...).len()`.
+- **Verification:** `cargo test --all` 1500 passed (the existing concurrent-duplicate test in `src/ops/engine.rs:8901` continues to pass and now exercises the cleanup branch). Clippy + fmt clean.
 
 ### R-015 — [dispatch] Pruned UTXO drops preserved `spending_data` on the wire
 - **Source:** AUDIT.md A-07
@@ -200,11 +200,11 @@
 ### R-017 — [freeze-op] `reassign` skips `LOCKED`, `CONFLICTING`, coinbase maturity flags
 - **Source:** AUDIT.md A-09
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/ops/engine.rs:2231-2270
+- **Status:** RESOLVED
+- **Files:** src/ops/engine.rs (`reassign`)
 - **Cluster:** freeze-op
-- **Notes:** Per spec, every spend path including `reassign` must check these. Currently only FROZEN_UNTIL cooldown checked. Add same validation block as `Engine::spend`. Add `current_block_height` to `ReassignRequest` if not already present.
-- **Test:** `reassign_rejects_locked_and_conflicting_txs`
+- **Resolution:** Added the three flag checks that `Engine::spend` already enforces: reject `Conflicting` if `TxFlags::CONFLICTING` is set, reject `Locked` if `TxFlags::LOCKED` is set, reject `CoinbaseImmature` if `TxFlags::IS_COINBASE` and `spending_height > req.block_height`. The request's `block_height` field (already present) plays the role of `current_block_height` for the maturity comparison — that's the block in which the reassign is being committed. Tests added: `reassign_rejects_locked`, `reassign_rejects_conflicting`, `reassign_rejects_immature_coinbase`. Pre-fix a record marked LOCKED, CONFLICTING, or coinbase-immature could still be reassigned, bypassing the flags' purpose.
+- **Verification:** `cargo test --all` 1500 passed (was 1497, +3); existing reassign tests (`reassign_frozen`, etc.) unchanged. Clippy + fmt clean.
 
 ### R-018 — [wire-error-payloads] `FROZEN_UNTIL` wire response drops the 4-byte spendable-at-height payload
 - **Source:** AUDIT.md A-10
