@@ -525,7 +525,7 @@ fn replay_spend(
     tx_key: &TxKey,
     offset: u32,
     spending_data: &[u8; 36],
-    new_spent_count: u32,
+    _new_spent_count: u32,
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
@@ -548,9 +548,18 @@ fn replay_spend(
         return ReplayResult::Failed(ReplayCause::IoError);
     }
 
-    // Update metadata counter
+    // R-010 (BC-04): re-derive the counter from on-device state by
+    // incrementing rather than overwriting with `new_spent_count`. The
+    // dispatcher computes `new_spent_count` from `engine.lookup` BEFORE
+    // taking the per-tx stripe lock, so two concurrent spend/unspend
+    // batches on the same record can compute conflicting absolute
+    // counts. Recovery now re-derives by counting the slot transition
+    // we just made (UNSPENT → SPENT means +1). The per-entry slot-state
+    // check at the top of this function makes the redo entry idempotent
+    // — a re-played already-spent entry exits via Skipped before
+    // reaching this point.
     if let Ok(mut meta) = io::read_metadata(device, ie.record_offset) {
-        meta.spent_utxos = new_spent_count;
+        meta.spent_utxos = { meta.spent_utxos }.saturating_add(1);
         let _ = io::write_metadata(device, ie.record_offset, &meta);
     }
 
@@ -562,7 +571,7 @@ fn replay_unspend(
     index: &PrimaryBackend,
     tx_key: &TxKey,
     offset: u32,
-    new_spent_count: u32,
+    _new_spent_count: u32,
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
@@ -583,8 +592,10 @@ fn replay_unspend(
         return ReplayResult::Failed(ReplayCause::IoError);
     }
 
+    // R-010 (BC-04): see `replay_spend` — re-derive counter rather than
+    // trusting the redo entry's pre-lock snapshot.
     if let Ok(mut meta) = io::read_metadata(device, ie.record_offset) {
-        meta.spent_utxos = new_spent_count;
+        meta.spent_utxos = { meta.spent_utxos }.saturating_sub(1);
         let _ = io::write_metadata(device, ie.record_offset, &meta);
     }
 
@@ -1084,8 +1095,7 @@ fn replay_compensate_unset_mined(
     for i in 0..inline {
         if { meta.block_entries_inline[i].block_id } == block_id {
             let existing = meta.block_entries_inline[i];
-            if { existing.block_height } == block_height
-                && { existing.subtree_idx } == subtree_idx
+            if { existing.block_height } == block_height && { existing.subtree_idx } == subtree_idx
             {
                 return ReplayResult::Skipped;
             }
@@ -1275,6 +1285,91 @@ mod tests {
         fn redo_log(&self) -> RedoLog {
             RedoLog::open(self.redo_dev.clone(), 0, 1024 * 1024).unwrap()
         }
+    }
+
+    /// R-010 (BC-04): the per-entry `new_spent_count` carried in
+    /// `RedoOp::Spend` and `RedoOp::Unspend` is computed from a
+    /// pre-lock `engine.lookup` snapshot, so concurrent batches on the
+    /// same record can compute conflicting absolute counts and persist
+    /// redo entries whose `new_spent_count` is wrong by the time
+    /// replay runs. Replay must therefore re-derive the counter from
+    /// on-device state — adding `+1` for each Spend it actually
+    /// applies and `-1` for each Unspend — rather than overwriting
+    /// `meta.spent_utxos` with the redo entry's snapshot.
+    #[test]
+    fn replay_spend_rederives_counter_ignoring_redo_snapshot() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xA0, 5);
+        let ie = h.index.lookup(&key).unwrap();
+
+        // Stamp the metadata's spent_utxos to a known prior value.
+        // The redo entry below will carry a totally wrong
+        // `new_spent_count = 99`; replay must IGNORE that value and
+        // produce `prior + 1 = 4`.
+        let mut prior_meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        prior_meta.spent_utxos = 3;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &prior_meta).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Spend {
+            tx_key: key,
+            offset: 0,
+            spending_data: [0xCD; 36],
+            new_spent_count: 99, // intentionally wrong
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+
+        let post_meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!(
+            { post_meta.spent_utxos },
+            4,
+            "replay must re-derive spent_utxos from prior+1, not trust the redo snapshot's 99"
+        );
+        let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        assert!(slot.is_spent());
+    }
+
+    /// Companion to `replay_spend_rederives_counter_ignoring_redo_snapshot`
+    /// for the unspend path. The redo entry carries
+    /// `new_spent_count = 99` (wrong); replay must produce
+    /// `prior - 1 = 4`.
+    #[test]
+    fn replay_unspend_rederives_counter_ignoring_redo_snapshot() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xA1, 5);
+        let ie = h.index.lookup(&key).unwrap();
+
+        // Pre-state: slot 0 is SPENT (so unspend has work to do) and
+        // metadata.spent_utxos = 5.
+        let slot0 = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        let spent = UtxoSlot::new_spent(slot0.hash, [0xEE; 36]);
+        io::write_utxo_slot(&*h.data_dev, ie.record_offset, 0, &spent).unwrap();
+        let mut prior_meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        prior_meta.spent_utxos = 5;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &prior_meta).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Unspend {
+            tx_key: key,
+            offset: 0,
+            new_spent_count: 99, // intentionally wrong
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+
+        let post_meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!(
+            { post_meta.spent_utxos },
+            4,
+            "replay must re-derive spent_utxos from prior-1, not trust the redo snapshot's 99"
+        );
+        let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        assert!(slot.is_unspent());
     }
 
     #[test]

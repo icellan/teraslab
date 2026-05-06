@@ -119,13 +119,14 @@
 - **Verification:** No code change behavior — this was a documentation correctness issue. `cargo test --all` 1493 passed, 0 failed, 0 ignored; clippy + fmt clean.
 
 ### R-010 — [dispatch-wal] Concurrent unspend/freeze/etc. compute redo `new_spent_count` outside per-tx stripe lock
-- **Source:** AUDIT.md BC-04, BC-37, BC-54, BC-66
+- **Source:** AUDIT.md BC-04 (BC-37/54/66 partial overlap)
 - **Severity:** CRITICAL
-- **Status:** OPEN
-- **Files:** src/server/dispatch.rs:2570-2713, :2719-2906, :3322-3412, :3416-3506, :3510-3625, :3637-3735, :3737-3826, :3828-3922, :4131-4225, src/recovery.rs:586
+- **Status:** RESOLVED (BC-04 / replay_spend + replay_unspend); BC-37/54/66 documented as separate work below.
+- **Files:** src/recovery.rs (`replay_spend`, `replay_unspend`)
 - **Cluster:** dispatch-wal
-- **Notes:** Reads `pre_spent` and computes redo payload outside the per-key stripe lock; two concurrent unspends compute the same snapshot and persist conflicting redo entries; replay sets `meta.spent_utxos` to a stale absolute. Fix: move `engine.lookup(&key)` + `running_spent` computation INSIDE the stripe lock (mirror spend's validate-then-apply); OR change redo entries to deltas and have replay take the lock + re-derive from on-device state. Same fix pattern covers reassign (BC-54), freeze/unfreeze batch (BC-37), mark_longest_chain (BC-66).
-- **Test:** `test_concurrent_unspend_batch_counter_consistency`, `test_concurrent_reassign_batch_compensation`
+- **Resolution:** Took the audit's recommended option (b): change replay to re-derive `meta.spent_utxos` from on-device state instead of trusting the redo entry's pre-lock `new_spent_count` snapshot. `replay_spend` now does `meta.spent_utxos = saturating_add(1)` after confirming the slot transitioned UNSPENT → SPENT (the existing idempotency check at the top of the function ensures we only count ONCE per redo entry, even on repeated replay). `replay_unspend` symmetrically does `saturating_sub(1)`. The redo entry's `new_spent_count` field is now informational and ignored by replay — kept on the wire for backward compatibility (existing on-disk redo entries still decode and replay correctly because their slot-state idempotency check is unchanged). This is in-process only — no on-disk format change required. The fix prevents two concurrent batches from corrupting the counter via conflicting absolute snapshots, and also prevents pre-fix scenarios where the dispatcher computed a counter from a stale `engine.lookup` between Phases 1 and 3.
+- **Limits / follow-ups:** BC-37 (handle_freeze_batch / handle_unfreeze_batch under-lock pattern), BC-54 (handle_reassign_batch lookup-outside-lock for `prior_utxo_hash` capture used in compensation), and BC-66 (mark_longest_chain `target_generation` computed pre-lock) are all variations of the BC-04 race but not covered by the replay-rederive fix because they affect compensation correctness rather than `spent_utxos`. They remain open as **R-217** (freeze-family batches), **R-218** (reassign before-image race), and **R-037** which already exists. Severity is MEDIUM for BC-37 (replay is idempotent for freeze ops by slot status) and HIGH for BC-54 (compensation sees stale prior hash).
+- **Verification:** `cargo test --all` 1495 passed (was 1493), 0 failed, 0 ignored. New tests `replay_spend_rederives_counter_ignoring_redo_snapshot` and `replay_unspend_rederives_counter_ignoring_redo_snapshot` plant a deliberately-wrong `new_spent_count = 99` in the redo entry, run recovery, and assert post-replay `meta.spent_utxos` reflects the correct re-derived value. Clippy + fmt clean.
 
 ### R-011 — [cluster-tcp-auth] Inter-node TCP frames unauthenticated (replication, topology, migration)
 - **Source:** AUDIT.md EF-01, D-20, gap #1
