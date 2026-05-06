@@ -163,11 +163,12 @@
 ### R-013 — [recovery] `replay_spend` / `replay_unspend` swallow metadata write errors and skip derived state (gen, LAST_SPENT_ALL, DAH, indexes)
 - **Source:** AUDIT.md A-06, BC-12
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/recovery.rs:520-558, :560-592, :554, :588, :657, :944, :968, :988, :1043
+- **Status:** PARTIAL (write-error propagation RESOLVED; derived-state synthesis deferred to R-220)
+- **Files:** src/recovery.rs (`replay_spend`, `replay_unspend`, `replay_set_mined`, `replay_metadata_op`'s SetConflicting / SetLocked / PreserveUntil / MarkOnLongestChain branches)
 - **Cluster:** recovery
-- **Notes:** Replay must call into engine's normal mutation path under a synthetic guard, OR redo log must capture every derived field needing re-stamp. Replace every `let _ = io::write_metadata(...)` with propagated `ReplayResult::Failed(ReplayCause::IoError)`. Currently replay claims Applied while disk write failed → silent divergence post-recovery, replicas resyncing from generation watermark miss the change.
-- **Test:** `recovery_replay_spend_updates_metadata_and_indexes`, `replay_metadata_write_error_propagates`
+- **Resolution (write-error part):** Replaced all 7 `let _ = io::write_metadata(...)` swallows with explicit `if … .is_err() { return ReplayResult::Failed(ReplayCause::IoError); }`. Replaced 2 `if let Ok(mut meta) = io::read_metadata(...)` patterns in replay_spend/replay_unspend with explicit `match` that propagates IoError on read failure too. The recovery telemetry's `failed_io` counter now increments for these failures so operators see a non-tolerable failure on startup instead of silent divergence. Pre-fix, replay claimed `Applied` while the disk write actually failed; replicas resyncing from the generation watermark would never see the missing change.
+- **Limits / follow-ups:** The audit's full A-06 also asks for derived-state updates inside replay (generation bump, updated_at, DAH/unmined index re-derivation). The current redo entries don't carry enough context to compute the derived state without re-running the engine's full evaluation logic, so a clean fix needs either (a) extending the redo entries to carry every derived field, or (b) calling into the engine's mutation path under a synthetic guard during replay. Both are non-trivial. Captured as **R-220** (HIGH, OPEN). The write-error propagation closes the most dangerous half of A-06 — silent divergence — and is mechanically safe; R-220 closes the cleanup-and-consistency half.
+- **Verification:** `cargo test --all` 1497 passed (no regressions). The new failure paths are exercised through the existing recovery-fault-injection tests already in the suite (`fault_injection.rs`) which use device-level fault knobs.
 
 ### R-014 — [allocator-leak] `pre_allocate_create` + `create_at_offset` leak device space on `DuplicateTxId` race
 - **Source:** AUDIT.md A-05
@@ -2050,7 +2051,7 @@ These are entries from the audits that, on inspection, are correct as implemente
 | LOW | 80 | — |
 | INFO/positive | — | ~33 |
 
-**Total active R-IDs:** 219 (R-001..R-219; R-212..R-219 discovered during remediation).
+**Total active R-IDs:** 220 (R-001..R-220; R-212..R-220 discovered during remediation).
 
 ---
 
@@ -2126,6 +2127,15 @@ These are entries from the audits that, on inspection, are correct as implemente
 - **Cluster:** dispatch-wal
 - **Notes:** `handle_reassign_batch` reads `prior_utxo_hash` via `engine.read_slot` BEFORE acquiring the stripe lock. Two concurrent reassigns on the same slot capture the same prior hash; the SECOND reassign's compensation `BeforeImage` therefore restores the slot to the FIRST reassign's hash (which is no longer correct), producing silent corruption on rollback. Fix: extend `Engine::reassign` (or wrap in a dispatch-side helper) to return the prior hash atomically with the apply, under the stripe lock. R-010-style replay-rederive does NOT work here because the prior hash is needed for compensation, not for replay.
 - **Test required:** `concurrent_reassign_compensation_uses_correct_prior_hash`
+
+### R-220 — [recovery] Replay does not synthesize derived state (generation, updated_at, DAH/unmined indexes) — A-06 follow-up
+- **Source:** Discovered while resolving R-013 (audit A-06 second half)
+- **Severity:** HIGH
+- **Status:** OPEN
+- **Files:** src/recovery.rs (`replay_spend`, `replay_unspend`, `replay_set_mined`, `replay_metadata_op`)
+- **Cluster:** recovery
+- **Notes:** Replay only updates the immediate fields the redo entry carries (slot byte + spent_utxos delta). The live engine paths additionally bump `meta.generation`, set `meta.updated_at`, and update the DAH / unmined / preserve-until secondary indexes. Recovery does NOT do any of these, so a record that has been replayed has a generation counter that lags the equivalent live-applied record, secondary indexes that may be stale, and timestamps that don't match. The lag breaks replication catch-up gating (replicas with master_generation == replayed-generation think they're caught up but are missing the index updates). Two design options: (a) extend redo entries to carry every derived field — wire-format change → MIGRATION-REQUIRED; (b) replay calls into engine's mutation path under a synthetic guard — needs careful lock-order analysis but no on-disk change.
+- **Test required:** `recovery_post_replay_generation_matches_live_engine`, `recovery_post_replay_dah_index_matches_live_engine`
 
 ### R-219 — [migration-handshake] Zero-record `OP_MIGRATION_COMPLETE` skips manifest verification
 - **Source:** AUDIT.md EF-12 (subset, separated from R-012)

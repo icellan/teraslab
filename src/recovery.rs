@@ -558,9 +558,20 @@ fn replay_spend(
     // check at the top of this function makes the redo entry idempotent
     // — a re-played already-spent entry exits via Skipped before
     // reaching this point.
-    if let Ok(mut meta) = io::read_metadata(device, ie.record_offset) {
-        meta.spent_utxos = { meta.spent_utxos }.saturating_add(1);
-        let _ = io::write_metadata(device, ie.record_offset, &meta);
+    //
+    // R-013 (A-06 / BC-12): metadata read AND write errors propagate as
+    // ReplayResult::Failed. Pre-fix this used `if let Ok(mut meta)` and
+    // `let _ = io::write_metadata(...)` which silently dropped both
+    // failure modes — the spend was reported Applied but the on-device
+    // counter never got updated. Replicas resyncing from the
+    // generation watermark would then see counter divergence.
+    let mut meta = match io::read_metadata(device, ie.record_offset) {
+        Ok(m) => m,
+        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+    };
+    meta.spent_utxos = { meta.spent_utxos }.saturating_add(1);
+    if io::write_metadata(device, ie.record_offset, &meta).is_err() {
+        return ReplayResult::Failed(ReplayCause::IoError);
     }
 
     ReplayResult::Applied
@@ -594,9 +605,14 @@ fn replay_unspend(
 
     // R-010 (BC-04): see `replay_spend` — re-derive counter rather than
     // trusting the redo entry's pre-lock snapshot.
-    if let Ok(mut meta) = io::read_metadata(device, ie.record_offset) {
-        meta.spent_utxos = { meta.spent_utxos }.saturating_sub(1);
-        let _ = io::write_metadata(device, ie.record_offset, &meta);
+    // R-013: propagate read AND write errors instead of dropping them.
+    let mut meta = match io::read_metadata(device, ie.record_offset) {
+        Ok(m) => m,
+        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+    };
+    meta.spent_utxos = { meta.spent_utxos }.saturating_sub(1);
+    if io::write_metadata(device, ie.record_offset, &meta).is_err() {
+        return ReplayResult::Failed(ReplayCause::IoError);
     }
 
     ReplayResult::Applied
@@ -665,7 +681,10 @@ fn replay_set_mined(
         }
     }
 
-    let _ = io::write_metadata(device, ie.record_offset, &meta);
+    // R-013: propagate metadata write failure instead of returning Applied with a dropped error.
+    if io::write_metadata(device, ie.record_offset, &meta).is_err() {
+        return ReplayResult::Failed(ReplayCause::IoError);
+    }
     ReplayResult::Applied
 }
 
@@ -952,7 +971,10 @@ fn replay_metadata_op(
             } else {
                 meta.flags -= meta.flags & TxFlags::CONFLICTING;
             }
-            let _ = io::write_metadata(device, ie.record_offset, &meta);
+            // R-013: propagate write failure.
+            if io::write_metadata(device, ie.record_offset, &meta).is_err() {
+                return ReplayResult::Failed(ReplayCause::IoError);
+            }
             ReplayResult::Applied
         }
         RedoOp::SetLocked { tx_key, value } => {
@@ -976,7 +998,10 @@ fn replay_metadata_op(
             } else {
                 meta.flags -= meta.flags & TxFlags::LOCKED;
             }
-            let _ = io::write_metadata(device, ie.record_offset, &meta);
+            // R-013: propagate write failure.
+            if io::write_metadata(device, ie.record_offset, &meta).is_err() {
+                return ReplayResult::Failed(ReplayCause::IoError);
+            }
             ReplayResult::Applied
         }
         RedoOp::PreserveUntil {
@@ -996,7 +1021,10 @@ fn replay_metadata_op(
             }
             meta.preserve_until = *block_height;
             meta.delete_at_height = 0;
-            let _ = io::write_metadata(device, ie.record_offset, &meta);
+            // R-013: propagate write failure.
+            if io::write_metadata(device, ie.record_offset, &meta).is_err() {
+                return ReplayResult::Failed(ReplayCause::IoError);
+            }
             ReplayResult::Applied
         }
         RedoOp::MarkOnLongestChain {
@@ -1051,7 +1079,10 @@ fn replay_metadata_op(
             if target_generation != 0 {
                 meta.generation = target_generation;
             }
-            let _ = io::write_metadata(device, ie.record_offset, &meta);
+            // R-013: propagate write failure.
+            if io::write_metadata(device, ie.record_offset, &meta).is_err() {
+                return ReplayResult::Failed(ReplayCause::IoError);
+            }
             ReplayResult::Applied
         }
         _ => ReplayResult::Skipped,
