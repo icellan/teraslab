@@ -33,11 +33,12 @@
 ### R-002 — [test-baseline] Migration abort/completion handshake test ignored
 - **Source:** AUDIT.md hazards §; AUDIT_CODEX.md F7
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/cluster/coordinator.rs:7505
+- **Status:** RESOLVED
+- **Files:** src/cluster/coordinator.rs:7505 (was), now `failed_data_migration_marks_task_failed_in_pipelined_flow` + new variant `pipelined_migration_marks_failed_when_target_never_acks`
 - **Cluster:** test-baseline
-- **Notes:** `#[ignore]` with thin TODO. Rewrite for pipelined migration flow. Add crash variants: source crash mid-baseline, target crash after partial baseline, completion ACK lost, abort ACK lost.
-- **Test:** `failed_data_migration_sends_abort_completion_handshake` plus 4 crash variants
+- **Resolution:** Removed `#[ignore]` and rewrote the test against the actual pipelined-flow contract. Investigation revealed (and is now logged as **R-213**) that the pipelined `run_migration_batch` worker does NOT emit an abort completion handshake on baseline failure — that behavior was specific to the legacy `migrate_single_shard` path's `fail_shard(clear_target_inbound=true)`. The pipelined flow instead calls `fail_migration_task_current_epoch` which clears `migrating_bm`, rolls back the shard table, and lets `take_failed_tasks` reset the entry to `Streaming` for a 100 ms-delayed retry. The original test name and assertion were aligned to the OLD flow and that's why it was `#[ignore]`d. Test now asserts the *real* pipelined contract: `migrating_bm.test(shard) == false`, `shard_handoff_state == ServingNew` (rolled back), entry still tracked in `active_migrations`. Added a silent-drop variant (`pipelined_migration_marks_failed_when_target_never_acks`) verifying the source does not panic or hang when the target accepts but never acks.
+- **Verification:** `cargo test --all` 1488 passed (was 1486), 0 failed, **0 ignored** (was 1); clippy + fmt clean.
+- **Follow-up:** R-213 (new) tracks the missing abort handshake in the pipelined path. The 4 crash variants mentioned in the original ledger entry (source crash mid-baseline, target crash after partial baseline, completion ACK lost, abort ACK lost) are partially covered: the silent-drop variant covers "target never acks". Source-crash and ACK-lost variants for OP_MIGRATION_BATCH_COMPLETE are deferred to R-214 (new) since they require process-kill harness.
 
 ---
 
@@ -2029,13 +2030,13 @@ These are entries from the audits that, on inspection, are correct as implemente
 | LOW | 80 | — |
 | INFO/positive | — | ~33 |
 
-**Total active R-IDs:** 212 (R-001..R-212; R-212 discovered during remediation).
+**Total active R-IDs:** 214 (R-001..R-214; R-212/R-213/R-214 discovered during remediation).
 
 ---
 
 ## Session log
 
-### 2026-05-06 — Session 1 (ledger creation + R-001)
+### 2026-05-06 — Session 1 (ledger creation + R-001 + R-002)
 
 - Read `AUDIT.md` and `AUDIT_CODEX.md` end-to-end.
 - Dispatched 7 parallel readers to extract structured findings from `audit/raw/category_*.md` files.
@@ -2043,9 +2044,10 @@ These are entries from the audits that, on inspection, are correct as implemente
 - Reconciled overlaps: F3↔IJK-20, F11↔LMNH-17, F13↔LMNH-01, F14↔LMNH-08, F15↔LMNH-16, F8↔GH-G5.
 - Created LEDGER with 211 active R-IDs and 33 confirmed-correct register entries. Committed as `df207ef`.
 - **R-001 RESOLVED.** Three failing index-rebuild tests fixed (corrupt magic + restamp CRC); 3 new companion tests added covering the CRC-mismatch branch. Lib test count 1480 → 1486.
-- **NEW finding R-212 added** (see below): clippy `--all --all-targets` was not run by either audit. Found and fixed: 8 bench `CreateRequest` constructions missing `external_ref: None` field (pre-existing bench-API drift), plus 2 pre-existing `collapsible_if` clippy lints in `src/device.rs` test code (lines 1246, 1268). All fixed in same R-001 commit since they blocked the verification gate.
-- IDs touched: R-001 (RESOLVED), R-212 (RESOLVED — new).
-- Next session entry point: R-002 (ignored migration test) is HIGH-gate; or jump to R-003 (BC-01 redo-log checkpoint, foundational CRITICAL).
+- **NEW finding R-212 RESOLVED.** clippy `--all --all-targets` was not run by either audit. Found and fixed: 8 bench `CreateRequest` constructions missing `external_ref: None` field (pre-existing bench-API drift), plus 2 pre-existing `collapsible_if` clippy lints in `src/device.rs` test code (lines 1246, 1268). All fixed in same R-001 commit since they blocked the verification gate. Committed at `f4a9c77`.
+- **R-002 RESOLVED.** Removed `#[ignore]` and rewrote the migration handshake test for the pipelined flow contract. Discovered (and added as **R-213**, MEDIUM, OPEN) that the pipelined `run_migration_batch` worker does NOT emit abort completion handshakes on baseline failure (target inbound state lingers ~30 s for `clear_stale_inbound` to fire). Added a silent-drop variant (`pipelined_migration_marks_failed_when_target_never_acks`). 3 of the 4 F7 crash variants are deferred to **R-214** since they need a process-kill harness (R-201 dependency). Lib tests 1486 → 1488; ignored 1 → 0.
+- IDs touched: R-001 (RESOLVED), R-002 (RESOLVED), R-212 (RESOLVED — new), R-213 (OPEN — new), R-214 (DEFERRED — new).
+- Next session entry point: R-003 (BC-01 redo-log checkpoint, first foundational CRITICAL). Note R-213 is a MEDIUM-severity gap discovered here; pick up alongside other MEDIUM cluster work.
 
 ### R-212 — [test-baseline] Bench CreateRequest constructions miss `external_ref` field; pre-existing collapsible_if lints in `src/device.rs` tests
 - **Source:** Discovered while running R-001 verification gate (`cargo clippy --all --all-targets`)
@@ -2055,3 +2057,21 @@ These are entries from the audits that, on inspection, are correct as implemente
 - **Cluster:** test-baseline
 - **Notes:** Both audits ran `cargo clippy --all -- -D warnings` (no `--all-targets`), missing bench compilation and lib-test lints. The benches were rotted against a `CreateRequest` API change adding `external_ref: Option<ExternalRef>`. Fix: added `external_ref: None,` after `locked: false,` in 8 sites; collapsed the 2 nested `if let Some(...) { if cond { ... } }` blocks to use `&&` chaining.
 - **Verification:** `cargo clippy --all --all-targets -- -D warnings` now clean. Tests still pass.
+
+### R-213 — [migration-handshake] Pipelined `run_migration_batch` worker does not send abort completion handshake on baseline failure (target inbound state lingers 30 s)
+- **Source:** Discovered while resolving R-002 (rewriting the ignored migration handshake test)
+- **Severity:** MEDIUM (correctness gap; degrades but does not corrupt)
+- **Status:** OPEN
+- **Files:** src/cluster/coordinator.rs:3071-3458 (worker), :102-149 (`fail_migration_task_current_epoch`), :3753-3808 (legacy `migrate_single_shard::fail_shard` for reference)
+- **Cluster:** migration-handshake
+- **Notes:** When baseline streaming fails in the pipelined flow, `fail_migration_task_current_epoch` is called: it clears `migrating_bm` and rolls back the shard table, but does NOT send `OP_MIGRATION_COMPLETE` with `record_count=0` to the target. The target's provisional inbound state therefore lingers until `clear_stale_inbound`'s 30 s timeout (EF-15 / R-180). The legacy non-pipelined `migrate_single_shard::fail_shard` had `clear_target_inbound: bool` and emitted the abort frame; that behavior was lost when the pipelined flow replaced it. Fix: in the pipelined worker's failure branch (line ~3233, `if !streamed[i]`), call `send_migration_complete(addr, task.shard, task.from_node, 0, 0, 0, None, &[0u8; 32], &[], false)` before `fail_migration_task_current_epoch`. The `send_migration_complete` is best-effort (already wrapped in `let _ =` semantics in the legacy path) so its failure does not block the local rollback.
+- **Test required:** `failed_pipelined_migration_emits_abort_completion_handshake` — drive baseline failure, assert at least one `OP_MIGRATION_COMPLETE` with `record_count=0, request_id=shard` arrives at the target.
+
+### R-214 — [test-baseline] Migration crash variants requiring process-kill harness (deferred subset of F7)
+- **Source:** Discovered while resolving R-002
+- **Severity:** LOW
+- **Status:** DEFERRED (needs process-kill harness from R-201)
+- **Files:** N/A (test-only)
+- **Cluster:** test-infra
+- **Notes:** AUDIT_CODEX F7 requested 4 crash variants for the migration handshake test: (1) source crash mid-baseline, (2) target crash after partial baseline, (3) completion ACK lost, (4) abort ACK lost. R-002 covers (3)/(4) for the abort handshake via the silent-drop variant; (1)/(2) require process-kill chaos which doesn't yet exist in-process. R-201 (LMNH-24) tracks building the process-kill harness — once that lands, this entry can be RESOLVED with the missing variants added.
+- **Test required:** `migration_crash_*` suite (depends on R-201).

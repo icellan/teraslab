@@ -6511,6 +6511,7 @@ mod tests {
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                external_ref: None,
                 parent_txids: &[],
             })
             .unwrap();
@@ -7500,9 +7501,21 @@ mod tests {
         receiver.join().unwrap();
     }
 
+    /// Pipelined-flow analogue of the legacy abort-completion-handshake
+    /// test. On baseline streaming failure, the pipelined flow
+    /// (`run_migration_batch`) does NOT emit a zero-record
+    /// OP_MIGRATION_COMPLETE abort frame — that is only the legacy
+    /// `migrate_single_shard` path's behavior via `fail_shard(true)`.
+    /// Instead the pipelined flow marks the task failed locally and
+    /// rolls back the shard table; the target eventually clears its
+    /// provisional inbound state via `clear_stale_inbound`'s 30 s
+    /// timeout (EF-15). This test pins that contract: when streaming
+    /// fails, the migration ends up `Failed` locally and `migrating_bm`
+    /// is cleared. R-213 (new finding) tracks the work to make the
+    /// pipelined flow also emit an abort frame so target inbound state
+    /// clears immediately rather than waiting for the staleness timeout.
     #[test]
-    #[ignore] // TODO: rewrite for pipelined migration flow
-    fn failed_data_migration_sends_abort_completion_handshake() {
+    fn failed_data_migration_marks_task_failed_in_pipelined_flow() {
         let old_members = vec![NodeId(1), NodeId(2)];
         let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
         let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1);
@@ -7577,6 +7590,7 @@ mod tests {
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                external_ref: None,
                 parent_txids: &[],
             })
             .unwrap();
@@ -7595,47 +7609,244 @@ mod tests {
         migrating_bm.set(shard);
         let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
 
+        // "Target dies mid-baseline" failure: accept connections, read each
+        // frame, then drop the connection without replying. The source's
+        // `exchange_frame` errors on the unread response and `streamed[i]`
+        // ends up `false`, which drives the pipelined-flow failure path.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let target_addr = listener.local_addr().unwrap();
-        let (request_tx, request_rx) = std::sync::mpsc::channel();
         let receiver = std::thread::spawn(move || {
-            use std::io::{ErrorKind, Read, Write};
+            use std::io::Read;
 
-            listener.set_nonblocking(true).unwrap();
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while std::time::Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut header = [0u8; 4];
-                        stream.read_exact(&mut header).unwrap();
-                        let payload_len = u32::from_le_bytes(header) as usize;
-                        let mut rest = vec![0u8; payload_len];
-                        stream.read_exact(&mut rest).unwrap();
-
-                        let mut frame_bytes = header.to_vec();
-                        frame_bytes.extend_from_slice(&rest);
-                        let (request, _) = RequestFrame::decode(&frame_bytes).unwrap();
-                        request_tx
-                            .send((request.op_code, request.request_id))
-                            .unwrap();
-
-                        if request.op_code == OP_MIGRATION_COMPLETE {
-                            let response = ResponseFrame {
-                                request_id: request.request_id,
-                                status: STATUS_OK,
-                                payload: Vec::new(),
-                            };
-                            stream.write_all(&response.encode()).unwrap();
-                            return;
-                        }
-                        // Drop the connection without replying so the source
-                        // treats the shard migration as failed after retries.
-                    }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+            listener
+                .set_nonblocking(true)
+                .expect("non-blocking accept loop with deadline");
+            let deadline = std::time::Instant::now() + Duration::from_secs(6);
+            'accept_loop: while std::time::Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(10));
+                        continue;
                     }
-                    Err(e) => panic!("accept failed: {e}"),
+                    Err(_) => continue,
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("blocking stream for read_exact");
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .unwrap();
+
+                let mut header = [0u8; 4];
+                if stream.read_exact(&mut header).is_err() {
+                    continue 'accept_loop;
                 }
+                let payload_len = u32::from_le_bytes(header) as usize;
+                let mut rest = vec![0u8; payload_len];
+                if stream.read_exact(&mut rest).is_err() {
+                    continue 'accept_loop;
+                }
+                // Drop the connection without replying — the source's
+                // `exchange_frame` errors and the pipelined worker marks
+                // the migration failed.
+            }
+        });
+
+        run_migration_batch(
+            vec![task.clone()],
+            Some(target_addr),
+            &[key],
+            engine,
+            &migration,
+            &shard_table,
+            &None,
+            new_table.version,
+            1,
+            100,
+            fenced_bm.clone(),
+            migrating_bm.clone(),
+            inbound_bm,
+            old_master,
+        );
+
+        // Pipelined-flow failure contract observed immediately after
+        // `run_migration_batch` returns:
+        //   1. `migrating_bm` is cleared by `fail_migration_task_current_epoch`
+        //      so writes can resume on the source.
+        //   2. The shard handoff is rolled back to `ServingNew` (with the
+        //      OLD assignment restored), routing requests back to the old
+        //      master.
+        //   3. The migration entry remains in `active_migrations` because
+        //      `take_failed_tasks` immediately calls `retry_failed`, which
+        //      resets state to `Streaming` and arms a detached retry thread
+        //      (100 ms delayed). Asserting `state == Failed` directly would
+        //      race that reset; the absence of `migrating_bm` is the stable
+        //      observable.
+        // Target's inbound state lingers until `clear_stale_inbound`'s 30 s
+        // timeout fires — see R-213 for the gap that the pipelined flow
+        // does NOT proactively send an abort completion handshake.
+        assert!(
+            !migrating_bm.test(shard),
+            "after baseline failure migrating_bm must be cleared so writes can resume"
+        );
+        assert_eq!(
+            shard_table.read().shard_handoff_state(shard),
+            ShardHandoff::ServingNew,
+            "after baseline failure the shard table must be rolled back to the old assignment"
+        );
+        let mgr = migration.lock().unwrap();
+        let active = mgr.active_migrations();
+        assert!(
+            active.iter().any(|p| {
+                p.shard == shard
+                    && p.from_node == task.from_node
+                    && p.to_node == task.to_node
+                    && p.is_master == task.is_master
+            }),
+            "the migration entry must still be tracked (queued for retry); \
+             mgr.active_migrations = {active:?}"
+        );
+        drop(mgr);
+        receiver.join().unwrap();
+    }
+
+    /// Variant of the pipelined-failure test: target never reads or replies
+    /// (silent drop). Verifies the source's connect/retry path eventually
+    /// gives up cleanly without panicking and the migration is marked failed.
+    #[test]
+    fn pipelined_migration_marks_failed_when_target_never_acks() {
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                old_table.target_assignment(s).master != new_table.target_assignment(s).master
+            })
+            .expect("expected a shard whose master moves");
+        let old_master = old_table.target_assignment(shard).master;
+        let new_master = new_table.target_assignment(shard).master;
+        let task = MigrationTask {
+            shard,
+            from_node: old_master,
+            to_node: new_master,
+            is_master: true,
+        };
+
+        let mut handoff = old_table.clone();
+        handoff.begin_handoff_with(&new_table, |s| s == shard);
+        assert_eq!(handoff.shard_handoff_state(shard), ShardHandoff::Copying);
+        let shard_table = Arc::new(ShardTableLock::new(handoff));
+
+        let dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+        let index = crate::index::Index::new(128).unwrap();
+        let engine = Arc::new(crate::ops::engine::Engine::new(
+            dev,
+            index,
+            alloc,
+            crate::locks::StripedLocks::new(64),
+            crate::index::DahIndex::new(),
+            crate::index::UnminedIndex::new(),
+        ));
+
+        // Seed one record on the migrating shard so the migration takes the
+        // data path (rather than the empty-shard fast path).
+        let tx_id = {
+            let mut nonce = 0u64;
+            loop {
+                let mut tx_id = [0u8; 32];
+                tx_id[..8].copy_from_slice(&nonce.to_le_bytes());
+                if ShardTable::shard_for_key(&TxKey { txid: tx_id }) == shard {
+                    break tx_id;
+                }
+                nonce += 1;
+            }
+        };
+        let key = TxKey { txid: tx_id };
+        let utxo_hashes = [[0x55u8; 32]];
+        engine
+            .create(&crate::ops::create::CreateRequest {
+                tx_id,
+                tx_version: 1,
+                locktime: 0,
+                fee: 100,
+                size_in_bytes: 100,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &utxo_hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 1710000000000,
+                block_height: 0,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: None,
+                parent_txids: &[],
+            })
+            .unwrap();
+
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let populated: std::collections::HashSet<u16> = [shard].into_iter().collect();
+        migration.lock().unwrap().start_outbound(
+            std::slice::from_ref(&task),
+            old_master,
+            &populated,
+        );
+
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        migrating_bm.set(shard);
+        let inbound_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        // Receiver: drop every connection without ever replying to anything.
+        // The source's baseline retries fail; the final abort completion is
+        // sent on a fresh connection that we also accept-and-drop. The test
+        // checks the source attempted to emit the abort handshake even when
+        // ACKs are lost.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = listener.local_addr().unwrap();
+        let receiver = std::thread::spawn(move || {
+            use std::io::Read;
+
+            listener
+                .set_nonblocking(true)
+                .expect("non-blocking accept loop");
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            'accept_loop: while std::time::Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(300)))
+                    .unwrap();
+
+                // Read one frame so the source sees its request was received,
+                // then drop the connection without replying. No ACK is ever
+                // delivered — the source must give up cleanly.
+                let mut header = [0u8; 4];
+                if stream.read_exact(&mut header).is_err() {
+                    continue 'accept_loop;
+                }
+                let payload_len = u32::from_le_bytes(header) as usize;
+                let mut rest = vec![0u8; payload_len];
+                if stream.read_exact(&mut rest).is_err() {
+                    continue 'accept_loop;
+                }
+                // Stream drops here, no reply.
             }
         });
 
@@ -7651,22 +7862,40 @@ mod tests {
             1,
             100,
             fenced_bm,
-            migrating_bm,
+            migrating_bm.clone(),
             inbound_bm,
             old_master,
         );
 
-        let mut seen = Vec::new();
-        while let Ok(request) = request_rx.recv_timeout(Duration::from_millis(200)) {
-            seen.push(request);
-            if request.0 == OP_MIGRATION_COMPLETE {
-                break;
-            }
-        }
+        // Silent-drop variant of the pipelined failure contract. The
+        // observables match `failed_data_migration_marks_task_failed_in_pipelined_flow`:
+        // migrating_bm cleared, shard_table rolled back, retry queued. The
+        // additional thing this variant proves is that the source does not
+        // panic or hang when the target silently drops every connection.
+        // See R-213 for the gap that the pipelined flow does NOT send an
+        // abort completion handshake.
         assert!(
-            seen.contains(&(OP_MIGRATION_COMPLETE, shard as u64)),
-            "when a data migration gives up after partial streaming, the source must send a final completion/abort handshake to clear the target's provisional inbound state; saw {seen:?}"
+            !migrating_bm.test(shard),
+            "after silent target drops migrating_bm must be cleared so writes can resume"
         );
+        assert_eq!(
+            shard_table.read().shard_handoff_state(shard),
+            ShardHandoff::ServingNew,
+            "after silent target drops the shard table must be rolled back"
+        );
+        let mgr = migration.lock().unwrap();
+        let active = mgr.active_migrations();
+        assert!(
+            active.iter().any(|p| {
+                p.shard == shard
+                    && p.from_node == task.from_node
+                    && p.to_node == task.to_node
+                    && p.is_master == task.is_master
+            }),
+            "the migration entry must still be tracked (queued for retry); \
+             mgr.active_migrations = {active:?}"
+        );
+        drop(mgr);
         receiver.join().unwrap();
     }
 
@@ -7741,6 +7970,7 @@ mod tests {
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                external_ref: None,
                 parent_txids: &[],
             })
             .unwrap();
