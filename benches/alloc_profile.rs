@@ -148,6 +148,7 @@ fn create_tx(engine: &Engine, tx_idx: u32, utxo_count: u32) {
         frozen: false,
         conflicting: false,
         locked: false,
+        external_ref: None,
         parent_txids: &[],
     };
     engine.create(&req).unwrap();
@@ -203,6 +204,7 @@ fn main() {
             frozen: false,
             conflicting: false,
             locked: false,
+            external_ref: None,
             parent_txids: &[],
         };
         let _ = engine.create(&req);

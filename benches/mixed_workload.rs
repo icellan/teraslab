@@ -81,6 +81,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                external_ref: None,
                 parent_txids: &[],
             };
             engine.create(&req).unwrap();
@@ -114,6 +115,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
                     frozen: false,
                     conflicting: false,
                     locked: false,
+                    external_ref: None,
                     parent_txids: &[],
                 };
                 let _ = engine.create(&req);

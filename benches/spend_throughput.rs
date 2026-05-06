@@ -72,6 +72,7 @@ fn setup_engine_with_txs(count: u32, utxos_per_tx: u32) -> Arc<Engine> {
             frozen: false,
             conflicting: false,
             locked: false,
+            external_ref: None,
             parent_txids: &[],
         };
         engine.create(&req).unwrap();
@@ -238,6 +239,7 @@ fn bench_set_mined(c: &mut Criterion) {
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                external_ref: None,
                 parent_txids: &[],
             };
             let _ = fresh_engine.create(&req);
@@ -348,6 +350,7 @@ fn bench_create(c: &mut Criterion) {
                         frozen: false,
                         conflicting: false,
                         locked: false,
+                        external_ref: None,
                         parent_txids: &[],
                     };
                     let _ = engine.create(&req);

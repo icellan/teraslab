@@ -373,28 +373,34 @@ impl Index {
 
         let mut offset = start;
         while offset + aligned_read as u64 <= end {
-            let mut buf = AlignedBuf::new(aligned_read, align);
-            if device.pread_exact_at(&mut buf, offset).is_err() {
-                offset += align as u64;
+            if let Some((free_offset, free_size)) = allocator.free_region_containing(offset) {
+                let free_end = free_offset.saturating_add(free_size).min(end);
+                offset = free_end.max(offset + align as u64);
                 continue;
             }
 
+            let mut buf = AlignedBuf::new(aligned_read, align);
+            device.pread_exact_at(&mut buf, offset)?;
+
             let meta = match TxMetadata::from_bytes(&buf[..METADATA_SIZE]) {
                 Ok(m) => m,
-                Err(_) => {
-                    offset += align as u64;
-                    continue;
+                Err(e) => {
+                    return Err(IndexError::FormatError {
+                        detail: format!("corrupt metadata at allocated offset {offset}: {e}"),
+                    });
                 }
             };
             if { meta.magic } != METADATA_MAGIC {
-                offset += align as u64;
-                continue;
+                return Err(IndexError::FormatError {
+                    detail: format!("invalid metadata magic at allocated offset {offset}"),
+                });
             }
 
             let record_size = { meta.record_size } as u64;
             if record_size == 0 {
-                offset += align as u64;
-                continue;
+                return Err(IndexError::FormatError {
+                    detail: format!("zero record_size at allocated offset {offset}"),
+                });
             }
 
             let key = TxKey { txid: meta.tx_id };
@@ -413,6 +419,13 @@ impl Index {
 
             // Advance past this record (aligned)
             let record_aligned = (record_size as usize).div_ceil(align) * align;
+            if offset + record_aligned as u64 > end {
+                return Err(IndexError::FormatError {
+                    detail: format!(
+                        "record at allocated offset {offset} extends past allocator high-water mark"
+                    ),
+                });
+            }
             offset += record_aligned as u64;
         }
 
@@ -437,28 +450,34 @@ impl Index {
 
         let mut offset = start;
         while offset + aligned_read as u64 <= end {
-            let mut buf = AlignedBuf::new(aligned_read, align);
-            if device.pread_exact_at(&mut buf, offset).is_err() {
-                offset += align as u64;
+            if let Some((free_offset, free_size)) = allocator.free_region_containing(offset) {
+                let free_end = free_offset.saturating_add(free_size).min(end);
+                offset = free_end.max(offset + align as u64);
                 continue;
             }
 
+            let mut buf = AlignedBuf::new(aligned_read, align);
+            device.pread_exact_at(&mut buf, offset)?;
+
             let meta = match TxMetadata::from_bytes(&buf[..METADATA_SIZE]) {
                 Ok(m) => m,
-                Err(_) => {
-                    offset += align as u64;
-                    continue;
+                Err(e) => {
+                    return Err(IndexError::FormatError {
+                        detail: format!("corrupt metadata at allocated offset {offset}: {e}"),
+                    });
                 }
             };
             if { meta.magic } != METADATA_MAGIC {
-                offset += align as u64;
-                continue;
+                return Err(IndexError::FormatError {
+                    detail: format!("invalid metadata magic at allocated offset {offset}"),
+                });
             }
 
             let record_size = { meta.record_size } as u64;
             if record_size == 0 {
-                offset += align as u64;
-                continue;
+                return Err(IndexError::FormatError {
+                    detail: format!("zero record_size at allocated offset {offset}"),
+                });
             }
 
             let key = TxKey { txid: meta.tx_id };
@@ -473,6 +492,13 @@ impl Index {
             }
 
             let record_aligned = (record_size as usize).div_ceil(align) * align;
+            if offset + record_aligned as u64 > end {
+                return Err(IndexError::FormatError {
+                    detail: format!(
+                        "record at allocated offset {offset} extends past allocator high-water mark"
+                    ),
+                });
+            }
             offset += record_aligned as u64;
         }
 
@@ -698,8 +724,31 @@ mod tests {
     use super::*;
     use crate::device::MemoryDevice;
     use crate::io::write_full_record;
-    use crate::record::{TxMetadata, UtxoSlot};
+    use crate::record::{CRC32_OFFSET, TxMetadata, UtxoSlot};
     use std::sync::Arc;
+
+    /// Corrupt the first 4 bytes of an allocated record's metadata header
+    /// (the magic field) AND restamp the CRC over the corrupted bytes so
+    /// `TxMetadata::from_bytes` accepts the header and the magic check is
+    /// the gate that fails. Without restamping the CRC, the CRC check
+    /// short-circuits before the magic check and the test exercises a
+    /// different code path than its name implies.
+    fn corrupt_magic_and_restamp_crc(dev: &dyn BlockDevice, offset: u64) {
+        let align = dev.alignment();
+        let mut buf = AlignedBuf::new(align, align);
+        dev.pread_exact_at(&mut buf, offset).unwrap();
+        // Zero the magic.
+        buf[0..4].copy_from_slice(&[0u8; 4]);
+        // Restamp CRC over the [0..METADATA_SIZE) header bytes (with the
+        // CRC slot temporarily zeroed during the hash, matching
+        // `TxMetadata::stamp_crc`'s semantics).
+        let mut hash_buf = [0u8; METADATA_SIZE];
+        hash_buf.copy_from_slice(&buf[..METADATA_SIZE]);
+        hash_buf[CRC32_OFFSET..CRC32_OFFSET + 4].copy_from_slice(&[0u8; 4]);
+        let crc = crc32fast::hash(&hash_buf);
+        buf[CRC32_OFFSET..CRC32_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        dev.pwrite_all_at(&buf, offset).unwrap();
+    }
 
     fn make_key(n: u64) -> TxKey {
         let mut txid = [0u8; 32];
@@ -1098,22 +1147,71 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_skips_corrupted_magic() {
+    fn rebuild_fails_on_corrupted_magic_in_allocated_region() {
         let (dev, alloc, records) = setup_device_with_records(10);
 
-        // Corrupt the magic number of record at index 3
         let offset = records[3].1;
+        corrupt_magic_and_restamp_crc(&*dev, offset);
+
+        let err = Index::rebuild(&*dev, &alloc).unwrap_err();
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(
+                    detail.contains("invalid metadata magic"),
+                    "expected magic-mismatch detail, got: {detail}"
+                );
+                assert!(detail.contains(&offset.to_string()));
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rebuild_fails_on_crc_mismatch_in_allocated_region() {
+        // Companion to the magic-mismatch test: when the magic bytes are
+        // zeroed WITHOUT restamping the CRC, `TxMetadata::from_bytes`
+        // rejects the header on CRC before the magic check is reached.
+        // The rebuild path must surface the CRC error in its detail
+        // string so operators can distinguish torn-write corruption
+        // from "valid header pointing at the wrong record type".
+        let (dev, alloc, records) = setup_device_with_records(10);
+
+        let offset = records[3].1;
+        let align = dev.alignment();
+        let mut buf = AlignedBuf::new(align, align);
+        dev.pread_exact_at(&mut buf, offset).unwrap();
+        buf[0..4].copy_from_slice(&[0u8; 4]);
+        dev.pwrite_all_at(&buf, offset).unwrap();
+
+        let err = Index::rebuild(&*dev, &alloc).unwrap_err();
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(
+                    detail.contains("corrupt metadata at allocated offset"),
+                    "expected CRC-error detail, got: {detail}"
+                );
+                assert!(detail.contains(&offset.to_string()));
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rebuild_skips_corruption_inside_freelist_hole() {
+        let (dev, mut alloc, records) = setup_device_with_records(10);
+
+        let offset = records[3].1;
+        let record_size = TxMetadata::record_size_for(5);
+        alloc.free(offset, record_size).unwrap();
+
         let align = dev.alignment();
         let mut buf = crate::device::AlignedBuf::new(align, align);
         dev.pread(&mut buf, offset).unwrap();
-        buf[0] = 0x00; // Corrupt first byte of magic
-        buf[1] = 0x00;
-        buf[2] = 0x00;
-        buf[3] = 0x00;
+        buf[0..4].copy_from_slice(&[0u8; 4]);
         dev.pwrite(&buf, offset).unwrap();
 
         let rebuilt = Index::rebuild(&*dev, &alloc).unwrap();
-        assert_eq!(rebuilt.len(), 9); // One less
+        assert_eq!(rebuilt.len(), 9);
         assert!(rebuilt.lookup(&records[3].0).is_none());
     }
 
@@ -1138,20 +1236,54 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_secondary_skips_corrupted() {
+    fn rebuild_secondary_fails_on_corrupted_allocated_record() {
         let (dev, alloc, records) = setup_device_with_records(20);
 
         // Corrupt record 0 (which has both dah and unmined set)
         let offset = records[0].1;
-        let align = dev.alignment();
-        let mut buf = crate::device::AlignedBuf::new(align, align);
-        dev.pread(&mut buf, offset).unwrap();
-        buf[0..4].copy_from_slice(&[0u8; 4]); // Zero magic
-        dev.pwrite(&buf, offset).unwrap();
+        corrupt_magic_and_restamp_crc(&*dev, offset);
 
-        let (dah, unmined) = Index::rebuild_secondary(&*dev, &alloc).unwrap();
-        assert_eq!(dah.len(), 9); // Lost one DAH entry
-        assert_eq!(unmined.len(), 4); // Lost one unmined entry
+        let err = match Index::rebuild_secondary(&*dev, &alloc) {
+            Ok(_) => panic!("corrupt allocated secondary record must fail rebuild"),
+            Err(err) => err,
+        };
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(
+                    detail.contains("invalid metadata magic"),
+                    "expected magic-mismatch detail, got: {detail}"
+                );
+                assert!(detail.contains(&offset.to_string()));
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rebuild_secondary_fails_on_crc_mismatch_in_allocated_record() {
+        let (dev, alloc, records) = setup_device_with_records(20);
+
+        let offset = records[0].1;
+        let align = dev.alignment();
+        let mut buf = AlignedBuf::new(align, align);
+        dev.pread_exact_at(&mut buf, offset).unwrap();
+        buf[0..4].copy_from_slice(&[0u8; 4]);
+        dev.pwrite_all_at(&buf, offset).unwrap();
+
+        let err = match Index::rebuild_secondary(&*dev, &alloc) {
+            Ok(_) => panic!("corrupt CRC must fail secondary rebuild"),
+            Err(err) => err,
+        };
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(
+                    detail.contains("corrupt metadata at allocated offset"),
+                    "expected CRC-error detail, got: {detail}"
+                );
+                assert!(detail.contains(&offset.to_string()));
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
     }
 
     #[test]

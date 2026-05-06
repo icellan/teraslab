@@ -366,9 +366,9 @@ impl PrimaryBackend {
 
     /// Rebuild the primary index into a redb database by scanning all records.
     ///
-    /// Records with I/O errors or invalid magic are skipped with a warning.
-    /// The total number of skipped offsets is logged at the end so operators
-    /// can detect partial rebuilds from device corruption.
+    /// Free holes from the allocator freelist are skipped. I/O errors or
+    /// invalid metadata in allocated regions fail the rebuild so startup
+    /// cannot silently create a partial primary index.
     pub fn rebuild_redb(
         config: &IndexConfig,
         device: &dyn BlockDevice,
@@ -385,39 +385,38 @@ impl PrimaryBackend {
 
         const BATCH_SIZE: usize = 10_000;
         let mut batch = Vec::with_capacity(BATCH_SIZE);
-        let mut skipped: u64 = 0;
-        let mut indexed: u64 = 0;
 
         let mut offset = start;
         while offset + aligned_read as u64 <= end {
-            let mut buf = crate::device::AlignedBuf::new(aligned_read, align);
-            if device.pread_exact_at(&mut buf, offset).is_err() {
-                skipped += 1;
-                offset += align as u64;
+            if let Some((free_offset, free_size)) = allocator.free_region_containing(offset) {
+                let free_end = free_offset.saturating_add(free_size).min(end);
+                offset = free_end.max(offset + align as u64);
                 continue;
             }
+
+            let mut buf = crate::device::AlignedBuf::new(aligned_read, align);
+            device.pread_exact_at(&mut buf, offset)?;
 
             let meta =
                 match crate::record::TxMetadata::from_bytes(&buf[..crate::record::METADATA_SIZE]) {
                     Ok(m) => m,
-                    Err(_) => {
-                        // CRC mismatch during a rebuild scan is indistinguishable
-                        // from unformatted region or partial write — skip like an
-                        // invalid magic.
-                        skipped += 1;
-                        offset += align as u64;
-                        continue;
+                    Err(e) => {
+                        return Err(IndexError::FormatError {
+                            detail: format!("corrupt metadata at allocated offset {offset}: {e}"),
+                        });
                     }
                 };
             if { meta.magic } != crate::record::METADATA_MAGIC {
-                offset += align as u64;
-                continue;
+                return Err(IndexError::FormatError {
+                    detail: format!("invalid metadata magic at allocated offset {offset}"),
+                });
             }
 
             let record_size = { meta.record_size } as u64;
             if record_size == 0 {
-                offset += align as u64;
-                continue;
+                return Err(IndexError::FormatError {
+                    detail: format!("zero record_size at allocated offset {offset}"),
+                });
             }
 
             let key = TxKey { txid: meta.tx_id };
@@ -433,7 +432,6 @@ impl PrimaryBackend {
                 generation: 0,
             };
             batch.push((key, entry));
-            indexed += 1;
 
             if batch.len() >= BATCH_SIZE {
                 primary.register_batch(&batch)?;
@@ -441,6 +439,13 @@ impl PrimaryBackend {
             }
 
             let record_aligned = (record_size as usize).div_ceil(align) * align;
+            if offset + record_aligned as u64 > end {
+                return Err(IndexError::FormatError {
+                    detail: format!(
+                        "record at allocated offset {offset} extends past allocator high-water mark"
+                    ),
+                });
+            }
             offset += record_aligned as u64;
         }
 
@@ -449,22 +454,14 @@ impl PrimaryBackend {
             primary.register_batch(&batch)?;
         }
 
-        if skipped > 0 {
-            tracing::warn!(
-                skipped,
-                indexed,
-                "rebuild_redb: skipped offsets due to I/O errors",
-            );
-        }
-
         Ok(Self::OnDisk(primary))
     }
 
     /// Rebuild the primary index into a file-backed mmap by scanning all records.
     ///
-    /// Records with I/O errors or invalid magic are skipped with a warning.
-    /// The total number of skipped offsets is logged at the end so operators
-    /// can detect partial rebuilds from device corruption.
+    /// Free holes from the allocator freelist are skipped. I/O errors or
+    /// invalid metadata in allocated regions fail the rebuild so startup
+    /// cannot silently create a partial primary index.
     pub fn rebuild_file_backed(
         path: &std::path::Path,
         device: &dyn BlockDevice,
@@ -480,36 +477,37 @@ impl PrimaryBackend {
         let read_size = align.max(crate::record::METADATA_SIZE);
         let aligned_read = read_size.div_ceil(align) * align;
 
-        let mut skipped: u64 = 0;
-        let mut indexed: u64 = 0;
-
         let mut offset = start;
         while offset + aligned_read as u64 <= end {
-            let mut buf = crate::device::AlignedBuf::new(aligned_read, align);
-            if device.pread_exact_at(&mut buf, offset).is_err() {
-                skipped += 1;
-                offset += align as u64;
+            if let Some((free_offset, free_size)) = allocator.free_region_containing(offset) {
+                let free_end = free_offset.saturating_add(free_size).min(end);
+                offset = free_end.max(offset + align as u64);
                 continue;
             }
+
+            let mut buf = crate::device::AlignedBuf::new(aligned_read, align);
+            device.pread_exact_at(&mut buf, offset)?;
 
             let meta =
                 match crate::record::TxMetadata::from_bytes(&buf[..crate::record::METADATA_SIZE]) {
                     Ok(m) => m,
-                    Err(_) => {
-                        skipped += 1;
-                        offset += align as u64;
-                        continue;
+                    Err(e) => {
+                        return Err(IndexError::FormatError {
+                            detail: format!("corrupt metadata at allocated offset {offset}: {e}"),
+                        });
                     }
                 };
             if { meta.magic } != crate::record::METADATA_MAGIC {
-                offset += align as u64;
-                continue;
+                return Err(IndexError::FormatError {
+                    detail: format!("invalid metadata magic at allocated offset {offset}"),
+                });
             }
 
             let record_size = { meta.record_size } as u64;
             if record_size == 0 {
-                offset += align as u64;
-                continue;
+                return Err(IndexError::FormatError {
+                    detail: format!("zero record_size at allocated offset {offset}"),
+                });
             }
 
             let key = TxKey { txid: meta.tx_id };
@@ -525,18 +523,16 @@ impl PrimaryBackend {
                 generation: 0,
             };
             index.register(key, entry)?;
-            indexed += 1;
 
             let record_aligned = (record_size as usize).div_ceil(align) * align;
+            if offset + record_aligned as u64 > end {
+                return Err(IndexError::FormatError {
+                    detail: format!(
+                        "record at allocated offset {offset} extends past allocator high-water mark"
+                    ),
+                });
+            }
             offset += record_aligned as u64;
-        }
-
-        if skipped > 0 {
-            tracing::warn!(
-                skipped,
-                indexed,
-                "rebuild_file_backed: skipped offsets due to I/O errors",
-            );
         }
 
         index.sync();
@@ -598,10 +594,26 @@ mod tests {
     use super::*;
     use crate::allocator::SlotAllocator;
     use crate::config::{IndexBackendMode, IndexConfig};
-    use crate::device::MemoryDevice;
+    use crate::device::{AlignedBuf, MemoryDevice};
     use crate::io::write_full_record;
-    use crate::record::{TxMetadata, UtxoSlot};
+    use crate::record::{CRC32_OFFSET, METADATA_SIZE, TxMetadata, UtxoSlot};
     use std::sync::Arc;
+
+    /// Mirror of the helper in `crate::index::tests`: corrupt the magic
+    /// bytes AND restamp the CRC so `TxMetadata::from_bytes` accepts the
+    /// header and the magic check is the gate that fails.
+    fn corrupt_magic_and_restamp_crc(dev: &dyn BlockDevice, offset: u64) {
+        let align = dev.alignment();
+        let mut buf = AlignedBuf::new(align, align);
+        dev.pread_exact_at(&mut buf, offset).unwrap();
+        buf[0..4].copy_from_slice(&[0u8; 4]);
+        let mut hash_buf = [0u8; METADATA_SIZE];
+        hash_buf.copy_from_slice(&buf[..METADATA_SIZE]);
+        hash_buf[CRC32_OFFSET..CRC32_OFFSET + 4].copy_from_slice(&[0u8; 4]);
+        let crc = crc32fast::hash(&hash_buf);
+        buf[CRC32_OFFSET..CRC32_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        dev.pwrite_all_at(&buf, offset).unwrap();
+    }
 
     fn make_key(n: u64) -> TxKey {
         let mut txid = [0u8; 32];
@@ -939,22 +951,51 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_redb_skips_corrupted_magic() {
+    fn rebuild_redb_fails_on_corrupted_magic_in_allocated_region() {
         let dir = tempfile::tempdir().unwrap();
         let config = redb_config(dir.path());
         let (dev, alloc, records) = setup_device_with_records(10);
 
-        // Corrupt record 3's magic
+        let offset = records[3].1;
+        corrupt_magic_and_restamp_crc(&*dev, offset);
+
+        let err = PrimaryBackend::rebuild_redb(&config, &*dev, &alloc).unwrap_err();
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(
+                    detail.contains("invalid metadata magic"),
+                    "expected magic-mismatch detail, got: {detail}"
+                );
+                assert!(detail.contains(&offset.to_string()));
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rebuild_redb_fails_on_crc_mismatch_in_allocated_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = redb_config(dir.path());
+        let (dev, alloc, records) = setup_device_with_records(10);
+
         let offset = records[3].1;
         let align = dev.alignment();
-        let mut buf = crate::device::AlignedBuf::new(align, align);
-        dev.pread(&mut buf, offset).unwrap();
+        let mut buf = AlignedBuf::new(align, align);
+        dev.pread_exact_at(&mut buf, offset).unwrap();
         buf[0..4].copy_from_slice(&[0u8; 4]);
-        dev.pwrite(&buf, offset).unwrap();
+        dev.pwrite_all_at(&buf, offset).unwrap();
 
-        let rebuilt = PrimaryBackend::rebuild_redb(&config, &*dev, &alloc).unwrap();
-        assert_eq!(rebuilt.len(), 9); // One less
-        assert!(rebuilt.lookup(&records[3].0).is_none());
+        let err = PrimaryBackend::rebuild_redb(&config, &*dev, &alloc).unwrap_err();
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(
+                    detail.contains("corrupt metadata at allocated offset"),
+                    "expected CRC-error detail, got: {detail}"
+                );
+                assert!(detail.contains(&offset.to_string()));
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
     }
 
     #[test]

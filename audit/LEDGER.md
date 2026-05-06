@@ -24,11 +24,11 @@
 ### R-001 — [test-baseline] Three index-rebuild tests fail on stale "invalid metadata magic" assertion
 - **Source:** AUDIT.md baseline §; AUDIT_CODEX.md F6
 - **Severity:** HIGH (gate)
-- **Status:** OPEN
+- **Status:** RESOLVED
 - **Files:** src/index/mod.rs:1127, src/index/mod.rs:1191, src/index/backend.rs:938
 - **Cluster:** test-baseline
-- **Notes:** `TxMetadata::from_bytes` (`src/record.rs:557`) rejects on CRC before magic check at `src/index/mod.rs:393`. Tests still assert old detail string. Decide: (a) update assertions to match `corrupt metadata at allocated offset … : <CRC error>`, or (b) corrupt-only-magic by recomputing CRC after byte flip. Add a separate test for valid-CRC + wrong-magic if constructible.
-- **Test:** `rebuild_fails_on_corrupted_magic_in_allocated_region`, `rebuild_secondary_fails_on_corrupted_allocated_record`, `rebuild_redb_fails_on_corrupted_magic_in_allocated_region`
+- **Resolution:** Took option (b) — tests now corrupt the magic AND restamp the CRC, so the magic-check branch the tests claim to exercise is actually exercised. Added a `corrupt_magic_and_restamp_crc` helper to each test module. Added 3 NEW companion tests (`rebuild_fails_on_crc_mismatch_in_allocated_region`, `rebuild_secondary_fails_on_crc_mismatch_in_allocated_record`, `rebuild_redb_fails_on_crc_mismatch_in_allocated_region`) that corrupt without restamping CRC and assert the `corrupt metadata at allocated offset` detail — covering the CRC-rejection branch that was previously the silent winner. All 6 tests pass.
+- **Verification:** `cargo build --release` clean; `cargo test --all` 1486 passed (was 1480), 0 failed, 1 ignored (R-002); `cargo clippy --all --all-targets -- -D warnings` clean; `cargo fmt --all -- --check` clean. Cross-backend: redb test (`rebuild_redb_*`) passes alongside in-memory variant.
 
 ### R-002 — [test-baseline] Migration abort/completion handshake test ignored
 - **Source:** AUDIT.md hazards §; AUDIT_CODEX.md F7
@@ -2029,19 +2029,29 @@ These are entries from the audits that, on inspection, are correct as implemente
 | LOW | 80 | — |
 | INFO/positive | — | ~33 |
 
-**Total active R-IDs:** 211 (R-001..R-211).
+**Total active R-IDs:** 212 (R-001..R-212; R-212 discovered during remediation).
 
 ---
 
 ## Session log
 
-### 2026-05-06 — Session 1 (ledger creation)
+### 2026-05-06 — Session 1 (ledger creation + R-001)
 
 - Read `AUDIT.md` and `AUDIT_CODEX.md` end-to-end.
 - Dispatched 7 parallel readers to extract structured findings from `audit/raw/category_*.md` files.
 - Verified Codex F1 (delete-rollback resurrection) and F2 (process-expired ownership/replication) by direct reads of `src/server/dispatch.rs:3940-4097` and `:4669-4720`. Both confirmed CRITICAL — NEW vs AUDIT.md.
 - Reconciled overlaps: F3↔IJK-20, F11↔LMNH-17, F13↔LMNH-01, F14↔LMNH-08, F15↔LMNH-16, F8↔GH-G5.
-- Created LEDGER with 211 active R-IDs and 33 confirmed-correct register entries.
-- IDs touched: R-001 .. R-211 (initial creation).
-- Open questions for next session: none yet — first-priority work is R-001 (failing tests) gating everything, then CRITICAL cluster.
-- Next session entry point: read this LEDGER, find first non-terminal entry in priority order, resume per-finding workflow from step 1 (verify bug exists with failing test).
+- Created LEDGER with 211 active R-IDs and 33 confirmed-correct register entries. Committed as `df207ef`.
+- **R-001 RESOLVED.** Three failing index-rebuild tests fixed (corrupt magic + restamp CRC); 3 new companion tests added covering the CRC-mismatch branch. Lib test count 1480 → 1486.
+- **NEW finding R-212 added** (see below): clippy `--all --all-targets` was not run by either audit. Found and fixed: 8 bench `CreateRequest` constructions missing `external_ref: None` field (pre-existing bench-API drift), plus 2 pre-existing `collapsible_if` clippy lints in `src/device.rs` test code (lines 1246, 1268). All fixed in same R-001 commit since they blocked the verification gate.
+- IDs touched: R-001 (RESOLVED), R-212 (RESOLVED — new).
+- Next session entry point: R-002 (ignored migration test) is HIGH-gate; or jump to R-003 (BC-01 redo-log checkpoint, foundational CRITICAL).
+
+### R-212 — [test-baseline] Bench CreateRequest constructions miss `external_ref` field; pre-existing collapsible_if lints in `src/device.rs` tests
+- **Source:** Discovered while running R-001 verification gate (`cargo clippy --all --all-targets`)
+- **Severity:** HIGH (gate)
+- **Status:** RESOLVED
+- **Files:** benches/alloc_profile.rs (2 sites), benches/engine_remaining.rs, benches/mixed_workload.rs (2 sites), benches/spend_throughput.rs (3 sites), src/device.rs:1246, :1268
+- **Cluster:** test-baseline
+- **Notes:** Both audits ran `cargo clippy --all -- -D warnings` (no `--all-targets`), missing bench compilation and lib-test lints. The benches were rotted against a `CreateRequest` API change adding `external_ref: Option<ExternalRef>`. Fix: added `external_ref: None,` after `locked: false,` in 8 sites; collapsed the 2 nested `if let Some(...) { if cond { ... } }` blocks to use `&&` chaining.
+- **Verification:** `cargo clippy --all --all-targets -- -D warnings` now clean. Tests still pass.
