@@ -2179,7 +2179,7 @@ impl Engine {
             .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
-        let meta = self.read_metadata_fast(ro)?;
+        let mut meta = self.read_metadata_fast(ro)?;
         if req.offset >= { meta.utxo_count } {
             return Err(SpendError::UtxoNotFound { offset: req.offset });
         }
@@ -2206,8 +2206,17 @@ impl Engine {
 
         let frozen = UtxoSlot::new_frozen(req.utxo_hash);
         self.write_slot_fast(ro, req.offset, &frozen)?;
-        let generation = { meta.generation };
-        Ok(generation)
+        // R-016 (A-08): bump generation, write metadata back, sync the
+        // index cache so subsequent fast-path ops (set_mined,
+        // set_conflicting, set_locked, preserve_until) see the
+        // post-freeze flags. Without this, the cached `tx_flags`
+        // diverges from the on-device state and fast paths miscompute
+        // DAH eligibility.
+        meta.generation = { meta.generation }.wrapping_add(1);
+        meta.updated_at = self.now_millis();
+        self.write_metadata_fast(ro, &meta)?;
+        self.sync_index_cache(&req.tx_key, &meta)?;
+        Ok(meta.generation)
     }
 
     /// Unfreeze a UTXO (set status to UNSPENT, spending_data zeroed).
@@ -2220,7 +2229,7 @@ impl Engine {
             .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
-        let meta = self.read_metadata_fast(ro)?;
+        let mut meta = self.read_metadata_fast(ro)?;
         if req.offset >= { meta.utxo_count } {
             return Err(SpendError::UtxoNotFound { offset: req.offset });
         }
@@ -2235,8 +2244,13 @@ impl Engine {
 
         let unspent = UtxoSlot::new_unspent(req.utxo_hash);
         self.write_slot_fast(ro, req.offset, &unspent)?;
-        let generation = { meta.generation };
-        Ok(generation)
+        // R-016 (A-08): see `freeze` — bump gen + sync cache so the
+        // next mutation sees the post-unfreeze flags.
+        meta.generation = { meta.generation }.wrapping_add(1);
+        meta.updated_at = self.now_millis();
+        self.write_metadata_fast(ro, &meta)?;
+        self.sync_index_cache(&req.tx_key, &meta)?;
+        Ok(meta.generation)
     }
 
     /// Reassign a frozen UTXO to a new hash with a spendable-after cooldown.
@@ -2677,6 +2691,15 @@ impl Engine {
         meta.updated_at = self.now_millis();
 
         self.write_metadata_fast(ro, &meta)?;
+
+        // R-019 (A-12): sync the index cache so subsequent fast-path
+        // ops (set_mined / set_conflicting / set_locked) see
+        // HAS_PRESERVE_UNTIL and skip DAH eviction. Pre-fix the
+        // metadata was written but the cached `tx_flags` did not get
+        // the discriminant bit; fast paths consulted the cache,
+        // concluded `has_preserve = false`, and bypassed the
+        // protection — premature pruning of preserved records.
+        self.sync_index_cache(&req.tx_key, &meta)?;
 
         if old_dah != 0 {
             self.update_dah_index(&req.tx_key, old_dah, 0)?;
@@ -7321,6 +7344,77 @@ mod tests {
         let slot = engine.read_slot(&key, 2).unwrap();
         assert!(slot.is_frozen());
         assert_eq!(slot.spending_data, [0xFF; 36]);
+    }
+
+    /// R-016 (A-08): freeze must bump generation, write metadata
+    /// back, and sync the index cache. Pre-fix the generation stayed
+    /// flat and the cached `tx_flags` diverged from on-device state,
+    /// causing fast-path ops (set_mined / set_conflicting / set_locked
+    /// / preserve_until) to miscompute DAH eligibility.
+    #[test]
+    fn freeze_bumps_generation_and_syncs_cache() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(0xF1, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        let pre_gen = engine.read_metadata(&key).unwrap().generation;
+        let pre_cache_gen = engine.lookup(&key).unwrap().generation;
+
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 1,
+                utxo_hash: req.utxo_hashes[1],
+            })
+            .unwrap();
+
+        let post_meta_gen = engine.read_metadata(&key).unwrap().generation;
+        let post_cache_gen = engine.lookup(&key).unwrap().generation;
+        assert!(
+            post_meta_gen > pre_gen,
+            "freeze must bump on-device generation"
+        );
+        assert!(
+            post_cache_gen > pre_cache_gen,
+            "freeze must sync the cache so index entry matches on-device generation"
+        );
+        assert_eq!(
+            post_meta_gen, post_cache_gen,
+            "cache and on-device generation must match after sync"
+        );
+    }
+
+    /// R-016 (A-08): unfreeze must also bump generation + sync cache.
+    #[test]
+    fn unfreeze_bumps_generation_and_syncs_cache() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(0xF2, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
+        let pre_gen = engine.read_metadata(&key).unwrap().generation;
+
+        engine
+            .unfreeze(&UnfreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
+
+        let post_meta_gen = engine.read_metadata(&key).unwrap().generation;
+        let post_cache_gen = engine.lookup(&key).unwrap().generation;
+        assert!(post_meta_gen > pre_gen, "unfreeze must bump generation");
+        assert_eq!(
+            post_meta_gen, post_cache_gen,
+            "unfreeze must sync the cache"
+        );
     }
 
     #[test]

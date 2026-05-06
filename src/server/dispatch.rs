@@ -5337,11 +5337,31 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
             (ERR_ALREADY_SPENT, spending_data.to_vec())
         }
         SpendError::Frozen { .. } => (ERR_FROZEN, vec![]),
-        SpendError::FrozenUntil { .. } => (ERR_FROZEN_UNTIL, vec![]),
+        // R-018 (A-10): include the 4-byte spendable_at_height in the
+        // wire payload so the client knows when to retry. The previous
+        // empty-payload behavior contradicted README's documented
+        // "ERR_FROZEN_UNTIL carries 4-byte spendable_at_height" contract
+        // and forced clients to either guess or poll blindly.
+        SpendError::FrozenUntil {
+            spendable_at_height,
+            ..
+        } => (ERR_FROZEN_UNTIL, spendable_at_height.to_le_bytes().to_vec()),
         SpendError::InvalidSpend { spending_data, .. } => {
             (ERR_INVALID_SPEND, spending_data.to_vec())
         }
-        SpendError::Pruned { .. } => (ERR_INVALID_SPEND, vec![]),
+        // R-015 (A-07): Pruned UTXOs preserve `spending_data` on disk
+        // for forensic / proof-of-prune lookups. Surface that data on
+        // the wire instead of a meaningless empty payload — clients
+        // looking at "why was my spend rejected" can then see WHO
+        // pruned the parent. Engine already returns Pruned with no
+        // spending_data field today; full A-07 fix is captured under
+        // R-015 and requires changing SpendError::Pruned to carry the
+        // spending_data — for now we surface the structurally-empty
+        // payload but log a warning so operators can spot the gap.
+        SpendError::Pruned { .. } => {
+            tracing::warn!("Pruned spending_data unavailable on wire (R-015 follow-up)");
+            (ERR_INVALID_SPEND, vec![])
+        }
         SpendError::AlreadyFrozen { .. } => (ERR_ALREADY_FROZEN, vec![]),
         SpendError::NotFrozen { .. } => (ERR_UTXO_NOT_FROZEN, vec![]),
         SpendError::StorageError { .. } => (ERR_INTERNAL, vec![]),
