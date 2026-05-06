@@ -19,6 +19,7 @@ use crate::ops::spend::*;
 use crate::ops::unspend::*;
 use crate::record::*;
 use crate::storage::blobstore::BlobStore;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -74,6 +75,15 @@ unsafe impl Send for Engine {}
 unsafe impl Sync for Engine {}
 
 impl Engine {
+    fn external_ref_for_create(req: &CreateRequest) -> Result<Option<ExternalRef>, CreateError> {
+        if !req.is_external {
+            return Ok(None);
+        }
+        req.external_ref
+            .map(Some)
+            .ok_or(CreateError::MissingExternalRef)
+    }
+
     /// Create a new engine with the given components.
     pub fn new(
         device: Arc<dyn BlockDevice>,
@@ -996,12 +1006,19 @@ impl Engine {
                     // spend_multi behavior, then return current state.
                     metadata.generation = { metadata.generation }.wrapping_add(1);
                     metadata.updated_at = self.now_millis();
+                    // R-004: propagate write errors instead of dropping
+                    // them on the floor. Pre-fix this was a `let _ = …`
+                    // that returned Ok(SpendResponse { … }) to the
+                    // client even when the on-disk metadata write
+                    // failed; a follow-up spend on the SAME utxo would
+                    // then see UNSPENT and accept a different
+                    // spending_data, producing a double-spend.
                     if !self.device_ptr.is_null() {
                         unsafe {
                             io::write_metadata_direct(self.device_ptr, record_offset, &metadata)
                         };
-                    } else if let Err(e) = self.write_metadata_fast(record_offset, &metadata) {
-                        tracing::warn!(err = ?e, "engine: write_metadata failed");
+                    } else {
+                        self.write_metadata_fast(record_offset, &metadata)?;
                     }
                     self.sync_index_cache(&req.tx_key, &metadata)?;
                     let block_ids = collect_block_ids(&metadata).to_vec();
@@ -1027,11 +1044,15 @@ impl Engine {
             }
         }
 
-        // 5. Write the spent slot
+        // 5. Write the spent slot. R-004: propagate the write error
+        // rather than logging-and-continuing. The dispatcher returns
+        // ERR_INTERNAL to the client and the redo log drives replay
+        // on the next startup. Silently ignoring the failure was a
+        // double-spend invitation (slot stays UNSPENT on disk while
+        // metadata says SPENT, and a follow-up spend with different
+        // spending_data succeeds).
         let new_slot = UtxoSlot::new_spent(req.utxo_hash, req.spending_data);
-        if let Err(e) = self.write_slot_fast(record_offset, req.offset, &new_slot) {
-            tracing::warn!(err = ?e, "engine: write_utxo_slot failed");
-        }
+        self.write_slot_fast(record_offset, req.offset, &new_slot)?;
 
         // 6. Update metadata
         let old_dah = { metadata.delete_at_height };
@@ -1050,11 +1071,12 @@ impl Engine {
             apply_dah_patch(&mut metadata, patch);
         }
 
-        // 8. Write metadata
+        // 8. Write metadata. R-004: propagate the write error rather
+        // than logging-and-continuing.
         if !self.device_ptr.is_null() {
             unsafe { io::write_metadata_direct(self.device_ptr, record_offset, &metadata) };
-        } else if let Err(e) = self.write_metadata_fast(record_offset, &metadata) {
-            tracing::warn!(err = ?e, "engine: write_metadata failed");
+        } else {
+            self.write_metadata_fast(record_offset, &metadata)?;
         }
 
         self.sync_index_cache(&req.tx_key, &metadata)?;
@@ -1612,6 +1634,7 @@ impl Engine {
         if self.index.read().lookup(&key).is_some() {
             return Err(CreateError::DuplicateTxId);
         }
+        let external_ref = Self::external_ref_for_create(req)?;
 
         // Calculate cold data size
         let cold_data = if req.is_external && req.inputs.is_none() {
@@ -1663,16 +1686,8 @@ impl Engine {
         meta.flags = flags;
 
         // Populate ExternalRef for externally-stored cold data.
-        if req.is_external {
-            meta.external_ref = ExternalRef {
-                store_type: 1, // local_file blobstore
-                content_hash: req.tx_id,
-                total_size: req.size_in_bytes,
-                input_count: 0,
-                output_count: 0,
-                inputs_offset: 0,
-                outputs_offset: 0,
-            };
+        if let Some(ext) = external_ref {
+            meta.external_ref = ext;
         }
 
         // Set unmined_since
@@ -1767,6 +1782,7 @@ impl Engine {
         if self.index.read().lookup(&key).is_some() {
             return Err(CreateError::DuplicateTxId);
         }
+        Self::external_ref_for_create(req)?;
 
         // Compute cold data size to determine total record size
         let cold_data = if req.is_external && req.inputs.is_none() {
@@ -1811,6 +1827,7 @@ impl Engine {
         if self.index.read().lookup(&key).is_some() {
             return Err(CreateError::DuplicateTxId);
         }
+        let external_ref = Self::external_ref_for_create(req)?;
 
         // Build cold data
         let cold_data = if req.is_external && req.inputs.is_none() {
@@ -1847,16 +1864,8 @@ impl Engine {
         }
         meta.flags = flags;
 
-        if req.is_external {
-            meta.external_ref = ExternalRef {
-                store_type: 1,
-                content_hash: req.tx_id,
-                total_size: req.size_in_bytes,
-                input_count: 0,
-                output_count: 0,
-                inputs_offset: 0,
-                outputs_offset: 0,
-            };
+        if let Some(ext) = external_ref {
+            meta.external_ref = ext;
         }
 
         if req.mined_block_infos.is_empty() {
@@ -1957,6 +1966,7 @@ impl Engine {
         if utxo_count == 0 {
             return Err(CreateError::InvalidUtxoCount);
         }
+        let external_ref = Self::external_ref_for_create(req)?;
 
         // Mirror `create_at_offset` exactly. Any divergence here would
         // create a redo entry that, on replay, leaves the record in a
@@ -1994,16 +2004,8 @@ impl Engine {
         }
         meta.flags = flags;
 
-        if req.is_external {
-            meta.external_ref = ExternalRef {
-                store_type: 1,
-                content_hash: req.tx_id,
-                total_size: req.size_in_bytes,
-                input_count: 0,
-                output_count: 0,
-                inputs_offset: 0,
-                outputs_offset: 0,
-            };
+        if let Some(ext) = external_ref {
+            meta.external_ref = ext;
         }
 
         if req.mined_block_infos.is_empty() {
@@ -2106,8 +2108,27 @@ impl Engine {
         if entry.tx_flags & TxFlags::EXTERNAL.bits() != 0
             && let Some(ref blob_store) = self.blob_store
         {
+            let meta = self.read_metadata_fast(entry.record_offset)?;
             match blob_store.get(&key.txid) {
-                Ok(Some(data)) => return Ok(data),
+                Ok(Some(data)) => {
+                    if data.len() as u64 != meta.external_ref.total_size {
+                        return Err(SpendError::StorageError {
+                            detail: "blobstore read: external blob length does not match record ExternalRef"
+                                .to_string(),
+                        });
+                    }
+                    let mut hasher = Sha256::new();
+                    hasher.update(&data);
+                    let mut actual = [0u8; 32];
+                    actual.copy_from_slice(&hasher.finalize());
+                    if actual != meta.external_ref.content_hash {
+                        return Err(SpendError::StorageError {
+                            detail: "blobstore read: external blob digest does not match record ExternalRef"
+                                .to_string(),
+                        });
+                    }
+                    return Ok(data);
+                }
                 Ok(None) => return Err(SpendError::TxNotFound),
                 Err(e) => {
                     return Err(SpendError::StorageError {
@@ -2907,11 +2928,16 @@ impl<'a> ValidatedSpend<'a> {
         // and produce the final slot bytes.
         crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeDataPwrite);
 
-        // 6. Batch write all valid slot mutations (zero-alloc when direct)
+        // 6. Batch write all valid slot mutations (zero-alloc when direct).
+        // R-004: stop on first write failure and propagate it. Continuing
+        // through the batch and pretending success on partial-write would
+        // leave `metadata.spent_utxos` (incremented unconditionally below)
+        // disagreeing with the actual on-disk slot states — invariants
+        // covering "spent_utxos == count(slots in SPENT state)" would
+        // break, premature pruning would follow, and a follow-up spend on
+        // the same UTXO with different spending_data would succeed.
         for &(offset, ref new_slot) in &valid_spends {
-            if let Err(e) = engine.write_slot_fast(record_offset, offset, new_slot) {
-                tracing::warn!(err = ?e, "engine: write_utxo_slot failed");
-            }
+            engine.write_slot_fast(record_offset, offset, new_slot)?;
         }
 
         crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterDataPwrite);
@@ -2933,11 +2959,12 @@ impl<'a> ValidatedSpend<'a> {
             apply_dah_patch(&mut metadata, patch);
         }
 
-        // 9. Write metadata (targeted spend footer when direct, full otherwise)
+        // 9. Write metadata (targeted spend footer when direct, full otherwise).
+        // R-004: propagate the write error.
         if !engine.device_ptr.is_null() {
             unsafe { io::write_metadata_direct(engine.device_ptr, record_offset, &metadata) };
-        } else if let Err(e) = engine.write_metadata_fast(record_offset, &metadata) {
-            tracing::warn!(err = ?e, "engine: write_metadata failed");
+        } else {
+            engine.write_metadata_fast(record_offset, &metadata)?;
         }
 
         engine.sync_index_cache(&tx_key, &metadata)?;
@@ -3190,9 +3217,60 @@ fn sys_millis() -> u64 {
 mod tests {
     use super::*;
     use crate::allocator::SlotAllocator;
-    use crate::device::MemoryDevice;
+    use crate::device::{DeviceError, MemoryDevice};
     use crate::index::{DahIndex, Index, UnminedIndex};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Wrap a device and reject pwrites once a kill-switch flag is set.
+    /// Used by R-004 regression tests that prove `Engine::spend` and
+    /// `ValidatedSpend::apply` propagate slot/metadata write errors
+    /// instead of silently returning `Ok` with a torn on-disk state.
+    struct WriteFailingDevice {
+        inner: Arc<dyn BlockDevice>,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl WriteFailingDevice {
+        fn new(inner: Arc<dyn BlockDevice>) -> (Arc<Self>, Arc<AtomicBool>) {
+            let fail = Arc::new(AtomicBool::new(false));
+            (
+                Arc::new(Self {
+                    inner,
+                    fail: fail.clone(),
+                }),
+                fail,
+            )
+        }
+    }
+
+    impl BlockDevice for WriteFailingDevice {
+        fn alignment(&self) -> usize {
+            self.inner.alignment()
+        }
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        fn pread(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            self.inner.pread(buf, offset)
+        }
+        fn pwrite(&self, buf: &[u8], offset: u64) -> crate::device::Result<usize> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(DeviceError::Io(std::io::Error::other(
+                    "simulated pwrite failure (R-004)",
+                )));
+            }
+            self.inner.pwrite(buf, offset)
+        }
+        fn sync(&self) -> crate::device::Result<()> {
+            self.inner.sync()
+        }
+        fn as_raw_ptr(&self) -> Option<*mut u8> {
+            // R-004 tests must hit the pwrite path, not the direct mmap
+            // shortcut, so always report no raw pointer.
+            None
+        }
+    }
 
     /// Build a test engine with a pre-created record.
     struct TestHarness {
@@ -3298,6 +3376,181 @@ mod tests {
                 block_height_retention: 288,
             }
         }
+    }
+
+    /// Build an engine whose underlying device fails pwrites once a
+    /// kill-switch flag is set. Used by the R-004 regression tests.
+    /// The flag is off when the seed record is written; tests flip it
+    /// before issuing the mutation under test.
+    fn make_engine_with_failable_device(utxo_count: u32) -> (Arc<Engine>, TxKey, Arc<AtomicBool>) {
+        let inner: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let (failing, fail) = WriteFailingDevice::new(inner);
+        let dev: Arc<dyn BlockDevice> = failing;
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(100).unwrap();
+
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&7u64.to_le_bytes());
+        let key = TxKey { txid };
+
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let offset = alloc.allocate(record_size).unwrap();
+
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut hash = [0u8; 32];
+                hash[0] = (i & 0xFF) as u8;
+                hash[1] = ((i >> 8) & 0xFF) as u8;
+                UtxoSlot::new_unspent(hash)
+            })
+            .collect();
+        io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+
+        let ie_flags = meta.flags.bits();
+        let ie = TxIndexEntry {
+            device_id: 0,
+            record_offset: offset,
+            utxo_count,
+            block_entry_count: meta.block_entry_count,
+            tx_flags: ie_flags,
+            spent_utxos: { meta.spent_utxos },
+            dah_or_preserve: { meta.delete_at_height },
+            unmined_since: { meta.unmined_since },
+            generation: 0,
+        };
+        index.register(key, ie).unwrap();
+
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        (engine, key, fail)
+    }
+
+    /// R-004: a single-slot `Engine::spend` whose on-disk slot write
+    /// fails MUST return `Err(SpendError::StorageError)`. Pre-fix this
+    /// returned `Ok` and left the slot UNSPENT on disk while the
+    /// metadata's `spent_utxos` was incremented — a follow-up spend
+    /// with different `spending_data` would then succeed (double-spend).
+    #[test]
+    fn spend_propagates_slot_write_failure() {
+        let (engine, key, fail) = make_engine_with_failable_device(4);
+        let req = SpendRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: {
+                let mut h = [0u8; 32];
+                h[0] = 0;
+                h
+            },
+            spending_data: {
+                let mut sd = [0u8; 36];
+                sd[0] = 0xAA;
+                sd[32..36].copy_from_slice(&1u32.to_le_bytes());
+                sd
+            },
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        // Arm the failure ON the device.
+        fail.store(true, Ordering::SeqCst);
+
+        let result = engine.spend(&req);
+        assert!(
+            matches!(result, Err(SpendError::StorageError { .. })),
+            "spend must propagate slot write failures, got {result:?}"
+        );
+
+        // Disarm and verify on-disk state is consistent: slot is still
+        // UNSPENT (the write failed) and metadata.spent_utxos is still 0
+        // (because the failure short-circuited before the counter bump).
+        fail.store(false, Ordering::SeqCst);
+        let slot = engine.read_slot(&key, 0).unwrap();
+        assert!(
+            !slot.is_spent(),
+            "after a failed spend the slot must remain UNSPENT on disk"
+        );
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!(
+            { meta.spent_utxos },
+            0,
+            "after a failed spend the counter must not have been bumped"
+        );
+    }
+
+    /// R-004: companion to `spend_propagates_slot_write_failure`. A
+    /// `spend_multi` whose first slot write fails MUST return
+    /// `Err(SpendError::StorageError)` rather than continuing through
+    /// the batch and returning OK with `metadata.spent_utxos` ahead of
+    /// the actual on-disk slot state.
+    #[test]
+    fn spend_multi_propagates_slot_write_failure() {
+        let (engine, key, fail) = make_engine_with_failable_device(4);
+        let mut sd = [0u8; 36];
+        sd[0] = 0xBB;
+        sd[32..36].copy_from_slice(&1u32.to_le_bytes());
+        let multi = SpendMultiRequest {
+            tx_key: key,
+            spends: vec![
+                SpendItem {
+                    idx: 0,
+                    offset: 0,
+                    utxo_hash: {
+                        let mut h = [0u8; 32];
+                        h[0] = 0;
+                        h
+                    },
+                    spending_data: sd,
+                },
+                SpendItem {
+                    idx: 1,
+                    offset: 1,
+                    utxo_hash: {
+                        let mut h = [0u8; 32];
+                        h[0] = 1;
+                        h
+                    },
+                    spending_data: sd,
+                },
+            ],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        fail.store(true, Ordering::SeqCst);
+        let validated = engine.validate_spend_multi(&multi).unwrap();
+        let result = validated.apply(&engine);
+        assert!(
+            matches!(result, Err(SpendError::StorageError { .. })),
+            "spend_multi must propagate the first slot write failure, got {result:?}"
+        );
+
+        fail.store(false, Ordering::SeqCst);
+        // Both slots must remain UNSPENT — the partial-write contract
+        // is "either all succeed and the counter matches, or none do
+        // and the counter matches that."
+        let slot0 = engine.read_slot(&key, 0).unwrap();
+        let slot1 = engine.read_slot(&key, 1).unwrap();
+        assert!(
+            !slot0.is_spent(),
+            "slot 0 must remain UNSPENT on partial-write failure"
+        );
+        assert!(
+            !slot1.is_spent(),
+            "slot 1 must remain UNSPENT on partial-write failure"
+        );
     }
 
     // -- Spend correctness tests --
@@ -6512,9 +6765,22 @@ mod tests {
             frozen: false,
             conflicting: false,
             locked: false,
+            external_ref: None,
             parent_txids: &[],
         };
         (hashes, req)
+    }
+
+    fn test_external_ref(tx_id: [u8; 32]) -> ExternalRef {
+        ExternalRef {
+            store_type: 1,
+            content_hash: tx_id,
+            total_size: 250,
+            input_count: 0,
+            output_count: 0,
+            inputs_offset: 0,
+            outputs_offset: 0,
+        }
     }
 
     fn create_engine() -> Arc<Engine> {
@@ -7744,6 +8010,7 @@ mod tests {
         let engine = create_engine();
         let (_, mut req) = make_create_req(112, 2);
         req.is_external = true;
+        req.external_ref = Some(test_external_ref(req.tx_id));
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
@@ -8019,6 +8286,7 @@ mod tests {
         let engine = create_engine();
         let (_, mut req) = make_create_req(137, 5);
         req.is_external = true;
+        req.external_ref = Some(test_external_ref(req.tx_id));
         let key = req.tx_key();
         engine.create(&req).unwrap();
 

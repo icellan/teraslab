@@ -58,11 +58,12 @@
 ### R-004 — [spend-op] `Engine::spend` swallows on-disk write errors at 5 sites; client sees Ok while UTXO remains UNSPENT
 - **Source:** AUDIT.md A-01
 - **Severity:** CRITICAL
-- **Status:** OPEN
+- **Status:** RESOLVED
 - **Files:** src/ops/engine.rs:1013, :1042, :1066, :2920, :2948
 - **Cluster:** spend-op
-- **Notes:** Replace every `if let Err(e) = self.write_slot_fast(...) { tracing::warn!(...) }` with `?` propagation. Dispatcher returns `ERR_INTERNAL`; redo log drives replay on next startup. Foundational for R-005.
-- **Test:** `fault_inject_write_slot_returns_error_after_validation`
+- **Resolution:** Replaced all 5 `if let Err(e) = self.write_*_fast(...) { tracing::warn!(...) }` swallows with `?` propagation. The dispatcher already maps `SpendError::StorageError` to `ERR_INTERNAL` so clients see a clean failure; the redo log entry was already written before the slot pwrite, so recovery on restart drives replay. Added a test-only `WriteFailingDevice` wrapper plus two regression tests (`spend_propagates_slot_write_failure`, `spend_multi_propagates_slot_write_failure`) that arm pwrite to fail, drive a single-slot and a batched spend through the engine, and assert (a) the call returns `Err(SpendError::StorageError)` not Ok, and (b) on-disk slot state remains UNSPENT and `metadata.spent_utxos` was not bumped — closing the double-spend window.
+- **Verification:** `cargo test --all` 1492 passed (was 1490), 0 failed, 0 ignored. Clippy + fmt clean.
+- **Test:** `spend_propagates_slot_write_failure`, `spend_multi_propagates_slot_write_failure`
 
 ### R-005 — [spend-op] `spend_multi` increments `meta.spent_utxos` even when slot writes silently fail
 - **Source:** AUDIT.md A-03
@@ -2051,7 +2052,9 @@ These are entries from the audits that, on inspection, are correct as implemente
 - IDs touched: R-001 (RESOLVED), R-002 (RESOLVED), R-212 (RESOLVED — new), R-213 (OPEN — new), R-214 (DEFERRED — new).
 - **R-003 RESOLVED.** New `teraslab::checkpoint` module + background task spawned in `bin/server.rs` performs snapshot+persist+checkpoint+reset when redo log usage exceeds 0.5. Lib tests 1488 → 1490. Two follow-ups discovered: **R-215** (move snapshot off redo-mutex hot path) and **R-216** (coordinate reset with replication catch-up watermarks), both MEDIUM/OPEN.
 - IDs touched (additional): R-003 (RESOLVED), R-215 (OPEN — new), R-216 (OPEN — new).
-- Next session entry point: R-004 (A-01 spend swallows write errors — CRITICAL).
+- **R-004 RESOLVED.** Replaced 5 `tracing::warn!` swallows in `Engine::spend` and `ValidatedSpend::apply` with `?` propagation. Added `WriteFailingDevice` test harness + 2 regression tests proving spend now returns `Err` AND leaves the slot UNSPENT on disk (no double-spend window). Lib tests 1490 → 1492.
+- IDs touched (additional): R-004 (RESOLVED).
+- Next session entry point: R-005 (A-03 spend_multi counter mismatch — CRITICAL, was blocked-by R-004 which is now resolved).
 
 ### R-212 — [test-baseline] Bench CreateRequest constructions miss `external_ref` field; pre-existing collapsible_if lints in `src/device.rs` tests
 - **Source:** Discovered while running R-001 verification gate (`cargo clippy --all --all-targets`)
