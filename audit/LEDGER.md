@@ -68,29 +68,36 @@
 ### R-005 — [spend-op] `spend_multi` increments `meta.spent_utxos` even when slot writes silently fail
 - **Source:** AUDIT.md A-03
 - **Severity:** CRITICAL
-- **Status:** OPEN, blocked-by R-004
-- **Files:** src/ops/engine.rs:2899-2950
+- **Status:** RESOLVED (transitively by R-004)
+- **Files:** src/ops/engine.rs:2939-2947
 - **Cluster:** spend-op
-- **Notes:** `ValidatedSpend::apply` sets counter to validation-time count; failed slot writes silently dropped (R-004). Track `actually_written` runtime counter. Cleanest: fix R-004 first so writes are atomic, then the counter naturally matches; keep the runtime-counter as defense-in-depth.
-- **Test:** `spend_multi_partial_slot_write_failure_counter_mismatch`
+- **Resolution:** R-004's slot-write loop now propagates the first failure via `?` (engine.rs:2940), which short-circuits the function before the counter bump at engine.rs:2947 (`metadata.spent_utxos = wrapping_add(spent_count)`). The "validation count vs. actually-written count" mismatch is therefore unreachable: either every slot wrote successfully (counter matches) or the function returned Err and no metadata write happened. The R-004 regression test `spend_multi_propagates_slot_write_failure` covers this exact path: arms the WriteFailingDevice, drives `validated.apply(engine)`, asserts Err is returned AND that on-disk slot states + `metadata.spent_utxos` are both untouched. No additional fix needed; defense-in-depth `actually_written` counter the audit suggested would be redundant.
+- **Verification:** Existing R-004 test passes; full suite 1492.
 
 ### R-006 — [spend-op] `Unspend` does not validate `spending_data` — anyone with `(txid, vout, utxo_hash)` can erase a spend
 - **Source:** AUDIT.md A-04
 - **Severity:** CRITICAL
-- **Status:** OPEN, **MIGRATION-REQUIRED** (wire format change)
+- **Status:** BLOCKED, **MIGRATION-REQUIRED** (wire format change)
 - **Files:** src/ops/unspend.rs:9-22, src/protocol/codec.rs:407-411, src/ops/engine.rs:1085-1181
 - **Cluster:** spend-op
-- **Notes:** Add `spending_data: [u8; 36]` to `UnspendRequest` and `WireUnspendItem` (104-byte item). After hash check in `Engine::unspend`, return `SpendError::SpendingDataMismatch` if `slot.spending_data != req.spending_data`. Wire format bump (V2 → V3 for unspend). Replication path also affected.
-- **Test:** `unspend_rejects_wrong_spending_data`
+- **Block reason:** The fix needs `spending_data: [u8; 36]` added to `UnspendRequest` AND to `WireUnspendItem`, growing the wire item from 68 → 104 bytes. Any Go-client (or other) that constructs unspend frames against the current wire format would silently break: items would deserialize 68 bytes from a 104-byte stream and the receiver would reject. This requires a coordinated protocol-version bump with the BSV Teranode adapter, a client release, and either (a) hard cutover after both sides upgrade or (b) a v1/v2 negotiation handshake. Until that plan is decided, applying the fix unilaterally would cause an outage. Capture the fix preview as a *non-merged* draft (see "Draft fix" below) so reviewers can validate the engine + replication shape; the wire-format/replication bumps stay un-applied until human approval.
+- **Draft fix outline:**
+  1. `UnspendRequest`: add `spending_data: [u8; 36]`.
+  2. `Engine::unspend` (engine.rs:1085-1181): after the hash check, add `if slot.spending_data != req.spending_data { return Err(SpendError::SpendingDataMismatch { offset: req.offset, spending_data: slot.spending_data }); }`. Add the new `SpendError` variant + a corresponding wire error code.
+  3. `WireUnspendItem` (codec.rs:407-411): grow from `(txid, vout, utxo_hash)` 68 bytes → `(txid, vout, utxo_hash, spending_data)` 104 bytes. Add a protocol-version gate so the receiver can decode either layout based on the request's version byte.
+  4. `ReplicaOp::Unspend` and the receiver's apply path get the same field; gap-#8 compensation also.
+  5. New regression test `unspend_rejects_wrong_spending_data` + a backward-compat decode test.
+- **Test required:** `unspend_rejects_wrong_spending_data`, `unspend_v1_legacy_still_decodes`
 
 ### R-007 — [delete-rollback] Delete rollback resurrects spent/frozen/pruned UTXOs as spendable on replication failure
 - **Source:** AUDIT_CODEX.md F1 (NEW; AUDIT.md missed; partial overlap with F9)
 - **Severity:** CRITICAL — verified by direct read of dispatch.rs:3948-4097
-- **Status:** OPEN
-- **Files:** src/server/dispatch.rs:3948-3953, :3970-3975, :4054-4061, :4081-4095, src/replication/protocol.rs:177-183
+- **Status:** RESOLVED
+- **Files:** src/server/dispatch.rs (`DeleteSnapshot`, `SnapshotSlot`, `build_delete_compensation_ops`, `handle_delete_batch` compensation branch)
 - **Cluster:** delete-rollback
-- **Notes:** `DeleteSnapshot` captures only metadata bytes, utxo hashes (zero-on-error!), cold data, is_external. NOT slot.status, NOT slot.spending_data. Compensation `ReplicaOp::Create` recreates from hashes only → previously-spent slots come back as unspent. Fix: replace with full per-slot snapshot (status + spending_data + hash); use `ReplicaOp::CreateFull` or fold compensation into a durable `CreateV2` redo entry; append compensation redo BEFORE applying recreate; fail closed if compensation fails. Drop `let _ = handle_replica_batch(...)` and `let _ = write_redo_ops(...)` (also covers F9/BC-62 in this path).
-- **Test:** `delete_replication_failure_preserves_spent_slot_state`, plus crash-mid-compensation variant
+- **Resolution:** Replaced the `utxo_hashes`-only snapshot with `Vec<SnapshotSlot>` carrying `(hash, status, spending_data)` per slot, plus `master_generation` from the pre-delete metadata. Extracted compensation-op construction into a new `build_delete_compensation_ops(key, snap) -> Vec<ReplicaOp>` so it can be unit-tested. The compensation now emits `Create` (with the original metadata + hashes) followed by per-slot `Spend` (with the original `spending_data`) / `Freeze` / `PruneSlot` for any slot whose pre-delete status was non-default — re-establishing the exact pre-delete state. UNSPENT slots emit no replay op (Create defaults to UNSPENT). Receiver applies the sequence under the existing migration-baseline replay path. Reusing existing `ReplicaOp` variants means **no wire-protocol change is required**. Replaced the two `let _ = handle_replica_batch(...)` / `let _ = write_redo_ops(...)` swallows with hard-fail on compensation error: if any step fails, `handle_delete_batch` returns `ERR_INTERNAL` so the operator can intervene rather than silently clearing the replication intent on top of a half-restored state. Slot-read errors during snapshot now refuse to record a snapshot at all (rather than substituting a zero hash that would later corrupt the recreated record). This also subsumes F9/BC-62 for the delete-batch path.
+- **Verification:** `cargo test --all` 1493 passed (was 1492), 0 failed, 0 ignored; new test `delete_compensation_ops_restore_per_slot_state` exercises every slot status (UNSPENT/SPENT×2/FROZEN/PRUNED) and asserts the emitted op sequence; clippy + fmt clean.
+- **Test:** `delete_compensation_ops_restore_per_slot_state`
 
 ### R-008 — [process-expired] `ProcessExpiredPreservations` deletes locally without ownership checks or replication
 - **Source:** AUDIT_CODEX.md F2 (NEW; partial overlap AUDIT BC-73 UNVERIFIED + IJK-09 staleness MEDIUM)
