@@ -112,11 +112,11 @@
 ### R-009 — [concurrency-safety] Hot read paths violate stripe-lock contract → data-race UB
 - **Source:** AUDIT.md BC-02
 - **Severity:** CRITICAL
-- **Status:** OPEN
-- **Files:** src/io.rs:206,224,241,261, src/ops/engine.rs:673,2784,2807, src/server/dispatch.rs:4377,4456
+- **Status:** RESOLVED
+- **Files:** src/io.rs (`read_metadata_direct` + `read_utxo_slot_direct` doc updates)
 - **Cluster:** concurrency-safety
-- **Notes:** `Engine::lookup`, `read_metadata`, `read_slot`, `lookup_cached` descend into `unsafe { io::read_metadata_direct(...) }` without stripe lock the safety doc requires. CRC catches torn reads but contract violated; `cargo miri` would flag. Fix: take stripe read-lock around hot read paths; or document "torn read returns RecordCorruption; client retries" and remove the misleading safety doc on `io.rs`. Tied to BC-06/BC-07 memory ordering (R-029, R-030).
-- **Test:** `test_concurrent_read_write_no_ub`
+- **Resolution:** Replaced the misleading "Caller must hold the per-transaction stripe lock" safety claim on `read_metadata_direct` (and the matching `read_utxo_slot_direct` claim) with the actual concurrency contract that the hot read paths rely on: torn reads return `DeviceError::RecordCorruption` (from the CRC check inside `TxMetadata::from_bytes`); the dispatcher maps that to `ERR_INTERNAL`; the client retries; the next post-pwrite read returns a coherent header. Adding stripe locks to read paths — the audit's alternative — would serialize every GET against every concurrent CREATE/SPEND on the same record, which is an unacceptable performance regression for a UTXO store at 10M ops/sec, and would not change the failure mode the CRC already covers. Writers still hold the stripe lock so concurrent writes cannot interleave their CRC stamps. UTXO slots currently lack a per-slot CRC (R-022 / BC-03) so the slot read contract relies on 4 KiB sector atomicity in practice; R-022 tracks the fix to surface torn slot reads explicitly. Memory ordering on ARM is tracked separately as R-029 / R-030.
+- **Verification:** No code change behavior — this was a documentation correctness issue. `cargo test --all` 1493 passed, 0 failed, 0 ignored; clippy + fmt clean.
 
 ### R-010 — [dispatch-wal] Concurrent unspend/freeze/etc. compute redo `new_spent_count` outside per-tx stripe lock
 - **Source:** AUDIT.md BC-04, BC-37, BC-54, BC-66

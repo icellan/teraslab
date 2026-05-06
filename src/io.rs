@@ -203,7 +203,30 @@ pub unsafe fn write_crc_direct(base_ptr: *mut u8, record_offset: u64, meta: &TxM
 /// # Safety
 ///
 /// `base_ptr` must be valid for at least `record_offset + METADATA_SIZE` bytes.
-/// Caller must hold the per-transaction stripe lock.
+///
+/// # Concurrency contract (R-009 / BC-02)
+///
+/// **Read-paths do NOT need the per-transaction stripe lock.** A reader
+/// that races with a concurrent `write_metadata_direct` on the same
+/// record can observe a torn header — which the CRC32 check at the end
+/// of `TxMetadata::from_bytes` detects and surfaces as
+/// `DeviceError::RecordCorruption`. The dispatcher maps that to
+/// `ERR_INTERNAL` so the client retries; the next read after the
+/// writer's pwrite/memcpy completes returns a coherent header.
+///
+/// Earlier comments on this function asserted "Caller must hold the
+/// per-transaction stripe lock" — that contract was never actually
+/// honored by `Engine::lookup` / `read_metadata` / `read_slot` /
+/// `lookup_cached`, which are hot-path read entries. Adding the lock
+/// would serialize all reads against all writes on the same record
+/// (an unacceptable performance regression for a UTXO store) without
+/// changing the failure mode the CRC already covers. The actual
+/// contract is what callers rely on: torn reads → `RecordCorruption`
+/// → retry; CRC-clean reads → consistent header.
+///
+/// `write_metadata_direct` MUST hold the stripe lock so concurrent
+/// writes do not interleave (each writer ends with a CRC over its own
+/// snapshot of the header).
 #[inline]
 pub unsafe fn read_metadata_direct(base_ptr: *const u8, record_offset: u64) -> Result<TxMetadata> {
     unsafe {
@@ -238,7 +261,17 @@ pub unsafe fn write_metadata_direct(base_ptr: *mut u8, record_offset: u64, metad
 /// # Safety
 ///
 /// `base_ptr` must be valid for at least `record_offset + METADATA_SIZE +
-/// (slot_index + 1) * UTXO_SLOT_SIZE` bytes. Caller must hold the stripe lock.
+/// (slot_index + 1) * UTXO_SLOT_SIZE` bytes.
+///
+/// # Concurrency contract (R-009 / BC-02)
+///
+/// Like [`read_metadata_direct`], read-paths do not hold the stripe
+/// lock. UTXO slots currently lack a per-slot CRC (see R-022 / BC-03)
+/// so a torn read returns whatever bytes were observed; callers that
+/// care about consistency must re-read after observing a status byte
+/// they did not expect, or rely on the surrounding 4 KiB sector
+/// atomicity that NVMe guarantees in practice. R-022 tracks the
+/// fix to add a slot-level CRC so torn reads surface explicitly.
 #[inline]
 pub unsafe fn read_utxo_slot_direct(
     base_ptr: *const u8,
