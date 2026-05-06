@@ -131,20 +131,28 @@
 ### R-011 — [cluster-tcp-auth] Inter-node TCP frames unauthenticated (replication, topology, migration)
 - **Source:** AUDIT.md EF-01, D-20, gap #1
 - **Severity:** CRITICAL
-- **Status:** OPEN
+- **Status:** BLOCKED, **MIGRATION-REQUIRED** (cross-node auth handshake)
 - **Files:** src/cluster/swim.rs:434,845,881, src/cluster/coordinator.rs:2589-2605, src/server/dispatch.rs:471-810,811-931, src/replication/tcp_transport.rs:99-123, src/replication/receiver.rs:142-198, src/cluster/auth.rs:1-19
 - **Cluster:** cluster-tcp-auth
-- **Notes:** `cluster::auth::sign/verify` wired into SWIM UDP only. `OP_TOPOLOGY_PROPOSE/VOTE/COMMIT`, `OP_REPLICA_BATCH`, `OP_MIGRATION_COMPLETE`, `OP_MIGRATION_BATCH_COMPLETE` go plain. Anyone reachable on the binary protocol port can forge a topology commit, replicate fake ops, or lift a migration fence. Fix: apply HMAC handshake to every inter-node TCP frame, or move to mTLS with role separation. Startup-time check: if `cluster_secret` set but transport doesn't enforce it, refuse to bind.
-- **Test:** `unauthenticated_replica_batch_rejected`, `unauthenticated_topology_commit_rejected`, `unauthenticated_migration_complete_rejected`
+- **Block reason:** Adding HMAC verification to OP_TOPOLOGY_*, OP_REPLICA_BATCH, OP_MIGRATION_COMPLETE, OP_MIGRATION_BATCH_COMPLETE in one shot would lock-step-require every node in the cluster to be upgraded simultaneously: a mid-rolling-upgrade replica that doesn't sign frames would be rejected by an upgraded master, or vice versa. The fix needs a phased rollout: (a) first ship a "verify-if-present, accept-if-absent" mode that the upgraded receiver uses while old senders still exist; (b) then a config flag that flips to "require auth" once every node has been upgraded; (c) finally deprecation of the unauthed path. Picking that staging plan is a human / operator decision because it touches the live cluster's availability budget. Until that decision is made, applying the fix unilaterally would either be a no-op (verify-if-present) or cause an outage (require auth before all nodes upgrade).
+- **Draft fix outline:**
+  1. Wrap every outbound inter-node `RequestFrame` in `tcp_transport::send_authed_frame` that computes `HMAC-SHA256(cluster_secret, header || payload)` and writes the digest as a trailer.
+  2. On the receive side, decode header, reject frames whose digest does not match. Add a new `ERR_CLUSTER_AUTH_FAILED` error code.
+  3. Validation: at startup, if `cluster_secret` is configured AND `enable_remote_bind = true`, require auth on inter-node TCP. If neither is set, leave loopback-only operation as-is.
+  4. Compatibility flag: `inter_node_auth_mode = "verify_if_present" | "require"` config, default `"verify_if_present"` for one release.
+- **Test required:** `unauthenticated_replica_batch_rejected`, `unauthenticated_topology_commit_rejected`, `unauthenticated_migration_complete_rejected`, `mid_rollout_mixed_signed_unsigned`
 
 ### R-012 — [migration-handshake] `OP_MIGRATION_COMPLETE` is unauthenticated AND zero-record completions skip manifest verification
 - **Source:** AUDIT.md EF-12, EF-21
 - **Severity:** CRITICAL — combined with R-011 enables silent shard data loss
-- **Status:** OPEN, blocked-by R-011 partially
+- **Status:** BLOCKED, blocked-by R-011 (auth) + needs separate R-219 for zero-record manifest path
 - **Files:** src/server/dispatch.rs:471-810, :567-571, :628-634, src/cluster/migration.rs:577-616
 - **Cluster:** migration-handshake
-- **Notes:** Beyond R-011 auth: the zero-record fast-path skips manifest verification entirely. Combined with EF-21 (`mark_inbound_complete` accepts completion from any source), an attacker on the binary protocol port can declare any shard migrated. Cross-check `from_node` against SWIM peer_addrs view; reject zero-record completions for non-empty source claims; require manifest verification on every completion path.
-- **Test:** `migration_complete_rejects_unsigned_forged_completion`, `zero_record_completion_requires_manifest`
+- **Notes:** Two issues:
+  1. **Auth (subset of R-011):** OP_MIGRATION_COMPLETE / OP_MIGRATION_BATCH_COMPLETE go plain TCP. Fixed when R-011 lands.
+  2. **Zero-record manifest skip:** Even with auth, the receiver currently treats `record_count == 0` as "empty migration, no manifest needed" — a confused-deputy attack where a malicious or buggy source declares a non-empty shard's migration complete with zero records causes silent data loss on the new master.
+- **Block reason:** (1) is gated by R-011's migration plan. (2) is independently fixable but requires a small wire-protocol clarification (every completion must carry the manifest hash, even for empty shards) — captured as **R-219** (HIGH, OPEN, needs human approval since it interacts with the empty-shard fast path that the cluster already optimizes for).
+- **Test required:** see R-219 + the R-011 test list.
 
 ---
 
@@ -2042,7 +2050,7 @@ These are entries from the audits that, on inspection, are correct as implemente
 | LOW | 80 | — |
 | INFO/positive | — | ~33 |
 
-**Total active R-IDs:** 216 (R-001..R-216; R-212..R-216 discovered during remediation).
+**Total active R-IDs:** 219 (R-001..R-219; R-212..R-219 discovered during remediation).
 
 ---
 
@@ -2100,6 +2108,33 @@ These are entries from the audits that, on inspection, are correct as implemente
 - **Cluster:** redo-log
 - **Notes:** When `RedoLog::reset()` runs, all entries before the most recent checkpoint are wiped. Replicas whose `last_acked_sequence` predates the new checkpoint will need a full resync; the catch-up path's `read_from_sequence` returns an empty Vec for those replicas which the manager currently treats as "all caught up" instead of "needs resync." Fix: have `perform_checkpoint` query `min(replica.last_acked_sequence)` across all live replicas before resetting; if the threshold is below that, skip reset (let the log fill briefly) OR signal replicas to resync. Add a `catchup_watermark_lag_seconds` metric so operators can detect when this defers checkpointing.
 - **Test required:** `replica_resync_signal_after_redo_reset`
+
+### R-217 — [dispatch-wal] freeze/unfreeze batch validates outside the per-tx stripe lock (BC-37)
+- **Source:** AUDIT.md BC-37
+- **Severity:** MEDIUM (replay is idempotent for freeze ops — observable via timing only)
+- **Status:** OPEN
+- **Files:** src/server/dispatch.rs (`handle_freeze_batch`, `handle_unfreeze_batch`)
+- **Cluster:** dispatch-wal
+- **Notes:** Same shape as BC-04 (R-010) but for freeze/unfreeze batches. The dispatcher reads `pre_state` from `engine.lookup` outside the per-tx stripe lock to compose the redo entry. Freeze ops carry no per-call counter so the BC-04 replay-rederive fix doesn't apply — the race is observable as a brief window where a concurrent batch's redo entry contradicts the actual state, but replay's slot-state idempotency check skips the wrong redo entry. Fix: take the stripe lock around lookup + redo + apply (validate-then-apply pattern), or extract a `engine::freeze_locked` API the dispatcher can call while holding the guard.
+- **Test required:** `concurrent_freeze_unfreeze_redo_consistency`
+
+### R-218 — [dispatch-wal] reassign captures `prior_utxo_hash` outside the per-tx stripe lock (BC-54)
+- **Source:** AUDIT.md BC-54
+- **Severity:** HIGH (compensation correctness)
+- **Status:** OPEN
+- **Files:** src/server/dispatch.rs (`handle_reassign_batch`)
+- **Cluster:** dispatch-wal
+- **Notes:** `handle_reassign_batch` reads `prior_utxo_hash` via `engine.read_slot` BEFORE acquiring the stripe lock. Two concurrent reassigns on the same slot capture the same prior hash; the SECOND reassign's compensation `BeforeImage` therefore restores the slot to the FIRST reassign's hash (which is no longer correct), producing silent corruption on rollback. Fix: extend `Engine::reassign` (or wrap in a dispatch-side helper) to return the prior hash atomically with the apply, under the stripe lock. R-010-style replay-rederive does NOT work here because the prior hash is needed for compensation, not for replay.
+- **Test required:** `concurrent_reassign_compensation_uses_correct_prior_hash`
+
+### R-219 — [migration-handshake] Zero-record `OP_MIGRATION_COMPLETE` skips manifest verification
+- **Source:** AUDIT.md EF-12 (subset, separated from R-012)
+- **Severity:** HIGH
+- **Status:** OPEN, **MIGRATION-REQUIRED** (manifest semantics on empty shards)
+- **Files:** src/server/dispatch.rs:567-571, :628-634
+- **Cluster:** migration-handshake
+- **Notes:** Receiver treats `record_count == 0` as "empty migration, no manifest needed", so a source declaring a non-empty shard's migration complete with `record_count = 0` causes silent data loss. Fix: every completion carries the manifest hash, including empty shards (`HMAC-SHA256` over an empty entry list yields a known constant; the receiver compares against that). Needs human approval because it interacts with the empty-shard fast path that the cluster already optimizes for. Once approved, fix is small (~30 LoC).
+- **Test required:** `zero_record_completion_with_wrong_manifest_rejected`
 
 ### R-214 — [test-baseline] Migration crash variants requiring process-kill harness (deferred subset of F7)
 - **Source:** Discovered while resolving R-002
