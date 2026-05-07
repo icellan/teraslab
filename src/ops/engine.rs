@@ -1002,25 +1002,22 @@ impl Engine {
             }
             UTXO_SPENT => {
                 if slot.spending_data == req.spending_data {
-                    // Idempotent re-spend — increment generation to match
-                    // spend_multi behavior, then return current state.
-                    metadata.generation = { metadata.generation }.wrapping_add(1);
-                    metadata.updated_at = self.now_millis();
-                    // R-004: propagate write errors instead of dropping
-                    // them on the floor. Pre-fix this was a `let _ = …`
-                    // that returned Ok(SpendResponse { … }) to the
-                    // client even when the on-disk metadata write
-                    // failed; a follow-up spend on the SAME utxo would
-                    // then see UNSPENT and accept a different
-                    // spending_data, producing a double-spend.
-                    if !self.device_ptr.is_null() {
-                        unsafe {
-                            io::write_metadata_direct(self.device_ptr, record_offset, &metadata)
-                        };
-                    } else {
-                        self.write_metadata_fast(record_offset, &metadata)?;
-                    }
-                    self.sync_index_cache(&req.tx_key, &metadata)?;
+                    // R-021 (BC-25 / BC-35): idempotent re-spend is a
+                    // true no-op — no slot change, no counter change,
+                    // no metadata write, no generation bump. Pre-fix
+                    // this branch bumped `metadata.generation` and
+                    // wrote the metadata back to disk WITHOUT emitting
+                    // a redo entry, so a crash between the metadata
+                    // write and its fsync could leave the on-device
+                    // generation lower than the value already returned
+                    // to the client (and propagated to replicas via
+                    // any subsequent ReplicaOp). Recovery had no redo
+                    // entry to replay, so the gap was permanent and
+                    // replication staleness checks would mismatch.
+                    // Aligning with `unspend`'s already-unspent branch
+                    // (lines above) — which also returns the unchanged
+                    // generation — eliminates the WAL gap entirely:
+                    // no write means nothing to recover.
                     let block_ids = collect_block_ids(&metadata).to_vec();
                     return Ok(SpendResponse {
                         signal: Signal::None,
@@ -5230,19 +5227,29 @@ mod tests {
 
     // -- Mutation bookkeeping additional tests --
 
+    /// R-021 (BC-25 / BC-35) regression: an idempotent re-spend (same
+    /// `spending_data` already on the slot) MUST be a true no-op — no
+    /// generation bump, no metadata write. Pre-fix the engine
+    /// incremented `metadata.generation` and wrote the new metadata
+    /// back to disk without emitting a redo entry, opening a window
+    /// where a crash between the metadata write and its fsync left
+    /// the on-device generation below the value the master had
+    /// already advertised to the client (and propagated to replicas).
+    /// Test pins the symmetry with `noop_unspend_does_not_increment_generation`.
     #[test]
-    fn idempotent_respend_increments_generation() {
+    fn idempotent_respend_does_not_increment_generation() {
         let h = TestHarness::new(10, TxFlags::empty());
         h.engine.spend(&h.spend_req(5)).unwrap();
         let g1 = { h.engine.read_metadata(&h.key).unwrap().generation };
 
-        // Spend again with same data (idempotent)
+        // Spend again with same data (idempotent) — must not bump.
         h.engine.spend(&h.spend_req(5)).unwrap();
         let g2 = { h.engine.read_metadata(&h.key).unwrap().generation };
 
-        // Generation DOES increment even for idempotent re-spends
-        // (the mutation was evaluated, even if no status change occurred)
-        assert_eq!(g2, g1 + 1);
+        assert_eq!(
+            g2, g1,
+            "idempotent re-spend must not bump generation (R-021)",
+        );
     }
 
     #[test]

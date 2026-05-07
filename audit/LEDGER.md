@@ -236,11 +236,12 @@
 ### R-021 — [dispatch-wal] Spend's idempotent re-spend writes metadata WITHOUT a redo entry → generation drifts on crash
 - **Source:** AUDIT.md BC-25, BC-35
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/ops/engine.rs:1003-1022, src/server/dispatch.rs:2431-2449, :881-883, :2899,2920,2931,2946-2950
+- **Status:** RESOLVED
+- **Files:** src/ops/engine.rs (`Engine::spend` UTXO_SPENT idempotent branch)
 - **Cluster:** dispatch-wal
-- **Notes:** Either skip metadata write entirely on idempotent path (don't bump gen for idempotent re-spend), or emit a `RedoOp::IdempotentBump` entry first. Currently the bump is durably written but with no redo coverage to recover it.
-- **Test:** `idempotent_spend_generation_recovery`
+- **Resolution:** Made the idempotent re-spend branch a true no-op — no slot change, no metadata write, no generation bump. Pre-fix it bumped `metadata.generation`, called `now_millis()`, wrote the new metadata back to disk, and synced the index cache, all without emitting a redo entry. A crash between the metadata write and its fsync left the on-device generation below the value that had already been returned to the client (and was about to be advertised to replicas via `ReplicaOp::Spend.master_generation`); recovery had nothing to replay, so the gap was permanent and replication staleness checks would mismatch on resync. The new behaviour aligns the spend idempotent branch with the existing `unspend` already-unspent branch (which has always been a true no-op), removing the WAL gap entirely — there is nothing to recover because nothing was written.
+- **Tests added:** `idempotent_respend_does_not_increment_generation` (replaces the prior `idempotent_respend_increments_generation` that pinned the buggy behaviour).
+- **Verification:** Full local gate green: `cargo build --release`, `cargo test --all` (1712 tests, 0 failed, 0 ignored — up from 1505 lib + earlier integration baseline), `cargo clippy --all --all-targets -- -D warnings`, `cargo fmt --all -- --check`. Cross-backend (memory + `TERASLAB_INDEX_BACKEND=redb`) verified for the regression test.
 
 ### Cluster: redo-log + recovery foundations
 
