@@ -5,6 +5,7 @@
 //! stream the missing redo entries instead of requiring a full resync.
 
 use std::collections::{BTreeSet, HashMap};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -23,6 +24,31 @@ fn durable_tmp_path(path: &Path) -> PathBuf {
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".tmp");
     PathBuf::from(tmp)
+}
+
+#[cfg(unix)]
+fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = std::fs::File::open(parent)?;
+    dir.sync_all()
+}
+
+#[cfg(not(unix))]
+fn fsync_parent_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn write_durable_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    ensure_parent_dir(path)?;
+    let tmp = durable_tmp_path(path);
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    fsync_parent_dir(path)?;
+    Ok(())
 }
 
 /// Manages persistent per-replica ACK tracking.
@@ -123,11 +149,7 @@ impl AckTracker {
             buf.extend_from_slice(addr_bytes);
             buf.extend_from_slice(&seq.to_le_bytes());
         }
-        // Atomic write: write to temp, then rename.
-        let tmp = durable_tmp_path(path);
-        std::fs::write(&tmp, &buf)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        write_durable_file(path, &buf)
     }
 
     /// Load ACK state from disk.
@@ -284,11 +306,7 @@ impl ReplicationIntentTracker {
             buf.extend_from_slice(&range.first_sequence.to_le_bytes());
             buf.extend_from_slice(&range.last_sequence.to_le_bytes());
         }
-        ensure_parent_dir(path)?;
-        let tmp = durable_tmp_path(path);
-        std::fs::write(&tmp, &buf)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        write_durable_file(path, &buf).map_err(ReplicationIntentError::Io)
     }
 
     fn read_from_disk(
@@ -467,11 +485,7 @@ impl ReplicaAppliedTracker {
             buf.extend_from_slice(bytes);
             buf.extend_from_slice(&seq.to_le_bytes());
         }
-        ensure_parent_dir(path)?;
-        let tmp = durable_tmp_path(path);
-        std::fs::write(&tmp, &buf)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        write_durable_file(path, &buf).map_err(ReplicaAppliedError::Io)
     }
 
     /// Load and parse the state map from disk.
@@ -759,6 +773,73 @@ mod tests {
         assert_eq!(all[&test_addr(5002)], 30);
     }
 
+    /// R-038 (D-01) regression: `spawn_lag_monitor` spawns a thread
+    /// that runs the lag-check loop, calls `current_seq_fn` at least
+    /// once per interval, and exits promptly when the shutdown flag is
+    /// set. Pre-fix `replica_lag_check_interval_secs` was a dead
+    /// config field — `spawn_lag_monitor` existed but was never called
+    /// from `bin/server.rs`. This test pins the contract so a future
+    /// refactor that breaks the spawn-and-shutdown handshake is
+    /// caught immediately.
+    #[test]
+    fn spawn_lag_monitor_polls_and_shuts_down() {
+        // Leak a tracker so the spawn_lag_monitor's `&'static` requirement
+        // is satisfied for the duration of the test. Cheap because we
+        // run a single-iteration loop and join the thread immediately.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ack.dat");
+        let tracker_box: Box<AckTracker> = Box::new(AckTracker::new(path));
+        let tracker_static: &'static AckTracker = Box::leak(tracker_box);
+        // Seed one replica well behind the master so the lag-warn branch
+        // would fire if our threshold were 0. We use a large warn
+        // threshold to avoid emitting anything from the test (we are
+        // not asserting on logs here, only on the polling contract).
+        tracker_static.record_ack(test_addr(6000), 5);
+
+        let poll_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let poll_count_for_fn = poll_count.clone();
+        let current_seq_fn: std::sync::Arc<dyn Fn() -> u64 + Send + Sync> =
+            std::sync::Arc::new(move || {
+                poll_count_for_fn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                1_000_000 // simulate a master far ahead of the seeded replica
+            });
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let handle = spawn_lag_monitor(
+            tracker_static,
+            current_seq_fn,
+            shutdown.clone(),
+            // 1-second interval: short enough to observe at least one
+            // poll within the test's max wait (5 s) but long enough
+            // that the test does not hammer.
+            1,
+            u64::MAX, // suppress any warn lines — we test polling, not logs
+        );
+
+        // Wait up to 5 seconds for at least one poll, then trigger
+        // shutdown. If polling never happened, the thread is stuck and
+        // the assertion below will fail.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while poll_count.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Give the loop one extra interval to observe shutdown.
+        let join_result = handle.join();
+        assert!(
+            join_result.is_ok(),
+            "lag monitor thread must exit cleanly on shutdown",
+        );
+        assert!(
+            poll_count.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "lag monitor must call current_seq_fn at least once before shutdown",
+        );
+    }
+
     #[test]
     fn empty_file_loads_ok() {
         let dir = tempfile::tempdir().unwrap();
@@ -794,6 +875,19 @@ mod tests {
 
         let reopened = AckTracker::new(path);
         assert_eq!(reopened.last_acked(&test_addr(5000)), 42);
+    }
+
+    #[test]
+    fn ack_tracker_flush_leaves_no_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ack.dat");
+        let tracker = AckTracker::new(path.clone());
+
+        tracker.record_ack(test_addr(5000), 42);
+        tracker.flush();
+
+        assert!(path.exists());
+        assert!(!durable_tmp_path(&path).exists());
     }
 
     // -------------------------------------------------------------------
@@ -898,6 +992,18 @@ mod tests {
     }
 
     #[test]
+    fn replication_intent_tracker_write_leaves_no_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.dat");
+        let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
+
+        tracker.begin(5, 7).unwrap();
+
+        assert!(path.exists());
+        assert!(!durable_tmp_path(&path).exists());
+    }
+
+    #[test]
     fn replication_intent_tracker_corrupt_range_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("intent.dat");
@@ -983,6 +1089,19 @@ mod tests {
 
         let reopened = ReplicaAppliedTracker::load(path).unwrap();
         assert_eq!(reopened.get("source"), 9);
+    }
+
+    #[test]
+    fn applied_tracker_flush_leaves_no_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("applied.dat");
+        let tracker = ReplicaAppliedTracker::load(path.clone()).unwrap();
+
+        tracker.set("source", 9);
+        tracker.flush().unwrap();
+
+        assert!(path.exists());
+        assert!(!durable_tmp_path(&path).exists());
     }
 
     #[test]

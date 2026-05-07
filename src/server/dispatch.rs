@@ -187,6 +187,16 @@ pub fn init_ack_tracker(path: std::path::PathBuf) {
     let _ = ACK_TRACKER.set(tracker);
 }
 
+/// R-038 (D-01): borrow the static [`AckTracker`] for background subsystems
+/// (e.g. the replica-lag monitor) that need a `&'static AckTracker` handle.
+///
+/// Returns `None` until [`init_ack_tracker`] has been called. Single-node
+/// servers never call it, so single-node callers naturally see `None` and
+/// skip lag monitoring.
+pub fn ack_tracker_handle() -> Option<&'static crate::replication::durable::AckTracker> {
+    ACK_TRACKER.get()
+}
+
 /// Initialize the persistent receiver-side applied tracker.
 ///
 /// Must be called once during clustered server startup before accepting

@@ -396,11 +396,13 @@
 ### R-038 — [replica-lag] `replica_lag_check_interval_secs` config dead; `spawn_lag_monitor` never spawned
 - **Source:** AUDIT.md D-01
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/config.rs:387,444, src/replication/durable.rs:679-709
+- **Status:** PARTIAL (wiring + warn-line emission landed; Prometheus gauge + /healthz surfacing tracked as R-222)
+- **Files:** src/server/dispatch.rs (`ack_tracker_handle`), src/bin/server.rs (post-checkpoint spawn), src/replication/durable.rs (regression test)
 - **Cluster:** replica-lag
-- **Notes:** Wire `spawn_lag_monitor` into `bin/server.rs` when `config.replica_lag_check_interval_secs > 0`. Add Prometheus gauge `repl_replica_lag_ops{replica="…"}`. Surface lag in `/healthz` so cluster degrades when lag exceeds threshold.
-- **Test:** `spawn_lag_monitor_emits_metrics`
+- **Resolution (partial):** Added `pub fn ack_tracker_handle() -> Option<&'static AckTracker>` to dispatch.rs to expose the static for background subsystems, then wired the spawn in `bin/server.rs` after the checkpoint task: when `config.replication_factor > 1 && config.replica_lag_check_interval_secs > 0`, the binary now grabs the tracker + redo log handles and calls `spawn_lag_monitor`. The monitor wakes every interval, reads `redo.lock().current_sequence()` via the closure, compares against each replica's persisted last-acked, and emits `tracing::warn!` when the gap exceeds the (currently hard-coded) 10_000-op threshold. Pre-fix the field was a configuration dead-letter — `spawn_lag_monitor` existed and was tested in isolation but no production code path ever called it, so a stuck replica only surfaced when an operator manually inspected the persistent ACK file.
+- **Residual scope (tracked as R-222):** Prometheus gauge `repl_replica_lag_ops{replica="…"}` and `/healthz` integration so the cluster reflects lag in its readiness response. The warn lines surface stuck replicas in the existing log-aggregation pipeline; the gauge + /healthz are operator-experience improvements not safety-critical.
+- **Tests added:** `spawn_lag_monitor_polls_and_shuts_down` (verifies the monitor spawns, calls `current_seq_fn` at least once per interval via an `AtomicU64` poll counter, and exits promptly when the shared `AtomicBool` shutdown flag is set).
+- **Verification:** Full local gate green: `cargo build --release`, `cargo test --all` (1507 passed in the relevant lib slot, 0 failed, 0 ignored — totals across all suites match prior baseline plus the new test), `cargo clippy --all --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 
 ### Cluster: cluster + sharding + migration
 
@@ -2149,6 +2151,25 @@ These are entries from the audits that, on inspection, are correct as implemente
 - **Cluster:** migration-handshake
 - **Notes:** Receiver treats `record_count == 0` as "empty migration, no manifest needed", so a source declaring a non-empty shard's migration complete with `record_count = 0` causes silent data loss. Fix: every completion carries the manifest hash, including empty shards (`HMAC-SHA256` over an empty entry list yields a known constant; the receiver compares against that). Needs human approval because it interacts with the empty-shard fast path that the cluster already optimizes for. Once approved, fix is small (~30 LoC).
 - **Test required:** `zero_record_completion_with_wrong_manifest_rejected`
+
+### R-223 — [tracker-atomicity] Replication trackers (Ack/Intent/Applied) lacked parent-dir fsync after rename
+- **Source:** Discovered while resolving R-038 (pattern parallel to R-094 for snapshots)
+- **Severity:** MEDIUM
+- **Status:** RESOLVED
+- **Files:** src/replication/durable.rs (`fsync_parent_dir`, `write_durable_file` helpers; `AckTracker::write_to_disk`, `ReplicationIntentTracker::write_to_disk`, `ReplicaAppliedTracker::write_to_disk` all call `write_durable_file`)
+- **Cluster:** tracker-atomicity
+- **Resolution:** All three persistent trackers (`AckTracker`, `ReplicationIntentTracker`, `ReplicaAppliedTracker`) now route their tempfile-then-rename writes through a shared `write_durable_file` helper that adds the missing parent-directory fsync after the rename. Pre-fix the rename atomicity was advisory only on Linux ext4 and unreliable on other filesystems (the rename may be visible but the directory metadata not yet flushed) — a master crash immediately after a tracker write could leave the on-disk file at the previous content, losing the most recently durable ACK or intent. Same pattern as R-094 for snapshots; this finding picks up the replication trackers that R-094 did not cover.
+- **Tests added:** `ack_tracker_flush_leaves_no_tmp_file`, `replication_intent_tracker_write_leaves_no_tmp_file` (both assert the rename completes — i.e. `path` exists and the tmp sibling does not — which is the user-observable contract preserved by the new helper).
+- **Verification:** Folded into the R-038 commit (full local gate green there).
+
+### R-222 — [replica-lag] Prometheus gauge + /healthz surfacing for replica lag (R-038 follow-up)
+- **Source:** Discovered while resolving R-038 (wiring landed; metrics/health surfaces deferred)
+- **Severity:** MEDIUM
+- **Status:** OPEN
+- **Files:** src/metrics.rs (new `ReplicationMetrics::repl_replica_lag_ops` gauge), src/replication/durable.rs (`spawn_lag_monitor` writes gauge), src/server/http.rs (`/healthz` consults gauge per replica), src/config.rs (consider `replica_lag_warn_threshold_ops` config field)
+- **Cluster:** replica-lag
+- **Notes:** R-038 landed the wiring + warn-line emission. The remaining work is operator-experience: surface lag as a labelled Prometheus gauge so dashboards can alert without parsing tracing output, and reflect lag-over-threshold in `/healthz` so an external load balancer can drain a node whose replication is falling behind. The current hard-coded 10_000-op warn threshold should also become a config knob (`replica_lag_warn_threshold_ops`, default 10_000). Scope: ~80 LoC + tests.
+- **Test required:** `lag_monitor_emits_prometheus_gauge`, `health_unhealthy_when_replica_lag_exceeds_threshold`
 
 ### R-221 — [conflicting-children] Full WAL coverage for `append_conflicting_child` (R-024 follow-up)
 - **Source:** Discovered while resolving R-024 (reorder-only fix landed)

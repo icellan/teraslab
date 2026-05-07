@@ -939,6 +939,58 @@ fn main() {
         )
     });
 
+    // R-038 (D-01): spawn the replica-lag monitor when:
+    //   (a) we are clustered (RF > 1, so `init_ack_tracker` has been
+    //       called and the static is populated), AND
+    //   (b) the operator has not explicitly disabled it via
+    //       `replica_lag_check_interval_secs = 0`.
+    // Pre-fix `replica_lag_check_interval_secs` was a dead config field —
+    // `spawn_lag_monitor` existed and was tested in isolation but no
+    // production code path ever called it. The lag monitor periodically
+    // compares the master's current redo sequence against each replica's
+    // last-acked sequence and emits `tracing::warn!` when the gap exceeds
+    // `warn_threshold` ops. A Prometheus gauge for the lag is captured as
+    // a follow-up (R-222) — for now the warn lines surface stuck replicas
+    // through the normal log-aggregation pipeline.
+    let _lag_monitor_handle: Option<std::thread::JoinHandle<()>> =
+        if config.replication_factor > 1 && config.replica_lag_check_interval_secs > 0 {
+            match (
+                teraslab::server::dispatch::ack_tracker_handle(),
+                redo_log.clone(),
+            ) {
+                (Some(tracker), Some(redo)) => {
+                    // 10_000 ops ~= a few seconds of full-throughput at
+                    // production rates. Conservative enough to avoid
+                    // false alarms during routine spikes; tight enough
+                    // that a genuinely stuck replica is flagged within
+                    // the first lag-check interval. Hard-coded for now;
+                    // a config knob is captured as part of R-222.
+                    let warn_threshold: u64 = 10_000;
+                    let current_seq_fn: std::sync::Arc<dyn Fn() -> u64 + Send + Sync> = {
+                        let redo = redo.clone();
+                        std::sync::Arc::new(move || redo.lock().current_sequence())
+                    };
+                    Some(teraslab::replication::durable::spawn_lag_monitor(
+                        tracker,
+                        current_seq_fn,
+                        shutdown_flag.clone(),
+                        config.replica_lag_check_interval_secs,
+                        warn_threshold,
+                    ))
+                }
+                _ => {
+                    tracing::warn!(
+                        rf = config.replication_factor,
+                        interval_secs = config.replica_lag_check_interval_secs,
+                        "replica-lag monitor not spawned: ACK_TRACKER or redo_log unavailable",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let server = ServerWithShutdown {
         inner: server,
         shutdown: shutdown_flag,
