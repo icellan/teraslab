@@ -331,11 +331,12 @@
 ### R-031 — [recovery-validation] `replay_create` (legacy, pre-CreateV2) registers WITHOUT validating on-device record bytes
 - **Source:** AUDIT.md BC-53
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/recovery.rs:715-744
+- **Status:** RESOLVED
+- **Files:** src/recovery.rs (`replay_create`)
 - **Cluster:** recovery
-- **Notes:** Either have legacy `replay_create` read device metadata + fail closed on missing/corrupt (mirror `replay_create_v2`), or deprecate the legacy Create opcode after a release cycle. Currently legacy entries register an index pointing at zeros.
-- **Test:** `legacy_create_redo_validation`
+- **Resolution:** Legacy `replay_create` now mirrors `replay_create_v2`'s validate-then-register pattern: it reads the on-device metadata header at `record_offset`, fails closed on I/O errors with `ReplayCause::MissingRecordBytes`, fails closed on `meta.utxo_count != redo_entry.utxo_count` with `ReplayCause::CorruptEntry`, and seeds the registered index entry's cached fields (`block_entry_count`, `tx_flags`, `spent_utxos`, `dah_or_preserve`, `unmined_since`, `generation`) from the validated metadata. Pre-fix the function blindly registered a zero-filled placeholder, so any legacy redo entry whose record bytes were torn or missing produced a perfectly-cached zero-state index entry pointing at unreadable bytes — and the engine's fast path would happily serve junk on first read.
+- **Tests added:** `legacy_replay_create_populates_cached_fields_from_metadata` (positive: confirms cached fields come from on-device metadata, not zeros), `legacy_replay_create_fails_closed_on_missing_record_bytes` (negative: confirms missing record bytes produce `failed_missing_record_bytes` and no index entry is registered).
+- **Verification:** Full local gate green: `cargo build --release`, `cargo test --all` (1716 passed, 0 failed, 0 ignored), `cargo clippy --all --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 
 ### R-032 — [hashtable-concurrency] Hash-table buckets 64-byte packed; concurrent reader can see torn bucket on writer's `set_entry`
 - **Source:** AUDIT.md BC-30

@@ -445,7 +445,7 @@ fn replay_entry(
             tx_key,
             record_offset,
             utxo_count,
-        } => replay_create(index, tx_key, *record_offset, *utxo_count),
+        } => replay_create(device, index, tx_key, *record_offset, *utxo_count),
         RedoOp::CreateV2 {
             tx_key,
             record_offset,
@@ -742,7 +742,31 @@ fn replay_unfreeze(
     ReplayResult::Applied
 }
 
+/// Legacy (pre-`CreateV2`) create replay.
+///
+/// Replays a `RedoOp::Create` entry written before gap #2 added the
+/// full-payload `RedoOp::CreateV2` variant. The entry only carries
+/// `record_offset + utxo_count` — there are no captured record bytes —
+/// so this function can only validate that the on-device record at
+/// `record_offset` is coherent enough to register an index entry that
+/// doesn't lie about the cached metadata fields.
+///
+/// R-031 (BC-53): pre-fix the function blindly registered an index
+/// entry with all-zero cached fields (`tx_flags`, `spent_utxos`,
+/// `dah_or_preserve`, `unmined_since`, `generation`) and zero
+/// `block_entry_count`. If the on-device metadata had been written
+/// before the crash but the redo entry never made it through, that
+/// was correct; but if the device write was incomplete or torn, the
+/// recovery would still register a perfectly-cached zero-state index
+/// entry pointing at unreadable bytes, then start serving reads from
+/// it. Aligning with `replay_create_v2`'s validate-then-register
+/// pattern: read the metadata header, fail closed on I/O / corruption,
+/// require the redo entry's `utxo_count` to match the on-device
+/// `utxo_count`, and seed the index entry's cached fields from the
+/// validated metadata so subsequent reads reflect the actual record
+/// state (not zeros).
 fn replay_create(
+    device: &dyn BlockDevice,
     index: &mut PrimaryBackend,
     tx_key: &TxKey,
     record_offset: u64,
@@ -753,16 +777,34 @@ fn replay_create(
         return ReplayResult::Skipped;
     }
 
+    // Read the on-device metadata header. A read error here means the
+    // record bytes are missing or corrupt; fail closed rather than
+    // registering an index entry pointing at unreadable data. This
+    // mirrors `replay_create_v2` (which performs the same read after
+    // pwriting the captured record bytes).
+    let meta = match crate::io::read_metadata(device, record_offset) {
+        Ok(m) => m,
+        Err(_) => return ReplayResult::Failed(ReplayCause::MissingRecordBytes),
+    };
+
+    // The redo entry's `utxo_count` MUST match the on-device metadata's
+    // `utxo_count` — otherwise the redo entry is referring to a record
+    // that no longer exists at `record_offset` (someone else's data, or
+    // a torn write). Fail closed.
+    if { meta.utxo_count } != utxo_count {
+        return ReplayResult::Failed(ReplayCause::CorruptEntry);
+    }
+
     let entry = TxIndexEntry {
         device_id: 0,
         record_offset,
         utxo_count,
-        block_entry_count: 0,
-        tx_flags: 0,
-        spent_utxos: 0,
-        dah_or_preserve: 0,
-        unmined_since: 0,
-        generation: 0,
+        block_entry_count: meta.block_entry_count,
+        tx_flags: meta.flags.bits(),
+        spent_utxos: { meta.spent_utxos },
+        dah_or_preserve: { meta.delete_at_height },
+        unmined_since: { meta.unmined_since },
+        generation: { meta.generation },
     };
     match index.register(*tx_key, entry) {
         Ok(()) => ReplayResult::Applied,
@@ -1758,6 +1800,128 @@ mod tests {
         let stats2 = recover(&*data_dev as &dyn BlockDevice, &redo, &mut index).unwrap();
         assert_eq!(stats2.entries_replayed, 0);
         assert_eq!(stats2.entries_skipped, 1);
+    }
+
+    /// R-031 (BC-53) regression: legacy `RedoOp::Create` replay must
+    /// read on-device metadata and populate cached index fields from
+    /// it, NOT register a zero-filled placeholder. Pre-fix the function
+    /// blindly registered an entry with all-zero `tx_flags`,
+    /// `spent_utxos`, `dah_or_preserve`, `unmined_since`, `generation`,
+    /// and `block_entry_count`, so subsequent fast-path reads returned
+    /// stale state for any record whose redo entry was the legacy
+    /// variant (e.g. logs written before gap #2 / `CreateV2` landed).
+    #[test]
+    fn legacy_replay_create_populates_cached_fields_from_metadata() {
+        let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut index = PrimaryBackend::new_in_memory(1000).unwrap();
+
+        let txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0xEE;
+            t
+        };
+        let key = TxKey { txid };
+        let utxo_count: u32 = 3;
+
+        // Write a real on-device record (mimicking the engine path
+        // that the legacy Create entry would have followed).
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        meta.flags = TxFlags::IS_COINBASE;
+        meta.spent_utxos = 0;
+        meta.unmined_since = 99_999;
+        meta.generation = 17;
+        let base_size = TxMetadata::record_size_for(utxo_count);
+        meta.record_size = base_size as u32;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (i + 1) as u8;
+                UtxoSlot::new_unspent(h)
+            })
+            .collect();
+        let record_offset = alloc.allocate(base_size).unwrap();
+        io::write_full_record(&*data_dev as &dyn BlockDevice, record_offset, &meta, &slots)
+            .unwrap();
+
+        // Append a LEGACY Create entry (no record_bytes) and recover.
+        let mut redo = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
+        redo.append_and_flush(RedoOp::Create {
+            tx_key: key,
+            record_offset,
+            utxo_count,
+        })
+        .unwrap();
+
+        let stats = recover(&*data_dev as &dyn BlockDevice, &redo, &mut index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+        assert_eq!(stats.entries_failed, 0);
+
+        // Cached fields MUST come from the on-device metadata — not zeros.
+        let recovered = index
+            .lookup(&key)
+            .expect("legacy Create replay must register the index entry");
+        assert_eq!(recovered.utxo_count, utxo_count);
+        assert_eq!(
+            recovered.tx_flags,
+            TxFlags::IS_COINBASE.bits(),
+            "tx_flags must reflect on-device flags, not zero",
+        );
+        assert_eq!(
+            recovered.unmined_since, 99_999,
+            "unmined_since must reflect on-device value, not zero",
+        );
+        assert_eq!(
+            recovered.generation, 17,
+            "generation must reflect on-device value, not zero",
+        );
+    }
+
+    /// R-031 regression (negative path): legacy `RedoOp::Create` whose
+    /// `record_offset` does not point at a coherent on-device record
+    /// MUST fail closed instead of registering a zero-cached entry
+    /// pointing at unreadable bytes. Pre-fix the function silently
+    /// registered the index entry, then the engine's fast-path read
+    /// would return junk on first access.
+    #[test]
+    fn legacy_replay_create_fails_closed_on_missing_record_bytes() {
+        let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut index = PrimaryBackend::new_in_memory(1000).unwrap();
+
+        let txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0xEF;
+            t
+        };
+        let key = TxKey { txid };
+        let utxo_count: u32 = 2;
+        let base_size = TxMetadata::record_size_for(utxo_count);
+        // Allocate the offset but DO NOT write any record bytes — the
+        // metadata read will see zeros (which fail CRC validation).
+        let record_offset = alloc.allocate(base_size).unwrap();
+
+        let mut redo = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
+        redo.append_and_flush(RedoOp::Create {
+            tx_key: key,
+            record_offset,
+            utxo_count,
+        })
+        .unwrap();
+
+        let stats = recover(&*data_dev as &dyn BlockDevice, &redo, &mut index).unwrap();
+        assert_eq!(stats.entries_replayed, 0);
+        assert_eq!(
+            stats.failed_missing_record_bytes, 1,
+            "legacy Create with no on-device record must fail closed (MissingRecordBytes)",
+        );
+        assert!(
+            index.lookup(&key).is_none(),
+            "no index entry must be registered when the record bytes are missing",
+        );
     }
 
     #[test]
