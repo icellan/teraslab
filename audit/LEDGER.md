@@ -468,11 +468,12 @@
 ### R-045 — [wire-dos] `GetBatch` masks storage corruption as zeros / TX_NOT_FOUND
 - **Source:** AUDIT_CODEX.md F4 (NEW)
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/server/dispatch.rs:4455-4465, :4469-4477, :4491-4501, :4506-4516
+- **Status:** RESOLVED (regression test deferred to R-225 — needs corrupt-device test scaffolding)
+- **Files:** src/server/dispatch.rs (`handle_get_batch`)
 - **Cluster:** wire-error-payloads
-- **Notes:** `handle_get_batch` converts `read_slot` errors → 69 zero bytes, `read_cold_data` → length 0, `read_conflicting_children` → count 0, non-`TxNotFound` metadata error → status 1 (TX_NOT_FOUND). Silent corruption presented to client. Propagate non-`TxNotFound` reads as explicit item errors; extend `WireGetResult` status mapping; or return top-level `STATUS_PARTIAL_ERROR + ERR_INTERNAL`. Never synthesize slot bytes / cold-data length / child count after I/O or checksum failure.
-- **Test:** `get_batch_propagates_storage_errors_not_zeros`
+- **Resolution:** Pre-fix the GetBatch slow path silently filled `read_slot` errors with 69 zero bytes, `read_cold_data` errors with length 0, `read_conflicting_children` errors with count 0, and mapped any non-`TxNotFound` `read_metadata` error to `WireGetResult.status = 1` (which the wire decodes as `ERR_TX_NOT_FOUND`). A client could not distinguish "tx really doesn't exist" from "tx exists but the device returned bad bytes" — the natural retry behaviour for the latter never fired, so storage corruption was permanently presented to the client as fabricated zeros. Now: (a) inner sub-read failures set an `inner_read_failed` flag and the outer item's `status` becomes `ERR_INTERNAL as u8` (255) instead of 0; (b) the non-`TxNotFound` metadata-read error branch returns `status = ERR_INTERNAL as u8` instead of 1; (c) the `TxNotFound` branch now uses `ERR_TX_NOT_FOUND as u8` explicitly. The classification loop already counts "other failures" separately from "not_found" and "redirect", so the metrics surface storage corruption distinctly from missing records.
+- **Tests added:** None — verified via the full existing test suite (1720 tests passing, no regression). A targeted regression test requires injectable read-failure scaffolding on top of `MemoryDevice` (the existing `WriteFailingDevice` only covers writes); building that scaffold is captured as new finding R-225.
+- **Verification:** Full local gate green: `cargo build --release`, `cargo test --all` (1720 passed, 0 failed, 0 ignored), `cargo clippy --all --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 
 ### R-046 — [snapshot-format] Snapshot deserialize uses unchecked `count * PRIMARY_ENTRY_SIZE` multiplication; OOM/panic on poisoned snapshot
 - **Source:** AUDIT.md GH-G1
@@ -2155,6 +2156,15 @@ These are entries from the audits that, on inspection, are correct as implemente
 - **Cluster:** migration-handshake
 - **Notes:** Receiver treats `record_count == 0` as "empty migration, no manifest needed", so a source declaring a non-empty shard's migration complete with `record_count = 0` causes silent data loss. Fix: every completion carries the manifest hash, including empty shards (`HMAC-SHA256` over an empty entry list yields a known constant; the receiver compares against that). Needs human approval because it interacts with the empty-shard fast path that the cluster already optimizes for. Once approved, fix is small (~30 LoC).
 - **Test required:** `zero_record_completion_with_wrong_manifest_rejected`
+
+### R-225 — [test-infra] `ReadFailingDevice` scaffolding for read-error regression tests (R-045 follow-up)
+- **Source:** Discovered while resolving R-045
+- **Severity:** LOW
+- **Status:** OPEN
+- **Files:** src/device.rs (new test-only `ReadFailingDevice` analog of `WriteFailingDevice`)
+- **Cluster:** test-infra
+- **Notes:** `WriteFailingDevice` (added in R-004) lets tests inject pwrite failures behind a `BlockDevice` wrapper. There is no symmetric `ReadFailingDevice`, so tests that need to exercise read-error paths (R-045 GetBatch corruption mapping, future R-029 / R-030 memory-ordering tests) currently can't pin the contract. Add a `ReadFailingDevice` with the same kill-switch pattern (`AtomicBool` flag, `pread_*` returns `DeviceError::Io` when set). Scope: ~30 LoC + the R-045 `get_batch_propagates_storage_errors_not_zeros` regression test that needs it.
+- **Test required:** `get_batch_propagates_storage_errors_not_zeros`
 
 ### R-224 — [wire-dos] Promote `MAX_STREAM_TOTAL_BYTES` to `ServerConfig::max_stream_total_bytes` (R-044 follow-up)
 - **Source:** Discovered while resolving R-044

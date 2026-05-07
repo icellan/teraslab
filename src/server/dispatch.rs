@@ -4666,6 +4666,15 @@ fn handle_get_batch(
                         data.push(meta.block_entry_count);
                     }
                 }
+                // R-045 (Codex F4): track whether any inner sub-read
+                // (slot / cold-data / conflicting-children) failed.
+                // Pre-fix the failures were silently filled with
+                // zeros / length-0 / count-0, so storage corruption
+                // was indistinguishable from a clean read of an
+                // empty record. Now we surface inner failures as
+                // ERR_INTERNAL on the result item — clients can
+                // retry instead of trusting the synthesized bytes.
+                let mut inner_read_failed = false;
                 if field_mask.has(FieldMask::UTXO_SLOTS) {
                     let utxo_count = { meta.utxo_count };
                     data.extend_from_slice(&utxo_count.to_le_bytes());
@@ -4677,7 +4686,13 @@ fn handle_get_batch(
                                 data.extend_from_slice(&slot.spending_data);
                             }
                             Err(_) => {
-                                // Slot read error — fill with zeros
+                                inner_read_failed = true;
+                                // Still emit padding bytes so the
+                                // length declared in `utxo_count`
+                                // matches the data length; the
+                                // per-item ERR_INTERNAL status tells
+                                // the client these bytes are
+                                // unreliable.
                                 data.extend_from_slice(&[0u8; 69]);
                             }
                         }
@@ -4690,6 +4705,7 @@ fn handle_get_batch(
                             data.extend_from_slice(&cold);
                         }
                         Err(_) => {
+                            inner_read_failed = true;
                             data.extend_from_slice(&0u32.to_le_bytes());
                         }
                     }
@@ -4714,21 +4730,38 @@ fn handle_get_batch(
                             }
                         }
                         Err(_) => {
+                            inner_read_failed = true;
                             data.push(0u8);
                         }
                     }
                 }
-                results.push(WireGetResult { status: 0, data });
+                let status = if inner_read_failed {
+                    // ERR_INTERNAL (255) on the wire — distinguishes
+                    // sub-read corruption from a clean `Ok(0)` case.
+                    ERR_INTERNAL as u8
+                } else {
+                    0
+                };
+                results.push(WireGetResult { status, data });
             }
             Err(SpendError::TxNotFound) => {
                 results.push(WireGetResult {
-                    status: 1,
+                    status: ERR_TX_NOT_FOUND as u8,
                     data: vec![],
                 });
             }
             Err(_) => {
+                // R-045 (Codex F4): a non-`TxNotFound` metadata read
+                // error is storage corruption / I/O failure, not a
+                // missing record. Pre-fix this returned status=1
+                // (ERR_TX_NOT_FOUND on the wire), so a client could
+                // not distinguish "tx really doesn't exist" from
+                // "tx exists but the device returned bad bytes" —
+                // the natural retry behaviour for the latter never
+                // fired. Surface as ERR_INTERNAL so the client
+                // retries.
                 results.push(WireGetResult {
-                    status: 1,
+                    status: ERR_INTERNAL as u8,
                     data: vec![],
                 });
             }
