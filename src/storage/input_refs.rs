@@ -81,11 +81,18 @@ pub fn write_input_refs(
 
     let mut buf = AlignedBuf::new(total, align);
 
-    // Read-modify-write if not aligned. Pre-read failure is non-fatal:
-    // the bytes we read are immediately overwritten by `refs` below; on
-    // success we are guaranteed an exact buffer (no partial blocks).
+    // R-051 (IJK-05): propagate pread errors. The pre-fix comment
+    // claimed "the bytes we read are immediately overwritten by
+    // `refs` below" — that is true for the `intra..intra +
+    // data_size` window the for-loop fills, but FALSE for the head
+    // bytes (`buf[0..intra]`) and any tail padding inside the
+    // aligned block. Those bytes belong to neighbouring records;
+    // on pread failure they remain zero from `AlignedBuf::new`,
+    // and the subsequent `pwrite_all_at` writes those zeros over
+    // the neighbouring records — silent corruption of
+    // record-adjacent metadata.
     if intra > 0 || !data_size.is_multiple_of(align) {
-        let _ = device.pread_exact_at(&mut buf, aligned_base);
+        device.pread_exact_at(&mut buf, aligned_base)?;
     }
 
     for (i, r) in refs.iter().enumerate() {

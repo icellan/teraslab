@@ -526,11 +526,12 @@
 ### R-051 — [mmap-io] `write_aligned` and `write_input_refs` swallow pre-read errors and write zeros for head/tail bytes → silent corruption of record-adjacent metadata
 - **Source:** AUDIT.md IJK-05
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/storage/manager.rs:300-318, src/storage/input_refs.rs:67-98
+- **Status:** RESOLVED (regression test deferred to R-225 — needs `ReadFailingDevice`)
+- **Files:** src/storage/manager.rs (`StorageManager::write_aligned`), src/storage/input_refs.rs (`write_input_refs`)
 - **Cluster:** mmap-io
-- **Notes:** Replace `let _ = self.device.pread_exact_at(...)` with `?`. Makes `write_cold_data` fallible for inline tier in edge cases — correct.
-- **Test:** `write_aligned_propagates_pread_error`
+- **Resolution:** Replaced `let _ = device.pread_exact_at(...)` with `?` in both alignment-aware write paths. Pre-fix the swallowed pread error left the head bytes (`buf[0..intra]`) and tail bytes (`buf[intra + data.len()..total]`) at zero from `AlignedBuf::new`; the subsequent `pwrite_all_at` then wrote those zeros over the bytes belonging to neighbouring records — silent corruption of record-adjacent metadata. The pre-fix comment claimed the read failure was non-fatal because "the bytes we read are immediately overwritten by `data` below"; that's true for the explicit-copy window only, NOT the head/tail bytes.
+- **Tests added:** None (regression test requires injectable read-failure scaffolding tracked under R-225). Full existing test suite (1720 → 1720 lib tests, 0 regression) confirms the success path still works correctly.
+- **Verification:** Full local gate green: `cargo build --release`, `cargo test --all` (1720 passed, 0 failed, 0 ignored), `cargo clippy --all --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 
 ### R-052 — [pruning] `MarkLongestChainBatch` not replicated; no `ReplicaOp` emitted despite mutating `unmined_since`/DAH/generation
 - **Source:** AUDIT.md IJK-20, AUDIT_CODEX.md F3

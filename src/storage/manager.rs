@@ -306,11 +306,19 @@ impl StorageManager {
 
         let mut buf = AlignedBuf::new(total, align);
         if intra > 0 || !data.len().is_multiple_of(align) {
-            // Pre-read for read-modify-write. A failure here is non-fatal
-            // because the bytes we read are immediately overwritten by
-            // `data` below; on success we are guaranteed an exact buffer
-            // (no partial blocks).
-            let _ = self.device.pread_exact_at(&mut buf, aligned_base);
+            // R-051 (IJK-05): propagate pread errors. The pre-fix
+            // comment claimed "the bytes we read are immediately
+            // overwritten by `data` below" — that is true for the
+            // `intra..intra + data.len()` window we explicitly copy
+            // into, but FALSE for the head bytes (`buf[0..intra]`)
+            // and tail bytes (`buf[intra + data.len()..total]`) of
+            // the aligned read-modify-write block. Those are OUTSIDE
+            // `data`, so on pread failure they remain zero from
+            // `AlignedBuf::new`, and the subsequent `pwrite_all_at`
+            // writes those zeros over the head/tail bytes that
+            // belonged to neighbouring records — silent corruption
+            // of record-adjacent metadata.
+            self.device.pread_exact_at(&mut buf, aligned_base)?;
         }
         buf[intra..intra + data.len()].copy_from_slice(data);
         self.device.pwrite_all_at(&buf, aligned_base)?;
