@@ -286,11 +286,11 @@
 ### R-026 — [replay-idempotency] Redo entries not actually idempotent — `replay_spend` overwrites `spent_utxos` unconditionally
 - **Source:** AUDIT.md BC-11
 - **Severity:** HIGH
-- **Status:** OPEN, blocked-by R-010
-- **Files:** src/recovery.rs:541-555, :580-590
+- **Status:** RESOLVED (resolved by the R-010 fix; this entry is the BC-11 paper-trail confirmation)
+- **Files:** src/recovery.rs (`replay_spend`, `replay_unspend`)
 - **Cluster:** replay-idempotency
-- **Notes:** Replace counter overwrite with delta-based (`new_spent_count = max(meta.spent_utxos.saturating_sub(delta), …)`) and tie delta to per-entry idempotency guard. Or take per-tx lock during replay and re-derive `spent_utxos` from a slot scan. Tied to R-010.
-- **Test:** `replay_spend_idempotent_counter`
+- **Resolution:** The R-010 fix (commit 39bbc02) already addressed this: `replay_spend` and `replay_unspend` no longer overwrite `meta.spent_utxos` with the redo entry's `new_spent_count`. Instead they (a) read the on-device slot, (b) check slot-state idempotency at the top (return `Skipped` if the slot already matches the post-state), and (c) re-derive the counter via `meta.spent_utxos.saturating_add(1)` / `saturating_sub(1)` based on the slot transition we are about to make. The per-entry slot-state check IS the idempotency guard the audit asked for, and re-deriving from on-device state instead of from the redo's `new_spent_count` removes the divergence the audit flagged. Tests `replay_spend_rederives_counter_ignoring_redo_snapshot` and `replay_unspend_rederives_counter_ignoring_redo_snapshot` (added in R-010) pin the contract.
+- **Verification:** Already covered by the R-010 commit; no new code change required for R-026.
 
 ### R-027 — [redo-log] Linear `write_pos` never wraps — naming "circular" misleads
 - **Source:** AUDIT.md BC-13
