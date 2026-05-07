@@ -837,11 +837,41 @@ async fn handle_health_live(State(_state): State<Arc<HttpState>>) -> impl IntoRe
 }
 
 async fn handle_health_ready(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
-    if state.ready.load(Ordering::Relaxed) {
-        (StatusCode::OK, "ready")
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+    match compute_health_ready(&state) {
+        ReadyState::Ready => (StatusCode::OK, "ready"),
+        ReadyState::NotReady(reason) => (StatusCode::SERVICE_UNAVAILABLE, reason),
     }
+}
+
+/// Result of the [`/health/ready`] readiness check, broken out from the
+/// axum handler so the readiness logic is testable without spinning up a
+/// router.
+#[derive(Debug, PartialEq, Eq)]
+enum ReadyState {
+    Ready,
+    NotReady(&'static str),
+}
+
+/// R-055 (LMNH-07): `/health/ready` must reflect whether this node is
+/// actually ready to take traffic, not just the boot-time `ready` flag.
+/// Pre-fix `state.ready` was hard-coded `true` at startup and never
+/// updated, so a load balancer would route requests to a clustered node
+/// before it joined a quorum and the node would reject every request
+/// with `ERR_CLUSTER_NOT_READY`. The cluster's own readiness gate
+/// (`cluster.cluster_health().is_ready()`, true once the node has
+/// observed at least one committed topology) is the authoritative
+/// source in clustered mode; in single-node mode (`state.cluster ==
+/// None`) only the local `state.ready` flag applies.
+fn compute_health_ready(state: &HttpState) -> ReadyState {
+    if !state.ready.load(Ordering::Relaxed) {
+        return ReadyState::NotReady("not ready");
+    }
+    if let Some(ref cluster) = state.cluster
+        && !cluster.cluster_health().is_ready()
+    {
+        return ReadyState::NotReady("cluster not ready (no committed quorum yet)");
+    }
+    ReadyState::Ready
 }
 
 // ---------------------------------------------------------------------------
@@ -2861,5 +2891,126 @@ mod tests {
             Some(expected_trace),
             "/metrics span should be parented to the inbound traceparent",
         );
+    }
+
+    /// Build a minimal `HttpState` for readiness tests. Caller supplies
+    /// the local `ready` flag and an optional cluster handle.
+    fn build_ready_test_state(
+        ready_flag: bool,
+        cluster: Option<Arc<RunningCluster>>,
+    ) -> Arc<HttpState> {
+        use crate::allocator::SlotAllocator;
+        use crate::device::{BlockDevice, MemoryDevice};
+        use crate::index::{DahIndex, Index, UnminedIndex};
+        use crate::locks::StripedLocks;
+        use crate::ops::engine::Engine;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(1024).unwrap();
+        let locks = StripedLocks::new(64);
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            locks,
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        let metrics: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
+        let histograms: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
+        Arc::new(HttpState {
+            engine,
+            metrics,
+            histograms,
+            ready: Arc::new(AtomicBool::new(ready_flag)),
+            log_level: Arc::new(AtomicU8::new(LOG_LEVEL_INFO)),
+            cluster,
+            redo_log: None,
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            http_port: 0,
+        })
+    }
+
+    /// R-055 baseline: in single-node mode (no cluster) with the
+    /// boot-time `ready` flag set, `/health/ready` returns ready. This
+    /// asserts the fix did not break the existing single-node contract.
+    #[test]
+    fn health_ready_returns_ready_in_single_node_mode() {
+        let state = build_ready_test_state(true, None);
+        assert_eq!(compute_health_ready(&state), ReadyState::Ready);
+    }
+
+    /// R-055 baseline: when the local `ready` flag is `false`, the
+    /// readiness check still rejects regardless of cluster state.
+    #[test]
+    fn health_ready_rejects_when_local_ready_flag_false() {
+        let state = build_ready_test_state(false, None);
+        assert_eq!(
+            compute_health_ready(&state),
+            ReadyState::NotReady("not ready"),
+        );
+    }
+
+    /// R-055 regression: in clustered mode, before the node has
+    /// observed a committed topology, `/health/ready` must return
+    /// SERVICE_UNAVAILABLE so a load balancer does not route traffic
+    /// to a node that will reject every request with
+    /// ERR_CLUSTER_NOT_READY. Pre-fix the handler returned 200 because
+    /// `state.ready` was hard-coded `true` at boot.
+    #[test]
+    fn health_ready_rejects_when_cluster_has_no_committed_term() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+
+        let table = ShardTable::compute(&[NodeId(1)], 1);
+        // No committed_members → committed_term stays 0 → cluster_health
+        // reports `Joining`, not `Alive`.
+        let cluster = Arc::new(new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            0,
+        ));
+        assert!(
+            !cluster.cluster_health().is_ready(),
+            "test setup precondition: cluster must report not-ready when no commit observed",
+        );
+
+        let state = build_ready_test_state(true, Some(cluster));
+        assert_eq!(
+            compute_health_ready(&state),
+            ReadyState::NotReady("cluster not ready (no committed quorum yet)"),
+        );
+    }
+
+    /// R-055 positive path: once the cluster has observed a committed
+    /// topology, `/health/ready` returns ready.
+    #[test]
+    fn health_ready_returns_ready_once_cluster_committed() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+
+        let table = ShardTable::compute(&[NodeId(1)], 1);
+        let cluster = Arc::new(new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[],
+            &[NodeId(1)],
+            &[],
+            &[],
+            &[],
+            0,
+        ));
+        assert!(
+            cluster.cluster_health().is_ready(),
+            "test setup precondition: cluster must report ready after a committed term",
+        );
+
+        let state = build_ready_test_state(true, Some(cluster));
+        assert_eq!(compute_health_ready(&state), ReadyState::Ready);
     }
 }

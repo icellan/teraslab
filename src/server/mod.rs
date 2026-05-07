@@ -211,6 +211,17 @@ fn handle_connection(
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
+    // R-054 (LMNH-01 / Codex F13): cap write time so a slow-reader
+    // client cannot pin a server thread indefinitely. Pre-fix
+    // `write_all` blocked forever waiting for the client to drain its
+    // recv buffer; ~`max_connections` slow readers exhausted the
+    // connection thread budget and DoS'd the master. 30 s matches the
+    // read timeout above; both should be longer than typical
+    // client-side handler latency but short enough that operators
+    // notice stuck connections promptly.
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(30)))
+        .map_err(|e| format!("set_write_timeout: {e}"))?;
 
     let mut read_buf = vec![0u8; 256 * 1024]; // 256 KB read buffer
     let mut conn_state = ConnectionState::new();

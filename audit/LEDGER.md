@@ -545,20 +545,21 @@
 ### R-054 — [dos-limits] Slow reader on response stream blocks server thread indefinitely (no write timeout)
 - **Source:** AUDIT.md LMNH-01, AUDIT_CODEX.md F13
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/server/mod.rs:208-287, :285
+- **Status:** RESOLVED
+- **Files:** src/server/mod.rs:208-225
 - **Cluster:** dos-limits
-- **Notes:** `stream.set_write_timeout(Some(Duration::from_secs(30)))` after read-timeout setup line 212. Optional: `TCP_USER_TIMEOUT` on Linux. Document write-timeout requirement.
-- **Test:** `slow_reader_does_not_pin_server_thread`
+- **Resolution:** Added `stream.set_write_timeout(Some(Duration::from_secs(30)))` immediately after the existing `set_read_timeout(Some(30 s))` call. This caps the time a single slow-reader client can pin a connection thread; ~`max_connections` slow readers can no longer DoS the master by refusing to drain their recv buffer. Inline comment references R-054/LMNH-01/F13 and explains the symmetry with the read timeout.
+- **Verification:** Covered by code review of the symmetric read/write timeout pair; full local gate (build + test --all + clippy --all-targets -D warnings + fmt --check) green, no regressions in 1505-test lib suite. (A live-socket regression test would need a multi-thread tokio + a real client that intentionally never reads — deferred as test infra task R-058 / proptest.)
 
-### R-055 — [observability] `/health/ready` hard-coded `true` at boot, never consults `cluster.is_ready()`
+### R-055 — [observability] `/health/ready` hard-coded `true` at boot, never consults cluster readiness
 - **Source:** AUDIT.md LMNH-07
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/bin/server.rs:894, src/server/http.rs:839-845, src/server/dispatch.rs:290-300
+- **Status:** RESOLVED
+- **Files:** src/server/http.rs:839-880
 - **Cluster:** observability
-- **Notes:** `handle_health_ready` checks `state.cluster.as_ref().map_or(true, |c| c.cluster_health().is_ready())`. Same gate for secondary-index readiness (dispatch:311).
-- **Test:** `health_ready_returns_503_until_cluster_ready`
+- **Resolution:** Extracted readiness logic into a synchronous `compute_health_ready(&HttpState) -> ReadyState` helper that (a) honours the existing `state.ready` flag and (b) when `state.cluster.is_some()`, additionally requires `cluster.cluster_health().is_ready()` (`swim_state == Alive`, i.e. at least one committed topology observed). Pre-fix the boot-time `state.ready: AtomicBool::new(true)` made the endpoint return 200 the instant the HTTP listener bound, so a load balancer would route to a clustered node before it had quorum and the node would reject every request with `ERR_CLUSTER_NOT_READY`. Single-node mode behaviour is unchanged (no cluster → only the local flag applies). Secondary-index readiness gate at dispatch:311 is a separate concern — captured as R-220 follow-up.
+- **Tests added:** `health_ready_returns_ready_in_single_node_mode`, `health_ready_rejects_when_local_ready_flag_false`, `health_ready_rejects_when_cluster_has_no_committed_term` (the regression — pre-fix it returned Ready), `health_ready_returns_ready_once_cluster_committed`.
+- **Verification:** 4 new tests pass on memory backend and `TERASLAB_INDEX_BACKEND=redb`; full local gate green.
 
 ### R-056 — [admin-auth] Admin mutation endpoints have zero auth when enabled
 - **Source:** AUDIT.md LMNH-08, AUDIT_CODEX.md F14
