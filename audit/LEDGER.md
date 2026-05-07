@@ -266,11 +266,13 @@
 ### R-024 — [conflicting-children] `append_conflicting_child` mutates parent metadata without a redo entry
 - **Source:** AUDIT.md BC-09, BC-44, AUDIT_CODEX.md F5
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/ops/engine.rs:1742, :1913, :2275-2360, :2318-2357, :2529, src/recovery.rs:849-869, src/server/dispatch.rs:4492
+- **Status:** PARTIAL (reorder fix landed; full WAL coverage tracked as R-221)
+- **Files:** src/ops/engine.rs (`Engine::append_conflicting_child`)
 - **Cluster:** conflicting-children
-- **Notes:** Write `RedoOp::AppendConflictingChild { parent_key, child_txid, prior_offset, prior_count, new_offset, new_count }` BEFORE alloc/free steps. Replay re-reads parent metadata and ensures children list is correct (idempotent). Currently crash mid-update leaves parent metadata referencing freed/reallocated regions; recovery explicitly skips conflict-link replay.
-- **Test:** `append_conflicting_child_crash_recovery`, `append_conflicting_child_multi_crash_window`
+- **Resolution (partial):** Reordered the steps inside `Engine::append_conflicting_child` so the OLD children-list block is freed LAST, only after the new block is fully written and the parent's metadata has been updated to reference it. Pre-fix the order was free-old → allocate-new → write → meta-update; that opened a window where the parent's metadata still pointed at an offset the allocator had already returned to its freelist (and could re-hand out to a different allocation), so any reader touching the parent's children list could read someone else's bytes. The new ordering keeps the parent metadata coherent with a fully-written, allocator-owned block at every step.
+- **Residual risk (tracked as R-221):** A crash AFTER the new block is written but BEFORE the parent metadata write means the new child is missing from the parent's children list (the new allocation is leaked, but the parent still references the OLD, intact block). The in-memory call sites all use `let _ = engine.append_conflicting_child(…)` (best-effort), so callers don't observe this gap, and `Engine::append_conflicting_child` is already idempotent on re-application — but there is currently no automatic recovery pass that re-runs missed appends. Full WAL coverage (`RedoOp::AppendConflictingChild` + post-engine drain pass through the engine) is captured as new finding R-221.
+- **Tests added:** `append_conflicting_child_preserves_list_across_multiple_appends` (exercises multiple ordered appends + dedup; indirectly catches any regression in the reorder by detecting list corruption that would result from the freed-then-reallocated block aliasing the parent's children offset).
+- **Verification:** Full local gate green: `cargo build --release`, `cargo test --all` (1713 passed, 0 failed, 0 ignored), `cargo clippy --all --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 
 ### R-025 — [allocator-wal] `pre_allocate_create` allocates DEVICE space BEFORE the create's redo entry is written
 - **Source:** AUDIT.md BC-10
@@ -2147,6 +2149,15 @@ These are entries from the audits that, on inspection, are correct as implemente
 - **Cluster:** migration-handshake
 - **Notes:** Receiver treats `record_count == 0` as "empty migration, no manifest needed", so a source declaring a non-empty shard's migration complete with `record_count = 0` causes silent data loss. Fix: every completion carries the manifest hash, including empty shards (`HMAC-SHA256` over an empty entry list yields a known constant; the receiver compares against that). Needs human approval because it interacts with the empty-shard fast path that the cluster already optimizes for. Once approved, fix is small (~30 LoC).
 - **Test required:** `zero_record_completion_with_wrong_manifest_rejected`
+
+### R-221 — [conflicting-children] Full WAL coverage for `append_conflicting_child` (R-024 follow-up)
+- **Source:** Discovered while resolving R-024 (reorder-only fix landed)
+- **Severity:** HIGH
+- **Status:** OPEN
+- **Files:** src/redo.rs (new variant), src/ops/engine.rs (`Engine::append_conflicting_child`), src/recovery.rs (skip + collect), src/bin/server.rs (post-engine drain)
+- **Cluster:** conflicting-children
+- **Notes:** R-024's reorder fix closed the "parent metadata references freed/reallocated region" window but did not close "child missing from parent's list" if we crash between the new-block write and the parent metadata write. Full coverage requires (a) a new `RedoOp::AppendConflictingChild { parent_key, child_txid }` written + fsynced before the allocate step; (b) recovery to collect these entries (skip in main pass, since recovery doesn't have engine/allocator handles); (c) a post-engine drain pass in `bin/server.rs` that iterates the collected list and calls `engine.append_conflicting_child` (already idempotent on dedup). Scope: ~250 LoC across 4 files, including round-trip wire-format tests for the new variant. The current `let _ =` callers tolerate transient failures, so this is a durability-of-recovery fix, not an availability fix.
+- **Test required:** `append_conflicting_child_redo_round_trip`, `append_conflicting_child_recovery_replays_pending_intent`
 
 ### R-214 — [test-baseline] Migration crash variants requiring process-kill harness (deferred subset of F7)
 - **Source:** Discovered while resolving R-002

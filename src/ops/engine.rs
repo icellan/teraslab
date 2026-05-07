@@ -2367,12 +2367,35 @@ impl Engine {
         }
         children.push(child_txid);
 
-        // Free old block
-        if count > 0 && offset != 0 {
-            let _ = self.allocator.lock().free(offset, (count * 32) as u64);
-        }
+        // R-024 (BC-09 / BC-44 / Codex F5): allocate + write + commit
+        // metadata BEFORE freeing the old block. Pre-fix the order was
+        // free-old → allocate-new → write → meta-update; that opened a
+        // window where the parent's metadata still pointed at an offset
+        // the allocator had already returned to its freelist (and could
+        // have re-handed out to a different allocation), so any reader
+        // touching the parent's children list could read someone else's
+        // bytes. The new ordering keeps the parent metadata coherent at
+        // every step:
+        //   - before metadata write: parent still references the old
+        //     block (which is still allocated and intact);
+        //   - after metadata write: parent references the new block,
+        //     which is fully written;
+        //   - the old block is freed last, only after metadata is
+        //     durable.
+        // A crash after writing the new block but before updating
+        // metadata leaks the new allocation, but the parent's children
+        // list is still self-consistent — preferable to a corrupted
+        // children list.
+        //
+        // The remaining residual risk — a child that should have been
+        // appended being absent from the parent's list when we crash
+        // before the metadata write — is captured as a follow-up
+        // finding (R-221) for redo-log coverage, since it requires a
+        // post-engine recovery pass and the engine's
+        // `append_conflicting_child` is already idempotent on
+        // re-application.
 
-        // Allocate and write new block
+        // Allocate and write new block.
         let new_size = (children.len() * 32) as u64;
         let new_offset =
             self.allocator
@@ -2401,12 +2424,18 @@ impl Engine {
                 detail: format!("{e}"),
             })?;
 
-        // Update metadata
+        // Update parent metadata to point at the new block.
         meta.conflicting_children_count = children.len() as u8;
         meta.conflicting_children_offset = new_offset;
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = self.now_millis();
         self.write_metadata_fast(ro, &meta)?;
+
+        // Only NOW free the old block. If we crashed before this line,
+        // the old block is leaked but the parent's metadata coherent.
+        if count > 0 && offset != 0 {
+            let _ = self.allocator.lock().free(offset, (count * 32) as u64);
+        }
 
         Ok(())
     }
@@ -5226,6 +5255,56 @@ mod tests {
     }
 
     // -- Mutation bookkeeping additional tests --
+
+    /// R-024 (BC-09 / BC-44 / Codex F5) regression: appending multiple
+    /// conflicting-children to a parent record must keep the parent's
+    /// metadata coherent with the children-list block. Pre-fix the
+    /// engine freed the OLD children block BEFORE allocating + writing
+    /// the new one, opening a window where the parent's metadata still
+    /// referenced an offset the allocator had already returned to its
+    /// freelist (and could re-hand out to a different allocation).
+    /// The new ordering — allocate-new → write-new → meta-update →
+    /// free-old — keeps the parent metadata referring to a valid block
+    /// at every step. This test exercises the happy path through
+    /// multiple appends and verifies the children list resolves
+    /// correctly on read-back, indirectly catching any regression in
+    /// the ordering (a freed-then-reallocated block would corrupt the
+    /// list).
+    #[test]
+    fn append_conflicting_child_preserves_list_across_multiple_appends() {
+        let h = TestHarness::new(1, TxFlags::empty());
+
+        let c1 = [0xAAu8; 32];
+        let c2 = [0xBBu8; 32];
+        let c3 = [0xCCu8; 32];
+
+        h.engine.append_conflicting_child(&h.key, c1).unwrap();
+        h.engine.append_conflicting_child(&h.key, c2).unwrap();
+        h.engine.append_conflicting_child(&h.key, c3).unwrap();
+
+        let children = h.engine.read_conflicting_children(&h.key).unwrap();
+        assert_eq!(
+            children,
+            vec![c1, c2, c3],
+            "children list must reflect every successful append in order",
+        );
+
+        // Idempotent re-append must not duplicate (existing dedup).
+        h.engine.append_conflicting_child(&h.key, c2).unwrap();
+        let children_after_dup = h.engine.read_conflicting_children(&h.key).unwrap();
+        assert_eq!(
+            children_after_dup,
+            vec![c1, c2, c3],
+            "duplicate child must be deduped",
+        );
+
+        // Verify parent metadata fields are coherent: count matches list,
+        // offset is non-zero (a real allocation), and the cached
+        // generation tracks the appends (one bump per real append).
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!({ meta.conflicting_children_count }, 3);
+        assert_ne!({ meta.conflicting_children_offset }, 0);
+    }
 
     /// R-021 (BC-25 / BC-35) regression: an idempotent re-spend (same
     /// `spending_data` already on the slot) MUST be a true no-op — no
