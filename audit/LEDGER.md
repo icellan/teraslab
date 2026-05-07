@@ -476,11 +476,12 @@
 ### R-046 — [snapshot-format] Snapshot deserialize uses unchecked `count * PRIMARY_ENTRY_SIZE` multiplication; OOM/panic on poisoned snapshot
 - **Source:** AUDIT.md GH-G1
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/index/mod.rs:563-575, :687-715
+- **Status:** RESOLVED
+- **Files:** src/index/mod.rs (`Index::deserialize_primary_with_offset`, `deserialize_secondary`)
 - **Cluster:** snapshot-format
-- **Notes:** `count.checked_mul(PRIMARY_ENTRY_SIZE).ok_or(IndexError::FormatError)?`. Cap count at ceiling (e.g. 1<<30). Add test writing poisoned snapshot with `count=u64::MAX` → `FormatError`, not panic.
-- **Test:** `snapshot_restore_rejects_poisoned_count`
+- **Resolution:** Both deserializers now (a) reject `count > 2^30` with `FormatError` before any allocation (the cap is well above any realistic UTXO working set) and (b) replace `count * ENTRY_SIZE` and `header_size + body_size + 4` with `checked_mul` / `checked_add`, returning `FormatError` on overflow. Pre-fix a poisoned snapshot whose `count` was `u64::MAX` produced an unchecked multiply that wrapped on 32-bit, bypassed the size sanity check, and reached either the slice-indexing loop (panic) or `Vec::with_capacity(count)` (OOM).
+- **Tests added:** `snapshot_restore_rejects_poisoned_primary_count` and `snapshot_restore_rejects_poisoned_secondary_count` — both build a minimal valid header, write `u64::MAX` into the count field, and assert the deserializer returns `IndexError::FormatError` rather than panicking or silently succeeding.
+- **Verification:** Full local gate green: `cargo build --release`, `cargo test --all` (1719 passed, 0 failed, 0 ignored), `cargo clippy --all --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 
 ### R-047 — [index-redb] `import_index` not transactional across three redb files
 - **Source:** AUDIT.md GH-G3

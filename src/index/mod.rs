@@ -563,8 +563,36 @@ impl Index {
         let count = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
         let capacity = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
 
-        let body_size = count * PRIMARY_ENTRY_SIZE;
-        let total = header_size + body_size + 4;
+        // R-046 (GH-G1): use `checked_mul` + `checked_add` so a poisoned
+        // snapshot whose declared `count` would make
+        // `count * PRIMARY_ENTRY_SIZE` overflow `usize` (matters on
+        // 32-bit; defensive on 64-bit) cannot bypass the size check
+        // below — the wrapped tiny `total` could otherwise pass and
+        // the loop would index `data[base..base + …]` and panic.
+        // Cap `count` at a sane ceiling so a hostile snapshot cannot
+        // request a multi-gigabyte `Vec` allocation via the
+        // index-rebuild fast path. 2^30 is well above any realistic
+        // working-set size for a UTXO store.
+        const MAX_PRIMARY_ENTRIES: usize = 1 << 30;
+        if count > MAX_PRIMARY_ENTRIES {
+            return Err(IndexError::FormatError {
+                detail: format!("snapshot count {count} exceeds maximum {MAX_PRIMARY_ENTRIES}",),
+            });
+        }
+        let body_size =
+            count
+                .checked_mul(PRIMARY_ENTRY_SIZE)
+                .ok_or_else(|| IndexError::FormatError {
+                    detail: format!(
+                        "snapshot count {count} * entry_size {PRIMARY_ENTRY_SIZE} overflows usize",
+                    ),
+                })?;
+        let total = header_size
+            .checked_add(body_size)
+            .and_then(|n| n.checked_add(4))
+            .ok_or_else(|| IndexError::FormatError {
+                detail: "snapshot total size overflows usize".into(),
+            })?;
         if data.len() < total {
             return Err(IndexError::FormatError {
                 detail: format!(
@@ -685,8 +713,30 @@ fn deserialize_secondary(
 
     let _version = u32::from_le_bytes(data[4..8].try_into().unwrap());
     let count = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
-    let body_size = count * SECONDARY_ENTRY_SIZE;
-    let total = header_size + body_size + 4;
+    // R-046 (GH-G1): use checked arithmetic for the same reasons as
+    // the primary `Index::restore` path. A poisoned secondary section
+    // could otherwise wrap `count * SECONDARY_ENTRY_SIZE` and bypass
+    // the size sanity check below.
+    const MAX_SECONDARY_ENTRIES: usize = 1 << 30;
+    if count > MAX_SECONDARY_ENTRIES {
+        return Err(IndexError::FormatError {
+            detail: format!("secondary count {count} exceeds maximum {MAX_SECONDARY_ENTRIES}",),
+        });
+    }
+    let body_size =
+        count
+            .checked_mul(SECONDARY_ENTRY_SIZE)
+            .ok_or_else(|| IndexError::FormatError {
+                detail: format!(
+                    "secondary count {count} * entry_size {SECONDARY_ENTRY_SIZE} overflows usize",
+                ),
+            })?;
+    let total = header_size
+        .checked_add(body_size)
+        .and_then(|n| n.checked_add(4))
+        .ok_or_else(|| IndexError::FormatError {
+            detail: "secondary total size overflows usize".into(),
+        })?;
 
     if data.len() < total {
         return Err(IndexError::FormatError {
@@ -915,6 +965,67 @@ mod tests {
         assert_eq!(restored_idx.len(), 1); // Primary should be fine
         assert!(flags.dah_needs_rebuild);
         assert!(restored_dah.is_empty());
+    }
+
+    /// R-046 (GH-G1) regression: a poisoned snapshot whose declared
+    /// primary `count` is `u64::MAX` MUST be rejected with a
+    /// `FormatError` instead of panicking on `count * PRIMARY_ENTRY_SIZE`
+    /// (32-bit overflow) or attempting a multi-gigabyte
+    /// `Vec::with_capacity(count)` (64-bit). Pre-fix the deserializer
+    /// performed unchecked `count * PRIMARY_ENTRY_SIZE`; on a 32-bit
+    /// build the wrap could even bypass the size sanity check and
+    /// reach the for-loop, where slice indexing would panic.
+    #[test]
+    fn snapshot_restore_rejects_poisoned_primary_count() {
+        // Build the minimal valid header for a primary section, then
+        // overwrite `count` with `u64::MAX`. The deserializer reads
+        // `count` from offset 8.
+        let mut data = Vec::new();
+        data.extend_from_slice(&SNAPSHOT_MAGIC); // 4 bytes
+        data.extend_from_slice(&1u32.to_le_bytes()); // version
+        data.extend_from_slice(&u64::MAX.to_le_bytes()); // POISONED count
+        data.extend_from_slice(&0u64.to_le_bytes()); // capacity
+        // 4-byte trailing checksum so the header alone passes the
+        // initial `data.len() < header_size + 4` gate.
+        data.extend_from_slice(&0u32.to_le_bytes());
+
+        let result = Index::deserialize_primary(&data);
+        match result {
+            Err(IndexError::FormatError { detail }) => {
+                assert!(
+                    detail.contains("exceeds maximum") || detail.contains("overflow"),
+                    "expected count-cap or overflow rejection, got: {detail}",
+                );
+            }
+            Err(other) => panic!("expected FormatError for poisoned count, got: {other:?}",),
+            Ok(_) => {
+                panic!("deserialize_primary must reject u64::MAX count, not silently succeed",)
+            }
+        }
+    }
+
+    /// R-046 regression for the secondary-section deserializer: same
+    /// pattern, same rejection contract.
+    #[test]
+    fn snapshot_restore_rejects_poisoned_secondary_count() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&DAH_SECTION_MAGIC); // 4
+        data.extend_from_slice(&SECONDARY_VERSION.to_le_bytes()); // 4
+        data.extend_from_slice(&u64::MAX.to_le_bytes()); // POISONED count
+        data.extend_from_slice(&0u32.to_le_bytes()); // checksum slot
+
+        match deserialize_secondary(&data, &DAH_SECTION_MAGIC) {
+            Err(IndexError::FormatError { detail }) => {
+                assert!(
+                    detail.contains("exceeds maximum") || detail.contains("overflow"),
+                    "expected count-cap or overflow rejection, got: {detail}",
+                );
+            }
+            Err(other) => {
+                panic!("expected FormatError for poisoned secondary count, got: {other:?}",)
+            }
+            Ok(_) => panic!("deserialize_secondary must reject u64::MAX count",),
+        }
     }
 
     #[test]
