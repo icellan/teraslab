@@ -521,7 +521,28 @@ pub(crate) fn handle_request(
             ) = if request.payload.len() >= 60 {
                 let entry_count =
                     u32::from_le_bytes(request.payload[56..60].try_into().unwrap()) as usize;
-                let needed = 60 + entry_count * 36;
+                // R-043 (GH-04): use `checked_mul` + `checked_add` so
+                // an attacker-controlled `entry_count` cannot overflow
+                // `usize` (matters on 32-bit; defensive on 64-bit) and
+                // produce a tiny `needed` that bypasses the size check
+                // before allocating a `Vec::with_capacity(entry_count)`.
+                // Pre-fix `60 + entry_count * 36` was an unchecked
+                // multiply on a `u32::MAX` payload value.
+                let needed = match 36usize
+                    .checked_mul(entry_count)
+                    .and_then(|n| n.checked_add(60))
+                {
+                    Some(n) => n,
+                    None => {
+                        return error_response(
+                            request.request_id,
+                            ERR_MIGRATION_IN_PROGRESS,
+                            &format!(
+                                "shard {shard} entry_count overflow ({entry_count}); rejecting frame",
+                            ),
+                        );
+                    }
+                };
                 if request.payload.len() < needed {
                     return error_response(
                         request.request_id,
@@ -7277,6 +7298,80 @@ mod tests {
             elapsed < std::time::Duration::from_millis(200),
             "pending inbound read should fail fast, took {:?}",
             elapsed
+        );
+    }
+
+    /// R-043 (GH-04) regression: a malicious or buggy peer that sends
+    /// an `OP_MIGRATION_COMPLETE` frame whose `entry_count` is so
+    /// large that `entry_count * 36` overflows `usize` MUST be rejected
+    /// with `ERR_MIGRATION_IN_PROGRESS` instead of allocating a
+    /// `Vec::with_capacity(entry_count)` (which would OOM the process,
+    /// and on 32-bit could even pass the size sanity check because
+    /// `60 + entry_count * 36` would wrap to a small value).
+    ///
+    /// We exercise the overflow path by sending `entry_count =
+    /// usize::MAX as u32` (which fits in the wire `u32` field) but a
+    /// payload that is only the 60-byte header. The server must
+    /// reject without panicking or allocating.
+    #[test]
+    fn migration_complete_unchecked_multiply_rejects_max_count() {
+        let h = DispatchTestHarness::new();
+        let shard = 17u16;
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 12);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4717".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        // Build a 60-byte header: shard:u64 | utxo_records_received:u64 |
+        // migration_epoch:u64 | source_manifest:32 | entry_count:u32 = u32::MAX.
+        let mut payload = Vec::with_capacity(60);
+        payload.extend_from_slice(&(shard as u64).to_le_bytes()); // shard:u64
+        payload.extend_from_slice(&0u64.to_le_bytes()); // utxo_records_received
+        payload.extend_from_slice(&0u64.to_le_bytes()); // migration_epoch
+        payload.extend_from_slice(&[0u8; 32]); // source_manifest (all zeros)
+        payload.extend_from_slice(&u32::MAX.to_le_bytes()); // entry_count = ATTACK
+        assert_eq!(payload.len(), 60);
+
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload,
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        // Either the overflow check fires (preferred) or the size
+        // mismatch fires (also acceptable — both end in a rejection
+        // before any large allocation). Both surface as
+        // `ERR_MIGRATION_IN_PROGRESS` per the existing rejection path.
+        assert_ne!(
+            resp.status, STATUS_OK,
+            "u32::MAX entry_count must be rejected, not accepted",
+        );
+        assert!(
+            !resp.payload.is_empty(),
+            "rejection must include an error message in the payload",
         );
     }
 

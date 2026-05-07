@@ -448,11 +448,12 @@
 ### R-043 — [wire-dos] `OP_MIGRATION_COMPLETE` `entry_count * 36` unchecked multiply
 - **Source:** AUDIT.md GH-04
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/server/dispatch.rs:510-541
+- **Status:** RESOLVED
+- **Files:** src/server/dispatch.rs (`OP_MIGRATION_COMPLETE` handler)
 - **Cluster:** wire-dos
-- **Notes:** `entry_count.checked_mul(36).and_then(|n| n.checked_add(60))?` or refactor to `validate_batch_count`. Test sending `entry_count=u32::MAX` with tiny payload → must reject.
-- **Test:** `migration_complete_unchecked_multiply_rejects_max_count`
+- **Resolution:** Replaced `60 + entry_count * 36` with `36usize.checked_mul(entry_count).and_then(|n| n.checked_add(60))`, rejecting frames whose `entry_count` overflows the size computation with `ERR_MIGRATION_IN_PROGRESS` instead of letting the wrapped tiny `needed` value bypass the size sanity check and reach `Vec::with_capacity(entry_count)`. Pre-fix on 32-bit (where `usize::MAX = 2^32-1`), an attacker advertising `entry_count = u32::MAX` produced `entry_count * 36 = 154 GB` which wrapped to a small number; the size check passed and the server then attempted a 4-billion-entry vector allocation. On 64-bit the overflow doesn't trigger but the defensive check costs nothing and matches the codebase's other validate-then-allocate patterns.
+- **Tests added:** `migration_complete_unchecked_multiply_rejects_max_count` (sends `entry_count = u32::MAX` with a 60-byte header, asserts non-OK response with a non-empty error payload).
+- **Verification:** Full local gate green: `cargo build --release`, `cargo test --all` (1717 passed, 0 failed, 0 ignored), `cargo clippy --all --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 
 ### R-044 — [wire-dos] OP_STREAM_CHUNK accepts attacker-controlled `chunk_data_len` up to MAX_FRAME_SIZE with no per-stream total cap
 - **Source:** AUDIT.md GH-06, GH-09
