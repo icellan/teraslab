@@ -5187,6 +5187,27 @@ fn handle_get_spend_batch(
 /// per-connection state. Validates the chunk offset matches the expected
 /// position (no gaps or overlaps). On write error the stream is aborted and
 /// removed from the connection state.
+/// R-044 (GH-06 / GH-09): per-stream upper bound on cumulative bytes.
+///
+/// Each active streaming-blob upload session is keyed by txid and
+/// holds an `ActiveStream` whose `bytes_received` counter grows by
+/// `chunk.data.len()` per `OP_STREAM_CHUNK`. Pre-fix that growth
+/// was unbounded — a malicious or buggy client could keep sending
+/// 4 KiB chunks until either the per-connection allocation budget
+/// or the underlying blob store filled up. The natural per-frame
+/// cap (`MAX_FRAME_SIZE`) limits a single chunk but doesn't constrain
+/// the total upload. 4 GiB is well above the largest legitimate
+/// transaction-cold-data payload but small enough that an attacker
+/// cannot weaponize one connection into multi-terabyte writes.
+/// Promoting this to `ServerConfig::max_stream_total_bytes` is
+/// captured as R-224.
+#[cfg(not(test))]
+const MAX_STREAM_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// In tests we use a much smaller cap so we can exercise the
+/// rejection path without allocating 4 GiB of test data.
+#[cfg(test)]
+const MAX_STREAM_TOTAL_BYTES: u64 = 1024;
+
 fn handle_stream_chunk(
     req: &RequestFrame,
     conn_state: &mut super::ConnectionState,
@@ -5241,6 +5262,32 @@ fn handle_stream_chunk(
         );
     }
 
+    // R-044: enforce the per-stream cumulative cap BEFORE writing.
+    // `checked_add` defends against an attacker who advertises a
+    // chunk_data_len that, added to the running counter, would wrap
+    // `u64` and silently bypass the cap below.
+    let projected = match stream.bytes_received.checked_add(chunk.data.len() as u64) {
+        Some(n) => n,
+        None => {
+            if let Some(s) = conn_state.streams.remove(&chunk.txid) {
+                let _ = s.writer.abort();
+            }
+            return error_response(req.request_id, ERR_INTERNAL, "stream byte counter overflow");
+        }
+    };
+    if projected > MAX_STREAM_TOTAL_BYTES {
+        if let Some(s) = conn_state.streams.remove(&chunk.txid) {
+            let _ = s.writer.abort();
+        }
+        return error_response(
+            req.request_id,
+            ERR_INTERNAL,
+            &format!(
+                "stream exceeds maximum total bytes ({MAX_STREAM_TOTAL_BYTES}): would reach {projected}",
+            ),
+        );
+    }
+
     // Write the chunk data.
     if let Err(e) = stream.writer.write_chunk(chunk.data) {
         // Abort the stream on write error.
@@ -5250,7 +5297,7 @@ fn handle_stream_chunk(
         return error_response(req.request_id, ERR_INTERNAL, &format!("write_chunk: {e}"));
     }
 
-    stream.bytes_received += chunk.data.len() as u64;
+    stream.bytes_received = projected;
 
     ResponseFrame {
         request_id: req.request_id,
@@ -6354,6 +6401,91 @@ mod tests {
         let utxo_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
         assert_eq!(utxo_count, 3, "utxo_count should be 3");
         let _ = pos; // silence unused warning
+    }
+
+    /// R-044 (GH-06 / GH-09) regression: an active streaming-blob
+    /// upload session whose cumulative `bytes_received` would exceed
+    /// `MAX_STREAM_TOTAL_BYTES` MUST be aborted with `ERR_INTERNAL`
+    /// — the server must not accept the chunk and must not let the
+    /// counter grow unbounded. Pre-fix the per-stream counter
+    /// incremented on every chunk with no upper bound, so a single
+    /// connection could write multi-terabyte blobs by sending
+    /// 4 KiB chunks indefinitely.
+    ///
+    /// Test uses the `cfg(test)` 1024-byte cap so we can exercise
+    /// the rejection path without allocating gigabytes of test data.
+    #[test]
+    fn stream_chunk_aborts_when_cumulative_bytes_exceed_cap() {
+        use crate::protocol::codec::encode_stream_chunk;
+        use crate::protocol::opcodes::OP_STREAM_CHUNK;
+        use crate::storage::blobstore::{BlobStore, MemoryBlobStore};
+
+        let h = DispatchTestHarness::new();
+        let blob_store: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(MemoryBlobStore::new());
+        let txid = DispatchTestHarness::make_txid(0xCA);
+
+        // Hold a single ConnectionState across two chunks, since the
+        // active-stream session lives in conn_state and per-chunk
+        // routing through handle_request is what production does.
+        let mut conn_state = crate::server::ConnectionState::new();
+
+        // Chunk 1: 800 bytes at offset 0 — under the 1024-byte cap.
+        let chunk1 = vec![0xAAu8; 800];
+        let req1 = RequestFrame {
+            request_id: 1,
+            op_code: OP_STREAM_CHUNK,
+            flags: 0,
+            payload: encode_stream_chunk(&txid, 0, &chunk1),
+        };
+        let resp1 = handle_request(
+            &req1,
+            &h.engine,
+            8192,
+            None,
+            None,
+            &mut conn_state,
+            Some(&*blob_store),
+        );
+        assert_eq!(
+            resp1.status,
+            STATUS_OK,
+            "first chunk under the cap must succeed; payload: {:?}",
+            String::from_utf8_lossy(&resp1.payload),
+        );
+
+        // Chunk 2: 300 bytes at offset 800 — pushes total to 1100,
+        // exceeding the 1024-byte cap. MUST be rejected with
+        // ERR_INTERNAL and a "exceeds maximum" message in the
+        // payload, and the stream session must be removed.
+        let chunk2 = vec![0xBBu8; 300];
+        let req2 = RequestFrame {
+            request_id: 2,
+            op_code: OP_STREAM_CHUNK,
+            flags: 0,
+            payload: encode_stream_chunk(&txid, 800, &chunk2),
+        };
+        let resp2 = handle_request(
+            &req2,
+            &h.engine,
+            8192,
+            None,
+            None,
+            &mut conn_state,
+            Some(&*blob_store),
+        );
+        assert_ne!(
+            resp2.status, STATUS_OK,
+            "second chunk that pushes total over the cap must be rejected",
+        );
+        let msg = String::from_utf8_lossy(&resp2.payload);
+        assert!(
+            msg.contains("exceeds maximum"),
+            "rejection must include the cap-exceeded reason; got: {msg}",
+        );
+        assert!(
+            !conn_state.streams.contains_key(&txid),
+            "stream session must be removed after exceeding the cap",
+        );
     }
 
     #[test]

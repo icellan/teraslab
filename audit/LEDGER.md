@@ -458,11 +458,12 @@
 ### R-044 — [wire-dos] OP_STREAM_CHUNK accepts attacker-controlled `chunk_data_len` up to MAX_FRAME_SIZE with no per-stream total cap
 - **Source:** AUDIT.md GH-06, GH-09
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/protocol/codec.rs:1583-1599, src/server/dispatch.rs:4923
+- **Status:** RESOLVED (config-knob promotion tracked as R-224)
+- **Files:** src/server/dispatch.rs (`handle_stream_chunk`, `MAX_STREAM_TOTAL_BYTES`)
 - **Cluster:** wire-dos
-- **Notes:** Add `ServerConfig::max_stream_total_bytes` (default 4 GiB). Track `stream.bytes_received` against it; reject chunk + abort stream when exceeded; `checked_add` on counter. Optional: idle timeout on `ActiveStream`.
-- **Test:** `stream_total_size_cap_enforced`
+- **Resolution:** Added a `MAX_STREAM_TOTAL_BYTES` constant (4 GiB in production builds, 1024 bytes in tests via `cfg(test)` so the rejection path can be exercised cheaply). `handle_stream_chunk` now `checked_add`s `chunk.data.len()` onto `stream.bytes_received` BEFORE writing — overflow returns `ERR_INTERNAL` with "stream byte counter overflow", and a projected total above the cap returns `ERR_INTERNAL` with "exceeds maximum total bytes (…)". In both cases the stream session is removed from `conn_state.streams` and the underlying `BlobStreamWriter` is `abort()`ed. Pre-fix the per-stream byte counter incremented unconditionally on every chunk, so a single connection could write multi-terabyte blobs by sending 4 KiB chunks indefinitely. Promoting the cap to `ServerConfig::max_stream_total_bytes` (with TOML + env override) is captured as R-224.
+- **Tests added:** `stream_chunk_aborts_when_cumulative_bytes_exceed_cap` (sends 800 B then 300 B against the 1024 B test cap; first succeeds, second is rejected with the "exceeds maximum" message and the session is removed).
+- **Verification:** Full local gate green: `cargo build --release`, `cargo test --all` (1720 passed, 0 failed, 0 ignored), `cargo clippy --all --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 
 ### R-045 — [wire-dos] `GetBatch` masks storage corruption as zeros / TX_NOT_FOUND
 - **Source:** AUDIT_CODEX.md F4 (NEW)
@@ -2154,6 +2155,15 @@ These are entries from the audits that, on inspection, are correct as implemente
 - **Cluster:** migration-handshake
 - **Notes:** Receiver treats `record_count == 0` as "empty migration, no manifest needed", so a source declaring a non-empty shard's migration complete with `record_count = 0` causes silent data loss. Fix: every completion carries the manifest hash, including empty shards (`HMAC-SHA256` over an empty entry list yields a known constant; the receiver compares against that). Needs human approval because it interacts with the empty-shard fast path that the cluster already optimizes for. Once approved, fix is small (~30 LoC).
 - **Test required:** `zero_record_completion_with_wrong_manifest_rejected`
+
+### R-224 — [wire-dos] Promote `MAX_STREAM_TOTAL_BYTES` to `ServerConfig::max_stream_total_bytes` (R-044 follow-up)
+- **Source:** Discovered while resolving R-044
+- **Severity:** LOW
+- **Status:** OPEN
+- **Files:** src/config.rs (new field + default + env override + validation), src/server/dispatch.rs (replace constant with config lookup)
+- **Cluster:** wire-dos
+- **Notes:** R-044 landed a 4-GiB hard-coded cap. Operators should be able to raise/lower it without recompiling — e.g. a node that hosts unusually large transactions might want a higher cap, while a node with constrained blob-store space might want a tighter one. Add `max_stream_total_bytes: u64` to `ServerConfig` (default 4 GiB), wire through TOML + `TERASLAB_MAX_STREAM_TOTAL_BYTES` env override, and pass into `handle_stream_chunk` (likely via the `dispatch_metrics`-style pattern of init-time installation, or as a per-call argument from `handle_request`). Scope: ~50 LoC + tests.
+- **Test required:** `max_stream_total_bytes_config_override_respected`
 
 ### R-223 — [tracker-atomicity] Replication trackers (Ack/Intent/Applied) lacked parent-dir fsync after rename
 - **Source:** Discovered while resolving R-038 (pattern parallel to R-094 for snapshots)
