@@ -295,11 +295,12 @@
 ### R-027 — [redo-log] Linear `write_pos` never wraps — naming "circular" misleads
 - **Source:** AUDIT.md BC-13
 - **Severity:** HIGH
-- **Status:** OPEN, blocked-by R-003
-- **Files:** src/redo.rs:983-1295
+- **Status:** RESOLVED
+- **Files:** src/redo.rs (module-level + `RedoLog` struct doc comments)
 - **Cluster:** redo-log
-- **Notes:** Either implement actual circular writes (wrap `write_pos` modulo `log_size` after `checkpoint()`), or rename `LinearRedoLog` to set expectations. R-003 must define semantic before this can be picked.
-- **Test:** `redo_log_linear_or_circular_documented`
+- **Resolution:** Corrected the misleading "circular redo log" naming in both the module-level doc and the `RedoLog` struct doc. The on-disk layout is linear-with-reset: `write_pos` advances monotonically until the periodic checkpoint task (R-003, `crate::checkpoint`) snapshots the engine state, calls `RedoLog::checkpoint`, and resets `write_pos` to zero so future appends start at the beginning of the log region. The pre-fix prose described "wrapping around when it reaches the end, reusing space freed by checkpoints" — there is no in-place wrap; a full log returns `RedoError::LogFull` until the checkpoint task completes. The new docs cross-reference `crate::checkpoint`, the `R-027 / BC-13` audit IDs, and explicitly state that the public type name is retained for back-compat.
+- **Tests added:** None — doc-only change. Full lib test suite passes (95 redo tests, no behaviour change).
+- **Verification:** Full local gate green: `cargo build --release`, `cargo test --lib redo` (95 passed), `cargo clippy --all --all-targets -- -D warnings` clean.
 
 ### R-028 — [allocator-wal] `pre_allocate_create` AllocateRegion fsync sequence is N fsyncs per batch
 - **Source:** AUDIT.md BC-36

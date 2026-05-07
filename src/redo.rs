@@ -1,8 +1,18 @@
-//! Circular redo log for crash recovery.
+//! Linear-with-reset redo log for crash recovery.
 //!
 //! Operations are appended to the log before data writes. On crash recovery,
-//! all entries after the last checkpoint are replayed idempotently. The log
-//! wraps around when it reaches the end, reusing space freed by checkpoints.
+//! all entries after the last checkpoint are replayed idempotently.
+//!
+//! R-027 (BC-13): the on-disk layout is **linear**, not circular: `write_pos`
+//! advances monotonically until the periodic checkpoint task (see
+//! [`crate::checkpoint`]) snapshots the engine state, calls
+//! [`RedoLog::checkpoint`], and then [`RedoLog::reset`]s `write_pos` back to
+//! zero so future appends start at the beginning of the log region. The
+//! prior module documentation called this "circular" and described "wrapping
+//! around", which set false expectations — there is no in-place wrap; a
+//! full log returns [`RedoError::LogFull`] until the checkpoint task
+//! completes. The naming has been corrected here; the public type names
+//! retain `RedoLog` for back-compat.
 
 use crate::device::{AlignedBuf, BlockDevice};
 use crate::index::TxKey;
@@ -976,10 +986,15 @@ impl RedoEntry {
 // RedoLog
 // ---------------------------------------------------------------------------
 
-/// Circular redo log on a block device.
+/// Linear-with-reset redo log on a block device.
 ///
 /// Entries are appended to an in-memory buffer and flushed to device
-/// on demand. A checkpoint marker allows space reclamation.
+/// on demand. `write_pos` advances monotonically; a successful
+/// [`RedoLog::checkpoint`] + [`RedoLog::reset`] pair (driven by
+/// [`crate::checkpoint`]) returns `write_pos` to zero so future
+/// appends start at the beginning of the log region. There is no
+/// in-place wrap — see the module-level documentation for the full
+/// rationale (R-027 / BC-13).
 pub struct RedoLog {
     device: Arc<dyn BlockDevice>,
     log_offset: u64,
