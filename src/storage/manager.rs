@@ -2,7 +2,7 @@
 //! external blob store tiers.
 
 use crate::device::{AlignedBuf, BlockDevice};
-use crate::record::{TxFlags, TxMetadata, METADATA_SIZE, UTXO_SLOT_SIZE};
+use crate::record::{METADATA_SIZE, TxFlags, TxMetadata, UTXO_SLOT_SIZE};
 use crate::storage::blobstore::BlobStore;
 use crate::storage::tiers::*;
 use std::sync::Arc;
