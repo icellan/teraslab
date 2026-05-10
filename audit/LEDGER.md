@@ -421,11 +421,12 @@
 ### R-040 — [quorum] No integration coverage for isolated 1-node remnant rejecting writes
 - **Source:** AUDIT.md EF-03
 - **Severity:** HIGH
-- **Status:** OPEN, blocked-by R-039
-- **Files:** tests/cluster_tcp.rs (new test)
+- **Status:** RESOLVED
+- **Files:** tests/cluster_tcp.rs (`isolated_node_rejects_writes_with_no_quorum`, `single_node_cluster_accepts_writes_without_quorum_check`)
 - **Cluster:** quorum
-- **Notes:** Multi-node integration test: start 3 nodes, kill 2, wait SWIM dead, send `OP_CREATE_BATCH`, assert `ERR_NO_QUORUM`. Control case: single-node cluster accepts same op.
-- **Test:** `isolated_node_rejects_writes_with_no_quorum`
+- **Resolution:** Landed the EF-03 multi-node TCP integration test that R-039's unit fix unblocked. The test starts 3 in-process `TestNode` instances on ephemeral ports with RF=2, polls `committed_topology_members().len() == 3` (so `peak_cluster_size` advances to 3 via the `MembershipChanged` event chain), shuts down 2 of the 3 peers, then polls until SWIM has marked them dead (`node_addresses().len() <= 1`). At that point `alive_node_count() = 1`, `peak_cluster_size() = 3`, `quorum_needed = (3/2)+1 = 2`, and the test sends `OP_CREATE_BATCH` against the surviving node and asserts `STATUS_ERROR` carrying `ERR_NO_QUORUM` (15) in the payload. The control test starts a single-node RF=1 cluster (`peak <= 1` early return in `check_quorum`) and asserts the same `OP_CREATE_BATCH` returns `STATUS_OK`. Pins the contract that quorum rejection fires for an isolated remnant of a previously-multi-node cluster but does NOT spuriously reject in standalone deployments.
+- **Tests added:** `isolated_node_rejects_writes_with_no_quorum`, `single_node_cluster_accepts_writes_without_quorum_check` (both in `tests/cluster_tcp.rs`).
+- **Verification:** Full local gate green per worktree-agent commit b77de0d.
 
 ### R-041 — [redirect-routing] REDIRECT has no hop count, TTL, or loop counter — clients chase stale routes forever
 - **Source:** AUDIT.md EF-09
