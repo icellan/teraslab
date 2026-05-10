@@ -37,6 +37,8 @@ use crate::index::{
 use crate::io;
 use crate::record::*;
 use crate::redo::{RedoEntry, RedoLog, RedoOp};
+use crate::storage::blob_gc::{self, BlobGcStats};
+use crate::storage::blobstore::{BlobError, BlobStore};
 use thiserror::Error;
 
 /// Errors during recovery.
@@ -290,6 +292,41 @@ pub fn recover_all_with_allocator(
         let _ = alloc.persist();
     }
 
+    Ok(stats)
+}
+
+/// Reconcile the external blob store against the primary index after
+/// recovery has finished replaying the redo log (R-049).
+///
+/// Walks every blob returned by [`BlobStore::list`] and deletes any blob
+/// whose primary-index entry is absent OR present without
+/// [`crate::record::TxFlags::EXTERNAL`]. Both signal an orphan from a failed
+/// create / aborted upload / cancelled migration: the foreground pipeline
+/// will never reference the blob again, so leaving it on disk would leak
+/// inodes forever.
+///
+/// Call this from startup AFTER [`recover_all_with_allocator`] returns
+/// successfully and BEFORE accepting client connections — the reconciliation
+/// is race-free at that point because no concurrent dispatch can write a new
+/// blob whose registration has not yet landed.
+///
+/// Errors from the underlying blob enumeration are surfaced; per-blob delete
+/// failures are logged at warn and counted in `delete_failed`.
+pub fn reconcile_blobs_after_recovery(
+    blob_store: &dyn BlobStore,
+    index: &PrimaryBackend,
+) -> Result<BlobGcStats, BlobError> {
+    let started = std::time::Instant::now();
+    let stats = blob_gc::reconcile_orphan_blobs_against_index(blob_store, index)?;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        total_blobs = stats.total_blobs,
+        kept = stats.kept,
+        deleted_no_index = stats.deleted_no_index,
+        deleted_not_external = stats.deleted_not_external,
+        delete_failed = stats.delete_failed,
+        "recovery: blob-store reconciliation complete",
+    );
     Ok(stats)
 }
 

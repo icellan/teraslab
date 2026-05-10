@@ -498,6 +498,14 @@ fn main() {
     let _redo_log_device: Arc<dyn BlockDevice> = redo_log_device;
     let redo_log: Option<RedoLog> = Some(redo_log);
 
+    // Construct the blob store up front so recovery can reconcile orphan
+    // blobs against the freshly-replayed primary index (R-049). The store is
+    // a thin path handle — initialising it does not touch any blob until
+    // recovery's `reconcile_blobs_after_recovery` call below.
+    let blob_store: Arc<dyn BlobStore> =
+        Arc::new(FileBlobStore::new(Path::new(&config.blobstore_path), 2));
+    tracing::info!(path = %config.blobstore_path, "blobstore configured");
+
     // Run recovery if we have a redo log, while indexes are still mutable.
     // Uses `recover_all_with_allocator` so the two-phase secondary
     // durability intent records (RedoOp::SecondaryUnminedUpdate /
@@ -554,6 +562,32 @@ fn main() {
                 std::process::exit(1);
             }
         }
+
+        // R-049: reconcile orphan external blobs against the freshly-replayed
+        // primary index. Failed creates / aborted uploads / cancelled
+        // migrations leave blobs on disk that the foreground pipeline will
+        // never reference; without this sweep they accumulate forever
+        // (audit IJK-08). Errors during reconciliation are non-fatal — a
+        // transient blob-store issue must not block the server from coming
+        // up; the periodic background sweep retries on its next tick.
+        match teraslab::recovery::reconcile_blobs_after_recovery(
+            blob_store.as_ref(),
+            &index,
+        ) {
+            Ok(stats) => {
+                tracing::info!(
+                    total_blobs = stats.total_blobs,
+                    kept = stats.kept,
+                    deleted_no_index = stats.deleted_no_index,
+                    deleted_not_external = stats.deleted_not_external,
+                    delete_failed = stats.delete_failed,
+                    "recovery: blob reconciliation summary",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "recovery: blob reconciliation failed (will retry from background sweep)");
+            }
+        }
     }
 
     // Wrap redo log in Arc<Mutex> for shared access from dispatch threads
@@ -592,11 +626,10 @@ fn main() {
         engine.set_redo_log(log.clone());
     }
 
-    // 4b. Initialize blobstore from config and attach to engine
-    let blob_store: Arc<dyn BlobStore> =
-        Arc::new(FileBlobStore::new(Path::new(&config.blobstore_path), 2));
+    // 4b. Attach the (already-constructed) blobstore to the engine. The
+    // store was built ahead of recovery so the orphan-blob reconciliation
+    // could run against the freshly-replayed primary index — see R-049.
     engine.set_blob_store(blob_store.clone());
-    tracing::info!(path = %config.blobstore_path, "blobstore configured");
 
     let engine = Arc::new(engine);
 

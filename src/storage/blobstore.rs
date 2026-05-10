@@ -291,11 +291,12 @@ impl FileBlobStore {
         if name.len() != 64 {
             return None;
         }
+        let bytes = name.as_bytes();
         let mut out = [0u8; 32];
-        for i in 0..32 {
-            let hi = (name.as_bytes()[i * 2] as char).to_digit(16)?;
-            let lo = (name.as_bytes()[i * 2 + 1] as char).to_digit(16)?;
-            out[i] = ((hi << 4) | lo) as u8;
+        for (i, slot) in out.iter_mut().enumerate() {
+            let hi = (bytes[i * 2] as char).to_digit(16)?;
+            let lo = (bytes[i * 2 + 1] as char).to_digit(16)?;
+            *slot = ((hi << 4) | lo) as u8;
         }
         Some(out)
     }
@@ -1264,5 +1265,109 @@ mod tests {
         writer.write_chunk(b"data").unwrap();
         writer.abort().unwrap();
         assert!(store.get(&key).unwrap().is_none());
+    }
+
+    // -- list / GC enumerator tests (R-049) --
+
+    #[test]
+    fn file_list_returns_finalised_blobs_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileBlobStore::new(dir.path(), 2);
+        let k1 = test_key(0x60);
+        let k2 = test_key(0x61);
+        let k3 = test_key(0x62);
+        store.put(&k1, b"a").unwrap();
+        store.put(&k2, b"bb").unwrap();
+        store.put(&k3, b"ccc").unwrap();
+
+        // Half-written blob: payload exists but sidecar is missing — must NOT
+        // appear in `list` (matches the `exists` contract).
+        let half_key = test_key(0x63);
+        let half_path = store.blob_path(&half_key);
+        std::fs::create_dir_all(half_path.parent().unwrap()).unwrap();
+        std::fs::write(&half_path, b"orphan-payload").unwrap();
+        assert!(!FileBlobStore::meta_path_for(&half_path).exists());
+
+        let listed: std::collections::HashSet<[u8; 32]> =
+            store.list().unwrap().into_iter().collect();
+        assert_eq!(listed.len(), 3);
+        assert!(listed.contains(&k1));
+        assert!(listed.contains(&k2));
+        assert!(listed.contains(&k3));
+        assert!(!listed.contains(&half_key));
+    }
+
+    #[test]
+    fn file_list_skips_meta_and_unrelated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileBlobStore::new(dir.path(), 2);
+        let key = test_key(0x70);
+        store.put(&key, b"payload").unwrap();
+
+        // Drop a junk file in the same prefix dir — must NOT be returned.
+        let parent = store.blob_path(&key).parent().unwrap().to_path_buf();
+        std::fs::write(parent.join("README"), b"junk").unwrap();
+        std::fs::write(parent.join("not-a-hex-name.dat"), b"nope").unwrap();
+
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], key);
+    }
+
+    #[test]
+    fn file_list_sweeps_stale_tmp_files() {
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileBlobStore::new(dir.path(), 2);
+
+        // Create a directory layout under the prefix tree by putting one
+        // legitimate blob — its parent dir is where we stash the .tmp.
+        let key = test_key(0x80);
+        store.put(&key, b"keep").unwrap();
+        let parent = store.blob_path(&key).parent().unwrap().to_path_buf();
+
+        // Stale .tmp: mtime backdated past the cutoff.
+        let stale_tmp = parent.join("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899.tmp");
+        std::fs::write(&stale_tmp, b"interrupted-upload").unwrap();
+        let stale_when = SystemTime::now()
+            - Duration::from_secs(FileBlobStore::STALE_TMP_AGE_SECS + 60);
+        let stale_ft = filetime::FileTime::from_system_time(stale_when);
+        filetime::set_file_mtime(&stale_tmp, stale_ft).unwrap();
+
+        // Fresh .tmp: mtime now — must NOT be deleted.
+        let fresh_tmp = parent.join("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff.tmp");
+        std::fs::write(&fresh_tmp, b"in-flight").unwrap();
+
+        // list() runs the sweep as a side effect.
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], key);
+
+        assert!(!stale_tmp.exists(), "stale .tmp must be swept");
+        assert!(fresh_tmp.exists(), "fresh .tmp must survive");
+    }
+
+    #[test]
+    fn memory_list_returns_keys() {
+        let store = MemoryBlobStore::new();
+        let k1 = test_key(0xAA);
+        let k2 = test_key(0xBB);
+        store.put(&k1, b"a").unwrap();
+        store.put(&k2, b"b").unwrap();
+
+        let listed: std::collections::HashSet<[u8; 32]> =
+            store.list().unwrap().into_iter().collect();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&k1));
+        assert!(listed.contains(&k2));
+    }
+
+    #[test]
+    fn memory_list_after_delete() {
+        let store = MemoryBlobStore::new();
+        let k1 = test_key(0xCC);
+        store.put(&k1, b"x").unwrap();
+        store.delete(&k1).unwrap();
+        assert!(store.list().unwrap().is_empty());
     }
 }
