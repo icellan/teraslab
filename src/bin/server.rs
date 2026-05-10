@@ -951,7 +951,7 @@ fn main() {
     if let Some(ref rl) = redo_log {
         server = server.with_redo_log(rl.clone());
     }
-    server = server.with_blob_store(blob_store);
+    server = server.with_blob_store(blob_store.clone());
     let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_clone = shutdown_flag.clone();
     ctrlc_handler(move || {
@@ -976,6 +976,31 @@ fn main() {
             shutdown_flag.clone(),
         )
     });
+
+    // R-049: spawn the periodic orphan-blob GC sweep. Recovery already
+    // reconciled the blob store against the freshly-replayed primary index
+    // on startup; this task takes care of orphans that accumulate during
+    // normal operation (failed creates whose registration was rejected,
+    // aborted streaming uploads, migrations cancelled mid-flight). The
+    // tick interval defaults to one hour and can be set to 0 to disable
+    // the periodic sweep entirely (recovery-time reconciliation still runs).
+    let _blob_gc_handle: Option<std::thread::JoinHandle<()>> =
+        if config.blob_gc_interval_secs > 0 {
+            let cfg = teraslab::storage::blob_gc::BlobGcConfig::new(
+                config.blob_gc_interval_secs,
+            );
+            Some(teraslab::storage::blob_gc::spawn_blob_gc_task(
+                cfg,
+                blob_store.clone(),
+                engine.clone(),
+                shutdown_flag.clone(),
+            ))
+        } else {
+            tracing::info!(
+                "blob-gc periodic sweep disabled (blob_gc_interval_secs = 0)",
+            );
+            None
+        };
 
     // R-038 (D-01): spawn the replica-lag monitor when:
     //   (a) we are clustered (RF > 1, so `init_ack_tracker` has been

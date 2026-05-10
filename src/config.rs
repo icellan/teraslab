@@ -333,6 +333,14 @@ pub struct ServerConfig {
     /// Directory for external blob storage (large transaction cold data).
     pub blobstore_path: String,
 
+    /// Interval in seconds between periodic orphan-blob garbage-collection
+    /// sweeps (R-049). Each tick walks the blob store and deletes any blob
+    /// whose primary-index entry is absent or not flagged EXTERNAL — debris
+    /// from failed creates, aborted uploads, and cancelled migrations.
+    /// Default: 3600 seconds (1 hour). Set to 0 to disable the periodic
+    /// sweep (recovery-time reconciliation still runs on every startup).
+    pub blob_gc_interval_secs: u64,
+
     /// Path for persisted cluster state (peak cluster size for quorum safety).
     /// If not set, derived from the first device path by appending `.cluster`.
     pub cluster_state_path: Option<PathBuf>,
@@ -446,6 +454,7 @@ impl Default for ServerConfig {
             swim_probe_interval_ms: 200,
             swim_suspicion_timeout_ms: 5000,
             blobstore_path: "/blobstore".to_string(),
+            blob_gc_interval_secs: 3600,
             cluster_state_path: None,
             cluster_secret: None,
             max_migration_threads: 16,
