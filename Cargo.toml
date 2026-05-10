@@ -37,6 +37,13 @@ rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# Constant-time byte comparison for the HTTP admin bearer-token middleware.
+# A naive `==` on tokens leaks the matching prefix length through reply timing
+# (the comparison short-circuits on first mismatch). `subtle::ConstantTimeEq`
+# always touches every byte, so reply timing is independent of the token.
+# Already in the lock graph as a transitive dep of rustls; promoting it to a
+# direct dep makes the use site explicit without adding to the build graph.
+subtle = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time"] }
 toml = "0.8"

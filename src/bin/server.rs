@@ -217,10 +217,10 @@ fn main() {
     }
     if config.enable_admin_endpoints {
         tracing::warn!(
-            "enable_admin_endpoints = true: /admin/* and /debug/* HTTP routes are exposed \
-             without authentication — any client that can reach the HTTP port can \
-             quiesce, drain, rebalance, or read sensitive debug data \
-             (see TERANODE_PRODUCTION_READINESS_GAPS.md gap #1)",
+            "enable_admin_endpoints = true: /admin/* and mutating /debug/* HTTP routes are \
+             registered behind bearer-token auth (Authorization: Bearer <admin_token>). \
+             Network access is still required to reach the port — pair with mTLS / a \
+             private interface for defence in depth (gap #1)",
         );
     }
 
@@ -902,8 +902,13 @@ fn main() {
     });
     let http_addr = config.http_listen_addr.clone();
     let admin_endpoints_enabled = config.enable_admin_endpoints;
+    // R-056: when admin endpoints are on, the bearer token has been validated
+    // non-empty by `validate_safe_defaults`. We pass an owned clone into the
+    // dedicated HTTP thread; cloning a small `String` is cheap and avoids
+    // sharing mutable state with the rest of the server.
+    let admin_token = config.admin_token.clone();
     std::thread::spawn(move || {
-        start_http_server(http_addr, http_state, admin_endpoints_enabled);
+        start_http_server(http_addr, http_state, admin_endpoints_enabled, admin_token);
     });
 
     // 7. Setup TCP server
