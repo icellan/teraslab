@@ -69,10 +69,25 @@ struct AckTrackerInner {
     dirty: bool,
     /// Timestamp of the last flush to disk.
     last_flush: Instant,
+    /// R-067 (D-03): number of ACK record_ack calls accumulated since
+    /// the last flush. Reset to 0 by `flush_locked`. Allows the
+    /// flush trigger to fire on EITHER the time threshold OR the
+    /// burst-count threshold, so a master that takes ~1000 ACKs in
+    /// 100 ms before crashing does not lose every one of them.
+    dirty_count: u32,
 }
 
 /// Minimum interval between flushes to disk (1 second).
 const FLUSH_INTERVAL_MS: u128 = 1000;
+
+/// R-067 (D-03): maximum number of ACK records that may accumulate
+/// in the dirty buffer before a flush is forced regardless of the
+/// time-based threshold. Pre-fix the tracker only flushed on the
+/// 1-second timer, so a master crashing 999 ms after the last
+/// flush could lose ~1000+ ACKs at peak throughput. 100 keeps the
+/// per-flush amortization useful while bounding the at-risk
+/// window to a small number of operations.
+const FLUSH_DIRTY_COUNT_THRESHOLD: u32 = 100;
 
 impl AckTracker {
     /// Create a new tracker with the given persistence path.
@@ -86,22 +101,33 @@ impl AckTracker {
                 last_acked,
                 dirty: false,
                 last_flush: Instant::now(),
+                dirty_count: 0,
             }),
         }
     }
 
-    /// Record a successful ACK from a replica. Flushes to disk if enough
-    /// time has passed since the last flush.
+    /// Record a successful ACK from a replica. Flushes to disk on
+    /// EITHER the 1-second time threshold OR an accumulated burst of
+    /// [`FLUSH_DIRTY_COUNT_THRESHOLD`] ACKs since the last flush
+    /// (R-067 / D-03). The 1-second window alone could lose a
+    /// thousand-ACK burst on a master that crashes ~999 ms after the
+    /// previous flush; the burst-count threshold caps the at-risk
+    /// window.
     pub fn record_ack(&self, addr: SocketAddr, through_sequence: u64) {
         let mut inner = self.inner.lock().unwrap();
         let entry = inner.last_acked.entry(addr).or_insert(0);
         if through_sequence > *entry {
             *entry = through_sequence;
             inner.dirty = true;
+            inner.dirty_count = inner.dirty_count.saturating_add(1);
         }
 
-        // Amortize: flush at most once per second.
-        if inner.dirty && inner.last_flush.elapsed().as_millis() >= FLUSH_INTERVAL_MS {
+        // Amortize: flush when either threshold is met. Time-based
+        // flush bounds latency; count-based flush bounds the number
+        // of at-risk ACKs in a burst.
+        let time_due = inner.last_flush.elapsed().as_millis() >= FLUSH_INTERVAL_MS;
+        let count_due = inner.dirty_count >= FLUSH_DIRTY_COUNT_THRESHOLD;
+        if inner.dirty && (time_due || count_due) {
             self.flush_locked(&mut inner);
         }
     }
@@ -132,6 +158,7 @@ impl AckTracker {
             return;
         }
         inner.dirty = false;
+        inner.dirty_count = 0;
         inner.last_flush = Instant::now();
     }
 
@@ -736,6 +763,39 @@ mod tests {
         // Lower sequence is ignored.
         tracker.record_ack(addr, 50);
         assert_eq!(tracker.last_acked(&addr), 100);
+    }
+
+    /// R-067 (D-03) regression: a burst of ACKs MUST trigger a flush
+    /// to disk on the count-based threshold, not just the time-based
+    /// 1-second window. Pre-fix only the time threshold existed, so a
+    /// master crashing within the 1-second window after the previous
+    /// flush could lose every ACK that arrived since.
+    #[test]
+    fn ack_burst_flushes_to_disk_before_time_window_elapses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ack.dat");
+        let tracker = AckTracker::new(path.clone());
+
+        // Send FLUSH_DIRTY_COUNT_THRESHOLD distinct ACKs in rapid
+        // succession (well under the 1-second time threshold). The
+        // count-based threshold must trigger a flush.
+        let burst = FLUSH_DIRTY_COUNT_THRESHOLD as u16;
+        for i in 0..burst {
+            tracker.record_ack(test_addr(7000 + i), 1);
+        }
+
+        // The on-disk state must include all burst entries — no
+        // explicit `flush()` call. Reopen the tracker from disk to
+        // observe what was actually persisted.
+        drop(tracker);
+        let reopened = AckTracker::new(path);
+        for i in 0..burst {
+            assert_eq!(
+                reopened.last_acked(&test_addr(7000 + i)),
+                1,
+                "burst entry {i} must be durable on count-threshold flush",
+            );
+        }
     }
 
     #[test]

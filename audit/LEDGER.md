@@ -734,11 +734,12 @@
 ### R-067 — [ack-tracking] `AckTracker` updates racy; 1s flush window can lose recent ACKs on master crash
 - **Source:** AUDIT.md D-03
 - **Severity:** MEDIUM
-- **Status:** OPEN
-- **Files:** src/replication/durable.rs:95-107
+- **Status:** RESOLVED (count-threshold flush; stream-key stability is R-068)
+- **Files:** src/replication/durable.rs (`AckTrackerInner::dirty_count`, `FLUSH_DIRTY_COUNT_THRESHOLD = 100`, `record_ack`, `flush_locked`)
 - **Cluster:** ack-tracking
-- **Notes:** Add write-after-N counter alongside time-based flush so ACK bursts don't accumulate. Document 1s window. Verify catchup stream-key derivation stable across master reconnects with/without `source_node_id`.
-- **Test:** `ack_tracker_crash_window_loses_recent_acks`
+- **Resolution:** Added a count-based flush trigger alongside the existing 1-second time-based one. The tracker now flushes on EITHER threshold: time-due (≥ 1 s since last flush) OR count-due (≥ 100 ACK bumps since last flush). Pre-fix the master could accept ~1000+ ACKs in the 999 ms after the previous flush and lose every one of them on a crash; the count threshold caps the at-risk burst window at 100 ACKs. The accumulated `dirty_count` is reset to 0 in `flush_locked` along with the time stamp. `dirty_count` uses `saturating_add` so a pathological burst cannot overflow.
+- **Tests added:** `ack_burst_flushes_to_disk_before_time_window_elapses` — sends `FLUSH_DIRTY_COUNT_THRESHOLD` distinct-addr ACKs in rapid succession (well under the 1 s threshold), drops the tracker, reopens from disk, asserts every burst entry is durable. Pre-fix the test would observe a fresh empty tracker because no flush had happened.
+- **Verification:** Full local gate green: `cargo build --release`, `cargo test --all` (1559+ in lib slot), `cargo clippy --all --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 
 ### R-068 — [replica-receiver] Stream-key fallback uses `peer_addr.to_string()`; ephemeral-port roll triggers full re-replay
 - **Source:** AUDIT.md D-05
