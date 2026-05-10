@@ -138,6 +138,20 @@ impl Engine {
         self.redo_log.lock().clone()
     }
 
+    /// Public accessor for the engine's redo log handle.
+    ///
+    /// Used by the replication receiver (R-034) so replica-applied
+    /// mutations can also be journaled to the local redo log. Without
+    /// this, a master crash followed by failover would require a full
+    /// resync of every replica because replica recovery would have no
+    /// log to replay.
+    ///
+    /// Returns `None` when no redo log has been attached (test paths,
+    /// unconfigured deployments).
+    pub fn redo_log(&self) -> Option<Arc<parking_lot::Mutex<crate::redo::RedoLog>>> {
+        self.redo_log_handle()
+    }
+
     /// Update the DAH secondary index with two-phase durability.
     ///
     /// Emits a transition from `old_height` to `new_height` (either may be
