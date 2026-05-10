@@ -70,6 +70,24 @@ pub enum ConfigError {
         /// The configured replication factor.
         rf: u8,
     },
+
+    /// `enable_admin_endpoints = true` was set without a non-empty
+    /// `admin_token` (or `TERASLAB_ADMIN_TOKEN` env override).
+    ///
+    /// When the mutating `/admin/*` and `/debug/*` surface is registered it
+    /// must be guarded by a bearer token so a network actor with TCP reach
+    /// cannot quiesce, drain, rebalance, or read sensitive debug data without
+    /// proving knowledge of an operator-issued secret. Opting into the surface
+    /// without a token is treated as a configuration mistake, not a deployment
+    /// choice — the server refuses to start so the misconfiguration is
+    /// surfaced before any port binds.
+    #[error(
+        "enable_admin_endpoints = true requires a non-empty admin_token (or the \
+         TERASLAB_ADMIN_TOKEN environment override) to gate the mutating /admin/* and \
+         /debug/* HTTP routes with bearer-token auth; either set admin_token in config / \
+         export TERASLAB_ADMIN_TOKEN, or set enable_admin_endpoints = false"
+    )]
+    AdminTokenRequired,
 }
 
 /// Parse the host portion of an `addr` string of the form `host:port`.
@@ -270,9 +288,24 @@ pub struct ServerConfig {
     /// `/admin/quiesce`, `/admin/rebalance`, `/admin/drain/{node_id}`,
     /// `/debug/log-level` (PUT), `/debug/records/{txid}`, `/debug/index`,
     /// or `/debug/redo`. Operators that need these endpoints must explicitly
-    /// opt in. When enabled, the server emits a `tracing::warn!` line at
-    /// startup naming the risk so the choice is auditable.
+    /// opt in *and* configure [`Self::admin_token`] — see
+    /// [`ConfigError::AdminTokenRequired`].
     pub enable_admin_endpoints: bool,
+
+    /// Bearer token required on `Authorization: Bearer <token>` for every
+    /// gated admin / debug request when [`Self::enable_admin_endpoints`] is
+    /// `true`.
+    ///
+    /// Set via the TOML field `admin_token = "..."` or the
+    /// [`Self::ENV_ADMIN_TOKEN`] environment variable (env wins on conflict;
+    /// an empty env value clears the TOML value).
+    ///
+    /// When `enable_admin_endpoints = true` and this field is `None` or
+    /// `Some("")`, [`Self::validate_safe_defaults`] returns
+    /// [`ConfigError::AdminTokenRequired`] and the server refuses to start.
+    /// When `enable_admin_endpoints = false`, this field is ignored: the
+    /// gated sub-router is never built so there is nothing to authenticate.
+    pub admin_token: Option<String>,
 
     /// Block height retention for DAH evaluation.
     pub block_height_retention: u32,
@@ -404,6 +437,7 @@ impl Default for ServerConfig {
             http_listen_addr: "127.0.0.1:9100".to_string(),
             enable_remote_bind: false,
             enable_admin_endpoints: false,
+            admin_token: None,
             block_height_retention: 288,
             node_id: 0,
             swim_port: 3301,
@@ -431,6 +465,13 @@ impl Default for ServerConfig {
 impl ServerConfig {
     pub const ENV_MIGRATION_POOL_SIZE: &'static str = "TERASLAB_MIGRATION_POOL_SIZE";
     pub const ENV_MIGRATION_BATCH_SIZE: &'static str = "TERASLAB_MIGRATION_BATCH_SIZE";
+
+    /// Environment variable that overrides [`Self::admin_token`]. When the
+    /// env var is set to a non-empty value it replaces any TOML-configured
+    /// token; when set to an empty value it explicitly clears the TOML
+    /// token (so an operator can disable a baked-in token without editing
+    /// the file). When the env var is absent the TOML value is preserved.
+    pub const ENV_ADMIN_TOKEN: &'static str = "TERASLAB_ADMIN_TOKEN";
 
     /// Whether clustering is enabled (node_id > 0).
     pub fn is_clustered(&self) -> bool {
@@ -550,7 +591,36 @@ impl ServerConfig {
     pub fn apply_env_overrides(&mut self) -> std::result::Result<(), String> {
         self.apply_migration_env_overrides()?;
         self.apply_observability_env_overrides()?;
+        self.apply_admin_token_env_override();
         Ok(())
+    }
+
+    /// Apply the [`Self::ENV_ADMIN_TOKEN`] override.
+    ///
+    /// Semantics (matches the rest of the env-override surface):
+    ///
+    /// - Env absent → leave TOML value unchanged.
+    /// - Env present and non-empty → replace the TOML value with the env
+    ///   value (env wins).
+    /// - Env present and empty → clear the TOML value (`None`).
+    ///
+    /// Empty / missing token is *not* an error here: the actual gate lives in
+    /// [`Self::validate_safe_defaults`], which only refuses startup when the
+    /// admin endpoints are also enabled. That keeps a deployment that opts
+    /// out of the admin surface entirely from needing a vestigial token.
+    pub fn apply_admin_token_env_override(&mut self) {
+        match std::env::var(Self::ENV_ADMIN_TOKEN) {
+            Ok(raw) if raw.is_empty() => {
+                // Explicit empty env value clears the TOML default.
+                self.admin_token = None;
+            }
+            Ok(raw) => {
+                self.admin_token = Some(raw);
+            }
+            Err(_) => {
+                // Env var not set / not unicode — preserve TOML value.
+            }
+        }
     }
 
     /// Apply `TERASLAB_*` environment overrides to migration tuning.
@@ -604,6 +674,10 @@ impl ServerConfig {
     ///    Cluster mode keys SWIM (and increasingly the other inter-node frames)
     ///    on the shared secret; an empty secret means anyone reachable on the
     ///    SWIM port can spoof membership/topology messages.
+    /// 4. `enable_admin_endpoints = true` requires a non-empty `admin_token`
+    ///    (TOML field or `TERASLAB_ADMIN_TOKEN` env override). Without a
+    ///    token the mutating `/admin/*` and `/debug/*` surface would be
+    ///    reachable by anyone with TCP access to the HTTP port.
     ///
     /// Errors are returned as a [`ConfigError`] enum so callers can map them to
     /// startup-fatal codes.
@@ -646,6 +720,20 @@ impl ServerConfig {
             return Err(ConfigError::ClusterSecretRequired {
                 rf: self.replication_factor,
             });
+        }
+
+        // (4) enable_admin_endpoints requires a non-empty admin_token.
+        // We treat both `None` and `Some("")` as "no token configured" so a
+        // degenerate TOML entry (`admin_token = ""`) is rejected on the same
+        // code path as omitting the field entirely.
+        if self.enable_admin_endpoints
+            && self
+                .admin_token
+                .as_ref()
+                .map(|s| s.is_empty())
+                .unwrap_or(true)
+        {
+            return Err(ConfigError::AdminTokenRequired);
         }
 
         Ok(())
@@ -1271,6 +1359,178 @@ listen_addr = "not-a-socket-addr"
                 assert_eq!(addr, "not-a-socket-addr");
             }
             other => panic!("expected InvalidListenAddr, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // R-056 (gap LMNH-08 / F14): admin-token requirement when admin
+    // endpoints are enabled, plus env override semantics.
+    // ------------------------------------------------------------------
+
+    /// The regression: pre-fix, `enable_admin_endpoints = true` with no
+    /// token returned `Ok(())` and let an unauthenticated mutation surface
+    /// up. This must now fail with `AdminTokenRequired`.
+    #[test]
+    fn startup_refuses_when_admin_endpoints_enabled_without_token() {
+        let cfg = ServerConfig {
+            enable_admin_endpoints: true,
+            admin_token: None,
+            ..ServerConfig::default()
+        };
+        let err = cfg
+            .validate_safe_defaults()
+            .expect_err("admin endpoints with no token must be rejected");
+        match err {
+            ConfigError::AdminTokenRequired => {}
+            other => panic!("expected AdminTokenRequired, got {other:?}"),
+        }
+    }
+
+    /// A degenerate empty token (`admin_token = ""` or `TERASLAB_ADMIN_TOKEN=`
+    /// after the override) is treated identically to no token. This guards
+    /// against a typo / misconfig sneaking past the gate.
+    #[test]
+    fn startup_refuses_when_admin_endpoints_enabled_with_empty_token() {
+        let cfg = ServerConfig {
+            enable_admin_endpoints: true,
+            admin_token: Some(String::new()),
+            ..ServerConfig::default()
+        };
+        let err = cfg.validate_safe_defaults().unwrap_err();
+        match err {
+            ConfigError::AdminTokenRequired => {}
+            other => panic!("expected AdminTokenRequired, got {other:?}"),
+        }
+    }
+
+    /// The happy path: a non-empty token plus `enable_admin_endpoints = true`
+    /// validates cleanly. The token is otherwise opaque to config validation.
+    #[test]
+    fn admin_endpoints_with_token_validates() {
+        let cfg = ServerConfig {
+            enable_admin_endpoints: true,
+            admin_token: Some("operator-issued-secret-1234".to_string()),
+            ..ServerConfig::default()
+        };
+        cfg.validate_safe_defaults()
+            .expect("admin endpoints with token must validate");
+    }
+
+    /// When admin endpoints are off the token requirement is not enforced —
+    /// a deployment that opts out of the mutating surface entirely should
+    /// not need to provision a vestigial secret.
+    #[test]
+    fn missing_admin_token_is_fine_when_admin_endpoints_disabled() {
+        let cfg = ServerConfig {
+            enable_admin_endpoints: false,
+            admin_token: None,
+            ..ServerConfig::default()
+        };
+        cfg.validate_safe_defaults()
+            .expect("no token is fine when admin surface is off");
+    }
+
+    /// Guards env var so two parallel admin-token tests don't collide.
+    fn admin_token_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::Mutex;
+        use std::sync::OnceLock;
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let m = LOCK.get_or_init(|| Mutex::new(()));
+        m.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    #[test]
+    fn admin_token_env_override_replaces_toml_value() {
+        let _guard = admin_token_env_guard();
+        // SAFETY: env access is single-threaded under `_guard`.
+        unsafe {
+            std::env::remove_var(ServerConfig::ENV_ADMIN_TOKEN);
+        }
+
+        let mut cfg = ServerConfig {
+            admin_token: Some("from-toml".to_string()),
+            ..ServerConfig::default()
+        };
+        unsafe {
+            std::env::set_var(ServerConfig::ENV_ADMIN_TOKEN, "from-env");
+        }
+        cfg.apply_admin_token_env_override();
+        assert_eq!(cfg.admin_token.as_deref(), Some("from-env"));
+
+        unsafe {
+            std::env::remove_var(ServerConfig::ENV_ADMIN_TOKEN);
+        }
+    }
+
+    #[test]
+    fn empty_admin_token_env_clears_toml_value() {
+        let _guard = admin_token_env_guard();
+        unsafe {
+            std::env::remove_var(ServerConfig::ENV_ADMIN_TOKEN);
+        }
+
+        let mut cfg = ServerConfig {
+            admin_token: Some("from-toml".to_string()),
+            ..ServerConfig::default()
+        };
+        unsafe {
+            std::env::set_var(ServerConfig::ENV_ADMIN_TOKEN, "");
+        }
+        cfg.apply_admin_token_env_override();
+        assert!(
+            cfg.admin_token.is_none(),
+            "explicit empty env must clear the TOML value (matches the OTLP \
+             endpoint override semantics)",
+        );
+
+        unsafe {
+            std::env::remove_var(ServerConfig::ENV_ADMIN_TOKEN);
+        }
+    }
+
+    #[test]
+    fn absent_admin_token_env_preserves_toml_value() {
+        let _guard = admin_token_env_guard();
+        unsafe {
+            std::env::remove_var(ServerConfig::ENV_ADMIN_TOKEN);
+        }
+
+        let mut cfg = ServerConfig {
+            admin_token: Some("from-toml".to_string()),
+            ..ServerConfig::default()
+        };
+        cfg.apply_admin_token_env_override();
+        assert_eq!(
+            cfg.admin_token.as_deref(),
+            Some("from-toml"),
+            "missing env var must leave the TOML value untouched",
+        );
+    }
+
+    /// `apply_env_overrides` plumbs through to the admin-token override so
+    /// callers do not have to remember which knobs are pre-validated.
+    #[test]
+    fn apply_env_overrides_pulls_in_admin_token() {
+        let _guard = admin_token_env_guard();
+        let _obs_guard = obs_env_guard();
+        clear_migration_env();
+        unsafe {
+            std::env::remove_var(ServerConfig::ENV_ADMIN_TOKEN);
+            std::env::remove_var(ObservabilityConfig::ENV_OTLP_ENDPOINT);
+            std::env::remove_var(ObservabilityConfig::ENV_SAMPLING_RATIO);
+            std::env::remove_var(ObservabilityConfig::ENV_SERVICE_NAME);
+        }
+
+        let mut cfg = ServerConfig::default();
+        unsafe {
+            std::env::set_var(ServerConfig::ENV_ADMIN_TOKEN, "set-via-env");
+        }
+        cfg.apply_env_overrides()
+            .expect("admin-token env override must apply cleanly");
+        assert_eq!(cfg.admin_token.as_deref(), Some("set-via-env"));
+
+        unsafe {
+            std::env::remove_var(ServerConfig::ENV_ADMIN_TOKEN);
         }
     }
 }

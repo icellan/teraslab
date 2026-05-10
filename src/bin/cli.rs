@@ -59,6 +59,17 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Bearer token for the gated `/admin/*` and mutating `/debug/*` HTTP
+    /// routes (R-056). When set, the CLI sends `Authorization: Bearer <token>`
+    /// on every request — the server-side middleware compares against
+    /// `ServerConfig::admin_token` in constant time. Reads from the
+    /// `TERASLAB_ADMIN_TOKEN` env var when the flag is omitted, so secrets
+    /// don't appear in shell history. Read-only endpoints (`/metrics`,
+    /// `/health/*`, `/status`, read-only `/admin/*` dashboards,
+    /// `/debug/freelist`, `GET /debug/log-level`) work with or without it.
+    #[arg(long, env = "TERASLAB_ADMIN_TOKEN", global = true)]
+    admin_token: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -155,23 +166,45 @@ enum Command {
 struct HttpClient {
     client: reqwest::blocking::Client,
     base_url: String,
+    /// Bearer token attached to every request as `Authorization: Bearer <token>`.
+    /// `None` skips the header entirely so unauthenticated endpoints stay
+    /// reachable from a CLI that has no token configured.
+    admin_token: Option<String>,
 }
 
 impl HttpClient {
-    fn new(base_url: &str) -> Self {
+    /// Construct an `HttpClient` that attaches `Authorization: Bearer <token>`
+    /// to every request when `admin_token` is `Some(non-empty)`. An empty
+    /// `Some("")` is treated identically to `None` so a wrapper script that
+    /// passes `--admin-token "$VAR"` does not accidentally send `Bearer ` to
+    /// the server when `$VAR` is unset.
+    fn with_auth(base_url: &str, admin_token: Option<String>) -> Self {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .expect("failed to create HTTP client");
+        let admin_token = admin_token.filter(|t| !t.is_empty());
         Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
+            admin_token,
         }
     }
 
-    fn get_json(&self, path: &str) -> Result<serde_json::Value, CliError> {
+    /// Build a request builder with the Authorization header attached when
+    /// `admin_token` is configured. All HTTP methods route through here so
+    /// no path can accidentally bypass the auth header.
+    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::blocking::RequestBuilder {
         let url = format!("{}{}", self.base_url, path);
-        let resp = self.client.get(&url).send()?;
+        let mut builder = self.client.request(method, &url);
+        if let Some(ref token) = self.admin_token {
+            builder = builder.bearer_auth(token);
+        }
+        builder
+    }
+
+    fn get_json(&self, path: &str) -> Result<serde_json::Value, CliError> {
+        let resp = self.request(reqwest::Method::GET, path).send()?;
         if !resp.status().is_success() {
             return Err(CliError::ServerError {
                 status: resp.status().as_u16(),
@@ -182,8 +215,7 @@ impl HttpClient {
     }
 
     fn get_text(&self, path: &str) -> Result<String, CliError> {
-        let url = format!("{}{}", self.base_url, path);
-        let resp = self.client.get(&url).send()?;
+        let resp = self.request(reqwest::Method::GET, path).send()?;
         if !resp.status().is_success() {
             return Err(CliError::ServerError {
                 status: resp.status().as_u16(),
@@ -194,8 +226,10 @@ impl HttpClient {
     }
 
     fn put_text(&self, path: &str, body: &str) -> Result<String, CliError> {
-        let url = format!("{}{}", self.base_url, path);
-        let resp = self.client.put(&url).body(body.to_string()).send()?;
+        let resp = self
+            .request(reqwest::Method::PUT, path)
+            .body(body.to_string())
+            .send()?;
         if !resp.status().is_success() {
             return Err(CliError::ServerError {
                 status: resp.status().as_u16(),
@@ -206,8 +240,7 @@ impl HttpClient {
     }
 
     fn is_ready(&self) -> bool {
-        self.client
-            .get(format!("{}/health/ready", self.base_url))
+        self.request(reqwest::Method::GET, "/health/ready")
             .timeout(Duration::from_secs(3))
             .send()
             .map(|r| r.status().is_success())
@@ -1207,7 +1240,7 @@ fn render_waiting(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
 #[allow(clippy::disallowed_macros)] // CLI user-facing stderr on error
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let http = HttpClient::new(&cli.addr);
+    let http = HttpClient::with_auth(&cli.addr, cli.admin_token.clone());
 
     let result = match cli.command {
         Command::Status => cmd_status(&http, cli.json),

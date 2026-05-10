@@ -16,14 +16,16 @@ use crate::ops::engine::Engine;
 use crate::redo::RedoLog;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, put};
 use rust_embed::Embed;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 
 /// Log levels for the runtime log level endpoint.
 const LOG_LEVEL_ERROR: u8 = 0;
@@ -59,23 +61,50 @@ pub struct HttpState {
     pub http_port: u16,
 }
 
+/// Bearer-token state shared with the admin auth middleware.
+///
+/// Stored as `Arc<[u8]>` (rather than `String`) so the constant-time
+/// comparison can borrow the raw bytes without re-validating UTF-8 or
+/// reallocating per request. Wrapped in an `Option` so the middleware can
+/// fail closed if it is ever installed without a configured token (a
+/// programmer error — `start_http_server` and `build_http_router` only
+/// install the gate when this is `Some`).
+#[derive(Clone)]
+pub(crate) struct AdminAuthState {
+    /// The expected bearer token, byte-for-byte. `None` means the gate
+    /// is mis-installed; the middleware fails closed in that case.
+    expected_token: Option<Arc<[u8]>>,
+}
+
 /// Start the HTTP observability server on the given address.
 ///
 /// This spawns a tokio runtime and blocks until shutdown.
 /// Call this from a dedicated thread.
 ///
-/// `enable_admin_endpoints` gates registration of the `/admin/*` routes and
-/// the mutating `/debug/*` routes. When `false` (the default), those routes
-/// are not part of the router at all and any request to them returns 404.
-/// When `true`, a `tracing::warn!` line is emitted naming the risk.
-pub fn start_http_server(bind_addr: String, state: Arc<HttpState>, enable_admin_endpoints: bool) {
+/// `enable_admin_endpoints` gates registration of the `/admin/*` mutation
+/// routes and the mutating `/debug/*` routes. When `false` (the default),
+/// those routes are not part of the router at all and any request to them
+/// returns 404. When `true`, the routes are registered behind a bearer-token
+/// middleware keyed on `admin_token` (constant-time comparison) — every
+/// request to a gated route must carry an `Authorization: Bearer <token>`
+/// header that matches `admin_token` exactly. `validate_safe_defaults` is
+/// expected to have rejected any combination where the gate is enabled
+/// without a non-empty token; this function logs a `tracing::error!` and
+/// refuses to register the routes if the invariant is violated, rather than
+/// installing an open mutation surface.
+pub fn start_http_server(
+    bind_addr: String,
+    state: Arc<HttpState>,
+    enable_admin_endpoints: bool,
+    admin_token: Option<String>,
+) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("failed to create tokio runtime for HTTP server");
 
     rt.block_on(async move {
-        let app = build_http_router(state, enable_admin_endpoints);
+        let app = build_http_router(state, enable_admin_endpoints, admin_token.clone());
 
         let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
             Ok(l) => l,
@@ -88,10 +117,9 @@ pub fn start_http_server(bind_addr: String, state: Arc<HttpState>, enable_admin_
         if enable_admin_endpoints {
             tracing::warn!(
                 %bind_addr,
-                "/admin/* and mutating /debug/* endpoints ENABLED — these expose state \
-                 mutation and sensitive debug data on this HTTP listener with no \
-                 transport-level auth (gap #1, mTLS pending). Disable in production by \
-                 setting enable_admin_endpoints = false.",
+                "/admin/* and mutating /debug/* endpoints ENABLED — bearer-token \
+                 auth is enforced (Authorization: Bearer <admin_token>). Disable in \
+                 production by setting enable_admin_endpoints = false.",
             );
         }
         tracing::info!(%bind_addr, "HTTP observability server listening");
@@ -104,18 +132,40 @@ pub fn start_http_server(bind_addr: String, state: Arc<HttpState>, enable_admin_
 
 /// Build the axum [`Router`] for the HTTP observability server.
 ///
-/// Always registers metrics / health / status / read-only `/admin/top` /
-/// WebSocket / UI routes. When `enable_admin_endpoints` is `true`, also
-/// registers `/admin/*` mutation routes and the mutating `/debug/*` routes
-/// (`/debug/log-level` PUT, `/debug/records/{txid}`, `/debug/index`,
-/// `/debug/redo`). When `false`, those routes are not part of the router and
-/// requests to them return 404.
+/// Always registers the unauthenticated observability surface: `/metrics`,
+/// `/health/live`, `/health/ready`, `/status`, the read-only `/admin/*`
+/// dashboards (`migration_status`, `nodes`, `memory`, `records`,
+/// `replication`, `top`), the read-only `/debug/*` endpoints
+/// (`freelist`, `GET /debug/log-level`), the `/ws/top` WebSocket, and the
+/// embedded `/ui/...` assets. These routes have no auth so load balancers,
+/// Prometheus, and Grafana keep working without operator-issued credentials.
+///
+/// When `enable_admin_endpoints` is `true`, the mutating sub-router is built
+/// (`/admin/quiesce|rebalance|drain/{node_id}`, `/debug/index|redo|records/{txid}`,
+/// `PUT /debug/log-level`) and merged behind an
+/// [`axum::middleware::from_fn_with_state`] guard that checks
+/// `Authorization: Bearer <admin_token>` on every request, comparing against
+/// the configured token in constant time via [`subtle::ConstantTimeEq`].
+/// If the caller passes `enable_admin_endpoints = true` with `None` or an
+/// empty `admin_token`, the gated sub-router is omitted entirely (so nothing
+/// is exposed unauthenticated) and a `tracing::error!` is logged — this path
+/// is expected to be unreachable because [`crate::config::ServerConfig::validate_safe_defaults`]
+/// rejects the combination at startup.
+///
+/// When `enable_admin_endpoints` is `false`, the gated routes are not part
+/// of the router and requests to them return 404.
 ///
 /// Split out from [`start_http_server`] so unit tests can construct the
 /// router without binding a TCP listener.
-pub(crate) fn build_http_router(state: Arc<HttpState>, enable_admin_endpoints: bool) -> Router {
+pub(crate) fn build_http_router(
+    state: Arc<HttpState>,
+    enable_admin_endpoints: bool,
+    admin_token: Option<String>,
+) -> Router {
     // Always-on routes: metrics, health, status, and read-only WS/UI surface.
-    let mut router = Router::new()
+    // Build the public router with `state` so the read-only handlers can
+    // share the engine / metrics state.
+    let public = Router::new()
         .route("/metrics", get(handle_metrics))
         .route("/health/live", get(handle_health_live))
         .route("/health/ready", get(handle_health_ready))
@@ -137,22 +187,137 @@ pub(crate) fn build_http_router(state: Arc<HttpState>, enable_admin_endpoints: b
         .route("/ws/top", get(handle_ws_top))
         // Web UI
         .route("/ui/", get(handle_ui_root))
-        .route("/ui/{*path}", get(handle_ui));
+        .route("/ui/{*path}", get(handle_ui))
+        .with_state(state.clone());
 
-    if enable_admin_endpoints {
-        router = router
-            // Admin mutation
-            .route("/admin/quiesce", put(handle_admin_quiesce))
-            .route("/admin/rebalance", put(handle_admin_rebalance))
-            .route("/admin/drain/{node_id}", put(handle_admin_drain))
-            // Debug mutation / sensitive read
-            .route("/debug/index", get(handle_debug_index))
-            .route("/debug/redo", get(handle_debug_redo))
-            .route("/debug/log-level", put(handle_set_log_level))
-            .route("/debug/records/{txid}", get(handle_debug_record));
+    if !enable_admin_endpoints {
+        return public;
     }
 
-    router.with_state(state)
+    // From here on the gated sub-router is being installed. The token must
+    // be present and non-empty — `validate_safe_defaults` is the contract
+    // owner. If the contract is violated we log loudly and refuse to mount
+    // the gated routes (returning the public router) rather than mounting
+    // an unauthenticated mutation surface.
+    let token_bytes: Arc<[u8]> = match admin_token.as_deref() {
+        Some(t) if !t.is_empty() => Arc::from(t.as_bytes().to_vec().into_boxed_slice()),
+        _ => {
+            tracing::error!(
+                "admin endpoints enabled without a configured admin_token — refusing to \
+                 register the mutating /admin/* and /debug/* routes. This is a programmer \
+                 error: ServerConfig::validate_safe_defaults should have rejected the \
+                 startup. Restart with admin_token set or with enable_admin_endpoints = false.",
+            );
+            return public;
+        }
+    };
+
+    let auth_state = AdminAuthState {
+        expected_token: Some(token_bytes),
+    };
+
+    let gated = Router::new()
+        // Admin mutation
+        .route("/admin/quiesce", put(handle_admin_quiesce))
+        .route("/admin/rebalance", put(handle_admin_rebalance))
+        .route("/admin/drain/{node_id}", put(handle_admin_drain))
+        // Debug mutation / sensitive read
+        .route("/debug/index", get(handle_debug_index))
+        .route("/debug/redo", get(handle_debug_redo))
+        .route("/debug/log-level", put(handle_set_log_level))
+        .route("/debug/records/{txid}", get(handle_debug_record))
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            require_admin_bearer,
+        ))
+        .with_state(state);
+
+    public.merge(gated)
+}
+
+/// Axum middleware enforcing `Authorization: Bearer <admin_token>` on the
+/// gated `/admin/*` and `/debug/*` sub-router.
+///
+/// Behaviour:
+///
+/// - Missing or malformed `Authorization` header → 401 Unauthorized.
+/// - Header present but the scheme is not `Bearer` (case-insensitive per
+///   RFC 6750 §2.1) → 401.
+/// - Bearer token does not match the configured token → 401.
+/// - Bearer token matches → request is forwarded to the inner handler.
+/// - Defensive: if the middleware was installed with no configured token
+///   (programmer error in `build_http_router`), every request is rejected
+///   with 401 rather than letting it through.
+///
+/// The token comparison uses [`subtle::ConstantTimeEq`] so reply timing
+/// does not leak the matching prefix length of an attacker-supplied token.
+async fn require_admin_bearer(
+    State(auth): State<AdminAuthState>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> axum::response::Response {
+    let expected = match auth.expected_token.as_deref() {
+        Some(bytes) if !bytes.is_empty() => bytes,
+        _ => {
+            // Defensive: this branch is only reached if `build_http_router`
+            // mounted the gate without a token, which it never does (the
+            // builder returns early in that case). Refuse rather than allow.
+            return (
+                StatusCode::UNAUTHORIZED,
+                "missing admin token configuration\n",
+            )
+                .into_response();
+        }
+    };
+
+    let supplied = match extract_bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "missing or malformed Authorization: Bearer <token> header\n",
+            )
+                .into_response();
+        }
+    };
+
+    // Constant-time compare. `ct_eq` returns `Choice` which short-circuits
+    // *neither* on length nor on content; converting to bool below is safe.
+    if supplied.as_bytes().ct_eq(expected).into() {
+        next.run(request).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "invalid admin bearer token\n").into_response()
+    }
+}
+
+/// Extract the raw token bytes from an `Authorization: Bearer <token>`
+/// header value, or return `None` if the header is missing, not valid
+/// ASCII, or does not start with a case-insensitive `Bearer ` prefix.
+///
+/// Per RFC 6750 §2.1 the scheme name is case-insensitive. Trailing
+/// whitespace inside the token is preserved verbatim — clients should not
+/// pad their tokens, and the constant-time comparison treats any padding
+/// as a mismatch.
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers.get(axum::http::header::AUTHORIZATION)?;
+    let s = raw.to_str().ok()?;
+    // Case-insensitive scheme match. `Bearer` is 6 bytes; require a
+    // whitespace separator after it so `BearerXYZ` does not match.
+    if s.len() < 7 {
+        return None;
+    }
+    let (scheme, rest) = s.split_at(6);
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    // Skip the single mandatory space; reject if anything else.
+    let rest_bytes = rest.as_bytes();
+    if rest_bytes.first() != Some(&b' ') {
+        return None;
+    }
+    let token = &rest[1..];
+    if token.is_empty() { None } else { Some(token) }
 }
 
 // ---------------------------------------------------------------------------
