@@ -9,9 +9,7 @@
 use teraslab::index::{PrimaryBackend, TxIndexEntry, TxKey};
 use teraslab::record::TxFlags;
 use teraslab::recovery::reconcile_blobs_after_recovery;
-use teraslab::storage::blob_gc::{
-    BlobGcStats, reconcile_orphan_blobs_against_index,
-};
+use teraslab::storage::blob_gc::{BlobGcStats, reconcile_orphan_blobs_against_index};
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
 
 /// Build a fresh primary index + blob store on a tempdir. The data device
@@ -78,7 +76,10 @@ fn failed_create_blob_garbage_collected_on_recovery() {
     assert_eq!(stats.deleted_no_index, 1);
     assert_eq!(stats.deleted_not_external, 0);
     assert_eq!(stats.delete_failed, 0);
-    assert!(!store.exists(&leaked).unwrap(), "leaked blob must be deleted");
+    assert!(
+        !store.exists(&leaked).unwrap(),
+        "leaked blob must be deleted"
+    );
 }
 
 /// A blob whose primary-index entry exists AND is flagged EXTERNAL is the
@@ -93,13 +94,15 @@ fn blob_gc_keeps_blobs_referenced_by_external_flagged_records() {
     store.put(&live, b"live external payload").unwrap();
     register_entry(&mut index, &live, TxFlags::EXTERNAL);
 
-    let stats =
-        reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index).unwrap();
+    let stats = reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index).unwrap();
     assert_eq!(stats.total_blobs, 1);
     assert_eq!(stats.kept, 1);
     assert_eq!(stats.deleted_no_index, 0);
     assert_eq!(stats.deleted_not_external, 0);
-    assert!(store.exists(&live).unwrap(), "live external blob must be kept");
+    assert!(
+        store.exists(&live).unwrap(),
+        "live external blob must be kept"
+    );
 
     // Round-trip: payload bytes are still readable and digest-verified.
     let read = store.get(&live).unwrap().unwrap();
@@ -120,8 +123,7 @@ fn blob_gc_skips_blobs_not_in_primary_index() {
     store.put(&o2, b"bb").unwrap();
     store.put(&o3, b"ccc").unwrap();
 
-    let stats =
-        reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index).unwrap();
+    let stats = reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index).unwrap();
     assert_eq!(stats.total_blobs, 3);
     assert_eq!(stats.kept, 0);
     assert_eq!(stats.deleted_no_index, 3);
@@ -142,8 +144,7 @@ fn blob_gc_deletes_blobs_when_index_entry_missing_external_flag() {
     store.put(&stale, b"stale blob").unwrap();
     register_entry(&mut index, &stale, TxFlags::IS_COINBASE);
 
-    let stats =
-        reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index).unwrap();
+    let stats = reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index).unwrap();
     assert_eq!(stats.total_blobs, 1);
     assert_eq!(stats.deleted_not_external, 1);
     assert!(!store.exists(&stale).unwrap());
@@ -165,8 +166,7 @@ fn blob_gc_mixed_set_recovery() {
     register_entry(&mut index, &keep_ext, TxFlags::EXTERNAL);
     register_entry(&mut index, &orphan_no_flag, TxFlags::empty());
 
-    let stats =
-        reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index).unwrap();
+    let stats = reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index).unwrap();
     assert_eq!(stats.total_blobs, 3);
     assert_eq!(stats.kept, 1);
     assert_eq!(stats.deleted_no_index, 1);
@@ -221,25 +221,23 @@ fn stale_tmp_files_swept_on_recovery() {
         .to_path_buf();
 
     // Stale .tmp: backdated mtime past the cutoff — must be deleted.
-    let stale_tmp = blob_root.join(
-        "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100.tmp",
-    );
+    let stale_tmp =
+        blob_root.join("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100.tmp");
     std::fs::write(&stale_tmp, b"interrupted-upload").unwrap();
-    let stale_when = SystemTime::now()
-        - Duration::from_secs(FileBlobStore::STALE_TMP_AGE_SECS + 60);
+    let stale_when =
+        SystemTime::now() - Duration::from_secs(FileBlobStore::STALE_TMP_AGE_SECS + 60);
     let ft = filetime::FileTime::from_system_time(stale_when);
     filetime::set_file_mtime(&stale_tmp, ft).unwrap();
 
     // Fresh .tmp: mtime now — must NOT be swept (an in-flight upload).
-    let fresh_tmp = blob_root.join(
-        "1122334455667788991122334455667788991122334455667788991122334455.tmp",
-    );
+    let fresh_tmp =
+        blob_root.join("1122334455667788991122334455667788991122334455667788991122334455.tmp");
     std::fs::write(&fresh_tmp, b"in-flight").unwrap();
 
     // Recovery-time reconciliation: anchor is kept (EXTERNAL, registered),
     // and the .tmp sweep runs as a side effect of `BlobStore::list`.
-    let stats = reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index)
-        .expect("reconcile");
+    let stats =
+        reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index).expect("reconcile");
     assert_eq!(stats.total_blobs, 1);
     assert_eq!(stats.kept, 1);
     assert_eq!(stats.deleted_no_index, 0);
@@ -265,12 +263,11 @@ fn reconcile_orphan_blobs_against_index_smoke() {
     store.put(&orphan, b"drop").unwrap();
     register_entry(&mut index, &keep, TxFlags::EXTERNAL);
 
-    let stats = reconcile_orphan_blobs_against_index(&store as &dyn BlobStore, &index)
-        .expect("reconcile");
+    let stats =
+        reconcile_orphan_blobs_against_index(&store as &dyn BlobStore, &index).expect("reconcile");
     assert_eq!(stats.total_blobs, 2);
     assert_eq!(stats.kept, 1);
     assert_eq!(stats.deleted_no_index, 1);
     assert!(store.exists(&keep).unwrap());
     assert!(!store.exists(&orphan).unwrap());
 }
-

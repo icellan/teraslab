@@ -347,10 +347,7 @@ impl FileBlobStore {
             };
             // Stale .tmp sweep — see STALE_TMP_AGE_SECS for rationale.
             if name.ends_with(TMP_SUFFIX) {
-                let mtime = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|m| m.modified().ok());
+                let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
                 if let Some(mtime) = mtime
                     && mtime <= stale_cutoff
                 {
@@ -1327,15 +1324,17 @@ mod tests {
         let parent = store.blob_path(&key).parent().unwrap().to_path_buf();
 
         // Stale .tmp: mtime backdated past the cutoff.
-        let stale_tmp = parent.join("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899.tmp");
+        let stale_tmp =
+            parent.join("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899.tmp");
         std::fs::write(&stale_tmp, b"interrupted-upload").unwrap();
-        let stale_when = SystemTime::now()
-            - Duration::from_secs(FileBlobStore::STALE_TMP_AGE_SECS + 60);
+        let stale_when =
+            SystemTime::now() - Duration::from_secs(FileBlobStore::STALE_TMP_AGE_SECS + 60);
         let stale_ft = filetime::FileTime::from_system_time(stale_when);
         filetime::set_file_mtime(&stale_tmp, stale_ft).unwrap();
 
         // Fresh .tmp: mtime now — must NOT be deleted.
-        let fresh_tmp = parent.join("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff.tmp");
+        let fresh_tmp =
+            parent.join("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff.tmp");
         std::fs::write(&fresh_tmp, b"in-flight").unwrap();
 
         // list() runs the sweep as a side effect.

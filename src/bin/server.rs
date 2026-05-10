@@ -570,10 +570,7 @@ fn main() {
         // (audit IJK-08). Errors during reconciliation are non-fatal — a
         // transient blob-store issue must not block the server from coming
         // up; the periodic background sweep retries on its next tick.
-        match teraslab::recovery::reconcile_blobs_after_recovery(
-            blob_store.as_ref(),
-            &index,
-        ) {
+        match teraslab::recovery::reconcile_blobs_after_recovery(blob_store.as_ref(), &index) {
             Ok(stats) => {
                 tracing::info!(
                     total_blobs = stats.total_blobs,
@@ -984,23 +981,18 @@ fn main() {
     // aborted streaming uploads, migrations cancelled mid-flight). The
     // tick interval defaults to one hour and can be set to 0 to disable
     // the periodic sweep entirely (recovery-time reconciliation still runs).
-    let _blob_gc_handle: Option<std::thread::JoinHandle<()>> =
-        if config.blob_gc_interval_secs > 0 {
-            let cfg = teraslab::storage::blob_gc::BlobGcConfig::new(
-                config.blob_gc_interval_secs,
-            );
-            Some(teraslab::storage::blob_gc::spawn_blob_gc_task(
-                cfg,
-                blob_store.clone(),
-                engine.clone(),
-                shutdown_flag.clone(),
-            ))
-        } else {
-            tracing::info!(
-                "blob-gc periodic sweep disabled (blob_gc_interval_secs = 0)",
-            );
-            None
-        };
+    let _blob_gc_handle: Option<std::thread::JoinHandle<()>> = if config.blob_gc_interval_secs > 0 {
+        let cfg = teraslab::storage::blob_gc::BlobGcConfig::new(config.blob_gc_interval_secs);
+        Some(teraslab::storage::blob_gc::spawn_blob_gc_task(
+            cfg,
+            blob_store.clone(),
+            engine.clone(),
+            shutdown_flag.clone(),
+        ))
+    } else {
+        tracing::info!("blob-gc periodic sweep disabled (blob_gc_interval_secs = 0)",);
+        None
+    };
 
     // R-038 (D-01): spawn the replica-lag monitor when:
     //   (a) we are clustered (RF > 1, so `init_ack_tracker` has been
