@@ -931,11 +931,12 @@
 ### R-089 — [wire-dos] `cold_data` length parsed from u32 with no per-item cap
 - **Source:** AUDIT.md GH-13
 - **Severity:** MEDIUM
-- **Status:** OPEN
-- **Files:** src/protocol/codec.rs:813-824
+- **Status:** RESOLVED
+- **Files:** src/protocol/opcodes.rs (new `MAX_COLD_DATA_PER_ITEM = 4 MiB`), src/protocol/codec.rs (new `CodecError::FieldOutOfBounds` variant + bounds check in `decode_create_batch_checked`)
 - **Cluster:** wire-dos
-- **Notes:** `MAX_COLD_DATA_PER_ITEM` constant (e.g. 4 MiB) in `src/protocol/opcodes.rs`; reject inside `decode_create_batch_checked`.
-- **Test:** `create_batch_rejects_cold_data_exceeding_max_per_item`
+- **Resolution:** Added per-item cap on the wire `cold_data` length. Pre-fix the `cold_len: u32` was unchecked, so an attacker fitting within the outer 16 MiB `MAX_FRAME_SIZE` could concentrate the entire budget into a single create item — the decoder then allocated a `Vec` of that size in `to_vec()` and the engine allocated another aligned write buffer of the same size, multiplying the wire-frame budget ~3× per item. The new `MAX_COLD_DATA_PER_ITEM = 4 MiB` is well above any realistic transaction (BSV transactions are typically a few KB; network single-tx limit is 10 MiB raw). Rejection happens BEFORE the decoder slices the payload, via the new `CodecError::FieldOutOfBounds { field, value, max }` variant.
+- **Tests added:** `create_batch_rejects_cold_data_exceeding_max_per_item` — builds a single-item create-batch payload with `cold_len = MAX_COLD_DATA_PER_ITEM + 1` (padded so the per-item-min size sanity check does not pre-empt it), asserts the decoder returns `FieldOutOfBounds` with the expected field/value/max.
+- **Verification:** Full local gate green: `cargo build --release`, `cargo test --all` (1778 passed, 0 failed, 0 ignored), `cargo clippy --all --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 
 ### R-090 — [wire-dos] Unbounded `utxo_count` and `parent_count` per item in CreateBatch
 - **Source:** AUDIT.md GH-14

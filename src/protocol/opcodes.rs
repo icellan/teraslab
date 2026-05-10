@@ -355,3 +355,18 @@ pub const FLAG_MIGRATION_VERIFY_ONLY: u16 = 0x0004;
 /// (typically 1–4 MiB) so the client can pipeline many chunks while the
 /// server maintains a stable memory budget.
 pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
+
+/// R-089 (GH-13): per-item upper bound on the `cold_data` payload inside
+/// a `OP_CREATE_BATCH` frame.
+///
+/// Each create item carries a `cold_data` blob whose length is encoded
+/// as a `u32`. Without a per-item cap, an attacker who fits within the
+/// outer [`MAX_FRAME_SIZE`] can still concentrate the entire 16 MiB
+/// budget into a single item — and the engine then allocates a `Vec`
+/// of that size in `to_vec()` plus another aligned write buffer of the
+/// same size. 4 MiB per item is well above any realistic transaction
+/// (BSV transactions are typically a few KB; the single-tx limit in
+/// the network is 10 MiB raw and most fall under 1 MiB). 4 MiB caps
+/// the per-item allocation at a predictable headroom while still
+/// permitting the largest legitimate transactions.
+pub const MAX_COLD_DATA_PER_ITEM: u32 = 4 * 1024 * 1024;

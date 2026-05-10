@@ -75,6 +75,19 @@ pub enum CodecError {
         /// Bytes actually remaining in the payload.
         have: usize,
     },
+    /// R-089 (GH-13): a length / count field exceeded its per-item
+    /// upper bound. Caught BEFORE allocation so a hostile frame
+    /// cannot drive memory pressure by concentrating the
+    /// frame-size budget into a single item.
+    #[error("{field} value {value} exceeds maximum {max}")]
+    FieldOutOfBounds {
+        /// Name of the bounded field.
+        field: &'static str,
+        /// Value carried on the wire.
+        value: u64,
+        /// Configured upper bound.
+        max: u64,
+    },
 }
 
 /// Absolute hard cap on the `count` field of any batch decoder when no
@@ -812,7 +825,21 @@ pub fn decode_create_batch_checked(
         } // has_cold(1) + cold_len(4)
         let _has_cold = data[pos];
         pos += 1;
-        let cold_len = get_u32(data, pos) as usize;
+        let cold_len_u32 = get_u32(data, pos);
+        // R-089 (GH-13): per-item bound. Without this an attacker can
+        // concentrate the entire MAX_FRAME_SIZE budget into a single
+        // create item and trigger a `Vec::with_capacity(cold_len)` for
+        // the same size, plus the aligned write buffer the engine
+        // allocates downstream — multiplying the wire-frame budget
+        // ~3× per item. 4 MiB is well above any realistic transaction.
+        if cold_len_u32 > crate::protocol::opcodes::MAX_COLD_DATA_PER_ITEM {
+            return Err(CodecError::FieldOutOfBounds {
+                field: "cold_data length per item",
+                value: cold_len_u32 as u64,
+                max: crate::protocol::opcodes::MAX_COLD_DATA_PER_ITEM as u64,
+            });
+        }
+        let cold_len = cold_len_u32 as usize;
         pos += 4;
         if pos + cold_len > data.len() {
             return Err(CodecError::SectionTruncated {
@@ -2866,6 +2893,68 @@ mod tests {
             encoded.capacity(),
             encoded.len()
         );
+    }
+
+    /// R-089 (GH-13) regression: a hostile `OP_CREATE_BATCH` whose
+    /// `cold_data` length exceeds [`MAX_COLD_DATA_PER_ITEM`] MUST be
+    /// rejected by `decode_create_batch_checked` with
+    /// `FieldOutOfBounds` BEFORE the decoder allocates a `Vec` of
+    /// that size. Pre-fix the per-item `cold_len` field was an
+    /// unchecked `u32`, so an attacker could concentrate the entire
+    /// 16 MiB `MAX_FRAME_SIZE` budget into a single create item and
+    /// trigger a same-size `Vec::with_capacity` plus an aligned
+    /// write buffer downstream — multiplying the wire-frame budget
+    /// ~3× per item.
+    #[test]
+    fn create_batch_rejects_cold_data_exceeding_max_per_item() {
+        use crate::protocol::opcodes::MAX_COLD_DATA_PER_ITEM;
+
+        // Build a single create item whose declared cold_data length
+        // is one byte over the cap. We don't actually send the bytes
+        // — the decoder must reject on the length field BEFORE
+        // attempting to slice the payload.
+        let mut payload = Vec::new();
+        // Batch header: count = 1.
+        put_u32(&mut payload, 1u32);
+
+        // First item — fixed prefix until cold_len.
+        // [txid:32][tx_version:4][locktime:4][fee:8][size_in_bytes:8]
+        // [extended_size:8][is_coinbase:1][spending_height:4][created_at:8]
+        // [flags:1][utxo_count:4 = 0][has_cold:1][cold_len:4]
+        payload.extend_from_slice(&[0xAAu8; 32]); // txid
+        put_u32(&mut payload, 1); // tx_version
+        put_u32(&mut payload, 0); // locktime
+        payload.extend_from_slice(&100u64.to_le_bytes()); // fee
+        payload.extend_from_slice(&100u64.to_le_bytes()); // size_in_bytes
+        payload.extend_from_slice(&100u64.to_le_bytes()); // extended_size
+        payload.push(0); // is_coinbase
+        put_u32(&mut payload, 0); // spending_height
+        payload.extend_from_slice(&0u64.to_le_bytes()); // created_at
+        payload.push(0); // flags
+        put_u32(&mut payload, 0); // utxo_count = 0 (no utxo_hashes follow)
+        payload.push(1); // has_cold = true
+        put_u32(&mut payload, MAX_COLD_DATA_PER_ITEM + 1); // POISONED cold_len
+
+        // The validate_batch_count guard checks `count * per_item_min
+        // <= available_bytes`. `per_item_min` for create-batch items is
+        // 96 bytes; pad past that so this guard does NOT pre-empt our
+        // bound check. The R-089 reject path must fire on the cold_len
+        // value itself, not on a length-vs-available mismatch.
+        while payload.len() - 4 < 96 {
+            payload.push(0);
+        }
+
+        let result = decode_create_batch_checked(&payload, MAX_DECODE_BATCH);
+        match result {
+            Err(CodecError::FieldOutOfBounds { field, value, max }) => {
+                assert_eq!(field, "cold_data length per item");
+                assert_eq!(value, (MAX_COLD_DATA_PER_ITEM + 1) as u64);
+                assert_eq!(max, MAX_COLD_DATA_PER_ITEM as u64);
+            }
+            other => panic!(
+                "decode_create_batch_checked must reject oversize cold_len with FieldOutOfBounds, got {other:?}",
+            ),
+        }
     }
 
     #[test]
