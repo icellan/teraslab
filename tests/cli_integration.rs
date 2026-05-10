@@ -56,12 +56,7 @@ fn start_test_server() -> u16 {
         // CLI integration covers /admin/* + /debug/* paths — register them.
         // R-056: gated routes need a bearer token; the CLI under test passes
         // the matching `--admin-token` so every command authenticates.
-        start_http_server(
-            addr,
-            state,
-            true,
-            Some(CLI_TEST_ADMIN_TOKEN.to_string()),
-        );
+        start_http_server(addr, state, true, Some(CLI_TEST_ADMIN_TOKEN.to_string()));
     });
     std::thread::sleep(std::time::Duration::from_millis(200));
     port

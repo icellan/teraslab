@@ -194,11 +194,7 @@ impl HttpClient {
     /// Build a request builder with the Authorization header attached when
     /// `admin_token` is configured. All HTTP methods route through here so
     /// no path can accidentally bypass the auth header.
-    fn request(
-        &self,
-        method: reqwest::Method,
-        path: &str,
-    ) -> reqwest::blocking::RequestBuilder {
+    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::blocking::RequestBuilder {
         let url = format!("{}{}", self.base_url, path);
         let mut builder = self.client.request(method, &url);
         if let Some(ref token) = self.admin_token {

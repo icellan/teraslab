@@ -91,7 +91,11 @@ fn http_get_auth(port: u16, path: &str, bearer: &str) -> (u16, String, String) {
 /// Lower-level GET that supports caller-supplied `extra_headers` (each
 /// terminated by `\r\n`). Internal helper for [`http_get`] and
 /// [`http_get_auth`].
-fn http_get_with_extra_headers(port: u16, path: &str, extra_headers: &str) -> (u16, String, String) {
+fn http_get_with_extra_headers(
+    port: u16,
+    path: &str,
+    extra_headers: &str,
+) -> (u16, String, String) {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -778,7 +782,10 @@ fn all_admin_mutation_routes_require_bearer_token() {
 
     // PUT /admin/drain/{node_id}
     let (status, _) = http_put(port, "/admin/drain/42", "");
-    assert_eq!(status, 401, "PUT /admin/drain/{{node_id}} must require auth");
+    assert_eq!(
+        status, 401,
+        "PUT /admin/drain/{{node_id}} must require auth"
+    );
 }
 
 /// A header that is present but malformed (no scheme, wrong scheme,

@@ -363,9 +363,7 @@ fn main() {
                                     "DAH rebuild failed — degraded readiness",
                                 );
                                 SecondaryLoadOutcome {
-                                    dah: DahBackend::from(
-                                        teraslab::index::DahIndex::new(),
-                                    ),
+                                    dah: DahBackend::from(teraslab::index::DahIndex::new()),
                                     unmined: UnminedBackend::from(unmined),
                                     status: SecondaryStatus {
                                         dah_ok: false,

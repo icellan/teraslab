@@ -263,7 +263,10 @@ async fn require_admin_bearer(
             // Defensive: this branch is only reached if `build_http_router`
             // mounted the gate without a token, which it never does (the
             // builder returns early in that case). Refuse rather than allow.
-            return (StatusCode::UNAUTHORIZED, "missing admin token configuration\n")
+            return (
+                StatusCode::UNAUTHORIZED,
+                "missing admin token configuration\n",
+            )
                 .into_response();
         }
     };

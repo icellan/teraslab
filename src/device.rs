@@ -1245,10 +1245,10 @@ mod tests {
     impl BlockDevice for ChunkyDevice {
         fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
             let mut p = self.progress.lock();
-            if let Some(eof_at) = self.read_eof_at {
-                if *p >= eof_at {
-                    return Ok(0);
-                }
+            if let Some(eof_at) = self.read_eof_at
+                && *p >= eof_at
+            {
+                return Ok(0);
             }
             let take = self.chunk.min(buf.len());
             let data = self.data.lock();
@@ -1267,10 +1267,10 @@ mod tests {
 
         fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize> {
             let mut p = self.progress.lock();
-            if let Some(zero_at) = self.zero_write_at {
-                if *p >= zero_at {
-                    return Ok(0);
-                }
+            if let Some(zero_at) = self.zero_write_at
+                && *p >= zero_at
+            {
+                return Ok(0);
             }
             let take = self.chunk.min(buf.len());
             let mut data = self.data.lock();
