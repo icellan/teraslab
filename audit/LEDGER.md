@@ -361,19 +361,21 @@
 ### R-034 — [replication-wal] Replica-applied mutations skip writing local redo log → failover requires full resync
 - **Source:** AUDIT.md BC-34
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/replication/receiver.rs:713-, src/ops/engine.rs:631-657, src/replication/durable.rs:639
+- **Status:** RESOLVED
+- **Files:** src/replication/receiver.rs (`apply_op`, new `build_post_apply_redo_op`, `write_replica_redo_entry`), src/ops/engine.rs (`Engine::redo_log` public accessor)
 - **Cluster:** replication-wal
-- **Notes:** Receiver's `apply_op` must also write a local redo entry via the engine's `redo_log_handle`. Non-trivial: redo entry must capture post-apply state, not the input op. Without this, failover on a master crash requires full resync of every surviving replica.
-- **Test:** `replica_redo_log_catch_up_after_failover`
+- **Resolution:** Each successful `apply_op` on the replica now appends a `RedoOp::*` entry to the engine's redo log capturing POST-apply state, then flushes BEFORE returning Ok. New `build_post_apply_redo_op(engine, &ReplicaOp)` maps every ReplicaOp variant (Spend / Unspend / SetMined / UnsetMined / Freeze / Unfreeze / Reassign / SetConflicting / SetLocked / PreserveUntil / Create / Delete / PruneSlot) to the matching `RedoOp` with counters (`new_spent_count`) and slot/index state read back from the engine — matching what the master's dispatch path writes pre-apply, so recovery's `replay_*` handlers see the same shape on either side. New `Engine::redo_log()` public accessor exposes the existing redo log handle to the receiver. Append/flush failures hard-fail the batch ACK (returning `ReplicaAck::Error`) so the master retries instead of advancing its durable high-water mark — re-introducing the divergence R-034 was opened to fix would defeat the purpose. Replicas that crash mid-batch can now replay through their own local recovery path; failover after master crash no longer requires a full resync of every surviving replica.
+- **Verification:** `cargo build --release` clean; `cargo test --all` 1478 passed (was 1475), 0 failed, 1 ignored (pre-existing R-002); `cargo clippy --all --all-targets -- -D warnings` clean; `cargo fmt --all -- --check` clean. New tests `replica_redo_log_catch_up_after_failover` (every successful apply emits exactly one redo entry, in order, with correct shape) and `replica_redo_entry_captures_post_apply_state` (two consecutive Spend ops produce entries with `new_spent_count` 1 then 2 — proves entries capture POST-apply state, not the input op verbatim).
+- **Test:** `replica_redo_log_catch_up_after_failover`, `replica_redo_entry_captures_post_apply_state`
 
 ### R-035 — [replication] LMNH-31: replica silently drops `write_metadata` errors during apply; ACKs while diverging
 - **Source:** AUDIT.md LMNH-31, intersects D-19/gap #5
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/replication/receiver.rs:684, :1127
+- **Status:** RESOLVED
+- **Files:** src/replication/receiver.rs (`apply_create_lifecycle_and_blob`, post-apply generation sync at end of `apply_op`)
 - **Cluster:** replication
-- **Notes:** Replace `let _ = io::write_metadata(...)` with proper error handling that fails the batch ACK. Master will retry instead of advancing durable high-water-mark. Use the error pattern from same file lines 216-221.
+- **Resolution:** Replaced both `let _ = crate::io::write_metadata(...)` swallows with `?` propagation through the existing `Result<(), String>` return type. The two sites: (a) extended-lifecycle metadata write (`apply_create_lifecycle_and_blob`) where the master sent generation/updated_at/unmined_since/DAH/preserve_until and we MUST persist them, and (b) the post-apply generation-sync write where the replica records the master's generation. Both `read_metadata` failures (turning the `if let Ok(...)` into `?`) and `write_metadata` failures now bubble up as Err strings; the outer batch loop in `handle_replica_batch_with_tracker` converts the Err into a `ReplicaAck::Error { failed_sequence, message }` (status STATUS_OK envelope, payload is Error variant) — the master treats this as not-yet-durable and retries instead of advancing its durable high-water mark.
+- **Verification:** `cargo build --release` clean; `cargo test --all` 1478 passed, 0 failed; `cargo clippy --all --all-targets -- -D warnings` clean. New regression test `replica_metadata_write_error_fails_batch_ack` builds a `BlockDevice` wrapper (`ArmableFailingDevice`) that fails every pwrite once armed, drives a Spend op through both `apply_op` directly (asserts Err) and `handle_replica_batch` (asserts `ReplicaAck::Error` with `failed_sequence == 1` AND `last_applied` unchanged at 0). The wrapper deliberately returns `None` from `as_raw_ptr()` so the engine's fast path cannot bypass the failing pwrite.
 - **Test:** `replica_metadata_write_error_fails_batch_ack`
 
 ### R-036 — [replication-intent] Replication intent started AFTER local apply; crash between local apply and intent fsync leaves silent local-only mutation
