@@ -2104,6 +2104,27 @@ fn remap_partial_items(pe: &mut PartialError, idx_map: &[usize]) {
     }
 }
 
+/// Group per-item REDIRECT errors by target address.
+///
+/// Wire format of `err.data` (R-041): `[addr_len:2][addr][shard_table_version:8 (le)]`
+/// — produced by the server's `encode_redirect_with_version`. Older
+/// servers emit the legacy form `[addr_len:2][addr]` (no trailing
+/// version); even older servers emit raw `addr_bytes` with no length
+/// prefix. The decoder accepts all three:
+///
+///   1. **Versioned (`addr_len + addr + 8 trailing bytes`)** — preferred;
+///      `decode_redirect_with_version` returns `(addr, Some(version))`.
+///   2. **Length-prefixed (`addr_len + addr`, no trailer)** —
+///      `decode_redirect_with_version` returns `(addr, None)`. Treated
+///      identically: the version is just unknown.
+///   3. **Raw addr bytes (legacy fallback)** — `decode_redirect_with_version`
+///      returns `None` (because the leading two bytes are not a valid
+///      length). We then try `from_utf8` over the whole buffer; if it
+///      parses as a non-empty UTF-8 string, treat it as the address.
+///
+/// Returns `None` if any item fails to parse via all three strategies —
+/// the caller surfaces the redirects as a `PartialError` rather than
+/// retrying blindly.
 fn collect_redirect_groups(
     errors: &[BatchItemError],
     idx_map: &[usize],
@@ -2113,12 +2134,18 @@ fn collect_redirect_groups(
         if err.code != ERR_REDIRECT || err.data.is_empty() {
             return None;
         }
-        let addr = std::str::from_utf8(&err.data).ok()?.trim();
+        let addr = match codec::decode_redirect_with_version(&err.data) {
+            Some((a, _version)) => a,
+            None => {
+                // Legacy raw-addr-only fallback (server predates R-041).
+                std::str::from_utf8(&err.data).ok()?.trim().to_string()
+            }
+        };
         if addr.is_empty() || (err.item_index as usize) >= idx_map.len() {
             return None;
         }
         groups
-            .entry(addr.to_string())
+            .entry(addr)
             .or_default()
             .push(idx_map[err.item_index as usize]);
     }

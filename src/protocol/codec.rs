@@ -1320,9 +1320,18 @@ pub fn decode_error_payload(data: &[u8]) -> Option<(u16, String)> {
 // Redirect response
 // ---------------------------------------------------------------------------
 
-/// Encode a redirect response payload.
+/// Encode a redirect response payload WITHOUT the shard-table version.
 ///
 /// Format: `[addr_len:2][addr]`
+///
+/// Prefer [`encode_redirect_with_version`] for cluster-mode REDIRECT replies:
+/// it appends the source node's `shard_table_version` so the client can
+/// detect a stale-routing loop and stop following before max-hop exhaustion.
+/// Older clients that only decode the address half of the payload remain
+/// compatible because the trailing 8 version bytes are simply ignored.
+///
+/// This bare form is retained for tests and any non-cluster code path that
+/// has no version in scope.
 pub fn encode_redirect(addr: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(2 + addr.len());
     put_u16(&mut buf, addr.len() as u16);
@@ -1330,7 +1339,41 @@ pub fn encode_redirect(addr: &str) -> Vec<u8> {
     buf
 }
 
-/// Decode a redirect response payload.
+/// Encode a redirect response payload that carries the source node's
+/// `shard_table_version` as the trailing 8 bytes.
+///
+/// Wire format: `[addr_len:2][addr][shard_table_version:8 (le)]`
+///
+/// The version is the server's own view of the partition map at the moment
+/// the REDIRECT was issued. A client that has cached a partition map at
+/// version `V_client` and receives a REDIRECT carrying `V_server` can decide:
+///
+///   - `V_server > V_client`: server is strictly ahead — refresh the
+///     partition map and retry against the new master.
+///   - `V_server <= V_client`: server is equal or *behind* the client —
+///     following the redirect would either land on the same node again
+///     (loop) or on a node with an even older view. The client should
+///     stop following and surface a routing error / refresh and retry
+///     instead of chasing.
+///
+/// Back-compat: callers that decode with [`decode_redirect`] (the
+/// address-only form) still parse the same address bytes; the trailing
+/// 8 bytes are silently ignored. New callers use
+/// [`decode_redirect_with_version`] to recover the version too.
+pub fn encode_redirect_with_version(addr: &str, shard_table_version: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(2 + addr.len() + 8);
+    put_u16(&mut buf, addr.len() as u16);
+    buf.extend_from_slice(addr.as_bytes());
+    buf.extend_from_slice(&shard_table_version.to_le_bytes());
+    buf
+}
+
+/// Decode the address half of a redirect response payload.
+///
+/// Compatible with both the legacy `[addr_len:2][addr]` form and the
+/// versioned `[addr_len:2][addr][shard_table_version:8]` form (the
+/// trailing 8 bytes, if present, are ignored). Use
+/// [`decode_redirect_with_version`] when the caller needs the version.
 pub fn decode_redirect(data: &[u8]) -> Option<String> {
     if data.len() < 2 {
         return None;
@@ -1340,6 +1383,73 @@ pub fn decode_redirect(data: &[u8]) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&data[2..2 + len]).to_string())
+}
+
+/// Decode a redirect response payload, recovering the trailing
+/// `shard_table_version` when present.
+///
+/// Returns `(addr, Some(version))` for the versioned form
+/// (`[addr_len:2][addr][shard_table_version:8]`) and `(addr, None)` for
+/// the legacy address-only form. Returns `None` for malformed input
+/// (truncated header, address overruns buffer, or trailing remainder
+/// that is neither 0 nor exactly 8 bytes).
+pub fn decode_redirect_with_version(data: &[u8]) -> Option<(String, Option<u64>)> {
+    if data.len() < 2 {
+        return None;
+    }
+    let len = get_u16(data, 0) as usize;
+    if data.len() < 2 + len {
+        return None;
+    }
+    let addr = String::from_utf8_lossy(&data[2..2 + len]).to_string();
+    let tail = &data[2 + len..];
+    let version = if tail.is_empty() {
+        None
+    } else if tail.len() == 8 {
+        Some(u64::from_le_bytes(tail.try_into().ok()?))
+    } else {
+        // Trailing bytes that are neither 0 nor exactly 8 indicate a
+        // malformed frame — refuse rather than silently truncating.
+        return None;
+    };
+    Some((addr, version))
+}
+
+/// Result of comparing a server-supplied REDIRECT version to a client's
+/// last known partition-map version. Drives the client-side loop-detection
+/// helper so callers don't have to re-implement the comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectFollowDecision {
+    /// Server's `shard_table_version` is strictly greater than the
+    /// client's known version: the server has fresher routing
+    /// information — the client should refresh its partition map (or
+    /// follow the supplied address) and retry.
+    Follow,
+    /// Server's version is equal to or older than the client's: the
+    /// REDIRECT target is stale or would loop back. Stop following.
+    Stale,
+    /// REDIRECT carried no version (legacy server). Caller falls back to
+    /// hop-counter based loop detection.
+    Unknown,
+}
+
+/// Decide whether a client should follow a REDIRECT given the server's
+/// reported `shard_table_version` and the client's own last-known version.
+///
+/// See [`RedirectFollowDecision`] for the three outcomes. Callers that
+/// receive `Stale` should refresh their partition map (re-fetch via
+/// `OP_GET_PARTITION_MAP`) before retrying — chasing the supplied address
+/// is guaranteed to either loop (same shard table version on both sides)
+/// or land on an even-staler view.
+pub fn classify_redirect(
+    server_version: Option<u64>,
+    client_known_version: u64,
+) -> RedirectFollowDecision {
+    match server_version {
+        None => RedirectFollowDecision::Unknown,
+        Some(v) if v > client_known_version => RedirectFollowDecision::Follow,
+        Some(_) => RedirectFollowDecision::Stale,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2470,6 +2580,76 @@ mod tests {
         let encoded = encode_redirect(addr);
         let decoded = decode_redirect(&encoded).unwrap();
         assert_eq!(decoded, addr);
+    }
+
+    // R-041: REDIRECT carries shard_table_version so clients can detect
+    // stale-route loops without relying solely on a hop counter.
+
+    #[test]
+    fn redirect_with_version_round_trip_recovers_addr_and_version() {
+        let addr = "10.0.0.42:3300";
+        let encoded = encode_redirect_with_version(addr, 7);
+        let (decoded_addr, decoded_version) = decode_redirect_with_version(&encoded).unwrap();
+        assert_eq!(decoded_addr, addr);
+        assert_eq!(decoded_version, Some(7));
+    }
+
+    #[test]
+    fn redirect_legacy_addr_only_decodes_with_no_version() {
+        // Old-server form: `[addr_len:2][addr]` with no trailing version.
+        let addr = "10.0.0.7:3300";
+        let encoded = encode_redirect(addr);
+        let (decoded_addr, decoded_version) = decode_redirect_with_version(&encoded).unwrap();
+        assert_eq!(decoded_addr, addr);
+        assert_eq!(decoded_version, None);
+    }
+
+    #[test]
+    fn redirect_versioned_payload_back_compat_with_legacy_decoder() {
+        // New servers emit the versioned form; old clients call
+        // `decode_redirect` (address only) and MUST still parse the
+        // address cleanly, ignoring the trailing 8 version bytes.
+        let addr = "172.20.0.5:3300";
+        let encoded = encode_redirect_with_version(addr, 99);
+        let decoded = decode_redirect(&encoded).unwrap();
+        assert_eq!(decoded, addr);
+    }
+
+    #[test]
+    fn redirect_with_version_rejects_malformed_trailer() {
+        // Trailing byte count must be exactly 0 (legacy) or 8 (versioned).
+        // 4 trailing bytes is malformed and must not silently truncate.
+        let mut bad = encode_redirect("a:1");
+        bad.extend_from_slice(&[1u8, 2, 3, 4]);
+        assert!(decode_redirect_with_version(&bad).is_none());
+    }
+
+    #[test]
+    fn classify_redirect_follow_when_server_strictly_ahead() {
+        assert_eq!(
+            classify_redirect(Some(10), 5),
+            RedirectFollowDecision::Follow
+        );
+    }
+
+    #[test]
+    fn classify_redirect_stale_when_versions_equal() {
+        // Server and client at the same version: following the redirect
+        // would land on a node whose shard table is identical to the
+        // one the client already used — a loop. Stop following.
+        assert_eq!(classify_redirect(Some(5), 5), RedirectFollowDecision::Stale);
+    }
+
+    #[test]
+    fn classify_redirect_stale_when_server_behind() {
+        // Server is strictly older than client — chasing this redirect
+        // would land on a node with a stale view; refresh + retry.
+        assert_eq!(classify_redirect(Some(3), 5), RedirectFollowDecision::Stale);
+    }
+
+    #[test]
+    fn classify_redirect_unknown_when_legacy_server() {
+        assert_eq!(classify_redirect(None, 5), RedirectFollowDecision::Unknown);
     }
 
     // -- FreezeBatch 1 item --
