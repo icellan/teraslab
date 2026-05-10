@@ -132,10 +132,7 @@ fn boundary_before_redo_fsync_leaves_no_state() {
     // do not match a real metadata magic).
     let read_back = io::read_metadata(&*data_dev as &dyn BlockDevice, 0);
     assert!(
-        read_back.is_err()
-            || read_back
-                .map(|m| { m.tx_id } == [0u8; 32])
-                .unwrap_or(false),
+        read_back.is_err() || read_back.map(|m| { m.tx_id } == [0u8; 32]).unwrap_or(false),
         "no record metadata should be visible at offset 0",
     );
 }
@@ -240,7 +237,10 @@ fn boundary_after_record_write_before_replication_local_state_consistent() {
     // record was already there, register the index, and converge to a
     // consistent state.
     let stats = recover(&*data_dev as &dyn BlockDevice, &redo, &mut index).unwrap();
-    assert_eq!(stats.entries_replayed, 1, "CreateV2 still applies (idempotent)");
+    assert_eq!(
+        stats.entries_replayed, 1,
+        "CreateV2 still applies (idempotent)"
+    );
     let entry = index.lookup(&key).expect("index registered");
     assert_eq!(entry.record_offset, record_offset);
 
@@ -298,10 +298,7 @@ fn boundary_after_replication_before_intent_clear_is_idempotent() {
         "commit clears the pending range",
     );
     reopened.commit(first_seq, last_seq).unwrap();
-    assert!(
-        reopened.pending().is_empty(),
-        "second commit is idempotent",
-    );
+    assert!(reopened.pending().is_empty(), "second commit is idempotent",);
 
     // Reopening once more confirms the on-disk state matches the
     // in-memory clear.

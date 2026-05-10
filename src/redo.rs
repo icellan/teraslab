@@ -729,8 +729,7 @@ impl RedoOp {
                 let record_offset = u64::from_le_bytes(data[32..40].try_into().unwrap());
                 let utxo_count = u32::from_le_bytes(data[40..44].try_into().unwrap());
                 let is_conflicting = data[44] != 0;
-                let record_len =
-                    u32::from_le_bytes(data[45..49].try_into().unwrap()) as usize;
+                let record_len = u32::from_le_bytes(data[45..49].try_into().unwrap()) as usize;
                 let record_end = 49usize.checked_add(record_len)?;
                 if data.len() < record_end + 2 {
                     return None;

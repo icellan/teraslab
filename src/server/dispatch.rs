@@ -121,8 +121,7 @@ static DISPATCH_REPLICA_LAST_APPLIED: AtomicU64 = AtomicU64::new(0);
 /// Both flags default to `true` (healthy) at process start so that test
 /// harnesses and code paths that never call [`set_secondary_status`] keep
 /// the historical "everything is ready" behavior.
-static SECONDARY_DAH_OK: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+static SECONDARY_DAH_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static SECONDARY_UNMINED_OK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
@@ -1592,10 +1591,7 @@ pub(crate) enum BeforeImage {
     /// No before-image needed — compensation reads current device state.
     None,
     /// Captured pre-apply block-entry fields for an unset-mined op.
-    UnsetMined {
-        block_height: u32,
-        subtree_idx: u32,
-    },
+    UnsetMined { block_height: u32, subtree_idx: u32 },
     /// Captured pre-apply utxo_hash for a reassign op.
     Reassign { prior_utxo_hash: [u8; 32] },
     /// Captured pre-apply status byte for a prune op.
@@ -2531,12 +2527,7 @@ fn handle_spend_batch(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(spend_redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -2616,8 +2607,7 @@ fn handle_unspend_batch(
     // 0) for every entry — replay is idempotent against UTXO_UNSPENT
     // slots so over-decrement on a re-played idempotent redo is
     // harmless because replay skips before touching metadata.
-    let mut running_spent: std::collections::HashMap<TxKey, u32> =
-        std::collections::HashMap::new();
+    let mut running_spent: std::collections::HashMap<TxKey, u32> = std::collections::HashMap::new();
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
@@ -2713,12 +2703,7 @@ fn handle_unspend_batch(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -2791,8 +2776,7 @@ fn handle_set_mined_batch(
             .filter_map(|v| {
                 let meta = engine.read_metadata(&v.key).ok()?;
                 let count = meta.block_entry_count as usize;
-                let inline =
-                    count.min(crate::record::INLINE_BLOCK_ENTRIES);
+                let inline = count.min(crate::record::INLINE_BLOCK_ENTRIES);
                 for i in 0..inline {
                     if { meta.block_entries_inline[i].block_id } == params.block_id {
                         return Some((
@@ -2849,10 +2833,12 @@ fn handle_set_mined_batch(
                     ));
                     before_images_by_key.push((
                         v.key,
-                        vec![pre_unset_image
-                            .get(&v.key)
-                            .copied()
-                            .unwrap_or(BeforeImage::None)],
+                        vec![
+                            pre_unset_image
+                                .get(&v.key)
+                                .copied()
+                                .unwrap_or(BeforeImage::None),
+                        ],
                     ));
                 } else {
                     repl_ops_by_key.push((
@@ -3275,12 +3261,7 @@ fn handle_create_batch(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -3379,12 +3360,7 @@ fn handle_freeze_batch(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -3478,12 +3454,7 @@ fn handle_unfreeze_batch(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -3708,12 +3679,7 @@ fn handle_set_conflicting_batch(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -3806,12 +3772,7 @@ fn handle_set_locked_batch(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -3905,12 +3866,7 @@ fn handle_preserve_until_batch(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -4672,12 +4628,7 @@ fn handle_preserve_transactions(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -6566,8 +6517,7 @@ mod tests {
 
         // Simulate "redo fsynced but engine lost": roll slot 0 back to
         // SPENT and counter back to 2.
-        let spent_zero =
-            crate::record::UtxoSlot::new_spent(original_slots[0].hash, [0xC0; 36]);
+        let spent_zero = crate::record::UtxoSlot::new_spent(original_slots[0].hash, [0xC0; 36]);
         crate::io::write_utxo_slot(
             &*h.data_dev as &dyn crate::device::BlockDevice,
             record_offset,
@@ -9682,7 +9632,8 @@ mod tests {
                 unmined_ok: false,
             },
         ] {
-            let resp = secondary_readiness_verdict(OP_DELETE_BATCH, *status, 1).expect("must reject");
+            let resp =
+                secondary_readiness_verdict(OP_DELETE_BATCH, *status, 1).expect("must reject");
             assert_eq!(extract_err(&resp), ERR_INDEX_DEGRADED);
         }
     }
@@ -9849,12 +9800,7 @@ mod tests {
             }],
         )];
         let before_images = vec![(key, vec![before_image])];
-        compensate_replication_failure(
-            &h.engine,
-            &repl_ops,
-            &before_images,
-            Some(&h.redo_log),
-        );
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log));
 
         // Post-compensation: the block entry MUST be restored with the
         // original (height, subtree). Not zeros.
@@ -9940,12 +9886,7 @@ mod tests {
                 prior_utxo_hash: original_hash,
             }],
         )];
-        compensate_replication_failure(
-            &h.engine,
-            &repl_ops,
-            &before_images,
-            Some(&h.redo_log),
-        );
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log));
 
         // Post-compensation: slot's hash MUST be the original — NOT zeros.
         let post_slot = h.engine.read_slot(&key, 0).expect("read post slot");
@@ -9975,12 +9916,8 @@ mod tests {
         // the dispatch path — we want to control the prior_status byte
         // explicitly).
         let entry = h.engine.lookup(&key).expect("lookup");
-        let mut slot = crate::io::read_utxo_slot(
-            h.engine.device(),
-            entry.record_offset,
-            0,
-        )
-        .expect("read slot");
+        let mut slot = crate::io::read_utxo_slot(h.engine.device(), entry.record_offset, 0)
+            .expect("read slot");
         slot.status = UTXO_SPENT;
         crate::io::write_utxo_slot(h.engine.device(), entry.record_offset, 0, &slot)
             .expect("write spent slot");
@@ -9994,7 +9931,10 @@ mod tests {
         // Run compensation with captured prior status = SPENT.
         let repl_ops = vec![(
             key,
-            vec![ReplicaOp::PruneSlot { tx_key: key, offset: 0 }],
+            vec![ReplicaOp::PruneSlot {
+                tx_key: key,
+                offset: 0,
+            }],
         )];
         let before_images = vec![(
             key,
@@ -10002,12 +9942,7 @@ mod tests {
                 prior_status: UTXO_SPENT,
             }],
         )];
-        compensate_replication_failure(
-            &h.engine,
-            &repl_ops,
-            &before_images,
-            Some(&h.redo_log),
-        );
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log));
 
         // Post-compensation: slot status MUST be SPENT, NOT UNSPENT.
         let post_slot = crate::io::read_utxo_slot(h.engine.device(), entry.record_offset, 0)
@@ -10031,12 +9966,8 @@ mod tests {
         let key = rollback_seed_record(&h, txid, 1);
 
         let entry = h.engine.lookup(&key).expect("lookup");
-        let mut slot = crate::io::read_utxo_slot(
-            h.engine.device(),
-            entry.record_offset,
-            0,
-        )
-        .expect("read slot");
+        let mut slot = crate::io::read_utxo_slot(h.engine.device(), entry.record_offset, 0)
+            .expect("read slot");
         slot.status = UTXO_FROZEN;
         crate::io::write_utxo_slot(h.engine.device(), entry.record_offset, 0, &slot)
             .expect("write frozen slot");
@@ -10049,7 +9980,10 @@ mod tests {
 
         let repl_ops = vec![(
             key,
-            vec![ReplicaOp::PruneSlot { tx_key: key, offset: 0 }],
+            vec![ReplicaOp::PruneSlot {
+                tx_key: key,
+                offset: 0,
+            }],
         )];
         let before_images = vec![(
             key,
@@ -10057,12 +9991,7 @@ mod tests {
                 prior_status: UTXO_FROZEN,
             }],
         )];
-        compensate_replication_failure(
-            &h.engine,
-            &repl_ops,
-            &before_images,
-            Some(&h.redo_log),
-        );
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log));
 
         let post_slot = crate::io::read_utxo_slot(h.engine.device(), entry.record_offset, 0)
             .expect("read post slot");
@@ -10138,10 +10067,10 @@ mod tests {
         // Verify the slot's metadata pre-recovery: the entry should be
         // ABSENT (the unset removed it; the compensation hasn't run yet).
         let pre_meta = h.engine.read_metadata(&key).expect("pre meta");
-        let pre_inline = (pre_meta.block_entry_count as usize)
-            .min(crate::record::INLINE_BLOCK_ENTRIES);
-        let pre_present = (0..pre_inline)
-            .any(|i| { pre_meta.block_entries_inline[i].block_id } == block_id);
+        let pre_inline =
+            (pre_meta.block_entry_count as usize).min(crate::record::INLINE_BLOCK_ENTRIES);
+        let pre_present =
+            (0..pre_inline).any(|i| { pre_meta.block_entries_inline[i].block_id } == block_id);
         assert!(
             !pre_present,
             "block entry should be absent before recovery (precondition)"
@@ -10152,8 +10081,8 @@ mod tests {
         let h2 = h.crash_and_recover();
 
         let post_meta = h2.engine.read_metadata(&key).expect("post meta");
-        let post_inline = (post_meta.block_entry_count as usize)
-            .min(crate::record::INLINE_BLOCK_ENTRIES);
+        let post_inline =
+            (post_meta.block_entry_count as usize).min(crate::record::INLINE_BLOCK_ENTRIES);
         let mut restored = false;
         for i in 0..post_inline {
             if { post_meta.block_entries_inline[i].block_id } == block_id {
@@ -10252,12 +10181,7 @@ mod tests {
                 prior_utxo_hash: original_hash,
             }],
         )];
-        compensate_replication_failure(
-            &h.engine,
-            &repl_ops,
-            &before_images,
-            Some(&h.redo_log),
-        );
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log));
 
         // Post-rollback slot: hash MUST equal the pre-reassign hash.
         let post_slot = crate::io::read_utxo_slot(h.engine.device(), entry.record_offset, 0)
