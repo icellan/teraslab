@@ -103,7 +103,7 @@ const OP_PRESERVE_UNTIL: u8 = 10;
 const OP_CREATE: u8 = 11;
 const OP_DELETE: u8 = 12;
 const OP_PRUNE_SLOT: u8 = 13;
-const _OP_MARK_LONGEST_CHAIN: u8 = 14;
+const OP_MARK_LONGEST_CHAIN: u8 = 14;
 
 /// A single replication operation sent from master to replica.
 /// A mutation operation to be replicated from master to replica.
@@ -188,6 +188,20 @@ pub enum ReplicaOp {
         tx_key: TxKey,
         offset: u32,
     },
+    /// Mark a transaction as on or off the longest chain.
+    ///
+    /// Mutates `unmined_since`, `delete_at_height`, and `generation` on
+    /// the master and must therefore be replicated. Recovery replay and
+    /// receiver apply paths use `master_generation` as the idempotency
+    /// token (R-053): a replica that already has `meta.generation >=
+    /// master_generation` treats this op as already applied.
+    MarkLongestChain {
+        tx_key: TxKey,
+        on_longest_chain: bool,
+        current_block_height: u32,
+        block_height_retention: u32,
+        master_generation: u32,
+    },
 }
 
 impl ReplicaOp {
@@ -206,7 +220,8 @@ impl ReplicaOp {
             | Self::PreserveUntil { tx_key, .. }
             | Self::Create { tx_key, .. }
             | Self::Delete { tx_key, .. }
-            | Self::PruneSlot { tx_key, .. } => *tx_key,
+            | Self::PruneSlot { tx_key, .. }
+            | Self::MarkLongestChain { tx_key, .. } => *tx_key,
         }
     }
 
@@ -244,6 +259,9 @@ impl ReplicaOp {
                 master_generation, ..
             }
             | Self::PreserveUntil {
+                master_generation, ..
+            }
+            | Self::MarkLongestChain {
                 master_generation, ..
             } => Some(*master_generation),
             Self::Create { .. } | Self::Delete { .. } | Self::PruneSlot { .. } => None,
@@ -409,6 +427,20 @@ impl ReplicaOp {
                 buf.push(OP_PRUNE_SLOT);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
+            }
+            ReplicaOp::MarkLongestChain {
+                tx_key,
+                on_longest_chain,
+                current_block_height,
+                block_height_retention,
+                master_generation,
+            } => {
+                buf.push(OP_MARK_LONGEST_CHAIN);
+                buf.extend_from_slice(&tx_key.txid);
+                buf.push(u8::from(*on_longest_chain));
+                buf.extend_from_slice(&current_block_height.to_le_bytes());
+                buf.extend_from_slice(&block_height_retention.to_le_bytes());
+                buf.extend_from_slice(&master_generation.to_le_bytes());
             }
         }
         buf
@@ -617,6 +649,21 @@ impl ReplicaOp {
                         offset: r_u32(rest, 32),
                     },
                     37,
+                ))
+            }
+            OP_MARK_LONGEST_CHAIN => {
+                // 32(tx_key) + 1(on_longest_chain) + 4(current_block_height)
+                // + 4(block_height_retention) + 4(master_generation) = 45.
+                need(rest, 45)?;
+                Ok((
+                    ReplicaOp::MarkLongestChain {
+                        tx_key: read_key(rest),
+                        on_longest_chain: rest[32] != 0,
+                        current_block_height: r_u32(rest, 33),
+                        block_height_retention: r_u32(rest, 37),
+                        master_generation: r_u32(rest, 41),
+                    },
+                    46,
                 ))
             }
             _ => Err(ProtocolError::UnknownOp(op_type)),
@@ -1043,6 +1090,13 @@ mod tests {
                 tx_key: key(13),
                 offset: 99,
             },
+            ReplicaOp::MarkLongestChain {
+                tx_key: key(14),
+                on_longest_chain: true,
+                current_block_height: 800_000,
+                block_height_retention: 288,
+                master_generation: 7,
+            },
         ];
 
         for op in &ops {
@@ -1050,6 +1104,68 @@ mod tests {
             let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
             assert_eq!(&decoded, op, "round-trip failed for {op:?}");
             assert_eq!(consumed, bytes.len());
+        }
+    }
+
+    /// R-052: explicit byte-layout round-trip for `MarkLongestChain`.
+    /// Verifies opcode 14, the exact 46-byte serialized length, and that
+    /// `on_longest_chain=false`, large `current_block_height`, and a
+    /// non-zero `master_generation` all survive a serialize/deserialize
+    /// round-trip — the decoder MUST observe the same bytes the encoder
+    /// emits.
+    #[test]
+    fn replica_op_mark_longest_chain_round_trip() {
+        // on_longest_chain = true case
+        let op_true = ReplicaOp::MarkLongestChain {
+            tx_key: key(0xAA),
+            on_longest_chain: true,
+            current_block_height: 0xDEAD_BEEF,
+            block_height_retention: 288,
+            master_generation: 42,
+        };
+        let bytes = op_true.serialize();
+        // 1 (opcode) + 32 (tx_key) + 1 (bool) + 4 + 4 + 4 = 46 bytes.
+        assert_eq!(bytes.len(), 46, "MarkLongestChain wire size must be 46");
+        // First byte must be opcode 14.
+        assert_eq!(bytes[0], 14, "MarkLongestChain opcode must be 14");
+        let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, op_true);
+        assert_eq!(consumed, 46);
+
+        // on_longest_chain = false case (the reorg-rollback flavor) —
+        // unmined_since gets set to current_block_height.
+        let op_false = ReplicaOp::MarkLongestChain {
+            tx_key: key(0xBB),
+            on_longest_chain: false,
+            current_block_height: 750_000,
+            block_height_retention: 0,
+            master_generation: u32::MAX,
+        };
+        let bytes2 = op_false.serialize();
+        assert_eq!(bytes2.len(), 46);
+        let (decoded2, consumed2) = ReplicaOp::deserialize(&bytes2).unwrap();
+        assert_eq!(decoded2, op_false);
+        assert_eq!(consumed2, 46);
+
+        // Sanity: tx_key + master_generation are exposed via accessors.
+        assert_eq!(decoded.tx_key(), key(0xAA));
+        assert_eq!(decoded.master_generation(), Some(42));
+        assert_eq!(decoded2.master_generation(), Some(u32::MAX));
+    }
+
+    /// Future-proofing guard: an unknown opcode (e.g. a value the
+    /// receiver doesn't yet recognise) MUST surface
+    /// [`ProtocolError::UnknownOp`] rather than panic, silently advance,
+    /// or misinterpret subsequent bytes. R-052 introduces opcode 14;
+    /// this test asserts the rejection path stays intact for opcode 99.
+    #[test]
+    fn unknown_op_byte_rejected_explicitly() {
+        let mut bad = vec![0u8; 64];
+        bad[0] = 99; // unassigned opcode
+        let err = ReplicaOp::deserialize(&bad).expect_err("unknown opcode must error");
+        match err {
+            ProtocolError::UnknownOp(v) => assert_eq!(v, 99),
+            other => panic!("expected UnknownOp(99), got {other:?}"),
         }
     }
 

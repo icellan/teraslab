@@ -4844,8 +4844,35 @@ pub fn redo_entry_to_replica_op(
             }
             Some(ReplicaOp::Delete { tx_key: *tx_key })
         }
-        // Checkpoint is a no-op. MarkOnLongestChain is a secondary index
-        // operation that gets rebuilt. SecondaryUnminedUpdate and
+        RedoOp::MarkOnLongestChain {
+            tx_key,
+            on_longest_chain,
+            current_block_height,
+            block_height_retention,
+            generation,
+        } => {
+            // R-052: a longest-chain mark applied after the baseline
+            // snapshot mutates `unmined_since` / DAH / generation on the
+            // master and MUST be forwarded so the migration target's
+            // copy of the record stays consistent with the source's.
+            // Pre-fix this entry was dropped, leaving the target's DAH
+            // and unmined_since stale on every reorg that landed inside
+            // the migration window. The redo entry already carries the
+            // exact target generation — propagate it as the master's
+            // generation so the receiver's R-053 idempotency gate
+            // observes the correct token.
+            if ShardTable::shard_for_key(tx_key) != shard {
+                return None;
+            }
+            Some(ReplicaOp::MarkLongestChain {
+                tx_key: *tx_key,
+                on_longest_chain: *on_longest_chain,
+                current_block_height: *current_block_height,
+                block_height_retention: *block_height_retention,
+                master_generation: *generation,
+            })
+        }
+        // Checkpoint is a no-op. SecondaryUnminedUpdate and
         // SecondaryDahUpdate are local durability-intent records for the
         // redb secondary indexes — replicas rebuild their secondaries from
         // their own metadata replay. AllocateRegion/FreeRegion are local
@@ -4862,7 +4889,6 @@ pub fn redo_entry_to_replica_op(
         // would attempt to "undo" an op the target never received and produce
         // divergence. Drop them from the migration delta.
         RedoOp::Checkpoint
-        | RedoOp::MarkOnLongestChain { .. }
         | RedoOp::SecondaryUnminedUpdate { .. }
         | RedoOp::SecondaryDahUpdate { .. }
         | RedoOp::AllocateRegion { .. }

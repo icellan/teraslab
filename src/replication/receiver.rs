@@ -1090,6 +1090,43 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 .map_err(|e| format!("prune_slot: {e}"))?;
             Ok(())
         }
+        ReplicaOp::MarkLongestChain {
+            tx_key,
+            on_longest_chain,
+            current_block_height,
+            block_height_retention,
+            master_generation,
+        } => {
+            // R-053: idempotency-by-generation. The pre-apply guard at
+            // the top of `apply_op` already rejects strictly-stale ops
+            // (`master_gen < local_gen`). For MarkLongestChain we also
+            // need to skip the equal-generation case: re-applying the
+            // same `MarkLongestChain` would otherwise bump generation
+            // again on the engine and write a stale `unmined_since`/DAH
+            // pair into the secondary indexes, even though the post-
+            // apply generation sync at the bottom of `apply_op` would
+            // immediately overwrite it back to `master_generation`. The
+            // visible effect would be a DAH index churn on every replay.
+            // Treating the equal-generation case as a no-op makes the
+            // op fully idempotent on the replica.
+            if let Ok(meta) = engine.read_metadata(tx_key) {
+                let local_gen = { meta.generation };
+                if local_gen >= *master_generation {
+                    return Ok(());
+                }
+            }
+            let req = crate::ops::mark_longest_chain::MarkOnLongestChainRequest {
+                tx_key: *tx_key,
+                on_longest_chain: *on_longest_chain,
+                current_block_height: *current_block_height,
+                block_height_retention: *block_height_retention,
+            };
+            match engine.mark_on_longest_chain(&req) {
+                Ok(_) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(e) => Err(format!("mark_longest_chain: {e}")),
+            }
+        }
     }?;
 
     // After applying the mutation, sync the record's generation counter
@@ -1469,6 +1506,169 @@ mod tests {
         apply_op(&engine, &op2).unwrap();
         let slot = engine.read_slot(&k, 1).unwrap();
         assert_eq!(slot.status, UTXO_UNSPENT);
+    }
+
+    /// R-052: applying a `MarkLongestChain` `ReplicaOp` MUST mutate
+    /// `unmined_since`, run the DAH evaluator, and sync the record's
+    /// generation to the master's value. Pre-fix the variant did not
+    /// exist; the receiver had no way to apply this mutation at all.
+    #[test]
+    fn apply_mark_longest_chain_off_sets_unmined_and_syncs_generation() {
+        let engine = make_engine();
+        let k = key(120);
+        create_record(&engine, k, 1);
+
+        let pre_gen = { engine.read_metadata(&k).unwrap().generation };
+        let master_generation = pre_gen + 1;
+        let op = ReplicaOp::MarkLongestChain {
+            tx_key: k,
+            on_longest_chain: false,
+            current_block_height: 800_000,
+            block_height_retention: 288,
+            master_generation,
+        };
+        apply_op(&engine, &op).unwrap();
+
+        let post = engine.read_metadata(&k).unwrap();
+        assert_eq!(
+            { post.unmined_since },
+            800_000,
+            "off-chain mark must set unmined_since to current_block_height",
+        );
+        assert_eq!(
+            { post.generation },
+            master_generation,
+            "generation must sync to master_generation after apply",
+        );
+    }
+
+    /// R-052: re-marking a record back ON the longest chain MUST clear
+    /// `unmined_since`. Verifies the inverse path of the off-chain test.
+    #[test]
+    fn apply_mark_longest_chain_on_clears_unmined() {
+        let engine = make_engine();
+        let k = key(121);
+        create_record(&engine, k, 1);
+
+        let g1 = { engine.read_metadata(&k).unwrap().generation } + 1;
+        apply_op(
+            &engine,
+            &ReplicaOp::MarkLongestChain {
+                tx_key: k,
+                on_longest_chain: false,
+                current_block_height: 800_000,
+                block_height_retention: 288,
+                master_generation: g1,
+            },
+        )
+        .unwrap();
+        assert_eq!({ engine.read_metadata(&k).unwrap().unmined_since }, 800_000);
+
+        // Now mark it back ON: unmined_since must reset to 0 and the
+        // generation must advance.
+        let g2 = g1 + 1;
+        apply_op(
+            &engine,
+            &ReplicaOp::MarkLongestChain {
+                tx_key: k,
+                on_longest_chain: true,
+                current_block_height: 801_000,
+                block_height_retention: 288,
+                master_generation: g2,
+            },
+        )
+        .unwrap();
+        let post = engine.read_metadata(&k).unwrap();
+        assert_eq!(
+            { post.unmined_since },
+            0,
+            "on-chain mark must clear unmined_since"
+        );
+        assert_eq!({ post.generation }, g2);
+    }
+
+    /// R-053: replaying the same `MarkLongestChain` op twice (same
+    /// `master_generation`) MUST be a no-op the second time. Equal-
+    /// generation guard inside `apply_op` for MarkLongestChain skips
+    /// the engine call entirely so generation does not bump twice and
+    /// the DAH/unmined indexes are not re-written.
+    ///
+    /// This is the unit-level mirror of the TCP integration test
+    /// `mark_longest_chain_replay_idempotent` — fails fast at the
+    /// receiver layer if the equal-generation gate is dropped.
+    #[test]
+    fn apply_mark_longest_chain_equal_generation_idempotent() {
+        let engine = make_engine();
+        let k = key(122);
+        create_record(&engine, k, 1);
+
+        let pre_gen = { engine.read_metadata(&k).unwrap().generation };
+        let master_generation = pre_gen + 1;
+        let op = ReplicaOp::MarkLongestChain {
+            tx_key: k,
+            on_longest_chain: false,
+            current_block_height: 850_000,
+            block_height_retention: 288,
+            master_generation,
+        };
+
+        // First apply mutates state.
+        apply_op(&engine, &op).unwrap();
+        let post1 = engine.read_metadata(&k).unwrap();
+        let post1_gen = { post1.generation };
+        let post1_unmined = { post1.unmined_since };
+        let post1_dah = { post1.delete_at_height };
+        assert_eq!(post1_gen, master_generation);
+        assert_eq!(post1_unmined, 850_000);
+
+        // Second apply (equal generation) MUST be a no-op.
+        apply_op(&engine, &op).unwrap();
+        let post2 = engine.read_metadata(&k).unwrap();
+        assert_eq!(
+            { post2.generation },
+            post1_gen,
+            "equal-generation replay must NOT bump generation (R-053)",
+        );
+        assert_eq!({ post2.unmined_since }, post1_unmined);
+        assert_eq!({ post2.delete_at_height }, post1_dah);
+    }
+
+    /// R-052: a strictly-stale `MarkLongestChain` op (master_generation
+    /// strictly less than the replica's current generation) MUST be
+    /// rejected by the pre-apply guard at the top of `apply_op`. The
+    /// replica's `unmined_since` must NOT be reverted.
+    #[test]
+    fn apply_stale_mark_longest_chain_skipped() {
+        let engine = make_engine();
+        let k = key(123);
+        create_record(&engine, k, 1);
+
+        // Advance to gen=5 via a non-chain op.
+        let op_advance = ReplicaOp::Freeze {
+            tx_key: k,
+            offset: 0,
+            master_generation: 5,
+        };
+        apply_op(&engine, &op_advance).unwrap();
+        let cur_gen = { engine.read_metadata(&k).unwrap().generation };
+        assert_eq!(cur_gen, 5);
+
+        // Stale MarkLongestChain at gen=3 — must NOT mutate state.
+        let stale = ReplicaOp::MarkLongestChain {
+            tx_key: k,
+            on_longest_chain: false,
+            current_block_height: 900_000,
+            block_height_retention: 288,
+            master_generation: 3,
+        };
+        apply_op(&engine, &stale).unwrap();
+        let post = engine.read_metadata(&k).unwrap();
+        assert_eq!({ post.generation }, 5, "stale op must not bump generation");
+        assert_eq!(
+            { post.unmined_since },
+            0,
+            "stale off-chain mark must NOT set unmined_since",
+        );
     }
 
     /// Build a full metadata buffer matching the extended wire format used by

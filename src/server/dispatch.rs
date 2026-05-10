@@ -2026,6 +2026,36 @@ fn compensate_replication_failure(
                     // If this path is reached from another handler, the record
                     // is already destroyed and cannot be restored here.
                 }
+                ReplicaOp::MarkLongestChain {
+                    on_longest_chain,
+                    current_block_height,
+                    block_height_retention,
+                    ..
+                } => {
+                    // R-052 best-effort compensation: re-apply with the
+                    // inverse `on_longest_chain` flag. Matches the no-
+                    // before-image strategy used by SetConflicting /
+                    // SetLocked / PreserveUntil — bit-exact pre-image
+                    // restoration is deferred until a dedicated
+                    // BeforeImage::MarkLongestChain variant is plumbed
+                    // through. The forward redo entry mirrors the call
+                    // so a recovery replay performs the same flip.
+                    let req = crate::ops::mark_longest_chain::MarkOnLongestChainRequest {
+                        tx_key: *key,
+                        on_longest_chain: !on_longest_chain,
+                        current_block_height: *current_block_height,
+                        block_height_retention: *block_height_retention,
+                    };
+                    if let Ok(resp) = engine.mark_on_longest_chain(&req) {
+                        comp_redo.push(RedoOp::MarkOnLongestChain {
+                            tx_key: *key,
+                            on_longest_chain: !on_longest_chain,
+                            current_block_height: *current_block_height,
+                            block_height_retention: *block_height_retention,
+                            generation: resp.generation,
+                        });
+                    }
+                }
             }
         }
     }
@@ -4398,11 +4428,16 @@ fn handle_mark_longest_chain_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    if let Err(e) = write_redo_ops(redo_log, &redo_ops) {
-        return error_response(req.request_id, ERR_INTERNAL, &e);
-    }
+    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+        Ok(range) => range,
+        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+    };
 
-    // Phase 3: Apply engine mutations.
+    // Phase 3: Apply engine mutations and capture per-item master
+    // generation so the replicated op carries the correct idempotency
+    // token (R-053). Build `repl_ops_by_key` in lockstep — only items
+    // that successfully apply locally get replicated.
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
     for v in &valid_items {
         match engine.mark_on_longest_chain(&MarkOnLongestChainRequest {
             tx_key: v.key,
@@ -4410,9 +4445,22 @@ fn handle_mark_longest_chain_batch(
             current_block_height: cbh,
             block_height_retention: bhr,
         }) {
-            Ok(_) => {
-                // MarkOnLongestChain is metadata-only; no dedicated ReplicaOp
-                // needed — the SetMined replication already covers block tracking.
+            Ok(resp) => {
+                // R-052: emit a dedicated MarkLongestChain ReplicaOp so
+                // replicas observe the same `unmined_since` / DAH /
+                // generation transition the master just applied.
+                // Pre-fix this handler emitted nothing here — silent
+                // master/replica divergence on every reorg.
+                repl_ops_by_key.push((
+                    v.key,
+                    vec![ReplicaOp::MarkLongestChain {
+                        tx_key: v.key,
+                        on_longest_chain,
+                        current_block_height: cbh,
+                        block_height_retention: bhr,
+                        master_generation: resp.generation,
+                    }],
+                ));
             }
             Err(err) => {
                 errors.push(spend_error_to_batch_error(v.idx as u32, &err));
@@ -4437,7 +4485,18 @@ fn handle_mark_longest_chain_batch(
         }
     }
 
-    batch_response(req.request_id, &errors)
+    // Phase 4: Replicate. Mirrors set_mined / spend handlers.
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+        Ok(o) => o,
+        Err(e) => {
+            let before_images = no_before_images(&repl_ops_by_key);
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
+            clear_replication_intent_after_compensation(redo_range);
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+        }
+    };
+
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -5431,11 +5490,7 @@ fn codec_error_response(request_id: u64, op_label: &str, err: CodecError) -> Res
     )
 }
 
-fn batch_response(request_id: u64, errors: &[BatchItemError]) -> ResponseFrame {
-    batch_response_with_outcome(request_id, errors, ReplicationOutcome::Full)
-}
-
-/// Like [`batch_response`], but promotes a clean response to
+/// Build a per-batch response frame, promoting clean responses to
 /// `STATUS_DEGRADED_DURABILITY` when replication returned
 /// [`ReplicationOutcome::Degraded`] (best-effort mode, zero replica ACKs).
 ///
@@ -5445,6 +5500,9 @@ fn batch_response(request_id: u64, errors: &[BatchItemError]) -> ResponseFrame {
 /// per-item diagnostic detail the client needs. The degraded-durability
 /// metric has already been incremented inside `replicate_all_ops`, so the
 /// server-side telemetry is unaffected.
+///
+/// Callers in non-cluster paths can pass [`ReplicationOutcome::Full`]
+/// (or [`ReplicationOutcome::NotApplicable`]) to get plain `STATUS_OK`.
 fn batch_response_with_outcome(
     request_id: u64,
     errors: &[BatchItemError],
