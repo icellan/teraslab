@@ -1,5 +1,7 @@
 //! Storage tier definitions for cold data placement.
 
+use crate::storage::blobstore::BlobDigest;
+
 /// Cold data up to this size is stored inline in the same NVMe allocation
 /// as the hot record (metadata + UTXO slots + cold data in one write).
 pub const INLINE_THRESHOLD: usize = 8 * 1024; // 8 KiB
@@ -38,8 +40,17 @@ pub enum ColdDataRef {
     Inline { cold_size: u32 },
     /// Written to a separate NVMe allocation.
     SeparateNvme { device_offset: u64, cold_size: u32 },
-    /// Will be uploaded to external blob store asynchronously.
-    External,
+    /// Uploaded to the external blob store.
+    ///
+    /// Carries the [`BlobDigest`] returned by [`crate::storage::blobstore::BlobStore::put`]
+    /// so the caller can stamp the actual content SHA-256 and length into the
+    /// record's [`crate::record::ExternalRef`]. Without this digest the
+    /// `content_hash` on the record would remain zero and any subsequent
+    /// integrity check on the blob payload would either trivially pass (if the
+    /// reader compares against zero) or trivially fail (if the reader compares
+    /// against the real digest). See R-048 / AUDIT.md IJK-01 for the
+    /// regression this prevents.
+    External { digest: BlobDigest },
     /// No cold data.
     None,
 }

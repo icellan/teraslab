@@ -114,14 +114,20 @@ impl StorageManager {
                 })
             }
             StorageTier::External => {
-                // The blob store returns the actual content digest and length;
-                // we discard them here because the synchronous write path in
-                // this manager does not currently maintain an `ExternalRef`.
-                // The async [`BlobUploader`](super::uploader::BlobUploader)
-                // path stamps the digest into the record's `ExternalRef` so
-                // subsequent reads can be integrity-checked end-to-end.
-                let _digest = self.blob_store.put(tx_id, &serialized)?;
-                Ok(ColdDataRef::External)
+                // R-048 (AUDIT.md IJK-01): the synchronous external-tier
+                // write path used to discard the digest returned by
+                // `BlobStore::put`, leaving any caller no way to populate
+                // `ExternalRef.content_hash`. With the digest stranded at
+                // zero, end-to-end integrity checks on subsequent reads
+                // become theatre — a corruption check that compares the
+                // recomputed payload SHA-256 against a zero digest would
+                // silently pass on bit rot or tampering. We now propagate
+                // the manager-returned `BlobDigest` through
+                // `ColdDataRef::External { digest }` so callers can stamp
+                // the actual SHA-256 and length into the record's
+                // `ExternalRef` BEFORE the metadata write.
+                let digest = self.blob_store.put(tx_id, &serialized)?;
+                Ok(ColdDataRef::External { digest })
             }
         }
     }
@@ -801,7 +807,14 @@ mod tests {
         let result = mgr
             .write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
             .unwrap();
-        assert_eq!(result, ColdDataRef::External);
+        let digest = match result {
+            ColdDataRef::External { digest } => digest,
+            other => panic!("expected External, got {other:?}"),
+        };
+        // The manager-returned digest must reflect the actual SHA-256 / length
+        // of the serialized cold-data payload — never a placeholder zero.
+        assert_eq!(digest.length, cold.serialized_size() as u64);
+        assert_ne!(digest.sha256, [0u8; 32]);
 
         // Read back via blob store
         let read = mgr.read_cold_data(offset, utxo_count, &meta).unwrap();
@@ -845,10 +858,19 @@ mod tests {
         let result = mgr
             .write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
             .unwrap();
-        assert_eq!(result, ColdDataRef::External);
+        let digest = match result {
+            ColdDataRef::External { digest } => digest,
+            other => panic!("expected External, got {other:?}"),
+        };
+        assert_ne!(digest.sha256, [0u8; 32]);
+        assert_eq!(digest.length, cold.serialized_size() as u64);
 
-        // Verify blob exists in store
+        // Verify blob exists in store and the manager-returned digest matches
+        // what the store independently reports — defends against any future
+        // manager bug that fabricates a digest without uploading the bytes.
         assert!(mgr.blob_store.exists(&meta.tx_id).unwrap());
+        let store_digest = mgr.blob_store.digest(&meta.tx_id).unwrap().unwrap();
+        assert_eq!(store_digest, digest);
     }
 
     #[test]
@@ -1096,7 +1118,7 @@ mod tests {
         let large_result = mgr
             .write_cold_data(&large_meta.tx_id, &large_cold, large_utxo, large_offset)
             .unwrap();
-        assert_eq!(large_result, ColdDataRef::External);
+        assert!(matches!(large_result, ColdDataRef::External { .. }));
 
         // Verify all data retrievable
         let read_small = mgr
@@ -1245,7 +1267,7 @@ mod tests {
             meta.flags = TxFlags::EXTERNAL;
             io::write_full_record(&*dev, offset, &meta, &[UtxoSlot::new_unspent([0; 32])]).unwrap();
             let result = mgr.write_cold_data(&meta.tx_id, &cold, 1, offset).unwrap();
-            assert_eq!(result, ColdDataRef::External);
+            assert!(matches!(result, ColdDataRef::External { .. }));
             let read = mgr.read_cold_data(offset, 1, &meta).unwrap();
             assert_eq!(read, cold);
         }
