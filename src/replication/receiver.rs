@@ -672,17 +672,28 @@ fn apply_create_lifecycle_and_blob(
     // Apply extended lifecycle metadata if present. Layout after the core
     // 46 bytes: generation(4) + updated_at(8) + unmined_since(4) +
     // delete_at_height(4) + preserve_until(4) = 24 bytes (total 70).
-    if metadata_bytes.len() >= 70
-        && let Ok(mut meta) = engine.read_metadata(tx_key)
-    {
+    //
+    // R-035 (LMNH-31): if the master sent extended-lifecycle bytes, we
+    // MUST persist them. Previously the per-step errors here were
+    // swallowed with `let _ = ...`, which could ACK the batch while the
+    // replica's record diverged from the master's (stale generation,
+    // stale unmined_since, stale DAH). Treat each failure as a hard
+    // batch-level error so the master retries instead of advancing its
+    // durable high-water mark.
+    if metadata_bytes.len() >= 70 {
+        let mut meta = engine
+            .read_metadata(tx_key)
+            .map_err(|e| format!("read metadata for lifecycle update: {e}"))?;
         meta.generation = u32::from_le_bytes(metadata_bytes[46..50].try_into().unwrap());
         meta.updated_at = u64::from_le_bytes(metadata_bytes[50..58].try_into().unwrap());
         meta.unmined_since = u32::from_le_bytes(metadata_bytes[58..62].try_into().unwrap());
         meta.delete_at_height = u32::from_le_bytes(metadata_bytes[62..66].try_into().unwrap());
         meta.preserve_until = u32::from_le_bytes(metadata_bytes[66..70].try_into().unwrap());
-        if let Some(entry) = engine.lookup(tx_key) {
-            let _ = crate::io::write_metadata(engine.device(), entry.record_offset, &meta);
-        }
+        let entry = engine
+            .lookup(tx_key)
+            .ok_or_else(|| format!("lookup after create for lifecycle update: tx {tx_key:?}"))?;
+        crate::io::write_metadata(engine.device(), entry.record_offset, &meta)
+            .map_err(|e| format!("write extended-lifecycle metadata: {e}"))?;
     }
 
     // Store cold data in the blobstore if provided. Blob persistence is part
@@ -1098,16 +1109,230 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
     // so both sides agree. The pre-apply guard above already rejected
     // stale ops (master_gen <= local_gen), so here we unconditionally
     // set the generation to the master's value.
+    //
+    // R-035 (LMNH-31): the previous implementation swallowed
+    // `read_metadata` and `write_metadata` errors with `let _ = ...`
+    // and `if let Ok(...)`. A failure here means the replica's
+    // generation counter has silently drifted from the master's, which
+    // makes the next pre-apply generation guard incorrectly reject a
+    // legitimate op (or accept a stale one). Both branches now hard-fail
+    // the batch ACK so the master retries.
     if let Some(master_gen) = op.master_generation() {
         let tx_key = op.tx_key();
-        if let Ok(mut meta) = engine.read_metadata(&tx_key)
-            && let Some(entry) = engine.lookup(&tx_key)
-        {
-            meta.generation = master_gen;
-            let _ = crate::io::write_metadata(engine.device(), entry.record_offset, &meta);
-        }
+        let mut meta = engine
+            .read_metadata(&tx_key)
+            .map_err(|e| format!("read metadata for generation sync: {e}"))?;
+        let entry = engine
+            .lookup(&tx_key)
+            .ok_or_else(|| format!("lookup for generation sync: tx {tx_key:?}"))?;
+        meta.generation = master_gen;
+        crate::io::write_metadata(engine.device(), entry.record_offset, &meta)
+            .map_err(|e| format!("write metadata for generation sync: {e}"))?;
     }
 
+    // R-034 (BC-34): write a local redo entry so the replica can replay
+    // through its own crash recovery and a failover does not require a
+    // full resync of every surviving replica. The entry captures the
+    // POST-apply state read back from the device, matching the discipline
+    // the master uses on its own write path. Failure to journal the entry
+    // is a hard batch-level error: ACKing without the local log would
+    // re-introduce the same divergence R-034 was opened to fix.
+    if let Some(redo_op) = build_post_apply_redo_op(engine, op)? {
+        write_replica_redo_entry(engine, &redo_op)?;
+    }
+
+    Ok(())
+}
+
+/// Build the post-apply redo entry for a `ReplicaOp` after it was
+/// successfully applied to the engine.
+///
+/// The entry captures the durable state currently on the device (counter
+/// values, slot status, generation), not the raw input op, so a replica
+/// crash + recovery replays the same on-device state the master would
+/// reach after replaying its own redo log. The dispatch path on the
+/// master computes these counters from validated state under the per-tx
+/// lock; on the replica we read them back from the device after the
+/// engine's apply_op has already taken and released the lock — ordering
+/// here is "apply, fsync data, then journal" instead of the master's
+/// "journal, then apply, then fsync data". Both orderings are correct
+/// because all replica apply paths are idempotent and the redo replay
+/// guards check the device state before re-writing.
+///
+/// Returns `Ok(None)` when the op has no recoverable redo entry (e.g.
+/// the engine apply was a graceful skip because the record had already
+/// been deleted), or when no redo log is attached (test paths).
+fn build_post_apply_redo_op(
+    engine: &Engine,
+    op: &ReplicaOp,
+) -> std::result::Result<Option<crate::redo::RedoOp>, String> {
+    use crate::redo::RedoOp;
+    if engine.redo_log().is_none() {
+        return Ok(None);
+    }
+    match op {
+        ReplicaOp::Spend {
+            tx_key,
+            offset,
+            spending_data,
+            ..
+        } => {
+            let meta = match engine.read_metadata(tx_key) {
+                Ok(m) => m,
+                Err(_) => return Ok(None),
+            };
+            let new_spent_count = { meta.spent_utxos };
+            Ok(Some(RedoOp::Spend {
+                tx_key: *tx_key,
+                offset: *offset,
+                spending_data: *spending_data,
+                new_spent_count,
+            }))
+        }
+        ReplicaOp::Unspend { tx_key, offset, .. } => {
+            let meta = match engine.read_metadata(tx_key) {
+                Ok(m) => m,
+                Err(_) => return Ok(None),
+            };
+            let new_spent_count = { meta.spent_utxos };
+            Ok(Some(RedoOp::Unspend {
+                tx_key: *tx_key,
+                offset: *offset,
+                new_spent_count,
+            }))
+        }
+        ReplicaOp::SetMined {
+            tx_key,
+            block_id,
+            block_height,
+            subtree_idx,
+            ..
+        } => Ok(Some(RedoOp::SetMined {
+            tx_key: *tx_key,
+            block_id: *block_id,
+            block_height: *block_height,
+            subtree_idx: *subtree_idx,
+            unset: false,
+        })),
+        ReplicaOp::UnsetMined {
+            tx_key, block_id, ..
+        } => Ok(Some(RedoOp::SetMined {
+            tx_key: *tx_key,
+            block_id: *block_id,
+            block_height: 0,
+            subtree_idx: 0,
+            unset: true,
+        })),
+        ReplicaOp::Freeze { tx_key, offset, .. } => Ok(Some(RedoOp::Freeze {
+            tx_key: *tx_key,
+            offset: *offset,
+        })),
+        ReplicaOp::Unfreeze { tx_key, offset, .. } => Ok(Some(RedoOp::Unfreeze {
+            tx_key: *tx_key,
+            offset: *offset,
+        })),
+        ReplicaOp::Reassign {
+            tx_key,
+            offset,
+            new_hash,
+            block_height,
+            spendable_after,
+            ..
+        } => Ok(Some(RedoOp::Reassign {
+            tx_key: *tx_key,
+            offset: *offset,
+            new_hash: *new_hash,
+            block_height: *block_height,
+            spendable_after: *spendable_after,
+        })),
+        ReplicaOp::SetConflicting {
+            tx_key,
+            value,
+            current_block_height,
+            retention,
+            ..
+        } => Ok(Some(RedoOp::SetConflicting {
+            tx_key: *tx_key,
+            value: *value,
+            current_block_height: *current_block_height,
+            block_height_retention: *retention,
+        })),
+        ReplicaOp::SetLocked { tx_key, value, .. } => Ok(Some(RedoOp::SetLocked {
+            tx_key: *tx_key,
+            value: *value,
+        })),
+        ReplicaOp::PreserveUntil {
+            tx_key,
+            block_height,
+            ..
+        } => Ok(Some(RedoOp::PreserveUntil {
+            tx_key: *tx_key,
+            block_height: *block_height,
+        })),
+        ReplicaOp::Create {
+            tx_key,
+            utxo_hashes,
+            ..
+        } => {
+            // Match the master's WAL-first contract: the replica records
+            // the index registration via the legacy `Create` variant. The
+            // CreateV2 full-payload path is the master's preferred form,
+            // but on the replica the on-device record is already byte-for-
+            // byte populated by `engine.create()` before this entry is
+            // appended; the legacy variant is sufficient for replay because
+            // replay verifies the record on disk before mutating.
+            let entry = match engine.lookup(tx_key) {
+                Some(e) => e,
+                None => return Ok(None),
+            };
+            Ok(Some(RedoOp::Create {
+                tx_key: *tx_key,
+                record_offset: entry.record_offset,
+                utxo_count: utxo_hashes.len() as u32,
+            }))
+        }
+        ReplicaOp::Delete { tx_key } => {
+            // After delete the index entry is gone, so we cannot re-read
+            // the record offset / size. Recovery treats `Delete` as
+            // "drop the index entry"; a replica that crashes here will
+            // still observe the index lookup miss because the delete
+            // already mutated the index in-memory and the next snapshot
+            // (or live engine state) carries no entry. Use sentinel zeros
+            // — replay's lookup-then-skip path handles the missing-index
+            // case as Skipped.
+            Ok(Some(RedoOp::Delete {
+                tx_key: *tx_key,
+                record_offset: 0,
+                record_size: 0,
+            }))
+        }
+        ReplicaOp::PruneSlot { tx_key, offset } => Ok(Some(RedoOp::PruneSlot {
+            tx_key: *tx_key,
+            offset: *offset,
+        })),
+    }
+}
+
+/// Append + flush a redo entry on the replica's local engine log.
+///
+/// Returns `Err(message)` when the engine has a redo log attached AND
+/// the append/flush fails — caller propagates to fail the batch ACK so
+/// the master retries instead of advancing its durable high-water mark.
+fn write_replica_redo_entry(
+    engine: &Engine,
+    op: &crate::redo::RedoOp,
+) -> std::result::Result<(), String> {
+    let log_arc = match engine.redo_log() {
+        Some(l) => l,
+        None => return Ok(()),
+    };
+    let mut guard = log_arc.lock();
+    guard
+        .append(op.clone())
+        .map_err(|e| format!("replica redo append: {e}"))?;
+    guard
+        .flush()
+        .map_err(|e| format!("replica redo flush: {e}"))?;
     Ok(())
 }
 
@@ -2616,5 +2841,355 @@ mod tests {
             before + 1,
             "replica_rejected_stale_cluster_key must increment exactly once per reject",
         );
+    }
+
+    // -----------------------------------------------------------------
+    // R-034 / R-035 regression tests
+    // -----------------------------------------------------------------
+
+    /// A `BlockDevice` wrapper that delegates to an inner `MemoryDevice`
+    /// but fails every `pwrite` once an arming flag is flipped on.
+    ///
+    /// Used by `replica_metadata_write_error_fails_batch_ack` to inject
+    /// a metadata-write failure during `apply_op` so we can verify the
+    /// error propagates back up to the batch ACK instead of being
+    /// silently swallowed.
+    struct ArmableFailingDevice {
+        inner: Arc<MemoryDevice>,
+        fail_writes: std::sync::atomic::AtomicBool,
+    }
+
+    impl ArmableFailingDevice {
+        fn new(inner: Arc<MemoryDevice>) -> Self {
+            Self {
+                inner,
+                fail_writes: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.fail_writes
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl crate::device::BlockDevice for ArmableFailingDevice {
+        fn pread(
+            &self,
+            buf: &mut [u8],
+            offset: u64,
+        ) -> std::result::Result<usize, crate::device::DeviceError> {
+            self.inner.pread(buf, offset)
+        }
+
+        fn pwrite(
+            &self,
+            buf: &[u8],
+            offset: u64,
+        ) -> std::result::Result<usize, crate::device::DeviceError> {
+            if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::device::DeviceError::Io(std::io::Error::other(
+                    "armed failure",
+                )));
+            }
+            self.inner.pwrite(buf, offset)
+        }
+
+        fn alignment(&self) -> usize {
+            self.inner.alignment()
+        }
+
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn sync(&self) -> std::result::Result<(), crate::device::DeviceError> {
+            self.inner.sync()
+        }
+
+        // Don't expose a raw pointer — the engine's fast path bypasses
+        // pwrite when `as_raw_ptr()` is `Some`, which would dodge our
+        // failure injection. Forcing the slow path keeps the test honest.
+        fn as_raw_ptr(&self) -> Option<*mut u8> {
+            None
+        }
+    }
+
+    fn make_engine_with_armable_device() -> (Arc<Engine>, Arc<ArmableFailingDevice>) {
+        let mem = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let dev = Arc::new(ArmableFailingDevice::new(mem));
+        let dev_trait: Arc<dyn BlockDevice> = dev.clone();
+        let alloc = SlotAllocator::new(dev_trait.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev_trait,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        (engine, dev)
+    }
+
+    fn attach_redo_log(engine: &Engine) -> Arc<parking_lot::Mutex<crate::redo::RedoLog>> {
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let log = crate::redo::RedoLog::open(redo_dev, 0, 4 * 1024 * 1024)
+            .expect("redo log opens on memory device");
+        let log_arc = Arc::new(parking_lot::Mutex::new(log));
+        engine.set_redo_log(log_arc.clone());
+        log_arc
+    }
+
+    /// R-035: a metadata write failure during `apply_op` (here, the
+    /// post-apply generation sync) must surface as a batch-level error
+    /// the master treats as not-yet-durable, instead of being silently
+    /// swallowed by the previous `let _ = io::write_metadata(...)`
+    /// pattern.
+    ///
+    /// We arm the device to fail every pwrite, then drive a Spend op
+    /// through `apply_op`. Even if the engine's spend itself succeeded
+    /// against the cached state path, the post-apply generation
+    /// reconciliation must call `crate::io::write_metadata` and observe
+    /// the failure. The fix routes that failure into the Result return,
+    /// so `apply_op` returns Err — which the outer batch handler turns
+    /// into a `ReplicaAck::Error`.
+    #[test]
+    fn replica_metadata_write_error_fails_batch_ack() {
+        let (engine, dev) = make_engine_with_armable_device();
+        let k = key(40);
+        create_record(&engine, k, 2);
+
+        // Arm the device so any further pwrite fails. The Spend will
+        // observe the failure during one of its on-device writes
+        // (slot or metadata); whichever surfaces first must propagate
+        // an error rather than being swallowed.
+        dev.arm();
+
+        let op = ReplicaOp::Spend {
+            tx_key: k,
+            offset: 0,
+            spending_data: [0xCD; 36],
+            // Force the post-apply generation-sync write path that
+            // R-035 was about. Use a master_generation strictly greater
+            // than the local one so the pre-apply guard accepts the op.
+            master_generation: 100,
+        };
+        let err = apply_op(&engine, &op).expect_err(
+            "apply_op must propagate the on-device write failure (R-035), not swallow it",
+        );
+        assert!(
+            !err.is_empty(),
+            "apply_op error message must be non-empty so the master can log the cause",
+        );
+
+        // Now drive the same op through `handle_replica_batch` so we
+        // verify the failure becomes a `ReplicaAck::Error` (not Ok)
+        // — the wire-level invariant the master relies on.
+        let batch = ReplicaBatch {
+            cluster_key: 0,
+            first_sequence: 1,
+            ops: vec![op.clone()],
+            source_node_id: None,
+            trace_ctx: None,
+        };
+        let req = RequestFrame {
+            request_id: 7,
+            op_code: OP_REPLICA_BATCH,
+            flags: 0,
+            payload: batch.serialize(),
+        };
+        let last = AtomicU64::new(0);
+        let resp = handle_replica_batch(&req, &engine, &last);
+        let ack = ReplicaAck::deserialize(&resp.payload).expect("ack decodes");
+        match ack {
+            ReplicaAck::Error {
+                failed_sequence,
+                message,
+            } => {
+                assert_eq!(failed_sequence, 1, "failed_sequence is the offending op");
+                assert!(
+                    !message.is_empty(),
+                    "error message must include diagnostic detail"
+                );
+            }
+            ReplicaAck::Ok { .. } => {
+                panic!("R-035: replica must NOT ACK Ok when an on-device metadata write failed")
+            }
+        }
+        assert_eq!(
+            last.load(Ordering::Relaxed),
+            0,
+            "last_applied must not advance when the op failed",
+        );
+    }
+
+    /// R-034: after a successful apply on the replica, the engine's
+    /// local redo log must contain a redo entry capturing the post-apply
+    /// state. Without this, a master crash followed by replica failover
+    /// requires a full resync because the surviving replica's recovery
+    /// path has no redo entries to replay.
+    ///
+    /// We attach a redo log to the receiver's engine, drive several
+    /// distinct `apply_op` calls through it, then read back the redo log
+    /// and assert the entries are present. We also assert (a) the
+    /// entries appear in apply order, and (b) the entry count matches
+    /// the call count — i.e. every successful apply produces exactly one
+    /// local redo record.
+    #[test]
+    fn replica_redo_log_catch_up_after_failover() {
+        let engine = make_engine();
+        let log_arc = attach_redo_log(&engine);
+
+        let k = key(60);
+        create_record(&engine, k, 3);
+        // The Create above used `engine.create()`; it does NOT write a
+        // replica redo entry on its own (that's the dispatch path's
+        // job). Snapshot the sequence number AFTER setup so we only
+        // count entries written by `apply_op`.
+        let pre_apply_seq = log_arc.lock().current_sequence();
+
+        let ops = vec![
+            ReplicaOp::Spend {
+                tx_key: k,
+                offset: 0,
+                spending_data: [0x11; 36],
+                master_generation: 50,
+            },
+            ReplicaOp::Spend {
+                tx_key: k,
+                offset: 1,
+                spending_data: [0x22; 36],
+                master_generation: 51,
+            },
+            ReplicaOp::Freeze {
+                tx_key: k,
+                offset: 2,
+                master_generation: 52,
+            },
+        ];
+
+        for op in &ops {
+            apply_op(&engine, op).expect("apply_op succeeds");
+        }
+
+        // Read all entries that were appended after the create-time
+        // snapshot.
+        let entries = {
+            let log = log_arc.lock();
+            log.read_from_sequence(pre_apply_seq)
+                .expect("redo log replay reads back appended entries")
+        };
+        assert_eq!(
+            entries.len(),
+            ops.len(),
+            "R-034: each successful apply_op must append exactly one local redo entry; \
+             saw {} entries for {} ops",
+            entries.len(),
+            ops.len(),
+        );
+
+        // First two are Spends targeting offsets 0 and 1, last is Freeze
+        // on offset 2. The exact sequence shape proves that apply_op is
+        // journaling per-op (and not, e.g., losing the second spend).
+        match &entries[0].op {
+            crate::redo::RedoOp::Spend { offset, .. } => assert_eq!(*offset, 0),
+            other => panic!("entry[0] should be Spend(off=0), got {other:?}"),
+        }
+        match &entries[1].op {
+            crate::redo::RedoOp::Spend { offset, .. } => assert_eq!(*offset, 1),
+            other => panic!("entry[1] should be Spend(off=1), got {other:?}"),
+        }
+        match &entries[2].op {
+            crate::redo::RedoOp::Freeze { offset, .. } => assert_eq!(*offset, 2),
+            other => panic!("entry[2] should be Freeze(off=2), got {other:?}"),
+        }
+    }
+
+    /// R-034 invariant: the redo entry written on the replica must
+    /// capture POST-apply state (the same shape the master writes), not
+    /// the input op verbatim. The engine bumps `meta.spent_utxos` on
+    /// every UNSPENT→SPENT transition, so an entry written after a
+    /// Spend must carry the new `spent_utxos` count, not zero.
+    ///
+    /// This guards against a regression where someone re-implements
+    /// `build_post_apply_redo_op` to copy the input op's fields verbatim
+    /// — which would corrupt `spent_utxos` on replay (recovery's
+    /// `replay_spend` overwrites `meta.spent_utxos = new_spent_count`
+    /// unconditionally).
+    #[test]
+    fn replica_redo_entry_captures_post_apply_state() {
+        let engine = make_engine();
+        let log_arc = attach_redo_log(&engine);
+
+        let k = key(61);
+        create_record(&engine, k, 4);
+        let pre_seq = log_arc.lock().current_sequence();
+
+        // Apply two spends — after the second, meta.spent_utxos == 2.
+        apply_op(
+            &engine,
+            &ReplicaOp::Spend {
+                tx_key: k,
+                offset: 0,
+                spending_data: [0xA1; 36],
+                master_generation: 10,
+            },
+        )
+        .unwrap();
+        apply_op(
+            &engine,
+            &ReplicaOp::Spend {
+                tx_key: k,
+                offset: 1,
+                spending_data: [0xA2; 36],
+                master_generation: 11,
+            },
+        )
+        .unwrap();
+
+        // Sanity: device-side counter is at 2.
+        let meta = engine.read_metadata(&k).unwrap();
+        let device_spent = { meta.spent_utxos };
+        assert_eq!(device_spent, 2, "device counter should be 2 after 2 spends");
+
+        let entries = log_arc
+            .lock()
+            .read_from_sequence(pre_seq)
+            .expect("redo log replay");
+        assert_eq!(entries.len(), 2, "two spend ops -> two redo entries");
+
+        // The second redo entry (Spend off=1) must carry
+        // new_spent_count == 2 — proving the entry captured the
+        // POST-apply counter (1 → 2), not the input op's zero.
+        match &entries[1].op {
+            crate::redo::RedoOp::Spend {
+                offset,
+                new_spent_count,
+                ..
+            } => {
+                assert_eq!(*offset, 1);
+                assert_eq!(
+                    *new_spent_count, 2,
+                    "R-034 invariant: redo entry MUST capture post-apply spent_utxos \
+                     (got {new_spent_count}, expected 2)"
+                );
+            }
+            other => panic!("entry[1] should be Spend, got {other:?}"),
+        }
+
+        // And the first entry should carry new_spent_count == 1.
+        match &entries[0].op {
+            crate::redo::RedoOp::Spend {
+                offset,
+                new_spent_count,
+                ..
+            } => {
+                assert_eq!(*offset, 0);
+                assert_eq!(*new_spent_count, 1);
+            }
+            other => panic!("entry[0] should be Spend, got {other:?}"),
+        }
     }
 }
