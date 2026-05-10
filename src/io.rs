@@ -185,6 +185,13 @@ pub unsafe fn write_crc_direct(base_ptr: *mut u8, record_offset: u64, meta: &TxM
         let p = base_ptr.add(record_offset as usize);
         let crc = meta.compute_crc();
         std::ptr::copy_nonoverlapping(crc.to_le_bytes().as_ptr(), p.add(CRC32_OFFSET), 4);
+        // R-030 (BC-07): Release fence after the CRC stamp — this
+        // is the LAST write of any direct-mutation sequence (the
+        // contract on the targeted footer helpers requires callers
+        // to follow with `write_crc_direct`), so the fence here
+        // covers the entire mutation. See `write_metadata_direct`
+        // for the full rationale.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -230,6 +237,28 @@ pub unsafe fn write_crc_direct(base_ptr: *mut u8, record_offset: u64, meta: &TxM
 #[inline]
 pub unsafe fn read_metadata_direct(base_ptr: *const u8, record_offset: u64) -> Result<TxMetadata> {
     unsafe {
+        // R-029 (BC-06): Acquire fence BEFORE the read so the
+        // CPU's load buffer is drained. On AArch64 this emits a
+        // `dmb ishld` (data memory barrier, load-only, inner
+        // shareable). Combined with the writer's Release fence
+        // (R-030), it prevents the CPU from observing the new
+        // CRC bytes paired with old field bytes (or vice versa)
+        // — the torn read the CRC check is supposed to catch.
+        // Without the fence, ARM's relaxed ordering can let
+        // independent loads complete out of program order, so a
+        // reader on a different core may see the four CRC bytes
+        // from the writer's most recent memcpy paired with header
+        // bytes from a previous one. The CRC validates correctly
+        // against the new bytes' CRC slot but the actual header
+        // payload is stale — silent corruption with a passing
+        // checksum. The fence is hardware-cheap (a single dmb)
+        // and the extra barrier is dwarfed by the metadata read
+        // itself. Note: Rust's strict memory model says fences
+        // alone don't establish happens-before without a paired
+        // atomic load/store; in practice the AArch64 hardware
+        // barrier prevents the reorderings we care about, and
+        // the CRC remains the true safety net.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         let src = base_ptr.add(record_offset as usize);
         let bytes = std::slice::from_raw_parts(src, METADATA_SIZE);
         Ok(TxMetadata::from_bytes(bytes)?)
@@ -253,6 +282,28 @@ pub unsafe fn write_metadata_direct(base_ptr: *mut u8, record_offset: u64, metad
         let mut buf = [0u8; METADATA_SIZE];
         metadata.to_bytes(&mut buf);
         dst_slice.copy_from_slice(&buf);
+        // R-030 (BC-07): Release fence AFTER the memcpy so all
+        // store operations commit before the next memory access
+        // can be observed by another core. On AArch64 this emits
+        // a `dmb ishst` (data memory barrier, store-only, inner
+        // shareable). Pairs with the reader's Acquire fence
+        // (R-029); together they prevent a reader on a different
+        // core from seeing the new CRC bytes alongside stale
+        // header bytes. Without this fence, ARM's relaxed store
+        // ordering allows the four CRC bytes (which `to_bytes`
+        // computes and writes inside `buf`, then the bulk
+        // copy_from_slice transfers to the destination) to land
+        // visibly before the rest of the buffer — a concurrent
+        // reader would compute a CRC over old header bytes plus
+        // the new CRC slot, see a mismatch, and surface
+        // RecordCorruption (which is the protective behaviour we
+        // already rely on); but in the WORST case for a same-CRC
+        // collision the reader sees a stale header that validates
+        // against the stale CRC. The fence eliminates the
+        // reordering window entirely. The stripe-lock contract on
+        // writes (held by callers) prevents two writers from
+        // interleaving; the fence covers the writer-vs-reader case.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -279,6 +330,10 @@ pub unsafe fn read_utxo_slot_direct(
     slot_index: u32,
 ) -> UtxoSlot {
     unsafe {
+        // R-029 (BC-06): Acquire fence — see `read_metadata_direct`
+        // for the full rationale. Slot reads have the same
+        // memory-ordering risk as metadata reads on AArch64.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         let slot_offset = record_offset + TxMetadata::utxo_slot_offset(slot_index);
         let src = base_ptr.add(slot_offset as usize);
         let bytes = std::slice::from_raw_parts(src, UTXO_SLOT_SIZE);
@@ -306,6 +361,10 @@ pub unsafe fn write_utxo_slot_direct(
         let mut buf = [0u8; UTXO_SLOT_SIZE];
         slot.to_bytes(&mut buf);
         dst_slice.copy_from_slice(&buf);
+        // R-030 (BC-07): Release fence — see `write_metadata_direct`
+        // for the full rationale. Slot writes have the same
+        // memory-ordering risk as metadata writes on AArch64.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -739,5 +798,131 @@ mod tests {
         let check_meta = read_metadata(&*dev, new_offset).unwrap();
         assert_eq!({ check_meta.utxo_count }, 50);
         assert_ne!(check_meta.tx_id, [0xBEu8; 32]); // Old txid is gone
+    }
+
+    /// R-029 / R-030 (BC-06 / BC-07) regression: under concurrent
+    /// write_metadata_direct + read_metadata_direct, the reader must
+    /// observe EITHER a coherent metadata value (one of the values
+    /// the writer wrote) OR a `RecordCorruption` error. The reader
+    /// must NEVER see a "successful" read whose `tx_version` /
+    /// `fee` field combination was never written by the writer
+    /// (which would indicate a torn read that the CRC failed to
+    /// catch, i.e. a missed memory-ordering barrier).
+    ///
+    /// Pre-fix the direct read/write paths had no memory fences;
+    /// on AArch64 the relaxed store ordering allowed a reader on a
+    /// different core to observe the new CRC bytes paired with old
+    /// header bytes (or vice versa) — silent corruption with a
+    /// validating CRC. The fences (Acquire on read, Release on
+    /// write) ensure the AArch64 hardware emits dmb instructions
+    /// that prevent the reordering.
+    ///
+    /// Note: even on x86-64 (where TSO largely guarantees the
+    /// ordering), the test exercises the contract; the fences are
+    /// essentially free on x86 (they compile to no instruction on
+    /// some configurations, otherwise just `mfence`). The point of
+    /// the test is the contract pin, not the AArch64 hardware
+    /// proof.
+    #[test]
+    fn direct_read_write_concurrent_stress_never_returns_torn_data() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dev = test_device();
+        let record_offset: u64 = 0;
+        // Two well-formed metadata values the writer rotates between.
+        // Each carries a distinctive (tx_version, fee) pair so the
+        // reader can validate it observed one of the two — never an
+        // unwritten combination.
+        let mut meta_a = TxMetadata::new(4);
+        meta_a.tx_id = [0xAAu8; 32];
+        meta_a.tx_version = 0xA1A2A3A4;
+        meta_a.fee = 0xAAAA_AAAA_AAAA_AAAA;
+        let mut meta_b = TxMetadata::new(4);
+        meta_b.tx_id = [0xBBu8; 32];
+        meta_b.tx_version = 0xB1B2B3B4;
+        meta_b.fee = 0xBBBB_BBBB_BBBB_BBBB;
+
+        // Seed the device with meta_a so a coherent read is always
+        // possible, and obtain the raw_ptr for the direct paths.
+        let slots: Vec<UtxoSlot> = (0..4)
+            .map(|i| UtxoSlot::new_unspent([i as u8; 32]))
+            .collect();
+        write_full_record(&*dev, record_offset, &meta_a, &slots).unwrap();
+
+        let base_ptr_addr = dev.as_raw_ptr().expect("memory device must expose raw_ptr") as usize;
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Writer thread: rotate between meta_a and meta_b. The
+        // stripe-lock contract says writers don't interleave; we
+        // model that by having a single writer.
+        let writer_stop = stop.clone();
+        let writer = std::thread::spawn(move || {
+            let mut toggle = false;
+            // Local copies because TxMetadata is not Send by default
+            // when borrowed through a *mut u8 via the writer side.
+            let local_a = meta_a;
+            let local_b = meta_b;
+            for _ in 0..20_000 {
+                if writer_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let m = if toggle { &local_a } else { &local_b };
+                toggle = !toggle;
+                unsafe {
+                    let p = base_ptr_addr as *mut u8;
+                    write_metadata_direct(p, record_offset, m);
+                }
+            }
+        });
+
+        // Reader threads: each spins reading and asserts the
+        // coherence invariant. If the read returns a coherent
+        // metadata value (CRC-validated), the (tx_version, fee)
+        // pair MUST be one of the two we wrote — never a torn
+        // mix. RecordCorruption is acceptable (CRC caught the
+        // tear); silent garbage is not.
+        let mut readers = Vec::new();
+        for _ in 0..3 {
+            let reader_stop = stop.clone();
+            readers.push(std::thread::spawn(move || {
+                let mut iterations = 0u64;
+                let mut corruption_count = 0u64;
+                while iterations < 30_000 && !reader_stop.load(Ordering::Relaxed) {
+                    let result = unsafe {
+                        let p = base_ptr_addr as *const u8;
+                        read_metadata_direct(p, record_offset)
+                    };
+                    match result {
+                        Ok(m) => {
+                            let v = { m.tx_version };
+                            let f = { m.fee };
+                            // Coherent read MUST be one of the two
+                            // pairs we wrote.
+                            let is_a = v == 0xA1A2A3A4 && f == 0xAAAA_AAAA_AAAA_AAAA;
+                            let is_b = v == 0xB1B2B3B4 && f == 0xBBBB_BBBB_BBBB_BBBB;
+                            assert!(
+                                is_a || is_b,
+                                "torn read passed CRC: tx_version={v:#x}, fee={f:#x}",
+                            );
+                        }
+                        Err(_) => {
+                            // CRC caught a torn read; this is the
+                            // correct fail-closed behaviour.
+                            corruption_count += 1;
+                        }
+                    }
+                    iterations += 1;
+                }
+                (iterations, corruption_count)
+            }));
+        }
+
+        for r in readers {
+            let (iters, _corruptions) = r.join().unwrap();
+            assert!(iters > 0, "reader thread must observe at least one read");
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
     }
 }

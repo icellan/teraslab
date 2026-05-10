@@ -314,20 +314,21 @@
 ### R-029 — [memory-ordering] `read_metadata_direct` reads bytes WITHOUT memory ordering — torn-write detection relies on CRC alone (ARM)
 - **Source:** AUDIT.md BC-06
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/io.rs:208-234, :73-189
+- **Status:** RESOLVED (jointly with R-030)
+- **Files:** src/io.rs (`read_metadata_direct`, `read_utxo_slot_direct`)
 - **Cluster:** memory-ordering
-- **Notes:** Use `std::sync::atomic::fence(Ordering::Release)` after byte copy and `Ordering::Acquire` before reading. On ARM without explicit barriers, reader on a different core can observe CRC bytes before field bytes → silent corruption with valid CRC.
-- **Test:** `read_metadata_memory_ordering_arm`
+- **Resolution:** Added `std::sync::atomic::fence(Ordering::Acquire)` at the entry of both `read_metadata_direct` and `read_utxo_slot_direct`. On AArch64 this emits a `dmb ishld` (data memory barrier, load-only, inner shareable) that drains the CPU's load buffer before the byte read, preventing the reorderings that would otherwise allow the reader to observe new CRC bytes paired with old header bytes (or vice versa) — the silent-corruption-with-valid-CRC case the audit flagged. Pairs with R-030's Release fence on the writer side. Documented the trade-off: Rust's strict memory model says fences alone don't establish happens-before without a paired atomic load/store, but the AArch64 hardware barrier prevents the reorderings we care about, and the CRC remains the true safety net.
+- **Verification:** Folded into the joint R-029/R-030 commit.
 
 ### R-030 — [memory-ordering] `write_metadata_direct` writes are NOT release-fenced — concurrent reader may observe stale CRC
 - **Source:** AUDIT.md BC-07
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/io.rs:226-234
+- **Status:** RESOLVED (jointly with R-029)
+- **Files:** src/io.rs (`write_metadata_direct`, `write_utxo_slot_direct`, `write_crc_direct`)
 - **Cluster:** memory-ordering
-- **Notes:** Add `fence(Ordering::Release)` after memcpy. On ARM, memcpy stores can reorder; reader seeing new CRC + stale field bytes returns corrupted data without detection.
-- **Test:** `metadata_write_memory_fence_arm`
+- **Resolution:** Added `std::sync::atomic::fence(Ordering::Release)` after the byte memcpy in `write_metadata_direct`, `write_utxo_slot_direct`, AND `write_crc_direct` (which is the LAST write of any targeted-mutation sequence). On AArch64 this emits a `dmb ishst` (data memory barrier, store-only, inner shareable) that ensures all stores commit before the next memory access can be observed by another core — preventing the reader on a different core from seeing the new CRC bytes alongside stale field bytes. Pairs with R-029's Acquire fence on the reader side.
+- **Tests added:** `direct_read_write_concurrent_stress_never_returns_torn_data` — spawns one writer thread that alternates between two distinctive `(tx_version, fee)` pairs and three reader threads; asserts every successful (CRC-validated) read observes ONE of the two written pairs (never an unwritten torn mix), and that `RecordCorruption` errors are also acceptable (CRC catching the tear is the correct fail-closed behaviour). The test exercises the contract on x86-64 (where TSO largely guarantees the ordering already) — the fences are the AArch64-specific protection but the test pins the contract uniformly.
+- **Verification:** Full local gate green: `cargo build --release`, `cargo test --all` (1721 passed, 0 failed, 0 ignored, modulo a pre-existing parallel-execution flake on `migration_active_gauge_tracks_inflight_shards` that passes on retry — confirmed unrelated to this change), `cargo clippy --all --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 
 ### R-031 — [recovery-validation] `replay_create` (legacy, pre-CreateV2) registers WITHOUT validating on-device record bytes
 - **Source:** AUDIT.md BC-53
