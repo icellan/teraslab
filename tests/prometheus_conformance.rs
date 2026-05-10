@@ -167,8 +167,16 @@ fn start_test_http_server() -> (u16, Arc<HttpState>) {
     let addr = format!("127.0.0.1:{port}");
     std::thread::spawn(move || {
         // Prom conformance tests do not touch /admin/* mutation paths,
-        // but enabling matches the existing public-surface coverage.
-        start_http_server(addr, state_clone, true);
+        // but enabling matches the existing public-surface coverage. The
+        // bearer-token gate (R-056) requires a non-empty admin_token even
+        // though no test in this file calls a gated route — the placeholder
+        // satisfies validate_safe_defaults / build_http_router invariants.
+        start_http_server(
+            addr,
+            state_clone,
+            true,
+            Some("prometheus-test-token-unused".to_string()),
+        );
     });
 
     // Give axum time to bind — matches the pattern in the sibling test file.

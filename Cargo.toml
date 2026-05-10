@@ -22,7 +22,7 @@ fault-injection = []
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 bitflags = "2"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 comfy-table = "7"
 crc32fast = "1"
 crossterm = "0.28"

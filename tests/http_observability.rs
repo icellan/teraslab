@@ -614,3 +614,220 @@ fn read_only_debug_log_level_still_works_when_admin_disabled() {
     let (status, _, _) = http_get(port, "/debug/log-level");
     assert_eq!(status, 200);
 }
+
+// --------------------------------------------------------------------------
+// R-056 (gap LMNH-08 / F14): bearer-token auth on the gated /admin/* and
+// mutating /debug/* routes. Pre-fix every request succeeded with 200; the
+// fix installs an axum middleware that enforces a constant-time bearer
+// compare against the configured admin_token.
+// --------------------------------------------------------------------------
+
+/// The regression: pre-fix `PUT /admin/quiesce` returned 200 to anyone that
+/// could reach the HTTP port. With auth enforced, no header → 401.
+#[test]
+fn admin_endpoint_returns_401_without_bearer_token() {
+    let (port, _state) = start_test_http_server();
+    // PUT /admin/quiesce is the cheapest gated mutation handler in the
+    // suite — nothing about its body parses the URL further.
+    let (status, body) = http_put(port, "/admin/quiesce", "");
+    assert_eq!(
+        status, 401,
+        "missing Authorization header must yield 401 Unauthorized; body was: {body}",
+    );
+    assert!(
+        body.contains("Authorization") || body.contains("token"),
+        "401 body should hint at the missing header, got: {body:?}",
+    );
+}
+
+#[test]
+fn admin_endpoint_returns_401_with_wrong_bearer_token() {
+    let (port, _state) = start_test_http_server();
+    let (status, body) = http_put_auth(port, "/admin/quiesce", "", "definitely-not-the-token");
+    assert_eq!(
+        status, 401,
+        "wrong bearer token must yield 401, body was: {body}",
+    );
+    assert!(
+        body.contains("invalid") || body.contains("token"),
+        "401 body should describe the auth failure, got: {body:?}",
+    );
+}
+
+#[test]
+fn admin_endpoint_succeeds_with_correct_bearer_token() {
+    let (port, _state) = start_test_http_server();
+    // GET /debug/redo is gated by R-056 but returns 200 in single-node mode
+    // (with a JSON body that flags the redo log as unavailable). It is the
+    // cleanest "the handler ran" probe in the suite — every other gated
+    // route either requires a cluster (drain, rebalance, quiesce) or a
+    // matching record (records/{txid}).
+    let (status, _, body) = http_get_auth(port, "/debug/redo", R056_TEST_TOKEN);
+    assert_eq!(
+        status, 200,
+        "correct bearer token must let the request reach the handler",
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("/debug/redo must return JSON when authed");
+    assert_eq!(
+        parsed["available"], false,
+        "single-node test harness has no redo log",
+    );
+}
+
+/// Even with admin auth fully enabled, `/metrics` must remain
+/// unauthenticated so Prometheus / Grafana can scrape without operator
+/// credentials. This guards against accidentally over-gating the
+/// observability surface in a future refactor.
+#[test]
+fn metrics_endpoint_unauthenticated_remains_accessible_with_admin_auth_enabled() {
+    let (port, _state) = start_test_http_server();
+    // No Authorization header at all.
+    let (status, content_type, body) = http_get(port, "/metrics");
+    assert_eq!(status, 200, "/metrics must stay unauthenticated");
+    assert!(content_type.contains("text/plain"));
+    assert!(body.contains("teraslab_spends_attempted_total"));
+}
+
+#[test]
+fn health_endpoints_unauthenticated_remain_accessible_with_admin_auth_enabled() {
+    let (port, _state) = start_test_http_server();
+    let (live_status, _, live_body) = http_get(port, "/health/live");
+    assert_eq!(live_status, 200);
+    assert_eq!(live_body, "ok");
+
+    let (ready_status, _, _) = http_get(port, "/health/ready");
+    // /health/ready is single-node ready by default in this harness, so 200
+    // is the expected outcome; the assertion that matters is "not 401".
+    assert_ne!(
+        ready_status, 401,
+        "/health/ready must never return 401 — it has no auth gate",
+    );
+    assert_eq!(ready_status, 200);
+}
+
+/// Read-only `/admin/*` dashboards (used by the operator UI and load
+/// balancers) must remain unauthenticated.
+#[test]
+fn read_only_admin_dashboards_remain_unauthenticated() {
+    let (port, _state) = start_test_http_server();
+    for path in [
+        "/admin/migration_status",
+        "/admin/nodes",
+        "/admin/memory",
+        "/admin/records",
+        "/admin/replication",
+        "/admin/top",
+        "/status",
+    ] {
+        let (status, _, _) = http_get(port, path);
+        assert_eq!(
+            status, 200,
+            "read-only dashboard {path} must stay unauthenticated, got {status}",
+        );
+    }
+}
+
+#[test]
+fn read_only_debug_routes_remain_unauthenticated() {
+    let (port, _state) = start_test_http_server();
+    let (freelist_status, _, _) = http_get(port, "/debug/freelist");
+    assert_eq!(
+        freelist_status, 200,
+        "/debug/freelist is read-only and must stay unauthenticated",
+    );
+    let (loglevel_status, _, _) = http_get(port, "/debug/log-level");
+    assert_eq!(
+        loglevel_status, 200,
+        "GET /debug/log-level is read-only and must stay unauthenticated",
+    );
+}
+
+/// PUT /debug/log-level + GET /debug/index, /debug/redo, /debug/records
+/// all sit behind the same middleware — every one must fail 401 without
+/// the token. This pins the full mutating-debug surface.
+#[test]
+fn debug_mutating_endpoint_requires_bearer_token() {
+    let (port, _state) = start_test_http_server();
+
+    // PUT /debug/log-level
+    let (status, _) = http_put(port, "/debug/log-level", "info");
+    assert_eq!(status, 401, "PUT /debug/log-level must require auth");
+
+    // GET /debug/index
+    let (status, _, _) = http_get(port, "/debug/index");
+    assert_eq!(status, 401, "GET /debug/index must require auth");
+
+    // GET /debug/redo
+    let (status, _, _) = http_get(port, "/debug/redo");
+    assert_eq!(status, 401, "GET /debug/redo must require auth");
+
+    // GET /debug/records/<txid>
+    let txid_hex = "00000000000000000000000000000000000000000000000000000000000000aa";
+    let (status, _, _) = http_get(port, &format!("/debug/records/{txid_hex}"));
+    assert_eq!(status, 401, "GET /debug/records/{{txid}} must require auth");
+}
+
+#[test]
+fn all_admin_mutation_routes_require_bearer_token() {
+    let (port, _state) = start_test_http_server();
+
+    // PUT /admin/rebalance
+    let (status, _) = http_put(port, "/admin/rebalance", "");
+    assert_eq!(status, 401, "PUT /admin/rebalance must require auth");
+
+    // PUT /admin/drain/{node_id}
+    let (status, _) = http_put(port, "/admin/drain/42", "");
+    assert_eq!(status, 401, "PUT /admin/drain/{{node_id}} must require auth");
+}
+
+/// A header that is present but malformed (no scheme, wrong scheme,
+/// missing space, missing token) must be rejected the same way as a
+/// missing header.
+#[test]
+fn admin_endpoint_rejects_malformed_authorization_header() {
+    let (port, _state) = start_test_http_server();
+
+    for bad in [
+        // No scheme prefix at all.
+        "definitely-not-the-token",
+        // Wrong scheme.
+        "Basic Zm9vOmJhcg==",
+        // Bearer with no separating space (BearerXYZ).
+        "BearerXYZdoesnotmatter",
+        // Bearer with empty token.
+        "Bearer ",
+    ] {
+        let extra = format!("Authorization: {bad}\r\n");
+        let (status, _) = http_put_with_extra_headers(port, "/admin/quiesce", "", &extra);
+        assert_eq!(
+            status, 401,
+            "malformed header {bad:?} must be rejected, got {status}",
+        );
+    }
+}
+
+/// RFC 6750 §2.1 specifies the scheme name is case-insensitive; clients
+/// that send `BEARER` or `bearer` must succeed when the token matches.
+/// We assert "not 401" rather than "200" because the underlying handler
+/// (`/admin/quiesce`) returns 400 in single-node mode — the point is that
+/// the auth gate accepted the request, not that the cluster handler was
+/// happy.
+#[test]
+fn admin_endpoint_accepts_case_insensitive_bearer_scheme() {
+    let (port, _state) = start_test_http_server();
+    for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+        let extra = format!("Authorization: {scheme} {R056_TEST_TOKEN}\r\n");
+        let (status, _) = http_put_with_extra_headers(port, "/admin/quiesce", "", &extra);
+        assert_ne!(
+            status, 401,
+            "scheme {scheme:?} must be accepted (case-insensitive per RFC 6750), got 401",
+        );
+        // The handler returns 400 in single-node mode (no cluster); both
+        // outcomes prove the gate let the request through.
+        assert!(
+            status == 200 || status == 400,
+            "expected 200 or 400 from quiesce handler after auth, got {status}",
+        );
+    }
+}

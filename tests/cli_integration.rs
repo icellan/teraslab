@@ -18,6 +18,10 @@ use teraslab::server::http::{HttpState, start_http_server};
 static CLI_METRICS: ThreadMetrics = ThreadMetrics::new();
 static CLI_HISTOGRAMS: ThreadHistograms = ThreadHistograms::new();
 
+/// The bearer token wired into both the test HTTP server and the CLI under
+/// test. R-056 makes the gated `/admin/*` and `/debug/*` routes require it.
+const CLI_TEST_ADMIN_TOKEN: &str = "cli-integration-test-token";
+
 fn start_test_server() -> u16 {
     let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
@@ -50,7 +54,14 @@ fn start_test_server() -> u16 {
     let addr = format!("127.0.0.1:{port}");
     std::thread::spawn(move || {
         // CLI integration covers /admin/* + /debug/* paths — register them.
-        start_http_server(addr, state, true);
+        // R-056: gated routes need a bearer token; the CLI under test passes
+        // the matching `--admin-token` so every command authenticates.
+        start_http_server(
+            addr,
+            state,
+            true,
+            Some(CLI_TEST_ADMIN_TOKEN.to_string()),
+        );
     });
     std::thread::sleep(std::time::Duration::from_millis(200));
     port
@@ -70,6 +81,11 @@ fn run_cli(port: u16, args: &[&str]) -> (String, String, i32) {
     let output = Command::new(cli_bin())
         .arg("--addr")
         .arg(&addr)
+        .arg("--admin-token")
+        .arg(CLI_TEST_ADMIN_TOKEN)
+        // Defensive: scrub the env override so the parent process's
+        // TERASLAB_ADMIN_TOKEN (if any) doesn't sneak in.
+        .env_remove("TERASLAB_ADMIN_TOKEN")
         .args(args)
         .output()
         .expect("failed to run teraslab-cli");
