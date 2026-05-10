@@ -98,6 +98,25 @@ pub enum RebuildError {
         /// `Display`-formatted rebuild error.
         rebuild_err: String,
     },
+
+    /// A redb [`crate::index::migration::import_index`] call was
+    /// observed to have started but never completed — the sentinel
+    /// file at [`crate::index::migration::import_sentinel_path`] is
+    /// still present. Opening the redb files in this state would
+    /// silently load whichever subset of the three indexes was
+    /// committed before the crash, producing inconsistent on-disk
+    /// state. R-047 / AUDIT GH-G3.
+    #[error(
+        "redb import was interrupted: in-progress sentinel present at \
+         {sentinel_path}; redb files may contain a partial import. \
+         Re-run `teraslab import-index` to overwrite the partial state, \
+         or remove the sentinel manually after verifying the on-disk \
+         redb files are consistent"
+    )]
+    RedbImportInProgress {
+        /// Path of the sentinel file that triggered the refusal.
+        sentinel_path: String,
+    },
 }
 
 /// Outcome of a secondary-index load attempt.
@@ -223,11 +242,26 @@ pub(crate) fn replay_cause_label(cause: ReplayCause) -> &'static str {
 /// On rebuild failure the redb file at [`IndexConfig::redb_path`] is
 /// **not** removed — the operator must inspect it before deciding to
 /// rescan. This is the gap #5 fail-closed contract.
+///
+/// Before any restore/rebuild attempt this function consults the
+/// import-in-progress sentinel written by
+/// [`crate::index::migration::import_index`]. If the sentinel exists
+/// the redb files may be in a partial state from an interrupted
+/// import; we refuse to proceed (R-047 / AUDIT GH-G3) and return
+/// [`RebuildError::RedbImportInProgress`] so the operator can re-run
+/// the import or manually clear the sentinel.
 pub fn load_primary_index_redb(
     config: &IndexConfig,
     device: &dyn BlockDevice,
     allocator: &SlotAllocator,
 ) -> Result<PrimaryBackend, RebuildError> {
+    if crate::index::migration::import_in_progress(config) {
+        return Err(RebuildError::RedbImportInProgress {
+            sentinel_path: crate::index::migration::import_sentinel_path(&config.redb_path)
+                .display()
+                .to_string(),
+        });
+    }
     let restore_err = match PrimaryBackend::restore_redb(config) {
         Ok(idx) => return Ok(idx),
         Err(e) => e,
@@ -606,6 +640,72 @@ mod tests {
             original_bytes,
             "redb primary file bytes must be preserved untouched on the fail-closed path"
         );
+    }
+
+    #[test]
+    fn startup_refuses_when_import_sentinel_present() {
+        // R-047: If `import_index` crashed mid-way it leaves the
+        // sentinel file behind. `load_primary_index_redb` MUST refuse
+        // to open the (possibly partial) redb files in that state.
+        let tmp = TempDir::new().unwrap();
+        let redb_path = tmp.path().join("primary.redb");
+        let dah_path = tmp.path().join("dah.redb");
+        let unmined_path = tmp.path().join("unmined.redb");
+
+        // Pre-populate the redb file so restore_redb would otherwise
+        // succeed; without the sentinel check the partial-state risk
+        // would slip through silently.
+        let _ = crate::index::redb_primary::RedbPrimary::open(&redb_path, 64 * 1024 * 1024)
+            .expect("create primary redb for sentinel test");
+
+        // Manually drop a sentinel file in the conventional location.
+        let sentinel = crate::index::migration::import_sentinel_path(&redb_path);
+        std::fs::write(&sentinel, b"in progress").unwrap();
+
+        let cfg = IndexConfig {
+            redb_path: redb_path.clone(),
+            redb_dah_path: dah_path,
+            redb_unmined_path: unmined_path,
+            ..IndexConfig::default()
+        };
+        let (dev, alloc) = fresh_dev_alloc();
+        let err = load_primary_index_redb(&cfg, &*dev, &alloc)
+            .expect_err("startup must refuse while sentinel exists");
+        match err {
+            RebuildError::RedbImportInProgress { ref sentinel_path } => {
+                assert_eq!(sentinel_path, &sentinel.display().to_string());
+            }
+            other => panic!("expected RedbImportInProgress, got {other:?}"),
+        }
+
+        // The redb file MUST be preserved untouched — the operator
+        // must investigate and re-run the import.
+        assert!(redb_path.exists(), "redb file must not be removed");
+        assert!(sentinel.exists(), "sentinel must not be removed");
+
+        // Operator workflow: removing the sentinel after manual
+        // verification re-enables startup.
+        std::fs::remove_file(&sentinel).unwrap();
+        load_primary_index_redb(&cfg, &*dev, &alloc)
+            .expect("startup must succeed once sentinel is cleared");
+    }
+
+    #[test]
+    fn redb_import_in_progress_error_message_includes_remediation() {
+        // Operator-facing display contract for the new RebuildError
+        // variant. Log scrapers and dashboards depend on the wording
+        // identifying the sentinel path and pointing to the import
+        // CLI.
+        let err = RebuildError::RedbImportInProgress {
+            sentinel_path: "/data/primary.redb.import-in-progress".to_string(),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("/data/primary.redb.import-in-progress"),
+            "msg: {msg}"
+        );
+        assert!(msg.contains("import was interrupted"), "msg: {msg}");
+        assert!(msg.contains("Re-run"), "msg: {msg}");
     }
 
     #[test]
