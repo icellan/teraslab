@@ -1269,3 +1269,245 @@ fn kill_node_detection_affected_shards() {
     shutdown_node(&node1);
     shutdown_node(&node2);
 }
+
+// ---------------------------------------------------------------------------
+// R-040 (AUDIT.md EF-03) — quorum: isolated 1-node remnant rejects writes.
+//
+// Contract: a node that was previously part of a multi-node cluster
+// (peak_cluster_size >= 2) must reject mutating ops with
+// `ERR_NO_QUORUM` once SWIM has marked enough peers dead that the
+// surviving alive count falls below the quorum threshold
+// `(peak / 2) + 1`. This prevents an isolated remnant of an N-node
+// cluster from independently accepting conflicting writes (split-brain
+// safety).
+//
+// Companion to R-039, which fixed `RunningCluster::alive_node_count`
+// to correctly include `self` when the local node is committed but
+// absent from `node_addrs` (production SWIM at swim.rs:454 ignores
+// self-loopback messages so self never registers as an "addr"). With
+// the R-039 fix applied, a 3-node cluster losing 2 peers reports
+// `alive_node_count = 1` (self only), `peak = 3`, `quorum_needed = 2`,
+// and the dispatcher rejects mutations. With R-039 reverted the count
+// would be `0` instead — still < 2, so the rejection still fires, but
+// for the wrong reason. This test pins the rejection contract so any
+// future regression that bypasses or weakens the quorum check (e.g.
+// reading peak from the wrong source, mis-classifying CREATE_BATCH as
+// non-mutation, or short-circuiting on empty `node_addrs`) fails loudly.
+// ---------------------------------------------------------------------------
+
+/// Wait until `cluster.committed_topology_members().len() == expected`,
+/// or panic with diagnostics. Used to pin the moment a topology has
+/// been committed across all `expected` peers. The poll interval is
+/// short (50 ms) and the ceiling is generous to absorb CI load.
+fn wait_for_committed_members_len(node: &TestNode, expected: usize, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if node.cluster.committed_topology_members().len() == expected {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let committed = node.cluster.committed_topology_members();
+    let term = node.cluster.committed_topology_term();
+    panic!(
+        "committed_topology_members().len()={} (expected {}) within {:?}: members={:?}, term={}",
+        committed.len(),
+        expected,
+        timeout,
+        committed,
+        term,
+    );
+}
+
+/// Wait until the surviving node sees `node_addrs` shrink to at most
+/// `max_remaining` peers (i.e. SWIM has marked the killed nodes dead
+/// and removed them via `NodeLeft`). Returns the final addrs map size
+/// or panics with diagnostics on timeout.
+fn wait_for_node_addrs_le(node: &TestNode, max_remaining: usize, timeout: Duration) -> usize {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let len = node.cluster.node_addresses().len();
+        if len <= max_remaining {
+            return len;
+        }
+        if std::time::Instant::now() >= deadline {
+            let alive = node.cluster.alive_node_count();
+            let committed = node.cluster.committed_topology_members();
+            let peak = node.cluster.peak_cluster_size();
+            panic!(
+                "node_addrs.len()={} (expected <= {}) within {:?}: alive={}, peak={}, committed={:?}",
+                len, max_remaining, timeout, alive, peak, committed,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn isolated_node_rejects_writes_with_no_quorum() {
+    // R-040 (AUDIT.md EF-03). Start a 3-node cluster with RF=2, wait for
+    // the topology commit, kill 2 of 3 peers, wait for SWIM to mark them
+    // dead (NodeLeft removes them from node_addrs), then send
+    // OP_CREATE_BATCH against the surviving node and assert it rejects
+    // with ERR_NO_QUORUM rather than independently committing the write.
+    let node1 = create_node(301, 0, 0, &[], 2);
+    let node2 = create_node(302, 0, 0, &[node1.swim_port], 2);
+    let node3 = create_node(303, 0, 0, &[node1.swim_port], 2);
+
+    // Wait for the 3-node topology to commit on the surviving node so
+    // that `committed_topology_members` reflects the full peak set
+    // (peak_size will have advanced to 3 via the same MembershipChanged
+    // event chain).
+    wait_for_committed_members_len(&node1, 3, Duration::from_secs(15));
+
+    // Sanity: peak should now be 3 — this is what fixes
+    // `quorum_needed = (peak / 2) + 1 = 2` for the post-isolation check.
+    let peak_before = node1.cluster.peak_cluster_size();
+    assert!(
+        peak_before >= 3,
+        "peak_cluster_size should have reached 3 after committed 3-node topology, got {peak_before}"
+    );
+
+    // Kill nodes 2 and 3 — their SWIM threads stop responding to probes.
+    // The surviving node (node1) will see suspicion_timeout=2s elapse
+    // and emit NodeLeft → node_addrs removes both peers.
+    shutdown_node(&node2);
+    shutdown_node(&node3);
+
+    // Wait for SWIM dead detection. probe_interval=100ms +
+    // suspicion_timeout=2s gives ~2.5s nominal; we allow up to 15s for
+    // CI load and indirect-probe completion. After this the surviving
+    // node's `node_addrs` should contain at most `self`
+    // (`RunningCluster::new` pre-seeds `self` into `node_addrs` at
+    // coordinator.rs:526; SWIM only ever adds *peers* via `NodeJoined`
+    // and removes them via `NodeLeft`).
+    let addrs_after = wait_for_node_addrs_le(&node1, 1, Duration::from_secs(15));
+    assert!(
+        addrs_after <= 1,
+        "after killing 2 peers in a 3-node cluster the surviving node's node_addrs should contain at most self; got len={addrs_after}, addrs={:?}",
+        node1.cluster.node_addresses(),
+    );
+    // Belt-and-suspenders: confirm the only remaining addr (if any) is self.
+    let addrs_map = node1.cluster.node_addresses();
+    if let Some(only_id) = addrs_map.keys().next() {
+        assert_eq!(
+            only_id.0, 301,
+            "the only remaining node_addr after peer death must be self (id=301), got id={}",
+            only_id.0
+        );
+    }
+
+    // The surviving node still sees a non-zero committed term (so
+    // is_ready() returns true and the cluster-readiness gate doesn't
+    // mask the quorum check), and peak is still >= 3 (peak_size only
+    // ever grows via fetch_max).
+    assert!(
+        node1.cluster.committed_topology_term() >= 1,
+        "surviving node should still report a committed topology term"
+    );
+    assert!(
+        node1.cluster.peak_cluster_size() >= 3,
+        "peak_cluster_size must remain >= 3 (peak only grows); got {}",
+        node1.cluster.peak_cluster_size()
+    );
+
+    // alive_node_count: with the R-039 fix in place this is 1 (self
+    // counted because committed contains self and addrs doesn't);
+    // without the fix it would be 0. Either way < quorum_needed=2.
+    let alive = node1.cluster.alive_node_count();
+    assert!(
+        alive < 2,
+        "isolated 1-node remnant must report alive_node_count < quorum_needed (got alive={alive})"
+    );
+
+    // Send OP_CREATE_BATCH against the surviving node. Quorum check
+    // runs BEFORE the redirect / readiness checks (see dispatch.rs:317),
+    // so we don't need a key the surviving node owns — any well-formed
+    // create payload will be rejected pre-dispatch.
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let txid = make_txid(900_001);
+    let hash = make_txid(900_002);
+    let payload = encode_create_payload(&txid, &hash);
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload,
+        },
+    );
+
+    // Contract: STATUS_ERROR with payload [code:u16 LE = ERR_NO_QUORUM]
+    // [msg_len:u16 LE][msg:N] — built by `error_response()`.
+    assert_eq!(
+        resp.status, STATUS_ERROR,
+        "isolated remnant must reject mutations with STATUS_ERROR (got status={})",
+        resp.status
+    );
+    assert!(
+        resp.payload.len() >= 4,
+        "ERR_NO_QUORUM response must carry [code:2][msg_len:2] header, got {} bytes",
+        resp.payload.len()
+    );
+    let error_code = u16::from_le_bytes(resp.payload[0..2].try_into().unwrap());
+    assert_eq!(
+        error_code, ERR_NO_QUORUM,
+        "isolated remnant must reject with ERR_NO_QUORUM (15), got code={error_code}"
+    );
+
+    shutdown_node(&node1);
+}
+
+#[test]
+fn single_node_cluster_accepts_writes_without_quorum_check() {
+    // R-040 control case. A single-node cluster (RF=1, peak=1) is the
+    // canonical case where `check_quorum` returns `None` immediately —
+    // a node that has only ever seen itself is a standalone deployment
+    // and quorum is trivially met. This pins the contract that the
+    // quorum check does NOT spuriously reject writes in single-node
+    // mode (the inverse of `isolated_node_rejects_writes_with_no_quorum`).
+    let node = create_node(311, 0, 0, &[], 1);
+
+    // Sanity: a freshly-started single-node cluster has peak == 1 and
+    // alive_node_count is at most 1 (self).
+    let peak = node.cluster.peak_cluster_size();
+    assert!(
+        peak <= 1,
+        "single-node cluster must have peak_cluster_size <= 1, got {peak}"
+    );
+
+    // Send the same OP_CREATE_BATCH that the isolated-remnant test rejected.
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node.tcp_port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let txid = make_txid(900_003);
+    let hash = make_txid(900_004);
+    let payload = encode_create_payload(&txid, &hash);
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload,
+        },
+    );
+
+    // Contract: single-node cluster accepts the write.
+    assert_eq!(
+        resp.status,
+        STATUS_OK,
+        "single-node cluster must accept OP_CREATE_BATCH (got status={}, payload_len={})",
+        resp.status,
+        resp.payload.len(),
+    );
+
+    shutdown_node(&node);
+}
