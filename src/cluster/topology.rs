@@ -307,6 +307,39 @@ impl PersistedTopologyState {
 }
 
 // ---------------------------------------------------------------------------
+// Split-brain detection helper
+// ---------------------------------------------------------------------------
+
+/// Decide whether a SWIM-reported `proposed` member set is a *safe* evolution
+/// of the currently committed `committed` set.
+///
+/// A change is safe when it is monotonic — either a pure superset (members
+/// joined) or a pure subset (members departed gracefully). A change that
+/// simultaneously adds a previously-uncommitted node AND drops a previously-
+/// committed node is the split-brain merge signature: two clusters that
+/// have learned about each other but never agreed on a common topology.
+/// Returning `false` for that case is the rejection signal that
+/// [`TopologyAuthority::on_membership_changed`] (and the fallback
+/// proposer paths) consult before generating a new term.
+///
+/// `committed.is_empty()` is treated as safe (the cluster has not committed
+/// any topology yet — there is nothing to split-brain against).
+///
+/// Both slices are assumed to be sorted ascending by `NodeId` (SWIM emits
+/// them sorted) but the implementation relies only on set semantics, so
+/// duplicate or out-of-order entries are tolerated correctly.
+fn is_safe_membership_change(committed: &[NodeId], proposed: &[NodeId]) -> bool {
+    if committed.is_empty() {
+        return true;
+    }
+    let proposed_has_all_committed = committed.iter().all(|c| proposed.contains(c));
+    let committed_has_all_proposed = proposed.iter().all(|p| committed.contains(p));
+    // Safe when the change is monotonic: pure superset OR pure subset.
+    // Equality satisfies both conditions and is also safe.
+    proposed_has_all_committed || committed_has_all_proposed
+}
+
+// ---------------------------------------------------------------------------
 // TopologyAuthority
 // ---------------------------------------------------------------------------
 
@@ -424,13 +457,46 @@ impl TopologyAuthority {
     ///
     /// Returns `Some(TopologyTerm)` if this node should propose
     /// (i.e., this node is the deterministic proposer = `members[0]`).
+    ///
+    /// # Split-brain rejection
+    ///
+    /// If the proposed `members` set is neither a superset nor a subset of
+    /// `committed_members` (i.e., it both *adds* nodes never previously
+    /// committed AND *drops* nodes that were previously committed), the
+    /// change is rejected as a probable split-brain heal: two independent
+    /// clusters that share a `cluster_secret` (or whose SWIM gossip
+    /// otherwise leaks across) have just learned about each other. Healing
+    /// such a merge by silently committing a unioned/intersected member
+    /// set would corrupt the shard tables on both sides — operators must
+    /// intervene (currently by tearing down one side; future work tracks
+    /// an `--allow-merge` flag and a separate `cluster_id` field).
+    ///
+    /// Pure additions (member joins) and pure removals (graceful drain) are
+    /// still accepted.
     pub fn on_membership_changed(&self, members: &[NodeId]) -> Option<TopologyTerm> {
-        *self.last_membership_change.lock().unwrap() = Instant::now();
-        *self.observed_membership.lock().unwrap() = members.to_vec();
-
         if members.is_empty() {
             return None;
         }
+
+        // Split-brain heal detection — refuse to commit a topology that both
+        // adds and removes members relative to the committed set. Run BEFORE
+        // updating observed_membership / last_membership_change so the
+        // fallback proposer path doesn't pick up the poisoned view either.
+        {
+            let committed_members = self.committed_members.read().unwrap();
+            if !committed_members.is_empty() && !is_safe_membership_change(&committed_members, members) {
+                tracing::error!(
+                    self_id = self.self_id.0,
+                    committed = ?committed_members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                    proposed = ?members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                    "cluster: refusing topology proposal — proposed member set is neither a superset nor a subset of committed members (probable split-brain heal). Operator intervention required.",
+                );
+                return None;
+            }
+        }
+
+        *self.last_membership_change.lock().unwrap() = Instant::now();
+        *self.observed_membership.lock().unwrap() = members.to_vec();
 
         // Skip if the committed membership is already identical.
         // This prevents redundant proposals when SWIM fires membership
@@ -645,6 +711,27 @@ impl TopologyAuthority {
             return None;
         }
 
+        // Split-brain heal defense: even though `on_membership_changed`
+        // would have rejected a non-monotonic SWIM event before populating
+        // `observed_membership`, a compromised or buggy caller might also
+        // mutate it directly (tests do, see `retry_proposal_returns_none_*`).
+        // Re-check here so a poisoned observation cannot be laundered into
+        // a proposal via the retry path.
+        {
+            let committed_members = self.committed_members.read().unwrap();
+            if !committed_members.is_empty()
+                && !is_safe_membership_change(&committed_members, &target_members)
+            {
+                tracing::error!(
+                    self_id = self.self_id.0,
+                    committed = ?committed_members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                    proposed = ?target_members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                    "cluster: refusing topology retry — observed members neither superset nor subset of committed (probable split-brain heal).",
+                );
+                return None;
+            }
+        }
+
         {
             let committed_members = self.committed_members.read().unwrap();
             if committed_members.len() == target_members.len()
@@ -702,6 +789,25 @@ impl TopologyAuthority {
 
         if target_members.is_empty() || target_members[0] == self.self_id {
             return None; // We are already the deterministic proposer
+        }
+
+        // Split-brain heal defense (defense in depth — see retry_proposal).
+        // The bootstrap-fallback `members` slice can come from the live
+        // socket map, which is updated outside `on_membership_changed`;
+        // re-validate here so a non-monotonic view never becomes a proposal.
+        {
+            let committed_members = self.committed_members.read().unwrap();
+            if !committed_members.is_empty()
+                && !is_safe_membership_change(&committed_members, &target_members)
+            {
+                tracing::error!(
+                    self_id = self.self_id.0,
+                    committed = ?committed_members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                    proposed = ?target_members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                    "cluster: refusing topology fallback proposal — target members neither superset nor subset of committed (probable split-brain heal).",
+                );
+                return None;
+            }
         }
 
         // Skip if the committed membership is already identical.
