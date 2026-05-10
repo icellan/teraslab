@@ -2,7 +2,7 @@
 //! external blob store tiers.
 
 use crate::device::{AlignedBuf, BlockDevice};
-use crate::record::{METADATA_SIZE, TxFlags, TxMetadata, UTXO_SLOT_SIZE};
+use crate::record::{TxFlags, TxMetadata, METADATA_SIZE, UTXO_SLOT_SIZE};
 use crate::storage::blobstore::BlobStore;
 use crate::storage::tiers::*;
 use std::sync::Arc;
@@ -1308,6 +1308,224 @@ mod tests {
             // Verify data is readable at the correct offset
             let read = mgr.read_cold_data(offset, utxo_count, &meta).unwrap();
             assert_eq!(read, cold, "cold data mismatch for utxo_count={utxo_count}");
+        }
+    }
+
+    // ---- R-048 (AUDIT.md IJK-01) regression tests ----
+    //
+    // These tests pin the invariant that `StorageManager::write_cold_data`
+    // for the External tier propagates the durable `BlobDigest` back to the
+    // caller via `ColdDataRef::External { digest }`. Pre-fix the variant was
+    // a unit `External` and the digest was discarded with `let _digest = ...`,
+    // so any caller wiring this manager into a real create path would have
+    // populated `ExternalRef.content_hash` with `[0; 32]`. Two consequences,
+    // both proven below:
+    //
+    //   1. The recorded `content_hash` would never match the real payload
+    //      SHA-256, so end-to-end integrity checks become theatre.
+    //   2. The blob store's own sidecar-based integrity check (which is what
+    //      defends against bit rot on the underlying file) only fires when
+    //      the on-disk payload disagrees with the digest computed at `put`
+    //      time. Without a manager-returned digest, callers cannot even
+    //      assert that the manager actually uploaded the bytes — the digest
+    //      could be fabricated.
+
+    /// Build a `FileBlobStore`-backed `StorageManager` so corruption tests can
+    /// mutate on-disk blob payloads independently of the recorded digest
+    /// sidecar. The in-memory store cannot model "payload changed but recorded
+    /// digest unchanged" because every mutation goes through `put`.
+    fn setup_with_file_blobstore() -> (
+        Arc<MemoryDevice>,
+        Arc<crate::storage::blobstore::FileBlobStore>,
+        StorageManager,
+        tempfile::TempDir,
+    ) {
+        let dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let blob_dir = tempfile::tempdir().unwrap();
+        let blob = Arc::new(crate::storage::blobstore::FileBlobStore::new(
+            blob_dir.path(),
+            2,
+        ));
+        let mgr = StorageManager::new(dev.clone(), alloc, blob.clone());
+        (dev, blob, mgr, blob_dir)
+    }
+
+    fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(data);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&h.finalize());
+        out
+    }
+
+    #[test]
+    fn external_create_populates_content_hash_from_blob_digest() {
+        // Direct invariant: the manager-returned digest must be the durable
+        // SHA-256 of the serialized cold-data payload, never the all-zero
+        // placeholder that pre-fix code stranded in `ExternalRef.content_hash`.
+        let (dev, blob, mgr, _tmp) = setup_with_file_blobstore();
+        let utxo_count = 2u32;
+        let hot_size = TxMetadata::record_size_for(utxo_count);
+        let offset = mgr.allocator.lock().allocate(hot_size).unwrap();
+
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id[0] = 0xCA;
+        meta.tx_id[1] = 0xFE;
+        meta.flags = TxFlags::EXTERNAL;
+        meta.record_size = hot_size as u32;
+        let slots = vec![UtxoSlot::new_unspent([0; 32]); utxo_count as usize];
+        io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+
+        // Cold data large enough to land in the External tier (> 1 MiB).
+        let cold = ColdData {
+            inputs: vec![0xAA; 1024 * 1024],
+            outputs: vec![0xBB; 256 * 1024],
+            inpoints: vec![0xCC; 64],
+        };
+        let serialized = cold.serialize();
+        let expected_sha = sha256_bytes(&serialized);
+
+        let result = mgr
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .unwrap();
+        let digest = match result {
+            ColdDataRef::External { digest } => digest,
+            other => panic!(
+                "expected External tier for {} bytes, got {other:?}",
+                serialized.len()
+            ),
+        };
+
+        // Pre-fix: this assertion would have been impossible — the unit
+        // variant carried no digest, and the eventual `ExternalRef.content_hash`
+        // would have been left at `[0; 32]`.
+        assert_ne!(digest.sha256, [0u8; 32], "digest must not be zero");
+        assert_eq!(
+            digest.sha256, expected_sha,
+            "manager-returned digest must equal SHA-256 of the serialized cold data",
+        );
+        assert_eq!(digest.length, serialized.len() as u64);
+
+        // Cross-check: the blob store independently reports the same digest.
+        // This catches a future bug where the manager fabricates a digest
+        // without uploading the bytes.
+        let store_digest = blob.digest(&meta.tx_id).unwrap().unwrap();
+        assert_eq!(store_digest.sha256, expected_sha);
+        assert_eq!(store_digest.length, serialized.len() as u64);
+
+        // And: stamping the manager-returned digest into `ExternalRef`
+        // produces a record whose recorded `content_hash` actually matches
+        // what is on disk — the entire point of R-048.
+        let ext_ref = crate::record::ExternalRef {
+            store_type: 1,
+            content_hash: digest.sha256,
+            total_size: digest.length,
+            input_count: 0,
+            output_count: 0,
+            inputs_offset: 0,
+            outputs_offset: 0,
+        };
+        assert_eq!(ext_ref.content_hash, expected_sha);
+    }
+
+    #[test]
+    fn external_blob_integrity_check_fires_on_corruption() {
+        // Audit-prescribed regression name. Pre-fix the recorded
+        // `content_hash` was permanently zero, so the two failure modes were:
+        //   * If a reader compared SHA-256 against zero, every read would
+        //     reject (which is what AUDIT.md IJK-01 reported).
+        //   * If a reader skipped the check on a zero hash, corruption would
+        //     go undetected.
+        // Either way, the integrity contract was broken. Post-fix the
+        // FileBlobStore's sidecar carries the durable digest from `put`, so
+        // mutating the on-disk payload (without touching the sidecar) MUST
+        // cause `read_cold_data` to surface a `DigestMismatch`.
+        let (dev, blob, mgr, _tmp) = setup_with_file_blobstore();
+        let utxo_count = 1u32;
+        let hot_size = TxMetadata::record_size_for(utxo_count);
+        let offset = mgr.allocator.lock().allocate(hot_size).unwrap();
+
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id[0] = 0xBA;
+        meta.tx_id[1] = 0xAD;
+        meta.flags = TxFlags::EXTERNAL;
+        meta.record_size = hot_size as u32;
+        let slots = vec![UtxoSlot::new_unspent([0; 32]); utxo_count as usize];
+        io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+
+        let cold = ColdData {
+            inputs: vec![0x11; 1024 * 1024 + 100],
+            outputs: vec![0x22; 1024],
+            inpoints: vec![],
+        };
+        let result = mgr
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .unwrap();
+        let digest = match result {
+            ColdDataRef::External { digest } => digest,
+            other => panic!("expected External, got {other:?}"),
+        };
+        // Sanity: the freshly-written blob reads back cleanly with the
+        // integrity check passing — establishes the baseline before we
+        // tamper with the on-disk bytes.
+        let clean_read = mgr.read_cold_data(offset, utxo_count, &meta).unwrap();
+        assert_eq!(clean_read, cold);
+
+        // Corrupt the on-disk payload while leaving the sidecar (which
+        // records the digest from `put`) intact. The sidecar holds
+        // `digest.sha256`; the payload now hashes to something else.
+        // FileBlobStore lays the payload out under base_dir/ab/cd/<hex>.
+        let key_hex: String = meta.tx_id.iter().map(|b| format!("{b:02x}")).collect();
+        let mut blob_path = _tmp.path().to_path_buf();
+        blob_path = blob_path
+            .join(&key_hex[0..2])
+            .join(&key_hex[2..4])
+            .join(&key_hex);
+        assert!(
+            blob_path.exists(),
+            "expected blob payload at {blob_path:?} (key {key_hex})"
+        );
+        let mut on_disk = std::fs::read(&blob_path).unwrap();
+        // Flip a byte in the middle of the payload.
+        let mid = on_disk.len() / 2;
+        on_disk[mid] ^= 0xFF;
+        std::fs::write(&blob_path, &on_disk).unwrap();
+
+        // Sidecar must still encode the original (now stale) digest.
+        let sidecar_digest = blob.digest(&meta.tx_id).unwrap().unwrap();
+        assert_eq!(
+            sidecar_digest, digest,
+            "sidecar must retain the original digest after payload corruption",
+        );
+
+        // The integrity check MUST fire — `BlobStore::get` recomputes the
+        // payload SHA-256 and compares against the sidecar. With a corrupted
+        // payload, that comparison fails and the error bubbles through the
+        // manager as `StorageError::Blob(BlobError::DigestMismatch { .. })`.
+        match mgr.read_cold_data(offset, utxo_count, &meta) {
+            Err(StorageError::Blob(crate::storage::blobstore::BlobError::DigestMismatch {
+                expected,
+                actual,
+                ..
+            })) => {
+                assert_eq!(
+                    expected, digest.sha256,
+                    "expected digest must match the manager-returned digest",
+                );
+                assert_ne!(
+                    actual, expected,
+                    "actual digest must differ after tampering"
+                );
+                assert_eq!(
+                    actual,
+                    sha256_bytes(&on_disk),
+                    "actual digest must equal SHA-256 of the tampered on-disk payload",
+                );
+            }
+            Ok(_) => panic!("integrity check did not fire on corrupted blob payload"),
+            Err(other) => panic!("expected DigestMismatch, got {other:?}"),
         }
     }
 }

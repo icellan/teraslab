@@ -484,7 +484,9 @@ impl TopologyAuthority {
         // fallback proposer path doesn't pick up the poisoned view either.
         {
             let committed_members = self.committed_members.read().unwrap();
-            if !committed_members.is_empty() && !is_safe_membership_change(&committed_members, members) {
+            if !committed_members.is_empty()
+                && !is_safe_membership_change(&committed_members, members)
+            {
                 tracing::error!(
                     self_id = self.self_id.0,
                     committed = ?committed_members.iter().map(|n| n.0).collect::<Vec<_>>(),
@@ -1751,6 +1753,196 @@ mod tests {
         assert!(
             v.accepted,
             "formation recovery should accept equal-term multi-node proposal"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // R-042 — split-brain heal rejection
+    // -----------------------------------------------------------------------
+
+    /// Helper to seed a TopologyAuthority with a committed membership at
+    /// the given term.
+    fn commit_membership(auth: &TopologyAuthority, term: u64, ids: &[u64]) {
+        let mems = members(ids);
+        let commit = TopologyCommit {
+            term,
+            proposer: NodeId(1),
+            members: mems.clone(),
+            digest: TopologyTerm::compute_digest(term, &mems),
+        };
+        auth.handle_commit(&commit);
+        assert_eq!(auth.committed_members(), mems);
+    }
+
+    #[test]
+    fn is_safe_membership_change_classifies_pure_additions_as_safe() {
+        // Joining a node is monotonic: committed ⊆ proposed.
+        assert!(is_safe_membership_change(
+            &members(&[1, 2, 3]),
+            &members(&[1, 2, 3, 4]),
+        ));
+    }
+
+    #[test]
+    fn is_safe_membership_change_classifies_pure_removals_as_safe() {
+        // Graceful drain is monotonic: proposed ⊆ committed.
+        assert!(is_safe_membership_change(
+            &members(&[1, 2, 3, 4]),
+            &members(&[1, 2, 3]),
+        ));
+    }
+
+    #[test]
+    fn is_safe_membership_change_classifies_no_change_as_safe() {
+        assert!(is_safe_membership_change(
+            &members(&[1, 2, 3]),
+            &members(&[1, 2, 3]),
+        ));
+    }
+
+    #[test]
+    fn is_safe_membership_change_classifies_first_commit_as_safe() {
+        // Empty committed set: anything is acceptable.
+        assert!(is_safe_membership_change(&[], &members(&[1, 2, 3])));
+    }
+
+    #[test]
+    fn is_safe_membership_change_rejects_split_brain_merge() {
+        // Committed [1, 2, 3]; SWIM now says [1, 2, 4].
+        // Node 3 dropped AND node 4 appeared — split-brain heal signature.
+        assert!(!is_safe_membership_change(
+            &members(&[1, 2, 3]),
+            &members(&[1, 2, 4]),
+        ));
+    }
+
+    #[test]
+    fn is_safe_membership_change_rejects_disjoint_clusters() {
+        // No overlap at all — clearly two independent clusters.
+        assert!(!is_safe_membership_change(
+            &members(&[1, 2, 3]),
+            &members(&[10, 11, 12]),
+        ));
+    }
+
+    /// Headline regression for R-042: the deterministic proposer must
+    /// refuse to issue a TopologyTerm when the proposed membership is
+    /// neither a superset nor a subset of the committed set.
+    #[test]
+    fn topology_proposer_refuses_non_superset_membership_change() {
+        // Node 1 is the deterministic proposer (lowest id).
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        // Cluster A committed: [1, 2, 3].
+        commit_membership(&auth, 1, &[1, 2, 3]);
+
+        // Sanity: a pure addition (cluster grows by one) is accepted.
+        let pure_add = auth.on_membership_changed(&members(&[1, 2, 3, 4]));
+        assert!(
+            pure_add.is_some(),
+            "monotonic add (join) must still be accepted",
+        );
+        assert_eq!(pure_add.unwrap().members, members(&[1, 2, 3, 4]));
+
+        // Reset to the original commit so the next assertion starts clean.
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        commit_membership(&auth, 1, &[1, 2, 3]);
+
+        // Sanity: a pure removal (graceful drain) is accepted.
+        let pure_drop = auth.on_membership_changed(&members(&[1, 2]));
+        assert!(
+            pure_drop.is_some(),
+            "monotonic remove (drain) must still be accepted",
+        );
+
+        // Real test: SWIM reports [1, 2, 5] — node 3 disappeared AND node 5
+        // showed up, the unmistakable two-clusters-merging pattern.
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        commit_membership(&auth, 1, &[1, 2, 3]);
+        // After commit, both committed_members AND observed_membership are
+        // pinned to [1,2,3] (handle_commit sets both). Capture the
+        // baseline so we can pin it across the refusal.
+        let observed_before = auth.observed_membership.lock().unwrap().clone();
+        assert_eq!(
+            observed_before,
+            members(&[1, 2, 3]),
+            "handle_commit pins observed_membership to the committed set",
+        );
+
+        let proposal = auth.on_membership_changed(&members(&[1, 2, 5]));
+        assert!(
+            proposal.is_none(),
+            "proposer must refuse non-monotonic membership change (split-brain heal)",
+        );
+
+        // The proposer's view of the cluster must NOT be poisoned by the
+        // refused event. observed_membership and committed_members both
+        // remain pinned to their pre-refusal values — the asymmetric
+        // event leaks NO state into the authority.
+        assert_eq!(
+            auth.observed_membership.lock().unwrap().clone(),
+            observed_before,
+            "refused event must not overwrite observed_membership",
+        );
+        assert_eq!(
+            auth.committed_members(),
+            members(&[1, 2, 3]),
+            "committed_members must remain unchanged after refusal",
+        );
+
+        // No pending proposal was registered.
+        assert!(
+            auth.pending_proposal.lock().unwrap().is_none(),
+            "refusal must not leave a pending proposal behind",
+        );
+
+        // voted_term must NOT have advanced — we never broadcast a proposal,
+        // so we cannot have self-voted.
+        assert_eq!(
+            auth.voted_term.load(Ordering::Relaxed),
+            0,
+            "refusal must not advance voted_term",
+        );
+    }
+
+    /// Defense in depth: the fallback proposer (`check_timeout`) must also
+    /// refuse a non-monotonic target membership.
+    #[test]
+    fn check_timeout_refuses_non_superset_membership_change() {
+        // Node 2 is NOT the deterministic proposer for [1, 3, 5]; it would
+        // become the fallback proposer after the timeout fires.
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_millis(1));
+        commit_membership(&auth, 1, &[1, 2, 3]);
+
+        // Wait past the timeout window so check_timeout proceeds past the
+        // elapsed guard.
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Bootstrap fallback: pass a non-monotonic set as the `members`
+        // arg (observed_membership is empty so the bootstrap path runs).
+        let result = auth.check_timeout(&members(&[1, 3, 5]));
+        assert!(
+            result.is_none(),
+            "fallback proposer must refuse non-monotonic target",
+        );
+    }
+
+    /// Defense in depth: the retry path must refuse a poisoned
+    /// observed_membership too.
+    #[test]
+    fn retry_proposal_refuses_non_superset_membership_change() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        commit_membership(&auth, 1, &[1, 2, 3]);
+
+        // Bypass on_membership_changed to install a poisoned observation
+        // (simulating a buggy caller or, more realistically, an observation
+        // that was monotonic when first installed but became non-monotonic
+        // after a subsequent commit).
+        *auth.observed_membership.lock().unwrap() = members(&[1, 2, 5]);
+
+        let retry = auth.retry_proposal();
+        assert!(
+            retry.is_none(),
+            "retry must refuse non-monotonic observed membership",
         );
     }
 }
