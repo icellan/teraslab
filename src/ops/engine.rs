@@ -2302,8 +2302,19 @@ impl Engine {
             return Err(SpendError::NotFrozen { offset: req.offset });
         }
 
-        // Write new slot with spendable height encoded in spending_data[0..4]
-        let spendable_height = req.block_height.saturating_add(req.spendable_after);
+        // R-063 (A-13): use checked_add. Pre-fix the engine used
+        // `saturating_add`, which silently clamped to `u32::MAX` and
+        // pinned the UTXO unspendable forever — the
+        // `spendable_height >= req.current_block_height` gate in the
+        // spend path would always be true. Now surfaces as
+        // `SpendError::ReassignOverflow` so the operator catches the
+        // pathological input.
+        let spendable_height = req.block_height.checked_add(req.spendable_after).ok_or(
+            SpendError::ReassignOverflow {
+                block_height: req.block_height,
+                spendable_after: req.spendable_after,
+            },
+        )?;
         let mut new_slot = UtxoSlot::new_unspent(req.new_utxo_hash);
         new_slot.spending_data[0..4].copy_from_slice(&spendable_height.to_le_bytes());
 
@@ -7813,6 +7824,48 @@ mod tests {
             matches!(result, Err(SpendError::Conflicting)),
             "reassign on CONFLICTING record must return Conflicting, got {result:?}"
         );
+    }
+
+    /// R-063 (A-13) regression: when the operator-supplied
+    /// `block_height + spendable_after` would overflow `u32`, reassign
+    /// MUST return `SpendError::ReassignOverflow` instead of silently
+    /// clamping with `saturating_add` and pinning the UTXO unspendable
+    /// forever (the spend path's `spendable_height >= current_block_height`
+    /// gate would always be true).
+    #[test]
+    fn reassign_overflow_checked_add_rejects_u32_max() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(0xA3, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
+
+        let result = engine.reassign(&ReassignRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: req.utxo_hashes[0],
+            new_utxo_hash: [0xCC; 32],
+            block_height: u32::MAX - 50,
+            spendable_after: 100, // u32::MAX - 50 + 100 overflows
+        });
+        match result {
+            Err(SpendError::ReassignOverflow {
+                block_height,
+                spendable_after,
+            }) => {
+                assert_eq!(block_height, u32::MAX - 50);
+                assert_eq!(spendable_after, 100);
+            }
+            other => panic!(
+                "reassign with overflowing spendable_height must return ReassignOverflow, got {other:?}",
+            ),
+        }
     }
 
     /// R-017 (A-09): reassign must reject coinbase records that have

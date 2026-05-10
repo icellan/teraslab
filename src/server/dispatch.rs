@@ -5516,6 +5516,7 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
         SpendError::NotFrozen { .. } => (ERR_UTXO_NOT_FROZEN, vec![]),
         SpendError::StorageError { .. } => (ERR_INTERNAL, vec![]),
         SpendError::DahOverflow { .. } => (ERR_INTERNAL, vec![]),
+        SpendError::ReassignOverflow { .. } => (ERR_INTERNAL, vec![]),
     };
     BatchItemError {
         item_index,
@@ -5549,7 +5550,9 @@ pub(crate) fn classify_spend_error(err: &SpendError) -> crate::metrics::Outcome 
         | SpendError::FrozenUntil { .. }
         | SpendError::AlreadyFrozen { .. }
         | SpendError::NotFrozen { .. } => Outcome::ErrFrozen,
-        SpendError::StorageError { .. } | SpendError::DahOverflow { .. } => Outcome::ErrStorage,
+        SpendError::StorageError { .. }
+        | SpendError::DahOverflow { .. }
+        | SpendError::ReassignOverflow { .. } => Outcome::ErrStorage,
         SpendError::CoinbaseImmature { .. }
         | SpendError::UtxoNotFound { .. }
         | SpendError::UtxoHashMismatch { .. } => Outcome::Other,

@@ -120,4 +120,20 @@ pub enum SpendError {
         /// Configured block-height retention window.
         retention: u32,
     },
+
+    /// R-063 (A-13): `block_height + spendable_after` for a `reassign`
+    /// operation would overflow a `u32`. Pre-fix the engine used
+    /// `saturating_add`, which silently clamped to `u32::MAX` and pinned
+    /// the UTXO unspendable forever. Now surfaces as an explicit error
+    /// the dispatcher maps to `ERR_INTERNAL` so the operator catches the
+    /// pathological input instead of silently corrupting state.
+    #[error(
+        "REASSIGN_OVERFLOW: block_height={block_height} + spendable_after={spendable_after} exceeds u32::MAX"
+    )]
+    ReassignOverflow {
+        /// Current block height supplied by the reassign request.
+        block_height: u32,
+        /// Configured spendable-after delay (in blocks) the request asked for.
+        spendable_after: u32,
+    },
 }

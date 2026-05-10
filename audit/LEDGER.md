@@ -652,11 +652,12 @@
 ### R-063 — [freeze-op] `reassign` `saturating_add` for `spendable_height` silently pins UTXO unspendable forever on overflow
 - **Source:** AUDIT.md A-13
 - **Severity:** MEDIUM
-- **Status:** OPEN
-- **Files:** src/ops/engine.rs:2254
+- **Status:** RESOLVED
+- **Files:** src/ops/engine.rs (`Engine::reassign`), src/ops/error.rs (new `SpendError::ReassignOverflow`), src/server/dispatch.rs (mapping to `ERR_INTERNAL` + `Outcome::ErrStorage`)
 - **Cluster:** freeze-op
-- **Notes:** `req.block_height.checked_add(req.spendable_after).ok_or(SpendError::ReassignOverflow {…})`. New error variant.
-- **Test:** `reassign_overflow_checked_add_rejects_u32_max`
+- **Resolution:** Replaced `req.block_height.saturating_add(req.spendable_after)` with `req.block_height.checked_add(req.spendable_after).ok_or(SpendError::ReassignOverflow { block_height, spendable_after })`. Added the `ReassignOverflow` variant to `SpendError` (mirrors the existing `DahOverflow` pattern), wired it through the dispatcher's per-item error mapping (→ `ERR_INTERNAL`) and `classify_spend_error` (→ `Outcome::ErrStorage`). Pre-fix the saturating clamp pinned the UTXO unspendable forever — every subsequent spend hit `spendable_height >= current_block_height` (since `spendable_height` was `u32::MAX`) and returned `FrozenUntil`. Now the operator catches the pathological input at the reassign call site instead of debugging a permanent freeze.
+- **Tests added:** `reassign_overflow_checked_add_rejects_u32_max` — calls `reassign` with `block_height = u32::MAX - 50` + `spendable_after = 100` and asserts the new `ReassignOverflow { block_height, spendable_after }` error variant fires with the correct field values.
+- **Verification:** Full local gate green: `cargo build --release`, `cargo test --all` (1746 passed, 0 failed, 0 ignored, prior to merging the R-052/R-053 worktree), `cargo clippy --all --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 
 ### R-064 — [reorg-op] `set_conflicting` slow path doesn't propagate to parent records' conflicting-children list in fast path
 - **Source:** AUDIT.md A-21
