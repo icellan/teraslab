@@ -934,3 +934,254 @@ fn tcp_consistency_verification() {
     _master_server.shutdown();
     _replica_server.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// R-052 / R-053: MarkLongestChain replication
+// ---------------------------------------------------------------------------
+
+/// R-052: A `MarkLongestChain` `ReplicaOp` MUST replicate the master's
+/// `unmined_since`, `delete_at_height`, and `generation` mutations to
+/// the replica. Pre-fix the dispatch handler emitted no `ReplicaOp` for
+/// `OP_MARK_LONGEST_CHAIN_BATCH`, so any reorg silently desynced master
+/// and replica DAH/unmined state.
+///
+/// This test exercises the receiver path directly: the master mutates
+/// its own engine; the replica receives the matching `ReplicaOp` over
+/// TCP. If R-052 is reverted (variant removed or the encode arm
+/// dropped) this test will fail to compile or the receiver will reject
+/// opcode 14 — both are loud failure modes.
+#[test]
+fn cluster_mark_longest_chain_replicates_dah_unmined() {
+    let (master_server, master_engine, _master_port) = start_test_server();
+    let (replica_server, replica_engine, replica_port) = start_test_server();
+
+    // Create the same record on both sides so they share a starting
+    // generation of 1 (Engine::create initialises generation = 1).
+    let txid = test_txid(7000);
+    let key = key_from_txid(txid);
+    create_record_on_engine(&master_engine, txid, 2);
+    create_record_on_engine(&replica_engine, txid, 2);
+
+    // Sanity: both records start with unmined_since = 0 and DAH = 0.
+    let master_pre = master_engine.read_metadata(&key).unwrap();
+    let replica_pre = replica_engine.read_metadata(&key).unwrap();
+    assert_eq!({ master_pre.unmined_since }, 0);
+    assert_eq!({ replica_pre.unmined_since }, 0);
+    assert_eq!({ master_pre.delete_at_height }, 0);
+    assert_eq!({ replica_pre.delete_at_height }, 0);
+    let master_pre_gen = { master_pre.generation };
+    assert_eq!(master_pre_gen, { replica_pre.generation });
+
+    // Apply mark_on_longest_chain(false) on master — simulates the tx
+    // dropping off the longest chain in a reorg. unmined_since is set
+    // to current_block_height; DAH is evaluated and may be set; the
+    // record's generation increments.
+    let req = teraslab::ops::mark_longest_chain::MarkOnLongestChainRequest {
+        tx_key: key,
+        on_longest_chain: false,
+        current_block_height: 800_500,
+        block_height_retention: 288,
+    };
+    let resp = master_engine.mark_on_longest_chain(&req).unwrap();
+    let master_post = master_engine.read_metadata(&key).unwrap();
+    let master_unmined_after = { master_post.unmined_since };
+    let master_dah_after = { master_post.delete_at_height };
+    let master_gen_after = { master_post.generation };
+    assert_eq!(
+        master_unmined_after, 800_500,
+        "master's unmined_since must update on mark(off, h)",
+    );
+    assert_eq!(master_gen_after, master_pre_gen + 1);
+    assert_eq!(resp.generation, master_gen_after);
+
+    // Build and send the matching ReplicaOp::MarkLongestChain to the
+    // replica. Pre-fix this variant did not exist; the bug was that the
+    // dispatch handler had nothing to send, so the replica observed no
+    // mutation at all.
+    let batch = ReplicaBatch {
+        first_sequence: 1,
+        ops: vec![ReplicaOp::MarkLongestChain {
+            tx_key: key,
+            on_longest_chain: false,
+            current_block_height: 800_500,
+            block_height_retention: 288,
+            master_generation: master_gen_after,
+        }],
+        trace_ctx: None,
+        source_node_id: None,
+        cluster_key: 0,
+    };
+    let ack = send_replica_batch_tcp(replica_port, &batch);
+    assert_eq!(
+        ack,
+        ReplicaAck::Ok {
+            through_sequence: 1
+        }
+    );
+
+    // Replica state MUST converge with master.
+    let replica_post = replica_engine.read_metadata(&key).unwrap();
+    assert_eq!(
+        { replica_post.unmined_since },
+        master_unmined_after,
+        "replica unmined_since diverged from master",
+    );
+    assert_eq!(
+        { replica_post.delete_at_height },
+        master_dah_after,
+        "replica delete_at_height diverged from master — DAH index would drift",
+    );
+    assert_eq!(
+        { replica_post.generation },
+        master_gen_after,
+        "replica generation must match master after applying MarkLongestChain",
+    );
+
+    master_server.shutdown();
+    replica_server.shutdown();
+}
+
+/// R-053: applying the same `MarkLongestChain` `ReplicaOp` twice on a
+/// replica MUST be a no-op the second time. Without per-generation
+/// idempotency, recovery replay of the redo log (or duplicate receive
+/// of the same wire batch after a transient ack drop) would cause:
+///   - generation to bump twice (de-syncing future stale-op checks),
+///   - DAH/unmined secondary indexes to be re-written for no reason,
+///   - the master's `master_generation` value to be overwritten, then
+///     immediately overwritten back via the post-apply generation
+///     sync — visible as redb churn under load.
+#[test]
+fn mark_longest_chain_replay_idempotent() {
+    let (replica_server, replica_engine, replica_port) = start_test_server();
+
+    // Replica starts with the record so the op has something to apply.
+    let txid = test_txid(7100);
+    let key = key_from_txid(txid);
+    create_record_on_engine(&replica_engine, txid, 1);
+
+    let pre = replica_engine.read_metadata(&key).unwrap();
+    let pre_gen = { pre.generation };
+
+    // Master generation is one ahead of the replica's starting generation
+    // — the canonical "first apply on the replica" case.
+    let master_generation = pre_gen + 1;
+
+    let op = ReplicaOp::MarkLongestChain {
+        tx_key: key,
+        on_longest_chain: false,
+        current_block_height: 900_000,
+        block_height_retention: 288,
+        master_generation,
+    };
+
+    // First apply: must mutate the replica's metadata.
+    let ack1 = send_replica_batch_tcp(
+        replica_port,
+        &ReplicaBatch {
+            first_sequence: 1,
+            ops: vec![op.clone()],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        },
+    );
+    assert_eq!(
+        ack1,
+        ReplicaAck::Ok {
+            through_sequence: 1
+        }
+    );
+    let post1 = replica_engine.read_metadata(&key).unwrap();
+    let post1_gen = { post1.generation };
+    let post1_unmined = { post1.unmined_since };
+    let post1_dah = { post1.delete_at_height };
+    assert_eq!(
+        post1_gen, master_generation,
+        "first apply must sync replica generation to master",
+    );
+    assert_eq!(
+        post1_unmined, 900_000,
+        "first apply must set unmined_since to current_block_height",
+    );
+
+    // Second apply of the SAME op (same master_generation): must be a
+    // no-op. The pre-apply guard inside `apply_op` for MarkLongestChain
+    // (R-053) skips when `local_gen >= master_generation` — here they
+    // are EQUAL, so the engine call is bypassed entirely. Without the
+    // R-053 fix, the equal-generation case would fall through and
+    // bump the engine generation again before the trailing
+    // generation-sync rewrites it back to master_generation.
+    let ack2 = send_replica_batch_tcp(
+        replica_port,
+        &ReplicaBatch {
+            first_sequence: 2,
+            ops: vec![op.clone()],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        },
+    );
+    assert_eq!(
+        ack2,
+        ReplicaAck::Ok {
+            through_sequence: 2
+        }
+    );
+    let post2 = replica_engine.read_metadata(&key).unwrap();
+    assert_eq!(
+        { post2.generation },
+        post1_gen,
+        "replay of same MarkLongestChain must NOT bump generation (R-053)",
+    );
+    assert_eq!(
+        { post2.unmined_since },
+        post1_unmined,
+        "replay must NOT change unmined_since",
+    );
+    assert_eq!(
+        { post2.delete_at_height },
+        post1_dah,
+        "replay must NOT churn the DAH index",
+    );
+
+    // A strictly-stale op (master_generation < local_gen) must also be
+    // rejected by the existing pre-apply guard at the top of apply_op.
+    // We send an op with an older master_generation and assert the
+    // replica state is unchanged.
+    let stale_op = ReplicaOp::MarkLongestChain {
+        tx_key: key,
+        on_longest_chain: true, // would normally clear unmined_since
+        current_block_height: 950_000,
+        block_height_retention: 288,
+        master_generation: master_generation.saturating_sub(1),
+    };
+    let ack3 = send_replica_batch_tcp(
+        replica_port,
+        &ReplicaBatch {
+            first_sequence: 3,
+            ops: vec![stale_op],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        },
+    );
+    assert_eq!(
+        ack3,
+        ReplicaAck::Ok {
+            through_sequence: 3
+        }
+    );
+    let post3 = replica_engine.read_metadata(&key).unwrap();
+    assert_eq!(
+        { post3.generation },
+        post1_gen,
+        "stale op must not bump generation",
+    );
+    assert_eq!(
+        { post3.unmined_since },
+        post1_unmined,
+        "stale op must not revert unmined_since to 0",
+    );
+
+    replica_server.shutdown();
+}

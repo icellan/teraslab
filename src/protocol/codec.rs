@@ -744,45 +744,37 @@ pub fn decode_create_batch_checked(
         pos += 4;
         let locktime = get_u32(data, pos);
         pos += 4;
-        let fee = u64::from_le_bytes(
-            data[pos..pos + 8]
-                .try_into()
-                .map_err(|_| CodecError::SectionTruncated {
-                    need: pos + 8,
-                    have: data.len(),
-                })?,
-        );
+        let fee = u64::from_le_bytes(data[pos..pos + 8].try_into().map_err(|_| {
+            CodecError::SectionTruncated {
+                need: pos + 8,
+                have: data.len(),
+            }
+        })?);
         pos += 8;
-        let size_in_bytes = u64::from_le_bytes(
-            data[pos..pos + 8]
-                .try_into()
-                .map_err(|_| CodecError::SectionTruncated {
-                    need: pos + 8,
-                    have: data.len(),
-                })?,
-        );
+        let size_in_bytes = u64::from_le_bytes(data[pos..pos + 8].try_into().map_err(|_| {
+            CodecError::SectionTruncated {
+                need: pos + 8,
+                have: data.len(),
+            }
+        })?);
         pos += 8;
-        let extended_size = u64::from_le_bytes(
-            data[pos..pos + 8]
-                .try_into()
-                .map_err(|_| CodecError::SectionTruncated {
-                    need: pos + 8,
-                    have: data.len(),
-                })?,
-        );
+        let extended_size = u64::from_le_bytes(data[pos..pos + 8].try_into().map_err(|_| {
+            CodecError::SectionTruncated {
+                need: pos + 8,
+                have: data.len(),
+            }
+        })?);
         pos += 8;
         let is_coinbase = data[pos] != 0;
         pos += 1;
         let spending_height = get_u32(data, pos);
         pos += 4;
-        let created_at = u64::from_le_bytes(
-            data[pos..pos + 8]
-                .try_into()
-                .map_err(|_| CodecError::SectionTruncated {
-                    need: pos + 8,
-                    have: data.len(),
-                })?,
-        );
+        let created_at = u64::from_le_bytes(data[pos..pos + 8].try_into().map_err(|_| {
+            CodecError::SectionTruncated {
+                need: pos + 8,
+                have: data.len(),
+            }
+        })?);
         pos += 8;
         let flags = data[pos];
         pos += 1;
@@ -791,12 +783,13 @@ pub fn decode_create_batch_checked(
 
         // Validate utxo_count fits in remaining bytes BEFORE allocating
         // the per-item Vec — protects against count = u32::MAX.
-        let utxo_bytes = (utxo_count as usize)
-            .checked_mul(32)
-            .ok_or(CodecError::SectionTruncated {
-                need: usize::MAX,
-                have: data.len() - pos,
-            })?;
+        let utxo_bytes =
+            (utxo_count as usize)
+                .checked_mul(32)
+                .ok_or(CodecError::SectionTruncated {
+                    need: usize::MAX,
+                    have: data.len() - pos,
+                })?;
         if pos + utxo_bytes > data.len() {
             return Err(CodecError::SectionTruncated {
                 need: pos + utxo_bytes,

@@ -434,7 +434,13 @@ pub fn open_mandatory_redo_log(
     path: &Path,
     size: u64,
     alignment: usize,
-) -> Result<(std::sync::Arc<dyn crate::device::BlockDevice>, crate::redo::RedoLog), RedoOpenError> {
+) -> Result<
+    (
+        std::sync::Arc<dyn crate::device::BlockDevice>,
+        crate::redo::RedoLog,
+    ),
+    RedoOpenError,
+> {
     let device = crate::device::DirectDevice::open(path, size, alignment).map_err(|e| {
         RedoOpenError::Device {
             path: path.display().to_string(),
@@ -442,12 +448,11 @@ pub fn open_mandatory_redo_log(
         }
     })?;
     let device: std::sync::Arc<dyn crate::device::BlockDevice> = std::sync::Arc::new(device);
-    let log = crate::redo::RedoLog::open(device.clone(), 0, size).map_err(|e| {
-        RedoOpenError::Log {
+    let log =
+        crate::redo::RedoLog::open(device.clone(), 0, size).map_err(|e| RedoOpenError::Log {
             path: path.display().to_string(),
             reason: format!("{e}"),
-        }
-    })?;
+        })?;
     Ok((device, log))
 }
 
@@ -488,8 +493,7 @@ mod tests {
             entries_failed: MAX_TOLERATED_MISSING_PRIMARY,
             ..RecoveryStats::default()
         };
-        check_replay_tolerance(&stats)
-            .expect("missing-primary at the cap must still be tolerated");
+        check_replay_tolerance(&stats).expect("missing-primary at the cap must still be tolerated");
     }
 
     #[test]
@@ -534,8 +538,8 @@ mod tests {
             entries_failed: n,
             ..RecoveryStats::default()
         };
-        let err = check_replay_tolerance(&stats)
-            .expect_err("missing-primary over cap must fail closed");
+        let err =
+            check_replay_tolerance(&stats).expect_err("missing-primary over cap must fail closed");
         assert!(err.contains("missing-primary"), "msg: {err}");
         assert!(err.contains("cap"), "msg: {err}");
     }
@@ -691,9 +695,15 @@ mod tests {
 
     #[test]
     fn replay_cause_labels_are_distinct() {
-        assert_eq!(replay_cause_label(ReplayCause::MissingPrimary), "missing-primary");
+        assert_eq!(
+            replay_cause_label(ReplayCause::MissingPrimary),
+            "missing-primary"
+        );
         assert_eq!(replay_cause_label(ReplayCause::IoError), "io-error");
-        assert_eq!(replay_cause_label(ReplayCause::CorruptEntry), "corrupt-entry");
+        assert_eq!(
+            replay_cause_label(ReplayCause::CorruptEntry),
+            "corrupt-entry"
+        );
         assert_eq!(replay_cause_label(ReplayCause::LogicError), "logic-error");
     }
 
@@ -711,7 +721,11 @@ mod tests {
             Err(e) => panic!("clean tmp path must open: {e}"),
         };
         // Smoke check: a freshly opened log starts at sequence 1.
-        assert_eq!(log.current_sequence(), 1, "freshly opened redo log must start at seq 1");
+        assert_eq!(
+            log.current_sequence(),
+            1,
+            "freshly opened redo log must start at seq 1"
+        );
     }
 
     #[test]
@@ -728,7 +742,10 @@ mod tests {
         match err {
             super::RedoOpenError::Device { path: p, reason } => {
                 assert!(p.contains("does/not/exist"), "path in error: {p}");
-                assert!(!reason.is_empty(), "reason must carry underlying error: {reason}");
+                assert!(
+                    !reason.is_empty(),
+                    "reason must carry underlying error: {reason}"
+                );
             }
             super::RedoOpenError::Log { .. } => {
                 panic!("missing parent dir should surface as Device error, not Log error");
@@ -752,7 +769,10 @@ mod tests {
         match err {
             super::RedoOpenError::Device { path: p, reason } => {
                 assert_eq!(p, dir_path.display().to_string(), "path in error: {p}");
-                assert!(!reason.is_empty(), "reason must carry underlying error: {reason}");
+                assert!(
+                    !reason.is_empty(),
+                    "reason must carry underlying error: {reason}"
+                );
             }
             super::RedoOpenError::Log { .. } => {
                 panic!("a directory path should surface as Device error, not Log error");
