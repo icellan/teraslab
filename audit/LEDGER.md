@@ -431,11 +431,36 @@
 ### R-041 — [redirect-routing] REDIRECT has no hop count, TTL, or loop counter — clients chase stale routes forever
 - **Source:** AUDIT.md EF-09
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/server/dispatch.rs:2287-2311,4283-4307,4763-4779, src/cluster/coordinator.rs:5598-5620, src/cluster/routing.rs:67-93
+- **Status:** RESOLVED
+- **Files:** src/protocol/codec.rs (`encode_redirect_with_version`, `decode_redirect_with_version`, `classify_redirect`, `RedirectFollowDecision`), src/protocol/opcodes.rs (extended `ERR_REDIRECT` doc), src/server/dispatch.rs (`check_shard_ownership` site 1, `handle_get_batch` site 2), client/rust/src/lib.rs (`collect_redirect_groups`)
 - **Cluster:** redirect-routing
-- **Notes:** Add hop counter to request frame (header byte or shifted flags bits). Reject redirects whose `hop_count > N` (suggest 4). Or encode `shard_table_version` from `RouteDecision::RedirectTo` into error_data so client detects stale version.
-- **Test:** `redirect_loop_detection_with_hop_counter`
+- **Resolution:** Took the **shard_table_version** option (lower blast radius than a request-frame hop counter). The dispatcher now plumbs the source node's `shard_table_version` from `RouteDecision::RedirectTo` into the REDIRECT response payload at every emit site so the client can detect a stale-route loop without changing the request-frame header. Three new codec helpers expose this:
+  - `encode_redirect_with_version(addr, version)` produces `[addr_len:2][addr][shard_table_version:8 (le)]`.
+  - `decode_redirect_with_version(data) -> Option<(String, Option<u64>)>` accepts both the new versioned form and the legacy address-only form (returns `(addr, None)` for legacy; rejects malformed trailers that are neither 0 nor exactly 8 bytes).
+  - `classify_redirect(server_v, client_v) -> RedirectFollowDecision { Follow | Stale | Unknown }` is the canonical comparator: `Follow` only when server is strictly ahead, `Stale` when equal-or-behind (i.e. chasing would loop), `Unknown` when the server omitted a version (legacy server).
+
+  Wire-format extension is back-compat for the **top-level `STATUS_REDIRECT`** path: `decode_redirect` (legacy decoder) reads `addr_len` bytes and silently ignores the trailing 8 version bytes. For the **per-item `BatchItemError.error_data`** path the previous wire was raw addr bytes with no length prefix; old clients calling `from_utf8(&err.data)` over the new versioned payload will fail to parse (binary version trailer is invalid UTF-8) and fall through to surface a `PartialError` to the caller — a graceful degradation, not silent corruption. The in-tree client (`collect_redirect_groups`) was updated to use the new decoder with a legacy-raw-addr fallback so it accepts all three wire shapes (versioned, length-prefixed-no-version, raw-addr).
+
+  GetSpend (site 3 in the audit, `dispatch.rs:4763-4779`) is intentionally **not** modified: `WireGetSpendResult` is a fixed-size 40-byte record with no addr field, so the GetSpend redirect path can not drive a redirect loop in the first place — the client must refresh routing to retry.
+
+- **Tests added:**
+  - `protocol::codec::tests::redirect_with_version_round_trip_recovers_addr_and_version`
+  - `protocol::codec::tests::redirect_legacy_addr_only_decodes_with_no_version`
+  - `protocol::codec::tests::redirect_versioned_payload_back_compat_with_legacy_decoder`
+  - `protocol::codec::tests::redirect_with_version_rejects_malformed_trailer`
+  - `protocol::codec::tests::classify_redirect_follow_when_server_strictly_ahead`
+  - `protocol::codec::tests::classify_redirect_stale_when_versions_equal`
+  - `protocol::codec::tests::classify_redirect_stale_when_server_behind`
+  - `protocol::codec::tests::classify_redirect_unknown_when_legacy_server`
+  - `server::dispatch::tests::redirect_includes_shard_table_version_for_loop_detection` — the headline regression: drives a real `OP_SET_MINED_BATCH` and a real `OP_GET_BATCH` against a 2-node cluster setup, asserts both `BatchItemError.error_data` and `WireGetResult.data` decode via `decode_redirect_with_version` to `(target_addr, Some(STALE_VERSION))`, and asserts `classify_redirect(version, STALE_VERSION) == Stale` and `classify_redirect(version, STALE_VERSION-1) == Follow`. Validated as a true regression test by reverting just site 1's encoding and confirming the test fails with `R-041: BatchItemError REDIRECT data must decode with version`.
+
+- **Verification:** Full local gate green: `cargo build --release` clean; `cargo test --all` 1691 passed, 0 failed, 1 ignored (R-002 only); `cargo clippy --all --all-targets -- -D warnings` clean; `cargo fmt --all -- --check` clean.
+
+- **Follow-ups (not blockers):**
+  - **R-226 (new, MEDIUM):** Wire the existing-but-unused `ClientConfig::max_redirects` field into a hop-counter belt-and-braces fence in `Client`'s top-level `Redirect` propagation path so an app that follows REDIRECT in its own retry loop (without consulting `classify_redirect`) cannot exceed 4 hops. The codec-level loop detection added by R-041 is the primary defense; the hop counter is defense-in-depth for clients that can't yet track `shard_table_version`.
+  - **R-227 (new, LOW):** Coordinate with the BSV Teranode Go adapter to update its REDIRECT decoder to consume the trailing `shard_table_version` and call its equivalent of `classify_redirect` before retrying. Until that lands, the Go adapter sees malformed addr strings (binary trailer) on REDIRECT and falls back to its own connection-error retry — a graceful but slower recovery path.
+
+- **Test:** `redirect_includes_shard_table_version_for_loop_detection` (renamed from the original `redirect_loop_detection_with_hop_counter` to match the chosen design).
 
 ### R-042 — [topology-commit] Split-brain heal — two clusters that learn about each other have no rejection path
 - **Source:** AUDIT.md EF-10
@@ -491,11 +516,12 @@
 ### R-047 — [index-redb] `import_index` not transactional across three redb files
 - **Source:** AUDIT.md GH-G3
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/index/migration.rs:79-128
+- **Status:** RESOLVED
+- **Files:** src/index/migration.rs (`write_import_sentinel`, `remove_import_sentinel`, `import_sentinel_path`, `import_in_progress`, `import_index`), src/server/startup.rs (`RebuildError::RedbImportInProgress`, `load_primary_index_redb`)
 - **Cluster:** index-redb
-- **Notes:** Sentinel `.import-in-progress` written before first commit, removed after all three commit succeed. On startup, refuse if sentinel exists. Or consolidate into single redb database with three tables.
-- **Test:** `import_index_transactional_across_three_files`
+- **Resolution:** `import_index` now writes a sentinel file at `<redb_path>.import-in-progress` (atomic tempfile + rename + parent-dir fsync) BEFORE opening the first redb backend, and removes it ONLY after all three (`primary`, `dah`, `unmined`) `register_batch` / `insert_batch` commits have returned `Ok`. Pre-fix a crash mid-import would leave the primary file fully populated while DAH and unmined remained empty (or any other partial permutation); the next startup happily opened all three as if they were complete and silently served an inconsistent index. `load_primary_index_redb` now consults `migration::import_in_progress` BEFORE any restore/rebuild attempt and returns the new `RebuildError::RedbImportInProgress` variant when the sentinel exists, so deployment automation gets a non-zero exit and operators get an explicit "import was interrupted; re-run import" message naming the sentinel path. The redb files themselves are preserved untouched so the operator can capture diagnostics, and re-running `import_index` overwrites the partial state and clears the sentinel automatically.
+- **Tests added:** `import_index_writes_sentinel_then_removes_on_success`, `import_index_transactional_across_three_files` (the named regression — fault-injects via a dah path that's actually a directory so `RedbDahIndex::open` fails after the primary commit; asserts the sentinel remains and the primary file was created), `import_index_rerun_after_partial_failure_clears_sentinel` (operator workflow), `import_sentinel_path_is_derived_from_primary_path` (path-derivation contract), `startup_refuses_when_import_sentinel_present` (asserts `load_primary_index_redb` returns `RedbImportInProgress`, redb file untouched, and that clearing the sentinel re-enables startup), `redb_import_in_progress_error_message_includes_remediation` (operator-facing display contract). Reverting only the `write_import_sentinel(&config.redb_path)` call in `import_index` causes both `import_index_transactional_across_three_files` and `import_index_rerun_after_partial_failure_clears_sentinel` to fail with the expected "sentinel must remain" / "import_in_progress" assertions, confirming the regression test catches the bug.
+- **Verification:** Full local gate green: `cargo build --release`, `cargo test --all` (1686 tests passed, 0 failed, 1 ignored — pre-existing `failed_data_migration_sends_abort_completion_handshake`; doc tests +2; total 1688) with `--test-threads=4` to suppress an unrelated pre-existing prometheus/dispatch parallel-execution flake, `cargo clippy --all --all-targets -- -D warnings` clean (after fixing two pre-existing collapsible-if warnings in `src/device.rs` test scaffolding), `cargo fmt --all -- --check` clean (after applying pre-existing fmt drift across the tree).
 
 ### Cluster: storage / blob / pruning
 
@@ -809,11 +835,11 @@
 ### R-080 — [hashtable] HashTable resize NOT crash-atomic for ANONYMOUS-mmap-backed tables (doc misleading)
 - **Source:** AUDIT.md BC-26
 - **Severity:** MEDIUM
-- **Status:** OPEN (doc-only)
-- **Files:** src/index/hashtable.rs:469-636,:1782-1900, src/index/backend.rs:19-28
+- **Status:** RESOLVED
+- **Files:** src/index/hashtable.rs (`HashTable::resize` doc comment)
 - **Cluster:** hashtable
-- **Notes:** Update doc to remove "without a redo log attached" wording — file-backed always attaches redo log if configured. Anonymous tables: process-death drops mapping, no recovery needed. Doc fix only.
-- **Test:** N/A
+- **Resolution:** Updated the `HashTable::resize` doc comment to split the anonymous-mmap-backed case (where crash-atomicity is meaningless because process death drops the mapping along with the entire address space — nothing to recover, the index is rebuilt from a snapshot or device scan on next startup) from the file-backed case (which is always crash-atomic via the redo log the file-backed constructor automatically attaches). Removed the "without a redo log attached" caveat that earlier conflated the two cases and misled readers into expecting durable resize behaviour from anonymous tables.
+- **Verification:** Doc-only change. `cargo doc --no-deps` succeeds; no behavioural test required.
 
 ### R-081 — [conflicting-children] `set_conflicting` slow path `if let Ok(...)` hides cold-data parse and append errors
 - **Source:** AUDIT.md A-25

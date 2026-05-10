@@ -928,11 +928,22 @@ impl HashTable {
 
     /// Resize the table to at least `new_capacity` buckets.
     ///
-    /// For anonymous tables, allocates a new mmap region and rehashes the
-    /// entries in place.
+    /// For anonymous-mmap-backed tables, allocates a new mmap region and
+    /// rehashes the entries in place. R-080 (BC-26): crash-atomicity is
+    /// not meaningful for the anonymous-backed case — process death
+    /// drops the mapping along with the entire address space, so there
+    /// is nothing on disk to recover. The redo log attachment is
+    /// silently no-op'd for anonymous tables and the index is rebuilt
+    /// from a snapshot or a device scan on next startup. (Earlier doc
+    /// language said "crash-atomic when a redo log is attached" without
+    /// the anonymous-vs-file-backed split, which misled readers into
+    /// expecting durable resize behaviour from anonymous tables.)
     ///
-    /// For file-backed tables, the resize is crash-atomic when a redo log
-    /// has been attached via [`HashTable::set_redo_log`]:
+    /// For file-backed tables, the resize is crash-atomic via the redo
+    /// log machinery the file-backed constructor automatically attaches
+    /// (so the "without a redo log attached" caveat earlier in this doc
+    /// has been removed — file-backed tables always have one when the
+    /// server is configured with a redo log path):
     ///
     /// 1. A [`RedoOp::HashtableResizeBegin`] entry is appended and fsynced
     ///    BEFORE any tmp file is created. The entry captures the raw bytes
