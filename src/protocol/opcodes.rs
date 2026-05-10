@@ -176,6 +176,39 @@ pub const ERR_COINBASE_IMMATURE: u16 = 10;
 pub const ERR_VOUT_OUT_OF_RANGE: u16 = 11;
 pub const ERR_ALREADY_EXISTS: u16 = 12;
 pub const ERR_FROZEN_UNTIL: u16 = 13;
+/// The receiver does not own the requested key's shard. The accompanying
+/// payload tells the client where to retry.
+///
+/// Two on-wire shapes carry REDIRECT data, both extended in R-041 to
+/// include the source node's `shard_table_version` so the client can
+/// detect a stale-route loop (server's view <= client's view → stop
+/// following):
+///
+///   - **Top-level `STATUS_REDIRECT` payload**: encoded by
+///     [`crate::protocol::codec::encode_redirect_with_version`] as
+///     `[addr_len:2][addr][shard_table_version:8 (le)]`.
+///     Back-compat: legacy [`crate::protocol::codec::decode_redirect`]
+///     parses only the address half and ignores the trailing 8 version
+///     bytes — old clients still work, just without loop detection.
+///
+///   - **Per-item `BatchItemError.error_data`** (`PartialError` responses
+///     from `OP_SPEND_BATCH` / `OP_CREATE_BATCH` / `OP_SET_MINED_BATCH`
+///     etc.): same format as above, length-prefixed addr + 8-byte
+///     trailing version. Pre-R-041 this field carried raw `addr_bytes`
+///     with no length prefix; the new decoder
+///     [`crate::protocol::codec::decode_redirect_with_version`]
+///     accepts both shapes (versioned, length-prefixed-no-version, and
+///     legacy raw-addr).
+///
+///   - **Per-item `WireGetResult.data`** (`OP_GET_BATCH` redirect
+///     responses): wire format is `[ERR_REDIRECT_byte:1]` followed by
+///     the same `[addr_len:2][addr][shard_table_version:8]` payload.
+///     The leading status byte preserves the legacy framing convention
+///     for that path.
+///
+/// Clients use [`crate::protocol::codec::classify_redirect`] to decide
+/// whether to follow the REDIRECT (server strictly ahead) or stop
+/// (server equal or behind → loop).
 pub const ERR_REDIRECT: u16 = 14;
 pub const ERR_NO_QUORUM: u16 = 15;
 

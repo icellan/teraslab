@@ -121,8 +121,7 @@ static DISPATCH_REPLICA_LAST_APPLIED: AtomicU64 = AtomicU64::new(0);
 /// Both flags default to `true` (healthy) at process start so that test
 /// harnesses and code paths that never call [`set_secondary_status`] keep
 /// the historical "everything is ready" behavior.
-static SECONDARY_DAH_OK: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+static SECONDARY_DAH_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static SECONDARY_UNMINED_OK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
@@ -1592,10 +1591,7 @@ pub(crate) enum BeforeImage {
     /// No before-image needed — compensation reads current device state.
     None,
     /// Captured pre-apply block-entry fields for an unset-mined op.
-    UnsetMined {
-        block_height: u32,
-        subtree_idx: u32,
-    },
+    UnsetMined { block_height: u32, subtree_idx: u32 },
     /// Captured pre-apply utxo_hash for a reassign op.
     Reassign { prior_utxo_hash: [u8; 32] },
     /// Captured pre-apply status byte for a prune op.
@@ -2290,15 +2286,35 @@ fn check_shard_ownership(
             if allow_if_migrating && cluster.is_migrating_outbound(&key) {
                 return None;
             }
-            // Determine the target node address for the redirect
+            // Determine the target node address for the redirect.
+            //
+            // R-041: encode the source node's `shard_table_version` from
+            // `RouteDecision::RedirectTo` into `error_data` alongside the
+            // address so the receiving client can detect a stale-route
+            // loop. Wire format: `[addr_len:2][addr][shard_table_version:8]`.
+            // Older clients (or external Go adapters) that read
+            // `error_data` as raw addr bytes via `from_utf8` will see a
+            // malformed UTF-8 buffer (the trailing version bytes are
+            // binary), `from_utf8` returns Err, and the legacy
+            // redirect-collector returns `None` — falling through to a
+            // PartialError surfaced to the caller. That is a graceful
+            // failure (no silent corruption); the legacy client just
+            // does not benefit from version-based loop detection.
             let route = cluster.route(&key);
             let error_data = match route {
-                crate::cluster::shards::RouteDecision::RedirectTo { node, .. } => {
-                    match cluster.node_addr(&node) {
-                        Some(addr) => addr.to_string().into_bytes(),
-                        None => Vec::new(),
-                    }
-                }
+                crate::cluster::shards::RouteDecision::RedirectTo {
+                    node,
+                    shard_table_version,
+                } => match cluster.node_addr(&node) {
+                    Some(addr) => crate::protocol::codec::encode_redirect_with_version(
+                        &addr.to_string(),
+                        shard_table_version,
+                    ),
+                    None => crate::protocol::codec::encode_redirect_with_version(
+                        "",
+                        shard_table_version,
+                    ),
+                },
                 crate::cluster::shards::RouteDecision::HandleLocally => return None,
             };
             // M10: count every stale-routed request so operators can alert on
@@ -2531,12 +2547,7 @@ fn handle_spend_batch(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(spend_redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -2616,8 +2627,7 @@ fn handle_unspend_batch(
     // 0) for every entry — replay is idempotent against UTXO_UNSPENT
     // slots so over-decrement on a re-played idempotent redo is
     // harmless because replay skips before touching metadata.
-    let mut running_spent: std::collections::HashMap<TxKey, u32> =
-        std::collections::HashMap::new();
+    let mut running_spent: std::collections::HashMap<TxKey, u32> = std::collections::HashMap::new();
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
@@ -2713,12 +2723,7 @@ fn handle_unspend_batch(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -2791,8 +2796,7 @@ fn handle_set_mined_batch(
             .filter_map(|v| {
                 let meta = engine.read_metadata(&v.key).ok()?;
                 let count = meta.block_entry_count as usize;
-                let inline =
-                    count.min(crate::record::INLINE_BLOCK_ENTRIES);
+                let inline = count.min(crate::record::INLINE_BLOCK_ENTRIES);
                 for i in 0..inline {
                     if { meta.block_entries_inline[i].block_id } == params.block_id {
                         return Some((
@@ -2849,10 +2853,12 @@ fn handle_set_mined_batch(
                     ));
                     before_images_by_key.push((
                         v.key,
-                        vec![pre_unset_image
-                            .get(&v.key)
-                            .copied()
-                            .unwrap_or(BeforeImage::None)],
+                        vec![
+                            pre_unset_image
+                                .get(&v.key)
+                                .copied()
+                                .unwrap_or(BeforeImage::None),
+                        ],
                     ));
                 } else {
                     repl_ops_by_key.push((
@@ -3275,12 +3281,7 @@ fn handle_create_batch(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -3379,12 +3380,7 @@ fn handle_freeze_batch(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -3478,12 +3474,7 @@ fn handle_unfreeze_batch(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -3708,12 +3699,7 @@ fn handle_set_conflicting_batch(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -3806,12 +3792,7 @@ fn handle_set_locked_batch(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -3905,12 +3886,7 @@ fn handle_preserve_until_batch(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -4295,18 +4271,30 @@ fn handle_get_batch(
 
             if !is_master && !is_migrating_out {
                 let route = cluster.route(&key);
+                // R-041: GetBatch per-item REDIRECT data layout is now
+                // `[ERR_REDIRECT_byte:1][addr_len:2][addr][shard_table_version:8]`
+                // — the trailing version lets the client detect a stale-route
+                // loop (server's view <= client's known view → stop following).
+                // The legacy form `[ERR_REDIRECT_byte:1][addr_bytes:N]` had no
+                // length prefix and no version, so any cluster-mid-topology-
+                // change cycle (A→B→C→A) was unobservable client-side.
                 let redirect_status = match route {
-                    crate::cluster::shards::RouteDecision::RedirectTo { node, .. } => {
-                        match cluster.node_addr(&node) {
-                            Some(addr) => {
-                                let addr_bytes = addr.to_string().into_bytes();
-                                let mut data = Vec::with_capacity(2 + addr_bytes.len());
-                                data.extend_from_slice(&(ERR_REDIRECT as u8).to_le_bytes());
-                                data.extend_from_slice(&addr_bytes);
-                                data
-                            }
-                            None => vec![ERR_REDIRECT as u8],
-                        }
+                    crate::cluster::shards::RouteDecision::RedirectTo {
+                        node,
+                        shard_table_version,
+                    } => {
+                        let addr_str = match cluster.node_addr(&node) {
+                            Some(a) => a.to_string(),
+                            None => String::new(),
+                        };
+                        let payload = crate::protocol::codec::encode_redirect_with_version(
+                            &addr_str,
+                            shard_table_version,
+                        );
+                        let mut data = Vec::with_capacity(1 + payload.len());
+                        data.push(ERR_REDIRECT as u8);
+                        data.extend_from_slice(&payload);
+                        data
                     }
                     _ => vec![ERR_REDIRECT as u8],
                 };
@@ -4672,12 +4660,7 @@ fn handle_preserve_transactions(
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(
-                engine,
-                &repl_ops_by_key,
-                &before_images,
-                redo_log,
-            );
+            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
             clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
@@ -6566,8 +6549,7 @@ mod tests {
 
         // Simulate "redo fsynced but engine lost": roll slot 0 back to
         // SPENT and counter back to 2.
-        let spent_zero =
-            crate::record::UtxoSlot::new_spent(original_slots[0].hash, [0xC0; 36]);
+        let spent_zero = crate::record::UtxoSlot::new_spent(original_slots[0].hash, [0xC0; 36]);
         crate::io::write_utxo_slot(
             &*h.data_dev as &dyn crate::device::BlockDevice,
             record_offset,
@@ -6714,6 +6696,138 @@ mod tests {
         let results = crate::protocol::codec::decode_get_response(&resp.payload).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, ERR_REDIRECT as u8);
+    }
+
+    // R-041: REDIRECT now carries shard_table_version so clients can detect
+    // a stale-route loop instead of chasing redirects forever. This test
+    // exercises the per-item REDIRECT path on both write (BatchItemError)
+    // and read (WireGetResult) flows and asserts the version round-trips.
+    #[test]
+    fn redirect_includes_shard_table_version_for_loop_detection() {
+        use crate::cluster::shards::NodeId;
+        use crate::cluster::shards::ShardTable;
+
+        // Hold the metrics lock so the global `operations` /
+        // `stale_routing_request_total` increments this test causes
+        // do not race with `prometheus_emits_operations_total_with_labels`
+        // (which compares a rendered snapshot against live counters).
+        let _metrics_guard = metrics_test_lock();
+
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(91);
+        let shard = ShardTable::shard_for_key(&TxKey { txid });
+        let members = vec![NodeId(1), NodeId(2)];
+        // Pick a non-trivial shard table version so an "0" placeholder
+        // would be obvious. compute_with_epoch(epoch=42) sets table.version=42.
+        const STALE_VERSION: u64 = 42;
+        let table = ShardTable::compute_with_epoch(&members, 2, STALE_VERSION);
+        let master = table.target_assignment(shard).master;
+        // self_id != master so this node redirects.
+        let self_id = if master == NodeId(1) {
+            NodeId(2)
+        } else {
+            NodeId(1)
+        };
+        let target_addr_for_master = if master == NodeId(1) {
+            "127.0.0.1:4501".parse::<std::net::SocketAddr>().unwrap()
+        } else {
+            "127.0.0.1:4502".parse::<std::net::SocketAddr>().unwrap()
+        };
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            self_id,
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:4501".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:4502".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+
+        // -------- Write path: BatchItemError redirect data --------
+        // SetMined writes are routed via check_shard_ownership, which
+        // emits BatchItemError { error_code: ERR_REDIRECT, error_data }.
+        let set_mined_params = SetMinedBatchParams {
+            block_id: 1,
+            block_height: 100,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 100,
+            block_height_retention: 288,
+        };
+        let payload = encode_set_mined_batch(&set_mined_params, &[txid]);
+        let resp = h.request_with_cluster(OP_SET_MINED_BATCH, payload, &cluster);
+        // Per-item redirect comes back as a partial-error with one entry.
+        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+        let errs = crate::protocol::codec::decode_sparse_errors(&resp.payload).unwrap();
+        assert_eq!(errs.len(), 1, "exactly one redirected item");
+        assert_eq!(errs[0].error_code, ERR_REDIRECT);
+
+        // R-041 assertion: error_data must decode to (addr, Some(version))
+        // via decode_redirect_with_version. Pre-fix the data was raw addr
+        // bytes with no version → decode_redirect_with_version would have
+        // returned (addr, None) and the client could not perform a
+        // server-vs-client version comparison.
+        let (addr, version) =
+            crate::protocol::codec::decode_redirect_with_version(&errs[0].error_data)
+                .expect("R-041: BatchItemError REDIRECT data must decode with version");
+        assert_eq!(addr, target_addr_for_master.to_string());
+        assert_eq!(
+            version,
+            Some(STALE_VERSION),
+            "R-041: server's shard_table_version must round-trip through error_data \
+             so a client at the same/newer version can detect a stale-route loop",
+        );
+
+        // The classify helper must say "Stale" when the client knows a
+        // version equal to the server's — chasing this redirect would
+        // either loop or land on an even-older view.
+        assert_eq!(
+            crate::protocol::codec::classify_redirect(version, STALE_VERSION),
+            crate::protocol::codec::RedirectFollowDecision::Stale,
+            "R-041: server.version == client.version must be classified Stale \
+             so the client refreshes/fails instead of looping",
+        );
+        // And "Follow" only when the server is strictly ahead.
+        assert_eq!(
+            crate::protocol::codec::classify_redirect(version, STALE_VERSION - 1),
+            crate::protocol::codec::RedirectFollowDecision::Follow,
+        );
+
+        // -------- Read path: WireGetResult REDIRECT data --------
+        // GET_BATCH per-item REDIRECT carries `[ERR_REDIRECT_byte:1][addr_len:2][addr][version:8]`
+        // in WireGetResult.data — strip the leading status byte and run
+        // the same decode/classify checks.
+        let resp = h.request_with_cluster(
+            OP_GET_BATCH,
+            crate::protocol::codec::encode_get_batch(FieldMask::ALL_METADATA, &[txid]),
+            &cluster,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let results = crate::protocol::codec::decode_get_response(&resp.payload).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, ERR_REDIRECT as u8);
+        assert!(
+            results[0].data.len() > 1,
+            "R-041: GetBatch REDIRECT payload must include addr+version, not just the status byte",
+        );
+        assert_eq!(
+            results[0].data[0], ERR_REDIRECT as u8,
+            "first byte is still the legacy ERR_REDIRECT status repeat"
+        );
+        let (get_addr, get_version) =
+            crate::protocol::codec::decode_redirect_with_version(&results[0].data[1..])
+                .expect("R-041: GetBatch REDIRECT payload must decode with version");
+        assert_eq!(get_addr, target_addr_for_master.to_string());
+        assert_eq!(
+            get_version,
+            Some(STALE_VERSION),
+            "R-041: GetBatch redirect must also carry the server's shard_table_version",
+        );
     }
 
     #[test]
@@ -9682,7 +9796,8 @@ mod tests {
                 unmined_ok: false,
             },
         ] {
-            let resp = secondary_readiness_verdict(OP_DELETE_BATCH, *status, 1).expect("must reject");
+            let resp =
+                secondary_readiness_verdict(OP_DELETE_BATCH, *status, 1).expect("must reject");
             assert_eq!(extract_err(&resp), ERR_INDEX_DEGRADED);
         }
     }
@@ -9849,12 +9964,7 @@ mod tests {
             }],
         )];
         let before_images = vec![(key, vec![before_image])];
-        compensate_replication_failure(
-            &h.engine,
-            &repl_ops,
-            &before_images,
-            Some(&h.redo_log),
-        );
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log));
 
         // Post-compensation: the block entry MUST be restored with the
         // original (height, subtree). Not zeros.
@@ -9940,12 +10050,7 @@ mod tests {
                 prior_utxo_hash: original_hash,
             }],
         )];
-        compensate_replication_failure(
-            &h.engine,
-            &repl_ops,
-            &before_images,
-            Some(&h.redo_log),
-        );
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log));
 
         // Post-compensation: slot's hash MUST be the original — NOT zeros.
         let post_slot = h.engine.read_slot(&key, 0).expect("read post slot");
@@ -9975,12 +10080,8 @@ mod tests {
         // the dispatch path — we want to control the prior_status byte
         // explicitly).
         let entry = h.engine.lookup(&key).expect("lookup");
-        let mut slot = crate::io::read_utxo_slot(
-            h.engine.device(),
-            entry.record_offset,
-            0,
-        )
-        .expect("read slot");
+        let mut slot = crate::io::read_utxo_slot(h.engine.device(), entry.record_offset, 0)
+            .expect("read slot");
         slot.status = UTXO_SPENT;
         crate::io::write_utxo_slot(h.engine.device(), entry.record_offset, 0, &slot)
             .expect("write spent slot");
@@ -9994,7 +10095,10 @@ mod tests {
         // Run compensation with captured prior status = SPENT.
         let repl_ops = vec![(
             key,
-            vec![ReplicaOp::PruneSlot { tx_key: key, offset: 0 }],
+            vec![ReplicaOp::PruneSlot {
+                tx_key: key,
+                offset: 0,
+            }],
         )];
         let before_images = vec![(
             key,
@@ -10002,12 +10106,7 @@ mod tests {
                 prior_status: UTXO_SPENT,
             }],
         )];
-        compensate_replication_failure(
-            &h.engine,
-            &repl_ops,
-            &before_images,
-            Some(&h.redo_log),
-        );
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log));
 
         // Post-compensation: slot status MUST be SPENT, NOT UNSPENT.
         let post_slot = crate::io::read_utxo_slot(h.engine.device(), entry.record_offset, 0)
@@ -10031,12 +10130,8 @@ mod tests {
         let key = rollback_seed_record(&h, txid, 1);
 
         let entry = h.engine.lookup(&key).expect("lookup");
-        let mut slot = crate::io::read_utxo_slot(
-            h.engine.device(),
-            entry.record_offset,
-            0,
-        )
-        .expect("read slot");
+        let mut slot = crate::io::read_utxo_slot(h.engine.device(), entry.record_offset, 0)
+            .expect("read slot");
         slot.status = UTXO_FROZEN;
         crate::io::write_utxo_slot(h.engine.device(), entry.record_offset, 0, &slot)
             .expect("write frozen slot");
@@ -10049,7 +10144,10 @@ mod tests {
 
         let repl_ops = vec![(
             key,
-            vec![ReplicaOp::PruneSlot { tx_key: key, offset: 0 }],
+            vec![ReplicaOp::PruneSlot {
+                tx_key: key,
+                offset: 0,
+            }],
         )];
         let before_images = vec![(
             key,
@@ -10057,12 +10155,7 @@ mod tests {
                 prior_status: UTXO_FROZEN,
             }],
         )];
-        compensate_replication_failure(
-            &h.engine,
-            &repl_ops,
-            &before_images,
-            Some(&h.redo_log),
-        );
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log));
 
         let post_slot = crate::io::read_utxo_slot(h.engine.device(), entry.record_offset, 0)
             .expect("read post slot");
@@ -10138,10 +10231,10 @@ mod tests {
         // Verify the slot's metadata pre-recovery: the entry should be
         // ABSENT (the unset removed it; the compensation hasn't run yet).
         let pre_meta = h.engine.read_metadata(&key).expect("pre meta");
-        let pre_inline = (pre_meta.block_entry_count as usize)
-            .min(crate::record::INLINE_BLOCK_ENTRIES);
-        let pre_present = (0..pre_inline)
-            .any(|i| { pre_meta.block_entries_inline[i].block_id } == block_id);
+        let pre_inline =
+            (pre_meta.block_entry_count as usize).min(crate::record::INLINE_BLOCK_ENTRIES);
+        let pre_present =
+            (0..pre_inline).any(|i| { pre_meta.block_entries_inline[i].block_id } == block_id);
         assert!(
             !pre_present,
             "block entry should be absent before recovery (precondition)"
@@ -10152,8 +10245,8 @@ mod tests {
         let h2 = h.crash_and_recover();
 
         let post_meta = h2.engine.read_metadata(&key).expect("post meta");
-        let post_inline = (post_meta.block_entry_count as usize)
-            .min(crate::record::INLINE_BLOCK_ENTRIES);
+        let post_inline =
+            (post_meta.block_entry_count as usize).min(crate::record::INLINE_BLOCK_ENTRIES);
         let mut restored = false;
         for i in 0..post_inline {
             if { post_meta.block_entries_inline[i].block_id } == block_id {
@@ -10252,12 +10345,7 @@ mod tests {
                 prior_utxo_hash: original_hash,
             }],
         )];
-        compensate_replication_failure(
-            &h.engine,
-            &repl_ops,
-            &before_images,
-            Some(&h.redo_log),
-        );
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log));
 
         // Post-rollback slot: hash MUST equal the pre-reassign hash.
         let post_slot = crate::io::read_utxo_slot(h.engine.device(), entry.record_offset, 0)

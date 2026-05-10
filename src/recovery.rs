@@ -1084,8 +1084,7 @@ fn replay_compensate_unset_mined(
     for i in 0..inline {
         if { meta.block_entries_inline[i].block_id } == block_id {
             let existing = meta.block_entries_inline[i];
-            if { existing.block_height } == block_height
-                && { existing.subtree_idx } == subtree_idx
+            if { existing.block_height } == block_height && { existing.subtree_idx } == subtree_idx
             {
                 return ReplayResult::Skipped;
             }
