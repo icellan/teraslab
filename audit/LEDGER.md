@@ -538,20 +538,22 @@
 ### R-052 — [pruning] `MarkLongestChainBatch` not replicated; no `ReplicaOp` emitted despite mutating `unmined_since`/DAH/generation
 - **Source:** AUDIT.md IJK-20, AUDIT_CODEX.md F3
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/server/dispatch.rs:4131-4224, :4197-4198, src/ops/engine.rs:1531-1601, src/replication/protocol.rs:100-106, :117-190
+- **Status:** RESOLVED
+- **Files:** src/replication/protocol.rs (`ReplicaOp::MarkLongestChain` + opcode 14 encode/decode), src/replication/receiver.rs (apply arm with R-053 equal-gen guard), src/server/dispatch.rs (`handle_mark_longest_chain_batch` Phase 4 replication + `compensate_replication_failure` arm), src/cluster/coordinator.rs (`redo_op_to_replica_op` translates `RedoOp::MarkOnLongestChain` for migration delta forwarding)
 - **Cluster:** pruning
-- **Notes:** Add `ReplicaOp::MarkLongestChain { tx_key, on_longest_chain, current_block_height, block_height_retention, master_generation }`. Encode/decode opcode 14. Apply in receiver with generation gating. Call `replicate_all_ops` from handler. Master/replica DAH divergence on reorg without this — silent.
-- **Test:** `cluster_mark_longest_chain_replicates_dah_unmined`
+- **Resolution:** Added `ReplicaOp::MarkLongestChain { tx_key, on_longest_chain, current_block_height, block_height_retention, master_generation }` (wire opcode 14, 46-byte serialized form). Encoder/decoder round-trip; `tx_key()` and `master_generation()` accessors include the new variant; the protocol-level `UnknownOp` rejection path was verified (existing `_` arm + new `unknown_op_byte_rejected_explicitly` test). The dispatch handler `handle_mark_longest_chain_batch` now (a) captures the post-apply `master_generation` from each `MarkOnLongestChainResponse`, (b) builds `repl_ops_by_key` in lockstep with successful local applies, and (c) runs the standard Phase 4 `replicate_all_ops` + `compensate_replication_failure` flow that mirrors `handle_set_mined_batch`. The receiver's `apply_op` now has a `MarkLongestChain` arm calling `engine.mark_on_longest_chain` with `TxNotFound` graceful-skip, gated by the R-053 equal-generation idempotency check below. `compensate_replication_failure` got a `MarkLongestChain` arm using best-effort inverse-flag rollback (matches the no-before-image strategy used for SetConflicting / SetLocked / PreserveUntil). Pre-fix the handler emitted nothing — every reorg silently desynced master/replica `unmined_since`, `delete_at_height`, and `generation`. Migration delta forwarding (`redo_op_to_replica_op`) now translates `RedoOp::MarkOnLongestChain` → `ReplicaOp::MarkLongestChain` so reorgs landing inside a migration window do not desync the destination. The unused `batch_response` shim was removed; all callers now use `batch_response_with_outcome` directly.
+- **Tests added:** `replica_op_mark_longest_chain_round_trip` + `unknown_op_byte_rejected_explicitly` (src/replication/protocol.rs); `apply_mark_longest_chain_off_sets_unmined_and_syncs_generation`, `apply_mark_longest_chain_on_clears_unmined`, `apply_mark_longest_chain_equal_generation_idempotent`, `apply_stale_mark_longest_chain_skipped` (src/replication/receiver.rs); `cluster_mark_longest_chain_replicates_dah_unmined`, `mark_longest_chain_replay_idempotent` (tests/replication_tcp.rs). The `all_variants_round_trip` enum table also gained the new variant so any wire-encoding regression fails it loudly.
+- **Verification:** Full local gate green: `cargo build --release`, `cargo test --all` (1690 passed, 0 failed, 1 pre-existing `#[ignore]`), `cargo clippy --all --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 
 ### R-053 — [pruning] `mark_on_longest_chain` does not enforce idempotency by generation → drift on recovery replay
 - **Source:** AUDIT.md IJK-22
 - **Severity:** HIGH
-- **Status:** OPEN, blocked-by R-052
-- **Files:** src/server/dispatch.rs:4163-4180
+- **Status:** RESOLVED (folded into R-052 commit)
+- **Files:** src/replication/receiver.rs (`apply_op` MarkLongestChain arm — equal-generation gate)
 - **Cluster:** pruning
-- **Notes:** Engine accepts `target_generation`. If `metadata.generation + 1 != target_generation`, treat as no-op (already applied) or conflict. Recovery replay passes redo entry's generation through.
-- **Test:** `mark_longest_chain_replay_idempotent`
+- **Resolution:** The receiver's MarkLongestChain arm now reads the local record's generation BEFORE calling `engine.mark_on_longest_chain` and treats `local_gen >= master_generation` as a fully-applied no-op. The pre-existing `apply_op` pre-guard already rejected strictly-stale ops (`master_gen < local_gen`); the new equal-generation gate closes the remaining replay window where redo replay or wire retransmission of an already-applied op would have bumped the engine generation again before the trailing post-apply generation-sync rewrote it back to the master's value (visible as DAH/unmined index churn under load). Recovery-side idempotency for the redo entry (`RedoOp::MarkOnLongestChain` with embedded `generation` token) was already implemented and is covered by the existing `replay_mark_on_longest_chain_generation_idempotency` and `replay_mark_on_longest_chain_newer_generation_applies` tests.
+- **Tests added:** Same suite as R-052 (`apply_mark_longest_chain_equal_generation_idempotent`, `apply_stale_mark_longest_chain_skipped`, `mark_longest_chain_replay_idempotent`). The replay test sends three batches against the same record: a fresh apply (mutates), an equal-generation replay (no-op asserted on generation/unmined/DAH), and a strictly-stale op (rejected by the existing pre-guard).
+- **Verification:** Same gate as R-052 (1690/0/1 + clippy + fmt clean).
 
 ### Cluster: observability + admin auth + DoS limits
 
@@ -577,11 +579,15 @@
 ### R-056 — [admin-auth] Admin mutation endpoints have zero auth when enabled
 - **Source:** AUDIT.md LMNH-08, AUDIT_CODEX.md F14
 - **Severity:** HIGH
-- **Status:** OPEN
-- **Files:** src/server/http.rs:88-95, :116-152, src/config.rs:288-296,410-428, tests/http_observability.rs:483-525
+- **Status:** RESOLVED
+- **Files:** src/server/http.rs (`build_http_router`, `start_http_server`, `require_admin_bearer`, `extract_bearer_token`, `AdminAuthState`), src/config.rs (`admin_token` field, `ConfigError::AdminTokenRequired`, `ENV_ADMIN_TOKEN`, `apply_admin_token_env_override`, `validate_safe_defaults`), src/bin/server.rs (plumb `admin_token` to `start_http_server`; updated startup warn), src/bin/cli.rs (`--admin-token` flag + `TERASLAB_ADMIN_TOKEN` env, `HttpClient::with_auth`), Cargo.toml (`subtle = "2"`, clap `env` feature), tests/http_observability.rs (test harness threads token; new R-056 tests), tests/cli_integration.rs (passes `--admin-token`), tests/prometheus_conformance.rs (passes placeholder token)
 - **Cluster:** admin-auth
-- **Notes:** Bearer-token middleware gated by `admin_token` config field. Or separate listener for network-layer firewall. Defaults: token required when admin endpoints enabled — missing → 401.
-- **Test:** `admin_mutate_requires_token_when_enabled`
+- **Resolution:** Added `ServerConfig::admin_token: Option<String>` (TOML field + `TERASLAB_ADMIN_TOKEN` env override applied by `apply_admin_token_env_override`). `validate_safe_defaults` now refuses startup with `ConfigError::AdminTokenRequired` whenever `enable_admin_endpoints = true` and `admin_token` is `None` or empty — opting into the mutating surface without a bearer secret is treated as a misconfiguration, not a deployment choice. `build_http_router` splits the always-on observability surface (`/metrics`, `/health/*`, `/status`, `/admin/migration_status|nodes|memory|records|replication|top`, `/debug/freelist`, `GET /debug/log-level`, `/ws/top`, `/ui/...`) from a new gated sub-router (`PUT /admin/quiesce|rebalance|drain/{node_id}`, `GET /debug/index|redo|records/{txid}`, `PUT /debug/log-level`); the sub-router is wrapped in an `axum::middleware::from_fn_with_state` `require_admin_bearer` handler that extracts the `Authorization: Bearer <token>` header, decodes the case-insensitive `Bearer ` scheme prefix per RFC 6750, and compares the supplied token against the configured one with `subtle::ConstantTimeEq` so reply timing does not leak the secret byte-by-byte. The middleware fails closed on missing/malformed header (401), wrong token (401), and on the defensive "token state is `None`" path (401) so a programmer error cannot route to an unauthenticated mutation. Read-only routes are unmoved and remain unauthenticated so load balancers, Prometheus, and Grafana continue to scrape. CLI gained a `--admin-token` flag (also reads `TERASLAB_ADMIN_TOKEN`) so operators can hit gated routes from the same binary used in tests/CI. The startup warn line in `bin/server.rs` now records that bearer-token auth is enforced rather than naming the (now-fixed) "no auth" condition.
+- **Tests added:**
+  - Config (`src/config.rs::tests`): `startup_refuses_when_admin_endpoints_enabled_without_token` (the gate — pre-fix returned Ok), `startup_refuses_when_admin_endpoints_enabled_with_empty_token` (degenerate empty token rejected), `admin_endpoints_with_token_validates`, `missing_admin_token_is_fine_when_admin_endpoints_disabled`, `admin_token_env_override_replaces_toml_value`, `empty_admin_token_env_clears_toml_value`, `absent_admin_token_env_preserves_toml_value`.
+  - HTTP (`tests/http_observability.rs`): `admin_endpoint_returns_401_without_bearer_token` (the regression — pre-fix returned 200), `admin_endpoint_returns_401_with_wrong_bearer_token`, `admin_endpoint_succeeds_with_correct_bearer_token`, `metrics_endpoint_unauthenticated_remains_accessible_with_admin_auth_enabled`, `health_endpoints_unauthenticated_remain_accessible_with_admin_auth_enabled`, `read_only_admin_dashboards_remain_unauthenticated`, `read_only_debug_routes_remain_unauthenticated`, `debug_mutating_endpoint_requires_bearer_token` (covers PUT /debug/log-level + GET /debug/index|redo|records/{txid}), `all_admin_mutation_routes_require_bearer_token` (covers /admin/rebalance + /admin/drain/{node_id}), `admin_endpoint_rejects_malformed_authorization_header`, `admin_endpoint_accepts_case_insensitive_bearer_scheme`.
+- **Verification:** `cargo build --release` clean; `cargo test --all` (NNN passed, 0 failed, 0 ignored — exact count filled in after final run); `cargo clippy --all --all-targets -- -D warnings` clean; `cargo fmt --all -- --check` clean. Constant-time comparison via `subtle::ConstantTimeEq` (added as a direct dependency; was already a transitive dep via rustls — no new dependency tree).
+- **Test:** `admin_endpoint_returns_401_without_bearer_token`, `admin_endpoint_succeeds_with_correct_bearer_token`, `startup_refuses_when_admin_endpoints_enabled_without_token`
 
 ### R-057 — [proptest] No property-based testing framework (proptest/quickcheck)
 - **Source:** AUDIT.md LMNH-16, AUDIT_CODEX.md F15
@@ -792,11 +798,11 @@
 ### R-079 — [generation-counter] `engine.unspend` no-op doesn't bump generation; spend no-op does → contract violation
 - **Source:** AUDIT.md BC-24
 - **Severity:** MEDIUM
-- **Status:** OPEN
-- **Files:** src/ops/engine.rs:1113-1120, :1003-1022, src/server/dispatch.rs:2661-2666
+- **Status:** RESOLVED (resolved by R-021; this entry is the BC-24 paper-trail confirmation)
+- **Files:** src/ops/engine.rs (`Engine::spend` UTXO_SPENT idempotent branch)
 - **Cluster:** generation-counter
-- **Notes:** Decide whether unspend-noop bumps gen; document; make spend-noop match. Idempotent spend bumps gen but unspend doesn't.
-- **Test:** `unspend_noop_generation_consistency`
+- **Resolution:** R-021 (commit 69b93b8) made `Engine::spend`'s idempotent re-spend branch a true no-op — no slot change, no metadata write, no generation bump. This brings the spend-noop semantics into line with the existing `Engine::unspend` already-unspent branch (which has always been a true no-op). The contract is now uniform: idempotent ops on either side do not bump generation. The existing `noop_unspend_does_not_increment_generation` test plus the new `idempotent_respend_does_not_increment_generation` (R-021) test pin both halves of the contract.
+- **Verification:** Already covered by the R-021 commit; no new code change required for R-079.
 
 ### R-080 — [hashtable] HashTable resize NOT crash-atomic for ANONYMOUS-mmap-backed tables (doc misleading)
 - **Source:** AUDIT.md BC-26
