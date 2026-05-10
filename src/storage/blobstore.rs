@@ -19,7 +19,7 @@
 //! data to callers, defending against bit rot and on-disk tampering.
 
 use sha2::{Digest, Sha256};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -210,6 +210,12 @@ pub trait BlobStore: Send + Sync {
     /// Check if a blob exists.
     fn exists(&self, key: &[u8; 32]) -> Result<bool>;
 
+    /// Return the durable digest sidecar for a blob without reading the full payload.
+    ///
+    /// Returns `Ok(None)` only when the payload or sidecar is absent. Returns
+    /// [`BlobError::InvalidMeta`] if the sidecar is present but malformed.
+    fn digest(&self, key: &[u8; 32]) -> Result<Option<BlobDigest>>;
+
     /// Stream a blob to a writer (for large blobs).
     ///
     /// Returns the number of bytes written, or [`BlobError::NotFound`] if the
@@ -223,6 +229,26 @@ pub trait BlobStore: Send + Sync {
     /// to finalize. If the stream is abandoned, call [`BlobStreamWriter::abort`]
     /// or drop the writer (which will NOT clean up — always call abort explicitly).
     fn begin_stream(&self, key: &[u8; 32]) -> Result<Box<dyn BlobStreamWriter>>;
+
+    /// Enumerate every txid currently materialised by the store.
+    ///
+    /// Used by the orphan-blob garbage collector (R-049): recovery and the
+    /// periodic background sweep call `list()` and reconcile each returned key
+    /// against the primary index. Any txid whose index entry is absent or not
+    /// flagged [`crate::record::TxFlags::EXTERNAL`] is an orphan from a failed
+    /// create, aborted upload, or migration cancellation, and is deleted.
+    ///
+    /// Implementations MAY also use this entry-point to perform incidental
+    /// housekeeping (e.g. [`FileBlobStore::list`] sweeps stale `.tmp` files
+    /// older than [`FileBlobStore::STALE_TMP_AGE_SECS`] seconds while it walks
+    /// the directory tree). Such side effects must never delete a finalised
+    /// blob payload or its sidecar — only `.tmp` debris from interrupted writes.
+    ///
+    /// Returns the list of txids whose payload **and** sidecar are present
+    /// (matching the [`Self::exists`] contract). Half-written blobs (payload
+    /// without sidecar, or vice versa) are NOT returned — they are unusable
+    /// and the caller has no way to reconcile them.
+    fn list(&self) -> Result<Vec<[u8; 32]>>;
 }
 
 /// File-based blob store organized by hash prefix directories.
@@ -237,6 +263,16 @@ pub struct FileBlobStore {
 }
 
 impl FileBlobStore {
+    /// Maximum age of a `.tmp` upload artefact before [`Self::list`] deletes it.
+    ///
+    /// Any in-progress streaming write (`begin_stream` → `write_chunk`* →
+    /// `finish`) must complete within this window. The default is intentionally
+    /// short (5 minutes) so that crashed uploads, dropped clients, and
+    /// abandoned migration-side blob writes do not leak inodes between GC
+    /// cycles. Blob payloads themselves are NEVER swept by age — only `.tmp`
+    /// files whose mtime indicates a write that started but never finished.
+    pub const STALE_TMP_AGE_SECS: u64 = 5 * 60;
+
     /// Create a new file blob store at the given directory.
     ///
     /// `prefix_depth` controls how many hex-byte pairs are used for
@@ -246,6 +282,107 @@ impl FileBlobStore {
             base_dir: base_dir.to_path_buf(),
             prefix_depth,
         }
+    }
+
+    /// Decode a hex filename back to a 32-byte txid. Returns `None` for any
+    /// name that is not exactly 64 lowercase-hex characters — this filters
+    /// `.tmp`, `.meta`, and any non-blob debris that may live in the tree.
+    fn decode_blob_filename(name: &str) -> Option<[u8; 32]> {
+        if name.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            let hi = (name.as_bytes()[i * 2] as char).to_digit(16)?;
+            let lo = (name.as_bytes()[i * 2 + 1] as char).to_digit(16)?;
+            out[i] = ((hi << 4) | lo) as u8;
+        }
+        Some(out)
+    }
+
+    /// Recursively walk the prefix directory tree under `dir`, accumulating
+    /// every txid whose payload **and** sidecar are present, and removing any
+    /// `.tmp` upload artefact whose mtime is older than `stale_cutoff`.
+    ///
+    /// Errors from individual directory entries (race with another process
+    /// removing the file mid-walk, transient stat failures) are logged at
+    /// `warn` and skipped — the GC sweep must make forward progress on
+    /// healthy entries even if one is misbehaving.
+    fn walk_dir(
+        dir: &Path,
+        stale_cutoff: std::time::SystemTime,
+        out: &mut Vec<[u8; 32]>,
+    ) -> std::io::Result<()> {
+        let read_dir = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        for entry in read_dir {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(dir = %dir.display(), err = %e, "blob list: read_dir entry failed");
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), err = %e, "blob list: file_type failed");
+                    continue;
+                }
+            };
+            if file_type.is_dir() {
+                if let Err(e) = Self::walk_dir(&path, stale_cutoff, out) {
+                    tracing::warn!(path = %path.display(), err = %e, "blob list: subdir walk failed");
+                }
+                continue;
+            }
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            // Stale .tmp sweep — see STALE_TMP_AGE_SECS for rationale.
+            if name.ends_with(TMP_SUFFIX) {
+                let mtime = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                if let Some(mtime) = mtime
+                    && mtime <= stale_cutoff
+                {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {
+                            tracing::info!(path = %path.display(), "blob list: removed stale .tmp file");
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            tracing::warn!(path = %path.display(), err = %e, "blob list: failed to remove stale .tmp file");
+                        }
+                    }
+                }
+                continue;
+            }
+            // Sidecar files are not blobs — they are accounted for via the
+            // companion payload's existence check below.
+            if name.ends_with(META_SUFFIX) {
+                continue;
+            }
+            let Some(txid) = Self::decode_blob_filename(name) else {
+                continue;
+            };
+            // Match the `exists` contract: only return blobs whose sidecar is
+            // also present. A payload without a sidecar (or vice versa) is a
+            // half-written blob and must not be returned to the GC reconciler.
+            let meta_path = Self::meta_path_for(&path);
+            if !meta_path.exists() {
+                continue;
+            }
+            out.push(txid);
+        }
+        Ok(())
     }
 
     fn blob_path(&self, key: &[u8; 32]) -> PathBuf {
@@ -440,6 +577,19 @@ impl BlobStore for FileBlobStore {
         Ok(path.exists() && meta_path.exists())
     }
 
+    fn digest(&self, key: &[u8; 32]) -> Result<Option<BlobDigest>> {
+        let path = self.blob_path(key);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let meta_path = Self::meta_path_for(&path);
+        if !meta_path.exists() {
+            return Ok(None);
+        }
+        let (sha256, length) = Self::read_meta(&path, key)?;
+        Ok(Some(BlobDigest { sha256, length }))
+    }
+
     fn stream_to(&self, key: &[u8; 32], writer: &mut dyn std::io::Write) -> Result<u64> {
         let path = self.blob_path(key);
         // Open both the payload and sidecar up front so a missing payload
@@ -454,19 +604,17 @@ impl BlobStore for FileBlobStore {
         };
         let (expected_sha, expected_len) = Self::read_meta(&path, key)?;
 
-        // Verify by hashing as we copy. Buffer a single chunk at a time so we
-        // do not require the full payload in memory.
+        // Pass 1: verify by hashing fixed-size chunks. Do not write to the
+        // caller until the full digest has been proven.
         let mut hasher = Sha256::new();
         let mut buf = [0u8; 64 * 1024];
         let mut total: u64 = 0;
-        let mut payload = Vec::with_capacity(expected_len as usize);
         loop {
             let n = file.read(&mut buf)?;
             if n == 0 {
                 break;
             }
             hasher.update(&buf[..n]);
-            payload.extend_from_slice(&buf[..n]);
             total += n as u64;
         }
         if total != expected_len {
@@ -487,8 +635,19 @@ impl BlobStore for FileBlobStore {
                 actual: actual_sha,
             });
         }
-        // Only after verification do we hand bytes to the caller.
-        writer.write_all(&payload)?;
+
+        // Pass 2: stream the verified payload without retaining it in memory.
+        file.rewind()?;
+        let mut copied: u64 = 0;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&buf[..n])?;
+            copied += n as u64;
+        }
+        debug_assert_eq!(copied, total);
         Ok(total)
     }
 
@@ -508,6 +667,19 @@ impl BlobStore for FileBlobStore {
             bytes_written: 0,
             hasher: Sha256::new(),
         }))
+    }
+
+    fn list(&self) -> Result<Vec<[u8; 32]>> {
+        let mut keys = Vec::new();
+        // Compute the stale-tmp cutoff once per sweep so every `.tmp` we
+        // examine is judged against the same instant — a file racing with the
+        // sweep cannot be deleted on one tick and survive on the next based
+        // on clock drift mid-walk.
+        let stale_cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(Self::STALE_TMP_AGE_SECS))
+            .unwrap_or(std::time::UNIX_EPOCH);
+        Self::walk_dir(&self.base_dir, stale_cutoff, &mut keys)?;
+        Ok(keys)
     }
 }
 
@@ -595,6 +767,14 @@ impl BlobStore for MemoryBlobStore {
         Ok(self.blobs.lock().contains_key(key))
     }
 
+    fn digest(&self, key: &[u8; 32]) -> Result<Option<BlobDigest>> {
+        let blobs = self.blobs.lock();
+        Ok(blobs.get(key).map(|entry| BlobDigest {
+            sha256: entry.sha256,
+            length: entry.data.len() as u64,
+        }))
+    }
+
     fn stream_to(&self, key: &[u8; 32], writer: &mut dyn std::io::Write) -> Result<u64> {
         let payload = match self.get(key)? {
             Some(d) => d,
@@ -610,6 +790,10 @@ impl BlobStore for MemoryBlobStore {
             buffer: Vec::new(),
             store: Arc::clone(&self.blobs),
         }))
+    }
+
+    fn list(&self) -> Result<Vec<[u8; 32]>> {
+        Ok(self.blobs.lock().keys().copied().collect())
     }
 }
 
@@ -692,6 +876,19 @@ mod tests {
         let (sha, len) = decode_meta(&meta_bytes).unwrap();
         assert_eq!(sha, expected_sha(b"payload"));
         assert_eq!(len, b"payload".len() as u64);
+    }
+
+    #[test]
+    fn file_digest_reads_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileBlobStore::new(dir.path(), 2);
+        let key = test_key(0x4A);
+        let digest = store.put(&key, b"digest only").unwrap();
+
+        let observed = store.digest(&key).unwrap().unwrap();
+        assert_eq!(observed, digest);
+        assert_eq!(observed.sha256, expected_sha(b"digest only"));
+        assert_eq!(observed.length, b"digest only".len() as u64);
     }
 
     #[test]
