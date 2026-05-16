@@ -135,6 +135,7 @@ pub fn spawn_checkpoint_task_with_reset_guard(
                             entries_before = stats.entries_before,
                             usage_after = stats.usage_after,
                             reset_performed = stats.reset_performed,
+                            checkpoint_duration_ms = stats.checkpoint_duration_ms,
                             "checkpoint complete",
                         );
                     }
@@ -154,6 +155,11 @@ pub struct CheckpointStats {
     pub entries_before: u64,
     pub usage_after: f64,
     pub reset_performed: bool,
+    /// F-G4-016: wall-clock time the dispatch visibility guard was
+    /// held during the snapshot. Operators should alert when this
+    /// climbs into the same order of magnitude as
+    /// `CheckpointConfig::poll_interval`.
+    pub checkpoint_duration_ms: u64,
 }
 
 /// Perform a single checkpoint: snapshot, persist, fence, compact.
@@ -181,9 +187,21 @@ pub fn perform_checkpoint_with_reset_guard<F>(
 where
     F: Fn(u64) -> bool,
 {
+    // F-G4-016: the visibility guard is held across `snapshot_index`
+    // and `persist_allocator`, so dispatch is quiesced for the entire
+    // snapshot duration. For a primary index with millions of entries
+    // this can run into the hundreds of ms and surfaces as periodic
+    // tail-latency spikes correlated with checkpoint cadence. This is
+    // a known tradeoff vs. the simpler "stop-the-world snapshot"
+    // design; a CoW / generation-tracking refactor is deferred until
+    // checkpoint latency is observed as a production bottleneck. The
+    // `checkpoint_duration_ms` field of the returned `CheckpointStats`
+    // exposes this so operators can alert when it crosses
+    // `poll_interval`.
     let _visibility_guard = engine.acquire_dispatch_visibility_guard();
     let entries_before = redo_log.lock().current_sequence();
     let snapshot_fence_sequence = entries_before.saturating_sub(1);
+    let started_at = std::time::Instant::now();
 
     // 1. Snapshot index + DAH + unmined to disk (tempfile + rename).
     engine
@@ -218,10 +236,12 @@ where
     };
 
     let usage_after = log.usage_fraction();
+    let checkpoint_duration_ms = started_at.elapsed().as_millis() as u64;
     Ok(CheckpointStats {
         entries_before,
         usage_after,
         reset_performed,
+        checkpoint_duration_ms,
     })
 }
 
