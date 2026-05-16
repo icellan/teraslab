@@ -472,8 +472,32 @@ impl std::fmt::Debug for HashTable {
     }
 }
 
-// Safety: HashTable owns its mmap allocation exclusively. The contents are
-// plain Copy data with no interior mutability or thread-local state.
+// # Safety
+//
+// `HashTable` owns its `ptr` (an mmap'd region) exclusively and the buckets
+// it points at are plain-`Copy` POD with no interior mutability. The raw
+// pointer prevents the compiler from auto-deriving `Send`/`Sync`, so we
+// assert both unsafely.
+//
+// Concurrency contract — the engine MUST enforce these externally:
+//
+// * `Send` — the table can move between threads only when no thread holds
+//   a borrow of `&self` / `&mut self`. The engine satisfies this by
+//   wrapping the table in `Arc<RwLock<…>>` per dataset.
+// * `Sync` — concurrent `&HashTable` access from multiple threads is sound
+//   ONLY while no thread is mutating (no `&mut HashTable` is live, no
+//   bucket is being rewritten via `bucket_mut`). The engine satisfies
+//   this with a per-dataset `RwLock`: readers hold `read()`, the
+//   `insert`/`remove`/`resize` paths hold `write()`.
+//
+// Violating either contract — e.g. sharing `&HashTable` across threads
+// while another thread holds `&mut HashTable` — is a data race. Bucket
+// writes are 64-byte non-atomic memcpys; a torn read sees a mix of old
+// and new bytes which `is_occupied()` will accept, allowing `register`
+// to find or shadow an entry under the wrong txid.
+//
+// `miri` flags this if a test ever exercises concurrent `&` access during
+// mutation.
 unsafe impl Send for HashTable {}
 unsafe impl Sync for HashTable {}
 
@@ -621,18 +645,36 @@ impl HashTable {
     }
 
     /// Safe accessor for bucket at `idx` (immutable).
+    ///
+    /// # Safety contract enforced by callers
+    ///
+    /// Despite the safe signature, this method only produces sound `&Bucket`
+    /// references when the caller (or the engine wrapper above) guarantees
+    /// no concurrent `bucket_mut(idx)` is live for any `idx`. See the
+    /// module-level `unsafe impl Sync` block for the full discussion —
+    /// `Sync` is asserted on the assumption that the engine wraps the
+    /// table in a `RwLock` so readers and writers do not overlap.
     #[inline]
     fn bucket(&self, idx: usize) -> &Bucket {
         debug_assert!(idx < self.capacity);
         // Safety: idx is within the mmap'd region (checked by caller or mask).
+        // Concurrent &-access from multiple threads is sound only while no
+        // thread is mutating; see the module-level Sync impl contract.
         unsafe { &*self.ptr.add(idx) }
     }
 
     /// Safe accessor for bucket at `idx` (mutable).
+    ///
+    /// `&mut self` provides Rust-level exclusivity within a single thread.
+    /// Across threads the per-dataset `RwLock` documented on the
+    /// module-level `unsafe impl Sync` block must be held in `write()`
+    /// mode by the caller.
     #[inline]
     fn bucket_mut(&mut self, idx: usize) -> &mut Bucket {
         debug_assert!(idx < self.capacity);
-        // Safety: idx is within the mmap'd region, &mut self guarantees exclusivity.
+        // Safety: idx is within the mmap'd region, &mut self guarantees
+        // exclusivity within this thread. Cross-thread exclusivity is the
+        // caller's responsibility (engine RwLock).
         unsafe { &mut *self.ptr.add(idx) }
     }
 
