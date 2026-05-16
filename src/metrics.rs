@@ -857,6 +857,18 @@ pub struct ReplicationMetrics {
     /// signal that a real bug in send_batch/recv_ack exists; the
     /// surrounding error path silently retries on the next batch.
     pub replica_worker_panics_total: PaddedCounter,
+    /// F-G7-001: receiver-side counter — incremented every time the
+    /// node accepts an inter-node opcode (e.g. `OP_REPLICA_BATCH`)
+    /// without an HMAC layer because `cluster_secret` is unset. The
+    /// trusted-overlay deployment model intentionally allows this in
+    /// single-node demos; multi-node clusters in production should
+    /// see a flat zero. A non-zero counter is an alert signal —
+    /// either the operator forgot to configure cluster_secret or a
+    /// peer is reaching the listener without the configured auth.
+    /// Bumped by the G5-owned auth gate at `server::mod`; the field
+    /// lives here so the G7 replication subsystem owns the metric
+    /// schema and tests can reference it directly.
+    pub replica_unauthenticated_accept_total: PaddedCounter,
 }
 
 /// Per-replica drill-down state exposed on `/admin/top`.
@@ -910,6 +922,7 @@ impl ReplicationMetrics {
             replica_apply_skipped_missing_tx: PaddedCounter::new(),
             ack_tracker_flush_failures: PaddedCounter::new(),
             replica_worker_panics_total: PaddedCounter::new(),
+            replica_unauthenticated_accept_total: PaddedCounter::new(),
         }
     }
 
