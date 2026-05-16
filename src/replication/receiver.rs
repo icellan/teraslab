@@ -3241,6 +3241,69 @@ mod tests {
         );
     }
 
+    /// F-G7-015 (positive verification): when the master retries a
+    /// batch after a partial / stale-connection drop, the receiver's
+    /// dedup tracker MUST skip the prefix that already applied and
+    /// only re-apply the suffix. Sending the exact same batch twice
+    /// must result in exactly one durable mutation per op, never two.
+    #[test]
+    fn duplicate_batch_after_stale_connection_skips_already_applied() {
+        let engine = make_engine();
+        let k = key(85);
+        create_record(&engine, k, 3);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = DEFAULT_STREAM_KEY;
+
+        // Master sends a batch covering ops at sequences 1..=2. The
+        // receiver applies them and advances the high-water mark.
+        let batch = make_spend_batch(1, k, 0..2, /* delete_at_height adj */ 1);
+        let req = batch_request(&batch, 1);
+        let resp = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            &tracker,
+            stream_key,
+            /* local_cluster_key */ 0,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(engine.read_slot(&k, 0).unwrap().status, UTXO_SPENT);
+        assert_eq!(engine.read_slot(&k, 1).unwrap().status, UTXO_SPENT);
+        let meta_after_first = engine.read_metadata(&k).unwrap();
+        let spent_after_first = { meta_after_first.spent_utxos };
+        let gen_after_first = { meta_after_first.generation };
+        assert_eq!(spent_after_first, 2);
+
+        // Master retries the same batch (simulating a stale-connection
+        // drop on the master side). The receiver's dedup tracker must
+        // skip both ops; engine counters must not move.
+        let resp2 = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            &tracker,
+            stream_key,
+            0,
+        );
+        assert_eq!(
+            resp2.status, STATUS_OK,
+            "duplicate batch must still ACK OK",
+        );
+        let meta_after_retry = engine.read_metadata(&k).unwrap();
+        assert_eq!(
+            { meta_after_retry.spent_utxos },
+            spent_after_first,
+            "duplicate batch must NOT double-bump spent_utxos counter",
+        );
+        assert_eq!(
+            { meta_after_retry.generation },
+            gen_after_first,
+            "duplicate batch must NOT bump generation again",
+        );
+    }
+
     // ----------------------------------------------------------------------
     // Phase 4 — wire-protocol trace context propagation
     // ----------------------------------------------------------------------
