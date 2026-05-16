@@ -3510,7 +3510,12 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].sequence, third);
         assert!(matches!(entries[0].op, RedoOp::Freeze { .. }));
-        assert!(log.write_position() < 4096);
+        // F-G4-001 reserves a header block (one device alignment unit) at
+        // the start of the redo region; F-G4-004 keeps each flush
+        // block-aligned. After compaction the retained payload sits in a
+        // single aligned block, so `write_position` is at most one
+        // alignment unit (4 KiB on the in-memory device).
+        assert!(log.write_position() <= 4096);
         assert!(first < second && second < third);
 
         drop(log);
