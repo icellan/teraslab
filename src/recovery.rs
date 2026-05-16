@@ -42,7 +42,19 @@ use crate::storage::blob_gc::{self, BlobGcStats};
 use crate::storage::blobstore::{BlobError, BlobStore};
 use thiserror::Error;
 
-const RECOVERY_PROGRESS_INTERVAL_ENTRIES: u64 = 1024;
+/// F-G4-011: how often `recover_*_progress` writes a durable
+/// recovery-progress marker mid-replay. Each marker is a separate
+/// `RedoLog::mark_recovery_progress` (append + fsync); too frequent a
+/// cadence amplifies recovery latency and exposes one more I/O failure
+/// surface per marker. The original value (1024) was conservatively
+/// fine-grained; widening it to 16 384 cuts the marker count by 16×
+/// without meaningfully growing the worst-case re-replay span if a
+/// crash interrupts the recovery (recovery is idempotent, so re-doing
+/// 16 K entries is not a correctness concern — only a startup-latency
+/// one, dominated by the per-entry I/O which is far larger than the
+/// per-1024 fsync). The final marker is still always written at the
+/// end of the recovered range so the next startup can skip the bulk.
+const RECOVERY_PROGRESS_INTERVAL_ENTRIES: u64 = 16384;
 
 /// Errors during recovery.
 #[derive(Error, Debug)]
