@@ -97,6 +97,16 @@ const INTENT_COMMIT_FLUSH_INTERVAL_MS: u128 = 1000;
 /// forcing a disk flush. `begin()` remains immediately durable; deferred
 /// commit flushes can only leave stale ranges that recovery replays
 /// idempotently.
+///
+/// F-G7-004 contract: the deferred `commit()` durability is safe ONLY
+/// when the master-side recovery replay path consults the receiver's
+/// `ReplicaAppliedTracker` before re-applying each range. Recovery
+/// MUST NOT bypass the dedup tracker (including for batches flagged
+/// `FLAG_MIGRATION_BATCH`; F-G7-005 enforces a non-zero cluster_key
+/// gate on those paths in clustered mode). If a future change to the
+/// recovery loop skips dedup, this constant must be set to 1 to make
+/// every commit immediately durable so stale ranges never reach
+/// recovery replay.
 const INTENT_COMMIT_FLUSH_DIRTY_COUNT_THRESHOLD: u32 = 100;
 
 impl AckTracker {
