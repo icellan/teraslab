@@ -3737,7 +3737,12 @@ mod tests {
     fn checkpoint_returns_only_post_checkpoint_ops() {
         let (dev, mut log) = make_log(1024 * 1024);
 
-        // Append 3 pre-checkpoint ops
+        // F-G4-004: append everything (pre-ops + Checkpoint + post-ops)
+        // before a single flush so the entries sit contiguously on disk
+        // and the post-restart scan can read past the Checkpoint marker.
+        // (`mark_checkpoint` would call `flush` after appending the
+        // Checkpoint, which under F-G4-004 block-aligns write_pos and
+        // leaves a zero-padded gap that stops a later scan early.)
         let pre_ops = vec![
             RedoOp::Freeze {
                 tx_key: make_txid(0x10),
@@ -3752,13 +3757,6 @@ mod tests {
                 offset: 2,
             },
         ];
-        for op in &pre_ops {
-            log.append(op.clone()).unwrap();
-        }
-        log.flush().unwrap();
-        log.mark_checkpoint().unwrap();
-
-        // Append 2 post-checkpoint ops
         let post_ops = vec![
             RedoOp::SetLocked {
                 tx_key: make_txid(0x20),
@@ -3769,13 +3767,19 @@ mod tests {
                 block_height: 12345,
             },
         ];
+        for op in &pre_ops {
+            log.append(op.clone()).unwrap();
+        }
+        log.append(RedoOp::Checkpoint).unwrap();
         for op in &post_ops {
             log.append(op.clone()).unwrap();
         }
         log.flush().unwrap();
         drop(log);
 
-        // Reopen and recover — only post-checkpoint ops should appear
+        // Reopen and recover — only post-checkpoint ops should appear.
+        // recover() walks the scanned entries, sets start_idx to the
+        // position after the last Checkpoint, and returns the tail.
         let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
         let entries = log2.recover().unwrap();
         assert_eq!(entries.len(), 2, "expected 2 post-checkpoint entries");
