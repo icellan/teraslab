@@ -69,6 +69,19 @@ impl DeviceIo for SyncFallback {
         offset: u64,
         user_data: u64,
     ) -> Result<(), std::io::Error> {
+        // F-G1-010: reject zero-length buffers symmetrically with
+        // `IoUringBackend::submit_read`. The pointer would be dangling
+        // (`NonNull::dangling()`) and libc::pread with len=0 is a
+        // documented no-op, but the contract on `submit_read` says the
+        // caller-supplied buffer is the I/O target — passing a
+        // dangling pointer through is a footgun that should fail
+        // loudly.
+        if buf.len() == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "submit_read: zero-length buffer (dangling pointer)",
+            ));
+        }
         self.pending.push(PendingOp {
             kind: OpKind::Read,
             fd,
@@ -87,6 +100,13 @@ impl DeviceIo for SyncFallback {
         offset: u64,
         user_data: u64,
     ) -> Result<(), std::io::Error> {
+        // F-G1-010: see submit_read above.
+        if buf.len() == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "submit_write: zero-length buffer (dangling pointer)",
+            ));
+        }
         self.pending.push(PendingOp {
             kind: OpKind::Write,
             fd,
@@ -377,6 +397,30 @@ mod tests {
             "queue_depth=u32::MAX must clamp to <= 4096 (got capacity={})",
             io.pending.capacity()
         );
+    }
+
+    /// F-G1-010 regression: `submit_read` must reject a zero-length
+    /// buffer instead of passing the `AlignedBuf::new(0, …)` dangling
+    /// pointer through to the syscall layer.
+    #[test]
+    fn sync_submit_read_rejects_zero_length_buffer() {
+        let mut io = SyncFallback::new(8).unwrap();
+        let mut buf = AlignedBuf::new(0, ALIGNMENT);
+        let err = io
+            .submit_read(0, &mut buf, 0, 1)
+            .expect_err("zero-length submit_read must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// F-G1-010 regression: same contract for `submit_write`.
+    #[test]
+    fn sync_submit_write_rejects_zero_length_buffer() {
+        let mut io = SyncFallback::new(8).unwrap();
+        let buf = AlignedBuf::new(0, ALIGNMENT);
+        let err = io
+            .submit_write(0, &buf, 0, 1)
+            .expect_err("zero-length submit_write must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

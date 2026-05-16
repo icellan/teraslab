@@ -215,6 +215,22 @@ impl DeviceIo for IoUringBackend {
         user_data: u64,
     ) -> Result<(), std::io::Error> {
         let len = buf.len();
+        // F-G1-010: a zero-length `AlignedBuf` carries a dangling
+        // (`NonNull::dangling().as_ptr()`) pointer. POSIX permits a
+        // zero-length pread/pwrite (it is a no-op returning 0) so the
+        // kernel will not deref the pointer, but the contract on
+        // `submit_read`/`submit_write` is "the kernel reads/writes the
+        // raw buffer pointer at any time between submission and
+        // completion" — handing it a dangling pointer (even paired
+        // with len=0) is a footgun. Reject explicitly so a future
+        // caller that adds a zero-length fast path fails loudly rather
+        // than silently bypassing every layer's validation.
+        if len == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "submit_read: zero-length buffer (would pass a dangling pointer to the kernel)",
+            ));
+        }
         if len > u32::MAX as usize {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -237,6 +253,13 @@ impl DeviceIo for IoUringBackend {
         user_data: u64,
     ) -> Result<(), std::io::Error> {
         let len = buf.len();
+        // F-G1-010: same rationale as submit_read above.
+        if len == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "submit_write: zero-length buffer (would pass a dangling pointer to the kernel)",
+            ));
+        }
         if len > u32::MAX as usize {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
