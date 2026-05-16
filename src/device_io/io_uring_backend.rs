@@ -56,6 +56,24 @@ const RING_MASK: u64 = (RING_SIZE as u64) - 1;
 ///
 /// Provides true asynchronous batched I/O via the kernel's io_uring
 /// interface. Instantiated through `IoUringBackend::new(queue_depth)`.
+///
+/// # Single-owner thread-safety contract (F-G1-014)
+///
+/// `IoUringBackend` is designed for **single-owner use**: every
+/// mutating method on the [`DeviceIo`] trait takes `&mut self`, so
+/// Rust's borrow checker already guarantees only one thread mutates
+/// the ring at a time. The internal [`ts_ring`](Self::ts_ring) uses
+/// `Ordering::Relaxed` because there is no actual cross-thread
+/// concurrency to synchronise: the timestamp ring is observed only
+/// from inside the same `&mut self` borrow that wrote it.
+///
+/// If a future refactor wants to share an `IoUringBackend` across
+/// threads via interior mutability (e.g. wrapping it in a `Mutex<…>`),
+/// the timestamp-ring `Ordering::Relaxed` calls below MUST be promoted
+/// to `Ordering::AcqRel` (write-store / read-swap) so submit→complete
+/// latency reads cannot observe stale timestamps from a different
+/// CPU's store buffer. The relaxed shape today is a deliberate
+/// optimisation, not a correctness oversight.
 pub struct IoUringBackend {
     ring: IoUring,
     /// Operations submitted but whose completions have not yet been drained.
@@ -68,6 +86,11 @@ pub struct IoUringBackend {
     ///
     /// Zeros mean "no outstanding timestamp" which — because `now_ns()` is
     /// never exactly 0 — is an acceptable empty sentinel.
+    ///
+    /// Single-owner cache: see the type-level safety doc above. Stays
+    /// `Relaxed` because every read/write happens under a unique
+    /// `&mut self` borrow on the same thread; there is no inter-thread
+    /// happens-before relationship to establish.
     ts_ring: Box<[AtomicU64; RING_SIZE]>,
     /// Common base `Instant` used to encode timestamps as compact `u64`
     /// nanoseconds. Recorded once at ring construction so subtraction is
