@@ -1205,12 +1205,13 @@ pub fn decode_get_response_checked(
         let data_len = get_u32(data, pos) as usize;
         pos += 4;
         // F-G5-018: cumulative tally — see comment above.
-        total_data_bytes = total_data_bytes.checked_add(data_len).ok_or_else(|| {
-            CodecError::SectionTruncated {
-                need: max_total + 1,
-                have: max_total,
-            }
-        })?;
+        total_data_bytes =
+            total_data_bytes
+                .checked_add(data_len)
+                .ok_or_else(|| CodecError::SectionTruncated {
+                    need: max_total + 1,
+                    have: max_total,
+                })?;
         if total_data_bytes > max_total {
             return Err(CodecError::SectionTruncated {
                 need: 4 + total_data_bytes,

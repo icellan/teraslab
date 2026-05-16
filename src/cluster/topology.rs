@@ -112,20 +112,21 @@ impl TopologyTerm {
 
     /// Deserialize from the wire.
     ///
-    /// F-G5-002: the `count` field is a client-supplied `u32` and the
-    /// subsequent `count * 8` multiplication previously ran without
-    /// `checked_mul`. The size check downstream (`data.len() < members_end
-    /// + 32`) bounded the practical maximum to ~`MAX_FRAME_SIZE / 8` (≈2M
-    /// members), far above any legitimate production cluster (dozens of
-    /// nodes). Combined with F-G5-001's no-secret auth bypass, an
-    /// unauthenticated peer could drive a 16 MiB pre-allocation per
-    /// connection. Two defences:
+    /// F-G5-002: bound the topology member list before allocation.
     ///
-    ///   1. `MAX_TOPOLOGY_MEMBERS` named cap rejected before any sizing
-    ///      arithmetic.
-    ///   2. `checked_mul` on `count * 8` so 32-bit targets do not
-    ///      silently overflow into a tiny `members_end` that bypasses
-    ///      the size check.
+    /// The `count` field is a client-supplied `u32` and the subsequent
+    /// `count * 8` multiplication previously ran without `checked_mul`.
+    /// The downstream size check bounded the practical maximum to roughly
+    /// `MAX_FRAME_SIZE / 8` — about 2M members, far above any legitimate
+    /// production cluster of dozens of nodes. Combined with F-G5-001's
+    /// no-secret auth bypass, an unauthenticated peer could drive a 16
+    /// MiB pre-allocation per connection. Two defences:
+    ///
+    /// 1. `MAX_TOPOLOGY_MEMBERS` named cap rejected before any sizing
+    ///    arithmetic.
+    /// 2. `checked_mul` on `count * 8` so 32-bit targets do not
+    ///    silently overflow into a tiny `members_end` that bypasses
+    ///    the size check.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
         if data.len() < 20 {
             return None;
