@@ -1470,7 +1470,12 @@ pub fn decode_redirect(data: &[u8]) -> Option<String> {
     if data.len() < 2 + len {
         return None;
     }
-    Some(String::from_utf8_lossy(&data[2..2 + len]).to_string())
+    // F-G5-021: strict UTF-8 parsing — `from_utf8_lossy` previously
+    // accepted non-UTF-8 bytes by substituting U+FFFD, and the resulting
+    // address then failed `parse::<SocketAddr>()` further down the line.
+    // Match the rest of the codec's strict truncation/parse semantics by
+    // returning `None` on invalid UTF-8.
+    Some(std::str::from_utf8(&data[2..2 + len]).ok()?.to_string())
 }
 
 /// Decode a redirect response payload, recovering the trailing
@@ -1489,7 +1494,8 @@ pub fn decode_redirect_with_version(data: &[u8]) -> Option<(String, Option<u64>)
     if data.len() < 2 + len {
         return None;
     }
-    let addr = String::from_utf8_lossy(&data[2..2 + len]).to_string();
+    // F-G5-021: strict UTF-8 — same fix as decode_redirect above.
+    let addr = std::str::from_utf8(&data[2..2 + len]).ok()?.to_string();
     let tail = &data[2 + len..];
     let version = if tail.is_empty() {
         None
