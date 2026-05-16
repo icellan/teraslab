@@ -10,7 +10,7 @@
 //! 7. Start TCP server
 //! 8. On shutdown: snapshot index, sync device
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8};
 
