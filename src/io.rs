@@ -392,20 +392,25 @@ pub unsafe fn write_utxo_slot_direct(
 /// record offset. The read is rounded up to the device alignment.
 pub fn read_metadata(device: &dyn BlockDevice, record_offset: u64) -> Result<TxMetadata> {
     let align = device.alignment();
-    let read_size = align_up(METADATA_SIZE, align);
-    let mut buf = AlignedBuf::new(read_size, align);
 
     // Record offset must be aligned (allocator guarantees this).
     let aligned_base = record_offset / align as u64 * align as u64;
     let intra_offset = (record_offset - aligned_base) as usize;
 
+    // F-G1-008: read directly from the aligned device buffer. The
+    // previous implementation allocated a second `AlignedBuf` of size
+    // `align_up(METADATA_SIZE, align)`, copied the header bytes into
+    // it, and then deserialized from there — one redundant heap alloc
+    // + memcpy per call. Recovery scans every record at boot, so this
+    // matters on the cold path; on the direct-ptr hot path this code
+    // is bypassed entirely.
     let total_read = align_up(intra_offset + METADATA_SIZE, align);
     let mut read_buf = AlignedBuf::new(total_read, align);
     device.pread_exact_at(&mut read_buf, aligned_base)?;
 
-    buf[..METADATA_SIZE].copy_from_slice(&read_buf[intra_offset..intra_offset + METADATA_SIZE]);
-
-    Ok(TxMetadata::from_bytes(&buf[..METADATA_SIZE])?)
+    Ok(TxMetadata::from_bytes(
+        &read_buf[intra_offset..intra_offset + METADATA_SIZE],
+    )?)
 }
 
 /// Write the [`TxMetadata`] header of a record at `record_offset`.

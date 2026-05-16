@@ -11,6 +11,8 @@
 //! ownership scope does not include that file.
 
 use teraslab::device::{AlignedBuf, BlockDevice, DeviceError, MemoryDevice};
+use teraslab::io::{read_metadata, write_metadata};
+use teraslab::record::TxMetadata;
 
 /// F-G1-007 regression: `MemoryDevice::pread` with an `offset` near
 /// `usize::MAX` plus a non-trivial buffer length must return
@@ -45,4 +47,25 @@ fn memory_device_pwrite_rejects_offset_buf_overflow() {
         }
         other => panic!("expected OutOfBounds, got {other:?}"),
     }
+}
+
+/// F-G1-008 regression: `read_metadata` must round-trip a header
+/// written by `write_metadata` exactly. The block-I/O path previously
+/// allocated a second `AlignedBuf` of size `align_up(METADATA_SIZE,
+/// align)`, copied bytes into it, and deserialized from there — one
+/// redundant heap alloc + memcpy. Post-fix the deserialize reads
+/// directly out of the aligned device buffer.
+#[test]
+fn read_metadata_block_path_round_trips_header_after_alloc_dedup() {
+    let dev = MemoryDevice::new(64 * 1024, 4096).unwrap();
+    let mut meta = TxMetadata::new(8);
+    meta.tx_id = [0x5Au8; 32];
+    meta.fee = 12345;
+    meta.locktime = 700_001;
+    write_metadata(&dev, 0, &meta).unwrap();
+
+    let read_back = read_metadata(&dev, 0).unwrap();
+    assert_eq!(read_back, meta);
+    assert_eq!({ read_back.utxo_count }, 8);
+    assert_eq!({ read_back.fee }, 12345);
 }
