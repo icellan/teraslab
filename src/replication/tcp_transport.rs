@@ -287,6 +287,19 @@ impl ReplicaTransport for TcpReplicaTransport {
         let (resp, _) = ResponseFrame::decode(&frame)
             .map_err(|e| ReplicationError::Transport(format!("decode response frame: {e}")))?;
 
+        // F-G7-002: The response's request_id MUST match the outgoing
+        // request_id we incremented in `send_batch`. If a future code
+        // path ever re-caches a transport after a partial-ACK timeout
+        // a stale buffered ACK could otherwise be silently attributed
+        // to the next request. Reject mismatches as a hard transport
+        // error so the caller drops the connection and reconnects.
+        if resp.request_id != self.request_id {
+            return Err(ReplicationError::Transport(format!(
+                "ack request_id mismatch: expected {}, got {}",
+                self.request_id, resp.request_id
+            )));
+        }
+
         if resp.status != STATUS_OK {
             // Try to deserialize as an error ack; otherwise wrap the status
             if let Ok(ack) = ReplicaAck::deserialize(&resp.payload) {
@@ -408,7 +421,10 @@ mod tests {
                 message: "apply failed".to_string(),
             };
             let resp = ResponseFrame {
-                request_id: 123,
+                // Match the transport's pre-incremented request_id (0)
+                // since this test invokes recv_ack without a prior
+                // send_batch (which would have bumped the counter).
+                request_id: 0,
                 status: STATUS_ERROR,
                 payload: ack.serialize(),
             };
@@ -426,6 +442,67 @@ mod tests {
             },
         );
 
+        handle.join().unwrap();
+    }
+
+    /// F-G7-002: a response whose `request_id` doesn't match the
+    /// transport's outgoing `request_id` must be rejected as a hard
+    /// transport error, even if the body is a well-formed `ReplicaAck`.
+    /// Without this, a stale buffered ACK from a previous request
+    /// could be silently attributed to the next call.
+    #[test]
+    fn recv_ack_rejects_request_id_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Drain the client's request frame so the round-trip
+            // completes (we ignore its contents).
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).unwrap();
+            let total_len = u32::from_le_bytes(len_buf) as usize;
+            let mut body = vec![0u8; total_len];
+            stream.read_exact(&mut body).unwrap();
+
+            // Reply with a wildly mismatched request_id.
+            let ack = ReplicaAck::Ok {
+                through_sequence: 1,
+            };
+            let resp = ResponseFrame {
+                request_id: 999_999,
+                status: STATUS_OK,
+                payload: ack.serialize(),
+            };
+            stream.write_all(&resp.encode()).unwrap();
+        });
+
+        let mut transport =
+            TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5)).unwrap();
+        let batch = ReplicaBatch {
+            first_sequence: 1,
+            ops: vec![ReplicaOp::Freeze {
+                tx_key: key(1),
+                offset: 0,
+                master_generation: 0,
+            }],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+        transport.send_batch(&batch).unwrap();
+        let err = transport
+            .recv_ack(Duration::from_secs(5))
+            .expect_err("must reject ack with mismatched request_id");
+        match err {
+            ReplicationError::Transport(msg) => {
+                assert!(
+                    msg.contains("request_id mismatch"),
+                    "expected request_id mismatch error, got: {msg}",
+                );
+            }
+            other => panic!("expected Transport error, got {other:?}"),
+        }
         handle.join().unwrap();
     }
 
