@@ -6,6 +6,28 @@ TeraSlab is a purpose-built Rust database server that serves as the UTXO store b
 
 Read `specs/SPEC_BRIEFING.md` for the full architecture analysis and rationale. Read `specs/teranode.lua` for the current Lua UDF implementation being replaced.
 
+## Parallel-agent worktrees — required cleanup
+
+Parallel fix/review work dispatches Agent-tool sub-agents in isolated `git worktree` checkouts under `.claude/worktrees/agent-<id>/`. Each carries its own `target/` directory (~2-4 GB). They accumulate fast — a single full review+fix campaign can leave 25+ stale worktrees totalling 60-80 GB.
+
+**The harness does not clean them up.** Run `scripts/cleanup-worktrees.sh` after every multi-agent dispatch:
+
+```bash
+# Remove all agent worktrees:
+scripts/cleanup-worktrees.sh
+
+# Keep specific in-flight agents (pass their IDs from the dispatch result):
+scripts/cleanup-worktrees.sh <agent_id_1> <agent_id_2>
+
+# Also delete orphan agent branches (refs are kept by default for inspection):
+scripts/cleanup-worktrees.sh --branches
+
+# Also cargo-clean the main target/ directory (~50 GB recovery):
+scripts/cleanup-worktrees.sh --target
+```
+
+Anything that orchestrates parallel agents must end its turn by calling this script. The script is idempotent and safe — it only touches `.claude/worktrees/agent-*` and never the main checkout.
+
 ## Project structure
 
 ```
