@@ -2675,7 +2675,11 @@ mod tests {
 
     #[test]
     fn mark_checkpoint_then_reset_reclaims_space() {
-        let (_, mut log) = make_log(8192);
+        // F-G4-001 reserves one alignment unit at the start of the
+        // region for the header; the entries region needs another
+        // alignment unit for at least one flush. 50 Freeze entries × 53
+        // bytes ≈ 2650 bytes, so a 16 KiB log gives ample room.
+        let (_, mut log) = make_log(16 * 1024);
         // Fill most of the log
         for i in 0..50u8 {
             log.append(RedoOp::Freeze {
