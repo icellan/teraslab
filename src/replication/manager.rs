@@ -626,7 +626,19 @@ impl ReplicationManager {
                 match sender.transport.recv_ack(timeout) {
                     Ok(ReplicaAck::Ok { through_sequence }) => {
                         let expected_through = batch.last_sequence();
-                        if through_sequence != expected_through {
+                        // F-G7-011: the receiver's `already_applied`
+                        // high-water mark may be AHEAD of this chunk's
+                        // last_sequence (e.g. a normal-replication
+                        // batch landed during catch-up). In that case
+                        // the receiver ACKs with the existing
+                        // high-water mark, which is `>=
+                        // expected_through`. Strict-equality marked
+                        // those replicas Down and caused spurious
+                        // flap. Treat ahead-of-chunk ACKs as success
+                        // (replica is healthy and already covers this
+                        // range) and only fail when the replica is
+                        // strictly BEHIND the chunk's last sequence.
+                        if through_sequence < expected_through {
                             sender.state = ReplicaState::Down;
                             ok = false;
                             break;
@@ -1347,6 +1359,79 @@ mod tests {
         .unwrap();
 
         assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
+    }
+
+    /// F-G7-011: when a catch-up chunk overlaps with normal replication
+    /// the replica's dedup tracker may already cover a higher
+    /// `through_sequence` than the chunk's last sequence. The receiver
+    /// then ACKs with that ahead-of-chunk high-water mark, not the
+    /// chunk's own. Previously the master's strict-equality check
+    /// (`through_sequence != expected_through`) transitioned the
+    /// replica to Down spuriously, causing flap. The fix accepts any
+    /// ACK that is `>= expected_through` as success.
+    #[test]
+    fn catchup_accepts_ack_ahead_of_chunk_last_sequence() {
+        // Custom transport whose recv_ack returns a through_sequence
+        // strictly greater than the most recently sent batch's last_sequence.
+        struct AheadAckTransport {
+            connected: bool,
+            extra_ahead: u64,
+            last_sent_through: u64,
+        }
+        impl ReplicaTransport for AheadAckTransport {
+            fn send_batch(
+                &mut self,
+                batch: &ReplicaBatch,
+            ) -> std::result::Result<(), ReplicationError> {
+                self.last_sent_through = batch.last_sequence();
+                Ok(())
+            }
+            fn recv_ack(
+                &mut self,
+                _timeout: Duration,
+            ) -> std::result::Result<ReplicaAck, ReplicationError> {
+                Ok(ReplicaAck::Ok {
+                    through_sequence: self.last_sent_through + self.extra_ahead,
+                })
+            }
+            fn is_connected(&self) -> bool {
+                self.connected
+            }
+        }
+
+        let transport = AheadAckTransport {
+            connected: true,
+            extra_ahead: 2,
+            last_sent_through: 0,
+        };
+        let mut mgr =
+            ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(transport)]);
+
+        // Drive into CatchingUp with three ops to ship (from_sequence = 1,
+        // master at 4 → ops 1..=3).
+        mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 1 };
+        mgr.next_sequence = 4;
+
+        let _ = mgr
+            .run_catchup(|from_seq| {
+                (from_seq..4)
+                    .map(|i| ReplicaOp::Freeze {
+                        tx_key: key(i as u8),
+                        offset: 0,
+                        master_generation: 0,
+                    })
+                    .collect()
+            })
+            .expect("run_catchup must not error when the replica is ahead");
+
+        // With the F-G7-011 fix the sender stays catching-up or becomes
+        // Live (never Down). Without the fix the strict-equality check
+        // would set it to Down.
+        assert!(
+            !matches!(*mgr.sender(0).state(), ReplicaState::Down),
+            "ahead-of-chunk ACK must not transition replica to Down (was {:?})",
+            mgr.sender(0).state(),
+        );
     }
 
     #[test]
