@@ -636,6 +636,13 @@ impl BlobStore for FileBlobStore {
     }
 
     fn get(&self, key: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        // F-G9-005: take the per-key lock so the payload+sidecar pair we
+        // observe is consistent with whatever writer most recently held the
+        // lock. Without this guard, a concurrent `FileStreamWriter::finish`
+        // that renames the payload before writing its sidecar leaves a brief
+        // window where a reader sees the new payload bytes against a stale
+        // sidecar digest — transient `DigestMismatch` errors.
+        let _guard = self.key_locks[Self::lock_index(key)].lock();
         let path = self.blob_path(key);
         Self::read_and_verify(&path, key)
     }
@@ -644,6 +651,8 @@ impl BlobStore for FileBlobStore {
         // Per the trait doc: verify the full payload digest before slicing.
         // Partial digests would not detect tampering of bytes outside the
         // requested window, so we read+verify the whole payload first.
+        // F-G9-005: per-key lock for the same consistency reason as `get`.
+        let _guard = self.key_locks[Self::lock_index(key)].lock();
         let data = match Self::read_and_verify(&self.blob_path(key), key)? {
             Some(d) => d,
             None => return Ok(None),
@@ -698,17 +707,27 @@ impl BlobStore for FileBlobStore {
 
     fn stream_to(&self, key: &[u8; 32], writer: &mut dyn std::io::Write) -> Result<u64> {
         let path = self.blob_path(key);
-        // Open both the payload and sidecar up front so a missing payload
-        // surfaces NotFound (matching the original behavior) before we try to
-        // verify integrity.
-        let mut file = match std::fs::File::open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(BlobError::NotFound { key: hex_key(key) });
-            }
-            Err(e) => return Err(BlobError::Io(e)),
+        // F-G9-005: take the per-key lock briefly to snapshot a consistent
+        // (open-fd, sidecar) pair. We drop the lock before the long-lived
+        // streaming work — the open file descriptor (inode) is then stable
+        // across any subsequent rename, since Linux's rename-while-open is
+        // inode-based, so the pages we hash in pass 1 and stream in pass 2
+        // are the same bytes as the sidecar read here describes.
+        let (mut file, expected_sha, expected_len) = {
+            let _guard = self.key_locks[Self::lock_index(key)].lock();
+            // Open both the payload and sidecar up front so a missing payload
+            // surfaces NotFound (matching the original behavior) before we try
+            // to verify integrity.
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BlobError::NotFound { key: hex_key(key) });
+                }
+                Err(e) => return Err(BlobError::Io(e)),
+            };
+            let (expected_sha, expected_len) = Self::read_meta(&path, key)?;
+            (file, expected_sha, expected_len)
         };
-        let (expected_sha, expected_len) = Self::read_meta(&path, key)?;
 
         // Pass 1: verify by hashing fixed-size chunks. Do not write to the
         // caller until the full digest has been proven.
