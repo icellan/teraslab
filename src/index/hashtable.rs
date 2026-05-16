@@ -825,8 +825,29 @@ impl HashTable {
         self.count -= 1;
 
         // Backward-shift: move subsequent entries back to fill the gap.
+        //
+        // F-G3-005: the loop normally terminates when it hits either an
+        // empty bucket or an entry with `probe_distance == 0`. Under a
+        // corrupted in-memory state (e.g. every bucket occupied with
+        // non-zero probe distances) those conditions could never trigger
+        // and the shift would walk forever, re-meeting itself after
+        // wraparound. Cap iterations at `self.capacity` — matches the
+        // bounds used by `get_entry`, `insert`, and `update_cached_fields`.
         let mut empty_idx = idx;
+        let mut steps = 0usize;
         loop {
+            if steps >= self.capacity {
+                // Hard invariant: the shift must terminate within one full
+                // pass over the table. Empty the cell we already vacated
+                // and bail — better to leak a probe than to spin.
+                tracing::error!(
+                    target: "teraslab::index",
+                    capacity = self.capacity,
+                    "HashTable::remove backward-shift exceeded table capacity — \
+                     refusing to continue; in-memory corruption suspected",
+                );
+                break;
+            }
             let next_idx = (empty_idx + 1) & self.mask;
             let next = self.bucket(next_idx);
             if next.is_empty() || (next.is_occupied() && next.probe_distance == 0) {
@@ -842,6 +863,7 @@ impl HashTable {
                 b.probe_distance -= 1;
             }
             empty_idx = next_idx;
+            steps += 1;
         }
         *self.bucket_mut(empty_idx) = Bucket::empty();
         self.max_probe = self.recompute_max_probe_distance();
@@ -2044,6 +2066,52 @@ mod tests {
         assert!(
             !path.with_extension("tmp").exists(),
             "tmp file must not leak"
+        );
+    }
+
+    // F-G3-005: the backward-shift loop in `remove` must terminate even if
+    // every bucket on the wraparound chain has `probe_distance > 0` (an
+    // invariant that should hold under correct usage but can be broken by
+    // memory corruption or future bugs). Pre-fix the loop would spin
+    // forever. We manufacture the pathological state by filling every
+    // bucket with a valid-but-non-probe-zero entry, then rewriting bucket 0
+    // with `probe_distance = 1` so the chain wraps without ever meeting
+    // the natural sentinel.
+    #[test]
+    fn remove_backward_shift_terminates_under_corruption() {
+        let mut t = HashTable::new(16).unwrap();
+        // Fill the table so every bucket is occupied.
+        for i in 0..16u64 {
+            t.insert(make_key(i), make_entry(i * 100)).unwrap();
+        }
+        assert_eq!(t.len(), 16, "table must be full for this test");
+
+        // Force every bucket to look like a wraparound chain by setting
+        // probe_distance on every bucket to at least 1. Safety: we hold
+        // `&mut t`, no other reference to the buckets is live.
+        for i in 0..t.capacity {
+            // bucket_mut requires &mut self; we already have it via `t`.
+            let b = t.bucket_mut(i);
+            if b.probe_distance == 0 {
+                b.probe_distance = 1;
+            }
+        }
+
+        // Pick any key the table contains and remove it. With the
+        // pre-fix code this would spin until OOM (or forever).
+        let target = make_key(0);
+        // `get_entry` may return None because we mangled probe distances,
+        // but `remove` walks the probe chain on its own. If it cannot
+        // find the key by hash, that's fine — the assertion below
+        // verifies termination, not removal.
+        let _ = t.remove(&target);
+
+        // Termination check: if we reach this line, the bounded loop fired.
+        // The cached count is allowed to be stale (the corruption broke
+        // the invariant), but the test must not hang.
+        assert!(
+            t.capacity() == 16,
+            "capacity should be unchanged after corrupted remove"
         );
     }
 }
