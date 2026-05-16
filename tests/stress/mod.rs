@@ -12,6 +12,7 @@ use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::*;
 use teraslab::ops::engine::Engine;
+use teraslab::ops::mark_longest_chain::*;
 use teraslab::ops::remaining::*;
 use teraslab::ops::set_mined::*;
 use teraslab::ops::spend::*;
@@ -44,6 +45,36 @@ fn make_utxo_hash(tx_n: u32, vout: u32) -> [u8; 32] {
     h[1] = ((vout >> 8) & 0xFF) as u8;
     h[4..8].copy_from_slice(&tx_n.to_le_bytes());
     h
+}
+
+fn create_stress_tx(engine: &Engine, n: u32, utxo_count: u32) -> TxKey {
+    let tx_id = make_tx_id(n);
+    let utxo_hashes: Vec<[u8; 32]> = (0..utxo_count).map(|v| make_utxo_hash(n, v)).collect();
+    let req = CreateRequest {
+        tx_id,
+        tx_version: 1,
+        locktime: 0,
+        fee: 500,
+        size_in_bytes: 250,
+        extended_size: 0,
+        is_coinbase: false,
+        spending_height: 0,
+        utxo_hashes: &utxo_hashes,
+        inputs: None,
+        outputs: None,
+        inpoints: None,
+        is_external: false,
+        created_at: 1710000000000,
+        block_height: 1000,
+        mined_block_infos: &[],
+        frozen: false,
+        conflicting: false,
+        locked: false,
+        external_ref: None,
+        parent_txids: &[],
+    };
+    engine.create(&req).unwrap();
+    TxKey { txid: tx_id }
 }
 
 /// Run random operations with 8 threads, verify consistency periodically.
@@ -81,6 +112,7 @@ pub fn stress_random_operations() {
             frozen: false,
             conflicting: false,
             locked: false,
+            external_ref: None,
             parent_txids: &[],
         };
         engine.create(&req).unwrap();
@@ -201,6 +233,7 @@ pub fn stress_device_fill_and_churn() {
             frozen: false,
             conflicting: false,
             locked: false,
+            external_ref: None,
             parent_txids: &[],
         };
         match engine.create(&req) {
@@ -246,6 +279,7 @@ pub fn stress_device_fill_and_churn() {
             frozen: false,
             conflicting: false,
             locked: false,
+            external_ref: None,
             parent_txids: &[],
         };
         match engine.create(&req) {
@@ -262,4 +296,266 @@ pub fn stress_device_fill_and_churn() {
         half,
         rechurned
     );
+}
+
+/// Repeatedly set and unset mined block entries across many records.
+pub fn stress_set_mined_reorg_churn() {
+    let engine = create_engine(64 * 1024 * 1024);
+    let tx_count = 512u32;
+
+    for i in 0..tx_count {
+        create_stress_tx(&engine, i, 2);
+    }
+
+    for round in 0..4u32 {
+        for i in 0..tx_count {
+            let key = TxKey {
+                txid: make_tx_id(i),
+            };
+            let block_id = 10_000 + round * tx_count + i;
+            let block_height = 2_000 + round;
+            engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: key,
+                    block_id,
+                    block_height,
+                    subtree_idx: round,
+                    current_block_height: block_height,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .unwrap();
+
+            let meta = engine.read_metadata(&key).unwrap();
+            assert_eq!(meta.block_entry_count, 1);
+
+            engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: key,
+                    block_id,
+                    block_height,
+                    subtree_idx: round,
+                    current_block_height: block_height + 1,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: true,
+                })
+                .unwrap();
+
+            let meta = engine.read_metadata(&key).unwrap();
+            assert_eq!(meta.block_entry_count, 0);
+            assert_eq!({ meta.unmined_since }, block_height + 1);
+        }
+    }
+}
+
+/// Flip longest-chain membership after mining without changing block entries.
+pub fn stress_mark_longest_chain_reorg_churn() {
+    let engine = create_engine(64 * 1024 * 1024);
+    let tx_count = 512u32;
+
+    for i in 0..tx_count {
+        let key = create_stress_tx(&engine, i, 2);
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 20_000 + i,
+                block_height: 2_000,
+                subtree_idx: 0,
+                current_block_height: 2_000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+    }
+
+    for round in 0..8u32 {
+        let on_longest_chain = round % 2 == 1;
+        let current_block_height = 2_100 + round;
+        for i in 0..tx_count {
+            let key = TxKey {
+                txid: make_tx_id(i),
+            };
+            engine
+                .mark_on_longest_chain(&MarkOnLongestChainRequest {
+                    tx_key: key,
+                    on_longest_chain,
+                    current_block_height,
+                    block_height_retention: 288,
+                })
+                .unwrap();
+
+            let meta = engine.read_metadata(&key).unwrap();
+            assert_eq!(meta.block_entry_count, 1);
+            let expected_unmined = if on_longest_chain {
+                0
+            } else {
+                current_block_height
+            };
+            assert_eq!({ meta.unmined_since }, expected_unmined);
+        }
+    }
+}
+
+/// Freeze and reassign many UTXOs, then spend the reassigned hashes.
+pub fn stress_reassign_churn() {
+    let engine = create_engine(64 * 1024 * 1024);
+    let tx_count = 512u32;
+
+    for i in 0..tx_count {
+        let key = create_stress_tx(&engine, i, 2);
+        let old_hash = make_utxo_hash(i, 0);
+        let new_hash = make_utxo_hash(i + 100_000, 0);
+
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: old_hash,
+            })
+            .unwrap();
+        engine
+            .reassign(&ReassignRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: old_hash,
+                new_utxo_hash: new_hash,
+                block_height: 2_000,
+                spendable_after: 3,
+            })
+            .unwrap();
+
+        let slot = engine.read_slot(&key, 0).unwrap();
+        assert!(slot.is_unspent());
+        assert_eq!(slot.hash, new_hash);
+
+        let mut spending_data = [0u8; 36];
+        spending_data[0..4].copy_from_slice(&(i + 50_000).to_le_bytes());
+        spending_data[32..36].copy_from_slice(&0u32.to_le_bytes());
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: new_hash,
+                spending_data,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 2_004,
+                block_height_retention: 288,
+            })
+            .unwrap();
+
+        assert_eq!({ engine.read_metadata(&key).unwrap().spent_utxos }, 1);
+    }
+}
+
+/// Toggle conflicting flags repeatedly and verify spend gating recovers.
+pub fn stress_set_conflicting_churn() {
+    let engine = create_engine(64 * 1024 * 1024);
+    let tx_count = 512u32;
+
+    for i in 0..tx_count {
+        create_stress_tx(&engine, i, 2);
+    }
+
+    for round in 0..8u32 {
+        let value = round % 2 == 0;
+        for i in 0..tx_count {
+            let key = TxKey {
+                txid: make_tx_id(i),
+            };
+            engine
+                .set_conflicting(&SetConflictingRequest {
+                    tx_key: key,
+                    value,
+                    current_block_height: 2_000 + round,
+                    block_height_retention: 288,
+                })
+                .unwrap();
+
+            let meta = engine.read_metadata(&key).unwrap();
+            assert_eq!(
+                meta.flags.contains(teraslab::record::TxFlags::CONFLICTING),
+                value
+            );
+        }
+    }
+
+    for i in 0..tx_count {
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
+        let mut spending_data = [0u8; 36];
+        spending_data[0..4].copy_from_slice(&(i + 75_000).to_le_bytes());
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: make_utxo_hash(i, 0),
+                spending_data,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 2_100,
+                block_height_retention: 288,
+            })
+            .unwrap();
+    }
+}
+
+/// Apply preserve_until repeatedly across records that also become prune candidates.
+pub fn stress_preserve_until_churn() {
+    let engine = create_engine(64 * 1024 * 1024);
+    let tx_count = 512u32;
+
+    for i in 0..tx_count {
+        create_stress_tx(&engine, i, 2);
+    }
+
+    for round in 0..4u32 {
+        for i in 0..tx_count {
+            let key = TxKey {
+                txid: make_tx_id(i),
+            };
+            let preserve_height = 5_000 + round * 100 + i % 100;
+            engine
+                .preserve_until(&PreserveUntilRequest {
+                    tx_key: key,
+                    block_height: preserve_height,
+                })
+                .unwrap();
+
+            let meta = engine.read_metadata(&key).unwrap();
+            assert_eq!({ meta.preserve_until }, preserve_height);
+            assert_eq!({ meta.delete_at_height }, 0);
+        }
+    }
+
+    for i in 0..tx_count {
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
+        for offset in 0..2u32 {
+            let mut spending_data = [0u8; 36];
+            spending_data[0..4].copy_from_slice(&(i + 90_000).to_le_bytes());
+            spending_data[32..36].copy_from_slice(&offset.to_le_bytes());
+            engine
+                .spend(&SpendRequest {
+                    tx_key: key,
+                    offset,
+                    utxo_hash: make_utxo_hash(i, offset),
+                    spending_data,
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 6_000,
+                    block_height_retention: 288,
+                })
+                .unwrap();
+        }
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.spent_utxos }, 2);
+        assert_eq!({ meta.delete_at_height }, 0);
+    }
 }

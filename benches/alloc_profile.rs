@@ -243,6 +243,7 @@ fn main() {
             tx_key: key,
             offset: (tx_i % 5),
             utxo_hash: make_utxo_hash(tx_i, tx_i % 5),
+            spending_data: [0xAB; 36],
             current_block_height: 2000,
             block_height_retention: 288,
         });

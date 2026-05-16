@@ -1791,12 +1791,13 @@ fn encode_unspend_batch_payload(params: &UnspendBatchParams, items: &[UnspendIte
         current_block_height: params.current_block_height,
         block_height_retention: params.block_height_retention,
     };
-    let wire_items: Vec<codec::WireSlotItem> = items
+    let wire_items: Vec<codec::WireUnspendItem> = items
         .iter()
-        .map(|i| codec::WireSlotItem {
+        .map(|i| codec::WireUnspendItem {
             txid: i.txid,
             vout: i.vout,
             utxo_hash: i.utxo_hash,
+            spending_data: i.spending_data,
         })
         .collect();
     codec::encode_unspend_batch(&wire_params, &wire_items)
@@ -1921,6 +1922,7 @@ fn encode_get_spend_batch_payload(items: &[GetSpendItem]) -> Vec<u8> {
         .map(|i| codec::WireGetSpendItem {
             txid: i.txid,
             vout: i.vout,
+            utxo_hash: i.utxo_hash,
         })
         .collect();
     codec::encode_get_spend_batch(&wire_items)
@@ -2201,7 +2203,8 @@ mod tests {
 
     use teraslab::allocator::SlotAllocator;
     use teraslab::cluster::coordinator::{
-        ClusterConfig as ServerClusterConfig, ClusterCoordinator, RunningCluster,
+        ClusterConfig as ServerClusterConfig, ClusterCoordinator, ReplicationRuntimeConfig,
+        RunningCluster,
     };
     use teraslab::cluster::shards::{NodeId, ShardTable};
     use teraslab::config::ServerConfig;
@@ -2295,9 +2298,12 @@ mod tests {
             engine.clone(),
             None,
             None,
-            None,
-            true,
-            Duration::from_secs(3),
+            ReplicationRuntimeConfig {
+                ack_policy: None,
+                best_effort: true,
+                timeout: Duration::from_secs(3),
+                timeout_during_migration: Duration::from_secs(30),
+            },
         ));
 
         let config = ServerConfig {

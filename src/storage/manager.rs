@@ -1,12 +1,25 @@
-//! Tiered storage manager — coordinates inline, separate NVMe, and
-//! external blob store tiers.
+//! Tiered storage manager — coordinates inline and external blob store tiers.
 
 use crate::device::{AlignedBuf, BlockDevice};
 use crate::record::{METADATA_SIZE, TxFlags, TxMetadata, UTXO_SLOT_SIZE};
 use crate::storage::blobstore::BlobStore;
 use crate::storage::tiers::*;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use thiserror::Error;
+
+/// Defence-in-depth upper bound on the cold-data payload returned by
+/// [`StorageManager::read_cold_data`] / [`StorageManager::stream_cold_data`].
+///
+/// Mirrors the wire-side [`crate::protocol::opcodes::MAX_COLD_DATA_PER_ITEM`]
+/// cap (R-089) on the read-back path so a corrupt or attacker-tampered
+/// `record_size` cannot trigger a multi-GiB aligned read. The extra
+/// [`METADATA_SIZE`] head-room covers the metadata + UTXO slot tail that
+/// `record_size` includes for inline records — `cold_size` is the
+/// `record_size - inline_cold_offset`, but we bound the cap generously so the
+/// inline tier never trips it under legitimate workloads.
+pub const MAX_COLD_DATA_READ_BYTES: u64 =
+    crate::protocol::opcodes::MAX_COLD_DATA_PER_ITEM as u64 + METADATA_SIZE as u64;
 
 #[derive(Error, Debug)]
 pub enum StorageError {
@@ -18,24 +31,100 @@ pub enum StorageError {
     Allocator(#[from] crate::allocator::AllocatorError),
     #[error("invalid cold data")]
     InvalidColdData,
+    /// An EXTERNAL-flagged record's blob is absent from the blob store.
+    ///
+    /// F-G9-001: previously `read_cold_data` silently returned an empty
+    /// [`ColdData`] in this case, which made a lost blob indistinguishable
+    /// from "the tx had no cold data". Callers (validation, SPV proofs,
+    /// audit tooling) MUST treat this as a data-integrity violation.
+    #[error("cold data blob not found for txid {key}")]
+    ColdDataNotFound { key: String },
+    /// SHA-256 of the blob payload returned by the store disagrees with
+    /// the record-anchored `ExternalRef.content_hash` durable digest.
+    ///
+    /// F-G9-002: pre-fix only the spend path cross-checked the
+    /// record-anchored digest against the recomputed payload hash. Other
+    /// read paths (audit tooling, SPV, prune validation) trusted the blob
+    /// store's sidecar alone — an attacker who could substitute both
+    /// payload and sidecar would pass the sidecar check while the
+    /// record-anchored digest would catch the swap. We now compare both.
+    #[error("blob content hash mismatch for txid {key}")]
+    ContentHashMismatch {
+        key: String,
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+    /// `record_size` decoded from on-device metadata exceeds the per-item
+    /// cold-data cap, signalling corruption or attacker tampering.
+    ///
+    /// F-G9-006: pre-fix the read-back path honoured `metadata.record_size`
+    /// up to `u32::MAX`, allowing a single corrupt record to trigger a
+    /// multi-GiB aligned device read. We mirror the wire-side R-089 cap
+    /// here as defence-in-depth.
+    #[error("cold data size {size} exceeds maximum {max}")]
+    ColdDataTooLarge { size: u64, max: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
+/// Lowercase hex encoding of a 32-byte txid for error messages.
+fn hex_key(key: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in key {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// F-G9-002: recompute SHA-256 of `payload` and compare against the
+/// record-anchored `expected` digest carried in `ExternalRef.content_hash`.
+///
+/// The all-zero placeholder is tolerated for records written before R-048
+/// populated the field — every blob shipped with a real digest on the
+/// post-R-048 create path, but legacy on-disk records may still have it at
+/// zero until they are re-created. We emit a `warn` on the zero-digest
+/// fallback so operators can spot stale records.
+fn verify_content_hash(
+    tx_id: &[u8; 32],
+    payload: &[u8],
+    expected: &[u8; 32],
+) -> std::result::Result<(), StorageError> {
+    if *expected == [0u8; 32] {
+        tracing::warn!(
+            txid = %hex_key(tx_id),
+            "read_cold_data: ExternalRef.content_hash is zero — skipping record-anchored digest check (legacy record?)",
+        );
+        return Ok(());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let mut actual = [0u8; 32];
+    actual.copy_from_slice(&hasher.finalize());
+    if actual != *expected {
+        return Err(StorageError::ContentHashMismatch {
+            key: hex_key(tx_id),
+            expected: *expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
 /// Manages tiered storage for cold data (inputs, outputs, inpoints).
 ///
-/// Coordinates the three tiers:
+/// Coordinates the production tiers:
 /// - **Inline**: cold data appended to record at `METADATA_SIZE + utxo_count * 69`
-/// - **Separate NVMe**: cold data in a separate device allocation
 /// - **External**: cold data in an external blob store (file or S3)
 pub struct StorageManager {
     device: Arc<dyn BlockDevice>,
+    /// Retained for tests and constructor compatibility; production cold data
+    /// no longer allocates a separate device region.
+    #[allow(dead_code)]
     allocator: parking_lot::Mutex<crate::allocator::SlotAllocator>,
     blob_store: Arc<dyn BlobStore>,
     /// Configurable inline threshold (defaults to `INLINE_THRESHOLD`).
     inline_threshold: usize,
-    /// Configurable separate threshold (defaults to `SEPARATE_THRESHOLD`).
-    separate_threshold: usize,
 }
 
 impl StorageManager {
@@ -50,7 +139,6 @@ impl StorageManager {
             allocator: parking_lot::Mutex::new(allocator),
             blob_store,
             inline_threshold: INLINE_THRESHOLD,
-            separate_threshold: SEPARATE_THRESHOLD,
         }
     }
 
@@ -58,8 +146,6 @@ impl StorageManager {
     pub fn tier_for_size(&self, data_size: usize) -> StorageTier {
         if data_size <= self.inline_threshold {
             StorageTier::Inline
-        } else if data_size <= self.separate_threshold {
-            StorageTier::SeparateNvme
         } else {
             StorageTier::External
         }
@@ -77,8 +163,6 @@ impl StorageManager {
     ///
     /// For inline tier: the caller must have already allocated space for
     /// the cold data at the end of the record. This writes it there.
-    ///
-    /// For separate NVMe: allocates a new device block and writes there.
     ///
     /// For external: writes to the blob store synchronously. For async
     /// upload, use [`BlobUploader`](super::uploader::BlobUploader) instead.
@@ -102,14 +186,6 @@ impl StorageManager {
                 let cold_offset = record_offset + Self::inline_cold_offset(utxo_count);
                 self.write_aligned(&serialized, cold_offset)?;
                 Ok(ColdDataRef::Inline {
-                    cold_size: data_size as u32,
-                })
-            }
-            StorageTier::SeparateNvme => {
-                let device_offset = self.allocator.lock().allocate(data_size as u64)?;
-                self.write_aligned(&serialized, device_offset)?;
-                Ok(ColdDataRef::SeparateNvme {
-                    device_offset,
                     cold_size: data_size as u32,
                 })
             }
@@ -137,7 +213,19 @@ impl StorageManager {
     /// Determines the tier from metadata flags and record_size:
     /// - `EXTERNAL` flag set → fetches from blob store
     /// - `record_size > METADATA_SIZE + utxo_count * 69` → inline cold data
-    /// - Otherwise → no cold data (separate NVMe is read via [`Self::read_cold_data_at`])
+    /// - Otherwise → no inline cold data
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::ColdDataNotFound`] when the record carries
+    ///   [`TxFlags::EXTERNAL`] but the blob is missing (F-G9-001).
+    /// - [`StorageError::ContentHashMismatch`] when the recomputed payload
+    ///   SHA-256 disagrees with the record-anchored
+    ///   `ExternalRef.content_hash` (F-G9-002). The all-zero placeholder is
+    ///   tolerated for backward compatibility with records written before
+    ///   R-048 populated the field, but is logged at `warn`.
+    /// - [`StorageError::ColdDataTooLarge`] when `record_size` implies a
+    ///   cold payload exceeding [`MAX_COLD_DATA_READ_BYTES`] (F-G9-006).
     pub fn read_cold_data(
         &self,
         record_offset: u64,
@@ -148,15 +236,21 @@ impl StorageManager {
 
         // External tier
         if flags.contains(TxFlags::EXTERNAL) {
-            let data = self.blob_store.get(&metadata.tx_id)?;
-            match data {
-                Some(bytes) => ColdData::deserialize(&bytes).ok_or(StorageError::InvalidColdData),
-                None => Ok(ColdData {
-                    inputs: vec![],
-                    outputs: vec![],
-                    inpoints: vec![],
-                }),
-            }
+            // F-G9-001: a missing blob on an EXTERNAL-flagged record is a
+            // data-integrity violation, NOT an "empty cold data" signal.
+            let bytes = self.blob_store.get(&metadata.tx_id)?.ok_or_else(|| {
+                StorageError::ColdDataNotFound {
+                    key: hex_key(&metadata.tx_id),
+                }
+            })?;
+            // F-G9-002: cross-check the recomputed payload SHA-256 against
+            // the record-anchored `ExternalRef.content_hash`. The blob
+            // store's own sidecar already covers payload-only tampering,
+            // but a coordinated payload+sidecar swap would slip past that
+            // check — only the durable record-anchored digest catches it.
+            let expected_hash: [u8; 32] = { metadata.external_ref.content_hash };
+            verify_content_hash(&metadata.tx_id, &bytes, &expected_hash)?;
+            ColdData::deserialize(&bytes).ok_or(StorageError::InvalidColdData)
         } else {
             // Inline tier: cold data at deterministic offset
             let cold_offset = record_offset + Self::inline_cold_offset(utxo_count);
@@ -172,31 +266,35 @@ impl StorageManager {
                 });
             }
 
+            // F-G9-006: cap the read length against the same per-item
+            // bound the codec enforces on writes (R-089). A corrupt record
+            // with `record_size = u32::MAX` would otherwise trigger a
+            // ~4 GiB aligned read.
+            if cold_size > MAX_COLD_DATA_READ_BYTES {
+                return Err(StorageError::ColdDataTooLarge {
+                    size: cold_size,
+                    max: MAX_COLD_DATA_READ_BYTES,
+                });
+            }
+
             let bytes = self.read_aligned(cold_offset, cold_size as usize)?;
             ColdData::deserialize(&bytes).ok_or(StorageError::InvalidColdData)
         }
     }
 
-    /// Read cold data from a specific device offset (for separate NVMe tier).
-    ///
-    /// The offset and size are typically stored in the index entry's
-    /// `cold_offset` and `cold_size` fields.
-    pub fn read_cold_data_at(&self, device_offset: u64, size: u32) -> Result<ColdData> {
-        if size == 0 {
-            return Ok(ColdData {
-                inputs: vec![],
-                outputs: vec![],
-                inpoints: vec![],
-            });
-        }
-        let bytes = self.read_aligned(device_offset, size as usize)?;
-        ColdData::deserialize(&bytes).ok_or(StorageError::InvalidColdData)
-    }
-
     /// Stream cold data to a writer (for large external blobs).
     ///
-    /// For inline or separate NVMe: reads from device and writes to the writer.
+    /// For inline records: reads from device and writes to the writer.
     /// For external: streams directly from the blob store.
+    ///
+    /// # Errors
+    ///
+    /// External tier: [`StorageError::ColdDataTooLarge`] is not surfaced
+    /// because the blob store's sidecar already encodes a durable payload
+    /// length — the bound is enforced at write time.
+    /// Inline tier: returns [`StorageError::ColdDataTooLarge`] when
+    /// `record_size` implies a cold payload exceeding
+    /// [`MAX_COLD_DATA_READ_BYTES`] (F-G9-006).
     pub fn stream_cold_data(
         &self,
         record_offset: u64,
@@ -217,6 +315,14 @@ impl StorageManager {
                 return Ok(0);
             }
 
+            // F-G9-006: mirror the wire-side R-089 cap on the read-back path.
+            if cold_size > MAX_COLD_DATA_READ_BYTES {
+                return Err(StorageError::ColdDataTooLarge {
+                    size: cold_size,
+                    max: MAX_COLD_DATA_READ_BYTES,
+                });
+            }
+
             let bytes = self.read_aligned(cold_offset, cold_size as usize)?;
             writer
                 .write_all(&bytes)
@@ -228,22 +334,21 @@ impl StorageManager {
     /// Delete cold data when a record is pruned.
     ///
     /// For inline tier: no-op (freed with the record allocation).
-    /// For separate NVMe tier: returns the separate allocation to the freelist.
     /// For external tier: deletes the blob from the blob store.
+    ///
+    /// # 1:1 invariant
+    ///
+    /// F-G9-016: each blob is keyed by txid, which is unique per record —
+    /// no reference counting is needed. A `delete` therefore cannot affect
+    /// another record's blob, and there is no leak under crash because the
+    /// `EXTERNAL` flag in the index entry is what keeps the blob alive
+    /// for the orphan-blob GC (R-049).
     ///
     /// # Parameters
     /// - `metadata`: the record's metadata (checked for EXTERNAL flag)
-    /// - `separate_cold`: optional (device_offset, size) for separate NVMe cold data
-    pub fn delete_cold_data(
-        &self,
-        metadata: &TxMetadata,
-        separate_cold: Option<(u64, u32)>,
-    ) -> Result<()> {
+    pub fn delete_cold_data(&self, metadata: &TxMetadata) -> Result<()> {
         if metadata.flags.contains(TxFlags::EXTERNAL) {
             self.blob_store.delete(&metadata.tx_id)?;
-        }
-        if let Some((offset, size)) = separate_cold {
-            self.allocator.lock().free(offset, size as u64)?;
         }
         // Inline: freed with the record allocation — no-op.
         Ok(())
@@ -396,15 +501,15 @@ mod tests {
     }
 
     #[test]
-    fn tier_8193_bytes_separate() {
+    fn tier_8193_bytes_external() {
         let (_, mgr) = setup();
-        assert_eq!(mgr.tier_for_size(8193), StorageTier::SeparateNvme);
+        assert_eq!(mgr.tier_for_size(8193), StorageTier::External);
     }
 
     #[test]
-    fn tier_500k_separate() {
+    fn tier_500k_external() {
         let (_, mgr) = setup();
-        assert_eq!(mgr.tier_for_size(500 * 1024), StorageTier::SeparateNvme);
+        assert_eq!(mgr.tier_for_size(500 * 1024), StorageTier::External);
     }
 
     #[test]
@@ -595,7 +700,7 @@ mod tests {
         let meta = TxMetadata::new(utxo_count);
 
         // Delete cold data (inline is no-op, but we also free the record allocation)
-        mgr.delete_cold_data(&meta, None).unwrap();
+        mgr.delete_cold_data(&meta).unwrap();
 
         // Free the entire record allocation (including inline cold data)
         mgr.allocator.lock().free(offset, total).unwrap();
@@ -605,51 +710,43 @@ mod tests {
         assert_eq!(offset, offset2);
     }
 
-    // ---- Separate NVMe cold data tests ----
+    // ---- Non-inline cold data tests ----
 
     #[test]
-    fn separate_nvme_cold_data_write_read() {
+    fn non_inline_cold_data_uses_external_blob_tier() {
         let (dev, mgr) = setup();
         let utxo_count = 3u32;
-
-        // Create cold data that exceeds inline threshold → SeparateNvme
         let cold = ColdData {
-            inputs: vec![0xAA; 50 * 1024], // 50 KiB → separate
+            inputs: vec![0xAA; 50 * 1024],
             outputs: vec![0xBB; 50 * 1024],
             inpoints: vec![],
         };
 
-        // Allocate hot record only (no inline cold space)
         let hot_size = TxMetadata::record_size_for(utxo_count);
         let record_offset = mgr.allocator.lock().allocate(hot_size).unwrap();
 
         let mut meta = TxMetadata::new(utxo_count);
         meta.record_size = hot_size as u32;
+        meta.flags = TxFlags::EXTERNAL;
         meta.tx_id[0] = 0x10;
         let slots: Vec<UtxoSlot> = (0..utxo_count)
             .map(|_| UtxoSlot::new_unspent([0; 32]))
             .collect();
         io::write_full_record(&*dev, record_offset, &meta, &slots).unwrap();
 
-        // Write cold data — should go to separate allocation
         let result = mgr
             .write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset)
             .unwrap();
-        let (sep_offset, sep_size) = match result {
-            ColdDataRef::SeparateNvme {
-                device_offset,
-                cold_size,
-            } => (device_offset, cold_size),
-            other => panic!("expected SeparateNvme, got {other:?}"),
-        };
+        assert!(matches!(result, ColdDataRef::External { .. }));
 
-        // Read back via read_cold_data_at
-        let read = mgr.read_cold_data_at(sep_offset, sep_size).unwrap();
+        let read = mgr
+            .read_cold_data(record_offset, utxo_count, &meta)
+            .unwrap();
         assert_eq!(read, cold);
     }
 
     #[test]
-    fn separate_nvme_hot_record_exact_size() {
+    fn non_inline_external_hot_record_exact_size() {
         let utxo_count = 5u32;
         let hot_size = TxMetadata::record_size_for(utxo_count);
 
@@ -659,13 +756,13 @@ mod tests {
             METADATA_SIZE as u64 + utxo_count as u64 * UTXO_SLOT_SIZE as u64,
         );
 
-        // For separate NVMe, record_size in metadata should NOT include cold data
+        // For external cold data, record_size in metadata does not include cold data.
         let meta = TxMetadata::new(utxo_count);
         assert_eq!({ meta.record_size }, hot_size as u32);
     }
 
     #[test]
-    fn separate_nvme_delete_frees_both() {
+    fn external_delete_removes_blob_only() {
         let (dev, mgr) = setup();
         let utxo_count = 2u32;
 
@@ -680,6 +777,7 @@ mod tests {
 
         let mut meta = TxMetadata::new(utxo_count);
         meta.record_size = hot_size as u32;
+        meta.flags = TxFlags::EXTERNAL;
         meta.tx_id[0] = 0x20;
         let slots: Vec<UtxoSlot> = (0..utxo_count)
             .map(|_| UtxoSlot::new_unspent([0; 32]))
@@ -689,29 +787,20 @@ mod tests {
         let result = mgr
             .write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset)
             .unwrap();
-        let (sep_offset, sep_size) = match result {
-            ColdDataRef::SeparateNvme {
-                device_offset,
-                cold_size,
-            } => (device_offset, cold_size),
-            other => panic!("expected SeparateNvme, got {other:?}"),
-        };
+        assert!(matches!(result, ColdDataRef::External { .. }));
+        assert!(mgr.blob_store.exists(&meta.tx_id).unwrap());
 
-        // Delete both hot record and separate cold allocation
-        mgr.delete_cold_data(&meta, Some((sep_offset, sep_size)))
-            .unwrap();
+        mgr.delete_cold_data(&meta).unwrap();
+        assert!(!mgr.blob_store.exists(&meta.tx_id).unwrap());
         mgr.allocator.lock().free(record_offset, hot_size).unwrap();
 
-        // Both allocations should be reusable
+        // Hot allocation should be reusable.
         let o1 = mgr.allocator.lock().allocate(hot_size).unwrap();
-        let o2 = mgr.allocator.lock().allocate(sep_size as u64).unwrap();
-        // They should be at the previously freed offsets (order may vary due to best-fit)
-        assert!(o1 == record_offset || o1 == sep_offset);
-        assert!(o2 == record_offset || o2 == sep_offset);
+        assert_eq!(o1, record_offset);
     }
 
     #[test]
-    fn separate_nvme_hot_record_committed_before_cold() {
+    fn external_hot_record_committed_before_cold() {
         let (dev, mgr) = setup();
         let utxo_count = 2u32;
 
@@ -720,6 +809,7 @@ mod tests {
 
         let mut meta = TxMetadata::new(utxo_count);
         meta.record_size = hot_size as u32;
+        meta.flags = TxFlags::EXTERNAL;
         meta.tx_id[0] = 0x30;
         let slots: Vec<UtxoSlot> = (0..utxo_count)
             .map(|_| UtxoSlot::new_unspent([0; 32]))
@@ -734,7 +824,7 @@ mod tests {
         let slot0 = io::read_utxo_slot(&*dev, record_offset, 0).unwrap();
         assert!(slot0.is_unspent());
 
-        // Now write cold data separately
+        // Now write cold data externally.
         let cold = ColdData {
             inputs: vec![0xCC; 20 * 1024],
             outputs: vec![],
@@ -743,7 +833,7 @@ mod tests {
         let result = mgr
             .write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset)
             .unwrap();
-        assert!(matches!(result, ColdDataRef::SeparateNvme { .. }));
+        assert!(matches!(result, ColdDataRef::External { .. }));
 
         // Hot record should still be readable
         let read_meta2 = io::read_metadata(&*dev, record_offset).unwrap();
@@ -751,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn separate_nvme_utxo_spendable_before_cold_write() {
+    fn external_utxo_spendable_before_cold_write() {
         let (dev, mgr) = setup();
         let utxo_count = 2u32;
 
@@ -760,6 +850,7 @@ mod tests {
 
         let mut meta = TxMetadata::new(utxo_count);
         meta.record_size = hot_size as u32;
+        meta.flags = TxFlags::EXTERNAL;
         meta.tx_id[0] = 0x40;
         let hash = [0xBB; 32];
         let slots = vec![UtxoSlot::new_unspent(hash); utxo_count as usize];
@@ -772,7 +863,7 @@ mod tests {
         assert!(slot.is_unspent());
         assert_eq!(slot.hash, hash);
 
-        // Now write cold data to separate allocation
+        // Now write cold data to the external tier.
         let cold = ColdData {
             inputs: vec![0; 20 * 1024],
             outputs: vec![],
@@ -887,7 +978,7 @@ mod tests {
         };
         mgr.write_cold_data(&meta.tx_id, &cold, 1, 0).unwrap();
 
-        mgr.delete_cold_data(&meta, None).unwrap();
+        mgr.delete_cold_data(&meta).unwrap();
         assert!(!mgr.blob_store.exists(&meta.tx_id).unwrap());
     }
 
@@ -1075,7 +1166,8 @@ mod tests {
             .unwrap();
         assert!(matches!(small_ref, ColdDataRef::Inline { .. }));
 
-        // Medium tx (50 KiB) → SeparateNvme
+        // Medium tx (50 KiB) → External. The old separate-NVMe tier was
+        // removed because record metadata cannot persist its offset/length.
         let med_cold = ColdData {
             inputs: vec![0x04; 25 * 1024],
             outputs: vec![0x05; 25 * 1024],
@@ -1086,19 +1178,14 @@ mod tests {
         let med_offset = mgr.allocator.lock().allocate(med_hot).unwrap();
         let mut med_meta = TxMetadata::new(med_utxo);
         med_meta.record_size = med_hot as u32;
+        med_meta.flags = TxFlags::EXTERNAL;
         med_meta.tx_id[0] = 0x02;
         let slots = vec![UtxoSlot::new_unspent([0; 32]); med_utxo as usize];
         io::write_full_record(&*dev, med_offset, &med_meta, &slots).unwrap();
         let med_result = mgr
             .write_cold_data(&med_meta.tx_id, &med_cold, med_utxo, med_offset)
             .unwrap();
-        let (med_sep_off, med_sep_sz) = match med_result {
-            ColdDataRef::SeparateNvme {
-                device_offset,
-                cold_size,
-            } => (device_offset, cold_size),
-            other => panic!("expected SeparateNvme for medium tx, got {other:?}"),
-        };
+        assert!(matches!(med_result, ColdDataRef::External { .. }));
 
         // Large tx (5 MB) → External
         let large_cold = ColdData {
@@ -1126,7 +1213,7 @@ mod tests {
             .unwrap();
         assert_eq!(read_small, small_cold);
 
-        let read_med = mgr.read_cold_data_at(med_sep_off, med_sep_sz).unwrap();
+        let read_med = mgr.read_cold_data(med_offset, med_utxo, &med_meta).unwrap();
         assert_eq!(read_med, med_cold);
 
         let read_large = mgr
@@ -1153,7 +1240,7 @@ mod tests {
         io::write_full_record(&*dev, off1, &meta1, &[UtxoSlot::new_unspent([0; 32])]).unwrap();
         mgr.write_cold_data(&meta1.tx_id, &cold1, 1, off1).unwrap();
 
-        // Separate NVMe
+        // Medium non-inline payload: external blob tier.
         let cold2 = ColdData {
             inputs: vec![2; 20 * 1024],
             outputs: vec![],
@@ -1163,16 +1250,11 @@ mod tests {
         let off2 = mgr.allocator.lock().allocate(hot2).unwrap();
         let mut meta2 = TxMetadata::new(1);
         meta2.record_size = hot2 as u32;
+        meta2.flags = TxFlags::EXTERNAL;
         meta2.tx_id[0] = 0xA2;
         io::write_full_record(&*dev, off2, &meta2, &[UtxoSlot::new_unspent([0; 32])]).unwrap();
-        let sep = mgr.write_cold_data(&meta2.tx_id, &cold2, 1, off2).unwrap();
-        let (sep_off, sep_sz) = match sep {
-            ColdDataRef::SeparateNvme {
-                device_offset,
-                cold_size,
-            } => (device_offset, cold_size),
-            other => panic!("expected SeparateNvme, got {other:?}"),
-        };
+        let medium_ref = mgr.write_cold_data(&meta2.tx_id, &cold2, 1, off2).unwrap();
+        assert!(matches!(medium_ref, ColdDataRef::External { .. }));
 
         // External
         let cold3 = ColdData {
@@ -1190,14 +1272,13 @@ mod tests {
         mgr.write_cold_data(&meta3.tx_id, &cold3, 1, off3).unwrap();
 
         // Prune all
-        mgr.delete_cold_data(&meta1, None).unwrap(); // inline: no-op
+        mgr.delete_cold_data(&meta1).unwrap(); // inline: no-op
         mgr.allocator.lock().free(off1, total1).unwrap();
 
-        mgr.delete_cold_data(&meta2, Some((sep_off, sep_sz)))
-            .unwrap(); // separate: frees allocation
+        mgr.delete_cold_data(&meta2).unwrap(); // external: deletes blob
         mgr.allocator.lock().free(off2, hot2).unwrap();
 
-        mgr.delete_cold_data(&meta3, None).unwrap(); // external: deletes blob
+        mgr.delete_cold_data(&meta3).unwrap(); // external: deletes blob
         mgr.allocator.lock().free(off3, hot3).unwrap();
         assert!(!mgr.blob_store.exists(&meta3.tx_id).unwrap());
     }
@@ -1206,7 +1287,7 @@ mod tests {
     fn e2e_mixed_workload() {
         let (dev, mgr) = setup();
 
-        // 100 small (inline), 10 medium (separate), 2 large (external)
+        // 100 small (inline), 10 medium (external), 2 large (external)
         for i in 0..100u32 {
             let cold = ColdData {
                 inputs: vec![i as u8; 100],
@@ -1237,18 +1318,13 @@ mod tests {
             let offset = mgr.allocator.lock().allocate(hot_size).unwrap();
             let mut meta = TxMetadata::new(1);
             meta.record_size = hot_size as u32;
+            meta.flags = TxFlags::EXTERNAL;
             meta.tx_id[0] = (i & 0xFF) as u8;
             meta.tx_id[1] = 0x02;
             io::write_full_record(&*dev, offset, &meta, &[UtxoSlot::new_unspent([0; 32])]).unwrap();
             let result = mgr.write_cold_data(&meta.tx_id, &cold, 1, offset).unwrap();
-            let (sep_off, sep_sz) = match result {
-                ColdDataRef::SeparateNvme {
-                    device_offset,
-                    cold_size,
-                } => (device_offset, cold_size),
-                other => panic!("expected SeparateNvme, got {other:?}"),
-            };
-            let read = mgr.read_cold_data_at(sep_off, sep_sz).unwrap();
+            assert!(matches!(result, ColdDataRef::External { .. }));
+            let read = mgr.read_cold_data(offset, 1, &meta).unwrap();
             assert_eq!(read, cold);
         }
 

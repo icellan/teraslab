@@ -2,7 +2,9 @@
 //!
 //! Wraps a `TcpStream` and uses the TeraSlab wire protocol frames:
 //! - Master to Replica: `RequestFrame` with `op_code=OP_REPLICA_BATCH`, payload = batch bytes
-//! - Replica to Master: `ResponseFrame` with `status=STATUS_OK`, payload = ack bytes
+//! - Replica to Master: `ResponseFrame` with `status=STATUS_OK` for
+//!   `ReplicaAck::Ok` and `status=STATUS_ERROR` for `ReplicaAck::Error`,
+//!   payload = ack bytes
 
 use crate::protocol::frame::{RequestFrame, ResponseFrame};
 use crate::protocol::opcodes::*;
@@ -13,6 +15,12 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use super::manager::ReplicaTransport;
+
+/// ACK response frames are tiny (`ResponseFrame` header + `ReplicaAck`).
+/// Keep this far below the general request-frame cap so a malicious replica
+/// cannot force the master to allocate multi-MiB buffers while waiting for ACKs.
+const MAX_ACK_FRAME_SIZE: usize = 1024;
+const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Configure TCP keepalive on a stream for fast broken-connection detection.
 ///
@@ -28,6 +36,12 @@ pub fn configure_tcp_keepalive(stream: &TcpStream) {
         use std::os::unix::io::AsRawFd;
         let fd = stream.as_raw_fd();
         unsafe {
+            // SAFETY: `fd` is borrowed from a live `TcpStream`, and every
+            // optval pointer below points to an initialized `libc::c_int`
+            // that remains valid for the duration of the `setsockopt` call.
+            // The level/option pairs are OS constants for TCP keepalive
+            // tuning. Errors are intentionally ignored because keepalive is
+            // a best-effort latency optimization; the socket remains usable.
             // Enable keepalive
             let enable: libc::c_int = 1;
             libc::setsockopt(
@@ -88,6 +102,8 @@ pub fn configure_tcp_keepalive(stream: &TcpStream) {
 pub struct TcpReplicaTransport {
     stream: TcpStream,
     request_id: u64,
+    write_timeout: Duration,
+    auth_secret: Option<Vec<u8>>,
 }
 
 impl TcpReplicaTransport {
@@ -97,6 +113,16 @@ impl TcpReplicaTransport {
     /// connections (e.g. after container SIGKILL) are detected quickly
     /// instead of waiting for the OS default keepalive timeout (minutes).
     pub fn connect(addr: &str, timeout: Duration) -> Result<Self, ReplicationError> {
+        Self::connect_with_auth(addr, timeout, None)
+    }
+
+    /// Connect to a replica and authenticate every request/response frame
+    /// with `auth_secret` when configured.
+    pub fn connect_with_auth(
+        addr: &str,
+        timeout: Duration,
+        auth_secret: Option<Vec<u8>>,
+    ) -> Result<Self, ReplicationError> {
         let sock_addr: std::net::SocketAddr = addr
             .parse()
             .map_err(|e| ReplicationError::Transport(format!("invalid address '{addr}': {e}")))?;
@@ -119,6 +145,8 @@ impl TcpReplicaTransport {
         Ok(Self {
             stream,
             request_id: 0,
+            write_timeout: timeout,
+            auth_secret,
         })
     }
 
@@ -129,10 +157,33 @@ impl TcpReplicaTransport {
     /// the same low-latency behavior as `connect()`. Any OS error is
     /// ignored because the stream is already usable without the option.
     pub fn from_stream(stream: TcpStream) -> Self {
+        Self::from_stream_with_auth(stream, None)
+    }
+
+    /// Wrap an existing stream with optional frame authentication.
+    pub fn from_stream_with_auth(stream: TcpStream, auth_secret: Option<Vec<u8>>) -> Self {
         let _ = stream.set_nodelay(true);
         Self {
             stream,
             request_id: 0,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
+            auth_secret,
+        }
+    }
+
+    /// Override the timeout applied immediately before every replication
+    /// write. `connect()` initializes this from the replication timeout;
+    /// tests and pre-accepted streams can set it explicitly.
+    pub fn set_write_timeout(&mut self, timeout: Duration) {
+        self.write_timeout = timeout;
+    }
+
+    /// Whether this pooled connection was created for the same auth mode.
+    pub fn auth_secret_matches(&self, auth_secret: Option<&[u8]>) -> bool {
+        match (&self.auth_secret, auth_secret) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.as_slice() == b,
+            _ => false,
         }
     }
 }
@@ -158,7 +209,16 @@ impl ReplicaTransport for TcpReplicaTransport {
             flags: 0,
             payload: batch.serialize(),
         };
-        let bytes = frame.encode();
+        let encoded = frame.encode();
+        let bytes = if let Some(secret) = self.auth_secret.as_deref() {
+            crate::cluster::auth::sign_frame(secret, &encoded)
+                .map_err(|e| ReplicationError::Transport(format!("sign request frame: {e}")))?
+        } else {
+            encoded
+        };
+        self.stream
+            .set_write_timeout(Some(self.write_timeout))
+            .map_err(|e| ReplicationError::Transport(format!("set write timeout: {e}")))?;
         self.stream
             .write_all(&bytes)
             .map_err(|e| ReplicationError::Transport(format!("send_batch write: {e}")))?;
@@ -187,9 +247,15 @@ impl ReplicaTransport for TcpReplicaTransport {
         })?;
         let total_len = u32::from_le_bytes(len_buf) as usize;
 
-        if total_len as u32 > MAX_FRAME_SIZE {
+        let max_ack_frame_size = MAX_ACK_FRAME_SIZE
+            + self
+                .auth_secret
+                .as_ref()
+                .map(|_| crate::cluster::auth::SIGNED_SUFFIX_LEN)
+                .unwrap_or(0);
+        if total_len > max_ack_frame_size {
             return Err(ReplicationError::Transport(format!(
-                "response frame too large: {total_len}"
+                "response ACK frame too large: {total_len} > {max_ack_frame_size}"
             )));
         }
 
@@ -210,7 +276,15 @@ impl ReplicaTransport for TcpReplicaTransport {
         full.extend_from_slice(&len_buf);
         full.extend_from_slice(&body);
 
-        let (resp, _) = ResponseFrame::decode(&full)
+        let frame = if let Some(secret) = self.auth_secret.as_deref() {
+            crate::cluster::auth::verify_frame(secret, &full).map_err(|e| {
+                ReplicationError::Transport(format!("authenticate response frame: {e}"))
+            })?
+        } else {
+            full
+        };
+
+        let (resp, _) = ResponseFrame::decode(&frame)
             .map_err(|e| ReplicationError::Transport(format!("decode response frame: {e}")))?;
 
         if resp.status != STATUS_OK {
@@ -230,24 +304,15 @@ impl ReplicaTransport for TcpReplicaTransport {
 
     /// Check whether the underlying TCP connection appears healthy.
     ///
-    /// TCP does not provide a clean "is alive" test without writing data.
-    /// This performs a non-blocking peek attempt; a clean connection that
-    /// has no pending data will return `WouldBlock`, which we treat as
-    /// connected.
+    /// TCP does not provide a clean "is alive" test without writing data, so
+    /// this is intentionally a cheap socket-error probe. It avoids temporarily
+    /// changing read timeouts or consuming/peeking stream bytes; the next
+    /// send/recv remains the authoritative liveness check.
     fn is_connected(&self) -> bool {
-        // Save current timeout, set to very short for the probe
-        let orig = self.stream.read_timeout().ok().flatten();
-        let _ = self.stream.set_read_timeout(Some(Duration::from_millis(1)));
-        let mut probe = [0u8; 1];
-        let connected = match self.stream.peek(&mut probe) {
-            Ok(0) => false, // EOF — peer closed
-            Ok(_) => true,  // Data available
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => true,
-            Err(_) => false,
-        };
-        let _ = self.stream.set_read_timeout(orig);
-        connected
+        self.stream
+            .take_error()
+            .map(|e| e.is_none())
+            .unwrap_or(false)
     }
 }
 
@@ -332,6 +397,39 @@ mod tests {
     }
 
     #[test]
+    fn recv_ack_accepts_status_error_with_replica_ack_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let ack = ReplicaAck::Error {
+                failed_sequence: 7,
+                message: "apply failed".to_string(),
+            };
+            let resp = ResponseFrame {
+                request_id: 123,
+                status: STATUS_ERROR,
+                payload: ack.serialize(),
+            };
+            stream.write_all(&resp.encode()).unwrap();
+        });
+
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        let mut transport = TcpReplicaTransport::from_stream(stream);
+        let ack = transport.recv_ack(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            ack,
+            ReplicaAck::Error {
+                failed_sequence: 7,
+                message: "apply failed".to_string(),
+            },
+        );
+
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn recv_ack_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -367,6 +465,29 @@ mod tests {
     }
 
     #[test]
+    fn recv_ack_max_allocation_1kib_for_error_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(&(MAX_ACK_FRAME_SIZE as u32 + 1).to_le_bytes())
+                .unwrap();
+        });
+
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        let mut transport = TcpReplicaTransport::from_stream(stream);
+
+        let result = transport.recv_ack(Duration::from_secs(5));
+        assert!(matches!(result, Err(ReplicationError::Transport(_))));
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("ACK frame too large"), "error was: {err}");
+
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn is_connected_on_live_stream() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -380,6 +501,31 @@ mod tests {
         let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
         let transport = TcpReplicaTransport::from_stream(stream);
         assert!(transport.is_connected());
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn is_connected_preserves_read_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        let timeout = Some(Duration::from_secs(7));
+        stream.set_read_timeout(timeout).unwrap();
+        let transport = TcpReplicaTransport::from_stream(stream);
+
+        assert!(transport.is_connected());
+        assert_eq!(
+            transport.stream.read_timeout().unwrap(),
+            timeout,
+            "is_connected must not mutate socket read timeout",
+        );
 
         handle.join().unwrap();
     }
@@ -466,6 +612,49 @@ mod tests {
             TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5)).unwrap();
         assert!(transport.is_connected());
 
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn write_timeout_independent_of_connect_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).unwrap();
+            let total_len = u32::from_le_bytes(len_buf) as usize;
+            let mut body = vec![0u8; total_len];
+            stream.read_exact(&mut body).unwrap();
+        });
+
+        let client = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        assert_eq!(client.write_timeout().unwrap(), None);
+        let mut transport = TcpReplicaTransport::from_stream(client);
+        let send_timeout = Duration::from_millis(250);
+        transport.set_write_timeout(send_timeout);
+
+        let batch = ReplicaBatch {
+            first_sequence: 1,
+            ops: vec![ReplicaOp::Freeze {
+                tx_key: key(1),
+                offset: 0,
+                master_generation: 1,
+            }],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+        transport.send_batch(&batch).unwrap();
+
+        assert_eq!(
+            transport.stream.write_timeout().unwrap(),
+            Some(send_timeout)
+        );
         handle.join().unwrap();
     }
 

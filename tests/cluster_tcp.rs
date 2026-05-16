@@ -13,9 +13,10 @@ use std::time::Duration;
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::cluster::coordinator::{
-    ClusterConfig, ClusterCoordinator, MasterQueryResult, RunningCluster,
+    ClusterConfig, ClusterCoordinator, MasterQueryResult, ReplicationRuntimeConfig, RunningCluster,
 };
 use teraslab::cluster::shards::{NUM_SHARDS, NodeId, ShardTable};
+use teraslab::cluster::topology::{TopologyCommit, TopologyTerm};
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, MemoryDevice};
 use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
@@ -24,6 +25,7 @@ use teraslab::ops::engine::Engine;
 use teraslab::protocol::codec::{WireCreateItem, encode_create_batch};
 use teraslab::protocol::frame::*;
 use teraslab::protocol::opcodes::*;
+use teraslab::replication::manager::AckPolicy;
 use teraslab::server::Server;
 
 #[allow(dead_code)]
@@ -60,6 +62,29 @@ fn create_node(
     swim_port: u16,
     seed_swim_ports: &[u16],
     rf: u8,
+) -> TestNode {
+    create_node_with_replication_runtime(
+        node_id,
+        tcp_port,
+        swim_port,
+        seed_swim_ports,
+        rf,
+        ReplicationRuntimeConfig {
+            ack_policy: None,
+            best_effort: true,
+            timeout: Duration::from_secs(3),
+            timeout_during_migration: Duration::from_secs(30),
+        },
+    )
+}
+
+fn create_node_with_replication_runtime(
+    node_id: u64,
+    tcp_port: u16,
+    swim_port: u16,
+    seed_swim_ports: &[u16],
+    rf: u8,
+    replication: ReplicationRuntimeConfig,
 ) -> TestNode {
     let tcp_port = if tcp_port == 0 {
         reserve_tcp_port()
@@ -110,14 +135,7 @@ fn create_node(
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);
-    let running = Arc::new(coordinator.start(
-        engine.clone(),
-        None,
-        None,
-        None,
-        true,
-        Duration::from_secs(3),
-    ));
+    let running = Arc::new(coordinator.start(engine.clone(), None, None, replication));
 
     let config = ServerConfig {
         listen_addr: format!("127.0.0.1:{tcp_port}"),
@@ -179,6 +197,42 @@ fn send_request(stream: &mut TcpStream, frame: &RequestFrame) -> ResponseFrame {
     full.extend_from_slice(&body);
     let (response, _) = ResponseFrame::decode(&full).unwrap();
     response
+}
+
+fn assert_status_error_code(resp: &ResponseFrame, expected: u16, context: &str) {
+    assert_eq!(
+        resp.status,
+        STATUS_ERROR,
+        "{context}: expected STATUS_ERROR, got status={} payload_len={}",
+        resp.status,
+        resp.payload.len()
+    );
+    assert!(
+        resp.payload.len() >= 4,
+        "{context}: error response must carry [code:2][msg_len:2], got {} bytes",
+        resp.payload.len()
+    );
+    let code = u16::from_le_bytes(resp.payload[0..2].try_into().unwrap());
+    assert_eq!(code, expected, "{context}: wrong error code");
+}
+
+fn assert_single_sparse_error_code(resp: &ResponseFrame, expected: u16, context: &str) {
+    assert_eq!(
+        resp.status,
+        STATUS_PARTIAL_ERROR,
+        "{context}: expected STATUS_PARTIAL_ERROR, got status={} payload_len={}",
+        resp.status,
+        resp.payload.len()
+    );
+    assert!(
+        resp.payload.len() >= 10,
+        "{context}: sparse error payload must include count/index/code, got {} bytes",
+        resp.payload.len()
+    );
+    let count = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+    assert_eq!(count, 1, "{context}: expected one sparse error");
+    let code = u16::from_le_bytes(resp.payload[8..10].try_into().unwrap());
+    assert_eq!(code, expected, "{context}: wrong sparse error code");
 }
 
 // ---------------------------------------------------------------------------
@@ -1076,6 +1130,7 @@ fn query_reaches_correct_node_returns_data() {
     query_payload.extend_from_slice(&1u32.to_le_bytes()); // count
     query_payload.extend_from_slice(&txid);
     query_payload.extend_from_slice(&0u32.to_le_bytes()); // vout=0
+    query_payload.extend_from_slice(&hash);
 
     let resp = send_request(
         &mut stream,
@@ -1508,6 +1563,113 @@ fn single_node_cluster_accepts_writes_without_quorum_check() {
         resp.status,
         resp.payload.len(),
     );
+
+    shutdown_node(&node);
+}
+
+#[test]
+fn tcp_write_to_pending_inbound_shard_returns_migration_in_progress() {
+    // R-060 code 19 triggerability. Mark a shard as pending inbound on
+    // a real TCP server and verify a client-visible write gets the
+    // per-item ERR_MIGRATION_IN_PROGRESS code, not a redirect or close.
+    let node = create_node(321, 0, 0, &[], 1);
+
+    let txid = make_txid(901_001);
+    let shard = ShardTable::shard_for_key(&TxKey { txid });
+    node.cluster.mark_inbound_active(shard);
+    assert!(node.cluster.has_pending_inbound_shard(shard));
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node.tcp_port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let hash = make_txid(901_002);
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 19,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: encode_create_payload(&txid, &hash),
+        },
+    );
+
+    assert_single_sparse_error_code(
+        &resp,
+        ERR_MIGRATION_IN_PROGRESS,
+        "pending inbound shard write",
+    );
+
+    shutdown_node(&node);
+}
+
+#[test]
+fn tcp_strict_replication_failure_returns_replication_failed() {
+    // R-060 code 20 triggerability. A strict RF=2 node with only itself
+    // in the committed topology cannot resolve the required replica
+    // target. The local handler must fail the real TCP client with
+    // ERR_REPLICATION_FAILED rather than reporting success.
+    let node = create_node_with_replication_runtime(
+        322,
+        0,
+        0,
+        &[],
+        2,
+        ReplicationRuntimeConfig {
+            ack_policy: Some(AckPolicy::WriteAll),
+            best_effort: false,
+            timeout: Duration::from_millis(50),
+            timeout_during_migration: Duration::from_millis(50),
+        },
+    );
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node.tcp_port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let members = vec![NodeId(322)];
+    let commit = TopologyCommit {
+        term: 1,
+        proposer: NodeId(322),
+        members: members.clone(),
+        voters: members.clone(),
+        digest: TopologyTerm::compute_digest(1, &members),
+    };
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1,
+            op_code: OP_TOPOLOGY_COMMIT,
+            flags: 0,
+            payload: commit.serialize(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK, "topology commit should succeed");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !node.cluster.cluster_health().is_ready() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "strict test node did not become cluster-ready after topology commit"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let txid = make_txid(901_003);
+    let hash = make_txid(901_004);
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 20,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: encode_create_payload(&txid, &hash),
+        },
+    );
+
+    assert_status_error_code(&resp, ERR_REPLICATION_FAILED, "strict replication failure");
 
     shutdown_node(&node);
 }

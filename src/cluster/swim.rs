@@ -28,6 +28,51 @@ const MSG_INDIRECT_ACK: u8 = 5;
 /// [msg_type:1][sender_id:8][sender_incarnation:8][sender_addr_len:2][sender_addr:N]
 /// [update_count:2][ [node_id:8][state:1][incarnation:8][addr_len:2][addr:N] × count ]
 const MAX_MSG_SIZE: usize = 4096;
+const MSG_SIZE_WARN_THRESHOLD: usize = MAX_MSG_SIZE * 4 / 5;
+const DEAD_MEMBER_FORGET_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncodedMessageSize {
+    Normal,
+    NearLimit,
+    Oversize,
+}
+
+fn classify_encoded_message_size(len: usize) -> EncodedMessageSize {
+    if len > MAX_MSG_SIZE {
+        EncodedMessageSize::Oversize
+    } else if len >= MSG_SIZE_WARN_THRESHOLD {
+        EncodedMessageSize::NearLimit
+    } else {
+        EncodedMessageSize::Normal
+    }
+}
+
+fn observe_encoded_message_size(msg_type: u8, len: usize) {
+    match classify_encoded_message_size(len) {
+        EncodedMessageSize::Normal => {}
+        EncodedMessageSize::NearLimit => {
+            tracing::warn!(
+                msg_type,
+                len,
+                max = MAX_MSG_SIZE,
+                "swim: encoded message is near UDP frame cap",
+            );
+        }
+        EncodedMessageSize::Oversize => {
+            tracing::warn!(
+                msg_type,
+                len,
+                max = MAX_MSG_SIZE,
+                "swim: encoded message exceeds UDP receive buffer cap; peer may truncate/drop it",
+            );
+        }
+    }
+    debug_assert!(
+        len <= MAX_MSG_SIZE,
+        "SWIM message type {msg_type} encoded to {len} bytes, above MAX_MSG_SIZE {MAX_MSG_SIZE}",
+    );
+}
 
 /// Configuration for the SWIM protocol.
 #[derive(Debug, Clone)]
@@ -396,14 +441,15 @@ impl SwimRunner {
                 }
                 last_seed_retry = Instant::now();
 
-                // Garbage-collect dead nodes older than 1 hour to prevent
-                // unbounded memory growth. Also clean up their address entries
-                // so gossip stops including them.
+                // Garbage-collect dead nodes after a long retention window to
+                // prevent unbounded memory growth. Membership keeps the
+                // highest seen incarnation after removal, so a forgotten
+                // NodeId cannot be reborn with a lower incarnation.
                 let forgotten = self
                     .membership
                     .lock()
                     .unwrap()
-                    .forget_dead_older_than(Duration::from_secs(3600));
+                    .forget_dead_older_than(DEAD_MEMBER_FORGET_AFTER);
                 if !forgotten.is_empty() {
                     let mut peers = self.peer_addrs.lock().unwrap();
                     let mut swim = self.swim_peer_addrs.lock().unwrap();
@@ -845,6 +891,7 @@ impl SwimRunner {
         if let Some(ref secret) = self.config.cluster_secret {
             buf = crate::cluster::auth::sign(secret, &buf);
         }
+        observe_encoded_message_size(msg_type, buf.len());
         buf
     }
 
@@ -881,6 +928,7 @@ impl SwimRunner {
         if let Some(ref secret) = self.config.cluster_secret {
             buf = crate::cluster::auth::sign(secret, &buf);
         }
+        observe_encoded_message_size(MSG_INDIRECT_ACK, buf.len());
         buf
     }
 
@@ -1031,6 +1079,26 @@ mod tests {
     }
 
     // ── Phase I: exponential seed backoff ────────────────────────────────
+
+    #[test]
+    fn swim_msg_size_warning_on_overflow() {
+        assert_eq!(
+            classify_encoded_message_size(MSG_SIZE_WARN_THRESHOLD - 1),
+            EncodedMessageSize::Normal,
+        );
+        assert_eq!(
+            classify_encoded_message_size(MSG_SIZE_WARN_THRESHOLD),
+            EncodedMessageSize::NearLimit,
+        );
+        assert_eq!(
+            classify_encoded_message_size(MAX_MSG_SIZE),
+            EncodedMessageSize::NearLimit,
+        );
+        assert_eq!(
+            classify_encoded_message_size(MAX_MSG_SIZE + 1),
+            EncodedMessageSize::Oversize,
+        );
+    }
 
     #[test]
     fn seed_retry_uses_exponential_backoff() {

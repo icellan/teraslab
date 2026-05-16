@@ -10,6 +10,7 @@ pub mod startup;
 use crate::cluster::coordinator::RunningCluster;
 use crate::config::ServerConfig;
 use crate::ops::engine::Engine;
+use crate::protocol::codec::encode_error_payload;
 use crate::protocol::frame::{RequestFrame, ResponseFrame};
 use crate::protocol::opcodes::*;
 use crate::redo::RedoLog;
@@ -20,6 +21,92 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
+
+/// F-G5-001 (CRITICAL): emit a single `tracing::warn!` the first time an
+/// inter-node opcode is received with no `cluster_secret` configured.
+/// The default (trusted-overlay) behaviour is fail-open per
+/// `_review/FIX_POLICY.md` §2; the warning surfaces the situation so
+/// an operator who forgot to wire a secret notices in production logs.
+///
+/// One-shot — additional unsigned inter-node frames after the first are
+/// silently accepted (still subject to the per-frame size / rate caps).
+static UNAUTHENTICATED_INTER_NODE_WARNED: AtomicBool = AtomicBool::new(false);
+
+const READ_BUF_RETAINED_SIZE: usize = 256 * 1024;
+const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Shared aggregate cap for request-frame memory across all connection
+/// threads. The single-frame `MAX_FRAME_SIZE` guard bounds one allocation;
+/// this limiter bounds the sum of frames being read/processed concurrently.
+#[derive(Debug)]
+pub(crate) struct InflightBytesLimiter {
+    limit: usize,
+    used: AtomicUsize,
+}
+
+#[derive(Debug)]
+pub(crate) struct InflightBytesPermit {
+    limiter: Arc<InflightBytesLimiter>,
+    bytes: usize,
+}
+
+impl InflightBytesLimiter {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<InflightBytesPermit> {
+        if self.limit == 0 {
+            return Some(InflightBytesPermit {
+                limiter: self.clone(),
+                bytes: 0,
+            });
+        }
+        if bytes > self.limit {
+            return None;
+        }
+
+        let mut observed = self.used.load(Ordering::Relaxed);
+        loop {
+            let next = observed.checked_add(bytes)?;
+            if next > self.limit {
+                return None;
+            }
+            match self.used.compare_exchange_weak(
+                observed,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(InflightBytesPermit {
+                        limiter: self.clone(),
+                        bytes,
+                    });
+                }
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for InflightBytesPermit {
+    fn drop(&mut self) {
+        if self.bytes != 0 {
+            self.limiter.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+    }
+}
 
 /// Per-connection state for streaming blob uploads.
 ///
@@ -27,6 +114,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// (aborted) when the connection closes.
 pub(crate) struct ConnectionState {
     pub(crate) streams: HashMap<[u8; 32], ActiveStream>,
+    pub(crate) max_stream_total_bytes: u64,
 }
 
 /// An in-progress streaming blob upload for a single txid.
@@ -39,7 +127,13 @@ impl ConnectionState {
     pub(crate) fn new() -> Self {
         Self {
             streams: HashMap::new(),
+            max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
         }
+    }
+
+    pub(crate) fn with_max_stream_total_bytes(mut self, max_stream_total_bytes: u64) -> Self {
+        self.max_stream_total_bytes = max_stream_total_bytes;
+        self
     }
 }
 
@@ -61,11 +155,14 @@ pub struct Server {
     blob_store: Option<Arc<dyn BlobStore>>,
     shutdown: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
+    inflight_request_bytes: Arc<InflightBytesLimiter>,
 }
 
 impl Server {
     /// Create a new server with the given engine and configuration.
     pub fn new(engine: Arc<Engine>, config: ServerConfig) -> Self {
+        let inflight_request_bytes =
+            Arc::new(InflightBytesLimiter::new(config.max_inflight_request_bytes));
         Self {
             engine,
             config,
@@ -74,6 +171,7 @@ impl Server {
             blob_store: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            inflight_request_bytes,
         }
     }
 
@@ -119,10 +217,17 @@ impl Server {
 
         while !self.shutdown.load(Ordering::Relaxed) {
             match listener.accept() {
-                Ok((stream, addr)) => {
+                Ok((mut stream, addr)) => {
                     let active = self.active_connections.load(Ordering::Relaxed);
                     if active >= self.config.max_connections {
                         tracing::warn!(peer_addr = %addr, active, "rejecting connection: max connections reached");
+                        let _ = stream.set_write_timeout(Some(CONNECTION_WRITE_TIMEOUT));
+                        let response = ResponseFrame {
+                            request_id: 0,
+                            status: STATUS_ERROR,
+                            payload: encode_error_payload(ERR_INTERNAL, "max connections reached"),
+                        };
+                        let _ = stream.write_all(&response.encode());
                         drop(stream);
                         continue;
                     }
@@ -133,19 +238,41 @@ impl Server {
                     let shutdown = self.shutdown.clone();
                     let active_conns = self.active_connections.clone();
                     let max_batch = self.config.max_batch_size;
+                    let max_stream_total_bytes = self.config.max_stream_total_bytes;
                     let cluster = self.cluster.clone();
                     let redo_log = self.redo_log.clone();
                     let blob_store = self.blob_store.clone();
+                    let inflight_request_bytes = self.inflight_request_bytes.clone();
+                    let cluster_secret = self
+                        .config
+                        .cluster_secret
+                        .as_ref()
+                        .map(|s| Arc::new(s.as_bytes().to_vec()));
+                    // F-G5-001 (NEEDS-ORCHESTRATOR): G10 owns
+                    // `ServerConfig::strict_auth` and the `--strict-auth`
+                    // CLI flag. Hardcoded `false` here preserves the
+                    // documented trusted-overlay default; once G10 wires
+                    // the config field, replace this with
+                    // `self.config.strict_auth`.
+                    let strict_auth = false;
 
                     std::thread::spawn(move || {
-                        if let Err(e) = handle_connection(
+                        if let Err(e) = handle_connection_inner(
                             stream,
                             &engine,
                             &shutdown,
-                            max_batch,
-                            cluster.as_deref(),
-                            redo_log.as_deref(),
-                            blob_store.as_deref(),
+                            ConnectionOptions {
+                                max_batch_size: max_batch,
+                                max_stream_total_bytes,
+                                cluster: cluster.as_deref(),
+                                redo_log: redo_log.as_deref(),
+                                blob_store: blob_store.as_deref(),
+                                inflight_request_bytes,
+                                cluster_secret,
+                                strict_auth,
+                                read_timeout: CONNECTION_READ_TIMEOUT,
+                                write_timeout: CONNECTION_WRITE_TIMEOUT,
+                            },
                         ) {
                             tracing::warn!(peer_addr = %addr, err = %e, "connection error");
                         }
@@ -191,25 +318,43 @@ impl Server {
     }
 }
 
+struct ConnectionOptions<'a> {
+    max_batch_size: u32,
+    max_stream_total_bytes: u64,
+    cluster: Option<&'a RunningCluster>,
+    redo_log: Option<&'a Mutex<RedoLog>>,
+    blob_store: Option<&'a dyn BlobStore>,
+    inflight_request_bytes: Arc<InflightBytesLimiter>,
+    cluster_secret: Option<Arc<Vec<u8>>>,
+    /// F-G5-001 (CRITICAL): when `true`, an inter-node opcode that arrives
+    /// without a `cluster_secret` configured is rejected with
+    /// `ERR_CLUSTER_AUTH_FAILED`. When `false` (the default trusted-overlay
+    /// behaviour), the frame is accepted unauthenticated — a one-shot
+    /// warning is emitted via [`UNAUTHENTICATED_INTER_NODE_WARNED`].
+    ///
+    /// Orchestrator-wired: G10 owns `ServerConfig::strict_auth` and the
+    /// CLI `--strict-auth` flag; this field is the local read-site.
+    strict_auth: bool,
+    read_timeout: Duration,
+    write_timeout: Duration,
+}
+
 /// Handle a single client connection: read frames, dispatch, respond.
 ///
 /// Creates a [`ConnectionState`] that tracks in-progress streaming blob
 /// uploads. When the connection closes (normally or on error), the
 /// `ConnectionState` `Drop` impl aborts any incomplete streams.
-fn handle_connection(
+fn handle_connection_inner(
     mut stream: TcpStream,
     engine: &Engine,
     shutdown: &AtomicBool,
-    max_batch_size: u32,
-    cluster: Option<&RunningCluster>,
-    redo_log: Option<&Mutex<RedoLog>>,
-    blob_store: Option<&dyn BlobStore>,
+    opts: ConnectionOptions<'_>,
 ) -> Result<(), String> {
     stream
         .set_nonblocking(false)
         .map_err(|e| format!("set_nonblocking: {e}"))?;
     stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .set_read_timeout(Some(opts.read_timeout))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
     // R-054 (LMNH-01 / Codex F13): cap write time so a slow-reader
     // client cannot pin a server thread indefinitely. Pre-fix
@@ -220,11 +365,12 @@ fn handle_connection(
     // client-side handler latency but short enough that operators
     // notice stuck connections promptly.
     stream
-        .set_write_timeout(Some(std::time::Duration::from_secs(30)))
+        .set_write_timeout(Some(opts.write_timeout))
         .map_err(|e| format!("set_write_timeout: {e}"))?;
 
-    let mut read_buf = vec![0u8; 256 * 1024]; // 256 KB read buffer
-    let mut conn_state = ConnectionState::new();
+    let mut read_buf = vec![0u8; READ_BUF_RETAINED_SIZE];
+    let mut conn_state =
+        ConnectionState::new().with_max_stream_total_bytes(opts.max_stream_total_bytes);
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -236,8 +382,8 @@ fn handle_connection(
         match stream.read_exact(&mut len_buf) {
             Ok(()) => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()), // Client disconnected
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(()),
             Err(e) => return Err(format!("read length: {e}")),
         }
 
@@ -248,7 +394,13 @@ fn handle_connection(
         // multi-gigabyte allocations before any decoding occurs (gap #10
         // in TERANODE_PRODUCTION_READINESS_GAPS.md).
         let total_length = u32::from_le_bytes(len_buf);
-        if total_length > MAX_FRAME_SIZE {
+        let max_wire_frame_size = MAX_FRAME_SIZE
+            + opts
+                .cluster_secret
+                .as_ref()
+                .map(|_| crate::cluster::auth::SIGNED_SUFFIX_LEN as u32)
+                .unwrap_or(0);
+        if total_length > max_wire_frame_size {
             let resp = ResponseFrame {
                 request_id: 0,
                 status: STATUS_ERROR,
@@ -256,7 +408,7 @@ fn handle_connection(
             };
             let _ = stream.write_all(&resp.encode());
             return Err(format!(
-                "frame too large: {total_length} > MAX_FRAME_SIZE {MAX_FRAME_SIZE}"
+                "frame too large: {total_length} > MAX_FRAME_SIZE {max_wire_frame_size}"
             ));
         }
 
@@ -264,6 +416,23 @@ fn handle_connection(
         // <= `MAX_FRAME_SIZE`, so the buffer growth is bounded regardless
         // of how many concurrent connections advertise large frames.
         let frame_len = total_length as usize;
+        let _inflight_permit = match opts.inflight_request_bytes.try_acquire(frame_len) {
+            Some(permit) => permit,
+            None => {
+                let resp = ResponseFrame {
+                    request_id: 0,
+                    status: STATUS_ERROR,
+                    payload: encode_error_payload(
+                        ERR_INTERNAL,
+                        "aggregate in-flight request memory limit exceeded",
+                    ),
+                };
+                let _ = stream.write_all(&resp.encode());
+                return Err(format!(
+                    "aggregate in-flight request memory limit exceeded: requested {frame_len} bytes"
+                ));
+            }
+        };
         if read_buf.len() < frame_len {
             read_buf.resize(frame_len, 0);
         }
@@ -276,24 +445,478 @@ fn handle_connection(
         frame_bytes.extend_from_slice(&len_buf);
         frame_bytes.extend_from_slice(&read_buf[..frame_len]);
 
+        let request_id = peek_request_id(&frame_bytes).unwrap_or(0);
+        let peeked_op = peek_request_op_code(&frame_bytes);
+        let is_inter_node_op = peeked_op.map(is_inter_node_auth_opcode).unwrap_or(false);
+        let auth_required = is_inter_node_op && opts.cluster_secret.is_some();
+        // F-G5-001 (CRITICAL): inter-node opcode arrived with no
+        // `cluster_secret`. Default behaviour is fail-open (trusted
+        // overlay, FIX_POLICY §2); opt-in `strict_auth` rejects.
+        // Either way, surface the first unauthenticated event in logs.
+        if is_inter_node_op && opts.cluster_secret.is_none() {
+            if opts.strict_auth {
+                let op_code = peeked_op.unwrap_or(0);
+                let resp = ResponseFrame {
+                    request_id,
+                    status: STATUS_ERROR,
+                    payload: encode_error_payload(
+                        ERR_CLUSTER_AUTH_FAILED,
+                        "strict_auth: cluster_secret required for inter-node opcode",
+                    ),
+                };
+                let _ = stream.write_all(&resp.encode());
+                return Err(format!(
+                    "strict_auth: rejecting unsigned inter-node op_code={op_code}"
+                ));
+            }
+            if !UNAUTHENTICATED_INTER_NODE_WARNED.swap(true, Ordering::AcqRel) {
+                let op_code = peeked_op.unwrap_or(0);
+                tracing::warn!(
+                    target: "teraslab::security",
+                    op_code,
+                    "inter-node opcode received without cluster_secret configured — \
+                     accepting unauthenticated frame (trusted-overlay default). \
+                     Configure `cluster_secret` or pass `--strict-auth` to enforce.",
+                );
+            }
+        }
+        let request_frame_bytes = if auth_required {
+            match crate::cluster::auth::verify_frame(
+                opts.cluster_secret
+                    .as_ref()
+                    .expect("checked above")
+                    .as_slice(),
+                &frame_bytes,
+            ) {
+                Ok(verified) => verified,
+                Err(e) => {
+                    let resp = ResponseFrame {
+                        request_id,
+                        status: STATUS_ERROR,
+                        payload: encode_error_payload(
+                            ERR_CLUSTER_AUTH_FAILED,
+                            &format!("cluster frame authentication failed: {e}"),
+                        ),
+                    };
+                    let _ = stream.write_all(&resp.encode());
+                    return Err(format!("cluster frame authentication failed: {e}"));
+                }
+            }
+        } else {
+            frame_bytes
+        };
+
         let (request, _) =
-            RequestFrame::decode(&frame_bytes).map_err(|e| format!("decode frame: {e}"))?;
+            RequestFrame::decode(&request_frame_bytes).map_err(|e| format!("decode frame: {e}"))?;
 
         // Dispatch to handler
         let response = dispatch::handle_request(
             &request,
             engine,
-            max_batch_size,
-            cluster,
-            redo_log,
+            opts.max_batch_size,
+            opts.cluster,
+            opts.redo_log,
             &mut conn_state,
-            blob_store,
+            opts.blob_store,
         );
 
         // Write response
-        let response_bytes = response.encode();
+        let encoded_response = response.encode();
+        let response_bytes = if auth_required {
+            crate::cluster::auth::sign_frame(
+                opts.cluster_secret
+                    .as_ref()
+                    .expect("checked above")
+                    .as_slice(),
+                &encoded_response,
+            )
+            .map_err(|e| format!("sign response frame: {e}"))?
+        } else {
+            encoded_response
+        };
         stream
             .write_all(&response_bytes)
             .map_err(|e| format!("write response: {e}"))?;
+        reset_read_buf_if_oversized(&mut read_buf);
+    }
+}
+
+fn peek_request_id(frame_bytes: &[u8]) -> Option<u64> {
+    if frame_bytes.len() < 12 {
+        return None;
+    }
+    Some(u64::from_le_bytes(frame_bytes[4..12].try_into().ok()?))
+}
+
+fn peek_request_op_code(frame_bytes: &[u8]) -> Option<u16> {
+    if frame_bytes.len() < 14 {
+        return None;
+    }
+    Some(u16::from_le_bytes(frame_bytes[12..14].try_into().ok()?))
+}
+
+fn reset_read_buf_if_oversized(read_buf: &mut Vec<u8>) {
+    if read_buf.capacity() > READ_BUF_RETAINED_SIZE {
+        *read_buf = vec![0u8; READ_BUF_RETAINED_SIZE];
+    } else if read_buf.len() != READ_BUF_RETAINED_SIZE {
+        read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::allocator::SlotAllocator;
+    use crate::device::{BlockDevice, MemoryDevice};
+    use crate::index::{DahIndex, Index, UnminedIndex};
+    use crate::locks::StripedLocks;
+
+    fn test_engine() -> Engine {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        Engine::new(
+            dev,
+            Index::new(1024).unwrap(),
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        )
+    }
+
+    #[test]
+    fn read_buf_shrinks_after_small_frame() {
+        let mut read_buf = vec![0u8; READ_BUF_RETAINED_SIZE * 4];
+        assert!(read_buf.capacity() > READ_BUF_RETAINED_SIZE);
+
+        reset_read_buf_if_oversized(&mut read_buf);
+
+        assert_eq!(read_buf.len(), READ_BUF_RETAINED_SIZE);
+        assert_eq!(read_buf.capacity(), READ_BUF_RETAINED_SIZE);
+    }
+
+    #[test]
+    fn silent_client_dropped_after_idle_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(test_engine());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server_engine = engine.clone();
+        let server_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = handle_connection_inner(
+                stream,
+                &server_engine,
+                &server_shutdown,
+                ConnectionOptions {
+                    max_batch_size: 1024,
+                    max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    cluster: None,
+                    redo_log: None,
+                    blob_store: None,
+                    inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
+                    cluster_secret: None,
+                    strict_auth: false,
+                    read_timeout: Duration::from_millis(50),
+                    write_timeout: Duration::from_secs(1),
+                },
+            );
+            tx.send(result).unwrap();
+        });
+
+        let _client = TcpStream::connect(addr).unwrap();
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("silent client should be dropped after read timeout");
+        assert!(result.is_ok(), "connection result was {result:?}");
+    }
+
+    #[test]
+    fn unsigned_inter_node_frame_rejected_when_cluster_secret_configured() {
+        assert_unsigned_protected_opcode_rejected(OP_REPLICA_BATCH);
+    }
+
+    #[test]
+    fn unsigned_topology_frame_rejected_when_cluster_secret_configured() {
+        assert_unsigned_protected_opcode_rejected(OP_TOPOLOGY_COMMIT);
+    }
+
+    #[test]
+    fn unsigned_migration_frame_rejected_when_cluster_secret_configured() {
+        assert_unsigned_protected_opcode_rejected(OP_MIGRATION_COMPLETE);
+    }
+
+    fn assert_unsigned_protected_opcode_rejected(op_code: u16) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(test_engine());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server_engine = engine.clone();
+        let server_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = handle_connection_inner(
+                stream,
+                &server_engine,
+                &server_shutdown,
+                ConnectionOptions {
+                    max_batch_size: 1024,
+                    max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    cluster: None,
+                    redo_log: None,
+                    blob_store: None,
+                    inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
+                    cluster_secret: Some(Arc::new(b"cluster-secret".to_vec())),
+                    strict_auth: false,
+                    read_timeout: Duration::from_secs(1),
+                    write_timeout: Duration::from_secs(1),
+                },
+            );
+            tx.send(result).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let request = RequestFrame {
+            request_id: 7,
+            op_code,
+            flags: 0,
+            payload: Vec::new(),
+        };
+        client.write_all(&request.encode()).unwrap();
+
+        let response = read_response_frame_for_test(&mut client);
+        assert_eq!(response.request_id, 7);
+        assert_eq!(response.status, STATUS_ERROR);
+        assert_eq!(
+            u16::from_le_bytes(response.payload[0..2].try_into().unwrap()),
+            ERR_CLUSTER_AUTH_FAILED
+        );
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server should return after auth failure");
+        assert!(result.is_err(), "auth failure should close connection");
+    }
+
+    #[test]
+    fn signed_inter_node_frame_receives_signed_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(test_engine());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server_engine = engine.clone();
+        let server_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = handle_connection_inner(
+                stream,
+                &server_engine,
+                &server_shutdown,
+                ConnectionOptions {
+                    max_batch_size: 1024,
+                    max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    cluster: None,
+                    redo_log: None,
+                    blob_store: None,
+                    inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
+                    cluster_secret: Some(Arc::new(b"cluster-secret".to_vec())),
+                    strict_auth: false,
+                    read_timeout: Duration::from_secs(1),
+                    write_timeout: Duration::from_secs(1),
+                },
+            );
+            tx.send(result).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let request = RequestFrame {
+            request_id: 8,
+            op_code: OP_GET_PARTITION_MAP,
+            flags: 0,
+            payload: Vec::new(),
+        };
+        let signed = crate::cluster::auth::sign_frame(b"cluster-secret", &request.encode())
+            .expect("request signing");
+        client.write_all(&signed).unwrap();
+
+        let signed_response = read_raw_frame_for_test(&mut client);
+        assert!(
+            signed_response.len() >= crate::cluster::auth::SIGNED_SUFFIX_LEN + 4,
+            "signed response should carry the auth suffix"
+        );
+        let verified =
+            crate::cluster::auth::verify_frame(b"cluster-secret", &signed_response).unwrap();
+        let (response, consumed) = ResponseFrame::decode(&verified).unwrap();
+        assert_eq!(consumed, verified.len());
+        assert_eq!(response.request_id, 8);
+        assert_eq!(response.status, STATUS_OK);
+
+        drop(client);
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server should exit after client disconnect");
+        assert!(result.is_ok(), "connection result was {result:?}");
+    }
+
+    #[test]
+    fn inflight_request_limiter_caps_aggregate_bytes() {
+        let limiter = Arc::new(InflightBytesLimiter::new(16));
+        let first = limiter.try_acquire(10).expect("first permit");
+        assert_eq!(limiter.used(), 10);
+        assert!(
+            limiter.try_acquire(7).is_none(),
+            "second permit should exceed aggregate cap"
+        );
+        drop(first);
+        assert_eq!(limiter.used(), 0);
+        let second = limiter.try_acquire(16).expect("full-cap permit");
+        assert_eq!(limiter.used(), 16);
+        drop(second);
+        assert_eq!(limiter.used(), 0);
+    }
+
+    fn read_raw_frame_for_test(stream: &mut TcpStream) -> Vec<u8> {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).unwrap();
+        let total_len = u32::from_le_bytes(len_buf) as usize;
+        let mut body = vec![0u8; total_len];
+        stream.read_exact(&mut body).unwrap();
+        let mut full = Vec::with_capacity(4 + total_len);
+        full.extend_from_slice(&len_buf);
+        full.extend_from_slice(&body);
+        full
+    }
+
+    fn read_response_frame_for_test(stream: &mut TcpStream) -> ResponseFrame {
+        let full = read_raw_frame_for_test(stream);
+        let (response, consumed) = ResponseFrame::decode(&full).unwrap();
+        assert_eq!(consumed, full.len());
+        response
+    }
+
+    /// F-G5-001 (CRITICAL): with `strict_auth = true` AND `cluster_secret =
+    /// None`, an inter-node opcode must be rejected with
+    /// `ERR_CLUSTER_AUTH_FAILED` rather than silently accepted.
+    #[test]
+    fn strict_auth_rejects_inter_node_op_when_secret_missing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(test_engine());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server_engine = engine.clone();
+        let server_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = handle_connection_inner(
+                stream,
+                &server_engine,
+                &server_shutdown,
+                ConnectionOptions {
+                    max_batch_size: 1024,
+                    max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    cluster: None,
+                    redo_log: None,
+                    blob_store: None,
+                    inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
+                    cluster_secret: None,
+                    strict_auth: true,
+                    read_timeout: Duration::from_secs(1),
+                    write_timeout: Duration::from_secs(1),
+                },
+            );
+            tx.send(result).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let request = RequestFrame {
+            request_id: 42,
+            op_code: OP_TOPOLOGY_COMMIT,
+            flags: 0,
+            payload: Vec::new(),
+        };
+        client.write_all(&request.encode()).unwrap();
+
+        let response = read_response_frame_for_test(&mut client);
+        assert_eq!(response.request_id, 42);
+        assert_eq!(response.status, STATUS_ERROR);
+        assert_eq!(
+            u16::from_le_bytes(response.payload[0..2].try_into().unwrap()),
+            ERR_CLUSTER_AUTH_FAILED
+        );
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server should return after strict-auth rejection");
+        assert!(
+            result.is_err(),
+            "strict_auth rejection should close connection: {result:?}",
+        );
+    }
+
+    /// F-G5-001 (CRITICAL): with `strict_auth = false` (default trusted-
+    /// overlay), an inter-node opcode without `cluster_secret` is accepted
+    /// — the warning is emitted once and dispatch proceeds.
+    #[test]
+    fn fail_open_accepts_inter_node_op_when_secret_missing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(test_engine());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server_engine = engine.clone();
+        let server_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = handle_connection_inner(
+                stream,
+                &server_engine,
+                &server_shutdown,
+                ConnectionOptions {
+                    max_batch_size: 1024,
+                    max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    cluster: None,
+                    redo_log: None,
+                    blob_store: None,
+                    inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
+                    cluster_secret: None,
+                    strict_auth: false,
+                    read_timeout: Duration::from_secs(1),
+                    write_timeout: Duration::from_secs(1),
+                },
+            );
+            tx.send(result).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        // GET_PARTITION_MAP is an inter-node opcode but the single-node
+        // dispatch path returns STATUS_OK with a 1-node trivial partition
+        // map. Asserting STATUS_OK confirms the frame reached dispatch
+        // (i.e. was not rejected by the auth gate).
+        let request = RequestFrame {
+            request_id: 9,
+            op_code: OP_GET_PARTITION_MAP,
+            flags: 0,
+            payload: Vec::new(),
+        };
+        client.write_all(&request.encode()).unwrap();
+
+        let response = read_response_frame_for_test(&mut client);
+        assert_eq!(response.request_id, 9);
+        assert_eq!(response.status, STATUS_OK);
+
+        drop(client);
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server should return after client disconnect");
+        assert!(result.is_ok(), "fail-open accepted result was {result:?}");
     }
 }

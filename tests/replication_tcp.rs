@@ -117,6 +117,7 @@ fn create_record_on_engine(engine: &Engine, txid: [u8; 32], utxo_count: u32) {
         frozen: false,
         conflicting: false,
         locked: false,
+        external_ref: None,
         parent_txids: &[],
     };
     engine.create(&req).unwrap();
@@ -208,6 +209,8 @@ fn tcp_replicate_spend() {
             tx_key: key,
             offset: 0,
             spending_data: sd,
+            current_block_height: 1000,
+            block_height_retention: 288,
             master_generation: 0,
         }],
         trace_ctx: None,
@@ -228,6 +231,61 @@ fn tcp_replicate_spend() {
     assert_eq!(slot.spending_data[0], 0xAB);
 
     master_server.shutdown();
+    replica_server.shutdown();
+}
+
+#[test]
+fn tcp_replicate_spend_uses_replicated_dah_context() {
+    let (replica_server, replica_engine, replica_port) = start_test_server();
+
+    let txid = test_txid(1500);
+    let key = key_from_txid(txid);
+    create_record_on_engine(&replica_engine, txid, 1);
+
+    let mut sd = [0u8; 36];
+    sd[0] = 0xD0;
+    let batch = ReplicaBatch {
+        first_sequence: 1,
+        ops: vec![
+            ReplicaOp::SetMined {
+                tx_key: key,
+                block_id: 1500,
+                block_height: 800_000,
+                subtree_idx: 0,
+                on_longest_chain: true,
+                current_block_height: 800_010,
+                block_height_retention: 7,
+                master_generation: 1,
+            },
+            ReplicaOp::Spend {
+                tx_key: key,
+                offset: 0,
+                spending_data: sd,
+                current_block_height: 800_050,
+                block_height_retention: 13,
+                master_generation: 2,
+            },
+        ],
+        trace_ctx: None,
+        source_node_id: None,
+        cluster_key: 0,
+    };
+
+    let ack = send_replica_batch_tcp(replica_port, &batch);
+    assert_eq!(
+        ack,
+        ReplicaAck::Ok {
+            through_sequence: 2
+        }
+    );
+
+    let meta = replica_engine.read_metadata(&key).unwrap();
+    assert_eq!(
+        { meta.delete_at_height },
+        800_063,
+        "replica must evaluate DAH with the context carried on the Spend op",
+    );
+
     replica_server.shutdown();
 }
 
@@ -291,6 +349,8 @@ fn tcp_replicate_create_and_spend_lifecycle() {
             tx_key: key,
             offset: 0,
             spending_data: sd,
+            current_block_height: 1000,
+            block_height_retention: 288,
             master_generation: 0,
         }],
         trace_ctx: None,
@@ -348,6 +408,8 @@ fn tcp_replicate_batch_50_ops() {
             tx_key: key,
             offset: 0,
             spending_data: sd,
+            current_block_height: 1000,
+            block_height_retention: 288,
             master_generation: 0,
         });
     }
@@ -451,6 +513,8 @@ fn tcp_replicate_mixed_ops() {
                 tx_key: key_from_txid(txid_spend),
                 offset: 0,
                 spending_data: sd,
+                current_block_height: 1000,
+                block_height_retention: 288,
                 master_generation: 0,
             },
             ReplicaOp::Freeze {
@@ -464,6 +528,8 @@ fn tcp_replicate_mixed_ops() {
                 block_height: 1000,
                 subtree_idx: 0,
                 on_longest_chain: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
                 master_generation: 0,
             },
         ],
@@ -539,6 +605,8 @@ fn tcp_catchup_missed_ops() {
             tx_key: key,
             offset: 0,
             spending_data: sd,
+            current_block_height: 1000,
+            block_height_retention: 288,
             master_generation: 0,
         });
     }
@@ -665,6 +733,8 @@ fn tcp_concurrent_replicate_and_client() {
                 tx_key: key,
                 offset: 0,
                 spending_data: sd,
+                current_block_height: 1000,
+                block_height_retention: 288,
                 master_generation: 0,
             });
         }
@@ -790,6 +860,8 @@ fn tcp_consistency_verification() {
             tx_key: key,
             offset: 0,
             spending_data: sd,
+            current_block_height: 1000,
+            block_height_retention: 288,
             master_generation: 0,
         });
     }
@@ -835,6 +907,8 @@ fn tcp_consistency_verification() {
             block_height: 1000 + i,
             subtree_idx: 0,
             on_longest_chain: true,
+            current_block_height: 1000 + i,
+            block_height_retention: 288,
             master_generation: 0,
         });
     }

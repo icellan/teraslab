@@ -108,8 +108,18 @@ impl ObservabilityConfig {
     /// * `TERASLAB_OTLP_ENDPOINT` — empty string clears the endpoint (disables OTLP).
     /// * `TERASLAB_TRACE_SAMPLING_RATIO` — must parse as `f64`; invalid values return an error.
     /// * `TERASLAB_SERVICE_NAME` — empty string clears the service name (defaults to `"teraslab"`).
+    ///
+    /// F-G6-026: every observed override is logged at `info` so operators
+    /// can confirm at startup whether their env-var-driven config landed.
+    /// A typo (e.g. `TERASLAB_OTLP_ENDPONIT`) leaves the field untouched
+    /// and the absence of the corresponding log line is the signal.
     pub fn apply_env_overrides(&mut self) -> Result<(), ObservabilityError> {
         if let Ok(v) = std::env::var(Self::ENV_OTLP_ENDPOINT) {
+            tracing::info!(
+                env_var = Self::ENV_OTLP_ENDPOINT,
+                value_set = !v.is_empty(),
+                "observability: env override applied (otlp_endpoint)",
+            );
             self.otlp_endpoint = if v.is_empty() { None } else { Some(v) };
         }
         if let Ok(v) = std::env::var(Self::ENV_SAMPLING_RATIO) {
@@ -119,9 +129,19 @@ impl ObservabilityConfig {
                     Self::ENV_SAMPLING_RATIO
                 ))
             })?;
+            tracing::info!(
+                env_var = Self::ENV_SAMPLING_RATIO,
+                value = parsed,
+                "observability: env override applied (trace_sampling_ratio)",
+            );
             self.trace_sampling_ratio = parsed;
         }
         if let Ok(v) = std::env::var(Self::ENV_SERVICE_NAME) {
+            tracing::info!(
+                env_var = Self::ENV_SERVICE_NAME,
+                value_set = !v.is_empty(),
+                "observability: env override applied (service_name)",
+            );
             self.service_name = if v.is_empty() { None } else { Some(v) };
         }
         Ok(())
@@ -210,11 +230,28 @@ pub fn init_subscriber(
 
 /// Build a `SdkTracerProvider` with a batch span processor exporting via
 /// gRPC OTLP to `endpoint`.
+///
+/// F-G6-012: emit a startup warning when the endpoint scheme is `http://`
+/// (plaintext gRPC). Span attributes today are limited (see F-G6-013
+/// positive verification), but the embedded W3C trace context flows on
+/// the cluster wire and operator-deployed collectors should encrypt the
+/// transport. We do not refuse to construct the exporter — that lives
+/// behind a future opt-in `require_tls` flag — but the operator must see
+/// the weakening.
 fn build_otlp_provider(
     endpoint: &str,
     sampling_ratio: f64,
     resource: Resource,
 ) -> Result<SdkTracerProvider, ObservabilityError> {
+    if endpoint.starts_with("http://") {
+        tracing::warn!(
+            target: "teraslab::security",
+            endpoint,
+            "OTLP endpoint is plaintext http:// — span attributes and the W3C trace \
+             context will travel unencrypted. Prefer https:// (or grpcs://) for \
+             production deployments.",
+        );
+    }
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint.to_string())
@@ -304,14 +341,30 @@ impl WireTraceContext {
 
     /// Decode a 24-byte slice. Returns `None` when the slice is all zeros.
     ///
-    /// Panics only if `buf.len() != 24`; callers are expected to slice the
-    /// fixed region out of the batch header before calling.
+    /// F-G6-021: short slices used to panic. Now we return `None` so a
+    /// malformed batch header can never crash the receiver thread; the
+    /// caller is responsible for distinguishing "no trace context" from
+    /// "bad payload" if needed (the wire format treats both the same).
+    /// Prefer [`read_from_array`](Self::read_from_array) for callers
+    /// that own a `[u8; SIZE]` and want the type system to enforce the
+    /// length invariant.
     pub fn read_from(buf: &[u8]) -> Option<Self> {
-        assert_eq!(
-            buf.len(),
-            Self::SIZE,
-            "WireTraceContext::read_from needs 24 bytes"
-        );
+        if buf.len() != Self::SIZE {
+            return None;
+        }
+        let mut trace_id = [0u8; 16];
+        trace_id.copy_from_slice(&buf[..16]);
+        let mut span_id = [0u8; 8];
+        span_id.copy_from_slice(&buf[16..]);
+        let ctx = Self { trace_id, span_id };
+        if ctx.is_zero() { None } else { Some(ctx) }
+    }
+
+    /// Decode a fixed-length 24-byte array. Type-system guarantees the
+    /// length is correct, so this entry point can never fail for length
+    /// reasons. Returns `None` only for the all-zero "no context"
+    /// sentinel.
+    pub fn read_from_array(buf: &[u8; Self::SIZE]) -> Option<Self> {
         let mut trace_id = [0u8; 16];
         trace_id.copy_from_slice(&buf[..16]);
         let mut span_id = [0u8; 8];

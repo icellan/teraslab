@@ -277,7 +277,10 @@ fn alloc_mmap_buckets(capacity: usize) -> Result<(*mut Bucket, usize, bool)> {
 ///
 /// # Safety
 ///
-/// `ptr` must point to a region of `byte_len` bytes allocated by `alloc_mmap_buckets`.
+/// `ptr` must be the exact pointer returned by [`alloc_mmap_buckets`] for
+/// this allocation, and `byte_len` must be the exact byte length returned
+/// with it. The region must not be accessed after this call, and this
+/// function must be called at most once for a given mapping.
 unsafe fn dealloc_mmap_buckets(ptr: *mut Bucket, byte_len: usize) {
     if byte_len > 0 && !ptr.is_null() {
         unsafe { libc::munmap(ptr.cast(), byte_len) };
@@ -329,30 +332,6 @@ fn sync_file_backed(table: &HashTable) -> Result<()> {
             std::io::Error::last_os_error()
         )));
     }
-    Ok(())
-}
-
-/// fsync the parent directory of `path` so that a recent rename into that
-/// directory is durable across a power failure.
-///
-/// On Unix, opens the parent directory read-only and calls
-/// [`std::fs::File::sync_all`]. On non-Unix platforms the call is a
-/// best-effort no-op (this server targets Linux/Unix).
-#[cfg(unix)]
-fn fsync_parent_dir(path: &std::path::Path) -> Result<()> {
-    let parent = path.parent().unwrap_or(std::path::Path::new("."));
-    let dir = std::fs::File::open(parent).map_err(|e| {
-        HashTableError::ResizeIo(format!("open parent dir {}: {e}", parent.display()))
-    })?;
-    dir.sync_all().map_err(|e| {
-        HashTableError::ResizeIo(format!("fsync parent dir {}: {e}", parent.display()))
-    })?;
-    Ok(())
-}
-
-/// Non-Unix fallback: best-effort no-op. See [`fsync_parent_dir`].
-#[cfg(not(unix))]
-fn fsync_parent_dir(_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
@@ -657,6 +636,39 @@ impl HashTable {
         unsafe { &mut *self.ptr.add(idx) }
     }
 
+    fn occupied_bucket_count(&self) -> usize {
+        (0..self.capacity)
+            .filter(|&idx| self.bucket(idx).is_occupied())
+            .count()
+    }
+
+    /// Validate that the cached count matches the occupied buckets.
+    pub fn validate_count_consistency(&self) -> bool {
+        self.count == self.occupied_bucket_count()
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_count_consistent(&self) {
+        if self.count.is_multiple_of(4096) {
+            debug_assert_eq!(
+                self.count,
+                self.occupied_bucket_count(),
+                "hash table cached count drifted from occupied bucket scan"
+            );
+        }
+    }
+
+    fn recompute_max_probe_distance(&self) -> usize {
+        let mut max_probe = 0usize;
+        for idx in 0..self.capacity {
+            let bucket = self.bucket(idx);
+            if bucket.is_occupied() {
+                max_probe = max_probe.max(bucket.probe_distance as usize);
+            }
+        }
+        max_probe
+    }
+
     /// Look up a transaction by key, returning the entry by value. O(1) expected.
     pub fn get_entry(&self, key: &TxKey) -> Option<TxIndexEntry> {
         let fp = txid_fingerprint(&key.txid);
@@ -736,6 +748,8 @@ impl HashTable {
                 if dist as usize > self.max_probe {
                     self.max_probe = dist as usize;
                 }
+                #[cfg(debug_assertions)]
+                self.debug_assert_count_consistent();
                 return Ok(None);
             }
 
@@ -763,6 +777,17 @@ impl HashTable {
                 });
             }
         }
+    }
+
+    fn copy_entries_into(&self, new_table: &mut HashTable) -> Result<()> {
+        for i in 0..self.capacity {
+            let bucket = self.bucket(i);
+            if bucket.is_occupied() {
+                let key = TxKey { txid: bucket.txid };
+                new_table.insert(key, bucket.entry())?;
+            }
+        }
+        Ok(())
     }
 
     /// Remove an entry by key. Returns the removed entry if it existed.
@@ -819,6 +844,9 @@ impl HashTable {
             empty_idx = next_idx;
         }
         *self.bucket_mut(empty_idx) = Bucket::empty();
+        self.max_probe = self.recompute_max_probe_distance();
+        #[cfg(debug_assertions)]
+        self.debug_assert_count_consistent();
 
         Some(removed)
     }
@@ -983,21 +1011,33 @@ impl HashTable {
             return Ok(());
         }
 
+        let new_table = self.build_resized(new_cap)?;
+        *self = new_table;
+        Ok(())
+    }
+
+    /// Build a resized copy of this table without mutating the current mapping.
+    ///
+    /// Callers can run this while holding a shared/upgradable read lock over the
+    /// owning index: existing readers keep using the old mapping while the copy
+    /// is built, and the caller later swaps the returned table under an exclusive
+    /// lock. This removes the O(entries) rehash from the reader-blocking section.
+    pub(crate) fn build_resized(&self, new_capacity: usize) -> Result<Self> {
+        let new_cap = new_capacity.next_power_of_two().max(16);
+        if new_cap <= self.capacity {
+            return Err(HashTableError::ResizeIo(format!(
+                "resized copy target {new_cap} is not larger than current capacity {}",
+                self.capacity
+            )));
+        }
+
         // Fast path: anonymous table. No journaling required because the
         // allocation is purely in-memory; a crash loses the table anyway.
         if matches!(self.backing, Backing::Anonymous) {
             let mut new_table = HashTable::new(new_cap)?;
-            for i in 0..self.capacity {
-                let bucket = self.bucket(i);
-                if bucket.is_occupied() {
-                    let key = TxKey { txid: bucket.txid };
-                    new_table.insert(key, bucket.entry())?;
-                }
-            }
-            let saved_redo = self.redo_log.take();
-            *self = new_table;
-            self.redo_log = saved_redo;
-            return Ok(());
+            self.copy_entries_into(&mut new_table)?;
+            new_table.redo_log = self.redo_log.clone();
+            return Ok(new_table);
         }
 
         // File-backed path with crash-atomic rename.
@@ -1024,13 +1064,7 @@ impl HashTable {
         // Remove any stale tmp file from a prior aborted resize.
         let _ = std::fs::remove_file(&tmp_path);
         let mut new_table = HashTable::open_file_backed(&tmp_path, new_cap)?;
-        for i in 0..self.capacity {
-            let bucket = self.bucket(i);
-            if bucket.is_occupied() {
-                let key = TxKey { txid: bucket.txid };
-                new_table.insert(key, bucket.entry())?;
-            }
-        }
+        self.copy_entries_into(&mut new_table)?;
 
         // Step 3: msync + fsync the tmp file so its contents are durable
         // on disk before the rename.
@@ -1052,7 +1086,9 @@ impl HashTable {
         crate::fault_injection::check(crate::fault_injection::SyncPoint::MidHashtableResize);
 
         // Step 5: fsync the parent directory so the rename is durable.
-        fsync_parent_dir(&old_path)?;
+        super::util::fsync_parent_dir(&old_path).map_err(|e| {
+            HashTableError::ResizeIo(format!("fsync parent dir {}: {e}", old_path.display()))
+        })?;
 
         // Adjust the new table's recorded path to the original path so
         // subsequent reopens find the right file.
@@ -1071,12 +1107,8 @@ impl HashTable {
                 .map_err(|e| HashTableError::ResizeRedo(format!("commit append: {e}")))?;
         }
 
-        // Carry the redo log handle across the struct swap so subsequent
-        // resizes remain journaled.
-        let saved_redo = self.redo_log.take();
-        *self = new_table;
-        self.redo_log = saved_redo;
-        Ok(())
+        new_table.redo_log = self.redo_log.clone();
+        Ok(new_table)
     }
 
     /// Iterate over all occupied `(TxKey, TxIndexEntry)` pairs.
@@ -1236,6 +1268,23 @@ mod tests {
         assert_eq!(removed, Some(entry));
         assert!(t.get_entry(&key).is_none());
         assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn hashtable_count_consistency() {
+        let mut t = HashTable::new(64).unwrap();
+        let keys: Vec<_> = (0..32).map(make_key).collect();
+        for (i, key) in keys.iter().enumerate() {
+            t.insert(*key, make_entry(i as u64 * 4096)).unwrap();
+        }
+        assert!(t.validate_count_consistency());
+        assert_eq!(t.len(), 32);
+
+        for key in keys.iter().take(12) {
+            assert!(t.remove(key).is_some());
+        }
+        assert!(t.validate_count_consistency());
+        assert_eq!(t.len(), 20);
     }
 
     #[test]
@@ -1408,6 +1457,26 @@ mod tests {
             "probe distance {} too high",
             t.max_probe_distance()
         );
+    }
+
+    #[test]
+    fn max_probe_distance_recomputed_after_remove() {
+        let mut t = HashTable::new(64).unwrap();
+        let mask = t.capacity() - 1;
+        let ka = make_colliding_key(5, 1, mask);
+        let kb = make_colliding_key(5, 2, mask);
+        let kc = make_colliding_key(5, 3, mask);
+
+        t.insert(ka, make_entry(1)).unwrap();
+        t.insert(kb, make_entry(2)).unwrap();
+        t.insert(kc, make_entry(3)).unwrap();
+        assert_eq!(t.max_probe_distance(), 2);
+
+        assert!(t.remove(&kc).is_some());
+        assert_eq!(t.max_probe_distance(), 1);
+
+        assert!(t.remove(&kb).is_some());
+        assert_eq!(t.max_probe_distance(), 0);
     }
 
     // -- Tombstone / delete tests --

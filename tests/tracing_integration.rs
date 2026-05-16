@@ -177,6 +177,7 @@ fn seed_record(engine: &Engine, tx_n: u32, utxo_count: u32) {
         frozen: false,
         conflicting: false,
         locked: false,
+        external_ref: None,
         parent_txids: &[],
     };
     engine.create(&req).unwrap();
@@ -334,6 +335,8 @@ fn replication_receiver_inherits_wire_trace_context() {
             tx_key: TxKey { txid: mktx(42) },
             offset: 0,
             spending_data: [0xAB; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
             master_generation: 1,
         }],
         trace_ctx: Some(wire_ctx),

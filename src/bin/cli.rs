@@ -52,7 +52,11 @@ struct Cli {
     addr: String,
 
     /// Binary protocol address for record lookups and bench.
-    #[arg(long, default_value = "localhost:3000", global = true)]
+    // F-G10-009: aligned to the server's default `listen_addr =
+    // 127.0.0.1:3300`. Pre-fix this defaulted to `localhost:3000` so a
+    // fresh `teraslab-cli bench ping` against a default server failed to
+    // connect — an out-of-the-box footgun on first try.
+    #[arg(long, default_value = "127.0.0.1:3300", global = true)]
     data_addr: String,
 
     /// Output JSON instead of formatted tables.

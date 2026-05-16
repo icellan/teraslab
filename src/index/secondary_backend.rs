@@ -9,8 +9,8 @@
 use crate::index::IndexError;
 use crate::index::dah_index::{DahIndex, DahRedoEntry};
 use crate::index::hashtable::TxKey;
-use crate::index::redb_dah::RedbDahIndex;
-use crate::index::redb_unmined::RedbUnminedIndex;
+use crate::index::redb_dah::{RedbDahIndex, RedbDahIter};
+use crate::index::redb_unmined::{RedbUnminedIndex, RedbUnminedIter};
 use crate::index::unmined_index::{UnminedIndex, UnminedRedoEntry};
 use crate::redo::RedoLog;
 use parking_lot::Mutex;
@@ -23,8 +23,8 @@ use parking_lot::Mutex;
 pub enum DahIter<'a> {
     /// In-memory index iterator (opaque `impl Iterator`).
     InMemory(Box<dyn Iterator<Item = (u32, TxKey)> + 'a>),
-    /// Collected entries from on-disk backend.
-    Collected(std::vec::IntoIter<(u32, TxKey)>),
+    /// Bounded-batch redb iterator.
+    Redb(RedbDahIter<'a>),
 }
 
 impl Iterator for DahIter<'_> {
@@ -33,14 +33,14 @@ impl Iterator for DahIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::InMemory(it) => it.next(),
-            Self::Collected(it) => it.next(),
+            Self::Redb(it) => it.next(),
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
             Self::InMemory(it) => it.size_hint(),
-            Self::Collected(it) => it.size_hint(),
+            Self::Redb(it) => it.size_hint(),
         }
     }
 }
@@ -49,8 +49,8 @@ impl Iterator for DahIter<'_> {
 pub enum UnminedIter<'a> {
     /// In-memory index iterator (opaque `impl Iterator`).
     InMemory(Box<dyn Iterator<Item = (u32, TxKey)> + 'a>),
-    /// Collected entries from on-disk backend.
-    Collected(std::vec::IntoIter<(u32, TxKey)>),
+    /// Bounded-batch redb iterator.
+    Redb(RedbUnminedIter<'a>),
 }
 
 impl Iterator for UnminedIter<'_> {
@@ -59,14 +59,14 @@ impl Iterator for UnminedIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::InMemory(it) => it.next(),
-            Self::Collected(it) => it.next(),
+            Self::Redb(it) => it.next(),
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
             Self::InMemory(it) => it.size_hint(),
-            Self::Collected(it) => it.size_hint(),
+            Self::Redb(it) => it.size_hint(),
         }
     }
 }
@@ -186,7 +186,7 @@ impl DahBackend {
     pub fn iter(&self) -> DahIter<'_> {
         match self {
             Self::InMemory(idx) => DahIter::InMemory(Box::new(idx.iter())),
-            Self::OnDisk(redb) => DahIter::Collected(redb.iter().into_iter()),
+            Self::OnDisk(redb) => DahIter::Redb(redb.iter_streaming()),
         }
     }
 }
@@ -308,7 +308,7 @@ impl UnminedBackend {
     pub fn iter(&self) -> UnminedIter<'_> {
         match self {
             Self::InMemory(idx) => UnminedIter::InMemory(Box::new(idx.iter())),
-            Self::OnDisk(redb) => UnminedIter::Collected(redb.iter().into_iter()),
+            Self::OnDisk(redb) => UnminedIter::Redb(redb.iter_streaming()),
         }
     }
 
@@ -610,7 +610,7 @@ mod tests {
 
     #[test]
     fn dah_iter_size_hint() {
-        // On-disk (Collected variant) gives exact bounds
+        // On-disk streaming iterators only report the currently buffered batch.
         let dir = tempfile::tempdir().unwrap();
         let mut redb =
             RedbDahIndex::open(dir.path().join("dah.redb").as_path(), 16 * 1024 * 1024).unwrap();
@@ -618,15 +618,15 @@ mod tests {
         redb.insert(200, key(2), None).unwrap();
         redb.insert(300, key(3), None).unwrap();
         let disk = DahBackend::OnDisk(redb);
-        let iter = disk.iter();
-        let (lower, upper) = iter.size_hint();
-        assert_eq!(lower, 3);
-        assert_eq!(upper, Some(3));
+        let mut iter = disk.iter();
+        assert_eq!(iter.size_hint(), (0, None));
+        assert_eq!(iter.by_ref().count(), 3);
+        assert_eq!(iter.size_hint(), (0, None));
     }
 
     #[test]
     fn unmined_iter_size_hint() {
-        // On-disk (Collected variant) gives exact bounds
+        // On-disk streaming iterators only report the currently buffered batch.
         let dir = tempfile::tempdir().unwrap();
         let mut redb =
             RedbUnminedIndex::open(dir.path().join("unmined.redb").as_path(), 16 * 1024 * 1024)
@@ -634,10 +634,10 @@ mod tests {
         redb.insert(100, key(1), None).unwrap();
         redb.insert(200, key(2), None).unwrap();
         let disk = UnminedBackend::OnDisk(redb);
-        let iter = disk.iter();
-        let (lower, upper) = iter.size_hint();
-        assert_eq!(lower, 2);
-        assert_eq!(upper, Some(2));
+        let mut iter = disk.iter();
+        assert_eq!(iter.size_hint(), (0, None));
+        assert_eq!(iter.by_ref().count(), 2);
+        assert_eq!(iter.size_hint(), (0, None));
     }
 
     #[test]

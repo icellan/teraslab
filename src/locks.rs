@@ -1,7 +1,7 @@
 //! Per-transaction lock striping for concurrent access.
 //!
-//! Uses bytes 16–17 of the txid (different from index bucket and fingerprint
-//! bytes) to select one of 65536 mutexes. This ensures that concurrent
+//! Uses bytes 16–23 of the txid (different from index bucket and fingerprint
+//! bytes) to select one of the configured mutex stripes. This ensures that concurrent
 //! operations on different transactions do not contend.
 
 use crate::index::TxKey;
@@ -34,8 +34,11 @@ impl StripedLocks {
 
     /// Compute which stripe a key maps to.
     pub fn stripe_index(&self, key: &TxKey) -> usize {
-        // Use bytes 16–17 (different from bucket index [0–7] and fingerprint [8–15])
-        let h = u16::from_le_bytes([key.txid[16], key.txid[17]]) as usize;
+        // Use bytes 16–23 (different from bucket index [0–7] and fingerprint [8–15]).
+        // This preserves distribution when operators configure more than 65,536 stripes.
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&key.txid[16..24]);
+        let h = u64::from_le_bytes(bytes) as usize;
         h & self.mask
     }
 
@@ -52,8 +55,8 @@ mod tests {
     fn make_key(n: u64) -> TxKey {
         let mut txid = [0u8; 32];
         txid[0..8].copy_from_slice(&n.to_le_bytes());
-        // Vary bytes 16-17 for stripe distribution
-        txid[16..18].copy_from_slice(&(n as u16).to_le_bytes());
+        // Vary bytes 16-23 for stripe distribution
+        txid[16..24].copy_from_slice(&n.to_le_bytes());
         TxKey { txid }
     }
 
@@ -113,6 +116,15 @@ mod tests {
             "poor stripe distribution: only {} distinct",
             seen.len()
         );
+    }
+
+    #[test]
+    fn stripe_index_large_lock_count_uses_more_than_16_bits() {
+        let locks = StripedLocks::new(1 << 17);
+        let low = make_key(1);
+        let high = make_key((1 << 16) + 1);
+
+        assert_ne!(locks.stripe_index(&low), locks.stripe_index(&high));
     }
 
     #[test]

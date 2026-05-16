@@ -304,6 +304,7 @@ impl Simulation {
                             frozen: false,
                             conflicting: false,
                             locked: false,
+                            external_ref: None,
                             parent_txids: &[],
                         };
                         if engine.create(&req).is_ok() {
@@ -360,6 +361,7 @@ impl Simulation {
                     frozen: false,
                     conflicting: false,
                     locked: false,
+                    external_ref: None,
                     parent_txids: &[],
                 };
 

@@ -54,6 +54,8 @@ pub struct ReplicationReceiver {
     /// non-zero) to fence stale-epoch masters before any engine work.
     /// `0` means "unknown" — accept unconditionally (V1-compat).
     local_cluster_key: Arc<AtomicU64>,
+    /// Shared HMAC secret for authenticated inter-node TCP frames.
+    auth_secret: Option<Arc<Vec<u8>>>,
 }
 
 impl ReplicationReceiver {
@@ -82,7 +84,14 @@ impl ReplicationReceiver {
             running: Arc::new(AtomicBool::new(true)),
             applied: Arc::new(ReplicaAppliedTracker::in_memory()),
             local_cluster_key,
+            auth_secret: None,
         }
+    }
+
+    /// Require HMAC-framed request/response traffic on this receiver.
+    pub fn with_auth_secret(mut self, secret: Vec<u8>) -> Self {
+        self.auth_secret = Some(Arc::new(secret));
+        self
     }
 
     /// Create a receiver with persistent idempotency state.
@@ -108,6 +117,7 @@ impl ReplicationReceiver {
             running: Arc::new(AtomicBool::new(true)),
             applied: Arc::new(tracker),
             local_cluster_key: Arc::new(AtomicU64::new(0)),
+            auth_secret: None,
         })
     }
 
@@ -151,6 +161,7 @@ impl ReplicationReceiver {
         let last_applied = self.last_applied_sequence.clone();
         let applied = self.applied.clone();
         let cluster_key = self.local_cluster_key.clone();
+        let auth_secret = self.auth_secret.clone();
 
         std::thread::spawn(move || {
             while running.load(Ordering::Relaxed) {
@@ -161,8 +172,17 @@ impl ReplicationReceiver {
                         let la = last_applied.clone();
                         let ap = applied.clone();
                         let ck = cluster_key.clone();
+                        let secret = auth_secret.clone();
                         std::thread::spawn(move || {
-                            handle_connection(&eng, stream, peer_addr, &run, &la, ap, ck);
+                            let ctx = ConnectionContext {
+                                engine: &eng,
+                                running: &run,
+                                last_applied: &la,
+                                applied: ap,
+                                local_cluster_key: ck,
+                                auth_secret: secret,
+                            };
+                            handle_connection(stream, peer_addr, ctx);
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -204,15 +224,25 @@ impl ReplicationReceiver {
 /// already-applied prefixes, applies every remaining op to the
 /// engine, persists the updated applied sequence to disk, and sends
 /// back a `ReplicaAck` response.
-fn handle_connection(
-    engine: &Engine,
-    mut stream: TcpStream,
-    peer_addr: SocketAddr,
-    running: &AtomicBool,
-    last_applied: &AtomicU64,
+struct ConnectionContext<'a> {
+    engine: &'a Engine,
+    running: &'a AtomicBool,
+    last_applied: &'a AtomicU64,
     applied: Arc<ReplicaAppliedTracker>,
     local_cluster_key: Arc<AtomicU64>,
-) {
+    auth_secret: Option<Arc<Vec<u8>>>,
+}
+
+fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: ConnectionContext<'_>) {
+    let ConnectionContext {
+        engine,
+        running,
+        last_applied,
+        applied,
+        local_cluster_key,
+        auth_secret,
+    } = ctx;
+
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     // Disable Nagle's algorithm on the accepted replication socket so
@@ -224,6 +254,8 @@ fn handle_connection(
     // own deduplication state. Re-using the same key across reconnects
     // from the same peer intentionally preserves last_applied_seq.
     let stream_key = peer_addr.to_string();
+    let mut body = Vec::new();
+    let mut frame_bytes = Vec::new();
 
     loop {
         if !running.load(Ordering::Relaxed) {
@@ -241,24 +273,61 @@ fn handle_connection(
         }
 
         let total_length = u32::from_le_bytes(len_buf);
-        if total_length > MAX_FRAME_SIZE {
+        let max_wire_frame_size = MAX_FRAME_SIZE
+            + auth_secret
+                .as_ref()
+                .map(|_| crate::cluster::auth::SIGNED_SUFFIX_LEN as u32)
+                .unwrap_or(0);
+        if total_length > max_wire_frame_size {
             // Frame too large, close connection
             return;
         }
 
         // Read the frame body
         let frame_len = total_length as usize;
-        let mut body = vec![0u8; frame_len];
-        if stream.read_exact(&mut body).is_err() {
+        if body.len() < frame_len {
+            body.resize(frame_len, 0);
+        }
+        if stream.read_exact(&mut body[..frame_len]).is_err() {
             return;
         }
 
         // Reconstruct and decode full frame
-        let mut frame_bytes = Vec::with_capacity(4 + frame_len);
+        frame_bytes.clear();
+        frame_bytes.reserve(4 + frame_len);
         frame_bytes.extend_from_slice(&len_buf);
-        frame_bytes.extend_from_slice(&body);
+        frame_bytes.extend_from_slice(&body[..frame_len]);
 
-        let (request, _) = match RequestFrame::decode(&frame_bytes) {
+        let request_id = if frame_bytes.len() >= 12 {
+            u64::from_le_bytes(frame_bytes[4..12].try_into().unwrap_or([0; 8]))
+        } else {
+            0
+        };
+        let verified_frame;
+        let request_frame_bytes: &[u8] = if let Some(secret) = auth_secret.as_deref() {
+            match crate::cluster::auth::verify_frame(secret.as_slice(), &frame_bytes) {
+                Ok(verified) => {
+                    verified_frame = verified;
+                    &verified_frame
+                }
+                Err(e) => {
+                    let response = ResponseFrame {
+                        request_id,
+                        status: STATUS_ERROR,
+                        payload: crate::protocol::codec::encode_error_payload(
+                            ERR_CLUSTER_AUTH_FAILED,
+                            &format!("cluster frame authentication failed: {e}"),
+                        ),
+                    };
+                    let _ = stream.write_all(&response.encode());
+                    return;
+                }
+            }
+        } else {
+            &frame_bytes
+        };
+
+        let (request, _) = match RequestFrame::decode(request_frame_bytes) {
             Ok(r) => r,
             Err(_) => return,
         };
@@ -281,7 +350,15 @@ fn handle_connection(
             }
         };
 
-        let response_bytes = response.encode();
+        let encoded_response = response.encode();
+        let response_bytes = if let Some(secret) = auth_secret.as_deref() {
+            match crate::cluster::auth::sign_frame(secret.as_slice(), &encoded_response) {
+                Ok(bytes) => bytes,
+                Err(_) => return,
+            }
+        } else {
+            encoded_response
+        };
         if stream.write_all(&response_bytes).is_err() {
             return;
         }
@@ -398,7 +475,7 @@ pub fn handle_replica_batch_with_tracker(
             };
             return ResponseFrame {
                 request_id: request.request_id,
-                status: STATUS_OK,
+                status: STATUS_ERROR,
                 payload: ack.serialize(),
             };
         }
@@ -546,7 +623,7 @@ pub fn handle_replica_batch_with_tracker(
             };
             return ResponseFrame {
                 request_id: request.request_id,
-                status: STATUS_OK,
+                status: STATUS_ERROR,
                 payload: ack.serialize(),
             };
         }
@@ -569,7 +646,7 @@ pub fn handle_replica_batch_with_tracker(
             };
             return ResponseFrame {
                 request_id: request.request_id,
-                status: STATUS_OK,
+                status: STATUS_ERROR,
                 payload: ack.serialize(),
             };
         }
@@ -653,6 +730,11 @@ fn apply_create_replica(
                 Ok(()) | Err(crate::ops::error::SpendError::TxNotFound) => {}
                 Err(e) => return Err(format!("replace duplicate create delete: {e}")),
             }
+            if let Some(bs) = engine.blob_store()
+                && let Err(e) = bs.delete(&tx_key.txid)
+            {
+                return Err(format!("replace duplicate create blob delete: {e}"));
+            }
             engine
                 .create(create_req)
                 .map_err(|e| format!("replace duplicate create: {e}"))?;
@@ -723,17 +805,19 @@ fn apply_create_lifecycle_and_blob(
 /// way that should abort the batch.
 pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), String> {
     // Pre-apply generation guard: reject stale ops BEFORE mutating state.
-    // An op is stale if its master_generation is strictly less than the
-    // record's current generation — a newer mutation has already been applied.
-    // Equal-generation replays are allowed through since all mutation ops
-    // are idempotent and the generation sync at the end is a no-op.
-    // Ops without master_generation (Create, Delete, PruneSlot) skip this
-    // check; they rely on idempotency in their match arms instead.
+    // An op is stale if the record's current generation is strictly ahead of
+    // the master's generation under wrapping serial-number ordering. A target
+    // generation is fresh only when it is within the next half of the u32
+    // space from the local generation, so u32::MAX -> 0 is accepted.
+    // Equal-generation replays are allowed through since all mutation ops are
+    // idempotent and the generation sync at the end is a no-op.
+    // Ops without master_generation (legacy Create, Delete, PruneSlot) skip
+    // this check; they rely on idempotency in their match arms instead.
     if let Some(master_gen) = op.master_generation() {
         let tx_key = op.tx_key();
         if let Ok(meta) = engine.read_metadata(&tx_key) {
             let local_gen = { meta.generation };
-            if master_gen < local_gen {
+            if local_gen != master_gen && generation_at_or_ahead(local_gen, master_gen) {
                 return Ok(()); // Stale op — already superseded by a newer mutation
             }
         }
@@ -746,6 +830,8 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             tx_key,
             offset,
             spending_data,
+            current_block_height,
+            block_height_retention,
             ..
         } => {
             // Read the slot to get the UTXO hash
@@ -763,11 +849,8 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 spending_data: *spending_data,
                 ignore_conflicting: true,
                 ignore_locked: true,
-                // Use u32::MAX to bypass spendable_height cooldown check.
-                // The master already validated the block height constraint;
-                // the replica just applies the mutation.
-                current_block_height: u32::MAX,
-                block_height_retention: 0,
+                current_block_height: *current_block_height,
+                block_height_retention: *block_height_retention,
             };
             match engine.spend(&req) {
                 Ok(_) => Ok(()),
@@ -780,22 +863,28 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 Err(e) => Err(format!("spend: {e}")),
             }
         }
-        ReplicaOp::Unspend { tx_key, offset, .. } => {
-            let hash = match engine.read_slot(tx_key, *offset) {
-                Ok(slot) => slot.hash,
+        ReplicaOp::Unspend {
+            tx_key,
+            offset,
+            spending_data,
+            current_block_height,
+            block_height_retention,
+            ..
+        } => {
+            let slot = match engine.read_slot(tx_key, *offset) {
+                Ok(slot) => slot,
                 Err(_) => return Ok(()),
             };
             let req = UnspendRequest {
                 tx_key: *tx_key,
                 offset: *offset,
-                utxo_hash: hash,
-                current_block_height: 0,
-                block_height_retention: 0,
+                utxo_hash: slot.hash,
+                spending_data: *spending_data,
+                current_block_height: *current_block_height,
+                block_height_retention: *block_height_retention,
             };
             match engine.unspend(&req) {
                 Ok(_) => Ok(()),
-                // Already unspent is fine (idempotent)
-                Err(crate::ops::error::SpendError::InvalidSpend { .. }) => Ok(()),
                 Err(e) => Err(format!("unspend: {e}")),
             }
         }
@@ -805,6 +894,8 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             block_height,
             subtree_idx,
             on_longest_chain,
+            current_block_height,
+            block_height_retention,
             ..
         } => {
             let req = SetMinedRequest {
@@ -812,8 +903,8 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 block_id: *block_id,
                 block_height: *block_height,
                 subtree_idx: *subtree_idx,
-                current_block_height: *block_height,
-                block_height_retention: 288,
+                current_block_height: *current_block_height,
+                block_height_retention: *block_height_retention,
                 on_longest_chain: *on_longest_chain,
                 unset_mined: false,
             };
@@ -824,15 +915,19 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             }
         }
         ReplicaOp::UnsetMined {
-            tx_key, block_id, ..
+            tx_key,
+            block_id,
+            current_block_height,
+            block_height_retention,
+            ..
         } => {
             let req = SetMinedRequest {
                 tx_key: *tx_key,
                 block_id: *block_id,
                 block_height: 0,
                 subtree_idx: 0,
-                current_block_height: 0,
-                block_height_retention: 288,
+                current_block_height: *current_block_height,
+                block_height_retention: *block_height_retention,
                 on_longest_chain: false,
                 unset_mined: true,
             };
@@ -1012,10 +1107,12 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
 
             // Parse extended fields at offset 70+: block_height(4) +
             // block_count(1) + [block_id(4)+block_height(4)+subtree_idx(4)]*N +
-            // parent_txid_count(2) + parent_txids(32*N).
+            // parent_txid_count(2) + parent_txids(32*N) +
+            // optional ExternalRef(65).
             let mut block_height = 0u32;
             let mut mined_block_infos = Vec::new();
             let mut parent_txids: Vec<[u8; 32]> = Vec::new();
+            let mut external_ref = None;
             if metadata_bytes.len() >= 75 {
                 let m = metadata_bytes.as_slice();
                 block_height = u32::from_le_bytes(m[70..74].try_into().unwrap());
@@ -1046,6 +1143,23 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                         pos += 32;
                     }
                 }
+                if *is_external && pos + 65 <= m.len() {
+                    let mut content_hash = [0u8; 32];
+                    content_hash.copy_from_slice(&m[pos + 1..pos + 33]);
+                    external_ref = Some(ExternalRef {
+                        store_type: m[pos],
+                        content_hash,
+                        total_size: u64::from_le_bytes(m[pos + 33..pos + 41].try_into().unwrap()),
+                        input_count: u32::from_le_bytes(m[pos + 41..pos + 45].try_into().unwrap()),
+                        output_count: u32::from_le_bytes(m[pos + 45..pos + 49].try_into().unwrap()),
+                        inputs_offset: u64::from_le_bytes(
+                            m[pos + 49..pos + 57].try_into().unwrap(),
+                        ),
+                        outputs_offset: u64::from_le_bytes(
+                            m[pos + 57..pos + 65].try_into().unwrap(),
+                        ),
+                    });
+                }
             }
 
             let create_req = CreateRequest {
@@ -1068,6 +1182,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 frozen,
                 conflicting,
                 locked,
+                external_ref,
                 parent_txids: &parent_txids,
             };
             apply_create_replica(engine, tx_key, &create_req, metadata_bytes, cold_data)
@@ -1101,6 +1216,14 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 .map_err(|e| format!("prune_slot: {e}"))?;
             Ok(())
         }
+        ReplicaOp::PruneSlotIfSpentBy {
+            tx_key,
+            offset,
+            child_txid,
+        } => engine
+            .prune_slot_if_spent_by_child(tx_key, *offset, *child_txid)
+            .map(|_| ())
+            .map_err(|e| format!("prune_slot_if_spent_by: {e}")),
         ReplicaOp::MarkLongestChain {
             tx_key,
             on_longest_chain,
@@ -1109,20 +1232,19 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             master_generation,
         } => {
             // R-053: idempotency-by-generation. The pre-apply guard at
-            // the top of `apply_op` already rejects strictly-stale ops
-            // (`master_gen < local_gen`). For MarkLongestChain we also
-            // need to skip the equal-generation case: re-applying the
-            // same `MarkLongestChain` would otherwise bump generation
-            // again on the engine and write a stale `unmined_since`/DAH
-            // pair into the secondary indexes, even though the post-
-            // apply generation sync at the bottom of `apply_op` would
-            // immediately overwrite it back to `master_generation`. The
-            // visible effect would be a DAH index churn on every replay.
-            // Treating the equal-generation case as a no-op makes the
-            // op fully idempotent on the replica.
+            // the top of `apply_op` already rejects strictly-stale ops under
+            // wrapping generation ordering. For MarkLongestChain we also need
+            // to skip the equal-generation case: re-applying the same
+            // `MarkLongestChain` would otherwise bump generation again on the
+            // engine and write a stale `unmined_since`/DAH pair into the
+            // secondary indexes, even though the post-apply generation sync
+            // at the bottom of `apply_op` would immediately overwrite it back
+            // to `master_generation`. The visible effect would be a DAH index
+            // churn on every replay. Treating local at-or-ahead as a no-op
+            // makes the op fully idempotent on the replica.
             if let Ok(meta) = engine.read_metadata(tx_key) {
                 let local_gen = { meta.generation };
-                if local_gen >= *master_generation {
+                if generation_at_or_ahead(local_gen, *master_generation) {
                     return Ok(());
                 }
             }
@@ -1144,8 +1266,8 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
     // to the master's value. The engine auto-increments generation on
     // every mutation, but the replica must use the master's generation
     // so both sides agree. The pre-apply guard above already rejected
-    // stale ops (master_gen <= local_gen), so here we unconditionally
-    // set the generation to the master's value.
+    // strictly-stale ops under wrapping generation ordering, so here we
+    // unconditionally set the generation to the master's value.
     //
     // R-035 (LMNH-31): the previous implementation swallowed
     // `read_metadata` and `write_metadata` errors with `let _ = ...`
@@ -1212,6 +1334,8 @@ fn build_post_apply_redo_op(
             tx_key,
             offset,
             spending_data,
+            current_block_height,
+            block_height_retention,
             ..
         } => {
             let meta = match engine.read_metadata(tx_key) {
@@ -1219,23 +1343,39 @@ fn build_post_apply_redo_op(
                 Err(_) => return Ok(None),
             };
             let new_spent_count = { meta.spent_utxos };
-            Ok(Some(RedoOp::Spend {
+            Ok(Some(RedoOp::SpendV2 {
                 tx_key: *tx_key,
                 offset: *offset,
                 spending_data: *spending_data,
                 new_spent_count,
+                current_block_height: *current_block_height,
+                block_height_retention: *block_height_retention,
+                target_generation: { meta.generation },
+                updated_at: { meta.updated_at },
             }))
         }
-        ReplicaOp::Unspend { tx_key, offset, .. } => {
+        ReplicaOp::Unspend {
+            tx_key,
+            offset,
+            spending_data,
+            current_block_height,
+            block_height_retention,
+            ..
+        } => {
             let meta = match engine.read_metadata(tx_key) {
                 Ok(m) => m,
                 Err(_) => return Ok(None),
             };
             let new_spent_count = { meta.spent_utxos };
-            Ok(Some(RedoOp::Unspend {
+            Ok(Some(RedoOp::UnspendV2 {
                 tx_key: *tx_key,
                 offset: *offset,
+                spending_data: *spending_data,
                 new_spent_count,
+                current_block_height: *current_block_height,
+                block_height_retention: *block_height_retention,
+                target_generation: { meta.generation },
+                updated_at: { meta.updated_at },
             }))
         }
         ReplicaOp::SetMined {
@@ -1260,14 +1400,28 @@ fn build_post_apply_redo_op(
             subtree_idx: 0,
             unset: true,
         })),
-        ReplicaOp::Freeze { tx_key, offset, .. } => Ok(Some(RedoOp::Freeze {
-            tx_key: *tx_key,
-            offset: *offset,
-        })),
-        ReplicaOp::Unfreeze { tx_key, offset, .. } => Ok(Some(RedoOp::Unfreeze {
-            tx_key: *tx_key,
-            offset: *offset,
-        })),
+        ReplicaOp::Freeze { tx_key, offset, .. } => {
+            let slot = match engine.read_slot(tx_key, *offset) {
+                Ok(slot) => slot,
+                Err(_) => return Ok(None),
+            };
+            Ok(Some(RedoOp::FreezeV2 {
+                tx_key: *tx_key,
+                offset: *offset,
+                utxo_hash: slot.hash,
+            }))
+        }
+        ReplicaOp::Unfreeze { tx_key, offset, .. } => {
+            let slot = match engine.read_slot(tx_key, *offset) {
+                Ok(slot) => slot,
+                Err(_) => return Ok(None),
+            };
+            Ok(Some(RedoOp::UnfreezeV2 {
+                tx_key: *tx_key,
+                offset: *offset,
+                utxo_hash: slot.hash,
+            }))
+        }
         ReplicaOp::Reassign {
             tx_key,
             offset,
@@ -1347,6 +1501,39 @@ fn build_post_apply_redo_op(
             tx_key: *tx_key,
             offset: *offset,
         })),
+        ReplicaOp::PruneSlotIfSpentBy {
+            tx_key,
+            offset,
+            child_txid,
+        } => Ok(Some(RedoOp::PruneSlotIfSpentBy {
+            tx_key: *tx_key,
+            offset: *offset,
+            child_txid: *child_txid,
+        })),
+        // R-052 ReplicaOp variant. Mirror the master-side
+        // RedoOp::MarkOnLongestChain entry so the replica's local
+        // recovery can replay this op (R-034 contract). The redo
+        // entry's `generation` field is the post-apply generation
+        // we just wrote — read it from on-device metadata.
+        ReplicaOp::MarkLongestChain {
+            tx_key,
+            on_longest_chain,
+            current_block_height,
+            block_height_retention,
+            ..
+        } => {
+            let meta = match engine.read_metadata(tx_key) {
+                Ok(m) => m,
+                Err(_) => return Ok(None),
+            };
+            Ok(Some(RedoOp::MarkOnLongestChain {
+                tx_key: *tx_key,
+                on_longest_chain: *on_longest_chain,
+                current_block_height: *current_block_height,
+                block_height_retention: *block_height_retention,
+                generation: { meta.generation },
+            }))
+        }
     }
 }
 
@@ -1396,10 +1583,46 @@ mod tests {
         ))
     }
 
+    fn make_engine_with_blob_store(
+        store: Arc<crate::storage::blobstore::MemoryBlobStore>,
+    ) -> Arc<Engine> {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let mut engine = Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        engine.set_blob_store(store);
+        Arc::new(engine)
+    }
+
     fn key(n: u8) -> TxKey {
         let mut txid = [0u8; 32];
         txid[0] = n;
         TxKey { txid }
+    }
+
+    #[test]
+    fn receiver_reuses_buffer_per_connection() {
+        let source = include_str!("receiver.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("receiver.rs contains production section");
+        assert!(
+            !production.contains("let mut body = vec![0u8; frame_len]"),
+            "replication receiver must reuse per-connection frame buffers",
+        );
+        assert!(
+            production.contains("let mut body = Vec::new();"),
+            "replication receiver must allocate the reusable body buffer outside the hot loop",
+        );
     }
 
     fn create_record(engine: &Engine, k: TxKey, utxo_count: u32) {
@@ -1431,9 +1654,17 @@ mod tests {
             frozen: false,
             conflicting: false,
             locked: false,
+            external_ref: None,
             parent_txids: &[],
         };
         engine.create(&req).unwrap();
+    }
+
+    fn set_generation(engine: &Engine, k: TxKey, generation: u32) {
+        let entry = engine.lookup(&k).unwrap();
+        let mut meta = engine.read_metadata(&k).unwrap();
+        meta.generation = generation;
+        io::write_metadata(engine.device(), entry.record_offset, &meta).unwrap();
     }
 
     #[test]
@@ -1449,6 +1680,8 @@ mod tests {
             tx_key: k,
             offset: 0,
             spending_data: [0xAB; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
             master_generation: 0,
         };
         apply_op(&engine, &op).unwrap();
@@ -1456,6 +1689,92 @@ mod tests {
         let slot = engine.read_slot(&k, 0).unwrap();
         assert_eq!(slot.status, UTXO_SPENT);
         assert_eq!(slot.spending_data[0], 0xAB);
+    }
+
+    #[test]
+    fn apply_spend_uses_replicated_dah_context() {
+        let engine = make_engine();
+        let k = key(3);
+        create_record(&engine, k, 1);
+
+        apply_op(
+            &engine,
+            &ReplicaOp::SetMined {
+                tx_key: k,
+                block_id: 42,
+                block_height: 700_000,
+                subtree_idx: 0,
+                on_longest_chain: true,
+                current_block_height: 700_010,
+                block_height_retention: 5,
+                master_generation: 1,
+            },
+        )
+        .unwrap();
+
+        apply_op(
+            &engine,
+            &ReplicaOp::Spend {
+                tx_key: k,
+                offset: 0,
+                spending_data: [0xBC; 36],
+                current_block_height: 700_123,
+                block_height_retention: 31,
+                master_generation: 2,
+            },
+        )
+        .unwrap();
+
+        let meta = engine.read_metadata(&k).unwrap();
+        assert_eq!(
+            { meta.delete_at_height },
+            700_154,
+            "receiver must use the master's DAH context, not a local default",
+        );
+    }
+
+    #[test]
+    fn apply_prune_slot_if_spent_by_updates_parent_counters() {
+        let engine = make_engine();
+        let parent = key(77);
+        let child = key(78);
+        create_record(&engine, parent, 2);
+
+        let mut parent_hash = [0u8; 32];
+        parent_hash[0] = 1;
+        parent_hash[4..8].copy_from_slice(&parent.txid[0..4]);
+        let mut spending_data = [0u8; 36];
+        spending_data[..32].copy_from_slice(&child.txid);
+        spending_data[32..36].copy_from_slice(&0u32.to_le_bytes());
+        engine
+            .spend(&crate::ops::spend::SpendRequest {
+                tx_key: parent,
+                offset: 1,
+                utxo_hash: parent_hash,
+                spending_data,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+
+        apply_op(
+            &engine,
+            &ReplicaOp::PruneSlotIfSpentBy {
+                tx_key: parent,
+                offset: 1,
+                child_txid: child.txid,
+            },
+        )
+        .unwrap();
+
+        let slot = engine.read_slot(&parent, 1).unwrap();
+        assert_eq!(slot.status, UTXO_PRUNED);
+        assert_eq!(slot.spending_data, spending_data);
+        let meta = engine.read_metadata(&parent).unwrap();
+        assert_eq!({ meta.spent_utxos }, 0);
+        assert_eq!({ meta.pruned_utxos }, 1);
     }
 
     #[test]
@@ -1468,6 +1787,8 @@ mod tests {
             tx_key: k,
             offset: 0,
             spending_data: [0xAB; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
             master_generation: 0,
         };
         apply_op(&engine, &op).unwrap();
@@ -1540,6 +1861,68 @@ mod tests {
     }
 
     #[test]
+    fn divergent_create_cleans_up_old_blob() {
+        use crate::record::ExternalRef;
+        use crate::storage::blobstore::{BlobStore, MemoryBlobStore};
+
+        let store = Arc::new(MemoryBlobStore::new());
+        let engine = make_engine_with_blob_store(store.clone());
+        let k = key(112);
+        let old_digest = store.put(&k.txid, b"old divergent blob").unwrap();
+        let old_hashes = [[0x11; 32]];
+        let old_ref = ExternalRef {
+            store_type: 1,
+            content_hash: old_digest.sha256,
+            total_size: old_digest.length,
+            input_count: 0,
+            output_count: 0,
+            inputs_offset: 0,
+            outputs_offset: 0,
+        };
+        let old_req = CreateRequest {
+            tx_id: k.txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 0,
+            size_in_bytes: old_digest.length,
+            extended_size: old_digest.length,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: &old_hashes,
+            inputs: None,
+            outputs: None,
+            inpoints: None,
+            is_external: true,
+            created_at: 0,
+            block_height: 0,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+            external_ref: Some(old_ref),
+            parent_txids: &[],
+        };
+        engine.create(&old_req).unwrap();
+        assert!(store.exists(&k.txid).unwrap());
+
+        let op = ReplicaOp::Create {
+            tx_key: k,
+            metadata_bytes: vec![],
+            utxo_hashes: vec![[0xCC; 32]; 2],
+            cold_data: None,
+            is_external: false,
+        };
+        apply_op(&engine, &op).unwrap();
+
+        assert!(
+            !store.exists(&k.txid).unwrap(),
+            "divergent duplicate replacement must remove the old external blob"
+        );
+        let meta = engine.read_metadata(&k).unwrap();
+        assert!(!meta.flags.contains(TxFlags::EXTERNAL));
+    }
+
+    #[test]
     fn apply_freeze_unfreeze() {
         let engine = make_engine();
         let k = key(20);
@@ -1594,6 +1977,8 @@ mod tests {
                 block_height: 1000,
                 subtree_idx: 0,
                 on_longest_chain: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
                 master_generation: 0,
             },
         )
@@ -1614,6 +1999,8 @@ mod tests {
                 tx_key: k,
                 offset: 0,
                 spending_data: [0; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
                 master_generation: 0,
             },
         )
@@ -1641,18 +2028,22 @@ mod tests {
             tx_key: k,
             offset: 0,
             spending_data: [0xAA; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
             master_generation: 2,
         };
         apply_op(&engine, &op1).unwrap();
         let cur_gen = { engine.read_metadata(&k).unwrap().generation };
         assert_eq!(cur_gen, 2);
 
-        // Now send a stale spend (master_gen=1 <= local_gen=2) on slot 1.
+        // Now send a stale spend on slot 1.
         // The pre-apply guard should skip it entirely.
         let op2 = ReplicaOp::Spend {
             tx_key: k,
             offset: 1,
             spending_data: [0xBB; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
             master_generation: 1,
         };
         apply_op(&engine, &op2).unwrap();
@@ -1662,16 +2053,57 @@ mod tests {
     }
 
     #[test]
+    fn generation_wraparound_idempotency() {
+        let engine = make_engine();
+        let k = key(104);
+        create_record(&engine, k, 3);
+        set_generation(&engine, k, u32::MAX);
+
+        // Fresh across wrap: master_generation 0 is one step ahead of MAX.
+        // A numeric stale guard (`master_gen < local_gen`) would skip it.
+        let wrapped = ReplicaOp::Spend {
+            tx_key: k,
+            offset: 0,
+            spending_data: [0xF0; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
+            master_generation: 0,
+        };
+        apply_op(&engine, &wrapped).unwrap();
+        let slot0 = engine.read_slot(&k, 0).unwrap();
+        assert_eq!(slot0.status, UTXO_SPENT);
+        assert_eq!(slot0.spending_data[0], 0xF0);
+        assert_eq!({ engine.read_metadata(&k).unwrap().generation }, 0);
+
+        // Stale pre-wrap op: MAX is now behind local generation 0 and must
+        // not mutate a different slot.
+        let stale_pre_wrap = ReplicaOp::Spend {
+            tx_key: k,
+            offset: 1,
+            spending_data: [0xF1; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
+            master_generation: u32::MAX,
+        };
+        apply_op(&engine, &stale_pre_wrap).unwrap();
+        let slot1 = engine.read_slot(&k, 1).unwrap();
+        assert_eq!(slot1.status, UTXO_UNSPENT);
+        assert_eq!({ engine.read_metadata(&k).unwrap().generation }, 0);
+    }
+
+    #[test]
     fn apply_fresh_spend_applies() {
         let engine = make_engine();
         let k = key(101);
         create_record(&engine, k, 3);
 
-        // Fresh op: master_gen=1 > local_gen=0.
+        // Fresh op: master_gen=1 is ahead of local_gen=0.
         let op = ReplicaOp::Spend {
             tx_key: k,
             offset: 0,
             spending_data: [0xCC; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
             master_generation: 1,
         };
         apply_op(&engine, &op).unwrap();
@@ -1718,6 +2150,8 @@ mod tests {
             tx_key: k,
             offset: 0,
             spending_data: [0xEE; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
             master_generation: 5,
         };
         apply_op(&engine, &op1).unwrap();
@@ -2049,6 +2483,39 @@ mod tests {
     }
 
     #[test]
+    fn stale_create_replication_does_not_replace_newer_record() {
+        let engine = make_engine();
+        let k = key(113);
+        let hashes = vec![[0x11; 32]; 1];
+
+        let fresh = ReplicaOp::Create {
+            tx_key: k,
+            metadata_bytes: build_full_metadata(7, false, 0, 5, 0, &[], &[]),
+            utxo_hashes: hashes.clone(),
+            cold_data: None,
+            is_external: false,
+        };
+        apply_op(&engine, &fresh).unwrap();
+
+        let stale = ReplicaOp::Create {
+            tx_key: k,
+            metadata_bytes: build_full_metadata(99, false, 0, 3, 0, &[], &[]),
+            utxo_hashes: vec![[0xEE; 32]; 1],
+            cold_data: None,
+            is_external: false,
+        };
+        apply_op(&engine, &stale).unwrap();
+
+        let meta = engine.read_metadata(&k).unwrap();
+        let generation = { meta.generation };
+        let tx_version = { meta.tx_version };
+        assert_eq!(generation, 5);
+        assert_eq!(tx_version, 7);
+        let slot = engine.read_slot(&k, 0).unwrap();
+        assert_eq!(slot.hash, hashes[0]);
+    }
+
+    #[test]
     fn last_applied_monotonic_under_concurrent_batches() {
         // Regression test: multiple concurrent handler threads calling
         // handle_replica_batch must not regress last_applied. The old
@@ -2070,12 +2537,16 @@ mod tests {
                     tx_key: key(200),
                     offset: 0,
                     spending_data: [0xAA; 36],
+                    current_block_height: 700_000,
+                    block_height_retention: 288,
                     master_generation: 1,
                 },
                 ReplicaOp::Spend {
                     tx_key: key(200),
                     offset: 1,
                     spending_data: [0xBB; 36],
+                    current_block_height: 700_000,
+                    block_height_retention: 288,
                     master_generation: 1,
                 },
             ],
@@ -2091,6 +2562,8 @@ mod tests {
                 tx_key: key(201),
                 offset: 0,
                 spending_data: [0xCC; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
                 master_generation: 1,
             }],
             trace_ctx: None,
@@ -2144,6 +2617,8 @@ mod tests {
                 tx_key: key(210),
                 offset: 0,
                 spending_data: [0xDD; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
                 master_generation: 1,
             }],
             trace_ctx: None,
@@ -2166,6 +2641,8 @@ mod tests {
                 tx_key: key(211),
                 offset: 0,
                 spending_data: [0xEE; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
                 master_generation: 1,
             }],
             trace_ctx: None,
@@ -2200,6 +2677,8 @@ mod tests {
                 tx_key,
                 offset,
                 spending_data: [0xAA; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
                 master_generation: generation,
             })
             .collect();
@@ -2686,6 +3165,8 @@ mod tests {
                 tx_key: key(42),
                 offset: 0,
                 spending_data: [0x77; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
                 master_generation: 1,
             }],
             trace_ctx: Some(wire_ctx),
@@ -2761,6 +3242,43 @@ mod tests {
             "STATUS_ERROR payload must carry an error_code prefix",
         );
         u16::from_le_bytes([payload[0], payload[1]])
+    }
+
+    #[test]
+    fn malformed_replica_batch_returns_status_error_ack() {
+        let engine = make_engine();
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let req = RequestFrame {
+            request_id: 55,
+            op_code: OP_REPLICA_BATCH,
+            flags: 0,
+            payload: Vec::new(),
+        };
+
+        let resp = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            &tracker,
+            DEFAULT_STREAM_KEY,
+            0,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "malformed replication payloads must fail at the frame layer",
+        );
+        match ReplicaAck::deserialize(&resp.payload).expect("ack decodes") {
+            ReplicaAck::Error {
+                failed_sequence,
+                message,
+            } => {
+                assert_eq!(failed_sequence, 0);
+                assert!(message.contains("deserialize batch"), "message: {message}");
+            }
+            other => panic!("expected ReplicaAck::Error, got {other:?}"),
+        }
     }
 
     /// Build a Spend-only batch for cluster-key tests. Mirrors the
@@ -3171,6 +3689,8 @@ mod tests {
             tx_key: k,
             offset: 0,
             spending_data: [0xCD; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
             // Force the post-apply generation-sync write path that
             // R-035 was about. Use a master_generation strictly greater
             // than the local one so the pre-apply guard accepts the op.
@@ -3202,6 +3722,10 @@ mod tests {
         };
         let last = AtomicU64::new(0);
         let resp = handle_replica_batch(&req, &engine, &last);
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "ReplicaAck::Error must also use STATUS_ERROR at the frame layer",
+        );
         let ack = ReplicaAck::deserialize(&resp.payload).expect("ack decodes");
         match ack {
             ReplicaAck::Error {
@@ -3255,12 +3779,16 @@ mod tests {
                 tx_key: k,
                 offset: 0,
                 spending_data: [0x11; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
                 master_generation: 50,
             },
             ReplicaOp::Spend {
                 tx_key: k,
                 offset: 1,
                 spending_data: [0x22; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
                 master_generation: 51,
             },
             ReplicaOp::Freeze {
@@ -3290,20 +3818,44 @@ mod tests {
             ops.len(),
         );
 
-        // First two are Spends targeting offsets 0 and 1, last is Freeze
-        // on offset 2. The exact sequence shape proves that apply_op is
-        // journaling per-op (and not, e.g., losing the second spend).
+        // First two are SpendV2 entries targeting offsets 0 and 1, last
+        // is Freeze on offset 2. The exact sequence shape proves that
+        // apply_op is journaling per-op (and not, e.g., losing the
+        // second spend).
         match &entries[0].op {
-            crate::redo::RedoOp::Spend { offset, .. } => assert_eq!(*offset, 0),
-            other => panic!("entry[0] should be Spend(off=0), got {other:?}"),
+            crate::redo::RedoOp::SpendV2 {
+                offset,
+                target_generation,
+                current_block_height,
+                block_height_retention,
+                ..
+            } => {
+                assert_eq!(*offset, 0);
+                assert_eq!(*target_generation, 50);
+                assert_eq!(*current_block_height, 700_000);
+                assert_eq!(*block_height_retention, 288);
+            }
+            other => panic!("entry[0] should be SpendV2(off=0), got {other:?}"),
         }
         match &entries[1].op {
-            crate::redo::RedoOp::Spend { offset, .. } => assert_eq!(*offset, 1),
-            other => panic!("entry[1] should be Spend(off=1), got {other:?}"),
+            crate::redo::RedoOp::SpendV2 {
+                offset,
+                target_generation,
+                current_block_height,
+                block_height_retention,
+                ..
+            } => {
+                assert_eq!(*offset, 1);
+                assert_eq!(*target_generation, 51);
+                assert_eq!(*current_block_height, 700_000);
+                assert_eq!(*block_height_retention, 288);
+            }
+            other => panic!("entry[1] should be SpendV2(off=1), got {other:?}"),
         }
         match &entries[2].op {
-            crate::redo::RedoOp::Freeze { offset, .. } => assert_eq!(*offset, 2),
-            other => panic!("entry[2] should be Freeze(off=2), got {other:?}"),
+            crate::redo::RedoOp::Freeze { offset, .. }
+            | crate::redo::RedoOp::FreezeV2 { offset, .. } => assert_eq!(*offset, 2),
+            other => panic!("entry[2] should be Freeze/FreezeV2(off=2), got {other:?}"),
         }
     }
 
@@ -3334,6 +3886,8 @@ mod tests {
                 tx_key: k,
                 offset: 0,
                 spending_data: [0xA1; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
                 master_generation: 10,
             },
         )
@@ -3344,6 +3898,8 @@ mod tests {
                 tx_key: k,
                 offset: 1,
                 spending_data: [0xA2; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
                 master_generation: 11,
             },
         )
@@ -3360,13 +3916,16 @@ mod tests {
             .expect("redo log replay");
         assert_eq!(entries.len(), 2, "two spend ops -> two redo entries");
 
-        // The second redo entry (Spend off=1) must carry
-        // new_spent_count == 2 — proving the entry captured the
-        // POST-apply counter (1 → 2), not the input op's zero.
+        // The second redo entry (SpendV2 off=1) must carry
+        // new_spent_count == 2 and target_generation == 11 — proving the
+        // entry captured POST-apply state, not just the input verb.
         match &entries[1].op {
-            crate::redo::RedoOp::Spend {
+            crate::redo::RedoOp::SpendV2 {
                 offset,
                 new_spent_count,
+                target_generation,
+                current_block_height,
+                block_height_retention,
                 ..
             } => {
                 assert_eq!(*offset, 1);
@@ -3375,21 +3934,26 @@ mod tests {
                     "R-034 invariant: redo entry MUST capture post-apply spent_utxos \
                      (got {new_spent_count}, expected 2)"
                 );
+                assert_eq!(*target_generation, 11);
+                assert_eq!(*current_block_height, 700_000);
+                assert_eq!(*block_height_retention, 288);
             }
-            other => panic!("entry[1] should be Spend, got {other:?}"),
+            other => panic!("entry[1] should be SpendV2, got {other:?}"),
         }
 
         // And the first entry should carry new_spent_count == 1.
         match &entries[0].op {
-            crate::redo::RedoOp::Spend {
+            crate::redo::RedoOp::SpendV2 {
                 offset,
                 new_spent_count,
+                target_generation,
                 ..
             } => {
                 assert_eq!(*offset, 0);
                 assert_eq!(*new_spent_count, 1);
+                assert_eq!(*target_generation, 10);
             }
-            other => panic!("entry[0] should be Spend, got {other:?}"),
+            other => panic!("entry[0] should be SpendV2, got {other:?}"),
         }
     }
 }

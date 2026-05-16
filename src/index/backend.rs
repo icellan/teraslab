@@ -7,7 +7,7 @@ use crate::allocator::SlotAllocator;
 use crate::config::IndexConfig;
 use crate::device::BlockDevice;
 use crate::index::hashtable::{TxIndexEntry, TxKey};
-use crate::index::redb_primary::{CachedFieldsUpdate, RedbPrimary};
+use crate::index::redb_primary::{CachedFieldsUpdate, RedbPrimary, RedbPrimaryIter};
 use crate::index::secondary_backend::{DahBackend, UnminedBackend};
 use crate::index::{DahIndex, Index, IndexError, IndexStats, RestoreFlags, UnminedIndex};
 
@@ -83,11 +83,44 @@ impl PrimaryBackend {
     }
 
     /// Look up where a transaction's record lives on disk.
+    ///
+    /// Returns the entry if present, `None` if the key is absent.
+    ///
+    /// For the on-disk redb backend, any underlying read failure
+    /// (begin_read, open_table, get) is escalated via `tracing::error!`
+    /// with `target = "teraslab::index"`, then collapsed to `None`. The
+    /// in-memory and file-backed variants are infallible.
+    ///
+    /// **Migration target**: call sites that need to distinguish
+    /// "key absent" from "redb read failed" should use
+    /// [`Self::lookup_checked`] and propagate the [`IndexError`]. The
+    /// `lookup` shim is retained so existing callers compile while the
+    /// migration is performed; engine code is the primary consumer.
     pub fn lookup(&self, key: &TxKey) -> Option<TxIndexEntry> {
+        match self.lookup_checked(key) {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::error!(
+                    target: "teraslab::index",
+                    err = %e,
+                    "PrimaryBackend::lookup: redb read failed; returning None (this can mask a real entry as missing — caller should migrate to lookup_checked)",
+                );
+                None
+            }
+        }
+    }
+
+    /// Fallible variant of [`Self::lookup`] that propagates redb read errors.
+    ///
+    /// Returns `Ok(Some(entry))` if the key is present, `Ok(None)` if the
+    /// key is absent, and an [`IndexError`] if the redb backend's read
+    /// transaction fails. The in-memory and file-backed variants are
+    /// infallible.
+    pub fn lookup_checked(&self, key: &TxKey) -> Result<Option<TxIndexEntry>, IndexError> {
         match self {
-            Self::InMemory(idx) => idx.lookup(key),
+            Self::InMemory(idx) => Ok(idx.lookup(key)),
             Self::OnDisk(redb) => redb.lookup(key),
-            Self::FileBacked(idx) => idx.lookup(key),
+            Self::FileBacked(idx) => Ok(idx.lookup(key)),
         }
     }
 
@@ -100,12 +133,87 @@ impl PrimaryBackend {
         }
     }
 
-    /// Remove a transaction from the index (on deletion/pruning).
-    pub fn unregister(&mut self, key: &TxKey) -> Option<TxIndexEntry> {
+    /// Register or update an entry without performing the mmap hash-table
+    /// resize inline. Redb has no mmap resize path, so it uses its normal
+    /// transactional register implementation.
+    pub(crate) fn register_without_resize(
+        &mut self,
+        key: TxKey,
+        entry: TxIndexEntry,
+    ) -> Result<(), IndexError> {
         match self {
-            Self::InMemory(idx) => idx.unregister(key),
+            Self::InMemory(idx) | Self::FileBacked(idx) => idx.register_without_resize(key, entry),
+            Self::OnDisk(redb) => redb.register(key, entry),
+        }
+    }
+
+    /// Target capacity for a pending mmap hash-table resize, if this backend
+    /// needs one. Redb does not use this path.
+    pub(crate) fn resize_target_capacity(&self) -> Option<usize> {
+        match self {
+            Self::InMemory(idx) | Self::FileBacked(idx) => idx.resize_target_capacity(),
+            Self::OnDisk(_) => None,
+        }
+    }
+
+    /// Build a resized copy of an mmap-backed index without mutating the
+    /// currently visible table. The engine swaps the returned backend under an
+    /// exclusive lock after the copy has been built under an upgradable read
+    /// lock, so concurrent lookups continue during the rehash.
+    pub(crate) fn resized_copy(&self, target_capacity: usize) -> Result<Self, IndexError> {
+        match self {
+            Self::InMemory(idx) => Ok(Self::InMemory(idx.resized_copy(target_capacity)?)),
+            Self::FileBacked(idx) => Ok(Self::FileBacked(idx.resized_copy(target_capacity)?)),
+            Self::OnDisk(_) => Err(IndexError::FormatError {
+                detail: "redb primary backend does not support hash-table resize".into(),
+            }),
+        }
+    }
+
+    /// Remove a transaction from the index (on deletion/pruning).
+    ///
+    /// Returns the removed entry, or `None` if the key was not present.
+    ///
+    /// For the on-disk redb backend, any underlying write failure
+    /// (begin_write, open_table, remove, commit) is escalated via
+    /// `tracing::error!` with `target = "teraslab::index"`, then collapsed
+    /// to `None`. The in-memory and file-backed variants are infallible.
+    ///
+    /// **Migration target**: call sites that need to distinguish "no entry
+    /// to remove" from "redb write failed" must use
+    /// [`Self::unregister_checked`] and propagate the [`IndexError`] —
+    /// otherwise a commit failure leaves the entry on disk while the caller
+    /// skips downstream cleanup (blob deletion, secondary-index removal,
+    /// shard-count adjustments). Engine code is the primary consumer.
+    pub fn unregister(&mut self, key: &TxKey) -> Option<TxIndexEntry> {
+        match self.unregister_checked(key) {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::error!(
+                    target: "teraslab::index",
+                    err = %e,
+                    "PrimaryBackend::unregister: redb write failed; returning None (the entry may still be on disk — caller should migrate to unregister_checked)",
+                );
+                None
+            }
+        }
+    }
+
+    /// Fallible variant of [`Self::unregister`] that propagates redb write
+    /// errors.
+    ///
+    /// Returns `Ok(Some(entry))` if the key was found and removed,
+    /// `Ok(None)` if the key was not present, and an [`IndexError`] if the
+    /// redb backend's write transaction fails. The in-memory and
+    /// file-backed variants are infallible.
+    pub fn unregister_checked(
+        &mut self,
+        key: &TxKey,
+    ) -> Result<Option<TxIndexEntry>, IndexError> {
+        match self {
+            Self::InMemory(idx) => Ok(idx.unregister(key)),
             Self::OnDisk(redb) => redb.unregister(key),
-            Self::FileBacked(idx) => idx.unregister(key),
+            Self::FileBacked(idx) => Ok(idx.unregister(key)),
         }
     }
 
@@ -225,14 +333,12 @@ impl PrimaryBackend {
 
     /// Iterate over all `(TxKey, TxIndexEntry)` pairs in the primary index.
     ///
-    /// **Warning (redb backend):** The on-disk variant materializes all entries
-    /// into memory (~63 bytes/entry). At 10M entries this is ~630 MB. Use
-    /// batched processing for large on-disk indexes in memory-constrained
-    /// environments.
+    /// The on-disk redb variant streams bounded batches instead of
+    /// materializing the full table in memory.
     pub fn iter(&self) -> PrimaryIter<'_> {
         match self {
             Self::InMemory(idx) | Self::FileBacked(idx) => PrimaryIter::InMemory(idx.iter()),
-            Self::OnDisk(redb) => PrimaryIter::Collected(redb.iter_collected().into_iter()),
+            Self::OnDisk(redb) => PrimaryIter::Redb(redb.iter_streaming()),
         }
     }
 
@@ -563,8 +669,8 @@ impl From<Index> for PrimaryBackend {
 pub enum PrimaryIter<'a> {
     /// In-memory hash table iterator.
     InMemory(crate::index::hashtable::HashTableIter<'a>),
-    /// Collected entries from on-disk backend (owned Vec iterator).
-    Collected(std::vec::IntoIter<(TxKey, TxIndexEntry)>),
+    /// Bounded-batch redb iterator.
+    Redb(RedbPrimaryIter<'a>),
 }
 
 impl Iterator for PrimaryIter<'_> {
@@ -573,14 +679,14 @@ impl Iterator for PrimaryIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::InMemory(it) => it.next(),
-            Self::Collected(it) => it.next(),
+            Self::Redb(it) => it.next(),
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
             Self::InMemory(it) => it.size_hint(),
-            Self::Collected(it) => it.size_hint(),
+            Self::Redb(it) => it.size_hint(),
         }
     }
 }

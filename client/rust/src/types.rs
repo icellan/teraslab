@@ -58,6 +58,9 @@ pub struct UnspendItem {
     pub vout: u32,
     /// Expected UTXO hash for verification.
     pub utxo_hash: UtxoHash,
+    /// Expected current spending data. The server only clears the slot if
+    /// this matches the marker recorded by the original spend.
+    pub spending_data: SpendingData,
 }
 
 /// Shared parameters for an [`UnspendBatch`](crate::Client::unspend_batch) request.
@@ -188,6 +191,8 @@ pub struct GetSpendItem {
     pub txid: TxID,
     /// Output index within the transaction.
     pub vout: u32,
+    /// Expected UTXO hash for this output.
+    pub utxo_hash: UtxoHash,
 }
 
 // ---------------------------------------------------------------------------

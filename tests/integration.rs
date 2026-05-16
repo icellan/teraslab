@@ -7,9 +7,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tempfile::TempDir;
 use teraslab::allocator::SlotAllocator;
+use teraslab::config::{IndexBackendMode, IndexConfig};
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
+use teraslab::index::{
+    DahBackend, DahIndex, Index, PrimaryBackend, TxKey, UnminedBackend, UnminedIndex,
+};
+use teraslab::index::{redb_dah::RedbDahIndex, redb_unmined::RedbUnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::*;
 use teraslab::ops::engine::Engine;
@@ -37,6 +42,136 @@ fn create_engine() -> Arc<Engine> {
         DahIndex::new(),
         UnminedIndex::new(),
     ))
+}
+
+struct BackendCase {
+    mode: IndexBackendMode,
+    _dir: TempDir,
+    config: IndexConfig,
+}
+
+impl BackendCase {
+    fn new(mode: IndexBackendMode) -> Self {
+        let dir = TempDir::new().unwrap();
+        let config = IndexConfig {
+            backend: mode.clone(),
+            redb_path: dir.path().join("primary.redb"),
+            redb_dah_path: dir.path().join("dah.redb"),
+            redb_unmined_path: dir.path().join("unmined.redb"),
+            redb_cache_size: 16 * 1024 * 1024,
+            file_backed_path: dir.path().join("primary.index"),
+        };
+        Self {
+            mode,
+            _dir: dir,
+            config,
+        }
+    }
+
+    fn fresh_indexes(&self) -> (PrimaryBackend, DahBackend, UnminedBackend) {
+        match self.mode {
+            IndexBackendMode::Memory => (
+                PrimaryBackend::new_in_memory(10_000).unwrap(),
+                DahBackend::new_in_memory(),
+                UnminedBackend::new_in_memory(),
+            ),
+            IndexBackendMode::Redb => (
+                PrimaryBackend::new_on_disk(&self.config).unwrap(),
+                DahBackend::OnDisk(
+                    RedbDahIndex::open(&self.config.redb_dah_path, self.config.redb_cache_size)
+                        .unwrap(),
+                ),
+                UnminedBackend::OnDisk(
+                    RedbUnminedIndex::open(
+                        &self.config.redb_unmined_path,
+                        self.config.redb_cache_size,
+                    )
+                    .unwrap(),
+                ),
+            ),
+            IndexBackendMode::FileBacked => (
+                PrimaryBackend::new_file_backed(&self.config.file_backed_path, 10_000).unwrap(),
+                DahBackend::new_in_memory(),
+                UnminedBackend::new_in_memory(),
+            ),
+        }
+    }
+
+    fn restart_indexes(
+        &self,
+        dev: &dyn BlockDevice,
+        alloc: &SlotAllocator,
+    ) -> (PrimaryBackend, DahBackend, UnminedBackend) {
+        match self.mode {
+            IndexBackendMode::Memory => {
+                let primary = PrimaryBackend::rebuild(dev, alloc).unwrap();
+                let (dah, unmined) = PrimaryBackend::rebuild_secondary(dev, alloc).unwrap();
+                (
+                    primary,
+                    DahBackend::from(dah),
+                    UnminedBackend::from(unmined),
+                )
+            }
+            IndexBackendMode::Redb => (
+                PrimaryBackend::restore_redb(&self.config).unwrap(),
+                DahBackend::OnDisk(
+                    RedbDahIndex::open(&self.config.redb_dah_path, self.config.redb_cache_size)
+                        .unwrap(),
+                ),
+                UnminedBackend::OnDisk(
+                    RedbUnminedIndex::open(
+                        &self.config.redb_unmined_path,
+                        self.config.redb_cache_size,
+                    )
+                    .unwrap(),
+                ),
+            ),
+            IndexBackendMode::FileBacked => {
+                let primary =
+                    PrimaryBackend::restore_file_backed(&self.config.file_backed_path, 10_000)
+                        .unwrap();
+                let (dah, unmined) = PrimaryBackend::rebuild_secondary(dev, alloc).unwrap();
+                (
+                    primary,
+                    DahBackend::from(dah),
+                    UnminedBackend::from(unmined),
+                )
+            }
+        }
+    }
+}
+
+fn create_engine_with_backends(
+    dev: Arc<dyn BlockDevice>,
+    alloc: SlotAllocator,
+    index: PrimaryBackend,
+    dah: DahBackend,
+    unmined: UnminedBackend,
+) -> Arc<Engine> {
+    Arc::new(Engine::new(
+        dev,
+        index,
+        alloc,
+        StripedLocks::new(1024),
+        dah,
+        unmined,
+    ))
+}
+
+fn assert_unmined_contains(engine: &Engine, key: TxKey, cutoff_height: u32, context: &str) {
+    let keys = engine.unmined_index().range_query(cutoff_height);
+    assert!(
+        keys.contains(&key),
+        "{context}: unmined index missing expected key"
+    );
+}
+
+fn assert_dah_contains(engine: &Engine, key: TxKey, current_height: u32, context: &str) {
+    let keys = engine.dah_index().range_query(current_height);
+    assert!(
+        keys.contains(&key),
+        "{context}: DAH index missing expected key"
+    );
 }
 
 fn make_tx_id(n: u32) -> [u8; 32] {
@@ -80,6 +215,50 @@ fn create_tx(engine: &Engine, n: u32, utxo_count: usize) -> TxKey {
         frozen: false,
         conflicting: false,
         locked: false,
+        external_ref: None,
+        parent_txids: &[],
+    };
+    engine.create(&req).unwrap();
+    TxKey { txid: tx_id }
+}
+
+fn create_mined_tx(
+    engine: &Engine,
+    n: u32,
+    utxo_count: usize,
+    block_id: u32,
+    block_height: u32,
+) -> TxKey {
+    let tx_id = make_tx_id(n);
+    let utxo_hashes: Vec<[u8; 32]> = (0..utxo_count as u32)
+        .map(|v| make_utxo_hash(n, v))
+        .collect();
+    let mined_block_infos = [MinedBlockInfo {
+        block_id,
+        block_height,
+        subtree_idx: 0,
+    }];
+    let req = CreateRequest {
+        tx_id,
+        tx_version: 1,
+        locktime: 0,
+        fee: 500,
+        size_in_bytes: 250,
+        extended_size: 0,
+        is_coinbase: false,
+        spending_height: 0,
+        utxo_hashes: &utxo_hashes,
+        inputs: None,
+        outputs: None,
+        inpoints: None,
+        is_external: false,
+        created_at: 1710000000000,
+        block_height,
+        mined_block_infos: &mined_block_infos,
+        frozen: false,
+        conflicting: false,
+        locked: false,
+        external_ref: None,
         parent_txids: &[],
     };
     engine.create(&req).unwrap();
@@ -251,6 +430,138 @@ impl StateVerifier {
 // ---------------------------------------------------------------------------
 // Integration tests
 // ---------------------------------------------------------------------------
+
+#[test]
+fn backend_modes_create_spend_and_reopen() {
+    for mode in [
+        IndexBackendMode::Memory,
+        IndexBackendMode::Redb,
+        IndexBackendMode::FileBacked,
+    ] {
+        let case = BackendCase::new(mode.clone());
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let key = {
+            let alloc = SlotAllocator::new(dev.clone()).unwrap();
+            let (primary, dah, unmined) = case.fresh_indexes();
+            let engine = create_engine_with_backends(dev.clone(), alloc, primary, dah, unmined);
+            let key = create_tx(&engine, 0x5900, 2);
+
+            spend_utxo(&engine, key, 0x5900, 1);
+            assert_eq!(engine.index_len(), 1, "initial index len for {mode:?}");
+
+            let meta = engine.read_metadata(&key).unwrap();
+            let spent_utxos = { meta.spent_utxos };
+            assert_eq!(spent_utxos, 1, "initial spent count for {mode:?}");
+            let slot = engine.read_slot(&key, 1).unwrap();
+            assert_eq!(slot.status, UTXO_SPENT, "initial spent slot for {mode:?}");
+
+            engine.persist_allocator().unwrap();
+            key
+        };
+
+        let recovered_alloc = SlotAllocator::recover(dev.clone()).unwrap();
+        let (primary, dah, unmined) = case.restart_indexes(&*dev, &recovered_alloc);
+        let restarted =
+            create_engine_with_backends(dev.clone(), recovered_alloc, primary, dah, unmined);
+
+        assert_eq!(restarted.index_len(), 1, "restarted index len for {mode:?}");
+        let meta = restarted.read_metadata(&key).unwrap();
+        let spent_utxos = { meta.spent_utxos };
+        assert_eq!(spent_utxos, 1, "restarted spent count for {mode:?}");
+        let slot = restarted.read_slot(&key, 1).unwrap();
+        assert_eq!(slot.status, UTXO_SPENT, "restarted spent slot for {mode:?}");
+        assert_eq!(
+            slot.spending_data[0..4],
+            (0x5900u32 + 10000).to_le_bytes(),
+            "restarted spending data for {mode:?}"
+        );
+    }
+}
+
+#[test]
+fn backend_modes_secondary_indexes_survive_reopen() {
+    const RETENTION: u32 = 288;
+    const EXPECTED_DAH: u32 = 2000 + RETENTION;
+    const MINED_TX_N: u32 = 0x5902;
+    const UNMINED_TX_N: u32 = 0x5901;
+
+    for mode in [
+        IndexBackendMode::Memory,
+        IndexBackendMode::Redb,
+        IndexBackendMode::FileBacked,
+    ] {
+        let case = BackendCase::new(mode.clone());
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+
+        let (unmined_key, dah_key) = {
+            let alloc = SlotAllocator::new(dev.clone()).unwrap();
+            let (primary, dah, unmined) = case.fresh_indexes();
+            let engine = create_engine_with_backends(dev.clone(), alloc, primary, dah, unmined);
+            let unmined_key = create_tx(&engine, UNMINED_TX_N, 2);
+            let dah_key = create_mined_tx(&engine, MINED_TX_N, 2, MINED_TX_N, 2000);
+
+            let meta = engine.read_metadata(&unmined_key).unwrap();
+            assert_eq!({ meta.unmined_since }, 1000, "created unmined for {mode:?}");
+            assert_unmined_contains(
+                &engine,
+                unmined_key,
+                1000,
+                &format!("created unmined {mode:?}"),
+            );
+
+            spend_utxo(&engine, dah_key, MINED_TX_N, 0);
+            spend_utxo(&engine, dah_key, MINED_TX_N, 1);
+            let meta = engine.read_metadata(&dah_key).unwrap();
+            assert_eq!(
+                { meta.delete_at_height },
+                EXPECTED_DAH,
+                "all-spent DAH for {mode:?}"
+            );
+            assert_dah_contains(
+                &engine,
+                dah_key,
+                EXPECTED_DAH,
+                &format!("created DAH {mode:?}"),
+            );
+
+            assert!(
+                !engine
+                    .unmined_index()
+                    .range_query(u32::MAX)
+                    .contains(&dah_key),
+                "mined tx should not be in unmined index for {mode:?}"
+            );
+
+            engine.persist_allocator().unwrap();
+            (unmined_key, dah_key)
+        };
+
+        let alloc = SlotAllocator::recover(dev.clone()).unwrap();
+        let (primary, dah, unmined) = case.restart_indexes(&*dev, &alloc);
+        let engine = create_engine_with_backends(dev.clone(), alloc, primary, dah, unmined);
+
+        assert_unmined_contains(
+            &engine,
+            unmined_key,
+            1000,
+            &format!("reopened unmined {mode:?}"),
+        );
+        assert_dah_contains(
+            &engine,
+            dah_key,
+            EXPECTED_DAH,
+            &format!("reopened all-spent {mode:?}"),
+        );
+        let meta = engine.read_metadata(&dah_key).unwrap();
+        assert_eq!(
+            { meta.delete_at_height },
+            EXPECTED_DAH,
+            "reopened metadata DAH for {mode:?}"
+        );
+    }
+}
 
 /// Full lifecycle: create → spend → setMined → delete
 #[test]
@@ -600,6 +911,7 @@ fn preserve_until_blocks_pruning() {
         frozen: false,
         conflicting: false,
         locked: false,
+        external_ref: None,
         parent_txids: &[],
     };
     let key = TxKey { txid: req.tx_id };
@@ -841,6 +1153,7 @@ fn dah_set_and_cleared() {
         frozen: false,
         conflicting: false,
         locked: false,
+        external_ref: None,
         parent_txids: &[],
     };
     let key = TxKey { txid: req.tx_id };
@@ -860,6 +1173,11 @@ fn dah_set_and_cleared() {
             tx_key: key,
             offset: 0,
             utxo_hash: make_utxo_hash(1, 0),
+            spending_data: {
+                let mut sd = [0u8; 36];
+                sd[0..4].copy_from_slice(&(1u32 + 10000).to_le_bytes());
+                sd
+            },
             current_block_height: 2000,
             block_height_retention: 288,
         })
@@ -924,6 +1242,7 @@ fn coinbase_maturity() {
         frozen: false,
         conflicting: false,
         locked: false,
+        external_ref: None,
         parent_txids: &[],
     };
     let key = TxKey { txid: tx_id };
@@ -1006,6 +1325,7 @@ fn cold_data_survives_mutations() {
         frozen: false,
         conflicting: false,
         locked: false,
+        external_ref: None,
         parent_txids: &[],
     };
     let key = TxKey { txid: tx_id };

@@ -317,12 +317,15 @@ impl Drop for AlignedBuf {
 // MemoryDevice
 // ---------------------------------------------------------------------------
 
-/// In-memory block device for testing and benchmarking.
+/// In-memory block device for tests and local benchmarks only.
 ///
 /// Enforces the same alignment constraints as [`DirectDevice`] so tests
 /// catch alignment bugs via `pread`/`pwrite`. Also exposes a stable raw
 /// pointer via [`as_raw_ptr`](BlockDevice::as_raw_ptr) for zero-copy
-/// access on the Engine hot path.
+/// access on the Engine hot path. That raw pointer intentionally bypasses
+/// I/O alignment checks, so production deployments must use the concrete
+/// storage backend selected by configuration rather than treating
+/// `MemoryDevice` as a raw-device substitute.
 pub struct MemoryDevice {
     /// Backing store for `pread` / `pwrite`.
     ///
@@ -430,6 +433,67 @@ impl BlockDevice for MemoryDevice {
 
     fn as_raw_ptr(&self) -> Option<*mut u8> {
         Some(self.raw_ptr)
+    }
+}
+
+/// Test-only wrapper that injects read failures behind any [`BlockDevice`].
+///
+/// The wrapper reports no raw pointer so callers under test cannot bypass the
+/// failing `pread` path through direct-memory access.
+#[cfg(test)]
+pub(crate) struct ReadFailingDevice {
+    inner: std::sync::Arc<dyn BlockDevice>,
+    fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl ReadFailingDevice {
+    pub(crate) fn new(
+        inner: std::sync::Arc<dyn BlockDevice>,
+    ) -> (
+        std::sync::Arc<Self>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            std::sync::Arc::new(Self {
+                inner,
+                fail: fail.clone(),
+            }),
+            fail,
+        )
+    }
+}
+
+#[cfg(test)]
+impl BlockDevice for ReadFailingDevice {
+    fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DeviceError::Io(std::io::Error::other(
+                "simulated pread failure",
+            )));
+        }
+        self.inner.pread(buf, offset)
+    }
+
+    fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize> {
+        self.inner.pwrite(buf, offset)
+    }
+
+    fn alignment(&self) -> usize {
+        self.inner.alignment()
+    }
+
+    fn size(&self) -> u64 {
+        self.inner.size()
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.inner.sync()
+    }
+
+    fn as_raw_ptr(&self) -> Option<*mut u8> {
+        None
     }
 }
 

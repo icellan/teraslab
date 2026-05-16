@@ -16,7 +16,7 @@ use teraslab::device::MemoryDevice;
 use teraslab::index::redb_dah::RedbDahIndex;
 use teraslab::index::redb_unmined::RedbUnminedIndex;
 use teraslab::index::{DahBackend, PrimaryBackend, TxIndexEntry, TxKey, UnminedBackend};
-use teraslab::record::TxFlags;
+use teraslab::record::{TxFlags, TxMetadata};
 use teraslab::redo::{RedoLog, RedoOp};
 
 fn make_key(n: u8) -> TxKey {
@@ -37,6 +37,20 @@ fn make_entry(offset: u64, unmined_since: u32, delete_at_height: u32) -> TxIndex
         unmined_since,
         generation: 0,
     }
+}
+
+fn write_device_metadata(
+    device: &MemoryDevice,
+    key: TxKey,
+    offset: u64,
+    unmined_since: u32,
+    delete_at_height: u32,
+) {
+    let mut meta = TxMetadata::new(5);
+    meta.tx_id = key.txid;
+    meta.unmined_since = unmined_since;
+    meta.delete_at_height = delete_at_height;
+    teraslab::io::write_metadata(device, offset, &meta).unwrap();
 }
 
 /// Crash between redo-fsync and redb commit: the intent record is durable,
@@ -91,9 +105,8 @@ fn crash_after_unmined_redo_fsync_before_redb_commit() {
     // Reopen the redo log to exercise the post-restart recovery path.
     let redo_log_reopened = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
 
-    // Use a throwaway data device — recover_all needs &dyn BlockDevice but
-    // SecondaryUnminedUpdate replay doesn't touch it.
     let data_dev = MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap();
+    write_device_metadata(&data_dev, key, 4096, 500, 0);
 
     let stats = teraslab::recovery::recover_all(
         &data_dev,
@@ -155,6 +168,7 @@ fn crash_after_dah_redo_fsync_before_redb_commit() {
 
     let redo_log_reopened = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
     let data_dev = MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap();
+    write_device_metadata(&data_dev, key, 8192, 0, 900);
     let alloc =
         SlotAllocator::new(Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap())).unwrap();
     let _ = alloc; // keep variable to ensure SlotAllocator is exercised in scope
@@ -226,6 +240,7 @@ fn crash_after_batched_redo_fsync_before_both_redb_commits() {
     let redo_log_reopened = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
 
     let data_dev = MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap();
+    write_device_metadata(&data_dev, key, 16384, 500, 900);
 
     let stats = teraslab::recovery::recover_all(
         &data_dev,
@@ -279,6 +294,7 @@ fn recover_skips_stale_redo_relative_to_primary() {
 
     let redo_log_reopened = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
     let data_dev = MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap();
+    write_device_metadata(&data_dev, key, 4096, 0, 0);
 
     let stats = teraslab::recovery::recover_all(
         &data_dev,
@@ -335,6 +351,7 @@ fn recover_dah_respects_has_preserve_until_flag() {
 
     let redo_log_reopened = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
     let data_dev = MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap();
+    write_device_metadata(&data_dev, key, 4096, 0, 0);
 
     let stats = teraslab::recovery::recover_all(
         &data_dev,

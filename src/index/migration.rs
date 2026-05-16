@@ -1,7 +1,8 @@
 //! Migration tooling for exporting/importing index data between backends.
 //!
-//! Uses the existing snapshot binary format as the portable intermediate
-//! representation, making it backend-agnostic.
+//! Exports use a streaming migration format with fixed-size records so large
+//! redb-backed indexes can be copied without first rebuilding a full in-memory
+//! [`Index`]. Import keeps a legacy `TSIX` snapshot fallback for older files.
 //!
 //! ## Import atomicity (R-047)
 //!
@@ -22,11 +23,14 @@
 //! either re-run the import (which overwrites the partial state) or
 //! delete the sentinel after manually verifying the on-disk state.
 
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config::IndexConfig;
 use crate::index::backend::PrimaryBackend;
 use crate::index::dah_index::DahIndex;
+use crate::index::hashtable::{TxIndexEntry, TxKey};
 
 use crate::index::redb_dah::RedbDahIndex;
 use crate::index::redb_primary::RedbPrimary;
@@ -40,6 +44,14 @@ use crate::index::{Index, IndexError};
 /// [`import_index`] before the first redb commit and removed only after
 /// all three commits succeed.
 const IMPORT_SENTINEL_SUFFIX: &str = ".import-in-progress";
+
+/// Streaming migration-file magic (`TeraSlab Migration Index`).
+const PORTABLE_MAGIC: [u8; 4] = *b"TSMI";
+const PORTABLE_VERSION: u32 = 1;
+const PORTABLE_MAX_COUNT: u64 = 1 << 30;
+const PORTABLE_PRIMARY_ENTRY_SIZE: usize = 63;
+const PORTABLE_SECONDARY_ENTRY_SIZE: usize = 36;
+const IMPORT_BATCH_SIZE: usize = 4096;
 
 /// Compute the import-sentinel path derived from the redb primary path.
 ///
@@ -140,41 +152,76 @@ pub struct ImportStats {
     pub unmined_entries: usize,
 }
 
-/// Export all index data to a portable snapshot file.
+/// Export all index data to a portable migration file.
 ///
-/// Works with any backend combination. The output file uses the existing
-/// snapshot binary format (magic "TSIX" + entries + CRC32).
+/// Works with any backend combination. The output file uses a streaming
+/// backend-agnostic format:
+///
+/// `[magic "TSMI"][version u32][primary_count u64][dah_count u64]`
+/// `[unmined_count u64][primary entries][dah entries][unmined entries][crc32]`.
+///
+/// The fixed-size entries intentionally mirror the existing snapshot payload
+/// layout, but this writer emits each entry directly from the backend iterator
+/// instead of materializing a temporary in-memory [`Index`].
 pub fn export_index(
     primary: &PrimaryBackend,
     dah: &DahBackend,
     unmined: &UnminedBackend,
     path: &std::path::Path,
 ) -> Result<ExportStats, IndexError> {
-    // Collect all data into in-memory indexes for serialization.
-    let mut mem_primary = Index::new(primary.len().max(16))?;
+    let declared =
+        PortableCounts::new(primary.len() as u64, dah.len() as u64, unmined.len() as u64)?;
+    let tmp_path = path.with_extension("tmp");
+    let file = File::create(&tmp_path)?;
+    let mut writer = BufWriter::new(file);
+    let mut hasher = crc32fast::Hasher::new();
+
+    write_portable_header(&mut writer, &mut hasher, declared)?;
+
+    let mut primary_entries = 0usize;
     for (key, entry) in primary.iter() {
-        mem_primary.register(key, entry)?;
+        write_tracked(&mut writer, &mut hasher, &encode_primary_entry(key, entry))?;
+        primary_entries += 1;
     }
+    ensure_export_count("primary", declared.primary_usize()?, primary_entries)?;
 
-    let mut mem_dah = DahIndex::new();
+    let mut dah_entries = 0usize;
     for (height, key) in dah.iter() {
-        mem_dah.insert(height, key);
+        write_tracked(
+            &mut writer,
+            &mut hasher,
+            &encode_secondary_entry(height, key),
+        )?;
+        dah_entries += 1;
     }
+    ensure_export_count("dah", declared.dah_usize()?, dah_entries)?;
 
-    let mut mem_unmined = UnminedIndex::new();
+    let mut unmined_entries = 0usize;
     for (height, key) in unmined.iter() {
-        mem_unmined.insert(height, key);
+        write_tracked(
+            &mut writer,
+            &mut hasher,
+            &encode_secondary_entry(height, key),
+        )?;
+        unmined_entries += 1;
     }
+    ensure_export_count("unmined", declared.unmined_usize()?, unmined_entries)?;
 
-    let stats = ExportStats {
-        primary_entries: mem_primary.len(),
-        dah_entries: mem_dah.len(),
-        unmined_entries: mem_unmined.len(),
-    };
+    writer.write_all(&hasher.finalize().to_le_bytes())?;
+    writer.flush()?;
+    let file = writer
+        .into_inner()
+        .map_err(|e| IndexError::Io(e.into_error()))?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp_path, path)?;
+    fsync_parent_dir(path)?;
 
-    mem_primary.snapshot_all(&mem_dah, &mem_unmined, path)?;
-
-    Ok(stats)
+    Ok(ExportStats {
+        primary_entries,
+        dah_entries,
+        unmined_entries,
+    })
 }
 
 /// Import index data from a portable snapshot file into the configured backend.
@@ -202,7 +249,19 @@ pub fn import_index(
     config: &IndexConfig,
     path: &std::path::Path,
 ) -> Result<(PrimaryBackend, DahBackend, UnminedBackend, ImportStats), IndexError> {
-    // Read the portable snapshot.
+    if is_streaming_migration_file(path)? {
+        import_streaming_index(config, path)
+    } else {
+        import_legacy_snapshot(config, path)
+    }
+}
+
+fn import_legacy_snapshot(
+    config: &IndexConfig,
+    path: &std::path::Path,
+) -> Result<(PrimaryBackend, DahBackend, UnminedBackend, ImportStats), IndexError> {
+    // Compatibility path for pre-streaming `TSIX` snapshots. This still
+    // materializes the legacy snapshot by design; new exports use `TSMI`.
     let (mem_idx, mem_dah, mem_unmined, _flags) = Index::restore_all(path)?;
 
     let primary_count = mem_idx.len();
@@ -225,12 +284,12 @@ pub fn import_index(
 
         let mut redb_dah = RedbDahIndex::open(&config.redb_dah_path, config.redb_cache_size)?;
         let dah_entries: Vec<_> = mem_dah.iter().collect();
-        redb_dah.insert_batch(&dah_entries);
+        redb_dah.insert_batch(&dah_entries)?;
 
         let mut redb_unmined =
             RedbUnminedIndex::open(&config.redb_unmined_path, config.redb_cache_size)?;
         let unmined_entries: Vec<_> = mem_unmined.iter().collect();
-        redb_unmined.insert_batch(&unmined_entries);
+        redb_unmined.insert_batch(&unmined_entries)?;
 
         // All three backends committed successfully — clear the sentinel.
         // Each `*_batch` call above commits its own write transaction
@@ -261,6 +320,405 @@ pub fn import_index(
             },
         ))
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PortableCounts {
+    primary: u64,
+    dah: u64,
+    unmined: u64,
+}
+
+impl PortableCounts {
+    fn new(primary: u64, dah: u64, unmined: u64) -> Result<Self, IndexError> {
+        for (name, count) in [("primary", primary), ("dah", dah), ("unmined", unmined)] {
+            if count > PORTABLE_MAX_COUNT {
+                return Err(IndexError::FormatError {
+                    detail: format!(
+                        "portable migration {name} count {count} exceeds maximum {PORTABLE_MAX_COUNT}"
+                    ),
+                });
+            }
+        }
+        Ok(Self {
+            primary,
+            dah,
+            unmined,
+        })
+    }
+
+    fn primary_usize(self) -> Result<usize, IndexError> {
+        portable_count_to_usize(self.primary, "primary")
+    }
+
+    fn dah_usize(self) -> Result<usize, IndexError> {
+        portable_count_to_usize(self.dah, "dah")
+    }
+
+    fn unmined_usize(self) -> Result<usize, IndexError> {
+        portable_count_to_usize(self.unmined, "unmined")
+    }
+}
+
+fn portable_count_to_usize(count: u64, name: &str) -> Result<usize, IndexError> {
+    usize::try_from(count).map_err(|_| IndexError::FormatError {
+        detail: format!("portable migration {name} count {count} does not fit usize"),
+    })
+}
+
+fn ensure_export_count(name: &str, declared: usize, actual: usize) -> Result<(), IndexError> {
+    if declared == actual {
+        return Ok(());
+    }
+    Err(IndexError::FormatError {
+        detail: format!(
+            "portable migration {name} count changed during export: declared {declared}, wrote {actual}"
+        ),
+    })
+}
+
+fn is_streaming_migration_file(path: &std::path::Path) -> Result<bool, IndexError> {
+    let mut file = File::open(path)?;
+    let mut magic = [0u8; 4];
+    read_exact_or_format(&mut file, &mut magic, "portable migration magic")?;
+    Ok(magic == PORTABLE_MAGIC)
+}
+
+fn import_streaming_index(
+    config: &IndexConfig,
+    path: &std::path::Path,
+) -> Result<(PrimaryBackend, DahBackend, UnminedBackend, ImportStats), IndexError> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = crc32fast::Hasher::new();
+    let counts = read_portable_header(&mut reader, &mut hasher)?;
+
+    if config.is_redb() {
+        import_streaming_redb(config, reader, hasher, counts)
+    } else {
+        import_streaming_memory(reader, hasher, counts)
+    }
+}
+
+fn import_streaming_memory<R: Read>(
+    mut reader: R,
+    mut hasher: crc32fast::Hasher,
+    counts: PortableCounts,
+) -> Result<(PrimaryBackend, DahBackend, UnminedBackend, ImportStats), IndexError> {
+    let mut primary = Index::new(counts.primary_usize()?.max(16))?;
+    for _ in 0..counts.primary {
+        let (key, entry) = read_primary_entry(&mut reader, &mut hasher)?;
+        primary.register(key, entry)?;
+    }
+
+    let mut dah = DahIndex::new();
+    for _ in 0..counts.dah {
+        let (height, key) = read_secondary_entry(&mut reader, &mut hasher)?;
+        dah.insert(height, key);
+    }
+
+    let mut unmined = UnminedIndex::new();
+    for _ in 0..counts.unmined {
+        let (height, key) = read_secondary_entry(&mut reader, &mut hasher)?;
+        unmined.insert(height, key);
+    }
+
+    verify_portable_checksum_and_eof(&mut reader, hasher)?;
+
+    Ok((
+        PrimaryBackend::InMemory(primary),
+        DahBackend::InMemory(dah),
+        UnminedBackend::InMemory(unmined),
+        ImportStats {
+            primary_entries: counts.primary_usize()?,
+            dah_entries: counts.dah_usize()?,
+            unmined_entries: counts.unmined_usize()?,
+        },
+    ))
+}
+
+fn import_streaming_redb<R: Read>(
+    config: &IndexConfig,
+    mut reader: R,
+    mut hasher: crc32fast::Hasher,
+    counts: PortableCounts,
+) -> Result<(PrimaryBackend, DahBackend, UnminedBackend, ImportStats), IndexError> {
+    write_import_sentinel(&config.redb_path).map_err(IndexError::Io)?;
+
+    let mut redb_primary = RedbPrimary::open(&config.redb_path, config.redb_cache_size)?;
+    import_primary_entries_to_redb(&mut reader, &mut hasher, counts.primary, &mut redb_primary)?;
+
+    let mut redb_dah = RedbDahIndex::open(&config.redb_dah_path, config.redb_cache_size)?;
+    import_secondary_entries_to_dah(&mut reader, &mut hasher, counts.dah, &mut redb_dah)?;
+
+    let mut redb_unmined =
+        RedbUnminedIndex::open(&config.redb_unmined_path, config.redb_cache_size)?;
+    import_secondary_entries_to_unmined(
+        &mut reader,
+        &mut hasher,
+        counts.unmined,
+        &mut redb_unmined,
+    )?;
+
+    verify_portable_checksum_and_eof(&mut reader, hasher)?;
+    remove_import_sentinel(&config.redb_path).map_err(IndexError::Io)?;
+
+    Ok((
+        PrimaryBackend::OnDisk(redb_primary),
+        DahBackend::OnDisk(redb_dah),
+        UnminedBackend::OnDisk(redb_unmined),
+        ImportStats {
+            primary_entries: counts.primary_usize()?,
+            dah_entries: counts.dah_usize()?,
+            unmined_entries: counts.unmined_usize()?,
+        },
+    ))
+}
+
+fn import_primary_entries_to_redb<R: Read>(
+    reader: &mut R,
+    hasher: &mut crc32fast::Hasher,
+    count: u64,
+    redb: &mut RedbPrimary,
+) -> Result<(), IndexError> {
+    let mut batch = Vec::with_capacity(batch_capacity(count));
+    for _ in 0..count {
+        batch.push(read_primary_entry(reader, hasher)?);
+        if batch.len() == IMPORT_BATCH_SIZE {
+            redb.register_batch(&batch)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        redb.register_batch(&batch)?;
+    }
+    Ok(())
+}
+
+fn import_secondary_entries_to_dah<R: Read>(
+    reader: &mut R,
+    hasher: &mut crc32fast::Hasher,
+    count: u64,
+    redb: &mut RedbDahIndex,
+) -> Result<(), IndexError> {
+    let mut batch = Vec::with_capacity(batch_capacity(count));
+    for _ in 0..count {
+        batch.push(read_secondary_entry(reader, hasher)?);
+        if batch.len() == IMPORT_BATCH_SIZE {
+            redb.insert_batch(&batch)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        redb.insert_batch(&batch)?;
+    }
+    Ok(())
+}
+
+fn import_secondary_entries_to_unmined<R: Read>(
+    reader: &mut R,
+    hasher: &mut crc32fast::Hasher,
+    count: u64,
+    redb: &mut RedbUnminedIndex,
+) -> Result<(), IndexError> {
+    let mut batch = Vec::with_capacity(batch_capacity(count));
+    for _ in 0..count {
+        batch.push(read_secondary_entry(reader, hasher)?);
+        if batch.len() == IMPORT_BATCH_SIZE {
+            redb.insert_batch(&batch)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        redb.insert_batch(&batch)?;
+    }
+    Ok(())
+}
+
+fn batch_capacity(count: u64) -> usize {
+    std::cmp::min(count, IMPORT_BATCH_SIZE as u64) as usize
+}
+
+fn write_portable_header<W: Write>(
+    writer: &mut W,
+    hasher: &mut crc32fast::Hasher,
+    counts: PortableCounts,
+) -> Result<(), IndexError> {
+    write_tracked(writer, hasher, &PORTABLE_MAGIC)?;
+    write_tracked(writer, hasher, &PORTABLE_VERSION.to_le_bytes())?;
+    write_tracked(writer, hasher, &counts.primary.to_le_bytes())?;
+    write_tracked(writer, hasher, &counts.dah.to_le_bytes())?;
+    write_tracked(writer, hasher, &counts.unmined.to_le_bytes())?;
+    Ok(())
+}
+
+fn read_portable_header<R: Read>(
+    reader: &mut R,
+    hasher: &mut crc32fast::Hasher,
+) -> Result<PortableCounts, IndexError> {
+    let mut magic = [0u8; 4];
+    read_tracked(reader, hasher, &mut magic, "portable migration magic")?;
+    if magic != PORTABLE_MAGIC {
+        return Err(IndexError::FormatError {
+            detail: "invalid portable migration magic".into(),
+        });
+    }
+
+    let version = read_u32(reader, hasher, "portable migration version")?;
+    if version != PORTABLE_VERSION {
+        return Err(IndexError::FormatError {
+            detail: format!(
+                "unsupported portable migration version {version}; expected {PORTABLE_VERSION}"
+            ),
+        });
+    }
+
+    PortableCounts::new(
+        read_u64(reader, hasher, "portable primary count")?,
+        read_u64(reader, hasher, "portable dah count")?,
+        read_u64(reader, hasher, "portable unmined count")?,
+    )
+}
+
+fn read_u32<R: Read>(
+    reader: &mut R,
+    hasher: &mut crc32fast::Hasher,
+    what: &str,
+) -> Result<u32, IndexError> {
+    let mut buf = [0u8; 4];
+    read_tracked(reader, hasher, &mut buf, what)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+fn read_u64<R: Read>(
+    reader: &mut R,
+    hasher: &mut crc32fast::Hasher,
+    what: &str,
+) -> Result<u64, IndexError> {
+    let mut buf = [0u8; 8];
+    read_tracked(reader, hasher, &mut buf, what)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn write_tracked<W: Write>(
+    writer: &mut W,
+    hasher: &mut crc32fast::Hasher,
+    bytes: &[u8],
+) -> Result<(), IndexError> {
+    writer.write_all(bytes)?;
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn read_tracked<R: Read>(
+    reader: &mut R,
+    hasher: &mut crc32fast::Hasher,
+    buf: &mut [u8],
+    what: &str,
+) -> Result<(), IndexError> {
+    read_exact_or_format(reader, buf, what)?;
+    hasher.update(buf);
+    Ok(())
+}
+
+fn read_exact_or_format<R: Read>(
+    reader: &mut R,
+    buf: &mut [u8],
+    what: &str,
+) -> Result<(), IndexError> {
+    reader.read_exact(buf).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            IndexError::FormatError {
+                detail: format!("portable migration truncated while reading {what}"),
+            }
+        } else {
+            IndexError::Io(e)
+        }
+    })
+}
+
+fn verify_portable_checksum_and_eof<R: Read>(
+    reader: &mut R,
+    hasher: crc32fast::Hasher,
+) -> Result<(), IndexError> {
+    let mut checksum_buf = [0u8; 4];
+    read_exact_or_format(reader, &mut checksum_buf, "portable migration checksum")?;
+    let stored = u32::from_le_bytes(checksum_buf);
+    let actual = hasher.finalize();
+    if stored != actual {
+        return Err(IndexError::ChecksumMismatch {
+            expected: stored,
+            actual,
+        });
+    }
+
+    let mut trailing = [0u8; 1];
+    match reader.read(&mut trailing) {
+        Ok(0) => Ok(()),
+        Ok(_) => Err(IndexError::FormatError {
+            detail: "portable migration has trailing bytes after checksum".into(),
+        }),
+        Err(e) => Err(IndexError::Io(e)),
+    }
+}
+
+fn encode_primary_entry(key: TxKey, entry: TxIndexEntry) -> [u8; PORTABLE_PRIMARY_ENTRY_SIZE] {
+    let mut buf = [0u8; PORTABLE_PRIMARY_ENTRY_SIZE];
+    buf[0..32].copy_from_slice(&key.txid);
+    buf[32] = entry.device_id;
+    buf[33..41].copy_from_slice(&entry.record_offset.to_le_bytes());
+    buf[41..45].copy_from_slice(&entry.utxo_count.to_le_bytes());
+    buf[45] = entry.block_entry_count;
+    buf[46] = entry.tx_flags;
+    buf[47..51].copy_from_slice(&entry.spent_utxos.to_le_bytes());
+    buf[51..55].copy_from_slice(&entry.dah_or_preserve.to_le_bytes());
+    buf[55..59].copy_from_slice(&entry.unmined_since.to_le_bytes());
+    buf[59..63].copy_from_slice(&entry.generation.to_le_bytes());
+    buf
+}
+
+fn read_primary_entry<R: Read>(
+    reader: &mut R,
+    hasher: &mut crc32fast::Hasher,
+) -> Result<(TxKey, TxIndexEntry), IndexError> {
+    let mut buf = [0u8; PORTABLE_PRIMARY_ENTRY_SIZE];
+    read_tracked(reader, hasher, &mut buf, "portable primary entry")?;
+
+    let mut txid = [0u8; 32];
+    txid.copy_from_slice(&buf[0..32]);
+    Ok((
+        TxKey { txid },
+        TxIndexEntry {
+            device_id: buf[32],
+            record_offset: u64::from_le_bytes(buf[33..41].try_into().unwrap()),
+            utxo_count: u32::from_le_bytes(buf[41..45].try_into().unwrap()),
+            block_entry_count: buf[45],
+            tx_flags: buf[46],
+            spent_utxos: u32::from_le_bytes(buf[47..51].try_into().unwrap()),
+            dah_or_preserve: u32::from_le_bytes(buf[51..55].try_into().unwrap()),
+            unmined_since: u32::from_le_bytes(buf[55..59].try_into().unwrap()),
+            generation: u32::from_le_bytes(buf[59..63].try_into().unwrap()),
+        },
+    ))
+}
+
+fn encode_secondary_entry(height: u32, key: TxKey) -> [u8; PORTABLE_SECONDARY_ENTRY_SIZE] {
+    let mut buf = [0u8; PORTABLE_SECONDARY_ENTRY_SIZE];
+    buf[0..4].copy_from_slice(&height.to_le_bytes());
+    buf[4..36].copy_from_slice(&key.txid);
+    buf
+}
+
+fn read_secondary_entry<R: Read>(
+    reader: &mut R,
+    hasher: &mut crc32fast::Hasher,
+) -> Result<(u32, TxKey), IndexError> {
+    let mut buf = [0u8; PORTABLE_SECONDARY_ENTRY_SIZE];
+    read_tracked(reader, hasher, &mut buf, "portable secondary entry")?;
+    let height = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let mut txid = [0u8; 32];
+    txid.copy_from_slice(&buf[4..36]);
+    Ok((height, TxKey { txid }))
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +957,117 @@ mod tests {
                 .expect("entry should exist");
             assert_eq!(e.record_offset, i * 100);
         }
+    }
+
+    #[test]
+    fn migration_export_streaming_does_not_materialize() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("streaming-export.tsm");
+
+        let src_config = IndexConfig {
+            backend: IndexBackendMode::Redb,
+            redb_path: dir.path().join("stream_src_primary.redb"),
+            redb_dah_path: dir.path().join("stream_src_dah.redb"),
+            redb_unmined_path: dir.path().join("stream_src_unmined.redb"),
+            redb_cache_size: 64 * 1024 * 1024,
+            ..IndexConfig::default()
+        };
+
+        let mut primary = PrimaryBackend::new_on_disk(&src_config).unwrap();
+        for i in 0..25u64 {
+            primary.register(make_key(i), make_entry(i * 100)).unwrap();
+        }
+
+        let mut dah = DahBackend::OnDisk(
+            RedbDahIndex::open(&src_config.redb_dah_path, src_config.redb_cache_size).unwrap(),
+        );
+        for i in 0..9u64 {
+            dah.insert(1_000 + i as u32, make_key(i), None).unwrap();
+        }
+
+        let mut unmined = UnminedBackend::OnDisk(
+            RedbUnminedIndex::open(&src_config.redb_unmined_path, src_config.redb_cache_size)
+                .unwrap(),
+        );
+        for i in 9..14u64 {
+            unmined.insert(2_000 + i as u32, make_key(i), None).unwrap();
+        }
+
+        crate::index::reset_index_new_call_count();
+        let export_stats = export_index(&primary, &dah, &unmined, &snap_path).unwrap();
+        assert_eq!(export_stats.primary_entries, 25);
+        assert_eq!(export_stats.dah_entries, 9);
+        assert_eq!(export_stats.unmined_entries, 5);
+        assert_eq!(
+            crate::index::index_new_call_count(),
+            0,
+            "export_index must stream redb entries without constructing an in-memory Index"
+        );
+
+        let file_bytes = std::fs::read(&snap_path).unwrap();
+        assert_eq!(&file_bytes[0..4], &PORTABLE_MAGIC);
+
+        let dst_config = IndexConfig {
+            backend: IndexBackendMode::Redb,
+            redb_path: dir.path().join("stream_dst_primary.redb"),
+            redb_dah_path: dir.path().join("stream_dst_dah.redb"),
+            redb_unmined_path: dir.path().join("stream_dst_unmined.redb"),
+            redb_cache_size: 64 * 1024 * 1024,
+            ..IndexConfig::default()
+        };
+
+        let (restored_primary, restored_dah, restored_unmined, import_stats) =
+            import_index(&dst_config, &snap_path).unwrap();
+        assert_eq!(
+            crate::index::index_new_call_count(),
+            0,
+            "streaming redb import must not restore the file into an in-memory Index first"
+        );
+
+        assert_eq!(import_stats.primary_entries, 25);
+        assert_eq!(import_stats.dah_entries, 9);
+        assert_eq!(import_stats.unmined_entries, 5);
+        assert_eq!(restored_primary.len(), 25);
+        assert_eq!(restored_dah.len(), 9);
+        assert_eq!(restored_unmined.len(), 5);
+        for i in 0..25u64 {
+            let entry = restored_primary.lookup(&make_key(i)).unwrap();
+            assert_eq!(entry.record_offset, i * 100);
+        }
+    }
+
+    #[test]
+    fn import_legacy_tsix_snapshot_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("legacy.snap");
+
+        let mut primary = Index::new(16).unwrap();
+        for i in 0..6u64 {
+            primary.register(make_key(i), make_entry(i * 100)).unwrap();
+        }
+        let mut dah = DahIndex::new();
+        dah.insert(100, make_key(1));
+        let mut unmined = UnminedIndex::new();
+        unmined.insert(200, make_key(2));
+        primary.snapshot_all(&dah, &unmined, &snap_path).unwrap();
+
+        let config = IndexConfig {
+            backend: IndexBackendMode::Redb,
+            redb_path: dir.path().join("legacy_primary.redb"),
+            redb_dah_path: dir.path().join("legacy_dah.redb"),
+            redb_unmined_path: dir.path().join("legacy_unmined.redb"),
+            redb_cache_size: 64 * 1024 * 1024,
+            ..IndexConfig::default()
+        };
+
+        let (restored_primary, restored_dah, restored_unmined, stats) =
+            import_index(&config, &snap_path).unwrap();
+        assert_eq!(stats.primary_entries, 6);
+        assert_eq!(stats.dah_entries, 1);
+        assert_eq!(stats.unmined_entries, 1);
+        assert_eq!(restored_primary.len(), 6);
+        assert_eq!(restored_dah.len(), 1);
+        assert_eq!(restored_unmined.len(), 1);
     }
 
     #[test]

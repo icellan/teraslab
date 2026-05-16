@@ -49,6 +49,11 @@ pub struct ReplicationConfig {
     pub replication_timeout: Duration,
     /// Entries per catchup batch.
     pub catchup_batch_size: usize,
+    /// Maximum redo-derived operations to send to one replica in one
+    /// catch-up pass. This bounds how long a lagging replica can monopolize
+    /// the catch-up loop before live replication and other replicas get a
+    /// scheduling opportunity.
+    pub catchup_max_ops_per_pass: usize,
 }
 
 impl Default for ReplicationConfig {
@@ -57,6 +62,24 @@ impl Default for ReplicationConfig {
             ack_policy: AckPolicy::WriteAll,
             replication_timeout: Duration::from_secs(5),
             catchup_batch_size: 1000,
+            catchup_max_ops_per_pass: 10_000,
+        }
+    }
+}
+
+/// Number of replica ACKs required for a write to satisfy `policy`.
+///
+/// `replica_targets` is the number of replicas the master sent to, so the
+/// replication factor is `replica_targets + 1` because the master already has
+/// one local durable copy. For `WriteMajority`, this returns the number of
+/// replica ACKs needed to reach a strict majority of all copies.
+pub fn required_replica_acks(replica_targets: usize, policy: AckPolicy) -> usize {
+    match policy {
+        AckPolicy::WriteAll => replica_targets,
+        AckPolicy::WriteMajority => {
+            let replication_factor = replica_targets.saturating_add(1);
+            let majority_copies = replication_factor / 2 + 1;
+            majority_copies.saturating_sub(1)
         }
     }
 }
@@ -485,14 +508,7 @@ impl ReplicationManager {
 
     /// Number of replica ACKs required by the current policy.
     pub fn required_ack_count(&self) -> usize {
-        let rf = self.senders.len() + 1; // replicas + master
-        match self.config.ack_policy {
-            AckPolicy::WriteAll => self.senders.len(),
-            AckPolicy::WriteMajority => {
-                let majority = rf / 2 + 1;
-                majority.saturating_sub(1) // master counts as 1
-            }
-        }
+        required_replica_acks(self.senders.len(), self.config.ack_policy)
     }
 
     /// Number of live replicas.
@@ -543,6 +559,7 @@ impl ReplicationManager {
         F: Fn(u64) -> Vec<ReplicaOp>,
     {
         let batch_size = self.config.catchup_batch_size;
+        let max_ops_per_pass = self.config.catchup_max_ops_per_pass.max(1);
         let timeout = self.config.replication_timeout;
         let master_seq = self.next_sequence;
         // Phase H — collect resync notifications inside the borrow loop;
@@ -562,7 +579,7 @@ impl ReplicationManager {
                 continue;
             }
 
-            let ops = ops_from_seq(from_seq);
+            let mut ops = ops_from_seq(from_seq);
             if ops.is_empty() {
                 // Redo log entries were reclaimed; can't catch up this way.
                 // Transition to NeedsResync so the caller knows a full
@@ -580,6 +597,9 @@ impl ReplicationManager {
                     sender.resync_emitted = true;
                 }
                 continue;
+            }
+            if ops.len() > max_ops_per_pass {
+                ops.truncate(max_ops_per_pass);
             }
 
             // Send in batches, advancing the sequence cursor per chunk
@@ -605,7 +625,14 @@ impl ReplicationManager {
                 }
                 match sender.transport.recv_ack(timeout) {
                     Ok(ReplicaAck::Ok { through_sequence }) => {
+                        let expected_through = batch.last_sequence();
+                        if through_sequence != expected_through {
+                            sender.state = ReplicaState::Down;
+                            ok = false;
+                            break;
+                        }
                         sender.last_acked = through_sequence;
+                        chunk_seq = through_sequence.saturating_add(1);
                     }
                     _ => {
                         sender.state = ReplicaState::Down;
@@ -613,12 +640,15 @@ impl ReplicationManager {
                         break;
                     }
                 }
-                chunk_seq += chunk.len() as u64;
             }
 
-            if ok {
+            if ok && sender.last_acked.saturating_add(1) >= master_seq {
                 sender.state = ReplicaState::Live;
                 sender.resync_emitted = false;
+            } else if ok {
+                sender.state = ReplicaState::CatchingUp {
+                    from_sequence: sender.last_acked.saturating_add(1),
+                };
             }
         }
 
@@ -750,6 +780,8 @@ mod tests {
             tx_key: key(1),
             offset: 0,
             spending_data: [0xAB; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
             master_generation: 0,
         }];
         mgr.replicate_batch(&ops).unwrap();
@@ -773,6 +805,8 @@ mod tests {
                 tx_key: key(i),
                 offset: i as u32,
                 spending_data: [i; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
                 master_generation: 0,
             })
             .collect();
@@ -932,6 +966,8 @@ mod tests {
                 tx_key: key(1),
                 offset: 0,
                 spending_data: [0x11; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
                 master_generation: 0,
             },
             ReplicaOp::SetMined {
@@ -940,6 +976,8 @@ mod tests {
                 block_height: 100,
                 subtree_idx: 0,
                 on_longest_chain: true,
+                current_block_height: 700_000,
+                block_height_retention: 288,
                 master_generation: 0,
             },
             ReplicaOp::PruneSlot {
@@ -1011,6 +1049,48 @@ mod tests {
             vec![Box::new(InMemoryTransport::pair().0)],
         );
         assert_eq!(mgr.required_ack_count(), 1);
+    }
+
+    #[test]
+    fn write_majority_threshold_consistency_rf2_through_rf7() {
+        let expected = [
+            (2usize, 1usize),
+            (3usize, 1usize),
+            (4usize, 2usize),
+            (5usize, 2usize),
+            (6usize, 3usize),
+            (7usize, 3usize),
+        ];
+
+        for (rf, required) in expected {
+            let replica_targets = rf - 1;
+            assert_eq!(
+                required_replica_acks(replica_targets, AckPolicy::WriteMajority),
+                required,
+                "RF={rf} WriteMajority threshold mismatch"
+            );
+            assert_eq!(
+                required_replica_acks(replica_targets, AckPolicy::WriteAll),
+                replica_targets,
+                "RF={rf} WriteAll threshold mismatch"
+            );
+
+            let transports: Vec<Box<dyn ReplicaTransport>> = (0..replica_targets)
+                .map(|_| Box::new(InMemoryTransport::pair().0) as Box<dyn ReplicaTransport>)
+                .collect();
+            let mgr = ReplicationManager::new(
+                ReplicationConfig {
+                    ack_policy: AckPolicy::WriteMajority,
+                    ..Default::default()
+                },
+                transports,
+            );
+            assert_eq!(
+                mgr.required_ack_count(),
+                required,
+                "manager RF={rf} threshold must use shared helper"
+            );
+        }
     }
 
     // -- Single-operation replication for each op type --
@@ -1182,6 +1262,8 @@ mod tests {
             tx_key: key(1),
             offset: 0,
             spending_data: [0xAB; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
             master_generation: 0,
         }];
         // Send same ops twice
@@ -1639,6 +1721,49 @@ mod tests {
         let _ = handle.join();
     }
 
+    #[test]
+    fn catchup_chunk_seq_matches_replica_ack_sequence() {
+        let (mt, rt) = InMemoryTransport::pair();
+
+        let handle = std::thread::spawn(move || {
+            let batch = rt.recv_batch(Duration::from_secs(1)).unwrap();
+            assert_eq!(batch.first_sequence, 10);
+            rt.send_ack(&ReplicaAck::Ok {
+                through_sequence: batch.first_sequence,
+            })
+            .unwrap();
+        });
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig {
+                catchup_batch_size: 3,
+                ..Default::default()
+            },
+            vec![Box::new(mt)],
+        );
+        mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 10 };
+        mgr.next_sequence = 20;
+
+        mgr.run_catchup(|from_seq| {
+            (from_seq..20)
+                .map(|i| ReplicaOp::Freeze {
+                    tx_key: key(i as u8),
+                    offset: 0,
+                    master_generation: 0,
+                })
+                .collect()
+        })
+        .unwrap();
+
+        assert_eq!(
+            *mgr.sender(0).state(),
+            ReplicaState::Down,
+            "catch-up must fail closed when replica ACK does not match the chunk end",
+        );
+
+        handle.join().unwrap();
+    }
+
     // -----------------------------------------------------------------------
     // Part 3.12: Connection management
     // -----------------------------------------------------------------------
@@ -1745,6 +1870,49 @@ mod tests {
         assert_eq!(received[2].first_sequence, 104);
         assert_eq!(received[2].ops.len(), 1);
         assert_eq!(received[2].last_sequence(), 104);
+    }
+
+    #[test]
+    fn catchup_max_ops_per_pass_keeps_replica_catching_up() {
+        let (master_t, replica_t) = InMemoryTransport::pair();
+        let handle = spawn_auto_ack_replica(replica_t);
+
+        let config = ReplicationConfig {
+            catchup_batch_size: 2,
+            catchup_max_ops_per_pass: 3,
+            ..Default::default()
+        };
+        let mut mgr = ReplicationManager::new(config, vec![Box::new(master_t)]);
+
+        mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 100 };
+        mgr.next_sequence = 110;
+
+        mgr.run_catchup(|from_seq| {
+            assert_eq!(from_seq, 100);
+            (0..10)
+                .map(|i| ReplicaOp::Freeze {
+                    tx_key: key(i),
+                    offset: 0,
+                    master_generation: 0,
+                })
+                .collect()
+        })
+        .unwrap();
+
+        assert_eq!(
+            *mgr.sender(0).state(),
+            ReplicaState::CatchingUp { from_sequence: 103 },
+            "catch-up must stop after the per-pass cap and remember where to resume"
+        );
+        assert_eq!(mgr.sender(0).last_acked(), 102);
+
+        drop(mgr);
+        let received = handle.join().unwrap();
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].first_sequence, 100);
+        assert_eq!(received[0].ops.len(), 2);
+        assert_eq!(received[1].first_sequence, 102);
+        assert_eq!(received[1].ops.len(), 1);
     }
 
     // -----------------------------------------------------------------------

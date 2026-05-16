@@ -192,11 +192,12 @@ fn bench_unspend_batch_codec(c: &mut Criterion) {
         current_block_height: 2000,
         block_height_retention: 288,
     };
-    let items: Vec<WireSlotItem> = (0..count)
-        .map(|i: u32| WireSlotItem {
+    let items: Vec<WireUnspendItem> = (0..count)
+        .map(|i: u32| WireUnspendItem {
             txid: test_txid(i),
             vout: i,
             utxo_hash: test_utxo_hash(i),
+            spending_data: [i as u8; 36],
         })
         .collect();
 
@@ -316,6 +317,7 @@ fn bench_get_spend_batch_codec(c: &mut Criterion) {
         .map(|i: u32| WireGetSpendItem {
             txid: test_txid(i),
             vout: i,
+            utxo_hash: [i as u8; 32],
         })
         .collect();
 

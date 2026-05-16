@@ -22,9 +22,38 @@
 
 use crate::cluster::auth;
 use crate::cluster::shards::NodeId;
+use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+
+/// 16-byte UUID identifying a cluster instance.
+///
+/// Two clusters that happened to be configured with the same `cluster_secret`
+/// but bootstrapped independently are distinguished by this value: the
+/// orchestrator generates and persists it at first boot, and every node in
+/// the same cluster shares the same id. Split-brain merges (where a SWIM
+/// gossip leak introduces members from a different `cluster_id`) are
+/// rejected before any topology commit can be issued.
+///
+/// `[0u8; 16]` is the "unset" sentinel — used by single-node test setups and
+/// by pre-orchestrator code paths. When `cluster_id` is unset on either
+/// side of a comparison the check falls back to the
+/// [`TopologyAuthority::committed_voter_ever_seen`] heuristic
+/// (track-and-reject unseen members).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct ClusterId(pub [u8; 16]);
+
+impl ClusterId {
+    /// All-zero sentinel meaning "no cluster_id configured".
+    pub const UNSET: ClusterId = ClusterId([0u8; 16]);
+
+    /// True when this id is the unset sentinel.
+    pub fn is_unset(&self) -> bool {
+        self.0 == [0u8; 16]
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Wire structures
@@ -168,14 +197,31 @@ pub struct TopologyCommit {
     pub proposer: NodeId,
     pub members: Vec<NodeId>,
     pub digest: [u8; 32],
+    /// Nodes whose accepted votes formed the quorum for this commit.
+    pub voters: Vec<NodeId>,
 }
 
 impl TopologyCommit {
+    /// Check that the embedded voter list is a quorum proof for `members`.
+    pub fn has_quorum_voter_proof(&self) -> bool {
+        let quorum_needed = (self.members.len() / 2) + 1;
+        if self.voters.len() < quorum_needed {
+            return false;
+        }
+        let mut seen = std::collections::HashSet::with_capacity(self.voters.len());
+        for voter in &self.voters {
+            if !self.members.contains(voter) || !seen.insert(*voter) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Serialize for the wire.
     ///
-    /// Format: `[term:8][proposer:8][member_count:4][member_id:8 * count][digest:32]`
+    /// Format: `[term:8][proposer:8][member_count:4][member_id:8 * count][digest:32][voter_count:4][voter_id:8 * count]`
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(52 + self.members.len() * 8);
+        let mut buf = Vec::with_capacity(56 + (self.members.len() + self.voters.len()) * 8);
         buf.extend_from_slice(&self.term.to_le_bytes());
         buf.extend_from_slice(&self.proposer.0.to_le_bytes());
         buf.extend_from_slice(&(self.members.len() as u32).to_le_bytes());
@@ -183,16 +229,41 @@ impl TopologyCommit {
             buf.extend_from_slice(&m.0.to_le_bytes());
         }
         buf.extend_from_slice(&self.digest);
+        buf.extend_from_slice(&(self.voters.len() as u32).to_le_bytes());
+        for voter in &self.voters {
+            buf.extend_from_slice(&voter.0.to_le_bytes());
+        }
         buf
     }
 
     /// Deserialize from the wire.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        TopologyTerm::deserialize(data).map(|t| Self {
-            term: t.term,
-            proposer: t.proposer,
-            members: t.members,
-            digest: t.digest,
+        let term = TopologyTerm::deserialize(data)?;
+        let voters_pos = 20 + term.members.len() * 8 + 32;
+        let voters = if data.len() >= voters_pos + 4 {
+            let count =
+                u32::from_le_bytes(data[voters_pos..voters_pos + 4].try_into().ok()?) as usize;
+            let voters_end = voters_pos + 4 + count * 8;
+            if data.len() < voters_end {
+                return None;
+            }
+            let mut voters = Vec::with_capacity(count);
+            for i in 0..count {
+                let off = voters_pos + 4 + i * 8;
+                voters.push(NodeId(u64::from_le_bytes(
+                    data[off..off + 8].try_into().ok()?,
+                )));
+            }
+            voters
+        } else {
+            Vec::new()
+        };
+        Some(Self {
+            term: term.term,
+            proposer: term.proposer,
+            members: term.members,
+            digest: term.digest,
+            voters,
         })
     }
 }
@@ -210,20 +281,37 @@ pub struct PersistedTopologyState {
     pub committed_term: u64,
     /// Members of the last committed term.
     pub committed_members: Vec<NodeId>,
+    /// Voters whose quorum approved the last committed term.
+    pub committed_voters: Vec<NodeId>,
     /// Highest term this node voted for (prevents double-voting).
     pub voted_term: u64,
     /// Monotonic SWIM incarnation counter for this node.
     /// Persisted so that after restart the node always has a higher
     /// incarnation than any previously gossiped value.
     pub incarnation: u64,
+    /// Every `NodeId` ever observed as a committed voter on this node.
+    /// Used as the fallback split-brain heal defence (F-G8-001) when
+    /// `cluster_id` is unset: any proposal introducing a previously
+    /// unseen member is rejected.
+    pub committed_voter_ever_seen: Vec<NodeId>,
 }
 
 impl PersistedTopologyState {
     /// Serialize to bytes.
     ///
-    /// Format: `[peak:8][committed_term:8][voted_term:8][member_count:4][member_ids:8*N][incarnation:8]`
+    /// Format: `[peak:8][committed_term:8][voted_term:8][member_count:4][member_ids:8*N][incarnation:8][voter_count:4][voter_ids:8*N][ever_seen_count:4][ever_seen_ids:8*N]`
+    ///
+    /// `[ever_seen_count][ever_seen_ids]` is appended for F-G8-001's
+    /// split-brain heal fallback. Older payloads without the trailer
+    /// decode with an empty `committed_voter_ever_seen` and the loader
+    /// seeds the set from `committed_voters`.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(36 + self.committed_members.len() * 8);
+        let mut buf = Vec::with_capacity(
+            44 + (self.committed_members.len()
+                + self.committed_voters.len()
+                + self.committed_voter_ever_seen.len())
+                * 8,
+        );
         buf.extend_from_slice(&self.peak_cluster_size.to_le_bytes());
         buf.extend_from_slice(&self.committed_term.to_le_bytes());
         buf.extend_from_slice(&self.voted_term.to_le_bytes());
@@ -232,6 +320,14 @@ impl PersistedTopologyState {
             buf.extend_from_slice(&m.0.to_le_bytes());
         }
         buf.extend_from_slice(&self.incarnation.to_le_bytes());
+        buf.extend_from_slice(&(self.committed_voters.len() as u32).to_le_bytes());
+        for voter in &self.committed_voters {
+            buf.extend_from_slice(&voter.0.to_le_bytes());
+        }
+        buf.extend_from_slice(&(self.committed_voter_ever_seen.len() as u32).to_le_bytes());
+        for v in &self.committed_voter_ever_seen {
+            buf.extend_from_slice(&v.0.to_le_bytes());
+        }
         buf
     }
 
@@ -266,12 +362,54 @@ impl PersistedTopologyState {
             } else {
                 0
             };
+            let voters_off = incarnation_off + 8;
+            let mut voters = Vec::new();
+            let mut voters_end = voters_off;
+            if voters_off + 4 <= data.len() {
+                let voter_count = u32::from_le_bytes(
+                    data[voters_off..voters_off + 4]
+                        .try_into()
+                        .unwrap_or([0; 4]),
+                ) as usize;
+                voters.reserve(voter_count);
+                for i in 0..voter_count {
+                    let off = voters_off + 4 + i * 8;
+                    if off + 8 <= data.len() {
+                        voters.push(NodeId(u64::from_le_bytes(
+                            data[off..off + 8].try_into().unwrap_or([0; 8]),
+                        )));
+                    }
+                }
+                voters_end = voters_off + 4 + voter_count * 8;
+            }
+            // Optional trailer: [ever_seen_count:4][ever_seen_ids:8*N].
+            // Older payloads do not have this; callers seed the runtime
+            // set from `committed_voters` in that case.
+            let mut ever_seen = Vec::new();
+            if voters_end + 4 <= data.len() {
+                let count = u32::from_le_bytes(
+                    data[voters_end..voters_end + 4]
+                        .try_into()
+                        .unwrap_or([0; 4]),
+                ) as usize;
+                ever_seen.reserve(count);
+                for i in 0..count {
+                    let off = voters_end + 4 + i * 8;
+                    if off + 8 <= data.len() {
+                        ever_seen.push(NodeId(u64::from_le_bytes(
+                            data[off..off + 8].try_into().unwrap_or([0; 8]),
+                        )));
+                    }
+                }
+            }
             Self {
                 peak_cluster_size: peak.max(1),
                 committed_term,
                 committed_members: members,
+                committed_voters: voters,
                 voted_term,
                 incarnation,
+                committed_voter_ever_seen: ever_seen,
             }
         } else if data.len() >= 16 {
             // Old format: [peak:8][epoch:8]
@@ -281,8 +419,10 @@ impl PersistedTopologyState {
                 peak_cluster_size: peak.max(1),
                 committed_term: epoch,
                 committed_members: Vec::new(),
+                committed_voters: Vec::new(),
                 voted_term: epoch,
                 incarnation: 0,
+                committed_voter_ever_seen: Vec::new(),
             }
         } else if data.len() >= 8 {
             // Oldest format: [peak:8] only
@@ -291,16 +431,20 @@ impl PersistedTopologyState {
                 peak_cluster_size: peak.max(1),
                 committed_term: 0,
                 committed_members: Vec::new(),
+                committed_voters: Vec::new(),
                 voted_term: 0,
                 incarnation: 0,
+                committed_voter_ever_seen: Vec::new(),
             }
         } else {
             Self {
                 peak_cluster_size: 1,
                 committed_term: 0,
                 committed_members: Vec::new(),
+                committed_voters: Vec::new(),
                 voted_term: 0,
                 incarnation: 0,
+                committed_voter_ever_seen: Vec::new(),
             }
         }
     }
@@ -356,12 +500,28 @@ struct PendingProposal {
 /// Thread-safe: all mutable state is behind a Mutex.
 pub struct TopologyAuthority {
     self_id: NodeId,
+    /// Per-cluster UUID — used to reject merges between independently
+    /// bootstrapped clusters that happen to share a `cluster_secret`.
+    /// `ClusterId::UNSET` means "not configured" (pre-orchestrator code
+    /// paths and single-node tests); when unset on either side of a
+    /// check the fallback `committed_voter_ever_seen` heuristic applies.
+    cluster_id: RwLock<ClusterId>,
     /// Highest committed term. Wrapped in `Arc` so SWIM gossip can share
     /// a reference and piggyback the value on probe messages for catch-up
     /// detection without polling.
     committed_term: Arc<AtomicU64>,
     /// Members of the committed term.
     committed_members: Arc<RwLock<Vec<NodeId>>>,
+    /// Voters whose quorum approved the committed term.
+    committed_voters: Arc<RwLock<Vec<NodeId>>>,
+    /// Every `NodeId` this authority has ever seen as a committed voter
+    /// in any term. Persisted across restarts via the membership-history
+    /// portion of [`PersistedTopologyState`]. Used as a fallback to
+    /// reject split-brain merges when `cluster_id` is unset (the
+    /// orchestrator has not wired UUID persistence yet): any proposal
+    /// introducing a `NodeId` not in this set is rejected unless
+    /// `committed_members` is empty (first-commit case).
+    committed_voter_ever_seen: Arc<RwLock<HashSet<NodeId>>>,
     /// Highest term this node voted for (persisted before responding).
     voted_term: AtomicU64,
     /// Pending proposal (if this node is the proposer).
@@ -391,8 +551,11 @@ impl TopologyAuthority {
     pub fn new(self_id: NodeId, propose_timeout: Duration) -> Self {
         Self {
             self_id,
+            cluster_id: RwLock::new(ClusterId::UNSET),
             committed_term: Arc::new(AtomicU64::new(0)),
             committed_members: Arc::new(RwLock::new(Vec::new())),
+            committed_voters: Arc::new(RwLock::new(Vec::new())),
+            committed_voter_ever_seen: Arc::new(RwLock::new(HashSet::new())),
             voted_term: AtomicU64::new(0),
             pending_proposal: Mutex::new(None),
             propose_timeout,
@@ -400,6 +563,107 @@ impl TopologyAuthority {
             observed_membership: Mutex::new(Vec::new()),
             last_commit_at_unix_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Set this authority's cluster_id.
+    ///
+    /// Called by the orchestrator on startup once the persisted UUID has
+    /// been loaded (or freshly generated on first boot). Subsequent
+    /// proposals coming from nodes whose cluster_id differs are rejected
+    /// as split-brain.
+    pub fn set_cluster_id(&self, id: ClusterId) {
+        *self.cluster_id.write().unwrap() = id;
+    }
+
+    /// Current cluster_id (defaults to [`ClusterId::UNSET`]).
+    pub fn cluster_id(&self) -> ClusterId {
+        *self.cluster_id.read().unwrap()
+    }
+
+    /// Snapshot the `committed_voter_ever_seen` set. Tests / persistence.
+    pub fn committed_voter_ever_seen_snapshot(&self) -> Vec<NodeId> {
+        let mut v: Vec<NodeId> = self
+            .committed_voter_ever_seen
+            .read()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        v.sort_unstable_by_key(|n| n.0);
+        v
+    }
+
+    /// Replace the `committed_voter_ever_seen` set. Used by the
+    /// persistence layer when restoring state.
+    pub fn set_committed_voter_ever_seen(&self, voters: &[NodeId]) {
+        let mut set = self.committed_voter_ever_seen.write().unwrap();
+        set.clear();
+        set.extend(voters.iter().copied());
+    }
+
+    /// Validate that `proposed_members` does not introduce a member never
+    /// previously observed as a committed voter on this node. Returns
+    /// `true` when the change is safe, `false` when it appears to be a
+    /// split-brain merge.
+    ///
+    /// Safe cases:
+    ///   * the ever-seen set is empty (first commit on this node);
+    ///   * every member of `proposed_members` has been a committed voter
+    ///     before (or is `self_id`, since self always counts as known).
+    pub fn ever_seen_check(&self, proposed_members: &[NodeId]) -> bool {
+        let seen = self.committed_voter_ever_seen.read().unwrap();
+        if seen.is_empty() {
+            return true;
+        }
+        for m in proposed_members {
+            if *m == self.self_id {
+                continue;
+            }
+            if !seen.contains(m) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Decide whether a proposed membership is safe to commit on this
+    /// node, applying both the monotonic-change check and the
+    /// ever-seen-voter check.
+    ///
+    /// `proposal_cluster_id` is `None` when the proposer omitted it
+    /// (legacy / pre-orchestrator) and `Some(id)` when present. When
+    /// both sides have a configured (non-unset) cluster_id and they
+    /// differ, the proposal is rejected outright. When either side is
+    /// unset, the check falls back to the ever-seen-voter heuristic.
+    pub fn membership_change_is_safe(
+        &self,
+        proposed_members: &[NodeId],
+        proposal_cluster_id: Option<ClusterId>,
+    ) -> bool {
+        // cluster_id check: only when both sides are configured.
+        let my_id = self.cluster_id();
+        if !my_id.is_unset()
+            && let Some(other) = proposal_cluster_id
+            && !other.is_unset()
+            && other != my_id
+        {
+            return false;
+        }
+
+        let committed_members = self.committed_members.read().unwrap();
+        if committed_members.is_empty() {
+            // First commit on this node — nothing to compare against.
+            return true;
+        }
+        if !is_safe_membership_change(&committed_members, proposed_members) {
+            return false;
+        }
+        drop(committed_members);
+
+        // Fallback split-brain heuristic: any previously-unseen NodeId
+        // is rejected. cluster_id (when wired) overrides this, but the
+        // pure-superset attack (F-G8-001) only requires this check.
+        self.ever_seen_check(proposed_members)
     }
 
     /// Get a shared reference to the committed term atomic.
@@ -417,7 +681,20 @@ impl TopologyAuthority {
             .store(state.committed_term, Ordering::Relaxed);
         self.voted_term.store(state.voted_term, Ordering::Relaxed);
         *self.committed_members.write().unwrap() = state.committed_members.clone();
-        *self.observed_membership.lock().unwrap() = state.committed_members.clone();
+        *self.committed_voters.write().unwrap() = state.committed_voters.clone();
+        *self.observed_membership.lock() = state.committed_members.clone();
+        // Restore the ever-seen voter set so the fallback split-brain
+        // check survives restarts. If the persisted file predates this
+        // field, seed it from `committed_voters` (the best we can do).
+        {
+            let mut seen = self.committed_voter_ever_seen.write().unwrap();
+            seen.clear();
+            if !state.committed_voter_ever_seen.is_empty() {
+                seen.extend(state.committed_voter_ever_seen.iter().copied());
+            } else {
+                seen.extend(state.committed_voters.iter().copied());
+            }
+        }
     }
 
     /// Current committed term.
@@ -430,13 +707,18 @@ impl TopologyAuthority {
         self.committed_members.read().unwrap().clone()
     }
 
+    /// Voters whose quorum approved the committed term.
+    pub fn committed_voters(&self) -> Vec<NodeId> {
+        self.committed_voters.read().unwrap().clone()
+    }
+
     /// Reset the membership-change timer to `now`.
     ///
     /// Called when a `TopologyStale` event is detected so the fallback
     /// proposer path fires sooner (on the very next timeout check) rather
     /// than waiting for the original membership-change timer to expire.
     pub fn reset_membership_timer(&self) {
-        *self.last_membership_change.lock().unwrap() = Instant::now();
+        *self.last_membership_change.lock() = Instant::now();
     }
 
     /// Current persisted state for saving to disk.
@@ -448,8 +730,10 @@ impl TopologyAuthority {
             peak_cluster_size: peak,
             committed_term: self.committed_term.load(Ordering::Relaxed),
             committed_members: self.committed_members.read().unwrap().clone(),
+            committed_voters: self.committed_voters.read().unwrap().clone(),
             voted_term: self.voted_term.load(Ordering::Relaxed),
             incarnation,
+            committed_voter_ever_seen: self.committed_voter_ever_seen_snapshot(),
         }
     }
 
@@ -478,27 +762,25 @@ impl TopologyAuthority {
             return None;
         }
 
-        // Split-brain heal detection — refuse to commit a topology that both
-        // adds and removes members relative to the committed set. Run BEFORE
+        // Split-brain heal detection — refuse to commit a topology that
+        // both adds and removes members relative to the committed set,
+        // OR that introduces a NodeId never previously observed as a
+        // committed voter on this node (F-G8-001 fallback). Run BEFORE
         // updating observed_membership / last_membership_change so the
         // fallback proposer path doesn't pick up the poisoned view either.
-        {
+        if !self.membership_change_is_safe(members, None) {
             let committed_members = self.committed_members.read().unwrap();
-            if !committed_members.is_empty()
-                && !is_safe_membership_change(&committed_members, members)
-            {
-                tracing::error!(
-                    self_id = self.self_id.0,
-                    committed = ?committed_members.iter().map(|n| n.0).collect::<Vec<_>>(),
-                    proposed = ?members.iter().map(|n| n.0).collect::<Vec<_>>(),
-                    "cluster: refusing topology proposal — proposed member set is neither a superset nor a subset of committed members (probable split-brain heal). Operator intervention required.",
-                );
-                return None;
-            }
+            tracing::error!(
+                self_id = self.self_id.0,
+                committed = ?committed_members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                proposed = ?members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                "cluster: refusing topology proposal — split-brain heal signature (non-monotonic change or unseen members). Operator intervention required.",
+            );
+            return None;
         }
 
-        *self.last_membership_change.lock().unwrap() = Instant::now();
-        *self.observed_membership.lock().unwrap() = members.to_vec();
+        *self.last_membership_change.lock() = Instant::now();
+        *self.observed_membership.lock() = members.to_vec();
 
         // Skip if the committed membership is already identical.
         // This prevents redundant proposals when SWIM fires membership
@@ -534,7 +816,7 @@ impl TopologyAuthority {
         let mut votes = std::collections::HashMap::new();
         votes.insert(self.self_id, true);
 
-        *self.pending_proposal.lock().unwrap() = Some(PendingProposal {
+        *self.pending_proposal.lock() = Some(PendingProposal {
             term: term.clone(),
             votes,
             quorum_needed,
@@ -554,6 +836,34 @@ impl TopologyAuthority {
 
         let valid_digest =
             propose.digest == TopologyTerm::compute_digest(propose.term, &propose.members);
+
+        // F-G8-002: the proposer-side split-brain checks fire in
+        // `on_membership_changed`, `retry_proposal`, and `check_timeout`,
+        // but the follower-side `handle_propose` previously accepted any
+        // valid-digest, higher-term proposal. A buggy or malicious node
+        // that bypassed its own checks could still gather a quorum from
+        // followers — apply the same guard on this side so a single
+        // round cannot launder a merged membership through the quorum.
+        if !valid_digest
+            || !self.membership_change_is_safe(&propose.members, None)
+        {
+            // Even when `voted_term` would normally advance, we refuse to
+            // self-vote for an unsafe proposal. Report the voter's last
+            // accepted term so the proposer can detect the divergence.
+            tracing::warn!(
+                self_id = self.self_id.0,
+                proposer = propose.proposer.0,
+                term = propose.term,
+                "cluster: rejecting topology propose — split-brain heal signature or bad digest",
+            );
+            return TopologyVote {
+                term: propose.term,
+                digest: propose.digest,
+                voter: self.self_id,
+                accepted: false,
+                voter_current_term: committed,
+            };
+        }
 
         // Accept if the term is strictly higher than anything we've seen.
         let mut accepted = propose.term > committed && propose.term > voted && valid_digest;
@@ -603,7 +913,7 @@ impl TopologyAuthority {
     ///
     /// Returns `Some(TopologyCommit)` if quorum is reached.
     pub fn handle_vote(&self, vote: &TopologyVote) -> Option<TopologyCommit> {
-        let mut pending = self.pending_proposal.lock().unwrap();
+        let mut pending = self.pending_proposal.lock();
         let proposal = pending.as_mut()?;
 
         // Must match our pending proposal.
@@ -615,11 +925,18 @@ impl TopologyAuthority {
 
         let accept_count = proposal.votes.values().filter(|&&v| v).count();
         if accept_count >= proposal.quorum_needed {
+            let mut voters = proposal
+                .votes
+                .iter()
+                .filter_map(|(node, accepted)| accepted.then_some(*node))
+                .collect::<Vec<_>>();
+            voters.sort_unstable_by_key(|node| node.0);
             let commit = TopologyCommit {
                 term: proposal.term.term,
                 proposer: proposal.term.proposer,
                 members: proposal.term.members.clone(),
                 digest: proposal.term.digest,
+                voters,
             };
             // Clear pending proposal
             *pending = None;
@@ -648,10 +965,27 @@ impl TopologyAuthority {
             return None;
         }
 
+        if !commit.has_quorum_voter_proof() {
+            return None;
+        }
+
         // Apply commit.
         self.committed_term.store(commit.term, Ordering::Relaxed);
         *self.committed_members.write().unwrap() = commit.members.clone();
-        *self.observed_membership.lock().unwrap() = commit.members.clone();
+        *self.committed_voters.write().unwrap() = commit.voters.clone();
+        *self.observed_membership.lock() = commit.members.clone();
+        // F-G8-001 fallback: every member of a committed term is, from
+        // now on, a "known" voter. Future proposals that introduce a
+        // NodeId not in this set will be rejected by `ever_seen_check`.
+        {
+            let mut seen = self.committed_voter_ever_seen.write().unwrap();
+            for v in &commit.voters {
+                seen.insert(*v);
+            }
+            for m in &commit.members {
+                seen.insert(*m);
+            }
+        }
         // Phase I — stamp the wall-clock time so cluster_health can
         // report `last_topology_commit_age_ms`. Best-effort: a system
         // clock without UNIX_EPOCH access stays at the prior value.
@@ -661,7 +995,7 @@ impl TopologyAuthority {
         }
 
         // Clear any pending proposal (superseded by this commit).
-        *self.pending_proposal.lock().unwrap() = None;
+        *self.pending_proposal.lock() = None;
 
         Some(commit.term)
     }
@@ -702,7 +1036,7 @@ impl TopologyAuthority {
     ///   * observed_membership is empty (nothing to propose).
     pub fn retry_proposal(&self) -> Option<TopologyTerm> {
         let target_members = {
-            let observed = self.observed_membership.lock().unwrap();
+            let observed = self.observed_membership.lock();
             if observed.is_empty() {
                 return None;
             }
@@ -718,20 +1052,18 @@ impl TopologyAuthority {
         // `observed_membership`, a compromised or buggy caller might also
         // mutate it directly (tests do, see `retry_proposal_returns_none_*`).
         // Re-check here so a poisoned observation cannot be laundered into
-        // a proposal via the retry path.
-        {
+        // a proposal via the retry path. Includes the F-G8-001 ever-seen
+        // fallback so pure-superset attacks are caught even if an external
+        // caller installed a "monotonic" observation containing unseen ids.
+        if !self.membership_change_is_safe(&target_members, None) {
             let committed_members = self.committed_members.read().unwrap();
-            if !committed_members.is_empty()
-                && !is_safe_membership_change(&committed_members, &target_members)
-            {
-                tracing::error!(
-                    self_id = self.self_id.0,
-                    committed = ?committed_members.iter().map(|n| n.0).collect::<Vec<_>>(),
-                    proposed = ?target_members.iter().map(|n| n.0).collect::<Vec<_>>(),
-                    "cluster: refusing topology retry — observed members neither superset nor subset of committed (probable split-brain heal).",
-                );
-                return None;
-            }
+            tracing::error!(
+                self_id = self.self_id.0,
+                committed = ?committed_members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                proposed = ?target_members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                "cluster: refusing topology retry — split-brain heal signature (non-monotonic change or unseen members).",
+            );
+            return None;
         }
 
         {
@@ -757,7 +1089,7 @@ impl TopologyAuthority {
         let mut votes = std::collections::HashMap::new();
         votes.insert(self.self_id, true);
 
-        *self.pending_proposal.lock().unwrap() = Some(PendingProposal {
+        *self.pending_proposal.lock() = Some(PendingProposal {
             term: term.clone(),
             votes,
             quorum_needed,
@@ -781,7 +1113,7 @@ impl TopologyAuthority {
     /// does not resurrect gracefully removed nodes that are still reachable.
     pub fn check_timeout(&self, members: &[NodeId]) -> Option<TopologyTerm> {
         let target_members = {
-            let observed = self.observed_membership.lock().unwrap();
+            let observed = self.observed_membership.lock();
             if observed.is_empty() {
                 members.to_vec()
             } else {
@@ -797,19 +1129,16 @@ impl TopologyAuthority {
         // The bootstrap-fallback `members` slice can come from the live
         // socket map, which is updated outside `on_membership_changed`;
         // re-validate here so a non-monotonic view never becomes a proposal.
-        {
+        // Applies the F-G8-001 ever-seen fallback as well.
+        if !self.membership_change_is_safe(&target_members, None) {
             let committed_members = self.committed_members.read().unwrap();
-            if !committed_members.is_empty()
-                && !is_safe_membership_change(&committed_members, &target_members)
-            {
-                tracing::error!(
-                    self_id = self.self_id.0,
-                    committed = ?committed_members.iter().map(|n| n.0).collect::<Vec<_>>(),
-                    proposed = ?target_members.iter().map(|n| n.0).collect::<Vec<_>>(),
-                    "cluster: refusing topology fallback proposal — target members neither superset nor subset of committed (probable split-brain heal).",
-                );
-                return None;
-            }
+            tracing::error!(
+                self_id = self.self_id.0,
+                committed = ?committed_members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                proposed = ?target_members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                "cluster: refusing topology fallback proposal — split-brain heal signature (non-monotonic change or unseen members).",
+            );
+            return None;
         }
 
         // Skip if the committed membership is already identical.
@@ -825,7 +1154,7 @@ impl TopologyAuthority {
             }
         }
 
-        let elapsed = self.last_membership_change.lock().unwrap().elapsed();
+        let elapsed = self.last_membership_change.lock().elapsed();
         if elapsed < self.propose_timeout {
             return None; // Still within timeout
         }
@@ -845,7 +1174,7 @@ impl TopologyAuthority {
         let mut votes = std::collections::HashMap::new();
         votes.insert(self.self_id, true);
 
-        *self.pending_proposal.lock().unwrap() = Some(PendingProposal {
+        *self.pending_proposal.lock() = Some(PendingProposal {
             term: term.clone(),
             votes,
             quorum_needed,
@@ -975,6 +1304,7 @@ mod tests {
             proposer: NodeId(1),
             members: mems.clone(),
             digest: TopologyTerm::compute_digest(5, &mems),
+            voters: mems.clone(),
         };
         let result = auth.handle_commit(&commit);
         assert_eq!(result, Some(5));
@@ -1008,6 +1338,7 @@ mod tests {
             proposer: NodeId(1),
             members: mems.clone(),
             digest: TopologyTerm::compute_digest(7, &mems),
+            voters: mems.clone(),
         };
         assert_eq!(auth.handle_commit(&commit), Some(7));
         assert!(
@@ -1032,6 +1363,7 @@ mod tests {
             proposer: NodeId(1),
             members: mems.clone(),
             digest: TopologyTerm::compute_digest(5, &mems),
+            voters: mems.clone(),
         };
         assert!(auth.handle_commit(&commit).is_none());
     }
@@ -1048,6 +1380,7 @@ mod tests {
             proposer: NodeId(1),
             members: mems.clone(),
             digest: TopologyTerm::compute_digest(5, &mems),
+            voters: mems.clone(),
         };
 
         // First commit succeeds
@@ -1074,6 +1407,7 @@ mod tests {
             proposer: NodeId(1),
             members: mems.clone(),
             digest: [0xFF; 32], // corrupt
+            voters: mems.clone(),
         };
         assert!(auth.handle_commit(&commit).is_none());
     }
@@ -1084,8 +1418,10 @@ mod tests {
             peak_cluster_size: 5,
             committed_term: 42,
             committed_members: members(&[1, 2, 3]),
+            committed_voters: members(&[1, 2, 3]),
             voted_term: 43,
             incarnation: 99,
+            committed_voter_ever_seen: members(&[1, 2, 3, 7]),
         };
         let data = state.serialize();
         let restored = PersistedTopologyState::deserialize(&data);
@@ -1094,6 +1430,7 @@ mod tests {
         assert_eq!(restored.voted_term, 43);
         assert_eq!(restored.committed_members.len(), 3);
         assert_eq!(restored.committed_members[0], NodeId(1));
+        assert_eq!(restored.committed_voters, members(&[1, 2, 3]));
         assert_eq!(restored.incarnation, 99);
     }
 
@@ -1134,6 +1471,44 @@ mod tests {
         assert!(rv.accepted);
         assert_eq!(rv.voter, NodeId(2));
         assert_eq!(rv.voter_current_term, 41);
+
+        let commit = TopologyCommit {
+            term: 42,
+            proposer: NodeId(1),
+            members: term.members.clone(),
+            digest: term.digest,
+            voters: members(&[1, 2]),
+        };
+        let cdata = commit.serialize();
+        let rc = TopologyCommit::deserialize(&cdata).unwrap();
+        assert_eq!(rc.term, 42);
+        assert_eq!(rc.members, term.members);
+        assert_eq!(rc.voters, members(&[1, 2]));
+        assert!(rc.has_quorum_voter_proof());
+    }
+
+    #[test]
+    fn topology_commit_persists_voter_list() {
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        let mems = members(&[1, 2, 3]);
+        let term = auth.on_membership_changed(&mems).unwrap();
+        let vote = TopologyVote {
+            term: term.term,
+            digest: term.digest,
+            voter: NodeId(2),
+            accepted: true,
+            voter_current_term: 0,
+        };
+        let commit = auth.handle_vote(&vote).expect("2/3 reaches quorum");
+
+        assert_eq!(commit.voters, members(&[1, 2]));
+        assert_eq!(auth.handle_commit(&commit), Some(term.term));
+        let persisted = auth.persisted_state(3, 99);
+        assert_eq!(persisted.committed_members, mems);
+        assert_eq!(persisted.committed_voters, members(&[1, 2]));
+
+        let restored = PersistedTopologyState::deserialize(&persisted.serialize());
+        assert_eq!(restored.committed_voters, members(&[1, 2]));
     }
 
     #[test]
@@ -1163,6 +1538,7 @@ mod tests {
             proposer: NodeId(1),
             members: members(&[1, 2, 3]),
             digest: t1.digest,
+            voters: members(&[1, 2, 3]),
         });
 
         // New membership change → term 2
@@ -1186,6 +1562,7 @@ mod tests {
             proposer: NodeId(1),
             members: remote_members.clone(),
             digest: TopologyTerm::compute_digest(5, &remote_members),
+            voters: remote_members.clone(),
         };
         let result = auth.handle_commit(&commit);
         assert_eq!(result, Some(5));
@@ -1205,6 +1582,7 @@ mod tests {
             proposer: NodeId(1),
             members: remote_members.clone(),
             digest: TopologyTerm::compute_digest(5, &remote_members),
+            voters: remote_members.clone(),
         };
         let result = auth.handle_commit(&commit);
         assert!(result.is_none());
@@ -1220,6 +1598,7 @@ mod tests {
             proposer: NodeId(1),
             members: members(&[1, 2, 3]),
             digest: [0xFF; 32], // corrupt
+            voters: members(&[1, 2, 3]),
         };
         assert!(auth.handle_commit(&commit).is_none());
         assert_eq!(auth.committed_term(), 0); // unchanged
@@ -1238,6 +1617,7 @@ mod tests {
             proposer: NodeId(1),
             members: mems.clone(),
             digest: TopologyTerm::compute_digest(5, &mems),
+            voters: mems.clone(),
         };
         auth.handle_commit(&commit);
         assert_eq!(auth.committed_term(), 5);
@@ -1274,8 +1654,9 @@ mod tests {
         let wrong_commit = TopologyCommit {
             term: 5,
             proposer: NodeId(1),
-            members: wrong_members,
+            members: wrong_members.clone(),
             digest: wrong_digest,
+            voters: wrong_members,
         };
         // This succeeds because the digest matches (term, wrong_members).
         // But the point is: if you use the WRONG members to compute the
@@ -1296,6 +1677,7 @@ mod tests {
             proposer: NodeId(1),
             members: original_members.clone(),
             digest: original_digest,
+            voters: original_members.clone(),
         };
         let result2 = auth2.handle_commit(&correct_commit);
         assert!(result2.is_some());
@@ -1349,6 +1731,7 @@ mod tests {
             proposer: NodeId(2),
             members: members(&[1, 2, 3, 4]),
             digest: TopologyTerm::compute_digest(5, &members(&[1, 2, 3, 4])),
+            voters: members(&[1, 2, 3, 4]),
         };
         auth.handle_commit(&commit);
 
@@ -1444,6 +1827,7 @@ mod tests {
             proposer: NodeId(1),
             members: mems.clone(),
             digest: TopologyTerm::compute_digest(5, &mems),
+            voters: mems.clone(),
         };
         auth.handle_commit(&commit);
 
@@ -1468,12 +1852,14 @@ mod tests {
             proposer: NodeId(1),
             members: original.clone(),
             digest: TopologyTerm::compute_digest(4, &original),
+            voters: original.clone(),
         });
         auth.handle_commit(&TopologyCommit {
             term: 5,
             proposer: NodeId(1),
             members: drained.clone(),
             digest: TopologyTerm::compute_digest(5, &drained),
+            voters: drained.clone(),
         });
 
         std::thread::sleep(Duration::from_millis(15));
@@ -1505,6 +1891,7 @@ mod tests {
             // This digest is compute_digest(5, [1,2,3]) which differs
             // from the original compute_digest(5, [1,3]).
             digest: TopologyTerm::compute_digest(5, &members(&[1, 2, 3])),
+            voters: members(&[1, 2, 3]),
         };
 
         // The commit applies (digest is internally consistent), but it
@@ -1519,6 +1906,7 @@ mod tests {
             proposer: NodeId(1),
             members: original_members.clone(),
             digest: TopologyTerm::compute_digest(5, &original_members),
+            voters: original_members.clone(),
         };
         let result = auth.handle_commit(&good_commit);
         assert_eq!(result, Some(5));
@@ -1549,6 +1937,7 @@ mod tests {
             proposer: NodeId(1),
             members: mems.clone(),
             digest: TopologyTerm::compute_digest(10, &mems),
+            voters: mems.clone(),
         };
         auth.handle_commit(&commit);
         assert_eq!(auth.committed_term(), 10);
@@ -1583,7 +1972,7 @@ mod tests {
     fn retry_proposal_returns_none_when_not_deterministic_proposer() {
         let auth = TopologyAuthority::new(NodeId(3), Duration::from_secs(1));
         // Observed membership: [1,2,3] — proposer would be node 1, not self.
-        *auth.observed_membership.lock().unwrap() = members(&[1, 2, 3]);
+        *auth.observed_membership.lock() = members(&[1, 2, 3]);
         assert!(auth.retry_proposal().is_none());
     }
 
@@ -1596,8 +1985,9 @@ mod tests {
             proposer: NodeId(1),
             members: mems.clone(),
             digest: TopologyTerm::compute_digest(1, &mems),
+            voters: mems.clone(),
         });
-        *auth.observed_membership.lock().unwrap() = mems;
+        *auth.observed_membership.lock() = mems;
         assert!(
             auth.retry_proposal().is_none(),
             "nothing to do — already committed"
@@ -1637,6 +2027,7 @@ mod tests {
             proposer: NodeId(1),
             members: old_mems.clone(),
             digest: TopologyTerm::compute_digest(1, &old_mems),
+            voters: old_mems.clone(),
         });
         assert!(
             auth.on_membership_changed(&mems).is_none(),
@@ -1697,8 +2088,10 @@ mod tests {
             peak_cluster_size: 0,
             committed_term: 1,
             committed_members: members(&[1]),
+            committed_voters: members(&[1]),
             voted_term: 1,
             incarnation: 0,
+            committed_voter_ever_seen: Vec::new(),
         };
         let data = state.serialize();
         let restored = PersistedTopologyState::deserialize(&data);
@@ -1740,6 +2133,7 @@ mod tests {
             proposer: NodeId(2),
             members: single.clone(),
             digest: TopologyTerm::compute_digest(1, &single),
+            voters: single.clone(),
         });
 
         // Proposal at term 1 (equal, not greater) with multi-node members.
@@ -1769,6 +2163,7 @@ mod tests {
             proposer: NodeId(1),
             members: mems.clone(),
             digest: TopologyTerm::compute_digest(term, &mems),
+            voters: mems.clone(),
         };
         auth.handle_commit(&commit);
         assert_eq!(auth.committed_members(), mems);
@@ -1861,7 +2256,7 @@ mod tests {
         // After commit, both committed_members AND observed_membership are
         // pinned to [1,2,3] (handle_commit sets both). Capture the
         // baseline so we can pin it across the refusal.
-        let observed_before = auth.observed_membership.lock().unwrap().clone();
+        let observed_before = auth.observed_membership.lock().clone();
         assert_eq!(
             observed_before,
             members(&[1, 2, 3]),
@@ -1879,7 +2274,7 @@ mod tests {
         // remain pinned to their pre-refusal values — the asymmetric
         // event leaks NO state into the authority.
         assert_eq!(
-            auth.observed_membership.lock().unwrap().clone(),
+            auth.observed_membership.lock().clone(),
             observed_before,
             "refused event must not overwrite observed_membership",
         );
@@ -1891,7 +2286,7 @@ mod tests {
 
         // No pending proposal was registered.
         assert!(
-            auth.pending_proposal.lock().unwrap().is_none(),
+            auth.pending_proposal.lock().is_none(),
             "refusal must not leave a pending proposal behind",
         );
 
@@ -1937,7 +2332,7 @@ mod tests {
         // (simulating a buggy caller or, more realistically, an observation
         // that was monotonic when first installed but became non-monotonic
         // after a subsequent commit).
-        *auth.observed_membership.lock().unwrap() = members(&[1, 2, 5]);
+        *auth.observed_membership.lock() = members(&[1, 2, 5]);
 
         let retry = auth.retry_proposal();
         assert!(

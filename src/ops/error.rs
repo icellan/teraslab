@@ -82,6 +82,8 @@ pub enum SpendError {
     Pruned {
         /// The slot offset.
         offset: u32,
+        /// Raw spending data that caused the prune (36 bytes).
+        spending_data: [u8; 36],
     },
 
     /// UTXO is already frozen (for freeze operation).

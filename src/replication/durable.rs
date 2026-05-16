@@ -8,8 +8,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::Instant;
+
+use parking_lot::Mutex;
 
 fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent()
@@ -89,6 +90,15 @@ const FLUSH_INTERVAL_MS: u128 = 1000;
 /// window to a small number of operations.
 const FLUSH_DIRTY_COUNT_THRESHOLD: u32 = 100;
 
+/// Minimum interval between deferred replication-intent commit flushes.
+const INTENT_COMMIT_FLUSH_INTERVAL_MS: u128 = 1000;
+
+/// Maximum number of committed intent removals that may stay dirty before
+/// forcing a disk flush. `begin()` remains immediately durable; deferred
+/// commit flushes can only leave stale ranges that recovery replays
+/// idempotently.
+const INTENT_COMMIT_FLUSH_DIRTY_COUNT_THRESHOLD: u32 = 100;
+
 impl AckTracker {
     /// Create a new tracker with the given persistence path.
     ///
@@ -114,7 +124,7 @@ impl AckTracker {
     /// previous flush; the burst-count threshold caps the at-risk
     /// window.
     pub fn record_ack(&self, addr: SocketAddr, through_sequence: u64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let entry = inner.last_acked.entry(addr).or_insert(0);
         if through_sequence > *entry {
             *entry = through_sequence;
@@ -134,19 +144,19 @@ impl AckTracker {
 
     /// Get the last-ACKed sequence for a replica, or 0 if unknown.
     pub fn last_acked(&self, addr: &SocketAddr) -> u64 {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner.last_acked.get(addr).copied().unwrap_or(0)
     }
 
     /// Get all tracked replicas and their ACK sequences.
     pub fn all_acked(&self) -> HashMap<SocketAddr, u64> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner.last_acked.clone()
     }
 
     /// Force a flush of any dirty state to disk.
     pub fn flush(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if inner.dirty {
             self.flush_locked(&mut inner);
         }
@@ -250,7 +260,15 @@ pub enum ReplicationIntentError {
 #[derive(Debug)]
 pub struct ReplicationIntentTracker {
     path: PathBuf,
-    inner: Mutex<BTreeSet<ReplicationIntentRange>>,
+    inner: Mutex<ReplicationIntentInner>,
+}
+
+#[derive(Debug)]
+struct ReplicationIntentInner {
+    pending: BTreeSet<ReplicationIntentRange>,
+    commit_dirty: bool,
+    last_flush: Instant,
+    dirty_commit_count: u32,
 }
 
 impl ReplicationIntentTracker {
@@ -259,14 +277,24 @@ impl ReplicationIntentTracker {
         let pending = Self::read_from_disk(&path)?;
         Ok(Self {
             path,
-            inner: Mutex::new(pending),
+            inner: Mutex::new(ReplicationIntentInner {
+                pending,
+                commit_dirty: false,
+                last_flush: Instant::now(),
+                dirty_commit_count: 0,
+            }),
         })
     }
 
     pub fn in_memory() -> Self {
         Self {
             path: PathBuf::new(),
-            inner: Mutex::new(BTreeSet::new()),
+            inner: Mutex::new(ReplicationIntentInner {
+                pending: BTreeSet::new(),
+                commit_dirty: false,
+                last_flush: Instant::now(),
+                dirty_commit_count: 0,
+            }),
         }
     }
 
@@ -278,13 +306,16 @@ impl ReplicationIntentTracker {
         if first_sequence == 0 || last_sequence < first_sequence {
             return Ok(());
         }
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let changed = inner.insert(ReplicationIntentRange {
+        let mut inner = self.inner.lock();
+        let changed = inner.pending.insert(ReplicationIntentRange {
             first_sequence,
             last_sequence,
         });
         if changed {
-            self.write_locked(&inner)?;
+            self.write_locked(&inner.pending)?;
+            inner.commit_dirty = false;
+            inner.dirty_commit_count = 0;
+            inner.last_flush = Instant::now();
         }
         Ok(())
     }
@@ -297,20 +328,38 @@ impl ReplicationIntentTracker {
         if first_sequence == 0 || last_sequence < first_sequence {
             return Ok(());
         }
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let changed = inner.remove(&ReplicationIntentRange {
+        let mut inner = self.inner.lock();
+        let changed = inner.pending.remove(&ReplicationIntentRange {
             first_sequence,
             last_sequence,
         });
         if changed {
-            self.write_locked(&inner)?;
+            if self.path.as_os_str().is_empty() {
+                return Ok(());
+            }
+            inner.commit_dirty = true;
+            inner.dirty_commit_count = inner.dirty_commit_count.saturating_add(1);
+            let time_due =
+                inner.last_flush.elapsed().as_millis() >= INTENT_COMMIT_FLUSH_INTERVAL_MS;
+            let count_due = inner.dirty_commit_count >= INTENT_COMMIT_FLUSH_DIRTY_COUNT_THRESHOLD;
+            if time_due || count_due {
+                self.flush_locked(&mut inner)?;
+            }
         }
         Ok(())
     }
 
     pub fn pending(&self) -> Vec<ReplicationIntentRange> {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.iter().copied().collect()
+        let inner = self.inner.lock();
+        inner.pending.iter().copied().collect()
+    }
+
+    pub fn flush(&self) -> std::result::Result<(), ReplicationIntentError> {
+        let mut inner = self.inner.lock();
+        if inner.commit_dirty {
+            self.flush_locked(&mut inner)?;
+        }
+        Ok(())
     }
 
     fn write_locked(
@@ -321,6 +370,17 @@ impl ReplicationIntentTracker {
             return Ok(());
         }
         Self::write_to_disk(&self.path, pending)
+    }
+
+    fn flush_locked(
+        &self,
+        inner: &mut ReplicationIntentInner,
+    ) -> std::result::Result<(), ReplicationIntentError> {
+        self.write_locked(&inner.pending)?;
+        inner.commit_dirty = false;
+        inner.dirty_commit_count = 0;
+        inner.last_flush = Instant::now();
+        Ok(())
     }
 
     fn write_to_disk(
@@ -452,7 +512,7 @@ impl ReplicaAppliedTracker {
     /// Highest sequence applied for `stream`. Returns `0` if the
     /// stream has no record yet.
     pub fn get(&self, stream: &str) -> u64 {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.inner.lock();
         inner.last_applied.get(stream).copied().unwrap_or(0)
     }
 
@@ -462,7 +522,7 @@ impl ReplicaAppliedTracker {
     /// cannot rewind the journal. Marks the tracker dirty for the
     /// next [`flush`](Self::flush) call.
     pub fn set(&self, stream: &str, seq: u64) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock();
         let entry = inner.last_applied.entry(stream.to_string()).or_insert(0);
         if seq > *entry {
             *entry = seq;
@@ -477,7 +537,7 @@ impl ReplicaAppliedTracker {
     /// temp file or the rename failed. The tracker is left dirty if
     /// the flush failed so a later retry can persist the update.
     pub fn flush(&self) -> std::result::Result<(), ReplicaAppliedError> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock();
         if !inner.dirty {
             return Ok(());
         }
@@ -495,7 +555,7 @@ impl ReplicaAppliedTracker {
     /// Snapshot of all tracked streams and their last-applied
     /// sequences — useful for diagnostics and tests.
     pub fn snapshot(&self) -> HashMap<String, u64> {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.inner.lock();
         inner.last_applied.clone()
     }
 
@@ -643,11 +703,13 @@ pub fn build_catchup_batch(
 /// the log has wrapped and a full resync is required instead.
 ///
 /// [`RunningCluster::local_cluster_key`]: crate::cluster::coordinator::RunningCluster::local_cluster_key
+#[allow(clippy::too_many_arguments)]
 pub fn run_catchup_for_replica(
     addr: &std::net::SocketAddr,
     from_seq: u64,
     current_seq: u64,
     batch_size: usize,
+    max_ops_per_pass: usize,
     ops_from_seq: &dyn Fn(u64) -> Vec<ReplicaOp>,
     first_available_seq: Option<u64>,
     local_cluster_key: u64,
@@ -661,9 +723,13 @@ pub fn run_catchup_for_replica(
     // we need are gone and the replica needs a full resync.
     check_redo_truncation(first_available_seq, from_seq)?;
 
-    let ops = ops_from_seq(from_seq);
+    let mut ops = ops_from_seq(from_seq);
     if ops.is_empty() {
         return Err("redo entries reclaimed; full resync required".to_string());
+    }
+    let max_ops_per_pass = max_ops_per_pass.max(1);
+    if ops.len() > max_ops_per_pass {
+        ops.truncate(max_ops_per_pass);
     }
 
     let mut transport =
@@ -1003,6 +1069,24 @@ mod tests {
             }],
         );
 
+        let stale_reopen = ReplicationIntentTracker::load(path.clone()).unwrap();
+        assert_eq!(
+            stale_reopen.pending(),
+            vec![
+                ReplicationIntentRange {
+                    first_sequence: 10,
+                    last_sequence: 12
+                },
+                ReplicationIntentRange {
+                    first_sequence: 20,
+                    last_sequence: 20
+                },
+            ],
+            "commit persistence is intentionally coalesced; stale ranges \
+             cause idempotent re-replication after a crash"
+        );
+
+        reopened.flush().unwrap();
         let reopened_again = ReplicationIntentTracker::load(path).unwrap();
         assert_eq!(
             reopened_again.pending(),
@@ -1010,6 +1094,39 @@ mod tests {
                 first_sequence: 20,
                 last_sequence: 20
             }],
+        );
+    }
+
+    #[test]
+    fn replication_intent_commit_flush_coalesces_until_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.dat");
+        let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
+
+        for i in 1..=INTENT_COMMIT_FLUSH_DIRTY_COUNT_THRESHOLD {
+            let seq = u64::from(i);
+            tracker.begin(seq, seq).unwrap();
+        }
+
+        for i in 1..INTENT_COMMIT_FLUSH_DIRTY_COUNT_THRESHOLD {
+            let seq = u64::from(i);
+            tracker.commit(seq, seq).unwrap();
+        }
+
+        let stale_reopen = ReplicationIntentTracker::load(path.clone()).unwrap();
+        assert_eq!(
+            stale_reopen.pending().len(),
+            INTENT_COMMIT_FLUSH_DIRTY_COUNT_THRESHOLD as usize,
+            "commit removals before the threshold should remain coalesced on disk"
+        );
+
+        let seq = u64::from(INTENT_COMMIT_FLUSH_DIRTY_COUNT_THRESHOLD);
+        tracker.commit(seq, seq).unwrap();
+
+        let flushed_reopen = ReplicationIntentTracker::load(path).unwrap();
+        assert!(
+            flushed_reopen.pending().is_empty(),
+            "threshold commit must flush the coalesced removals"
         );
     }
 

@@ -10,32 +10,31 @@
 //! periodically samples the log's usage fraction; when it crosses the
 //! configured threshold (default 0.5), the thread takes a checkpoint:
 //!
-//! 1. Acquire the redo log mutex (blocks new appends).
+//! 1. Quiesce dispatch long enough to establish a stable redo fence.
 //! 2. Snapshot the in-memory primary, DAH, and unmined indexes to disk
 //!    via [`crate::ops::engine::Engine::snapshot_index`] (atomic via
 //!    tempfile + rename).
 //! 3. Persist the allocator's freelist + high-water mark via
 //!    [`crate::ops::engine::Engine::persist_allocator`].
-//! 4. Append a [`crate::redo::RedoOp::Checkpoint`] marker to the log.
-//! 5. Call [`crate::redo::RedoLog::reset`] to wipe entries and reset
-//!    `write_pos` to 0.
-//! 6. Release the mutex; appends resume from offset 0.
+//! 4. Append a [`crate::redo::RedoOp::RecoveryProgress`] fence through the
+//!    snapshotted sequence.
+//! 5. Compact redo entries through that fence when replica ACK watermarks
+//!    allow reclamation; post-fence entries are preserved.
 //!
 //! Crash safety: each step's effects are durable independently of the
 //! others. Snapshot is fsynced before the rename; allocator persist is
-//! fsynced before returning; checkpoint marker is fsynced; reset wipes
-//! the leading block atomically. After a crash at any point recovery
-//! either replays the un-checkpointed entries on top of the most recent
-//! snapshot (safe — recovery is idempotent) or, if reset already ran,
-//! observes an empty log and trusts the snapshot directly.
+//! fsynced before returning; recovery-progress marker is fsynced; prefix
+//! compaction fsyncs the rewritten log. After a crash at any point recovery
+//! either replays all un-fenced entries on top of the most recent snapshot
+//! (safe — recovery is idempotent) or, if compaction already ran, sees only
+//! entries newer than the snapshot fence.
 //!
-//! Concurrency: the redo mutex serializes the checkpoint with concurrent
-//! mutation appends. The snapshot reads index/dah/unmined under their own
-//! locks; those locks are held for the snapshot's duration which is
-//! O(entries) — operators should size the redo log so the checkpoint
-//! cadence keeps the snapshot small enough that the write-stall is
-//! tolerable. (R-215 tracks moving snapshotting off the redo-mutex hot
-//! path via copy-on-write or epoch-based reads.)
+//! Concurrency: the redo mutex is held only while sampling the fence and
+//! while appending/compacting the marker. Snapshot file I/O no longer holds
+//! the redo mutex, so replica catch-up and other redo readers are not pinned
+//! behind filesystem work. Dispatch is still quiesced while the in-memory
+//! snapshot is collected so the fence cannot race ahead of unapplied
+//! mutations.
 
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -46,6 +45,8 @@ use std::time::Duration;
 
 use crate::ops::engine::Engine;
 use crate::redo::RedoLog;
+
+type ResetGuard = Arc<dyn Fn(u64) -> bool + Send + Sync + 'static>;
 
 /// Configuration for the background checkpoint task.
 #[derive(Debug, Clone)]
@@ -81,6 +82,22 @@ pub fn spawn_checkpoint_task(
     redo_log: Arc<Mutex<RedoLog>>,
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
+    spawn_checkpoint_task_with_reset_guard(config, engine, redo_log, shutdown, Arc::new(|_| true))
+}
+
+/// Spawn a checkpoint task with an explicit guard for redo reset.
+///
+/// The guard receives the highest pre-checkpoint redo sequence that would be
+/// erased by `reset()`. Returning `false` still writes the snapshot and
+/// checkpoint marker, but leaves redo bytes intact so lagging replicas can
+/// catch up from the old log.
+pub fn spawn_checkpoint_task_with_reset_guard(
+    config: CheckpointConfig,
+    engine: Arc<Engine>,
+    redo_log: Arc<Mutex<RedoLog>>,
+    shutdown: Arc<AtomicBool>,
+    reset_guard: ResetGuard,
+) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("teraslab-checkpoint".to_string())
         .spawn(move || {
@@ -106,12 +123,18 @@ pub fn spawn_checkpoint_task(
                     "redo log above watermark — checkpointing",
                 );
                 let started = std::time::Instant::now();
-                match perform_checkpoint(&config, &engine, &redo_log) {
+                match perform_checkpoint_with_reset_guard(
+                    &config,
+                    &engine,
+                    &redo_log,
+                    |floor_sequence| reset_guard(floor_sequence),
+                ) {
                     Ok(stats) => {
                         tracing::info!(
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             entries_before = stats.entries_before,
                             usage_after = stats.usage_after,
+                            reset_performed = stats.reset_performed,
                             "checkpoint complete",
                         );
                     }
@@ -130,23 +153,37 @@ pub fn spawn_checkpoint_task(
 pub struct CheckpointStats {
     pub entries_before: u64,
     pub usage_after: f64,
+    pub reset_performed: bool,
 }
 
-/// Perform a single checkpoint: snapshot, persist, mark, reset.
+/// Perform a single checkpoint: snapshot, persist, fence, compact.
 ///
-/// Held lock order: redo log mutex (whole function), then index/dah/unmined
-/// (acquired inside `engine.snapshot_index`), then allocator (acquired
-/// inside `engine.persist_allocator`). New mutation appends block on the
-/// redo mutex for the duration.
+/// The redo log mutex is held only for the initial fence sample and final
+/// marker/compaction step. Dispatch is quiesced across the snapshot so every
+/// redo entry through the sampled fence has a corresponding applied engine
+/// effect in the snapshot.
 pub fn perform_checkpoint(
     config: &CheckpointConfig,
     engine: &Engine,
     redo_log: &Mutex<RedoLog>,
 ) -> Result<CheckpointStats, String> {
-    // Hold the redo lock for the whole checkpoint so concurrent appends
-    // cannot interleave with the snapshot/marker/reset sequence.
-    let mut log = redo_log.lock();
-    let entries_before = log.current_sequence();
+    perform_checkpoint_with_reset_guard(config, engine, redo_log, |_| true)
+}
+
+/// Perform a checkpoint using `can_reset` to decide whether it is safe to
+/// reclaim redo bytes after the checkpoint marker is durable.
+pub fn perform_checkpoint_with_reset_guard<F>(
+    config: &CheckpointConfig,
+    engine: &Engine,
+    redo_log: &Mutex<RedoLog>,
+    can_reset: F,
+) -> Result<CheckpointStats, String>
+where
+    F: Fn(u64) -> bool,
+{
+    let _visibility_guard = engine.acquire_dispatch_visibility_guard();
+    let entries_before = redo_log.lock().current_sequence();
+    let snapshot_fence_sequence = entries_before.saturating_sub(1);
 
     // 1. Snapshot index + DAH + unmined to disk (tempfile + rename).
     engine
@@ -158,21 +195,33 @@ pub fn perform_checkpoint(
         .persist_allocator()
         .map_err(|e| format!("persist_allocator: {e}"))?;
 
-    // 3. Write a checkpoint marker so any post-snapshot entries that
-    //    landed before the snapshot/persist returned (there should be
-    //    none because we hold the lock, but the marker is also a
-    //    forward-compatibility invariant) have an explicit commit point.
-    log.checkpoint()
-        .map_err(|e| format!("redo checkpoint: {e}"))?;
+    // 3. Fence recovery at the sequence covered by the snapshot. This is not
+    //    a Checkpoint marker: recovery must still replay post-fence entries
+    //    that can exist when non-dispatch redo producers append while the
+    //    snapshot is being written.
+    let mut log = redo_log.lock();
+    log.mark_recovery_progress(snapshot_fence_sequence)
+        .map_err(|e| format!("redo checkpoint fence: {e}"))?;
 
-    // 4. Reset the log so future appends write from offset 0 again.
-    //    Sequence numbers continue monotonically.
-    log.reset().map_err(|e| format!("redo reset: {e}"))?;
+    // 4. Reclaim only the covered prefix. Sequence numbers continue
+    //    monotonically, and entries after the fence remain available.
+    let reset_performed = if can_reset(snapshot_fence_sequence) {
+        log.compact_prefix_through(snapshot_fence_sequence)
+            .map_err(|e| format!("redo compact: {e}"))?;
+        true
+    } else {
+        tracing::warn!(
+            snapshot_fence_sequence,
+            "checkpoint reset skipped because redo entries are still needed",
+        );
+        false
+    };
 
     let usage_after = log.usage_fraction();
     Ok(CheckpointStats {
         entries_before,
         usage_after,
+        reset_performed,
     })
 }
 
@@ -242,6 +291,7 @@ mod tests {
             stats.entries_before > 0,
             "should have observed some entries before checkpoint"
         );
+        assert!(stats.reset_performed, "unguarded checkpoint should reset");
         assert!(
             stats.usage_after < 0.01,
             "usage_fraction must drop near zero after reset"
@@ -273,5 +323,44 @@ mod tests {
         // sequences — sequences are NOT reset, only the write_pos is.
         let next = log.append(RedoOp::Checkpoint).unwrap();
         assert!(next > seq_before);
+    }
+
+    #[test]
+    fn perform_checkpoint_skips_reset_when_guard_rejects_floor() {
+        let (engine, redo, dir) = make_engine_and_redo();
+        let snap_path = dir.path().join("guarded.snap");
+
+        let floor_before;
+        {
+            let mut log = redo.lock();
+            log.append(RedoOp::Checkpoint).unwrap();
+            log.append(RedoOp::Checkpoint).unwrap();
+            log.flush().unwrap();
+            floor_before = log.current_sequence().saturating_sub(1);
+        }
+
+        let cfg = CheckpointConfig::new(snap_path);
+        let stats = perform_checkpoint_with_reset_guard(&cfg, &engine, &redo, |floor_sequence| {
+            assert_eq!(floor_sequence, floor_before);
+            false
+        })
+        .unwrap();
+
+        assert!(!stats.reset_performed);
+        assert!(stats.usage_after > 0.0);
+
+        let log = redo.lock();
+        assert!(
+            log.write_position() > 0,
+            "guarded checkpoint must leave redo bytes in place"
+        );
+        assert!(
+            log.read_from_sequence(1).unwrap().len() >= 2,
+            "lagging replica catch-up must still be able to read pre-checkpoint entries"
+        );
+        assert!(
+            log.recover().unwrap().is_empty(),
+            "startup recovery must skip entries covered by the durable snapshot fence"
+        );
     }
 }

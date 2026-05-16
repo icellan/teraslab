@@ -6,7 +6,7 @@ use crate::index::TxKey;
 use crate::ops::error::SpendError;
 use crate::ops::signal::Signal;
 use crate::record::{TxMetadata, UtxoSlot};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// A single spend item within a spendMulti batch.
 #[derive(Debug, Clone)]
@@ -46,7 +46,7 @@ pub struct SpendMultiResponse {
     /// Current block IDs on the record.
     pub block_ids: Vec<u32>,
     /// Per-item errors (idx → error). Missing idx = success.
-    pub errors: HashMap<u32, SpendError>,
+    pub errors: BTreeMap<u32, SpendError>,
     /// Number of UTXOs actually spent in this batch (not counting idempotent re-spends).
     pub spent_count: u32,
     /// Record generation after this mutation (for replication).
@@ -145,10 +145,14 @@ pub struct ValidatedSpend<'a> {
     /// Validated spend operations: (slot_offset, new_slot_state).
     /// Only items that passed all validation checks.
     pub(crate) valid_spends: Vec<(u32, UtxoSlot)>,
-    /// Per-item errors from validation (idx → error).
-    pub errors: HashMap<u32, SpendError>,
+    /// Per-item errors from validation (idx → error), sorted by idx for
+    /// deterministic response encoding.
+    pub errors: BTreeMap<u32, SpendError>,
     /// Number of UTXOs that will actually change state (not counting idempotent re-spends).
     pub spent_count: u32,
+    /// Number of valid request items that were already spent with identical
+    /// spending data and therefore became no-op successes.
+    pub idempotent_count: u32,
     /// Record generation BEFORE this mutation. The post-mutation generation
     /// will be `pre_generation.wrapping_add(1)`.
     pub pre_generation: u32,
@@ -197,5 +201,10 @@ impl<'a> ValidatedSpend<'a> {
     /// to set per-redo-entry `new_spent_count` correctly.
     pub fn transitions(&self) -> &[(u32, UtxoSlot)] {
         &self.valid_spends
+    }
+
+    /// Number of no-op successes observed during validation.
+    pub fn idempotent_count(&self) -> u32 {
+        self.idempotent_count
     }
 }

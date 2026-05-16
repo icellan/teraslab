@@ -172,27 +172,43 @@ pub const MAX_TOLERATED_MISSING_PRIMARY: u64 = 65_536;
 /// Returns `Err(message)` when any non-`MissingPrimary` cause appears
 /// at all, OR when the `MissingPrimary` count exceeds the cap.
 pub fn check_replay_tolerance(stats: &RecoveryStats) -> Result<(), String> {
+    check_replay_tolerance_with_cap(stats, MAX_TOLERATED_MISSING_PRIMARY)
+}
+
+/// Apply the replay tolerance policy with an operator-configured
+/// MissingPrimary cap.
+pub fn check_replay_tolerance_with_cap(
+    stats: &RecoveryStats,
+    max_missing_primary: u64,
+) -> Result<(), String> {
+    // F-G6-018: tag each error with the structured `cause=<label>` field
+    // sourced from `replay_cause_label` so log scrapers and dashboards
+    // see the exact same wording the per-cause classifier emits.
     if stats.failed_io > 0 {
         return Err(format!(
             "recovery: {n} replay failure(s) caused by device I/O errors — \
              non-tolerable, the device is unreachable or returning corrupt \
-             blocks; investigate before restarting",
-            n = stats.failed_io
+             blocks; investigate before restarting [cause={cause}]",
+            n = stats.failed_io,
+            cause = replay_cause_label(ReplayCause::IoError),
         ));
     }
     if stats.failed_corrupt > 0 {
         return Err(format!(
             "recovery: {n} replay failure(s) caused by corrupt redo or \
              metadata records — non-tolerable, on-device data is unreadable; \
-             investigate before restarting",
-            n = stats.failed_corrupt
+             investigate before restarting [cause={cause}]",
+            n = stats.failed_corrupt,
+            cause = replay_cause_label(ReplayCause::CorruptEntry),
         ));
     }
     if stats.failed_logic > 0 {
         return Err(format!(
             "recovery: {n} replay failure(s) caused by logic-level \
-             inconsistency — non-tolerable; investigate before restarting",
-            n = stats.failed_logic
+             inconsistency — non-tolerable; investigate before restarting \
+             [cause={cause}]",
+            n = stats.failed_logic,
+            cause = replay_cause_label(ReplayCause::LogicError),
         ));
     }
     if stats.failed_missing_record_bytes > 0 {
@@ -205,18 +221,20 @@ pub fn check_replay_tolerance(stats: &RecoveryStats) -> Result<(), String> {
         return Err(format!(
             "recovery: {n} create-replay failure(s) — full record bytes \
              could not be written to device; non-tolerable, the device \
-             returned short I/O; investigate before restarting",
-            n = stats.failed_missing_record_bytes
+             returned short I/O; investigate before restarting [cause={cause}]",
+            n = stats.failed_missing_record_bytes,
+            cause = replay_cause_label(ReplayCause::MissingRecordBytes),
         ));
     }
-    if stats.failed_missing_primary > MAX_TOLERATED_MISSING_PRIMARY {
+    if stats.failed_missing_primary > max_missing_primary {
         return Err(format!(
             "recovery: {n} missing-primary replay failure(s) exceed cap \
              ({cap}) — the redo log references far more deleted records than \
              the primary index can plausibly explain; verify device / path \
-             and investigate before restarting",
+             and investigate before restarting [cause={cause}]",
             n = stats.failed_missing_primary,
-            cap = MAX_TOLERATED_MISSING_PRIMARY,
+            cap = max_missing_primary,
+            cause = replay_cause_label(ReplayCause::MissingPrimary),
         ));
     }
     Ok(())
@@ -225,7 +243,11 @@ pub fn check_replay_tolerance(stats: &RecoveryStats) -> Result<(), String> {
 /// Convert a [`ReplayCause`] into the human label used in tolerance
 /// error messages. Kept `pub(crate)` so other diagnostic surfaces can
 /// reuse the same wording.
-#[allow(dead_code)]
+///
+/// F-G6-018: this function used to be `#[allow(dead_code)]` because no
+/// caller existed. It now backs the cause-label suffix that
+/// [`check_replay_tolerance_with_cap`] appends to its error messages,
+/// so the label strings can never drift from the per-cause classifier.
 pub(crate) fn replay_cause_label(cause: ReplayCause) -> &'static str {
     match cause {
         ReplayCause::MissingPrimary => "missing-primary",
@@ -256,10 +278,30 @@ pub fn load_primary_index_redb(
     allocator: &SlotAllocator,
 ) -> Result<PrimaryBackend, RebuildError> {
     if crate::index::migration::import_in_progress(config) {
+        let sentinel_path = crate::index::migration::import_sentinel_path(&config.redb_path);
+        // F-G6-028: log the sentinel's mtime + wall-clock age so the
+        // operator can distinguish "fresh sentinel from a crashed
+        // import" from "stale sentinel restored from backup". The
+        // refusal is unconditional (we don't auto-clear), but the log
+        // line gives operators the context to decide quickly.
+        if let Ok(meta) = std::fs::metadata(&sentinel_path)
+            && let Ok(mtime) = meta.modified()
+            && let Ok(age) = std::time::SystemTime::now().duration_since(mtime)
+        {
+            tracing::warn!(
+                sentinel_path = %sentinel_path.display(),
+                mtime_unix_secs = mtime
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                age_secs = age.as_secs(),
+                "redb import-in-progress sentinel detected — startup will refuse \
+                 until the sentinel is cleared. Age hints at whether this is a \
+                 fresh crash or a stale leftover.",
+            );
+        }
         return Err(RebuildError::RedbImportInProgress {
-            sentinel_path: crate::index::migration::import_sentinel_path(&config.redb_path)
-                .display()
-                .to_string(),
+            sentinel_path: sentinel_path.display().to_string(),
         });
     }
     let restore_err = match PrimaryBackend::restore_redb(config) {
@@ -576,6 +618,20 @@ mod tests {
             check_replay_tolerance(&stats).expect_err("missing-primary over cap must fail closed");
         assert!(err.contains("missing-primary"), "msg: {err}");
         assert!(err.contains("cap"), "msg: {err}");
+    }
+
+    #[test]
+    fn replay_tolerance_uses_configured_missing_primary_cap() {
+        let stats = RecoveryStats {
+            failed_missing_primary: 11,
+            entries_failed: 11,
+            ..RecoveryStats::default()
+        };
+        check_replay_tolerance_with_cap(&stats, 11)
+            .expect("configured cap should accept at-threshold missing-primary count");
+        let err = check_replay_tolerance_with_cap(&stats, 10)
+            .expect_err("configured cap should reject over-threshold count");
+        assert!(err.contains("(10)"), "msg: {err}");
     }
 
     #[test]

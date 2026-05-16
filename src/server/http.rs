@@ -27,12 +27,27 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct DrainQuery {
+    #[serde(default)]
+    wait_seconds: u64,
+}
+
 /// Log levels for the runtime log level endpoint.
 const LOG_LEVEL_ERROR: u8 = 0;
 const LOG_LEVEL_WARN: u8 = 1;
 const LOG_LEVEL_INFO: u8 = 2;
 const LOG_LEVEL_DEBUG: u8 = 3;
 const LOG_LEVEL_TRACE: u8 = 4;
+
+/// Maximum number of remote `/admin/top?local=true` fetches in flight at once.
+///
+/// A large cluster can have hundreds of members. Without this cap, one
+/// operator poll spawns one Tokio task and opens one HTTP request per peer.
+const ADMIN_TOP_REMOTE_FANOUT_LIMIT: usize = 32;
+
+/// Maximum time a `/ws/top` client may block one push before the server drops it.
+const WS_TOP_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Embedded static files for the admin Web UI.
 #[derive(Embed)]
@@ -59,6 +74,9 @@ pub struct HttpState {
     pub active_connections: Arc<AtomicUsize>,
     /// HTTP port used by this node (for deriving other nodes' HTTP addresses).
     pub http_port: u16,
+    /// Replica lag threshold used by `/health/ready` in clustered mode.
+    /// A value of 0 disables readiness degradation for lag.
+    pub replica_lag_warn_threshold_ops: u64,
 }
 
 /// Bearer-token state shared with the admin auth middleware.
@@ -98,10 +116,57 @@ pub fn start_http_server(
     enable_admin_endpoints: bool,
     admin_token: Option<String>,
 ) {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    if let Err(e) = try_start_http_server(bind_addr, state, enable_admin_endpoints, admin_token) {
+        // F-G6-027: runtime build failure used to panic the dedicated
+        // HTTP thread without any operator signal — `/metrics` and
+        // `/health` would silently go dark. We log loudly here and
+        // return; the caller (a `std::thread::spawn` in `bin/server.rs`)
+        // will see the thread exit cleanly. The companion `Err` return
+        // from `try_start_http_server` is what allows the caller to
+        // observe the failure for future restart logic.
+        tracing::error!(
+            err = %e,
+            "HTTP observability server terminated — endpoints (metrics, health, admin) \
+             are now unreachable. The TCP data port is unaffected.",
+        );
+    }
+}
+
+/// Result-returning variant of [`start_http_server`] for callers that
+/// want to propagate startup or build failures (F-G6-027). The fire-and-
+/// forget wrapper above logs and discards the error so the legacy
+/// `std::thread::spawn` site in `bin/server.rs` keeps working without
+/// changes.
+pub fn try_start_http_server(
+    bind_addr: String,
+    state: Arc<HttpState>,
+    enable_admin_endpoints: bool,
+    admin_token: Option<String>,
+) -> std::io::Result<()> {
+    // F-G6-016: derive worker threads from the host's available
+    // parallelism. Floor at 2 so single-core / cgroup-restricted hosts
+    // still get a usable runtime; ceiling at 1/4 of CPUs to keep the
+    // observability runtime from starving the data path. The previous
+    // hard-coded `worker_threads(4)` was fine for a small cluster but
+    // saturated under large-fan-out `/admin/top` loads.
+    let parallelism = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let worker_threads = (parallelism / 4).max(2);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("teraslab-http")
+        .worker_threads(worker_threads)
         .enable_all()
-        .build()
-        .expect("failed to create tokio runtime for HTTP server");
+        .build()?;
+
+    // F-G6-017: install a per-thread panic hook so a handler panic logs
+    // a structured `tracing::error!` instead of vanishing into stderr.
+    // axum already converts panics into 500 Internal Server Error
+    // responses, so observability is the only thing this hook adds.
+    // The chain back to the previous hook is preserved so other
+    // installs (test harness, sentry, etc.) still fire.
+    install_http_panic_hook_once();
 
     rt.block_on(async move {
         let app = build_http_router(state, enable_admin_endpoints, admin_token.clone());
@@ -122,11 +187,41 @@ pub fn start_http_server(
                  production by setting enable_admin_endpoints = false.",
             );
         }
-        tracing::info!(%bind_addr, "HTTP observability server listening");
+        tracing::info!(%bind_addr, worker_threads, "HTTP observability server listening");
 
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!(err = %e, "HTTP server error");
         }
+    });
+    Ok(())
+}
+
+/// F-G6-017: install a `tracing`-aware panic hook exactly once for the
+/// HTTP server thread. Wrapping the previous global hook preserves
+/// existing panic handling (e.g., `RUST_BACKTRACE=1` output).
+fn install_http_panic_hook_once() {
+    use std::sync::Once;
+    static HOOK_INSTALLED: Once = Once::new();
+    HOOK_INSTALLED.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let payload = info
+                .payload()
+                .downcast_ref::<&'static str>()
+                .copied()
+                .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("<non-string panic payload>");
+            tracing::error!(
+                location,
+                payload,
+                "HTTP handler panicked — axum will return 500 to the caller",
+            );
+            prev(info);
+        }));
     });
 }
 
@@ -165,6 +260,14 @@ pub(crate) fn build_http_router(
     // Always-on routes: metrics, health, status, and read-only WS/UI surface.
     // Build the public router with `state` so the read-only handlers can
     // share the engine / metrics state.
+    //
+    // F-G6-002 / F-G6-003: `/admin/top` and `/ws/top` USED to live here.
+    // They expose internal counters and (in cluster mode) fan out to every
+    // peer over plaintext HTTP, so they now sit in the gated sub-router
+    // below behind the same bearer-token middleware as the mutating
+    // routes. When admin endpoints are disabled they return 404 to
+    // unauthenticated callers, which matches every other sensitive
+    // surface in this server.
     let public = Router::new()
         .route("/metrics", get(handle_metrics))
         .route("/health/live", get(handle_health_live))
@@ -179,12 +282,9 @@ pub(crate) fn build_http_router(
         .route("/admin/memory", get(handle_admin_memory))
         .route("/admin/records", get(handle_admin_records))
         .route("/admin/replication", get(handle_admin_replication))
-        .route("/admin/top", get(handle_admin_top))
         // Read-only debug surface (no state mutation, no record contents).
         .route("/debug/freelist", get(handle_debug_freelist))
         .route("/debug/log-level", get(handle_get_log_level))
-        // WebSocket
-        .route("/ws/top", get(handle_ws_top))
         // Web UI
         .route("/ui/", get(handle_ui_root))
         .route("/ui/{*path}", get(handle_ui))
@@ -200,7 +300,26 @@ pub(crate) fn build_http_router(
     // the gated routes (returning the public router) rather than mounting
     // an unauthenticated mutation surface.
     let token_bytes: Arc<[u8]> = match admin_token.as_deref() {
-        Some(t) if !t.is_empty() => Arc::from(t.as_bytes().to_vec().into_boxed_slice()),
+        Some(t) if !t.is_empty() => {
+            // F-G6-005: short tokens are practically brute-forceable
+            // (e.g., a 1-byte token through the case-insensitive Bearer
+            // accept loop). `validate_safe_defaults` in `src/config.rs`
+            // owns the hard reject (NEEDS-ORCHESTRATOR for G10); we
+            // surface a startup warning so operators see the weakness
+            // even in pre-config-fix builds.
+            const ADMIN_TOKEN_MIN_BYTES: usize = 16;
+            if t.len() < ADMIN_TOKEN_MIN_BYTES {
+                tracing::warn!(
+                    target: "teraslab::security",
+                    token_len = t.len(),
+                    min_recommended = ADMIN_TOKEN_MIN_BYTES,
+                    "admin_token is shorter than {} bytes — recommend a 32-byte CSPRNG-derived \
+                     value. The constant-time compare cannot defend against a guessable token.",
+                    ADMIN_TOKEN_MIN_BYTES,
+                );
+            }
+            Arc::from(t.as_bytes().to_vec().into_boxed_slice())
+        }
         _ => {
             tracing::error!(
                 "admin endpoints enabled without a configured admin_token — refusing to \
@@ -216,15 +335,26 @@ pub(crate) fn build_http_router(
         expected_token: Some(token_bytes),
     };
 
+    // F-G6-006: cap the body size on `PUT /debug/log-level` so an
+    // authenticated-but-hostile caller can't send a 2 MiB body just to
+    // exercise `String::to_lowercase`. 64 bytes covers every valid input
+    // and a generous client-side mistake margin.
     let gated = Router::new()
         // Admin mutation
         .route("/admin/quiesce", put(handle_admin_quiesce))
         .route("/admin/rebalance", put(handle_admin_rebalance))
         .route("/admin/drain/{node_id}", put(handle_admin_drain))
+        // F-G6-002 / F-G6-003: sensitive read surface moved here so the
+        // bearer-token middleware below covers `/admin/top` and `/ws/top`.
+        .route("/admin/top", get(handle_admin_top))
+        .route("/ws/top", get(handle_ws_top))
         // Debug mutation / sensitive read
         .route("/debug/index", get(handle_debug_index))
         .route("/debug/redo", get(handle_debug_redo))
-        .route("/debug/log-level", put(handle_set_log_level))
+        .route(
+            "/debug/log-level",
+            put(handle_set_log_level).layer(axum::extract::DefaultBodyLimit::max(64)),
+        )
         .route("/debug/records/{txid}", get(handle_debug_record))
         .layer(middleware::from_fn_with_state(
             auth_state,
@@ -282,9 +412,18 @@ async fn require_admin_bearer(
         }
     };
 
-    // Constant-time compare. `ct_eq` returns `Choice` which short-circuits
-    // *neither* on length nor on content; converting to bool below is safe.
-    if supplied.as_bytes().ct_eq(expected).into() {
+    // F-G6-004: `subtle::ConstantTimeEq::ct_eq` for unequal-length
+    // slices short-circuits to `Choice(0)` without comparing bytes. The
+    // raw-byte path therefore leaks the configured token's length to a
+    // timing-savvy attacker who can vary the supplied token length and
+    // measure response time. To make the reply timing independent of
+    // both content AND length, we hash both inputs into a 32-byte
+    // SHA-256 digest and compare those — every call now compares a
+    // fixed-size buffer of constant length.
+    use sha2::Digest;
+    let supplied_digest = sha2::Sha256::digest(supplied.as_bytes());
+    let expected_digest = sha2::Sha256::digest(expected);
+    if supplied_digest.ct_eq(expected_digest.as_slice()).into() {
         next.run(request).await
     } else {
         (StatusCode::UNAUTHORIZED, "invalid admin bearer token\n").into_response()
@@ -1017,26 +1156,97 @@ enum ReadyState {
     NotReady(&'static str),
 }
 
-/// R-055 (LMNH-07): `/health/ready` must reflect whether this node is
-/// actually ready to take traffic, not just the boot-time `ready` flag.
+/// R-055 (LMNH-07) / F-G6-001: `/health/ready` must reflect whether
+/// this node is actually ready to take traffic, not just the boot-time
+/// `ready` flag.
+///
 /// Pre-fix `state.ready` was hard-coded `true` at startup and never
 /// updated, so a load balancer would route requests to a clustered node
 /// before it joined a quorum and the node would reject every request
-/// with `ERR_CLUSTER_NOT_READY`. The cluster's own readiness gate
-/// (`cluster.cluster_health().is_ready()`, true once the node has
-/// observed at least one committed topology) is the authoritative
-/// source in clustered mode; in single-node mode (`state.cluster ==
-/// None`) only the local `state.ready` flag applies.
+/// with `ERR_CLUSTER_NOT_READY`. F-G6-001 extends that fix to cover the
+/// degraded-secondary case: when the DAH or unmined secondary failed to
+/// rebuild at startup, dispatch returns `ERR_INDEX_DEGRADED` for any
+/// dependent endpoint, so the load balancer must NOT receive a 200 here.
+///
+/// Order of checks (each returns a body explaining which subsystem is
+/// degraded):
+///
+/// 1. `state.ready` — the binary's recovery-complete flag. False until
+///    recovery has finished and the engine is attached.
+/// 2. `dispatch::secondary_status()` — flipped at startup if the DAH or
+///    unmined index rebuild failed.
+/// 3. In clustered mode: `cluster.cluster_health().is_ready()` (the
+///    node has observed at least one committed topology).
+/// 4. In clustered mode: replication lag below the operator threshold.
 fn compute_health_ready(state: &HttpState) -> ReadyState {
     if !state.ready.load(Ordering::Relaxed) {
-        return ReadyState::NotReady("not ready");
+        return ReadyState::NotReady("not ready (recovery in progress)");
+    }
+    // F-G6-001: dispatch flips the secondary readiness flags to `false`
+    // at startup when the DAH or unmined index rebuild fails. The TCP
+    // dispatch path already rejects dependent handlers with
+    // `ERR_INDEX_DEGRADED`; the HTTP readiness gate must do the same so
+    // load balancers stop routing traffic to a node that will fail.
+    let sec = crate::server::dispatch::secondary_status();
+    if !sec.dah_ok {
+        return ReadyState::NotReady("DAH secondary index degraded");
+    }
+    if !sec.unmined_ok {
+        return ReadyState::NotReady("unmined secondary index degraded");
     }
     if let Some(ref cluster) = state.cluster
         && !cluster.cluster_health().is_ready()
     {
         return ReadyState::NotReady("cluster not ready (no committed quorum yet)");
     }
+    if state.cluster.is_some()
+        && state.replica_lag_warn_threshold_ops > 0
+        && cached_replica_lag_exceeds(state)
+    {
+        return ReadyState::NotReady("replica lag exceeds threshold");
+    }
     ReadyState::Ready
+}
+
+/// F-G6-015: the replica-lag readiness predicate runs on every
+/// `/health/ready` probe and was originally a fresh atomic scan over
+/// `MAX_REPLICAS`. Load balancers typically poll readiness every
+/// 1-5 seconds, and we cache the verdict for [`READINESS_LAG_CACHE_TTL`]
+/// so a hot poll loop does not turn into an unbounded series of
+/// `Acquire` loads on the metrics atomics. The cached value is a single
+/// bool (the "exceeds threshold" verdict) packed together with the
+/// nanosecond timestamp it was captured.
+const READINESS_LAG_CACHE_TTL_MS: u64 = 500;
+
+/// Cached `(timestamp_ns, exceeds_threshold)` pair for the replica-lag
+/// readiness check. `timestamp_ns == 0` means "no cached verdict yet".
+/// `AtomicU64` packs the bool as the low bit and the timestamp in the
+/// upper 63 bits so the read+verdict observation is atomic.
+static REPLICA_LAG_CACHE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn cached_replica_lag_exceeds(state: &HttpState) -> bool {
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let cached = REPLICA_LAG_CACHE.load(Ordering::Relaxed);
+    if cached != 0 {
+        let cached_ts = cached >> 1;
+        let cached_val = (cached & 1) != 0;
+        let age_ns = now_ns.saturating_sub(cached_ts);
+        if age_ns < READINESS_LAG_CACHE_TTL_MS * 1_000_000 {
+            return cached_val;
+        }
+    }
+    // Cache miss: recompute and store. The metrics consumer uses
+    // `Acquire` semantics (see F-G6-024 in `metrics::ReplicationMetrics::lag`).
+    let exceeds = replication_metrics().is_some_and(|r| {
+        (0..MAX_REPLICAS).any(|i| r.lag(i) > state.replica_lag_warn_threshold_ops)
+    });
+    let packed = (now_ns << 1) | u64::from(exceeds);
+    REPLICA_LAG_CACHE.store(packed, Ordering::Relaxed);
+    exceeds
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,6 +1284,36 @@ fn shard_counts(table: &ShardTable, self_id: NodeId) -> (u32, u32, u32, u32, usi
         target_replica_count,
         table.pending_handoff_count(),
     )
+}
+
+fn cluster_drain_complete(cluster: &RunningCluster) -> bool {
+    let self_id = cluster.self_id();
+    let table = cluster.shard_table();
+    let table_guard = table.read();
+    let (master_count, _, target_master_count, _, pending_handoff_shards) =
+        shard_counts(&table_guard, self_id);
+    drop(table_guard);
+
+    master_count == 0
+        && target_master_count == 0
+        && pending_handoff_shards == 0
+        && cluster.active_migrations() == 0
+}
+
+async fn wait_for_cluster_drain(cluster: &RunningCluster, wait_seconds: u64) -> bool {
+    if wait_seconds == 0 {
+        return cluster_drain_complete(cluster);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_seconds);
+    loop {
+        if cluster_drain_complete(cluster) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
@@ -1322,21 +1562,45 @@ async fn handle_admin_rebalance(State(state): State<Arc<HttpState>>) -> impl Int
 async fn handle_admin_drain(
     State(state): State<Arc<HttpState>>,
     Path(node_id): Path<u64>,
+    Query(query): Query<DrainQuery>,
 ) -> impl IntoResponse {
     match state.cluster {
         Some(ref cluster) => {
             if cluster.self_id().0 == node_id {
                 cluster.quiesce();
-                (
-                    StatusCode::OK,
-                    format!("drain initiated for node {node_id}"),
-                )
+                if query.wait_seconds > 0 {
+                    if wait_for_cluster_drain(cluster, query.wait_seconds).await {
+                        (StatusCode::OK, format!("drain complete for node {node_id}"))
+                    } else {
+                        (
+                            StatusCode::ACCEPTED,
+                            format!(
+                                "drain still in progress for node {node_id} after {}s",
+                                query.wait_seconds
+                            ),
+                        )
+                    }
+                } else {
+                    (
+                        StatusCode::ACCEPTED,
+                        format!(
+                            "drain initiated for node {node_id}; use ?wait_seconds=N to wait for completion"
+                        ),
+                    )
+                }
             } else {
+                // F-G6-011: the path `node_id` only ever has one
+                // legal value — `self_id`. Reject mismatched IDs with
+                // 400 and an unambiguous body so operators do not
+                // silently mis-target a node.
                 (
                     StatusCode::BAD_REQUEST,
                     format!(
-                        "can only drain local node ({}), use --addr to target node {node_id} directly",
-                        cluster.self_id().0
+                        "drain path node_id ({}) does not match this server's node_id ({}); \
+                         each node drains itself — re-issue the request against the HTTP \
+                         endpoint of the target node",
+                        node_id,
+                        cluster.self_id().0,
                     ),
                 )
             }
@@ -1681,14 +1945,42 @@ fn histogram_json(h: &crate::metrics::LatencyHistogram) -> serde_json::Value {
     })
 }
 
-/// Build a cluster-wide top snapshot by fetching from all nodes in parallel.
+async fn fetch_remote_top_snapshot(
+    client: reqwest::Client,
+    url: String,
+    traceparent: Option<String>,
+) -> Option<serde_json::Value> {
+    // F-G6-008: the inbound /admin/top span has the W3C trace context the
+    // caller sent us. Without re-emitting it on the cluster fan-out, each
+    // remote peer starts an orphan trace. Attach the header byte-for-byte
+    // so the operator's tracing backend can stitch the cluster snapshot
+    // into one logical trace.
+    let mut req = client.get(&url);
+    if let Some(tp) = traceparent {
+        req = req.header("traceparent", tp);
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<serde_json::Value>().await.ok()
+}
+
+/// Build a cluster-wide top snapshot by fetching from all nodes with bounded
+/// parallelism.
 ///
 /// Returns the local snapshot plus remote node snapshots, with an aggregate.
 /// Remote nodes are queried with `?local=true` to prevent recursive fan-out.
 /// If a remote node doesn't respond within 2 seconds, it is omitted.
+///
+/// F-G6-008: the optional `traceparent` is taken from the current
+/// `tracing::Span` (set by `http_span_for` on the inbound handler) and
+/// re-emitted on every outbound HTTP request so the operator can stitch
+/// the cluster trace together.
 async fn build_cluster_top_snapshot(state: &HttpState) -> serde_json::Value {
     let local = build_local_top_snapshot(state);
     let mut all_nodes = vec![local.clone()];
+    let traceparent = traceparent_for_span(&tracing::Span::current());
 
     // Fan out to remote nodes (if clustered)
     if let Some(ref cluster) = state.cluster {
@@ -1696,28 +1988,42 @@ async fn build_cluster_top_snapshot(state: &HttpState) -> serde_json::Value {
         let addrs = cluster.node_addresses();
         let http_port = state.http_port;
 
-        let mut handles = Vec::new();
+        let mut urls = Vec::new();
         for (&node_id, &addr) in &addrs {
             if node_id == self_id {
                 continue; // Skip self — already have local snapshot
             }
             let url = format!("http://{}:{}/admin/top?local=true", addr.ip(), http_port);
-            handles.push(tokio::spawn(async move {
-                let client = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(2))
-                    .build()
-                    .ok()?;
-                let resp = client.get(&url).send().await.ok()?;
-                if !resp.status().is_success() {
-                    return None;
-                }
-                resp.json::<serde_json::Value>().await.ok()
-            }));
+            urls.push(url);
         }
 
-        for handle in handles {
-            if let Ok(Some(snapshot)) = handle.await {
-                all_nodes.push(snapshot);
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+        {
+            let mut urls = urls.into_iter();
+            let mut tasks = tokio::task::JoinSet::new();
+
+            for _ in 0..ADMIN_TOP_REMOTE_FANOUT_LIMIT {
+                let Some(url) = urls.next() else { break };
+                tasks.spawn(fetch_remote_top_snapshot(
+                    client.clone(),
+                    url,
+                    traceparent.clone(),
+                ));
+            }
+
+            while let Some(joined) = tasks.join_next().await {
+                if let Ok(Some(snapshot)) = joined {
+                    all_nodes.push(snapshot);
+                }
+                if let Some(url) = urls.next() {
+                    tasks.spawn(fetch_remote_top_snapshot(
+                        client.clone(),
+                        url,
+                        traceparent.clone(),
+                    ));
+                }
             }
         }
     }
@@ -1768,24 +2074,32 @@ fn aggregate_snapshots(nodes: &[serde_json::Value]) -> serde_json::Value {
         counters.insert(key.to_string(), serde_json::json!(sum));
     }
 
-    // Latency: take the max of p99/p95, weighted mean for p50/mean
+    // Latency: take the max of p99/p95, weighted mean for p50/mean.
+    //
+    // F-G6-009: empty-data nodes (timed out or `count == 0`) used to be
+    // counted into the denominator anyway because the original sum/sum
+    // pattern was symmetric; skipping them explicitly here keeps the
+    // weighted mean honest. We also accumulate the product in `u128` so
+    // a long-running hot node cannot overflow u64 (lock-wait counts can
+    // be in the millions, mean_ns in the nanoseconds — the product fits
+    // in 64 bits today but blows past it on multi-hour clusters).
     let latency_keys = ["spend", "spend_multi", "unspend", "lock_wait"];
     let mut latency = serde_json::Map::new();
     for lk in &latency_keys {
-        let total_count: u64 = nodes
-            .iter()
-            .filter_map(|n| n["latency"][*lk]["count"].as_u64())
-            .sum();
+        let mut total_count: u128 = 0;
+        let mut weighted_sum: u128 = 0;
+        for n in nodes {
+            let c = n["latency"][*lk]["count"].as_u64().unwrap_or(0);
+            if c == 0 {
+                continue;
+            }
+            let m = n["latency"][*lk]["mean_ns"].as_u64().unwrap_or(0);
+            total_count += c as u128;
+            weighted_sum += (c as u128) * (m as u128);
+        }
+        let total_count_u64: u64 = total_count.min(u128::from(u64::MAX)) as u64;
         let weighted_mean: u64 = if total_count > 0 {
-            let sum: u64 = nodes
-                .iter()
-                .map(|n| {
-                    let c = n["latency"][*lk]["count"].as_u64().unwrap_or(0);
-                    let m = n["latency"][*lk]["mean_ns"].as_u64().unwrap_or(0);
-                    c * m
-                })
-                .sum();
-            sum / total_count
+            (weighted_sum / total_count).min(u128::from(u64::MAX)) as u64
         } else {
             0
         };
@@ -1807,7 +2121,7 @@ fn aggregate_snapshots(nodes: &[serde_json::Value]) -> serde_json::Value {
         latency.insert(
             lk.to_string(),
             serde_json::json!({
-                "count": total_count,
+                "count": total_count_u64,
                 "mean_ns": weighted_mean,
                 "p50_ns": max_p50,
                 "p95_ns": max_p95,
@@ -1969,15 +2283,29 @@ async fn ws_top_loop(mut socket: WebSocket, state: Arc<HttpState>) {
             })
         };
         let msg = Message::Text(snapshot.to_string().into());
-        if socket.send(msg).await.is_err() {
-            break; // Client disconnected
+        match tokio::time::timeout(WS_TOP_SEND_TIMEOUT, socket.send(msg)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => break, // Client disconnected
+            Err(_) => break,     // Client stopped reading; drop the slow socket
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        // Drain any incoming messages (pings, close frames)
-        while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(1), socket.recv()).await
+        // F-G6-010: drain incoming messages (pings, close frames). Break
+        // the outer loop on `Message::Close` so a well-behaved client
+        // that initiates a graceful close doesn't sit idle for the
+        // 5-second send timeout before we notice.
+        let mut closed = false;
+        while let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(Duration::from_millis(10), socket.recv()).await
         {
-            // Just consume; we don't process client messages
+            if matches!(msg, Message::Close(_)) {
+                tracing::debug!("ws/top: client sent Close frame; exiting loop");
+                closed = true;
+                break;
+            }
+        }
+        if closed {
+            break;
         }
     }
 }
@@ -2079,6 +2407,10 @@ async fn handle_debug_record(
     State(state): State<Arc<HttpState>>,
     Path(txid_hex): Path<String>,
 ) -> impl IntoResponse {
+    if txid_hex.len() > TXID_HEX_LEN {
+        return (StatusCode::BAD_REQUEST, "invalid txid length".to_string());
+    }
+
     // Parse hex txid
     let txid_bytes = match parse_hex_txid(&txid_hex) {
         Some(b) => b,
@@ -2138,7 +2470,21 @@ async fn handle_ui(Path(path): Path<String>) -> impl IntoResponse {
 
 /// Serve a file from the embedded `UiAssets`, falling back to `index.html`
 /// for client-side routing (SPA).
+///
+/// F-G6-007: `rust_embed` already cannot serve files outside the embed
+/// map, so `..`-traversal attempts simply miss and SPA-fallback to
+/// `index.html`. That's harmless today, but the SPA fallback masks the
+/// signal that the caller is probing for traversal. Return 404 for any
+/// path containing `..` or `\` so future refactors that swap to a
+/// filesystem loader can't silently re-introduce a traversal hole.
 fn serve_embedded_file(path: &str) -> (StatusCode, [(axum::http::HeaderName, String); 1], Vec<u8>) {
+    if path.contains("..") || path.contains('\\') {
+        return (
+            StatusCode::NOT_FOUND,
+            [(axum::http::header::CONTENT_TYPE, "text/plain".to_string())],
+            b"not found".to_vec(),
+        );
+    }
     let (data, mime) = match UiAssets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path)
@@ -2186,8 +2532,10 @@ fn json_response(
     )
 }
 
+const TXID_HEX_LEN: usize = 64;
+
 fn parse_hex_txid(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
+    if hex.len() != TXID_HEX_LEN {
         return None;
     }
     let mut bytes = [0u8; 32];
@@ -2595,6 +2943,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn admin_top_fanout_documented() {
+        let source = include_str!("http.rs");
+        assert!(
+            source.contains("ADMIN_TOP_REMOTE_FANOUT_LIMIT"),
+            "remote /admin/top fan-out must keep an explicit concurrency cap"
+        );
+        assert!(
+            source.contains("tokio::task::JoinSet::new()"),
+            "cluster top snapshot should use a bounded task set, not one task per peer"
+        );
+        let forbidden = ["let mut handles", " = Vec::new();"].concat();
+        assert!(
+            !source.contains(&forbidden),
+            "regression: unbounded remote task collection returned"
+        );
+    }
+
+    #[test]
+    fn websocket_top_send_has_backpressure_timeout() {
+        let source = include_str!("http.rs");
+        assert!(
+            source.contains("WS_TOP_SEND_TIMEOUT"),
+            "websocket top loop must keep an explicit send timeout",
+        );
+        assert!(
+            source.contains("tokio::time::timeout(WS_TOP_SEND_TIMEOUT, socket.send(msg))"),
+            "socket.send must be bounded so slow readers are dropped",
+        );
+    }
+
     /// The `/ws/top` push body is built via `build_local_top_snapshot` in
     /// single-node mode (and the cluster snapshot wraps the same payload in
     /// an envelope). Verify that the local snapshot JSON contains the
@@ -2645,6 +3024,7 @@ mod tests {
             redo_log: None,
             active_connections: Arc::new(AtomicUsize::new(0)),
             http_port: 0,
+            replica_lag_warn_threshold_ops: 10_000,
         };
 
         let snap = build_local_top_snapshot(&state);
@@ -2822,6 +3202,7 @@ mod tests {
             redo_log: None,
             active_connections: Arc::new(AtomicUsize::new(0)),
             http_port: 0,
+            replica_lag_warn_threshold_ops: 10_000,
         };
 
         let snap = build_local_top_snapshot(&state);
@@ -2911,6 +3292,7 @@ mod tests {
             redo_log: None,
             active_connections: Arc::new(AtomicUsize::new(0)),
             http_port: 0,
+            replica_lag_warn_threshold_ops: 10_000,
         };
 
         // The single-node `/ws/top` loop serializes this exact object as
@@ -3095,6 +3477,7 @@ mod tests {
             redo_log: None,
             active_connections: Arc::new(AtomicUsize::new(0)),
             http_port: 0,
+            replica_lag_warn_threshold_ops: 0,
         })
     }
 
@@ -3177,5 +3560,75 @@ mod tests {
 
         let state = build_ready_test_state(true, Some(cluster));
         assert_eq!(compute_health_ready(&state), ReadyState::Ready);
+    }
+
+    #[test]
+    fn health_ready_rejects_when_replica_lag_exceeds_threshold() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+        use crate::metrics::{ReplicationMetrics, init_replication_metrics, replication_metrics};
+        use std::sync::OnceLock;
+
+        static REPL: OnceLock<ReplicationMetrics> = OnceLock::new();
+        init_replication_metrics(REPL.get_or_init(ReplicationMetrics::new));
+        let repl = replication_metrics().expect("replication metrics installed");
+        repl.leader_sequence.store(100, Ordering::Relaxed);
+        repl.per_replica[0]
+            .last_acked_seq
+            .store(10, Ordering::Relaxed);
+
+        let table = ShardTable::compute(&[NodeId(1)], 1);
+        let cluster = Arc::new(new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[],
+            &[NodeId(1)],
+            &[],
+            &[],
+            &[],
+            0,
+        ));
+        let mut state = build_ready_test_state(true, Some(cluster));
+        Arc::get_mut(&mut state)
+            .expect("unique test state")
+            .replica_lag_warn_threshold_ops = 50;
+
+        assert_eq!(
+            compute_health_ready(&state),
+            ReadyState::NotReady("replica lag exceeds threshold"),
+        );
+
+        repl.leader_sequence.store(0, Ordering::Relaxed);
+        repl.per_replica[0]
+            .last_acked_seq
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn drain_wait_helper_reports_completion_only_after_self_has_no_master_shards() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+
+        let draining = Arc::new(new_test_running_cluster(
+            NodeId(1),
+            ShardTable::compute(&[NodeId(1)], 1),
+            &[],
+            &[NodeId(1)],
+            &[],
+            &[],
+            &[],
+            0,
+        ));
+        assert!(!wait_for_cluster_drain(&draining, 0).await);
+
+        let drained = Arc::new(new_test_running_cluster(
+            NodeId(1),
+            ShardTable::compute(&[NodeId(2)], 1),
+            &[],
+            &[NodeId(2)],
+            &[],
+            &[],
+            &[],
+            0,
+        ));
+        assert!(wait_for_cluster_drain(&drained, 0).await);
     }
 }

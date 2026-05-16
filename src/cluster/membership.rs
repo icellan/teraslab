@@ -58,6 +58,9 @@ pub struct MemberInfo {
 pub struct Membership {
     self_id: NodeId,
     members: HashMap<NodeId, MemberInfo>,
+    /// Highest incarnation observed for each NodeId, retained even after a
+    /// Dead member is garbage-collected from `members`.
+    max_seen_incarnation: HashMap<NodeId, u64>,
     suspicion_timeout: Duration,
     cached_alive: Vec<NodeId>,
 }
@@ -68,6 +71,7 @@ impl Membership {
         Self {
             self_id,
             members: HashMap::new(),
+            max_seen_incarnation: HashMap::new(),
             suspicion_timeout,
             cached_alive: vec![self_id],
         }
@@ -117,6 +121,10 @@ impl Membership {
         }
 
         let mut events = Vec::new();
+        let historic_incarnation = self.max_seen_incarnation.get(&node).copied().unwrap_or(0);
+        if incarnation < historic_incarnation {
+            return events;
+        }
 
         match self.members.get_mut(&node) {
             Some(info) => {
@@ -179,6 +187,11 @@ impl Membership {
             }
         }
 
+        self.max_seen_incarnation
+            .entry(node)
+            .and_modify(|max| *max = (*max).max(incarnation))
+            .or_insert(incarnation);
+
         events
     }
 
@@ -195,7 +208,12 @@ impl Membership {
             && incarnation >= info.incarnation
         {
             info.state = NodeState::Suspect;
+            info.incarnation = incarnation;
             info.state_changed_at = Instant::now();
+            self.max_seen_incarnation
+                .entry(node)
+                .and_modify(|max| *max = (*max).max(incarnation))
+                .or_insert(incarnation);
             self.rebuild_alive_cache();
             events.push(ClusterEvent::NodeSuspect(node));
             if let Some(m) = swim_metrics() {
@@ -223,7 +241,12 @@ impl Membership {
             let suspect_started_at = info.state_changed_at;
             let now = Instant::now();
             info.state = NodeState::Dead;
+            info.incarnation = incarnation;
             info.state_changed_at = now;
+            self.max_seen_incarnation
+                .entry(node)
+                .and_modify(|max| *max = (*max).max(incarnation))
+                .or_insert(incarnation);
             let elapsed = now.saturating_duration_since(suspect_started_at);
             post_transition = Some((was_suspect, elapsed));
         }
@@ -590,6 +613,36 @@ mod tests {
         assert!(m.member_info(&NodeId(2)).is_none());
         // Alive node 3 is unaffected.
         assert!(m.member_info(&NodeId(3)).is_some());
+    }
+
+    #[test]
+    fn dead_node_reborn_cannot_use_lower_incarnation() {
+        let mut m = Membership::new(NodeId(1), Duration::from_millis(10));
+        m.mark_alive(NodeId(2), addr(3001), 10, true);
+        m.mark_dead(NodeId(2), 10);
+
+        let forgotten = m.forget_dead_older_than(Duration::ZERO);
+        assert_eq!(forgotten, vec![NodeId(2)]);
+        assert!(m.member_info(&NodeId(2)).is_none());
+
+        let events = m.mark_alive(NodeId(2), addr(3001), 9, true);
+        assert!(
+            events.is_empty(),
+            "lower-incarnation rebirth must be ignored"
+        );
+        assert!(
+            m.member_info(&NodeId(2)).is_none(),
+            "forgotten node must not be reinserted at a lower incarnation"
+        );
+
+        let events = m.mark_alive(NodeId(2), addr(3001), 10, true);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(2), _))),
+            "same-or-higher incarnation may rejoin after GC"
+        );
+        assert_eq!(m.member_info(&NodeId(2)).unwrap().incarnation, 10);
     }
 
     #[test]

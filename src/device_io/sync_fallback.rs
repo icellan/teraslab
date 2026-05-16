@@ -89,7 +89,7 @@ impl DeviceIo for SyncFallback {
     fn submit_and_wait(&mut self, _min_complete: usize) -> Result<Vec<Completion>, std::io::Error> {
         let mut completions = Vec::with_capacity(self.pending.len());
         for op in self.pending.drain(..) {
-            let result = match op.kind {
+            let raw_result = match op.kind {
                 OpKind::Read => unsafe {
                     libc::pread(
                         op.fd,
@@ -107,9 +107,29 @@ impl DeviceIo for SyncFallback {
                     )
                 },
             };
+            // F-G1-001: On error pread/pwrite returns -1 and sets errno.
+            // The `DeviceIo::Completion::result` contract (see
+            // `device_io/mod.rs::Completion::result`) is "bytes
+            // transferred, or **negative errno** on failure" — matching
+            // the io_uring CQE encoding so downstream telemetry
+            // (`record_completion_error` in the io_uring backend) and
+            // any caller that translates `result` to
+            // `io::Error::from_raw_os_error(-result)` produce the same
+            // value across both backends. Before this fix every distinct
+            // I/O failure (EBADF / EIO / ENOSPC / EAGAIN) collapsed to
+            // a single `-1`. Now we read errno and stamp `-errno` so
+            // callers can distinguish them.
+            let result = if raw_result < 0 {
+                let errno = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                -errno
+            } else {
+                raw_result as i32
+            };
             completions.push(Completion {
                 user_data: op.user_data,
-                result: result as i32,
+                result,
             });
         }
         Ok(completions)
@@ -320,7 +340,49 @@ mod tests {
     #[test]
     fn create_device_io_returns_sync_on_macos() {
         // On macOS (or any non-Linux), create_device_io should return SyncFallback
-        let io = super::super::create_device_io(32);
+        let io = super::super::create_device_io(32).unwrap();
         assert_eq!(io.pending(), 0);
+    }
+
+    /// F-G1-001 regression: a failed read on a bad fd must surface the
+    /// real errno (negated, per the `DeviceIo::Completion::result`
+    /// contract) — `-libc::EBADF` here — not a bare `-1`. Before the
+    /// fix every libc error collapsed to `-1` and downstream telemetry
+    /// (`io_uring_backend::record_completion_error`) recorded the
+    /// wrong error class for sync-fallback failures.
+    #[test]
+    fn sync_pread_on_bad_fd_returns_neg_ebadf() {
+        let mut io = SyncFallback::new(8).unwrap();
+        // -1 is never a valid open fd; libc::pread(-1, ...) returns -1
+        // and sets errno = EBADF.
+        let bad_fd: std::os::fd::RawFd = -1;
+        let mut rbuf = AlignedBuf::new(ALIGNMENT, ALIGNMENT);
+        io.submit_read(bad_fd, &mut rbuf, 0, 0xCAFE).unwrap();
+        let completions = io.submit_and_wait(1).unwrap();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].user_data, 0xCAFE);
+        assert_eq!(
+            completions[0].result,
+            -libc::EBADF,
+            "bad fd must surface negative EBADF, not bare -1",
+        );
+    }
+
+    /// F-G1-001 regression: a failed pwrite to a bad fd must surface
+    /// `-libc::EBADF` as well — same contract as the read case.
+    #[test]
+    fn sync_pwrite_on_bad_fd_returns_neg_ebadf() {
+        let mut io = SyncFallback::new(8).unwrap();
+        let bad_fd: std::os::fd::RawFd = -1;
+        let wbuf = AlignedBuf::new(ALIGNMENT, ALIGNMENT);
+        io.submit_write(bad_fd, &wbuf, 0, 0xBEEF).unwrap();
+        let completions = io.submit_and_wait(1).unwrap();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].user_data, 0xBEEF);
+        assert_eq!(
+            completions[0].result,
+            -libc::EBADF,
+            "bad fd must surface negative EBADF, not bare -1",
+        );
     }
 }

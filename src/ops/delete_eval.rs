@@ -62,6 +62,12 @@ fn checked_new_dah(
 /// 5. State transition tracking via LAST_SPENT_ALL flag
 /// 6. If all-spent AND has blocks AND on longest chain → set/update DAH
 /// 7. If conditions not met AND DAH is set → clear DAH
+///
+/// Unmined transactions intentionally do not get `delete_at_height` here:
+/// `metadata.unmined_since != 0` means the transaction is not on the longest
+/// chain, so pruning is driven by the unmined secondary index rather than the
+/// DAH index. This preserves data needed for reorg handling until a separate
+/// unmined-retention policy decides it is safe to delete.
 pub fn evaluate_delete_at_height(
     metadata: &TxMetadata,
     current_block_height: u32,

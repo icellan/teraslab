@@ -30,16 +30,19 @@
 //! across multiple recovery passes (e.g. crash mid-replay).
 
 use crate::allocator::SlotAllocator;
-use crate::device::BlockDevice;
+use crate::device::{AlignedBuf, BlockDevice};
 use crate::index::{
     DahBackend, DahRedoEntry, PrimaryBackend, TxIndexEntry, TxKey, UnminedBackend, UnminedRedoEntry,
 };
 use crate::io;
+use crate::ops::delete_eval::{DahPatch, evaluate_delete_at_height};
 use crate::record::*;
 use crate::redo::{RedoEntry, RedoLog, RedoOp};
 use crate::storage::blob_gc::{self, BlobGcStats};
 use crate::storage::blobstore::{BlobError, BlobStore};
 use thiserror::Error;
+
+const RECOVERY_PROGRESS_INTERVAL_ENTRIES: u64 = 1024;
 
 /// Errors during recovery.
 #[derive(Error, Debug)]
@@ -120,6 +123,18 @@ pub struct RecoveryStats {
     /// Gap #2: `CreateV2` replay could not write the full record bytes
     /// the entry carried (short device read/write). NOT tolerable.
     pub failed_missing_record_bytes: u64,
+}
+
+/// Engine-level conflicting-child append intent collected during recovery.
+///
+/// Low-level recovery cannot replay this safely because the operation needs
+/// the engine's allocator and per-key stripe locks. Startup drains these after
+/// constructing the engine by calling `Engine::append_conflicting_child`, which
+/// deduplicates an already-applied append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingAppendConflictingChild {
+    pub parent_key: TxKey,
+    pub child_txid: [u8; 32],
 }
 
 impl RecoveryStats {
@@ -203,10 +218,68 @@ pub fn recover_all_with_allocator(
     index: &mut PrimaryBackend,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
-    mut allocator: Option<&mut SlotAllocator>,
+    allocator: Option<&mut SlotAllocator>,
 ) -> Result<RecoveryStats, RecoveryError> {
+    let (stats, _) = recover_all_with_allocator_collecting_pending_conflicts(
+        device, redo_log, index, dah, unmined, allocator,
+    )?;
+    Ok(stats)
+}
+
+/// Full recovery variant that also returns engine-level conflicting-child
+/// append intents that must be drained after [`crate::ops::engine::Engine`]
+/// construction.
+pub fn recover_all_with_allocator_collecting_pending_conflicts(
+    device: &dyn BlockDevice,
+    redo_log: &RedoLog,
+    index: &mut PrimaryBackend,
+    dah: &mut DahBackend,
+    unmined: &mut UnminedBackend,
+    allocator: Option<&mut SlotAllocator>,
+) -> Result<(RecoveryStats, Vec<PendingAppendConflictingChild>), RecoveryError> {
     let entries = redo_log.recover()?;
+    recover_entries_with_allocator_collecting_pending_conflicts(
+        device, entries, index, dah, unmined, allocator, None,
+    )
+}
+
+/// Full recovery with durable progress markers written every
+/// [`RECOVERY_PROGRESS_INTERVAL_ENTRIES`] safely processed entries and once
+/// at the end of the recovered range.
+pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
+    device: &dyn BlockDevice,
+    redo_log: &mut RedoLog,
+    index: &mut PrimaryBackend,
+    dah: &mut DahBackend,
+    unmined: &mut UnminedBackend,
+    allocator: Option<&mut SlotAllocator>,
+) -> Result<(RecoveryStats, Vec<PendingAppendConflictingChild>), RecoveryError> {
+    let entries = redo_log.recover()?;
+    recover_entries_with_allocator_collecting_pending_conflicts(
+        device,
+        entries,
+        index,
+        dah,
+        unmined,
+        allocator,
+        Some((redo_log, RECOVERY_PROGRESS_INTERVAL_ENTRIES)),
+    )
+}
+
+fn recover_entries_with_allocator_collecting_pending_conflicts(
+    device: &dyn BlockDevice,
+    entries: Vec<RedoEntry>,
+    index: &mut PrimaryBackend,
+    dah: &mut DahBackend,
+    unmined: &mut UnminedBackend,
+    mut allocator: Option<&mut SlotAllocator>,
+    mut progress: Option<(&mut RedoLog, u64)>,
+) -> Result<(RecoveryStats, Vec<PendingAppendConflictingChild>), RecoveryError> {
     let mut stats = RecoveryStats::default();
+    let mut pending_conflicting_children = Vec::new();
+    let mut processed_since_progress = 0u64;
+    let mut last_progress_sequence = 0u64;
+    let mut last_safe_sequence = 0u64;
 
     // Track pending hash-table-resize intents by capacity. A Begin adds an
     // entry; a matching Commit removes it. After the replay loop, any
@@ -221,12 +294,22 @@ pub fn recover_all_with_allocator(
                 tx_key,
                 old_height,
                 new_height,
-            } => replay_secondary_unmined(index, unmined, tx_key, *old_height, *new_height),
+            } => replay_secondary_unmined(device, index, unmined, tx_key, *old_height, *new_height),
             RedoOp::SecondaryDahUpdate {
                 tx_key,
                 old_height,
                 new_height,
-            } => replay_secondary_dah(index, dah, tx_key, *old_height, *new_height),
+            } => replay_secondary_dah(device, index, dah, tx_key, *old_height, *new_height),
+            RedoOp::AppendConflictingChild {
+                parent_key,
+                child_txid,
+            } => {
+                pending_conflicting_children.push(PendingAppendConflictingChild {
+                    parent_key: *parent_key,
+                    child_txid: *child_txid,
+                });
+                ReplayResult::Skipped
+            }
             RedoOp::AllocateRegion { .. } | RedoOp::FreeRegion { .. } => {
                 match allocator.as_deref_mut() {
                     Some(alloc) => {
@@ -237,6 +320,37 @@ pub fn recover_all_with_allocator(
                         }
                     }
                     None => ReplayResult::Skipped,
+                }
+            }
+            RedoOp::Delete {
+                tx_key,
+                record_offset,
+                record_size,
+            } => {
+                let delete_outcome =
+                    replay_delete(device, index, tx_key, *record_offset, *record_size);
+                if matches!(delete_outcome, ReplayResult::Failed(_)) {
+                    delete_outcome
+                } else if *record_offset != 0 && *record_size != 0 {
+                    match allocator.as_deref_mut() {
+                        Some(alloc) => {
+                            let free = RedoOp::FreeRegion {
+                                offset: *record_offset,
+                                size: *record_size,
+                                device_id: 0,
+                            };
+                            if alloc.replay_redo(&free)
+                                || matches!(delete_outcome, ReplayResult::Applied)
+                            {
+                                ReplayResult::Applied
+                            } else {
+                                ReplayResult::Skipped
+                            }
+                        }
+                        None => delete_outcome,
+                    }
+                } else {
+                    delete_outcome
                 }
             }
             RedoOp::HashtableResizeBegin {
@@ -251,14 +365,67 @@ pub fn recover_all_with_allocator(
                 pending_resizes.remove(new_capacity);
                 ReplayResult::Applied
             }
+            RedoOp::CreateV2 {
+                record_offset,
+                record_bytes,
+                ..
+            } => {
+                if let Some(alloc) = allocator.as_deref()
+                    && !alloc.is_allocated_range(*record_offset, record_bytes.len() as u64)
+                {
+                    ReplayResult::Failed(ReplayCause::LogicError)
+                } else {
+                    replay_entry(device, index, entry)
+                }
+            }
+            RedoOp::CompensateUnsetMined {
+                tx_key,
+                block_id,
+                block_height,
+                subtree_idx,
+            } => replay_compensate_unset_mined_with_allocator(
+                device,
+                index,
+                allocator.as_deref_mut(),
+                tx_key,
+                *block_id,
+                *block_height,
+                *subtree_idx,
+            ),
             _ => replay_entry(device, index, entry),
         };
+        let progress_safe = matches!(
+            outcome,
+            ReplayResult::Applied
+                | ReplayResult::Skipped
+                | ReplayResult::Failed(ReplayCause::MissingPrimary)
+        );
         match outcome {
             ReplayResult::Applied => stats.entries_replayed += 1,
             ReplayResult::Skipped => stats.entries_skipped += 1,
             ReplayResult::Failed(cause) => stats.record_failure(cause),
         }
+        if progress_safe {
+            last_safe_sequence = entry.sequence;
+            processed_since_progress = processed_since_progress.saturating_add(1);
+            if let Some((log, interval)) = progress.as_mut()
+                && *interval > 0
+                && processed_since_progress >= *interval
+            {
+                log.mark_recovery_progress(entry.sequence)?;
+                last_progress_sequence = entry.sequence;
+                processed_since_progress = 0;
+            }
+        }
     }
+
+    if let Some((log, _)) = progress.as_mut()
+        && last_safe_sequence > last_progress_sequence
+    {
+        log.mark_recovery_progress(last_safe_sequence)?;
+    }
+
+    reconcile_secondary_indexes_from_metadata(device, index, dah, unmined)?;
 
     // Clean up any orphan tmp files from resizes that started but never
     // committed. The original index file is intact (rename is atomic and
@@ -292,7 +459,41 @@ pub fn recover_all_with_allocator(
         let _ = alloc.persist();
     }
 
-    Ok(stats)
+    Ok((stats, pending_conflicting_children))
+}
+
+fn reconcile_secondary_indexes_from_metadata(
+    device: &dyn BlockDevice,
+    index: &PrimaryBackend,
+    dah: &mut DahBackend,
+    unmined: &mut UnminedBackend,
+) -> Result<(), RecoveryError> {
+    dah.clear();
+    unmined.clear();
+    for (key, entry) in index.iter() {
+        let meta = match io::read_metadata(device, entry.record_offset) {
+            Ok(meta) => meta,
+            Err(_) => {
+                return Err(RecoveryError::Index(
+                    crate::index::IndexError::FormatError {
+                        detail: format!(
+                            "secondary reconcile failed to read metadata for {:?}",
+                            key.txid
+                        ),
+                    },
+                ));
+            }
+        };
+        let dah_height = { meta.delete_at_height };
+        if dah_height != 0 {
+            dah.insert(dah_height, key, None)?;
+        }
+        let unmined_height = { meta.unmined_since };
+        if unmined_height != 0 {
+            unmined.insert(unmined_height, key, None)?;
+        }
+    }
+    Ok(())
 }
 
 /// Reconcile the external blob store against the primary index after
@@ -356,17 +557,24 @@ fn path_from_bytes(bytes: &[u8]) -> std::path::PathBuf {
 /// match the primary, the redo entry is stale (primary moved on) and we
 /// skip the secondary update entirely.
 fn replay_secondary_unmined(
+    device: &dyn BlockDevice,
     index: &PrimaryBackend,
     unmined: &mut UnminedBackend,
     tx_key: &TxKey,
     _old_height: u32,
     new_height: u32,
 ) -> ReplayResult {
-    // Primary's authoritative unmined_since. If absent, the record was
-    // deleted between when the redo was written and now — recovery skip.
-    let primary_unmined = match index.lookup(tx_key) {
-        Some(e) => e.unmined_since,
+    // The on-device record is authoritative here. R-077: after a crash
+    // between the primary metadata write and a primary-index/redb cache
+    // commit, the cached TxIndexEntry can be stale while the record already
+    // contains the redo target value.
+    let ie = match index.lookup(tx_key) {
+        Some(e) => e,
         None => return ReplayResult::Skipped,
+    };
+    let primary_unmined = match io::read_metadata(device, ie.record_offset) {
+        Ok(meta) => meta.unmined_since,
+        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
     };
     if primary_unmined != new_height {
         // Redo is stale relative to primary — a later redo has already
@@ -389,6 +597,7 @@ fn replay_secondary_unmined(
 }
 
 fn replay_secondary_dah(
+    device: &dyn BlockDevice,
     index: &PrimaryBackend,
     dah: &mut DahBackend,
     tx_key: &TxKey,
@@ -399,12 +608,10 @@ fn replay_secondary_dah(
         Some(e) => e,
         None => return ReplayResult::Skipped,
     };
-    // Extract the primary's current delete_at_height from the cached fields.
-    // The `HAS_PRESERVE_UNTIL` flag determines whether dah_or_preserve holds
-    // the DAH or a preserve_until value; if the former, the DAH is 0.
-    let has_preserve =
-        TxFlags::from_bits_truncate(ie.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL);
-    let primary_dah = if has_preserve { 0 } else { ie.dah_or_preserve };
+    let primary_dah = match io::read_metadata(device, ie.record_offset) {
+        Ok(meta) => meta.delete_at_height,
+        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+    };
     if primary_dah != new_height {
         return ReplayResult::Skipped;
     }
@@ -437,6 +644,23 @@ enum ReplayResult {
     Failed(ReplayCause),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ReplayDerivedContext {
+    current_block_height: u32,
+    block_height_retention: u32,
+    target_generation: u32,
+    updated_at: u64,
+}
+
+fn apply_replay_dah_patch(metadata: &mut TxMetadata, patch: &DahPatch) {
+    metadata.delete_at_height = patch.new_delete_at_height;
+    if patch.last_spent_all {
+        metadata.flags |= TxFlags::LAST_SPENT_ALL;
+    } else {
+        metadata.flags -= metadata.flags & TxFlags::LAST_SPENT_ALL;
+    }
+}
+
 fn replay_entry(
     device: &dyn BlockDevice,
     index: &mut PrimaryBackend,
@@ -455,12 +679,68 @@ fn replay_entry(
             *offset,
             spending_data,
             *new_spent_count,
+            None,
+        ),
+        RedoOp::SpendV2 {
+            tx_key,
+            offset,
+            spending_data,
+            new_spent_count,
+            current_block_height,
+            block_height_retention,
+            target_generation,
+            updated_at,
+        } => replay_spend(
+            device,
+            index,
+            tx_key,
+            *offset,
+            spending_data,
+            *new_spent_count,
+            Some(ReplayDerivedContext {
+                current_block_height: *current_block_height,
+                block_height_retention: *block_height_retention,
+                target_generation: *target_generation,
+                updated_at: *updated_at,
+            }),
         ),
         RedoOp::Unspend {
             tx_key,
             offset,
+            spending_data,
             new_spent_count,
-        } => replay_unspend(device, index, tx_key, *offset, *new_spent_count),
+        } => replay_unspend(
+            device,
+            index,
+            tx_key,
+            *offset,
+            spending_data.as_ref(),
+            *new_spent_count,
+            None,
+        ),
+        RedoOp::UnspendV2 {
+            tx_key,
+            offset,
+            spending_data,
+            new_spent_count,
+            current_block_height,
+            block_height_retention,
+            target_generation,
+            updated_at,
+        } => replay_unspend(
+            device,
+            index,
+            tx_key,
+            *offset,
+            Some(spending_data),
+            *new_spent_count,
+            Some(ReplayDerivedContext {
+                current_block_height: *current_block_height,
+                block_height_retention: *block_height_retention,
+                target_generation: *target_generation,
+                updated_at: *updated_at,
+            }),
+        ),
         RedoOp::SetMined {
             tx_key,
             block_id,
@@ -476,8 +756,20 @@ fn replay_entry(
             *subtree_idx,
             *unset,
         ),
-        RedoOp::Freeze { tx_key, offset } => replay_freeze(device, index, tx_key, *offset),
-        RedoOp::Unfreeze { tx_key, offset } => replay_unfreeze(device, index, tx_key, *offset),
+        RedoOp::Freeze { tx_key, offset } => replay_freeze(device, index, tx_key, *offset, None),
+        RedoOp::FreezeV2 {
+            tx_key,
+            offset,
+            utxo_hash,
+        } => replay_freeze(device, index, tx_key, *offset, Some(utxo_hash)),
+        RedoOp::Unfreeze { tx_key, offset } => {
+            replay_unfreeze(device, index, tx_key, *offset, None)
+        }
+        RedoOp::UnfreezeV2 {
+            tx_key,
+            offset,
+            utxo_hash,
+        } => replay_unfreeze(device, index, tx_key, *offset, Some(utxo_hash)),
         RedoOp::Create {
             tx_key,
             record_offset,
@@ -500,8 +792,13 @@ fn replay_entry(
             record_bytes,
             parent_txids,
         ),
-        RedoOp::Delete { tx_key, .. } => replay_delete(index, tx_key),
-        RedoOp::Checkpoint => ReplayResult::Skipped,
+        RedoOp::Delete {
+            tx_key,
+            record_offset,
+            record_size,
+        } => replay_delete(device, index, tx_key, *record_offset, *record_size),
+        RedoOp::AppendConflictingChild { .. } => ReplayResult::Skipped,
+        RedoOp::Checkpoint | RedoOp::RecoveryProgress { .. } => ReplayResult::Skipped,
         // SecondaryUnminedUpdate / SecondaryDahUpdate are durability-intent
         // records for redb secondary indexes — the primary index has no
         // state to reconcile from them. `recover_all` handles them via the
@@ -548,6 +845,17 @@ fn replay_entry(
             offset,
             prior_status,
         } => replay_compensate_prune(device, index, tx_key, *offset, *prior_status),
+        RedoOp::CompensateSetLocked {
+            tx_key,
+            prior_locked,
+            prior_delete_at_height,
+        } => replay_compensate_set_locked(
+            device,
+            index,
+            tx_key,
+            *prior_locked,
+            *prior_delete_at_height,
+        ),
         // Remaining ops (Reassign, PruneSlot, SetConflicting, SetLocked,
         // PreserveUntil, MarkOnLongestChain) are metadata-only writes.
         // They're idempotent: the metadata pwrite is atomic at the block
@@ -563,6 +871,7 @@ fn replay_spend(
     offset: u32,
     spending_data: &[u8; 36],
     _new_spent_count: u32,
+    derived: Option<ReplayDerivedContext>,
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
@@ -607,6 +916,21 @@ fn replay_spend(
         Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
     };
     meta.spent_utxos = { meta.spent_utxos }.saturating_add(1);
+    if let Some(ctx) = derived {
+        meta.generation = ctx.target_generation;
+        meta.updated_at = ctx.updated_at;
+        let dah_patch = match evaluate_delete_at_height(
+            &meta,
+            ctx.current_block_height,
+            ctx.block_height_retention,
+        ) {
+            Ok((_signal, patch)) => patch,
+            Err(_) => return ReplayResult::Failed(ReplayCause::LogicError),
+        };
+        if let Some(ref patch) = dah_patch {
+            apply_replay_dah_patch(&mut meta, patch);
+        }
+    }
     if io::write_metadata(device, ie.record_offset, &meta).is_err() {
         return ReplayResult::Failed(ReplayCause::IoError);
     }
@@ -619,7 +943,9 @@ fn replay_unspend(
     index: &PrimaryBackend,
     tx_key: &TxKey,
     offset: u32,
+    expected_spending_data: Option<&[u8; 36]>,
     _new_spent_count: u32,
+    derived: Option<ReplayDerivedContext>,
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
@@ -632,6 +958,15 @@ fn replay_unspend(
     };
 
     if slot.status == UTXO_UNSPENT {
+        return ReplayResult::Skipped;
+    }
+    if slot.status != UTXO_SPENT {
+        return ReplayResult::Skipped;
+    }
+
+    if let Some(expected_spending_data) = expected_spending_data
+        && slot.spending_data != *expected_spending_data
+    {
         return ReplayResult::Skipped;
     }
 
@@ -648,6 +983,21 @@ fn replay_unspend(
         Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
     };
     meta.spent_utxos = { meta.spent_utxos }.saturating_sub(1);
+    if let Some(ctx) = derived {
+        meta.generation = ctx.target_generation;
+        meta.updated_at = ctx.updated_at;
+        let dah_patch = match evaluate_delete_at_height(
+            &meta,
+            ctx.current_block_height,
+            ctx.block_height_retention,
+        ) {
+            Ok((_signal, patch)) => patch,
+            Err(_) => return ReplayResult::Failed(ReplayCause::LogicError),
+        };
+        if let Some(ref patch) = dah_patch {
+            apply_replay_dah_patch(&mut meta, patch);
+        }
+    }
     if io::write_metadata(device, ie.record_offset, &meta).is_err() {
         return ReplayResult::Failed(ReplayCause::IoError);
     }
@@ -718,6 +1068,8 @@ fn replay_set_mined(
         }
     }
 
+    meta.generation = { meta.generation }.wrapping_add(1);
+
     // R-013: propagate metadata write failure instead of returning Applied with a dropped error.
     if io::write_metadata(device, ie.record_offset, &meta).is_err() {
         return ReplayResult::Failed(ReplayCause::IoError);
@@ -730,6 +1082,7 @@ fn replay_freeze(
     index: &PrimaryBackend,
     tx_key: &TxKey,
     offset: u32,
+    expected_hash: Option<&[u8; 32]>,
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
@@ -741,7 +1094,16 @@ fn replay_freeze(
         Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
     };
 
+    if let Some(expected_hash) = expected_hash
+        && slot.hash != *expected_hash
+    {
+        return ReplayResult::Skipped;
+    }
+
     if slot.status == UTXO_FROZEN {
+        return ReplayResult::Skipped;
+    }
+    if slot.status != UTXO_UNSPENT {
         return ReplayResult::Skipped;
     }
 
@@ -757,6 +1119,7 @@ fn replay_unfreeze(
     index: &PrimaryBackend,
     tx_key: &TxKey,
     offset: u32,
+    expected_hash: Option<&[u8; 32]>,
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
@@ -768,7 +1131,16 @@ fn replay_unfreeze(
         Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
     };
 
+    if let Some(expected_hash) = expected_hash
+        && slot.hash != *expected_hash
+    {
+        return ReplayResult::Skipped;
+    }
+
     if slot.status == UTXO_UNSPENT {
+        return ReplayResult::Skipped;
+    }
+    if slot.status != UTXO_FROZEN {
         return ReplayResult::Skipped;
     }
 
@@ -853,10 +1225,52 @@ fn replay_create(
     }
 }
 
-fn replay_delete(index: &mut PrimaryBackend, tx_key: &TxKey) -> ReplayResult {
-    match index.unregister(tx_key) {
-        Some(_) => ReplayResult::Applied,
-        None => ReplayResult::Skipped,
+fn write_zeroed_metadata_header(device: &dyn BlockDevice, record_offset: u64) -> ReplayResult {
+    let align = device.alignment();
+    let aligned_base = record_offset / align as u64 * align as u64;
+    let intra_offset = (record_offset - aligned_base) as usize;
+    let total_size = io::align_up(intra_offset + METADATA_SIZE, align);
+
+    let mut buf = crate::device::AlignedBuf::new(total_size, align);
+    if (intra_offset != 0 || !METADATA_SIZE.is_multiple_of(align))
+        && device.pread_exact_at(&mut buf, aligned_base).is_err()
+    {
+        return ReplayResult::Failed(ReplayCause::IoError);
+    }
+    buf[intra_offset..intra_offset + METADATA_SIZE].fill(0);
+    if device.pwrite_all_at(&buf, aligned_base).is_err() {
+        return ReplayResult::Failed(ReplayCause::IoError);
+    }
+    if device.sync().is_err() {
+        return ReplayResult::Failed(ReplayCause::IoError);
+    }
+    ReplayResult::Applied
+}
+
+fn replay_delete(
+    device: &dyn BlockDevice,
+    index: &mut PrimaryBackend,
+    tx_key: &TxKey,
+    record_offset: u64,
+    record_size: u64,
+) -> ReplayResult {
+    let mut applied = false;
+    if record_offset != 0 && record_size != 0 {
+        match write_zeroed_metadata_header(device, record_offset) {
+            ReplayResult::Applied => applied = true,
+            ReplayResult::Skipped => {}
+            failed @ ReplayResult::Failed(_) => return failed,
+        }
+    }
+
+    if index.unregister(tx_key).is_some() {
+        applied = true;
+    }
+
+    if applied {
+        ReplayResult::Applied
+    } else {
+        ReplayResult::Skipped
     }
 }
 
@@ -956,25 +1370,14 @@ fn replay_create_v2(
     }
 
     // Conflicting-child link replay is intentionally NOT performed in
-    // this recovery path. Establishing the link requires writing a
-    // 32-byte block to the parent's record area + mutating the parent's
-    // metadata header (`conflicting_children_offset/count`), which goes
-    // through `Engine::append_conflicting_child` — a function that
-    // depends on the engine's allocator + lock striping infrastructure
-    // and is not available from the bare `recovery` entry point.
-    //
-    // This is documented as a known limitation: the dispatch path
-    // already calls `engine.append_conflicting_child` with `let _ =`,
-    // treating it as best-effort and not consensus-critical. Because
-    // the parent's metadata mutation is not journaled by its own redo
-    // entry, a crash mid-link-update is recovered through the parent's
-    // record-level integrity, not through this redo entry.
-    //
-    // The `is_conflicting` flag and `parent_txids` are captured in the
-    // redo entry so a future post-recovery pass (after the engine is
-    // built) can re-establish the links if needed without re-reading
-    // every metadata header. The bind is silenced rather than dropped
-    // so the deserialized entry round-trips cleanly.
+    // this low-level create replay path. Establishing the link requires
+    // writing a child-list block and mutating the parent's metadata via
+    // `Engine::append_conflicting_child`, which depends on the engine's
+    // allocator and stripe locks. R-221 covers that parent mutation with
+    // a separate `RedoOp::AppendConflictingChild` intent; full startup
+    // recovery collects those entries and drains them after constructing
+    // the engine. Keep these CreateV2 fields bound so old entries still
+    // round-trip exactly.
     let _ = (is_conflicting, parent_txids);
 
     ReplayResult::Applied
@@ -1028,6 +1431,42 @@ fn replay_metadata_op(
             let mut pruned = slot;
             pruned.status = UTXO_PRUNED;
             if io::write_utxo_slot(device, ie.record_offset, *offset, &pruned).is_err() {
+                return ReplayResult::Failed(ReplayCause::IoError);
+            }
+            ReplayResult::Applied
+        }
+        RedoOp::PruneSlotIfSpentBy {
+            tx_key,
+            offset,
+            child_txid,
+        } => {
+            let ie = match index.lookup(tx_key) {
+                Some(e) => e,
+                None => return ReplayResult::Skipped,
+            };
+            let slot = match io::read_utxo_slot(device, ie.record_offset, *offset) {
+                Ok(s) => s,
+                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+            };
+            if slot.status == UTXO_PRUNED {
+                return ReplayResult::Skipped;
+            }
+            if slot.status != UTXO_SPENT || slot.spending_data[..32] != child_txid[..] {
+                return ReplayResult::Skipped;
+            }
+            let mut pruned = slot;
+            pruned.status = UTXO_PRUNED;
+            if io::write_utxo_slot(device, ie.record_offset, *offset, &pruned).is_err() {
+                return ReplayResult::Failed(ReplayCause::IoError);
+            }
+            let mut meta = match io::read_metadata(device, ie.record_offset) {
+                Ok(meta) => meta,
+                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+            };
+            meta.spent_utxos = { meta.spent_utxos }.saturating_sub(1);
+            meta.pruned_utxos = { meta.pruned_utxos }.saturating_add(1);
+            meta.generation = { meta.generation }.wrapping_add(1);
+            if io::write_metadata(device, ie.record_offset, &meta).is_err() {
                 return ReplayResult::Failed(ReplayCause::IoError);
             }
             ReplayResult::Applied
@@ -1123,39 +1562,40 @@ fn replay_metadata_op(
             };
             // H7: generation-based idempotency. The redo entry declares the
             // target generation after applying the op. Skip when the
-            // on-device generation is already >= the target — a later op
-            // (or this op itself already replayed) has equal-or-newer
+            // on-device generation is already at-or-ahead of the target — a
+            // later op (or this op itself already replayed) has equal-or-newer
             // state. On apply, bump the generation to the target so a
-            // subsequent replay of the same entry is correctly observed
-            // as already-applied. This prevents replay from leaving the
+            // subsequent replay of the same entry is correctly observed as
+            // already-applied. This prevents replay from leaving the
             // generation counter stale and tripping replication staleness
             // checks on otherwise-valid future ops.
             //
-            // Generation comparison uses plain `<`. Generations are
-            // monotonically assigned per record and only wrap after ~4B
-            // mutations on a single record — far beyond any redo-log
-            // retention window. A target of 0 means the dispatcher did
-            // not record a generation (legacy/unknown); fall back to the
-            // prior unmined-since check so idempotency is still enforced.
+            // Generation comparison uses wrapping serial-number ordering:
+            // target is newer only when it is within the next half of the
+            // u32 space from the current generation. A target of 0 still
+            // means legacy/unknown unless it is modularly ahead of the
+            // current generation, which is the real u32::MAX -> 0 wrap case.
             let target_generation = *generation;
             let current_generation = { meta.generation };
+            let has_generation_token = target_generation != 0
+                || generation_target_ahead(current_generation, target_generation);
             let target_unmined = if *on_longest_chain {
                 0
             } else {
                 *current_block_height
             };
-            if target_generation == 0 {
+            if !has_generation_token {
                 // No generation supplied — fall back to value-equality
                 // idempotency on unmined_since alone.
                 if { meta.unmined_since } == target_unmined {
                     return ReplayResult::Skipped;
                 }
-            } else if current_generation >= target_generation {
+            } else if generation_at_or_ahead(current_generation, target_generation) {
                 // Already caught up (or ahead).
                 return ReplayResult::Skipped;
             }
             meta.unmined_since = target_unmined;
-            if target_generation != 0 {
+            if has_generation_token {
                 meta.generation = target_generation;
             }
             // R-013: propagate write failure.
@@ -1179,6 +1619,26 @@ fn replay_metadata_op(
 fn replay_compensate_unset_mined(
     device: &dyn BlockDevice,
     index: &PrimaryBackend,
+    tx_key: &TxKey,
+    block_id: u32,
+    block_height: u32,
+    subtree_idx: u32,
+) -> ReplayResult {
+    replay_compensate_unset_mined_with_allocator(
+        device,
+        index,
+        None,
+        tx_key,
+        block_id,
+        block_height,
+        subtree_idx,
+    )
+}
+
+fn replay_compensate_unset_mined_with_allocator(
+    device: &dyn BlockDevice,
+    index: &PrimaryBackend,
+    allocator: Option<&mut SlotAllocator>,
     tx_key: &TxKey,
     block_id: u32,
     block_height: u32,
@@ -1223,9 +1683,7 @@ fn replay_compensate_unset_mined(
         }
     }
 
-    // Not present — append to inline if room. If overflow would be needed,
-    // we can't reconstruct it from the redo log alone (overflow lives on
-    // device); fail closed since this signals divergent state.
+    // Not present — append to inline if room.
     if count < INLINE_BLOCK_ENTRIES {
         meta.block_entries_inline[count] = BlockEntry {
             block_id,
@@ -1238,12 +1696,111 @@ fn replay_compensate_unset_mined(
         }
         ReplayResult::Applied
     } else {
-        // Full inline + overflow already exists. Restoring a block entry
-        // here would require allocating overflow space which is outside
-        // the recovery path's responsibility. Treat as logic-error so
-        // startup fails closed instead of silently dropping the entry.
-        ReplayResult::Failed(ReplayCause::LogicError)
+        let Some(alloc) = allocator else {
+            // The legacy `recover` path has no allocator handle. Fail
+            // closed rather than silently dropping a compensation entry
+            // that needs overflow storage.
+            return ReplayResult::Failed(ReplayCause::LogicError);
+        };
+        match append_recovery_overflow_block_entry(
+            device,
+            alloc,
+            &mut meta,
+            BlockEntry {
+                block_id,
+                block_height,
+                subtree_idx,
+            },
+        ) {
+            Ok(()) => {
+                if io::write_metadata(device, ie.record_offset, &meta).is_err() {
+                    ReplayResult::Failed(ReplayCause::IoError)
+                } else {
+                    ReplayResult::Applied
+                }
+            }
+            Err(RecoveryOverflowError::Io) => ReplayResult::Failed(ReplayCause::IoError),
+            Err(RecoveryOverflowError::Logic) => ReplayResult::Failed(ReplayCause::LogicError),
+        }
     }
+}
+
+#[derive(Debug)]
+enum RecoveryOverflowError {
+    Io,
+    Logic,
+}
+
+fn append_recovery_overflow_block_entry(
+    device: &dyn BlockDevice,
+    allocator: &mut SlotAllocator,
+    metadata: &mut TxMetadata,
+    entry: BlockEntry,
+) -> std::result::Result<(), RecoveryOverflowError> {
+    let count = metadata.block_entry_count as usize;
+    let overflow_count = count.saturating_sub(INLINE_BLOCK_ENTRIES);
+    let mut overflow = read_recovery_overflow_entries(device, metadata)?;
+    if overflow.len() != overflow_count {
+        return Err(RecoveryOverflowError::Logic);
+    }
+    overflow.push(entry);
+
+    let alignment = device.alignment();
+    let data_size = overflow.len() * BLOCK_ENTRY_SIZE;
+    let block_size = io::align_up(data_size, alignment);
+    let offset = if metadata.block_overflow_offset == 0 {
+        allocator
+            .allocate(block_size as u64)
+            .map_err(|_| RecoveryOverflowError::Logic)?
+    } else {
+        metadata.block_overflow_offset
+    };
+
+    let mut buf = AlignedBuf::new(block_size, alignment);
+    for (i, overflow_entry) in overflow.iter().enumerate() {
+        let start = i * BLOCK_ENTRY_SIZE;
+        overflow_entry.to_bytes(&mut buf[start..start + BLOCK_ENTRY_SIZE]);
+    }
+    device
+        .pwrite_all_at(&buf, offset)
+        .map_err(|_| RecoveryOverflowError::Io)?;
+    metadata.block_overflow_offset = offset;
+    metadata.block_entry_count = metadata
+        .block_entry_count
+        .checked_add(1)
+        .ok_or(RecoveryOverflowError::Logic)?;
+    Ok(())
+}
+
+fn read_recovery_overflow_entries(
+    device: &dyn BlockDevice,
+    metadata: &TxMetadata,
+) -> std::result::Result<Vec<BlockEntry>, RecoveryOverflowError> {
+    let overflow_count = (metadata.block_entry_count as usize).saturating_sub(INLINE_BLOCK_ENTRIES);
+    if overflow_count == 0 {
+        return Ok(Vec::new());
+    }
+    let overflow_offset = metadata.block_overflow_offset;
+    if overflow_offset == 0 {
+        return Err(RecoveryOverflowError::Logic);
+    }
+
+    let alignment = device.alignment();
+    let data_size = overflow_count * BLOCK_ENTRY_SIZE;
+    let read_size = io::align_up(data_size, alignment);
+    let mut buf = AlignedBuf::new(read_size, alignment);
+    device
+        .pread_exact_at(&mut buf, overflow_offset)
+        .map_err(|_| RecoveryOverflowError::Io)?;
+
+    let mut entries = Vec::with_capacity(overflow_count);
+    for i in 0..overflow_count {
+        let start = i * BLOCK_ENTRY_SIZE;
+        entries.push(BlockEntry::from_bytes(
+            &buf[start..start + BLOCK_ENTRY_SIZE],
+        ));
+    }
+    Ok(entries)
 }
 
 /// Gap #8 (TERANODE_PRODUCTION_READINESS_GAPS.md): replay a
@@ -1317,6 +1874,46 @@ fn replay_compensate_prune(
     ReplayResult::Applied
 }
 
+/// Replay a set-locked compensation intent recorded mid-rollback.
+///
+/// Restores both the locked flag and `delete_at_height` captured before the
+/// failed-replication SetLocked mutation. Idempotent: if both fields already
+/// match, replay skips.
+fn replay_compensate_set_locked(
+    device: &dyn BlockDevice,
+    index: &PrimaryBackend,
+    tx_key: &TxKey,
+    prior_locked: bool,
+    prior_delete_at_height: u32,
+) -> ReplayResult {
+    let ie = match index.lookup(tx_key) {
+        Some(e) => e,
+        None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
+    };
+
+    let mut meta = match io::read_metadata(device, ie.record_offset) {
+        Ok(m) => m,
+        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+    };
+
+    let is_locked = meta.flags.contains(TxFlags::LOCKED);
+    if is_locked == prior_locked && { meta.delete_at_height } == prior_delete_at_height {
+        return ReplayResult::Skipped;
+    }
+
+    if prior_locked {
+        meta.flags |= TxFlags::LOCKED;
+    } else {
+        meta.flags -= meta.flags & TxFlags::LOCKED;
+    }
+    meta.delete_at_height = prior_delete_at_height;
+
+    if io::write_metadata(device, ie.record_offset, &meta).is_err() {
+        return ReplayResult::Failed(ReplayCause::IoError);
+    }
+    ReplayResult::Applied
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1326,6 +1923,8 @@ mod tests {
     use super::*;
     use crate::allocator::SlotAllocator;
     use crate::device::MemoryDevice;
+    use crate::locks::StripedLocks;
+    use crate::ops::engine::Engine;
     use crate::redo::RedoLog;
     use std::sync::Arc;
 
@@ -1397,6 +1996,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn append_conflicting_child_recovery_replays_pending_intent() {
+        let mut h = RecoveryTestHarness::new();
+        let parent_key = h.create_record(0xD0, 1);
+        let child_txid = [0xD1; 32];
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::AppendConflictingChild {
+            parent_key,
+            child_txid,
+        })
+        .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+        let (stats, pending) = recover_all_with_allocator_collecting_pending_conflicts(
+            &*h.data_dev,
+            &redo,
+            &mut h.index,
+            &mut dah,
+            &mut unmined,
+            Some(&mut h.alloc),
+        )
+        .unwrap();
+
+        assert_eq!(stats.entries_replayed, 0);
+        assert_eq!(stats.entries_skipped, 1);
+        assert_eq!(
+            pending,
+            vec![PendingAppendConflictingChild {
+                parent_key,
+                child_txid,
+            }]
+        );
+
+        let data_dev = h.data_dev.clone();
+        let engine = Engine::new(
+            data_dev,
+            h.index,
+            h.alloc,
+            StripedLocks::new(1024),
+            dah,
+            unmined,
+        );
+
+        for intent in &pending {
+            engine
+                .append_conflicting_child(&intent.parent_key, intent.child_txid)
+                .unwrap();
+        }
+        assert_eq!(
+            engine.read_conflicting_children(&parent_key).unwrap(),
+            vec![child_txid]
+        );
+
+        for intent in &pending {
+            engine
+                .append_conflicting_child(&intent.parent_key, intent.child_txid)
+                .unwrap();
+        }
+        assert_eq!(
+            engine.read_conflicting_children(&parent_key).unwrap(),
+            vec![child_txid],
+            "draining the same pending intent twice must not duplicate the child",
+        );
+    }
+
     /// R-010 (BC-04): the per-entry `new_spent_count` carried in
     /// `RedoOp::Spend` and `RedoOp::Unspend` is computed from a
     /// pre-lock `engine.lookup` snapshot, so concurrent batches on the
@@ -1465,6 +2131,7 @@ mod tests {
         redo.append_and_flush(RedoOp::Unspend {
             tx_key: key,
             offset: 0,
+            spending_data: Some([0xEE; 36]),
             new_spent_count: 99, // intentionally wrong
         })
         .unwrap();
@@ -1480,6 +2147,39 @@ mod tests {
         );
         let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
         assert!(slot.is_unspent());
+    }
+
+    #[test]
+    fn replay_unspend_rejects_wrong_spending_data_without_clearing_slot() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xA2, 1);
+        let ie = h.index.lookup(&key).unwrap();
+
+        let slot0 = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        let stored_spending_data = [0x11; 36];
+        let spent = UtxoSlot::new_spent(slot0.hash, stored_spending_data);
+        io::write_utxo_slot(&*h.data_dev, ie.record_offset, 0, &spent).unwrap();
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        meta.spent_utxos = 1;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Unspend {
+            tx_key: key,
+            offset: 0,
+            spending_data: Some([0x22; 36]),
+            new_spent_count: 0,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_skipped, 1);
+
+        let post_slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        assert!(post_slot.is_spent());
+        assert_eq!(post_slot.spending_data, stored_spending_data);
+        let post_meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!({ post_meta.spent_utxos }, 1);
     }
 
     #[test]
@@ -1777,6 +2477,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn recover_all_rejects_create_v2_offset_not_owned_by_allocator() {
+        let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut index = PrimaryBackend::new_in_memory(1000).unwrap();
+        let mut dah = DahBackend::from(crate::index::DahIndex::new());
+        let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
+
+        let mut txid = [0u8; 32];
+        txid[0] = 0xCD;
+        let key = TxKey { txid };
+        let utxo_count = 1;
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        meta.record_size = TxMetadata::record_size_for(utxo_count) as u32;
+
+        let mut record_bytes = Vec::new();
+        let mut meta_bytes = [0u8; METADATA_SIZE];
+        meta.to_bytes(&mut meta_bytes);
+        record_bytes.extend_from_slice(&meta_bytes);
+        let mut slot_bytes = [0u8; UTXO_SLOT_SIZE];
+        UtxoSlot::new_unspent([0x44; 32]).to_bytes(&mut slot_bytes);
+        record_bytes.extend_from_slice(&slot_bytes);
+
+        let mut redo = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+        redo.append_and_flush(RedoOp::CreateV2 {
+            tx_key: key,
+            // DATA_REGION_OFFSET is inside the data area, but this fresh
+            // allocator has not replayed/observed any allocation yet.
+            record_offset: crate::allocator::DATA_REGION_OFFSET,
+            utxo_count,
+            is_conflicting: false,
+            record_bytes,
+            parent_txids: Vec::new(),
+        })
+        .unwrap();
+
+        let stats = recover_all_with_allocator(
+            &*data_dev,
+            &redo,
+            &mut index,
+            &mut dah,
+            &mut unmined,
+            Some(&mut alloc),
+        )
+        .unwrap();
+        assert_eq!(stats.entries_failed, 1);
+        assert_eq!(stats.failed_logic, 1);
+        assert!(
+            index.lookup(&key).is_none(),
+            "invalid CreateV2 offset must not register primary index entry"
+        );
+    }
+
     /// Gap #2: replay must be idempotent — running recovery twice over
     /// the same redo log produces the same final state. Verifies the
     /// "primary already registered → skip" path.
@@ -1984,6 +2739,95 @@ mod tests {
     }
 
     #[test]
+    fn replay_set_mined_bumps_on_device_generation_when_applied() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(79, 1);
+        let record_offset = h.index.lookup(&key).unwrap().record_offset;
+        assert_eq!(
+            {
+                io::read_metadata(&*h.data_dev, record_offset)
+                    .unwrap()
+                    .generation
+            },
+            0,
+        );
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SetMined {
+            tx_key: key,
+            block_id: 42,
+            block_height: 800_000,
+            subtree_idx: 7,
+            unset: false,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+
+        let meta = io::read_metadata(&*h.data_dev, record_offset).unwrap();
+        assert_eq!({ meta.block_entry_count }, 1);
+        assert_eq!({ meta.generation }, 1);
+    }
+
+    #[test]
+    fn freeze_v2_replay_skips_hash_mismatch_without_mutating_slot() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(77, 1);
+        let original =
+            io::read_utxo_slot(&*h.data_dev, h.index.lookup(&key).unwrap().record_offset, 0)
+                .unwrap();
+
+        let mut wrong_hash = original.hash;
+        wrong_hash[0] ^= 0xFF;
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::FreezeV2 {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: wrong_hash,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 0);
+        assert_eq!(stats.entries_skipped, 1);
+
+        let after =
+            io::read_utxo_slot(&*h.data_dev, h.index.lookup(&key).unwrap().record_offset, 0)
+                .unwrap();
+        assert_eq!(after.status, UTXO_UNSPENT);
+        assert_eq!(after.hash, original.hash);
+    }
+
+    #[test]
+    fn unfreeze_v2_replay_skips_non_frozen_slot() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(78, 1);
+        let original =
+            io::read_utxo_slot(&*h.data_dev, h.index.lookup(&key).unwrap().record_offset, 0)
+                .unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::UnfreezeV2 {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: original.hash,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 0);
+        assert_eq!(stats.entries_skipped, 1);
+
+        let after =
+            io::read_utxo_slot(&*h.data_dev, h.index.lookup(&key).unwrap().record_offset, 0)
+                .unwrap();
+        assert_eq!(after.status, UTXO_UNSPENT);
+        assert_eq!(after.hash, original.hash);
+    }
+
+    #[test]
     fn recovery_of_spend_multi_batch() {
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(8, 10);
@@ -2063,6 +2907,47 @@ mod tests {
     }
 
     #[test]
+    fn recover_all_delete_tombstones_and_frees_region() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xD0, 5);
+        let ie = h.index.lookup(&key).unwrap();
+        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        let record_size = { meta.record_size } as u64;
+        assert!(h.alloc.is_allocated_range(ie.record_offset, record_size));
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Delete {
+            tx_key: key,
+            record_offset: ie.record_offset,
+            record_size,
+        })
+        .unwrap();
+
+        let mut dah_backend = DahBackend::new_in_memory();
+        let mut unmined_backend = UnminedBackend::new_in_memory();
+        let stats = recover_all_with_allocator(
+            &*h.data_dev,
+            &redo,
+            &mut h.index,
+            &mut dah_backend,
+            &mut unmined_backend,
+            Some(&mut h.alloc),
+        )
+        .unwrap();
+
+        assert_eq!(stats.entries_replayed, 1);
+        assert!(h.index.lookup(&key).is_none());
+        assert!(
+            !h.alloc.is_allocated_range(ie.record_offset, record_size),
+            "delete redo replay must release the deleted record's allocator range"
+        );
+        assert!(
+            io::read_metadata(&*h.data_dev, ie.record_offset).is_err(),
+            "delete redo replay must tombstone the on-device metadata"
+        );
+    }
+
+    #[test]
     fn unspend_already_unspent_skipped() {
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(11, 5);
@@ -2071,6 +2956,7 @@ mod tests {
         redo.append_and_flush(RedoOp::Unspend {
             tx_key: key,
             offset: 0,
+            spending_data: Some([0; 36]),
             new_spent_count: 0,
         })
         .unwrap();
@@ -2147,8 +3033,10 @@ mod tests {
             .unwrap();
 
         let stats2 = recover(&*h.data_dev, &redo2, &mut h.index).unwrap();
-        // Already applied — skipped (idempotent)
-        assert_eq!(stats2.entries_skipped, 1);
+        // Already applied — skipped (idempotent). The reopened redo log
+        // contains both the first spend entry and the newly appended retry,
+        // so both are observed and skipped.
+        assert_eq!(stats2.entries_skipped, 2);
         assert_eq!(stats2.entries_replayed, 0);
 
         let ie = h.index.lookup(&key).unwrap();
@@ -2232,6 +3120,33 @@ mod tests {
     }
 
     #[test]
+    fn replay_compensate_set_locked_restores_dah() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(124, 5);
+        let ie = h.index.lookup(&key).unwrap();
+
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        meta.flags |= TxFlags::LOCKED;
+        meta.delete_at_height = 0;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::CompensateSetLocked {
+            tx_key: key,
+            prior_locked: false,
+            prior_delete_at_height: 1288,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+
+        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert!(!meta.flags.contains(TxFlags::LOCKED));
+        assert_eq!({ meta.delete_at_height }, 1288);
+    }
+
+    #[test]
     fn replay_preserve_until() {
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(25, 5);
@@ -2278,11 +3193,61 @@ mod tests {
     }
 
     #[test]
+    fn generation_wraparound_idempotency() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0x79, 5);
+        let ie = h.index.lookup(&key).unwrap();
+
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        meta.generation = u32::MAX;
+        meta.unmined_since = 0;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+
+        let mut redo = h.redo_log();
+
+        // Fresh across wrap: target generation 0 is one step ahead of MAX.
+        // Plain numeric `current >= target` would incorrectly skip this.
+        redo.append_and_flush(RedoOp::MarkOnLongestChain {
+            tx_key: key,
+            on_longest_chain: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            generation: 0,
+        })
+        .unwrap();
+
+        // Stale pre-wrap op: after the first entry applies, generation MAX is
+        // behind local generation 0 in modular order and must not overwrite
+        // the post-wrap state.
+        redo.append_and_flush(RedoOp::MarkOnLongestChain {
+            tx_key: key,
+            on_longest_chain: false,
+            current_block_height: 1001,
+            block_height_retention: 288,
+            generation: u32::MAX,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1, "{stats:?}");
+        assert_eq!(stats.entries_skipped, 1, "{stats:?}");
+        assert_eq!(stats.entries_failed, 0, "{stats:?}");
+
+        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!({ meta.unmined_since }, 1000);
+        assert_eq!(
+            { meta.generation },
+            0,
+            "wrapped generation 0 must be persisted as the applied target"
+        );
+    }
+
+    #[test]
     fn replay_mark_on_longest_chain_generation_idempotency() {
         // H7: two redo entries with the same `unmined_since` target but
         // different generations — first applies (generation bumped to the
         // entry's target), second is skipped because the on-device
-        // generation now equals (>=) the second entry's generation.
+        // generation is at-or-ahead of the second entry's generation.
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(0x7A, 5);
         let ie = h.index.lookup(&key).unwrap();
@@ -2306,7 +3271,7 @@ mod tests {
 
         // Entry B: SAME target (unmined_since = 1000) but earlier
         // generation = 5. Should be skipped because after entry A the
-        // on-device generation is 7, which is >= 5.
+        // on-device generation is at-or-ahead of 5.
         redo.append_and_flush(RedoOp::MarkOnLongestChain {
             tx_key: key,
             on_longest_chain: false,
@@ -2333,9 +3298,9 @@ mod tests {
 
     #[test]
     fn replay_mark_on_longest_chain_newer_generation_applies() {
-        // H7: a second redo entry with a HIGHER generation than the first
-        // still applies (target_generation > current_generation), and the
-        // on-device generation is pushed to the newer target.
+        // H7: a second redo entry with a newer generation than the first
+        // still applies, and the on-device generation is pushed to the newer
+        // target.
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(0x7B, 5);
         let ie = h.index.lookup(&key).unwrap();
@@ -2361,7 +3326,7 @@ mod tests {
         .unwrap();
 
         let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
-        assert_eq!(stats.entries_replayed, 2);
+        assert_eq!(stats.entries_replayed, 2, "{stats:?}");
         assert_eq!(stats.entries_skipped, 0);
 
         let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
@@ -2386,20 +3351,15 @@ mod tests {
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(30, 5);
 
-        // Set primary index's cached unmined_since to 500 to simulate what
-        // the engine would have done (WAL-first MarkOnLongestChain replay).
         let ie = h.index.lookup(&key).unwrap();
-        h.index
-            .update_cached_fields(
-                &key,
-                ie.tx_flags,
-                ie.block_entry_count,
-                ie.spent_utxos,
-                ie.dah_or_preserve,
-                500,
-                ie.generation,
-            )
-            .unwrap();
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        meta.unmined_since = 500;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+
+        // Deliberately keep the primary index cache stale. R-077 recovery
+        // must use the on-device metadata as the authority after a crash
+        // between the metadata write and the primary cache commit.
+        assert_eq!(ie.unmined_since, 0);
 
         // Redo log: the intent record (as if fsynced) but redb commit skipped.
         let mut redo = h.redo_log();
@@ -2474,6 +3434,9 @@ mod tests {
         let key = h.create_record(32, 5);
 
         let ie = h.index.lookup(&key).unwrap();
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        meta.unmined_since = 500;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
         h.index
             .update_cached_fields(
                 &key,
@@ -2520,8 +3483,13 @@ mod tests {
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(33, 5);
 
-        // Set primary's DAH cache to 900.
+        // Set on-device DAH to 900. The device record is recovery's
+        // authoritative source; the primary cache update below only keeps
+        // this older test setup internally consistent.
         let ie = h.index.lookup(&key).unwrap();
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        meta.delete_at_height = 900;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
         // Ensure HAS_PRESERVE_UNTIL is cleared so dah_or_preserve == DAH.
         let tf = TxFlags::from_bits_truncate(ie.tx_flags) - TxFlags::HAS_PRESERVE_UNTIL;
         h.index
@@ -2535,6 +3503,11 @@ mod tests {
                 ie.generation,
             )
             .unwrap();
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        meta.flags = tf;
+        meta.delete_at_height = 900;
+        meta.unmined_since = 500;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
 
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::SecondaryDahUpdate {
@@ -2594,6 +3567,62 @@ mod tests {
         // Skipped — primary has no entry for this key.
         assert_eq!(stats.entries_skipped, 1);
         assert!(unmined_backend.is_empty());
+    }
+
+    #[test]
+    fn compensate_unset_mined_recovery_allocates_overflow() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xE9, 1);
+        let ie = h.index.lookup(&key).unwrap();
+
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        for i in 0..INLINE_BLOCK_ENTRIES {
+            meta.block_entries_inline[i] = BlockEntry {
+                block_id: (i + 1) as u32,
+                block_height: 900_000 + i as u32,
+                subtree_idx: i as u32,
+            };
+        }
+        meta.block_entry_count = INLINE_BLOCK_ENTRIES as u8;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::CompensateUnsetMined {
+            tx_key: key,
+            block_id: 99,
+            block_height: 901_999,
+            subtree_idx: 7,
+        })
+        .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+        let stats = recover_all_with_allocator(
+            &*h.data_dev,
+            &redo,
+            &mut h.index,
+            &mut dah,
+            &mut unmined,
+            Some(&mut h.alloc),
+        )
+        .unwrap();
+
+        assert_eq!(stats.entries_replayed, 1);
+        assert_eq!(stats.entries_failed, 0);
+
+        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!(meta.block_entry_count, 4);
+        let overflow_offset = meta.block_overflow_offset;
+        assert_ne!(overflow_offset, 0);
+        let overflow = read_recovery_overflow_entries(&*h.data_dev, &meta).unwrap();
+        assert_eq!(
+            overflow,
+            vec![BlockEntry {
+                block_id: 99,
+                block_height: 901_999,
+                subtree_idx: 7,
+            }]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2775,6 +3804,11 @@ mod tests {
                 ie.generation,
             )
             .unwrap();
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        meta.flags = tf;
+        meta.delete_at_height = 900;
+        meta.unmined_since = 500;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
 
         let mut redo = h.redo_log();
         // Batched fsync — both ops in one flush, as the engine would do.
@@ -2803,10 +3837,75 @@ mod tests {
             &mut unmined_backend,
         )
         .unwrap();
-        assert_eq!(stats.entries_replayed, 2);
+        assert_eq!(stats.entries_replayed, 2, "{stats:?}");
 
         assert_eq!(dah_backend.range_query(900).len(), 1);
         assert_eq!(unmined_backend.range_query(500).len(), 1);
+    }
+
+    #[test]
+    fn recovery_post_replay_generation_matches_live_engine() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(35, 1);
+        let ie = h.index.lookup(&key).unwrap();
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        meta.block_entry_count = 1;
+        meta.block_entries_inline[0] = BlockEntry {
+            block_id: 1,
+            block_height: 900,
+            subtree_idx: 0,
+        };
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+        h.index
+            .update_cached_fields(&key, 0, 1, 0, 0, 0, 0)
+            .unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SpendV2 {
+            tx_key: key,
+            offset: 0,
+            spending_data: [0x51; 36],
+            new_spent_count: 1,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            target_generation: 7,
+            updated_at: 123_456,
+        })
+        .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+        let stats = recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined).unwrap();
+        assert_eq!(stats.entries_replayed, 1, "{stats:?}");
+
+        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!({ meta.spent_utxos }, 1);
+        assert_eq!({ meta.generation }, 7);
+        assert_eq!({ meta.updated_at }, 123_456);
+        assert_eq!({ meta.delete_at_height }, 1288);
+        assert_eq!(dah.range_query(1288), vec![key]);
+    }
+
+    #[test]
+    fn recovery_post_replay_dah_index_matches_live_engine() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(36, 1);
+        let ie = h.index.lookup(&key).unwrap();
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        meta.delete_at_height = 900;
+        meta.unmined_since = 500;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+        h.index
+            .update_cached_fields(&key, 0, 0, 0, 900, 500, 0)
+            .unwrap();
+
+        let redo = h.redo_log();
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+        recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined).unwrap();
+
+        assert_eq!(dah.range_query(900), vec![key]);
+        assert_eq!(unmined.range_query(500), vec![key]);
     }
 
     // -----------------------------------------------------------------------

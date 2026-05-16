@@ -155,6 +155,11 @@ for r in &results {
 ### Get Spend Status
 
 ```rust
+let items = vec![GetSpendItem {
+    txid,
+    vout: 0,
+    utxo_hash: [0xAA; 32],
+}];
 let results = client.get_spend_batch(items).await?;
 for r in &results {
     match r.slot_status {

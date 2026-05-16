@@ -297,6 +297,33 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_frame_roundtrip_corpus() {
+        for payload_len in [0usize, 1, 7, 12, 255, 4096] {
+            let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
+            let request = RequestFrame {
+                request_id: 0xA5A5_0000 + payload_len as u64,
+                op_code: OP_GET_BATCH,
+                flags: payload_len as u16,
+                payload: payload.clone(),
+            };
+            let encoded = request.encode();
+            let (decoded, consumed) = RequestFrame::decode(&encoded).unwrap();
+            assert_eq!(decoded, request);
+            assert_eq!(consumed, encoded.len());
+
+            let response = ResponseFrame {
+                request_id: request.request_id,
+                status: STATUS_OK,
+                payload,
+            };
+            let encoded = response.encode();
+            let (decoded, consumed) = ResponseFrame::decode(&encoded).unwrap();
+            assert_eq!(decoded, response);
+            assert_eq!(consumed, encoded.len());
+        }
+    }
+
+    #[test]
     fn max_payload_frame() {
         let frame = RequestFrame {
             request_id: 1,
@@ -330,6 +357,33 @@ mod tests {
         data[0..4].copy_from_slice(&too_big.to_le_bytes());
         let result = RequestFrame::decode(&data);
         assert!(matches!(result, Err(FrameError::TooLarge { .. })));
+    }
+
+    #[test]
+    fn malformed_frame_length_corpus_rejects_without_panic() {
+        let corpus: &[&[u8]] = &[
+            &[],
+            &[0],
+            &[0, 0],
+            &[0, 0, 0],
+            &0u32.to_le_bytes(),
+            &5u32.to_le_bytes(),
+            &(MIN_REQUEST_BODY - 1).to_le_bytes(),
+            &(MAX_FRAME_SIZE + 1).to_le_bytes(),
+        ];
+
+        for data in corpus {
+            assert!(RequestFrame::decode(data).is_err());
+            assert!(ResponseFrame::decode(data).is_err());
+        }
+
+        let mut truncated_request = Vec::new();
+        truncated_request.extend_from_slice(&MIN_REQUEST_BODY.to_le_bytes());
+        truncated_request.extend_from_slice(&[0u8; (MIN_REQUEST_BODY - 1) as usize]);
+        assert!(matches!(
+            RequestFrame::decode(&truncated_request),
+            Err(FrameError::Truncated { .. })
+        ));
     }
 
     #[test]

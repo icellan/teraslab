@@ -61,6 +61,7 @@ fn start_test_http_server_with_admin(
         redo_log: None,
         active_connections: Arc::new(AtomicUsize::new(0)),
         http_port: 0,
+        replica_lag_warn_threshold_ops: 10_000,
     });
 
     let addr = format!("127.0.0.1:{port}");
@@ -306,6 +307,7 @@ fn debug_records_returns_json_for_existing_record() {
         frozen: false,
         conflicting: false,
         locked: false,
+        external_ref: None,
         parent_txids: &[],
     };
     state.engine.create(&req).unwrap();
@@ -318,6 +320,21 @@ fn debug_records_returns_json_for_existing_record() {
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(parsed["tx_version"], 2);
     assert_eq!(parsed["utxo_count"], 1);
+}
+
+#[test]
+fn debug_records_rejects_long_path() {
+    let (port, _state) = start_test_http_server();
+    let long_txid = "a".repeat(65);
+
+    let (status, _, body) = http_get_auth(
+        port,
+        &format!("/debug/records/{long_txid}"),
+        R056_TEST_TOKEN,
+    );
+
+    assert_eq!(status, 400);
+    assert_eq!(body, "invalid txid length");
 }
 
 #[test]

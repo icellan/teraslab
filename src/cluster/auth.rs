@@ -21,6 +21,8 @@
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::protocol::opcodes::MAX_FRAME_SIZE;
+
 /// Length of the HMAC-SHA256 tag in bytes.
 pub const HMAC_TAG_LEN: usize = 32;
 
@@ -147,6 +149,87 @@ pub fn verify_with_now<'a>(key: &[u8], data: &'a [u8], now_ms: u64) -> io::Resul
         ));
     }
     Ok(payload)
+}
+
+/// Sign an already-encoded request/response frame body.
+///
+/// The length prefix is not part of the signed input. Instead, the body
+/// (`request_id || opcode/status || flags? || payload`) is signed and the
+/// frame is re-emitted with a larger length prefix that includes the
+/// timestamp+tag suffix. This lets receivers verify before decoding while
+/// keeping the existing frame structs unchanged.
+pub fn sign_frame(key: &[u8], encoded_frame: &[u8]) -> io::Result<Vec<u8>> {
+    if encoded_frame.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too short for length prefix",
+        ));
+    }
+    let len = u32::from_le_bytes(encoded_frame[0..4].try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame length prefix read failed",
+        )
+    })?) as usize;
+    let frame_len = 4usize
+        .checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame length overflow"))?;
+    if encoded_frame.len() != frame_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame length does not match buffer",
+        ));
+    }
+    let signed_body = sign(key, &encoded_frame[4..]);
+    if signed_body.len() > MAX_FRAME_SIZE as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "signed frame exceeds maximum frame size",
+        ));
+    }
+    let mut out = Vec::with_capacity(4 + signed_body.len());
+    out.extend_from_slice(&(signed_body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&signed_body);
+    Ok(out)
+}
+
+/// Verify an authenticated frame and return a normal unsigned frame.
+///
+/// The returned bytes are suitable for [`crate::protocol::frame::RequestFrame::decode`]
+/// or [`crate::protocol::frame::ResponseFrame::decode`].
+pub fn verify_frame(key: &[u8], encoded_frame: &[u8]) -> io::Result<Vec<u8>> {
+    if encoded_frame.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too short for length prefix",
+        ));
+    }
+    let len = u32::from_le_bytes(encoded_frame[0..4].try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame length prefix read failed",
+        )
+    })?) as usize;
+    let frame_len = 4usize
+        .checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame length overflow"))?;
+    if encoded_frame.len() != frame_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame length does not match buffer",
+        ));
+    }
+    let unsigned_body = verify(key, &encoded_frame[4..])?;
+    if unsigned_body.len() > MAX_FRAME_SIZE as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsigned frame exceeds maximum frame size",
+        ));
+    }
+    let mut out = Vec::with_capacity(4 + unsigned_body.len());
+    out.extend_from_slice(&(unsigned_body.len() as u32).to_le_bytes());
+    out.extend_from_slice(unsigned_body);
+    Ok(out)
 }
 
 /// Constant-time comparison to prevent timing attacks.
@@ -373,6 +456,43 @@ mod tests {
         match verify_with_now(key, &signed, now_ms) {
             Ok(_) => panic!("tampered timestamp must be rejected"),
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
+        }
+    }
+
+    #[test]
+    fn signed_frame_round_trip_strips_suffix() {
+        let frame = crate::protocol::frame::RequestFrame {
+            request_id: 9,
+            op_code: crate::protocol::opcodes::OP_REPLICA_BATCH,
+            flags: 2,
+            payload: b"batch".to_vec(),
+        };
+        let encoded = frame.encode();
+        let signed = sign_frame(b"cluster-secret", &encoded).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(signed[0..4].try_into().unwrap()) as usize,
+            encoded.len() - 4 + SIGNED_SUFFIX_LEN,
+            "signed frame length must include the auth suffix"
+        );
+
+        let verified = verify_frame(b"cluster-secret", &signed).unwrap();
+        assert_eq!(verified, encoded);
+        let (decoded, consumed) = crate::protocol::frame::RequestFrame::decode(&verified).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn signed_frame_rejects_unsigned_body() {
+        let frame = crate::protocol::frame::ResponseFrame {
+            request_id: 1,
+            status: crate::protocol::opcodes::STATUS_OK,
+            payload: b"ack".to_vec(),
+        };
+        let encoded = frame.encode();
+        match verify_frame(b"cluster-secret", &encoded) {
+            Ok(_) => panic!("unsigned frame must not verify"),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
         }
     }
 

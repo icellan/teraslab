@@ -69,6 +69,18 @@ pub struct SetLockedRequest {
     pub value: bool,
 }
 
+/// Response from setLocked with the pre-apply state needed for exact rollback.
+#[derive(Debug, Clone)]
+pub struct SetLockedResponse {
+    /// Record generation after mutation.
+    pub generation: u32,
+    /// Whether the record was locked before this operation.
+    pub prior_locked: bool,
+    /// `delete_at_height` before this operation. Locking clears this field,
+    /// so replication-failure compensation must restore it exactly.
+    pub prior_delete_at_height: u32,
+}
+
 // -- PreserveUntil --
 
 /// Request to preserve a record until a specific block height.

@@ -15,6 +15,9 @@ pub struct UnspendRequest {
     pub offset: u32,
     /// Expected UTXO hash.
     pub utxo_hash: [u8; 32],
+    /// Expected current spending data. The slot is only cleared if this
+    /// matches the 36-byte marker recorded by the original spend.
+    pub spending_data: [u8; 36],
     /// Current block height (for DAH evaluation).
     pub current_block_height: u32,
     /// Block height retention (for DAH evaluation).

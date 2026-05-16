@@ -4,7 +4,7 @@
 //! record in one I/O operation, and registers it in the index.
 
 use crate::index::TxKey;
-use crate::record::BlockEntry;
+use crate::record::{BlockEntry, ExternalRef};
 use thiserror::Error;
 
 /// Errors from record creation.
@@ -21,6 +21,10 @@ pub enum CreateError {
     /// Zero UTXOs is not valid.
     #[error("invalid utxo count: 0")]
     InvalidUtxoCount,
+
+    /// External records must carry a digest-bound blob reference.
+    #[error("external blob reference missing")]
+    MissingExternalRef,
 
     /// Device I/O or allocator error.
     #[error("storage error: {detail}")]
@@ -83,6 +87,12 @@ pub struct CreateRequest<'a> {
     pub conflicting: bool,
     /// Create as locked.
     pub locked: bool,
+    /// Authoritative external blob reference when `is_external` is true.
+    ///
+    /// This must contain the digest and length returned by the durable
+    /// blobstore commit. External creates without this reference are
+    /// rejected before any record is written.
+    pub external_ref: Option<ExternalRef>,
     /// Parent txids for conflicting-children updates when conflicting=true.
     pub parent_txids: &'a [[u8; 32]],
 }

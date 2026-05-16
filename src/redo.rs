@@ -6,13 +6,36 @@
 //! R-027 (BC-13): the on-disk layout is **linear**, not circular: `write_pos`
 //! advances monotonically until the periodic checkpoint task (see
 //! [`crate::checkpoint`]) snapshots the engine state, calls
-//! [`RedoLog::checkpoint`], and then [`RedoLog::reset`]s `write_pos` back to
+//! [`RedoLog::mark_checkpoint`], and then [`RedoLog::reset`]s `write_pos` back to
 //! zero so future appends start at the beginning of the log region. The
 //! prior module documentation called this "circular" and described "wrapping
 //! around", which set false expectations — there is no in-place wrap; a
 //! full log returns [`RedoError::LogFull`] until the checkpoint task
 //! completes. The naming has been corrected here; the public type names
 //! retain `RedoLog` for back-compat.
+//!
+//! ## On-disk layout (F-G4-001)
+//!
+//! The redo region starts with a fixed-size [`RedoHeader`] occupying the
+//! first aligned block (`HEADER_BLOCK_SIZE` bytes, equal to the device's
+//! alignment, typically 4 KiB). The header carries:
+//!
+//! * a magic + format version so older logs are rejected with a clear
+//!   "version not supported" error rather than silently misparsing;
+//! * the high-water `next_sequence`, persisted on every flush /
+//!   compaction / reset so a restart after `compact_prefix_through` reduced
+//!   the log to empty does NOT reseed sequence numbers from 1 (which
+//!   prior to F-G4-001 silently corrupted replication watermarks);
+//! * the last `checkpoint_seq`, in case the on-disk entries no longer
+//!   include a `Checkpoint` marker after compaction.
+//! * a CRC-32 over the rest of the header; an invalid CRC fails `open()`
+//!   with a versioning error rather than silently falling back to "scan
+//!   from offset 0 with `next_sequence = 1`".
+//!
+//! Entries are appended starting at byte `HEADER_BLOCK_SIZE` of the redo
+//! region; `write_pos` is offset RELATIVE to the entries region. Capacity
+//! reported via [`RedoLog::capacity`] is the entries-only size
+//! (`log_size - HEADER_BLOCK_SIZE`).
 
 use crate::device::{AlignedBuf, BlockDevice};
 use crate::index::TxKey;
@@ -44,6 +67,16 @@ pub enum RedoError {
     #[error("corrupted entry at offset {offset}")]
     Corrupted { offset: u64 },
 
+    /// Redo entry sequence numbers must be contiguous within a log epoch.
+    #[error(
+        "redo sequence out of order at offset {offset}: previous={previous}, current={current}"
+    )]
+    SequenceOutOfOrder {
+        offset: u64,
+        previous: u64,
+        current: u64,
+    },
+
     /// The requested log region (`log_offset + log_size`) does not fit
     /// within the backing device. Rejected at open-time so callers never
     /// perform an I/O past the end of the device.
@@ -55,9 +88,151 @@ pub enum RedoError {
         log_size: u64,
         device_size: u64,
     },
+
+    /// F-G4-001: the header block carries a magic byte string that does not
+    /// match the current redo-log format. Either a foreign region was
+    /// pointed at, or the log was written by a version of the binary that
+    /// used a different (older or newer) magic. Recovery refuses to open
+    /// rather than silently misparsing as the current format.
+    #[error(
+        "redo header magic mismatch: expected {expected:#x?}, found {found:#x?} — log was written by an incompatible version"
+    )]
+    HeaderMagicMismatch {
+        expected: [u8; 8],
+        found: [u8; 8],
+    },
+
+    /// F-G4-001: the header block CRC does not match the rest of the
+    /// header bytes. The header was corrupted (torn write, device
+    /// corruption, etc.). Recovery refuses to open rather than silently
+    /// falling back to "scan + seed `next_sequence = 1`", which would
+    /// reuse sequence numbers and silently break replication watermarks.
+    #[error("redo header CRC mismatch: stored {stored:#x}, computed {computed:#x}")]
+    HeaderCrcMismatch { stored: u32, computed: u32 },
+
+    /// F-G4-001: the header carries a format version this binary does not
+    /// know how to interpret. Reject at open rather than guessing.
+    #[error("redo header version {found} not supported (expected {expected})")]
+    UnsupportedHeaderVersion { expected: u16, found: u16 },
+
+    /// F-G4-001: the redo region is too small to hold even the fixed-size
+    /// header block plus a single aligned entry block.
+    #[error(
+        "redo log region too small: {log_size} bytes (header block requires {required_for_header})"
+    )]
+    LogRegionTooSmall {
+        log_size: u64,
+        required_for_header: u64,
+    },
+
+    /// F-G4-002: a prior `flush()` returned an I/O error and the in-memory
+    /// state is no longer trustworthy. The log is poisoned; subsequent
+    /// `append`/`flush` calls fail until the process restarts and recovers
+    /// from the on-disk state.
+    #[error("redo log poisoned by earlier flush failure; restart required")]
+    Poisoned,
 }
 
 pub type Result<T> = std::result::Result<T, RedoError>;
+
+// ---------------------------------------------------------------------------
+// RedoHeader (F-G4-001)
+// ---------------------------------------------------------------------------
+
+/// Magic bytes identifying a TeraSlab redo log written in the
+/// header-bearing format introduced by F-G4-001. Any prior on-disk
+/// representation (entries written directly at `log_offset` with no
+/// header) is rejected at open with [`RedoError::HeaderMagicMismatch`].
+const REDO_HEADER_MAGIC: [u8; 8] = *b"TSLREDO1";
+
+/// Current redo-log format version. Bumping this rejects older logs at
+/// open with [`RedoError::UnsupportedHeaderVersion`] rather than silently
+/// misparsing them.
+const REDO_HEADER_VERSION: u16 = 1;
+
+/// On-disk layout of the redo-region header block (F-G4-001).
+///
+/// Layout: `magic(8) | version(2) | reserved(2) | next_sequence(8) |
+/// checkpoint_seq(8) | crc32(4)` = 32 bytes; written into the first
+/// `HEADER_BLOCK_SIZE` bytes of the redo region with the remaining
+/// bytes zeroed. The CRC covers every byte before it.
+const HEADER_FIXED_LEN: usize = 8 + 2 + 2 + 8 + 8 + 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RedoHeader {
+    next_sequence: u64,
+    checkpoint_seq: u64,
+}
+
+impl RedoHeader {
+    /// Serialize the header into a fresh `Vec<u8>` of length
+    /// [`HEADER_FIXED_LEN`]. Callers should pad to the chosen block size
+    /// (typically the device alignment) before writing to the device.
+    fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(HEADER_FIXED_LEN);
+        buf.extend_from_slice(&REDO_HEADER_MAGIC);
+        buf.extend_from_slice(&REDO_HEADER_VERSION.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 2]); // reserved
+        buf.extend_from_slice(&self.next_sequence.to_le_bytes());
+        buf.extend_from_slice(&self.checkpoint_seq.to_le_bytes());
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        debug_assert_eq!(buf.len(), HEADER_FIXED_LEN);
+        buf
+    }
+
+    /// Parse a header from the prefix of `data`.
+    ///
+    /// Returns [`RedoError::HeaderMagicMismatch`] if the magic byte string
+    /// does not match the current format (rejecting older logs and foreign
+    /// regions), [`RedoError::UnsupportedHeaderVersion`] for a known-magic
+    /// but unknown-version header, [`RedoError::HeaderCrcMismatch`] if the
+    /// CRC is corrupt.
+    fn deserialize(data: &[u8]) -> Result<Self> {
+        if data.len() < HEADER_FIXED_LEN {
+            // Treat too-short region as magic mismatch so the error is
+            // self-describing: callers see "expected vs found magic" with
+            // the bytes that were actually present.
+            let mut found = [0u8; 8];
+            let copy_len = data.len().min(8);
+            found[..copy_len].copy_from_slice(&data[..copy_len]);
+            return Err(RedoError::HeaderMagicMismatch {
+                expected: REDO_HEADER_MAGIC,
+                found,
+            });
+        }
+        let mut found_magic = [0u8; 8];
+        found_magic.copy_from_slice(&data[..8]);
+        if found_magic != REDO_HEADER_MAGIC {
+            return Err(RedoError::HeaderMagicMismatch {
+                expected: REDO_HEADER_MAGIC,
+                found: found_magic,
+            });
+        }
+        let version = u16::from_le_bytes(data[8..10].try_into().unwrap());
+        if version != REDO_HEADER_VERSION {
+            return Err(RedoError::UnsupportedHeaderVersion {
+                expected: REDO_HEADER_VERSION,
+                found: version,
+            });
+        }
+        // skip reserved 2 bytes
+        let next_sequence = u64::from_le_bytes(data[12..20].try_into().unwrap());
+        let checkpoint_seq = u64::from_le_bytes(data[20..28].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(data[28..32].try_into().unwrap());
+        let computed = crc32fast::hash(&data[..28]);
+        if stored_crc != computed {
+            return Err(RedoError::HeaderCrcMismatch {
+                stored: stored_crc,
+                computed,
+            });
+        }
+        Ok(RedoHeader {
+            next_sequence,
+            checkpoint_seq,
+        })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RedoOp
@@ -103,6 +278,41 @@ const OP_COMPENSATE_REASSIGN: u8 = 24;
 /// of the slot so rollback restores `UTXO_SPENT` / `UTXO_FROZEN` /
 /// `UTXO_UNSPENT` exactly instead of unconditionally restoring UNSPENT.
 const OP_COMPENSATE_PRUNE: u8 = 25;
+/// Gap #8: compensation intent for set-locked. Carries the prior locked
+/// flag and `delete_at_height` so rollback restores pruning state exactly.
+const OP_COMPENSATE_SET_LOCKED: u8 = 26;
+/// Conditional parent-prune entry used when deleting a child transaction.
+/// Replays only if the parent slot is still spent by the deleted child txid.
+const OP_PRUNE_SLOT_IF_SPENT_BY: u8 = 27;
+/// Durable intent to append a child txid to a parent's conflicting-child list.
+const OP_APPEND_CONFLICTING_CHILD: u8 = 28;
+/// Recovery progress marker written after replay has safely processed all
+/// entries through `through_sequence`.
+const OP_RECOVERY_PROGRESS: u8 = 29;
+/// Spend redo entry with derived metadata context.
+const OP_SPEND_V2: u8 = 30;
+/// Unspend redo entry with derived metadata context.
+const OP_UNSPEND_V2: u8 = 31;
+/// F-G4-008: explicit V2 tag for freeze entries that carry `utxo_hash`.
+/// Disambiguates from legacy [`OP_FREEZE`] entries by type byte rather
+/// than data length, so a future entry shape with 68+ bytes cannot be
+/// silently routed to the V2 decoder.
+const OP_FREEZE_V2: u8 = 32;
+/// F-G4-008: explicit V2 tag for unfreeze entries that carry `utxo_hash`.
+const OP_UNFREEZE_V2: u8 = 33;
+
+/// F-G4-006: hard cap on the number of parent_txids decoded from a single
+/// `CreateV2` redo entry. Bitcoin transactions in practice rarely have
+/// more than a handful of conflicting parents; a wire-controlled
+/// `u16::MAX` would let a corrupt-but-CRC-valid entry pin ~2 MiB at
+/// startup per offending entry, multiplied by however many such entries
+/// the redo region contains.
+const MAX_CREATE_V2_PARENTS: usize = 64;
+/// F-G4-006: hard cap on the `record_bytes` slab decoded from a single
+/// `CreateV2` redo entry. The TeraSlab record size is bounded by
+/// `TxMetadata::record_size_for(utxo_count)` plus cold data, which in
+/// the worst case the engine emits is well under 1 MiB.
+const MAX_CREATE_V2_RECORD_BYTES: usize = 1 * 1024 * 1024;
 
 /// A redo log operation that can be serialized and replayed.
 #[derive(Debug, Clone, PartialEq)]
@@ -113,10 +323,33 @@ pub enum RedoOp {
         spending_data: [u8; 36],
         new_spent_count: u32,
     },
+    SpendV2 {
+        tx_key: TxKey,
+        offset: u32,
+        spending_data: [u8; 36],
+        new_spent_count: u32,
+        current_block_height: u32,
+        block_height_retention: u32,
+        target_generation: u32,
+        updated_at: u64,
+    },
     Unspend {
         tx_key: TxKey,
         offset: u32,
+        /// Expected spending data before clearing. `None` is used only for
+        /// legacy redo entries written before unspend carried this field.
+        spending_data: Option<[u8; 36]>,
         new_spent_count: u32,
+    },
+    UnspendV2 {
+        tx_key: TxKey,
+        offset: u32,
+        spending_data: [u8; 36],
+        new_spent_count: u32,
+        current_block_height: u32,
+        block_height_retention: u32,
+        target_generation: u32,
+        updated_at: u64,
     },
     SetMined {
         tx_key: TxKey,
@@ -129,9 +362,23 @@ pub enum RedoOp {
         tx_key: TxKey,
         offset: u32,
     },
+    /// Freeze entry written by dispatch paths that validated a specific
+    /// UTXO hash. Legacy [`RedoOp::Freeze`] entries remain decodable.
+    FreezeV2 {
+        tx_key: TxKey,
+        offset: u32,
+        utxo_hash: [u8; 32],
+    },
     Unfreeze {
         tx_key: TxKey,
         offset: u32,
+    },
+    /// Unfreeze entry written by dispatch paths that validated a specific
+    /// UTXO hash. Legacy [`RedoOp::Unfreeze`] entries remain decodable.
+    UnfreezeV2 {
+        tx_key: TxKey,
+        offset: u32,
+        utxo_hash: [u8; 32],
     },
     Reassign {
         tx_key: TxKey,
@@ -143,6 +390,11 @@ pub enum RedoOp {
     PruneSlot {
         tx_key: TxKey,
         offset: u32,
+    },
+    PruneSlotIfSpentBy {
+        tx_key: TxKey,
+        offset: u32,
+        child_txid: [u8; 32],
     },
     /// Legacy create entry: only enough payload to register the index
     /// entry on replay. Kept so logs written before gap #2 can still be
@@ -207,6 +459,24 @@ pub enum RedoOp {
         current_block_height: u32,
         block_height_retention: u32,
     },
+    /// R-221: intent to append `child_txid` to `parent_key`'s
+    /// conflicting-children list.
+    ///
+    /// The engine writes and fsyncs this before allocating/writing the
+    /// replacement child-list block. Low-level recovery cannot safely replay
+    /// it because the append path needs the engine allocator and stripe locks,
+    /// so full startup recovery collects these entries and drains them after
+    /// constructing the engine.
+    ///
+    /// Wire layout (after the type byte):
+    /// ```text
+    /// [parent_key:32]
+    /// [child_txid:32]
+    /// ```
+    AppendConflictingChild {
+        parent_key: TxKey,
+        child_txid: [u8; 32],
+    },
     SetLocked {
         tx_key: TxKey,
         value: bool,
@@ -222,9 +492,10 @@ pub enum RedoOp {
         block_height_retention: u32,
         /// Target record generation after this op is applied. Used by the
         /// replay handler as the idempotency token (H7): replay skips when
-        /// the on-device `meta.generation` is already `>= generation`,
-        /// and on apply writes `meta.generation = generation` so subsequent
-        /// replays of the same entry are correctly observed as idempotent.
+        /// the on-device `meta.generation` is already at-or-ahead under the
+        /// wrapping generation order, and on apply writes
+        /// `meta.generation = generation` so subsequent replays of the same
+        /// entry are correctly observed as idempotent.
         generation: u32,
     },
     /// Two-phase durability intent record for the unmined secondary index.
@@ -379,6 +650,34 @@ pub enum RedoOp {
         /// The slot's `status` byte before the prune was applied.
         prior_status: u8,
     },
+    /// Gap #8 compensation intent for set-locked rollback.
+    ///
+    /// Captures the pre-apply locked flag and `delete_at_height` so recovery
+    /// can restore pruning state exactly after a crash mid-compensation.
+    ///
+    /// Wire layout (after the type byte):
+    /// ```text
+    /// [tx_key:32]
+    /// [prior_locked:1]
+    /// [prior_delete_at_height:4 LE]
+    /// ```
+    CompensateSetLocked {
+        /// Primary key of the affected transaction.
+        tx_key: TxKey,
+        /// Whether the record was locked before SetLocked was applied.
+        prior_locked: bool,
+        /// The record's `delete_at_height` before SetLocked was applied.
+        prior_delete_at_height: u32,
+    },
+    /// Startup replay progress marker.
+    ///
+    /// Unlike [`RedoOp::Checkpoint`], this does not prove the whole engine
+    /// snapshot is durable and does not reclaim log space. It only lets a
+    /// subsequent crash during recovery skip redo entries that were already
+    /// replayed safely by an earlier recovery attempt.
+    RecoveryProgress {
+        through_sequence: u64,
+    },
     Checkpoint,
 }
 
@@ -386,16 +685,22 @@ impl RedoOp {
     fn op_type(&self) -> u8 {
         match self {
             RedoOp::Spend { .. } => OP_SPEND,
+            RedoOp::SpendV2 { .. } => OP_SPEND_V2,
             RedoOp::Unspend { .. } => OP_UNSPEND,
+            RedoOp::UnspendV2 { .. } => OP_UNSPEND_V2,
             RedoOp::SetMined { .. } => OP_SET_MINED,
             RedoOp::Freeze { .. } => OP_FREEZE,
+            RedoOp::FreezeV2 { .. } => OP_FREEZE_V2,
             RedoOp::Unfreeze { .. } => OP_UNFREEZE,
+            RedoOp::UnfreezeV2 { .. } => OP_UNFREEZE_V2,
             RedoOp::Reassign { .. } => OP_REASSIGN,
             RedoOp::PruneSlot { .. } => OP_PRUNE_SLOT,
+            RedoOp::PruneSlotIfSpentBy { .. } => OP_PRUNE_SLOT_IF_SPENT_BY,
             RedoOp::Create { .. } => OP_CREATE,
             RedoOp::CreateV2 { .. } => OP_CREATE_V2,
             RedoOp::Delete { .. } => OP_DELETE,
             RedoOp::SetConflicting { .. } => OP_SET_CONFLICTING,
+            RedoOp::AppendConflictingChild { .. } => OP_APPEND_CONFLICTING_CHILD,
             RedoOp::SetLocked { .. } => OP_SET_LOCKED,
             RedoOp::PreserveUntil { .. } => OP_PRESERVE_UNTIL,
             RedoOp::MarkOnLongestChain { .. } => OP_MARK_LONGEST_CHAIN,
@@ -408,6 +713,8 @@ impl RedoOp {
             RedoOp::CompensateUnsetMined { .. } => OP_COMPENSATE_UNSET_MINED,
             RedoOp::CompensateReassign { .. } => OP_COMPENSATE_REASSIGN,
             RedoOp::CompensatePrune { .. } => OP_COMPENSATE_PRUNE,
+            RedoOp::CompensateSetLocked { .. } => OP_COMPENSATE_SET_LOCKED,
+            RedoOp::RecoveryProgress { .. } => OP_RECOVERY_PROGRESS,
             RedoOp::Checkpoint => OP_CHECKPOINT,
         }
     }
@@ -418,12 +725,17 @@ impl RedoOp {
     pub fn tx_key(&self) -> Option<&TxKey> {
         match self {
             RedoOp::Spend { tx_key, .. }
+            | RedoOp::SpendV2 { tx_key, .. }
             | RedoOp::Unspend { tx_key, .. }
+            | RedoOp::UnspendV2 { tx_key, .. }
             | RedoOp::SetMined { tx_key, .. }
             | RedoOp::Freeze { tx_key, .. }
+            | RedoOp::FreezeV2 { tx_key, .. }
             | RedoOp::Unfreeze { tx_key, .. }
+            | RedoOp::UnfreezeV2 { tx_key, .. }
             | RedoOp::Reassign { tx_key, .. }
             | RedoOp::PruneSlot { tx_key, .. }
+            | RedoOp::PruneSlotIfSpentBy { tx_key, .. }
             | RedoOp::Create { tx_key, .. }
             | RedoOp::CreateV2 { tx_key, .. }
             | RedoOp::Delete { tx_key, .. }
@@ -435,11 +747,14 @@ impl RedoOp {
             | RedoOp::SecondaryDahUpdate { tx_key, .. }
             | RedoOp::CompensateUnsetMined { tx_key, .. }
             | RedoOp::CompensateReassign { tx_key, .. }
-            | RedoOp::CompensatePrune { tx_key, .. } => Some(tx_key),
+            | RedoOp::CompensatePrune { tx_key, .. }
+            | RedoOp::CompensateSetLocked { tx_key, .. } => Some(tx_key),
+            RedoOp::AppendConflictingChild { parent_key, .. } => Some(parent_key),
             RedoOp::AllocateRegion { .. }
             | RedoOp::FreeRegion { .. }
             | RedoOp::HashtableResizeBegin { .. }
             | RedoOp::HashtableResizeCommit { .. }
+            | RedoOp::RecoveryProgress { .. }
             | RedoOp::Checkpoint => None,
         }
     }
@@ -458,14 +773,58 @@ impl RedoOp {
                 buf.extend_from_slice(spending_data);
                 buf.extend_from_slice(&new_spent_count.to_le_bytes());
             }
+            RedoOp::SpendV2 {
+                tx_key,
+                offset,
+                spending_data,
+                new_spent_count,
+                current_block_height,
+                block_height_retention,
+                target_generation,
+                updated_at,
+            } => {
+                buf.extend_from_slice(&tx_key.txid);
+                buf.extend_from_slice(&offset.to_le_bytes());
+                buf.extend_from_slice(spending_data);
+                buf.extend_from_slice(&new_spent_count.to_le_bytes());
+                buf.extend_from_slice(&current_block_height.to_le_bytes());
+                buf.extend_from_slice(&block_height_retention.to_le_bytes());
+                buf.extend_from_slice(&target_generation.to_le_bytes());
+                buf.extend_from_slice(&updated_at.to_le_bytes());
+            }
             RedoOp::Unspend {
                 tx_key,
                 offset,
+                spending_data,
                 new_spent_count,
             } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
+                if let Some(spending_data) = spending_data {
+                    buf.extend_from_slice(spending_data);
+                    buf.extend_from_slice(&new_spent_count.to_le_bytes());
+                } else {
+                    buf.extend_from_slice(&new_spent_count.to_le_bytes());
+                }
+            }
+            RedoOp::UnspendV2 {
+                tx_key,
+                offset,
+                spending_data,
+                new_spent_count,
+                current_block_height,
+                block_height_retention,
+                target_generation,
+                updated_at,
+            } => {
+                buf.extend_from_slice(&tx_key.txid);
+                buf.extend_from_slice(&offset.to_le_bytes());
+                buf.extend_from_slice(spending_data);
                 buf.extend_from_slice(&new_spent_count.to_le_bytes());
+                buf.extend_from_slice(&current_block_height.to_le_bytes());
+                buf.extend_from_slice(&block_height_retention.to_le_bytes());
+                buf.extend_from_slice(&target_generation.to_le_bytes());
+                buf.extend_from_slice(&updated_at.to_le_bytes());
             }
             RedoOp::SetMined {
                 tx_key,
@@ -485,6 +844,29 @@ impl RedoOp {
             | RedoOp::PruneSlot { tx_key, offset } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
+            }
+            RedoOp::PruneSlotIfSpentBy {
+                tx_key,
+                offset,
+                child_txid,
+            } => {
+                buf.extend_from_slice(&tx_key.txid);
+                buf.extend_from_slice(&offset.to_le_bytes());
+                buf.extend_from_slice(child_txid);
+            }
+            RedoOp::FreezeV2 {
+                tx_key,
+                offset,
+                utxo_hash,
+            }
+            | RedoOp::UnfreezeV2 {
+                tx_key,
+                offset,
+                utxo_hash,
+            } => {
+                buf.extend_from_slice(&tx_key.txid);
+                buf.extend_from_slice(&offset.to_le_bytes());
+                buf.extend_from_slice(utxo_hash);
             }
             RedoOp::Reassign {
                 tx_key,
@@ -548,6 +930,13 @@ impl RedoOp {
                 buf.push(if *value { 1 } else { 0 });
                 buf.extend_from_slice(&current_block_height.to_le_bytes());
                 buf.extend_from_slice(&block_height_retention.to_le_bytes());
+            }
+            RedoOp::AppendConflictingChild {
+                parent_key,
+                child_txid,
+            } => {
+                buf.extend_from_slice(&parent_key.txid);
+                buf.extend_from_slice(child_txid);
             }
             RedoOp::SetLocked { tx_key, value } => {
                 buf.extend_from_slice(&tx_key.txid);
@@ -643,6 +1032,18 @@ impl RedoOp {
                 buf.extend_from_slice(&offset.to_le_bytes());
                 buf.push(*prior_status);
             }
+            RedoOp::CompensateSetLocked {
+                tx_key,
+                prior_locked,
+                prior_delete_at_height,
+            } => {
+                buf.extend_from_slice(&tx_key.txid);
+                buf.push(if *prior_locked { 1 } else { 0 });
+                buf.extend_from_slice(&prior_delete_at_height.to_le_bytes());
+            }
+            RedoOp::RecoveryProgress { through_sequence } => {
+                buf.extend_from_slice(&through_sequence.to_le_bytes());
+            }
             RedoOp::Checkpoint => {}
         }
     }
@@ -664,6 +1065,54 @@ impl RedoOp {
                     new_spent_count: cnt,
                 })
             }
+            OP_SPEND_V2 if data.len() >= 96 => {
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                let offset = u32::from_le_bytes(data[32..36].try_into().unwrap());
+                let mut sd = [0u8; 36];
+                sd.copy_from_slice(&data[36..72]);
+                Some(RedoOp::SpendV2 {
+                    tx_key: TxKey { txid },
+                    offset,
+                    spending_data: sd,
+                    new_spent_count: u32::from_le_bytes(data[72..76].try_into().unwrap()),
+                    current_block_height: u32::from_le_bytes(data[76..80].try_into().unwrap()),
+                    block_height_retention: u32::from_le_bytes(data[80..84].try_into().unwrap()),
+                    target_generation: u32::from_le_bytes(data[84..88].try_into().unwrap()),
+                    updated_at: u64::from_le_bytes(data[88..96].try_into().unwrap()),
+                })
+            }
+            OP_UNSPEND if data.len() >= 76 => {
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                let offset = u32::from_le_bytes(data[32..36].try_into().unwrap());
+                let mut sd = [0u8; 36];
+                sd.copy_from_slice(&data[36..72]);
+                let cnt = u32::from_le_bytes(data[72..76].try_into().unwrap());
+                Some(RedoOp::Unspend {
+                    tx_key: TxKey { txid },
+                    offset,
+                    spending_data: Some(sd),
+                    new_spent_count: cnt,
+                })
+            }
+            OP_UNSPEND_V2 if data.len() >= 96 => {
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                let offset = u32::from_le_bytes(data[32..36].try_into().unwrap());
+                let mut sd = [0u8; 36];
+                sd.copy_from_slice(&data[36..72]);
+                Some(RedoOp::UnspendV2 {
+                    tx_key: TxKey { txid },
+                    offset,
+                    spending_data: sd,
+                    new_spent_count: u32::from_le_bytes(data[72..76].try_into().unwrap()),
+                    current_block_height: u32::from_le_bytes(data[76..80].try_into().unwrap()),
+                    block_height_retention: u32::from_le_bytes(data[80..84].try_into().unwrap()),
+                    target_generation: u32::from_le_bytes(data[84..88].try_into().unwrap()),
+                    updated_at: u64::from_le_bytes(data[88..96].try_into().unwrap()),
+                })
+            }
             OP_UNSPEND if data.len() >= 40 => {
                 let mut txid = [0u8; 32];
                 txid.copy_from_slice(&data[..32]);
@@ -672,6 +1121,7 @@ impl RedoOp {
                 Some(RedoOp::Unspend {
                     tx_key: TxKey { txid },
                     offset,
+                    spending_data: None,
                     new_spent_count: cnt,
                 })
             }
@@ -684,6 +1134,34 @@ impl RedoOp {
                     block_height: u32::from_le_bytes(data[36..40].try_into().unwrap()),
                     subtree_idx: u32::from_le_bytes(data[40..44].try_into().unwrap()),
                     unset: data[44] != 0,
+                })
+            }
+            // F-G4-008: distinct opcodes for V2 freeze/unfreeze. The old
+            // overlap with [`OP_FREEZE`] / [`OP_UNFREEZE`] (disambiguating
+            // by `data.len() >= 68`) was fragile against future entry
+            // shapes; routing by op_type byte is unambiguous.
+            OP_FREEZE_V2 if data.len() >= 68 => {
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                let offset = u32::from_le_bytes(data[32..36].try_into().unwrap());
+                let mut utxo_hash = [0u8; 32];
+                utxo_hash.copy_from_slice(&data[36..68]);
+                Some(RedoOp::FreezeV2 {
+                    tx_key: TxKey { txid },
+                    offset,
+                    utxo_hash,
+                })
+            }
+            OP_UNFREEZE_V2 if data.len() >= 68 => {
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                let offset = u32::from_le_bytes(data[32..36].try_into().unwrap());
+                let mut utxo_hash = [0u8; 32];
+                utxo_hash.copy_from_slice(&data[36..68]);
+                Some(RedoOp::UnfreezeV2 {
+                    tx_key: TxKey { txid },
+                    offset,
+                    utxo_hash,
                 })
             }
             OP_FREEZE | OP_UNFREEZE | OP_PRUNE_SLOT if data.len() >= 36 => {
@@ -706,6 +1184,18 @@ impl RedoOp {
                     }),
                     _ => None,
                 }
+            }
+            OP_PRUNE_SLOT_IF_SPENT_BY if data.len() >= 68 => {
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                let offset = u32::from_le_bytes(data[32..36].try_into().unwrap());
+                let mut child_txid = [0u8; 32];
+                child_txid.copy_from_slice(&data[36..68]);
+                Some(RedoOp::PruneSlotIfSpentBy {
+                    tx_key: TxKey { txid },
+                    offset,
+                    child_txid,
+                })
             }
             OP_REASSIGN if data.len() >= 76 => {
                 let mut txid = [0u8; 32];
@@ -740,21 +1230,40 @@ impl RedoOp {
                 let utxo_count = u32::from_le_bytes(data[40..44].try_into().unwrap());
                 let is_conflicting = data[44] != 0;
                 let record_len = u32::from_le_bytes(data[45..49].try_into().unwrap()) as usize;
+                // F-G4-006: cap `record_len` so a corrupt-but-CRC-valid
+                // entry cannot inflate startup memory by a fabricated value
+                // larger than any legitimate record. Real records are
+                // bounded by `TxMetadata::record_size_for(utxo_count)`
+                // plus cold data; 1 MiB is a comfortable upper bound that
+                // exceeds anything the engine emits.
+                if record_len > MAX_CREATE_V2_RECORD_BYTES {
+                    return None;
+                }
                 let record_end = 49usize.checked_add(record_len)?;
                 if data.len() < record_end + 2 {
                     return None;
                 }
                 let record_bytes = data[49..record_end].to_vec();
-                let parents_count =
+                let parents_count_raw =
                     u16::from_le_bytes(data[record_end..record_end + 2].try_into().unwrap())
                         as usize;
                 let parents_start = record_end + 2;
-                let parents_end = parents_start.checked_add(parents_count.checked_mul(32)?)?;
+                let parents_end =
+                    parents_start.checked_add(parents_count_raw.checked_mul(32)?)?;
                 if data.len() < parents_end {
                     return None;
                 }
-                let mut parent_txids: Vec<[u8; 32]> = Vec::with_capacity(parents_count);
-                for i in 0..parents_count {
+                // F-G4-006: cap `parents_count` so a corrupt entry
+                // cannot pre-allocate ~2 MiB of `[u8; 32]` slots. Real
+                // transactions rarely have more than a few conflicting
+                // parents; cap at 64 (still well above any observed
+                // legitimate value).
+                if parents_count_raw > MAX_CREATE_V2_PARENTS {
+                    return None;
+                }
+                // Cap is enforced above; allocation is now bounded.
+                let mut parent_txids: Vec<[u8; 32]> = Vec::with_capacity(parents_count_raw);
+                for i in 0..parents_count_raw {
                     let off = parents_start + i * 32;
                     let mut ptx = [0u8; 32];
                     ptx.copy_from_slice(&data[off..off + 32]);
@@ -786,6 +1295,16 @@ impl RedoOp {
                     value: data[32] != 0,
                     current_block_height: u32::from_le_bytes(data[33..37].try_into().unwrap()),
                     block_height_retention: u32::from_le_bytes(data[37..41].try_into().unwrap()),
+                })
+            }
+            OP_APPEND_CONFLICTING_CHILD if data.len() >= 64 => {
+                let mut parent_txid = [0u8; 32];
+                parent_txid.copy_from_slice(&data[..32]);
+                let mut child_txid = [0u8; 32];
+                child_txid.copy_from_slice(&data[32..64]);
+                Some(RedoOp::AppendConflictingChild {
+                    parent_key: TxKey { txid: parent_txid },
+                    child_txid,
                 })
             }
             OP_SET_LOCKED if data.len() >= 33 => {
@@ -905,6 +1424,19 @@ impl RedoOp {
                     prior_status,
                 })
             }
+            OP_COMPENSATE_SET_LOCKED if data.len() >= 37 => {
+                // [tx_key:32][prior_locked:1][prior_delete_at_height:4]
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                Some(RedoOp::CompensateSetLocked {
+                    tx_key: TxKey { txid },
+                    prior_locked: data[32] != 0,
+                    prior_delete_at_height: u32::from_le_bytes(data[33..37].try_into().unwrap()),
+                })
+            }
+            OP_RECOVERY_PROGRESS if data.len() >= 8 => Some(RedoOp::RecoveryProgress {
+                through_sequence: u64::from_le_bytes(data[..8].try_into().unwrap()),
+            }),
             OP_CHECKPOINT => Some(RedoOp::Checkpoint),
             _ => None,
         }
@@ -990,39 +1522,71 @@ impl RedoEntry {
 ///
 /// Entries are appended to an in-memory buffer and flushed to device
 /// on demand. `write_pos` advances monotonically; a successful
-/// [`RedoLog::checkpoint`] + [`RedoLog::reset`] pair (driven by
+/// [`RedoLog::mark_checkpoint`] + [`RedoLog::reset`] pair (driven by
 /// [`crate::checkpoint`]) returns `write_pos` to zero so future
 /// appends start at the beginning of the log region. There is no
 /// in-place wrap — see the module-level documentation for the full
 /// rationale (R-027 / BC-13).
 pub struct RedoLog {
     device: Arc<dyn BlockDevice>,
+    /// Device byte offset of the redo region's first byte (the header).
     log_offset: u64,
+    /// Total bytes of the redo region, header + entries.
     log_size: u64,
+    /// F-G4-001: bytes reserved at the start of the redo region for the
+    /// fixed-size header block; equal to the device's alignment, captured
+    /// at `open` so it is stable for the life of this `RedoLog`.
+    header_block_size: u64,
+    /// Bytes written into the entries region (relative to the entries
+    /// region start, not the device). Advances monotonically until
+    /// `reset` / `compact_prefix_through` rewinds it.
     write_pos: u64,
     checkpoint_seq: u64,
     next_sequence: u64,
     buffer: Vec<u8>,
-    flushed_pos: u64,
+    /// Durable entries discovered at open plus entries from successful
+    /// flushes. Recovery and replica catch-up use this cache instead of
+    /// rescanning the full redo region on every call.
+    entries_cache: Vec<RedoEntry>,
+    /// Entries appended to `buffer` but not yet fsynced. Moved into
+    /// `entries_cache` only after `flush()` succeeds.
+    pending_entries: Vec<RedoEntry>,
     /// Entry count for metrics: number of `append()` calls currently sitting
     /// in `buffer`. Reset to 0 after a successful `flush()`. Zero-cost when
     /// metrics are not initialized — the counter is still updated but never
     /// read by the hot path.
     buffered_entries: u64,
+    /// F-G4-002: once a `flush()` returns an I/O error, the in-memory
+    /// buffer state is no longer trustworthy — another thread's appends
+    /// may sit alongside the failed batch and a subsequent successful
+    /// flush would silently persist ops the originating client was told
+    /// failed. Poisoning the log here forces operators to restart, at
+    /// which point recovery reconstructs from the on-disk state.
+    poisoned: bool,
 }
 
 impl RedoLog {
     /// Open or create a redo log at the given device region.
     ///
-    /// Scans for existing entries to determine the current position.
+    /// Reads the on-disk header (F-G4-001) to recover `next_sequence` and
+    /// `checkpoint_seq`; if the header magic is missing the region is
+    /// freshly initialised. If the magic matches a foreign / older format
+    /// the open fails with [`RedoError::HeaderMagicMismatch`] (or
+    /// [`RedoError::HeaderCrcMismatch`] / [`RedoError::UnsupportedHeaderVersion`])
+    /// rather than silently falling back to "scan from offset 0 and seed
+    /// `next_sequence = 1`", which prior to F-G4-001 reused sequence
+    /// numbers across restarts whenever compaction emptied the entries
+    /// region.
     ///
     /// # Errors
     ///
-    /// Returns [`RedoError::OutOfBounds`] if `log_offset + log_size` would
-    /// overflow `u64` or extend past the device's reported size. This
-    /// check runs before any I/O so invalid configurations are caught
-    /// immediately rather than surfacing as later `DeviceError::OutOfBounds`
-    /// failures from `pread`/`pwrite`.
+    /// * [`RedoError::OutOfBounds`] if `log_offset + log_size` would
+    ///   overflow `u64` or extend past the device's reported size.
+    /// * [`RedoError::LogRegionTooSmall`] if the region cannot hold the
+    ///   fixed-size header block plus a single aligned entry block.
+    /// * [`RedoError::HeaderMagicMismatch`] / [`RedoError::HeaderCrcMismatch`] /
+    ///   [`RedoError::UnsupportedHeaderVersion`] when the existing header
+    ///   does not match this binary's expected format.
     pub fn open(device: Arc<dyn BlockDevice>, log_offset: u64, log_size: u64) -> Result<Self> {
         let device_size = device.size();
         let end = log_offset
@@ -1039,53 +1603,156 @@ impl RedoLog {
                 device_size,
             });
         }
+
+        let align = device.alignment() as u64;
+        if align == 0 {
+            return Err(RedoError::LogRegionTooSmall {
+                log_size,
+                required_for_header: 1,
+            });
+        }
+        // F-G4-001: reserve at least one aligned block for the header,
+        // and at least one more for entries.
+        let header_block_size = align;
+        if log_size < header_block_size.saturating_mul(2) {
+            return Err(RedoError::LogRegionTooSmall {
+                log_size,
+                required_for_header: header_block_size.saturating_mul(2),
+            });
+        }
+
         let mut log = Self {
             device,
             log_offset,
             log_size,
+            header_block_size,
             write_pos: 0,
             checkpoint_seq: 0,
             next_sequence: 1,
             buffer: Vec::new(),
-            flushed_pos: 0,
+            entries_cache: Vec::new(),
+            pending_entries: Vec::new(),
             buffered_entries: 0,
+            poisoned: false,
         };
 
-        // Scan existing entries to find write position and checkpoint
-        let entries = log.scan_all()?;
-        if let Some(last) = entries.last() {
-            log.next_sequence = last.sequence + 1;
-        }
+        // Try to read the on-disk header. If the magic is absent
+        // (region is freshly zeroed), initialise a fresh header below.
+        // If the magic is present but invalid, propagate the error so
+        // the operator sees a clear "version not supported" rather than
+        // silently misparsing.
+        let header_present = log.read_header_or_init()?;
 
-        // Find last checkpoint to set checkpoint_seq
-        for e in entries.iter().rev() {
-            if e.op == RedoOp::Checkpoint {
-                log.checkpoint_seq = e.sequence;
-                break;
+        // Scan existing entries from the entries region to find the
+        // write tail and entries cache. A checksum/truncation failure at
+        // the final entry is treated as the end of valid log data, so
+        // appends after restart resume at the last fully-valid entry
+        // instead of overwriting from offset zero.
+        let (entries, tail_pos) = log.scan_entries_region_with_tail()?;
+        log.write_pos = tail_pos;
+        log.entries_cache = entries.clone();
+
+        // F-G4-001: the on-disk header is the authoritative source for
+        // `next_sequence`. Only fall back to scan-derived value if the
+        // region was freshly initialised (no header was written yet) or
+        // the scan observed a strictly higher sequence than the header
+        // recorded.
+        if let Some(last) = entries.last() {
+            let scan_next = last.sequence + 1;
+            if !header_present || scan_next > log.next_sequence {
+                log.next_sequence = scan_next;
             }
         }
 
+        // Find last checkpoint to set checkpoint_seq (only if not
+        // already set authoritatively by the header).
+        if !header_present {
+            for e in entries.iter().rev() {
+                if e.op == RedoOp::Checkpoint {
+                    log.checkpoint_seq = e.sequence;
+                    break;
+                }
+            }
+        }
+
+        // If the region looked fresh, write an initial header so the
+        // next open sees the same authoritative state.
+        if !header_present {
+            log.write_header()?;
+        }
+
         Ok(log)
+    }
+
+    /// Device byte offset of the first entry byte (header block end).
+    fn entries_region_offset(&self) -> u64 {
+        self.log_offset + self.header_block_size
+    }
+
+    /// Number of bytes available for entries (region minus header block).
+    fn entries_region_size(&self) -> u64 {
+        self.log_size - self.header_block_size
+    }
+
+    /// Read the on-disk header (F-G4-001). Returns `Ok(true)` when a
+    /// valid header was decoded; `Ok(false)` when the header block is
+    /// freshly zeroed (magic bytes all zero) and the caller should
+    /// initialise a new header. Returns a typed error for non-zero /
+    /// mismatched magic, bad CRC, or unsupported version.
+    fn read_header_or_init(&mut self) -> Result<bool> {
+        let align = self.device.alignment();
+        let mut buf = AlignedBuf::new(self.header_block_size as usize, align);
+        self.device.pread_exact_at(&mut buf, self.log_offset)?;
+        if buf[..HEADER_FIXED_LEN].iter().all(|b| *b == 0) {
+            return Ok(false);
+        }
+        let header = RedoHeader::deserialize(&buf[..HEADER_FIXED_LEN])?;
+        self.next_sequence = header.next_sequence.max(1);
+        self.checkpoint_seq = header.checkpoint_seq;
+        Ok(true)
+    }
+
+    /// Serialize and durably write the header. Pads to `header_block_size`
+    /// with zeros so the write covers the full reserved block atomically
+    /// at the device's alignment.
+    fn write_header(&self) -> Result<()> {
+        let header = RedoHeader {
+            next_sequence: self.next_sequence,
+            checkpoint_seq: self.checkpoint_seq,
+        };
+        let bytes = header.serialize();
+        let align = self.device.alignment();
+        let mut buf = AlignedBuf::new(self.header_block_size as usize, align);
+        buf[..bytes.len()].copy_from_slice(&bytes);
+        // Trailing bytes are already zeroed by AlignedBuf::new.
+        self.device.pwrite_all_at(&buf, self.log_offset)?;
+        self.device.sync()?;
+        Ok(())
     }
 
     /// Append an operation to the buffer (not yet durable).
     ///
     /// Returns the assigned sequence number.
     pub fn append(&mut self, op: RedoOp) -> Result<u64> {
+        // F-G4-002: refuse to append on a poisoned log.
+        if self.poisoned {
+            return Err(RedoError::Poisoned);
+        }
         let seq = self.next_sequence;
-        self.next_sequence += 1;
-
         let entry = RedoEntry { sequence: seq, op };
         let bytes = entry.serialize();
 
-        if self.write_pos + self.buffer.len() as u64 + bytes.len() as u64 > self.log_size {
+        let entries_capacity = self.entries_region_size();
+        if self.write_pos + self.buffer.len() as u64 + bytes.len() as u64 > entries_capacity {
             return Err(RedoError::LogFull {
                 used: self.write_pos + self.buffer.len() as u64,
-                capacity: self.log_size,
+                capacity: entries_capacity,
             });
         }
 
         self.buffer.extend_from_slice(&bytes);
+        self.pending_entries.push(entry);
+        self.next_sequence += 1;
         if let Some(m) = redo_metrics() {
             m.redo_append_total.inc();
             self.buffered_entries += 1;
@@ -1094,38 +1761,54 @@ impl RedoLog {
     }
 
     /// Flush the buffer to device, making all appended entries durable.
+    ///
+    /// F-G4-004: writes are append-only at aligned offsets — the buffer
+    /// is padded to the next alignment boundary in-memory, so there is
+    /// no read-modify-write of the trailing partial block. After the
+    /// entries pwrite the header is rewritten with the new
+    /// `next_sequence` so the value survives a restart even when the
+    /// entries region is later compacted to empty (F-G4-001).
+    ///
+    /// F-G4-002: any I/O error here poisons the log; the in-memory
+    /// buffer is dropped before returning so a retry by a different
+    /// thread cannot accidentally re-flush the same bytes.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn flush(&mut self) -> Result<()> {
+        if self.poisoned {
+            return Err(RedoError::Poisoned);
+        }
         if self.buffer.is_empty() {
             return Ok(());
         }
 
         let align = self.device.alignment();
-        let device_offset = self.log_offset + self.write_pos;
-        let aligned_offset = device_offset / align as u64 * align as u64;
+        let align_u64 = align as u64;
+        let entries_region_off = self.entries_region_offset();
+        let device_offset = entries_region_off + self.write_pos;
+        // Append-only: writes start at an aligned offset. New flushes
+        // always keep `write_pos` block-aligned (see end of function),
+        // so `intra` is normally 0; the partial-block branch is taken
+        // only if a previous run left a non-aligned tail.
+        let aligned_offset = device_offset / align_u64 * align_u64;
         let intra = (device_offset - aligned_offset) as usize;
         let total = intra + self.buffer.len();
+        // Round up to alignment, padding with zeros — the
+        // sequence-monotonicity scan stops at the first length=0 word,
+        // so trailing zero bytes are the natural end-of-data sentinel.
         let aligned_total = total.div_ceil(align) * align;
 
         let mut buf = AlignedBuf::new(aligned_total, align);
-
-        // Read existing data if we're not block-aligned
-        if intra > 0 || !total.is_multiple_of(align) {
-            let read_len =
-                aligned_total.min((self.log_size - (aligned_offset - self.log_offset)) as usize);
-            let read_aligned = read_len.div_ceil(align) * align;
-            if read_aligned <= buf.len() {
-                // A pre-write read-modify-write read failure on the redo
-                // log tail is not fatal here: this branch only runs when
-                // the write straddles a partial block, and any bytes the
-                // device returns are immediately overwritten by the new
-                // entry below. We swallow the error (matching previous
-                // behaviour) but use the exact-read helper so that on
-                // success we are guaranteed a complete block of context.
-                let _ = self
-                    .device
-                    .pread_exact_at(&mut buf[..read_aligned], aligned_offset);
-            }
+        if intra > 0 {
+            // F-G4-004: read back only the leading partial block — not
+            // the entire aligned_total. Trailing bytes past our buffer
+            // remain zero (AlignedBuf::new), so there is no
+            // read-then-rewrite of the tail.
+            self.device
+                .pread_exact_at(&mut buf[..align], aligned_offset)?;
+            // Defensive zero of anything past `intra` that the read
+            // pulled in, so the post-buffer area is a clean tail-zero
+            // sentinel.
+            buf[intra..align].fill(0);
         }
 
         buf[intra..intra + self.buffer.len()].copy_from_slice(&self.buffer);
@@ -1133,6 +1816,7 @@ impl RedoLog {
             if let Some(m) = redo_metrics() {
                 m.redo_flush_errors_total.inc();
             }
+            self.poison_drop_buffer();
             return Err(e.into());
         }
         crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeRedoFsync);
@@ -1147,21 +1831,45 @@ impl RedoLog {
             if let Some(m) = redo_metrics() {
                 m.redo_flush_errors_total.inc();
             }
+            self.poison_drop_buffer();
             return Err(e.into());
         }
         crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterRedoFsync);
 
         let flushed_bytes = self.buffer.len() as u64;
         let flushed_entries = self.buffered_entries;
-        self.write_pos += flushed_bytes;
-        self.flushed_pos = self.write_pos;
+        // F-G4-004: bump write_pos by the aligned amount so subsequent
+        // flushes always start at the next aligned offset.
+        self.write_pos = (aligned_offset + aligned_total as u64) - entries_region_off;
         self.buffer.clear();
+        self.entries_cache.append(&mut self.pending_entries);
         self.buffered_entries = 0;
+
+        // F-G4-001: persist the new `next_sequence` so it survives a
+        // restart after compaction empties the entries region.
+        if let Err(e) = self.write_header() {
+            if let Some(m) = redo_metrics() {
+                m.redo_flush_errors_total.inc();
+            }
+            self.poison_drop_buffer();
+            return Err(e);
+        }
+
         if let Some(m) = redo_metrics() {
             m.redo_bytes_per_flush.record_ns(flushed_bytes);
             m.redo_entries_per_flush.record_ns(flushed_entries);
         }
         Ok(())
+    }
+
+    /// F-G4-002: drop all in-flight buffer + pending state on flush
+    /// failure. Other threads that contributed to `buffer` will see
+    /// `Poisoned` on their next call.
+    fn poison_drop_buffer(&mut self) {
+        self.poisoned = true;
+        self.buffer.clear();
+        self.pending_entries.clear();
+        self.buffered_entries = 0;
     }
 
     /// Append and flush in one call.
@@ -1176,7 +1884,7 @@ impl RedoLog {
     ///
     /// All `ops` are appended to the in-memory buffer in order, then the
     /// buffer is flushed to device. The returned `(first_seq, last_seq)`
-    /// covers the assigned sequence range. Empty `ops` returns `(current, current)`
+    /// covers the assigned sequence range. Empty `ops` returns `(0, 0)`
     /// without flushing.
     ///
     /// Used by two-phase durability for secondary indexes: multiple
@@ -1184,8 +1892,7 @@ impl RedoLog {
     /// into a single fsync before the redb transactions are committed.
     pub fn append_batch_and_flush(&mut self, ops: &[RedoOp]) -> Result<(u64, u64)> {
         if ops.is_empty() {
-            let seq = self.next_sequence;
-            return Ok((seq, seq));
+            return Ok((0, 0));
         }
         let first_seq = self.next_sequence;
         let mut last_seq = first_seq;
@@ -1196,30 +1903,64 @@ impl RedoLog {
         Ok((first_seq, last_seq))
     }
 
-    /// Write a checkpoint marker. All entries before this are committed.
-    pub fn checkpoint(&mut self) -> Result<()> {
+    /// Write and flush a checkpoint marker.
+    ///
+    /// This only records the recovery boundary. It does not reclaim redo-log
+    /// space; callers that have durably snapshotted all state must call
+    /// [`RedoLog::reset`] after this marker to make earlier bytes reusable.
+    pub fn mark_checkpoint(&mut self) -> Result<()> {
         let seq = self.append(RedoOp::Checkpoint)?;
         self.flush()?;
         self.checkpoint_seq = seq;
-        Ok(())
+        // F-G4-001: persist the updated checkpoint_seq in the header.
+        self.write_header()
+    }
+
+    /// Write and flush a recovery-progress marker.
+    ///
+    /// This marker means startup replay safely processed every redo entry
+    /// through `through_sequence`. It does not replace checkpoints and does
+    /// not reclaim bytes; it only bounds repeated recovery work if the
+    /// process crashes again before the next checkpoint can reset the log.
+    pub fn mark_recovery_progress(&mut self, through_sequence: u64) -> Result<()> {
+        self.append(RedoOp::RecoveryProgress { through_sequence })?;
+        self.flush()
     }
 
     /// Read all entries after the last checkpoint (for crash recovery).
     pub fn recover(&self) -> Result<Vec<RedoEntry>> {
         let all = self.scan_all()?;
 
-        // Find last checkpoint
-        let mut checkpoint_idx = None;
+        // F-G4-010: bound `progress_through` against the highest entry
+        // sequence we have actually seen, so a corrupt-but-CRC-valid
+        // `RecoveryProgress` with `through_sequence = u64::MAX` cannot
+        // mask all post-marker entries from replay.
+        let max_seq = all.iter().map(|e| e.sequence).max().unwrap_or(0);
+
+        // Find last checkpoint and any recovery-progress marker after it.
+        let mut start_idx = 0usize;
+        let mut progress_through = 0u64;
         for (i, e) in all.iter().enumerate() {
             if e.op == RedoOp::Checkpoint {
-                checkpoint_idx = Some(i);
+                start_idx = i + 1;
+                progress_through = 0;
+            } else if let RedoOp::RecoveryProgress { through_sequence } = e.op
+                && i >= start_idx
+                && through_sequence > progress_through
+                && through_sequence <= max_seq
+            {
+                progress_through = through_sequence;
             }
         }
 
-        match checkpoint_idx {
-            Some(idx) => Ok(all[idx + 1..].to_vec()),
-            None => Ok(all),
-        }
+        Ok(all[start_idx..]
+            .iter()
+            .filter(|entry| {
+                !matches!(entry.op, RedoOp::RecoveryProgress { .. })
+                    && entry.sequence > progress_through
+            })
+            .cloned()
+            .collect())
     }
 
     /// Read all entries with sequence >= `from_seq` from the log.
@@ -1249,26 +1990,24 @@ impl RedoLog {
         Ok(all.first().map(|e| e.sequence))
     }
 
-    /// Advance the checkpoint, allowing entries before it to be reclaimed.
-    pub fn advance_checkpoint(&mut self, up_to_sequence: u64) -> Result<()> {
-        if up_to_sequence > self.checkpoint_seq {
-            self.checkpoint_seq = up_to_sequence;
-        }
-        Ok(())
-    }
+    // F-G4-003: `advance_checkpoint` was dead code — only mutated an
+    // in-memory `checkpoint_seq` and reclaimed nothing. The live
+    // reclamation path is `compact_prefix_through`. The dead method has
+    // been removed entirely.
 
-    /// Current write position within the log (bytes from start).
+    /// Current write position within the entries region (bytes from
+    /// start of entries region; does NOT include the header block).
     pub fn write_position(&self) -> u64 {
         self.write_pos + self.buffer.len() as u64
     }
 
-    /// Space remaining in the log.
+    /// Space remaining in the entries region.
     pub fn available_space(&self) -> u64 {
-        self.log_size
+        self.entries_region_size()
             .saturating_sub(self.write_pos + self.buffer.len() as u64)
     }
 
-    /// Fraction of the log's capacity currently used (0.0 .. 1.0).
+    /// Fraction of the entries region's capacity currently used (0.0 .. 1.0).
     ///
     /// Used by the background checkpoint task to decide when to roll the
     /// log: when this exceeds the configured threshold the task takes a
@@ -1276,56 +2015,238 @@ impl RedoLog {
     /// marker, and `reset()`s the log so future appends write from offset
     /// 0 again.
     pub fn usage_fraction(&self) -> f64 {
-        if self.log_size == 0 {
+        let cap = self.entries_region_size();
+        if cap == 0 {
             return 1.0;
         }
         let used = self.write_pos + self.buffer.len() as u64;
-        used as f64 / self.log_size as f64
+        used as f64 / cap as f64
     }
 
-    /// Total capacity of the log in bytes.
+    /// Total capacity of the entries region in bytes.
     pub fn capacity(&self) -> u64 {
-        self.log_size
+        self.entries_region_size()
     }
 
     /// Reset the log (after checkpoint + reclaim). Dangerous — only call
     /// when all entries have been checkpointed and applied.
+    ///
+    /// F-G4-013: zero the entire entries region (not just the first
+    /// aligned block) so a stale entry left past the first block from a
+    /// previous run cannot be re-discovered by
+    /// `scan_entries_region_with_tail`. After zeroing, the header is
+    /// rewritten so the persisted `next_sequence` does NOT roll back
+    /// (F-G4-001).
     pub fn reset(&mut self) -> Result<()> {
-        // Zero out the first block to mark end of entries
         let align = self.device.alignment();
-        let buf = AlignedBuf::new(align, align);
-        self.device.pwrite_all_at(&buf, self.log_offset)?;
+        let entries_off = self.entries_region_offset();
+        let entries_size = self.entries_region_size() as usize;
+        // Zero the entire entries region in alignment-sized chunks. For
+        // the typical 64 MiB log this is a one-time cost at checkpoint
+        // cadence; not in the hot append path.
+        const ZERO_CHUNK: usize = 1024 * 1024; // 1 MiB at a time
+        let chunk = ZERO_CHUNK.next_multiple_of(align);
+        let buf = AlignedBuf::new(chunk, align);
+        let mut written = 0usize;
+        while written < entries_size {
+            let remaining = entries_size - written;
+            let this = remaining.min(chunk);
+            let this_aligned = this.div_ceil(align) * align;
+            self.device
+                .pwrite_all_at(&buf[..this_aligned], entries_off + written as u64)?;
+            written += this_aligned;
+        }
+        self.device.sync()?;
         self.write_pos = 0;
-        self.flushed_pos = 0;
         self.buffer.clear();
+        self.entries_cache.clear();
+        self.pending_entries.clear();
         self.buffered_entries = 0;
+        // F-G4-001: persist the new write_pos / next_sequence in the
+        // header — the entries region is empty but `next_sequence` must
+        // not roll back across restarts.
+        self.write_header()
+    }
+
+    /// Reclaim entries whose effects are covered by a durable snapshot.
+    ///
+    /// Unlike [`Self::reset`], this preserves any entries with sequence
+    /// numbers greater than `through_sequence`. That lets checkpointing
+    /// snapshot at a stable fence while concurrent or later writers keep
+    /// their redo ranges available for recovery and replica catch-up.
+    ///
+    /// F-G4-012: after writing the retained entries we also zero the
+    /// aligned block immediately past them so any stale entries from
+    /// before the compaction cannot be re-discovered. The on-disk header
+    /// preserves the high-water `next_sequence` so even an empty
+    /// retained set does not roll back the sequence counter (F-G4-001).
+    pub fn compact_prefix_through(&mut self, through_sequence: u64) -> Result<()> {
+        if self.poisoned {
+            return Err(RedoError::Poisoned);
+        }
+        self.flush()?;
+
+        let mut retained: Vec<RedoEntry> = self
+            .entries_cache
+            .iter()
+            .filter(|entry| entry.sequence > through_sequence)
+            .cloned()
+            .collect();
+        if retained.iter().all(|entry| {
+            matches!(
+                &entry.op,
+                RedoOp::RecoveryProgress {
+                    through_sequence: marker_through,
+                } if *marker_through <= through_sequence
+            )
+        }) {
+            retained.clear();
+        }
+
+        let mut bytes = Vec::new();
+        for entry in &retained {
+            bytes.extend_from_slice(&entry.serialize());
+        }
+
+        let entries_capacity = self.entries_region_size();
+        let required = bytes
+            .len()
+            .checked_add(ENTRY_HEADER_SIZE)
+            .ok_or(RedoError::LogFull {
+                used: u64::MAX,
+                capacity: entries_capacity,
+            })?;
+        if required as u64 > entries_capacity {
+            return Err(RedoError::LogFull {
+                used: required as u64,
+                capacity: entries_capacity,
+            });
+        }
+
+        let align = self.device.alignment();
+        // F-G4-012: write the retained bytes plus one extra aligned
+        // block of zeros so the next scan sees a clean tail-zero
+        // sentinel and does not re-discover stale entries left in the
+        // log region from before compaction.
+        let content_aligned = required.div_ceil(align) * align;
+        let total_with_tail = content_aligned.saturating_add(align);
+        let mut buf = AlignedBuf::new(total_with_tail, align);
+        buf[..bytes.len()].copy_from_slice(&bytes);
+        self.device
+            .pwrite_all_at(&buf, self.entries_region_offset())?;
+        self.device.sync()?;
+
+        // Round the new write_pos UP to the alignment boundary so
+        // subsequent flushes start at an aligned offset — preserves
+        // F-G4-004's append-only invariant.
+        self.write_pos = content_aligned as u64;
+        self.buffer.clear();
+        self.entries_cache = retained;
+        self.pending_entries.clear();
+        self.buffered_entries = 0;
+
+        // F-G4-001: persist next_sequence and checkpoint_seq so an
+        // empty retained set after compaction does not roll back the
+        // sequence counter after a restart.
+        self.write_header()?;
         Ok(())
     }
 
-    /// Scan all valid entries in the log from the beginning.
+    /// Scan all valid entries in the log from the entries cache.
     fn scan_all(&self) -> Result<Vec<RedoEntry>> {
+        Ok(self.entries_cache.clone())
+    }
+
+    /// Scan the entries region from disk in aligned chunks (F-G4-009).
+    ///
+    /// Prior to this fix the scan allocated `log_size` bytes up-front
+    /// (default 64 MiB; configurable to GiB). Now we read in
+    /// `SCAN_CHUNK_BYTES` slices, carrying over any trailing partial
+    /// entry between chunks. Memory footprint at startup is bounded at
+    /// `SCAN_CHUNK_BYTES + entries.size_of` instead of `log_size +
+    /// entries.size_of`.
+    fn scan_entries_region_with_tail(&self) -> Result<(Vec<RedoEntry>, u64)> {
+        // 4 MiB working buffer (alignment-rounded). Tunable.
+        const SCAN_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
         let align = self.device.alignment();
-        let read_size = self.log_size as usize;
-        let aligned_read = read_size.div_ceil(align) * align;
+        let entries_off = self.entries_region_offset();
+        let entries_size = self.entries_region_size();
+        let total_to_read = entries_size as usize;
+        let chunk = SCAN_CHUNK_BYTES.next_multiple_of(align).max(align);
 
-        let mut buf = AlignedBuf::new(aligned_read, align);
-        self.device.pread_exact_at(&mut buf, self.log_offset)?;
-
-        let data = &buf[..read_size];
         let mut entries = Vec::new();
-        let mut pos = 0;
+        let mut prev_seq: Option<u64> = None;
+        // Bytes pending from the previous chunk (partial trailing entry).
+        let mut carry: Vec<u8> = Vec::new();
+        // Total bytes consumed within the entries region.
+        let mut consumed_in_region: u64 = 0;
+        let mut scan_start: u64 = 0;
 
-        while pos < data.len() {
-            match RedoEntry::deserialize(&data[pos..]) {
-                Some((entry, consumed)) => {
-                    entries.push(entry);
-                    pos += consumed;
+        while scan_start < total_to_read as u64 {
+            let remaining = total_to_read as u64 - scan_start;
+            let this_read = remaining.min(chunk as u64) as usize;
+            let aligned_read = this_read.div_ceil(align) * align;
+            let mut buf = AlignedBuf::new(aligned_read, align);
+            self.device
+                .pread_exact_at(&mut buf, entries_off + scan_start)?;
+            let chunk_slice = &buf[..this_read];
+
+            // Concatenate any partial-entry carry from the previous
+            // chunk with this chunk's bytes. The carry is bounded by
+            // the max entry size, not by total scan size.
+            let combined: Vec<u8> = if carry.is_empty() {
+                chunk_slice.to_vec()
+            } else {
+                let mut v = std::mem::take(&mut carry);
+                v.extend_from_slice(chunk_slice);
+                v
+            };
+
+            // Drain whole entries from `combined`.
+            let mut local_pos = 0usize;
+            let mut stop_scan = false;
+            loop {
+                match RedoEntry::deserialize(&combined[local_pos..]) {
+                    Some((entry, consumed_entry)) => {
+                        if let Some(prev) = prev_seq
+                            && prev.checked_add(1) != Some(entry.sequence)
+                        {
+                            return Err(RedoError::SequenceOutOfOrder {
+                                offset: consumed_in_region + local_pos as u64,
+                                previous: prev,
+                                current: entry.sequence,
+                            });
+                        }
+                        prev_seq = Some(entry.sequence);
+                        entries.push(entry);
+                        local_pos += consumed_entry;
+                    }
+                    None => {
+                        // Distinguish "end-of-data marker" (length=0)
+                        // from "partial entry split across chunks".
+                        if combined[local_pos..].len() >= ENTRY_HEADER_SIZE {
+                            let lw = u32::from_le_bytes(
+                                combined[local_pos..local_pos + 4].try_into().unwrap(),
+                            );
+                            if lw == 0 {
+                                stop_scan = true;
+                                break;
+                            }
+                        }
+                        // Partial entry: defer to next chunk.
+                        carry = combined[local_pos..].to_vec();
+                        break;
+                    }
                 }
-                None => break,
             }
+            consumed_in_region += local_pos as u64;
+            if stop_scan {
+                return Ok((entries, consumed_in_region));
+            }
+            scan_start += this_read as u64;
         }
-
-        Ok(entries)
+        Ok((entries, consumed_in_region))
     }
 }
 
@@ -1336,7 +2257,53 @@ impl RedoLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::MemoryDevice;
+    use crate::device::{DeviceError, MemoryDevice};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct ReadFailingDevice {
+        inner: Arc<MemoryDevice>,
+        fail_reads: AtomicBool,
+    }
+
+    impl ReadFailingDevice {
+        fn new(size: u64) -> Self {
+            Self {
+                inner: Arc::new(MemoryDevice::new(size, 4096).unwrap()),
+                fail_reads: AtomicBool::new(false),
+            }
+        }
+
+        fn fail_reads(&self) {
+            self.fail_reads.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl BlockDevice for ReadFailingDevice {
+        fn pread(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            if self.fail_reads.load(Ordering::SeqCst) {
+                return Err(DeviceError::Io(std::io::Error::other(
+                    "simulated redo pread failure",
+                )));
+            }
+            self.inner.pread(buf, offset)
+        }
+
+        fn pwrite(&self, buf: &[u8], offset: u64) -> crate::device::Result<usize> {
+            self.inner.pwrite(buf, offset)
+        }
+
+        fn alignment(&self) -> usize {
+            self.inner.alignment()
+        }
+
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn sync(&self) -> crate::device::Result<()> {
+            self.inner.sync()
+        }
+    }
 
     fn make_log(size: u64) -> (Arc<MemoryDevice>, RedoLog) {
         let dev = Arc::new(MemoryDevice::new(size, 4096).unwrap());
@@ -1410,6 +2377,23 @@ mod tests {
     }
 
     #[test]
+    fn redo_flush_rmw_read_failure() {
+        let dev = Arc::new(ReadFailingDevice::new(1024 * 1024));
+        let mut log = RedoLog::open(dev.clone(), 0, 1024 * 1024).unwrap();
+        log.append(RedoOp::Freeze {
+            tx_key: test_key(9),
+            offset: 1,
+        })
+        .unwrap();
+
+        dev.fail_reads();
+        let err = log
+            .flush()
+            .expect_err("partial-block RMW read failure must abort redo flush");
+        assert!(matches!(err, RedoError::Io(_)), "unexpected error: {err:?}");
+    }
+
+    #[test]
     fn append_100_flush_recover_all() {
         let (_, mut log) = make_log(1024 * 1024);
         for i in 0..100u8 {
@@ -1445,28 +2429,28 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_clears_entries() {
+    fn mark_checkpoint_clears_recovery_entries() {
         let (_, mut log) = make_log(1024 * 1024);
         log.append_and_flush(RedoOp::Freeze {
             tx_key: test_key(1),
             offset: 0,
         })
         .unwrap();
-        log.checkpoint().unwrap();
+        log.mark_checkpoint().unwrap();
 
         let entries = log.recover().unwrap();
         assert!(entries.is_empty());
     }
 
     #[test]
-    fn checkpoint_only_returns_after() {
+    fn mark_checkpoint_only_returns_after() {
         let (_, mut log) = make_log(1024 * 1024);
         log.append_and_flush(RedoOp::Freeze {
             tx_key: test_key(1),
             offset: 0,
         })
         .unwrap();
-        log.checkpoint().unwrap();
+        log.mark_checkpoint().unwrap();
         log.append_and_flush(RedoOp::Unfreeze {
             tx_key: test_key(2),
             offset: 1,
@@ -1512,6 +2496,50 @@ mod tests {
         assert!(entries.len() <= 1);
     }
 
+    #[test]
+    fn redo_sequence_monotonicity_validation() {
+        let (dev, mut log) = make_log(1024 * 1024);
+        let first_op = RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        };
+        let second_op = RedoOp::Freeze {
+            tx_key: test_key(2),
+            offset: 1,
+        };
+        log.append_and_flush(first_op.clone()).unwrap();
+        log.append_and_flush(second_op.clone()).unwrap();
+
+        let first_entry = RedoEntry {
+            sequence: 1,
+            op: first_op,
+        }
+        .serialize();
+        let rewritten_second = RedoEntry {
+            sequence: 99,
+            op: second_op,
+        }
+        .serialize();
+        let align = dev.alignment();
+        let mut buf = AlignedBuf::new(align, align);
+        dev.pread(&mut buf, 0).unwrap();
+        let second_offset = first_entry.len();
+        buf[second_offset..second_offset + rewritten_second.len()]
+            .copy_from_slice(&rewritten_second);
+        dev.pwrite(&buf, 0).unwrap();
+
+        match RedoLog::open(dev, 0, 1024 * 1024) {
+            Err(RedoError::SequenceOutOfOrder {
+                previous, current, ..
+            }) => {
+                assert_eq!(previous, 1);
+                assert_eq!(current, 99);
+            }
+            Ok(_) => panic!("expected SequenceOutOfOrder, got Ok"),
+            Err(other) => panic!("expected SequenceOutOfOrder, got {other:?}"),
+        }
+    }
+
     // -- Serialization round-trip tests --
 
     #[test]
@@ -1526,6 +2554,7 @@ mod tests {
             RedoOp::Unspend {
                 tx_key: test_key(2),
                 offset: 3,
+                spending_data: Some([0xCD; 36]),
                 new_spent_count: 10,
             },
             RedoOp::SetMined {
@@ -1577,6 +2606,10 @@ mod tests {
                 current_block_height: 500,
                 block_height_retention: 288,
             },
+            RedoOp::AppendConflictingChild {
+                parent_key: test_key(111),
+                child_txid: [0xDD; 32],
+            },
             RedoOp::SetLocked {
                 tx_key: test_key(12),
                 value: false,
@@ -1601,6 +2634,9 @@ mod tests {
                 tx_key: test_key(16),
                 old_height: 100,
                 new_height: 600,
+            },
+            RedoOp::RecoveryProgress {
+                through_sequence: 16,
             },
             RedoOp::Checkpoint,
         ];
@@ -1642,7 +2678,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_then_reset_reclaims_space() {
+    fn mark_checkpoint_then_reset_reclaims_space() {
         let (_, mut log) = make_log(8192);
         // Fill most of the log
         for i in 0..50u8 {
@@ -1653,7 +2689,7 @@ mod tests {
             .unwrap();
         }
         log.flush().unwrap();
-        log.checkpoint().unwrap();
+        log.mark_checkpoint().unwrap();
 
         // Reset reclaims all space
         log.reset().unwrap();
@@ -1666,6 +2702,26 @@ mod tests {
         .unwrap();
         let entries = log.recover().unwrap();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn mark_checkpoint_does_not_reclaim_space() {
+        let (_, mut log) = make_log(1024 * 1024);
+        let initial = log.available_space();
+        log.append_and_flush(RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        })
+        .unwrap();
+        let after_append = log.available_space();
+
+        log.mark_checkpoint().unwrap();
+
+        assert!(
+            log.available_space() < after_append,
+            "mark_checkpoint only writes a marker; reset performs reclamation"
+        );
+        assert!(after_append < initial);
     }
 
     #[test]
@@ -1703,6 +2759,27 @@ mod tests {
     }
 
     #[test]
+    fn redo_repeated_reads_use_entry_cache_after_open() {
+        let dev = Arc::new(ReadFailingDevice::new(1024 * 1024));
+        let dev_trait: Arc<dyn BlockDevice> = dev.clone();
+        let mut log = RedoLog::open(dev_trait, 0, 1024 * 1024).unwrap();
+        let op = RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        };
+        log.append_and_flush(op.clone()).unwrap();
+
+        // If recover/read_from_sequence/earliest_sequence rescan the device,
+        // this flag makes them fail. They should use the in-memory entry
+        // cache populated by open() plus successful flushes.
+        dev.fail_reads();
+
+        assert_eq!(log.earliest_sequence().unwrap(), Some(1));
+        assert_eq!(log.read_from_sequence(1).unwrap()[0].op, op);
+        assert_eq!(log.recover().unwrap().len(), 1);
+    }
+
+    #[test]
     fn reopen_after_checkpoint() {
         let (dev, mut log) = make_log(1024 * 1024);
         log.append_and_flush(RedoOp::Freeze {
@@ -1710,7 +2787,7 @@ mod tests {
             offset: 0,
         })
         .unwrap();
-        log.checkpoint().unwrap();
+        log.mark_checkpoint().unwrap();
         log.append_and_flush(RedoOp::Freeze {
             tx_key: test_key(2),
             offset: 1,
@@ -1757,6 +2834,50 @@ mod tests {
     }
 
     #[test]
+    fn open_resumes_append_after_last_valid_entry_when_final_entry_is_partial() {
+        let (dev, mut log) = make_log(1024 * 1024);
+        let first = RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        };
+        let second = RedoOp::Freeze {
+            tx_key: test_key(2),
+            offset: 1,
+        };
+        let third = RedoOp::Freeze {
+            tx_key: test_key(3),
+            offset: 2,
+        };
+
+        log.append_and_flush(first.clone()).unwrap();
+        let first_tail = log.write_position();
+        log.append_and_flush(second).unwrap();
+        drop(log);
+
+        let align = dev.alignment();
+        let mut buf = AlignedBuf::new(align, align);
+        dev.pread(&mut buf, 0).unwrap();
+        buf[first_tail as usize + 20] ^= 0xFF;
+        dev.pwrite(&buf, 0).unwrap();
+
+        let mut reopened = RedoLog::open(dev.clone(), 0, 1024 * 1024).unwrap();
+        assert_eq!(
+            reopened.write_position(),
+            first_tail,
+            "open must resume after the last fully valid entry",
+        );
+        assert_eq!(reopened.current_sequence(), 2);
+
+        reopened.append_and_flush(third.clone()).unwrap();
+        let entries = reopened.recover().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].op, first);
+        assert_eq!(entries[1].op, third);
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 2);
+    }
+
+    #[test]
     fn rapid_checkpoint_append_cycles() {
         let (_, mut log) = make_log(1024 * 1024);
 
@@ -1769,7 +2890,7 @@ mod tests {
                 .unwrap();
             }
             log.flush().unwrap();
-            log.checkpoint().unwrap();
+            log.mark_checkpoint().unwrap();
 
             // Verify only entries after the most recent checkpoint are returned
             let entries = log.recover().unwrap();
@@ -1887,11 +3008,40 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_spend_v2() {
+        assert_round_trip(RedoOp::SpendV2 {
+            tx_key: make_txid(0xA2),
+            offset: 42,
+            spending_data: [0x5A; 36],
+            new_spent_count: 17,
+            current_block_height: 800_000,
+            block_height_retention: 288,
+            target_generation: 12,
+            updated_at: 123_456_789,
+        });
+    }
+
+    #[test]
     fn round_trip_unspend() {
         assert_round_trip(RedoOp::Unspend {
             tx_key: make_txid(0xB2),
             offset: 99,
+            spending_data: Some([0xBC; 36]),
             new_spent_count: 3,
+        });
+    }
+
+    #[test]
+    fn round_trip_unspend_v2() {
+        assert_round_trip(RedoOp::UnspendV2 {
+            tx_key: make_txid(0xB3),
+            offset: 99,
+            spending_data: [0xBC; 36],
+            new_spent_count: 3,
+            current_block_height: 800_100,
+            block_height_retention: 144,
+            target_generation: 13,
+            updated_at: 987_654_321,
         });
     }
 
@@ -1926,10 +3076,28 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_freeze_v2() {
+        assert_round_trip(RedoOp::FreezeV2 {
+            tx_key: make_txid(0xD6),
+            offset: 8,
+            utxo_hash: [0xAB; 32],
+        });
+    }
+
+    #[test]
     fn round_trip_unfreeze() {
         assert_round_trip(RedoOp::Unfreeze {
             tx_key: make_txid(0xE6),
             offset: 255,
+        });
+    }
+
+    #[test]
+    fn round_trip_unfreeze_v2() {
+        assert_round_trip(RedoOp::UnfreezeV2 {
+            tx_key: make_txid(0xE7),
+            offset: 256,
+            utxo_hash: [0xCD; 32],
         });
     }
 
@@ -2036,6 +3204,14 @@ mod tests {
             value: false,
             current_block_height: 100,
             block_height_retention: 1000,
+        });
+    }
+
+    #[test]
+    fn append_conflicting_child_redo_round_trip() {
+        assert_round_trip(RedoOp::AppendConflictingChild {
+            parent_key: make_txid(0x3D),
+            child_txid: make_txid(0x3E).txid,
         });
     }
 
@@ -2193,6 +3369,25 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_compensate_set_locked() {
+        assert_round_trip(RedoOp::CompensateSetLocked {
+            tx_key: make_txid(0x86),
+            prior_locked: false,
+            prior_delete_at_height: 1288,
+        });
+        assert_round_trip(RedoOp::CompensateSetLocked {
+            tx_key: make_txid(0x87),
+            prior_locked: true,
+            prior_delete_at_height: 0,
+        });
+        assert_round_trip(RedoOp::CompensateSetLocked {
+            tx_key: make_txid(0x88),
+            prior_locked: false,
+            prior_delete_at_height: u32::MAX,
+        });
+    }
+
+    #[test]
     fn append_batch_and_flush_assigns_contiguous_sequences() {
         let (_, mut log) = make_log(1024 * 1024);
         let ops = vec![
@@ -2223,8 +3418,7 @@ mod tests {
     fn append_batch_and_flush_empty_no_flush() {
         let (_, mut log) = make_log(1024 * 1024);
         let (first, last) = log.append_batch_and_flush(&[]).unwrap();
-        assert_eq!(first, 1);
-        assert_eq!(last, 1);
+        assert_eq!((first, last), (0, 0));
         let entries = log.recover().unwrap();
         assert!(entries.is_empty());
     }
@@ -2266,6 +3460,69 @@ mod tests {
         let all = log.scan_all().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].op, RedoOp::Checkpoint);
+    }
+
+    #[test]
+    fn recovery_progress_tracking() {
+        let (_, mut log) = make_log(1024 * 1024);
+        let first = log
+            .append_and_flush(RedoOp::Freeze {
+                tx_key: test_key(1),
+                offset: 0,
+            })
+            .unwrap();
+        log.mark_recovery_progress(first).unwrap();
+        let second = log
+            .append_and_flush(RedoOp::Unfreeze {
+                tx_key: test_key(1),
+                offset: 0,
+            })
+            .unwrap();
+
+        let entries = log.recover().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sequence, second);
+        assert!(matches!(entries[0].op, RedoOp::Unfreeze { .. }));
+    }
+
+    #[test]
+    fn compact_prefix_through_preserves_post_fence_entries() {
+        let (dev, mut log) = make_log(1024 * 1024);
+        let first = log
+            .append_and_flush(RedoOp::Freeze {
+                tx_key: test_key(1),
+                offset: 0,
+            })
+            .unwrap();
+        let second = log
+            .append_and_flush(RedoOp::Unfreeze {
+                tx_key: test_key(1),
+                offset: 0,
+            })
+            .unwrap();
+        let third = log
+            .append_and_flush(RedoOp::Freeze {
+                tx_key: test_key(2),
+                offset: 0,
+            })
+            .unwrap();
+
+        log.mark_recovery_progress(second).unwrap();
+        log.compact_prefix_through(second).unwrap();
+
+        let entries = log.recover().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sequence, third);
+        assert!(matches!(entries[0].op, RedoOp::Freeze { .. }));
+        assert!(log.write_position() < 4096);
+        assert!(first < second && second < third);
+
+        drop(log);
+        let reopened = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
+        let entries = reopened.recover().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sequence, third);
+        assert!(matches!(entries[0].op, RedoOp::Freeze { .. }));
     }
 
     // -----------------------------------------------------------------------
@@ -2364,6 +3621,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn redo_append_failure_sequence_gap() {
+        let (_, mut log) = make_log(4096);
+        loop {
+            match log.append(RedoOp::Freeze {
+                tx_key: test_key(1),
+                offset: 1,
+            }) {
+                Ok(_) => {}
+                Err(RedoError::LogFull { .. }) => break,
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+
+        let next_after_first_failure = log.next_sequence;
+        let second = log.append(RedoOp::Freeze {
+            tx_key: test_key(2),
+            offset: 2,
+        });
+        assert!(matches!(second, Err(RedoError::LogFull { .. })));
+        assert_eq!(
+            log.next_sequence, next_after_first_failure,
+            "failed append must not consume a sequence number"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Corrupted entry recovery: entries before corruption are returned
     // -----------------------------------------------------------------------
@@ -2431,7 +3714,7 @@ mod tests {
             log.append(op.clone()).unwrap();
         }
         log.flush().unwrap();
-        log.checkpoint().unwrap();
+        log.mark_checkpoint().unwrap();
 
         // Append 2 post-checkpoint ops
         let post_ops = vec![

@@ -31,21 +31,71 @@ use teraslab::server::Server;
 use teraslab::server::dispatch::{SecondaryStatus, set_secondary_status};
 use teraslab::server::http::{HttpState, start_http_server};
 use teraslab::server::startup::{
-    SecondaryLoadOutcome, check_replay_tolerance, fallback_dah_index, fallback_unmined_index,
-    load_primary_index_file_backed, load_primary_index_in_memory, load_primary_index_redb,
-    open_mandatory_redo_log, rebuild_in_memory_secondaries, secondaries_from_pair,
+    SecondaryLoadOutcome, check_replay_tolerance_with_cap, fallback_dah_index,
+    fallback_unmined_index, load_primary_index_file_backed, load_primary_index_in_memory,
+    load_primary_index_redb, open_mandatory_redo_log, rebuild_in_memory_secondaries,
+    secondaries_from_pair,
 };
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
 
-/// Detect the first non-loopback IPv4 address on this host.
-/// Used when `listen_addr` is `0.0.0.0` and no `advertise_addr` is configured,
-/// so the node can advertise a reachable IP to cluster peers.
+/// Walk local interfaces via `getifaddrs(3)` and return the first
+/// non-loopback IPv4 address. Used as a best-effort fallback when
+/// `listen_addr = 0.0.0.0` and the operator did not configure
+/// `advertise_addr`; if no usable interface is found (or the call fails) the
+/// caller refuses to start rather than guessing.
+///
+/// Pre-fix this function connected a UDP socket to `8.8.8.8:53` to discover
+/// the default-route interface. Two problems:
+///
+/// 1. The kernel route lookup touches Google's public IP, which trips egress
+///    monitoring / DLP in audited / air-gapped environments — surprising in
+///    a self-hosted UTXO database.
+/// 2. In clusters where `8.8.8.8` is unroutable, the function returned
+///    `None`, the binary then fell back to `bind_addr.ip()` (= `0.0.0.0`),
+///    and `0.0.0.0` was advertised to other nodes — silently breaking SWIM
+///    convergence in a non-obvious way.
+///
+/// The new behaviour iterates the interface list directly
+/// (`libc::getifaddrs`) and returns only IPv4 addresses that are not
+/// loopback. The caller logs and exits when this returns `None`, so the
+/// operator sees a clear "set advertise_addr" message at startup instead of
+/// silent misconfiguration.
+///
+/// See F-G10-008 in the audit.
 fn detect_local_ip() -> Option<std::net::IpAddr> {
-    // Connect a UDP socket to a public IP to discover our default route address.
-    // No traffic is sent — this just causes the OS to select the outgoing interface.
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:53").ok()?;
-    socket.local_addr().ok().map(|a| a.ip())
+    use std::net::{IpAddr, Ipv4Addr};
+    // SAFETY: libc::getifaddrs returns a heap-allocated linked list that we
+    // own; we walk the list reading scalar fields out of repr-C structs and
+    // free it via libc::freeifaddrs when done. No raw pointers escape this
+    // function. The `unsafe` is isolated to this helper.
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 || ifap.is_null() {
+            return None;
+        }
+        let mut chosen: Option<IpAddr> = None;
+        let mut cursor = ifap;
+        while !cursor.is_null() {
+            let entry = &*cursor;
+            if !entry.ifa_addr.is_null() {
+                let family = (*entry.ifa_addr).sa_family as i32;
+                if family == libc::AF_INET {
+                    let sin = &*(entry.ifa_addr as *const libc::sockaddr_in);
+                    // `s_addr` is in network byte order on every supported
+                    // platform; from_be lifts that into the host order
+                    // `Ipv4Addr::from(u32)` expects.
+                    let addr = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                    if !addr.is_loopback() && !addr.is_unspecified() {
+                        chosen = Some(IpAddr::V4(addr));
+                        break;
+                    }
+                }
+            }
+            cursor = entry.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+        chosen
+    }
 }
 
 /// Global metrics counters for the server binary.
@@ -77,6 +127,12 @@ fn main() {
     // subscriber (OTLP endpoint, sampling ratio, service name).
     let args: Vec<String> = std::env::args().collect();
 
+    // F-X-001 / F-G10 strict_auth: presence of `--strict-auth` anywhere in
+    // the args promotes the multi-node-without-secret WARN to a hard
+    // refuse. This is the hard-mode toggle for the trusted-overlay
+    // deployment model documented in `docs/DEPLOYMENT_ASSUMPTIONS.md`.
+    let strict_auth_cli = args.iter().any(|a| a == "--strict-auth");
+
     let mut config = if args.len() > 1 && args[1] == "--config" {
         if args.len() < 3 {
             // CLI usage message goes to stderr before the subscriber is
@@ -84,7 +140,9 @@ fn main() {
             // operators always see it on bad invocation.
             #[allow(clippy::disallowed_macros)]
             {
-                eprintln!("Usage: teraslab-server --config <path.toml>");
+                eprintln!(
+                    "Usage: teraslab-server --config <path.toml> [--strict-auth]"
+                );
             }
             std::process::exit(1);
         }
@@ -101,6 +159,12 @@ fn main() {
         // line until we have a real subscriber a few lines below.
         ServerConfig::default()
     };
+    // CLI flag wins over TOML (matches the rest of the env/CLI override
+    // chain). TOML `strict_auth = true` still applies when `--strict-auth`
+    // is absent.
+    if strict_auth_cli {
+        config.strict_auth = true;
+    }
     let used_defaults = !(args.len() > 1 && args[1] == "--config");
 
     // Apply TERASLAB_* env overrides on top of TOML values. If env vars
@@ -174,6 +238,37 @@ fn main() {
         device_size_mib = config.device_size / (1024 * 1024),
         "TeraSlab server starting",
     );
+
+    // F-X-001: trusted-overlay deployment model — when the cluster is
+    // multi-node (RF>1 OR node_id>0) AND no `cluster_secret` is
+    // configured, the wire protocol authenticates nothing. Single-node
+    // demos rely on this fail-open default; production clusters running
+    // on a private network are expected to set a secret. Emit a prominent
+    // boot-time warning under the `teraslab::security` target so
+    // operators always see the missing-secret state in the audit trail.
+    //
+    // `validate_safe_defaults` already converted the same condition into
+    // a hard error when `strict_auth = true` (or `--strict-auth` on the
+    // CLI). See `docs/DEPLOYMENT_ASSUMPTIONS.md` for the full rationale.
+    let multi_node = config.node_id > 0 || config.replication_factor > 1;
+    let cluster_secret_missing = config
+        .cluster_secret
+        .as_ref()
+        .map(|s| s.is_empty())
+        .unwrap_or(true);
+    if multi_node && cluster_secret_missing && !config.strict_auth {
+        tracing::warn!(
+            target: "teraslab::security",
+            node_id = config.node_id,
+            replication_factor = config.replication_factor,
+            "cluster is multi-node but no cluster_secret is configured: inter-node SWIM, \
+             topology, replication, and migration frames will be ACCEPTED UNAUTHENTICATED. \
+             This is the documented trusted-overlay default (see \
+             docs/DEPLOYMENT_ASSUMPTIONS.md). For hard-mode production deployments set \
+             `strict_auth = true` in TOML or pass `--strict-auth` on the daemon CLI to \
+             refuse startup in this state.",
+        );
+    }
 
     // 1. Open device
     let device_path = &config.device_paths[0];
@@ -458,7 +553,11 @@ fn main() {
 
     tracing::info!(
         entries = index.len(),
-        load_factor = index.stats().load_factor * 100.0,
+        // F-G10-012: the previous field name `load_factor` was a labelling
+        // bug — the value already multiplies the unitless 0..1 ratio by
+        // 100, so it's a percentage. Renamed to `load_factor_pct` so
+        // dashboards / alerts read the right unit.
+        load_factor_pct = index.stats().load_factor * 100.0,
         "index loaded",
     );
     tracing::info!(entries = dah_index.len(), "DAH index loaded");
@@ -496,15 +595,15 @@ fn main() {
     // Keep the device handle alive for the lifetime of the process so
     // any future redo-log replay/extension paths share the same fd.
     let _redo_log_device: Arc<dyn BlockDevice> = redo_log_device;
-    let redo_log: Option<RedoLog> = Some(redo_log);
+    let mut redo_log: Option<RedoLog> = Some(redo_log);
 
     // Construct the blob store up front so recovery can reconcile orphan
     // blobs against the freshly-replayed primary index (R-049). The store is
     // a thin path handle — initialising it does not touch any blob until
     // recovery's `reconcile_blobs_after_recovery` call below.
     let blob_store: Arc<dyn BlobStore> =
-        Arc::new(FileBlobStore::new(Path::new(&config.blobstore_path), 2));
-    tracing::info!(path = %config.blobstore_path, "blobstore configured");
+        Arc::new(FileBlobStore::new(&config.blobstore_path, 2));
+    tracing::info!(path = %config.blobstore_path.display(), "blobstore configured");
 
     // Run recovery if we have a redo log, while indexes are still mutable.
     // Uses `recover_all_with_allocator` so the two-phase secondary
@@ -513,8 +612,9 @@ fn main() {
     // RedoOp::AllocateRegion / FreeRegion entries replay into the rebuilt
     // allocator so freelist mutations between snapshots are not lost.
     let mut allocator = allocator;
-    if let Some(ref redo) = redo_log {
-        match teraslab::recovery::recover_all_with_allocator(
+    let mut pending_conflicting_children = Vec::new();
+    if let Some(ref mut redo) = redo_log {
+        match teraslab::recovery::recover_all_with_allocator_collecting_pending_conflicts_progress(
             &*device,
             redo,
             &mut index,
@@ -522,7 +622,8 @@ fn main() {
             &mut unmined_index,
             Some(&mut allocator),
         ) {
-            Ok(stats) => {
+            Ok((stats, pending)) => {
+                pending_conflicting_children = pending;
                 tracing::info!(
                     replayed = stats.entries_replayed,
                     skipped = stats.entries_skipped,
@@ -541,7 +642,10 @@ fn main() {
                 // Any I/O / corrupt-entry / logic-error failure is fatal
                 // regardless of count: those are storage-level corruption
                 // signals that must not be papered over.
-                if let Err(msg) = check_replay_tolerance(&stats) {
+                if let Err(msg) = check_replay_tolerance_with_cap(
+                    &stats,
+                    config.recovery_missing_primary_tolerance,
+                ) {
                     tracing::error!(
                         failed_missing_primary = stats.failed_missing_primary,
                         failed_io = stats.failed_io,
@@ -617,6 +721,40 @@ fn main() {
         unmined_index,
     );
 
+    // Drain R-221 engine-level append intents after constructing the engine
+    // but before attaching the engine redo handle. The allocator already has
+    // redo attached above, so replacement child-list block allocations remain
+    // journaled; the original AppendConflictingChild intent remains in the
+    // log until checkpoint, so writing a duplicate high-level intent here is
+    // unnecessary.
+    //
+    // F-G10-015: `Engine::append_conflicting_child` is idempotent for the
+    // (parent, child) pair — recovery may surface a draining-intent for a
+    // child the redo replay already applied to the index. The engine
+    // tolerates the redundant call by short-circuiting when the child is
+    // already present in the parent's list. Until G2 surfaces a public
+    // `has_conflicting_child` accessor we rely on that engine-side check;
+    // the orchestrator should follow up to expose the accessor so this
+    // loop can pre-filter (audit follow-up FUP-G10-015).
+    if !pending_conflicting_children.is_empty() {
+        for pending in &pending_conflicting_children {
+            if let Err(e) = engine.append_conflicting_child(&pending.parent_key, pending.child_txid)
+            {
+                tracing::error!(
+                    parent_key = ?pending.parent_key,
+                    child_txid = ?pending.child_txid,
+                    err = %e,
+                    "recovery: failed to drain conflicting-child append intent; aborting startup",
+                );
+                std::process::exit(1);
+            }
+        }
+        tracing::info!(
+            drained = pending_conflicting_children.len(),
+            "recovery: drained pending conflicting-child append intents",
+        );
+    }
+
     // Attach the redo log so the engine performs two-phase durability for
     // secondary index updates (redo fsync BEFORE redb commit).
     if let Some(ref log) = redo_log {
@@ -632,19 +770,50 @@ fn main() {
 
     // 5. Start cluster if configured
     let cluster = if config.is_clustered() {
-        use teraslab::cluster::coordinator::{ClusterConfig, ClusterCoordinator};
+        use teraslab::cluster::coordinator::{
+            ClusterConfig, ClusterCoordinator, ReplicationRuntimeConfig,
+        };
         use teraslab::cluster::shards::NodeId;
 
-        let bind_addr: std::net::SocketAddr =
-            config.listen_addr.parse().expect("invalid listen_addr");
+        // `validate_safe_defaults` already parsed both `listen_addr` and
+        // `advertise_addr` (when set) — F-G10-013 made `advertise_addr` a
+        // typed config error. The parses here are defensive: if they ever
+        // fail, that's a logic bug between validation and use, not an
+        // operator-fixable issue, so we log and exit rather than panicking.
+        let bind_addr: std::net::SocketAddr = match config.listen_addr.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(addr = %config.listen_addr, err = %e, "FATAL: listen_addr unparseable post-validation");
+                std::process::exit(1);
+            }
+        };
         // Determine the address to advertise to other nodes.
         // If advertise_addr is set, use it. Otherwise, if listen_addr uses
-        // 0.0.0.0 (common in Docker), auto-detect a non-loopback IP.
+        // 0.0.0.0 (common in Docker), detect a non-loopback IP via getifaddrs.
+        // If no advertise address is available we refuse to start: silently
+        // advertising 0.0.0.0 (or guessing 8.8.8.8's route) broke SWIM
+        // convergence in non-obvious ways. See F-G10-008.
         let self_addr: std::net::SocketAddr = if let Some(ref adv) = config.advertise_addr {
-            adv.parse().expect("invalid advertise_addr")
+            match adv.parse() {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::error!(addr = %adv, err = %e, "FATAL: advertise_addr unparseable post-validation");
+                    std::process::exit(1);
+                }
+            }
         } else if bind_addr.ip().is_unspecified() {
-            let ip = detect_local_ip().unwrap_or(bind_addr.ip());
-            std::net::SocketAddr::new(ip, bind_addr.port())
+            match detect_local_ip() {
+                Some(ip) => std::net::SocketAddr::new(ip, bind_addr.port()),
+                None => {
+                    tracing::error!(
+                        listen_addr = %config.listen_addr,
+                        "FATAL: listen_addr is 0.0.0.0 (or ::) but no non-loopback interface was found \
+                         and `advertise_addr` is unset; set `advertise_addr` explicitly so peers can \
+                         reach this node",
+                    );
+                    std::process::exit(1);
+                }
+            }
         } else {
             bind_addr
         };
@@ -669,7 +838,8 @@ fn main() {
 
         let cluster_state_path = config.resolved_cluster_state_path();
         // Load topology state (backward-compatible with old format).
-        let topo_state = teraslab::cluster::coordinator::load_topology_state(&cluster_state_path);
+        let topo_state =
+            teraslab::cluster::coordinator::load_startup_topology_state(&cluster_state_path);
         let initial_peak = topo_state.peak_cluster_size as usize;
         let initial_epoch = topo_state.committed_term;
 
@@ -686,7 +856,9 @@ fn main() {
                 .as_ref()
                 .map(|s| s.as_bytes().to_vec()),
             max_migration_threads: config.max_migration_threads,
-            topology_propose_timeout: probe_interval * 3,
+            topology_propose_timeout: std::time::Duration::from_millis(
+                config.resolved_topology_propose_timeout_ms(),
+            ),
             migration_pool_size: config.migration_pool_size,
             migration_batch_size: config.migration_batch_size,
             persisted_incarnation: topo_state.incarnation,
@@ -712,9 +884,14 @@ fn main() {
             engine.clone(),
             Some(cluster_state_path),
             redo_log.clone(),
-            config.resolved_ack_policy(),
-            config.is_replication_best_effort(),
-            std::time::Duration::from_millis(config.replication_timeout_ms.max(1)),
+            ReplicationRuntimeConfig {
+                ack_policy: config.resolved_ack_policy(),
+                best_effort: config.is_replication_best_effort(),
+                timeout: std::time::Duration::from_millis(config.replication_timeout_ms.max(1)),
+                timeout_during_migration: std::time::Duration::from_millis(
+                    config.replication_timeout_during_migration_ms.max(1),
+                ),
+            },
         );
         // Restore migration state from a previous run so shards that were
         // mid-migration remain blocked (inbound) or tracked (outbound).
@@ -747,6 +924,11 @@ fn main() {
         }
 
         if config.replication_factor > 1 {
+            // Startup barrier: durable pending replication intents must be
+            // resolved before any HTTP or TCP listener is started below. If a
+            // restarted master accepted new writes first, an old local-only
+            // mutation could remain neither replicated nor compensated while
+            // new sequence ranges advance past it.
             let start = std::time::Instant::now();
             loop {
                 match teraslab::server::dispatch::recover_pending_replication_intents(
@@ -836,6 +1018,7 @@ fn main() {
                         last_acked + 1,
                         current_seq,
                         1000,
+                        10_000,
                         &|from_seq| {
                             let rl = match redo_ref.as_ref() {
                                 Some(rl) => rl,
@@ -912,11 +1095,20 @@ fn main() {
 
     // 6. Start HTTP observability server
     let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let http_port: u16 = config
-        .http_listen_addr
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse().ok())
-        .unwrap_or(9100);
+    // F-G10-021: parse the validated `http_listen_addr` and take its port
+    // directly. Pre-fix this fell back to `9100` on parse failure, which
+    // silently misreported the bound port when validation was weakened.
+    let http_port: u16 = match config.http_listen_addr.parse::<std::net::SocketAddr>() {
+        Ok(sa) => sa.port(),
+        Err(e) => {
+            tracing::error!(
+                addr = %config.http_listen_addr,
+                err = %e,
+                "FATAL: http_listen_addr unparseable post-validation",
+            );
+            std::process::exit(1);
+        }
+    };
     let http_state = Arc::new(HttpState {
         engine: engine.clone(),
         metrics: &SERVER_METRICS,
@@ -927,14 +1119,18 @@ fn main() {
         redo_log: redo_log.clone(),
         active_connections: active_connections.clone(),
         http_port,
+        replica_lag_warn_threshold_ops: config.replica_lag_warn_threshold_ops,
     });
     let http_addr = config.http_listen_addr.clone();
     let admin_endpoints_enabled = config.enable_admin_endpoints;
     // R-056: when admin endpoints are on, the bearer token has been validated
     // non-empty by `validate_safe_defaults`. We pass an owned clone into the
     // dedicated HTTP thread; cloning a small `String` is cheap and avoids
-    // sharing mutable state with the rest of the server.
-    let admin_token = config.admin_token.clone();
+    // sharing mutable state with the rest of the server. The unwrap of the
+    // `Secret` newtype is benign: the inner `String` is what
+    // `start_http_server` already consumes, and `Secret` only wraps the
+    // `Debug` impl, not the runtime API.
+    let admin_token = config.admin_token.as_ref().map(|s| s.as_str().to_string());
     std::thread::spawn(move || {
         start_http_server(http_addr, http_state, admin_endpoints_enabled, admin_token);
     });
@@ -950,11 +1146,12 @@ fn main() {
     }
     server = server.with_blob_store(blob_store.clone());
     let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let shutdown_clone = shutdown_flag.clone();
-    ctrlc_handler(move || {
-        tracing::info!("shutdown signal received");
-        shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
-    });
+    // F-G10-002: the bin's `shutdown_flag` only drives the background
+    // tasks (checkpoint / blob_gc / lag_monitor). The `Server::run` accept
+    // loop polls its own private flag — we flip that one via the public
+    // `Server::shutdown()` method from the signal handler below, AFTER we
+    // wrap `Server` in `Arc` so the handler closure can hold a reference.
+    let server = Arc::new(server);
 
     // R-003: spawn the redo-log checkpoint task. Without a periodic
     // snapshot+reset, the redo log fills (~750k mutations at the 64 MiB
@@ -963,15 +1160,42 @@ fn main() {
     // `LogFull`. The task wakes every 100 ms; when usage_fraction
     // crosses 0.5 it takes a snapshot, persists the allocator, writes a
     // checkpoint marker, and resets the log so future appends start
-    // from offset 0.
-    let _checkpoint_handle = redo_log.as_ref().map(|log| {
+    // from offset 0. In replicated mode, the reset is skipped while any
+    // known replica's durable ACK is below the redo floor that reset
+    // would erase.
+    let checkpoint_handle = redo_log.as_ref().map(|log| {
         let cfg = teraslab::checkpoint::CheckpointConfig::new(config.index_snapshot_path.clone());
-        teraslab::checkpoint::spawn_checkpoint_task(
-            cfg,
-            engine.clone(),
-            log.clone(),
-            shutdown_flag.clone(),
-        )
+        if let Some(tracker) = teraslab::server::dispatch::ack_tracker_handle() {
+            let reset_guard: std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync + 'static> =
+                std::sync::Arc::new(move |floor_sequence| {
+                    let all = tracker.all_acked();
+                    let min_acked = all.values().copied().min().unwrap_or(floor_sequence);
+                    let can_reset = min_acked >= floor_sequence;
+                    if !can_reset {
+                        tracing::warn!(
+                            floor_sequence,
+                            min_acked,
+                            replicas = all.len(),
+                            "checkpoint reset deferred until replicas catch up",
+                        );
+                    }
+                    can_reset
+                });
+            teraslab::checkpoint::spawn_checkpoint_task_with_reset_guard(
+                cfg,
+                engine.clone(),
+                log.clone(),
+                shutdown_flag.clone(),
+                reset_guard,
+            )
+        } else {
+            teraslab::checkpoint::spawn_checkpoint_task(
+                cfg,
+                engine.clone(),
+                log.clone(),
+                shutdown_flag.clone(),
+            )
+        }
     });
 
     // R-049: spawn the periodic orphan-blob GC sweep. Recovery already
@@ -981,7 +1205,7 @@ fn main() {
     // aborted streaming uploads, migrations cancelled mid-flight). The
     // tick interval defaults to one hour and can be set to 0 to disable
     // the periodic sweep entirely (recovery-time reconciliation still runs).
-    let _blob_gc_handle: Option<std::thread::JoinHandle<()>> = if config.blob_gc_interval_secs > 0 {
+    let blob_gc_handle: Option<std::thread::JoinHandle<()>> = if config.blob_gc_interval_secs > 0 {
         let cfg = teraslab::storage::blob_gc::BlobGcConfig::new(config.blob_gc_interval_secs);
         Some(teraslab::storage::blob_gc::spawn_blob_gc_task(
             cfg,
@@ -1004,23 +1228,16 @@ fn main() {
     // production code path ever called it. The lag monitor periodically
     // compares the master's current redo sequence against each replica's
     // last-acked sequence and emits `tracing::warn!` when the gap exceeds
-    // `warn_threshold` ops. A Prometheus gauge for the lag is captured as
-    // a follow-up (R-222) — for now the warn lines surface stuck replicas
-    // through the normal log-aggregation pipeline.
-    let _lag_monitor_handle: Option<std::thread::JoinHandle<()>> =
+    // `replica_lag_warn_threshold_ops`. `/metrics` exposes the same lag as
+    // a bounded-cardinality gauge, and `/health/ready` uses the threshold to
+    // let load balancers drain lagging leaders.
+    let lag_monitor_handle: Option<std::thread::JoinHandle<()>> =
         if config.replication_factor > 1 && config.replica_lag_check_interval_secs > 0 {
             match (
                 teraslab::server::dispatch::ack_tracker_handle(),
                 redo_log.clone(),
             ) {
                 (Some(tracker), Some(redo)) => {
-                    // 10_000 ops ~= a few seconds of full-throughput at
-                    // production rates. Conservative enough to avoid
-                    // false alarms during routine spikes; tight enough
-                    // that a genuinely stuck replica is flagged within
-                    // the first lag-check interval. Hard-coded for now;
-                    // a config knob is captured as part of R-222.
-                    let warn_threshold: u64 = 10_000;
                     let current_seq_fn: std::sync::Arc<dyn Fn() -> u64 + Send + Sync> = {
                         let redo = redo.clone();
                         std::sync::Arc::new(move || redo.lock().current_sequence())
@@ -1030,7 +1247,7 @@ fn main() {
                         current_seq_fn,
                         shutdown_flag.clone(),
                         config.replica_lag_check_interval_secs,
-                        warn_threshold,
+                        config.replica_lag_warn_threshold_ops,
                     ))
                 }
                 _ => {
@@ -1046,18 +1263,48 @@ fn main() {
             None
         };
 
-    let server = ServerWithShutdown {
-        inner: server,
-        shutdown: shutdown_flag,
+    let app = ServerWithShutdown {
+        inner: server.clone(),
+        shutdown: shutdown_flag.clone(),
         engine,
         snap_path: config.index_snapshot_path.clone(),
         device,
         cluster,
         otlp_provider,
+        // F-G10-003: hold the redo log so we can flush it on shutdown
+        // before `device.sync()`. Defense-in-depth: per-op fsync is the
+        // primary durability guarantee; this just ensures any tail buffer
+        // is on disk before we tear down.
+        redo_log: redo_log.clone(),
+        // F-G10-022: take ownership of background-thread join handles so
+        // `run()` can join them after the shutdown flag is set but before
+        // `device.sync()`. Pre-fix these were `_`-prefixed bindings that
+        // dropped at end-of-scope, leaving threads potentially mid-fsync
+        // while the foreground unwind raced ahead.
+        checkpoint_handle: Mutex::new(checkpoint_handle),
+        blob_gc_handle: Mutex::new(blob_gc_handle),
+        lag_monitor_handle: Mutex::new(lag_monitor_handle),
     };
 
+    // F-G10-001 + F-G10-002: install the SIGINT/SIGTERM handler now. The
+    // handler closure flips BOTH atomics: the bin's `shutdown_flag` drives
+    // the background tasks (checkpoint / blob_gc / lag_monitor), and the
+    // public `Server::shutdown()` flips the accept-loop flag that
+    // `Server::run` polls. Pre-fix only the former was wired and the
+    // latter atomic was internal to `Server::new`, so no signal could ever
+    // exit the accept loop.
+    {
+        let shutdown_clone = shutdown_flag.clone();
+        let server_inner = server.clone();
+        ctrlc_handler(move || {
+            tracing::info!("shutdown signal received");
+            shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+            server_inner.shutdown();
+        });
+    }
+
     // 7. Start serving
-    if let Err(e) = server.run() {
+    if let Err(e) = app.run() {
         tracing::error!(err = %e, "server error");
         std::process::exit(1);
     }
@@ -1066,8 +1313,7 @@ fn main() {
 }
 
 struct ServerWithShutdown {
-    inner: Server,
-    #[allow(dead_code)]
+    inner: Arc<Server>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     engine: Arc<Engine>,
     snap_path: PathBuf,
@@ -1076,11 +1322,48 @@ struct ServerWithShutdown {
     /// OTLP provider, present when `[observability].otlp_endpoint` was
     /// configured. Flushed with a 5 s timeout on graceful shutdown.
     otlp_provider: Option<teraslab::observability::OtelTracerProvider>,
+    /// Redo log handle, held so `run()` can flush it on shutdown ahead of
+    /// `device.sync()`. See F-G10-003.
+    redo_log: Option<Arc<Mutex<RedoLog>>>,
+    /// Join handle for the redo-log checkpoint thread. See F-G10-022.
+    checkpoint_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Join handle for the periodic blob-GC sweep thread. See F-G10-022.
+    blob_gc_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Join handle for the replica-lag monitor thread. See F-G10-022.
+    lag_monitor_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl ServerWithShutdown {
     fn run(&self) -> Result<(), String> {
         let result = self.inner.run();
+
+        // Mirror the signal-handler's flag flip in case `Server::run`
+        // returned for another reason (a bind error, a test that called
+        // `shutdown()` directly). Background threads exit on their next
+        // poll once the flag is true.
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // F-G10-022: join background tasks before persistence. Each
+        // observes the shutdown flag on its poll loop (typically ≤100 ms)
+        // and exits. We bound the wait so a stuck thread cannot pin the
+        // daemon forever — falling through and running persistence is
+        // safer than blocking forever on shutdown.
+        Self::join_with_timeout(
+            "checkpoint",
+            self.checkpoint_handle.lock().take(),
+            std::time::Duration::from_secs(5),
+        );
+        Self::join_with_timeout(
+            "blob_gc",
+            self.blob_gc_handle.lock().take(),
+            std::time::Duration::from_secs(5),
+        );
+        Self::join_with_timeout(
+            "lag_monitor",
+            self.lag_monitor_handle.lock().take(),
+            std::time::Duration::from_secs(5),
+        );
 
         // On shutdown: stop cluster, sync device
         if let Some(ref cluster) = self.cluster {
@@ -1102,6 +1385,22 @@ impl ServerWithShutdown {
             Err(e) => tracing::warn!(err = %e, "allocator persist failed"),
         }
 
+        match teraslab::server::dispatch::flush_replication_intent_tracker() {
+            Ok(()) => tracing::info!("replication intent tracker flushed"),
+            Err(e) => tracing::warn!(err = %e, "replication intent tracker flush failed"),
+        }
+
+        // F-G10-003: flush the redo log before syncing the data device.
+        // Per-op fsync in the hot path is the primary durability guarantee;
+        // this just makes sure the tail buffer (if any) is on disk before
+        // the next-restart redo scan reads it.
+        if let Some(ref log) = self.redo_log {
+            match log.lock().flush() {
+                Ok(()) => tracing::info!("redo log flushed"),
+                Err(e) => tracing::warn!(err = %e, "redo log flush failed"),
+            }
+        }
+
         // Sync device
         if let Err(e) = self.device.sync() {
             tracing::warn!(err = %e, "device sync error");
@@ -1118,13 +1417,66 @@ impl ServerWithShutdown {
 
         result
     }
+
+    /// Join a background thread with a wall-clock timeout. If the thread
+    /// has not exited by the deadline, log a warning and leak the handle.
+    /// Used by the shutdown path so a stuck task does not hold up the
+    /// rest of persistence forever. See F-G10-022.
+    fn join_with_timeout(
+        name: &'static str,
+        handle: Option<std::thread::JoinHandle<()>>,
+        timeout: std::time::Duration,
+    ) {
+        let Some(handle) = handle else {
+            return;
+        };
+        // `JoinHandle` has no built-in timeout, so delegate to a helper
+        // thread that signals on completion. The helper joins the real
+        // task; we wait on a channel with the deadline.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let joiner = std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = tx.send(());
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(()) => {
+                let _ = joiner.join();
+                tracing::info!(task = name, "background task joined");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    task = name,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "background task did not exit within timeout — leaving handle to be \
+                     reaped on process exit",
+                );
+            }
+        }
+    }
 }
 
+/// Register a SIGINT + SIGTERM handler that fires the given closure on the
+/// first signal observed.
+///
+/// Pre-fix this function was a stub that immediately dropped `handler`, so
+/// the daemon had no graceful-shutdown signal path at all: `kill -TERM` /
+/// Ctrl-C hard-killed the process and the cleanup chain (cluster stop,
+/// snapshot, allocator persist, replication-intent flush, device.sync,
+/// OTLP flush) never ran. The `ctrlc` crate registers a single forwarding
+/// handler on both SIGINT and SIGTERM (with the `termination` feature) and
+/// runs the closure on a dedicated handler thread; calling it twice in the
+/// same process is a programmer error and panics, so the binary may only
+/// register one handler.
+///
+/// See F-G10-001 in the audit.
 fn ctrlc_handler<F: Fn() + Send + 'static>(handler: F) {
-    // Unfortunately without a signal crate, we can't easily catch SIGINT.
-    // The server's read timeout + shutdown flag handle graceful shutdown.
-    // For production, add the `ctrlc` or `signal-hook` crate.
-    drop(handler);
+    if let Err(e) = ctrlc::set_handler(handler) {
+        // A duplicate registration (`ctrlc::Error::MultipleHandlers`) is
+        // the only realistic failure mode at this point. Log and continue
+        // — failing the daemon over a signal-handler diagnostic would be
+        // worse than not having graceful shutdown.
+        tracing::error!(err = %e, "failed to install SIGINT/SIGTERM handler — graceful shutdown disabled");
+    }
 }
 
 /// Fallback `tracing` subscriber used ONLY on the early error paths before
@@ -1147,3 +1499,10 @@ fn init_tracing_subscriber_fallback() {
     // harness in the same process), we simply keep the existing one.
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
+
+// F-G10-016: the previous in-module test asserted startup ordering by
+// grepping the source file at compile time, which silently broke any time
+// the recovery block was refactored. Runtime coverage of the same
+// invariant ("recovery completes before any listener accepts") lives in
+// `tests/g10_lifecycle.rs`, where a slow-recovery fault-injection point
+// proves no TCP/HTTP socket can answer during the recovery window.

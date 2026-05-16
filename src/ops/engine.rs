@@ -20,7 +20,7 @@ use crate::ops::unspend::*;
 use crate::record::*;
 use crate::storage::blobstore::BlobStore;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Thread-safe store engine for UTXO operations.
@@ -39,6 +39,15 @@ pub struct Engine {
     locks: StripedLocks,
     dah_index: parking_lot::Mutex<DahBackend>,
     unmined_index: parking_lot::Mutex<UnminedBackend>,
+    /// Per-engine visibility barrier used by TCP dispatch and checkpointing.
+    ///
+    /// Client-facing reads take this barrier so they cannot observe the local
+    /// commit window between engine apply and failed-replication compensation.
+    /// Checkpointing also takes it to fence against in-flight local mutations.
+    /// The barrier deliberately lives on the engine, not in a process-global
+    /// static, because integration tests and embedded deployments can host
+    /// multiple independent nodes in one process.
+    dispatch_visibility_barrier: parking_lot::Mutex<()>,
     /// Shared redo log used by secondary indexes for two-phase durability.
     ///
     /// When `Some`, the engine appends and fsyncs a
@@ -48,11 +57,17 @@ pub struct Engine {
     /// primary redo flush could leave the secondary index out of sync with
     /// the primary index. In-memory secondary indexes ignore the log — they
     /// are rebuilt on startup from the primary redo replay + device scan.
-    redo_log: parking_lot::Mutex<Option<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>>,
+    redo_log: std::sync::OnceLock<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>,
     blob_store: Option<Arc<dyn BlobStore>>,
-    /// Per-shard record counts for O(1) migration verification.
-    /// Updated atomically on create/delete. Indexed by shard number.
+    /// Per-shard record counts for migration verification.
+    ///
+    /// Startup leaves these counters uninitialized so `Engine::new` does not
+    /// scan the full primary index. The first `shard_record_count` call scans
+    /// the primary index once and publishes all counters; create/delete then
+    /// maintain them atomically while holding the primary index write lock.
     shard_counts: Vec<std::sync::atomic::AtomicU64>,
+    /// True once `shard_counts` has been populated from the primary index.
+    shard_counts_initialized: std::sync::atomic::AtomicBool,
     /// Cached wall-clock time in milliseconds since Unix epoch.
     ///
     /// Avoids a `clock_gettime` syscall on every mutation. The dispatch
@@ -95,14 +110,10 @@ impl Engine {
     ) -> Self {
         let device_ptr = device.as_raw_ptr().unwrap_or(std::ptr::null_mut());
         let index = index.into();
-        let shard_counts: Vec<std::sync::atomic::AtomicU64> = (0..4096)
+        let shard_count_capacity = crate::cluster::shards::NUM_SHARDS;
+        let shard_counts: Vec<std::sync::atomic::AtomicU64> = (0..shard_count_capacity)
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
-        // Initialize shard counts from the existing index.
-        for (key, _) in index.iter() {
-            let shard = crate::cluster::shards::ShardTable::shard_for_key(&key) as usize;
-            shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         Self {
             device,
             device_ptr,
@@ -111,9 +122,11 @@ impl Engine {
             locks,
             dah_index: parking_lot::Mutex::new(dah_index.into()),
             unmined_index: parking_lot::Mutex::new(unmined_index.into()),
-            redo_log: parking_lot::Mutex::new(None),
+            dispatch_visibility_barrier: parking_lot::Mutex::new(()),
+            redo_log: std::sync::OnceLock::new(),
             blob_store: None,
             shard_counts,
+            shard_counts_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_millis: std::sync::atomic::AtomicU64::new(sys_millis()),
             #[cfg(test)]
             fail_next_register: std::sync::atomic::AtomicBool::new(false),
@@ -129,13 +142,15 @@ impl Engine {
     /// dispatch layer for primary-op durability should be passed here so
     /// that primary and secondary entries share a single log.
     pub fn set_redo_log(&self, redo_log: Arc<parking_lot::Mutex<crate::redo::RedoLog>>) {
-        *self.redo_log.lock() = Some(redo_log);
+        if self.redo_log.set(redo_log).is_err() {
+            tracing::warn!("engine redo log already attached; ignoring replacement");
+        }
     }
 
     /// Clone the engine's redo log handle for use as an `Option<&Mutex<_>>`
     /// in secondary index calls.
     fn redo_log_handle(&self) -> Option<Arc<parking_lot::Mutex<crate::redo::RedoLog>>> {
-        self.redo_log.lock().clone()
+        self.redo_log.get().cloned()
     }
 
     /// Public accessor for the engine's redo log handle.
@@ -150,6 +165,11 @@ impl Engine {
     /// unconfigured deployments).
     pub fn redo_log(&self) -> Option<Arc<parking_lot::Mutex<crate::redo::RedoLog>>> {
         self.redo_log_handle()
+    }
+
+    /// Acquire this engine's dispatch/checkpoint visibility barrier.
+    pub(crate) fn acquire_dispatch_visibility_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.dispatch_visibility_barrier.lock()
     }
 
     /// Update the DAH secondary index with two-phase durability.
@@ -450,16 +470,20 @@ impl Engine {
     /// issuing individual `clock_gettime` syscalls.
     pub fn refresh_clock(&self) {
         self.cached_millis
-            .store(sys_millis(), std::sync::atomic::Ordering::Relaxed);
+            .store(sys_millis(), std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Read the cached wall-clock time (milliseconds since Unix epoch).
-    fn now_millis(&self) -> u64 {
-        self.cached_millis
-            .load(std::sync::atomic::Ordering::Relaxed)
+    pub(crate) fn now_millis(&self) -> u64 {
+        self.cached_millis.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Set the blobstore for external cold data storage.
+    ///
+    /// This is an initialization hook. Call it before wrapping the engine in
+    /// an `Arc` and before accepting client traffic; runtime reconfiguration
+    /// is intentionally not supported because blob references must remain
+    /// stable for already-created external records.
     pub fn set_blob_store(&mut self, store: Arc<dyn BlobStore>) {
         self.blob_store = Some(store);
     }
@@ -484,19 +508,67 @@ impl Engine {
         self.blob_store.as_deref()
     }
 
-    /// Get the record count for a shard (O(1), lock-free).
+    /// Get the record count for a shard.
+    ///
+    /// The first call after startup lazily initializes all shard counters by
+    /// scanning the primary index once. Subsequent calls are O(1) and
+    /// lock-free.
     pub fn shard_record_count(&self, shard: u16) -> u64 {
-        self.shard_counts[shard as usize].load(std::sync::atomic::Ordering::Relaxed)
+        let counter = &self.shard_counts[shard as usize];
+        if !self
+            .shard_counts_initialized
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.initialize_shard_counts();
+        }
+        counter.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Register a new primary-index entry AND increment the matching shard
-    /// count atomically within the same index write-lock critical section.
+    fn initialize_shard_counts(&self) {
+        if self
+            .shard_counts_initialized
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+
+        let guard = self.index.read();
+        if self
+            .shard_counts_initialized
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+
+        let mut counts = vec![0u64; crate::cluster::shards::NUM_SHARDS];
+        for (key, _) in guard.iter() {
+            let shard = crate::cluster::shards::ShardTable::shard_for_key(&key) as usize;
+            counts[shard] += 1;
+        }
+        for (counter, count) in self.shard_counts.iter().zip(counts) {
+            counter.store(count, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.shard_counts_initialized
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn shard_counts_initialized_for_test(&self) -> bool {
+        self.shard_counts_initialized
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Register a primary-index entry and, if shard counters have been
+    /// initialized, increment the matching shard count atomically within the
+    /// same index write-lock critical section only when this is a new key.
     ///
-    /// This guarantees that `shard_counts` never drifts from the primary
-    /// index: if the backend `register` fails, no count mutation is
-    /// observed; if it succeeds, the matching `fetch_add` is executed
-    /// before the write lock is released. Migration correctness checks
-    /// (e.g. `engine.shard_record_count(s) > 0`) read a consistent view.
+    /// Before lazy initialization, count mutations are intentionally skipped:
+    /// the first `shard_record_count` call will scan the primary index after
+    /// any active writer drops this lock. After initialization, this guarantees
+    /// `shard_counts` never drifts from the primary index: if backend
+    /// `register` fails, no count mutation is observed; if it succeeds with a
+    /// newly inserted key, the matching `fetch_add` executes before the write
+    /// lock is released.
     ///
     /// # Errors
     /// Returns [`IndexError`](crate::index::IndexError) from the underlying
@@ -521,30 +593,65 @@ impl Engine {
             }
         }
         let shard = crate::cluster::shards::ShardTable::shard_for_key(&key) as usize;
-        let mut guard = self.index.write();
-        guard.register(key, entry)?;
-        // Commit the count mutation BEFORE releasing the write lock so a
-        // concurrent reader that takes the index read lock observes either
-        // (not-registered, old-count) or (registered, new-count) but never
-        // the inconsistent pair.
-        self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        drop(guard);
+        let resize_target = {
+            let mut guard = self.index.write();
+            let len_before = guard.len();
+            guard.register_without_resize(key, entry)?;
+            let inserted = guard.len() > len_before;
+            // Commit the count mutation BEFORE releasing the write lock once
+            // counters have been lazily initialized. Before that point, the first
+            // reader will scan the primary index after this write lock releases.
+            let counts_initialized = self
+                .shard_counts_initialized
+                .load(std::sync::atomic::Ordering::Acquire);
+            if inserted && counts_initialized {
+                self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+            guard.resize_target_capacity()
+        };
+        if let Some(target_capacity) = resize_target {
+            self.resize_primary_index_without_blocking_readers(target_capacity)?;
+        }
         Ok(())
     }
 
-    /// Unregister a primary-index entry AND decrement the matching shard
-    /// count atomically within the same index write-lock critical section.
+    fn resize_primary_index_without_blocking_readers(
+        &self,
+        requested_capacity: usize,
+    ) -> Result<(), crate::index::IndexError> {
+        let guard = self.index.upgradable_read();
+        let Some(target_capacity) = guard
+            .resize_target_capacity()
+            .map(|target| target.max(requested_capacity))
+        else {
+            return Ok(());
+        };
+
+        let resized = guard.resized_copy(target_capacity)?;
+        let mut write_guard = parking_lot::RwLockUpgradableReadGuard::upgrade(guard);
+        *write_guard = resized;
+        Ok(())
+    }
+
+    /// Unregister a primary-index entry and, if shard counters have been
+    /// initialized, decrement the matching shard count atomically within the
+    /// same index write-lock critical section.
     ///
     /// Returns the removed entry (or `None` if the key was not present).
-    /// The shard count is only decremented when an entry was actually
-    /// removed — this prevents underflow when `delete` is invoked twice on
-    /// the same key (e.g. duplicate replication journal replay).
+    /// After lazy initialization, the shard count is only decremented when an
+    /// entry was actually removed. Before initialization, the first
+    /// `shard_record_count` call will scan the primary index after any active
+    /// writer drops this lock.
     fn unregister_with_shard_count(&self, key: &TxKey) -> Option<TxIndexEntry> {
         let shard = crate::cluster::shards::ShardTable::shard_for_key(key) as usize;
         let mut guard = self.index.write();
         let removed = guard.unregister(key);
-        if removed.is_some() {
-            self.shard_counts[shard].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if removed.is_some()
+            && self
+                .shard_counts_initialized
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.shard_counts[shard].fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
         drop(guard);
         removed
@@ -573,6 +680,35 @@ impl Engine {
         }
     }
 
+    /// Read metadata from device and verify it matches the requested transaction.
+    ///
+    /// F-G2-001 defense-in-depth: the lock-free read paths (`read_metadata`,
+    /// `read_slot`, `read_slots`, `read_block_entry`, `get_spend`,
+    /// `read_cold_data`) all resolve `TxKey → record_offset` via the primary
+    /// index and then dereference the offset on the device without holding the
+    /// per-tx stripe lock. If a concurrent `delete` re-orders its index
+    /// unregistration against the allocator free (or any future refactor
+    /// regresses that ordering), a different transaction's metadata can sit at
+    /// the same offset with a valid CRC. Reading it back would silently
+    /// satisfy the original lookup with unrelated data.
+    ///
+    /// This helper closes the gap by comparing `meta.tx_id` against
+    /// `key.txid` after the read. A mismatch is surfaced as `TxNotFound` —
+    /// the same answer the caller would have received had they observed the
+    /// post-unregister state of the primary index.
+    #[inline]
+    fn read_metadata_for_key(
+        &self,
+        key: &TxKey,
+        record_offset: u64,
+    ) -> std::result::Result<TxMetadata, SpendError> {
+        let meta = self.read_metadata_fast(record_offset)?;
+        if meta.tx_id != key.txid {
+            return Err(SpendError::TxNotFound);
+        }
+        Ok(meta)
+    }
+
     /// Write metadata to device, using direct memory access when available.
     #[inline(always)]
     fn write_metadata_fast(
@@ -592,6 +728,45 @@ impl Engine {
         }
     }
 
+    fn write_zeroed_metadata_header(
+        &self,
+        record_offset: u64,
+    ) -> std::result::Result<(), SpendError> {
+        if !self.device_ptr.is_null() {
+            // Safety: `device_ptr` points to the mapped device region owned by
+            // this engine. Callers pass allocator-aligned record offsets.
+            unsafe {
+                std::ptr::write_bytes(
+                    self.device_ptr.add(record_offset as usize),
+                    0,
+                    METADATA_SIZE,
+                );
+            }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            Ok(())
+        } else {
+            let align = self.device.alignment();
+            let aligned_base = record_offset / align as u64 * align as u64;
+            let intra_offset = (record_offset - aligned_base) as usize;
+            let total_size = io::align_up(intra_offset + METADATA_SIZE, align);
+
+            let mut buf = AlignedBuf::new(total_size, align);
+            if intra_offset != 0 || !METADATA_SIZE.is_multiple_of(align) {
+                self.device
+                    .pread_exact_at(&mut buf, aligned_base)
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("{e}"),
+                    })?;
+            }
+            buf[intra_offset..intra_offset + METADATA_SIZE].fill(0);
+            self.device
+                .pwrite_all_at(&buf, aligned_base)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("{e}"),
+                })
+        }
+    }
+
     /// Read a UTXO slot, using direct memory access when available.
     #[inline(always)]
     fn read_slot_fast(
@@ -600,7 +775,10 @@ impl Engine {
         slot_index: u32,
     ) -> std::result::Result<UtxoSlot, SpendError> {
         if !self.device_ptr.is_null() {
-            Ok(unsafe { io::read_utxo_slot_direct(self.device_ptr, record_offset, slot_index) })
+            unsafe { io::read_utxo_slot_direct(self.device_ptr, record_offset, slot_index) }
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("{e}"),
+                })
         } else {
             io::read_utxo_slot(&*self.device, record_offset, slot_index).map_err(|e| {
                 SpendError::StorageError {
@@ -820,8 +998,9 @@ impl Engine {
                 _guard: guard,
                 tx_key: req.tx_key,
                 valid_spends: Vec::new(),
-                errors: HashMap::new(),
+                errors: BTreeMap::new(),
                 spent_count: 0,
+                idempotent_count: 0,
                 pre_generation: metadata.generation,
                 block_ids,
                 record_offset,
@@ -832,12 +1011,13 @@ impl Engine {
         }
 
         // 4+5. Read each slot inline and validate immediately.
-        // No intermediate HashMap. For duplicate vouts in the same batch, we
+        // No intermediate lookup map. For duplicate vouts in the same batch, we
         // check valid_spends to find the already-spent state (since device
         // writes haven't happened yet during validation).
-        let mut errors: HashMap<u32, SpendError> = HashMap::new();
+        let mut errors: BTreeMap<u32, SpendError> = BTreeMap::new();
         let mut valid_spends: Vec<(u32, UtxoSlot)> = Vec::with_capacity(req.spends.len());
         let mut spent_count: u32 = 0;
+        let mut idempotent_count: u32 = 0;
 
         for item in &req.spends {
             if item.offset >= utxo_count {
@@ -893,6 +1073,7 @@ impl Engine {
                 }
                 UTXO_SPENT => {
                     if slot.spending_data == item.spending_data {
+                        idempotent_count += 1;
                         continue;
                     }
                     if slot.spending_data == [FROZEN_BYTE; 36] {
@@ -917,6 +1098,7 @@ impl Engine {
                         item.idx,
                         SpendError::Pruned {
                             offset: item.offset,
+                            spending_data: slot.spending_data,
                         },
                     );
                 }
@@ -947,6 +1129,7 @@ impl Engine {
             valid_spends,
             errors,
             spent_count,
+            idempotent_count,
             pre_generation: metadata.generation,
             block_ids,
             record_offset,
@@ -959,7 +1142,7 @@ impl Engine {
     /// Execute a single spend — zero-allocation fast path.
     ///
     /// Inlines the validate-and-apply logic for exactly one UTXO,
-    /// avoiding the `Vec` and `HashMap` allocations that `spend_multi` uses.
+    /// avoiding the `Vec` and ordered-map allocations that `spend_multi` uses.
     pub fn spend(&self, req: &SpendRequest) -> Result<SpendResponse, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
 
@@ -1046,7 +1229,12 @@ impl Engine {
                     spending_data: slot.spending_data,
                 });
             }
-            UTXO_PRUNED => return Err(SpendError::Pruned { offset: req.offset }),
+            UTXO_PRUNED => {
+                return Err(SpendError::Pruned {
+                    offset: req.offset,
+                    spending_data: slot.spending_data,
+                });
+            }
             UTXO_FROZEN => return Err(SpendError::Frozen { offset: req.offset }),
             _ => {
                 return Err(SpendError::StorageError {
@@ -1146,17 +1334,32 @@ impl Engine {
                 if slot.spending_data == [FROZEN_BYTE; 36] {
                     return Err(SpendError::Frozen { offset: req.offset });
                 }
+                if slot.spending_data != req.spending_data {
+                    return Err(SpendError::InvalidSpend {
+                        offset: req.offset,
+                        spending_data: slot.spending_data,
+                    });
+                }
+                let current = { metadata.spent_utxos };
+                if current == 0 {
+                    return Err(SpendError::StorageError {
+                        detail: format!(
+                            "metadata spent_utxos is zero while slot {} is spent",
+                            req.offset
+                        ),
+                    });
+                }
+
                 // Valid unspend
                 let new_slot = UtxoSlot::new_unspent(req.utxo_hash);
                 self.write_slot_fast(record_offset, req.offset, &new_slot)?;
-
-                let current = { metadata.spent_utxos };
-                if current > 0 {
-                    metadata.spent_utxos = current - 1;
-                }
+                metadata.spent_utxos = current - 1;
             }
             UTXO_PRUNED => {
-                return Err(SpendError::Pruned { offset: req.offset });
+                return Err(SpendError::Pruned {
+                    offset: req.offset,
+                    spending_data: slot.spending_data,
+                });
             }
             UTXO_FROZEN => {
                 return Err(SpendError::Frozen { offset: req.offset });
@@ -1540,6 +1743,10 @@ impl Engine {
     /// Shared parameters are passed once by reference; only the `tx_key`
     /// varies per item. This avoids copying 28 bytes of params per item.
     ///
+    /// Atomicity is per transaction, not per batch: each key takes its own
+    /// stripe lock inside [`Self::set_mined_inner`], and earlier items remain
+    /// visible if a later item fails.
+    ///
     /// Returns one `Result` per key, in the same order as `keys`.
     pub fn set_mined_batch(
         &self,
@@ -1762,7 +1969,7 @@ impl Engine {
         if req.conflicting {
             for parent_txid in req.parent_txids {
                 let parent_key = TxKey { txid: *parent_txid };
-                let _ = self.append_conflicting_child(&parent_key, req.tx_id);
+                self.append_conflicting_child_best_effort(&parent_key, req.tx_id, "create");
             }
         }
 
@@ -1933,7 +2140,11 @@ impl Engine {
         if req.conflicting {
             for parent_txid in req.parent_txids {
                 let parent_key = TxKey { txid: *parent_txid };
-                let _ = self.append_conflicting_child(&parent_key, req.tx_id);
+                self.append_conflicting_child_best_effort(
+                    &parent_key,
+                    req.tx_id,
+                    "create_at_offset",
+                );
             }
         }
 
@@ -2108,6 +2319,10 @@ impl Engine {
     /// If cold data is stored inline on the device, reads it directly.
     /// If the record has the EXTERNAL flag and no inline cold data, falls
     /// back to the blobstore keyed by txid.
+    ///
+    /// F-G2-001: metadata reads on this lock-free path go through
+    /// `read_metadata_for_key` so a `delete + create_at_offset` race never
+    /// returns another transaction's cold data.
     pub fn read_cold_data(&self, key: &TxKey) -> Result<Vec<u8>, SpendError> {
         let entry = self
             .index
@@ -2119,7 +2334,7 @@ impl Engine {
         if entry.tx_flags & TxFlags::EXTERNAL.bits() != 0
             && let Some(ref blob_store) = self.blob_store
         {
-            let meta = self.read_metadata_fast(entry.record_offset)?;
+            let meta = self.read_metadata_for_key(key, entry.record_offset)?;
             match blob_store.get(&key.txid) {
                 Ok(Some(data)) => {
                     if data.len() as u64 != meta.external_ref.total_size {
@@ -2150,7 +2365,7 @@ impl Engine {
         }
 
         // Read metadata to determine record_size, then compute inline cold offset.
-        let meta = self.read_metadata_fast(entry.record_offset)?;
+        let meta = self.read_metadata_for_key(key, entry.record_offset)?;
         let cold_intra =
             crate::storage::manager::StorageManager::inline_cold_offset(entry.utxo_count);
         let cold_size = (meta.record_size as u64).saturating_sub(cold_intra);
@@ -2172,6 +2387,80 @@ impl Engine {
             })?;
 
         Ok(buf[intra..intra + cold_size as usize].to_vec())
+    }
+
+    /// Return the distinct parent txids encoded in a child's cold-data
+    /// input blob.
+    pub fn parent_txids_for_child(&self, child_key: &TxKey) -> Result<Vec<[u8; 32]>, SpendError> {
+        let cold_bytes = self.read_cold_data(child_key)?;
+        extract_parent_txids_from_cold_data(&cold_bytes).map_err(|err| SpendError::StorageError {
+            detail: format!("parse child parent txids: {err}"),
+        })
+    }
+
+    /// Find parent UTXO slots currently spent by `child_txid`.
+    ///
+    /// Missing parents are treated as an empty result: parent records can
+    /// legitimately have been pruned first or live on another shard in
+    /// callers that do not perform ownership routing.
+    pub fn slots_spent_by_child(
+        &self,
+        parent_key: &TxKey,
+        child_txid: [u8; 32],
+    ) -> Result<Vec<u32>, SpendError> {
+        let _guard = self.locks.lock(parent_key);
+        let entry = match self.index.read().lookup(parent_key) {
+            Some(entry) => entry,
+            None => return Ok(Vec::new()),
+        };
+        let meta = self.read_metadata_fast(entry.record_offset)?;
+        let mut offsets = Vec::new();
+        let utxo_count = { meta.utxo_count };
+        for offset in 0..utxo_count {
+            let slot = self.read_slot_fast(entry.record_offset, offset)?;
+            if slot.status == UTXO_SPENT && slot.spending_data[..32] == child_txid[..] {
+                offsets.push(offset);
+            }
+        }
+        Ok(offsets)
+    }
+
+    /// Mark a parent UTXO slot as PRUNED if it is still spent by the
+    /// supplied child txid.
+    ///
+    /// This is idempotent: already-pruned slots and slots no longer spent
+    /// by `child_txid` are left unchanged.
+    pub fn prune_slot_if_spent_by_child(
+        &self,
+        parent_key: &TxKey,
+        offset: u32,
+        child_txid: [u8; 32],
+    ) -> Result<bool, SpendError> {
+        let _guard = self.locks.lock(parent_key);
+        let entry = match self.index.read().lookup(parent_key) {
+            Some(entry) => entry,
+            None => return Ok(false),
+        };
+        let mut meta = self.read_metadata_fast(entry.record_offset)?;
+        if offset >= { meta.utxo_count } {
+            return Ok(false);
+        }
+        let mut slot = self.read_slot_fast(entry.record_offset, offset)?;
+        if slot.status == UTXO_PRUNED {
+            return Ok(false);
+        }
+        if slot.status != UTXO_SPENT || slot.spending_data[..32] != child_txid[..] {
+            return Ok(false);
+        }
+        slot.status = UTXO_PRUNED;
+        self.write_slot_fast(entry.record_offset, offset, &slot)?;
+        meta.spent_utxos = { meta.spent_utxos }.saturating_sub(1);
+        meta.pruned_utxos = { meta.pruned_utxos }.saturating_add(1);
+        meta.generation = { meta.generation }.wrapping_add(1);
+        meta.updated_at = self.now_millis();
+        self.write_metadata_fast(entry.record_offset, &meta)?;
+        self.sync_index_cache(parent_key, &meta)?;
+        Ok(true)
     }
 
     // -----------------------------------------------------------------------
@@ -2354,73 +2643,136 @@ impl Engine {
         parent_key: &TxKey,
         child_txid: [u8; 32],
     ) -> Result<(), SpendError> {
-        let _guard = self.locks.lock(parent_key);
-        let entry = match self.index.read().lookup(parent_key) {
-            Some(e) => e,
-            None => return Ok(()),
-        };
-        let ro = entry.record_offset;
-        let mut meta = self.read_metadata_fast(ro)?;
+        let mut intent_logged = false;
+        loop {
+            let (ro, count, offset, mut children) = {
+                let _guard = self.locks.lock(parent_key);
+                let entry = match self.index.read().lookup(parent_key) {
+                    Some(e) => e,
+                    None => return Ok(()),
+                };
+                let ro = entry.record_offset;
+                let meta = self.read_metadata_fast(ro)?;
+                let count = { meta.conflicting_children_count } as usize;
+                let offset = { meta.conflicting_children_offset };
 
-        let count = { meta.conflicting_children_count } as usize;
-        let offset = { meta.conflicting_children_offset };
+                let children = self.read_conflicting_children_at(count, offset)?;
+                if children.contains(&child_txid) {
+                    return Ok(());
+                }
 
-        // Read existing children
-        let mut children: Vec<[u8; 32]> = Vec::with_capacity(count + 1);
-        if count > 0 && offset != 0 {
-            let align = self.device.alignment();
-            let aligned_base = offset / align as u64 * align as u64;
-            let intra = (offset - aligned_base) as usize;
-            let read_len = (intra + count * 32).div_ceil(align) * align;
-            let mut buf = crate::device::AlignedBuf::new(read_len, align);
-            self.device
-                .pread_exact_at(&mut buf, aligned_base)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("{e}"),
-                })?;
-            for i in 0..count {
-                let start = intra + i * 32;
-                let mut txid = [0u8; 32];
-                txid.copy_from_slice(&buf[start..start + 32]);
-                children.push(txid);
+                (ro, count, offset, children)
+            };
+
+            children.push(child_txid);
+            if children.len() > u8::MAX as usize {
+                return Err(SpendError::StorageError {
+                    detail: "conflicting children limit exceeded".into(),
+                });
             }
+
+            // R-221: the parent metadata update below points at a newly
+            // allocated children-list block. Persist the high-level append
+            // intent before any allocator/new-block work so a crash after the
+            // replacement block write but before the metadata write can be
+            // recovered by replaying this idempotent append after engine
+            // construction.
+            if !intent_logged {
+                if let Some(log) = self.redo_log_handle() {
+                    log.lock()
+                        .append_and_flush(crate::redo::RedoOp::AppendConflictingChild {
+                            parent_key: *parent_key,
+                            child_txid,
+                        })
+                        .map_err(|e| SpendError::StorageError {
+                            detail: format!("append conflicting child redo: {e}"),
+                        })?;
+                }
+                intent_logged = true;
+            }
+
+            // R-024 keeps the old block allocated until metadata points at a
+            // fully-written replacement. R-143 additionally keeps allocator
+            // work outside the parent stripe lock: prepare the replacement
+            // unlocked, then re-lock only to validate the snapshot and commit.
+            let new_offset = self.allocate_conflicting_children_block(&children)?;
+
+            let mut parent_gone = false;
+            let committed = {
+                let _guard = self.locks.lock(parent_key);
+                match self.index.read().lookup(parent_key) {
+                    None => {
+                        parent_gone = true;
+                        false
+                    }
+                    Some(entry) if entry.record_offset != ro => false,
+                    Some(_) => {
+                        let mut meta = self.read_metadata_fast(ro)?;
+                        let latest_count = { meta.conflicting_children_count } as usize;
+                        let latest_offset = { meta.conflicting_children_offset };
+                        if latest_count != count || latest_offset != offset {
+                            false
+                        } else {
+                            meta.conflicting_children_count = children.len() as u8;
+                            meta.conflicting_children_offset = new_offset;
+                            meta.generation = { meta.generation }.wrapping_add(1);
+                            meta.updated_at = self.now_millis();
+                            self.write_metadata_fast(ro, &meta)?;
+                            true
+                        }
+                    }
+                }
+            };
+
+            if parent_gone {
+                self.free_conflicting_children_block(new_offset, children.len())?;
+                return Ok(());
+            }
+
+            if committed {
+                if count > 0 && offset != 0 {
+                    let _ = self.free_conflicting_children_block(offset, count);
+                }
+                return Ok(());
+            }
+
+            self.free_conflicting_children_block(new_offset, children.len())?;
+        }
+    }
+
+    fn read_conflicting_children_at(
+        &self,
+        count: usize,
+        offset: u64,
+    ) -> Result<Vec<[u8; 32]>, SpendError> {
+        let mut children: Vec<[u8; 32]> = Vec::with_capacity(count + 1);
+        if count == 0 || offset == 0 {
+            return Ok(children);
         }
 
-        // Dedup
-        if children.contains(&child_txid) {
-            return Ok(());
+        let align = self.device.alignment();
+        let aligned_base = offset / align as u64 * align as u64;
+        let intra = (offset - aligned_base) as usize;
+        let read_len = (intra + count * 32).div_ceil(align) * align;
+        let mut buf = crate::device::AlignedBuf::new(read_len, align);
+        self.device
+            .pread_exact_at(&mut buf, aligned_base)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("{e}"),
+            })?;
+        for i in 0..count {
+            let start = intra + i * 32;
+            let mut txid = [0u8; 32];
+            txid.copy_from_slice(&buf[start..start + 32]);
+            children.push(txid);
         }
-        children.push(child_txid);
+        Ok(children)
+    }
 
-        // R-024 (BC-09 / BC-44 / Codex F5): allocate + write + commit
-        // metadata BEFORE freeing the old block. Pre-fix the order was
-        // free-old → allocate-new → write → meta-update; that opened a
-        // window where the parent's metadata still pointed at an offset
-        // the allocator had already returned to its freelist (and could
-        // have re-handed out to a different allocation), so any reader
-        // touching the parent's children list could read someone else's
-        // bytes. The new ordering keeps the parent metadata coherent at
-        // every step:
-        //   - before metadata write: parent still references the old
-        //     block (which is still allocated and intact);
-        //   - after metadata write: parent references the new block,
-        //     which is fully written;
-        //   - the old block is freed last, only after metadata is
-        //     durable.
-        // A crash after writing the new block but before updating
-        // metadata leaks the new allocation, but the parent's children
-        // list is still self-consistent — preferable to a corrupted
-        // children list.
-        //
-        // The remaining residual risk — a child that should have been
-        // appended being absent from the parent's list when we crash
-        // before the metadata write — is captured as a follow-up
-        // finding (R-221) for redo-log coverage, since it requires a
-        // post-engine recovery pass and the engine's
-        // `append_conflicting_child` is already idempotent on
-        // re-application.
-
-        // Allocate and write new block.
+    fn allocate_conflicting_children_block(
+        &self,
+        children: &[[u8; 32]],
+    ) -> Result<u64, SpendError> {
         let new_size = (children.len() * 32) as u64;
         let new_offset =
             self.allocator
@@ -2435,34 +2787,26 @@ impl Engine {
         let intra = (new_offset - aligned_base) as usize;
         let write_len = (intra + children.len() * 32).div_ceil(align) * align;
         let mut wbuf = crate::device::AlignedBuf::new(write_len, align);
-        self.device
-            .pread_exact_at(&mut wbuf, aligned_base)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("{e}"),
-            })?;
         for (i, child) in children.iter().enumerate() {
             wbuf[intra + i * 32..intra + (i + 1) * 32].copy_from_slice(child);
         }
-        self.device
-            .pwrite_all_at(&wbuf, aligned_base)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("{e}"),
-            })?;
-
-        // Update parent metadata to point at the new block.
-        meta.conflicting_children_count = children.len() as u8;
-        meta.conflicting_children_offset = new_offset;
-        meta.generation = { meta.generation }.wrapping_add(1);
-        meta.updated_at = self.now_millis();
-        self.write_metadata_fast(ro, &meta)?;
-
-        // Only NOW free the old block. If we crashed before this line,
-        // the old block is leaked but the parent's metadata coherent.
-        if count > 0 && offset != 0 {
-            let _ = self.allocator.lock().free(offset, (count * 32) as u64);
+        if let Err(err) = self.device.pwrite_all_at(&wbuf, aligned_base) {
+            let _ = self.free_conflicting_children_block(new_offset, children.len());
+            return Err(SpendError::StorageError {
+                detail: format!("{err}"),
+            });
         }
 
-        Ok(())
+        Ok(new_offset)
+    }
+
+    fn free_conflicting_children_block(&self, offset: u64, count: usize) -> Result<(), SpendError> {
+        self.allocator
+            .lock()
+            .free(offset, (count * 32) as u64)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("allocator free for conflicting children failed: {e}"),
+            })
     }
 
     /// Read all conflicting children txids for a transaction.
@@ -2477,29 +2821,57 @@ impl Engine {
 
         let count = { meta.conflicting_children_count } as usize;
         let offset = { meta.conflicting_children_offset };
-        if count == 0 || offset == 0 {
-            return Ok(Vec::new());
-        }
+        self.read_conflicting_children_at(count, offset)
+    }
 
-        let align = self.device.alignment();
-        let aligned_base = offset / align as u64 * align as u64;
-        let intra = (offset - aligned_base) as usize;
-        let read_len = (intra + count * 32).div_ceil(align) * align;
-        let mut buf = crate::device::AlignedBuf::new(read_len, align);
-        self.device
-            .pread_exact_at(&mut buf, aligned_base)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("{e}"),
-            })?;
-
-        let mut result = Vec::with_capacity(count);
-        for i in 0..count {
-            let start = intra + i * 32;
-            let mut txid = [0u8; 32];
-            txid.copy_from_slice(&buf[start..start + 32]);
-            result.push(txid);
+    fn append_conflicting_child_best_effort(
+        &self,
+        parent_key: &TxKey,
+        child_txid: [u8; 32],
+        source: &'static str,
+    ) {
+        if let Err(err) = self.append_conflicting_child(parent_key, child_txid) {
+            tracing::warn!(
+                ?parent_key,
+                ?child_txid,
+                ?err,
+                source,
+                "failed to append conflicting child"
+            );
         }
-        Ok(result)
+    }
+
+    fn append_conflicting_children_from_cold_data(&self, child_key: &TxKey, source: &'static str) {
+        let cold_bytes = match self.read_cold_data(child_key) {
+            Ok(cold_bytes) => cold_bytes,
+            Err(err) => {
+                tracing::warn!(
+                    ?child_key,
+                    ?err,
+                    source,
+                    "failed to read cold data for conflicting-child propagation"
+                );
+                return;
+            }
+        };
+
+        let parent_txids = match extract_parent_txids_from_cold_data(&cold_bytes) {
+            Ok(parent_txids) => parent_txids,
+            Err(err) => {
+                tracing::warn!(
+                    ?child_key,
+                    err,
+                    source,
+                    "failed to parse cold data for conflicting-child propagation"
+                );
+                return;
+            }
+        };
+
+        for parent_txid in parent_txids {
+            let parent_key = TxKey { txid: parent_txid };
+            self.append_conflicting_child_best_effort(&parent_key, child_key.txid, source);
+        }
     }
 
     /// Set or clear the conflicting flag on a transaction.
@@ -2516,7 +2888,7 @@ impl Engine {
         let ro = entry.record_offset;
 
         // Fast path: DAH evaluation from cached fields, no metadata read.
-        if !self.device_ptr.is_null() {
+        let response = if !self.device_ptr.is_null() {
             let mut tf = TxFlags::from_bits_truncate(entry.tx_flags);
             let has_preserve = tf.contains(TxFlags::HAS_PRESERVE_UNTIL);
             let old_dah = if has_preserve {
@@ -2595,56 +2967,70 @@ impl Engine {
             // Update DAH secondary index (two-phase durable)
             self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
 
-            return Ok(SetConflictingResponse { signal, generation });
-        }
-
-        // Slow path: no direct pointer
-        let mut meta = self.read_metadata_fast(ro)?;
-        let old_dah = { meta.delete_at_height };
-
-        if req.value {
-            meta.flags |= TxFlags::CONFLICTING;
+            SetConflictingResponse { signal, generation }
         } else {
-            meta.flags -= meta.flags & TxFlags::CONFLICTING;
-        }
+            // Slow path: no direct pointer
+            let mut meta = self.read_metadata_fast(ro)?;
+            let old_dah = { meta.delete_at_height };
 
-        meta.generation = { meta.generation }.wrapping_add(1);
-        meta.updated_at = self.now_millis();
-
-        let (signal, dah_patch) =
-            evaluate_delete_at_height(&meta, req.current_block_height, req.block_height_retention)?;
-        if let Some(ref patch) = dah_patch {
-            apply_dah_patch(&mut meta, patch);
-        }
-
-        self.write_metadata_fast(ro, &meta)?;
-        self.sync_index_cache(&req.tx_key, &meta)?;
-
-        let new_dah = { meta.delete_at_height };
-        self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
-
-        // Update parent records' conflicting-children lists
-        if req.value {
-            // Read cold data to find parent txids from inputs.
-            // Must drop the child lock first to avoid holding two locks.
-            drop(_guard);
-            if let Ok(cold_bytes) = self.read_cold_data(&req.tx_key) {
-                let parent_txids = extract_parent_txids_from_cold_data(&cold_bytes);
-                for parent_txid in parent_txids {
-                    let parent_key = TxKey { txid: parent_txid };
-                    let _ = self.append_conflicting_child(&parent_key, req.tx_key.txid);
-                }
+            if req.value {
+                meta.flags |= TxFlags::CONFLICTING;
+            } else {
+                meta.flags -= meta.flags & TxFlags::CONFLICTING;
             }
+
+            meta.generation = { meta.generation }.wrapping_add(1);
+            meta.updated_at = self.now_millis();
+
+            let (signal, dah_patch) = evaluate_delete_at_height(
+                &meta,
+                req.current_block_height,
+                req.block_height_retention,
+            )?;
+            if let Some(ref patch) = dah_patch {
+                apply_dah_patch(&mut meta, patch);
+            }
+
+            self.write_metadata_fast(ro, &meta)?;
+            self.sync_index_cache(&req.tx_key, &meta)?;
+
+            let new_dah = { meta.delete_at_height };
+            self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
+
+            SetConflictingResponse {
+                signal,
+                generation: { meta.generation },
+            }
+        };
+
+        // Update parent records' conflicting-children lists. The helper writes
+        // its own R-221 redo intent before allocating the replacement list
+        // block; this call remains best-effort for availability, but failures
+        // must be visible.
+        // Drop the child lock before taking parent locks.
+        if req.value {
+            drop(_guard);
+            self.append_conflicting_children_from_cold_data(&req.tx_key, "set_conflicting");
         }
 
-        Ok(SetConflictingResponse {
-            signal,
-            generation: { meta.generation },
-        })
+        Ok(response)
     }
 
     /// Set or clear the locked flag on a transaction.
     pub fn set_locked(&self, req: &SetLockedRequest) -> Result<u32, SpendError> {
+        Ok(self.set_locked_with_before_image(req)?.generation)
+    }
+
+    /// Set or clear the locked flag and return the pre-apply lock/DAH state.
+    ///
+    /// Dispatch uses this for replication-failure compensation. A locked
+    /// transition clears `delete_at_height`; blindly applying the inverse
+    /// `set_locked(false)` would leave DAH at zero and change pruning
+    /// behaviour after rollback.
+    pub fn set_locked_with_before_image(
+        &self,
+        req: &SetLockedRequest,
+    ) -> Result<SetLockedResponse, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
             .index
@@ -2656,6 +3042,7 @@ impl Engine {
         // Fast path: all needed state is in the index cache + 4-byte generation read.
         if !self.device_ptr.is_null() {
             let mut tf = TxFlags::from_bits_truncate(entry.tx_flags);
+            let prior_locked = tf.contains(TxFlags::LOCKED);
             let has_preserve = tf.contains(TxFlags::HAS_PRESERVE_UNTIL);
             let old_dah = if has_preserve {
                 0
@@ -2718,12 +3105,17 @@ impl Engine {
             // Update DAH secondary index (two-phase durable)
             self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
 
-            return Ok(generation);
+            return Ok(SetLockedResponse {
+                generation,
+                prior_locked,
+                prior_delete_at_height: old_dah,
+            });
         }
 
         // Slow path: no direct pointer
         let mut meta = self.read_metadata_fast(ro)?;
         let old_dah = { meta.delete_at_height };
+        let prior_locked = meta.flags.contains(TxFlags::LOCKED);
 
         if req.value {
             meta.flags |= TxFlags::LOCKED;
@@ -2742,6 +3134,46 @@ impl Engine {
 
         let new_dah = { meta.delete_at_height };
         self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
+
+        Ok(SetLockedResponse {
+            generation: { meta.generation },
+            prior_locked,
+            prior_delete_at_height: old_dah,
+        })
+    }
+
+    /// Restore the exact pre-`set_locked` lock state and DAH during rollback.
+    ///
+    /// This is intentionally a rare-path helper: it uses metadata read/write
+    /// rather than the mmap fast path so compensation can update flags, primary
+    /// cache, and DAH secondary index in one place.
+    pub(crate) fn restore_set_locked_for_compensation(
+        &self,
+        key: &TxKey,
+        locked: bool,
+        delete_at_height: u32,
+    ) -> Result<u32, SpendError> {
+        let _guard = self.locks.lock(key);
+        let entry = self
+            .index
+            .read()
+            .lookup(key)
+            .ok_or(SpendError::TxNotFound)?;
+        let mut meta = self.read_metadata_fast(entry.record_offset)?;
+        let old_dah = { meta.delete_at_height };
+
+        if locked {
+            meta.flags |= TxFlags::LOCKED;
+        } else {
+            meta.flags -= meta.flags & TxFlags::LOCKED;
+        }
+        meta.delete_at_height = delete_at_height;
+        meta.generation = { meta.generation }.wrapping_add(1);
+        meta.updated_at = self.now_millis();
+
+        self.write_metadata_fast(entry.record_offset, &meta)?;
+        self.sync_index_cache(key, &meta)?;
+        self.update_dah_index(key, old_dah, delete_at_height)?;
 
         Ok(meta.generation)
     }
@@ -2799,6 +3231,29 @@ impl Engine {
     /// Delete a transaction record.
     ///
     /// Removes from index, frees device space, and cleans up secondary indexes.
+    ///
+    /// # Ordering (F-G2-001)
+    ///
+    /// The on-device tombstone, primary-index removal, and allocator free
+    /// MUST happen in the order:
+    ///
+    /// 1. Tombstone the metadata header (so any rebuild-from-device can no
+    ///    longer parse the record).
+    /// 2. `sync()` the device so the tombstone is durable before any future
+    ///    overwrite of the same region.
+    /// 3. Unregister the key from the primary index.
+    /// 4. Return the region to the allocator.
+    ///
+    /// Steps 3 and 4 are deliberately ordered: a concurrent reader that
+    /// holds an offset obtained from the primary index could otherwise see
+    /// the region after it has been re-allocated and rewritten by a parallel
+    /// `create_at_offset`, and would return an unrelated transaction's
+    /// metadata as if it belonged to the deleted key. Unregistering BEFORE
+    /// freeing closes the window — any subsequent `lookup(key)` returns
+    /// `None`, so no reader can dereference the post-free offset under this
+    /// key. Even if the ordering ever regresses, `read_metadata_for_key`
+    /// verifies `meta.tx_id == key.txid` and surfaces a mismatch as
+    /// `TxNotFound`.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
@@ -2813,27 +3268,40 @@ impl Engine {
             ({ meta.record_size }) as u64
         };
 
-        // Tombstone the metadata before freeing the region so crash-time index
-        // rebuilds cannot resurrect this record from stale bytes in freed space.
-        let mut tombstone = self.read_metadata_fast(entry.record_offset)?;
-        tombstone.magic = 0;
-        tombstone.record_size = 0;
-        self.write_metadata_fast(entry.record_offset, &tombstone)?;
+        // Step 1: Tombstone the metadata before freeing the region so crash-time
+        // index rebuilds cannot resurrect this record from stale bytes in freed
+        // space. Zero the full header, not just magic/record_size: freed
+        // regions can be reallocated later, and old tx metadata must not
+        // remain readable.
+        self.write_zeroed_metadata_header(entry.record_offset)?;
+        // Step 2: Sync so the tombstone is durable before any reuse.
+        self.device.sync().map_err(|e| SpendError::StorageError {
+            detail: format!("delete tombstone sync failed: {e}"),
+        })?;
 
-        // Free device space
+        // Step 3: Remove from primary index AND decrement shard_counts in
+        // the same critical section so the two can never drift (H2
+        // correctness fix). `unregister_with_shard_count` only decrements
+        // when an entry was actually removed, preventing underflow if the
+        // key was concurrently removed between the earlier `lookup` and
+        // this point. This MUST precede the allocator free (F-G2-001):
+        // otherwise a concurrent `create_at_offset` could re-allocate the
+        // same offset and write a fresh, CRC-valid `TxMetadata` for a
+        // different transaction; a lock-free reader holding the offset
+        // returned by the still-live primary-index entry would then read
+        // that unrelated metadata back as if it belonged to `tx_key`.
+        self.unregister_with_shard_count(&req.tx_key);
+
+        // Step 4: Return the region to the allocator. From this point on
+        // the offset can be handed out to a future `create`/`create_at_offset`.
+        // Because step 3 already removed the primary-index entry, no
+        // reader can reach this offset via `lookup(req.tx_key)` any longer.
         self.allocator
             .lock()
             .free(entry.record_offset, record_size)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("{e}"),
             })?;
-
-        // Remove from primary index AND decrement shard_counts in the same
-        // critical section so the two can never drift (H2 correctness fix).
-        // `unregister_with_shard_count` only decrements when an entry was
-        // actually removed, preventing underflow if the key was concurrently
-        // removed between the earlier `lookup` and this point.
-        self.unregister_with_shard_count(&req.tx_key);
 
         // Clean up secondary indexes with two-phase durability.
         // The cached entry captured before unregister carries the heights we
@@ -2858,6 +3326,12 @@ impl Engine {
     }
 
     /// Read spending data for a specific UTXO (point read, no lock needed).
+    ///
+    /// This is a lock-free path: it does not acquire the per-tx stripe lock.
+    /// Reads rely on (a) the CRC32 check on metadata (`io.rs:206`) for torn
+    /// headers, and (b) `read_metadata_for_key`'s `tx_id` check (F-G2-001)
+    /// to defend against cross-tx aliasing if a concurrent
+    /// `delete + create_at_offset` ever reused this offset.
     pub fn get_spend(&self, req: &GetSpendRequest) -> Result<GetSpendResponse, SpendError> {
         let entry = self
             .index
@@ -2866,7 +3340,7 @@ impl Engine {
             .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
-        let meta = self.read_metadata_fast(ro)?;
+        let meta = self.read_metadata_for_key(&req.tx_key, ro)?;
         if req.offset >= { meta.utxo_count } {
             return Err(SpendError::UtxoNotFound { offset: req.offset });
         }
@@ -2895,14 +3369,28 @@ impl Engine {
         self.unmined_index.lock()
     }
 
-    /// Read metadata for a transaction (for testing).
+    /// Read on-device metadata for a transaction.
+    ///
+    /// This is used by production read/diagnostic paths as well as tests.
+    /// The method takes the primary-index read lock only long enough to get
+    /// the record offset, then performs a device read without taking the
+    /// transaction's stripe lock. Callers that need a mutation-stable view
+    /// must already hold the appropriate stripe lock or must tolerate a
+    /// point-in-time diagnostic snapshot.
+    ///
+    /// Lock-free torn-write protection comes from the CRC32 on `TxMetadata`
+    /// (see `io::read_metadata_direct`'s safety doc). F-G2-001 adds a
+    /// second-line defense: the read goes through `read_metadata_for_key`,
+    /// which compares `meta.tx_id` against `key.txid` and surfaces a
+    /// mismatch as `TxNotFound` so a `delete + create_at_offset` race can
+    /// never deliver an unrelated transaction's metadata.
     pub fn read_metadata(&self, key: &TxKey) -> Result<TxMetadata, SpendError> {
         let entry = self
             .index
             .read()
             .lookup(key)
             .ok_or(SpendError::TxNotFound)?;
-        self.read_metadata_fast(entry.record_offset)
+        self.read_metadata_for_key(key, entry.record_offset)
     }
 
     /// Look up a transaction's cached index fields without reading device memory.
@@ -2918,14 +3406,86 @@ impl Engine {
         self.index.read().lookup(key)
     }
 
-    /// Read a UTXO slot (for testing).
+    /// Read a single on-device UTXO slot.
+    ///
+    /// This is used by production GET/debug paths and tests. Like
+    /// [`Self::read_metadata`], it resolves the record offset under the
+    /// primary-index read lock and then reads the slot without holding the
+    /// transaction's stripe lock. Mutation handlers should not use this as a
+    /// validate-then-write primitive unless they already hold that stripe.
+    ///
+    /// F-G2-001: a metadata read is performed first via
+    /// `read_metadata_for_key` to verify the record at `record_offset` still
+    /// belongs to `key.txid` — closing the `delete + create_at_offset`
+    /// aliasing race for lock-free readers.
     pub fn read_slot(&self, key: &TxKey, offset: u32) -> Result<UtxoSlot, SpendError> {
         let entry = self
             .index
             .read()
             .lookup(key)
             .ok_or(SpendError::TxNotFound)?;
+        // Verify the offset still belongs to this key before reading the slot
+        // (F-G2-001 second-line defense; subsumes F-G2-010 doc concern).
+        let _meta = self.read_metadata_for_key(key, entry.record_offset)?;
         self.read_slot_fast(entry.record_offset, offset)
+    }
+
+    /// Read every UTXO slot for a transaction.
+    ///
+    /// This resolves the primary index once, reads metadata once to get the
+    /// authoritative slot count, then performs one aligned slot-region read.
+    /// The metadata read goes through `read_metadata_for_key` so a stale
+    /// offset (post-delete + reuse) is surfaced as `TxNotFound` instead of
+    /// returning slots from an unrelated transaction (F-G2-001).
+    pub fn read_slots(&self, key: &TxKey) -> Result<Vec<UtxoSlot>, SpendError> {
+        let entry = self
+            .index
+            .read()
+            .lookup(key)
+            .ok_or(SpendError::TxNotFound)?;
+        let meta = self.read_metadata_for_key(key, entry.record_offset)?;
+        io::read_all_utxo_slots(&*self.device, entry.record_offset, meta.utxo_count).map_err(|e| {
+            SpendError::StorageError {
+                detail: format!("{e}"),
+            }
+        })
+    }
+
+    /// Read one mined-block entry, including entries stored in overflow.
+    ///
+    /// This is used by dispatch before-image capture. Like [`Self::read_metadata`],
+    /// it is a diagnostic snapshot unless the caller already holds the
+    /// transaction's mutation stripe. The metadata fetch verifies
+    /// `meta.tx_id == key.txid` (F-G2-001).
+    pub fn read_block_entry(
+        &self,
+        key: &TxKey,
+        block_id: u32,
+    ) -> Result<Option<BlockEntry>, SpendError> {
+        let entry = self
+            .index
+            .read()
+            .lookup(key)
+            .ok_or(SpendError::TxNotFound)?;
+        let metadata = self.read_metadata_for_key(key, entry.record_offset)?;
+        let count = metadata.block_entry_count as usize;
+        let inline = count.min(INLINE_BLOCK_ENTRIES);
+        for i in 0..inline {
+            if { metadata.block_entries_inline[i].block_id } == block_id {
+                return Ok(Some(metadata.block_entries_inline[i]));
+            }
+        }
+        if count <= INLINE_BLOCK_ENTRIES {
+            return Ok(None);
+        }
+        let overflow = read_overflow_entries(&*self.device, &metadata).map_err(|e| {
+            SpendError::StorageError {
+                detail: format!("{e}"),
+            }
+        })?;
+        Ok(overflow
+            .into_iter()
+            .find(|entry| entry.block_id == block_id))
     }
 
     /// Get the DAH index (for testing).
@@ -3018,6 +3578,7 @@ impl<'a> ValidatedSpend<'a> {
             valid_spends,
             errors,
             spent_count,
+            idempotent_count: _,
             pre_generation: _,
             block_ids,
             record_offset,
@@ -3030,6 +3591,18 @@ impl<'a> ValidatedSpend<'a> {
         // any data-region pwrite. Recovery must replay the redo entries
         // and produce the final slot bytes.
         crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeDataPwrite);
+
+        if spent_count == 0 {
+            let generation = { metadata.generation };
+            drop(_guard);
+            return Ok(SpendMultiResponse {
+                signal: Signal::None,
+                block_ids,
+                errors,
+                spent_count,
+                generation,
+            });
+        }
 
         // 6. Batch write all valid slot mutations (zero-alloc when direct).
         // R-004: stop on first write failure and propagate it. Continuing
@@ -3100,44 +3673,62 @@ impl<'a> ValidatedSpend<'a> {
 /// Cold data format: `[inputs_len:4 LE][inputs_blob][outputs_len:4 LE][...][inpoints_len:4 LE][...]`
 /// The inputs_blob contains length-prefixed entries: `[count:4 LE][per-input: [len:4 LE][extended-bytes]]`
 /// The first 32 bytes of each extended-input are the prev_txid.
-fn extract_parent_txids_from_cold_data(cold_bytes: &[u8]) -> Vec<[u8; 32]> {
+fn extract_parent_txids_from_cold_data(cold_bytes: &[u8]) -> Result<Vec<[u8; 32]>, &'static str> {
+    if cold_bytes.is_empty() {
+        return Ok(Vec::new());
+    }
     if cold_bytes.len() < 4 {
-        return Vec::new();
+        return Err("cold data missing inputs length");
     }
+
     // Outer wrapper: [inputs_blob_len:4][inputs_blob][...]
-    let inputs_blob_len =
-        u32::from_le_bytes(cold_bytes[0..4].try_into().unwrap_or([0; 4])) as usize;
-    if inputs_blob_len == 0 || 4 + inputs_blob_len > cold_bytes.len() {
-        return Vec::new();
+    let mut u32_bytes = [0u8; 4];
+    u32_bytes.copy_from_slice(&cold_bytes[0..4]);
+    let inputs_blob_len = u32::from_le_bytes(u32_bytes) as usize;
+    if inputs_blob_len == 0 {
+        return Ok(Vec::new());
     }
-    let inputs_blob = &cold_bytes[4..4 + inputs_blob_len];
+    let inputs_end = 4usize
+        .checked_add(inputs_blob_len)
+        .ok_or("inputs blob length overflow")?;
+    if inputs_end > cold_bytes.len() {
+        return Err("inputs blob length exceeds cold data");
+    }
+    let inputs_blob = &cold_bytes[4..inputs_end];
 
     // Inner format: [count:4][per-input: [len:4][extended-bytes]]
     if inputs_blob.len() < 4 {
-        return Vec::new();
+        return Err("inputs blob missing count");
     }
-    let count = u32::from_le_bytes(inputs_blob[0..4].try_into().unwrap_or([0; 4])) as usize;
+    u32_bytes.copy_from_slice(&inputs_blob[0..4]);
+    let count = u32::from_le_bytes(u32_bytes) as usize;
     let mut pos = 4usize;
     let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for _ in 0..count {
         if pos + 4 > inputs_blob.len() {
-            break;
+            return Err("input entry length truncated");
         }
-        let entry_len =
-            u32::from_le_bytes(inputs_blob[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
+        u32_bytes.copy_from_slice(&inputs_blob[pos..pos + 4]);
+        let entry_len = u32::from_le_bytes(u32_bytes) as usize;
         pos += 4;
-        if entry_len < 32 || pos + entry_len > inputs_blob.len() {
-            break;
+        if entry_len < 32 {
+            return Err("input entry shorter than parent txid");
+        }
+        let entry_end = pos
+            .checked_add(entry_len)
+            .ok_or("input entry length overflow")?;
+        if entry_end > inputs_blob.len() {
+            return Err("input entry data truncated");
         }
         let mut txid = [0u8; 32];
         txid.copy_from_slice(&inputs_blob[pos..pos + 32]);
         if seen.insert(txid) {
             result.push(txid);
         }
-        pos += entry_len;
+        pos = entry_end;
     }
-    result
+    Ok(result)
 }
 
 /// Build inline cold data from optional inputs/outputs/inpoints.
@@ -3322,8 +3913,9 @@ mod tests {
     use crate::allocator::SlotAllocator;
     use crate::device::{DeviceError, MemoryDevice};
     use crate::index::{DahIndex, Index, UnminedIndex};
+    use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// Wrap a device and reject pwrites once a kill-switch flag is set.
     /// Used by R-004 regression tests that prove `Engine::spend` and
@@ -3371,6 +3963,46 @@ mod tests {
         fn as_raw_ptr(&self) -> Option<*mut u8> {
             // R-004 tests must hit the pwrite path, not the direct mmap
             // shortcut, so always report no raw pointer.
+            None
+        }
+    }
+
+    struct SyncCountingDevice {
+        inner: Arc<dyn BlockDevice>,
+        syncs: Arc<AtomicU64>,
+    }
+
+    impl SyncCountingDevice {
+        fn new(inner: Arc<dyn BlockDevice>) -> (Arc<Self>, Arc<AtomicU64>) {
+            let syncs = Arc::new(AtomicU64::new(0));
+            (
+                Arc::new(Self {
+                    inner,
+                    syncs: syncs.clone(),
+                }),
+                syncs,
+            )
+        }
+    }
+
+    impl BlockDevice for SyncCountingDevice {
+        fn alignment(&self) -> usize {
+            self.inner.alignment()
+        }
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        fn pread(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            self.inner.pread(buf, offset)
+        }
+        fn pwrite(&self, buf: &[u8], offset: u64) -> crate::device::Result<usize> {
+            self.inner.pwrite(buf, offset)
+        }
+        fn sync(&self) -> crate::device::Result<()> {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            self.inner.sync()
+        }
+        fn as_raw_ptr(&self) -> Option<*mut u8> {
             None
         }
     }
@@ -3751,6 +4383,20 @@ mod tests {
     }
 
     #[test]
+    fn spend_coinbase_zero_spending_height_boundary() {
+        // The storage spec defines the maturity gate as
+        // `spending_height > 0 && spending_height > current_block_height`.
+        // A zero height therefore means "no maturity height recorded" and
+        // must not accidentally behave as immature at genesis/low heights.
+        let h = TestHarness::with_metadata(10, TxFlags::IS_COINBASE, |m| {
+            m.spending_height = 0;
+        });
+        let mut req = h.spend_req(0);
+        req.current_block_height = 0;
+        assert!(h.engine.spend(&req).is_ok());
+    }
+
+    #[test]
     fn spend_hash_mismatch() {
         let h = TestHarness::new(10, TxFlags::empty());
         let mut req = h.spend_req(0);
@@ -3813,7 +4459,10 @@ mod tests {
         io::write_utxo_slot(&*h.engine.device, entry.record_offset, 4, &pruned_slot).unwrap();
 
         match h.engine.spend(&h.spend_req(4)) {
-            Err(SpendError::Pruned { offset: 4 }) => {}
+            Err(SpendError::Pruned {
+                offset: 4,
+                spending_data,
+            }) => assert_eq!(spending_data, h.make_spending_data(0x11)),
             other => panic!("expected Pruned, got {other:?}"),
         }
     }
@@ -3992,6 +4641,46 @@ mod tests {
     }
 
     #[test]
+    fn spend_multi_errors_deterministic_iteration() {
+        let h = TestHarness::new(20, TxFlags::empty());
+        let req = SpendMultiRequest {
+            tx_key: h.key,
+            spends: vec![
+                SpendItem {
+                    offset: 9,
+                    utxo_hash: [0xFF; 32],
+                    spending_data: h.make_spending_data(0x09),
+                    idx: 90,
+                },
+                SpendItem {
+                    offset: 1,
+                    utxo_hash: [0xEE; 32],
+                    spending_data: h.make_spending_data(0x01),
+                    idx: 10,
+                },
+                SpendItem {
+                    offset: 5,
+                    utxo_hash: [0xDD; 32],
+                    spending_data: h.make_spending_data(0x05),
+                    idx: 50,
+                },
+            ],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        let resp = h.engine.spend_multi(&req).unwrap();
+        let keys: Vec<u32> = resp.errors.keys().copied().collect();
+        assert_eq!(
+            keys,
+            vec![10, 50, 90],
+            "spend_multi error iteration order must be stable for response encoding"
+        );
+    }
+
+    #[test]
     fn spend_multi_empty() {
         let h = TestHarness::new(10, TxFlags::empty());
         let req = SpendMultiRequest {
@@ -4032,6 +4721,80 @@ mod tests {
         h.engine.spend_multi(&req).unwrap();
         let g1 = { h.engine.read_metadata(&h.key).unwrap().generation };
         assert_eq!(g1, g0 + 1);
+    }
+
+    #[test]
+    fn spend_multi_idempotent_does_not_bump_generation() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        let req = SpendMultiRequest {
+            tx_key: h.key,
+            spends: vec![SpendItem {
+                offset: 3,
+                utxo_hash: h.slot_hash(3),
+                spending_data: h.make_spending_data(0x33),
+                idx: 0,
+            }],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        h.engine.spend_multi(&req).unwrap();
+        let generation_after_first = { h.engine.read_metadata(&h.key).unwrap().generation };
+
+        let resp = h.engine.spend_multi(&req).unwrap();
+        let generation_after_second = { h.engine.read_metadata(&h.key).unwrap().generation };
+
+        assert!(resp.errors.is_empty());
+        assert_eq!(resp.spent_count, 0);
+        assert_eq!(resp.generation, generation_after_first);
+        assert_eq!(generation_after_second, generation_after_first);
+    }
+
+    #[test]
+    fn spend_idempotent_count_direct_not_subtracted() {
+        let h = TestHarness::new(3, TxFlags::empty());
+        let spending_data = h.make_spending_data(0x33);
+        h.engine
+            .spend(&SpendRequest {
+                tx_key: h.key,
+                offset: 0,
+                utxo_hash: h.slot_hash(0),
+                spending_data,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+
+        let req = SpendMultiRequest {
+            tx_key: h.key,
+            spends: vec![
+                SpendItem {
+                    offset: 0,
+                    utxo_hash: h.slot_hash(0),
+                    spending_data,
+                    idx: 10,
+                },
+                SpendItem {
+                    offset: 1,
+                    utxo_hash: h.slot_hash(1),
+                    spending_data: h.make_spending_data(0x44),
+                    idx: 20,
+                },
+            ],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        let validated = h.engine.validate_spend_multi(&req).unwrap();
+        assert_eq!(validated.idempotent_count(), 1);
+        assert_eq!(validated.spent_count, 1);
+        assert!(validated.errors.is_empty());
     }
 
     #[test]
@@ -4212,6 +4975,7 @@ mod tests {
             tx_key: h.key,
             offset: 5,
             utxo_hash: h.slot_hash(5),
+            spending_data: h.make_spending_data(0xAB),
             current_block_height: 1000,
             block_height_retention: 288,
         };
@@ -4231,6 +4995,7 @@ mod tests {
             tx_key: h.key,
             offset: 5,
             utxo_hash: h.slot_hash(5),
+            spending_data: h.make_spending_data(0xAB),
             current_block_height: 1000,
             block_height_retention: 288,
         };
@@ -4252,6 +5017,7 @@ mod tests {
             tx_key: h.key,
             offset: 3,
             utxo_hash: h.slot_hash(3),
+            spending_data: h.make_spending_data(0xAB),
             current_block_height: 1000,
             block_height_retention: 288,
         };
@@ -4268,6 +5034,7 @@ mod tests {
             tx_key: TxKey { txid: [0xFF; 32] },
             offset: 0,
             utxo_hash: [0; 32],
+            spending_data: [0; 36],
             current_block_height: 1000,
             block_height_retention: 288,
         };
@@ -4286,6 +5053,7 @@ mod tests {
             tx_key: h.key,
             offset: 5,
             utxo_hash: [0xFF; 32],
+            spending_data: h.make_spending_data(0xAB),
             current_block_height: 1000,
             block_height_retention: 288,
         };
@@ -4293,6 +5061,64 @@ mod tests {
             Err(SpendError::UtxoHashMismatch { offset: 5 }) => {}
             other => panic!("expected UtxoHashMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unspend_rejects_wrong_spending_data_without_mutating_slot() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        h.engine.spend(&h.spend_req(5)).unwrap();
+
+        let wrong_spending_data = h.make_spending_data(0xCD);
+        let req = UnspendRequest {
+            tx_key: h.key,
+            offset: 5,
+            utxo_hash: h.slot_hash(5),
+            spending_data: wrong_spending_data,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        match h.engine.unspend(&req) {
+            Err(SpendError::InvalidSpend {
+                offset: 5,
+                spending_data,
+            }) => assert_eq!(spending_data, h.make_spending_data(0xAB)),
+            other => panic!("expected InvalidSpend, got {other:?}"),
+        }
+
+        let slot = h.engine.read_slot(&h.key, 5).unwrap();
+        assert!(slot.is_spent());
+        assert_eq!(slot.spending_data, h.make_spending_data(0xAB));
+        assert_eq!({ h.engine.read_metadata(&h.key).unwrap().spent_utxos }, 1);
+    }
+
+    #[test]
+    fn prune_slot_if_spent_by_child_updates_counters_once() {
+        let h = TestHarness::new(3, TxFlags::empty());
+        h.engine.spend(&h.spend_req(1)).unwrap();
+        let mut child_txid = [0u8; 32];
+        child_txid.copy_from_slice(&h.make_spending_data(0xAB)[..32]);
+
+        let applied = h
+            .engine
+            .prune_slot_if_spent_by_child(&h.key, 1, child_txid)
+            .unwrap();
+        assert!(applied);
+        let slot = h.engine.read_slot(&h.key, 1).unwrap();
+        assert_eq!(slot.status, UTXO_PRUNED);
+        assert_eq!(slot.spending_data, h.make_spending_data(0xAB));
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!({ meta.spent_utxos }, 0);
+        assert_eq!({ meta.pruned_utxos }, 1);
+
+        let applied_again = h
+            .engine
+            .prune_slot_if_spent_by_child(&h.key, 1, child_txid)
+            .unwrap();
+        assert!(!applied_again);
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!({ meta.spent_utxos }, 0);
+        assert_eq!({ meta.pruned_utxos }, 1);
     }
 
     #[test]
@@ -4305,6 +5131,7 @@ mod tests {
             tx_key: h.key,
             offset: 5,
             utxo_hash: h.slot_hash(5),
+            spending_data: h.make_spending_data(0xAB),
             current_block_height: 1000,
             block_height_retention: 288,
         };
@@ -4322,6 +5149,7 @@ mod tests {
             tx_key: h.key,
             offset: 5,
             utxo_hash: h.slot_hash(5),
+            spending_data: h.make_spending_data(0xAB),
             current_block_height: 1000,
             block_height_retention: 288,
         };
@@ -4353,6 +5181,7 @@ mod tests {
             tx_key: h.key,
             offset: 5,
             utxo_hash: h.slot_hash(5),
+            spending_data: h.make_spending_data(0xAB),
             current_block_height: 1000,
             block_height_retention: 288,
         };
@@ -4507,6 +5336,8 @@ mod tests {
 
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.spent_utxos }, 1); // Only incremented once
+        let slot = engine.read_slot(&key, 5).unwrap();
+        assert_eq!(slot.spending_data, sd);
     }
 
     #[test]
@@ -4540,10 +5371,14 @@ mod tests {
 
         let mut successes = 0;
         let mut already_spent = 0;
+        let mut already_spent_payloads = Vec::new();
         for handle in results {
             match handle.join().unwrap() {
                 Ok(_) => successes += 1,
-                Err(SpendError::AlreadySpent { .. }) => already_spent += 1,
+                Err(SpendError::AlreadySpent { spending_data, .. }) => {
+                    already_spent += 1;
+                    already_spent_payloads.push(spending_data);
+                }
                 other => panic!("unexpected result: {other:?}"),
             }
         }
@@ -4553,6 +5388,13 @@ mod tests {
 
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.spent_utxos }, 1);
+        let winning_spending_data = engine.read_slot(&key, 5).unwrap().spending_data;
+        assert!(
+            already_spent_payloads
+                .iter()
+                .all(|payload| *payload == winning_spending_data),
+            "every AlreadySpent error must return the winning spending_data"
+        );
     }
 
     #[test]
@@ -4852,28 +5694,40 @@ mod tests {
     // -- Unspend additional tests --
 
     #[test]
-    fn unspend_counter_not_below_zero() {
+    fn unspend_rejects_spent_slot_when_counter_is_zero() {
         let h = TestHarness::new(10, TxFlags::empty());
-        // Metadata starts with spent_utxos = 0; unspending should not underflow
-        // First ensure slot is in unspent state but force spent_utxos = 0
-        // Actually, unspend of an unspent slot is a noop, so let's test with
-        // spent_utxos already at 0 but a slot that is actually spent
+        // Metadata starts with spent_utxos = 0. A spent slot with a zero
+        // counter is corruption, not a valid unspend: clearing the slot would
+        // hide the mismatch and make recovery/accounting impossible.
         let entry = h.engine.lookup(&h.key).unwrap();
         let spent_slot = UtxoSlot::new_spent(h.slot_hash(3), h.make_spending_data(0x11));
         io::write_utxo_slot(&*h.engine.device, entry.record_offset, 3, &spent_slot).unwrap();
-        // metadata.spent_utxos is still 0 (we wrote the slot directly, bypassing counter)
 
         let req = UnspendRequest {
             tx_key: h.key,
             offset: 3,
             utxo_hash: h.slot_hash(3),
+            spending_data: h.make_spending_data(0x11),
             current_block_height: 1000,
             block_height_retention: 288,
         };
-        h.engine.unspend(&req).unwrap();
+        match h.engine.unspend(&req) {
+            Err(SpendError::StorageError { detail }) => {
+                assert!(
+                    detail.contains("spent_utxos is zero"),
+                    "detail was: {detail}"
+                );
+            }
+            other => panic!("expected StorageError for inconsistent counter, got {other:?}"),
+        }
 
         let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!({ meta.spent_utxos }, 0); // Should not go below 0
+        assert_eq!({ meta.spent_utxos }, 0);
+        let slot = h.engine.read_slot(&h.key, 3).unwrap();
+        assert!(
+            slot.is_spent(),
+            "slot must remain spent after rejected unspend"
+        );
     }
 
     #[test]
@@ -4888,11 +5742,15 @@ mod tests {
             tx_key: h.key,
             offset: 3,
             utxo_hash: h.slot_hash(3),
+            spending_data: h.make_spending_data(0x11),
             current_block_height: 1000,
             block_height_retention: 288,
         };
         match h.engine.unspend(&req) {
-            Err(SpendError::Pruned { offset: 3 }) => {}
+            Err(SpendError::Pruned {
+                offset: 3,
+                spending_data,
+            }) => assert_eq!(spending_data, h.make_spending_data(0x11)),
             other => panic!("expected Pruned, got {other:?}"),
         }
     }
@@ -4934,6 +5792,7 @@ mod tests {
             tx_key: h.key,
             offset: 0,
             utxo_hash: h.slot_hash(0),
+            spending_data: h.make_spending_data(0xAB),
             current_block_height: 1000,
             block_height_retention: 288,
         };
@@ -4989,6 +5848,7 @@ mod tests {
             tx_key: h.key,
             offset: 0,
             utxo_hash: h.slot_hash(0),
+            spending_data: h.make_spending_data(0xAB),
             current_block_height: 1000,
             block_height_retention: 288,
         };
@@ -5083,6 +5943,7 @@ mod tests {
             tx_key: h.key,
             offset: 0,
             utxo_hash: h.slot_hash(0),
+            spending_data: h.make_spending_data(0xAB),
             current_block_height: 1000,
             block_height_retention: 288,
         };
@@ -5117,6 +5978,7 @@ mod tests {
             tx_key: h.key,
             offset: 0,
             utxo_hash: h.slot_hash(0),
+            spending_data: h.make_spending_data(0xAB),
             current_block_height: 2000,
             block_height_retention: 288,
         };
@@ -5209,6 +6071,12 @@ mod tests {
                         hash[0] = (i & 0xFF) as u8;
                         hash[1] = ((i >> 8) & 0xFF) as u8;
                         hash
+                    },
+                    spending_data: {
+                        let mut sd = [0u8; 36];
+                        sd[0] = i as u8;
+                        sd[32..36].copy_from_slice(&1u32.to_le_bytes());
+                        sd
                     },
                     current_block_height: 1000,
                     block_height_retention: 288,
@@ -5331,6 +6199,156 @@ mod tests {
         assert_ne!({ meta.conflicting_children_offset }, 0);
     }
 
+    /// R-143 regression: `append_conflicting_child` must not hold the parent
+    /// stripe lock while waiting on allocator work for the replacement
+    /// children-list block.
+    #[test]
+    fn append_conflicting_child_lock_order() {
+        let h = TestHarness::new(1, TxFlags::empty());
+        let c1 = [0x11u8; 32];
+        let c2 = [0x22u8; 32];
+
+        h.engine.append_conflicting_child(&h.key, c1).unwrap();
+
+        let allocator_guard = h.engine.allocator.lock();
+        let engine = h.engine.clone();
+        let key = h.key;
+        let append_started = Arc::new(AtomicBool::new(false));
+        let append_started_thread = append_started.clone();
+        let append_handle = std::thread::spawn(move || {
+            append_started_thread.store(true, Ordering::SeqCst);
+            engine.append_conflicting_child(&key, c2)
+        });
+
+        while !append_started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let engine = h.engine.clone();
+        let key = h.key;
+        let probe_handle = std::thread::spawn(move || {
+            let _guard = engine.locks.lock(&key);
+            locked_tx.send(()).unwrap();
+        });
+
+        let parent_lock_available = locked_rx.recv_timeout(std::time::Duration::from_millis(250));
+        drop(allocator_guard);
+
+        append_handle.join().unwrap().unwrap();
+        probe_handle.join().unwrap();
+        assert!(
+            parent_lock_available.is_ok(),
+            "append_conflicting_child held the parent stripe lock while blocked on allocator"
+        );
+
+        let children = h.engine.read_conflicting_children(&h.key).unwrap();
+        assert_eq!(children, vec![c1, c2]);
+    }
+
+    /// R-064/R-081 regression: `set_conflicting(true)` must update parent
+    /// records' conflicting-child lists on the fast mmap path too. Pre-fix
+    /// the fast path returned before the cold-data parent propagation block,
+    /// so the child was marked conflicting but the parent had no backlink.
+    #[test]
+    fn set_conflicting_fast_path_updates_parent_children() {
+        let h = TestHarness::new(1, TxFlags::empty());
+
+        let mut child_txid = [0x22u8; 32];
+        child_txid[0] = 2;
+        let child_key = TxKey { txid: child_txid };
+        let child_hashes = [[0xABu8; 32]];
+
+        let mut extended_input = vec![0u8; 36];
+        extended_input[..32].copy_from_slice(&h.key.txid);
+
+        let mut inputs_blob = Vec::new();
+        inputs_blob.extend_from_slice(&1u32.to_le_bytes());
+        inputs_blob.extend_from_slice(&(extended_input.len() as u32).to_le_bytes());
+        inputs_blob.extend_from_slice(&extended_input);
+
+        h.engine
+            .create(&CreateRequest {
+                tx_id: child_txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 0,
+                size_in_bytes: 100,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &child_hashes,
+                inputs: Some(&inputs_blob),
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 0,
+                block_height: 1000,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: None,
+                parent_txids: &[],
+            })
+            .unwrap();
+
+        h.engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: child_key,
+                value: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+
+        let children = h.engine.read_conflicting_children(&h.key).unwrap();
+        assert_eq!(children, vec![child_txid]);
+    }
+
+    /// R-118 regression: when a children-list allocation reuses a freed
+    /// block, alignment padding in the new block must not preserve stale
+    /// bytes from the prior owner. Pre-fix `append_conflicting_child`
+    /// pre-read the destination block and only overwrote the 32-byte child
+    /// entry, leaving the rest of the allocated 4 KiB block unchanged.
+    #[test]
+    fn append_conflicting_child_no_stale_bytes_leak() {
+        let h = TestHarness::new(1, TxFlags::empty());
+        let align = h.engine.device.alignment();
+
+        let stale_offset = h.engine.allocator.lock().allocate(align as u64).unwrap();
+        let mut stale = AlignedBuf::new(align, align);
+        stale.fill(0xA5);
+        h.engine.device.pwrite_all_at(&stale, stale_offset).unwrap();
+        h.engine
+            .allocator
+            .lock()
+            .free(stale_offset, align as u64)
+            .unwrap();
+
+        let child = [0xDDu8; 32];
+        h.engine.append_conflicting_child(&h.key, child).unwrap();
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!(
+            { meta.conflicting_children_offset },
+            stale_offset,
+            "test setup expects allocator to reuse the stale block"
+        );
+
+        let mut read_back = AlignedBuf::new(align, align);
+        h.engine
+            .device
+            .pread_exact_at(&mut read_back, stale_offset)
+            .unwrap();
+        assert_eq!(&read_back[..32], &child);
+        assert!(
+            read_back[32..].iter().all(|b| *b == 0),
+            "children-list padding must be zeroed, not stale bytes from the freed block"
+        );
+    }
+
     /// R-021 (BC-25 / BC-35) regression: an idempotent re-spend (same
     /// `spending_data` already on the slot) MUST be a true no-op — no
     /// generation bump, no metadata write. Pre-fix the engine
@@ -5366,6 +6384,7 @@ mod tests {
             tx_key: h.key,
             offset: 5,
             utxo_hash: h.slot_hash(5),
+            spending_data: h.make_spending_data(0xAB),
             current_block_height: 1000,
             block_height_retention: 288,
         };
@@ -5395,6 +6414,7 @@ mod tests {
             tx_key: h.key,
             offset: 0,
             utxo_hash: h.slot_hash(0),
+            spending_data: h.make_spending_data(0xAB),
             current_block_height: 1000,
             block_height_retention: 288,
         };
@@ -5451,6 +6471,7 @@ mod tests {
             tx_key: h.key,
             offset: 0,
             utxo_hash: h.slot_hash(0),
+            spending_data: h.make_spending_data(0xAB),
             current_block_height: 1000,
             block_height_retention: 288,
         };
@@ -6595,6 +7616,34 @@ mod tests {
     }
 
     #[test]
+    fn read_block_entry_finds_overflow_entry() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        for bid in 1..=5u32 {
+            h.engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: h.key,
+                    block_id: bid,
+                    block_height: 700_000 + bid,
+                    subtree_idx: bid + 10,
+                    current_block_height: 800_000,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .unwrap();
+        }
+
+        let entry = h
+            .engine
+            .read_block_entry(&h.key, 5)
+            .unwrap()
+            .expect("overflow block entry");
+        assert_eq!({ entry.block_id }, 5);
+        assert_eq!({ entry.block_height }, 700_005);
+        assert_eq!({ entry.subtree_idx }, 15);
+    }
+
+    #[test]
     fn set_mined_overflow_unset_from_overflow() {
         let h = TestHarness::new(10, TxFlags::empty());
         for bid in 1..=5u32 {
@@ -6946,9 +7995,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn external_create_without_external_ref_is_rejected_before_allocation() {
+        let engine = create_engine();
+        let (_, mut req) = make_create_req(31, 2);
+        req.is_external = true;
+        req.inputs = None;
+        req.outputs = None;
+        req.inpoints = None;
+        req.external_ref = None;
+
+        let next_before = engine.allocator().lock().next_offset();
+        match engine.create(&req) {
+            Err(CreateError::MissingExternalRef) => {}
+            other => panic!("expected MissingExternalRef, got {other:?}"),
+        }
+        assert!(engine.lookup(&req.tx_key()).is_none());
+        assert_eq!(engine.allocator().lock().next_offset(), next_before);
+
+        match engine.pre_allocate_create(&req) {
+            Err(CreateError::MissingExternalRef) => {}
+            other => panic!("expected MissingExternalRef from pre_allocate_create, got {other:?}"),
+        }
+        assert_eq!(engine.allocator().lock().next_offset(), next_before);
+    }
+
+    #[test]
+    fn external_create_persists_authoritative_external_ref() {
+        let engine = create_engine();
+        let (_, mut req) = make_create_req(32, 2);
+        req.is_external = true;
+        req.inputs = None;
+        req.outputs = None;
+        req.inpoints = None;
+        let external_ref = test_external_ref(req.tx_id);
+        req.external_ref = Some(external_ref);
+
+        engine.create(&req).unwrap();
+        let meta = engine.read_metadata(&req.tx_key()).unwrap();
+        assert!(meta.flags.contains(TxFlags::EXTERNAL));
+        let actual = meta.external_ref;
+        assert_eq!(actual, external_ref);
+    }
+
     fn create_engine() -> Arc<Engine> {
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(1000).unwrap();
+        Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ))
+    }
+
+    fn create_engine_without_direct_ptr() -> Arc<Engine> {
+        let inner: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let (dev, _fail) = crate::device::ReadFailingDevice::new(inner);
+        let dev: Arc<dyn BlockDevice> = dev;
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(1000).unwrap();
         Arc::new(Engine::new(
@@ -7582,6 +8691,32 @@ mod tests {
     }
 
     #[test]
+    fn freeze_already_frozen_wrong_hash_returns_hash_mismatch() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(161, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
+
+        let mut wrong_hash = req.utxo_hashes[0];
+        wrong_hash[0] ^= 0xFF;
+        match engine.freeze(&FreezeRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: wrong_hash,
+        }) {
+            Err(SpendError::UtxoHashMismatch { offset: 0 }) => {}
+            other => panic!("expected UtxoHashMismatch before AlreadyFrozen, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn freeze_spent_utxo() {
         let engine = create_engine();
         let (_, req) = make_create_req(62, 5);
@@ -8040,6 +9175,52 @@ mod tests {
     }
 
     #[test]
+    fn reassign_spendable_height_boundary_at_exact_height() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(85, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
+
+        let new_hash = [0xEF; 32];
+        engine
+            .reassign(&ReassignRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+                new_utxo_hash: new_hash,
+                block_height: 1000,
+                spendable_after: 100,
+            })
+            .unwrap();
+
+        let mut sd = [0u8; 36];
+        sd[0] = 0xF0;
+        match engine.spend(&SpendRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: new_hash,
+            spending_data: sd,
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1100,
+            block_height_retention: 288,
+        }) {
+            Err(SpendError::FrozenUntil {
+                spendable_at_height: 1100,
+                ..
+            }) => {}
+            other => panic!("exact spendable_height remains frozen; got {other:?}"),
+        }
+    }
+
+    #[test]
     fn reassign_spendable_after_cooldown() {
         let engine = create_engine();
         let (_, req) = make_create_req(84, 5);
@@ -8198,6 +9379,56 @@ mod tests {
             Err(SpendError::Conflicting) => {}
             other => panic!("expected Conflicting, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn set_locked_conflicting_fast_slow_generation_parity() {
+        fn run(engine: Arc<Engine>) -> (u32, u32, u32, u32, u8, u8) {
+            let (_, req) = make_create_req(124, 5);
+            let key = req.tx_key();
+            engine.create(&req).unwrap();
+
+            let conflicting = engine
+                .set_conflicting(&SetConflictingRequest {
+                    tx_key: key,
+                    value: true,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                })
+                .unwrap();
+            let after_conflict = engine.read_metadata(&key).unwrap();
+            let conflict_entry = engine.index.read().lookup(&key).unwrap();
+            assert_eq!(conflicting.generation, { after_conflict.generation });
+            assert_eq!(conflict_entry.generation, { after_conflict.generation });
+            assert_eq!(conflict_entry.tx_flags, after_conflict.flags.bits());
+            assert_ne!({ after_conflict.delete_at_height }, 0);
+
+            let locked_generation = engine
+                .set_locked(&SetLockedRequest {
+                    tx_key: key,
+                    value: true,
+                })
+                .unwrap();
+            let after_locked = engine.read_metadata(&key).unwrap();
+            let locked_entry = engine.index.read().lookup(&key).unwrap();
+            assert_eq!(locked_generation, { after_locked.generation });
+            assert_eq!(locked_entry.generation, { after_locked.generation });
+            assert_eq!(locked_entry.tx_flags, after_locked.flags.bits());
+            assert_eq!({ after_locked.delete_at_height }, 0);
+
+            (
+                conflicting.generation,
+                locked_generation,
+                { after_conflict.delete_at_height },
+                { after_locked.delete_at_height },
+                after_conflict.flags.bits(),
+                after_locked.flags.bits(),
+            )
+        }
+
+        let fast = run(create_engine());
+        let slow = run(create_engine_without_direct_ptr());
+        assert_eq!(fast, slow);
     }
 
     // -- SetLocked tests --
@@ -8410,6 +9641,35 @@ mod tests {
     }
 
     #[test]
+    fn delete_syncs_tombstone_before_freeing_region() {
+        let inner: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let (dev, syncs) = SyncCountingDevice::new(inner);
+        let dev: Arc<dyn BlockDevice> = dev;
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(1000).unwrap();
+        let engine = Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let (_, req) = make_create_req(126, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        syncs.store(0, Ordering::SeqCst);
+        engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+
+        assert!(
+            syncs.load(Ordering::SeqCst) >= 1,
+            "delete must sync the tombstone before allocator.free can reuse the region",
+        );
+    }
+
+    #[test]
     fn delete_then_lookup_none() {
         let engine = create_engine();
         let (_, req) = make_create_req(121, 5);
@@ -8463,6 +9723,27 @@ mod tests {
         assert!(
             rebuilt.lookup(&key).is_none(),
             "rebuild must ignore freed records whose metadata was tombstoned",
+        );
+    }
+
+    #[test]
+    fn tombstone_overwrites_metadata_header() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(125, 5);
+        let key = req.tx_key();
+        let created = engine.create(&req).unwrap();
+
+        engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+
+        let align = engine.device.alignment();
+        let mut buf = AlignedBuf::new(io::align_up(METADATA_SIZE, align), align);
+        engine
+            .device
+            .pread_exact_at(&mut buf, created.record_offset)
+            .unwrap();
+        assert!(
+            buf[..METADATA_SIZE].iter().all(|b| *b == 0),
+            "delete tombstone must zero the full metadata header"
         );
     }
 
@@ -9091,6 +10372,8 @@ mod tests {
             1,
             "counter should be 1 (idempotent — not incremented 100 times)"
         );
+        let slot = engine.read_slot(&key, 0).unwrap();
+        assert_eq!(slot.spending_data, sd);
     }
 
     #[test]
@@ -9128,10 +10411,14 @@ mod tests {
 
         let mut successes = 0u32;
         let mut already_spent = 0u32;
+        let mut already_spent_payloads = Vec::new();
         for result in &results {
             match result {
                 Ok(_) => successes += 1,
-                Err(SpendError::AlreadySpent { .. }) => already_spent += 1,
+                Err(SpendError::AlreadySpent { spending_data, .. }) => {
+                    already_spent += 1;
+                    already_spent_payloads.push(*spending_data);
+                }
                 other => panic!("unexpected result: {other:?}"),
             }
         }
@@ -9141,6 +10428,13 @@ mod tests {
 
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.spent_utxos }, 1);
+        let winning_spending_data = engine.read_slot(&key, 0).unwrap().spending_data;
+        assert!(
+            already_spent_payloads
+                .iter()
+                .all(|payload| *payload == winning_spending_data),
+            "every AlreadySpent error must return the winning spending_data"
+        );
     }
 
     #[test]
@@ -9247,7 +10541,7 @@ mod tests {
         let cached = h
             .engine
             .cached_millis
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .load(std::sync::atomic::Ordering::SeqCst);
         // Should be close to current time (within 2 seconds).
         let now = sys_millis();
         assert!(cached > 0, "cached clock should be initialized");
@@ -9263,15 +10557,33 @@ mod tests {
         let before = h
             .engine
             .cached_millis
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .load(std::sync::atomic::Ordering::SeqCst);
         // Sleep briefly so the clock advances.
         std::thread::sleep(std::time::Duration::from_millis(5));
         h.engine.refresh_clock();
         let after = h
             .engine
             .cached_millis
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .load(std::sync::atomic::Ordering::SeqCst);
         assert!(after >= before, "refresh_clock should advance cached time");
+    }
+
+    #[test]
+    fn clock_refresh_staleness_bounded() {
+        let h = TestHarness::new(2, TxFlags::empty());
+        h.engine
+            .cached_millis
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+
+        h.engine.refresh_clock();
+
+        let cached = h.engine.now_millis();
+        let now = sys_millis();
+        assert!(cached > 1, "refresh_clock should publish a fresh timestamp");
+        assert!(
+            now.abs_diff(cached) < 2000,
+            "cached clock should be close to current time"
+        );
     }
 
     #[test]
@@ -9282,7 +10594,7 @@ mod tests {
         let cached = h
             .engine
             .cached_millis
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .load(std::sync::atomic::Ordering::SeqCst);
 
         // Perform a mutation.
         h.engine.spend(&h.spend_req(0)).unwrap();
@@ -9298,6 +10610,183 @@ mod tests {
     }
 
     // -- H2: atomic shard-count update tests --
+
+    #[test]
+    fn engine_startup_shard_counts_lazy() {
+        fn key_for_shard(shard: u16, salt: u8) -> TxKey {
+            assert!(shard < crate::cluster::shards::NUM_SHARDS as u16);
+            let mut txid = [0u8; 32];
+            txid[0..2].copy_from_slice(&shard.to_le_bytes());
+            txid[2] = salt;
+            txid[8..16].copy_from_slice(&((shard as u64) << 8 | salt as u64).to_le_bytes());
+            TxKey { txid }
+        }
+
+        fn dummy_entry() -> TxIndexEntry {
+            TxIndexEntry {
+                device_id: 0,
+                record_offset: 0,
+                utxo_count: 1,
+                block_entry_count: 0,
+                tx_flags: 0,
+                spent_utxos: 0,
+                dah_or_preserve: 0,
+                unmined_since: 0,
+                generation: 0,
+            }
+        }
+
+        const EXISTING_SHARD: u16 = 1234;
+        const OTHER_EXISTING_SHARD: u16 = 1235;
+        const PRE_INIT_CREATE_SHARD: u16 = 1236;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(1000).unwrap();
+        index
+            .register(key_for_shard(EXISTING_SHARD, 1), dummy_entry())
+            .unwrap();
+        index
+            .register(key_for_shard(EXISTING_SHARD, 2), dummy_entry())
+            .unwrap();
+        index
+            .register(key_for_shard(OTHER_EXISTING_SHARD, 1), dummy_entry())
+            .unwrap();
+
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        assert!(
+            !engine.shard_counts_initialized_for_test(),
+            "Engine::new must not eagerly initialize shard_counts",
+        );
+
+        let (_, mut pre_init_req) = make_create_req(71, 1);
+        pre_init_req.tx_id = key_for_shard(PRE_INIT_CREATE_SHARD, 1).txid;
+        engine
+            .create(&pre_init_req)
+            .expect("create before lazy count initialization should succeed");
+        assert!(
+            !engine.shard_counts_initialized_for_test(),
+            "create before first shard_record_count should not force a full index scan",
+        );
+
+        assert_eq!(
+            engine.shard_record_count(EXISTING_SHARD),
+            2,
+            "first shard_record_count must not return zero for existing records",
+        );
+        assert!(engine.shard_counts_initialized_for_test());
+        assert_eq!(engine.shard_record_count(OTHER_EXISTING_SHARD), 1);
+        assert_eq!(engine.shard_record_count(PRE_INIT_CREATE_SHARD), 1);
+
+        let (_, mut post_init_req) = make_create_req(72, 1);
+        post_init_req.tx_id = key_for_shard(EXISTING_SHARD, 3).txid;
+        engine
+            .create(&post_init_req)
+            .expect("create after lazy count initialization should succeed");
+        assert_eq!(engine.shard_record_count(EXISTING_SHARD), 3);
+
+        engine
+            .delete(&DeleteRequest {
+                tx_key: post_init_req.tx_key(),
+            })
+            .expect("delete after lazy count initialization should succeed");
+        assert_eq!(engine.shard_record_count(EXISTING_SHARD), 2);
+
+        engine
+            .register(key_for_shard(EXISTING_SHARD, 1), dummy_entry())
+            .expect("updating an existing index key should succeed");
+        assert_eq!(
+            engine.shard_record_count(EXISTING_SHARD),
+            2,
+            "updating an existing key must not increment the shard count",
+        );
+    }
+
+    #[test]
+    fn primary_resize_preserves_entries_without_inline_write_lock_rehash() {
+        fn key(i: u64) -> TxKey {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            txid[8..16].copy_from_slice(&(i.wrapping_mul(17)).to_le_bytes());
+            TxKey { txid }
+        }
+
+        fn entry(i: u64) -> TxIndexEntry {
+            TxIndexEntry {
+                device_id: 0,
+                record_offset: i * 4096,
+                utxo_count: 1,
+                block_entry_count: 0,
+                tx_flags: 0,
+                spent_utxos: 0,
+                dah_or_preserve: 0,
+                unmined_since: 0,
+                generation: 0,
+            }
+        }
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let engine = Engine::new(
+            dev,
+            Index::new(1).unwrap(),
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        let initial_capacity = engine.index.read().stats().capacity;
+        for i in 0..20 {
+            engine
+                .register_with_shard_count(key(i), entry(i))
+                .expect("register should resize without losing entries");
+        }
+
+        let resized_capacity = engine.index.read().stats().capacity;
+        assert!(
+            resized_capacity > initial_capacity,
+            "test must cross the resize threshold"
+        );
+        for i in 0..20 {
+            assert_eq!(
+                engine.lookup(&key(i)).unwrap().record_offset,
+                i * 4096,
+                "resized primary index lost entry {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn primary_resize_lock_mode_allows_concurrent_lookups() {
+        let h = TestHarness::new(1, TxFlags::empty());
+        let engine = h.engine.clone();
+        let key = h.key;
+
+        let resize_like_guard = engine.index.upgradable_read();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader_engine = engine.clone();
+        std::thread::spawn(move || {
+            tx.send(reader_engine.lookup(&key).is_some()).unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .expect("lookup must not block behind an upgradable resize guard"),
+            "lookup should find the existing key while resize copy lock is held"
+        );
+        drop(resize_like_guard);
+    }
 
     /// Sum of per-shard counts observed on `engine`, computed from the
     /// `shard_counts` field used in migration decisions.

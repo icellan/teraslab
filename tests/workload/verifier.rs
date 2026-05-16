@@ -97,6 +97,15 @@ impl StateVerifier {
                     frozen: false,
                     conflicting: false,
                     locked: false,
+                    external_ref: (*is_external).then_some(ExternalRef {
+                        store_type: 1,
+                        content_hash: *tx_id,
+                        total_size: 250,
+                        input_count: 0,
+                        output_count: 0,
+                        inputs_offset: 0,
+                        outputs_offset: 0,
+                    }),
                     parent_txids: &[],
                 };
 

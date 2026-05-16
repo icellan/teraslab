@@ -79,6 +79,24 @@ fn start_swim(id: u64, swim_port: u16, tcp_port: u16, seeds: &[u16]) -> SwimNode
     )
 }
 
+fn start_swim_with_secret(
+    id: u64,
+    swim_port: u16,
+    tcp_port: u16,
+    seeds: &[u16],
+    cluster_secret: &[u8],
+) -> SwimNode {
+    start_swim_with_config_and_secret(
+        id,
+        swim_port,
+        tcp_port,
+        seeds,
+        TEST_PROBE_INTERVAL,
+        TEST_SUSPICION_TIMEOUT,
+        Some(cluster_secret.to_vec()),
+    )
+}
+
 fn start_swim_with_config(
     id: u64,
     swim_port: u16,
@@ -86,6 +104,26 @@ fn start_swim_with_config(
     seeds: &[u16],
     probe_interval: Duration,
     suspicion_timeout: Duration,
+) -> SwimNode {
+    start_swim_with_config_and_secret(
+        id,
+        swim_port,
+        tcp_port,
+        seeds,
+        probe_interval,
+        suspicion_timeout,
+        None,
+    )
+}
+
+fn start_swim_with_config_and_secret(
+    id: u64,
+    swim_port: u16,
+    tcp_port: u16,
+    seeds: &[u16],
+    probe_interval: Duration,
+    suspicion_timeout: Duration,
+    cluster_secret: Option<Vec<u8>>,
 ) -> SwimNode {
     let seed_addrs: Vec<SocketAddr> = seeds.iter().map(|&p| swim_addr(p)).collect();
     let runner = SwimRunner::new(SwimConfig {
@@ -95,7 +133,7 @@ fn start_swim_with_config(
         seed_nodes: seed_addrs,
         probe_interval,
         suspicion_timeout,
-        cluster_secret: None,
+        cluster_secret,
         persisted_incarnation: 0,
         committed_term: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
@@ -190,6 +228,44 @@ fn three_nodes_form_cluster_over_udp() {
         count(&events3) >= 1,
         "node 3 should see at least 1 join, got {}",
         count(&events3)
+    );
+}
+
+#[test]
+fn wrong_secret_nodes_dont_converge() {
+    let n1 = start_swim_with_secret(6, 15006, 15007, &[], b"cluster-a-secret");
+    let n2 = start_swim_with_secret(7, 15008, 15009, &[15006], b"cluster-b-secret");
+
+    let events1 = wait_for(
+        &n1.rx,
+        |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, ClusterEvent::NodeJoined(NodeId(7), _)))
+        },
+        Duration::from_secs(2),
+    );
+    let events2 = wait_for(
+        &n2.rx,
+        |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, ClusterEvent::NodeJoined(NodeId(6), _)))
+        },
+        Duration::from_secs(2),
+    );
+
+    assert!(
+        !events1
+            .iter()
+            .any(|event| matches!(event, ClusterEvent::NodeJoined(NodeId(7), _))),
+        "node 6 must not accept SWIM gossip signed with node 7's different secret: {events1:?}",
+    );
+    assert!(
+        !events2
+            .iter()
+            .any(|event| matches!(event, ClusterEvent::NodeJoined(NodeId(6), _))),
+        "node 7 must not accept SWIM gossip signed with node 6's different secret: {events2:?}",
     );
 }
 

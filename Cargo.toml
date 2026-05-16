@@ -26,6 +26,14 @@ clap = { version = "4", features = ["derive", "env"] }
 comfy-table = "7"
 crc32fast = "1"
 crossterm = "0.28"
+# Cross-platform signal handler (SIGINT + SIGTERM) for graceful shutdown.
+# Pre-fix `ctrlc_handler` in the server binary was a no-op stub, so SIGINT /
+# SIGTERM hard-killed the daemon and skipped the shutdown path entirely
+# (cluster stop, index snapshot, allocator persist, replication-intent flush,
+# device.sync, OTLP flush — none of it ran). `ctrlc` is a small, well-known
+# crate (~200 LOC over `nix`/`winapi`) that registers a single handler and
+# forwards SIGINT/SIGTERM to a closure. See F-G10-001 in the review.
+ctrlc = { version = "3", features = ["termination"] }
 getrandom = "0.2"
 libc = "0.2"
 mime_guess = "2"
@@ -66,6 +74,7 @@ io-uring = "0.7"
 criterion = { version = "0.5", features = ["html_reports"] }
 filetime = "0.2"
 prometheus-parse = "0.2"
+proptest = "1"
 tempfile = "3"
 
 [[bench]]

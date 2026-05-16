@@ -6,13 +6,13 @@
 //! # Record integrity
 //!
 //! [`TxMetadata`] embeds a CRC32 checksum computed over the entire 256-byte
-//! header (with the checksum slot zeroed during computation). Every write
-//! recomputes the CRC and stores it in the header; every read validates the
-//! stored CRC against a freshly-computed value and returns
+//! header (with the checksum slot zeroed during computation). Each
+//! [`UtxoSlot`] also stores a CRC32 over its logical 69-byte payload. Every
+//! write recomputes the relevant CRC and every read validates it, returning
 //! [`RecordError::CrcMismatch`] on disagreement. This guards against torn
 //! writes, bit-rot, and partial-sector updates that would otherwise silently
-//! corrupt fields such as `utxo_count`, `spent_utxos`, or
-//! `block_entries_inline`.
+//! corrupt fields such as `utxo_count`, `spent_utxos`, slot status, or
+//! slot `spending_data`.
 
 use bitflags::bitflags;
 use thiserror::Error;
@@ -21,8 +21,14 @@ use thiserror::Error;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Size of a single UTXO slot in bytes.
-pub const UTXO_SLOT_SIZE: usize = 69;
+/// Logical payload size of a single UTXO slot before the checksum footer.
+pub const UTXO_SLOT_PAYLOAD_SIZE: usize = 69;
+
+/// Byte offset of the UTXO slot CRC32 footer within the on-disk slot.
+pub const UTXO_SLOT_CRC32_OFFSET: usize = UTXO_SLOT_PAYLOAD_SIZE;
+
+/// Size of a single UTXO slot on disk, including the CRC32 footer.
+pub const UTXO_SLOT_SIZE: usize = UTXO_SLOT_PAYLOAD_SIZE + 4;
 
 /// Size of a single block entry in bytes.
 pub const BLOCK_ENTRY_SIZE: usize = 12;
@@ -71,10 +77,10 @@ pub const METADATA_PADDING: usize = METADATA_PADDING_AMOUNT;
 
 /// Errors produced when parsing on-disk record structures.
 ///
-/// Currently the only failure mode is a CRC32 checksum mismatch on
-/// [`TxMetadata`] deserialization, which indicates disk corruption, a torn
-/// write, or a partial-sector update. Callers must propagate this error —
-/// silent acceptance of corrupted metadata is unsafe for a UTXO store.
+/// CRC32 checksum mismatches on [`TxMetadata`] or [`UtxoSlot`]
+/// deserialization indicate disk corruption, a torn write, or a
+/// partial-sector update. Callers must propagate this error — silent
+/// acceptance of corrupted record bytes is unsafe for a UTXO store.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum RecordError {
     /// The CRC32 checksum stored in the record header did not match the
@@ -95,8 +101,9 @@ pub enum RecordError {
 
 /// A single UTXO output slot on disk.
 ///
-/// Fixed at 69 bytes. Always pre-allocated at full size from creation, even
-/// when unspent, so the record never grows on spend (eliminating copy-on-write).
+/// Fixed at 73 bytes on disk: 69 logical bytes plus a 4-byte CRC32 footer.
+/// Always pre-allocated at full size from creation, even when unspent, so
+/// the record never grows on spend (eliminating copy-on-write).
 ///
 /// # spending_data interpretation by status
 ///
@@ -175,23 +182,33 @@ impl UtxoSlot {
         dst[..32].copy_from_slice(&self.hash);
         dst[32] = self.status;
         dst[33..69].copy_from_slice(&self.spending_data);
+        let crc = crc32fast::hash(&dst[..UTXO_SLOT_PAYLOAD_SIZE]);
+        dst[UTXO_SLOT_CRC32_OFFSET..UTXO_SLOT_CRC32_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     }
 
     /// Deserialize a slot from a byte slice.
     ///
     /// The source must be at least `UTXO_SLOT_SIZE` bytes.
-    pub fn from_bytes(src: &[u8]) -> Self {
+    pub fn from_bytes(src: &[u8]) -> Result<Self, RecordError> {
         debug_assert!(src.len() >= UTXO_SLOT_SIZE);
+        let mut expected = [0u8; 4];
+        expected.copy_from_slice(&src[UTXO_SLOT_CRC32_OFFSET..UTXO_SLOT_CRC32_OFFSET + 4]);
+        let expected = u32::from_le_bytes(expected);
+        let actual = crc32fast::hash(&src[..UTXO_SLOT_PAYLOAD_SIZE]);
+        if actual != expected {
+            return Err(RecordError::CrcMismatch { expected, actual });
+        }
+
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&src[..32]);
         let status = src[32];
         let mut spending_data = [0u8; 36];
         spending_data.copy_from_slice(&src[33..69]);
-        Self {
+        Ok(Self {
             hash,
             status,
             spending_data,
-        }
+        })
     }
 }
 
@@ -587,10 +604,13 @@ impl TxMetadata {
 
     /// Deserialize metadata from a byte slice without validating the CRC.
     ///
-    /// Intended for diagnostics / recovery tooling that needs to inspect a
-    /// corrupted record. Library code on the hot path must use
-    /// [`TxMetadata::from_bytes`] to preserve correctness guarantees.
-    pub fn from_bytes_unchecked(src: &[u8]) -> Self {
+    /// **Crate-internal diagnostics helper.** Intended for recovery /
+    /// debugging tooling that needs to inspect a known-corrupt header.
+    /// F-G1-006: the visibility was tightened from `pub` to `pub(crate)`
+    /// so external callers cannot bypass the CRC integrity story by
+    /// grepping for "fast metadata read". Library code on the hot path
+    /// must use [`TxMetadata::from_bytes`] which validates the CRC.
+    pub(crate) fn from_bytes_unchecked(src: &[u8]) -> Self {
         debug_assert!(src.len() >= METADATA_SIZE);
         let mut meta = std::mem::MaybeUninit::<Self>::uninit();
         // Safety: TxMetadata is repr(C, packed) and Copy.
@@ -661,15 +681,16 @@ impl Eq for TxMetadata {}
 // Compile-time assertions
 // ---------------------------------------------------------------------------
 
-const _: () = assert!(std::mem::size_of::<UtxoSlot>() == UTXO_SLOT_SIZE);
+const _: () = assert!(std::mem::size_of::<UtxoSlot>() == UTXO_SLOT_PAYLOAD_SIZE);
 const _: () = assert!(std::mem::size_of::<BlockEntry>() == BLOCK_ENTRY_SIZE);
 const _: () = assert!(BLOCK_ENTRY_SIZE == 12);
-const _: () = assert!(UTXO_SLOT_SIZE == 69);
+const _: () = assert!(UTXO_SLOT_PAYLOAD_SIZE == 69);
+const _: () = assert!(UTXO_SLOT_SIZE == 73);
 const _: () = assert!(std::mem::size_of::<TxFlags>() == 1);
 const _: () = assert!(METADATA_SIZE.is_multiple_of(64));
 // METADATA_SIZE is 320 bytes (grew from 256 to accommodate the trailing
 // `crc32` field — see task C7). The header is cache-line aligned and UTXO
-// slots live at a deterministic offset `METADATA_SIZE + vout * 69`.
+// slots live at a deterministic offset `METADATA_SIZE + vout * UTXO_SLOT_SIZE`.
 const _: () = assert!(METADATA_SIZE == 320);
 const _: () = assert!(std::mem::size_of::<TxMetadata>() == METADATA_SIZE);
 // The CRC slot must sit inside the header (before the padding tail) so it
@@ -679,6 +700,33 @@ const _: () = assert!(CRC32_OFFSET + 4 <= METADATA_SIZE);
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Half of the `u32` generation number space.
+///
+/// Record generations are compared as wrapping serial numbers. A target
+/// generation is considered ahead of a local generation only when it is in the
+/// next half of the `u32` space: `0 < target.wrapping_sub(local) < 2^31`.
+/// The exact half-range distance is ambiguous, so it is classified as
+/// not-ahead; redo and replication callers treat that as already applied or
+/// stale and must not rely on retaining more than `2^31 - 1` outstanding
+/// mutations for one record.
+pub const GENERATION_ORDER_WINDOW: u32 = 1u32 << 31;
+
+/// Return true when `target` is newer than `local` under wrapping generation
+/// ordering.
+pub fn generation_target_ahead(local: u32, target: u32) -> bool {
+    let delta = target.wrapping_sub(local);
+    delta != 0 && delta < GENERATION_ORDER_WINDOW
+}
+
+/// Return true when `local` is at or ahead of `target` under wrapping
+/// generation ordering.
+///
+/// This is the replacement for plain `local >= target` when deciding whether
+/// redo replay or replica apply has already observed a record generation.
+pub fn generation_at_or_ahead(local: u32, target: u32) -> bool {
+    !generation_target_ahead(local, target)
+}
 
 fn hex_short(data: &[u8]) -> String {
     if data.len() <= 4 {
@@ -701,8 +749,10 @@ mod tests {
 
     #[test]
     fn utxo_slot_size() {
-        assert_eq!(std::mem::size_of::<UtxoSlot>(), UTXO_SLOT_SIZE);
-        assert_eq!(UTXO_SLOT_SIZE, 69);
+        assert_eq!(std::mem::size_of::<UtxoSlot>(), UTXO_SLOT_PAYLOAD_SIZE);
+        assert_eq!(UTXO_SLOT_PAYLOAD_SIZE, 69);
+        assert_eq!(UTXO_SLOT_CRC32_OFFSET, 69);
+        assert_eq!(UTXO_SLOT_SIZE, 73);
     }
 
     #[test]
@@ -719,6 +769,17 @@ mod tests {
     #[test]
     fn tx_flags_size() {
         assert_eq!(std::mem::size_of::<TxFlags>(), 1);
+    }
+
+    #[test]
+    fn generation_order_handles_wraparound() {
+        assert!(generation_at_or_ahead(7, 7));
+        assert!(generation_target_ahead(7, 8));
+        assert!(generation_at_or_ahead(8, 7));
+        assert!(generation_target_ahead(u32::MAX, 0));
+        assert!(generation_at_or_ahead(0, u32::MAX));
+        assert!(!generation_target_ahead(0, 1u32 << 31));
+        assert!(generation_at_or_ahead(0, 1u32 << 31));
     }
 
     // -- Layout field offset tests --
@@ -755,12 +816,27 @@ mod tests {
 
         let mut buf = [0u8; UTXO_SLOT_SIZE];
         slot.to_bytes(&mut buf);
-        let restored = UtxoSlot::from_bytes(&buf);
+        let restored = UtxoSlot::from_bytes(&buf).expect("slot CRC should verify");
 
         assert_eq!(restored.hash, hash);
         assert_eq!(restored.status, UTXO_SPENT);
         assert_eq!(restored.spending_data, sd);
         assert_eq!(slot, restored);
+    }
+
+    #[test]
+    fn utxo_slot_crc_rejects_torn_payload() {
+        let slot = UtxoSlot::new_spent([0x44; 32], [0x55; 36]);
+        let mut buf = [0u8; UTXO_SLOT_SIZE];
+        slot.to_bytes(&mut buf);
+
+        buf[33] ^= 0x01;
+
+        let err = UtxoSlot::from_bytes(&buf).expect_err("torn slot payload must fail CRC");
+        assert!(
+            matches!(err, RecordError::CrcMismatch { .. }),
+            "expected CrcMismatch, got {err:?}",
+        );
     }
 
     #[test]
@@ -776,7 +852,7 @@ mod tests {
 
         let mut buf = [0u8; UTXO_SLOT_SIZE];
         slot.to_bytes(&mut buf);
-        let restored = UtxoSlot::from_bytes(&buf);
+        let restored = UtxoSlot::from_bytes(&buf).expect("slot CRC should verify");
         assert_eq!(slot, restored);
     }
 
@@ -793,7 +869,7 @@ mod tests {
 
         let mut buf = [0u8; UTXO_SLOT_SIZE];
         slot.to_bytes(&mut buf);
-        let restored = UtxoSlot::from_bytes(&buf);
+        let restored = UtxoSlot::from_bytes(&buf).expect("slot CRC should verify");
         assert_eq!(slot, restored);
     }
 
@@ -815,7 +891,7 @@ mod tests {
 
         let mut buf = [0u8; UTXO_SLOT_SIZE];
         slot.to_bytes(&mut buf);
-        let restored = UtxoSlot::from_bytes(&buf);
+        let restored = UtxoSlot::from_bytes(&buf).expect("slot CRC should verify");
         assert_eq!(slot, restored);
     }
 
@@ -829,7 +905,7 @@ mod tests {
 
         let mut buf = [0u8; UTXO_SLOT_SIZE];
         slot.to_bytes(&mut buf);
-        let restored = UtxoSlot::from_bytes(&buf);
+        let restored = UtxoSlot::from_bytes(&buf).expect("slot CRC should verify");
         assert_eq!(slot, restored);
     }
 
@@ -992,7 +1068,7 @@ mod tests {
 
         let mut buf = [0u8; UTXO_SLOT_SIZE];
         slot.to_bytes(&mut buf);
-        let restored = UtxoSlot::from_bytes(&buf);
+        let restored = UtxoSlot::from_bytes(&buf).expect("slot CRC should verify");
 
         assert_eq!(restored.hash, [0u8; 32]);
         assert_eq!(restored.status, UTXO_UNSPENT);
@@ -1007,7 +1083,7 @@ mod tests {
 
         let mut buf = [0u8; UTXO_SLOT_SIZE];
         slot.to_bytes(&mut buf);
-        let restored = UtxoSlot::from_bytes(&buf);
+        let restored = UtxoSlot::from_bytes(&buf).expect("slot CRC should verify");
 
         assert_eq!(restored.hash, [0xFFu8; 32]);
         assert_eq!(restored.status, UTXO_UNSPENT);
@@ -1363,7 +1439,7 @@ mod tests {
 
         let mut buf = [0u8; UTXO_SLOT_SIZE];
         slot.to_bytes(&mut buf);
-        let restored = UtxoSlot::from_bytes(&buf);
+        let restored = UtxoSlot::from_bytes(&buf).expect("slot CRC should verify");
 
         assert_eq!(restored.status, UTXO_SPENT);
         assert_eq!(restored.hash, hash);

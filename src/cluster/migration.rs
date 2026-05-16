@@ -931,6 +931,46 @@ impl MigrationManager {
         }
     }
 
+    /// Remove completed outbound migrations while preserving Failed entries.
+    ///
+    /// Failed entries are the durable retry queue for membership/topology
+    /// handlers. The coordinator uses this after a migration batch returns
+    /// so a dead target cannot trigger an unbounded detached retry loop.
+    pub fn cleanup_completed_keep_failed(&mut self) {
+        let mut maybe_unfence: Vec<u16> = Vec::new();
+        for p in &self.active {
+            if p.is_complete() && self.fenced_shards.test(p.shard) {
+                maybe_unfence.push(p.shard);
+            }
+        }
+
+        self.active.retain(|p| !p.is_complete());
+
+        for shard in maybe_unfence {
+            let still_fenced = self
+                .active
+                .iter()
+                .any(|p| p.shard == shard && p.state == MigrationState::Fenced);
+            if !still_fenced {
+                self.unfence_shard(shard);
+            }
+        }
+
+        if self
+            .active
+            .iter()
+            .all(|p| p.state != MigrationState::Fenced)
+        {
+            self.fenced_shards.clear_all();
+        }
+
+        self.inbound_migrations.retain(|m| !m.completed);
+        self.inbound_bitmap.clear_all();
+        for m in &self.inbound_migrations {
+            self.inbound_bitmap.set(m.shard);
+        }
+    }
+
     /// Check if a shard is currently being migrated outbound.
     pub fn is_migrating_shard(&self, shard: u16) -> bool {
         self.active

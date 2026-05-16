@@ -56,6 +56,26 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --no-deps --all
 
+      # F-X-010: dependency supply-chain hygiene. `cargo-audit` flags
+      # known CVEs in the dependency tree; `cargo-deny` enforces our
+      # policy in `deny.toml` (banned crates, license allow-list, version
+      # duplicates). Both run on every PR. No untrusted github.* inputs
+      # flow into these run commands — every argument is a static string.
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit || true
+      - name: Cargo audit (RustSec advisories)
+        # `|| true` while we incrementally clear advisories; the goal of
+        # this initial integration is visibility, not fail-the-build. Flip
+        # to a hard fail once the advisory baseline is clean.
+        run: cargo audit || true
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny || true
+      - name: Cargo deny (policy)
+        # Same staged rollout as cargo-audit. `deny.toml` lives at repo
+        # root; absence is non-fatal here so this step is safe before the
+        # policy file is committed.
+        run: cargo deny check --hide-inclusion-graph || true
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

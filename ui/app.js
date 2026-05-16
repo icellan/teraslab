@@ -128,6 +128,20 @@
         push(store.history.errors, errRate);
     }
     function push(buf, v) { buf.push(v); if (buf.length > HISTORY_MAX) buf.shift(); }
+    function escapeHtml(value) {
+        return String(value ?? '').replace(/[&<>"']/g, ch => ({
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#39;',
+        }[ch]));
+    }
+    function displayValue(value) {
+        if (value === null || value === undefined) return '';
+        if (typeof value === 'object') return JSON.stringify(value);
+        return value;
+    }
 
     // ---------------------------------------------------------------------------
     // API
@@ -182,7 +196,7 @@
     function renderAlerts(alerts) {
         if (!alerts.length) return '';
         return '<div class="alerts">' + alerts.map(a =>
-            `<div class="alert ${a.severity}"><span class="ts-kicker">${a.severity}</span><span>${a.message}</span></div>`
+            `<div class="alert ${escapeHtml(a.severity)}"><span class="ts-kicker">${escapeHtml(a.severity)}</span><span>${escapeHtml(a.message)}</span></div>`
         ).join('') + '</div>';
     }
 
@@ -1343,7 +1357,7 @@
         const r = await fetch('/debug/records/' + txid);
         if (!r.ok) { el.innerHTML = '<div class="alert warning">Record not found</div>'; return; }
         const d = await r.json();
-        el.innerHTML = '<table><tbody>' + Object.entries(d).map(kv => `<tr><td>${kv[0]}</td><td style="color:var(--ts-text)">${kv[1]}</td></tr>`).join('') + '</tbody></table>';
+        el.innerHTML = '<table><tbody>' + Object.entries(d).map(kv => `<tr><td>${escapeHtml(kv[0])}</td><td style="color:var(--ts-text)">${escapeHtml(displayValue(kv[1]))}</td></tr>`).join('') + '</tbody></table>';
     };
     window._setLogLevel = async function (level) {
         await fetch('/debug/log-level', { method: 'PUT', body: level });

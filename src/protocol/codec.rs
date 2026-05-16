@@ -115,6 +115,13 @@ fn put_u32(buf: &mut Vec<u8>, v: u32) {
 fn put_u16(buf: &mut Vec<u8>, v: u16) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
+fn checked_u32_len(field: &'static str, len: usize) -> Result<u32, CodecError> {
+    u32::try_from(len).map_err(|_| CodecError::FieldOutOfBounds {
+        field,
+        value: len as u64,
+        max: u32::MAX as u64,
+    })
+}
 fn get_u32(d: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(d[o..o + 4].try_into().unwrap())
 }
@@ -423,6 +430,15 @@ pub struct WireSlotItem {
     pub utxo_hash: [u8; 32],
 }
 
+/// A single unspend item on the wire.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WireUnspendItem {
+    pub txid: [u8; 32],
+    pub vout: u32,
+    pub utxo_hash: [u8; 32],
+    pub spending_data: [u8; 36],
+}
+
 /// Encode a batch of slot items.
 pub fn encode_slot_item_batch(items: &[WireSlotItem]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + items.len() * 68);
@@ -581,9 +597,9 @@ pub struct UnspendBatchParams {
 
 /// Encode an UnspendBatch request payload.
 ///
-/// Format: `[count:4][cbh:4][bhr:4][items: txid(32)+vout(4)+hash(32) × count]`
-pub fn encode_unspend_batch(params: &UnspendBatchParams, items: &[WireSlotItem]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(12 + items.len() * 68);
+/// Format: `[count:4][cbh:4][bhr:4][items: txid(32)+vout(4)+hash(32)+spending_data(36) × count]`
+pub fn encode_unspend_batch(params: &UnspendBatchParams, items: &[WireUnspendItem]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(12 + items.len() * 104);
     put_u32(&mut buf, items.len() as u32);
     put_u32(&mut buf, params.current_block_height);
     put_u32(&mut buf, params.block_height_retention);
@@ -591,6 +607,7 @@ pub fn encode_unspend_batch(params: &UnspendBatchParams, items: &[WireSlotItem])
         buf.extend_from_slice(&item.txid);
         put_u32(&mut buf, item.vout);
         buf.extend_from_slice(&item.utxo_hash);
+        buf.extend_from_slice(&item.spending_data);
     }
     buf
 }
@@ -601,7 +618,7 @@ pub fn encode_unspend_batch(params: &UnspendBatchParams, items: &[WireSlotItem])
 pub fn decode_unspend_batch_checked(
     data: &[u8],
     max_batch: u32,
-) -> Result<(UnspendBatchParams, Vec<WireSlotItem>), CodecError> {
+) -> Result<(UnspendBatchParams, Vec<WireUnspendItem>), CodecError> {
     if data.len() < 12 {
         return Err(CodecError::HeaderTooShort {
             need: 12,
@@ -613,15 +630,15 @@ pub fn decode_unspend_batch_checked(
         current_block_height: get_u32(data, 4),
         block_height_retention: get_u32(data, 8),
     };
-    validate_batch_count(count, max_batch, 68, data.len() - 12)?;
+    validate_batch_count(count, max_batch, 104, data.len() - 12)?;
     let count = count as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 12;
     for _ in 0..count {
-        if pos + 68 > data.len() {
+        if pos + 104 > data.len() {
             return Err(CodecError::TruncatedBatch {
                 count: count as u32,
-                per_item_min: 68,
+                per_item_min: 104,
                 available: data.len().saturating_sub(12),
             });
         }
@@ -630,18 +647,21 @@ pub fn decode_unspend_batch_checked(
         let vout = get_u32(data, pos + 32);
         let mut uh = [0u8; 32];
         uh.copy_from_slice(&data[pos + 36..pos + 68]);
-        items.push(WireSlotItem {
+        let mut sd = [0u8; 36];
+        sd.copy_from_slice(&data[pos + 68..pos + 104]);
+        items.push(WireUnspendItem {
             txid,
             vout,
             utxo_hash: uh,
+            spending_data: sd,
         });
-        pos += 68;
+        pos += 104;
     }
     Ok((params, items))
 }
 
 /// Decode an UnspendBatch request payload using [`MAX_DECODE_BATCH`].
-pub fn decode_unspend_batch(data: &[u8]) -> Option<(UnspendBatchParams, Vec<WireSlotItem>)> {
+pub fn decode_unspend_batch(data: &[u8]) -> Option<(UnspendBatchParams, Vec<WireUnspendItem>)> {
     decode_unspend_batch_checked(data, MAX_DECODE_BATCH).ok()
 }
 
@@ -793,6 +813,13 @@ pub fn decode_create_batch_checked(
         pos += 1;
         let utxo_count = get_u32(data, pos);
         pos += 4;
+        if utxo_count > crate::protocol::opcodes::MAX_UTXO_HASHES_PER_CREATE_ITEM {
+            return Err(CodecError::FieldOutOfBounds {
+                field: "utxo_hash count per create item",
+                value: utxo_count as u64,
+                max: crate::protocol::opcodes::MAX_UTXO_HASHES_PER_CREATE_ITEM as u64,
+            });
+        }
 
         // Validate utxo_count fits in remaining bytes BEFORE allocating
         // the per-item Vec — protects against count = u32::MAX.
@@ -893,6 +920,13 @@ pub fn decode_create_batch_checked(
         }
         let parent_count = get_u32(data, pos);
         pos += 4;
+        if parent_count > crate::protocol::opcodes::MAX_PARENT_TXIDS_PER_CREATE_ITEM {
+            return Err(CodecError::FieldOutOfBounds {
+                field: "parent_txid count per create item",
+                value: parent_count as u64,
+                max: crate::protocol::opcodes::MAX_PARENT_TXIDS_PER_CREATE_ITEM as u64,
+            });
+        }
         let parent_bytes =
             (parent_count as usize)
                 .checked_mul(32)
@@ -1099,17 +1133,30 @@ pub struct WireGetResult {
     pub data: Vec<u8>,
 }
 
-/// Encode GetBatch response items.
-pub fn encode_get_response(items: &[WireGetResult]) -> Vec<u8> {
+/// Encode GetBatch response items, rejecting lengths that cannot be represented
+/// by the wire format.
+pub fn try_encode_get_response(items: &[WireGetResult]) -> Result<Vec<u8>, CodecError> {
+    let item_count = checked_u32_len("get_response.item_count", items.len())?;
+    for item in items {
+        checked_u32_len("get_response.item_data_len", item.data.len())?;
+    }
     let data_est: usize = items.iter().map(|i| 5 + i.data.len()).sum();
     let mut buf = Vec::with_capacity(4 + data_est);
-    put_u32(&mut buf, items.len() as u32);
+    put_u32(&mut buf, item_count);
     for item in items {
         buf.push(item.status);
-        put_u32(&mut buf, item.data.len() as u32);
+        put_u32(
+            &mut buf,
+            checked_u32_len("get_response.item_data_len", item.data.len())?,
+        );
         buf.extend_from_slice(&item.data);
     }
-    buf
+    Ok(buf)
+}
+
+/// Encode GetBatch response items.
+pub fn encode_get_response(items: &[WireGetResult]) -> Vec<u8> {
+    try_encode_get_response(items).expect("GetBatch response length exceeds wire format")
 }
 
 /// Decode GetBatch response items, validating count before allocation.
@@ -1322,11 +1369,25 @@ pub fn decode_partial_with_signals(
 ///
 /// Format: `[error_code:2][message_len:2][message]`
 pub fn encode_error_payload(error_code: u16, message: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + message.len());
+    let message_bytes = truncate_u16_message(message);
+    let mut buf = Vec::with_capacity(4 + message_bytes.len());
     put_u16(&mut buf, error_code);
-    put_u16(&mut buf, message.len() as u16);
-    buf.extend_from_slice(message.as_bytes());
+    put_u16(&mut buf, message_bytes.len() as u16);
+    buf.extend_from_slice(message_bytes);
     buf
+}
+
+fn truncate_u16_message(message: &str) -> &[u8] {
+    const MAX: usize = u16::MAX as usize;
+    if message.len() <= MAX {
+        return message.as_bytes();
+    }
+
+    let mut end = MAX;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    &message.as_bytes()[..end]
 }
 
 /// Decode a global error response payload.
@@ -1569,15 +1630,17 @@ pub fn decode_sparse_errors(data: &[u8]) -> Option<Vec<BatchItemError>> {
 pub struct WireGetSpendItem {
     pub txid: [u8; 32],
     pub vout: u32,
+    pub utxo_hash: [u8; 32],
 }
 
 /// Encode a GetSpendBatch request payload.
 pub fn encode_get_spend_batch(items: &[WireGetSpendItem]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + items.len() * 36);
+    let mut buf = Vec::with_capacity(4 + items.len() * 68);
     put_u32(&mut buf, items.len() as u32);
     for item in items {
         buf.extend_from_slice(&item.txid);
         put_u32(&mut buf, item.vout);
+        buf.extend_from_slice(&item.utxo_hash);
     }
     buf
 }
@@ -1596,23 +1659,29 @@ pub fn decode_get_spend_batch_checked(
         });
     }
     let count = get_u32(data, 0);
-    validate_batch_count(count, max_batch, 36, data.len() - 4)?;
+    validate_batch_count(count, max_batch, 68, data.len() - 4)?;
     let count = count as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 4;
     for _ in 0..count {
-        if pos + 36 > data.len() {
+        if pos + 68 > data.len() {
             return Err(CodecError::TruncatedBatch {
                 count: count as u32,
-                per_item_min: 36,
+                per_item_min: 68,
                 available: data.len().saturating_sub(4),
             });
         }
         let mut txid = [0u8; 32];
         txid.copy_from_slice(&data[pos..pos + 32]);
         let vout = get_u32(data, pos + 32);
-        items.push(WireGetSpendItem { txid, vout });
-        pos += 36;
+        let mut utxo_hash = [0u8; 32];
+        utxo_hash.copy_from_slice(&data[pos + 36..pos + 68]);
+        items.push(WireGetSpendItem {
+            txid,
+            vout,
+            utxo_hash,
+        });
+        pos += 68;
     }
     Ok(items)
 }
@@ -2040,6 +2109,7 @@ mod tests {
                     t
                 },
                 vout: i as u32,
+                utxo_hash: [i as u8; 32],
             })
             .collect();
         let encoded = encode_get_spend_batch(&items);
@@ -2104,15 +2174,17 @@ mod tests {
             current_block_height: 500,
             block_height_retention: 288,
         };
-        let items = vec![WireSlotItem {
+        let items = vec![WireUnspendItem {
             txid: test_txid(1),
             vout: 3,
             utxo_hash: test_txid(2),
+            spending_data: [0xA1; 36],
         }];
         let encoded = encode_unspend_batch(&params, &items);
         let (dp, di) = decode_unspend_batch(&encoded).unwrap();
         assert_eq!(dp, params);
         assert_eq!(di, items);
+        assert_eq!(di[0].spending_data, [0xA1; 36]);
     }
 
     #[test]
@@ -2121,8 +2193,8 @@ mod tests {
             current_block_height: 1000,
             block_height_retention: 144,
         };
-        let items: Vec<WireSlotItem> = (0..512u16)
-            .map(|i| WireSlotItem {
+        let items: Vec<WireUnspendItem> = (0..512u16)
+            .map(|i| WireUnspendItem {
                 txid: {
                     let mut t = [0u8; 32];
                     t[0..2].copy_from_slice(&i.to_le_bytes());
@@ -2130,6 +2202,7 @@ mod tests {
                 },
                 vout: i as u32,
                 utxo_hash: test_txid(i as u8),
+                spending_data: [i as u8; 36],
             })
             .collect();
         let encoded = encode_unspend_batch(&params, &items);
@@ -2256,6 +2329,64 @@ mod tests {
         assert_eq!(decoded[0].mined_block_id, Some(42));
     }
 
+    #[test]
+    fn create_batch_prefix_malformed_corpus_rejects_every_truncation() {
+        let items = vec![
+            WireCreateItem {
+                txid: test_txid(11),
+                tx_version: 2,
+                locktime: 42,
+                fee: 10_000,
+                size_in_bytes: 512,
+                extended_size: 768,
+                is_coinbase: false,
+                spending_height: 100,
+                created_at: 1_700_000_000_111,
+                flags: 0x01,
+                utxo_hashes: vec![[0x11; 32], [0x12; 32], [0x13; 32]],
+                cold_data: (0..37).map(|n| n as u8).collect(),
+                block_height: 700_001,
+                mined_block_id: Some(44),
+                mined_block_height: Some(800_004),
+                mined_subtree_idx: Some(9),
+                parent_txids: vec![[0x21; 32], [0x22; 32]],
+            },
+            WireCreateItem {
+                txid: test_txid(12),
+                tx_version: 1,
+                locktime: 0,
+                fee: 2_500,
+                size_in_bytes: 225,
+                extended_size: 0,
+                is_coinbase: true,
+                spending_height: 150,
+                created_at: 1_700_000_000_222,
+                flags: 0,
+                utxo_hashes: vec![[0x31; 32]],
+                cold_data: Vec::new(),
+                block_height: 700_002,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: Vec::new(),
+            },
+        ];
+        let encoded = encode_create_batch(&items);
+
+        for cut in 0..encoded.len() {
+            let result = decode_create_batch_checked(&encoded[..cut], MAX_DECODE_BATCH);
+            assert!(
+                result.is_err(),
+                "truncated create corpus prefix of {cut} bytes decoded successfully"
+            );
+        }
+
+        assert_eq!(
+            decode_create_batch_checked(&encoded, MAX_DECODE_BATCH).unwrap(),
+            items
+        );
+    }
+
     // -- GetBatch --
 
     #[test]
@@ -2295,6 +2426,19 @@ mod tests {
         let encoded = encode_get_response(&items);
         let decoded = decode_get_response(&encoded).unwrap();
         assert_eq!(decoded, items);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn get_batch_response_length_guard_rejects_truncation() {
+        match checked_u32_len("get_response.item_data_len", u32::MAX as usize + 1) {
+            Err(CodecError::FieldOutOfBounds { field, value, max }) => {
+                assert_eq!(field, "get_response.item_data_len");
+                assert_eq!(value, u32::MAX as u64 + 1);
+                assert_eq!(max, u32::MAX as u64);
+            }
+            other => panic!("expected FieldOutOfBounds, got {other:?}"),
+        }
     }
 
     // -- GetSpend response with mixed statuses --
@@ -2597,6 +2741,19 @@ mod tests {
         let (code, msg) = decode_error_payload(&encoded).unwrap();
         assert_eq!(code, ERR_INTERNAL);
         assert_eq!(msg, "something went wrong");
+    }
+
+    #[test]
+    fn error_response_truncates_message_to_encoded_u16_length() {
+        let long = "x".repeat(u16::MAX as usize + 10);
+        let encoded = encode_error_payload(ERR_INTERNAL, &long);
+        let declared = u16::from_le_bytes(encoded[2..4].try_into().unwrap()) as usize;
+
+        assert_eq!(declared, u16::MAX as usize);
+        assert_eq!(encoded.len(), 4 + declared);
+        let (code, msg) = decode_error_payload(&encoded).unwrap();
+        assert_eq!(code, ERR_INTERNAL);
+        assert_eq!(msg.len(), declared);
     }
 
     // -- Redirect response --
@@ -2958,6 +3115,77 @@ mod tests {
     }
 
     #[test]
+    fn create_batch_rejects_utxo_count_exceeding_max_per_item() {
+        use crate::protocol::opcodes::MAX_UTXO_HASHES_PER_CREATE_ITEM;
+
+        let mut payload = Vec::new();
+        put_u32(&mut payload, 1u32);
+        payload.extend_from_slice(&[0xAAu8; 32]); // txid
+        put_u32(&mut payload, 1); // tx_version
+        put_u32(&mut payload, 0); // locktime
+        payload.extend_from_slice(&100u64.to_le_bytes()); // fee
+        payload.extend_from_slice(&100u64.to_le_bytes()); // size_in_bytes
+        payload.extend_from_slice(&100u64.to_le_bytes()); // extended_size
+        payload.push(0); // is_coinbase
+        put_u32(&mut payload, 0); // spending_height
+        payload.extend_from_slice(&0u64.to_le_bytes()); // created_at
+        payload.push(0); // flags
+        put_u32(&mut payload, MAX_UTXO_HASHES_PER_CREATE_ITEM + 1);
+        while payload.len() - 4 < 96 {
+            payload.push(0);
+        }
+
+        let result = decode_create_batch_checked(&payload, MAX_DECODE_BATCH);
+        match result {
+            Err(CodecError::FieldOutOfBounds { field, value, max }) => {
+                assert_eq!(field, "utxo_hash count per create item");
+                assert_eq!(value, (MAX_UTXO_HASHES_PER_CREATE_ITEM + 1) as u64);
+                assert_eq!(max, MAX_UTXO_HASHES_PER_CREATE_ITEM as u64);
+            }
+            other => panic!(
+                "decode_create_batch_checked must reject oversize utxo_count with FieldOutOfBounds, got {other:?}",
+            ),
+        }
+    }
+
+    #[test]
+    fn create_batch_rejects_parent_count_exceeding_max_per_item() {
+        use crate::protocol::opcodes::MAX_PARENT_TXIDS_PER_CREATE_ITEM;
+
+        let mut payload = Vec::new();
+        put_u32(&mut payload, 1u32);
+        payload.extend_from_slice(&[0xAAu8; 32]); // txid
+        put_u32(&mut payload, 1); // tx_version
+        put_u32(&mut payload, 0); // locktime
+        payload.extend_from_slice(&100u64.to_le_bytes()); // fee
+        payload.extend_from_slice(&100u64.to_le_bytes()); // size_in_bytes
+        payload.extend_from_slice(&100u64.to_le_bytes()); // extended_size
+        payload.push(0); // is_coinbase
+        put_u32(&mut payload, 0); // spending_height
+        payload.extend_from_slice(&0u64.to_le_bytes()); // created_at
+        payload.push(0); // flags
+        put_u32(&mut payload, 0); // utxo_count
+        payload.push(0); // has_cold
+        put_u32(&mut payload, 0); // cold_len
+        put_u32(&mut payload, 0); // block_height
+        payload.push(0); // has_mined
+        put_u32(&mut payload, MAX_PARENT_TXIDS_PER_CREATE_ITEM + 1);
+        assert_eq!(payload.len() - 4, 96);
+
+        let result = decode_create_batch_checked(&payload, MAX_DECODE_BATCH);
+        match result {
+            Err(CodecError::FieldOutOfBounds { field, value, max }) => {
+                assert_eq!(field, "parent_txid count per create item");
+                assert_eq!(value, (MAX_PARENT_TXIDS_PER_CREATE_ITEM + 1) as u64);
+                assert_eq!(max, MAX_PARENT_TXIDS_PER_CREATE_ITEM as u64);
+            }
+            other => panic!(
+                "decode_create_batch_checked must reject oversize parent_count with FieldOutOfBounds, got {other:?}",
+            ),
+        }
+    }
+
+    #[test]
     fn encode_partial_with_signals_capacity_sufficient() {
         let successes: Vec<BatchItemSuccess> = (0..50)
             .map(|i| BatchItemSuccess {
@@ -3189,7 +3417,7 @@ mod tests {
             err,
             CodecError::TruncatedBatch {
                 count: 500,
-                per_item_min: 68,
+                per_item_min: 104,
                 ..
             }
         ));

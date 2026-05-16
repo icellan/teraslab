@@ -7,6 +7,7 @@
 use crate::index::hashtable::{TxIndexEntry, TxKey};
 use crate::index::{IndexError, IndexStats};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use std::collections::VecDeque;
 use std::path::Path;
 
 /// Entry value size: 1 + 8 + 4 + 1 + 1 + 4 + 4 + 4 + 4 = 31 bytes.
@@ -15,6 +16,12 @@ const ENTRY_VALUE_SIZE: usize = 31;
 /// ReDB table definition: txid(32 bytes) -> serialized TxIndexEntry(31 bytes).
 const PRIMARY_TABLE: TableDefinition<[u8; 32], [u8; ENTRY_VALUE_SIZE]> =
     TableDefinition::new("primary_index");
+
+/// Maximum rows materialized by the streaming iterator at once.
+#[cfg(not(test))]
+const ITER_BATCH_SIZE: usize = 4096;
+#[cfg(test)]
+const ITER_BATCH_SIZE: usize = 8;
 
 /// ReDB-backed primary index.
 ///
@@ -131,28 +138,19 @@ impl RedbPrimary {
     }
 
     /// Look up a transaction's index entry.
-    pub fn lookup(&self, key: &TxKey) -> Option<TxIndexEntry> {
-        let txn = match self.db.begin_read() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(err = %e, "redb lookup: begin_read failed");
-                return None;
-            }
-        };
-        let table = match txn.open_table(PRIMARY_TABLE) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(err = %e, "redb lookup: open_table failed");
-                return None;
-            }
-        };
-        match table.get(key.txid) {
-            Ok(Some(guard)) => Some(deserialize_entry(&guard.value())),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(err = %e, "redb lookup: get failed");
-                None
-            }
+    ///
+    /// Returns `Ok(Some(entry))` if the key is present, `Ok(None)` if the key
+    /// is absent, and an [`IndexError`] on any redb read failure (begin_read,
+    /// open_table, get). Callers MUST propagate the error — earlier versions
+    /// collapsed a transient redb read error into `None`, which is
+    /// indistinguishable from a key-miss and can be interpreted as
+    /// "transaction absent" by spend/unspend logic.
+    pub fn lookup(&self, key: &TxKey) -> Result<Option<TxIndexEntry>, IndexError> {
+        let txn = self.db.begin_read().map_err(map_redb_txn_err)?;
+        let table = txn.open_table(PRIMARY_TABLE).map_err(map_redb_table_err)?;
+        match table.get(key.txid).map_err(map_redb_storage_err)? {
+            Some(guard) => Ok(Some(deserialize_entry(&guard.value()))),
+            None => Ok(None),
         }
     }
 
@@ -175,43 +173,30 @@ impl RedbPrimary {
     }
 
     /// Remove a transaction from the index.
-    pub fn unregister(&mut self, key: &TxKey) -> Option<TxIndexEntry> {
-        let txn = match self.begin_write() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(err = %e, "redb unregister: begin_write failed");
-                return None;
-            }
-        };
+    ///
+    /// Returns `Ok(Some(entry))` if the key was found and removed,
+    /// `Ok(None)` if the key was not present, and an [`IndexError`] if the
+    /// redb transaction (begin/open/remove/commit) fails.
+    ///
+    /// Callers MUST propagate the error. Earlier versions returned `None` on
+    /// commit failure, which was indistinguishable from a key-miss and caused
+    /// downstream delete/prune paths to silently skip cleanup while the entry
+    /// remained on disk.
+    pub fn unregister(&mut self, key: &TxKey) -> Result<Option<TxIndexEntry>, IndexError> {
+        self.check_fail_injection()?;
+        let txn = self.begin_write().map_err(map_redb_txn_err)?;
         let result = {
-            let mut table = match txn.open_table(PRIMARY_TABLE) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(err = %e, "redb unregister: open_table failed");
-                    return None;
-                }
-            };
-            match table.remove(key.txid) {
-                Ok(Some(guard)) => Some(deserialize_entry(&guard.value())),
-                Ok(None) => None,
-                Err(e) => {
-                    tracing::warn!(err = %e, "redb unregister: remove failed");
-                    return None;
-                }
+            let mut table = txn.open_table(PRIMARY_TABLE).map_err(map_redb_table_err)?;
+            match table.remove(key.txid).map_err(map_redb_storage_err)? {
+                Some(guard) => Some(deserialize_entry(&guard.value())),
+                None => None,
             }
         };
-        match txn.commit() {
-            Ok(()) => {
-                if result.is_some() {
-                    self.count -= 1;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, "redb unregister: commit failed");
-                return None;
-            }
+        txn.commit().map_err(map_redb_commit_err)?;
+        if result.is_some() {
+            self.count -= 1;
         }
-        result
+        Ok(result)
     }
 
     /// Remove multiple transactions from the index in a single write transaction.
@@ -357,6 +342,43 @@ impl RedbPrimary {
         result
     }
 
+    /// Iterate over all entries using bounded batches.
+    ///
+    /// Unlike [`Self::iter_collected`], this never materializes the full redb
+    /// table. Each refill opens a short read transaction, copies at most
+    /// [`ITER_BATCH_SIZE`] rows, and resumes from the next lexicographic txid.
+    pub fn iter_streaming(&self) -> RedbPrimaryIter<'_> {
+        RedbPrimaryIter {
+            primary: self,
+            next_start: Some([0u8; 32]),
+            buffer: VecDeque::new(),
+            finished: false,
+        }
+    }
+
+    fn load_iter_batch(&self, start: [u8; 32]) -> Vec<(TxKey, TxIndexEntry)> {
+        let mut result = Vec::with_capacity(ITER_BATCH_SIZE);
+        if let Ok(txn) = self.db.begin_read()
+            && let Ok(table) = txn.open_table(PRIMARY_TABLE)
+            && let Ok(range) = table.range(start..)
+        {
+            for row in range.take(ITER_BATCH_SIZE) {
+                match row {
+                    Ok((k, v)) => {
+                        let key = TxKey { txid: k.value() };
+                        let entry = deserialize_entry(&v.value());
+                        result.push((key, entry));
+                    }
+                    Err(e) => {
+                        tracing::warn!(err = %e, "redb iter_streaming: row read failed");
+                        break;
+                    }
+                }
+            }
+        }
+        result
+    }
+
     /// Index statistics for monitoring.
     pub fn stats(&self) -> IndexStats {
         let file_size = self
@@ -467,6 +489,58 @@ impl RedbPrimary {
     }
 }
 
+/// Bounded-memory iterator over all entries in a redb primary index.
+pub struct RedbPrimaryIter<'a> {
+    primary: &'a RedbPrimary,
+    next_start: Option<[u8; 32]>,
+    buffer: VecDeque<(TxKey, TxIndexEntry)>,
+    finished: bool,
+}
+
+impl RedbPrimaryIter<'_> {
+    #[cfg(test)]
+    pub(crate) fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    fn refill(&mut self) {
+        if self.finished || !self.buffer.is_empty() {
+            return;
+        }
+        let Some(start) = self.next_start else {
+            self.finished = true;
+            return;
+        };
+
+        let batch = self.primary.load_iter_batch(start);
+        if batch.is_empty() {
+            self.finished = true;
+            self.next_start = None;
+            return;
+        }
+
+        let last_key = batch.last().map(|(key, _)| key.txid);
+        self.buffer = batch.into();
+        self.next_start = last_key.and_then(next_lexicographic_key);
+        if self.next_start.is_none() {
+            self.finished = true;
+        }
+    }
+}
+
+impl Iterator for RedbPrimaryIter<'_> {
+    type Item = (TxKey, TxIndexEntry);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.refill();
+        self.buffer.pop_front()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.buffer.len(), None)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Serialization
 // ---------------------------------------------------------------------------
@@ -527,6 +601,17 @@ fn map_redb_storage_err(e: redb::StorageError) -> IndexError {
     IndexError::FormatError {
         detail: format!("redb storage error: {e}"),
     }
+}
+
+fn next_lexicographic_key(mut key: [u8; 32]) -> Option<[u8; 32]> {
+    for byte in key.iter_mut().rev() {
+        if *byte != u8::MAX {
+            *byte += 1;
+            return Some(key);
+        }
+        *byte = 0;
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -672,6 +757,36 @@ mod tests {
                 .any(|(k, e)| k == &make_key(i) && e.record_offset == i * 100);
             assert!(found, "entry {i} not found in iter");
         }
+    }
+
+    #[test]
+    fn streaming_iterator_does_not_materialize_full_set() {
+        let (_dir, mut primary) = open_temp();
+        let total = ITER_BATCH_SIZE as u64 + 3;
+        for i in 0..total {
+            primary.register(make_key(i), make_entry(i * 100)).unwrap();
+        }
+
+        let mut iter = primary.iter_streaming();
+        assert_eq!(iter.buffered_len(), 0);
+
+        let first = iter.next().expect("first streaming entry");
+        assert!(first.1.record_offset < total * 100);
+        assert!(
+            iter.buffered_len() < total as usize,
+            "streaming iterator materialized all {total} entries"
+        );
+        assert!(
+            iter.buffered_len() < ITER_BATCH_SIZE,
+            "streaming iterator buffered more than one batch"
+        );
+
+        let mut count = 1usize;
+        for (_key, entry) in iter {
+            assert!(entry.record_offset < total * 100);
+            count += 1;
+        }
+        assert_eq!(count, total as usize);
     }
 
     #[test]

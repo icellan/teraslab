@@ -6,18 +6,17 @@ use crate::storage::blobstore::BlobDigest;
 /// as the hot record (metadata + UTXO slots + cold data in one write).
 pub const INLINE_THRESHOLD: usize = 8 * 1024; // 8 KiB
 
-/// Cold data above INLINE_THRESHOLD but below this is stored in a separate
-/// NVMe allocation on the same device.
-pub const SEPARATE_THRESHOLD: usize = 1024 * 1024; // 1 MiB
-
 /// Which storage tier to use for the given cold data size.
-/// Above `SEPARATE_THRESHOLD`, cold data goes to an external blob store.
+/// Above [`INLINE_THRESHOLD`], cold data goes to an external blob store.
+///
+/// Earlier phase documents described a middle "separate NVMe" tier. The
+/// production record metadata has no durable fields for a separate cold-data
+/// offset/length, so the middle tier is deliberately removed instead of
+/// returning an unreferencable allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageTier {
     /// Cold data inline at `record_offset + METADATA_SIZE + utxo_count * 69`.
     Inline,
-    /// Cold data in a separate NVMe allocation on the same device.
-    SeparateNvme,
     /// Cold data in an external blob store (file, S3, MinIO).
     External,
 }
@@ -26,8 +25,6 @@ pub enum StorageTier {
 pub fn tier_for_size(data_size: usize) -> StorageTier {
     if data_size <= INLINE_THRESHOLD {
         StorageTier::Inline
-    } else if data_size <= SEPARATE_THRESHOLD {
-        StorageTier::SeparateNvme
     } else {
         StorageTier::External
     }
@@ -38,8 +35,6 @@ pub fn tier_for_size(data_size: usize) -> StorageTier {
 pub enum ColdDataRef {
     /// Written inline at deterministic offset. No extra state needed.
     Inline { cold_size: u32 },
-    /// Written to a separate NVMe allocation.
-    SeparateNvme { device_offset: u64, cold_size: u32 },
     /// Uploaded to the external blob store.
     ///
     /// Carries the [`BlobDigest`] returned by [`crate::storage::blobstore::BlobStore::put`]
@@ -144,17 +139,13 @@ mod tests {
 
     #[test]
     fn tier_separate() {
-        assert_eq!(
-            tier_for_size(INLINE_THRESHOLD + 1),
-            StorageTier::SeparateNvme
-        );
-        assert_eq!(tier_for_size(500 * 1024), StorageTier::SeparateNvme);
-        assert_eq!(tier_for_size(SEPARATE_THRESHOLD), StorageTier::SeparateNvme);
+        assert_eq!(tier_for_size(INLINE_THRESHOLD + 1), StorageTier::External);
+        assert_eq!(tier_for_size(500 * 1024), StorageTier::External);
     }
 
     #[test]
     fn tier_external() {
-        assert_eq!(tier_for_size(SEPARATE_THRESHOLD + 1), StorageTier::External);
+        assert_eq!(tier_for_size(INLINE_THRESHOLD + 1), StorageTier::External);
         assert_eq!(tier_for_size(320 * 1024 * 1024), StorageTier::External);
     }
 

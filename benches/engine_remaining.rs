@@ -130,6 +130,11 @@ fn bench_unspend(c: &mut Criterion) {
                 tx_key: key,
                 offset: 0,
                 utxo_hash: make_utxo_hash(tx_idx, 0),
+                spending_data: {
+                    let mut sd = [0u8; 36];
+                    sd[0..4].copy_from_slice(&(tx_idx + 10000).to_le_bytes());
+                    sd
+                },
                 current_block_height: 2000,
                 block_height_retention: 288,
             });

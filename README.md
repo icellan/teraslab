@@ -142,7 +142,8 @@ seed_nodes = []                       # e.g. ["10.0.0.2:3301", "10.0.0.3:3301"]
 replication_factor = 1                # 1 = no replication, 2 = master + 1 replica
 swim_probe_interval_ms = 200          # SWIM heartbeat interval
 swim_suspicion_timeout_ms = 5000      # Time before suspect node is declared dead
-cluster_secret = ""                   # Shared secret for HMAC-SHA256 cluster auth (optional)
+topology_propose_timeout_ms = 0       # 0 = max(swim_probe_interval_ms * 3, 500)
+cluster_secret = ""                   # Shared secret for HMAC-SHA256 SWIM + inter-node TCP auth
 max_migration_threads = 16            # Max concurrent migration threads per topology change
 
 # --- Replication durability ---
@@ -151,8 +152,8 @@ replication_timeout_ms = 3000         # Timeout for each replication batch ACK
 replication_degraded_mode = "reject"  # "reject" or "best_effort" when ack policy fails
 
 # --- Migration performance ---
-migration_pool_size = 4               # Parallel TCP connections per migration target
-migration_batch_size = 100            # Records per baseline streaming batch
+migration_pool_size = 128             # Parallel TCP connections per migration target
+migration_batch_size = 500            # Records per baseline streaming batch
 replica_lag_check_interval_secs = 30  # Interval between replica lag checks (0 to disable)
 ```
 
@@ -255,7 +256,7 @@ All operations are batch-oriented. Single-item operations are batches of size 1.
 | Opcode | Name | Description |
 |--------|------|-------------|
 | 20 | `GetBatch` | Fetch transaction data with field mask |
-| 21 | `GetSpendBatch` | Check UTXO spend status (lightweight) |
+| 21 | `GetSpendBatch` | Check UTXO spend status by txid/vout/hash (lightweight) |
 
 **Pruner:**
 
@@ -279,6 +280,24 @@ All operations are batch-oriented. Single-item operations are batches of size 1.
 | 100 | `GetPartitionMap` | Fetch shard-to-node mapping (cluster) |
 | 101 | `Health` | Health check |
 | 102 | `Ping` | Latency measurement |
+| 103 | `GetCommittedTopology` | Fetch the latest quorum-committed topology |
+| 104 | `AdminDiagnoseKey` | Diagnose per-key routing and local shard state |
+| 105 | `PartitionVersionReport` | Inter-node shard version report after topology commit |
+| 106 | `AdminClusterHealth` | Cluster readiness snapshot for clients/tests |
+
+**Inter-node replication, migration, and topology:**
+
+| Opcode | Name | Description |
+|--------|------|-------------|
+| 240 | `ReplicaBatch` | Send a batch of replica operations |
+| 241 | `ReplicaAck` | Acknowledge a replica batch |
+| 242 | `MigrationComplete` | Verify and complete a single shard migration |
+| 243 | `MigrationBatchComplete` | Verify and complete multiple shard migrations |
+| 250 | `Heartbeat` | Inter-node heartbeat |
+| 251 | `TopologyPropose` | Propose a new topology term |
+| 252 | `TopologyVote` | Vote for a topology term |
+| 253 | `TopologyCommit` | Commit a quorum-approved topology term |
+| 255 | `IncrementSpentExtraRecs` | Compatibility no-op |
 
 ### Error codes
 
@@ -305,7 +324,25 @@ All operations are batch-oriented. Single-item operations are batches of size 1.
 | 18 | `STREAM_OFFSET_MISMATCH` | Chunk offset does not match expected stream position |
 | 19 | `MIGRATION_IN_PROGRESS` | Shard being migrated, retry shortly |
 | 20 | `REPLICATION_FAILED` | Required replication ACKs not received within timeout |
+| 21 | `MIGRATION_MANIFEST_REQUIRED` | Migration completion omitted the required manifest, including for empty shards |
+| 22 | `MIGRATION_MANIFEST_MISMATCH` | Migration manifest hash/count does not match received shard data |
+| 23 | `TOPOLOGY_PERSIST_FAILED` | Topology vote was accepted in memory but could not be fsynced |
+| 24 | `STALE_EPOCH` | Sender used an obsolete topology epoch |
+| 25 | `CLUSTER_NOT_READY` | Node has not observed its first quorum-committed topology |
+| 26 | `INDEX_DEGRADED` | Required secondary index is unavailable after startup rebuild/open failure |
+| 27 | `CLUSTER_AUTH_FAILED` | Inter-node HMAC frame authentication failed |
 | 255 | `INTERNAL` | Unexpected server error |
+
+### Response status codes
+
+| Code | Name | Meaning |
+|------|------|---------|
+| 0 | `OK` | Request succeeded |
+| 1 | `ERROR` | Request failed with an error payload |
+| 2 | `NOT_FOUND` | Requested object was not found |
+| 3 | `REDIRECT` | Retry against the shard owner in the payload |
+| 4 | `PARTIAL_ERROR` | Batch partially succeeded; per-item errors are encoded in the payload |
+| 5 | `DEGRADED_DURABILITY` | Local mutation succeeded, but best-effort replication did not satisfy the configured ACK policy |
 
 ## HTTP observability
 
@@ -477,7 +514,7 @@ In a multi-node cluster, mutations require quorum (majority of the peak observed
 When the shard table changes (node join/leave), data migrates automatically:
 - Master migrations: shard data streams from old master to new master
 - Replica backfill: newly assigned replicas receive shard data from the current master
-- During migration, reads on the old master continue serving locally; reads on the new master wait briefly for data to arrive. Writes to shards with pending inbound migration return `MIGRATION_IN_PROGRESS` so clients retry.
+- During migration, reads on the old master continue serving locally. Reads and writes routed to the new master while inbound data is still pending return `MIGRATION_IN_PROGRESS` quickly; clients should poll/retry with backoff instead of treating this as a permanent miss.
 
 ## Architecture
 
@@ -496,7 +533,7 @@ Each transaction occupies a contiguous region on the block device:
 ### Tiered storage
 
 - **Hot path** (NVMe): Metadata + UTXO slots. All spend/setMined/freeze operations touch only this tier.
-- **Cold data** (filesystem blob store): Transaction inputs, outputs, and inpoints. Stored inline if <8 KiB, in a separate device block if 8 KiB-1 MiB, or in the external blob store if >1 MiB.
+- **Cold data** (filesystem blob store): Transaction inputs, outputs, and inpoints. Stored inline if <8 KiB, otherwise in the external blob store. The earlier separate-device middle tier is not enabled because current metadata has no durable offset/length fields for it.
 
 ### Crash recovery
 
@@ -560,12 +597,9 @@ redb_cache_size = 268435456  # 256 MiB (default)
 
 #### Error recovery
 
-If a redb database file is corrupt on startup, the server will:
-1. Delete the corrupt file
-2. Attempt to create a fresh empty database at the same path
-3. If that also fails, fall back to the in-memory backend for that index
+redb startup is fail-closed for the primary index. The server first attempts to open the configured primary redb file. If that fails, it rebuilds the primary redb index from a device scan. If the rebuild also fails, startup exits without deleting the existing redb file, so operators can capture diagnostics before an explicit rescan or repair.
 
-The primary index will be rebuilt from a device scan if the redb file is missing or cannot be opened. The secondary indexes (DAH, unmined) start empty and are repopulated as operations arrive.
+Secondary redb indexes (DAH and unmined) are isolated from the primary. If a secondary redb file cannot be opened, the node starts in degraded readiness with an empty in-memory replacement for that secondary; endpoints that depend on the missing secondary return `INDEX_DEGRADED` until the operator fixes the underlying issue and restarts. The server does not silently delete corrupt redb files or automatically fall back to a fully in-memory backend for the primary.
 
 #### Migration between backends
 
@@ -619,7 +653,7 @@ teraslab/
 │   ├── bin/cli.rs            Admin CLI binary
 │   ├── config.rs             Configuration (TOML)
 │   ├── device.rs             Block device abstraction (MemoryDevice, DirectDevice)
-│   ├── device_io/            I/O backends (sync fallback, io_uring stub)
+│   ├── device_io/            I/O backend scaffolding (sync fallback; io_uring not production-wired)
 │   ├── record.rs             On-disk record types (TxMetadata, UtxoSlot)
 │   ├── allocator.rs          Freelist-based slot allocator
 │   ├── index/                Primary + secondary indexes (in-memory and redb on-disk backends)
@@ -633,7 +667,7 @@ teraslab/
 │   ├── server/               TCP server, dispatch, HTTP observability, WebSocket
 │   ├── cluster/              SWIM membership, sharding, migration, topology authority
 │   ├── replication/          Master-replica replication with durable sequencing
-│   └── storage/              Tiered storage (inline, separate NVMe, external blob)
+│   └── storage/              Tiered storage (inline, external blob)
 ├── client/
 │   ├── go/                   Go client library
 │   └── rust/                 Rust client library (async, Tokio)

@@ -90,11 +90,11 @@ pub trait DeviceIo: Send + Sync {
 /// on unsupported kernels or non-Linux platforms (macOS, test environments).
 /// When a fallback is taken on Linux, the reason is emitted to stderr so
 /// operators can diagnose why the faster path was not selected.
-pub fn create_device_io(queue_depth: u32) -> Box<dyn DeviceIo> {
+pub fn create_device_io(queue_depth: u32) -> std::io::Result<Box<dyn DeviceIo>> {
     #[cfg(target_os = "linux")]
     {
         match IoUringBackend::new(queue_depth) {
-            Ok(backend) => return Box::new(backend),
+            Ok(backend) => return Ok(Box::new(backend)),
             Err(e) => {
                 // Operators should see this: it means the server is running
                 // on the slower sync path. Common causes: kernel < 5.6,
@@ -107,13 +107,5 @@ pub fn create_device_io(queue_depth: u32) -> Box<dyn DeviceIo> {
         }
     }
     let _ = queue_depth;
-    match SyncFallback::new(queue_depth) {
-        Ok(backend) => Box::new(backend),
-        Err(e) => {
-            // SyncFallback::new only returns Ok, so this is genuinely unreachable —
-            // but avoid unwrap/expect per CLAUDE.md and panic with a clear message
-            // instead of silently hiding the bug if the signature ever changes.
-            panic!("SyncFallback::new returned an error it documents as impossible: {e}");
-        }
-    }
+    SyncFallback::new(queue_depth).map(|backend| Box::new(backend) as Box<dyn DeviceIo>)
 }

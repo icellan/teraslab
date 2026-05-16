@@ -17,6 +17,7 @@ use teraslab::protocol::codec::*;
 use teraslab::protocol::frame::*;
 use teraslab::protocol::opcodes::*;
 use teraslab::server::Server;
+use teraslab::storage::blobstore::{BlobStore, MemoryBlobStore};
 
 /// Start a server on a random port and return (server_handle, port).
 fn start_test_server() -> (Arc<Server>, u16) {
@@ -52,6 +53,79 @@ fn start_test_server() -> (Arc<Server>, u16) {
     });
 
     // Wait for server to start
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    (server, port)
+}
+
+fn start_test_server_with_max_connections(max_connections: usize) -> (Arc<Server>, u16) {
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+    let alloc = SlotAllocator::new(dev.clone()).unwrap();
+    let index = Index::new(10_000).unwrap();
+    let engine = Arc::new(Engine::new(
+        dev,
+        index,
+        alloc,
+        StripedLocks::new(1024),
+        DahIndex::new(),
+        UnminedIndex::new(),
+    ));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let config = ServerConfig {
+        listen_addr: format!("127.0.0.1:{port}"),
+        max_connections,
+        max_batch_size: 8192,
+        ..Default::default()
+    };
+
+    let server = Arc::new(Server::new(engine, config));
+    let server_clone = server.clone();
+
+    std::thread::spawn(move || {
+        server_clone.run().unwrap();
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    (server, port)
+}
+
+fn start_test_server_with_blob_store() -> (Arc<Server>, u16) {
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+    let alloc = SlotAllocator::new(dev.clone()).unwrap();
+    let index = Index::new(10_000).unwrap();
+    let engine = Arc::new(Engine::new(
+        dev,
+        index,
+        alloc,
+        StripedLocks::new(1024),
+        DahIndex::new(),
+        UnminedIndex::new(),
+    ));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let config = ServerConfig {
+        listen_addr: format!("127.0.0.1:{port}"),
+        max_connections: 10,
+        max_batch_size: 8192,
+        ..Default::default()
+    };
+
+    let blob_store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    let server = Arc::new(Server::new(engine, config).with_blob_store(blob_store));
+    let server_clone = server.clone();
+
+    std::thread::spawn(move || {
+        server_clone.run().unwrap();
+    });
+
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     (server, port)
@@ -129,6 +203,21 @@ fn make_create_item(txid: [u8; 32], utxo_count: u32, tx_n: u32) -> WireCreateIte
         mined_subtree_idx: None,
         parent_txids: vec![],
     }
+}
+
+fn assert_single_sparse_error(resp: &ResponseFrame, expected_code: u16) -> BatchItemError {
+    assert_eq!(
+        resp.status,
+        STATUS_PARTIAL_ERROR,
+        "expected sparse error code {expected_code}, got status={} payload_len={}",
+        resp.status,
+        resp.payload.len()
+    );
+    let errors = decode_sparse_errors(&resp.payload).unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].item_index, 0);
+    assert_eq!(errors[0].error_code, expected_code);
+    errors[0].clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -216,7 +305,11 @@ fn create_then_get_spend() {
     assert_eq!(resp.status, STATUS_OK, "create failed: {:?}", resp.payload);
 
     // GetSpend to verify the UTXO exists and is unspent
-    let get_payload = encode_get_spend_batch(&[WireGetSpendItem { txid, vout: 0 }]);
+    let get_payload = encode_get_spend_batch(&[WireGetSpendItem {
+        txid,
+        vout: 0,
+        utxo_hash: test_utxo_hash(1, 0),
+    }]);
     let resp = send_request(
         &mut stream,
         &RequestFrame {
@@ -232,6 +325,458 @@ fn create_then_get_spend() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].status, 0);
     assert_eq!(results[0].slot_status, 0x00); // Unspent
+
+    server.shutdown();
+}
+
+#[test]
+fn get_spend_wire_validates_utxo_hash() {
+    let (server, port) = start_test_server();
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    let txid = test_txid(130);
+    let resp = create_records(&mut stream, &[make_create_item(txid, 2, 130)], 130);
+    assert_eq!(resp.status, STATUS_OK);
+
+    let mut wrong_hash = test_utxo_hash(130, 0);
+    wrong_hash[0] ^= 0xFF;
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 131,
+            op_code: OP_GET_SPEND_BATCH,
+            flags: 0,
+            payload: encode_get_spend_batch(&[WireGetSpendItem {
+                txid,
+                vout: 0,
+                utxo_hash: wrong_hash,
+            }]),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK);
+    let results = decode_get_spend_response(&resp.payload).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].status, 1);
+    assert_eq!(results[0].error_code, ERR_UTXO_HASH_MISMATCH);
+
+    server.shutdown();
+}
+
+#[test]
+fn tcp_error_code_triggerability_core_item_errors() {
+    let (server, port) = start_test_server();
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    // 12 ALREADY_EXISTS: duplicate create of the same txid.
+    let duplicate_txid = test_txid(1310);
+    let item = make_create_item(duplicate_txid, 1, 1310);
+    let resp = create_records(&mut stream, std::slice::from_ref(&item), 1310);
+    assert_eq!(resp.status, STATUS_OK);
+    let resp = create_records(&mut stream, &[item], 1311);
+    assert_single_sparse_error(&resp, ERR_ALREADY_EXISTS);
+
+    // 11 VOUT_OUT_OF_RANGE: spend an output beyond the slot count.
+    let range_txid = test_txid(1312);
+    let resp = create_records(&mut stream, &[make_create_item(range_txid, 1, 1312)], 1312);
+    assert_eq!(resp.status, STATUS_OK);
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1313,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload: encode_spend_batch(
+                &SpendBatchParams {
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1_000,
+                    block_height_retention: 288,
+                },
+                &[WireSpendItem {
+                    txid: range_txid,
+                    vout: 9,
+                    utxo_hash: test_utxo_hash(1312, 9),
+                    spending_data: [0x11; 36],
+                }],
+            ),
+        },
+    );
+    assert_single_sparse_error(&resp, ERR_VOUT_OUT_OF_RANGE);
+
+    // 4 ALREADY_FROZEN: freeze an already-frozen UTXO.
+    let frozen_txid = test_txid(1314);
+    let frozen_hash = test_utxo_hash(1314, 0);
+    let resp = create_records(&mut stream, &[make_create_item(frozen_txid, 1, 1314)], 1314);
+    assert_eq!(resp.status, STATUS_OK);
+    let freeze_payload = encode_slot_item_batch(&[WireSlotItem {
+        txid: frozen_txid,
+        vout: 0,
+        utxo_hash: frozen_hash,
+    }]);
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1315,
+            op_code: OP_FREEZE_BATCH,
+            flags: 0,
+            payload: freeze_payload.clone(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK);
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1316,
+            op_code: OP_FREEZE_BATCH,
+            flags: 0,
+            payload: freeze_payload,
+        },
+    );
+    assert_single_sparse_error(&resp, ERR_ALREADY_FROZEN);
+
+    // 5 UTXO_NOT_FROZEN: reassign requires the old UTXO to be frozen.
+    let reassign_txid = test_txid(1317);
+    let reassign_hash = test_utxo_hash(1317, 0);
+    let resp = create_records(
+        &mut stream,
+        &[make_create_item(reassign_txid, 1, 1317)],
+        1317,
+    );
+    assert_eq!(resp.status, STATUS_OK);
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1318,
+            op_code: OP_REASSIGN_BATCH,
+            flags: 0,
+            payload: encode_reassign_batch(
+                &ReassignBatchParams {
+                    block_height: 1_000,
+                    spendable_after: 5,
+                },
+                &[WireReassignItem {
+                    txid: reassign_txid,
+                    vout: 0,
+                    utxo_hash: reassign_hash,
+                    new_utxo_hash: test_utxo_hash(99_999, 0),
+                }],
+            ),
+        },
+    );
+    assert_single_sparse_error(&resp, ERR_UTXO_NOT_FROZEN);
+
+    // 6 INVALID_SPEND: wrong unspend marker must not clear a real spend.
+    let unspend_txid = test_txid(1319);
+    let unspend_hash = test_utxo_hash(1319, 0);
+    let resp = create_records(
+        &mut stream,
+        &[make_create_item(unspend_txid, 1, 1319)],
+        1319,
+    );
+    assert_eq!(resp.status, STATUS_OK);
+    let good_spending_data = [0x22; 36];
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1320,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload: encode_spend_batch(
+                &SpendBatchParams {
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1_000,
+                    block_height_retention: 288,
+                },
+                &[WireSpendItem {
+                    txid: unspend_txid,
+                    vout: 0,
+                    utxo_hash: unspend_hash,
+                    spending_data: good_spending_data,
+                }],
+            ),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK);
+    let err = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1321,
+            op_code: OP_UNSPEND_BATCH,
+            flags: 0,
+            payload: encode_unspend_batch(
+                &UnspendBatchParams {
+                    current_block_height: 1_000,
+                    block_height_retention: 288,
+                },
+                &[WireUnspendItem {
+                    txid: unspend_txid,
+                    vout: 0,
+                    utxo_hash: unspend_hash,
+                    spending_data: [0x33; 36],
+                }],
+            ),
+        },
+    );
+    let err = assert_single_sparse_error(&err, ERR_INVALID_SPEND);
+    assert_eq!(err.error_data, good_spending_data);
+
+    // 13 FROZEN_UNTIL: reassign cooldown blocks spend until the target height.
+    let cooldown_txid = test_txid(1322);
+    let cooldown_hash = test_utxo_hash(1322, 0);
+    let cooldown_new_hash = test_utxo_hash(1323, 0);
+    let resp = create_records(
+        &mut stream,
+        &[make_create_item(cooldown_txid, 1, 1322)],
+        1322,
+    );
+    assert_eq!(resp.status, STATUS_OK);
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1323,
+            op_code: OP_FREEZE_BATCH,
+            flags: 0,
+            payload: encode_slot_item_batch(&[WireSlotItem {
+                txid: cooldown_txid,
+                vout: 0,
+                utxo_hash: cooldown_hash,
+            }]),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK);
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1324,
+            op_code: OP_REASSIGN_BATCH,
+            flags: 0,
+            payload: encode_reassign_batch(
+                &ReassignBatchParams {
+                    block_height: 1_000,
+                    spendable_after: 10,
+                },
+                &[WireReassignItem {
+                    txid: cooldown_txid,
+                    vout: 0,
+                    utxo_hash: cooldown_hash,
+                    new_utxo_hash: cooldown_new_hash,
+                }],
+            ),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK);
+    let err = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1325,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload: encode_spend_batch(
+                &SpendBatchParams {
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1_005,
+                    block_height_retention: 288,
+                },
+                &[WireSpendItem {
+                    txid: cooldown_txid,
+                    vout: 0,
+                    utxo_hash: cooldown_new_hash,
+                    spending_data: [0x44; 36],
+                }],
+            ),
+        },
+    );
+    let err = assert_single_sparse_error(&err, ERR_FROZEN_UNTIL);
+    assert_eq!(err.error_data, 1_010u32.to_le_bytes());
+
+    // 3 ALREADY_SPENT: second spend with different spending_data returns the
+    // original 36-byte winner payload.
+    let spent_txid = test_txid(1326);
+    let spent_hash = test_utxo_hash(1326, 0);
+    let resp = create_records(&mut stream, &[make_create_item(spent_txid, 1, 1326)], 1326);
+    assert_eq!(resp.status, STATUS_OK);
+    let winner_spending_data = [0x55; 36];
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1326,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload: encode_spend_batch(
+                &SpendBatchParams {
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1_000,
+                    block_height_retention: 288,
+                },
+                &[WireSpendItem {
+                    txid: spent_txid,
+                    vout: 0,
+                    utxo_hash: spent_hash,
+                    spending_data: winner_spending_data,
+                }],
+            ),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK);
+    let err = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1327,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload: encode_spend_batch(
+                &SpendBatchParams {
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1_000,
+                    block_height_retention: 288,
+                },
+                &[WireSpendItem {
+                    txid: spent_txid,
+                    vout: 0,
+                    utxo_hash: spent_hash,
+                    spending_data: [0x66; 36],
+                }],
+            ),
+        },
+    );
+    let err = assert_single_sparse_error(&err, ERR_ALREADY_SPENT);
+    assert_eq!(err.error_data, winner_spending_data);
+
+    // 7 FROZEN: frozen UTXO cannot be spent.
+    let frozen_spend_txid = test_txid(1328);
+    let frozen_spend_hash = test_utxo_hash(1328, 0);
+    let mut frozen_item = make_create_item(frozen_spend_txid, 1, 1328);
+    frozen_item.flags = 0x04;
+    let resp = create_records(&mut stream, &[frozen_item], 1328);
+    assert_eq!(resp.status, STATUS_OK);
+    let err = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1328,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload: encode_spend_batch(
+                &SpendBatchParams {
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1_000,
+                    block_height_retention: 288,
+                },
+                &[WireSpendItem {
+                    txid: frozen_spend_txid,
+                    vout: 0,
+                    utxo_hash: frozen_spend_hash,
+                    spending_data: [0x77; 36],
+                }],
+            ),
+        },
+    );
+    assert_single_sparse_error(&err, ERR_FROZEN);
+
+    // 8 CONFLICTING: conflicting UTXO cannot be spent unless explicitly ignored.
+    let conflicting_txid = test_txid(1329);
+    let conflicting_hash = test_utxo_hash(1329, 0);
+    let mut conflicting_item = make_create_item(conflicting_txid, 1, 1329);
+    conflicting_item.flags = 0x02;
+    let resp = create_records(&mut stream, &[conflicting_item], 1329);
+    assert_eq!(resp.status, STATUS_OK);
+    let err = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1329,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload: encode_spend_batch(
+                &SpendBatchParams {
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1_000,
+                    block_height_retention: 288,
+                },
+                &[WireSpendItem {
+                    txid: conflicting_txid,
+                    vout: 0,
+                    utxo_hash: conflicting_hash,
+                    spending_data: [0x88; 36],
+                }],
+            ),
+        },
+    );
+    assert_single_sparse_error(&err, ERR_CONFLICTING);
+
+    // 9 LOCKED: locked UTXO cannot be spent unless explicitly ignored.
+    let locked_txid = test_txid(1330);
+    let locked_hash = test_utxo_hash(1330, 0);
+    let mut locked_item = make_create_item(locked_txid, 1, 1330);
+    locked_item.flags = 0x01;
+    let resp = create_records(&mut stream, &[locked_item], 1330);
+    assert_eq!(resp.status, STATUS_OK);
+    let err = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1330,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload: encode_spend_batch(
+                &SpendBatchParams {
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1_000,
+                    block_height_retention: 288,
+                },
+                &[WireSpendItem {
+                    txid: locked_txid,
+                    vout: 0,
+                    utxo_hash: locked_hash,
+                    spending_data: [0x99; 36],
+                }],
+            ),
+        },
+    );
+    assert_single_sparse_error(&err, ERR_LOCKED);
+
+    // 10 COINBASE_IMMATURE: immature coinbase carries the maturity height.
+    let coinbase_txid = test_txid(1331);
+    let coinbase_hash = test_utxo_hash(1331, 0);
+    let mut coinbase_item = make_create_item(coinbase_txid, 1, 1331);
+    coinbase_item.is_coinbase = true;
+    coinbase_item.spending_height = 1_100;
+    let resp = create_records(&mut stream, &[coinbase_item], 1331);
+    assert_eq!(resp.status, STATUS_OK);
+    let err = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1331,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload: encode_spend_batch(
+                &SpendBatchParams {
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1_050,
+                    block_height_retention: 288,
+                },
+                &[WireSpendItem {
+                    txid: coinbase_txid,
+                    vout: 0,
+                    utxo_hash: coinbase_hash,
+                    spending_data: [0xAA; 36],
+                }],
+            ),
+        },
+    );
+    let err = assert_single_sparse_error(&err, ERR_COINBASE_IMMATURE);
+    assert_eq!(err.error_data, 1_100u32.to_le_bytes());
 
     server.shutdown();
 }
@@ -285,7 +830,11 @@ fn create_spend_get_spend() {
             request_id: 22,
             op_code: OP_GET_SPEND_BATCH,
             flags: 0,
-            payload: encode_get_spend_batch(&[WireGetSpendItem { txid, vout: 0 }]),
+            payload: encode_get_spend_batch(&[WireGetSpendItem {
+                txid,
+                vout: 0,
+                utxo_hash: test_utxo_hash(2, 0),
+            }]),
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -422,7 +971,11 @@ fn create_set_mined_delete() {
             request_id: 33,
             op_code: OP_GET_SPEND_BATCH,
             flags: 0,
-            payload: encode_get_spend_batch(&[WireGetSpendItem { txid, vout: 0 }]),
+            payload: encode_get_spend_batch(&[WireGetSpendItem {
+                txid,
+                vout: 0,
+                utxo_hash: test_utxo_hash(3, 0),
+            }]),
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -541,7 +1094,11 @@ fn freeze_unfreeze_over_tcp() {
             request_id: 42,
             op_code: OP_GET_SPEND_BATCH,
             flags: 0,
-            payload: encode_get_spend_batch(&[WireGetSpendItem { txid, vout: 0 }]),
+            payload: encode_get_spend_batch(&[WireGetSpendItem {
+                txid,
+                vout: 0,
+                utxo_hash: test_utxo_hash(4, 0),
+            }]),
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -570,7 +1127,11 @@ fn freeze_unfreeze_over_tcp() {
             request_id: 44,
             op_code: OP_GET_SPEND_BATCH,
             flags: 0,
-            payload: encode_get_spend_batch(&[WireGetSpendItem { txid, vout: 0 }]),
+            payload: encode_get_spend_batch(&[WireGetSpendItem {
+                txid,
+                vout: 0,
+                utxo_hash: test_utxo_hash(4, 0),
+            }]),
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -645,7 +1206,11 @@ fn freeze_reassign_get_spend() {
             request_id: 503,
             op_code: OP_GET_SPEND_BATCH,
             flags: 0,
-            payload: encode_get_spend_batch(&[WireGetSpendItem { txid, vout: 0 }]),
+            payload: encode_get_spend_batch(&[WireGetSpendItem {
+                txid,
+                vout: 0,
+                utxo_hash: new_hash,
+            }]),
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -848,9 +1413,21 @@ fn batch_spend_1024_items() {
             op_code: OP_GET_SPEND_BATCH,
             flags: 0,
             payload: encode_get_spend_batch(&[
-                WireGetSpendItem { txid, vout: 0 },
-                WireGetSpendItem { txid, vout: 512 },
-                WireGetSpendItem { txid, vout: 1023 },
+                WireGetSpendItem {
+                    txid,
+                    vout: 0,
+                    utxo_hash: test_utxo_hash(5, 0),
+                },
+                WireGetSpendItem {
+                    txid,
+                    vout: 512,
+                    utxo_hash: test_utxo_hash(5, 512),
+                },
+                WireGetSpendItem {
+                    txid,
+                    vout: 1023,
+                    utxo_hash: test_utxo_hash(5, 1023),
+                },
             ]),
         },
     );
@@ -1134,20 +1711,162 @@ fn oversized_frame_rejected() {
     let too_big: u32 = MAX_FRAME_SIZE + 1;
     stream.write_all(&too_big.to_le_bytes()).unwrap();
 
-    // The server should reject and close the connection.
-    // Try to read a response (it should be an error or disconnection).
     let mut len_buf = [0u8; 4];
-    match stream.read_exact(&mut len_buf) {
-        Ok(()) => {
-            // Server sent an error response before closing
-            let total_length = u32::from_le_bytes(len_buf) as usize;
-            let mut body = vec![0u8; total_length];
-            let _ = stream.read_exact(&mut body);
-        }
-        Err(_) => {
-            // Connection closed — also acceptable
-        }
-    }
+    stream
+        .read_exact(&mut len_buf)
+        .expect("server must send an explicit error frame");
+    let total_length = u32::from_le_bytes(len_buf) as usize;
+    let mut body = vec![0u8; total_length];
+    stream
+        .read_exact(&mut body)
+        .expect("server must send the complete error frame body");
+
+    let mut full = Vec::with_capacity(4 + total_length);
+    full.extend_from_slice(&len_buf);
+    full.extend_from_slice(&body);
+    let (resp, consumed) = ResponseFrame::decode(&full).unwrap();
+    assert_eq!(consumed, full.len());
+    assert_eq!(resp.request_id, 0);
+    assert_eq!(resp.status, STATUS_ERROR);
+    assert_eq!(resp.payload, b"frame too large");
+
+    server.shutdown();
+}
+
+#[test]
+fn max_connection_rejection_sends_error_frame() {
+    let (server, port) = start_test_server_with_max_connections(1);
+    let _held = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+
+    // Give the accept thread time to count the held connection before
+    // opening the over-limit connection.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let mut rejected = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    rejected
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    let mut len_buf = [0u8; 4];
+    rejected
+        .read_exact(&mut len_buf)
+        .expect("over-limit connection must receive an error frame");
+    let total_length = u32::from_le_bytes(len_buf) as usize;
+    let mut body = vec![0u8; total_length];
+    rejected
+        .read_exact(&mut body)
+        .expect("over-limit connection must receive a complete error body");
+
+    let mut full = Vec::with_capacity(4 + total_length);
+    full.extend_from_slice(&len_buf);
+    full.extend_from_slice(&body);
+    let (resp, consumed) = ResponseFrame::decode(&full).unwrap();
+    assert_eq!(consumed, full.len());
+    assert_eq!(resp.request_id, 0);
+    assert_eq!(resp.status, STATUS_ERROR);
+    let (code, msg) = decode_error_payload(&resp.payload).unwrap();
+    assert_eq!(code, ERR_INTERNAL);
+    assert!(msg.contains("max connections"));
+
+    server.shutdown();
+}
+
+#[test]
+fn stream_isolation_per_connection() {
+    let (server, port) = start_test_server_with_blob_store();
+    let mut stream_a = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    let mut stream_b = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    stream_a
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    stream_b
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    let txid = test_txid(1300);
+    let resp_a = send_request(
+        &mut stream_a,
+        &RequestFrame {
+            request_id: 1300,
+            op_code: OP_STREAM_CHUNK,
+            flags: 0,
+            payload: encode_stream_chunk(&txid, 0, b"hello"),
+        },
+    );
+    assert_eq!(resp_a.status, STATUS_OK);
+
+    // If stream state leaked across connections, B would inherit A's
+    // 5-byte offset and this chunk would be accepted. Per-connection
+    // isolation means B has no prior bytes and must reject offset 5.
+    let resp_b = send_request(
+        &mut stream_b,
+        &RequestFrame {
+            request_id: 1301,
+            op_code: OP_STREAM_CHUNK,
+            flags: 0,
+            payload: encode_stream_chunk(&txid, 5, b"world"),
+        },
+    );
+    assert_eq!(resp_b.status, STATUS_ERROR);
+    let (code, msg) = decode_error_payload(&resp_b.payload).unwrap();
+    assert_eq!(code, ERR_STREAM_OFFSET_MISMATCH);
+    assert!(msg.contains("expected offset 0"));
+
+    server.shutdown();
+}
+
+#[test]
+fn stream_end_without_active_stream_returns_stream_not_found() {
+    let (server, port) = start_test_server_with_blob_store();
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    let txid = test_txid(1302);
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1302,
+            op_code: OP_STREAM_END,
+            flags: 0,
+            payload: encode_stream_end(&txid, 0),
+        },
+    );
+    assert_eq!(resp.status, STATUS_ERROR);
+    let (code, msg) = decode_error_payload(&resp.payload).unwrap();
+    assert_eq!(code, ERR_STREAM_NOT_FOUND);
+    assert!(msg.contains("no active stream"));
+
+    server.shutdown();
+}
+
+#[test]
+fn external_blob_create_without_uploaded_blob_returns_blob_not_found() {
+    let (server, port) = start_test_server_with_blob_store();
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    let mut item = make_create_item(test_txid(1303), 1, 1303);
+    item.flags = FLAG_EXTERNAL_BLOB;
+
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1303,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: encode_create_batch(&[item]),
+        },
+    );
+    assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+    let errors = decode_sparse_errors(&resp.payload).unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].item_index, 0);
+    assert_eq!(errors[0].error_code, ERR_BLOB_NOT_FOUND);
+    assert!(errors[0].error_data.is_empty());
 
     server.shutdown();
 }
@@ -1178,6 +1897,7 @@ fn pipelined_requests_5_batches() {
             payload: encode_get_spend_batch(&[WireGetSpendItem {
                 txid: test_txid(1200 + i),
                 vout: 0,
+                utxo_hash: test_utxo_hash(1200 + i, 0),
             }]),
         };
         let bytes = frame.encode();
@@ -1408,7 +2128,11 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
             request_id: 1509,
             op_code: OP_GET_SPEND_BATCH,
             flags: 0,
-            payload: encode_get_spend_batch(&[WireGetSpendItem { txid, vout: 0 }]),
+            payload: encode_get_spend_batch(&[WireGetSpendItem {
+                txid,
+                vout: 0,
+                utxo_hash: test_utxo_hash(1500, 0),
+            }]),
         },
     );
     assert_eq!(resp.status, STATUS_OK);

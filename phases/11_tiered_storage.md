@@ -4,6 +4,8 @@
 
 Implement the tiered storage system for transaction inputs/outputs. Small txs have data inline on NVMe, medium txs in a separate NVMe region, and large txs in an external blob store. This completes the storage architecture.
 
+**Current implementation note (R-108):** the separate-NVMe middle tier described in this phase is not enabled in production. The fixed `TxMetadata` layout has no durable `separate_cold_offset` / `separate_cold_size` fields, so medium cold data now routes to the external blob tier instead of creating an unreferencable device allocation. Reintroducing this tier requires a metadata schema migration.
+
 ## Dependencies
 
 Phases 1-10 must be complete with all tests passing.

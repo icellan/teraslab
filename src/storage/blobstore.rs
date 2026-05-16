@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -50,6 +51,7 @@ const META_SUFFIX: &str = ".meta";
 
 /// Suffix used for in-progress write tmp files.
 const TMP_SUFFIX: &str = ".tmp";
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// On-disk sidecar layout: 32-byte SHA-256 digest followed by 8-byte length (little-endian).
 ///
@@ -140,14 +142,49 @@ fn fsync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn fsync_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn create_dir_all_durable(base_dir: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    let mut dirs = Vec::new();
+    for dir in path.ancestors() {
+        dirs.push(dir);
+        if dir == base_dir {
+            break;
+        }
+    }
+    for dir in dirs {
+        fsync_dir(dir)?;
+    }
+    Ok(())
+}
+
+fn unique_tmp_path(final_path: &Path) -> PathBuf {
+    let id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut tmp = final_path.as_os_str().to_os_string();
+    tmp.push(format!(
+        ".{}.{}.{}",
+        std::process::id(),
+        id,
+        TMP_SUFFIX.trim_start_matches('.')
+    ));
+    PathBuf::from(tmp)
+}
+
 /// Atomically write `data` to `final_path` via a sibling `.tmp` file with
 /// fsync on the file. The parent directory is **not** fsync'd here — the
 /// caller must call [`fsync_parent_dir`] once after all related files
 /// (payload + sidecar) have been renamed.
 fn atomic_write_no_dir_fsync(final_path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let mut tmp = final_path.as_os_str().to_os_string();
-    tmp.push(TMP_SUFFIX);
-    let tmp_path = PathBuf::from(tmp);
+    let tmp_path = unique_tmp_path(final_path);
 
     // Scope the file handle so it's closed before the rename.
     {
@@ -260,6 +297,7 @@ pub trait BlobStore: Send + Sync {
 pub struct FileBlobStore {
     base_dir: PathBuf,
     prefix_depth: usize,
+    key_locks: Arc<Vec<parking_lot::Mutex<()>>>,
 }
 
 impl FileBlobStore {
@@ -281,7 +319,12 @@ impl FileBlobStore {
         Self {
             base_dir: base_dir.to_path_buf(),
             prefix_depth,
+            key_locks: Arc::new((0..256).map(|_| parking_lot::Mutex::new(())).collect()),
         }
+    }
+
+    fn lock_index(key: &[u8; 32]) -> usize {
+        key[0] as usize
     }
 
     /// Decode a hex filename back to a 32-byte txid. Returns `None` for any
@@ -450,6 +493,8 @@ impl FileBlobStore {
 /// digest is computed incrementally so streams of arbitrary size do not
 /// require buffering the full payload to hash it at finish time.
 struct FileStreamWriter {
+    key_locks: Arc<Vec<parking_lot::Mutex<()>>>,
+    lock_index: usize,
     temp_path: PathBuf,
     final_path: PathBuf,
     file: std::fs::File,
@@ -468,12 +513,15 @@ impl BlobStreamWriter for FileStreamWriter {
     fn finish(self: Box<Self>) -> Result<BlobDigest> {
         // Decompose the box so we can take ownership of individual fields.
         let FileStreamWriter {
+            key_locks,
+            lock_index,
             temp_path,
             final_path,
             file,
             bytes_written,
             hasher,
         } = *self;
+        let _guard = key_locks[lock_index].lock();
 
         // 1. fsync the payload temp file, then rename into place.
         file.sync_all()?;
@@ -505,9 +553,10 @@ impl BlobStreamWriter for FileStreamWriter {
 
 impl BlobStore for FileBlobStore {
     fn put(&self, key: &[u8; 32], data: &[u8]) -> Result<BlobDigest> {
+        let _guard = self.key_locks[Self::lock_index(key)].lock();
         let path = self.blob_path(key);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            create_dir_all_durable(&self.base_dir, parent)?;
         }
 
         // Atomic payload write: tmp -> fsync -> rename.
@@ -651,14 +700,14 @@ impl BlobStore for FileBlobStore {
 
     fn begin_stream(&self, key: &[u8; 32]) -> Result<Box<dyn BlobStreamWriter>> {
         let final_path = self.blob_path(key);
-        let mut temp_path = final_path.as_os_str().to_os_string();
-        temp_path.push(TMP_SUFFIX);
-        let temp_path = PathBuf::from(temp_path);
+        let temp_path = unique_tmp_path(&final_path);
         if let Some(parent) = final_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            create_dir_all_durable(&self.base_dir, parent)?;
         }
         let file = std::fs::File::create(&temp_path)?;
         Ok(Box::new(FileStreamWriter {
+            key_locks: Arc::clone(&self.key_locks),
+            lock_index: Self::lock_index(key),
             temp_path,
             final_path,
             file,
@@ -1012,6 +1061,42 @@ mod tests {
     }
 
     #[test]
+    fn file_concurrent_puts_same_key_do_not_corrupt_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(FileBlobStore::new(dir.path(), 2));
+        let key = test_key(7);
+
+        let payloads: Vec<Vec<u8>> = (0..16u8).map(|i| vec![i; 1024 + i as usize]).collect();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(payloads.len()));
+        let handles: Vec<_> = payloads
+            .clone()
+            .into_iter()
+            .map(|data| {
+                let s = store.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    s.put(&key, &data).unwrap();
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let stored = store.get(&key).unwrap().unwrap();
+        assert!(
+            payloads.iter().any(|candidate| candidate == &stored),
+            "final blob must match one complete writer payload"
+        );
+        assert!(
+            store.digest(&key).unwrap().is_some(),
+            "sidecar must remain readable after same-key concurrency"
+        );
+    }
+
+    #[test]
     fn file_put_non_writable_dir() {
         let store = FileBlobStore::new(Path::new("/nonexistent/path/blobs"), 2);
         let result = store.put(&test_key(1), b"data");
@@ -1138,6 +1223,18 @@ mod tests {
                 "leftover tmp file: {p:?}"
             );
         }
+    }
+
+    #[test]
+    fn file_blobstore_uses_durable_directory_creation() {
+        let source = include_str!("blobstore.rs");
+        let calls = source
+            .matches("create_dir_all_durable(&self.base_dir, parent)?")
+            .count();
+        assert!(
+            calls >= 2,
+            "put() and begin_stream() must fsync newly-created prefix directories"
+        );
     }
 
     #[test]

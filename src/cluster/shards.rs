@@ -367,6 +367,13 @@ impl ShardTable {
         let Some(replica_idx) = promote_idx else {
             // `new_master` is not in this shard's assignment — refuse to
             // mutate so we don't fabricate an arbitrary cross-shard owner.
+            tracing::warn!(
+                shard,
+                current_master = ?current.master,
+                candidate_master = ?new_master,
+                replicas = ?current.replicas,
+                "set_master_for_shard ignored candidate outside shard assignment",
+            );
             return;
         };
         let demoted = std::mem::replace(&mut current.master, new_master);
@@ -878,6 +885,75 @@ mod tests {
         assert_eq!(table.shard_handoff_state(shard), ShardHandoff::ServingNew);
         // The target assignment is now also the old master (reverted).
         assert_eq!(table.target_assignment(shard).master, old_master);
+    }
+
+    #[test]
+    fn set_master_logs_when_node_not_in_assignment() {
+        use std::sync::{Arc, Mutex};
+        use tracing::Event;
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::Context;
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::registry::LookupSpan;
+
+        #[derive(Default)]
+        struct CaptureLayer {
+            warnings: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[derive(Default)]
+        struct MessageVisitor {
+            message: Option<String>,
+        }
+
+        impl Visit for MessageVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.message = Some(format!("{value:?}"));
+                }
+            }
+        }
+
+        impl<S> Layer<S> for CaptureLayer
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                if event.metadata().level() != &tracing::Level::WARN {
+                    return;
+                }
+                let mut visitor = MessageVisitor::default();
+                event.record(&mut visitor);
+                if let Some(message) = visitor.message {
+                    self.warnings.lock().expect("capture lock").push(message);
+                }
+            }
+        }
+
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("warn"))
+            .with(CaptureLayer {
+                warnings: warnings.clone(),
+            });
+
+        let mut table = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 1);
+        let before = table.target_assignment(0).clone();
+
+        tracing::subscriber::with_default(subscriber, || {
+            table.set_master_for_shard(0, NodeId(99));
+        });
+
+        assert_eq!(table.target_assignment(0), &before);
+        assert!(
+            warnings
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .any(|msg| msg.contains("set_master_for_shard ignored candidate")),
+            "expected warning for ignored unrelated master candidate"
+        );
     }
 
     #[test]

@@ -315,6 +315,8 @@ fn sequence_never_goes_backward() {
                 tx_key: key(i),
                 offset: 0,
                 spending_data: [i; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
                 master_generation: 0,
             },
             ReplicaOp::Freeze {
@@ -594,6 +596,7 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
         term: 10,
         proposer: NodeId(1),
         members: mems.clone(),
+        voters: mems.clone(),
         digest: TopologyTerm::compute_digest(10, &mems),
     };
     assert_eq!(auth.handle_commit(&commit), Some(10));
@@ -629,6 +632,7 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
         term: 1,
         proposer: NodeId(1),
         members: old_mems.clone(),
+        voters: old_mems.clone(),
         digest: TopologyTerm::compute_digest(1, &old_mems),
     };
     auth.handle_commit(&old_commit);
@@ -700,6 +704,7 @@ fn topology_cluster_formation_three_simultaneous_starts() {
             term: 1,
             proposer: NodeId(id),
             members: mems.clone(),
+            voters: mems.clone(),
             digest: TopologyTerm::compute_digest(1, &mems),
         };
         auth.handle_commit(&commit);
@@ -742,6 +747,7 @@ fn topology_formation_recovery_blocked_by_outstanding_vote() {
         term: 1,
         proposer: NodeId(2),
         members: mems.clone(),
+        voters: mems.clone(),
         digest: TopologyTerm::compute_digest(1, &mems),
     };
     auth.handle_commit(&commit);
@@ -1159,18 +1165,17 @@ fn topology_persisted_state_8byte_compat() {
 fn topology_persisted_state_pre_incarnation_compat() {
     use teraslab::cluster::topology::PersistedTopologyState;
 
-    let state = PersistedTopologyState {
-        peak_cluster_size: 3,
-        committed_term: 5,
-        committed_members: vec![NodeId(1), NodeId(2), NodeId(3)],
-        voted_term: 6,
-        incarnation: 42,
-    };
-    let data = state.serialize();
+    let mut data = Vec::new();
+    let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+    data.extend_from_slice(&3u64.to_le_bytes());
+    data.extend_from_slice(&5u64.to_le_bytes());
+    data.extend_from_slice(&6u64.to_le_bytes());
+    data.extend_from_slice(&(members.len() as u32).to_le_bytes());
+    for member in &members {
+        data.extend_from_slice(&member.0.to_le_bytes());
+    }
 
-    // Truncate the last 8 bytes (incarnation) to simulate old format.
-    let truncated = &data[..data.len() - 8];
-    let restored = PersistedTopologyState::deserialize(truncated);
+    let restored = PersistedTopologyState::deserialize(&data);
     assert_eq!(restored.peak_cluster_size, 3);
     assert_eq!(restored.committed_term, 5);
     assert_eq!(restored.voted_term, 6);
@@ -1190,8 +1195,10 @@ fn topology_restore_then_vote_safety() {
         peak_cluster_size: 3,
         committed_term: 10,
         committed_members: vec![NodeId(1), NodeId(2), NodeId(3)],
+        committed_voters: vec![NodeId(1), NodeId(2), NodeId(3)],
         voted_term: 12,
         incarnation: 0,
+        committed_voter_ever_seen: vec![NodeId(1), NodeId(2), NodeId(3)],
     };
 
     let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
@@ -1533,6 +1540,7 @@ fn topology_full_5_node_quorum_cycle() {
         term: commit.term,
         proposer: commit.proposer,
         members: commit.members.clone(),
+        voters: commit.voters.clone(),
         digest: commit.digest,
     };
     for node in &nodes {
@@ -1687,6 +1695,7 @@ fn split_brain_heal_detects_independent_clusters() {
         term: 5,
         proposer: NodeId(1),
         members: a_members.clone(),
+        voters: a_members.clone(),
         digest: TopologyTerm::compute_digest(5, &a_members),
     });
     assert_eq!(a_proposer.committed_term(), 5);
@@ -1699,6 +1708,7 @@ fn split_brain_heal_detects_independent_clusters() {
         term: 7,
         proposer: NodeId(4),
         members: b_members.clone(),
+        voters: b_members.clone(),
         digest: TopologyTerm::compute_digest(7, &b_members),
     });
     assert_eq!(b_proposer.committed_term(), 7);
@@ -1773,6 +1783,7 @@ fn split_brain_heal_detects_independent_clusters() {
         term: 5,
         proposer: NodeId(1),
         members: a_members.clone(),
+        voters: a_members.clone(),
         digest: TopologyTerm::compute_digest(5, &a_members),
     });
 

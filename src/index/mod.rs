@@ -13,6 +13,7 @@ pub mod redb_primary;
 pub mod redb_unmined;
 pub mod secondary_backend;
 pub mod unmined_index;
+mod util;
 
 pub use backend::PrimaryBackend;
 pub use dah_index::{DahIndex, DahRedoEntry};
@@ -67,10 +68,26 @@ const SNAPSHOT_VERSION: u32 = 1;
 const DAH_SECTION_MAGIC: [u8; 4] = *b"DAHI";
 const UNMINED_SECTION_MAGIC: [u8; 4] = *b"UNMI";
 const SECONDARY_VERSION: u32 = 1;
+const MAX_SNAPSHOT_COUNT: usize = 1 << 30;
 
 // Per-entry sizes in the snapshot file
 const PRIMARY_ENTRY_SIZE: usize = 32 + 1 + 8 + 4 + 1 + 1 + 4 + 4 + 4 + 4; // TxKey + TxIndexEntry = 63
 const SECONDARY_ENTRY_SIZE: usize = 4 + 32; // height + txid = 36
+
+#[cfg(test)]
+thread_local! {
+    static INDEX_NEW_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_index_new_call_count() {
+    INDEX_NEW_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn index_new_call_count() -> usize {
+    INDEX_NEW_CALLS.with(std::cell::Cell::get)
+}
 
 // ---------------------------------------------------------------------------
 // IndexStats
@@ -121,6 +138,9 @@ impl Index {
     /// The hash table is pre-allocated to `expected_records / 0.7` buckets
     /// (rounded to the next power of two) to keep the load factor below 70%.
     pub fn new(expected_records: usize) -> Result<Self> {
+        #[cfg(test)]
+        INDEX_NEW_CALLS.with(|calls| calls.set(calls.get() + 1));
+
         let capacity = (expected_records as f64 / 0.7).ceil() as usize;
         let table = HashTable::new(capacity.max(16))?;
         Ok(Self {
@@ -177,10 +197,44 @@ impl Index {
     /// Automatically resizes the hash table if the load factor exceeds
     /// the threshold (default 0.7).
     pub fn register(&mut self, key: TxKey, entry: TxIndexEntry) -> Result<()> {
-        self.table.insert(key, entry)?;
-        if self.table.load_factor() > self.resize_threshold {
-            self.table.resize(self.table.capacity() * 2)?;
+        self.register_without_resize(key, entry)?;
+        if let Some(target_capacity) = self.resize_target_capacity() {
+            self.resize_to_capacity(target_capacity)?;
         }
+        Ok(())
+    }
+
+    /// Register or update an entry without performing an automatic resize.
+    ///
+    /// Production engine inserts use this to keep the primary-index write lock
+    /// short, then perform the O(entries) resize copy under an upgradable read
+    /// lock so concurrent readers are not blocked by the rehash.
+    pub(crate) fn register_without_resize(
+        &mut self,
+        key: TxKey,
+        entry: TxIndexEntry,
+    ) -> Result<()> {
+        self.table.insert(key, entry)?;
+        Ok(())
+    }
+
+    pub(crate) fn resize_target_capacity(&self) -> Option<usize> {
+        if self.table.load_factor() > self.resize_threshold {
+            Some(self.table.capacity() * 2)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn resized_copy(&self, target_capacity: usize) -> Result<Self> {
+        Ok(Self {
+            table: self.table.build_resized(target_capacity)?,
+            resize_threshold: self.resize_threshold,
+        })
+    }
+
+    fn resize_to_capacity(&mut self, target_capacity: usize) -> Result<()> {
+        self.table.resize(target_capacity)?;
         Ok(())
     }
 
@@ -260,6 +314,7 @@ impl Index {
         f.sync_all()?;
         drop(f);
         std::fs::rename(&tmp_path, path)?;
+        util::fsync_parent_dir(path)?;
         Ok(())
     }
 
@@ -289,6 +344,7 @@ impl Index {
         f.sync_all()?;
         drop(f);
         std::fs::rename(&tmp_path, path)?;
+        util::fsync_parent_dir(path)?;
         Ok(())
     }
 
@@ -559,7 +615,14 @@ impl Index {
             });
         }
 
-        let _version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        if version != SNAPSHOT_VERSION {
+            return Err(IndexError::FormatError {
+                detail: format!(
+                    "unsupported snapshot version {version}; expected {SNAPSHOT_VERSION}"
+                ),
+            });
+        }
         let count = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
         let capacity = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
 
@@ -573,10 +636,9 @@ impl Index {
         // request a multi-gigabyte `Vec` allocation via the
         // index-rebuild fast path. 2^30 is well above any realistic
         // working-set size for a UTXO store.
-        const MAX_PRIMARY_ENTRIES: usize = 1 << 30;
-        if count > MAX_PRIMARY_ENTRIES {
+        if count > MAX_SNAPSHOT_COUNT {
             return Err(IndexError::FormatError {
-                detail: format!("snapshot count {count} exceeds maximum {MAX_PRIMARY_ENTRIES}",),
+                detail: format!("snapshot count {count} exceeds maximum {MAX_SNAPSHOT_COUNT}",),
             });
         }
         let body_size =
@@ -711,16 +773,22 @@ fn deserialize_secondary(
         });
     }
 
-    let _version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    if version != SECONDARY_VERSION {
+        return Err(IndexError::FormatError {
+            detail: format!(
+                "unsupported secondary version {version}; expected {SECONDARY_VERSION}"
+            ),
+        });
+    }
     let count = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
     // R-046 (GH-G1): use checked arithmetic for the same reasons as
     // the primary `Index::restore` path. A poisoned secondary section
     // could otherwise wrap `count * SECONDARY_ENTRY_SIZE` and bypass
     // the size sanity check below.
-    const MAX_SECONDARY_ENTRIES: usize = 1 << 30;
-    if count > MAX_SECONDARY_ENTRIES {
+    if count > MAX_SNAPSHOT_COUNT {
         return Err(IndexError::FormatError {
-            detail: format!("secondary count {count} exceeds maximum {MAX_SECONDARY_ENTRIES}",),
+            detail: format!("secondary count {count} exceeds maximum {MAX_SNAPSHOT_COUNT}",),
         });
     }
     let body_size =
@@ -881,6 +949,65 @@ mod tests {
 
         let result = Index::restore(&snap_path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn snapshot_restore_rejects_unknown_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("index.snap");
+
+        let mut idx = Index::new(100).unwrap();
+        idx.register(make_key(1), make_entry(100)).unwrap();
+        idx.snapshot(&snap_path).unwrap();
+
+        let mut data = std::fs::read(&snap_path).unwrap();
+        data[4..8].copy_from_slice(&(SNAPSHOT_VERSION + 1).to_le_bytes());
+        let checksum = crc32fast::hash(&data[..data.len() - 4]);
+        let checksum_offset = data.len() - 4;
+        data[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
+        std::fs::write(&snap_path, &data).unwrap();
+
+        match Index::restore(&snap_path) {
+            Err(IndexError::FormatError { detail }) => {
+                assert!(
+                    detail.contains("unsupported snapshot version"),
+                    "unexpected detail: {detail}",
+                );
+            }
+            Err(other) => panic!("expected unknown-version FormatError, got {other:?}"),
+            Ok(_) => panic!("unknown snapshot version must be rejected"),
+        }
+    }
+
+    #[test]
+    fn secondary_restore_rejects_unknown_version() {
+        let entries = vec![(42u32, make_key(1))];
+        let mut data = serialize_secondary(&DAH_SECTION_MAGIC, entries.into_iter());
+        data[4..8].copy_from_slice(&(SECONDARY_VERSION + 1).to_le_bytes());
+        let checksum = crc32fast::hash(&data[..data.len() - 4]);
+        let checksum_offset = data.len() - 4;
+        data[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
+
+        match deserialize_secondary(&data, &DAH_SECTION_MAGIC) {
+            Err(IndexError::FormatError { detail }) => {
+                assert!(
+                    detail.contains("unsupported secondary version"),
+                    "unexpected detail: {detail}",
+                );
+            }
+            Err(other) => panic!("expected unknown-version FormatError, got {other:?}"),
+            Ok(_) => panic!("unknown secondary version must be rejected"),
+        }
+    }
+
+    #[test]
+    fn snapshot_atomicity_fsync_parent_dir() {
+        let source = include_str!("mod.rs");
+        let calls = source.matches("util::fsync_parent_dir(path)?").count();
+        assert!(
+            calls >= 2,
+            "both snapshot() and snapshot_all() must fsync the parent directory after rename",
+        );
     }
 
     #[test]

@@ -143,6 +143,15 @@ pub struct AllocatorStats {
     pub utilization: f64,
 }
 
+/// A successfully reserved device-space region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocatedRegion {
+    /// Device byte offset of the reserved region.
+    pub offset: u64,
+    /// Aligned reservation size in bytes.
+    pub size: u64,
+}
+
 // ---------------------------------------------------------------------------
 // SlotAllocator
 // ---------------------------------------------------------------------------
@@ -197,6 +206,22 @@ enum FreelistBackend {
     Large {
         by_offset: std::collections::BTreeMap<u64, u64>,
         by_size: std::collections::BTreeSet<(u64, u64)>,
+    },
+}
+
+// Source of an in-memory reservation. Kept so redo failures can roll the
+// allocator state back before the caller observes an unjournaled offset.
+#[derive(Debug, Clone, Copy)]
+enum Reservation {
+    FromFreelist {
+        /// The allocation's returned offset (= region start).
+        alloc_offset: u64,
+        /// The original region's full size (needed for rollback if we split
+        /// and took the head).
+        region_size: u64,
+    },
+    FromHighWater {
+        previous_next_offset: u64,
     },
 }
 
@@ -454,50 +479,7 @@ impl SlotAllocator {
     /// having happened.
     pub fn allocate(&mut self, size: u64) -> Result<u64> {
         let aligned_size = self.align_up(size);
-
-        // Source of the reservation — needed for rollback on redo failure.
-        enum Reservation {
-            FromFreelist {
-                /// The allocation's returned offset (= region start).
-                alloc_offset: u64,
-                /// The original region's full size (needed for rollback if
-                /// we split and took the head).
-                region_size: u64,
-            },
-            FromHighWater {
-                previous_next_offset: u64,
-            },
-        }
-
-        let (offset, reservation) =
-            if let Some((region_offset, region_size)) = self.freelist.best_fit(aligned_size) {
-                // best_fit already removed/split the region in the freelist.
-                self.freelist.maybe_demote();
-                (
-                    region_offset,
-                    Reservation::FromFreelist {
-                        alloc_offset: region_offset,
-                        region_size,
-                    },
-                )
-            } else {
-                // No suitable free region — extend at the append point.
-                let offset = self.next_offset;
-                if offset + aligned_size > self.device_size {
-                    return Err(AllocatorError::DeviceFull {
-                        requested: aligned_size,
-                        largest_free: self.freelist.largest(),
-                    });
-                }
-                let previous_next_offset = self.next_offset;
-                self.next_offset = offset + aligned_size;
-                (
-                    offset,
-                    Reservation::FromHighWater {
-                        previous_next_offset,
-                    },
-                )
-            };
+        let (offset, reservation) = self.reserve_aligned(aligned_size)?;
 
         // Journal the reservation BEFORE returning — ensures the allocation
         // survives a crash between this point and the next `persist()`.
@@ -514,36 +496,7 @@ impl SlotAllocator {
             if let Err(e) = flush_result {
                 // Roll back the in-memory reservation so callers never
                 // observe an allocation that is not durably journaled.
-                match reservation {
-                    Reservation::FromFreelist {
-                        alloc_offset,
-                        region_size,
-                    } => {
-                        // Re-insert the original region. The returned
-                        // `region_size` matches the size we took out in
-                        // `best_fit` (which internally split if needed).
-                        //
-                        // best_fit's contract: when the region was larger
-                        // than the aligned allocation, it re-inserted the
-                        // remainder. That remainder is still in the freelist
-                        // — we need to remove it and merge back to the
-                        // original region, then insert.
-                        if region_size > aligned_size {
-                            let remainder_offset = alloc_offset + aligned_size;
-                            // Remove the remainder we just left in the
-                            // freelist, then re-insert the full original
-                            // region.
-                            self.freelist.remove(remainder_offset);
-                        }
-                        self.freelist.insert(alloc_offset, region_size);
-                        self.freelist.maybe_promote();
-                    }
-                    Reservation::FromHighWater {
-                        previous_next_offset,
-                    } => {
-                        self.next_offset = previous_next_offset;
-                    }
-                }
+                self.rollback_reservation(aligned_size, reservation);
                 return Err(AllocatorError::RedoLogFailure {
                     detail: format!("allocate redo append/flush failed: {e}"),
                 });
@@ -554,13 +507,81 @@ impl SlotAllocator {
             crate::fault_injection::check(crate::fault_injection::SyncPoint::MidAllocatorPersist);
         }
 
-        if let Some(m) = allocator_metrics() {
-            m.alloc_total.inc();
-            m.alloc_bytes_total.inc_by(aligned_size);
-            self.refresh_freelist_gauges(m);
-        }
+        self.record_allocation_metrics(1, aligned_size);
 
         Ok(offset)
+    }
+
+    /// Allocate multiple regions, flushing all successful allocation redo
+    /// entries with a single fsync.
+    ///
+    /// The returned vector has one entry per requested size. `Some(region)`
+    /// means that item was reserved; `None` means that item did not fit at
+    /// the point it was considered. Successfully reserved regions preserve
+    /// the same ordering semantics as repeated [`Self::allocate`] calls.
+    ///
+    /// If the batch redo flush fails, every in-memory reservation made by
+    /// this call is rolled back in reverse order and
+    /// [`AllocatorError::RedoLogFailure`] is returned.
+    pub fn allocate_batch(&mut self, sizes: &[u64]) -> Result<Vec<Option<AllocatedRegion>>> {
+        let mut results = Vec::with_capacity(sizes.len());
+        let mut reservations: Vec<(u64, Reservation)> = Vec::new();
+        let mut redo_ops: Vec<RedoOp> = Vec::new();
+
+        for size in sizes {
+            let aligned_size = self.align_up(*size);
+            match self.reserve_aligned(aligned_size) {
+                Ok((offset, reservation)) => {
+                    results.push(Some(AllocatedRegion {
+                        offset,
+                        size: aligned_size,
+                    }));
+                    reservations.push((aligned_size, reservation));
+                    redo_ops.push(RedoOp::AllocateRegion {
+                        offset,
+                        size: aligned_size,
+                        device_id: self.redo_device_id,
+                    });
+                }
+                Err(AllocatorError::DeviceFull { .. }) => {
+                    results.push(None);
+                }
+                Err(e) => {
+                    for (aligned_size, reservation) in reservations.into_iter().rev() {
+                        self.rollback_reservation(aligned_size, reservation);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        if let Some(log_arc) = self.redo_log.clone()
+            && !redo_ops.is_empty()
+        {
+            let flush_result = {
+                let mut log = log_arc.lock();
+                log.append_batch_and_flush(&redo_ops)
+            };
+            if let Err(e) = flush_result {
+                for (aligned_size, reservation) in reservations.into_iter().rev() {
+                    self.rollback_reservation(aligned_size, reservation);
+                }
+                return Err(AllocatorError::RedoLogFailure {
+                    detail: format!("allocate batch redo append/flush failed: {e}"),
+                });
+            }
+            crate::fault_injection::check(crate::fault_injection::SyncPoint::MidAllocatorPersist);
+        }
+
+        let mut allocated_count = 0u64;
+        let mut allocated_bytes = 0u64;
+        for region in results.iter().flatten() {
+            allocated_count += 1;
+            allocated_bytes += region.size;
+        }
+        self.record_allocation_metrics(allocated_count, allocated_bytes);
+
+        Ok(results)
     }
 
     /// Return a region to the freelist.
@@ -574,7 +595,19 @@ impl SlotAllocator {
     pub fn free(&mut self, offset: u64, size: u64) -> Result<()> {
         let aligned_size = self.align_up(size);
 
-        if offset < self.data_region_start || offset + aligned_size > self.device_size {
+        if aligned_size == 0 {
+            return Err(AllocatorError::InvalidFree {
+                offset,
+                size: aligned_size,
+            });
+        }
+        let Some(end) = offset.checked_add(aligned_size) else {
+            return Err(AllocatorError::InvalidFree {
+                offset,
+                size: aligned_size,
+            });
+        };
+        if offset < self.data_region_start || end > self.device_size {
             return Err(AllocatorError::InvalidFree {
                 offset,
                 size: aligned_size,
@@ -635,6 +668,79 @@ impl SlotAllocator {
         }
 
         Ok(())
+    }
+
+    fn reserve_aligned(&mut self, aligned_size: u64) -> Result<(u64, Reservation)> {
+        if let Some((region_offset, region_size)) = self.freelist.best_fit(aligned_size) {
+            // best_fit already removed/split the region in the freelist.
+            self.freelist.maybe_demote();
+            Ok((
+                region_offset,
+                Reservation::FromFreelist {
+                    alloc_offset: region_offset,
+                    region_size,
+                },
+            ))
+        } else {
+            // No suitable free region — extend at the append point.
+            let offset = self.next_offset;
+            let Some(end) = offset.checked_add(aligned_size) else {
+                return Err(AllocatorError::DeviceFull {
+                    requested: aligned_size,
+                    largest_free: self.freelist.largest(),
+                });
+            };
+            if end > self.device_size {
+                return Err(AllocatorError::DeviceFull {
+                    requested: aligned_size,
+                    largest_free: self.freelist.largest(),
+                });
+            }
+            let previous_next_offset = self.next_offset;
+            self.next_offset = end;
+            Ok((
+                offset,
+                Reservation::FromHighWater {
+                    previous_next_offset,
+                },
+            ))
+        }
+    }
+
+    fn rollback_reservation(&mut self, aligned_size: u64, reservation: Reservation) {
+        match reservation {
+            Reservation::FromFreelist {
+                alloc_offset,
+                region_size,
+            } => {
+                // Re-insert the original region. The returned `region_size`
+                // matches the size we took out in `best_fit` (which
+                // internally split if needed). If it split, remove the
+                // remainder before restoring the full region.
+                if region_size > aligned_size {
+                    let remainder_offset = alloc_offset + aligned_size;
+                    self.freelist.remove(remainder_offset);
+                }
+                self.freelist.insert(alloc_offset, region_size);
+                self.freelist.maybe_promote();
+            }
+            Reservation::FromHighWater {
+                previous_next_offset,
+            } => {
+                self.next_offset = previous_next_offset;
+            }
+        }
+    }
+
+    fn record_allocation_metrics(&self, count: u64, bytes: u64) {
+        if count == 0 {
+            return;
+        }
+        if let Some(m) = allocator_metrics() {
+            m.alloc_total.inc_by(count);
+            m.alloc_bytes_total.inc_by(bytes);
+            self.refresh_freelist_gauges(m);
+        }
     }
 
     /// Refresh the freelist-shape gauges in [`crate::metrics::AllocatorMetrics`].
@@ -703,7 +809,12 @@ impl SlotAllocator {
 
     fn replay_allocate(&mut self, offset: u64, size: u64) -> bool {
         let aligned_size = self.align_up(size);
-        let end = offset.saturating_add(aligned_size);
+        let Some(end) = offset.checked_add(aligned_size) else {
+            return false;
+        };
+        if aligned_size == 0 || offset < self.data_region_start || end > self.device_size {
+            return false;
+        }
 
         // Bump high-water mark past the allocated region if necessary.
         let bumped = if end > self.next_offset {
@@ -763,12 +874,18 @@ impl SlotAllocator {
 
     fn replay_free(&mut self, offset: u64, size: u64) -> bool {
         let aligned_size = self.align_up(size);
+        if aligned_size == 0 {
+            return false;
+        }
+        let Some(end) = offset.checked_add(aligned_size) else {
+            return false;
+        };
 
         // Idempotency: if the region is entirely inside an existing free
         // region, skip.
         if let Some((prev_off, prev_sz)) = self.freelist.prev_before(offset + 1)
             && prev_off <= offset
-            && prev_off + prev_sz >= offset + aligned_size
+            && prev_off.saturating_add(prev_sz) >= end
         {
             return false;
         }
@@ -776,7 +893,20 @@ impl SlotAllocator {
         // Safety: reject frees outside the valid data region silently —
         // a corrupt redo entry must not bring the allocator to an
         // inconsistent state.
-        if offset < self.data_region_start || offset.saturating_add(aligned_size) > self.device_size
+        if offset < self.data_region_start || end > self.device_size {
+            return false;
+        }
+
+        // Reject partial overlaps. Idempotent contained frees were handled
+        // above; any remaining overlap would create intersecting freelist
+        // regions and allow a later allocation to hand out live space.
+        if let Some((prev_off, prev_sz)) = self.freelist.prev_before(offset + 1)
+            && prev_off.saturating_add(prev_sz) > offset
+        {
+            return false;
+        }
+        if let Some((next_off, _)) = self.freelist.next_from(offset)
+            && next_off < end
         {
             return false;
         }
@@ -784,7 +914,7 @@ impl SlotAllocator {
         let mut final_offset = offset;
         let mut final_size = aligned_size;
 
-        let next_boundary = offset + aligned_size;
+        let next_boundary = end;
         if let Some((next_off, next_sz)) = self.freelist.next_from(next_boundary)
             && next_off == next_boundary
         {
@@ -985,6 +1115,47 @@ impl SlotAllocator {
     /// should read [`SlotAllocator::stats`] for a full snapshot.
     pub fn free_region_count(&self) -> usize {
         self.freelist.len()
+    }
+
+    /// Return the free region containing `offset`, if any.
+    ///
+    /// Rebuild scans use this to distinguish expected holes from corrupt
+    /// allocated records. The returned tuple is `(region_offset, region_size)`.
+    pub fn free_region_containing(&self, offset: u64) -> Option<(u64, u64)> {
+        let (free_offset, free_size) = self.freelist.prev_before(offset.saturating_add(1))?;
+        if offset >= free_offset && offset < free_offset.saturating_add(free_size) {
+            Some((free_offset, free_size))
+        } else {
+            None
+        }
+    }
+
+    /// Return true if `[offset, offset + size)` is inside the allocator's
+    /// high-water mark and does not overlap any free region.
+    ///
+    /// Recovery uses this before trusting a `CreateV2.record_offset`: a
+    /// redo entry that points outside allocator-owned space must not
+    /// register a primary index entry.
+    pub fn is_allocated_range(&self, offset: u64, size: u64) -> bool {
+        let aligned_size = self.align_up(size);
+        let Some(end) = offset.checked_add(aligned_size) else {
+            return false;
+        };
+        if aligned_size == 0
+            || offset < self.data_region_start
+            || end > self.next_offset
+            || end > self.device_size
+        {
+            return false;
+        }
+
+        !self
+            .freelist
+            .iter_offset_order()
+            .any(|(free_offset, free_size)| {
+                let free_end = free_offset.saturating_add(free_size);
+                free_offset < end && free_end > offset
+            })
     }
 
     /// Start of the data region on device.
@@ -1792,6 +1963,51 @@ mod tests {
     }
 
     #[test]
+    fn allocator_replay_free_overlap_detection() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+
+        let o1 = alloc.allocate(8192).unwrap();
+        let o2 = alloc.allocate(4096).unwrap();
+        alloc.free(o1, 8192).unwrap();
+        assert_eq!(alloc.free_region_containing(o1), Some((o1, 8192)));
+        assert!(
+            alloc.free_region_containing(o2).is_none(),
+            "second allocation must still be live before replay"
+        );
+
+        let applied = alloc.replay_redo(&RedoOp::FreeRegion {
+            offset: o1 + 4096,
+            size: 8192,
+            device_id: 0,
+        });
+        assert!(
+            !applied,
+            "partial-overlap replay free must be rejected as corrupt"
+        );
+        assert_eq!(alloc.free_region_containing(o1), Some((o1, 8192)));
+        assert!(
+            alloc.free_region_containing(o2).is_none(),
+            "partial overlap must not add the live second allocation to freelist"
+        );
+    }
+
+    #[test]
+    fn allocated_range_validation_rejects_free_or_out_of_range_regions() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        let off = alloc.allocate(8192).unwrap();
+
+        assert!(alloc.is_allocated_range(off, 4096));
+        assert!(alloc.is_allocated_range(off, 8192));
+        assert!(!alloc.is_allocated_range(off + 4096, 8192));
+
+        alloc.free(off, 8192).unwrap();
+        assert!(!alloc.is_allocated_range(off, 4096));
+        assert!(!alloc.is_allocated_range(alloc.next_offset(), 4096));
+    }
+
+    #[test]
     fn replay_is_idempotent() {
         // Replaying the same stream twice must yield the same state.
         let dev = test_device(16);
@@ -1863,6 +2079,37 @@ mod tests {
             device_id: 0,
         });
         assert!(!applied2, "second replay must be a no-op");
+    }
+
+    #[test]
+    fn allocator_replay_bounds_check() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        let before_next = alloc.next_offset();
+
+        let applied_past_end = alloc.replay_redo(&RedoOp::AllocateRegion {
+            offset: alloc.device_size - 2048,
+            size: 4096,
+            device_id: 0,
+        });
+        assert!(!applied_past_end, "out-of-bounds replay must be ignored");
+        assert_eq!(
+            alloc.next_offset(),
+            before_next,
+            "out-of-bounds replay must not advance next_offset"
+        );
+
+        let applied_before_data = alloc.replay_redo(&RedoOp::AllocateRegion {
+            offset: DATA_REGION_OFFSET - 4096,
+            size: 4096,
+            device_id: 0,
+        });
+        assert!(!applied_before_data, "header-region replay must be ignored");
+        assert_eq!(
+            alloc.next_offset(),
+            before_next,
+            "header-region replay must not advance next_offset"
+        );
     }
 
     #[test]

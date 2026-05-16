@@ -161,6 +161,7 @@ fn start_test_http_server() -> (u16, Arc<HttpState>) {
         redo_log: None,
         active_connections: Arc::new(AtomicUsize::new(0)),
         http_port: port,
+        replica_lag_warn_threshold_ops: 10_000,
     });
 
     let state_clone = state.clone();
@@ -241,6 +242,7 @@ fn drive_workload(engine: &Engine) {
             frozen: false,
             conflicting: false,
             locked: false,
+            external_ref: None,
             parent_txids: &[],
         };
         engine.create(&req).unwrap();

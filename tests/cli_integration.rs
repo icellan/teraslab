@@ -49,6 +49,7 @@ fn start_test_server() -> u16 {
         redo_log: None,
         active_connections: Arc::new(AtomicUsize::new(0)),
         http_port: 0,
+        replica_lag_warn_threshold_ops: 10_000,
     });
 
     let addr = format!("127.0.0.1:{port}");

@@ -12,7 +12,7 @@ use crate::cluster::coordinator::RunningCluster;
 use crate::cluster::shards::{NodeId, ShardHandoff, ShardTable};
 use crate::index::TxKey;
 use crate::ops::create::*;
-use crate::ops::engine::{Engine, build_cold_data};
+use crate::ops::engine::Engine;
 use crate::ops::error::SpendError;
 use crate::ops::mark_longest_chain::*;
 use crate::ops::remaining::*;
@@ -37,8 +37,6 @@ use std::sync::LazyLock;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
-const MIGRATION_REPLICATION_TIMEOUT_FLOOR: Duration = Duration::from_secs(30);
-
 /// Per-address replication connection slot. Each replica address gets its
 /// own independent mutex, so concurrent sends to different replicas never
 /// contend on a single lock. At millions of ops/sec with RF=3, this
@@ -53,6 +51,23 @@ struct PerAddrSlot {
 /// so concurrent sends to different replicas proceed without contention.
 static REPL_POOL: LazyLock<Mutex<HashMap<SocketAddr, std::sync::Arc<Mutex<PerAddrSlot>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn le_u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
+    let b = bytes.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_le_bytes([b[0], b[1]]))
+}
+
+fn le_u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    let b = bytes.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn le_u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
+    let b = bytes.get(offset..offset.checked_add(8)?)?;
+    Some(u64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
+}
 
 /// Configurable worker thread count for the replication runtime.
 /// Set via [`init_repl_worker_threads`] before the runtime is first used.
@@ -82,6 +97,33 @@ static REPL_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .build()
         .expect("failed to create replication tokio runtime")
 });
+
+const MAX_REPLICATION_FANOUTS_IN_FLIGHT: usize = 128;
+static REPLICATION_FANOUT_PERMITS: LazyLock<(std::sync::Mutex<usize>, std::sync::Condvar)> =
+    LazyLock::new(|| (std::sync::Mutex::new(0), std::sync::Condvar::new()));
+
+struct ReplicationFanoutPermit;
+
+fn acquire_replication_fanout_permit() -> ReplicationFanoutPermit {
+    let (lock, cvar) = &*REPLICATION_FANOUT_PERMITS;
+    let mut in_flight = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    while *in_flight >= MAX_REPLICATION_FANOUTS_IN_FLIGHT {
+        in_flight = cvar
+            .wait(in_flight)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    *in_flight += 1;
+    ReplicationFanoutPermit
+}
+
+impl Drop for ReplicationFanoutPermit {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*REPLICATION_FANOUT_PERMITS;
+        let mut in_flight = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *in_flight = in_flight.saturating_sub(1);
+        cvar.notify_one();
+    }
+}
 
 /// Persistent replication ACK tracker. Initialized during server startup
 /// via `init_ack_tracker()`. Records per-replica durable ACK sequences
@@ -223,6 +265,16 @@ pub fn init_replication_intent_tracker(
         .map_err(|_| "replication intent tracker already initialized".to_string())
 }
 
+/// Flush any coalesced replication-intent commits before a clean shutdown.
+pub fn flush_replication_intent_tracker() -> std::result::Result<(), String> {
+    if let Some(tracker) = REPLICATION_INTENT_TRACKER.get() {
+        tracker
+            .flush()
+            .map_err(|e| format!("replication intent flush: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Initialize the dispatch metrics reference.
 ///
 /// Must be called once during server startup before any requests are processed.
@@ -329,6 +381,8 @@ pub(crate) fn handle_request(
         return err_resp;
     }
 
+    let _visibility_guard = acquire_dispatch_visibility_guard(engine, request.op_code);
+
     // Refresh the cached wall-clock time once per request so that all
     // individual operations within the batch share the same timestamp.
     engine.refresh_clock();
@@ -339,7 +393,6 @@ pub(crate) fn handle_request(
     // item count is payload-dependent.
     if let Some(m) = DISPATCH_METRICS.get() {
         match request.op_code {
-            OP_CREATE_BATCH => m.creates_attempted.inc(),
             OP_SET_MINED_BATCH => m.set_mined_attempted.inc(),
             OP_GET_BATCH | OP_GET_SPEND_BATCH => m.gets_attempted.inc(),
             OP_FREEZE_BATCH => m.freezes_attempted.inc(),
@@ -492,21 +545,9 @@ pub(crate) fn handle_request(
             //   [manifest_hash:32] (optional)    — XOR-hash of (txid, generation) pairs
             let shard = request.request_id as u16;
 
-            let expected_records = if request.payload.len() >= 8 {
-                u64::from_le_bytes(request.payload[..8].try_into().unwrap())
-            } else {
-                0
-            };
-            let _fence_sequence = if request.payload.len() >= 16 {
-                u64::from_le_bytes(request.payload[8..16].try_into().unwrap())
-            } else {
-                0
-            };
-            let migration_epoch = if request.payload.len() >= 24 {
-                u64::from_le_bytes(request.payload[16..24].try_into().unwrap())
-            } else {
-                0
-            };
+            let expected_records = le_u64_at(&request.payload, 0).unwrap_or(0);
+            let _fence_sequence = le_u64_at(&request.payload, 8).unwrap_or(0);
+            let migration_epoch = le_u64_at(&request.payload, 16).unwrap_or(0);
             let source_manifest: Option<[u8; 32]> = if request.payload.len() >= 56 {
                 let mut h = [0u8; 32];
                 h.copy_from_slice(&request.payload[24..56]);
@@ -519,8 +560,16 @@ pub(crate) fn handle_request(
                 Option<Vec<(TxKey, u32)>>,
                 Option<NodeId>,
             ) = if request.payload.len() >= 60 {
-                let entry_count =
-                    u32::from_le_bytes(request.payload[56..60].try_into().unwrap()) as usize;
+                let entry_count = match le_u32_at(&request.payload, 56) {
+                    Some(n) => n as usize,
+                    None => {
+                        return error_response(
+                            request.request_id,
+                            ERR_MIGRATION_IN_PROGRESS,
+                            "malformed exact-manifest entry count",
+                        );
+                    }
+                };
                 // R-043 (GH-04): use `checked_mul` + `checked_add` so
                 // an attacker-controlled `entry_count` cannot overflow
                 // `usize` (matters on 32-bit; defensive on 64-bit) and
@@ -559,15 +608,27 @@ pub(crate) fn handle_request(
                     let mut txid = [0u8; 32];
                     txid.copy_from_slice(&request.payload[pos..pos + 32]);
                     pos += 32;
-                    let generation =
-                        u32::from_le_bytes(request.payload[pos..pos + 4].try_into().unwrap());
+                    let Some(generation) = le_u32_at(&request.payload, pos) else {
+                        return error_response(
+                            request.request_id,
+                            ERR_MIGRATION_IN_PROGRESS,
+                            "malformed exact-manifest generation",
+                        );
+                    };
                     pos += 4;
                     entries.push((TxKey { txid }, generation));
                 }
                 let completion_from_node = if request.payload.len() >= needed + 8 {
-                    Some(NodeId(u64::from_le_bytes(
-                        request.payload[needed..needed + 8].try_into().unwrap(),
-                    )))
+                    match le_u64_at(&request.payload, needed) {
+                        Some(node) => Some(NodeId(node)),
+                        None => {
+                            return error_response(
+                                request.request_id,
+                                ERR_MIGRATION_IN_PROGRESS,
+                                "malformed migration completion source node",
+                            );
+                        }
+                    }
                 } else {
                     None
                 };
@@ -594,24 +655,16 @@ pub(crate) fn handle_request(
                 }
             }
 
-            // A bare zero-count completion (no manifest, no exact entries)
-            // is a control-plane signal used by fast paths to clear pending
-            // inbound state when the target already has the shard contents.
-            let no_data_completion = expected_records == 0
-                && source_manifest.is_none()
-                && source_entries
-                    .as_ref()
-                    .is_none_or(|entries| entries.is_empty());
             let verify_only = request.flags & FLAG_MIGRATION_VERIFY_ONLY != 0;
 
-            // Safety requirement (H3): when the source claims `record_count > 0`,
-            // it MUST also send a manifest hash (or exact-entry manifest). Without
-            // one, we cannot verify that every received record matches the source's
-            // contents and a malformed/stale frame could mark a non-empty shard
-            // migrated prematurely. Reject non-empty completions that lack both.
+            // Safety requirement (R-219): every completion, including an
+            // empty shard (`record_count == 0`), MUST send cryptographic
+            // manifest evidence. The prior zero-count/no-manifest fast path
+            // let a stale source clear inbound state for a non-empty shard
+            // without proving the target's contents.
             let has_manifest_evidence =
                 source_manifest.is_some() || source_entries.as_ref().is_some_and(|e| !e.is_empty());
-            if expected_records > 0 && !has_manifest_evidence {
+            if !has_manifest_evidence {
                 return error_response(
                     request.request_id,
                     ERR_MIGRATION_MANIFEST_REQUIRED,
@@ -647,20 +700,10 @@ pub(crate) fn handle_request(
                 }
             }
 
-            // Note: the zero-count + no-manifest fast-path is preserved as a
-            // legitimate control-plane signal used when the receiver already
-            // holds the shard contents (e.g. via prior replica delivery) and
-            // the source just needs to clear pending-inbound state. The
-            // `record_count > 0` guard above is sufficient to close H3: any
-            // frame claiming to have delivered data MUST include cryptographic
-            // evidence that the data actually matches the source.
-
             // Verify the actual record count matches expected exactly
             // using the O(1) per-shard counter.
             let actual = engine.shard_record_count(shard);
-            let count_ok = if no_data_completion {
-                true
-            } else if expected_records == 0 {
+            let count_ok = if expected_records == 0 {
                 actual == 0
             } else {
                 actual == expected_records
@@ -755,13 +798,7 @@ pub(crate) fn handle_request(
             }
 
             if let Some(cluster) = cluster {
-                if no_data_completion {
-                    if let Some(from_node) = completion_from_node {
-                        cluster.mark_inbound_complete_from_source(shard, from_node);
-                    } else {
-                        cluster.mark_inbound_complete_all(shard);
-                    }
-                } else if let Some(from_node) = completion_from_node {
+                if let Some(from_node) = completion_from_node {
                     cluster.mark_inbound_complete_from_source(shard, from_node);
                 } else {
                     cluster.mark_inbound_complete(shard);
@@ -792,8 +829,32 @@ pub(crate) fn handle_request(
                     "batch-complete: too short",
                 );
             }
-            let shard_count = u32::from_le_bytes(request.payload[..4].try_into().unwrap()) as usize;
-            let expected_len = 4 + shard_count * 2 + 8;
+            let shard_count = match le_u32_at(&request.payload, 0) {
+                Some(n) => n as usize,
+                None => {
+                    return error_response(
+                        request.request_id,
+                        ERR_INTERNAL,
+                        "batch-complete: malformed shard count",
+                    );
+                }
+            };
+            let expected_len = match 2usize
+                .checked_mul(shard_count)
+                .and_then(|n| n.checked_add(4))
+                .and_then(|n| n.checked_add(8))
+            {
+                Some(len) => len,
+                None => {
+                    return error_response(
+                        request.request_id,
+                        ERR_INTERNAL,
+                        &format!(
+                            "batch-complete: shard_count overflow ({shard_count}); rejecting frame"
+                        ),
+                    );
+                }
+            };
             if request.payload.len() < expected_len {
                 return error_response(
                     request.request_id,
@@ -807,16 +868,24 @@ pub(crate) fn handle_request(
             let mut shards = Vec::with_capacity(shard_count);
             for i in 0..shard_count {
                 let off = 4 + i * 2;
-                shards.push(u16::from_le_bytes(
-                    request.payload[off..off + 2].try_into().unwrap(),
-                ));
+                let Some(shard) = le_u16_at(&request.payload, off) else {
+                    return error_response(
+                        request.request_id,
+                        ERR_INTERNAL,
+                        "batch-complete: malformed shard id",
+                    );
+                };
+                shards.push(shard);
             }
             let from_node_off = 4 + shard_count * 2;
-            let from_node = NodeId(u64::from_le_bytes(
-                request.payload[from_node_off..from_node_off + 8]
-                    .try_into()
-                    .unwrap(),
-            ));
+            let Some(from_node_id) = le_u64_at(&request.payload, from_node_off) else {
+                return error_response(
+                    request.request_id,
+                    ERR_INTERNAL,
+                    "batch-complete: malformed source node",
+                );
+            };
+            let from_node = NodeId(from_node_id);
 
             if let Some(cluster) = cluster {
                 cluster.mark_inbound_complete_many_from_source(&shards, from_node);
@@ -999,6 +1068,8 @@ pub(crate) fn handle_request(
 // Redo log helper
 // ---------------------------------------------------------------------------
 
+const REDO_GROUP_COMMIT_WINDOW: Duration = Duration::from_micros(200);
+
 /// Append redo ops to the log and flush.
 ///
 /// Returns the sequence number of the last appended entry on success.
@@ -1018,6 +1089,14 @@ fn write_redo_ops(
     redo_log: Option<&Mutex<RedoLog>>,
     ops: &[RedoOp],
 ) -> std::result::Result<(u64, u64), String> {
+    write_redo_ops_with_group_window(redo_log, ops, REDO_GROUP_COMMIT_WINDOW)
+}
+
+fn write_redo_ops_with_group_window(
+    redo_log: Option<&Mutex<RedoLog>>,
+    ops: &[RedoOp],
+    group_window: Duration,
+) -> std::result::Result<(u64, u64), String> {
     let redo = match redo_log {
         Some(r) => r,
         None => return Ok((0, 0)),
@@ -1025,14 +1104,24 @@ fn write_redo_ops(
     if ops.is_empty() {
         return Ok((0, 0));
     }
-    let mut log = redo.lock();
-    let first_seq = log.current_sequence();
-    let mut last_seq = first_seq;
-    for op in ops {
-        last_seq = log
-            .append(op.clone())
-            .map_err(|e| format!("redo log append: {e}"))?;
+
+    let (first_seq, last_seq) = {
+        let mut log = redo.lock();
+        let first_seq = log.current_sequence();
+        let mut last_seq = first_seq;
+        for op in ops {
+            last_seq = log
+                .append(op.clone())
+                .map_err(|e| format!("redo log append: {e}"))?;
+        }
+        (first_seq, last_seq)
+    };
+
+    if !group_window.is_zero() {
+        std::thread::sleep(group_window);
     }
+
+    let mut log = redo.lock();
     log.flush().map_err(|e| format!("redo log flush: {e}"))?;
     Ok((first_seq, last_seq))
 }
@@ -1092,16 +1181,49 @@ fn valid_redo_range(range: (u64, u64)) -> bool {
     range.0 != 0 && range.1 >= range.0
 }
 
-fn begin_replication_intent(range: (u64, u64)) -> std::result::Result<(), String> {
+fn begin_replication_intent_with_tracker(
+    range: (u64, u64),
+    tracker: Option<&crate::replication::durable::ReplicationIntentTracker>,
+) -> std::result::Result<(), String> {
     if !valid_redo_range(range) {
         return Ok(());
     }
-    if let Some(tracker) = REPLICATION_INTENT_TRACKER.get() {
+    if let Some(tracker) = tracker {
         tracker
             .begin(range.0, range.1)
             .map_err(|e| format!("replication intent begin: {e}"))?;
     }
     Ok(())
+}
+
+fn write_replicated_redo_ops(
+    cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+    ops: &[RedoOp],
+) -> std::result::Result<(u64, u64), String> {
+    write_replicated_redo_ops_with_tracker(
+        cluster.is_some(),
+        redo_log,
+        ops,
+        REPLICATION_INTENT_TRACKER.get(),
+    )
+}
+
+fn write_replicated_redo_ops_with_tracker(
+    replication_applicable: bool,
+    redo_log: Option<&Mutex<RedoLog>>,
+    ops: &[RedoOp],
+    tracker: Option<&crate::replication::durable::ReplicationIntentTracker>,
+) -> std::result::Result<(u64, u64), String> {
+    let range = write_redo_ops(redo_log, ops)?;
+    if replication_applicable && !ops.is_empty() {
+        // R-036: the master-side intent is the durable bridge between
+        // "redo fsynced" and "replica ACK policy satisfied". It must be
+        // persisted before the local engine apply; otherwise a crash in that
+        // window leaves a local-only mutation with no startup barrier.
+        begin_replication_intent_with_tracker(range, tracker)?;
+    }
+    Ok(range)
 }
 
 fn commit_replication_intent(range: (u64, u64)) -> std::result::Result<(), String> {
@@ -1116,18 +1238,22 @@ fn commit_replication_intent(range: (u64, u64)) -> std::result::Result<(), Strin
     Ok(())
 }
 
-fn clear_replication_intent_after_compensation(range: (u64, u64)) {
-    if let Err(e) = commit_replication_intent(range) {
-        tracing::warn!(err = %e, "replication intent: failed to clear after compensation");
+fn clear_replication_intents_after_compensation(ranges: &[(u64, u64)]) {
+    for &range in ranges {
+        if let Err(e) = commit_replication_intent(range) {
+            tracing::warn!(err = %e, "replication intent: failed to clear after compensation");
+        }
     }
 }
 
-fn clear_replication_intent_after_success(range: (u64, u64)) {
-    if let Err(e) = commit_replication_intent(range) {
-        tracing::warn!(
-            err = %e,
-            "replication intent: failed to clear after successful replica ACKs; startup recovery will replay"
-        );
+fn clear_replication_intents_after_success(ranges: &[(u64, u64)]) {
+    for &range in ranges {
+        if let Err(e) = commit_replication_intent(range) {
+            tracing::warn!(
+                err = %e,
+                "replication intent: failed to clear after successful replica ACKs; startup recovery will replay"
+            );
+        }
     }
 }
 
@@ -1272,15 +1398,17 @@ fn replicate_all_ops(
     cluster: Option<&RunningCluster>,
     ops_by_key: &[(TxKey, Vec<ReplicaOp>)],
     redo_seq_range: (u64, u64),
+    intent_ranges: &[(u64, u64)],
 ) -> std::result::Result<ReplicationOutcome, String> {
     let cluster = match cluster {
         Some(c) => c,
         None => return Ok(ReplicationOutcome::NotApplicable),
     };
     if ops_by_key.is_empty() {
+        clear_replication_intents_after_success(intent_ranges);
         return Ok(ReplicationOutcome::NotApplicable);
     }
-    begin_replication_intent(redo_seq_range)?;
+    let _fanout_permit = acquire_replication_fanout_permit();
 
     // Group all ops by target replica address — including any dual-write
     // expansion for shards currently migrating outbound (Phase E).
@@ -1298,7 +1426,7 @@ fn replicate_all_ops(
                 "replication target resolution failed: no replica targets for RF={rf}",
             ));
         }
-        clear_replication_intent_after_success(redo_seq_range);
+        clear_replication_intents_after_success(intent_ranges);
         return Ok(ReplicationOutcome::NotApplicable);
     }
 
@@ -1309,16 +1437,19 @@ fn replicate_all_ops(
     let ack_timeout = replication_ack_timeout_for(
         cluster.replication_timeout(),
         cluster.migration_pressure_active(),
+        cluster.replication_timeout_during_migration(),
     );
     // Phase B3: stamp every outbound batch with the live coordinator
     // epoch so the receiver's gate can reject stale-cluster writes.
     let cluster_key = cluster.local_cluster_key();
+    let auth_secret = cluster.cluster_secret().map(|s| s.to_vec());
     // Preserve the (addr, result) association so we can apply per-set
     // ACK accounting (Phase E) after the parallel fan-out completes.
     let results: Vec<(SocketAddr, std::result::Result<(), String>)> =
         REPL_RUNTIME.block_on(async {
             let mut handles = Vec::with_capacity(by_addr.len());
             for (addr, ops) in by_addr {
+                let auth_secret = auth_secret.clone();
                 handles.push(tokio::task::spawn_blocking(move || {
                     if ops.is_empty() {
                         return (addr, Ok(()));
@@ -1330,7 +1461,8 @@ fn replicate_all_ops(
                         source_node_id: Some(source_node_id),
                         cluster_key,
                     };
-                    let res = send_replica_batch_to(addr, &batch, ack_timeout);
+                    let res =
+                        send_replica_batch_to(addr, &batch, ack_timeout, auth_secret.as_deref());
                     (addr, res)
                 }));
             }
@@ -1408,7 +1540,7 @@ fn replicate_all_ops(
                 total_targets,
                 "replication: degraded ack (best_effort)",
             );
-            clear_replication_intent_after_success(redo_seq_range);
+            clear_replication_intents_after_success(intent_ranges);
             Ok(ReplicationOutcome::Full)
         }
         ReplicationClassification::ZeroAckBestEffort => {
@@ -1424,19 +1556,23 @@ fn replicate_all_ops(
                 err = %last_error.clone().unwrap_or_default(),
                 "replication: DEGRADED DURABILITY — 0 replicas ACKed, client will receive STATUS_DEGRADED_DURABILITY (best_effort)",
             );
-            clear_replication_intent_after_success(redo_seq_range);
+            clear_replication_intents_after_success(intent_ranges);
             Ok(ReplicationOutcome::Degraded)
         }
         ReplicationClassification::FullAck => {
-            clear_replication_intent_after_success(redo_seq_range);
+            clear_replication_intents_after_success(intent_ranges);
             Ok(ReplicationOutcome::Full)
         }
     }
 }
 
-fn replication_ack_timeout_for(base: Duration, migration_pressure: bool) -> Duration {
+fn replication_ack_timeout_for(
+    base: Duration,
+    migration_pressure: bool,
+    migration_timeout_floor: Duration,
+) -> Duration {
     if migration_pressure {
-        base.max(MIGRATION_REPLICATION_TIMEOUT_FLOOR)
+        base.max(migration_timeout_floor)
     } else {
         base
     }
@@ -1460,7 +1596,9 @@ pub fn recover_pending_replication_intents(
         None => return Ok(()),
     };
     recover_pending_replication_intents_from_tracker(tracker, redo_log, engine, |ops, range| {
-        replicate_all_ops(Some(cluster), ops, range).map(|_| ())
+        // The intent range is already present in the durable tracker; this
+        // recovery path commits it explicitly after successful fan-out.
+        replicate_all_ops(Some(cluster), ops, range, &[]).map(|_| ())
     })
 }
 
@@ -1485,10 +1623,15 @@ where
     })?;
 
     for range in pending {
-        let entries = {
+        let (entries, earliest_sequence, current_sequence) = {
             let log = redo_log.lock();
-            log.read_from_sequence(range.first_sequence)
-                .map_err(|e| format!("read redo for pending replication intent: {e}"))?
+            let entries = log
+                .read_from_sequence(range.first_sequence)
+                .map_err(|e| format!("read redo for pending replication intent: {e}"))?;
+            let earliest = log
+                .earliest_sequence()
+                .map_err(|e| format!("read redo floor for pending replication intent: {e}"))?;
+            (entries, earliest, log.current_sequence())
         };
         let entries: Vec<_> = entries
             .into_iter()
@@ -1500,6 +1643,23 @@ where
             || entries.first().map(|e| e.sequence) != Some(range.first_sequence)
             || entries.last().map(|e| e.sequence) != Some(range.last_sequence)
         {
+            let range_reclaimed = match earliest_sequence {
+                Some(earliest) => earliest > range.first_sequence,
+                None => current_sequence > range.last_sequence,
+            };
+            if range_reclaimed {
+                tracing::warn!(
+                    first_sequence = range.first_sequence,
+                    last_sequence = range.last_sequence,
+                    ?earliest_sequence,
+                    current_sequence,
+                    "pending replication intent refers to reclaimed redo range; clearing marker and requiring replica full resync/catch-up",
+                );
+                tracker
+                    .commit(range.first_sequence, range.last_sequence)
+                    .map_err(|e| format!("replication intent commit: {e}"))?;
+                continue;
+            }
             return Err(format!(
                 "pending replication intent {}..{} cannot be resolved: redo entries missing",
                 range.first_sequence, range.last_sequence,
@@ -1581,12 +1741,7 @@ pub(crate) fn classify_replication_outcome(
     best_effort: bool,
 ) -> ReplicationClassification {
     let required = match ack_policy {
-        Some(crate::replication::manager::AckPolicy::WriteAll) => total_targets,
-        Some(crate::replication::manager::AckPolicy::WriteMajority) => {
-            // For majority across N replica targets, we need ceil(N/2)
-            // replica ACKs (master itself counts implicitly as one copy).
-            total_targets.div_ceil(2)
-        }
+        Some(policy) => crate::replication::manager::required_replica_acks(total_targets, policy),
         None => 0, // best-effort: no minimum
     };
 
@@ -1615,6 +1770,7 @@ pub(crate) fn classify_replication_outcome(
 /// * `UnsetMined` — block_height + subtree_idx of the entry being cleared.
 /// * `Reassign` — utxo_hash of the slot before the reassign.
 /// * `Prune` — status byte of the slot before the prune.
+/// * `SetLocked` — locked flag + DAH before SetLocked cleared pruning state.
 ///
 /// `None` indicates "no before-image needed" (the op's compensation is
 /// fully determined by the on-device state at rollback time, e.g.
@@ -1627,6 +1783,11 @@ pub(crate) enum BeforeImage {
     UnsetMined { block_height: u32, subtree_idx: u32 },
     /// Captured pre-apply utxo_hash for a reassign op.
     Reassign { prior_utxo_hash: [u8; 32] },
+    /// Captured pre-apply locked flag and DAH for a set-locked op.
+    SetLocked {
+        prior_locked: bool,
+        prior_delete_at_height: u32,
+    },
     /// Captured pre-apply status byte for a prune op.
     ///
     /// `PruneSlot` `ReplicaOp`s are currently only generated by the
@@ -1650,6 +1811,30 @@ fn no_before_images(repl_ops: &[(TxKey, Vec<ReplicaOp>)]) -> Vec<(TxKey, Vec<Bef
         .iter()
         .map(|(k, ops)| (*k, vec![BeforeImage::None; ops.len()]))
         .collect()
+}
+
+fn before_images_match_repl_ops(
+    repl_ops: &[(TxKey, Vec<ReplicaOp>)],
+    before_images: &[(TxKey, Vec<BeforeImage>)],
+) -> bool {
+    repl_ops.len() == before_images.len()
+        && repl_ops
+            .iter()
+            .zip(before_images)
+            .all(|((op_key, ops), (before_key, images))| {
+                op_key == before_key && ops.len() == images.len()
+            })
+}
+
+fn push_repl_with_before_image(
+    repl_ops: &mut Vec<(TxKey, Vec<ReplicaOp>)>,
+    before_images: &mut Vec<(TxKey, Vec<BeforeImage>)>,
+    key: TxKey,
+    op: ReplicaOp,
+    before: BeforeImage,
+) {
+    repl_ops.push((key, vec![op]));
+    before_images.push((key, vec![before]));
 }
 
 /// Compensate for a replication failure by reversing locally-applied mutations.
@@ -1702,62 +1887,73 @@ fn compensate_replication_failure(
     repl_ops: &[(TxKey, Vec<ReplicaOp>)],
     before_images: &[(TxKey, Vec<BeforeImage>)],
     redo_log: Option<&Mutex<RedoLog>>,
-) {
+) -> std::result::Result<(), String> {
     let mut comp_redo: Vec<RedoOp> = Vec::new();
 
-    // Helper: look up the before-image aligned with `repl_ops[i].1[j]`.
-    // Returns `BeforeImage::None` if the parallel arrays disagree on
-    // shape — this is a programmer error in the dispatch handler that
-    // must not crash production. The compensation paths that need a
-    // before-image (UnsetMined, Reassign, PruneSlot) check for
-    // `BeforeImage::None` explicitly and skip emitting a Compensate*
-    // redo entry in that case (the in-memory restore still runs to
-    // keep the local state consistent for the immediate request).
-    let lookup_before = |i: usize, j: usize| -> BeforeImage {
-        if let Some((_, vec)) = before_images.get(i)
-            && let Some(b) = vec.get(j)
-        {
-            *b
-        } else {
-            BeforeImage::None
-        }
-    };
+    let before_shape_ok = before_images_match_repl_ops(repl_ops, before_images);
+    if !before_shape_ok {
+        tracing::error!(
+            repl_groups = repl_ops.len(),
+            before_groups = before_images.len(),
+            "replication compensation aborted: before-image shape mismatch"
+        );
+        return Err("before-image shape mismatch".to_string());
+    }
+
+    // Helper: look up the before-image aligned with `repl_ops[i].1[j]`. Shape
+    // was validated above, so a missing entry is impossible unless this function
+    // is edited incorrectly.
+    let lookup_before = |i: usize, j: usize| -> BeforeImage { before_images[i].1[j] };
 
     for (i, (key, ops)) in repl_ops.iter().enumerate() {
         for (j, op) in ops.iter().enumerate() {
             match op {
-                ReplicaOp::Spend { offset, .. } => {
+                ReplicaOp::Spend {
+                    offset,
+                    current_block_height,
+                    block_height_retention,
+                    ..
+                } => {
                     if let Ok(slot) = engine.read_slot(key, *offset) {
                         let req = crate::ops::unspend::UnspendRequest {
                             tx_key: *key,
                             offset: *offset,
                             utxo_hash: slot.hash,
-                            current_block_height: 0,
-                            block_height_retention: 0,
+                            spending_data: slot.spending_data,
+                            current_block_height: *current_block_height,
+                            block_height_retention: *block_height_retention,
                         };
                         let _ = engine.unspend(&req);
                         comp_redo.push(RedoOp::Unspend {
                             tx_key: *key,
                             offset: *offset,
+                            spending_data: Some(slot.spending_data),
                             new_spent_count: 0,
                         });
                     }
                 }
-                ReplicaOp::Unspend { offset, .. } => {
-                    // Reverse unspend → re-spend the slot with zero spending_data
+                ReplicaOp::Unspend {
+                    offset,
+                    spending_data,
+                    current_block_height,
+                    block_height_retention,
+                    ..
+                } => {
+                    // Reverse unspend → re-spend the slot with its exact
+                    // prior spending_data and original DAH evaluation context.
                     if let Ok(slot) = engine.read_slot(key, *offset) {
                         let req = crate::ops::spend::SpendMultiRequest {
                             tx_key: *key,
                             spends: vec![crate::ops::spend::SpendItem {
                                 offset: *offset,
                                 utxo_hash: slot.hash,
-                                spending_data: [0u8; 36],
+                                spending_data: *spending_data,
                                 idx: 0,
                             }],
                             ignore_conflicting: true,
                             ignore_locked: true,
-                            current_block_height: 0,
-                            block_height_retention: 0,
+                            current_block_height: *current_block_height,
+                            block_height_retention: *block_height_retention,
                         };
                         if let Ok(v) = engine.validate_spend_multi(&req) {
                             let _ = v.apply(engine);
@@ -1765,7 +1961,7 @@ fn compensate_replication_failure(
                         comp_redo.push(RedoOp::Spend {
                             tx_key: *key,
                             offset: *offset,
-                            spending_data: [0u8; 36],
+                            spending_data: *spending_data,
                             new_spent_count: 0,
                         });
                     }
@@ -1778,9 +1974,10 @@ fn compensate_replication_failure(
                             utxo_hash: slot.hash,
                         };
                         let _ = engine.unfreeze(&req);
-                        comp_redo.push(RedoOp::Unfreeze {
+                        comp_redo.push(RedoOp::UnfreezeV2 {
                             tx_key: *key,
                             offset: *offset,
+                            utxo_hash: slot.hash,
                         });
                     }
                 }
@@ -1792,9 +1989,10 @@ fn compensate_replication_failure(
                             utxo_hash: slot.hash,
                         };
                         let _ = engine.freeze(&req);
-                        comp_redo.push(RedoOp::Freeze {
+                        comp_redo.push(RedoOp::FreezeV2 {
                             tx_key: *key,
                             offset: *offset,
+                            utxo_hash: slot.hash,
                         });
                     }
                 }
@@ -1802,6 +2000,8 @@ fn compensate_replication_failure(
                     block_id,
                     block_height,
                     subtree_idx,
+                    current_block_height,
+                    block_height_retention,
                     ..
                 } => {
                     let req = crate::ops::set_mined::SetMinedRequest {
@@ -1811,8 +2011,8 @@ fn compensate_replication_failure(
                         subtree_idx: *subtree_idx,
                         on_longest_chain: false,
                         unset_mined: true,
-                        current_block_height: 0,
-                        block_height_retention: 0,
+                        current_block_height: *current_block_height,
+                        block_height_retention: *block_height_retention,
                     };
                     let _ = engine.set_mined(&req);
                     comp_redo.push(RedoOp::SetMined {
@@ -1823,7 +2023,12 @@ fn compensate_replication_failure(
                         unset: true,
                     });
                 }
-                ReplicaOp::UnsetMined { block_id, .. } => {
+                ReplicaOp::UnsetMined {
+                    block_id,
+                    current_block_height,
+                    block_height_retention,
+                    ..
+                } => {
                     // Gap #8: reverse unset → re-set the block entry using
                     // the captured pre-apply block_height + subtree_idx.
                     // When no before-image is available we fall back to
@@ -1845,8 +2050,8 @@ fn compensate_replication_failure(
                         subtree_idx: sti,
                         on_longest_chain: true,
                         unset_mined: false,
-                        current_block_height: 0,
-                        block_height_retention: 0,
+                        current_block_height: *current_block_height,
+                        block_height_retention: *block_height_retention,
                     };
                     let _ = engine.set_mined(&req);
                     // Forward redo entry: re-add the original block entry
@@ -1929,7 +2134,8 @@ fn compensate_replication_failure(
                         });
                     }
                 }
-                ReplicaOp::PruneSlot { offset, .. } => {
+                ReplicaOp::PruneSlot { offset, .. }
+                | ReplicaOp::PruneSlotIfSpentBy { offset, .. } => {
                     // Gap #8: PruneSlot only changes the status byte to
                     // UTXO_PRUNED. The slot data (hash, spending_data) is
                     // preserved on device. To reverse, restore the captured
@@ -1990,15 +2196,26 @@ fn compensate_replication_failure(
                     });
                 }
                 ReplicaOp::SetLocked { value, .. } => {
-                    let req = crate::ops::remaining::SetLockedRequest {
-                        tx_key: *key,
-                        value: !value,
+                    let (target_locked, target_dah) = match lookup_before(i, j) {
+                        BeforeImage::SetLocked {
+                            prior_locked,
+                            prior_delete_at_height,
+                        } => (prior_locked, prior_delete_at_height),
+                        _ => (!value, 0),
                     };
-                    let _ = engine.set_locked(&req);
+                    let _ =
+                        engine.restore_set_locked_for_compensation(key, target_locked, target_dah);
                     comp_redo.push(RedoOp::SetLocked {
                         tx_key: *key,
-                        value: !value,
+                        value: target_locked,
                     });
+                    if matches!(lookup_before(i, j), BeforeImage::SetLocked { .. }) {
+                        comp_redo.push(RedoOp::CompensateSetLocked {
+                            tx_key: *key,
+                            prior_locked: target_locked,
+                            prior_delete_at_height: target_dah,
+                        });
+                    }
                 }
                 ReplicaOp::PreserveUntil { .. } => {
                     let req = crate::ops::remaining::PreserveUntilRequest {
@@ -2061,7 +2278,34 @@ fn compensate_replication_failure(
     }
 
     if !comp_redo.is_empty() {
-        let _ = write_redo_ops(redo_log, &comp_redo);
+        write_redo_ops(redo_log, &comp_redo)
+            .map(|_| ())
+            .map_err(|e| format!("replication compensation redo write failed: {e}"))?;
+    }
+
+    Ok(())
+}
+
+fn compensate_replication_failure_or_error(
+    request_id: u64,
+    engine: &Engine,
+    repl_ops: &[(TxKey, Vec<ReplicaOp>)],
+    before_images: &[(TxKey, Vec<BeforeImage>)],
+    redo_log: Option<&Mutex<RedoLog>>,
+    intent_ranges: &[(u64, u64)],
+) -> Option<ResponseFrame> {
+    match compensate_replication_failure(engine, repl_ops, before_images, redo_log) {
+        Ok(()) => {
+            clear_replication_intents_after_compensation(intent_ranges);
+            None
+        }
+        Err(cause) => {
+            tracing::error!(
+                cause = %cause,
+                "replication compensation failed; leaving replication intent pending for operator recovery"
+            );
+            Some(error_response(request_id, ERR_INTERNAL, &cause))
+        }
     }
 }
 
@@ -2076,6 +2320,7 @@ fn send_replica_batch_to(
     addr: SocketAddr,
     batch: &ReplicaBatch,
     ack_timeout: Duration,
+    auth_secret: Option<&[u8]>,
 ) -> std::result::Result<(), String> {
     // Get or create the per-address slot. The outer pool lock is held
     // only for the HashMap lookup/insert, not during I/O.
@@ -2095,18 +2340,25 @@ fn send_replica_batch_to(
     let mut slot_guard = slot.lock();
 
     let mut transport = match slot_guard.connection.take() {
-        Some(t) if t.is_connected() => t,
-        _ => TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5))
-            .map_err(|e| format!("connect: {e}"))?,
+        Some(t) if t.is_connected() && t.auth_secret_matches(auth_secret) => t,
+        _ => TcpReplicaTransport::connect_with_auth(
+            &addr.to_string(),
+            Duration::from_secs(5),
+            auth_secret.map(|s| s.to_vec()),
+        )
+        .map_err(|e| format!("connect: {e}"))?,
     };
 
     if let Err(e) = transport.send_batch(batch) {
         // Connection may be stale (broken by partition, killed node, etc.).
         // Drop the broken transport and reconnect once before giving up.
         drop(transport);
-        let mut retry_transport =
-            TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5))
-                .map_err(|e2| format!("send: {e}; reconnect: {e2}"))?;
+        let mut retry_transport = TcpReplicaTransport::connect_with_auth(
+            &addr.to_string(),
+            Duration::from_secs(5),
+            auth_secret.map(|s| s.to_vec()),
+        )
+        .map_err(|e2| format!("send: {e}; reconnect: {e2}"))?;
         if let Err(e2) = retry_transport.send_batch(batch) {
             return Err(format!("send after reconnect: {e2}"));
         }
@@ -2185,6 +2437,21 @@ fn is_mutation_opcode(op: u16) -> bool {
             | OP_PRESERVE_TRANSACTIONS
             | OP_PROCESS_EXPIRED_PRESERVATIONS
     )
+}
+
+fn needs_dispatch_visibility_barrier(op: u16) -> bool {
+    is_mutation_opcode(op)
+        || matches!(
+            op,
+            OP_GET_BATCH | OP_GET_SPEND_BATCH | OP_QUERY_OLD_UNMINED | OP_REPLICA_BATCH
+        )
+}
+
+fn acquire_dispatch_visibility_guard(
+    engine: &Engine,
+    op: u16,
+) -> Option<parking_lot::MutexGuard<'_, ()>> {
+    needs_dispatch_visibility_barrier(op).then(|| engine.acquire_dispatch_visibility_guard())
 }
 
 /// Phase I — true if `op` is a client-facing read or write that must
@@ -2430,9 +2697,11 @@ fn handle_spend_batch(
     // `idempotent` is items that were silently no-op (already SPENT with the
     // same spending_data). `failed` is items present in the errors vec.
     let mut succeeded: u64 = 0;
+    let mut idempotent: u64 = 0;
     let mut errors: Vec<BatchItemError> = Vec::new();
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
     let mut spend_redo_range: (u64, u64) = (0, 0);
+    let mut spend_intent_ranges: Vec<(u64, u64)> = Vec::new();
 
     // WAL-first ordering: for each txid group we validate under lock,
     // write redo ops to the WAL (fsync), THEN apply the mutation.
@@ -2512,21 +2781,27 @@ fn handle_spend_batch(
         let mut key_repl_ops: Vec<ReplicaOp> = Vec::new();
         let mut running_count = pre_spent_count;
         for &(i, item) in group {
-            if !error_indices.contains(&(i as u32)) {
-                if transition_offsets.contains(&item.vout) {
-                    // Real UNSPENT → SPENT — counter advances by 1.
-                    running_count = running_count.wrapping_add(1);
-                }
-                redo_ops.push(RedoOp::Spend {
+            if !error_indices.contains(&(i as u32)) && transition_offsets.contains(&item.vout) {
+                // Real UNSPENT → SPENT — counter advances by 1. Idempotent
+                // re-spends do not emit redo/replication or bump generation;
+                // they match the single-spend no-op contract.
+                running_count = running_count.wrapping_add(1);
+                redo_ops.push(RedoOp::SpendV2 {
                     tx_key: key,
                     offset: item.vout,
                     spending_data: item.spending_data,
                     new_spent_count: running_count,
+                    current_block_height: params.current_block_height,
+                    block_height_retention: params.block_height_retention,
+                    target_generation: post_generation,
+                    updated_at: engine.now_millis(),
                 });
                 key_repl_ops.push(ReplicaOp::Spend {
                     tx_key: key,
                     offset: item.vout,
                     spending_data: item.spending_data,
+                    current_block_height: params.current_block_height,
+                    block_height_retention: params.block_height_retention,
                     master_generation: post_generation,
                 });
             }
@@ -2535,24 +2810,30 @@ fn handle_spend_batch(
         // Phase 3: Write redo BEFORE engine mutation (WAL-first).
         // Lock is still held via ValidatedSpend, so no concurrent
         // mutation can interleave.
-        match write_redo_ops(redo_log, &redo_ops) {
-            Ok(range) => {
-                if spend_redo_range.0 == 0 && spend_redo_range.1 == 0 {
-                    spend_redo_range = range;
-                } else if range.1 > 0 {
-                    spend_redo_range.1 = range.1; // Extend the end
+        if !redo_ops.is_empty() {
+            match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
+                Ok(range) => {
+                    if valid_redo_range(range) {
+                        spend_intent_ranges.push(range);
+                    }
+                    if spend_redo_range.0 == 0 && spend_redo_range.1 == 0 {
+                        spend_redo_range = range;
+                    } else if range.1 > 0 {
+                        spend_redo_range.1 = range.1; // Extend the end
+                    }
                 }
-            }
-            Err(e) => {
-                // Redo failure: don't apply, return error.
-                // ValidatedSpend drops here, releasing the lock.
-                return error_response(req.request_id, ERR_INTERNAL, &e);
+                Err(e) => {
+                    // Redo failure: don't apply, return error.
+                    // ValidatedSpend drops here, releasing the lock.
+                    return error_response(req.request_id, ERR_INTERNAL, &e);
+                }
             }
         }
 
         // Phase 4: Apply the mutation (still under lock).
         // ValidatedSpend is consumed, lock released after write.
         let validation_errors = validated.errors.clone();
+        idempotent += validated.idempotent_count() as u64;
         let resp = match validated.apply(engine) {
             Ok(r) => r,
             Err(e) => {
@@ -2567,9 +2848,9 @@ fn handle_spend_batch(
         }
 
         // Tally this group's outcomes before draining the validation
-        // errors: real transitions come from resp.spent_count (which
-        // excludes idempotent re-spends), failed from the error map.
-        // Idempotent = group.len() - succeeded - failed.
+        // errors: real transitions come from resp.spent_count, and no-op
+        // successes come directly from the validator's idempotent count.
+        // Failed items come from the error map.
         succeeded += resp.spent_count as u64;
 
         for (idx, err) in validation_errors {
@@ -2584,9 +2865,12 @@ fn handle_spend_batch(
     // validation failures *and* redirect errors (when the txid is not owned
     // by this node), so all three buckets sum to items.len().
     let failed_total = errors.len() as u64;
-    let idempotent_total = (items.len() as u64)
-        .saturating_sub(succeeded)
-        .saturating_sub(failed_total);
+    let idempotent_total = idempotent;
+    debug_assert_eq!(
+        succeeded + idempotent_total + failed_total,
+        items.len() as u64,
+        "spend batch item accounting should be exhaustive"
+    );
     if let Some(m) = DISPATCH_METRICS.get() {
         m.spends_succeeded.inc_by(succeeded);
         m.spends_idempotent.inc_by(idempotent_total);
@@ -2606,12 +2890,25 @@ fn handle_spend_batch(
     }
 
     // Phase 5: Replicate (redo already fsynced, engine already applied).
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, spend_redo_range) {
+    let repl_outcome = match replicate_all_ops(
+        cluster,
+        &repl_ops_by_key,
+        spend_redo_range,
+        &spend_intent_ranges,
+    ) {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
-            clear_replication_intent_after_compensation(spend_redo_range);
+            if let Some(resp) = compensate_replication_failure_or_error(
+                req.request_id,
+                engine,
+                &repl_ops_by_key,
+                &before_images,
+                redo_log,
+                &spend_intent_ranges,
+            ) {
+                return resp;
+            }
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -2676,7 +2973,7 @@ fn handle_unspend_batch(
     struct ValidUnspend<'a> {
         idx: usize,
         key: TxKey,
-        item: &'a WireSlotItem,
+        item: &'a WireUnspendItem,
         pre_generation: u32,
     }
     let mut valid_items: Vec<ValidUnspend> = Vec::new();
@@ -2709,10 +3006,15 @@ fn handle_unspend_batch(
         // there, modeling the per-item recovery state.
         let counter = running_spent.entry(key).or_insert(pre_spent);
         *counter = counter.saturating_sub(1);
-        redo_ops.push(RedoOp::Unspend {
+        redo_ops.push(RedoOp::UnspendV2 {
             tx_key: key,
             offset: item.vout,
+            spending_data: item.spending_data,
             new_spent_count: *counter,
+            current_block_height: params.current_block_height,
+            block_height_retention: params.block_height_retention,
+            target_generation: pre_generation.wrapping_add(1),
+            updated_at: engine.now_millis(),
         });
         valid_items.push(ValidUnspend {
             idx: i,
@@ -2723,7 +3025,7 @@ fn handle_unspend_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
     };
@@ -2737,6 +3039,7 @@ fn handle_unspend_batch(
             tx_key: v.key,
             offset: v.item.vout,
             utxo_hash: v.item.utxo_hash,
+            spending_data: v.item.spending_data,
             current_block_height: params.current_block_height,
             block_height_retention: params.block_height_retention,
         }) {
@@ -2752,6 +3055,9 @@ fn handle_unspend_batch(
                     vec![ReplicaOp::Unspend {
                         tx_key: v.key,
                         offset: v.item.vout,
+                        spending_data: v.item.spending_data,
+                        current_block_height: params.current_block_height,
+                        block_height_retention: params.block_height_retention,
                         master_generation: resp.generation,
                     }],
                 ));
@@ -2782,12 +3088,21 @@ fn handle_unspend_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
+    {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
-            clear_replication_intent_after_compensation(redo_range);
+            if let Some(resp) = compensate_replication_failure_or_error(
+                req.request_id,
+                engine,
+                &repl_ops_by_key,
+                &before_images,
+                redo_log,
+                &[redo_range],
+            ) {
+                return resp;
+            }
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -2841,7 +3156,7 @@ fn handle_set_mined_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
     };
@@ -2857,27 +3172,14 @@ fn handle_set_mined_batch(
         valid_items
             .iter()
             .filter_map(|v| {
-                let meta = engine.read_metadata(&v.key).ok()?;
-                let count = meta.block_entry_count as usize;
-                let inline = count.min(crate::record::INLINE_BLOCK_ENTRIES);
-                for i in 0..inline {
-                    if { meta.block_entries_inline[i].block_id } == params.block_id {
-                        return Some((
-                            v.key,
-                            BeforeImage::UnsetMined {
-                                block_height: { meta.block_entries_inline[i].block_height },
-                                subtree_idx: { meta.block_entries_inline[i].subtree_idx },
-                            },
-                        ));
-                    }
-                }
-                // Not in inline range — overflow lookup omitted: the
-                // unset path on an overflow entry is itself rare, and
-                // before-image capture for that case would require a
-                // device read per call. Fall back to no-image; the
-                // compensation handler will skip emitting a Compensate*
-                // entry which is preferable to one with stale data.
-                None
+                let entry = engine.read_block_entry(&v.key, params.block_id).ok()??;
+                Some((
+                    v.key,
+                    BeforeImage::UnsetMined {
+                        block_height: { entry.block_height },
+                        subtree_idx: { entry.subtree_idx },
+                    },
+                ))
             })
             .collect()
     } else {
@@ -2911,6 +3213,8 @@ fn handle_set_mined_batch(
                         vec![ReplicaOp::UnsetMined {
                             tx_key: v.key,
                             block_id: params.block_id,
+                            current_block_height: params.current_block_height,
+                            block_height_retention: params.block_height_retention,
                             master_generation: mgen,
                         }],
                     ));
@@ -2932,6 +3236,8 @@ fn handle_set_mined_batch(
                             block_height: params.block_height,
                             subtree_idx: params.subtree_idx,
                             on_longest_chain: params.on_longest_chain,
+                            current_block_height: params.current_block_height,
+                            block_height_retention: params.block_height_retention,
                             master_generation: mgen,
                         }],
                     ));
@@ -2959,18 +3265,22 @@ fn handle_set_mined_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
+    {
         Ok(o) => o,
         Err(e) => {
             // Gap #8: rollback uses the captured pre-unset block-entry
             // fields so a crash mid-rollback can be replayed exactly.
-            compensate_replication_failure(
+            if let Some(resp) = compensate_replication_failure_or_error(
+                req.request_id,
                 engine,
                 &repl_ops_by_key,
                 &before_images_by_key,
                 redo_log,
-            );
-            clear_replication_intent_after_compensation(redo_range);
+                &[redo_range],
+            ) {
+                return resp;
+            }
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -3001,13 +3311,9 @@ fn parse_cold_data_fields(cold_data: &[u8]) -> (Option<&[u8]>, Option<&[u8]>, Op
     }
     let mut pos = 0usize;
 
-    let il = u32::from_le_bytes(cold_data[pos..pos + 4].try_into().unwrap()) as usize;
-    pos += 4;
-    if pos + il > cold_data.len() {
+    let Some(inputs) = take_cold_data_section(cold_data, &mut pos) else {
         return (None, None, None);
-    }
-    let inputs = &cold_data[pos..pos + il];
-    pos += il;
+    };
 
     let inputs_opt = if inputs.is_empty() {
         None
@@ -3015,16 +3321,9 @@ fn parse_cold_data_fields(cold_data: &[u8]) -> (Option<&[u8]>, Option<&[u8]>, Op
         Some(inputs)
     };
 
-    if pos + 4 > cold_data.len() {
+    let Some(outputs) = take_cold_data_section(cold_data, &mut pos) else {
         return (inputs_opt, None, None);
-    }
-    let ol = u32::from_le_bytes(cold_data[pos..pos + 4].try_into().unwrap()) as usize;
-    pos += 4;
-    if pos + ol > cold_data.len() {
-        return (inputs_opt, None, None);
-    }
-    let outputs = &cold_data[pos..pos + ol];
-    pos += ol;
+    };
 
     let outputs_opt = if outputs.is_empty() {
         None
@@ -3032,15 +3331,9 @@ fn parse_cold_data_fields(cold_data: &[u8]) -> (Option<&[u8]>, Option<&[u8]>, Op
         Some(outputs)
     };
 
-    if pos + 4 > cold_data.len() {
+    let Some(inpoints) = take_cold_data_section(cold_data, &mut pos) else {
         return (inputs_opt, outputs_opt, None);
-    }
-    let pl = u32::from_le_bytes(cold_data[pos..pos + 4].try_into().unwrap()) as usize;
-    pos += 4;
-    if pos + pl > cold_data.len() {
-        return (inputs_opt, outputs_opt, None);
-    }
-    let inpoints = &cold_data[pos..pos + pl];
+    };
 
     let inpoints_opt = if inpoints.is_empty() {
         None
@@ -3049,6 +3342,17 @@ fn parse_cold_data_fields(cold_data: &[u8]) -> (Option<&[u8]>, Option<&[u8]>, Op
     };
 
     (inputs_opt, outputs_opt, inpoints_opt)
+}
+
+fn take_cold_data_section<'a>(cold_data: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    let len_end = pos.checked_add(4)?;
+    let len_bytes = cold_data.get(*pos..len_end)?;
+    let len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
+    let start = len_end;
+    let end = start.checked_add(len)?;
+    let section = cold_data.get(start..end)?;
+    *pos = end;
+    Some(section)
 }
 
 fn handle_create_batch(
@@ -3064,8 +3368,30 @@ fn handle_create_batch(
         Err(e) => return codec_error_response(req.request_id, "create batch", e),
     };
 
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.creates_attempted.inc_by(items.len() as u64);
+    }
+
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
+
+    fn release_create_reservation(
+        engine: &Engine,
+        record_offset: u64,
+        reservation_size: u64,
+        context: &str,
+    ) -> std::result::Result<(), String> {
+        engine
+            .allocator()
+            .lock()
+            .free(record_offset, reservation_size)
+            .map_err(|e| {
+                format!(
+                    "create reservation rollback failed after {context}: \
+                     offset={record_offset} size={reservation_size}: {e}"
+                )
+            })
+    }
 
     // Pre-compute mined_block_infos for each item so CreateRequest can borrow them.
     let mined_infos: Vec<Vec<crate::ops::create::MinedBlockInfo>> = items
@@ -3083,12 +3409,24 @@ fn handle_create_batch(
         })
         .collect();
 
-    // Phase 1: Validate ownership, check blobs, pre-allocate space, build redo ops.
+    // Phase 1: Validate ownership, check blobs, and build the record bytes
+    // that will be captured in CreateV2 after batch allocation assigns
+    // record offsets.
+    struct PendingCreate<'a> {
+        idx: usize,
+        create_req: CreateRequest<'a>,
+        utxo_count: u32,
+        reservation_size: u64,
+        record_bytes: Vec<u8>,
+    }
+
     struct ValidCreate<'a> {
         idx: usize,
         create_req: CreateRequest<'a>,
         record_offset: u64,
+        reservation_size: u64,
     }
+    let mut pending_items: Vec<PendingCreate> = Vec::new();
     let mut valid_items: Vec<ValidCreate> = Vec::new();
 
     for (i, item) in items.iter().enumerate() {
@@ -3170,108 +3508,112 @@ fn handle_create_batch(
             parent_txids: &item.parent_txids,
         };
 
-        // Pre-allocate space to get record_offset for the redo entry.
-        match engine.pre_allocate_create(&create_req) {
-            Ok((record_offset, utxo_count)) => {
-                let key = TxKey { txid: item.txid };
-                // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): build
-                // the full record bytes BEFORE the WAL flush so the redo
-                // entry contains everything recovery needs to
-                // reconstruct the on-device record byte-for-byte. Any
-                // failure here is internal (mirrors `create_at_offset`'s
-                // own validation surface).
-                let record_bytes = match engine.build_create_record_bytes(&create_req) {
-                    Ok((bytes, _)) => bytes,
-                    Err(_) => {
-                        // pre_allocate_create already accepted the
-                        // request, so a build failure here indicates a
-                        // logic-level inconsistency. Free the
-                        // pre-allocated space and report internal error.
-                        let utxo_count_for_free = create_req.utxo_hashes.len() as u32;
-                        let base_size =
-                            crate::record::TxMetadata::record_size_for(utxo_count_for_free);
-                        let cold_len = if create_req.is_external && create_req.inputs.is_none() {
-                            0u64
-                        } else {
-                            build_cold_data(
-                                create_req.inputs,
-                                create_req.outputs,
-                                create_req.inpoints,
-                            )
-                            .len() as u64
-                        };
-                        let _ = engine
-                            .allocator()
-                            .lock()
-                            .free(record_offset, base_size + cold_len);
-                        errors.push(BatchItemError {
-                            item_index: i as u32,
-                            error_code: ERR_INTERNAL,
-                            error_data: vec![],
-                        });
-                        continue;
-                    }
-                };
-                let parent_txids: Vec<[u8; 32]> = if create_req.conflicting {
-                    create_req.parent_txids.to_vec()
-                } else {
-                    Vec::new()
-                };
-                redo_ops.push(RedoOp::CreateV2 {
-                    tx_key: key,
-                    record_offset,
-                    utxo_count,
-                    is_conflicting: create_req.conflicting,
-                    record_bytes,
-                    parent_txids,
-                });
-                valid_items.push(ValidCreate {
-                    idx: i,
-                    create_req,
-                    record_offset,
-                });
-            }
-            Err(CreateError::DuplicateTxId) => {
-                errors.push(BatchItemError {
-                    item_index: i as u32,
-                    error_code: ERR_ALREADY_EXISTS,
-                    error_data: vec![],
-                });
-            }
+        let key = TxKey { txid: item.txid };
+        if engine.lookup(&key).is_some() {
+            errors.push(BatchItemError {
+                item_index: i as u32,
+                error_code: ERR_ALREADY_EXISTS,
+                error_data: vec![],
+            });
+            continue;
+        }
+
+        // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): build the full
+        // record bytes before any create WAL flush so the redo entry
+        // contains everything recovery needs to reconstruct the on-device
+        // record byte-for-byte.
+        let (record_bytes, utxo_count) = match engine.build_create_record_bytes(&create_req) {
+            Ok(built) => built,
             Err(_) => {
                 errors.push(BatchItemError {
                     item_index: i as u32,
                     error_code: ERR_INTERNAL,
                     error_data: vec![],
                 });
+                continue;
             }
-        }
+        };
+        let reservation_size = record_bytes.len() as u64;
+        pending_items.push(PendingCreate {
+            idx: i,
+            create_req,
+            utxo_count,
+            reservation_size,
+            record_bytes,
+        });
+    }
+
+    // Phase 1b: reserve all successful create candidates with one allocator
+    // WAL fsync. The redo log still contains ordinary AllocateRegion entries,
+    // so recovery does not need a new on-disk operation.
+    let reservation_sizes: Vec<u64> = pending_items
+        .iter()
+        .map(|pending| pending.reservation_size)
+        .collect();
+    let allocated_regions = match engine.allocator().lock().allocate_batch(&reservation_sizes) {
+        Ok(regions) => regions,
+        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &format!("{e}")),
+    };
+
+    for (pending, allocated) in pending_items.into_iter().zip(allocated_regions) {
+        let Some(region) = allocated else {
+            errors.push(BatchItemError {
+                item_index: pending.idx as u32,
+                error_code: ERR_INTERNAL,
+                error_data: vec![],
+            });
+            continue;
+        };
+        let key = TxKey {
+            txid: pending.create_req.tx_id,
+        };
+        let parent_txids: Vec<[u8; 32]> = if pending.create_req.conflicting {
+            pending.create_req.parent_txids.to_vec()
+        } else {
+            Vec::new()
+        };
+        redo_ops.push(RedoOp::CreateV2 {
+            tx_key: key,
+            record_offset: region.offset,
+            utxo_count: pending.utxo_count,
+            is_conflicting: pending.create_req.conflicting,
+            record_bytes: pending.record_bytes,
+            parent_txids,
+        });
+        valid_items.push(ValidCreate {
+            idx: pending.idx,
+            create_req: pending.create_req,
+            record_offset: region.offset,
+            reservation_size: region.size,
+        });
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => {
             // Redo failed: free all pre-allocated space.
+            let mut rollback_errors = Vec::new();
             for v in &valid_items {
-                let utxo_count = v.create_req.utxo_hashes.len() as u32;
-                let base_size = crate::record::TxMetadata::record_size_for(utxo_count);
-                let cold_len = if v.create_req.is_external && v.create_req.inputs.is_none() {
-                    0u64
-                } else {
-                    build_cold_data(
-                        v.create_req.inputs,
-                        v.create_req.outputs,
-                        v.create_req.inpoints,
-                    )
-                    .len() as u64
-                };
-                let _ = engine
-                    .allocator()
-                    .lock()
-                    .free(v.record_offset, base_size + cold_len);
+                if let Err(rollback_err) = release_create_reservation(
+                    engine,
+                    v.record_offset,
+                    v.reservation_size,
+                    "create redo write failure",
+                ) {
+                    tracing::error!(err = %rollback_err, "create batch rollback failed");
+                    rollback_errors.push(rollback_err);
+                }
             }
-            return error_response(req.request_id, ERR_INTERNAL, &e);
+            let msg = if rollback_errors.is_empty() {
+                e
+            } else {
+                format!(
+                    "{e}; allocator rollback errors: {}",
+                    rollback_errors.join("; ")
+                )
+            };
+            return error_response(req.request_id, ERR_INTERNAL, &msg);
         }
     };
 
@@ -3356,48 +3698,40 @@ fn handle_create_batch(
                 // AFTER pre_allocate_create reserved space — free the
                 // reserved region so the allocator does not leak under
                 // concurrent create races on the same txid.
-                let utxo_count = v.create_req.utxo_hashes.len() as u32;
-                let base_size = crate::record::TxMetadata::record_size_for(utxo_count);
-                let cold_len = if v.create_req.is_external && v.create_req.inputs.is_none() {
-                    0u64
-                } else {
-                    build_cold_data(
-                        v.create_req.inputs,
-                        v.create_req.outputs,
-                        v.create_req.inpoints,
-                    )
-                    .len() as u64
-                };
-                let _ = engine
-                    .allocator()
-                    .lock()
-                    .free(v.record_offset, base_size + cold_len);
-                errors.push(BatchItemError {
-                    item_index: v.idx as u32,
-                    error_code: ERR_ALREADY_EXISTS,
-                    error_data: vec![],
-                });
+                let rollback = release_create_reservation(
+                    engine,
+                    v.record_offset,
+                    v.reservation_size,
+                    "create_at_offset duplicate",
+                );
+                match rollback {
+                    Ok(()) => errors.push(BatchItemError {
+                        item_index: v.idx as u32,
+                        error_code: ERR_ALREADY_EXISTS,
+                        error_data: vec![],
+                    }),
+                    Err(e) => {
+                        tracing::error!(err = %e, "create batch rollback failed");
+                        errors.push(BatchItemError {
+                            item_index: v.idx as u32,
+                            error_code: ERR_INTERNAL,
+                            error_data: vec![],
+                        });
+                    }
+                }
             }
             Err(_) => {
                 // R-014 (A-05): same fix for the catch-all error path —
                 // any failure after pre_allocate_create must release
                 // the reserved region.
-                let utxo_count = v.create_req.utxo_hashes.len() as u32;
-                let base_size = crate::record::TxMetadata::record_size_for(utxo_count);
-                let cold_len = if v.create_req.is_external && v.create_req.inputs.is_none() {
-                    0u64
-                } else {
-                    build_cold_data(
-                        v.create_req.inputs,
-                        v.create_req.outputs,
-                        v.create_req.inpoints,
-                    )
-                    .len() as u64
-                };
-                let _ = engine
-                    .allocator()
-                    .lock()
-                    .free(v.record_offset, base_size + cold_len);
+                if let Err(e) = release_create_reservation(
+                    engine,
+                    v.record_offset,
+                    v.reservation_size,
+                    "create_at_offset failure",
+                ) {
+                    tracing::error!(err = %e, "create batch rollback failed");
+                }
                 errors.push(BatchItemError {
                     item_index: v.idx as u32,
                     error_code: ERR_INTERNAL,
@@ -3408,12 +3742,21 @@ fn handle_create_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
+    {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
-            clear_replication_intent_after_compensation(redo_range);
+            if let Some(resp) = compensate_replication_failure_or_error(
+                req.request_id,
+                engine,
+                &repl_ops_by_key,
+                &before_images,
+                redo_log,
+                &[redo_range],
+            ) {
+                return resp;
+            }
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -3468,16 +3811,17 @@ fn handle_freeze_batch(
             continue;
         }
         let key = TxKey { txid: item.txid };
-        redo_ops.push(RedoOp::Freeze {
+        redo_ops.push(RedoOp::FreezeV2 {
             tx_key: key,
             offset: item.vout,
+            utxo_hash: item.utxo_hash,
         });
         valid_items.push(ValidFreeze { idx: i, key, item });
     }
     let total_items = items.len() as u64;
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
     };
@@ -3507,12 +3851,21 @@ fn handle_freeze_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
+    {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
-            clear_replication_intent_after_compensation(redo_range);
+            if let Some(resp) = compensate_replication_failure_or_error(
+                req.request_id,
+                engine,
+                &repl_ops_by_key,
+                &before_images,
+                redo_log,
+                &[redo_range],
+            ) {
+                return resp;
+            }
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -3563,15 +3916,16 @@ fn handle_unfreeze_batch(
             continue;
         }
         let key = TxKey { txid: item.txid };
-        redo_ops.push(RedoOp::Unfreeze {
+        redo_ops.push(RedoOp::UnfreezeV2 {
             tx_key: key,
             offset: item.vout,
+            utxo_hash: item.utxo_hash,
         });
         valid_items.push(ValidUnfreeze { idx: i, key, item });
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
     };
@@ -3601,12 +3955,21 @@ fn handle_unfreeze_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
+    {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
-            clear_replication_intent_after_compensation(redo_range);
+            if let Some(resp) = compensate_replication_failure_or_error(
+                req.request_id,
+                engine,
+                &repl_ops_by_key,
+                &before_images,
+                redo_log,
+                &[redo_range],
+            ) {
+                return resp;
+            }
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -3668,7 +4031,7 @@ fn handle_reassign_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
     };
@@ -3717,18 +4080,22 @@ fn handle_reassign_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
+    {
         Ok(o) => o,
         Err(e) => {
             // Gap #8: rollback restores the captured prior utxo_hash, no
             // zeros, no defaults.
-            compensate_replication_failure(
+            if let Some(resp) = compensate_replication_failure_or_error(
+                req.request_id,
                 engine,
                 &repl_ops_by_key,
                 &before_images_by_key,
                 redo_log,
-            );
-            clear_replication_intent_after_compensation(redo_range);
+                &[redo_range],
+            ) {
+                return resp;
+            }
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -3764,8 +4131,20 @@ fn handle_set_conflicting_batch(
         Err(e) => return codec_error_response(req.request_id, "set_conflicting batch", e),
     };
     let value = shared[0] != 0;
-    let cbh = u32::from_le_bytes(shared[1..5].try_into().unwrap());
-    let bhr = u32::from_le_bytes(shared[5..9].try_into().unwrap());
+    let Some(cbh) = le_u32_at(&shared, 1) else {
+        return error_response(
+            req.request_id,
+            ERR_INTERNAL,
+            "malformed set_conflicting shared data",
+        );
+    };
+    let Some(bhr) = le_u32_at(&shared, 5) else {
+        return error_response(
+            req.request_id,
+            ERR_INTERNAL,
+            "malformed set_conflicting shared data",
+        );
+    };
     let total_items = txids.len() as u64;
 
     let mut errors = Vec::new();
@@ -3793,7 +4172,7 @@ fn handle_set_conflicting_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
     };
@@ -3826,12 +4205,21 @@ fn handle_set_conflicting_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
+    {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
-            clear_replication_intent_after_compensation(redo_range);
+            if let Some(resp) = compensate_replication_failure_or_error(
+                req.request_id,
+                engine,
+                &repl_ops_by_key,
+                &before_images,
+                redo_log,
+                &[redo_range],
+            ) {
+                return resp;
+            }
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -3890,25 +4278,33 @@ fn handle_set_locked_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
     };
 
     // Phase 3: Apply engine mutations and build repl ops from engine results.
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    let mut before_images_by_key: Vec<(TxKey, Vec<BeforeImage>)> = Vec::new();
     for v in &valid_items {
-        match engine.set_locked(&SetLockedRequest {
+        match engine.set_locked_with_before_image(&SetLockedRequest {
             tx_key: v.key,
             value,
         }) {
-            Ok(mgen) => {
+            Ok(resp) => {
                 repl_ops_by_key.push((
                     v.key,
                     vec![ReplicaOp::SetLocked {
                         tx_key: v.key,
                         value,
-                        master_generation: mgen,
+                        master_generation: resp.generation,
+                    }],
+                ));
+                before_images_by_key.push((
+                    v.key,
+                    vec![BeforeImage::SetLocked {
+                        prior_locked: resp.prior_locked,
+                        prior_delete_at_height: resp.prior_delete_at_height,
                     }],
                 ));
             }
@@ -3919,12 +4315,20 @@ fn handle_set_locked_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
+    {
         Ok(o) => o,
         Err(e) => {
-            let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
-            clear_replication_intent_after_compensation(redo_range);
+            if let Some(resp) = compensate_replication_failure_or_error(
+                req.request_id,
+                engine,
+                &repl_ops_by_key,
+                &before_images_by_key,
+                redo_log,
+                &[redo_range],
+            ) {
+                return resp;
+            }
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -3958,7 +4362,13 @@ fn handle_preserve_until_batch(
         Ok(r) => r,
         Err(e) => return codec_error_response(req.request_id, "preserve_until batch", e),
     };
-    let height = u32::from_le_bytes(shared[0..4].try_into().unwrap());
+    let Some(height) = le_u32_at(&shared, 0) else {
+        return error_response(
+            req.request_id,
+            ERR_INTERNAL,
+            "malformed preserve_until shared data",
+        );
+    };
     let total_items = txids.len() as u64;
 
     let mut errors = Vec::new();
@@ -3984,7 +4394,7 @@ fn handle_preserve_until_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
     };
@@ -4013,12 +4423,21 @@ fn handle_preserve_until_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
+    {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
-            clear_replication_intent_after_compensation(redo_range);
+            if let Some(resp) = compensate_replication_failure_or_error(
+                req.request_id,
+                engine,
+                &repl_ops_by_key,
+                &before_images,
+                redo_log,
+                &[redo_range],
+            ) {
+                return resp;
+            }
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -4099,6 +4518,11 @@ pub(crate) fn build_delete_compensation_ops(key: &TxKey, snap: &DeleteSnapshot) 
                     tx_key: *key,
                     offset,
                     spending_data: slot.spending_data,
+                    // Delete compensation first restores lifecycle metadata
+                    // through Create; these slot restamps must not re-evaluate
+                    // DAH and move the snapshotted pruning target.
+                    current_block_height: 0,
+                    block_height_retention: 0,
                     master_generation: snap.master_generation,
                 });
             }
@@ -4144,6 +4568,7 @@ fn handle_delete_batch(
     struct ValidDelete {
         idx: usize,
         key: TxKey,
+        parent_prunes: Vec<ParentPrune>,
         /// Full record snapshot for compensation. Contains the metadata
         /// bytes AND per-slot state (hash + status + spending_data) so
         /// the compensation path can rebuild not just an empty record
@@ -4153,57 +4578,63 @@ fn handle_delete_batch(
         /// UNSPENT, opening a double-spend window.
         snapshot: Option<DeleteSnapshot>,
     }
+    #[derive(Clone, Copy)]
+    struct ParentPrune {
+        key: TxKey,
+        offset: u32,
+    }
     let mut valid_items: Vec<ValidDelete> = Vec::new();
-    for (i, txid) in txids.iter().enumerate() {
+    'items: for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
         let key = TxKey { txid: *txid };
         let record_offset = engine.lookup(&key).map(|e| e.record_offset).unwrap_or(0);
-        redo_ops.push(RedoOp::Delete {
-            tx_key: key,
-            record_offset,
-            record_size: 0,
-        });
-
+        let record_size = if record_offset == 0 {
+            0
+        } else {
+            match engine.read_metadata(&key) {
+                Ok(meta) => ({ meta.record_size }) as u64,
+                Err(e) => {
+                    errors.push(BatchItemError {
+                        item_index: i as u32,
+                        error_code: ERR_INTERNAL,
+                        error_data: format!("delete metadata read failed: {e}").into_bytes(),
+                    });
+                    continue;
+                }
+            }
+        };
         // Snapshot the record for compensation. Read metadata + every
         // slot's full state (hash + status + spending_data). R-007: a
         // partial snapshot — utxo_hashes only — meant a compensation
         // recreated previously-spent slots as UNSPENT, allowing a
         // double-spend immediately after a failed delete.
         let snapshot = if let Ok(meta) = engine.read_metadata(&key) {
-            let mut slots = Vec::with_capacity(meta.utxo_count as usize);
-            let mut snapshot_failed = false;
-            for v in 0..meta.utxo_count {
-                match engine.read_slot(&key, v) {
-                    Ok(slot) => slots.push(SnapshotSlot {
+            let slots = match engine.read_slots(&key) {
+                Ok(slots) => slots
+                    .into_iter()
+                    .map(|slot| SnapshotSlot {
                         hash: slot.hash,
                         status: slot.status,
                         spending_data: slot.spending_data,
-                    }),
-                    Err(e) => {
-                        // R-007 / IJK-19: do NOT silently substitute a
-                        // zero hash here. A read failure means we cannot
-                        // produce a faithful pre-delete snapshot; if
-                        // replication later fails we would compensate
-                        // with a corrupted view. Refuse to snapshot the
-                        // record and let the outer loop skip recording
-                        // a snapshot — the delete path will still be
-                        // best-effort but we will return ERR_INTERNAL
-                        // rather than recreating a record we know is
-                        // wrong.
-                        tracing::error!(
-                            txid = ?key.txid,
-                            offset = v,
-                            err = ?e,
-                            "delete snapshot: slot read failed; skipping snapshot",
-                        );
-                        snapshot_failed = true;
-                        break;
-                    }
+                    })
+                    .collect::<Vec<_>>(),
+                Err(e) => {
+                    // R-007 / IJK-19: do NOT silently substitute a
+                    // zero hash here. A read failure means we cannot
+                    // produce a faithful pre-delete snapshot; if
+                    // replication later fails we would compensate with
+                    // a corrupted view.
+                    tracing::error!(
+                        txid = ?key.txid,
+                        err = ?e,
+                        "delete snapshot: slot-region read failed; skipping snapshot",
+                    );
+                    Vec::new()
                 }
-            }
+            };
             // Build the metadata bytes in the same format as migrate_shard.
             let mut meta_buf = Vec::with_capacity(70);
             meta_buf.extend_from_slice(&meta.tx_version.to_le_bytes());
@@ -4231,7 +4662,7 @@ fn handle_delete_batch(
                 None
             };
 
-            if snapshot_failed {
+            if slots.len() != meta.utxo_count as usize {
                 None
             } else {
                 Some(DeleteSnapshot {
@@ -4246,28 +4677,172 @@ fn handle_delete_batch(
             None
         };
 
+        if snapshot
+            .as_ref()
+            .is_some_and(|snap| snap.is_external && snap.cold_data.is_none())
+        {
+            errors.push(BatchItemError {
+                item_index: i as u32,
+                error_code: ERR_INTERNAL,
+                error_data: b"delete external blob snapshot missing".to_vec(),
+            });
+            continue;
+        }
+
+        // R-119: deleting a child transaction must first make every
+        // parent slot spent by that child terminal (`PRUNED`), replacing
+        // Lua's `deletedChildren` map with the Rust slot status. This
+        // local path is intentionally fail-closed in cluster mode when a
+        // parent belongs to another shard master; a distributed
+        // master-to-master prune transaction is still required for that
+        // topology.
+        let mut parent_prunes = Vec::new();
+        let parent_txids = match engine.parent_txids_for_child(&key) {
+            Ok(parent_txids) => parent_txids,
+            Err(e) => {
+                errors.push(BatchItemError {
+                    item_index: i as u32,
+                    error_code: ERR_INTERNAL,
+                    error_data: format!("delete parent-prune input parse failed: {e}").into_bytes(),
+                });
+                continue;
+            }
+        };
+        for parent_txid in parent_txids {
+            if let Some(route_err) = check_shard_ownership(&parent_txid, i as u32, cluster, false) {
+                errors.push(BatchItemError {
+                    item_index: i as u32,
+                    error_code: ERR_INTERNAL,
+                    error_data: format!(
+                        "delete parent-prune requires local parent master; route error {}",
+                        route_err.error_code
+                    )
+                    .into_bytes(),
+                });
+                continue 'items;
+            }
+            let parent_key = TxKey { txid: parent_txid };
+            match engine.slots_spent_by_child(&parent_key, key.txid) {
+                Ok(offsets) => {
+                    parent_prunes.extend(offsets.into_iter().map(|offset| ParentPrune {
+                        key: parent_key,
+                        offset,
+                    }));
+                }
+                Err(e) => {
+                    errors.push(BatchItemError {
+                        item_index: i as u32,
+                        error_code: ERR_INTERNAL,
+                        error_data: format!("delete parent-prune scan failed: {e}").into_bytes(),
+                    });
+                    continue 'items;
+                }
+            }
+        }
+
+        for prune in &parent_prunes {
+            redo_ops.push(RedoOp::PruneSlotIfSpentBy {
+                tx_key: prune.key,
+                offset: prune.offset,
+                child_txid: key.txid,
+            });
+        }
+        redo_ops.push(RedoOp::Delete {
+            tx_key: key,
+            record_offset,
+            record_size,
+        });
+
         valid_items.push(ValidDelete {
             idx: i,
             key,
+            parent_prunes,
             snapshot,
         });
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
     };
 
     // Phase 3: Apply engine mutations and build repl ops.
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    let mut before_images_by_key: Vec<(TxKey, Vec<BeforeImage>)> = Vec::new();
     let mut deleted_snapshots: Vec<(TxKey, DeleteSnapshot)> = Vec::new();
     for v in valid_items.iter() {
+        let mut item_prune_ops: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+        let mut item_prune_before: Vec<(TxKey, Vec<BeforeImage>)> = Vec::new();
+        let mut item_failed = false;
+        for prune in &v.parent_prunes {
+            match engine.prune_slot_if_spent_by_child(&prune.key, prune.offset, v.key.txid) {
+                Ok(applied) => {
+                    if applied {
+                        push_repl_with_before_image(
+                            &mut item_prune_ops,
+                            &mut item_prune_before,
+                            prune.key,
+                            ReplicaOp::PruneSlotIfSpentBy {
+                                tx_key: prune.key,
+                                offset: prune.offset,
+                                child_txid: v.key.txid,
+                            },
+                            BeforeImage::Prune {
+                                prior_status: crate::record::UTXO_SPENT,
+                            },
+                        );
+                    }
+                }
+                Err(err) => {
+                    if !item_prune_ops.is_empty() {
+                        match compensate_replication_failure(
+                            engine,
+                            &item_prune_ops,
+                            &item_prune_before,
+                            redo_log,
+                        ) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                return error_response(req.request_id, ERR_INTERNAL, &e);
+                            }
+                        }
+                    }
+                    errors.push(spend_error_to_batch_error(v.idx as u32, &err));
+                    item_failed = true;
+                    break;
+                }
+            }
+        }
+        if item_failed {
+            continue;
+        }
         match engine.delete(&DeleteRequest { tx_key: v.key }) {
             Ok(()) => {
-                repl_ops_by_key.push((v.key, vec![ReplicaOp::Delete { tx_key: v.key }]));
+                repl_ops_by_key.extend(item_prune_ops);
+                before_images_by_key.extend(item_prune_before);
+                push_repl_with_before_image(
+                    &mut repl_ops_by_key,
+                    &mut before_images_by_key,
+                    v.key,
+                    ReplicaOp::Delete { tx_key: v.key },
+                    BeforeImage::None,
+                );
             }
             Err(err) => {
+                if !item_prune_ops.is_empty() {
+                    match compensate_replication_failure(
+                        engine,
+                        &item_prune_ops,
+                        &item_prune_before,
+                        redo_log,
+                    ) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            return error_response(req.request_id, ERR_INTERNAL, &e);
+                        }
+                    }
+                }
                 errors.push(spend_error_to_batch_error(v.idx as u32, &err));
             }
         }
@@ -4282,7 +4857,8 @@ fn handle_delete_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
+    {
         Ok(o) => o,
         Err(e) => {
             // Compensate: re-create deleted records from snapshots, then
@@ -4368,11 +4944,26 @@ fn handle_delete_batch(
                 .filter(|(_, ops)| !ops.iter().any(|o| matches!(o, ReplicaOp::Delete { .. })))
                 .cloned()
                 .collect();
+            let non_delete_before: Vec<_> = repl_ops_by_key
+                .iter()
+                .zip(before_images_by_key.iter())
+                .filter(|((_, ops), _)| !ops.iter().any(|o| matches!(o, ReplicaOp::Delete { .. })))
+                .map(|(_, before)| before.clone())
+                .collect();
             if !non_delete.is_empty() {
-                let nd_before = no_before_images(&non_delete);
-                compensate_replication_failure(engine, &non_delete, &nd_before, redo_log);
+                if let Some(resp) = compensate_replication_failure_or_error(
+                    req.request_id,
+                    engine,
+                    &non_delete,
+                    &non_delete_before,
+                    redo_log,
+                    &[redo_range],
+                ) {
+                    return resp;
+                }
+            } else {
+                clear_replication_intents_after_compensation(&[redo_range]);
             }
-            clear_replication_intent_after_compensation(redo_range);
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -4407,8 +4998,20 @@ fn handle_mark_longest_chain_batch(
         Err(e) => return codec_error_response(req.request_id, "mark_longest_chain batch", e),
     };
     let on_longest_chain = shared[0] != 0;
-    let cbh = u32::from_le_bytes(shared[1..5].try_into().unwrap());
-    let bhr = u32::from_le_bytes(shared[5..9].try_into().unwrap());
+    let Some(cbh) = le_u32_at(&shared, 1) else {
+        return error_response(
+            req.request_id,
+            ERR_INTERNAL,
+            "malformed mark_longest_chain shared data",
+        );
+    };
+    let Some(bhr) = le_u32_at(&shared, 5) else {
+        return error_response(
+            req.request_id,
+            ERR_INTERNAL,
+            "malformed mark_longest_chain shared data",
+        );
+    };
     let total_items = txids.len() as u64;
 
     let mut errors = Vec::new();
@@ -4426,29 +5029,23 @@ fn handle_mark_longest_chain_batch(
             continue;
         }
         let key = TxKey { txid: *txid };
-        // Target generation for this mutation is the current primary
-        // generation + 1. Replay uses this as the idempotency token (H7):
-        // once applied, meta.generation == target_generation, so a later
-        // replay with the same (or smaller) generation is skipped.
-        // If the record does not exist, default to 1 — the engine will
-        // produce TxNotFound, and the replay handler will treat the op as
-        // a no-op on the missing record.
-        let target_generation = engine
-            .lookup(&key)
-            .map(|e| e.generation.wrapping_add(1))
-            .unwrap_or(1);
         redo_ops.push(RedoOp::MarkOnLongestChain {
             tx_key: key,
             on_longest_chain,
             current_block_height: cbh,
             block_height_retention: bhr,
-            generation: target_generation,
+            // The dispatcher is deliberately outside the per-tx stripe
+            // lock at WAL-build time, so it cannot safely predict the
+            // post-mutation generation. `0` selects replay's
+            // value-idempotent path instead of a stale pre-lock
+            // generation token.
+            generation: 0,
         });
         valid_items.push(ValidMark { idx: i, key });
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
     };
@@ -4506,12 +5103,21 @@ fn handle_mark_longest_chain_batch(
     }
 
     // Phase 4: Replicate. Mirrors set_mined / spend handlers.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
+    {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
-            clear_replication_intent_after_compensation(redo_range);
+            if let Some(resp) = compensate_replication_failure_or_error(
+                req.request_id,
+                engine,
+                &repl_ops_by_key,
+                &before_images,
+                redo_log,
+                &[redo_range],
+            ) {
+                return resp;
+            }
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -4769,21 +5375,21 @@ fn handle_get_batch(
                 if field_mask.has(FieldMask::UTXO_SLOTS) {
                     let utxo_count = { meta.utxo_count };
                     data.extend_from_slice(&utxo_count.to_le_bytes());
-                    for v in 0..utxo_count {
-                        match engine.read_slot(&key, v) {
-                            Ok(slot) => {
+                    match engine.read_slots(&key) {
+                        Ok(slots) if slots.len() == utxo_count as usize => {
+                            for slot in slots {
                                 data.extend_from_slice(&slot.hash);
                                 data.push(slot.status);
                                 data.extend_from_slice(&slot.spending_data);
                             }
-                            Err(_) => {
-                                inner_read_failed = true;
-                                // Still emit padding bytes so the
-                                // length declared in `utxo_count`
-                                // matches the data length; the
-                                // per-item ERR_INTERNAL status tells
-                                // the client these bytes are
-                                // unreliable.
+                        }
+                        _ => {
+                            inner_read_failed = true;
+                            // Still emit padding bytes so the length declared
+                            // in `utxo_count` matches the data length; the
+                            // per-item ERR_INTERNAL status tells the client
+                            // these bytes are unreliable.
+                            for _ in 0..utxo_count {
                                 data.extend_from_slice(&[0u8; 69]);
                             }
                         }
@@ -4896,10 +5502,16 @@ fn handle_get_batch(
             .inc_by(OpCode::Get, Outcome::Other, other_failed);
     }
 
+    let payload = match try_encode_get_response(&results) {
+        Ok(payload) => payload,
+        Err(e) => {
+            return codec_error_response(req.request_id, "get batch response", e);
+        }
+    };
     ResponseFrame {
         request_id: req.request_id,
         status: STATUS_OK,
-        payload: encode_get_response(&results),
+        payload,
     }
 }
 
@@ -4907,13 +5519,33 @@ fn handle_get_batch(
 // Pruner operations
 // ---------------------------------------------------------------------------
 
+/// Return the current unmined-index snapshot at the instant the index query
+/// runs. The result is not a read lock over subsequent engine mutations:
+/// concurrent set-mined/mark-longest-chain updates may become visible
+/// immediately after this response is assembled.
 fn handle_query_old_unmined(req: &RequestFrame, engine: &Engine) -> ResponseFrame {
     // Payload: [cutoff_height:4]
     if req.payload.len() < 4 {
         return error_response(req.request_id, ERR_INTERNAL, "malformed query");
     }
-    let cutoff = u32::from_le_bytes(req.payload[0..4].try_into().unwrap());
-    let keys = engine.unmined_index().range_query(cutoff);
+    let Some(cutoff) = le_u32_at(&req.payload, 0) else {
+        return error_response(req.request_id, ERR_INTERNAL, "malformed query");
+    };
+    let candidates = engine.unmined_index().range_query(cutoff);
+    let mut keys = Vec::with_capacity(candidates.len());
+    for key in candidates {
+        match engine.read_metadata(&key) {
+            Ok(meta) if { meta.preserve_until } == 0 => keys.push(key),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    txid_prefix = ?&key.txid[..4],
+                    err = ?e,
+                    "query_old_unmined: skipping candidate whose metadata could not be revalidated"
+                );
+            }
+        }
+    }
 
     let mut payload = Vec::with_capacity(4 + keys.len() * 32);
     payload.extend_from_slice(&(keys.len() as u32).to_le_bytes());
@@ -4940,7 +5572,13 @@ fn handle_preserve_transactions(
         Ok(r) => r,
         Err(e) => return codec_error_response(req.request_id, "preserve_transactions batch", e),
     };
-    let height = u32::from_le_bytes(shared[0..4].try_into().unwrap());
+    let Some(height) = le_u32_at(&shared, 0) else {
+        return error_response(
+            req.request_id,
+            ERR_INTERNAL,
+            "malformed preserve_transactions shared data",
+        );
+    };
 
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
@@ -4965,7 +5603,7 @@ fn handle_preserve_transactions(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_redo_ops(redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
     };
@@ -4994,12 +5632,21 @@ fn handle_preserve_transactions(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range) {
+    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
+    {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
-            compensate_replication_failure(engine, &repl_ops_by_key, &before_images, redo_log);
-            clear_replication_intent_after_compensation(redo_range);
+            if let Some(resp) = compensate_replication_failure_or_error(
+                req.request_id,
+                engine,
+                &repl_ops_by_key,
+                &before_images,
+                redo_log,
+                &[redo_range],
+            ) {
+                return resp;
+            }
             return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
         }
     };
@@ -5057,7 +5704,9 @@ fn handle_process_expired(
     if req.payload.len() < 4 {
         return error_response(req.request_id, ERR_INTERNAL, "malformed");
     }
-    let current_height = u32::from_le_bytes(req.payload[0..4].try_into().unwrap());
+    let Some(current_height) = le_u32_at(&req.payload, 0) else {
+        return error_response(req.request_id, ERR_INTERNAL, "malformed");
+    };
 
     // Query DAH index for transactions due for deletion. The DAH index
     // is per-node and reflects only records this node knows about, so
@@ -5145,11 +5794,7 @@ fn handle_process_expired(
         STATUS_OK | STATUS_DEGRADED_DURABILITY => (candidate_count, 0u32),
         STATUS_PARTIAL_ERROR => {
             // Sparse-error encoding starts with a u32 error count.
-            let err_count = if delete_resp.payload.len() >= 4 {
-                u32::from_le_bytes(delete_resp.payload[0..4].try_into().unwrap())
-            } else {
-                candidate_count
-            };
+            let err_count = le_u32_at(&delete_resp.payload, 0).unwrap_or(candidate_count);
             (candidate_count.saturating_sub(err_count), err_count)
         }
         _ => return delete_resp,
@@ -5226,45 +5871,40 @@ fn handle_get_spend_batch(
             }
         }
 
-        // GetSpend needs the utxo_hash for validation. Since the wire format
-        // only sends txid+vout, we skip hash validation at this level and
-        // return whatever is at that slot offset.
         let key = TxKey { txid: item.txid };
-        match engine.read_metadata(&key) {
-            Ok(meta) => {
-                let utxo_count = { meta.utxo_count };
-                if item.vout >= utxo_count {
-                    results.push(WireGetSpendResult {
-                        status: 1,
-                        error_code: ERR_VOUT_OUT_OF_RANGE,
-                        slot_status: 0,
-                        spending_data: [0; 36],
-                    });
-                } else {
-                    match engine.read_slot(&key, item.vout) {
-                        Ok(slot) => {
-                            results.push(WireGetSpendResult {
-                                status: 0,
-                                error_code: ERR_OK,
-                                slot_status: slot.status,
-                                spending_data: slot.spending_data,
-                            });
-                        }
-                        Err(_) => {
-                            results.push(WireGetSpendResult {
-                                status: 1,
-                                error_code: ERR_INTERNAL,
-                                slot_status: 0,
-                                spending_data: [0; 36],
-                            });
-                        }
-                    }
-                }
+        match engine.get_spend(&GetSpendRequest {
+            tx_key: key,
+            offset: item.vout,
+            utxo_hash: item.utxo_hash,
+        }) {
+            Ok(spend) => {
+                results.push(WireGetSpendResult {
+                    status: 0,
+                    error_code: ERR_OK,
+                    slot_status: spend.status,
+                    spending_data: spend.spending_data.unwrap_or([0; 36]),
+                });
             }
             Err(SpendError::TxNotFound) => {
                 results.push(WireGetSpendResult {
                     status: 1,
                     error_code: ERR_TX_NOT_FOUND,
+                    slot_status: 0,
+                    spending_data: [0; 36],
+                });
+            }
+            Err(SpendError::UtxoNotFound { .. }) => {
+                results.push(WireGetSpendResult {
+                    status: 1,
+                    error_code: ERR_VOUT_OUT_OF_RANGE,
+                    slot_status: 0,
+                    spending_data: [0; 36],
+                });
+            }
+            Err(SpendError::UtxoHashMismatch { .. }) => {
+                results.push(WireGetSpendResult {
+                    status: 1,
+                    error_code: ERR_UTXO_HASH_MISMATCH,
                     slot_status: 0,
                     spending_data: [0; 36],
                 });
@@ -5323,15 +5963,8 @@ fn handle_get_spend_batch(
 /// the total upload. 4 GiB is well above the largest legitimate
 /// transaction-cold-data payload but small enough that an attacker
 /// cannot weaponize one connection into multi-terabyte writes.
-/// Promoting this to `ServerConfig::max_stream_total_bytes` is
-/// captured as R-224.
-#[cfg(not(test))]
-const MAX_STREAM_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-/// In tests we use a much smaller cap so we can exercise the
-/// rejection path without allocating 4 GiB of test data.
-#[cfg(test)]
-const MAX_STREAM_TOTAL_BYTES: u64 = 1024;
-
+/// Operators can tune this per connection with
+/// `ServerConfig::max_stream_total_bytes`.
 fn handle_stream_chunk(
     req: &RequestFrame,
     conn_state: &mut super::ConnectionState,
@@ -5399,7 +6032,8 @@ fn handle_stream_chunk(
             return error_response(req.request_id, ERR_INTERNAL, "stream byte counter overflow");
         }
     };
-    if projected > MAX_STREAM_TOTAL_BYTES {
+    let max_stream_total_bytes = conn_state.max_stream_total_bytes;
+    if projected > max_stream_total_bytes {
         if let Some(s) = conn_state.streams.remove(&chunk.txid) {
             let _ = s.writer.abort();
         }
@@ -5407,7 +6041,7 @@ fn handle_stream_chunk(
             req.request_id,
             ERR_INTERNAL,
             &format!(
-                "stream exceeds maximum total bytes ({MAX_STREAM_TOTAL_BYTES}): would reach {projected}",
+                "stream exceeds maximum total bytes ({max_stream_total_bytes}): would reach {projected}",
             ),
         );
     }
@@ -5488,14 +6122,10 @@ fn handle_stream_end(req: &RequestFrame, conn_state: &mut super::ConnectionState
 // ---------------------------------------------------------------------------
 
 fn error_response(request_id: u64, code: u16, msg: &str) -> ResponseFrame {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&code.to_le_bytes());
-    payload.extend_from_slice(&(msg.len() as u16).to_le_bytes());
-    payload.extend_from_slice(msg.as_bytes());
     ResponseFrame {
         request_id,
         status: STATUS_ERROR,
-        payload,
+        payload: encode_error_payload(code, msg),
     }
 }
 
@@ -5591,17 +6221,8 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
         }
         // R-015 (A-07): Pruned UTXOs preserve `spending_data` on disk
         // for forensic / proof-of-prune lookups. Surface that data on
-        // the wire instead of a meaningless empty payload — clients
-        // looking at "why was my spend rejected" can then see WHO
-        // pruned the parent. Engine already returns Pruned with no
-        // spending_data field today; full A-07 fix is captured under
-        // R-015 and requires changing SpendError::Pruned to carry the
-        // spending_data — for now we surface the structurally-empty
-        // payload but log a warning so operators can spot the gap.
-        SpendError::Pruned { .. } => {
-            tracing::warn!("Pruned spending_data unavailable on wire (R-015 follow-up)");
-            (ERR_INVALID_SPEND, vec![])
-        }
+        // the wire instead of a meaningless empty payload.
+        SpendError::Pruned { spending_data, .. } => (ERR_INVALID_SPEND, spending_data.to_vec()),
         SpendError::AlreadyFrozen { .. } => (ERR_ALREADY_FROZEN, vec![]),
         SpendError::NotFrozen { .. } => (ERR_UTXO_NOT_FROZEN, vec![]),
         SpendError::StorageError { .. } => (ERR_INTERNAL, vec![]),
@@ -5952,11 +6573,50 @@ fn encode_key_diagnosis(d: &crate::cluster::migration::KeyDiagnosis, out: &mut V
 mod tests {
     use super::*;
     use crate::allocator::SlotAllocator;
-    use crate::device::{BlockDevice, MemoryDevice};
+    use crate::device::{BlockDevice, MemoryDevice, ReadFailingDevice};
     use crate::index::{DahIndex, Index, UnminedIndex};
     use crate::locks::StripedLocks;
     use crate::ops::engine::Engine;
     use std::sync::Arc;
+
+    #[test]
+    fn dispatch_parsers_use_take_helper() {
+        let source = include_str!("dispatch.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("dispatch.rs contains production section");
+        assert!(
+            !production.contains("try_into().unwrap()"),
+            "production dispatch parsers must use checked endian helpers, not try_into().unwrap()",
+        );
+    }
+
+    #[test]
+    fn replication_backpressure_bounded_by_permit_pool() {
+        let mut permits = Vec::new();
+        for _ in 0..MAX_REPLICATION_FANOUTS_IN_FLIGHT {
+            permits.push(acquire_replication_fanout_permit());
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let permit = acquire_replication_fanout_permit();
+            tx.send(()).unwrap();
+            drop(permit);
+        });
+
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "a new replication fan-out must block while all permits are held"
+        );
+        permits.pop();
+        rx.recv_timeout(std::time::Duration::from_secs(1))
+            .expect("dropping a permit should release one waiting fan-out");
+        drop(permits);
+        waiter.join().unwrap();
+    }
 
     /// Test harness for Layer 1 dispatch testing.
     ///
@@ -5971,6 +6631,10 @@ mod tests {
         fn new() -> Self {
             let dev: Arc<dyn BlockDevice> =
                 Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+            Self::with_device(dev)
+        }
+
+        fn with_device(dev: Arc<dyn BlockDevice>) -> Self {
             let alloc = SlotAllocator::new(dev.clone()).unwrap();
             let index = Index::new(10000).unwrap();
             let locks = StripedLocks::new(1024);
@@ -6101,6 +6765,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_cold_data_fields_rejects_truncated_large_section_length() {
+        let mut cold_data = Vec::new();
+        cold_data.extend_from_slice(&u32::MAX.to_le_bytes());
+        cold_data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        cold_data.extend_from_slice(&0u32.to_le_bytes());
+
+        let (inputs, outputs, inpoints) = parse_cold_data_fields(&cold_data);
+        assert!(inputs.is_none());
+        assert!(outputs.is_none());
+        assert!(inpoints.is_none());
+    }
+
     // -----------------------------------------------------------------------
     // 1a. handle_query_old_unmined — matching txids returned
     // -----------------------------------------------------------------------
@@ -6159,6 +6836,34 @@ mod tests {
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
         assert_eq!(code, ERR_INTERNAL);
         assert!(msg.contains("malformed"), "expected 'malformed' in: {msg}");
+    }
+
+    #[test]
+    fn dispatch_query_old_unmined_skips_preserved_records() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(9);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        {
+            let mut ui = h.engine.unmined_index();
+            ui.insert(100, TxKey { txid }, None).unwrap();
+        }
+
+        let mut shared = Vec::new();
+        shared.extend_from_slice(&1000u32.to_le_bytes());
+        let payload = encode_txid_batch(&[txid], &shared);
+        assert_eq!(
+            h.request(OP_PRESERVE_TRANSACTIONS, payload).status,
+            STATUS_OK
+        );
+
+        let resp = h.request(OP_QUERY_OLD_UNMINED, 200u32.to_le_bytes().to_vec());
+        assert_eq!(resp.status, STATUS_OK);
+        let count = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+        assert_eq!(
+            count, 0,
+            "preserved unmined tx must not be returned to the pruner"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6429,6 +7134,34 @@ mod tests {
         assert!(msg.contains("malformed"), "expected 'malformed' in: {msg}");
     }
 
+    #[test]
+    fn get_batch_propagates_storage_errors_not_zeros() {
+        let inner: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let (failing, fail_reads) = ReadFailingDevice::new(inner);
+        let dev: Arc<dyn BlockDevice> = failing;
+        let h = DispatchTestHarness::with_device(dev);
+
+        let txid = DispatchTestHarness::make_txid(41);
+        assert_eq!(h.create_tx(txid, 2).status, STATUS_OK);
+
+        fail_reads.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let payload = encode_get_batch(FieldMask::RAW_METADATA, &[txid]);
+        let resp = h.request(OP_GET_BATCH, payload);
+        assert_eq!(resp.status, STATUS_OK);
+        let results = decode_get_response(&resp.payload).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].status, ERR_INTERNAL as u8,
+            "storage read failures must surface as ERR_INTERNAL per-item status"
+        );
+        assert!(
+            results[0].data.is_empty(),
+            "metadata read failures must not synthesize a zero-filled record"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // 4l. SetMined malformed payload
     // -----------------------------------------------------------------------
@@ -6529,17 +7262,54 @@ mod tests {
         let _ = pos; // silence unused warning
     }
 
+    #[test]
+    fn dispatch_get_utxo_slots_round_trips_slot_region() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(42);
+
+        assert_eq!(h.create_tx(txid, 3).status, STATUS_OK);
+
+        let resp = h.request(
+            OP_GET_BATCH,
+            encode_get_batch(FieldMask::UTXO_SLOTS, &[txid]),
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let results = decode_get_response(&resp.payload).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, STATUS_OK);
+
+        let data = &results[0].data;
+        let utxo_count = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        assert_eq!(utxo_count, 3);
+        assert_eq!(data.len(), 4 + 3 * 69);
+
+        let mut pos = 4;
+        for i in 0..3u8 {
+            let hash = &data[pos..pos + 32];
+            pos += 32;
+            let status = data[pos];
+            pos += 1;
+            let spending_data = &data[pos..pos + 36];
+            pos += 36;
+
+            assert_eq!(hash[0], i);
+            assert_eq!(hash[1], 0);
+            assert_eq!(status, crate::record::UTXO_UNSPENT);
+            assert_eq!(spending_data, &[0u8; 36]);
+        }
+    }
+
     /// R-044 (GH-06 / GH-09) regression: an active streaming-blob
     /// upload session whose cumulative `bytes_received` would exceed
-    /// `MAX_STREAM_TOTAL_BYTES` MUST be aborted with `ERR_INTERNAL`
+    /// the configured per-stream byte cap MUST be aborted with `ERR_INTERNAL`
     /// — the server must not accept the chunk and must not let the
     /// counter grow unbounded. Pre-fix the per-stream counter
     /// incremented on every chunk with no upper bound, so a single
     /// connection could write multi-terabyte blobs by sending
     /// 4 KiB chunks indefinitely.
     ///
-    /// Test uses the `cfg(test)` 1024-byte cap so we can exercise
-    /// the rejection path without allocating gigabytes of test data.
+    /// Test installs a 1024-byte cap on the connection state so we can
+    /// exercise the rejection path without allocating gigabytes of test data.
     #[test]
     fn stream_chunk_aborts_when_cumulative_bytes_exceed_cap() {
         use crate::protocol::codec::encode_stream_chunk;
@@ -6553,7 +7323,8 @@ mod tests {
         // Hold a single ConnectionState across two chunks, since the
         // active-stream session lives in conn_state and per-chunk
         // routing through handle_request is what production does.
-        let mut conn_state = crate::server::ConnectionState::new();
+        let mut conn_state =
+            crate::server::ConnectionState::new().with_max_stream_total_bytes(1024);
 
         // Chunk 1: 800 bytes at offset 0 — under the 1024-byte cap.
         let chunk1 = vec![0xAAu8; 800];
@@ -6616,6 +7387,7 @@ mod tests {
 
     #[test]
     fn dispatch_external_create_binds_record_to_blob_digest() {
+        let _guard = metrics_test_lock();
         let h = DispatchTestHarness::new();
         let blob_store = crate::storage::blobstore::MemoryBlobStore::new();
         let txid = DispatchTestHarness::make_txid(41);
@@ -6665,6 +7437,67 @@ mod tests {
             blob_digest.length
         );
         assert_ne!(&data[1..33], &txid);
+    }
+
+    #[test]
+    fn delete_external_blob_missing_rejects_before_wal_and_mutation() {
+        let _guard = metrics_test_lock();
+        let mut h = DispatchTestHarness::new();
+        let blob_store: Arc<dyn crate::storage::blobstore::BlobStore> =
+            Arc::new(crate::storage::blobstore::MemoryBlobStore::new());
+        h.engine.set_blob_store(blob_store.clone());
+
+        let txid = DispatchTestHarness::make_txid(42);
+        blob_store
+            .put(&txid, b"external transaction payload")
+            .unwrap();
+
+        let item = WireCreateItem {
+            txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 123,
+            extended_size: 123,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1700000000000,
+            flags: FLAG_EXTERNAL_BLOB,
+            utxo_hashes: vec![[0xBC; 32]],
+            cold_data: vec![],
+            block_height: 0,
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+        let resp =
+            h.request_with_blob_store(OP_CREATE_BATCH, encode_create_batch(&[item]), &*blob_store);
+        assert_eq!(resp.status, STATUS_OK);
+
+        blob_store.delete(&txid).unwrap();
+
+        let resp = h.request(OP_DELETE_BATCH, encode_txid_batch(&[txid], &[]));
+        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+        let errors = decode_sparse_errors(&resp.payload).unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].item_index, 0);
+        assert_eq!(errors[0].error_code, ERR_INTERNAL);
+        assert!(
+            String::from_utf8_lossy(&errors[0].error_data)
+                .contains("external blob snapshot missing")
+        );
+
+        let resp = h.request(
+            OP_GET_BATCH,
+            encode_get_batch(FieldMask::TX_VERSION, &[txid]),
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let results = decode_get_response(&resp.payload).unwrap();
+        assert_eq!(
+            results[0].status, STATUS_OK,
+            "delete must not remove the record when its external blob snapshot is missing"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6787,6 +7620,91 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dispatch_delete_child_prunes_parent_slot_before_removing_child() {
+        let h = DispatchTestHarness::new();
+        let parent_txid = DispatchTestHarness::make_txid(71);
+        let child_txid = DispatchTestHarness::make_txid(72);
+
+        assert_eq!(h.create_tx(parent_txid, 2).status, STATUS_OK);
+
+        let mut extended_input = vec![0u8; 36];
+        extended_input[..32].copy_from_slice(&parent_txid);
+        extended_input[32..36].copy_from_slice(&1u32.to_le_bytes());
+        let mut inputs_blob = Vec::new();
+        inputs_blob.extend_from_slice(&1u32.to_le_bytes());
+        inputs_blob.extend_from_slice(&(extended_input.len() as u32).to_le_bytes());
+        inputs_blob.extend_from_slice(&extended_input);
+        let child_cold = crate::ops::engine::build_cold_data(Some(&inputs_blob), None, None);
+
+        let child = WireCreateItem {
+            txid: child_txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 250,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1700000000000,
+            flags: 0,
+            utxo_hashes: vec![[0xCC; 32]],
+            cold_data: child_cold,
+            block_height: 0,
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+        assert_eq!(
+            h.request(OP_CREATE_BATCH, encode_create_batch(&[child]))
+                .status,
+            STATUS_OK
+        );
+
+        let mut parent_hash = [0u8; 32];
+        parent_hash[0] = 1;
+        let mut spending_data = [0u8; 36];
+        spending_data[..32].copy_from_slice(&child_txid);
+        spending_data[32..36].copy_from_slice(&0u32.to_le_bytes());
+        let spend = WireSpendItem {
+            txid: parent_txid,
+            vout: 1,
+            utxo_hash: parent_hash,
+            spending_data,
+        };
+        let spend_params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        assert_eq!(
+            h.request(OP_SPEND_BATCH, encode_spend_batch(&spend_params, &[spend]))
+                .status,
+            STATUS_OK
+        );
+
+        let delete_resp = h.request(OP_DELETE_BATCH, encode_txid_batch(&[child_txid], &[]));
+        assert_eq!(delete_resp.status, STATUS_OK);
+
+        let child_get = h.request(
+            OP_GET_BATCH,
+            encode_get_batch(FieldMask::TX_VERSION, &[child_txid]),
+        );
+        let child_results = decode_get_response(&child_get.payload).unwrap();
+        assert_eq!(child_results[0].status, 1);
+
+        let parent_key = TxKey { txid: parent_txid };
+        let parent_slot = h.engine.read_slot(&parent_key, 1).unwrap();
+        assert_eq!(parent_slot.status, crate::record::UTXO_PRUNED);
+        assert_eq!(parent_slot.spending_data, spending_data);
+
+        let parent_meta = h.engine.read_metadata(&parent_key).unwrap();
+        assert_eq!({ parent_meta.spent_utxos }, 0);
+        assert_eq!({ parent_meta.pruned_utxos }, 1);
+    }
+
     // -----------------------------------------------------------------------
     // 5r. Ping returns OK
     // -----------------------------------------------------------------------
@@ -6873,10 +7791,107 @@ mod tests {
         redo_dev: Arc<MemoryDevice>,
     }
 
+    struct CountingSyncDevice {
+        inner: Arc<MemoryDevice>,
+        sync_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingSyncDevice {
+        fn new(size: u64, alignment: usize) -> Self {
+            Self {
+                inner: Arc::new(MemoryDevice::new(size, alignment).unwrap()),
+                sync_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn sync_count(&self) -> usize {
+            self.sync_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl BlockDevice for CountingSyncDevice {
+        fn pread(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            self.inner.pread(buf, offset)
+        }
+
+        fn pwrite(&self, buf: &[u8], offset: u64) -> crate::device::Result<usize> {
+            self.inner.pwrite(buf, offset)
+        }
+
+        fn alignment(&self) -> usize {
+            self.inner.alignment()
+        }
+
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn sync(&self) -> crate::device::Result<()> {
+            self.sync_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.sync()
+        }
+    }
+
+    #[test]
+    fn redo_group_commit_coalesces_concurrent_dispatch_writers() {
+        let redo_dev = Arc::new(CountingSyncDevice::new(4 * 1024 * 1024, 4096));
+        let redo_log = Arc::new(Mutex::new(
+            RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024)
+                .expect("redo log opens"),
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+
+        let spawn_writer = |byte: u8| {
+            let redo_log = Arc::clone(&redo_log);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let tx_key = TxKey { txid: [byte; 32] };
+                barrier.wait();
+                write_redo_ops_with_group_window(
+                    Some(redo_log.as_ref()),
+                    &[RedoOp::Delete {
+                        tx_key,
+                        record_offset: u64::from(byte) * 4096,
+                        record_size: 4096,
+                    }],
+                    Duration::from_millis(50),
+                )
+                .expect("grouped redo write succeeds")
+            })
+        };
+
+        let first = spawn_writer(1);
+        let second = spawn_writer(2);
+        barrier.wait();
+
+        let mut ranges = vec![
+            first.join().expect("first writer joins"),
+            second.join().expect("second writer joins"),
+        ];
+        ranges.sort_by_key(|range| range.0);
+
+        assert_eq!(ranges, vec![(1, 1), (2, 2)]);
+        assert_eq!(
+            redo_dev.sync_count(),
+            1,
+            "concurrent dispatch writers should share one redo fsync"
+        );
+
+        let entries = redo_log.lock().recover().expect("recover grouped entries");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 2);
+    }
+
     impl RedoDispatchHarness {
         fn new() -> Self {
+            Self::new_with_redo_size(4 * 1024 * 1024)
+        }
+
+        fn new_with_redo_size(redo_size: u64) -> Self {
             let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-            let redo_dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+            let redo_dev = Arc::new(MemoryDevice::new(redo_size.max(4096), 4096).unwrap());
             let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
             let index = Index::new(10000).unwrap();
             let locks = StripedLocks::new(1024);
@@ -6893,12 +7908,41 @@ mod tests {
             let redo_log = crate::redo::RedoLog::open(
                 redo_dev.clone() as Arc<dyn BlockDevice>,
                 0,
-                4 * 1024 * 1024,
+                redo_size.max(4096),
             )
             .unwrap();
             Self {
                 engine,
                 redo_log: Arc::new(Mutex::new(redo_log)),
+                data_dev,
+                redo_dev,
+            }
+        }
+
+        fn new_with_exact_redo_log_size(log_size: u64) -> Self {
+            let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+            let redo_dev = Arc::new(MemoryDevice::new(log_size.max(4096), 4096).unwrap());
+            let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+            let index = Index::new(10000).unwrap();
+            let locks = StripedLocks::new(1024);
+            let dah = DahIndex::new();
+            let unmined = UnminedIndex::new();
+            let engine = Engine::new(
+                data_dev.clone() as Arc<dyn BlockDevice>,
+                index,
+                alloc,
+                locks,
+                dah,
+                unmined,
+            );
+            let redo_log =
+                crate::redo::RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, log_size)
+                    .unwrap();
+            let redo_log = Arc::new(Mutex::new(redo_log));
+            engine.allocator().lock().set_redo_log(redo_log.clone());
+            Self {
+                engine,
+                redo_log,
                 data_dev,
                 redo_dev,
             }
@@ -7285,10 +8329,11 @@ mod tests {
         assert_eq!({ pre_unspend_meta.spent_utxos }, 2);
 
         // Now unspend slot 0 only.
-        let unspend_items = vec![WireSlotItem {
+        let unspend_items = vec![WireUnspendItem {
             txid,
             vout: 0,
             utxo_hash: original_slots[0].hash,
+            spending_data: [0xC0; 36],
         }];
         let unspend_params = UnspendBatchParams {
             current_block_height: 1000,
@@ -7651,7 +8696,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_get_pending_inbound_returns_quick_retry_signal() {
+    fn client_handles_migration_in_progress_polling() {
         let h = DispatchTestHarness::new();
         let shard = 77u16;
         let mut txid = [0u8; 32];
@@ -7766,7 +8811,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_complete_zero_count_clears_populated_inbound_shard() {
+    fn migration_complete_zero_count_without_manifest_rejected() {
         let h = DispatchTestHarness::new();
         let shard = 91u16;
         let mut txid = [0u8; 32];
@@ -7805,16 +8850,20 @@ mod tests {
             &mut conn_state,
             None,
         );
-        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(resp.status, STATUS_ERROR);
+        assert_eq!(
+            u16::from_le_bytes(resp.payload[0..2].try_into().unwrap()),
+            ERR_MIGRATION_MANIFEST_REQUIRED
+        );
         assert_eq!(
             cluster.inbound_pending_count(),
-            0,
-            "zero-count completion should clear pending inbound even when the shard already has data"
+            1,
+            "zero-count completion without manifest must not clear pending inbound"
         );
     }
 
     #[test]
-    fn migration_complete_full_zero_payload_clears_populated_inbound_shard() {
+    fn migration_complete_full_zero_payload_rejected() {
         let h = DispatchTestHarness::new();
         let shard = 92u16;
         let mut txid = [0u8; 32];
@@ -7864,11 +8913,70 @@ mod tests {
             None,
         );
 
-        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(resp.status, STATUS_ERROR);
+        assert_eq!(
+            u16::from_le_bytes(resp.payload[0..2].try_into().unwrap()),
+            ERR_MIGRATION_MANIFEST_REQUIRED
+        );
         assert_eq!(
             cluster.inbound_pending_count(),
-            0,
-            "the real zero-count completion wire format should clear populated inbound shards"
+            1,
+            "all-zero manifest is treated as missing and must not clear inbound"
+        );
+    }
+
+    #[test]
+    fn migration_complete_zero_count_with_wrong_manifest_rejected() {
+        let h = DispatchTestHarness::new();
+        let shard = 93u16;
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 12);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4604".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        assert_eq!(h.engine.shard_record_count(shard), 0);
+        assert_eq!(cluster.inbound_pending_count(), 1);
+
+        let payload =
+            build_migration_complete_payload(0, 0, 0, Some([0xFFu8; 32]), Some(&[]), None);
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload,
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_ERROR);
+        assert_eq!(
+            u16::from_le_bytes(resp.payload[0..2].try_into().unwrap()),
+            ERR_MIGRATION_MANIFEST_MISMATCH
+        );
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            1,
+            "wrong zero-record manifest must not clear inbound"
         );
     }
 
@@ -7983,6 +9091,55 @@ mod tests {
     }
 
     #[test]
+    fn classify_write_majority_threshold_consistency_rf2_through_rf7() {
+        let expected = [
+            (2usize, 1usize),
+            (3usize, 1usize),
+            (4usize, 2usize),
+            (5usize, 2usize),
+            (6usize, 3usize),
+            (7usize, 3usize),
+        ];
+
+        for (rf, required) in expected {
+            let targets = rf - 1;
+            let below = required.saturating_sub(1);
+            if below < required {
+                assert_eq!(
+                    classify_replication_outcome(
+                        below,
+                        targets,
+                        Some(AckPolicy::WriteMajority),
+                        false,
+                    ),
+                    ReplicationClassification::PolicyViolation { required },
+                    "RF={rf} below-majority must fail"
+                );
+            }
+
+            let at_threshold = classify_replication_outcome(
+                required,
+                targets,
+                Some(AckPolicy::WriteMajority),
+                false,
+            );
+            if required == targets {
+                assert_eq!(
+                    at_threshold,
+                    ReplicationClassification::FullAck,
+                    "RF={rf} all targets acked"
+                );
+            } else {
+                assert_eq!(
+                    at_threshold,
+                    ReplicationClassification::PartialAck,
+                    "RF={rf} threshold ack count should satisfy majority"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn classify_no_targets_is_full() {
         // Empty target list — nothing to ACK, trivially full.
         let c = classify_replication_outcome(0, 0, None, true);
@@ -7990,18 +9147,22 @@ mod tests {
     }
 
     #[test]
-    fn replication_ack_timeout_extends_only_during_migration_pressure() {
+    fn replication_timeout_migration_pressure_override() {
         assert_eq!(
-            replication_ack_timeout_for(Duration::from_secs(3), false),
+            replication_ack_timeout_for(Duration::from_secs(3), false, Duration::from_secs(30)),
             Duration::from_secs(3)
         );
         assert_eq!(
-            replication_ack_timeout_for(Duration::from_secs(3), true),
+            replication_ack_timeout_for(Duration::from_secs(3), true, Duration::from_secs(30)),
             Duration::from_secs(30)
         );
         assert_eq!(
-            replication_ack_timeout_for(Duration::from_secs(45), true),
+            replication_ack_timeout_for(Duration::from_secs(45), true, Duration::from_secs(30)),
             Duration::from_secs(45)
+        );
+        assert_eq!(
+            replication_ack_timeout_for(Duration::from_secs(3), true, Duration::from_secs(10)),
+            Duration::from_secs(10)
         );
     }
 
@@ -8133,10 +9294,10 @@ mod tests {
     // H3: OP_MIGRATION_COMPLETE manifest enforcement.
     //
     // Source nodes MUST include a manifest hash (or exact-entry manifest)
-    // when `record_count > 0`. Without one, a malformed/stale frame could
-    // mark a non-empty shard migrated prematurely. These tests exercise
-    // the three required paths:
-    //   1. non-empty with no manifest → rejected with ERR_MIGRATION_MANIFEST_REQUIRED
+    // for every completion, including empty shards. Without one, a
+    // malformed/stale frame could mark a shard migrated prematurely.
+    // These tests exercise the required paths:
+    //   1. no manifest → rejected with ERR_MIGRATION_MANIFEST_REQUIRED
     //   2. non-empty with mismatched manifest → ERR_MIGRATION_MANIFEST_MISMATCH
     //   3. non-empty with matching manifest → STATUS_OK and pending-inbound cleared
     // -----------------------------------------------------------------------
@@ -8169,6 +9330,14 @@ mod tests {
             payload.extend_from_slice(&node.0.to_le_bytes());
         }
         payload
+    }
+
+    fn compute_manifest_for_entries(entries: &[(TxKey, u32)]) -> [u8; 32] {
+        let mut manifest = crate::cluster::coordinator::ManifestHasher::new();
+        for (key, generation) in entries {
+            manifest.fold(&key.txid, *generation);
+        }
+        manifest.finalize()
     }
 
     /// Construct a txid whose shard (low 12 bits of txid[0..2]) equals `shard`.
@@ -8244,6 +9413,137 @@ mod tests {
             observed_ops[0].1.as_slice(),
             [ReplicaOp::Delete { tx_key: deleted }] if *deleted == tx_key
         ));
+    }
+
+    #[test]
+    fn intent_persists_before_local_apply() {
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let redo_log = Mutex::new(
+            RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).expect("redo log opens on memory device"),
+        );
+        let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
+        let tx_key = TxKey {
+            txid: txid_for_shard(42, 9),
+        };
+
+        let range = write_replicated_redo_ops_with_tracker(
+            true,
+            Some(&redo_log),
+            &[RedoOp::Delete {
+                tx_key,
+                record_offset: 4096,
+                record_size: 256,
+            }],
+            Some(&tracker),
+        )
+        .expect("replicated redo write and intent begin succeed");
+
+        assert_eq!(
+            tracker.pending(),
+            vec![crate::replication::durable::ReplicationIntentRange {
+                first_sequence: range.0,
+                last_sequence: range.1,
+            }],
+            "the intent marker must be durable before any caller applies the local mutation"
+        );
+        let entries = redo_log
+            .lock()
+            .read_from_sequence(range.0)
+            .expect("redo range remains readable");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sequence, range.0);
+    }
+
+    #[test]
+    fn compensation_no_observable_window() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let engine = Arc::new(DispatchTestHarness::new().engine);
+        let reader_engine = Arc::clone(&engine);
+        let mutation_guard = acquire_dispatch_visibility_guard(engine.as_ref(), OP_SPEND_BATCH)
+            .expect("mutation op should acquire the visibility barrier");
+        let reader_entered = Arc::new(AtomicBool::new(false));
+        let reader_finished = Arc::new(AtomicBool::new(false));
+        let reader_entered_thread = Arc::clone(&reader_entered);
+        let reader_finished_thread = Arc::clone(&reader_finished);
+
+        let handle = std::thread::spawn(move || {
+            reader_entered_thread.store(true, Ordering::SeqCst);
+            let _read_guard =
+                acquire_dispatch_visibility_guard(reader_engine.as_ref(), OP_GET_BATCH)
+                    .expect("read op should acquire the visibility barrier");
+            reader_finished_thread.store(true, Ordering::SeqCst);
+        });
+
+        while !reader_entered.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !reader_finished.load(Ordering::SeqCst),
+            "client reads must block while a mutation can still be rolled back"
+        );
+
+        drop(mutation_guard);
+        handle.join().expect("reader thread joins");
+        assert!(
+            reader_finished.load(Ordering::SeqCst),
+            "reader proceeds after mutation replication/compensation window closes"
+        );
+    }
+
+    #[test]
+    fn intent_recovery_handles_redo_wrap_around_gracefully() {
+        let h = DispatchTestHarness::new();
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let redo_log = Mutex::new(
+            RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).expect("redo log opens on memory device"),
+        );
+        let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
+        let tx_key = TxKey {
+            txid: txid_for_shard(41, 9),
+        };
+        let range = write_redo_ops(
+            Some(&redo_log),
+            &[RedoOp::Delete {
+                tx_key,
+                record_offset: 4096,
+                record_size: 256,
+            }],
+        )
+        .expect("redo write succeeds");
+        tracker.begin(range.0, range.1).unwrap();
+
+        {
+            let mut log = redo_log.lock();
+            log.mark_checkpoint().unwrap();
+            log.reset().unwrap();
+            assert_eq!(log.earliest_sequence().unwrap(), None);
+            assert!(log.current_sequence() > range.1);
+        }
+
+        let mut replicated = false;
+        recover_pending_replication_intents_from_tracker(
+            &tracker,
+            Some(&redo_log),
+            &h.engine,
+            |_ops, _range| {
+                replicated = true;
+                Ok(())
+            },
+        )
+        .expect("reclaimed redo range should clear stale intent instead of bricking startup");
+
+        assert!(
+            !replicated,
+            "reclaimed range cannot be incrementally replayed"
+        );
+        assert!(
+            tracker.pending().is_empty(),
+            "stale pending intent should be cleared after redo reclamation"
+        );
     }
 
     /// Phase I — `OP_ADMIN_CLUSTER_HEALTH` returns the cluster health
@@ -8566,7 +9866,7 @@ mod tests {
             vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
         )];
 
-        let err = replicate_all_ops(Some(&cluster), &ops, (0, 0))
+        let err = replicate_all_ops(Some(&cluster), &ops, (0, 0), &[])
             .expect_err("RF>1 write must fail when the replica address is unresolved");
         assert!(
             err.contains("has no resolved address"),
@@ -8997,7 +10297,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_no_data_completion_clears_only_source_inbound() {
+    fn migration_empty_manifest_completion_clears_only_source_inbound() {
         let h = DispatchTestHarness::new();
         let shard = 34u16;
         let members = vec![
@@ -9027,7 +10327,7 @@ mod tests {
             0,
             0,
             0,
-            None,
+            Some(compute_manifest_for_entries(&[])),
             Some(&[]),
             Some(crate::cluster::shards::NodeId(2)),
         );
@@ -9112,6 +10412,30 @@ mod tests {
             "batch completion from one source must not clear other sources"
         );
         assert!(cluster.has_pending_inbound_shard(shard));
+    }
+
+    #[test]
+    fn migration_batch_complete_rejects_huge_shard_count_before_allocation() {
+        let h = DispatchTestHarness::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let req = RequestFrame {
+            request_id: 0,
+            op_code: OP_MIGRATION_BATCH_COMPLETE,
+            flags: 0,
+            payload,
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, None, None, &mut conn_state, None);
+
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, msg) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(
+            msg.contains("batch-complete"),
+            "expected batch-complete rejection, got {msg}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -9295,6 +10619,7 @@ mod tests {
             proposer,
             members: members.clone(),
             digest: crate::cluster::topology::TopologyTerm::compute_digest(700, &members),
+            voters: members.clone(),
         };
         let req = RequestFrame {
             request_id: 2,
@@ -9320,6 +10645,91 @@ mod tests {
             "committed_term must be persisted before the commit reply returns"
         );
         assert_eq!(persisted.committed_members, members);
+    }
+
+    #[test]
+    fn deleted_topo_file_prevents_single_node_bootstrap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cluster_state_path = tmp.path().join("node.cluster");
+        let topology_path =
+            crate::cluster::coordinator::topology_state_path_for_cluster_state(&cluster_state_path);
+        let self_id = crate::cluster::shards::NodeId(1);
+        let prior_members = vec![
+            self_id,
+            crate::cluster::shards::NodeId(2),
+            crate::cluster::shards::NodeId(3),
+        ];
+        let prior_table =
+            crate::cluster::shards::ShardTable::compute_with_epoch(&prior_members, 1, 9);
+        let prior_cluster =
+            crate::cluster::coordinator::new_test_running_cluster_with_topology_path(
+                self_id,
+                prior_table,
+                &[(self_id, "127.0.0.1:4801".parse().unwrap())],
+                &prior_members,
+                &[],
+                &[],
+                &[],
+                3,
+                Some(topology_path.clone()),
+            );
+        prior_cluster
+            .persist_topology()
+            .expect("multi-node topology marker should persist");
+        std::fs::remove_file(&topology_path).expect("delete persisted topology file");
+
+        let restored =
+            crate::cluster::coordinator::load_startup_topology_state(&cluster_state_path);
+        assert!(
+            restored.peak_cluster_size >= 2,
+            "deleted .topo must not erase local multi-node evidence; restored peak={}",
+            restored.peak_cluster_size,
+        );
+
+        let h = DispatchTestHarness::new();
+        let fresh_single_node_table =
+            crate::cluster::shards::ShardTable::compute_with_epoch(&[self_id], 1, 1);
+        let rebooted_cluster = crate::cluster::coordinator::new_test_running_cluster(
+            self_id,
+            fresh_single_node_table,
+            &[(self_id, "127.0.0.1:4802".parse().unwrap())],
+            &[self_id],
+            &[],
+            &[],
+            &[],
+            restored.peak_cluster_size as usize,
+        );
+        let item = WireCreateItem {
+            txid: DispatchTestHarness::make_txid(82),
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 250,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1700000000000,
+            flags: 0,
+            utxo_hashes: vec![DispatchTestHarness::make_txid(83)],
+            cold_data: vec![],
+            block_height: 0,
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+        let resp = h.request_with_cluster(
+            OP_CREATE_BATCH,
+            encode_create_batch(&[item]),
+            &rebooted_cluster,
+        );
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "node with deleted .topo and prior multi-node marker must not accept fresh single-node writes",
+        );
+        assert!(resp.payload.len() >= 2);
+        let err_code = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
+        assert_eq!(err_code, ERR_NO_QUORUM);
     }
 
     // -----------------------------------------------------------------------
@@ -9447,6 +10857,44 @@ mod tests {
         assert_eq!(after.4 - before.4, 1, "one batch processed");
     }
 
+    #[test]
+    fn pruned_utxo_spend_returns_original_spending_data() {
+        let _guard = metrics_test_lock();
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(44);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let key = TxKey { txid };
+        let entry = h.engine.lookup(&key).unwrap();
+        let utxo_hash = [0u8; 32];
+        let spending_data = [0x5Au8; 36];
+        let mut pruned_slot = crate::record::UtxoSlot::new_spent(utxo_hash, spending_data);
+        pruned_slot.status = crate::record::UTXO_PRUNED;
+        crate::io::write_utxo_slot(h.engine.device(), entry.record_offset, 0, &pruned_slot)
+            .unwrap();
+
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let item = WireSpendItem {
+            txid,
+            vout: 0,
+            utxo_hash,
+            spending_data: [0xFF; 36],
+        };
+
+        let resp = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &[item]));
+        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+        let errors = decode_sparse_errors(&resp.payload).unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].item_index, 0);
+        assert_eq!(errors[0].error_code, ERR_INVALID_SPEND);
+        assert_eq!(errors[0].error_data, spending_data.to_vec());
+    }
+
     /// Re-sending the exact same spend should classify the second send as
     /// idempotent rather than succeeded or failed.
     #[test]
@@ -9538,20 +10986,23 @@ mod tests {
         // Now submit unspend for A (real), B (noop), and C with wrong hash (fail).
         let wrong_hash = [0x88u8; 32];
         let items = vec![
-            WireSlotItem {
+            WireUnspendItem {
                 txid: txid_a,
                 vout: 0,
                 utxo_hash: utxo_hash_vout0,
+                spending_data: [0x77; 36],
             },
-            WireSlotItem {
+            WireUnspendItem {
                 txid: txid_b,
                 vout: 0,
                 utxo_hash: utxo_hash_vout0,
+                spending_data: [0; 36],
             },
-            WireSlotItem {
+            WireUnspendItem {
                 txid: txid_c,
                 vout: 0,
                 utxo_hash: wrong_hash,
+                spending_data: [0; 36],
             },
         ];
         let params = UnspendBatchParams {
@@ -9568,6 +11019,60 @@ mod tests {
         assert_eq!(after.2 - before.2, 1, "items_idempotent += 1 (B)");
         assert_eq!(after.3 - before.3, 1, "items_failed += 1 (C wrong hash)");
         assert_eq!(after.4 - before.4, 1, "one unspend batch");
+    }
+
+    #[test]
+    fn handle_unspend_batch_rejects_wrong_spending_data() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(53);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let stored_spending_data = [0x91; 36];
+        let spend_item = WireSpendItem {
+            txid,
+            vout: 0,
+            utxo_hash: [0; 32],
+            spending_data: stored_spending_data,
+        };
+        assert_eq!(
+            h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &[spend_item]))
+                .status,
+            STATUS_OK,
+        );
+
+        let unspend_params = UnspendBatchParams {
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let unspend_item = WireUnspendItem {
+            txid,
+            vout: 0,
+            utxo_hash: [0; 32],
+            spending_data: [0x92; 36],
+        };
+        let resp = h.request(
+            OP_UNSPEND_BATCH,
+            encode_unspend_batch(&unspend_params, &[unspend_item]),
+        );
+        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+        let errors = decode_sparse_errors(&resp.payload).unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].item_index, 0);
+        assert_eq!(errors[0].error_code, ERR_INVALID_SPEND);
+        assert_eq!(errors[0].error_data, stored_spending_data.to_vec());
+
+        let slot = h
+            .engine
+            .read_slot(&TxKey { txid }, 0)
+            .expect("slot must remain readable");
+        assert!(slot.is_spent());
+        assert_eq!(slot.spending_data, stored_spending_data);
     }
 
     /// SetMined items should tick attempted/succeeded/failed per item.
@@ -9614,8 +11119,8 @@ mod tests {
         assert_eq!(after_fail - before_fail, 1, "set_mined_items_failed += 1");
     }
 
-    /// Create items should tick creates_attempted (once per batch),
-    /// creates_succeeded, and creates_failed.
+    /// Create items should tick creates_attempted, creates_succeeded,
+    /// and creates_failed once per item.
     #[test]
     fn handle_create_batch_ticks_outcome_counters() {
         let _guard = metrics_test_lock();
@@ -9682,8 +11187,8 @@ mod tests {
         let after_fail = m.creates_failed.get();
         assert_eq!(
             after_att - before_att,
-            1,
-            "creates_attempted += 1 (per batch)"
+            2,
+            "creates_attempted += 2 (per item)"
         );
         assert_eq!(after_succ - before_succ, 1, "creates_succeeded += 1");
         assert_eq!(after_fail - before_fail, 1, "creates_failed += 1");
@@ -9968,7 +11473,13 @@ mod tests {
                 },
                 Outcome::ErrConflicting,
             ),
-            (SpendError::Pruned { offset: 0 }, Outcome::ErrConflicting),
+            (
+                SpendError::Pruned {
+                    offset: 0,
+                    spending_data: [0xAB; 36],
+                },
+                Outcome::ErrConflicting,
+            ),
             (SpendError::AlreadyFrozen { offset: 0 }, Outcome::ErrFrozen),
             (SpendError::NotFrozen { offset: 0 }, Outcome::ErrFrozen),
             (
@@ -10818,7 +12329,7 @@ mod tests {
         let tail = &ops[1..];
         let spent_a = tail.iter().find(|op| {
             matches!(op,
-                ReplicaOp::Spend { tx_key, offset: 1, spending_data, master_generation }
+                ReplicaOp::Spend { tx_key, offset: 1, spending_data, master_generation, .. }
                 if *tx_key == key && *spending_data == spend_a && *master_generation == 7
             )
         });
@@ -10829,7 +12340,7 @@ mod tests {
 
         let spent_b = tail.iter().find(|op| {
             matches!(op,
-                ReplicaOp::Spend { tx_key, offset: 4, spending_data, master_generation }
+                ReplicaOp::Spend { tx_key, offset: 4, spending_data, master_generation, .. }
                 if *tx_key == key && *spending_data == spend_b && *master_generation == 7
             )
         });
@@ -10936,11 +12447,14 @@ mod tests {
             vec![ReplicaOp::UnsetMined {
                 tx_key: key,
                 block_id,
+                current_block_height: 0,
+                block_height_retention: 0,
                 master_generation: 0, // not material to compensation
             }],
         )];
         let before_images = vec![(key, vec![before_image])];
-        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log));
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+            .unwrap();
 
         // Post-compensation: the block entry MUST be restored with the
         // original (height, subtree). Not zeros.
@@ -10959,6 +12473,400 @@ mod tests {
             }
         }
         assert!(found, "block entry not restored after compensation");
+    }
+
+    #[test]
+    fn rollback_unset_mined_restores_overflow_block_entry_exactly() {
+        use crate::ops::set_mined::SetMinedRequest;
+
+        let h = RedoDispatchHarness::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0x43;
+        let key = rollback_seed_record(&h, txid, 1);
+
+        for bid in 1..=5u32 {
+            h.engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: key,
+                    block_id: bid,
+                    block_height: 900_000 + bid,
+                    subtree_idx: 20 + bid,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                    current_block_height: 0,
+                    block_height_retention: 0,
+                })
+                .expect("seed mined entry");
+        }
+
+        let block_id = 5;
+        let before = h
+            .engine
+            .read_block_entry(&key, block_id)
+            .expect("read before image")
+            .expect("overflow before image");
+        let block_height = { before.block_height };
+        let subtree_idx = { before.subtree_idx };
+        let before_image = BeforeImage::UnsetMined {
+            block_height,
+            subtree_idx,
+        };
+
+        h.engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id,
+                block_height,
+                subtree_idx,
+                on_longest_chain: false,
+                unset_mined: true,
+                current_block_height: 0,
+                block_height_retention: 0,
+            })
+            .expect("local unset");
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::UnsetMined {
+                tx_key: key,
+                block_id,
+                current_block_height: 0,
+                block_height_retention: 0,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = vec![(key, vec![before_image])];
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+            .unwrap();
+
+        let restored = h
+            .engine
+            .read_block_entry(&key, block_id)
+            .expect("read restored entry")
+            .expect("restored overflow entry");
+        assert_eq!({ restored.block_height }, 900_005);
+        assert_eq!({ restored.subtree_idx }, 25);
+    }
+
+    #[test]
+    fn unspend_compensation_preserves_dah() {
+        use crate::ops::set_mined::SetMinedRequest;
+        use crate::ops::spend::SpendRequest;
+
+        let h = RedoDispatchHarness::new();
+        let txid = DispatchTestHarness::make_txid(156);
+        let key = rollback_seed_record(&h, txid, 2);
+
+        h.engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 156,
+                block_height: 900_000,
+                subtree_idx: 0,
+                on_longest_chain: true,
+                unset_mined: false,
+                current_block_height: 900_000,
+                block_height_retention: 50,
+            })
+            .expect("mine record");
+
+        let slot0 = h.engine.read_slot(&key, 0).expect("slot 0");
+        h.engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: slot0.hash,
+                spending_data: [0xA0; 36],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 900_010,
+                block_height_retention: 50,
+            })
+            .expect("spend first output");
+
+        let slot1 = h.engine.read_slot(&key, 1).expect("slot 1");
+        let failed_spending_data = [0xB1; 36];
+        h.engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 1,
+                utxo_hash: slot1.hash,
+                spending_data: failed_spending_data,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 900_020,
+                block_height_retention: 50,
+            })
+            .expect("spend second output");
+
+        let after_spend = h.engine.read_metadata(&key).expect("metadata after spend");
+        assert_eq!({ after_spend.spent_utxos }, 2);
+        assert_eq!({ after_spend.delete_at_height }, 900_070);
+        assert!(
+            !h.engine.dah_index().range_query(u32::MAX).is_empty(),
+            "test setup should register the DAH before rollback",
+        );
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Spend {
+                tx_key: key,
+                offset: 1,
+                spending_data: failed_spending_data,
+                current_block_height: 900_020,
+                block_height_retention: 50,
+                master_generation: { after_spend.generation },
+            }],
+        )];
+        let before_images = no_before_images(&repl_ops);
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+            .unwrap();
+
+        let restored = h.engine.read_metadata(&key).expect("metadata restored");
+        assert_eq!({ restored.spent_utxos }, 1);
+        assert_eq!(
+            { restored.delete_at_height },
+            0,
+            "rollback unspend must clear DAH when the record is no longer all-spent",
+        );
+        assert!(
+            h.engine.dah_index().range_query(u32::MAX).is_empty(),
+            "rollback must remove the stale DAH index entry",
+        );
+        let post_slot1 = h.engine.read_slot(&key, 1).expect("post slot 1");
+        assert_eq!(post_slot1.status, crate::record::UTXO_UNSPENT);
+    }
+
+    #[test]
+    fn rollback_set_locked_restores_prior_dah() {
+        use crate::ops::set_mined::SetMinedRequest;
+        use crate::ops::spend::SpendRequest;
+
+        let h = RedoDispatchHarness::new();
+        let txid = DispatchTestHarness::make_txid(155);
+        let key = rollback_seed_record(&h, txid, 1);
+
+        h.engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 1,
+                block_height: 700,
+                subtree_idx: 0,
+                on_longest_chain: true,
+                unset_mined: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("mine record");
+        let slot = h.engine.read_slot(&key, 0).expect("slot 0");
+        h.engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: slot.hash,
+                spending_data: [0x55; 36],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("spend all outputs");
+
+        let before = h.engine.read_metadata(&key).expect("metadata before lock");
+        let prior_dah = { before.delete_at_height };
+        assert_ne!(prior_dah, 0, "test setup should have DAH pruning state");
+        assert!(!before.flags.contains(crate::record::TxFlags::LOCKED));
+
+        let locked = h
+            .engine
+            .set_locked_with_before_image(&crate::ops::remaining::SetLockedRequest {
+                tx_key: key,
+                value: true,
+            })
+            .expect("lock record");
+        let after_lock = h.engine.read_metadata(&key).expect("metadata after lock");
+        assert!(after_lock.flags.contains(crate::record::TxFlags::LOCKED));
+        assert_eq!({ after_lock.delete_at_height }, 0);
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::SetLocked {
+                tx_key: key,
+                value: true,
+                master_generation: locked.generation,
+            }],
+        )];
+        let before_images = vec![(
+            key,
+            vec![BeforeImage::SetLocked {
+                prior_locked: locked.prior_locked,
+                prior_delete_at_height: locked.prior_delete_at_height,
+            }],
+        )];
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+            .unwrap();
+
+        let restored = h.engine.read_metadata(&key).expect("metadata restored");
+        assert!(!restored.flags.contains(crate::record::TxFlags::LOCKED));
+        assert_eq!({ restored.delete_at_height }, prior_dah);
+    }
+
+    #[test]
+    fn compensation_redo_failure_returns_error() {
+        use crate::ops::remaining::FreezeRequest;
+
+        let h = RedoDispatchHarness::new_with_redo_size(4096);
+        let key = rollback_seed_record(&h, DispatchTestHarness::make_txid(157), 1);
+        let slot = h.engine.read_slot(&key, 0).expect("slot");
+        h.engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: slot.hash,
+            })
+            .expect("freeze locally");
+
+        {
+            let mut log = h.redo_log.lock();
+            let mut n = 0u8;
+            loop {
+                let result = log.append_and_flush(RedoOp::Delete {
+                    tx_key: TxKey { txid: [n; 32] },
+                    record_offset: u64::from(n) * 4096,
+                    record_size: 4096,
+                });
+                if result.is_err() {
+                    break;
+                }
+                n = n.wrapping_add(1);
+            }
+        }
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Freeze {
+                tx_key: key,
+                offset: 0,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = no_before_images(&repl_ops);
+        let err =
+            compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+                .expect_err("redo log full must make compensation fail visibly");
+        assert!(
+            err.contains("replication compensation redo write failed"),
+            "unexpected compensation error: {err}"
+        );
+    }
+
+    #[test]
+    fn create_batch_redo_failure_surfaces_allocator_rollback_failure() {
+        let h = RedoDispatchHarness::new_with_exact_redo_log_size(60);
+        let resp = h.create_tx(DispatchTestHarness::make_txid(158), 1);
+
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, msg) = decode_error_payload(&resp.payload).expect("error payload");
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(
+            msg.contains("redo log append"),
+            "expected primary redo failure in error: {msg}"
+        );
+        assert!(
+            msg.contains("allocator rollback errors"),
+            "expected rollback failure to be surfaced in error: {msg}"
+        );
+        assert!(
+            msg.contains("create reservation rollback failed after create redo write failure"),
+            "expected create reservation rollback context in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_batch_fsync_count_optimized() {
+        let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = Arc::new(CountingSyncDevice::new(8 * 1024 * 1024, 4096));
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(10000).unwrap();
+        let locks = StripedLocks::new(1024);
+        let dah = DahIndex::new();
+        let unmined = UnminedIndex::new();
+        let engine = Engine::new(
+            data_dev as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            locks,
+            dah,
+            unmined,
+        );
+        let redo_log = crate::redo::RedoLog::open(
+            redo_dev.clone() as Arc<dyn BlockDevice>,
+            0,
+            8 * 1024 * 1024,
+        )
+        .unwrap();
+        let redo_log = Arc::new(Mutex::new(redo_log));
+        engine.set_redo_log(redo_log.clone());
+        engine.allocator().lock().set_redo_log(redo_log.clone());
+
+        let items: Vec<WireCreateItem> = (0..10u8)
+            .map(|i| WireCreateItem {
+                txid: DispatchTestHarness::make_txid(180u8.wrapping_add(i)),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 250,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1700000000000 + u64::from(i),
+                flags: 0,
+                utxo_hashes: vec![[i; 32]],
+                cold_data: vec![],
+                block_height: 700_000,
+                mined_block_id: Some(10_000 + u32::from(i)),
+                mined_block_height: Some(700_000 + u32::from(i)),
+                mined_subtree_idx: Some(u32::from(i)),
+                parent_txids: vec![],
+            })
+            .collect();
+
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: encode_create_batch(&items),
+        };
+        let before_syncs = redo_dev.sync_count();
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &engine,
+            8192,
+            None,
+            Some(&redo_log),
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            redo_dev.sync_count() - before_syncs,
+            2,
+            "create batch should fsync once for allocator reservations and once for CreateV2 WAL"
+        );
+
+        let entries = redo_log.lock().recover().unwrap();
+        let allocate_entries = entries
+            .iter()
+            .filter(|entry| matches!(entry.op, RedoOp::AllocateRegion { .. }))
+            .count();
+        let create_entries = entries
+            .iter()
+            .filter(|entry| matches!(entry.op, RedoOp::CreateV2 { .. }))
+            .count();
+        assert_eq!(allocate_entries, items.len());
+        assert_eq!(create_entries, items.len());
     }
 
     /// Test 2 (gap #8): reassign rollback restores the original
@@ -11026,7 +12934,8 @@ mod tests {
                 prior_utxo_hash: original_hash,
             }],
         )];
-        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log));
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+            .unwrap();
 
         // Post-compensation: slot's hash MUST be the original — NOT zeros.
         let post_slot = h.engine.read_slot(&key, 0).expect("read post slot");
@@ -11038,6 +12947,75 @@ mod tests {
         // And NOT the all-zero stub (which would happen with the old
         // best-effort path even if `original_hash` happens to be all-zero).
         // The test value is non-zero so this is meaningful here.
+    }
+
+    #[test]
+    fn compensation_fallback_never_writes_zero_hashes() {
+        use crate::ops::remaining::{FreezeRequest, ReassignRequest};
+
+        let h = RedoDispatchHarness::new();
+        let txid = DispatchTestHarness::make_txid(153);
+        let key = rollback_seed_record(&h, txid, 2);
+
+        let original_hash = h.engine.read_slot(&key, 1).expect("slot 1").hash;
+        assert_ne!(
+            original_hash, [0u8; 32],
+            "test precondition: use a non-zero original hash"
+        );
+        h.engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 1,
+                utxo_hash: original_hash,
+            })
+            .expect("freeze");
+
+        let mut new_hash = [0u8; 32];
+        for (i, b) in new_hash.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(31);
+        }
+        h.engine
+            .reassign(&ReassignRequest {
+                tx_key: key,
+                offset: 1,
+                utxo_hash: original_hash,
+                new_utxo_hash: new_hash,
+                block_height: 700_001,
+                spendable_after: 100,
+            })
+            .expect("reassign");
+        assert_eq!(h.engine.read_slot(&key, 1).unwrap().hash, new_hash);
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Reassign {
+                tx_key: key,
+                offset: 1,
+                new_hash,
+                block_height: 700_001,
+                spendable_after: 100,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = Vec::new();
+
+        let err =
+            compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+                .expect_err("before-image shape mismatch should fail closed");
+        assert!(
+            err.contains("before-image shape mismatch"),
+            "unexpected compensation error: {err}"
+        );
+
+        let post_hash = h.engine.read_slot(&key, 1).unwrap().hash;
+        assert_eq!(
+            post_hash, new_hash,
+            "before-image shape mismatch must fail closed instead of writing a zero hash"
+        );
+        assert_ne!(
+            post_hash, [0u8; 32],
+            "compensation must never substitute an all-zero fallback hash"
+        );
     }
 
     /// Test 3a (gap #8): prune rollback against a SPENT slot restores
@@ -11082,7 +13060,8 @@ mod tests {
                 prior_status: UTXO_SPENT,
             }],
         )];
-        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log));
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+            .unwrap();
 
         // Post-compensation: slot status MUST be SPENT, NOT UNSPENT.
         let post_slot = crate::io::read_utxo_slot(h.engine.device(), entry.record_offset, 0)
@@ -11131,7 +13110,8 @@ mod tests {
                 prior_status: UTXO_FROZEN,
             }],
         )];
-        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log));
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+            .unwrap();
 
         let post_slot = crate::io::read_utxo_slot(h.engine.device(), entry.record_offset, 0)
             .expect("read post slot");
@@ -11321,7 +13301,8 @@ mod tests {
                 prior_utxo_hash: original_hash,
             }],
         )];
-        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log));
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+            .unwrap();
 
         // Post-rollback slot: hash MUST equal the pre-reassign hash.
         let post_slot = crate::io::read_utxo_slot(h.engine.device(), entry.record_offset, 0)
@@ -11338,5 +13319,81 @@ mod tests {
         // documented reassign-rollback semantics — silence the unused
         // bind so this test doesn't rely on the exact post-status.
         let _ = frozen_slot;
+    }
+
+    #[test]
+    fn concurrent_reassign_compensation_uses_correct_prior_hash() {
+        use crate::ops::remaining::{FreezeRequest, ReassignRequest};
+
+        let h = RedoDispatchHarness::new();
+        let txid = DispatchTestHarness::make_txid(154);
+        let key = rollback_seed_record(&h, txid, 2);
+
+        let original_hash = h.engine.read_slot(&key, 0).expect("slot 0").hash;
+        h.engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: original_hash,
+            })
+            .expect("freeze original");
+
+        let first_hash = [0xA1; 32];
+        h.engine
+            .reassign(&ReassignRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: original_hash,
+                new_utxo_hash: first_hash,
+                block_height: 750_000,
+                spendable_after: 100,
+            })
+            .expect("first reassign");
+
+        h.engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: first_hash,
+            })
+            .expect("freeze first hash");
+
+        let second_hash = [0xB2; 32];
+        h.engine
+            .reassign(&ReassignRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: first_hash,
+                new_utxo_hash: second_hash,
+                block_height: 750_100,
+                spendable_after: 100,
+            })
+            .expect("second reassign");
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Reassign {
+                tx_key: key,
+                offset: 0,
+                new_hash: second_hash,
+                block_height: 750_100,
+                spendable_after: 100,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = vec![(
+            key,
+            vec![BeforeImage::Reassign {
+                prior_utxo_hash: first_hash,
+            }],
+        )];
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+            .unwrap();
+
+        let post_slot = h.engine.read_slot(&key, 0).expect("post slot");
+        assert_eq!(
+            post_slot.hash, first_hash,
+            "rollback of the second reassign must restore the first reassign's hash, not the original hash"
+        );
     }
 }

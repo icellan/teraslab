@@ -19,6 +19,23 @@ use crate::record::{
 /// Result type for I/O helper operations.
 pub type Result<T> = std::result::Result<T, DeviceError>;
 
+/// F-G1-005: convert a `u64` device record offset to `usize` with a
+/// debug-assertion that the value fits. On 64-bit targets (the only
+/// currently-supported ones) this is unconditionally true; on a future
+/// 32-bit / wasm32 port the check fires loudly instead of silently
+/// truncating to the low 32 bits — silent truncation could land the
+/// pointer inside another transaction's data region with a CRC that
+/// happens to validate against the wrong record (no mismatch on read).
+#[inline(always)]
+fn off_to_usize(record_offset: u64) -> usize {
+    debug_assert!(
+        record_offset <= usize::MAX as u64,
+        "record_offset {record_offset} exceeds platform pointer width (usize::MAX = {})",
+        usize::MAX
+    );
+    record_offset as usize
+}
+
 // ===========================================================================
 // TxMetadata byte-offset constants (repr(C, packed), 256 bytes)
 // ===========================================================================
@@ -76,7 +93,7 @@ pub unsafe fn write_mutation_footer_direct(
     meta: &TxMetadata,
 ) {
     unsafe {
-        let p = base_ptr.add(record_offset as usize);
+        let p = base_ptr.add(off_to_usize(record_offset));
         // flags (1 byte)
         p.add(META_OFF_FLAGS).write(meta.flags.bits());
         // generation (4 bytes LE)
@@ -113,7 +130,7 @@ pub unsafe fn write_mutation_footer_direct(
 pub unsafe fn write_spend_footer_direct(base_ptr: *mut u8, record_offset: u64, meta: &TxMetadata) {
     unsafe {
         write_mutation_footer_direct(base_ptr, record_offset, meta);
-        let p = base_ptr.add(record_offset as usize);
+        let p = base_ptr.add(off_to_usize(record_offset));
         std::ptr::copy_nonoverlapping(
             meta.spent_utxos.to_le_bytes().as_ptr(),
             p.add(META_OFF_SPENT_UTXOS),
@@ -131,7 +148,7 @@ pub unsafe fn write_spend_footer_direct(base_ptr: *mut u8, record_offset: u64, m
 pub unsafe fn write_mined_footer_direct(base_ptr: *mut u8, record_offset: u64, meta: &TxMetadata) {
     unsafe {
         write_mutation_footer_direct(base_ptr, record_offset, meta);
-        let p = base_ptr.add(record_offset as usize);
+        let p = base_ptr.add(off_to_usize(record_offset));
         std::ptr::copy_nonoverlapping(
             meta.unmined_since.to_le_bytes().as_ptr(),
             p.add(META_OFF_UNMINED_SINCE),
@@ -154,7 +171,7 @@ pub unsafe fn write_block_entry_direct(
     entry: &BlockEntry,
 ) {
     unsafe {
-        let p = base_ptr.add(record_offset as usize);
+        let p = base_ptr.add(off_to_usize(record_offset));
         // block_entry_count (1 byte)
         p.add(META_OFF_BLOCK_ENTRY_COUNT).write(count);
         // BlockEntry at inline_index (12 bytes)
@@ -182,7 +199,7 @@ pub unsafe fn write_block_entry_direct(
 #[inline]
 pub unsafe fn write_crc_direct(base_ptr: *mut u8, record_offset: u64, meta: &TxMetadata) {
     unsafe {
-        let p = base_ptr.add(record_offset as usize);
+        let p = base_ptr.add(off_to_usize(record_offset));
         let crc = meta.compute_crc();
         std::ptr::copy_nonoverlapping(crc.to_le_bytes().as_ptr(), p.add(CRC32_OFFSET), 4);
         // R-030 (BC-07): Release fence after the CRC stamp — this
@@ -259,7 +276,7 @@ pub unsafe fn read_metadata_direct(base_ptr: *const u8, record_offset: u64) -> R
         // barrier prevents the reorderings we care about, and
         // the CRC remains the true safety net.
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-        let src = base_ptr.add(record_offset as usize);
+        let src = base_ptr.add(off_to_usize(record_offset));
         let bytes = std::slice::from_raw_parts(src, METADATA_SIZE);
         Ok(TxMetadata::from_bytes(bytes)?)
     }
@@ -277,7 +294,7 @@ pub unsafe fn read_metadata_direct(base_ptr: *const u8, record_offset: u64) -> R
 #[inline]
 pub unsafe fn write_metadata_direct(base_ptr: *mut u8, record_offset: u64, metadata: &TxMetadata) {
     unsafe {
-        let dst = base_ptr.add(record_offset as usize);
+        let dst = base_ptr.add(off_to_usize(record_offset));
         let dst_slice = std::slice::from_raw_parts_mut(dst, METADATA_SIZE);
         let mut buf = [0u8; METADATA_SIZE];
         metadata.to_bytes(&mut buf);
@@ -316,28 +333,25 @@ pub unsafe fn write_metadata_direct(base_ptr: *mut u8, record_offset: u64, metad
 ///
 /// # Concurrency contract (R-009 / BC-02)
 ///
-/// Like [`read_metadata_direct`], read-paths do not hold the stripe
-/// lock. UTXO slots currently lack a per-slot CRC (see R-022 / BC-03)
-/// so a torn read returns whatever bytes were observed; callers that
-/// care about consistency must re-read after observing a status byte
-/// they did not expect, or rely on the surrounding 4 KiB sector
-/// atomicity that NVMe guarantees in practice. R-022 tracks the
-/// fix to add a slot-level CRC so torn reads surface explicitly.
+/// Like [`read_metadata_direct`], read-paths do not hold the stripe lock.
+/// UTXO slots carry a per-slot CRC, so a torn read returns
+/// `DeviceError::RecordCorruption` instead of exposing unchecked slot
+/// bytes to spend/recovery logic.
 #[inline]
 pub unsafe fn read_utxo_slot_direct(
     base_ptr: *const u8,
     record_offset: u64,
     slot_index: u32,
-) -> UtxoSlot {
+) -> Result<UtxoSlot> {
     unsafe {
         // R-029 (BC-06): Acquire fence — see `read_metadata_direct`
         // for the full rationale. Slot reads have the same
         // memory-ordering risk as metadata reads on AArch64.
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         let slot_offset = record_offset + TxMetadata::utxo_slot_offset(slot_index);
-        let src = base_ptr.add(slot_offset as usize);
+        let src = base_ptr.add(off_to_usize(slot_offset));
         let bytes = std::slice::from_raw_parts(src, UTXO_SLOT_SIZE);
-        UtxoSlot::from_bytes(bytes)
+        Ok(UtxoSlot::from_bytes(bytes)?)
     }
 }
 
@@ -356,7 +370,7 @@ pub unsafe fn write_utxo_slot_direct(
 ) {
     unsafe {
         let slot_offset = record_offset + TxMetadata::utxo_slot_offset(slot_index);
-        let dst = base_ptr.add(slot_offset as usize);
+        let dst = base_ptr.add(off_to_usize(slot_offset));
         let dst_slice = std::slice::from_raw_parts_mut(dst, UTXO_SLOT_SIZE);
         let mut buf = [0u8; UTXO_SLOT_SIZE];
         slot.to_bytes(&mut buf);
@@ -425,7 +439,7 @@ pub fn write_metadata(
 
 /// Read a single [`UtxoSlot`] at `slot_index` within the record at `record_offset`.
 ///
-/// The slot offset is: `record_offset + METADATA_SIZE + slot_index * 69`.
+/// The slot offset is: `record_offset + METADATA_SIZE + slot_index * UTXO_SLOT_SIZE`.
 pub fn read_utxo_slot(
     device: &dyn BlockDevice,
     record_offset: u64,
@@ -442,7 +456,46 @@ pub fn read_utxo_slot(
 
     Ok(UtxoSlot::from_bytes(
         &buf[intra_offset..intra_offset + UTXO_SLOT_SIZE],
-    ))
+    )?)
+}
+
+/// Read every [`UtxoSlot`] for a record in one aligned device read.
+///
+/// This is the batched counterpart to [`read_utxo_slot`] for GET/delete
+/// snapshot paths that need the full slot set. It avoids one aligned
+/// `pread` per slot while preserving the same O_DIRECT alignment rules.
+pub fn read_all_utxo_slots(
+    device: &dyn BlockDevice,
+    record_offset: u64,
+    slot_count: u32,
+) -> Result<Vec<UtxoSlot>> {
+    if slot_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let align = device.alignment();
+    let first_slot_offset = record_offset + TxMetadata::utxo_slot_offset(0);
+    let aligned_base = first_slot_offset / align as u64 * align as u64;
+    let intra_offset = (first_slot_offset - aligned_base) as usize;
+    let slot_bytes = (slot_count as usize)
+        .checked_mul(UTXO_SLOT_SIZE)
+        .ok_or_else(|| {
+            DeviceError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "slot read byte count overflow",
+            ))
+        })?;
+    let total_read = align_up(intra_offset + slot_bytes, align);
+
+    let mut buf = AlignedBuf::new(total_read, align);
+    device.pread_exact_at(&mut buf, aligned_base)?;
+
+    let mut slots = Vec::with_capacity(slot_count as usize);
+    for i in 0..slot_count as usize {
+        let start = intra_offset + i * UTXO_SLOT_SIZE;
+        slots.push(UtxoSlot::from_bytes(&buf[start..start + UTXO_SLOT_SIZE])?);
+    }
+    Ok(slots)
 }
 
 /// Write a single [`UtxoSlot`] at `slot_index` within the record at `record_offset`.
@@ -462,7 +515,7 @@ pub fn write_utxo_slot(
     let total_size = align_up(intra_offset + UTXO_SLOT_SIZE, align);
 
     let mut buf = AlignedBuf::new(total_size, align);
-    // Read-modify-write: 69 bytes is always less than a 4096 block.
+    // Read-modify-write: one slot is always less than a 4096 block.
     device.pread_exact_at(&mut buf, aligned_base)?;
 
     let mut slot_bytes = [0u8; UTXO_SLOT_SIZE];
@@ -675,6 +728,16 @@ mod tests {
 
         let results = read_utxo_slots(&*dev, 0, &[]).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn read_all_utxo_slots_batch_reads_full_slot_region() {
+        let dev = test_device();
+        let (_, slots) = create_test_record(&*dev, 0, 10);
+
+        let results = read_all_utxo_slots(&*dev, 0, 10).unwrap();
+        assert_eq!(results, slots);
+        assert!(read_all_utxo_slots(&*dev, 0, 0).unwrap().is_empty());
     }
 
     #[test]

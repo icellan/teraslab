@@ -2,9 +2,80 @@
 
 use crate::observability::ObservabilityConfig;
 use serde::Deserialize;
+use std::fmt;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use thiserror::Error;
+
+/// A bearer string (admin token, cluster secret) whose `Debug` impl never
+/// prints the raw bytes — only `"<redacted, len=N>"`.
+///
+/// Prevents accidental leaks via `tracing::debug!(?config, ...)` or panic
+/// messages that format the whole struct. See F-G10-007 in the audit.
+///
+/// Equality follows the inner string for config tests; the `Debug` impl is
+/// the only piece that diverges from `String`. Note: equality is *not*
+/// constant-time — that property only matters for HTTP/wire-side compares
+/// (see `subtle` crate usage in the HTTP middleware), not for config
+/// validation, which runs once at startup.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    /// Wrap a raw secret string. Empty strings are allowed at this layer —
+    /// emptiness is enforced by [`ServerConfig::validate_safe_defaults`].
+    pub fn new<S: Into<String>>(s: S) -> Self {
+        Self(s.into())
+    }
+
+    /// Whether the wrapped secret is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Length of the wrapped secret in bytes (`String::len` semantics).
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Borrow the inner secret as `&str`. Used by the HMAC/auth wiring; the
+    /// `Debug` redaction is the only protection — callers must not log this.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Borrow the inner secret bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<redacted, len={}>", self.0.len())
+    }
+}
+
+impl<'de> Deserialize<'de> for Secret {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Secret)
+    }
+}
+
+impl From<String> for Secret {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
 
 /// Errors produced when validating a [`ServerConfig`] before startup.
 ///
@@ -56,15 +127,18 @@ pub enum ConfigError {
         addr: String,
     },
 
-    /// Cluster mode was enabled (RF > 1) without a `cluster_secret`.
+    /// Cluster mode was enabled without a `cluster_secret`.
     ///
-    /// With RF > 1 every replica/topology/migration frame is authority-bearing
-    /// inter-node traffic; without an HMAC secret any peer that can connect can
-    /// inject those frames.
+    /// With clustering enabled, every SWIM/topology/migration frame is
+    /// authority-bearing inter-node traffic; without an HMAC secret any peer
+    /// that can connect can inject those frames. RF > 1 is also rejected
+    /// because replication traffic is authority-bearing even if `node_id`
+    /// was misconfigured as 0.
     #[error(
-        "replication_factor = {rf} (> 1) requires a non-empty cluster_secret to authenticate \
-         inter-node SWIM messages and cluster control frames; either set cluster_secret in \
-         config or lower replication_factor to 1"
+        "cluster mode or replication_factor = {rf} requires a non-empty cluster_secret to \
+         authenticate inter-node SWIM messages and cluster control frames; either set \
+         cluster_secret in config or run true single-node mode (node_id = 0, \
+         replication_factor = 1)"
     )]
     ClusterSecretRequired {
         /// The configured replication factor.
@@ -88,6 +162,73 @@ pub enum ConfigError {
          export TERASLAB_ADMIN_TOKEN, or set enable_admin_endpoints = false"
     )]
     AdminTokenRequired,
+
+    /// `device_paths` was empty. The startup path indexes `device_paths[0]`
+    /// to derive the redo log path and cluster state path; an empty vec
+    /// would panic. See F-G10-004.
+    #[error(
+        "device_paths must contain at least one path; the default \
+         \"teraslab-data.dat\" is used when no TOML override is provided"
+    )]
+    NoDevicePaths,
+
+    /// `advertise_addr` does not parse as `host:port` (only checked when set).
+    /// See F-G10-013.
+    #[error(
+        "advertise_addr {addr:?} is not a valid host:port (parse error: {source}); \
+         use e.g. \"192.168.1.10:3300\""
+    )]
+    InvalidAdvertiseAddr {
+        /// The raw address string that failed to parse.
+        addr: String,
+        /// Underlying parse error.
+        source: std::net::AddrParseError,
+    },
+
+    /// `--strict-auth` was set (or `strict_auth = true` in TOML) and the
+    /// multi-node configuration is missing a `cluster_secret`. See F-X-001
+    /// for the full threat-model rationale.
+    #[error(
+        "strict_auth = true (or --strict-auth) requires a non-empty cluster_secret in \
+         multi-node configurations (node_id > 0 OR replication_factor > 1), found none. \
+         Either drop --strict-auth to fall back to trusted-overlay defaults (a security \
+         warning will be logged) or provide cluster_secret"
+    )]
+    StrictAuthRequiresSecret,
+
+    /// One of the sizing knobs is zero, not a power of 2 where required, or
+    /// otherwise out of range. See F-G10-005.
+    #[error("invalid sizing config: {0}")]
+    InvalidSizing(String),
+
+    /// `cluster_secret` was set but is shorter than the minimum required
+    /// entropy (16 bytes / 128 bits). See F-G10-011.
+    #[error(
+        "cluster_secret is {actual} bytes; minimum required is {min} bytes to give \
+         the HMAC enough entropy against an attacker who can speak SWIM/replication. \
+         Use `openssl rand -base64 24` or similar to generate one"
+    )]
+    ClusterSecretTooShort {
+        /// Actual length of the configured secret in bytes.
+        actual: usize,
+        /// Minimum required length in bytes.
+        min: usize,
+    },
+
+    /// `admin_token` was set but is shorter than the minimum required length
+    /// when both `enable_admin_endpoints` and `enable_remote_bind` are on.
+    /// See F-G10-010.
+    #[error(
+        "admin_token is {actual} bytes; minimum required is {min} bytes when both \
+         enable_admin_endpoints and enable_remote_bind are true (remote-reachable \
+         admin surface). Use `openssl rand -base64 24` or similar to generate one"
+    )]
+    AdminTokenTooShort {
+        /// Actual length of the configured token in bytes.
+        actual: usize,
+        /// Minimum required length in bytes.
+        min: usize,
+    },
 }
 
 /// Parse the host portion of an `addr` string of the form `host:port`.
@@ -103,6 +244,18 @@ fn parse_usize_env(name: &str) -> std::result::Result<Option<usize>, String> {
         Ok(raw) if raw.trim().is_empty() => Ok(None),
         Ok(raw) => raw
             .parse::<usize>()
+            .map(Some)
+            .map_err(|e| format!("{name} must be a non-negative integer: {e}")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(format!("{name} could not be read: {e}")),
+    }
+}
+
+fn parse_u64_env(name: &str) -> std::result::Result<Option<u64>, String> {
+    match std::env::var(name) {
+        Ok(raw) if raw.trim().is_empty() => Ok(None),
+        Ok(raw) => raw
+            .parse::<u64>()
             .map(Some)
             .map_err(|e| format!("{name} must be a non-negative integer: {e}")),
         Err(std::env::VarError::NotPresent) => Ok(None),
@@ -268,6 +421,14 @@ pub struct ServerConfig {
     /// Maximum concurrent client connections.
     pub max_connections: usize,
 
+    /// Maximum cumulative payload bytes accepted for one streaming blob
+    /// upload on a single connection before the stream is aborted.
+    pub max_stream_total_bytes: u64,
+
+    /// Maximum aggregate request-frame bytes allowed in flight across all
+    /// TCP connection threads. A value of 0 disables the aggregate cap.
+    pub max_inflight_request_bytes: usize,
+
     /// HTTP listen address for observability endpoints (metrics, health, debug).
     pub http_listen_addr: String,
 
@@ -305,7 +466,10 @@ pub struct ServerConfig {
     /// [`ConfigError::AdminTokenRequired`] and the server refuses to start.
     /// When `enable_admin_endpoints = false`, this field is ignored: the
     /// gated sub-router is never built so there is nothing to authenticate.
-    pub admin_token: Option<String>,
+    ///
+    /// Wrapped in [`Secret`] so debug-formatting the whole config does not
+    /// leak the token to logs / OTLP traces. See F-G10-007.
+    pub admin_token: Option<Secret>,
 
     /// Block height retention for DAH evaluation.
     pub block_height_retention: u32,
@@ -330,8 +494,16 @@ pub struct ServerConfig {
     /// SWIM suspicion timeout in milliseconds.
     pub swim_suspicion_timeout_ms: u64,
 
+    /// Topology proposal timeout in milliseconds. `0` means derive from
+    /// `max(swim_probe_interval_ms * 3, 500)`.
+    pub topology_propose_timeout_ms: u64,
+
     /// Directory for external blob storage (large transaction cold data).
-    pub blobstore_path: String,
+    ///
+    /// Default `./teraslab-blobstore` (per F-G10-006). Previously defaulted
+    /// to `/blobstore`, which is unwritable for any non-root process and
+    /// caused first-create failures on a fresh deploy.
+    pub blobstore_path: PathBuf,
 
     /// Interval in seconds between periodic orphan-blob garbage-collection
     /// sweeps (R-049). Each tick walks the blob store and deletes any blob
@@ -350,7 +522,24 @@ pub struct ServerConfig {
     /// When set, all SWIM messages and inter-node TCP connections are
     /// authenticated. Peers that cannot produce a valid HMAC are rejected.
     /// All nodes in the cluster must use the same secret.
-    pub cluster_secret: Option<String>,
+    ///
+    /// Wrapped in [`Secret`] so debug-formatting the whole config does not
+    /// leak the secret to logs / OTLP traces. See F-G10-007.
+    pub cluster_secret: Option<Secret>,
+
+    /// When `true`, refuse to start in multi-node configurations
+    /// (`node_id > 0` OR `replication_factor > 1`) without a `cluster_secret`.
+    ///
+    /// Default is `false` (matches the trusted-overlay deployment model
+    /// documented in `docs/DEPLOYMENT_ASSUMPTIONS.md`): a missing secret
+    /// triggers a prominent boot-time `tracing::warn!` instead of a hard
+    /// refuse, so demo / single-host clusters spin up without ceremony but
+    /// operators always see the warning.
+    ///
+    /// Operators that need a hard-mode (production) start with no fallback
+    /// can flip this to `true` via TOML or `--strict-auth` on the daemon
+    /// CLI. See F-X-001.
+    pub strict_auth: bool,
 
     /// Maximum concurrent migration threads per topology change.
     /// Prevents resource exhaustion during rapid churn. Default: 16.
@@ -368,6 +557,14 @@ pub struct ServerConfig {
 
     /// Timeout in milliseconds for each replication batch ACK. Default: 3000.
     pub replication_timeout_ms: u64,
+
+    /// Timeout floor in milliseconds for foreground replication ACKs while
+    /// local migration pressure is active. Default: 30000.
+    ///
+    /// Migration traffic can temporarily contend with live replication on the
+    /// same target links; this knob makes the longer pressure-window timeout
+    /// explicit instead of silently stretching `replication_timeout_ms`.
+    pub replication_timeout_during_migration_ms: u64,
 
     /// Behavior when the replication ACK policy cannot be satisfied.
     ///
@@ -399,12 +596,23 @@ pub struct ServerConfig {
 
     /// Number of records per baseline streaming batch during migration.
     /// Larger batches reduce round-trip overhead but increase memory per batch.
-    /// Default: 100.
+    /// Default: 500.
     pub migration_batch_size: usize,
 
     /// Interval in seconds between replica lag checks. Default: 30.
     /// Set to 0 to disable lag monitoring.
     pub replica_lag_check_interval_secs: u64,
+
+    /// Replica lag threshold, in redo sequences, for warn logs and HTTP
+    /// readiness degradation. Default: 10,000. Set to 0 to log/report lag
+    /// without making `/health/ready` fail.
+    pub replica_lag_warn_threshold_ops: u64,
+
+    /// Maximum MissingPrimary replay failures tolerated during startup
+    /// recovery. MissingPrimary is benign for redo entries superseded by a
+    /// later delete, but a very high count can indicate a wrong device/index
+    /// pairing. Default preserves the historical cap: 65,536.
+    pub recovery_missing_primary_tolerance: u64,
 
     // -- Index backend settings --
     /// Index backend configuration. Controls whether the primary and secondary
@@ -442,6 +650,8 @@ impl Default for ServerConfig {
             lock_stripes: 65536,
             max_batch_size: 8192,
             max_connections: 1024,
+            max_stream_total_bytes: Self::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+            max_inflight_request_bytes: 256 * 1024 * 1024,
             http_listen_addr: "127.0.0.1:9100".to_string(),
             enable_remote_bind: false,
             enable_admin_endpoints: false,
@@ -453,17 +663,22 @@ impl Default for ServerConfig {
             replication_factor: 1,
             swim_probe_interval_ms: 200,
             swim_suspicion_timeout_ms: 5000,
-            blobstore_path: "/blobstore".to_string(),
+            topology_propose_timeout_ms: 0,
+            blobstore_path: PathBuf::from("./teraslab-blobstore"),
             blob_gc_interval_secs: 3600,
             cluster_state_path: None,
             cluster_secret: None,
+            strict_auth: false,
             max_migration_threads: 16,
             ack_policy: "auto".to_string(),
             replication_timeout_ms: 3000,
+            replication_timeout_during_migration_ms: 30000,
             replication_degraded_mode: "reject".to_string(),
             migration_pool_size: 128,
             migration_batch_size: 500,
             replica_lag_check_interval_secs: 30,
+            replica_lag_warn_threshold_ops: 10_000,
+            recovery_missing_primary_tolerance: 65_536,
             index: IndexConfig::default(),
             device_id: None,
             observability: ObservabilityConfig::default(),
@@ -474,6 +689,8 @@ impl Default for ServerConfig {
 impl ServerConfig {
     pub const ENV_MIGRATION_POOL_SIZE: &'static str = "TERASLAB_MIGRATION_POOL_SIZE";
     pub const ENV_MIGRATION_BATCH_SIZE: &'static str = "TERASLAB_MIGRATION_BATCH_SIZE";
+    pub const ENV_MAX_STREAM_TOTAL_BYTES: &'static str = "TERASLAB_MAX_STREAM_TOTAL_BYTES";
+    pub const DEFAULT_MAX_STREAM_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
     /// Environment variable that overrides [`Self::admin_token`]. When the
     /// env var is set to a non-empty value it replaces any TOML-configured
@@ -487,13 +704,34 @@ impl ServerConfig {
         self.node_id > 0
     }
 
+    /// Resolve the topology proposal timeout used by non-proposer nodes
+    /// waiting for the deterministic proposer to broadcast a term.
+    pub fn resolved_topology_propose_timeout_ms(&self) -> u64 {
+        if self.topology_propose_timeout_ms == 0 {
+            self.swim_probe_interval_ms.saturating_mul(3).max(500)
+        } else {
+            self.topology_propose_timeout_ms
+        }
+    }
+
     /// Resolve the redo log file path. Uses `redo_log_path` if explicitly set,
     /// otherwise derives it from the first device path by appending `.redo`.
+    ///
+    /// When `redo_log_path` is `None` and `device_paths` is empty (a
+    /// misconfiguration that `validate_safe_defaults` rejects with
+    /// `ConfigError::NoDevicePaths`), this falls back to the built-in
+    /// default `teraslab-data.dat.redo` rather than panicking. The
+    /// validation gate is the source of truth — see F-G10-004.
     pub fn resolved_redo_log_path(&self) -> PathBuf {
         match &self.redo_log_path {
             Some(p) => p.clone(),
             None => {
-                let mut p = self.device_paths[0].clone().into_os_string();
+                let base = self
+                    .device_paths
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| PathBuf::from("teraslab-data.dat"));
+                let mut p = base.into_os_string();
                 p.push(".redo");
                 PathBuf::from(p)
             }
@@ -502,11 +740,19 @@ impl ServerConfig {
 
     /// Resolve the cluster state file path. Uses `cluster_state_path` if set,
     /// otherwise derives from the first device path by appending `.cluster`.
+    ///
+    /// Same fallback story as [`Self::resolved_redo_log_path`] when
+    /// `device_paths` is empty — `validate_safe_defaults` is the gate.
     pub fn resolved_cluster_state_path(&self) -> PathBuf {
         match &self.cluster_state_path {
             Some(p) => p.clone(),
             None => {
-                let mut p = self.device_paths[0].clone().into_os_string();
+                let base = self
+                    .device_paths
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| PathBuf::from("teraslab-data.dat"));
+                let mut p = base.into_os_string();
                 p.push(".cluster");
                 PathBuf::from(p)
             }
@@ -523,11 +769,15 @@ impl ServerConfig {
             "write_all" => Some(AckPolicy::WriteAll),
             "write_majority" => Some(AckPolicy::WriteMajority),
             "best_effort" => None,
-            _ => match self.replication_factor {
+            "auto" => match self.replication_factor {
                 0 | 1 => None,
                 2 => Some(AckPolicy::WriteAll),
                 _ => Some(AckPolicy::WriteMajority),
             },
+            // `validate_cluster_safety` rejects this before startup. Keep the
+            // runtime fallback conservative for callers that resolve before
+            // validating.
+            _ => Some(AckPolicy::WriteAll),
         }
     }
 
@@ -549,12 +799,38 @@ impl ServerConfig {
     /// — the runtime signal emitted when RF > 1 best-effort is *not* in use
     /// but individual best-effort paths fall back because replicas ACK-failed.
     pub fn validate_cluster_safety(&self) -> std::result::Result<(), String> {
+        match self.ack_policy.as_str() {
+            "auto" | "write_all" | "write_majority" | "best_effort" => {}
+            other => {
+                return Err(format!(
+                    "unknown ack_policy {other:?}: expected \"auto\", \"write_all\", \
+                     \"write_majority\", or \"best_effort\"",
+                ));
+            }
+        }
+        match self.replication_degraded_mode.as_str() {
+            "reject" | "best_effort" => {}
+            other => {
+                return Err(format!(
+                    "unknown replication_degraded_mode {other:?}: expected \"reject\" or \"best_effort\"",
+                ));
+            }
+        }
         if self.replication_factor > 1 && self.replication_degraded_mode == "best_effort" {
             return Err(format!(
                 "replication_degraded_mode = \"best_effort\" is not allowed with \
                  replication_factor = {} (> 1): acknowledged writes could be lost \
                  if the master crashes before replicas catch up. Either set \
                  replication_degraded_mode = \"reject\" or lower replication_factor to 1.",
+                self.replication_factor,
+            ));
+        }
+        if self.replication_factor > 1 && self.ack_policy == "best_effort" {
+            return Err(format!(
+                "ack_policy = \"best_effort\" is not allowed with replication_factor = {} (> 1): \
+                 it disables replica ACK enforcement and can acknowledge writes with zero durable \
+                 replicas. Use \"auto\", \"write_all\", or \"write_majority\", or lower \
+                 replication_factor to 1.",
                 self.replication_factor,
             ));
         }
@@ -599,6 +875,7 @@ impl ServerConfig {
     /// Apply all `TERASLAB_*` environment overrides to runtime config.
     pub fn apply_env_overrides(&mut self) -> std::result::Result<(), String> {
         self.apply_migration_env_overrides()?;
+        self.apply_stream_env_overrides()?;
         self.apply_observability_env_overrides()?;
         self.apply_admin_token_env_override();
         Ok(())
@@ -624,7 +901,7 @@ impl ServerConfig {
                 self.admin_token = None;
             }
             Ok(raw) => {
-                self.admin_token = Some(raw);
+                self.admin_token = Some(Secret::new(raw));
             }
             Err(_) => {
                 // Env var not set / not unicode — preserve TOML value.
@@ -643,6 +920,15 @@ impl ServerConfig {
         }
         if let Some(value) = parse_usize_env(Self::ENV_MIGRATION_BATCH_SIZE)? {
             self.migration_batch_size = value;
+        }
+        Ok(())
+    }
+
+    /// Apply `TERASLAB_MAX_STREAM_TOTAL_BYTES` to the per-connection streaming
+    /// upload cap.
+    pub fn apply_stream_env_overrides(&mut self) -> std::result::Result<(), String> {
+        if let Some(value) = parse_u64_env(Self::ENV_MAX_STREAM_TOTAL_BYTES)? {
+            self.max_stream_total_bytes = value;
         }
         Ok(())
     }
@@ -679,10 +965,11 @@ impl ServerConfig {
     ///    mTLS wave lands, the binary protocol and HTTP admin endpoints have
     ///    no per-connection authentication, so binding a routable interface
     ///    is only safe on a private/audited network with the explicit opt-in.
-    /// 3. `replication_factor > 1` requires a non-empty `cluster_secret`.
-    ///    Cluster mode keys SWIM (and increasingly the other inter-node frames)
-    ///    on the shared secret; an empty secret means anyone reachable on the
-    ///    SWIM port can spoof membership/topology messages.
+    /// 3. Cluster mode (`node_id > 0`) or `replication_factor > 1` requires a
+    ///    non-empty `cluster_secret`. Cluster mode keys SWIM and inter-node
+    ///    TCP frames on the shared secret; an empty secret means anyone
+    ///    reachable on those ports can spoof membership, topology,
+    ///    replication, or migration messages.
     /// 4. `enable_admin_endpoints = true` requires a non-empty `admin_token`
     ///    (TOML field or `TERASLAB_ADMIN_TOKEN` env override). Without a
     ///    token the mutating `/admin/*` and `/debug/*` surface would be
@@ -691,6 +978,16 @@ impl ServerConfig {
     /// Errors are returned as a [`ConfigError`] enum so callers can map them to
     /// startup-fatal codes.
     pub fn validate_safe_defaults(&self) -> std::result::Result<(), ConfigError> {
+        // (0a) device_paths must be non-empty (resolve_redo_log_path / cluster
+        // state path index `[0]` unconditionally). See F-G10-004.
+        if self.device_paths.is_empty() {
+            return Err(ConfigError::NoDevicePaths);
+        }
+
+        // (0b) Size sanity gates. Pre-fix `device_alignment = 0` or
+        // non-power-of-2 `lock_stripes` produced cryptic runtime panics.
+        self.validate_sizes()?;
+
         // (1) + (2): listen_addr.
         let listen_ip =
             parse_bind_host(&self.listen_addr).map_err(|e| ConfigError::InvalidListenAddr {
@@ -718,16 +1015,45 @@ impl ServerConfig {
             });
         }
 
-        // (3) RF>1 requires a cluster_secret.
-        if self.replication_factor > 1
-            && self
-                .cluster_secret
-                .as_ref()
-                .map(|s| s.is_empty())
-                .unwrap_or(true)
+        // (2b) advertise_addr (when set) must parse — pre-fix the daemon
+        // bin called `.expect("invalid advertise_addr")` post-validation,
+        // turning misconfig into a cryptic panic. See F-G10-013.
+        if let Some(ref adv) = self.advertise_addr {
+            adv.parse::<std::net::SocketAddr>()
+                .map_err(|e| ConfigError::InvalidAdvertiseAddr {
+                    addr: adv.clone(),
+                    source: e,
+                })?;
+        }
+
+        // (3) Cluster/SWIM mode or RF>1 requires a cluster_secret.
+        //
+        // Per the trusted-overlay deployment model (see
+        // `docs/DEPLOYMENT_ASSUMPTIONS.md`) the default behaviour is
+        // fail-open with a startup warning logged from the daemon binary —
+        // hard rejection only happens when the operator opts into
+        // `strict_auth = true` (or `--strict-auth`). See F-X-001.
+        let multi_node = self.is_clustered() || self.replication_factor > 1;
+        let cluster_secret_missing = self
+            .cluster_secret
+            .as_ref()
+            .map(|s| s.is_empty())
+            .unwrap_or(true);
+        if multi_node && cluster_secret_missing && self.strict_auth {
+            return Err(ConfigError::StrictAuthRequiresSecret);
+        }
+
+        // (3b) cluster_secret entropy. Even in non-strict mode an explicit
+        // short secret is rejected — a 1-byte secret is a typo, not a
+        // deployment choice, and the HMAC offers no protection at that
+        // length. See F-G10-011.
+        if let Some(ref s) = self.cluster_secret
+            && !s.is_empty()
+            && s.len() < Self::MIN_CLUSTER_SECRET_LEN
         {
-            return Err(ConfigError::ClusterSecretRequired {
-                rf: self.replication_factor,
+            return Err(ConfigError::ClusterSecretTooShort {
+                actual: s.len(),
+                min: Self::MIN_CLUSTER_SECRET_LEN,
             });
         }
 
@@ -743,6 +1069,92 @@ impl ServerConfig {
                 .unwrap_or(true)
         {
             return Err(ConfigError::AdminTokenRequired);
+        }
+
+        // (4b) When the admin surface is reachable over a network
+        // (`enable_admin_endpoints && enable_remote_bind`), the token must
+        // carry enough entropy. A 1-char token over the public internet is
+        // brute-forceable in milliseconds. See F-G10-010.
+        if self.enable_admin_endpoints && self.enable_remote_bind
+            && let Some(ref t) = self.admin_token
+            && !t.is_empty()
+            && t.len() < Self::MIN_REMOTE_ADMIN_TOKEN_LEN
+        {
+            return Err(ConfigError::AdminTokenTooShort {
+                actual: t.len(),
+                min: Self::MIN_REMOTE_ADMIN_TOKEN_LEN,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Minimum length (in bytes) for `cluster_secret` when set. 16 bytes ≈
+    /// 128 bits of entropy from a properly random source — the same lower
+    /// bound the audit recommends in F-G10-011.
+    pub const MIN_CLUSTER_SECRET_LEN: usize = 16;
+
+    /// Minimum length (in bytes) for `admin_token` when both
+    /// `enable_admin_endpoints` and `enable_remote_bind` are on. See
+    /// F-G10-010.
+    pub const MIN_REMOTE_ADMIN_TOKEN_LEN: usize = 16;
+
+    /// Validate the size / cardinality knobs. Pre-fix these passed through
+    /// with `0` / `usize::MAX` / non-power-of-2 values and produced runtime
+    /// panics or cryptic errors (divide-by-zero in alignment math, overflow
+    /// in hashtable capacity). See F-G10-005.
+    pub fn validate_sizes(&self) -> std::result::Result<(), ConfigError> {
+        fn pow2(name: &str, v: usize) -> std::result::Result<(), ConfigError> {
+            if v == 0 || !v.is_power_of_two() {
+                return Err(ConfigError::InvalidSizing(format!(
+                    "{name} = {v} must be a non-zero power of two"
+                )));
+            }
+            Ok(())
+        }
+        fn nonzero_usize(name: &str, v: usize) -> std::result::Result<(), ConfigError> {
+            if v == 0 {
+                return Err(ConfigError::InvalidSizing(format!(
+                    "{name} must be non-zero"
+                )));
+            }
+            Ok(())
+        }
+        fn nonzero_u32(name: &str, v: u32) -> std::result::Result<(), ConfigError> {
+            if v == 0 {
+                return Err(ConfigError::InvalidSizing(format!(
+                    "{name} must be non-zero"
+                )));
+            }
+            Ok(())
+        }
+        fn nonzero_u64(name: &str, v: u64) -> std::result::Result<(), ConfigError> {
+            if v == 0 {
+                return Err(ConfigError::InvalidSizing(format!(
+                    "{name} must be non-zero"
+                )));
+            }
+            Ok(())
+        }
+
+        pow2("device_alignment", self.device_alignment)?;
+        pow2("lock_stripes", self.lock_stripes)?;
+        nonzero_u64("device_size", self.device_size)?;
+        nonzero_u64("redo_log_size", self.redo_log_size)?;
+        nonzero_usize("expected_records", self.expected_records)?;
+        nonzero_u32("max_batch_size", self.max_batch_size)?;
+        nonzero_usize("max_connections", self.max_connections)?;
+
+        // device_size must be large enough to hold at least one record's
+        // worth of data; the runtime allocator otherwise hits a divide-by-
+        // zero. Use UTXO_SLOT_SIZE+METADATA_SIZE as the lower bound here.
+        const MIN_DEVICE_SIZE: u64 = (crate::record::METADATA_SIZE
+            + crate::record::UTXO_SLOT_SIZE) as u64;
+        if self.device_size < MIN_DEVICE_SIZE {
+            return Err(ConfigError::InvalidSizing(format!(
+                "device_size = {} is below the minimum {} bytes (one record header + slot)",
+                self.device_size, MIN_DEVICE_SIZE
+            )));
         }
 
         Ok(())
@@ -905,6 +1317,22 @@ backend = ""
     }
 
     #[test]
+    fn ack_policy_best_effort_requires_degraded_mode_best_effort() {
+        let cfg = ServerConfig {
+            node_id: 7,
+            replication_factor: 3,
+            ack_policy: "best_effort".to_string(),
+            replication_degraded_mode: "reject".to_string(),
+            ..ServerConfig::default()
+        };
+
+        let err = cfg.validate_cluster_safety().unwrap_err();
+        assert!(err.contains("ack_policy"), "error was: {err}");
+        assert!(err.contains("best_effort"), "error was: {err}");
+        assert!(err.contains("replication_factor = 3"), "error was: {err}");
+    }
+
+    #[test]
     fn best_effort_with_rf_1_is_accepted() {
         // RF=1 means no replicas — best_effort is a no-op and permitted.
         let cfg = ServerConfig {
@@ -932,6 +1360,31 @@ backend = ""
     }
 
     #[test]
+    fn unknown_ack_policy_is_rejected() {
+        let cfg = ServerConfig {
+            ack_policy: "write_quorumish".to_string(),
+            ..ServerConfig::default()
+        };
+
+        let err = cfg.validate_cluster_safety().unwrap_err();
+        assert!(err.contains("unknown ack_policy"), "error was: {err}");
+    }
+
+    #[test]
+    fn unknown_replication_degraded_mode_is_rejected() {
+        let cfg = ServerConfig {
+            replication_degraded_mode: "maybe".to_string(),
+            ..ServerConfig::default()
+        };
+
+        let err = cfg.validate_cluster_safety().unwrap_err();
+        assert!(
+            err.contains("unknown replication_degraded_mode"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
     fn default_config_validates_cluster_safety() {
         let cfg = ServerConfig::default();
         cfg.validate_cluster_safety()
@@ -943,6 +1396,31 @@ backend = ""
         let cfg = ServerConfig::default();
         assert_eq!(cfg.migration_pool_size, 128);
         assert_eq!(cfg.migration_batch_size, 500);
+    }
+
+    #[test]
+    fn default_replica_lag_threshold_is_configured() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.replica_lag_check_interval_secs, 30);
+        assert_eq!(cfg.replica_lag_warn_threshold_ops, 10_000);
+        assert_eq!(cfg.recovery_missing_primary_tolerance, 65_536);
+        assert_eq!(cfg.max_inflight_request_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn topology_propose_timeout_can_be_decoupled_from_probe_interval() {
+        let auto_fast_probe = ServerConfig {
+            swim_probe_interval_ms: 10,
+            ..ServerConfig::default()
+        };
+        assert_eq!(auto_fast_probe.resolved_topology_propose_timeout_ms(), 500);
+
+        let explicit = ServerConfig {
+            swim_probe_interval_ms: 10,
+            topology_propose_timeout_ms: 2_500,
+            ..ServerConfig::default()
+        };
+        assert_eq!(explicit.resolved_topology_propose_timeout_ms(), 2_500);
     }
 
     #[test]
@@ -1008,6 +1486,12 @@ backend = ""
         }
     }
 
+    fn clear_stream_env() {
+        unsafe {
+            std::env::remove_var(ServerConfig::ENV_MAX_STREAM_TOTAL_BYTES);
+        }
+    }
+
     #[test]
     fn migration_env_overrides_replace_toml_values() {
         let _guard = obs_env_guard();
@@ -1029,6 +1513,46 @@ backend = ""
         assert_eq!(cfg.migration_pool_size, 256);
         assert_eq!(cfg.migration_batch_size, 2048);
         clear_migration_env();
+    }
+
+    #[test]
+    fn max_stream_total_bytes_env_override_respected() {
+        let _guard = obs_env_guard();
+        clear_stream_env();
+
+        let mut cfg = ServerConfig {
+            max_stream_total_bytes: 4096,
+            ..ServerConfig::default()
+        };
+        unsafe {
+            std::env::set_var(ServerConfig::ENV_MAX_STREAM_TOTAL_BYTES, "2048");
+        }
+
+        cfg.apply_stream_env_overrides()
+            .expect("stream env override applies cleanly");
+
+        assert_eq!(cfg.max_stream_total_bytes, 2048);
+        clear_stream_env();
+    }
+
+    #[test]
+    fn max_stream_total_bytes_empty_env_leaves_config_unchanged() {
+        let _guard = obs_env_guard();
+        clear_stream_env();
+
+        let mut cfg = ServerConfig {
+            max_stream_total_bytes: 4096,
+            ..ServerConfig::default()
+        };
+        unsafe {
+            std::env::set_var(ServerConfig::ENV_MAX_STREAM_TOTAL_BYTES, " ");
+        }
+
+        cfg.apply_stream_env_overrides()
+            .expect("empty stream env override is ignored");
+
+        assert_eq!(cfg.max_stream_total_bytes, 4096);
+        clear_stream_env();
     }
 
     #[test]
@@ -1285,14 +1809,30 @@ cluster_secret = "0123456789abcdef"
     }
 
     #[test]
-    fn rf_one_without_cluster_secret_is_accepted() {
+    fn cluster_mode_requires_secret_regardless_of_rf() {
         let toml_str = r#"
 node_id = 1
 replication_factor = 1
 "#;
         let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        let err = cfg
+            .validate_safe_defaults()
+            .expect_err("node_id>0 with no cluster_secret must be rejected even at RF=1");
+        match err {
+            ConfigError::ClusterSecretRequired { rf } => assert_eq!(rf, 1),
+            other => panic!("expected ClusterSecretRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_node_rf_one_without_cluster_secret_is_accepted() {
+        let toml_str = r#"
+node_id = 0
+replication_factor = 1
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
         cfg.validate_safe_defaults()
-            .expect("RF=1 needs no cluster_secret");
+            .expect("true single-node mode needs no cluster_secret");
     }
 
     #[test]
@@ -1402,7 +1942,7 @@ listen_addr = "not-a-socket-addr"
     fn startup_refuses_when_admin_endpoints_enabled_with_empty_token() {
         let cfg = ServerConfig {
             enable_admin_endpoints: true,
-            admin_token: Some(String::new()),
+            admin_token: Some(Secret::new(String::new())),
             ..ServerConfig::default()
         };
         let err = cfg.validate_safe_defaults().unwrap_err();
@@ -1418,7 +1958,7 @@ listen_addr = "not-a-socket-addr"
     fn admin_endpoints_with_token_validates() {
         let cfg = ServerConfig {
             enable_admin_endpoints: true,
-            admin_token: Some("operator-issued-secret-1234".to_string()),
+            admin_token: Some(Secret::new("operator-issued-secret-1234")),
             ..ServerConfig::default()
         };
         cfg.validate_safe_defaults()
@@ -1457,14 +1997,17 @@ listen_addr = "not-a-socket-addr"
         }
 
         let mut cfg = ServerConfig {
-            admin_token: Some("from-toml".to_string()),
+            admin_token: Some(Secret::new("from-toml")),
             ..ServerConfig::default()
         };
         unsafe {
             std::env::set_var(ServerConfig::ENV_ADMIN_TOKEN, "from-env");
         }
         cfg.apply_admin_token_env_override();
-        assert_eq!(cfg.admin_token.as_deref(), Some("from-env"));
+        assert_eq!(
+            cfg.admin_token.as_ref().map(|s| s.as_str()),
+            Some("from-env"),
+        );
 
         unsafe {
             std::env::remove_var(ServerConfig::ENV_ADMIN_TOKEN);
@@ -1479,7 +2022,7 @@ listen_addr = "not-a-socket-addr"
         }
 
         let mut cfg = ServerConfig {
-            admin_token: Some("from-toml".to_string()),
+            admin_token: Some(Secret::new("from-toml")),
             ..ServerConfig::default()
         };
         unsafe {
@@ -1505,12 +2048,12 @@ listen_addr = "not-a-socket-addr"
         }
 
         let mut cfg = ServerConfig {
-            admin_token: Some("from-toml".to_string()),
+            admin_token: Some(Secret::new("from-toml")),
             ..ServerConfig::default()
         };
         cfg.apply_admin_token_env_override();
         assert_eq!(
-            cfg.admin_token.as_deref(),
+            cfg.admin_token.as_ref().map(|s| s.as_str()),
             Some("from-toml"),
             "missing env var must leave the TOML value untouched",
         );
@@ -1536,7 +2079,10 @@ listen_addr = "not-a-socket-addr"
         }
         cfg.apply_env_overrides()
             .expect("admin-token env override must apply cleanly");
-        assert_eq!(cfg.admin_token.as_deref(), Some("set-via-env"));
+        assert_eq!(
+            cfg.admin_token.as_ref().map(|s| s.as_str()),
+            Some("set-via-env"),
+        );
 
         unsafe {
             std::env::remove_var(ServerConfig::ENV_ADMIN_TOKEN);

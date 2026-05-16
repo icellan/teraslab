@@ -16,6 +16,7 @@ use crate::index::unmined_index::UnminedRedoEntry;
 use crate::redo::{RedoLog, RedoOp};
 use parking_lot::Mutex;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use std::collections::VecDeque;
 use std::path::Path;
 
 /// Forward table: `[height_be(4) || txid(32)]` -> `()`
@@ -23,6 +24,9 @@ const UNMINED_FORWARD: TableDefinition<[u8; 36], ()> = TableDefinition::new("unm
 
 /// Reverse table: `txid(32)` -> `height_le(4)`
 const UNMINED_REVERSE: TableDefinition<[u8; 32], [u8; 4]> = TableDefinition::new("unmined_reverse");
+
+/// Maximum rows materialized by the streaming iterator at once.
+const ITER_BATCH_SIZE: usize = 4096;
 
 /// ReDB-backed unmined secondary index.
 pub struct RedbUnminedIndex {
@@ -296,76 +300,40 @@ impl RedbUnminedIndex {
     /// Much faster than calling [`insert`](Self::insert) in a loop because
     /// only one fsync is performed for the entire batch. No redo entries are
     /// returned (bulk import does not need them).
-    pub fn insert_batch(&mut self, entries: &[(u32, TxKey)]) {
+    pub fn insert_batch(&mut self, entries: &[(u32, TxKey)]) -> Result<(), IndexError> {
         if entries.is_empty() {
-            return;
+            return Ok(());
         }
-        let txn = match self.begin_write() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(err = %e, "redb unmined insert_batch: begin_write failed");
-                return;
-            }
-        };
+        let txn = self.begin_write().map_err(map_txn_err)?;
         let mut new_count = 0usize;
         {
-            let mut fwd = match txn.open_table(UNMINED_FORWARD) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(err = %e, "redb unmined insert_batch: open_table(forward) failed");
-                    return;
-                }
-            };
-            let mut rev = match txn.open_table(UNMINED_REVERSE) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(err = %e, "redb unmined insert_batch: open_table(reverse) failed");
-                    return;
-                }
-            };
+            let mut fwd = txn.open_table(UNMINED_FORWARD).map_err(map_table_err)?;
+            let mut rev = txn.open_table(UNMINED_REVERSE).map_err(map_table_err)?;
 
             for &(height, key) in entries {
                 let mut already_exists = false;
-                match rev.get(key.txid) {
-                    Ok(Some(guard)) => {
-                        let old_height = u32::from_le_bytes(guard.value());
-                        drop(guard);
-                        if old_height == height {
-                            continue;
-                        }
-                        already_exists = true;
-                        if let Err(e) = fwd.remove(make_forward_key(old_height, &key)) {
-                            tracing::warn!(err = %e, "redb unmined insert_batch: remove old forward failed");
-                            return;
-                        }
+                if let Some(guard) = rev.get(key.txid).map_err(map_storage_err)? {
+                    let old_height = u32::from_le_bytes(guard.value());
+                    drop(guard);
+                    if old_height == height {
+                        continue;
                     }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!(err = %e, "redb unmined insert_batch: reverse lookup failed");
-                        return;
-                    }
+                    already_exists = true;
+                    fwd.remove(make_forward_key(old_height, &key))
+                        .map_err(map_storage_err)?;
                 }
                 if !already_exists {
                     new_count += 1;
                 }
-                if let Err(e) = rev.insert(key.txid, height.to_le_bytes()) {
-                    tracing::warn!(err = %e, "redb unmined insert_batch: reverse insert failed");
-                    return;
-                }
-                if let Err(e) = fwd.insert(make_forward_key(height, &key), ()) {
-                    tracing::warn!(err = %e, "redb unmined insert_batch: forward insert failed");
-                    return;
-                }
+                rev.insert(key.txid, height.to_le_bytes())
+                    .map_err(map_storage_err)?;
+                fwd.insert(make_forward_key(height, &key), ())
+                    .map_err(map_storage_err)?;
             }
         }
-        match txn.commit() {
-            Ok(()) => {
-                self.count += new_count;
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, "redb unmined insert_batch: commit failed");
-            }
-        }
+        txn.commit().map_err(map_commit_err)?;
+        self.count += new_count;
+        Ok(())
     }
 
     /// Iterate over all `(height, key)` pairs.
@@ -384,6 +352,39 @@ impl RedbUnminedIndex {
         result
     }
 
+    /// Iterate over all `(height, key)` pairs using bounded batches.
+    pub fn iter_streaming(&self) -> RedbUnminedIter<'_> {
+        RedbUnminedIter {
+            index: self,
+            next_start: Some([0u8; 32]),
+            buffer: VecDeque::new(),
+            finished: false,
+        }
+    }
+
+    fn load_iter_batch(&self, start: [u8; 32]) -> Vec<(u32, TxKey)> {
+        let mut result = Vec::with_capacity(ITER_BATCH_SIZE);
+        if let Ok(txn) = self.db.begin_read()
+            && let Ok(table) = txn.open_table(UNMINED_REVERSE)
+            && let Ok(range) = table.range(start..)
+        {
+            for row in range.take(ITER_BATCH_SIZE) {
+                match row {
+                    Ok((k, v)) => {
+                        let key = TxKey { txid: k.value() };
+                        let height = u32::from_le_bytes(v.value());
+                        result.push((height, key));
+                    }
+                    Err(e) => {
+                        tracing::warn!(err = %e, "redb unmined iter_streaming: row read failed");
+                        break;
+                    }
+                }
+            }
+        }
+        result
+    }
+
     /// Replay a redo entry to bring the index up to date.
     ///
     /// Idempotent: if the redb state already matches the redo entry's
@@ -397,6 +398,53 @@ impl RedbUnminedIndex {
         } else {
             self.insert(entry.new_height, key, None)
         }
+    }
+}
+
+/// Bounded-memory iterator over all entries in a redb unmined index.
+pub struct RedbUnminedIter<'a> {
+    index: &'a RedbUnminedIndex,
+    next_start: Option<[u8; 32]>,
+    buffer: VecDeque<(u32, TxKey)>,
+    finished: bool,
+}
+
+impl RedbUnminedIter<'_> {
+    fn refill(&mut self) {
+        if self.finished || !self.buffer.is_empty() {
+            return;
+        }
+        let Some(start) = self.next_start else {
+            self.finished = true;
+            return;
+        };
+
+        let batch = self.index.load_iter_batch(start);
+        if batch.is_empty() {
+            self.finished = true;
+            self.next_start = None;
+            return;
+        }
+
+        let last_key = batch.last().map(|(_, key)| key.txid);
+        self.buffer = batch.into();
+        self.next_start = last_key.and_then(next_lexicographic_key);
+        if self.next_start.is_none() {
+            self.finished = true;
+        }
+    }
+}
+
+impl Iterator for RedbUnminedIter<'_> {
+    type Item = (u32, TxKey);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.refill();
+        self.buffer.pop_front()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.buffer.len(), None)
     }
 }
 
@@ -433,6 +481,17 @@ fn map_storage_err(e: redb::StorageError) -> IndexError {
     IndexError::FormatError {
         detail: format!("redb storage error (unmined): {e}"),
     }
+}
+
+fn next_lexicographic_key(mut key: [u8; 32]) -> Option<[u8; 32]> {
+    for byte in key.iter_mut().rev() {
+        if *byte != u8::MAX {
+            *byte += 1;
+            return Some(key);
+        }
+        *byte = 0;
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -590,7 +649,7 @@ mod tests {
     fn insert_batch_basic() {
         let (_dir, mut idx) = open_temp();
         let entries: Vec<_> = (1..=10u8).map(|n| (n as u32 * 100, key(n))).collect();
-        idx.insert_batch(&entries);
+        idx.insert_batch(&entries).unwrap();
         assert_eq!(idx.len(), 10);
 
         let result = idx.range_query(1000);
@@ -604,7 +663,7 @@ mod tests {
             (100, key(1)),
             (200, key(1)), // same key, different height
         ];
-        idx.insert_batch(&entries);
+        idx.insert_batch(&entries).unwrap();
         assert_eq!(idx.len(), 1);
 
         // Should be at height 200
@@ -615,7 +674,7 @@ mod tests {
     #[test]
     fn insert_batch_empty() {
         let (_dir, mut idx) = open_temp();
-        idx.insert_batch(&[]);
+        idx.insert_batch(&[]).unwrap();
         assert_eq!(idx.len(), 0);
     }
 
@@ -636,7 +695,7 @@ mod tests {
             RedbUnminedIndex::open(dir2.path().join("unmined.redb").as_path(), 16 * 1024 * 1024)
                 .unwrap();
         let entries: Vec<_> = (1..=20u8).map(|n| (n as u32 * 100, key(n))).collect();
-        idx2.insert_batch(&entries);
+        idx2.insert_batch(&entries).unwrap();
 
         assert_eq!(idx1.len(), idx2.len());
         let r1 = idx1.range_query(2000);

@@ -220,11 +220,11 @@ pub const ERR_MIGRATION_IN_PROGRESS: u16 = 19;
 /// the durability contract (RF copies) was not satisfied.
 pub const ERR_REPLICATION_FAILED: u16 = 20;
 
-/// OP_MIGRATION_COMPLETE arrived with `record_count > 0` but no manifest
-/// hash / exact-manifest entries. Safety: without the hash, we cannot
-/// verify every received record matches the source's contents, so a
-/// malformed or stale frame could mark a non-empty shard migrated
-/// prematurely. Sources must include a manifest when the shard has data.
+/// OP_MIGRATION_COMPLETE arrived without a manifest hash / exact-manifest
+/// entries. Safety: without the hash, we cannot verify every received
+/// record matches the source's contents, so a malformed or stale frame
+/// could mark a shard migrated prematurely. Sources must include a
+/// manifest even for empty shards.
 pub const ERR_MIGRATION_MANIFEST_REQUIRED: u16 = 21;
 
 /// OP_MIGRATION_COMPLETE carried a manifest hash that did not match the
@@ -267,6 +267,13 @@ pub const ERR_CLUSTER_NOT_READY: u16 = 25;
 /// the underlying I/O / device error and restart the node so the secondary
 /// rebuild can be re-attempted.
 pub const ERR_INDEX_DEGRADED: u16 = 26;
+
+/// Inter-node request or response frame failed HMAC authentication.
+///
+/// Returned only on cluster-control/replication sockets when a node is
+/// configured with `cluster_secret` and the peer sends an unsigned,
+/// malformed, stale, or wrongly-signed frame.
+pub const ERR_CLUSTER_AUTH_FAILED: u16 = 27;
 
 // Streaming errors
 /// Blob stream not found for the given txid on this connection.
@@ -356,6 +363,23 @@ pub const FLAG_MIGRATION_VERIFY_ONLY: u16 = 0x0004;
 /// server maintains a stable memory budget.
 pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 
+/// Opcodes that carry cluster authority and therefore require HMAC framing
+/// whenever a `cluster_secret` is configured.
+pub fn is_inter_node_auth_opcode(op_code: u16) -> bool {
+    matches!(
+        op_code,
+        OP_GET_PARTITION_MAP
+            | OP_GET_COMMITTED_TOPOLOGY
+            | OP_REPLICA_BATCH
+            | OP_MIGRATION_COMPLETE
+            | OP_MIGRATION_BATCH_COMPLETE
+            | OP_TOPOLOGY_PROPOSE
+            | OP_TOPOLOGY_VOTE
+            | OP_TOPOLOGY_COMMIT
+            | OP_PARTITION_VERSION_REPORT
+    )
+}
+
 /// R-089 (GH-13): per-item upper bound on the `cold_data` payload inside
 /// a `OP_CREATE_BATCH` frame.
 ///
@@ -370,3 +394,19 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 /// the per-item allocation at a predictable headroom while still
 /// permitting the largest legitimate transactions.
 pub const MAX_COLD_DATA_PER_ITEM: u32 = 4 * 1024 * 1024;
+
+/// R-090: maximum UTXO hashes accepted in one `OP_CREATE_BATCH` item.
+///
+/// The outer frame cap already prevents truly unbounded input, but without
+/// a named per-item ceiling one create item can still reserve a multi-megabyte
+/// `Vec<[u8; 32]>` before the engine applies any semantic validation. 131,072
+/// outputs consumes 4 MiB of hash storage and is far above normal transaction
+/// fanout while keeping per-item memory predictable.
+pub const MAX_UTXO_HASHES_PER_CREATE_ITEM: u32 = 131_072;
+
+/// R-090: maximum conflicting-parent txids accepted in one create item.
+///
+/// Parent lists are only used for conflicting-child bookkeeping. A 65,536 item
+/// cap still permits pathological conflict fanout while bounding the decoder's
+/// pre-allocation to 2 MiB per create item.
+pub const MAX_PARENT_TXIDS_PER_CREATE_ITEM: u32 = 65_536;

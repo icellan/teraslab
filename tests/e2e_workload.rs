@@ -158,6 +158,7 @@ fn e2e_concurrent_10_threads_zero_mismatches() {
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                external_ref: None,
                 parent_txids: &[],
             })
             .unwrap();
@@ -364,6 +365,7 @@ fn realistic_block_reorg() {
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                external_ref: None,
                 parent_txids: &[],
             })
             .unwrap();
@@ -494,6 +496,7 @@ fn realistic_large_transaction() {
             frozen: false,
             conflicting: false,
             locked: false,
+            external_ref: None,
             parent_txids: &[],
         })
         .unwrap();
@@ -563,6 +566,7 @@ fn tiered_storage_mixed_workload() {
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                external_ref: None,
                 parent_txids: &[],
             })
             .unwrap();
@@ -594,6 +598,7 @@ fn tiered_storage_mixed_workload() {
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                external_ref: None,
                 parent_txids: &[],
             })
             .unwrap();
@@ -682,6 +687,7 @@ fn tiered_storage_cold_data_read() {
             frozen: false,
             conflicting: false,
             locked: false,
+            external_ref: None,
             parent_txids: &[],
         })
         .unwrap();
@@ -853,6 +859,7 @@ fn stability_device_fill_and_churn() {
             frozen: false,
             conflicting: false,
             locked: false,
+            external_ref: None,
             parent_txids: &[],
         }) {
             Ok(_) => {
@@ -894,6 +901,7 @@ fn stability_device_fill_and_churn() {
             frozen: false,
             conflicting: false,
             locked: false,
+            external_ref: None,
             parent_txids: &[],
         }) {
             Ok(_) => new_created += 1,
@@ -936,6 +944,7 @@ fn perf_spend_throughput() {
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                external_ref: None,
                 parent_txids: &[],
             })
             .unwrap();
@@ -1004,6 +1013,7 @@ fn perf_create_throughput() {
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                external_ref: None,
                 parent_txids: &[],
             })
             .unwrap();
@@ -1045,6 +1055,7 @@ fn perf_set_mined_throughput() {
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                external_ref: None,
                 parent_txids: &[],
             })
             .unwrap();
@@ -1103,6 +1114,7 @@ fn perf_spend_multi_throughput() {
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                external_ref: None,
                 parent_txids: &[],
             })
             .unwrap();
@@ -1173,6 +1185,7 @@ fn perf_memory_per_record() {
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                external_ref: None,
                 parent_txids: &[],
             })
             .unwrap();
@@ -1223,6 +1236,7 @@ fn perf_read_throughput() {
                 frozen: false,
                 conflicting: false,
                 locked: false,
+                external_ref: None,
                 parent_txids: &[],
             })
             .unwrap();
@@ -1288,6 +1302,7 @@ fn perf_concurrent_spend_throughput() {
                     frozen: false,
                     conflicting: false,
                     locked: false,
+                    external_ref: None,
                     parent_txids: &[],
                 })
                 .unwrap();

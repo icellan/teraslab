@@ -1,6 +1,6 @@
 //! Wire-format types for operation-based replication.
 //!
-//! Compact binary serialization — a Spend op is under 80 bytes on the wire.
+//! Compact binary serialization — a Spend op is under 90 bytes on the wire.
 //!
 //! # Wire layout
 //!
@@ -104,26 +104,34 @@ const OP_CREATE: u8 = 11;
 const OP_DELETE: u8 = 12;
 const OP_PRUNE_SLOT: u8 = 13;
 const OP_MARK_LONGEST_CHAIN: u8 = 14;
+const OP_PRUNE_SLOT_IF_SPENT_BY: u8 = 15;
 
 /// A single replication operation sent from master to replica.
 /// A mutation operation to be replicated from master to replica.
 ///
-/// Every mutation variant carries `master_generation` — the record's
-/// generation counter on the master AFTER the mutation was applied.
+/// Every record-retaining mutation variant carries or embeds
+/// `master_generation` — the record's generation counter on the master AFTER
+/// the mutation was applied.
 /// The replica uses this to:
 /// - Set the generation to the master's value instead of auto-incrementing
-/// - Detect stale/out-of-order ops (master_generation <= local generation)
+/// - Detect stale/out-of-order ops with wrapping generation ordering
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReplicaOp {
     Spend {
         tx_key: TxKey,
         offset: u32,
         spending_data: [u8; 36],
+        current_block_height: u32,
+        block_height_retention: u32,
         master_generation: u32,
     },
     Unspend {
         tx_key: TxKey,
         offset: u32,
+        /// Expected spending data before clearing.
+        spending_data: [u8; 36],
+        current_block_height: u32,
+        block_height_retention: u32,
         master_generation: u32,
     },
     SetMined {
@@ -132,11 +140,15 @@ pub enum ReplicaOp {
         block_height: u32,
         subtree_idx: u32,
         on_longest_chain: bool,
+        current_block_height: u32,
+        block_height_retention: u32,
         master_generation: u32,
     },
     UnsetMined {
         tx_key: TxKey,
         block_id: u32,
+        current_block_height: u32,
+        block_height_retention: u32,
         master_generation: u32,
     },
     Freeze {
@@ -188,13 +200,19 @@ pub enum ReplicaOp {
         tx_key: TxKey,
         offset: u32,
     },
+    PruneSlotIfSpentBy {
+        tx_key: TxKey,
+        offset: u32,
+        child_txid: [u8; 32],
+    },
     /// Mark a transaction as on or off the longest chain.
     ///
     /// Mutates `unmined_since`, `delete_at_height`, and `generation` on
     /// the master and must therefore be replicated. Recovery replay and
     /// receiver apply paths use `master_generation` as the idempotency
-    /// token (R-053): a replica that already has `meta.generation >=
-    /// master_generation` treats this op as already applied.
+    /// token (R-053): a replica that is already at-or-ahead of
+    /// `master_generation` under wrapping generation ordering treats this op
+    /// as already applied.
     MarkLongestChain {
         tx_key: TxKey,
         on_longest_chain: bool,
@@ -221,14 +239,16 @@ impl ReplicaOp {
             | Self::Create { tx_key, .. }
             | Self::Delete { tx_key, .. }
             | Self::PruneSlot { tx_key, .. }
+            | Self::PruneSlotIfSpentBy { tx_key, .. }
             | Self::MarkLongestChain { tx_key, .. } => *tx_key,
         }
     }
 
     /// Extract the master generation from a mutation op, if present.
     ///
-    /// Create, Delete, and PruneSlot don't carry generation because
-    /// Create sets it via metadata_bytes and Delete/PruneSlot remove data.
+    /// Create embeds generation in its extended metadata bytes at offsets
+    /// 46..50. Delete and PruneSlot don't carry generation because they remove
+    /// data or mutate only a terminal slot status.
     pub fn master_generation(&self) -> Option<u32> {
         match self {
             Self::Spend {
@@ -264,16 +284,25 @@ impl ReplicaOp {
             | Self::MarkLongestChain {
                 master_generation, ..
             } => Some(*master_generation),
-            Self::Create { .. } | Self::Delete { .. } | Self::PruneSlot { .. } => None,
+            Self::Create { metadata_bytes, .. } => create_embedded_generation(metadata_bytes),
+            Self::Delete { .. } | Self::PruneSlot { .. } | Self::PruneSlotIfSpentBy { .. } => None,
         }
     }
+}
+
+fn create_embedded_generation(metadata_bytes: &[u8]) -> Option<u32> {
+    if metadata_bytes.len() < 50 {
+        return None;
+    }
+    Some(u32::from_le_bytes(metadata_bytes[46..50].try_into().ok()?))
 }
 
 impl ReplicaOp {
     /// Serialize this op to bytes. Returns the serialized form.
     ///
-    /// Mutation ops append `master_generation` (4 bytes LE) after all
-    /// other fields. Create/Delete/PruneSlot do not carry generation.
+    /// Most mutation ops append `master_generation` (4 bytes LE) after all
+    /// other fields. Create embeds it in the extended metadata bytes.
+    /// Delete/PruneSlot do not carry generation.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(80);
         match self {
@@ -281,22 +310,32 @@ impl ReplicaOp {
                 tx_key,
                 offset,
                 spending_data,
+                current_block_height,
+                block_height_retention,
                 master_generation,
             } => {
                 buf.push(OP_SPEND);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
                 buf.extend_from_slice(spending_data);
+                buf.extend_from_slice(&current_block_height.to_le_bytes());
+                buf.extend_from_slice(&block_height_retention.to_le_bytes());
                 buf.extend_from_slice(&master_generation.to_le_bytes());
             }
             ReplicaOp::Unspend {
                 tx_key,
                 offset,
+                spending_data,
+                current_block_height,
+                block_height_retention,
                 master_generation,
             } => {
                 buf.push(OP_UNSPEND);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
+                buf.extend_from_slice(spending_data);
+                buf.extend_from_slice(&current_block_height.to_le_bytes());
+                buf.extend_from_slice(&block_height_retention.to_le_bytes());
                 buf.extend_from_slice(&master_generation.to_le_bytes());
             }
             ReplicaOp::SetMined {
@@ -305,6 +344,8 @@ impl ReplicaOp {
                 block_height,
                 subtree_idx,
                 on_longest_chain,
+                current_block_height,
+                block_height_retention,
                 master_generation,
             } => {
                 buf.push(OP_SET_MINED);
@@ -313,16 +354,22 @@ impl ReplicaOp {
                 buf.extend_from_slice(&block_height.to_le_bytes());
                 buf.extend_from_slice(&subtree_idx.to_le_bytes());
                 buf.push(u8::from(*on_longest_chain));
+                buf.extend_from_slice(&current_block_height.to_le_bytes());
+                buf.extend_from_slice(&block_height_retention.to_le_bytes());
                 buf.extend_from_slice(&master_generation.to_le_bytes());
             }
             ReplicaOp::UnsetMined {
                 tx_key,
                 block_id,
+                current_block_height,
+                block_height_retention,
                 master_generation,
             } => {
                 buf.push(OP_UNSET_MINED);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&block_id.to_le_bytes());
+                buf.extend_from_slice(&current_block_height.to_le_bytes());
+                buf.extend_from_slice(&block_height_retention.to_le_bytes());
                 buf.extend_from_slice(&master_generation.to_le_bytes());
             }
             ReplicaOp::Freeze {
@@ -428,6 +475,16 @@ impl ReplicaOp {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
             }
+            ReplicaOp::PruneSlotIfSpentBy {
+                tx_key,
+                offset,
+                child_txid,
+            } => {
+                buf.push(OP_PRUNE_SLOT_IF_SPENT_BY);
+                buf.extend_from_slice(&tx_key.txid);
+                buf.extend_from_slice(&offset.to_le_bytes());
+                buf.extend_from_slice(child_txid);
+            }
             ReplicaOp::MarkLongestChain {
                 tx_key,
                 on_longest_chain,
@@ -456,35 +513,44 @@ impl ReplicaOp {
 
         match op_type {
             OP_SPEND => {
-                need(rest, 76)?; // 32 + 4 + 36 + 4(gen)
+                need(rest, 84)?; // 32 + 4 + 36 + 4(current) + 4(retention) + 4(gen)
                 let key = read_key(rest);
                 let offset = u32::from_le_bytes(rest[32..36].try_into().unwrap());
                 let mut sd = [0u8; 36];
                 sd.copy_from_slice(&rest[36..72]);
-                let master_generation = r_u32(rest, 72);
+                let current_block_height = r_u32(rest, 72);
+                let block_height_retention = r_u32(rest, 76);
+                let master_generation = r_u32(rest, 80);
                 Ok((
                     ReplicaOp::Spend {
                         tx_key: key,
                         offset,
                         spending_data: sd,
+                        current_block_height,
+                        block_height_retention,
                         master_generation,
                     },
-                    77,
+                    85,
                 ))
             }
             OP_UNSPEND => {
-                need(rest, 40)?; // 32 + 4 + 4(gen)
+                need(rest, 84)?; // 32 + 4 + 36 + 4(current) + 4(retention) + 4(gen)
+                let mut sd = [0u8; 36];
+                sd.copy_from_slice(&rest[36..72]);
                 Ok((
                     ReplicaOp::Unspend {
                         tx_key: read_key(rest),
                         offset: r_u32(rest, 32),
-                        master_generation: r_u32(rest, 36),
+                        spending_data: sd,
+                        current_block_height: r_u32(rest, 72),
+                        block_height_retention: r_u32(rest, 76),
+                        master_generation: r_u32(rest, 80),
                     },
-                    41,
+                    85,
                 ))
             }
             OP_SET_MINED => {
-                need(rest, 49)?; // 32 + 4 + 4 + 4 + 1 + 4(gen)
+                need(rest, 57)?; // 32 + 4 + 4 + 4 + 1 + 4(current) + 4(retention) + 4(gen)
                 Ok((
                     ReplicaOp::SetMined {
                         tx_key: read_key(rest),
@@ -492,20 +558,24 @@ impl ReplicaOp {
                         block_height: r_u32(rest, 36),
                         subtree_idx: r_u32(rest, 40),
                         on_longest_chain: rest[44] != 0,
-                        master_generation: r_u32(rest, 45),
+                        current_block_height: r_u32(rest, 45),
+                        block_height_retention: r_u32(rest, 49),
+                        master_generation: r_u32(rest, 53),
                     },
-                    50,
+                    58,
                 ))
             }
             OP_UNSET_MINED => {
-                need(rest, 40)?; // 32 + 4 + 4(gen)
+                need(rest, 48)?; // 32 + 4 + 4(current) + 4(retention) + 4(gen)
                 Ok((
                     ReplicaOp::UnsetMined {
                         tx_key: read_key(rest),
                         block_id: r_u32(rest, 32),
-                        master_generation: r_u32(rest, 36),
+                        current_block_height: r_u32(rest, 36),
+                        block_height_retention: r_u32(rest, 40),
+                        master_generation: r_u32(rest, 44),
                     },
-                    41,
+                    49,
                 ))
             }
             OP_FREEZE => {
@@ -611,16 +681,9 @@ impl ReplicaOp {
                 } else {
                     None
                 };
-                // Backward-compatible: if there is a byte remaining, read
-                // is_external; otherwise default to false so old replication
-                // streams still work.
-                let is_external = if pos < rest.len() {
-                    let v = rest[pos] != 0;
-                    pos += 1;
-                    v
-                } else {
-                    false
-                };
+                need(rest, pos + 1)?;
+                let is_external = rest[pos] != 0;
+                pos += 1;
                 Ok((
                     ReplicaOp::Create {
                         tx_key: key,
@@ -649,6 +712,19 @@ impl ReplicaOp {
                         offset: r_u32(rest, 32),
                     },
                     37,
+                ))
+            }
+            OP_PRUNE_SLOT_IF_SPENT_BY => {
+                need(rest, 68)?;
+                let mut child_txid = [0u8; 32];
+                child_txid.copy_from_slice(&rest[36..68]);
+                Ok((
+                    ReplicaOp::PruneSlotIfSpentBy {
+                        tx_key: read_key(rest),
+                        offset: r_u32(rest, 32),
+                        child_txid,
+                    },
+                    69,
                 ))
             }
             OP_MARK_LONGEST_CHAIN => {
@@ -987,11 +1063,13 @@ mod tests {
             tx_key: key(1),
             offset: 5,
             spending_data: [0xAB; 36],
+            current_block_height: 700_000,
+            block_height_retention: 144,
             master_generation: 0,
         };
         let bytes = op.serialize();
         assert!(
-            bytes.len() < 80,
+            bytes.len() < 90,
             "spend serialized to {} bytes",
             bytes.len()
         );
@@ -1017,17 +1095,35 @@ mod tests {
     }
 
     #[test]
+    fn prune_slot_if_spent_by_round_trip() {
+        let op = ReplicaOp::PruneSlotIfSpentBy {
+            tx_key: key(2),
+            offset: 42,
+            child_txid: [0xC1; 32],
+        };
+        let bytes = op.serialize();
+        let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, op);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
     fn all_variants_round_trip() {
         let ops = vec![
             ReplicaOp::Spend {
                 tx_key: key(1),
                 offset: 0,
                 spending_data: [0x11; 36],
+                current_block_height: 700_000,
+                block_height_retention: 144,
                 master_generation: 0,
             },
             ReplicaOp::Unspend {
                 tx_key: key(2),
                 offset: 1,
+                spending_data: [0x22; 36],
+                current_block_height: 700_001,
+                block_height_retention: 145,
                 master_generation: 0,
             },
             ReplicaOp::SetMined {
@@ -1036,11 +1132,15 @@ mod tests {
                 block_height: 800000,
                 subtree_idx: 7,
                 on_longest_chain: true,
+                current_block_height: 800010,
+                block_height_retention: 288,
                 master_generation: 0,
             },
             ReplicaOp::UnsetMined {
                 tx_key: key(4),
                 block_id: 200,
+                current_block_height: 800020,
+                block_height_retention: 288,
                 master_generation: 0,
             },
             ReplicaOp::Freeze {
@@ -1089,6 +1189,11 @@ mod tests {
             ReplicaOp::PruneSlot {
                 tx_key: key(13),
                 offset: 99,
+            },
+            ReplicaOp::PruneSlotIfSpentBy {
+                tx_key: key(15),
+                offset: 100,
+                child_txid: [0xC1; 32],
             },
             ReplicaOp::MarkLongestChain {
                 tx_key: key(14),
@@ -1191,6 +1296,51 @@ mod tests {
     }
 
     #[test]
+    fn create_embedded_generation_is_exposed_for_stale_guard() {
+        let mut metadata_bytes = vec![0u8; 70];
+        metadata_bytes[46..50].copy_from_slice(&42u32.to_le_bytes());
+        let op = ReplicaOp::Create {
+            tx_key: key(3),
+            metadata_bytes,
+            utxo_hashes: vec![[0xAB; 32]],
+            cold_data: None,
+            is_external: false,
+        };
+        assert_eq!(op.master_generation(), Some(42));
+    }
+
+    #[test]
+    fn legacy_create_without_embedded_generation_has_no_generation_token() {
+        let op = ReplicaOp::Create {
+            tx_key: key(4),
+            metadata_bytes: vec![0u8; 46],
+            utxo_hashes: vec![[0xAB; 32]],
+            cold_data: None,
+            is_external: false,
+        };
+        assert_eq!(op.master_generation(), None);
+    }
+
+    #[test]
+    fn create_missing_is_external_byte_rejected() {
+        let op = ReplicaOp::Create {
+            tx_key: key(2),
+            metadata_bytes: vec![0; 32],
+            utxo_hashes: vec![[0xAB; 32]],
+            cold_data: None,
+            is_external: false,
+        };
+        let mut bytes = op.serialize();
+        assert_eq!(bytes.pop(), Some(0), "last byte is the is_external flag");
+        let err = ReplicaOp::deserialize(&bytes)
+            .expect_err("truncated Create must not default is_external to false");
+        match err {
+            ProtocolError::BufferTooShort { .. } => {}
+            other => panic!("expected BufferTooShort, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn batch_round_trip() {
         let batch = ReplicaBatch {
             first_sequence: 100,
@@ -1199,6 +1349,8 @@ mod tests {
                     tx_key: key(1),
                     offset: 0,
                     spending_data: [0x11; 36],
+                    current_block_height: 700_000,
+                    block_height_retention: 288,
                     master_generation: 0,
                 },
                 ReplicaOp::Freeze {
@@ -1228,6 +1380,8 @@ mod tests {
                 tx_key: key(i),
                 offset: i as u32,
                 spending_data: [i; 36],
+                current_block_height: 700_000 + i as u32,
+                block_height_retention: 288,
                 master_generation: 0,
             })
             .collect();
@@ -1368,6 +1522,8 @@ mod tests {
                     tx_key: key(1),
                     offset: 7,
                     spending_data: [0x55; 36],
+                    current_block_height: 700_000,
+                    block_height_retention: 288,
                     master_generation: 11,
                 },
                 ReplicaOp::Delete { tx_key: key(2) },

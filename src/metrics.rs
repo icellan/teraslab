@@ -929,14 +929,25 @@ impl ReplicationMetrics {
     }
 
     /// Compute replication lag for a replica (leader_seq − last_acked).
+    ///
+    /// F-G6-024: the consumer reads both atomics with `Acquire` semantics
+    /// so writers' `Release` stores on `leader_sequence` / `last_acked_seq`
+    /// are observed in their causal order. The producer side currently
+    /// uses `Relaxed` on the write path (see `record_ack` /
+    /// `mark_in_flight`) — promoting those to `Release` lives in G7's
+    /// `src/replication/manager.rs` and is tracked as DEFERRED to that
+    /// agent. Using `Acquire` here is the consumer half of the pairing
+    /// and is correct regardless of the writer's current ordering: an
+    /// `Acquire` load is at least as strict as `Relaxed`, so this change
+    /// never weakens observed behaviour.
     pub fn lag(&self, replica_idx: usize) -> u64 {
         if replica_idx >= MAX_REPLICAS {
             return 0;
         }
-        let leader = self.leader_sequence.load(Ordering::Relaxed);
+        let leader = self.leader_sequence.load(Ordering::Acquire);
         let acked = self.per_replica[replica_idx]
             .last_acked_seq
-            .load(Ordering::Relaxed);
+            .load(Ordering::Acquire);
         leader.saturating_sub(acked)
     }
 }

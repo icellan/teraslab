@@ -31,7 +31,7 @@ use teraslab::io;
 use teraslab::record::{METADATA_SIZE, TxFlags, TxMetadata, UTXO_SLOT_SIZE, UtxoSlot};
 use teraslab::recovery::{recover, recover_all_with_allocator};
 use teraslab::redo::{RedoLog, RedoOp};
-use teraslab::replication::durable::ReplicationIntentTracker;
+use teraslab::replication::durable::{ReplicationIntentRange, ReplicationIntentTracker};
 
 // ---------------------------------------------------------------------------
 // Shared scaffolding
@@ -300,13 +300,27 @@ fn boundary_after_replication_before_intent_clear_is_idempotent() {
     reopened.commit(first_seq, last_seq).unwrap();
     assert!(reopened.pending().is_empty(), "second commit is idempotent",);
 
-    // Reopening once more confirms the on-disk state matches the
-    // in-memory clear.
+    // Commit persistence is intentionally coalesced. A crash before the
+    // coalesced commit is flushed may reload the stale range, which is safe
+    // because startup recovery replays/clears it idempotently.
+    let stale_reopen = ReplicationIntentTracker::load(path.clone()).unwrap();
+    assert_eq!(
+        stale_reopen.pending(),
+        vec![ReplicationIntentRange {
+            first_sequence: first_seq,
+            last_sequence: last_seq,
+        }],
+        "unflushed commit remains recoverable on disk",
+    );
+    drop(stale_reopen);
+
+    // Clean shutdown flushes the coalesced clear to disk.
+    reopened.flush().unwrap();
     drop(reopened);
     let reopened_again = ReplicationIntentTracker::load(path).unwrap();
     assert!(
         reopened_again.pending().is_empty(),
-        "pending range is cleared on disk after commit",
+        "pending range is cleared on disk after flush",
     );
 }
 
