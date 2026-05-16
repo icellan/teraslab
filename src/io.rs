@@ -184,6 +184,99 @@ pub unsafe fn write_block_entry_direct(
     // that reflects the final disk state.
 }
 
+/// Write the common mutation footer AND restamp the CRC in one call.
+///
+/// F-G1-002: the preferred entrypoint for callers that mutate the
+/// "footer fields" (flags, generation, updated_at, delete_at_height)
+/// and have no other in-flight header edits to batch. The individual
+/// [`write_mutation_footer_direct`] + [`write_crc_direct`] pair is
+/// still public for the rare caller that needs to interleave multiple
+/// footer writes (e.g. footer + block_entry) and stamp the CRC once at
+/// the end — but every other caller should use this combined helper so
+/// "forgot the CRC finalizer" cannot happen by omission.
+///
+/// # Safety
+///
+/// Same as [`write_mutation_footer_direct`].
+#[inline]
+pub unsafe fn write_mutation_footer_and_crc_direct(
+    base_ptr: *mut u8,
+    record_offset: u64,
+    meta: &TxMetadata,
+) {
+    // Safety: same contract as the primitives — caller holds the
+    // stripe lock and the base_ptr is valid for METADATA_SIZE bytes
+    // at the record offset.
+    unsafe {
+        write_mutation_footer_direct(base_ptr, record_offset, meta);
+        write_crc_direct(base_ptr, record_offset, meta);
+    }
+}
+
+/// Write the spend footer (flags + generation + updated_at +
+/// delete_at_height + spent_utxos) AND restamp the CRC in one call.
+///
+/// See [`write_mutation_footer_and_crc_direct`] for the rationale on
+/// why callers should prefer the combined helpers.
+///
+/// # Safety
+///
+/// Same as [`write_mutation_footer_direct`].
+#[inline]
+pub unsafe fn write_spend_footer_and_crc_direct(
+    base_ptr: *mut u8,
+    record_offset: u64,
+    meta: &TxMetadata,
+) {
+    // Safety: see write_mutation_footer_and_crc_direct.
+    unsafe {
+        write_spend_footer_direct(base_ptr, record_offset, meta);
+        write_crc_direct(base_ptr, record_offset, meta);
+    }
+}
+
+/// Write the mined footer (footer + unmined_since) AND restamp the CRC
+/// in one call.
+///
+/// # Safety
+///
+/// Same as [`write_mutation_footer_direct`].
+#[inline]
+pub unsafe fn write_mined_footer_and_crc_direct(
+    base_ptr: *mut u8,
+    record_offset: u64,
+    meta: &TxMetadata,
+) {
+    // Safety: see write_mutation_footer_and_crc_direct.
+    unsafe {
+        write_mined_footer_direct(base_ptr, record_offset, meta);
+        write_crc_direct(base_ptr, record_offset, meta);
+    }
+}
+
+/// Write a single inline block entry AND restamp the CRC in one call.
+///
+/// # Safety
+///
+/// Same as [`write_block_entry_direct`].
+#[inline]
+pub unsafe fn write_block_entry_and_crc_direct(
+    base_ptr: *mut u8,
+    record_offset: u64,
+    count: u8,
+    inline_index: usize,
+    entry: &BlockEntry,
+    meta: &TxMetadata,
+) {
+    // Safety: see write_mutation_footer_and_crc_direct. `meta` must
+    // reflect the post-write block_entry_count + block_entries_inline
+    // state so the CRC matches the on-disk bytes.
+    unsafe {
+        write_block_entry_direct(base_ptr, record_offset, count, inline_index, entry);
+        write_crc_direct(base_ptr, record_offset, meta);
+    }
+}
+
 /// Write only the CRC32 field of a metadata header (4 bytes at
 /// [`CRC32_OFFSET`]), computed from the full in-memory `meta`.
 ///
@@ -192,6 +285,12 @@ pub unsafe fn write_block_entry_direct(
 /// subsequent reads validate the header as a whole. `meta` must reflect
 /// the final disk state of every field, including those already written
 /// by preceding targeted helpers.
+///
+/// Most callers should use one of the combined `_and_crc_direct`
+/// wrappers (e.g. [`write_mutation_footer_and_crc_direct`]) instead of
+/// pairing this primitive with a footer write — F-G1-002 introduced
+/// the combined wrappers specifically to make "forgot the CRC
+/// finalizer" structurally impossible.
 ///
 /// # Safety
 ///
@@ -392,20 +491,25 @@ pub unsafe fn write_utxo_slot_direct(
 /// record offset. The read is rounded up to the device alignment.
 pub fn read_metadata(device: &dyn BlockDevice, record_offset: u64) -> Result<TxMetadata> {
     let align = device.alignment();
-    let read_size = align_up(METADATA_SIZE, align);
-    let mut buf = AlignedBuf::new(read_size, align);
 
     // Record offset must be aligned (allocator guarantees this).
     let aligned_base = record_offset / align as u64 * align as u64;
     let intra_offset = (record_offset - aligned_base) as usize;
 
+    // F-G1-008: read directly from the aligned device buffer. The
+    // previous implementation allocated a second `AlignedBuf` of size
+    // `align_up(METADATA_SIZE, align)`, copied the header bytes into
+    // it, and then deserialized from there — one redundant heap alloc
+    // + memcpy per call. Recovery scans every record at boot, so this
+    // matters on the cold path; on the direct-ptr hot path this code
+    // is bypassed entirely.
     let total_read = align_up(intra_offset + METADATA_SIZE, align);
     let mut read_buf = AlignedBuf::new(total_read, align);
     device.pread_exact_at(&mut read_buf, aligned_base)?;
 
-    buf[..METADATA_SIZE].copy_from_slice(&read_buf[intra_offset..intra_offset + METADATA_SIZE]);
-
-    Ok(TxMetadata::from_bytes(&buf[..METADATA_SIZE])?)
+    Ok(TxMetadata::from_bytes(
+        &read_buf[intra_offset..intra_offset + METADATA_SIZE],
+    )?)
 }
 
 /// Write the [`TxMetadata`] header of a record at `record_offset`.

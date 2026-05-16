@@ -336,8 +336,13 @@ pub struct MemoryDevice {
     data: parking_lot::RwLock<Vec<u8>>,
     /// Stable pointer into the Vec's heap allocation. Valid for the lifetime
     /// of this device because the Vec is never resized after construction.
+    ///
+    /// F-G1-017: paired `raw_len` was removed — `size()` now derives the
+    /// length from `data.read().len()` so there is one source of truth.
+    /// The Vec is still never resized after construction; the field
+    /// could come back if a future `MemoryDevice::resize` lands, but
+    /// then both pointer AND length must be updated together.
     raw_ptr: *mut u8,
-    raw_len: usize,
     alignment: usize,
 }
 
@@ -362,11 +367,9 @@ impl MemoryDevice {
         validate_alignment(alignment)?;
         let mut data = vec![0u8; size as usize];
         let raw_ptr = data.as_mut_ptr();
-        let raw_len = data.len();
         Ok(Self {
             data: parking_lot::RwLock::new(data),
             raw_ptr,
-            raw_len,
             alignment,
         })
     }
@@ -393,14 +396,24 @@ impl BlockDevice for MemoryDevice {
         self.check_alignment(offset, buf.len())?;
         let data = self.data.read();
         let off = offset as usize;
-        if off + buf.len() > data.len() {
+        // F-G1-007: use checked addition so an offset near `usize::MAX` plus
+        // a non-trivial buffer length cannot wrap to a small number and
+        // bypass the bounds check. `None` (overflow) maps to out-of-bounds
+        // unconditionally — there is no legitimate caller that wants a
+        // wrap-around read.
+        let end = off.checked_add(buf.len()).ok_or(DeviceError::OutOfBounds {
+            offset,
+            len: buf.len() as u64,
+            device_size: data.len() as u64,
+        })?;
+        if end > data.len() {
             return Err(DeviceError::OutOfBounds {
                 offset,
                 len: buf.len() as u64,
                 device_size: data.len() as u64,
             });
         }
-        buf.copy_from_slice(&data[off..off + buf.len()]);
+        buf.copy_from_slice(&data[off..end]);
         Ok(buf.len())
     }
 
@@ -408,14 +421,21 @@ impl BlockDevice for MemoryDevice {
         self.check_alignment(offset, buf.len())?;
         let mut data = self.data.write();
         let off = offset as usize;
-        if off + buf.len() > data.len() {
+        // F-G1-007: see pread above — checked_add protects against the
+        // off + buf.len() wrap case.
+        let end = off.checked_add(buf.len()).ok_or(DeviceError::OutOfBounds {
+            offset,
+            len: buf.len() as u64,
+            device_size: data.len() as u64,
+        })?;
+        if end > data.len() {
             return Err(DeviceError::OutOfBounds {
                 offset,
                 len: buf.len() as u64,
                 device_size: data.len() as u64,
             });
         }
-        data[off..off + buf.len()].copy_from_slice(buf);
+        data[off..end].copy_from_slice(buf);
         Ok(buf.len())
     }
 
@@ -424,7 +444,12 @@ impl BlockDevice for MemoryDevice {
     }
 
     fn size(&self) -> u64 {
-        self.raw_len as u64
+        // F-G1-017: single source of truth — derive from the Vec's
+        // length. The Vec is never resized after construction, so this
+        // is observationally the same value the construction-time
+        // `raw_len` snapshot used to carry, just without the drift
+        // risk if a future `resize` is added.
+        self.data.read().len() as u64
     }
 
     fn sync(&self) -> Result<()> {
@@ -663,7 +688,17 @@ impl DirectDevice {
 impl BlockDevice for DirectDevice {
     fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
         self.check_alignment(offset, buf.len())?;
-        if offset + buf.len() as u64 > self.size {
+        // F-G1-007: checked_add against u64::MAX so a near-MAX offset plus
+        // a non-trivial buffer length cannot wrap to a small number and
+        // bypass the bounds check.
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(DeviceError::OutOfBounds {
+                offset,
+                len: buf.len() as u64,
+                device_size: self.size,
+            })?;
+        if end > self.size {
             return Err(DeviceError::OutOfBounds {
                 offset,
                 len: buf.len() as u64,
@@ -709,7 +744,15 @@ impl BlockDevice for DirectDevice {
 
     fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize> {
         self.check_alignment(offset, buf.len())?;
-        if offset + buf.len() as u64 > self.size {
+        // F-G1-007: checked_add — see DirectDevice::pread for rationale.
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(DeviceError::OutOfBounds {
+                offset,
+                len: buf.len() as u64,
+                device_size: self.size,
+            })?;
+        if end > self.size {
             return Err(DeviceError::OutOfBounds {
                 offset,
                 len: buf.len() as u64,
