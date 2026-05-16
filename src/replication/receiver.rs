@@ -409,6 +409,19 @@ pub fn handle_replica_batch_with_cluster_key(
     // here because cargo runs unit tests in parallel; a shared tracker
     // would silently skip "already applied" sequences across unrelated
     // tests and break their assertions.
+    //
+    // F-G7-013: the tracker lives in a `thread_local!` slot, so it
+    // is owned by each worker thread for that thread's lifetime.
+    // This is intentional for the test path (cargo test workers are
+    // short-lived) but DOES leak one tracker per worker until the
+    // thread exits. Production paths must go through
+    // `init_replica_applied_tracker` so the receiver shares a single
+    // process-wide `ReplicaAppliedTracker`; the fallback path here
+    // is reserved for non-production single-stream callers and
+    // tests. If you find this fallback being exercised by a
+    // long-lived server thread, switch the caller to explicit
+    // tracker injection — do not rely on this slot for steady-state
+    // production use.
     thread_local! {
         static IN_MEMORY_TRACKER: std::cell::RefCell<Option<Arc<ReplicaAppliedTracker>>> =
             const { std::cell::RefCell::new(None) };
