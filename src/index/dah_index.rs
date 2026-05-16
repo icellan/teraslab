@@ -50,6 +50,18 @@ impl DahIndex {
         // Remove old entry if it exists at a different height.
         if let Some(&old_height) = self.by_txid.get(&key) {
             if old_height == height {
+                // F-G3-019: the no-op branch assumes the by_height bucket
+                // for this height already contains `key`. If a previous
+                // bug left the two maps out of sync, this assertion fires
+                // in debug builds rather than silently masking the drift.
+                debug_assert!(
+                    self.by_height
+                        .get(&height)
+                        .is_some_and(|v| v.contains(&key)),
+                    "dah_index invariant violated: by_txid says height={height} but \
+                     by_height[{height}] does not contain {:?}",
+                    key.txid,
+                );
                 return; // Already at this height, no-op.
             }
             self.remove_from_height_vec(old_height, &key);
