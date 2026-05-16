@@ -3228,6 +3228,16 @@ fn handle_set_mined_batch(
     // historical fields. We read the metadata once per valid_item; if
     // the block_id is not currently present, the unset is a no-op and
     // there is nothing to compensate.
+    //
+    // F-G5-022 (hypothesis): the read here happens OUTSIDE the engine's
+    // per-key stripe lock; a concurrent same-key mutation that lands
+    // between this read and the engine apply below would make the
+    // captured before-image not actually before the current mutation,
+    // and compensation rollback would then restore stale state. The
+    // engine's `unset_mined_with_before_image` (parallel to
+    // `set_locked_with_before_image`) is the centralized fix and lives
+    // in src/ops/ (G2 territory) — this comment flags the concurrency
+    // boundary so the next G2 pass can lift the read inside the lock.
     let pre_unset_image: std::collections::HashMap<TxKey, BeforeImage> = if params.unset_mined {
         valid_items
             .iter()
