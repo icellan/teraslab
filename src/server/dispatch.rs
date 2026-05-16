@@ -5850,6 +5850,16 @@ fn handle_process_expired(
     // replication + compensation logic from R-007 runs. The synthetic
     // request keeps the original request_id so the response correlates
     // back to the caller.
+    //
+    // F-G5-028: calling `handle_delete_batch` directly (rather than
+    // re-entering `handle_request`) bypasses the dispatcher's
+    // `needs_cluster_readiness`, `check_secondary_readiness`, and
+    // `check_quorum` middleware. That is intentional and safe here
+    // because the outer `OP_PROCESS_EXPIRED_PRESERVATIONS` request has
+    // already cleared every one of those gates — re-entering the
+    // dispatcher would cost an extra cluster-state read for no benefit.
+    // A future maintainer who wants quorum re-checked under a slow path
+    // should route through `handle_request` instead.
     let delete_payload = crate::protocol::codec::encode_txid_batch(&owned_due, &[]);
     let delete_req = RequestFrame {
         request_id: req.request_id,
