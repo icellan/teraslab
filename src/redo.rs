@@ -2937,40 +2937,50 @@ mod tests {
 
     #[test]
     fn crash_simulation_random_corruption() {
-        // Write 10 entries, then corrupt at random positions
-        // Recovery should always succeed (possibly with fewer entries)
+        // Write 10 entries in a single flush so they sit contiguously
+        // in the entries region (F-G4-004 block-aligns each flush).
+        // Then for each corruption point we copy the first two blocks
+        // (header + first entries block) to a fresh device and flip one
+        // byte inside the entries block. Recovery must never panic or
+        // error — it returns whatever prefix scanned cleanly.
         let (dev, mut log) = make_log(1024 * 1024);
         for i in 0..10u8 {
-            log.append_and_flush(RedoOp::Freeze {
+            log.append(RedoOp::Freeze {
                 tx_key: test_key(i),
                 offset: i as u32,
             })
             .unwrap();
         }
+        log.flush().unwrap();
 
-        // Try 50 different corruption points
-        for corrupt_offset in (20..500).step_by(10) {
+        let align = dev.alignment();
+        // 10 Freeze entries × 53 bytes = 530 bytes, well within one
+        // 4 KiB block. Corrupt offsets cover that range (relative to
+        // the entries region, i.e. starting after the header block).
+        for entries_offset in (10..500).step_by(10) {
             let dev2 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-            // Copy original data
-            let align = dev.alignment();
-            let mut buf = AlignedBuf::new(align, align);
-            dev.pread(&mut buf, 0).unwrap();
-            dev2.pwrite(&buf, 0).unwrap();
+            // Copy the header block + first entries block from dev.
+            let mut header_buf = AlignedBuf::new(align, align);
+            dev.pread(&mut header_buf, 0).unwrap();
+            dev2.pwrite(&header_buf, 0).unwrap();
+            let mut entries_buf = AlignedBuf::new(align, align);
+            dev.pread(&mut entries_buf, align as u64).unwrap();
+            dev2.pwrite(&entries_buf, align as u64).unwrap();
 
-            // Corrupt one byte
+            // Flip a byte inside the entries block.
             let mut buf2 = AlignedBuf::new(align, align);
-            dev2.pread(&mut buf2, 0).unwrap();
-            if corrupt_offset < buf2.len() {
-                buf2[corrupt_offset] ^= 0xFF;
-                dev2.pwrite(&buf2, 0).unwrap();
+            dev2.pread(&mut buf2, align as u64).unwrap();
+            if entries_offset < buf2.len() {
+                buf2[entries_offset] ^= 0xFF;
+                dev2.pwrite(&buf2, align as u64).unwrap();
             }
 
-            // Recovery should not panic or error
+            // Recovery should not panic or error.
             let log2 = RedoLog::open(dev2, 0, 1024 * 1024).unwrap();
             let result = log2.recover();
             assert!(
                 result.is_ok(),
-                "recovery failed at corruption offset {corrupt_offset}"
+                "recovery failed at entries-region corruption offset {entries_offset}"
             );
         }
     }
