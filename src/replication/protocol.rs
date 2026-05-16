@@ -948,6 +948,13 @@ fn decode_source_node_id(bytes: &[u8]) -> Option<u64> {
     if raw == 0 { None } else { Some(raw) }
 }
 
+/// F-G7-017: cap diagnostic strings in `ReplicaAck::Error` so a
+/// long-tail message (e.g. a `format!` that embeds a full filesystem
+/// path) cannot overflow `MAX_ACK_FRAME_SIZE` on the master side
+/// and lose the entire ACK. The cap matches the master's frame budget
+/// minus the fixed ReplicaAck::Error header bytes and HMAC suffix.
+pub const MAX_ACK_ERROR_MESSAGE_LEN: usize = 2048;
+
 impl ReplicaAck {
     /// Serialize to bytes.
     pub fn serialize(&self) -> Vec<u8> {
@@ -961,10 +968,24 @@ impl ReplicaAck {
                 failed_sequence,
                 message,
             } => {
+                // F-G7-017: truncate at a char boundary so the
+                // resulting String stays valid UTF-8. Use a slice of
+                // the original; clients on the read side decode with
+                // from_utf8_lossy so even a mid-codepoint cut would
+                // be tolerated, but we keep the wire encoding clean.
+                let message_bytes = if message.len() > MAX_ACK_ERROR_MESSAGE_LEN {
+                    let mut cut = MAX_ACK_ERROR_MESSAGE_LEN;
+                    while cut > 0 && !message.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    &message.as_bytes()[..cut]
+                } else {
+                    message.as_bytes()
+                };
                 buf.push(1);
                 buf.extend_from_slice(&failed_sequence.to_le_bytes());
-                buf.extend_from_slice(&(message.len() as u32).to_le_bytes());
-                buf.extend_from_slice(message.as_bytes());
+                buf.extend_from_slice(&(message_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(message_bytes);
             }
         }
         buf
@@ -1580,6 +1601,39 @@ mod tests {
         let bytes = ack.serialize();
         let decoded = ReplicaAck::deserialize(&bytes).unwrap();
         assert_eq!(decoded, ack);
+    }
+
+    /// F-G7-017: messages longer than MAX_ACK_ERROR_MESSAGE_LEN must
+    /// be truncated at serialize time so a bug in the replica's error
+    /// formatter cannot overflow the master's MAX_ACK_FRAME_SIZE
+    /// budget and lose the diagnostic entirely.
+    #[test]
+    fn ack_error_message_truncated_above_cap() {
+        let oversized = "x".repeat(MAX_ACK_ERROR_MESSAGE_LEN + 1024);
+        let ack = ReplicaAck::Error {
+            failed_sequence: 11,
+            message: oversized,
+        };
+        let bytes = ack.serialize();
+        let decoded = ReplicaAck::deserialize(&bytes).unwrap();
+        match decoded {
+            ReplicaAck::Error {
+                failed_sequence,
+                message,
+            } => {
+                assert_eq!(failed_sequence, 11);
+                assert_eq!(
+                    message.len(),
+                    MAX_ACK_ERROR_MESSAGE_LEN,
+                    "message must be truncated to MAX_ACK_ERROR_MESSAGE_LEN bytes",
+                );
+                assert!(
+                    message.bytes().all(|b| b == b'x'),
+                    "truncation must preserve the prefix",
+                );
+            }
+            other => panic!("expected Error variant, got {other:?}"),
+        }
     }
 
     #[test]

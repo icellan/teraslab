@@ -16,10 +16,15 @@ use std::time::Duration;
 
 use super::manager::ReplicaTransport;
 
-/// ACK response frames are tiny (`ResponseFrame` header + `ReplicaAck`).
-/// Keep this far below the general request-frame cap so a malicious replica
-/// cannot force the master to allocate multi-MiB buffers while waiting for ACKs.
-const MAX_ACK_FRAME_SIZE: usize = 1024;
+/// ACK response frames are mostly tiny (`ResponseFrame` header +
+/// `ReplicaAck::Ok` is ~22 bytes), but `ReplicaAck::Error` carries a
+/// variable-length diagnostic message. F-G7-017 raised the cap from
+/// 1 KiB to 4 KiB after a `format!("flush applied tracker: {e}")`
+/// containing a long path overflowed the previous budget and lost
+/// the diagnostic. The sender additionally truncates messages above
+/// `MAX_ACK_ERROR_MESSAGE_LEN` so a buggy replica cannot push the
+/// master past this cap.
+const MAX_ACK_FRAME_SIZE: usize = 4096;
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Configure TCP keepalive on a stream for fast broken-connection detection.
@@ -541,8 +546,12 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// F-G7-017: the master rejects ACK frames larger than
+    /// `MAX_ACK_FRAME_SIZE` (4 KiB after F-G7-017). The test asserts
+    /// the cap is enforced; the constant name stays generic so the
+    /// test survives further raises.
     #[test]
-    fn recv_ack_max_allocation_1kib_for_error_response() {
+    fn recv_ack_max_allocation_capped_for_error_response() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
