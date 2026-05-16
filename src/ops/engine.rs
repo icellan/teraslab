@@ -2031,7 +2031,10 @@ impl Engine {
     ///
     /// If the caller decides not to finalize (e.g., redo flush fails), it
     /// must free the allocated space via `self.allocator.lock().free(offset, size)`.
-    pub fn pre_allocate_create(&self, req: &CreateRequest) -> Result<(u64, u32), CreateError> {
+    pub fn pre_allocate_create(
+        &self,
+        req: &CreateRequest,
+    ) -> Result<(u64, u32, u64), CreateError> {
         let utxo_count = req.utxo_hashes.len() as u32;
         if utxo_count == 0 {
             return Err(CreateError::InvalidUtxoCount);
@@ -2062,7 +2065,15 @@ impl Engine {
             .allocate(total_size)
             .map_err(|_| CreateError::DeviceFull)?;
 
-        Ok((record_offset, utxo_count))
+        // F-G2-006: return the computed `total_size` so the caller can
+        // pass it through to `create_at_offset` and we can defend the
+        // implicit contract that both sites recompute the same value.
+        // Pre-fix the two sites both rebuilt `cold_data` independently
+        // from `req`; any future divergence (mutated `req`, swapped
+        // `req`, non-deterministic builder) would silently desync the
+        // on-device `record_size` from the allocator reservation and
+        // corrupt the adjacent record.
+        Ok((record_offset, utxo_count, total_size))
     }
 
     /// Create a transaction record at a pre-allocated device offset.
@@ -2075,6 +2086,32 @@ impl Engine {
         &self,
         req: &CreateRequest,
         record_offset: u64,
+    ) -> Result<CreateResponse, CreateError> {
+        self.create_at_offset_inner(req, record_offset, None)
+    }
+
+    /// Variant of [`Self::create_at_offset`] that verifies the caller's
+    /// reservation size matches the on-device `record_size` this function
+    /// computes from `req`. F-G2-006: the dispatch layer reserves bytes via
+    /// `pre_allocate_create` and then calls `create_at_offset` with what is
+    /// supposed to be the same `req`. The recomputation is now defended
+    /// with a `debug_assert_eq!` so any divergence (mutated request, swapped
+    /// request, non-deterministic cold-data builder) panics in debug builds
+    /// and surfaces a `StorageError` in release.
+    pub fn create_at_offset_verified(
+        &self,
+        req: &CreateRequest,
+        record_offset: u64,
+        expected_total_size: u64,
+    ) -> Result<CreateResponse, CreateError> {
+        self.create_at_offset_inner(req, record_offset, Some(expected_total_size))
+    }
+
+    fn create_at_offset_inner(
+        &self,
+        req: &CreateRequest,
+        record_offset: u64,
+        expected_total_size: Option<u64>,
     ) -> Result<CreateResponse, CreateError> {
         let utxo_count = req.utxo_hashes.len() as u32;
         if utxo_count == 0 {
@@ -2096,6 +2133,30 @@ impl Engine {
         } else {
             build_cold_data(req.inputs, req.outputs, req.inpoints)
         };
+
+        // F-G2-006: if the caller passed `pre_allocate_create`'s
+        // `total_size`, defend the implicit contract that both sites
+        // compute the same record layout. A mismatch means the request
+        // was mutated between the two calls (or a different request
+        // reached us) — the on-device `record_size` would otherwise
+        // disagree with the allocator reservation and writes would
+        // either under-fill or spill into the adjacent record.
+        if let Some(expected) = expected_total_size {
+            let base_size = TxMetadata::record_size_for(utxo_count);
+            let actual = base_size + cold_data.len() as u64;
+            debug_assert_eq!(
+                actual, expected,
+                "create_at_offset record_size diverged from pre_allocate_create \
+                 reservation: pre_allocate={expected}, recomputed={actual}",
+            );
+            if actual != expected {
+                return Err(CreateError::StorageError {
+                    detail: format!(
+                        "create_at_offset record_size {actual} != reservation {expected}",
+                    ),
+                });
+            }
+        }
 
         // Build metadata
         let mut meta = TxMetadata::new(utxo_count);
