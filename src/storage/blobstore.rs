@@ -326,6 +326,12 @@ pub struct FileBlobStore {
     base_dir: PathBuf,
     prefix_depth: usize,
     key_locks: Arc<Vec<parking_lot::Mutex<()>>>,
+    /// F-G9-017: count of `walk_dir` errors observed during `list` and
+    /// `list_for_gc` sweeps. Each subdir / entry / metadata failure logs a
+    /// `warn` line AND increments this counter so operators can alert when
+    /// the filesystem state is silently degrading reconciliation results.
+    /// Exposed via [`Self::walk_failures`].
+    walk_failures: Arc<AtomicU64>,
 }
 
 impl FileBlobStore {
@@ -348,7 +354,23 @@ impl FileBlobStore {
             base_dir: base_dir.to_path_buf(),
             prefix_depth,
             key_locks: Arc::new((0..256).map(|_| parking_lot::Mutex::new(())).collect()),
+            walk_failures: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Total number of `walk_dir` errors observed by `list` / `list_for_gc`
+    /// since this store was created (F-G9-017).
+    ///
+    /// A non-zero value indicates the orphan-blob GC sweep produced
+    /// silently-incomplete results: every failed subdir / entry / metadata
+    /// stat means at least one blob was not classified this round. Use as
+    /// an alerting signal: rising values point at filesystem permission or
+    /// I/O degradation that needs operator attention.
+    ///
+    /// Read with [`Ordering::Relaxed`] — this is observability telemetry,
+    /// not a synchronization primitive.
+    pub fn walk_failures(&self) -> u64 {
+        self.walk_failures.load(Ordering::Relaxed)
     }
 
     fn lock_index(key: &[u8; 32]) -> usize {
@@ -386,11 +408,14 @@ impl FileBlobStore {
     /// Errors from individual directory entries (race with another process
     /// removing the file mid-walk, transient stat failures) are logged at
     /// `warn` and skipped — the GC sweep must make forward progress on
-    /// healthy entries even if one is misbehaving.
+    /// healthy entries even if one is misbehaving. Each such failure also
+    /// increments `walk_failures` so operators can alert on degraded
+    /// filesystem state (F-G9-017).
     fn walk_dir(
         dir: &Path,
         stale_cutoff: std::time::SystemTime,
         min_age_cutoff: Option<std::time::SystemTime>,
+        walk_failures: &AtomicU64,
         out: &mut Vec<[u8; 32]>,
     ) -> std::io::Result<()> {
         let read_dir = match std::fs::read_dir(dir) {
@@ -402,6 +427,7 @@ impl FileBlobStore {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
+                    walk_failures.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(dir = %dir.display(), err = %e, "blob list: read_dir entry failed");
                     continue;
                 }
@@ -410,12 +436,16 @@ impl FileBlobStore {
             let file_type = match entry.file_type() {
                 Ok(t) => t,
                 Err(e) => {
+                    walk_failures.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(path = %path.display(), err = %e, "blob list: file_type failed");
                     continue;
                 }
             };
             if file_type.is_dir() {
-                if let Err(e) = Self::walk_dir(&path, stale_cutoff, min_age_cutoff, out) {
+                if let Err(e) =
+                    Self::walk_dir(&path, stale_cutoff, min_age_cutoff, walk_failures, out)
+                {
+                    walk_failures.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(path = %path.display(), err = %e, "blob list: subdir walk failed");
                 }
                 continue;
@@ -837,7 +867,13 @@ impl BlobStore for FileBlobStore {
         let stale_cutoff = std::time::SystemTime::now()
             .checked_sub(std::time::Duration::from_secs(Self::STALE_TMP_AGE_SECS))
             .unwrap_or(std::time::UNIX_EPOCH);
-        Self::walk_dir(&self.base_dir, stale_cutoff, None, &mut keys)?;
+        Self::walk_dir(
+            &self.base_dir,
+            stale_cutoff,
+            None,
+            &self.walk_failures,
+            &mut keys,
+        )?;
         Ok(keys)
     }
 
@@ -855,6 +891,7 @@ impl BlobStore for FileBlobStore {
             &self.base_dir,
             stale_cutoff,
             Some(min_age_cutoff),
+            &self.walk_failures,
             &mut keys,
         )?;
         Ok(keys)
