@@ -16,13 +16,29 @@ Operator constraints (from the user, 2026-05-16):
 ## Discipline rules (apply to every fix)
 
 - **CLAUDE.md absolute rules still apply**: no `todo!()`, no `unimplemented!()`, no `#[ignore]` on tests, no `unwrap()` / `expect()` in lib code, no stub Ok(()) returns. Real implementations only.
-- **Tests gate every fix**. For each finding you fix: (a) write a failing test that reproduces the issue (or extend an existing test to cover it), (b) verify it fails on `main`, (c) apply the fix, (d) confirm the test passes, (e) confirm `cargo test --all` still passes. If you cannot write a test (e.g., race condition that only manifests under specific timing), document the rationale in the commit message.
-- **Each fix is its own commit**. Conventional Commits format. Message starts `fix(<scope>): <F-G?-NNN> short title`. Body explains the *why*.
-- **No commit attribution to AI**. Per the user's CLAUDE.md, never add Co-Authored-By, "Generated with Claude", or any AI attribution to commit messages. Author is Siggi only.
-- **No drive-by fixes**. Stick to the finding. If you spot something unrelated, file a follow-up note in `_review/follow_ups.md`; do not bundle it.
-- **Surgical**. Match existing style, error patterns, test patterns. Don't refactor adjacent code.
-- **No silent error swallowing in your fix**. If a fix to one finding introduces a new `let _ =` or bare `tracing::warn` over a Result, you have just opened a new copy of F-X-002.
-- **Style checks**: after each fix, run `cargo fmt --all` and `cargo clippy --all-targets -- -D warnings`. Both must be clean before you commit.
+- **Tests gate every fix** (but cheaply — see test cadence below): for each finding (a) write or extend a test that reproduces the issue, (b) verify it fails before your fix, (c) apply the fix, (d) confirm the test passes. If you cannot write a test (e.g., race condition needing specific timing), document why in the commit message.
+- **Each fix is its own commit**. Conventional Commits: `fix(<scope>): <F-G?-NNN> short title`. Body explains the *why*.
+- **No commit attribution to AI**. Never add Co-Authored-By, "Generated with Claude", or any AI attribution. Author is Siggi.
+- **No drive-by fixes**. Stick to the finding. Anything unrelated → `_review/follow_ups.md`.
+- **Surgical**. Match existing style. No refactoring of adjacent code.
+- **No silent error swallowing in your fix** (don't open a new copy of F-X-002).
+
+## Test cadence (FAST workflow — replaces old "test-per-fix")
+
+`cargo test --all` is heavy on this project (3-6 min). Do not run it per fix.
+
+**Per fix** (every commit):
+- `cargo check` (fast incremental compile-check; ~5-30s).
+- Targeted test: run only the specific test(s) that exercise the code path you touched. Use `cargo test <module>::<test_name>` or `cargo test --test <integration_file>`. Verify before-fix FAIL, after-fix PASS.
+- Stage only the files you touched. Commit. NO AI attribution.
+
+**Once per group** (last commit before returning to orchestrator):
+- `cargo test --all 2>&1 | tail -30` — must pass.
+- `cargo clippy --all-targets -- -D warnings 2>&1 | tail -20` — must be clean.
+- `cargo fmt --all -- --check` — must be clean (or run `cargo fmt --all` and amend).
+- If the group-final test fails: bisect your commits (`git bisect` or visual diff of likely culprits), fix, recommit.
+
+**Baseline note**: `main` should build cleanly at the commit you branched from (`8920447 wip: pre-review-fix baseline snapshot`). If your first `cargo check` fails on the unmodified worktree, that is a NEEDS-ORCHESTRATOR situation — report it back rather than working around it.
 
 ## Ownership matrix (parallel-agent rule)
 
