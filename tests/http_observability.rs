@@ -444,8 +444,13 @@ fn admin_replication_returns_json() {
 
 #[test]
 fn admin_top_returns_full_snapshot() {
+    // F-G6-002: `/admin/top` exposes internal counters and fans out to
+    // every cluster peer in clustered mode. It now sits behind the same
+    // bearer-token middleware as the mutating routes, so the snapshot
+    // is only retrievable when the operator supplies the configured
+    // admin bearer token.
     let (port, _state) = start_test_http_server();
-    let (status, _, body) = http_get(port, "/admin/top");
+    let (status, _, body) = http_get_auth(port, "/admin/top", R056_TEST_TOKEN);
     assert_eq!(status, 200);
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
 
@@ -731,6 +736,11 @@ fn health_endpoints_unauthenticated_remain_accessible_with_admin_auth_enabled() 
 /// balancers) must remain unauthenticated.
 #[test]
 fn read_only_admin_dashboards_remain_unauthenticated() {
+    // F-G6-002: `/admin/top` was moved to the gated sub-router because
+    // its payload leaks internal counters / redo offsets / replication
+    // progress and triggers a cluster-wide HTTP fan-out. The remaining
+    // read-only dashboards stay unauthenticated so a load balancer or a
+    // Grafana JSON datasource can hit them without operator credentials.
     let (port, _state) = start_test_http_server();
     for path in [
         "/admin/migration_status",
@@ -738,7 +748,6 @@ fn read_only_admin_dashboards_remain_unauthenticated() {
         "/admin/memory",
         "/admin/records",
         "/admin/replication",
-        "/admin/top",
         "/status",
     ] {
         let (status, _, _) = http_get(port, path);
@@ -747,6 +756,26 @@ fn read_only_admin_dashboards_remain_unauthenticated() {
             "read-only dashboard {path} must stay unauthenticated, got {status}",
         );
     }
+}
+
+/// F-G6-002: the moved `/admin/top` and `/ws/top` routes must reject
+/// unauthenticated callers with 401 — they are no longer part of the
+/// always-public read-only surface above.
+#[test]
+fn admin_top_requires_bearer_token() {
+    let (port, _state) = start_test_http_server();
+    let (status, _, _) = http_get(port, "/admin/top");
+    assert_eq!(
+        status, 401,
+        "/admin/top must require admin bearer token (F-G6-002)"
+    );
+    // GET /ws/top is a WebSocket upgrade endpoint — without the bearer
+    // token the middleware short-circuits before the upgrade handshake.
+    let (status, _, _) = http_get(port, "/ws/top");
+    assert_eq!(
+        status, 401,
+        "/ws/top must require admin bearer token (F-G6-003)"
+    );
 }
 
 #[test]
