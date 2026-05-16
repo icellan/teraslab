@@ -45,6 +45,20 @@ use crate::ops::engine::Engine;
 use crate::record::TxFlags;
 use crate::storage::blobstore::{BlobError, BlobStore};
 
+/// Minimum age a blob must reach before the periodic [`reconcile_orphan_blobs`]
+/// sweep will consider it for deletion (F-G9-004).
+///
+/// The dispatch path orders `blob_store.put` BEFORE the index `register`. A
+/// concurrent sweep that observes the blob between those two operations
+/// would mis-classify it as an orphan. The 60-second grace gives the
+/// in-flight create enough time to land its index registration even under
+/// substantial replication lag.
+///
+/// Recovery's reconciliation is race-free (no clients connected) and uses
+/// the un-aged [`BlobStore::list`] path; this constant only applies to the
+/// runtime [`reconcile_orphan_blobs`] sweep.
+pub const PERIODIC_GC_MIN_BLOB_AGE: Duration = Duration::from_secs(60);
+
 /// Counters returned by a single reconciliation sweep.
 ///
 /// `total_blobs` is the number of blobs returned by [`BlobStore::list`] — the
@@ -108,12 +122,13 @@ pub enum LookupOutcome {
 /// registration must have either finalised the registration (so we observe the
 /// `EXTERNAL` flag and keep the blob) or aborted (so we sweep it). The dispatch
 /// path orders blob `put` BEFORE the index `register`, so a sweep that races a
-/// half-completed create may delete a freshly written blob whose registration
-/// is about to land. To avoid that race in production, callers SHOULD invoke
-/// this from recovery (no concurrent dispatch) or from the background task
-/// after the create flow has been quiesced — or accept the failure mode that a
-/// freshly-uploaded blob whose index registration was about to land may need a
-/// re-upload. The recovery path is race-free because no client is connected.
+/// half-completed create can mis-classify a freshly written blob as an orphan.
+///
+/// F-G9-004 mitigates the race by making the periodic sweep call
+/// [`BlobStore::list_for_gc`] with a grace-period filter ([`PERIODIC_GC_MIN_BLOB_AGE`]),
+/// so blobs younger than the grace are skipped this round and re-examined on
+/// the next sweep. Recovery uses the un-aged `list()` because no client is
+/// connected and the race cannot occur.
 pub fn reconcile_orphan_blobs_with<F>(
     blob_store: &dyn BlobStore,
     mut lookup: F,
@@ -121,7 +136,24 @@ pub fn reconcile_orphan_blobs_with<F>(
 where
     F: FnMut(&TxKey) -> LookupOutcome,
 {
-    let keys = blob_store.list()?;
+    reconcile_orphan_blobs_with_filter(blob_store, None, &mut lookup)
+}
+
+/// Internal helper shared by recovery (no min-age filter) and the periodic
+/// sweep (with min-age filter). See [`reconcile_orphan_blobs_with`] and
+/// [`reconcile_orphan_blobs`] for the public entry points.
+fn reconcile_orphan_blobs_with_filter<F>(
+    blob_store: &dyn BlobStore,
+    min_blob_age: Option<Duration>,
+    lookup: &mut F,
+) -> Result<BlobGcStats, BlobError>
+where
+    F: FnMut(&TxKey) -> LookupOutcome,
+{
+    let keys = match min_blob_age {
+        Some(age) => blob_store.list_for_gc(age)?,
+        None => blob_store.list()?,
+    };
     let mut stats = BlobGcStats {
         total_blobs: keys.len() as u64,
         ..Default::default()
@@ -200,16 +232,22 @@ pub fn reconcile_orphan_blobs_against_index(
 
 /// Live sweep against the runtime [`Engine`] used by the periodic background
 /// task. The engine acquires its own index read lock per lookup.
+///
+/// Applies the [`PERIODIC_GC_MIN_BLOB_AGE`] grace-period filter so blobs that
+/// were just uploaded by an in-flight create — and whose index registration
+/// has not yet landed — are skipped this round and re-examined on the next
+/// sweep (F-G9-004).
 pub fn reconcile_orphan_blobs(
     blob_store: &dyn BlobStore,
     engine: &Engine,
 ) -> Result<BlobGcStats, BlobError> {
-    reconcile_orphan_blobs_with(blob_store, |key| match engine.lookup(key) {
+    let mut lookup = |key: &TxKey| match engine.lookup(key) {
         Some(entry) => LookupOutcome::Found {
             tx_flags: entry.tx_flags,
         },
         None => LookupOutcome::NoEntry,
-    })
+    };
+    reconcile_orphan_blobs_with_filter(blob_store, Some(PERIODIC_GC_MIN_BLOB_AGE), &mut lookup)
 }
 
 /// Format a 32-byte txid as a lowercase hex string for log lines.
