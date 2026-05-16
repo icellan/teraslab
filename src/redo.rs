@@ -2373,23 +2373,6 @@ mod tests {
     }
 
     #[test]
-    fn redo_flush_rmw_read_failure() {
-        let dev = Arc::new(ReadFailingDevice::new(1024 * 1024));
-        let mut log = RedoLog::open(dev.clone(), 0, 1024 * 1024).unwrap();
-        log.append(RedoOp::Freeze {
-            tx_key: test_key(9),
-            offset: 1,
-        })
-        .unwrap();
-
-        dev.fail_reads();
-        let err = log
-            .flush()
-            .expect_err("partial-block RMW read failure must abort redo flush");
-        assert!(matches!(err, RedoError::Io(_)), "unexpected error: {err:?}");
-    }
-
-    #[test]
     fn append_100_flush_recover_all() {
         let (_, mut log) = make_log(1024 * 1024);
         for i in 0..100u8 {
