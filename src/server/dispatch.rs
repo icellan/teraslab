@@ -7986,6 +7986,10 @@ mod tests {
             RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024)
                 .expect("redo log opens"),
         ));
+        // Capture sync count after open — F-G4-001's initial header
+        // write at open also syncs, and is not part of the group-commit
+        // accounting under test.
+        let baseline_syncs = redo_dev.sync_count();
         let barrier = Arc::new(std::sync::Barrier::new(3));
 
         let spawn_writer = |byte: u8| {
@@ -8018,10 +8022,16 @@ mod tests {
         ranges.sort_by_key(|range| range.0);
 
         assert_eq!(ranges, vec![(1, 1), (2, 2)]);
+        // F-G4-001 made flush() emit two device syncs per effective
+        // flush: one for the entries pwrite and one for the persisted-
+        // header pwrite. Group commit collapses the two concurrent
+        // writers into one effective flush, so the post-open delta is
+        // exactly 2 syncs.
         assert_eq!(
-            redo_dev.sync_count(),
-            1,
-            "concurrent dispatch writers should share one redo fsync"
+            redo_dev.sync_count() - baseline_syncs,
+            2,
+            "concurrent dispatch writers should share one effective flush \
+             (one entries sync + one header sync under F-G4-001)"
         );
 
         let entries = redo_log.lock().recover().expect("recover grouped entries");
