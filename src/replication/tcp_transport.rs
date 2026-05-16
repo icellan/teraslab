@@ -322,10 +322,20 @@ impl ReplicaTransport for TcpReplicaTransport {
 
     /// Check whether the underlying TCP connection appears healthy.
     ///
-    /// TCP does not provide a clean "is alive" test without writing data, so
-    /// this is intentionally a cheap socket-error probe. It avoids temporarily
-    /// changing read timeouts or consuming/peeking stream bytes; the next
-    /// send/recv remains the authoritative liveness check.
+    /// F-G7-014: this is a BEST-EFFORT probe, NOT a true liveness
+    /// check. It calls `TcpStream::take_error` which consumes the
+    /// asynchronous error flag (SO_ERROR). On macOS the flag only
+    /// surfaces ECONNRESET-class events, not graceful peer FIN: a
+    /// peer that has closed its half of the socket still reports
+    /// `is_connected == true` until the next read returns EOF.
+    /// Concurrent callers also race because `take_error` is consuming.
+    ///
+    /// `check_reconnected` in
+    /// [`crate::replication::manager::ReplicationManager`] uses this
+    /// as a hint to move a sender from Down → CatchingUp; the next
+    /// `send_batch` / `recv_ack` is the authoritative liveness check
+    /// and re-marks the sender Down on hard failure. Do not rely on
+    /// this method as a positive correctness signal.
     fn is_connected(&self) -> bool {
         self.stream
             .take_error()
