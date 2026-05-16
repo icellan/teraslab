@@ -36,7 +36,11 @@ const HEADER_CRC_OFFSET: usize = 44;
 const FREELIST_OFFSET: usize = 48;
 
 /// Maximum number of free regions that can be serialized to the device header.
-const MAX_PERSISTED_FREE_REGIONS: usize = (DATA_REGION_OFFSET as usize - FREELIST_OFFSET) / 16;
+///
+/// Exposed publicly so observability surfaces (and the F-G1-009
+/// regression test) can compare the current freelist size against the
+/// persist-time cap.
+pub const MAX_PERSISTED_FREE_REGIONS: usize = (DATA_REGION_OFFSET as usize - FREELIST_OFFSET) / 16;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -89,6 +93,16 @@ pub enum AllocatorError {
     /// effect. The caller must treat the operation as not having happened.
     #[error("redo log failure: {detail}")]
     RedoLogFailure { detail: String },
+
+    /// The freelist has more entries than the on-device header can store
+    /// (`MAX_PERSISTED_FREE_REGIONS`). [`SlotAllocator::persist`] previously
+    /// silently truncated the list to the first N entries (in offset
+    /// order), permanently leaking the tail regions on the next
+    /// `recover()`. F-G1-009: persist now returns this variant explicitly
+    /// so the operator can react (compact, grow the header region, or
+    /// add an overflow-chain implementation) before space is leaked.
+    #[error("freelist overflow: {entries} entries, max persistable is {max}")]
+    FreelistOverflow { entries: usize, max: usize },
 }
 
 /// Result type for allocator operations.
@@ -954,7 +968,22 @@ impl SlotAllocator {
     /// CRC field is treated as zero so [`SlotAllocator::recover`] can
     /// reproduce the value by zeroing the field before hashing.
     pub fn persist(&self) -> Result<()> {
-        let count = self.freelist.len().min(MAX_PERSISTED_FREE_REGIONS);
+        // F-G1-009: refuse to silently truncate a freelist that does not
+        // fit in the on-device header. Pre-fix this branch was
+        // `let count = self.freelist.len().min(MAX_PERSISTED_FREE_REGIONS);`
+        // and any overflow entries were lost on the next `recover()` —
+        // free space leaked permanently with no log line and no metric.
+        // The cap is large (~65k entries on a 1 MiB header), but
+        // pathologically fragmented workloads can reach it, and a leak
+        // there is silent corruption from the operator's point of view.
+        let entries = self.freelist.len();
+        if entries > MAX_PERSISTED_FREE_REGIONS {
+            return Err(AllocatorError::FreelistOverflow {
+                entries,
+                max: MAX_PERSISTED_FREE_REGIONS,
+            });
+        }
+        let count = entries;
         let aligned_len = self.align_up(FREELIST_OFFSET as u64 + (count as u64) * 16);
         let mut buf = AlignedBuf::new(aligned_len as usize, self.alignment);
 
@@ -1218,6 +1247,20 @@ impl SlotAllocator {
             used_bytes: used,
             utilization,
         }
+    }
+
+    /// Test-only: directly push a free region into the freelist without
+    /// coalescing or validation. Used by F-G1-009 regression coverage to
+    /// force a freelist that exceeds `MAX_PERSISTED_FREE_REGIONS` so
+    /// `persist()` exercises the overflow branch deterministically.
+    ///
+    /// Public (rather than `pub(crate)`) so the integration-test crate
+    /// can use it — the only callers are F-G1-009 regressions. Do not
+    /// use from production code: it bypasses every allocator invariant
+    /// (offset/size validation, coalescing, overlap rejection).
+    #[doc(hidden)]
+    pub fn __test_force_push_free_region(&mut self, offset: u64, size: u64) {
+        self.freelist.insert(offset, size);
     }
 }
 
@@ -2471,5 +2514,41 @@ mod tests {
             "local freelist should contain ≥ 1 region after freeing (got {})",
             local_stats.free_region_count,
         );
+    }
+
+    /// F-G1-009 regression: when the freelist contains more entries than
+    /// the on-device header can hold (`MAX_PERSISTED_FREE_REGIONS`),
+    /// `persist()` must return `FreelistOverflow` rather than silently
+    /// truncating to the first N entries and leaking the tail regions
+    /// on the next `recover()`.
+    ///
+    /// Uses the test-only `__test_force_push_free_region` helper to seed
+    /// the freelist past the cap deterministically. The cap is large
+    /// (~65k entries) so a natural allocate/free workload to reach it
+    /// would take seconds; the helper makes the test instant.
+    #[test]
+    fn persist_rejects_freelist_overflow() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+
+        // The freelist begins empty; push `MAX_PERSISTED_FREE_REGIONS + 1`
+        // entries at non-overlapping offsets above DATA_REGION_OFFSET so
+        // the structural invariants stay sane (the helper bypasses
+        // coalescing but offsets are still distinct).
+        for i in 0..=MAX_PERSISTED_FREE_REGIONS {
+            // Each entry occupies a 4096-byte region; offsets must be
+            // strictly increasing and not collide.
+            let off = DATA_REGION_OFFSET + (i as u64) * 4096;
+            alloc.__test_force_push_free_region(off, 4096);
+        }
+        assert!(alloc.freelist.len() > MAX_PERSISTED_FREE_REGIONS);
+
+        match alloc.persist() {
+            Err(AllocatorError::FreelistOverflow { entries, max }) => {
+                assert!(entries > max, "entries ({entries}) must exceed max ({max})");
+                assert_eq!(max, MAX_PERSISTED_FREE_REGIONS);
+            }
+            other => panic!("expected FreelistOverflow, got {other:?}"),
+        }
     }
 }
