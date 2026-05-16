@@ -473,6 +473,17 @@ pub(crate) fn handle_request(
             status: STATUS_OK,
             payload: b"ok".to_vec(),
         },
+        // F-G5-006: SWIM heartbeats use the dedicated UDP gossip port, not
+        // this TCP data port. The OP_HEARTBEAT constant exists for clients
+        // that have not been updated to use the gossip transport — respond
+        // with STATUS_OK and an empty payload instead of falling into the
+        // catch-all "unknown opcode" error so an operator who misconfigures
+        // a probe doesn't see misleading ERR_INTERNAL responses.
+        OP_HEARTBEAT => ResponseFrame {
+            request_id: request.request_id,
+            status: STATUS_OK,
+            payload: vec![],
+        },
         OP_INCREMENT_SPENT_EXTRA_RECS => ResponseFrame {
             request_id: request.request_id,
             status: STATUS_OK,
