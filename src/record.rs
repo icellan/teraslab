@@ -610,6 +610,12 @@ impl TxMetadata {
     /// so external callers cannot bypass the CRC integrity story by
     /// grepping for "fast metadata read". Library code on the hot path
     /// must use [`TxMetadata::from_bytes`] which validates the CRC.
+    ///
+    /// `#[allow(dead_code)]` because the helper is kept for future
+    /// diagnostics tooling; the `pub(crate)` visibility documents the
+    /// intent but means no crate-external caller can reach it, and
+    /// today no in-crate caller exists.
+    #[allow(dead_code)]
     pub(crate) fn from_bytes_unchecked(src: &[u8]) -> Self {
         debug_assert!(src.len() >= METADATA_SIZE);
         let mut meta = std::mem::MaybeUninit::<Self>::uninit();

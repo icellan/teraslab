@@ -76,7 +76,7 @@ impl DeviceIo for SyncFallback {
         // caller-supplied buffer is the I/O target — passing a
         // dangling pointer through is a footgun that should fail
         // loudly.
-        if buf.len() == 0 {
+        if buf.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "submit_read: zero-length buffer (dangling pointer)",
@@ -101,7 +101,7 @@ impl DeviceIo for SyncFallback {
         user_data: u64,
     ) -> Result<(), std::io::Error> {
         // F-G1-010: see submit_read above.
-        if buf.len() == 0 {
+        if buf.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "submit_write: zero-length buffer (dangling pointer)",
