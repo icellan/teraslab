@@ -20,9 +20,9 @@ This audit is independent of the existing internal `docs/TERANODE_PRODUCTION_REA
 | Source LOC | 98,234 lines across 70 `*.rs` files |
 
 ### Failing tests (live in main)
-1. `index::tests::rebuild_fails_on_corrupted_magic_in_allocated_region` — `src/index/mod.rs:1127` — assertion `detail.contains("invalid metadata magic")` fails because `TxMetadata::from_bytes` (`src/record.rs:557`) now rejects on **CRC mismatch** before the magic check at `src/index/mod.rs:393` is reached. Detail returned is `"corrupt metadata at allocated offset {offset}: {e}"`. **The test expectation is stale; either rewrite the test to corrupt only the magic without breaking CRC, or update the assertion to match the actual diagnostic.**
-2. `index::tests::rebuild_secondary_fails_on_corrupted_allocated_record` — same root cause, `src/index/mod.rs:1191`.
-3. `index::backend::tests::rebuild_redb_fails_on_corrupted_magic_in_allocated_region` — same root cause, `src/index/backend.rs:938`.
+1. ~~`index::tests::rebuild_fails_on_corrupted_magic_in_allocated_region`~~ — **RESOLVED** (F-G3-009). The current code in `src/index/mod.rs:1387-1525` and the sibling test in `src/index/backend.rs:989-1034` use the `corrupt_magic_and_restamp_crc` helper (`mod.rs:854`, `backend.rs:640`) which zeroes the magic and restamps the CRC over the post-edit header. `TxMetadata::from_bytes` now accepts the CRC and the magic check is the gate that fires. Each "rebuild_fails_on_corrupted_magic_…" test pairs with a sibling "…_on_crc_mismatch_in_allocated_region" test exercising the other path.
+2. ~~`index::tests::rebuild_secondary_fails_on_corrupted_allocated_record`~~ — **RESOLVED** (F-G3-009), same fix.
+3. ~~`index::backend::tests::rebuild_redb_fails_on_corrupted_magic_in_allocated_region`~~ — **RESOLVED** (F-G3-009), same fix.
 
 ### Ignored test
 `src/cluster/coordinator.rs:7505` — `#[ignore] // TODO: rewrite for pipelined migration flow`. Per the project's CLAUDE.md absolute rules, every `#[ignore]` is a finding unless its justification is documented; the inline comment is too thin (no rewrite tracker, no link, no expected schedule).
