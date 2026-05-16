@@ -281,9 +281,22 @@ impl RedbDahIndex {
 
     /// Insert multiple transactions in a single write transaction.
     ///
-    /// Much faster than calling [`insert`](Self::insert) in a loop because
-    /// only one fsync is performed for the entire batch.
-    pub fn insert_batch(&mut self, entries: &[(u32, TxKey)]) -> Result<(), IndexError> {
+    /// **MIGRATION ONLY — does NOT use two-phase durability.** Unlike
+    /// [`insert`](Self::insert), this method commits the redb transaction
+    /// without first appending and fsyncing a [`RedoOp::SecondaryDahUpdate`]
+    /// record, so a crash between the redb commit and the next checkpoint
+    /// can lose entries that were just written. The trade-off is acceptable
+    /// for one-shot bulk import (see [`crate::index::migration`]) which
+    /// detects partial imports via its own sentinel-file mechanism and is
+    /// not interleaved with foreground mutations.
+    ///
+    /// Restricted to `pub(crate)` so hot-path callers cannot accidentally
+    /// adopt the bulk path and lose the redo-log guarantee that
+    /// [`insert`](Self::insert) provides.
+    pub(crate) fn insert_batch(
+        &mut self,
+        entries: &[(u32, TxKey)],
+    ) -> Result<(), IndexError> {
         if entries.is_empty() {
             return Ok(());
         }
