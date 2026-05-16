@@ -3685,7 +3685,9 @@ mod tests {
     fn corrupted_entry_recovery_returns_entries_before_corruption() {
         let (dev, mut log) = make_log(1024 * 1024);
 
-        // Write 5 entries
+        // F-G4-004: append all entries before a single flush so they
+        // sit contiguously in one entries block. Otherwise the scan
+        // would stop at the zero-padded gap after the first entry.
         let ops: Vec<RedoOp> = (0..5u8)
             .map(|i| RedoOp::Freeze {
                 tx_key: make_txid(i),
@@ -3693,19 +3695,24 @@ mod tests {
             })
             .collect();
         for op in &ops {
-            log.append_and_flush(op.clone()).unwrap();
+            log.append(op.clone()).unwrap();
         }
+        log.flush().unwrap();
 
-        // Determine where the third entry starts (after two entries).
-        // Each Freeze entry is: 4 (length) + 8 (seq) + 1 (type) + 32 (txid) + 4 (offset) + 4 (crc) = 53 bytes
+        // Each Freeze entry is: 4 (length) + 8 (seq) + 1 (type) + 32
+        // (txid) + 4 (offset) + 4 (crc) = 53 bytes. Corrupt a byte in
+        // the middle of the third entry.
         let entry_size = 53usize;
-        let corrupt_target = entry_size * 2 + 10; // middle of the third entry
+        let corrupt_target = entry_size * 2 + 10; // middle of third entry
 
+        // The entries region starts at offset = device alignment
+        // (F-G4-001 header block claims the first alignment unit).
         let align = dev.alignment();
+        let entries_region_offset = align as u64;
         let mut buf = AlignedBuf::new(align, align);
-        dev.pread(&mut buf, 0).unwrap();
+        dev.pread(&mut buf, entries_region_offset).unwrap();
         buf[corrupt_target] ^= 0xFF;
-        dev.pwrite(&buf, 0).unwrap();
+        dev.pwrite(&buf, entries_region_offset).unwrap();
 
         // Reopen and recover
         let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
