@@ -2569,8 +2569,24 @@ impl Engine {
         }
         slot.status = UTXO_PRUNED;
         self.write_slot_fast(entry.record_offset, offset, &slot)?;
-        meta.spent_utxos = { meta.spent_utxos }.saturating_sub(1);
-        meta.pruned_utxos = { meta.pruned_utxos }.saturating_add(1);
+        // F-G2-017: switch from `saturating_sub`/`saturating_add` to
+        // `checked_*` so a violation of the per-record invariant
+        // surfaces as a `StorageError` instead of silently clamping.
+        // The earlier `slot.status == UTXO_PRUNED` short-circuit
+        // (line above) and `UTXO_SPENT` guard mean these arithmetic
+        // ops are unreachable-overflow in current code; the explicit
+        // check is defense-in-depth for any future change that
+        // re-orders the guards.
+        meta.spent_utxos = { meta.spent_utxos }.checked_sub(1).ok_or_else(|| {
+            SpendError::StorageError {
+                detail: "prune_slot_if_spent_by_child: spent_utxos underflow".into(),
+            }
+        })?;
+        meta.pruned_utxos = { meta.pruned_utxos }.checked_add(1).ok_or_else(|| {
+            SpendError::StorageError {
+                detail: "prune_slot_if_spent_by_child: pruned_utxos overflow".into(),
+            }
+        })?;
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = self.now_millis();
         self.write_metadata_fast(entry.record_offset, &meta)?;
@@ -2585,6 +2601,14 @@ impl Engine {
     /// Freeze a UTXO (set status to FROZEN, spending_data all 0xFF).
     ///
     /// Does NOT modify metadata counters — frozen does not count as "spent".
+    ///
+    /// F-G2-012: freeze/unfreeze does NOT touch `spent_utxos` and therefore
+    /// cannot cross the all-spent boundary — DAH eval is intentionally
+    /// omitted. `evaluate_delete_at_height` gates eligibility on
+    /// `spent_utxos == utxo_count`; a freeze can never change that
+    /// equality, so re-evaluating after a freeze would be a guaranteed
+    /// no-op that adds an index round-trip. Do not add an eval call here
+    /// without changing the invariant.
     pub fn freeze(&self, req: &FreezeRequest) -> Result<u32, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
@@ -2635,6 +2659,10 @@ impl Engine {
     }
 
     /// Unfreeze a UTXO (set status to UNSPENT, spending_data zeroed).
+    ///
+    /// F-G2-012: like `freeze`, this does NOT touch `spent_utxos` and is
+    /// not a candidate for DAH evaluation. See [`Self::freeze`] for the
+    /// full rationale.
     pub fn unfreeze(&self, req: &UnfreezeRequest) -> Result<u32, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
@@ -3156,6 +3184,22 @@ impl Engine {
     }
 
     /// Set or clear the locked flag on a transaction.
+    ///
+    /// Returns the post-mutation generation.
+    ///
+    /// # F-G2-013: rollback hazard for callers that need DAH restore
+    ///
+    /// Locking clears `delete_at_height`; unlocking does NOT restore the
+    /// pre-lock DAH (the engine has no memory of it). Any caller that
+    /// might need to compensate a `set_locked(true)` (e.g. on a
+    /// replication failure) MUST go through
+    /// [`Self::set_locked_with_before_image`] to capture
+    /// `prior_delete_at_height` and use [`Self::restore_set_locked_for_compensation`]
+    /// on rollback. Plain `set_locked(false)` after a failed
+    /// `set_locked(true)` silently drops the DAH and the record becomes
+    /// unprunable on the next sweep. This `u32` return signature exists
+    /// only for callers that have no compensation requirement
+    /// (e.g. benchmarks, idempotent replay).
     pub fn set_locked(&self, req: &SetLockedRequest) -> Result<u32, SpendError> {
         Ok(self.set_locked_with_before_image(req)?.generation)
     }
