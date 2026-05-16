@@ -4945,6 +4945,18 @@ fn handle_delete_batch(
             // intervene; silently clearing the replication intent on
             // top of a half-restored state is exactly the divergence
             // BC-62 / F9 warned about.
+            // F-G5-023 (maintainability hazard): this in-process
+            // compensation path hand-constructs an OP_REPLICA_BATCH frame
+            // and feeds it back through `handle_replica_batch`. That
+            // bypasses every check the network path applies (HMAC, the
+            // cluster_key gate, sequence-number dedupe) — intentional
+            // because the inputs are trusted-by-construction, but the
+            // network path and the compensation path will drift apart if
+            // a future security gate is added to one and not the other.
+            // The structural fix is to extract a pure `apply_replica_ops`
+            // function in `src/replication/receiver.rs` (G7 territory)
+            // and call it from both sites; for now the synthesised-frame
+            // approach is wired so the rollback semantics stay correct.
             let mut compensation_failed: Option<String> = None;
             for (key, snap) in &deleted_snapshots {
                 let ops = build_delete_compensation_ops(key, snap);
