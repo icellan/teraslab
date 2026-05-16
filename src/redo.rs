@@ -2486,9 +2486,18 @@ mod tests {
             tx_key: test_key(2),
             offset: 1,
         };
-        log.append_and_flush(first_op.clone()).unwrap();
-        log.append_and_flush(second_op.clone()).unwrap();
+        // F-G4-004: append both in one flush so the entries are
+        // contiguous on disk; otherwise each flush would block-align
+        // write_pos and the trailing zero-padding would stop the scan
+        // before reaching the second entry.
+        log.append(first_op.clone()).unwrap();
+        log.append(second_op.clone()).unwrap();
+        log.flush().unwrap();
 
+        // Rewrite the second entry's sequence number to 99 so the
+        // monotonicity scan rejects it. The first alignment unit of
+        // the redo region is the F-G4-001 header block; the entries
+        // region starts at offset = device alignment.
         let first_entry = RedoEntry {
             sequence: 1,
             op: first_op,
@@ -2500,12 +2509,13 @@ mod tests {
         }
         .serialize();
         let align = dev.alignment();
+        let entries_region_offset = align as u64;
         let mut buf = AlignedBuf::new(align, align);
-        dev.pread(&mut buf, 0).unwrap();
+        dev.pread(&mut buf, entries_region_offset).unwrap();
         let second_offset = first_entry.len();
         buf[second_offset..second_offset + rewritten_second.len()]
             .copy_from_slice(&rewritten_second);
-        dev.pwrite(&buf, 0).unwrap();
+        dev.pwrite(&buf, entries_region_offset).unwrap();
 
         match RedoLog::open(dev, 0, 1024 * 1024) {
             Err(RedoError::SequenceOutOfOrder {
