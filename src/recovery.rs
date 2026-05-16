@@ -1241,8 +1241,24 @@ fn replay_create(
     record_offset: u64,
     utxo_count: u32,
 ) -> ReplayResult {
-    // Idempotent: if already in index, skip
-    if index.lookup(tx_key).is_some() {
+    // Idempotent: if already in index, skip — but if the existing
+    // index entry's `record_offset` does NOT match the redo entry's,
+    // surface a warning (F-G4-014). Skipping is still correct (a
+    // later replay of Delete + Create restamped the index entry), but
+    // the reordering may indicate an upstream bug worth investigating.
+    if let Some(existing) = index.lookup(tx_key) {
+        if existing.record_offset != record_offset || existing.utxo_count != utxo_count {
+            tracing::warn!(
+                target: "teraslab::recovery",
+                txid_prefix = ?&tx_key.txid[..4],
+                expected_record_offset = record_offset,
+                actual_record_offset = existing.record_offset,
+                expected_utxo_count = utxo_count,
+                actual_utxo_count = existing.utxo_count,
+                "F-G4-014: replay_create skipped — existing index entry diverges from redo entry; \
+                 likely a delete+recreate that crossed the redo log",
+            );
+        }
         return ReplayResult::Skipped;
     }
 
