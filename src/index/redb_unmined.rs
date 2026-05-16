@@ -283,16 +283,23 @@ impl RedbUnminedIndex {
     /// Remove all entries.
     ///
     /// Uses table drop + recreate for O(1) memory instead of row-by-row deletion.
-    pub fn clear(&mut self) {
-        if let Ok(txn) = self.begin_write() {
-            // Drop and recreate tables — O(1) memory regardless of entry count.
-            let _ = txn.delete_table(UNMINED_FORWARD);
-            let _ = txn.delete_table(UNMINED_REVERSE);
-            let _ = txn.open_table(UNMINED_FORWARD);
-            let _ = txn.open_table(UNMINED_REVERSE);
-            let _ = txn.commit();
-        }
+    ///
+    /// Returns an [`IndexError`] if the redb begin/delete/recreate/commit
+    /// chain fails. The cached `count` is only reset to zero after the
+    /// commit succeeds; previously every step silently swallowed errors
+    /// then forced `count = 0`, leaving an "empty" in-memory view over
+    /// a fully-populated table on disk.
+    pub fn clear(&mut self) -> Result<(), IndexError> {
+        let txn = self.begin_write().map_err(map_txn_err)?;
+        // Drop and recreate tables — O(1) memory regardless of entry count.
+        txn.delete_table(UNMINED_FORWARD).map_err(map_table_err)?;
+        txn.delete_table(UNMINED_REVERSE).map_err(map_table_err)?;
+        // Open the empty tables so they exist for subsequent transactions.
+        txn.open_table(UNMINED_FORWARD).map_err(map_table_err)?;
+        txn.open_table(UNMINED_REVERSE).map_err(map_table_err)?;
+        txn.commit().map_err(map_commit_err)?;
         self.count = 0;
+        Ok(())
     }
 
     /// Insert multiple transactions in a single write transaction.
@@ -575,7 +582,23 @@ mod tests {
         let (_dir, mut idx) = open_temp();
         idx.insert(100, key(1), None).unwrap();
         idx.insert(200, key(2), None).unwrap();
-        idx.clear();
+        idx.clear().unwrap();
+        assert!(idx.is_empty());
+    }
+
+    // F-G3-002: `clear` must propagate redb errors. Pre-fix every step of
+    // the drop+recreate chain was `let _ = …` and `self.count = 0` was
+    // unconditional. Pins the success path: cached count drops only after
+    // the commit returns `Ok`.
+    #[test]
+    fn clear_returns_ok_and_zeroes_count_only_on_success() {
+        let (_dir, mut idx) = open_temp();
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
+        assert_eq!(idx.len(), 2);
+        let result: Result<(), IndexError> = idx.clear();
+        result.expect("redb clear should succeed on an open temp db");
+        assert_eq!(idx.len(), 0);
         assert!(idx.is_empty());
     }
 
@@ -791,7 +814,7 @@ mod tests {
         let (_dir, mut idx) = open_temp();
         idx.insert(100, key(1), None).unwrap();
         idx.insert(200, key(2), None).unwrap();
-        idx.clear();
+        idx.clear().unwrap();
         assert!(idx.is_empty());
         assert!(idx.range_query(1000).is_empty());
 
@@ -857,7 +880,7 @@ mod tests {
             let mut idx = RedbUnminedIndex::open(&db_path, 16 * 1024 * 1024).unwrap();
             idx.insert(100, key(1), None).unwrap();
             idx.insert(200, key(2), None).unwrap();
-            idx.clear();
+            idx.clear().unwrap();
         }
 
         let idx = RedbUnminedIndex::open(&db_path, 16 * 1024 * 1024).unwrap();

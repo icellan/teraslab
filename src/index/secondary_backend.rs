@@ -175,9 +175,15 @@ impl DahBackend {
     }
 
     /// Remove all entries.
-    pub fn clear(&mut self) {
+    ///
+    /// Returns an [`IndexError`] if the redb backend fails to commit the
+    /// drop+recreate transaction. The in-memory variant is infallible.
+    pub fn clear(&mut self) -> Result<(), IndexError> {
         match self {
-            Self::InMemory(idx) => idx.clear(),
+            Self::InMemory(idx) => {
+                idx.clear();
+                Ok(())
+            }
             Self::OnDisk(redb) => redb.clear(),
         }
     }
@@ -297,9 +303,15 @@ impl UnminedBackend {
     }
 
     /// Remove all entries.
-    pub fn clear(&mut self) {
+    ///
+    /// Returns an [`IndexError`] if the redb backend fails to commit the
+    /// drop+recreate transaction. The in-memory variant is infallible.
+    pub fn clear(&mut self) -> Result<(), IndexError> {
         match self {
-            Self::InMemory(idx) => idx.clear(),
+            Self::InMemory(idx) => {
+                idx.clear();
+                Ok(())
+            }
             Self::OnDisk(redb) => redb.clear(),
         }
     }
@@ -444,7 +456,7 @@ mod tests {
         with_both_dah_backends(|backend| {
             backend.insert(100, key(1), None).unwrap();
             backend.insert(200, key(2), None).unwrap();
-            backend.clear();
+            backend.clear().unwrap();
             assert!(backend.is_empty());
             assert!(backend.range_query(1000).is_empty());
         });
@@ -553,7 +565,7 @@ mod tests {
         with_both_unmined_backends(|backend| {
             backend.insert(100, key(1), None).unwrap();
             backend.insert(200, key(2), None).unwrap();
-            backend.clear();
+            backend.clear().unwrap();
             assert!(backend.is_empty());
         });
     }

@@ -468,8 +468,11 @@ fn reconcile_secondary_indexes_from_metadata(
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
 ) -> Result<(), RecoveryError> {
-    dah.clear();
-    unmined.clear();
+    // F-G3-002: propagate failures from the redb drop+recreate so we do not
+    // start the reconcile loop over a half-cleared table whose cached count
+    // disagrees with the on-disk rows.
+    dah.clear().map_err(RecoveryError::Index)?;
+    unmined.clear().map_err(RecoveryError::Index)?;
     for (key, entry) in index.iter() {
         let meta = match io::read_metadata(device, entry.record_offset) {
             Ok(meta) => meta,
