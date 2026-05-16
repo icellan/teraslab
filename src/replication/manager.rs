@@ -446,10 +446,33 @@ impl ReplicationManager {
             handles
                 .into_iter()
                 .map(|h| {
-                    h.join()
-                        .unwrap_or(Outcome::TransportErr(ReplicationError::Transport(
-                            "replica worker panicked".into(),
+                    h.join().unwrap_or_else(|payload| {
+                        // F-G7-009: capture the panic payload so the
+                        // diagnostic isn't lost. The scoped worker's
+                        // panic was previously masked behind a
+                        // constant string, hiding correctness bugs in
+                        // send_batch / recv_ack behind a benign-looking
+                        // transport error. Downcast common payload
+                        // shapes (&str, String) and bump a counter so
+                        // operators can alert on the underlying bug.
+                        let detail = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "<non-string panic payload>".to_string()
+                        };
+                        if let Some(m) = replication_metrics() {
+                            m.replica_worker_panics_total.inc();
+                        }
+                        tracing::error!(
+                            panic = %detail,
+                            "replica replication worker panicked",
+                        );
+                        Outcome::TransportErr(ReplicationError::Transport(format!(
+                            "replica worker panicked: {detail}"
                         )))
+                    })
                 })
                 .collect()
         });
@@ -1382,6 +1405,68 @@ mod tests {
         .unwrap();
 
         assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
+    }
+
+    /// F-G7-009: a panicking replica worker must:
+    ///   1. Surface the panic message in the resulting TransportErr
+    ///      so the diagnostic isn't lost,
+    ///   2. Bump `replica_worker_panics_total` so operators can
+    ///      alert on the underlying bug.
+    #[test]
+    fn replicate_batch_panic_captured_with_payload() {
+        struct PanickingTransport;
+        impl ReplicaTransport for PanickingTransport {
+            fn send_batch(
+                &mut self,
+                _batch: &ReplicaBatch,
+            ) -> std::result::Result<(), ReplicationError> {
+                panic!("synthetic send_batch failure: oxidized");
+            }
+            fn recv_ack(
+                &mut self,
+                _t: Duration,
+            ) -> std::result::Result<ReplicaAck, ReplicationError> {
+                unreachable!("send_batch panicked");
+            }
+            fn is_connected(&self) -> bool {
+                true
+            }
+        }
+
+        // Install metrics so the counter has somewhere to live.
+        static TEST_METRICS: std::sync::OnceLock<&'static crate::metrics::ReplicationMetrics> =
+            std::sync::OnceLock::new();
+        let metrics_ref = *TEST_METRICS
+            .get_or_init(|| Box::leak(Box::new(crate::metrics::ReplicationMetrics::new())));
+        crate::metrics::init_replication_metrics(metrics_ref);
+        let metrics = crate::metrics::replication_metrics()
+            .expect("replication metrics installed for test");
+        let before = metrics.replica_worker_panics_total.get();
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteAll,
+                replication_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+            vec![Box::new(PanickingTransport)],
+        );
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }];
+        let err = mgr.replicate_batch(&ops).expect_err("must fail");
+        let after = metrics.replica_worker_panics_total.get();
+        assert!(
+            after >= before + 1,
+            "replica_worker_panics_total must bump (was {before}, now {after})",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("oxidized") || msg.contains("synthetic"),
+            "panic payload must propagate into the error message (got: {msg})",
+        );
     }
 
     /// F-G7-011: when a catch-up chunk overlaps with normal replication

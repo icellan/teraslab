@@ -850,6 +850,13 @@ pub struct ReplicationMetrics {
     /// investigate disk pressure or permission errors as soon as
     /// this starts climbing.
     pub ack_tracker_flush_failures: PaddedCounter,
+    /// F-G7-009: master-side counter — incremented every time the
+    /// `replicate_batch` fan-out's scoped worker panics. The panic
+    /// payload is logged + the replica transitions to Down via the
+    /// outer reconciliation loop. A non-zero counter is a hard
+    /// signal that a real bug in send_batch/recv_ack exists; the
+    /// surrounding error path silently retries on the next batch.
+    pub replica_worker_panics_total: PaddedCounter,
 }
 
 /// Per-replica drill-down state exposed on `/admin/top`.
@@ -902,6 +909,7 @@ impl ReplicationMetrics {
             replica_rejected_stale_cluster_key: PaddedCounter::new(),
             replica_apply_skipped_missing_tx: PaddedCounter::new(),
             ack_tracker_flush_failures: PaddedCounter::new(),
+            replica_worker_panics_total: PaddedCounter::new(),
         }
     }
 
