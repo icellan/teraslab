@@ -1222,8 +1222,7 @@ const READINESS_LAG_CACHE_TTL_MS: u64 = 500;
 /// readiness check. `timestamp_ns == 0` means "no cached verdict yet".
 /// `AtomicU64` packs the bool as the low bit and the timestamp in the
 /// upper 63 bits so the read+verdict observation is atomic.
-static REPLICA_LAG_CACHE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static REPLICA_LAG_CACHE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn cached_replica_lag_exceeds(state: &HttpState) -> bool {
     let now_ns = SystemTime::now()
@@ -2618,6 +2617,17 @@ pub(crate) fn encode_traceparent(ctx: &WireTraceContext) -> String {
 ///
 /// Returns a guarded span that — when dropped — ends the span. Callers keep
 /// the guard alive for the duration of their handler body.
+///
+/// # Verified — F-G6-013 (positive verification)
+///
+/// The span carries exactly one attribute: `route`, a `&'static str`
+/// constant chosen at the call site (e.g. `"/metrics"`, `"/admin/top"`).
+/// No user-controlled input — txid, peer address, raw header value,
+/// request body — is ever attached to this span. Operators deploying
+/// OTLP exporters can rely on the fact that span attributes do not
+/// leak request payloads. Future PRs that add dynamic span fields
+/// here MUST re-audit (see also `metrics::tests` for the parallel
+/// label-cardinality invariant).
 pub(crate) fn http_span_for(headers: &HeaderMap, route: &'static str) -> tracing::Span {
     use opentelemetry::trace::TraceContextExt;
     use tracing_opentelemetry::OpenTelemetrySpanExt;

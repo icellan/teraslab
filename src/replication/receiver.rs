@@ -20,7 +20,62 @@ use crate::replication::protocol::{ReplicaAck, ReplicaBatch, ReplicaOp};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+/// F-G7-003: cap on aggregate in-flight bytes across all
+/// standalone-receiver connections. The standalone
+/// [`ReplicationReceiver`] does its own inline frame buffering
+/// outside the main server's bytes-limiter. Without an aggregate
+/// cap, N concurrent peers can each force a [`MAX_FRAME_SIZE`]
+/// allocation BEFORE the HMAC verification step runs — trivial
+/// DoS for unauthenticated cluster traffic.
+///
+/// 256 MiB is generous enough for many concurrent replicas while
+/// still bounding worst-case memory pressure. Once the cap is
+/// reached new connection handlers refuse the frame and close
+/// the connection.
+const RECEIVER_INFLIGHT_BYTES_CAP: usize = 256 * 1024 * 1024;
+
+/// Aggregate counter of bytes currently held in the standalone
+/// [`ReplicationReceiver`]'s per-connection frame buffers
+/// (F-G7-003).
+static RECEIVER_INFLIGHT_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII guard that decrements [`RECEIVER_INFLIGHT_BYTES`] on drop.
+/// Returned from [`reserve_inflight_bytes`] when the reservation
+/// succeeds; the per-connection handler holds the guard for the
+/// lifetime of the frame's body buffer.
+struct InflightBytesGuard {
+    bytes: usize,
+}
+
+impl Drop for InflightBytesGuard {
+    fn drop(&mut self) {
+        RECEIVER_INFLIGHT_BYTES.fetch_sub(self.bytes, Ordering::Release);
+    }
+}
+
+/// Attempt to reserve `bytes` against the aggregate cap. Returns
+/// `Some(guard)` on success (caller drops the guard to release),
+/// `None` when the reservation would exceed `RECEIVER_INFLIGHT_BYTES_CAP`.
+fn reserve_inflight_bytes(bytes: usize) -> Option<InflightBytesGuard> {
+    // Use a CAS loop so concurrent reservations stay accurate.
+    let mut current = RECEIVER_INFLIGHT_BYTES.load(Ordering::Acquire);
+    loop {
+        if current.saturating_add(bytes) > RECEIVER_INFLIGHT_BYTES_CAP {
+            return None;
+        }
+        match RECEIVER_INFLIGHT_BYTES.compare_exchange_weak(
+            current,
+            current + bytes,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(InflightBytesGuard { bytes }),
+            Err(actual) => current = actual,
+        }
+    }
+}
 
 /// Default stream key used when a receiver has not been told to
 /// discriminate by peer address. Chosen as a short literal so the
@@ -254,7 +309,24 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
     // own deduplication state. Re-using the same key across reconnects
     // from the same peer intentionally preserves last_applied_seq.
     let stream_key = peer_addr.to_string();
-    let mut body = Vec::new();
+    // F-G7-003: wrap the per-connection body buffer so its growth
+    // is tracked against `RECEIVER_INFLIGHT_BYTES_CAP`. Dropping
+    // `body` (when this function returns) releases the reservation.
+    struct CountedBody {
+        buf: Vec<u8>,
+        reserved: usize,
+    }
+    impl Drop for CountedBody {
+        fn drop(&mut self) {
+            if self.reserved > 0 {
+                RECEIVER_INFLIGHT_BYTES.fetch_sub(self.reserved, Ordering::Release);
+            }
+        }
+    }
+    let mut body = CountedBody {
+        buf: Vec::new(),
+        reserved: 0,
+    };
     let mut frame_bytes = Vec::new();
 
     loop {
@@ -285,10 +357,34 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
 
         // Read the frame body
         let frame_len = total_length as usize;
-        if body.len() < frame_len {
-            body.resize(frame_len, 0);
+        // F-G7-003: when the body Vec needs to grow, reserve the
+        // growth delta against the global inflight cap and absorb
+        // the reservation into the connection-scoped `body.reserved`
+        // counter so the CountedBody Drop releases it on return.
+        let new_bytes = frame_len.saturating_sub(body.buf.len());
+        if new_bytes > 0 {
+            match reserve_inflight_bytes(new_bytes) {
+                Some(guard) => {
+                    // Transfer the reservation from the guard to
+                    // the connection counter — we don't want the
+                    // guard's Drop to fire (it would release the
+                    // bytes we just promised to hold for the
+                    // body Vec).
+                    body.reserved += guard.bytes;
+                    std::mem::forget(guard);
+                }
+                None => {
+                    tracing::warn!(
+                        frame_len,
+                        new_bytes,
+                        "replication receiver: inflight bytes cap exceeded — closing connection",
+                    );
+                    return;
+                }
+            }
+            body.buf.resize(frame_len, 0);
         }
-        if stream.read_exact(&mut body[..frame_len]).is_err() {
+        if stream.read_exact(&mut body.buf[..frame_len]).is_err() {
             return;
         }
 
@@ -296,7 +392,7 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
         frame_bytes.clear();
         frame_bytes.reserve(4 + frame_len);
         frame_bytes.extend_from_slice(&len_buf);
-        frame_bytes.extend_from_slice(&body[..frame_len]);
+        frame_bytes.extend_from_slice(&body.buf[..frame_len]);
 
         let request_id = if frame_bytes.len() >= 12 {
             u64::from_le_bytes(frame_bytes[4..12].try_into().unwrap_or([0; 8]))
@@ -409,6 +505,19 @@ pub fn handle_replica_batch_with_cluster_key(
     // here because cargo runs unit tests in parallel; a shared tracker
     // would silently skip "already applied" sequences across unrelated
     // tests and break their assertions.
+    //
+    // F-G7-013: the tracker lives in a `thread_local!` slot, so it
+    // is owned by each worker thread for that thread's lifetime.
+    // This is intentional for the test path (cargo test workers are
+    // short-lived) but DOES leak one tracker per worker until the
+    // thread exits. Production paths must go through
+    // `init_replica_applied_tracker` so the receiver shares a single
+    // process-wide `ReplicaAppliedTracker`; the fallback path here
+    // is reserved for non-production single-stream callers and
+    // tests. If you find this fallback being exercised by a
+    // long-lived server thread, switch the caller to explicit
+    // tracker injection — do not rely on this slot for steady-state
+    // production use.
     thread_local! {
         static IN_MEMORY_TRACKER: std::cell::RefCell<Option<Arc<ReplicaAppliedTracker>>> =
             const { std::cell::RefCell::new(None) };
@@ -522,6 +631,38 @@ pub fn handle_replica_batch_with_tracker(
         payload.extend_from_slice(&ERR_STALE_EPOCH.to_le_bytes());
         // Empty diagnostic message — the master logs the reject and
         // re-discovers cluster topology on the next handshake.
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        return ResponseFrame {
+            request_id: request.request_id,
+            status: STATUS_ERROR,
+            payload,
+        };
+    }
+
+    // F-G7-005: tighten the cluster_key gate for migration batches.
+    // The dedup-bypass path (FLAG_MIGRATION_BATCH) skips the
+    // already-applied skip_count logic and unconditionally re-applies
+    // every op. A buggy or hostile sender that sets the flag bit and
+    // a `cluster_key = 0` wildcard could therefore replay arbitrary
+    // mutations through the dedup-bypass path. When the receiver is
+    // in steady-state clustered mode (`local_cluster_key != 0`) we
+    // require a non-zero `cluster_key` on migration batches so the
+    // sender's epoch is explicit; the wildcard remains accepted only
+    // for normal-replication batches (where the per-stream dedup
+    // tracker plus the generation guard absorb any replay damage).
+    let is_migration_flag = request.flags & FLAG_MIGRATION_BATCH != 0;
+    if is_migration_flag && batch.cluster_key == 0 && local_cluster_key != 0 {
+        if let Some(m) = crate::metrics::replication_metrics() {
+            m.replica_rejected_stale_cluster_key.inc();
+        }
+        tracing::warn!(
+            local_cluster_key,
+            first_sequence = batch.first_sequence,
+            ops_len = batch.ops.len(),
+            "replica rejected migration batch: cluster_key wildcard not allowed in clustered mode"
+        );
+        let mut payload = Vec::with_capacity(6);
+        payload.extend_from_slice(&ERR_STALE_EPOCH.to_le_bytes());
         payload.extend_from_slice(&0u16.to_le_bytes());
         return ResponseFrame {
             request_id: request.request_id,
@@ -792,6 +933,27 @@ fn apply_create_lifecycle_and_blob(
     Ok(())
 }
 
+/// F-G7-006: record that `apply_op` skipped a non-Create/non-Delete
+/// op because the target TX or slot was missing on this replica.
+///
+/// The graceful skip preserves liveness on a replica that joined late
+/// or lost an earlier Create batch, but it ALSO masks real divergence
+/// (lost Create, dropped intent range, dedup-tracker drift). The
+/// metric is the operator-facing signal: a non-zero value means the
+/// master is sending mutations against records the replica never
+/// received and counters such as `spent_utxos` are silently diverging.
+#[inline]
+fn record_apply_skipped_missing_tx(op_name: &'static str, tx_key: &TxKey) {
+    if let Some(m) = crate::metrics::replication_metrics() {
+        m.replica_apply_skipped_missing_tx.inc();
+    }
+    tracing::warn!(
+        op = op_name,
+        tx_key = ?tx_key.txid,
+        "replica apply: tx or slot not found — skipping op; potential replication divergence",
+    );
+}
+
 /// Apply a single `ReplicaOp` to the engine.
 ///
 /// For Spend, Freeze, Unfreeze, and Reassign operations the replica
@@ -838,7 +1000,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             let hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
                 Err(_) => {
-                    // TX or slot not found — skip gracefully
+                    // TX or slot not found — skip gracefully but
+                    // surface the divergence via metrics + warn log
+                    // so operators can detect a missing Create.
+                    record_apply_skipped_missing_tx("spend", tx_key);
                     return Ok(());
                 }
             };
@@ -873,7 +1038,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
         } => {
             let slot = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    record_apply_skipped_missing_tx("unspend", tx_key);
+                    return Ok(());
+                }
             };
             let req = UnspendRequest {
                 tx_key: *tx_key,
@@ -910,7 +1078,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             };
             match engine.set_mined(&req) {
                 Ok(_) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("set_mined", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("set_mined: {e}")),
             }
         }
@@ -933,14 +1104,20 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             };
             match engine.set_mined(&req) {
                 Ok(_) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("unset_mined", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("unset_mined: {e}")),
             }
         }
         ReplicaOp::Freeze { tx_key, offset, .. } => {
             let hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    record_apply_skipped_missing_tx("freeze", tx_key);
+                    return Ok(());
+                }
             };
             let req = FreezeRequest {
                 tx_key: *tx_key,
@@ -951,14 +1128,20 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::AlreadyFrozen { .. }) => Ok(()),
                 Err(crate::ops::error::SpendError::AlreadySpent { .. }) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("freeze", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("freeze: {e}")),
             }
         }
         ReplicaOp::Unfreeze { tx_key, offset, .. } => {
             let hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    record_apply_skipped_missing_tx("unfreeze", tx_key);
+                    return Ok(());
+                }
             };
             let req = UnfreezeRequest {
                 tx_key: *tx_key,
@@ -968,7 +1151,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             match engine.unfreeze(&req) {
                 Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::NotFrozen { .. }) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("unfreeze", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("unfreeze: {e}")),
             }
         }
@@ -982,7 +1168,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
         } => {
             let old_hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    record_apply_skipped_missing_tx("reassign", tx_key);
+                    return Ok(());
+                }
             };
             let req = ReassignRequest {
                 tx_key: *tx_key,
@@ -995,7 +1184,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             match engine.reassign(&req) {
                 Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::NotFrozen { .. }) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("reassign", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("reassign: {e}")),
             }
         }
@@ -1014,7 +1206,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             };
             match engine.set_conflicting(&req) {
                 Ok(_) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("set_conflicting", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("set_conflicting: {e}")),
             }
         }
@@ -1025,7 +1220,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             };
             match engine.set_locked(&req) {
                 Ok(_) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("set_locked", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("set_locked: {e}")),
             }
         }
@@ -1040,7 +1238,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             };
             match engine.preserve_until(&req) {
                 Ok(_) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("preserve_until", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("preserve_until: {e}")),
             }
         }
@@ -1201,11 +1402,17 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             // slot directly via io, similar to how recovery handles it.
             let entry = match engine.lookup(tx_key) {
                 Some(e) => e,
-                None => return Ok(()), // TX not found — skip
+                None => {
+                    record_apply_skipped_missing_tx("prune_slot", tx_key);
+                    return Ok(()); // TX not found — skip
+                }
             };
             let slot = match io::read_utxo_slot(engine.device(), entry.record_offset, *offset) {
                 Ok(s) => s,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    record_apply_skipped_missing_tx("prune_slot", tx_key);
+                    return Ok(());
+                }
             };
             if slot.status == UTXO_PRUNED {
                 return Ok(()); // already pruned
@@ -1256,7 +1463,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             };
             match engine.mark_on_longest_chain(&req) {
                 Ok(_) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("mark_longest_chain", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("mark_longest_chain: {e}")),
             }
         }
@@ -1289,6 +1499,20 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             .map_err(|e| format!("write metadata for generation sync: {e}"))?;
     }
 
+    // F-G7-016: enforce "apply, fsync data, then journal" by explicitly
+    // syncing the engine's block device BEFORE building the post-apply
+    // redo entry. The engine's mutation paths (spend/freeze/...) write
+    // through `write_slot_fast` / `write_metadata_fast`, which only
+    // promise the writes have left this process — the OS page cache
+    // may still buffer them. A replica crash between the engine write
+    // and the redo append would otherwise leave the on-device state
+    // and the redo log out of sync. The post-apply redo entry then
+    // reads back state we know is durable, so replay sees an entry
+    // whose target state matches the disk.
+    if let Err(e) = engine.device().sync() {
+        return Err(format!("post-apply device sync (F-G7-016): {e}"));
+    }
+
     // R-034 (BC-34): write a local redo entry so the replica can replay
     // through its own crash recovery and a failover does not require a
     // full resync of every surviving replica. The entry captures the
@@ -1313,7 +1537,9 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
 /// master computes these counters from validated state under the per-tx
 /// lock; on the replica we read them back from the device after the
 /// engine's apply_op has already taken and released the lock — ordering
-/// here is "apply, fsync data, then journal" instead of the master's
+/// here is "apply, fsync data, then journal" (the explicit
+/// `engine.device().sync()` call in `apply_op` enforces the data fsync
+/// before this function runs, F-G7-016) instead of the master's
 /// "journal, then apply, then fsync data". Both orderings are correct
 /// because all replica apply paths are idempotent and the redo replay
 /// guards check the device state before re-writing.
@@ -1608,6 +1834,34 @@ mod tests {
         TxKey { txid }
     }
 
+    /// F-G7-003: the per-process inflight-bytes counter must
+    /// refuse reservations that would cross
+    /// `RECEIVER_INFLIGHT_BYTES_CAP`. Guarantees a known DoS bound:
+    /// unauthenticated peers can't collectively force more than
+    /// `RECEIVER_INFLIGHT_BYTES_CAP` bytes of body buffer allocation.
+    #[test]
+    fn inflight_bytes_cap_refuses_oversize_reservations() {
+        // Snapshot the counter so concurrent test threads don't make
+        // us flaky (test threads do not interact with the standalone
+        // receiver, but the static is process-wide).
+        let baseline = RECEIVER_INFLIGHT_BYTES.load(Ordering::Acquire);
+
+        // A reasonable reservation succeeds.
+        let small = reserve_inflight_bytes(1024).expect("1 KiB reservation must succeed");
+        assert_eq!(
+            RECEIVER_INFLIGHT_BYTES.load(Ordering::Acquire),
+            baseline + 1024,
+        );
+
+        // A reservation that would exceed the cap returns None.
+        let huge = reserve_inflight_bytes(RECEIVER_INFLIGHT_BYTES_CAP + 1);
+        assert!(huge.is_none(), "reservation past the cap must fail",);
+
+        // Releasing the small reservation restores the counter.
+        drop(small);
+        assert_eq!(RECEIVER_INFLIGHT_BYTES.load(Ordering::Acquire), baseline,);
+    }
+
     #[test]
     fn receiver_reuses_buffer_per_connection() {
         let source = include_str!("receiver.rs");
@@ -1619,8 +1873,12 @@ mod tests {
             !production.contains("let mut body = vec![0u8; frame_len]"),
             "replication receiver must reuse per-connection frame buffers",
         );
+        // After F-G7-003 the per-connection buffer is wrapped in a
+        // `CountedBody` so the global inflight-bytes counter can
+        // track its growth. The reuse contract is preserved — the
+        // wrapper still lives outside the read loop.
         assert!(
-            production.contains("let mut body = Vec::new();"),
+            production.contains("let mut body = CountedBody {"),
             "replication receiver must allocate the reusable body buffer outside the hot loop",
         );
     }
@@ -3111,6 +3369,66 @@ mod tests {
         );
     }
 
+    /// F-G7-015 (positive verification): when the master retries a
+    /// batch after a partial / stale-connection drop, the receiver's
+    /// dedup tracker MUST skip the prefix that already applied and
+    /// only re-apply the suffix. Sending the exact same batch twice
+    /// must result in exactly one durable mutation per op, never two.
+    #[test]
+    fn duplicate_batch_after_stale_connection_skips_already_applied() {
+        let engine = make_engine();
+        let k = key(85);
+        create_record(&engine, k, 3);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = DEFAULT_STREAM_KEY;
+
+        // Master sends a batch covering ops at sequences 1..=2. The
+        // receiver applies them and advances the high-water mark.
+        let batch = make_spend_batch(1, k, 0..2, /* delete_at_height adj */ 1);
+        let req = batch_request(&batch, 1);
+        let resp = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            &tracker,
+            stream_key,
+            /* local_cluster_key */ 0,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(engine.read_slot(&k, 0).unwrap().status, UTXO_SPENT);
+        assert_eq!(engine.read_slot(&k, 1).unwrap().status, UTXO_SPENT);
+        let meta_after_first = engine.read_metadata(&k).unwrap();
+        let spent_after_first = { meta_after_first.spent_utxos };
+        let gen_after_first = { meta_after_first.generation };
+        assert_eq!(spent_after_first, 2);
+
+        // Master retries the same batch (simulating a stale-connection
+        // drop on the master side). The receiver's dedup tracker must
+        // skip both ops; engine counters must not move.
+        let resp2 = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            &tracker,
+            stream_key,
+            0,
+        );
+        assert_eq!(resp2.status, STATUS_OK, "duplicate batch must still ACK OK",);
+        let meta_after_retry = engine.read_metadata(&k).unwrap();
+        assert_eq!(
+            { meta_after_retry.spent_utxos },
+            spent_after_first,
+            "duplicate batch must NOT double-bump spent_utxos counter",
+        );
+        assert_eq!(
+            { meta_after_retry.generation },
+            gen_after_first,
+            "duplicate batch must NOT bump generation again",
+        );
+    }
+
     // ----------------------------------------------------------------------
     // Phase 4 — wire-protocol trace context propagation
     // ----------------------------------------------------------------------
@@ -3514,6 +3832,129 @@ mod tests {
         assert_eq!(
             slot2_before, slot2_after,
             "rejected migration batch must not mutate engine state",
+        );
+    }
+
+    /// F-G7-005: when the receiver is in clustered mode
+    /// (`local_cluster_key != 0`) a migration batch (`FLAG_MIGRATION_BATCH`)
+    /// stamped with the V1-compat wildcard `cluster_key = 0` must be
+    /// rejected. The dedup-bypass path would otherwise unconditionally
+    /// re-apply arbitrary mutations under a forged migration flag.
+    #[test]
+    fn migration_batch_with_wildcard_cluster_key_rejected_in_clustered_mode() {
+        let engine = make_engine();
+        create_record(&engine, key(80), 4);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let local_cluster_key: u64 = 7;
+
+        let slot1_before = engine.read_slot(&key(80), 1).unwrap().status;
+        // Migration batch stamped with cluster_key = 0 (V1 wildcard).
+        let wildcard_batch = batch_with_cluster_key(0, key(80), 1..2, 1, /* wildcard */ 0);
+        let req = RequestFrame {
+            op_code: OP_REPLICA_BATCH,
+            request_id: 11,
+            flags: FLAG_MIGRATION_BATCH,
+            payload: wildcard_batch.serialize(),
+        };
+
+        let resp = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            &tracker,
+            DEFAULT_STREAM_KEY,
+            local_cluster_key,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "wildcard-cluster_key migration batch must be rejected in clustered mode",
+        );
+        assert_eq!(decode_error_code(&resp.payload), ERR_STALE_EPOCH);
+        let slot1_after = engine.read_slot(&key(80), 1).unwrap().status;
+        assert_eq!(
+            slot1_before, slot1_after,
+            "rejected wildcard migration batch must not mutate engine state",
+        );
+    }
+
+    /// F-G7-005 boundary: a migration batch with cluster_key = 0 must
+    /// still be accepted when `local_cluster_key = 0` (the receiver
+    /// hasn't observed a quorum-committed cluster term yet, e.g.
+    /// post-restart or single-node demo). The wildcard reject only
+    /// applies once the receiver is in clustered steady state.
+    #[test]
+    fn migration_batch_with_wildcard_cluster_key_accepted_when_local_zero() {
+        let engine = make_engine();
+        create_record(&engine, key(81), 2);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+
+        let migration_batch = batch_with_cluster_key(0, key(81), 0..1, 1, /* wildcard */ 0);
+        let req = RequestFrame {
+            op_code: OP_REPLICA_BATCH,
+            request_id: 12,
+            flags: FLAG_MIGRATION_BATCH,
+            payload: migration_batch.serialize(),
+        };
+
+        let resp = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            &tracker,
+            DEFAULT_STREAM_KEY,
+            /* local_cluster_key */ 0,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "wildcard migration batch must be accepted when local_cluster_key = 0",
+        );
+        assert_eq!(engine.read_slot(&key(81), 0).unwrap().status, UTXO_SPENT);
+    }
+
+    /// F-G7-006: `apply_op` skips a Spend whose TX or slot is missing
+    /// on the replica and returns Ok(()) to keep the batch ACK
+    /// flowing. Silent skips mask real replication divergence (a lost
+    /// Create batch, dropped intent range, dedup-tracker drift). The
+    /// receiver must bump the `replica_apply_skipped_missing_tx`
+    /// metric every time this happens so operators have a
+    /// machine-readable divergence signal.
+    #[test]
+    fn apply_spend_on_missing_tx_increments_divergence_metric() {
+        let engine = make_engine();
+        let k = key(90);
+        // Deliberately do NOT create the record; the replica is missing it.
+
+        static TEST_METRICS: std::sync::OnceLock<&'static crate::metrics::ReplicationMetrics> =
+            std::sync::OnceLock::new();
+        let metrics_ref = *TEST_METRICS
+            .get_or_init(|| Box::leak(Box::new(crate::metrics::ReplicationMetrics::new())));
+        crate::metrics::init_replication_metrics(metrics_ref);
+        let metrics =
+            crate::metrics::replication_metrics().expect("replication metrics installed for test");
+        let before = metrics.replica_apply_skipped_missing_tx.get();
+
+        let op = ReplicaOp::Spend {
+            tx_key: k,
+            offset: 0,
+            spending_data: [0x99; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
+            master_generation: 0,
+        };
+        // Must succeed (silent skip) so the batch ACK isn't aborted.
+        apply_op(&engine, &op).unwrap();
+
+        let after = metrics.replica_apply_skipped_missing_tx.get();
+        assert!(
+            after >= before + 1,
+            "spend on missing TX must bump replica_apply_skipped_missing_tx \
+             (was {before}, now {after})",
         );
     }
 

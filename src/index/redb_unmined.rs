@@ -108,11 +108,24 @@ impl RedbUnminedIndex {
         key: TxKey,
         redo_log: Option<&Mutex<RedoLog>>,
     ) -> Result<(), IndexError> {
-        let old_height = self.get_height(&key).unwrap_or(0);
+        // F-G3-013: open the write transaction BEFORE reading the existing
+        // height so the value used for `RedoOp::SecondaryUnminedUpdate.old_height`
+        // is TOCTOU-free. See `RedbDahIndex::insert` for the same fix and
+        // the rationale (replay handler only uses `new_height` today, but
+        // a future delta-replay path could grow a dependency on it).
+        let txn = self.begin_write().map_err(map_txn_err)?;
+        let (old_height, was_new) = {
+            let rev = txn.open_table(UNMINED_REVERSE).map_err(map_table_err)?;
+            match rev.get(key.txid).map_err(map_storage_err)? {
+                Some(guard) => (u32::from_le_bytes(guard.value()), false),
+                None => (0u32, true),
+            }
+        };
         if old_height == height {
             // No-op: redb state already matches. No redo entry needed
             // because the primary's current unmined_since equals `height`
             // and recovery will not try to "undo" a no-op.
+            drop(txn);
             return Ok(());
         }
 
@@ -133,23 +146,13 @@ impl RedbUnminedIndex {
 
         // Phase 2: commit redb. At this point the redo log (if any) has a
         // durable record of the intent; recovery can re-apply if this fails.
-        let txn = self.begin_write().map_err(map_txn_err)?;
-        let was_new;
         {
             let mut fwd = txn.open_table(UNMINED_FORWARD).map_err(map_table_err)?;
             let mut rev = txn.open_table(UNMINED_REVERSE).map_err(map_table_err)?;
 
-            match rev.get(key.txid).map_err(map_storage_err)? {
-                Some(guard) => {
-                    let existing_height = u32::from_le_bytes(guard.value());
-                    drop(guard);
-                    was_new = false;
-                    let old_fwd_key = make_forward_key(existing_height, &key);
-                    fwd.remove(old_fwd_key).map_err(map_storage_err)?;
-                }
-                None => {
-                    was_new = true;
-                }
+            if !was_new {
+                let old_fwd_key = make_forward_key(old_height, &key);
+                fwd.remove(old_fwd_key).map_err(map_storage_err)?;
             }
 
             rev.insert(key.txid, height.to_le_bytes())
@@ -245,26 +248,55 @@ impl RedbUnminedIndex {
     }
 
     /// Return all txids with unmined_since in `[0, cutoff_height]`.
+    ///
+    /// F-G3-008: every redb read error path now emits a `tracing::error!`
+    /// at `target = "teraslab::index"` before falling back to an empty
+    /// vector. Pre-fix every error was eaten silently; pruner / cleanup
+    /// loops driven by this method couldn't distinguish "no entries at
+    /// this cutoff" from "redb read failed".
     pub fn range_query(&self, cutoff_height: u32) -> Vec<TxKey> {
         let mut result = Vec::new();
         let txn = match self.db.begin_read() {
             Ok(t) => t,
-            Err(_) => return result,
+            Err(e) => {
+                tracing::error!(
+                    target: "teraslab::index",
+                    err = %e,
+                    "RedbUnminedIndex::range_query: begin_read failed; returning empty vec",
+                );
+                return result;
+            }
         };
         let table = match txn.open_table(UNMINED_FORWARD) {
             Ok(t) => t,
-            Err(_) => return result,
+            Err(e) => {
+                tracing::error!(
+                    target: "teraslab::index",
+                    err = %e,
+                    "RedbUnminedIndex::range_query: open_table failed; returning empty vec",
+                );
+                return result;
+            }
         };
 
         let start = [0u8; 36];
         let end = make_forward_key(cutoff_height, &TxKey { txid: [0xFF; 32] });
 
-        if let Ok(range) = table.range(start..=end) {
-            for (k, _) in range.flatten() {
-                let composite = k.value();
-                let mut txid = [0u8; 32];
-                txid.copy_from_slice(&composite[4..36]);
-                result.push(TxKey { txid });
+        match table.range(start..=end) {
+            Ok(range) => {
+                for (k, _) in range.flatten() {
+                    let composite = k.value();
+                    let mut txid = [0u8; 32];
+                    txid.copy_from_slice(&composite[4..36]);
+                    result.push(TxKey { txid });
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "teraslab::index",
+                    err = %e,
+                    "RedbUnminedIndex::range_query: table.range failed; returning partial/empty vec",
+                );
             }
         }
         result
@@ -283,24 +315,41 @@ impl RedbUnminedIndex {
     /// Remove all entries.
     ///
     /// Uses table drop + recreate for O(1) memory instead of row-by-row deletion.
-    pub fn clear(&mut self) {
-        if let Ok(txn) = self.begin_write() {
-            // Drop and recreate tables — O(1) memory regardless of entry count.
-            let _ = txn.delete_table(UNMINED_FORWARD);
-            let _ = txn.delete_table(UNMINED_REVERSE);
-            let _ = txn.open_table(UNMINED_FORWARD);
-            let _ = txn.open_table(UNMINED_REVERSE);
-            let _ = txn.commit();
-        }
+    ///
+    /// Returns an [`IndexError`] if the redb begin/delete/recreate/commit
+    /// chain fails. The cached `count` is only reset to zero after the
+    /// commit succeeds; previously every step silently swallowed errors
+    /// then forced `count = 0`, leaving an "empty" in-memory view over
+    /// a fully-populated table on disk.
+    pub fn clear(&mut self) -> Result<(), IndexError> {
+        let txn = self.begin_write().map_err(map_txn_err)?;
+        // Drop and recreate tables — O(1) memory regardless of entry count.
+        txn.delete_table(UNMINED_FORWARD).map_err(map_table_err)?;
+        txn.delete_table(UNMINED_REVERSE).map_err(map_table_err)?;
+        // Open the empty tables so they exist for subsequent transactions.
+        txn.open_table(UNMINED_FORWARD).map_err(map_table_err)?;
+        txn.open_table(UNMINED_REVERSE).map_err(map_table_err)?;
+        txn.commit().map_err(map_commit_err)?;
         self.count = 0;
+        Ok(())
     }
 
     /// Insert multiple transactions in a single write transaction.
     ///
-    /// Much faster than calling [`insert`](Self::insert) in a loop because
-    /// only one fsync is performed for the entire batch. No redo entries are
-    /// returned (bulk import does not need them).
-    pub fn insert_batch(&mut self, entries: &[(u32, TxKey)]) -> Result<(), IndexError> {
+    /// **MIGRATION ONLY — does NOT use two-phase durability.** Unlike
+    /// [`insert`](Self::insert), this method commits the redb transaction
+    /// without first appending and fsyncing a
+    /// [`RedoOp::SecondaryUnminedUpdate`] record, so a crash between the
+    /// redb commit and the next checkpoint can lose entries that were just
+    /// written. The trade-off is acceptable for one-shot bulk import (see
+    /// [`crate::index::migration`]) which detects partial imports via its
+    /// own sentinel-file mechanism and is not interleaved with foreground
+    /// mutations.
+    ///
+    /// Restricted to `pub(crate)` so hot-path callers cannot accidentally
+    /// adopt the bulk path and lose the redo-log guarantee that
+    /// [`insert`](Self::insert) provides.
+    pub(crate) fn insert_batch(&mut self, entries: &[(u32, TxKey)]) -> Result<(), IndexError> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -575,7 +624,23 @@ mod tests {
         let (_dir, mut idx) = open_temp();
         idx.insert(100, key(1), None).unwrap();
         idx.insert(200, key(2), None).unwrap();
-        idx.clear();
+        idx.clear().unwrap();
+        assert!(idx.is_empty());
+    }
+
+    // F-G3-002: `clear` must propagate redb errors. Pre-fix every step of
+    // the drop+recreate chain was `let _ = …` and `self.count = 0` was
+    // unconditional. Pins the success path: cached count drops only after
+    // the commit returns `Ok`.
+    #[test]
+    fn clear_returns_ok_and_zeroes_count_only_on_success() {
+        let (_dir, mut idx) = open_temp();
+        idx.insert(100, key(1), None).unwrap();
+        idx.insert(200, key(2), None).unwrap();
+        assert_eq!(idx.len(), 2);
+        let result: Result<(), IndexError> = idx.clear();
+        result.expect("redb clear should succeed on an open temp db");
+        assert_eq!(idx.len(), 0);
         assert!(idx.is_empty());
     }
 
@@ -791,7 +856,7 @@ mod tests {
         let (_dir, mut idx) = open_temp();
         idx.insert(100, key(1), None).unwrap();
         idx.insert(200, key(2), None).unwrap();
-        idx.clear();
+        idx.clear().unwrap();
         assert!(idx.is_empty());
         assert!(idx.range_query(1000).is_empty());
 
@@ -857,7 +922,7 @@ mod tests {
             let mut idx = RedbUnminedIndex::open(&db_path, 16 * 1024 * 1024).unwrap();
             idx.insert(100, key(1), None).unwrap();
             idx.insert(200, key(2), None).unwrap();
-            idx.clear();
+            idx.clear().unwrap();
         }
 
         let idx = RedbUnminedIndex::open(&db_path, 16 * 1024 * 1024).unwrap();
@@ -1013,11 +1078,11 @@ mod tests {
 
     #[test]
     fn redo_flush_failure_blocks_redb_commit() {
-        // Use a redo log sized so small that a single append fills it,
-        // triggering LogFull on the second call.
+        // Use a redo log just large enough to fit its 8 KiB header and a
+        // handful of records, then keep appending until it runs out.
         let (_dir, mut idx) = open_temp();
-        let dev = Arc::new(MemoryDevice::new(4096, 4096).unwrap());
-        let log = RedoLog::open(dev.clone(), 0, 256).unwrap();
+        let dev = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let log = RedoLog::open(dev.clone(), 0, 16 * 1024).unwrap();
         let redo = Mutex::new(log);
 
         // First insert consumes space in the tiny log.
@@ -1039,7 +1104,7 @@ mod tests {
                     break;
                 }
             }
-            if next > 50 {
+            if next > 200 {
                 panic!("expected redo log to fill up");
             }
         }

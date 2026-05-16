@@ -451,7 +451,7 @@ pub(crate) fn handle_request(
         }
         OP_GET_BATCH => handle_get_batch(request, engine, max_batch_size, cluster),
         OP_GET_SPEND_BATCH => handle_get_spend_batch(request, engine, max_batch_size, cluster),
-        OP_QUERY_OLD_UNMINED => handle_query_old_unmined(request, engine),
+        OP_QUERY_OLD_UNMINED => handle_query_old_unmined(request, engine, cluster),
         OP_PRESERVE_TRANSACTIONS => {
             handle_preserve_transactions(request, engine, max_batch_size, cluster, redo_log)
         }
@@ -473,6 +473,27 @@ pub(crate) fn handle_request(
             status: STATUS_OK,
             payload: b"ok".to_vec(),
         },
+        // F-G5-006: SWIM heartbeats use the dedicated UDP gossip port, not
+        // this TCP data port. The OP_HEARTBEAT constant exists for clients
+        // that have not been updated to use the gossip transport — respond
+        // with STATUS_OK and an empty payload instead of falling into the
+        // catch-all "unknown opcode" error so an operator who misconfigures
+        // a probe doesn't see misleading ERR_INTERNAL responses.
+        OP_HEARTBEAT => ResponseFrame {
+            request_id: request.request_id,
+            status: STATUS_OK,
+            payload: vec![],
+        },
+        // F-G5-015: OP_INCREMENT_SPENT_EXTRA_RECS is a no-op compatibility
+        // shim retained for clients carried over from the pre-TeraSlab Lua
+        // UDF. The old store maintained extra-records counters that
+        // TeraSlab tracks implicitly via UTXO generation. Returning
+        // STATUS_OK with an empty payload is the contract: callers expect
+        // success and do not parse a body. Returning an error here would
+        // break legacy clients; logging on every call would flood the
+        // logs. The constant is retained until all clients have migrated;
+        // a counter would be a better signal, but a counter requires
+        // shared mutable state and the call-site is hot.
         OP_INCREMENT_SPENT_EXTRA_RECS => ResponseFrame {
             request_id: request.request_id,
             status: STATUS_OK,
@@ -490,6 +511,18 @@ pub(crate) fn handle_request(
             if request.flags & FLAG_MIGRATION_BATCH != 0
                 && let Some(cluster) = cluster
             {
+                // F-G5-010: request_id is overloaded to carry the shard
+                // number for migration batches. Reject any caller whose
+                // upper 48 bits are non-zero — that would silently land
+                // on a different shard than the caller intended (typo,
+                // bug, or attacker repurposing the field).
+                if request.request_id >> 16 != 0 {
+                    return error_response(
+                        request.request_id,
+                        ERR_INTERNAL,
+                        "FLAG_MIGRATION_BATCH: request_id must encode shard in low 16 bits",
+                    );
+                }
                 let shard = request.request_id as u16;
                 let already_expected = cluster.inbound_bitmap().test(shard);
                 let should_track_handoff = {
@@ -543,6 +576,17 @@ pub(crate) fn handle_request(
             //   [fence_sequence:8] (optional)    — redo fence sequence for audit
             //   [topology_epoch:8] (optional)    — reject stale migrations
             //   [manifest_hash:32] (optional)    — XOR-hash of (txid, generation) pairs
+            // F-G5-004: reject any caller that sets the upper 48 bits of
+            // request_id. Like FLAG_MIGRATION_BATCH (F-G5-010), the field
+            // is overloaded for shard identity here; a typo or repurposed
+            // id must not silently target an unintended shard.
+            if request.request_id >> 16 != 0 {
+                return error_response(
+                    request.request_id,
+                    ERR_INTERNAL,
+                    "OP_MIGRATION_COMPLETE: request_id must encode shard in low 16 bits",
+                );
+            }
             let shard = request.request_id as u16;
 
             let expected_records = le_u64_at(&request.payload, 0).unwrap_or(0);
@@ -1110,9 +1154,16 @@ fn write_redo_ops_with_group_window(
         let first_seq = log.current_sequence();
         let mut last_seq = first_seq;
         for op in ops {
-            last_seq = log
-                .append(op.clone())
-                .map_err(|e| format!("redo log append: {e}"))?;
+            last_seq = log.append(op.clone()).map_err(|e| {
+                // F-G5-008: log the underlying I/O error (which may
+                // contain file paths or kernel diagnostic strings) at
+                // `error!` level for operator triage, but return a
+                // sanitized message to the client so internal
+                // deployment topology is not leaked through ERR_INTERNAL
+                // payloads. Same treatment for `redo log flush` below.
+                tracing::error!(err = %e, "redo log append failed");
+                "redo log append failed".to_string()
+            })?;
         }
         (first_seq, last_seq)
     };
@@ -1122,7 +1173,10 @@ fn write_redo_ops_with_group_window(
     }
 
     let mut log = redo.lock();
-    log.flush().map_err(|e| format!("redo log flush: {e}"))?;
+    log.flush().map_err(|e| {
+        tracing::error!(err = %e, "redo log flush failed");
+        "redo log flush failed".to_string()
+    })?;
     Ok((first_seq, last_seq))
 }
 
@@ -1625,12 +1679,18 @@ where
     for range in pending {
         let (entries, earliest_sequence, current_sequence) = {
             let log = redo_log.lock();
-            let entries = log
-                .read_from_sequence(range.first_sequence)
-                .map_err(|e| format!("read redo for pending replication intent: {e}"))?;
-            let earliest = log
-                .earliest_sequence()
-                .map_err(|e| format!("read redo floor for pending replication intent: {e}"))?;
+            // F-G5-008: redo I/O errors carry kernel diagnostic strings
+            // and (depending on the storage backend) file paths. Log
+            // detail for operator triage; return a sanitized message
+            // that does not leak deployment topology to clients.
+            let entries = log.read_from_sequence(range.first_sequence).map_err(|e| {
+                tracing::error!(err = %e, "read redo for pending replication intent failed");
+                "read redo for pending replication intent failed".to_string()
+            })?;
+            let earliest = log.earliest_sequence().map_err(|e| {
+                tracing::error!(err = %e, "read redo floor for pending replication intent failed");
+                "read redo floor for pending replication intent failed".to_string()
+            })?;
             (entries, earliest, log.current_sequence())
         };
         let entries: Vec<_> = entries
@@ -3168,6 +3228,16 @@ fn handle_set_mined_batch(
     // historical fields. We read the metadata once per valid_item; if
     // the block_id is not currently present, the unset is a no-op and
     // there is nothing to compensate.
+    //
+    // F-G5-022 (hypothesis): the read here happens OUTSIDE the engine's
+    // per-key stripe lock; a concurrent same-key mutation that lands
+    // between this read and the engine apply below would make the
+    // captured before-image not actually before the current mutation,
+    // and compensation rollback would then restore stale state. The
+    // engine's `unset_mined_with_before_image` (parallel to
+    // `set_locked_with_before_image`) is the centralized fix and lives
+    // in src/ops/ (G2 territory) — this comment flags the concurrency
+    // boundary so the next G2 pass can lift the read inside the lock.
     let pre_unset_image: std::collections::HashMap<TxKey, BeforeImage> = if params.unset_mined {
         valid_items
             .iter()
@@ -4875,6 +4945,18 @@ fn handle_delete_batch(
             // intervene; silently clearing the replication intent on
             // top of a half-restored state is exactly the divergence
             // BC-62 / F9 warned about.
+            // F-G5-023 (maintainability hazard): this in-process
+            // compensation path hand-constructs an OP_REPLICA_BATCH frame
+            // and feeds it back through `handle_replica_batch`. That
+            // bypasses every check the network path applies (HMAC, the
+            // cluster_key gate, sequence-number dedupe) — intentional
+            // because the inputs are trusted-by-construction, but the
+            // network path and the compensation path will drift apart if
+            // a future security gate is added to one and not the other.
+            // The structural fix is to extract a pure `apply_replica_ops`
+            // function in `src/replication/receiver.rs` (G7 territory)
+            // and call it from both sites; for now the synthesised-frame
+            // approach is wired so the rollback semantics stay correct.
             let mut compensation_failed: Option<String> = None;
             for (key, snap) in &deleted_snapshots {
                 let ops = build_delete_compensation_ops(key, snap);
@@ -5523,7 +5605,20 @@ fn handle_get_batch(
 /// runs. The result is not a read lock over subsequent engine mutations:
 /// concurrent set-mined/mark-longest-chain updates may become visible
 /// immediately after this response is assembled.
-fn handle_query_old_unmined(req: &RequestFrame, engine: &Engine) -> ResponseFrame {
+///
+/// F-G5-003: in cluster mode, the response is filtered to keys whose
+/// shard this node is master of. Pre-fix the handler walked the entire
+/// local unmined index and returned every txid below `cutoff`, which
+/// disclosed the unmined-pool view of shards this node only held as a
+/// replica (or stale data from before a migration). With cluster
+/// information available, only locally-mastered keys are returned;
+/// in single-node mode (`cluster = None`) the full index is returned
+/// as before.
+fn handle_query_old_unmined(
+    req: &RequestFrame,
+    engine: &Engine,
+    cluster: Option<&RunningCluster>,
+) -> ResponseFrame {
     // Payload: [cutoff_height:4]
     if req.payload.len() < 4 {
         return error_response(req.request_id, ERR_INTERNAL, "malformed query");
@@ -5534,6 +5629,14 @@ fn handle_query_old_unmined(req: &RequestFrame, engine: &Engine) -> ResponseFram
     let candidates = engine.unmined_index().range_query(cutoff);
     let mut keys = Vec::with_capacity(candidates.len());
     for key in candidates {
+        // F-G5-003: skip keys this node does not master. Single-node mode
+        // (no cluster) keeps the prior behaviour.
+        if let Some(c) = cluster {
+            match c.is_master(&key) {
+                crate::cluster::coordinator::MasterQueryResult::Yes => {}
+                _ => continue,
+            }
+        }
         match engine.read_metadata(&key) {
             Ok(meta) if { meta.preserve_until } == 0 => keys.push(key),
             Ok(_) => {}
@@ -5769,6 +5872,16 @@ fn handle_process_expired(
     // replication + compensation logic from R-007 runs. The synthetic
     // request keeps the original request_id so the response correlates
     // back to the caller.
+    //
+    // F-G5-028: calling `handle_delete_batch` directly (rather than
+    // re-entering `handle_request`) bypasses the dispatcher's
+    // `needs_cluster_readiness`, `check_secondary_readiness`, and
+    // `check_quorum` middleware. That is intentional and safe here
+    // because the outer `OP_PROCESS_EXPIRED_PRESERVATIONS` request has
+    // already cleared every one of those gates — re-entering the
+    // dispatcher would cost an extra cluster-state read for no benefit.
+    // A future maintainer who wants quorum re-checked under a slow path
+    // should route through `handle_request` instead.
     let delete_payload = crate::protocol::codec::encode_txid_batch(&owned_due, &[]);
     let delete_req = RequestFrame {
         request_id: req.request_id,
@@ -5987,25 +6100,26 @@ fn handle_stream_chunk(
     };
 
     // Get or create the stream session for this txid.
+    //
+    // F-G5-024: collapse the previous Vacant-insert + separate get_mut(...)
+    // .expect("just inserted") pattern into a single branch. The old code
+    // was locally safe (either the entry already existed, or we just
+    // inserted on Ok, or the Err arm returned early) but a future
+    // contributor could add an early return on the Occupied path without
+    // realising the second lookup needs both branches present.
     use std::collections::hash_map::Entry;
-    if let Entry::Vacant(entry) = conn_state.streams.entry(chunk.txid) {
-        match blob_store.begin_stream(&chunk.txid) {
-            Ok(writer) => {
-                entry.insert(super::ActiveStream {
-                    writer,
-                    bytes_received: 0,
-                });
-            }
+    let stream = match conn_state.streams.entry(chunk.txid) {
+        Entry::Occupied(occupied) => occupied.into_mut(),
+        Entry::Vacant(vacant) => match blob_store.begin_stream(&chunk.txid) {
+            Ok(writer) => vacant.insert(super::ActiveStream {
+                writer,
+                bytes_received: 0,
+            }),
             Err(e) => {
                 return error_response(req.request_id, ERR_INTERNAL, &format!("begin_stream: {e}"));
             }
-        }
-    }
-
-    let stream = conn_state
-        .streams
-        .get_mut(&chunk.txid)
-        .expect("just inserted");
+        },
+    };
 
     // Verify chunk offset matches expected position.
     if chunk.offset != stream.bytes_received {
@@ -6228,6 +6342,13 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
         SpendError::StorageError { .. } => (ERR_INTERNAL, vec![]),
         SpendError::DahOverflow { .. } => (ERR_INTERNAL, vec![]),
         SpendError::ReassignOverflow { .. } => (ERR_INTERNAL, vec![]),
+        // F-G2-002: reserved frozen-sentinel rejection. Reuses
+        // `ERR_INVALID_SPEND` — semantically the request is malformed
+        // (caller asked us to write the on-disk frozen marker as the
+        // spender). No new wire opcode is added; the client can
+        // distinguish via the empty payload (real `InvalidSpend` carries
+        // the 36-byte `spending_data`).
+        SpendError::ReservedSpendingData { .. } => (ERR_INVALID_SPEND, vec![]),
     };
     BatchItemError {
         item_index,
@@ -6266,7 +6387,10 @@ pub(crate) fn classify_spend_error(err: &SpendError) -> crate::metrics::Outcome 
         | SpendError::ReassignOverflow { .. } => Outcome::ErrStorage,
         SpendError::CoinbaseImmature { .. }
         | SpendError::UtxoNotFound { .. }
-        | SpendError::UtxoHashMismatch { .. } => Outcome::Other,
+        | SpendError::UtxoHashMismatch { .. }
+        // F-G2-002: reserved-sentinel rejection is a request-shape error,
+        // grouped with the other "Other" bucket entries.
+        | SpendError::ReservedSpendingData { .. } => Outcome::Other,
     }
 }
 
@@ -6360,14 +6484,19 @@ fn handle_admin_diagnose_key(
     cluster: Option<&RunningCluster>,
 ) -> ResponseFrame {
     let payload = &req.payload;
-    if payload.len() < 4 {
+    // F-G5-007: route count through the bounds-checked le_u32_at helper
+    // (rather than the panic-on-truncate try_into-expect pattern) so a
+    // future refactor that drops the inline length check cannot panic on
+    // a client-controlled payload. Same change applies to F-G5-009 in
+    // handle_partition_version_report.
+    let Some(count_u32) = le_u32_at(payload, 0) else {
         return error_response(
             req.request_id,
             ERR_INTERNAL,
             "malformed admin diagnose: missing count",
         );
-    }
-    let count = u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes")) as usize;
+    };
+    let count = count_u32 as usize;
     if count as u32 > ADMIN_DIAGNOSE_KEY_MAX_TXIDS {
         return error_response(
             req.request_id,
@@ -6471,14 +6600,18 @@ fn handle_partition_version_report(
 ) -> ResponseFrame {
     // Reject mismatched cluster_key — a stale coordinator must not influence
     // this node's view of the partition map.
-    if req.payload.len() < 8 {
+    // F-G5-009: use le_u64_at instead of the silently-substituted-zero
+    // try_into-unwrap_or pattern that previously parsed a truncated
+    // payload as cluster_key = 0. The preceding length check makes the
+    // path unreachable today but the pattern was inconsistent with the
+    // rest of the dispatcher's helpers.
+    let Some(request_cluster_key) = le_u64_at(&req.payload, 0) else {
         return error_response(
             req.request_id,
             ERR_INTERNAL,
             "malformed partition version report: missing cluster_key",
         );
-    }
-    let request_cluster_key = u64::from_le_bytes(req.payload[0..8].try_into().unwrap_or([0u8; 8]));
+    };
 
     let (self_id, local_cluster_key) = match cluster {
         Some(c) => (c.self_id().0, c.local_cluster_key()),
@@ -6589,6 +6722,19 @@ mod tests {
         assert!(
             !production.contains("try_into().unwrap()"),
             "production dispatch parsers must use checked endian helpers, not try_into().unwrap()",
+        );
+        // F-G5-007: `try_into().expect(...)` is the same panic-on-truncate
+        // pattern under a different macro name; reject both.
+        assert!(
+            !production.contains("try_into().expect("),
+            "production dispatch parsers must use checked endian helpers, not try_into().expect()",
+        );
+        // F-G5-009: `try_into().unwrap_or(...)` silently substitutes the
+        // fallback on a truncated payload, which can bypass downstream
+        // equality / mismatch checks. Use le_u32_at / le_u64_at instead.
+        assert!(
+            !production.contains("try_into().unwrap_or("),
+            "production dispatch parsers must use checked endian helpers, not try_into().unwrap_or()",
         );
     }
 

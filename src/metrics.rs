@@ -2,6 +2,21 @@
 //!
 //! Thread-local counters avoid atomic contention. Cache-line padding
 //! prevents false sharing between cores.
+//!
+//! # Verified — F-G6-022 (positive verification, label-cardinality bound)
+//!
+//! Every labelled metric in this file is keyed by a fixed-cardinality
+//! enum with a `const all()` slice — [`Outcome`], [`OpCode`],
+//! [`MigrationLabel`], [`UringErrClass`], [`SwimChurnKind`]. No metric
+//! is ever labelled by a user-controlled string (client IP, request
+//! path, txid, peer address). Prometheus label cardinality is therefore
+//! bounded at compile time, which is load-bearing for the scrape
+//! cost / dashboard correctness contract.
+//!
+//! Future PRs that add a `.with_label_values(...)` style API or a
+//! `String`-keyed label MUST re-audit this invariant. The matching
+//! HTTP-side check lives in [`crate::server::http::http_span_for`]
+//! (F-G6-013), which keeps OTLP span attributes equally bounded.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
@@ -565,13 +580,25 @@ impl ThreadMetrics {
 
 /// Number of histogram buckets.
 ///
-/// Bucket layout (nanoseconds):
-/// - 0: \[0, 128)
-/// - 1: \[128, 256)
-/// - 2: \[256, 512)
+/// Bucket layout (nanoseconds): bucket `i` covers `[128 * 2^(i-1), 128 * 2^i)`
+/// for `i >= 1`; bucket 0 covers `[0, 128)`. The final bucket
+/// (`i == NUM_BUCKETS - 1`) is open-ended and rendered as `+Inf` in
+/// Prometheus output regardless of the formal upper bound.
+///
+/// - 0:  \[0, 128) ns
+/// - 1:  \[128, 256) ns
+/// - 2:  \[256, 512) ns
 /// - ...
-/// - 23: \[1s, 2s)
-/// - 24: \[2s, infinity)
+/// - 22: \[268_435_456, 536_870_912) ns  (~0.27s, ~0.54s)
+/// - 23: \[536_870_912, 1_073_741_824) ns  (~0.54s, ~1.07s)
+/// - 24: \[1_073_741_824, infinity) ns  (~1.07s+, open-ended → `+Inf`)
+///
+/// F-G6-023: the previous comment said bucket 23 was `[1s, 2s)`, which
+/// disagreed with `bucket_upper_ns_at(i) = 128 << i`. The implementation
+/// is the source of truth; the comment is corrected here. The renderer
+/// emits one Prometheus `_bucket{le="..."}` line per bucket and uses
+/// `+Inf` for the last bucket only, so percentile estimates retain
+/// resolution all the way up to bucket 23's upper bound (~1.07s).
 const NUM_BUCKETS: usize = 25;
 
 /// Latency histogram with fixed log2 buckets.
@@ -833,6 +860,42 @@ pub struct ReplicationMetrics {
     /// stale-epoch gate). A non-zero value means a master is sending
     /// from a stale epoch and should re-discover the cluster topology.
     pub replica_rejected_stale_cluster_key: PaddedCounter,
+    /// F-G7-006: receiver-side counter — incremented every time
+    /// `apply_op` gracefully skips a non-Create/non-Delete op because
+    /// the target TX or slot was not found. A non-zero value means
+    /// the master is sending mutations against records the replica
+    /// never received (lost Create batch, missing intent range, or
+    /// dedup-tracker drift). The silent skip leaves replica counters
+    /// diverged from the master without surfacing an error; operators
+    /// must investigate any sustained growth.
+    pub replica_apply_skipped_missing_tx: PaddedCounter,
+    /// F-G7-008: master-side counter — incremented every time
+    /// `AckTracker::flush_locked` fails to persist the last-ACKed
+    /// map to disk. A non-zero counter means the on-disk view of
+    /// per-replica progress is stale; a master restart will
+    /// re-stream more ops than necessary. Operators should
+    /// investigate disk pressure or permission errors as soon as
+    /// this starts climbing.
+    pub ack_tracker_flush_failures: PaddedCounter,
+    /// F-G7-009: master-side counter — incremented every time the
+    /// `replicate_batch` fan-out's scoped worker panics. The panic
+    /// payload is logged + the replica transitions to Down via the
+    /// outer reconciliation loop. A non-zero counter is a hard
+    /// signal that a real bug in send_batch/recv_ack exists; the
+    /// surrounding error path silently retries on the next batch.
+    pub replica_worker_panics_total: PaddedCounter,
+    /// F-G7-001: receiver-side counter — incremented every time the
+    /// node accepts an inter-node opcode (e.g. `OP_REPLICA_BATCH`)
+    /// without an HMAC layer because `cluster_secret` is unset. The
+    /// trusted-overlay deployment model intentionally allows this in
+    /// single-node demos; multi-node clusters in production should
+    /// see a flat zero. A non-zero counter is an alert signal —
+    /// either the operator forgot to configure cluster_secret or a
+    /// peer is reaching the listener without the configured auth.
+    /// Bumped by the G5-owned auth gate at `server::mod`; the field
+    /// lives here so the G7 replication subsystem owns the metric
+    /// schema and tests can reference it directly.
+    pub replica_unauthenticated_accept_total: PaddedCounter,
 }
 
 /// Per-replica drill-down state exposed on `/admin/top`.
@@ -883,6 +946,10 @@ impl ReplicationMetrics {
             per_replica: [ZERO_CELL; MAX_REPLICAS],
             leader_sequence: AtomicU64::new(0),
             replica_rejected_stale_cluster_key: PaddedCounter::new(),
+            replica_apply_skipped_missing_tx: PaddedCounter::new(),
+            ack_tracker_flush_failures: PaddedCounter::new(),
+            replica_worker_panics_total: PaddedCounter::new(),
+            replica_unauthenticated_accept_total: PaddedCounter::new(),
         }
     }
 
@@ -1503,6 +1570,41 @@ mod tests {
         h.record_ns(1_000_000); // 1ms — bucket 12
         assert_eq!(h.count(), 3);
         assert_eq!(h.sum_ns(), 1_001_010);
+    }
+
+    /// F-G6-023 regression guard: `bucket_upper_ns_at` must return the
+    /// canonical `128 << i` series for every non-terminal bucket and only
+    /// fall back to `u64::MAX` for the very last bucket. The Prometheus
+    /// renderer in `src/server/http.rs` depends on this so percentile
+    /// estimates retain resolution all the way up to bucket 23.
+    #[test]
+    fn histogram_bucket_upper_bounds_are_powers_of_two_until_last() {
+        let h = LatencyHistogram::new();
+        // Bucket 0 is a special-case (128 ns lower-bound floor).
+        assert_eq!(h.bucket_upper_ns_at(0), 128);
+        // Every interior bucket is 128 << i.
+        for i in 1..NUM_BUCKETS - 1 {
+            let want = 128u64 << i;
+            assert_eq!(
+                h.bucket_upper_ns_at(i),
+                want,
+                "bucket {i} upper bound must be {want} ns (128 << {i}); off-by-one would \
+                 alias the [{want}, +Inf) range into the +Inf bucket and lose resolution",
+            );
+        }
+        // The final bucket is open-ended.
+        assert_eq!(h.bucket_upper_ns_at(NUM_BUCKETS - 1), u64::MAX);
+        // And out-of-range indexes saturate to +Inf rather than panic.
+        assert_eq!(h.bucket_upper_ns_at(NUM_BUCKETS), u64::MAX);
+        assert_eq!(h.bucket_upper_ns_at(NUM_BUCKETS + 16), u64::MAX);
+        // Specifically: bucket 23 must NOT be aliased into +Inf. The
+        // F-G6-023 finding suggested a precision loss between ~537 ms
+        // and infinity; verify the renderer-visible bound matches the
+        // documented half-open layout.
+        assert_eq!(h.bucket_upper_ns_at(23), 128u64 << 23);
+        // ~1.07 s — well above 1 second, confirming the doc comment fix.
+        assert!(h.bucket_upper_ns_at(23) > 1_000_000_000);
+        assert!(h.bucket_upper_ns_at(23) < 2_000_000_000);
     }
 
     #[test]

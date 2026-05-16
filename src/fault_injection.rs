@@ -24,10 +24,15 @@
 //!   corresponding side-effect has been observed by the caller, so
 //!   placing the check immediately before an fsync simulates a crash
 //!   "between previous-step-durable and this-fsync".
-//! - [`FaultMode::NoOpAt`]: if the supplied `point` matches, silently
-//!   skip (do nothing). Used to simulate "the durability call succeeded
-//!   in returning but the write never actually hit the platter" — rare
-//!   but useful for cross-checking replay idempotency.
+//!
+//! F-G1-013 removed an earlier `NoOpAt` variant: it was reserved for a
+//! future extension that would gate a real side-effect, but `check`
+//! never actually wrapped any work, so `NoOpAt(point)` was
+//! observationally identical to `None`. Tests that armed it could not
+//! distinguish a working harness from a broken one, so the variant was
+//! removed to keep the surface honest. When a future extension lands
+//! that genuinely gates an action, the variant can be re-added with
+//! enforcement.
 //!
 //! ## Crash semantics
 //!
@@ -133,18 +138,6 @@ pub enum FaultMode {
     None,
     /// Panic when the armed [`SyncPoint`] is reached.
     PanicAt(SyncPoint),
-    /// Silently skip past the armed [`SyncPoint`] — the caller that
-    /// invoked [`check`] proceeds as if nothing happened, but any
-    /// action guarded by the check site (e.g. an fsync wrapped by the
-    /// harness) is NOT executed.
-    ///
-    /// Currently [`check`] does not gate any real work itself — the
-    /// production side-effect (fsync / pwrite / redb commit) is still
-    /// performed by the caller after [`check`] returns. `NoOpAt` is
-    /// therefore functionally equivalent to `None` unless a future
-    /// extension adds guarded actions. It is retained here so tests
-    /// can express intent without a breaking API change later.
-    NoOpAt(SyncPoint),
 }
 
 #[cfg(any(test, feature = "fault-injection"))]
@@ -285,14 +278,6 @@ mod tests {
             cleared,
             FaultMode::PanicAt(SyncPoint::BeforeRedoFsync)
         ));
-    }
-
-    #[test]
-    fn noop_at_does_not_panic() {
-        let _prev = arm(FaultMode::NoOpAt(SyncPoint::BeforeIndexCommit));
-        check(SyncPoint::BeforeIndexCommit);
-        check(SyncPoint::AfterIndexCommit);
-        let _ = disarm();
     }
 
     /// Extract the `&str` message from a panic payload. Covers the two

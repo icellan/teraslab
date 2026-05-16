@@ -18,12 +18,12 @@
 //!
 //! ## V1 (legacy — decoded for one-version compat, never produced)
 //!
-//! `[version=1:1][first_seq:8][count:4][trace_id:16][span_id:8][source_node_id:8][op0_len:4][op0]…`
-//!
-//! Header is 45 bytes ([`ReplicaBatch::HEADER_SIZE_V1`]). Decoded
-//! frames have `cluster_key = 0`. Senders never produce V1; this path
-//! exists solely so a receiver upgraded ahead of a sender during the
-//! Phase B rollout still parses incoming traffic.
+//! V1 (legacy, lacking `cluster_key`) decoded with a 45-byte header.
+//! F-G7-012 removed the V1 decoder: senders never produced V1 in this
+//! repository's history, and the V1 wildcard cluster_key was a
+//! defense-in-depth hole against the Phase B2 stale-epoch gate. The
+//! receiver now rejects any leading version byte other than V2 with
+//! [`ProtocolError::UnknownVersion`].
 //!
 //! ## Common fields
 //!
@@ -39,15 +39,9 @@ use crate::index::TxKey;
 use crate::observability::WireTraceContext;
 use thiserror::Error;
 
-/// Legacy batch wire layout — decoded for one-version compatibility but
-/// never produced by this crate. V1 frames lack the `cluster_key` field
-/// and decode with `cluster_key = 0`.
-pub const BATCH_PROTOCOL_V1: u8 = 1;
-
-/// Current batch wire layout. Identical to [`BATCH_PROTOCOL_V1`] except
-/// 8 additional bytes (u64 little-endian `cluster_key`) are inserted
-/// into the header immediately AFTER `source_node_id` and BEFORE
-/// `op0_len`. Senders always produce V2; receivers decode V1 or V2.
+/// Current batch wire layout. F-G7-012 removed the legacy V1 decoder;
+/// receivers reject any other version byte with
+/// [`ProtocolError::UnknownVersion`]. Senders always produce V2.
 ///
 /// Full wire layout:
 /// `[version=2:1][first_seq:8][count:4][trace_id:16][span_id:8][source_node_id:8][cluster_key:8][op0_len:4][op0]…`
@@ -870,15 +864,17 @@ impl ReplicaBatch {
     ///
     /// * Leading byte == [`BATCH_PROTOCOL_V2`]: parse V2 layout
     ///   (53-byte header including `cluster_key`).
-    /// * Leading byte == [`BATCH_PROTOCOL_V1`]: parse legacy V1 layout
-    ///   (45-byte header) and set `cluster_key = 0`. This compat path
-    ///   exists for one-version rollout only — senders never produce V1.
     /// * Anything else: [`ProtocolError::UnknownVersion`].
+    ///
+    /// F-G7-012 removed the legacy V1 decoder: V1 frames decoded with
+    /// `cluster_key = 0`, which the Phase B2 stale-epoch gate treats
+    /// as a wildcard. Accepting V1 in clustered mode therefore
+    /// silently bypassed the epoch invariant. Senders have always
+    /// produced V2, so removing the decoder is the cheapest fix.
     pub fn deserialize(data: &[u8]) -> Result<Self> {
         need(data, 1)?;
         match data[0] {
             BATCH_PROTOCOL_V2 => Self::decode_v2(data),
-            BATCH_PROTOCOL_V1 => Self::decode_v1(data),
             other => Err(ProtocolError::UnknownVersion(other)),
         }
     }
@@ -904,27 +900,10 @@ impl ReplicaBatch {
         })
     }
 
-    /// Decode a legacy V1 frame (45-byte header, no `cluster_key`).
-    /// Returned `cluster_key` is always `0`.
-    fn decode_v1(data: &[u8]) -> Result<Self> {
-        need(data, Self::HEADER_SIZE_V1)?;
-        let first_sequence = u64::from_le_bytes(data[1..9].try_into().unwrap());
-        let count = u32::from_le_bytes(data[9..13].try_into().unwrap()) as usize;
-        let trace_ctx = WireTraceContext::read_from(&data[13..13 + WireTraceContext::SIZE]);
-        let source_off = 13 + WireTraceContext::SIZE;
-        let source_node_id = decode_source_node_id(&data[source_off..source_off + 8]);
-        let ops = Self::decode_ops(data, Self::HEADER_SIZE_V1, count)?;
-        Ok(ReplicaBatch {
-            first_sequence,
-            ops,
-            trace_ctx,
-            source_node_id,
-            cluster_key: 0,
-        })
-    }
-
-    /// Common op-stream decoder shared by V1 and V2 paths. `header_size`
-    /// is the byte offset at which the length-prefixed op stream begins.
+    /// Op-stream decoder. `header_size` is the byte offset at which
+    /// the length-prefixed op stream begins. Kept as a separate helper
+    /// in case a future version of the wire format reuses the same
+    /// length-prefixed op layout with a different header size.
     fn decode_ops(data: &[u8], header_size: usize, count: usize) -> Result<Vec<ReplicaOp>> {
         let mut pos = header_size;
         let mut ops = Vec::with_capacity(count);
@@ -950,16 +929,8 @@ impl ReplicaBatch {
     /// Layout: `version(1) + first_sequence(8) + count(4) + trace_ctx(24) + source_node_id(8) + cluster_key(8) = 53`.
     pub const HEADER_SIZE: usize = 1 + 8 + 4 + WireTraceContext::SIZE + 8 + 8;
 
-    /// Legacy (V1) batch header overhead in bytes — kept for the
-    /// one-version compat decoder. Lacks the `cluster_key` field.
-    ///
-    /// Layout: `version(1) + first_sequence(8) + count(4) + trace_ctx(24) + source_node_id(8) = 45`.
-    pub const HEADER_SIZE_V1: usize = 1 + 8 + 4 + WireTraceContext::SIZE + 8;
-
     /// Byte offset of the `trace_id` field in the serialized frame.
     /// Exposed for the test suite that inspects exact byte layout.
-    /// Identical for V1 and V2 (the version-incompatible field is
-    /// inserted later in the header).
     pub const TRACE_ID_OFFSET: usize = 1 + 8 + 4;
 
     /// Byte offset of the `span_id` field in the serialized frame.
@@ -977,6 +948,13 @@ fn decode_source_node_id(bytes: &[u8]) -> Option<u64> {
     if raw == 0 { None } else { Some(raw) }
 }
 
+/// F-G7-017: cap diagnostic strings in `ReplicaAck::Error` so a
+/// long-tail message (e.g. a `format!` that embeds a full filesystem
+/// path) cannot overflow `MAX_ACK_FRAME_SIZE` on the master side
+/// and lose the entire ACK. The cap matches the master's frame budget
+/// minus the fixed ReplicaAck::Error header bytes and HMAC suffix.
+pub const MAX_ACK_ERROR_MESSAGE_LEN: usize = 2048;
+
 impl ReplicaAck {
     /// Serialize to bytes.
     pub fn serialize(&self) -> Vec<u8> {
@@ -990,10 +968,24 @@ impl ReplicaAck {
                 failed_sequence,
                 message,
             } => {
+                // F-G7-017: truncate at a char boundary so the
+                // resulting String stays valid UTF-8. Use a slice of
+                // the original; clients on the read side decode with
+                // from_utf8_lossy so even a mid-codepoint cut would
+                // be tolerated, but we keep the wire encoding clean.
+                let message_bytes = if message.len() > MAX_ACK_ERROR_MESSAGE_LEN {
+                    let mut cut = MAX_ACK_ERROR_MESSAGE_LEN;
+                    while cut > 0 && !message.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    &message.as_bytes()[..cut]
+                } else {
+                    message.as_bytes()
+                };
                 buf.push(1);
                 buf.extend_from_slice(&failed_sequence.to_le_bytes());
-                buf.extend_from_slice(&(message.len() as u32).to_le_bytes());
-                buf.extend_from_slice(message.as_bytes());
+                buf.extend_from_slice(&(message_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(message_bytes);
             }
         }
         buf
@@ -1404,7 +1396,7 @@ mod tests {
         // V2: version(1) + first_sequence(8) + count(4) + trace_ctx(24) + source_node_id(8) + cluster_key(8) = 53.
         assert_eq!(ReplicaBatch::HEADER_SIZE, 53);
         // Legacy V1 header (compat decode path): same minus cluster_key.
-        assert_eq!(ReplicaBatch::HEADER_SIZE_V1, 45);
+        // HEADER_SIZE_V1 (45) was the legacy V1 layout — removed in F-G7-012.
         assert_eq!(ReplicaBatch::TRACE_ID_OFFSET, 13);
         assert_eq!(ReplicaBatch::SPAN_ID_OFFSET, 29);
         assert_eq!(ReplicaBatch::CLUSTER_KEY_OFFSET, 45);
@@ -1492,13 +1484,13 @@ mod tests {
 
     #[test]
     fn replication_batch_rejects_unknown_version_byte() {
-        // Any leading byte other than BATCH_PROTOCOL_V1/V2 must error. We
+        // Any leading byte other than BATCH_PROTOCOL_V2 must error. We
         // construct a frame whose body would otherwise be valid for the
         // current layout.
         let op = ReplicaOp::Delete { tx_key: key(4) };
         let ob = op.serialize();
         let mut frame = Vec::new();
-        frame.push(0xFE); // not V1, not V2
+        frame.push(0xFE); // not V2
         frame.extend_from_slice(&7u64.to_le_bytes());
         frame.extend_from_slice(&1u32.to_le_bytes());
         frame.extend_from_slice(&[0u8; WireTraceContext::SIZE]);
@@ -1510,6 +1502,33 @@ mod tests {
         match err {
             ProtocolError::UnknownVersion(v) => assert_eq!(v, 0xFE),
             other => panic!("expected UnknownVersion, got {other:?}"),
+        }
+    }
+
+    /// F-G7-012: the legacy V1 decoder is removed because V1 frames
+    /// stamped `cluster_key = 0` which the stale-epoch gate accepts
+    /// as a wildcard, silently bypassing the Phase B2 epoch invariant.
+    /// Senders never produced V1 in this repository's history. The
+    /// decoder must now reject the V1 version byte as unknown.
+    #[test]
+    fn replication_batch_rejects_v1_version_byte() {
+        let op = ReplicaOp::Delete { tx_key: key(9) };
+        let ob = op.serialize();
+        let mut frame = Vec::new();
+        // Reconstruct what a V1 frame looked like — leading byte = 1.
+        frame.push(1u8);
+        frame.extend_from_slice(&777u64.to_le_bytes());
+        frame.extend_from_slice(&1u32.to_le_bytes());
+        frame.extend_from_slice(&[0u8; WireTraceContext::SIZE]);
+        frame.extend_from_slice(&55u64.to_le_bytes());
+        frame.extend_from_slice(&(ob.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&ob);
+
+        let err = ReplicaBatch::deserialize(&frame)
+            .expect_err("V1 frames must be rejected as unknown version");
+        match err {
+            ProtocolError::UnknownVersion(v) => assert_eq!(v, 1),
+            other => panic!("expected UnknownVersion(1), got {other:?}"),
         }
     }
 
@@ -1543,40 +1562,6 @@ mod tests {
     #[test]
     fn replica_batch_v2_header_size_is_53() {
         assert_eq!(ReplicaBatch::HEADER_SIZE, 53);
-        assert_eq!(ReplicaBatch::HEADER_SIZE_V1, 45);
-    }
-
-    #[test]
-    fn replica_batch_v1_legacy_frame_decodes_with_cluster_key_zero() {
-        // Hand-construct a V1 frame (45-byte header, leading byte 0x01)
-        // exactly per the legacy V1 layout:
-        //   [version:1][first_seq:8][count:4][trace_id:16][span_id:8][source_node_id:8][op0_len:4][op0]…
-        let op = ReplicaOp::Delete { tx_key: key(9) };
-        let ob = op.serialize();
-        let mut frame = Vec::new();
-        frame.push(BATCH_PROTOCOL_V1);
-        frame.extend_from_slice(&777u64.to_le_bytes()); // first_sequence
-        frame.extend_from_slice(&1u32.to_le_bytes()); // count
-        frame.extend_from_slice(&[0u8; WireTraceContext::SIZE]); // trace ctx
-        frame.extend_from_slice(&55u64.to_le_bytes()); // source_node_id
-        frame.extend_from_slice(&(ob.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&ob);
-        // Header alone must be exactly 45 bytes.
-        assert_eq!(
-            ReplicaBatch::HEADER_SIZE_V1,
-            1 + 8 + 4 + WireTraceContext::SIZE + 8,
-        );
-
-        let decoded = ReplicaBatch::deserialize(&frame).unwrap();
-        assert_eq!(
-            decoded.cluster_key, 0,
-            "V1 frames decode with cluster_key=0"
-        );
-        assert_eq!(decoded.first_sequence, 777);
-        assert_eq!(decoded.source_node_id, Some(55));
-        assert_eq!(decoded.ops.len(), 1);
-        assert_eq!(decoded.ops[0], op);
-        assert_eq!(decoded.trace_ctx, None);
     }
 
     #[test]
@@ -1616,6 +1601,39 @@ mod tests {
         let bytes = ack.serialize();
         let decoded = ReplicaAck::deserialize(&bytes).unwrap();
         assert_eq!(decoded, ack);
+    }
+
+    /// F-G7-017: messages longer than MAX_ACK_ERROR_MESSAGE_LEN must
+    /// be truncated at serialize time so a bug in the replica's error
+    /// formatter cannot overflow the master's MAX_ACK_FRAME_SIZE
+    /// budget and lose the diagnostic entirely.
+    #[test]
+    fn ack_error_message_truncated_above_cap() {
+        let oversized = "x".repeat(MAX_ACK_ERROR_MESSAGE_LEN + 1024);
+        let ack = ReplicaAck::Error {
+            failed_sequence: 11,
+            message: oversized,
+        };
+        let bytes = ack.serialize();
+        let decoded = ReplicaAck::deserialize(&bytes).unwrap();
+        match decoded {
+            ReplicaAck::Error {
+                failed_sequence,
+                message,
+            } => {
+                assert_eq!(failed_sequence, 11);
+                assert_eq!(
+                    message.len(),
+                    MAX_ACK_ERROR_MESSAGE_LEN,
+                    "message must be truncated to MAX_ACK_ERROR_MESSAGE_LEN bytes",
+                );
+                assert!(
+                    message.bytes().all(|b| b == b'x'),
+                    "truncation must preserve the prefix",
+                );
+            }
+            other => panic!("expected Error variant, got {other:?}"),
+        }
     }
 
     #[test]

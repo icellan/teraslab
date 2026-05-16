@@ -495,15 +495,20 @@ fn kill_before_secondary_redb_commit_reconciles_via_redo() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 5: NoOpAt and non-matching points do not fire panics
+// Test 5: armed-but-mismatched points are silent
 // ---------------------------------------------------------------------------
 
 /// Sanity coverage for the fault-injection harness itself from the
-/// integration-test side: armed-but-mismatched points are silent, and
-/// `NoOpAt` never panics. Without this a test author could miswrite
-/// an arm/assert and pass spuriously.
+/// integration-test side: an arm at one [`SyncPoint`] must not fire at
+/// any other point. Without this a test author could miswrite an
+/// arm/assert pair and pass spuriously.
+///
+/// F-G1-013 removed the previous `NoOpAt` variant (and the
+/// corresponding sub-assert here) because it was observationally
+/// identical to `None` — a "never panics" check on a variant that
+/// never did anything could not catch a broken harness either way.
 #[test]
-fn unmatched_and_noop_fault_modes_are_silent() {
+fn unmatched_fault_modes_are_silent() {
     // Unmatched: armed at AfterRedoFsync, but the flush runs without a
     // fsync-triggering check (no redo log in scope) — the arm just
     // stays active and is cleared.
@@ -519,10 +524,5 @@ fn unmatched_and_noop_fault_modes_are_silent() {
         cleared,
         FaultMode::PanicAt(SyncPoint::AfterRedoFsync)
     ));
-
-    // NoOpAt never panics.
-    let _ = arm(FaultMode::NoOpAt(SyncPoint::AfterRedoFsync));
-    teraslab::fault_injection::check(SyncPoint::AfterRedoFsync);
-    let _ = disarm();
     assert_eq!(current(), FaultMode::None);
 }

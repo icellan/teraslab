@@ -458,12 +458,28 @@ impl Index {
                     detail: format!("zero record_size at allocated offset {offset}"),
                 });
             }
+            // F-G3-014: cross-check `record_size` against the layout
+            // implied by `utxo_count`. A CRC-valid header whose
+            // `record_size` disagrees with `record_size_for(utxo_count)`
+            // is corrupt — advancing by the declared size would skip
+            // legitimate records and produce a quiet partial rebuild.
+            let utxo_count = { meta.utxo_count };
+            let expected_record_size = TxMetadata::record_size_for(utxo_count);
+            if record_size != expected_record_size {
+                return Err(IndexError::FormatError {
+                    detail: format!(
+                        "record_size mismatch at allocated offset {offset}: \
+                         declared {record_size}, expected {expected_record_size} \
+                         for utxo_count={utxo_count}"
+                    ),
+                });
+            }
 
             let key = TxKey { txid: meta.tx_id };
             let entry = TxIndexEntry {
                 device_id: 0,
                 record_offset: offset,
-                utxo_count: { meta.utxo_count },
+                utxo_count,
                 block_entry_count: meta.block_entry_count,
                 tx_flags: meta.flags.bits(),
                 spent_utxos: meta.spent_utxos,
@@ -533,6 +549,21 @@ impl Index {
             if record_size == 0 {
                 return Err(IndexError::FormatError {
                     detail: format!("zero record_size at allocated offset {offset}"),
+                });
+            }
+            // F-G3-014: same cross-check as `Index::rebuild` — a CRC-valid
+            // header whose declared `record_size` disagrees with the
+            // layout implied by `utxo_count` cannot be trusted to advance
+            // the offset correctly.
+            let utxo_count = { meta.utxo_count };
+            let expected_record_size = TxMetadata::record_size_for(utxo_count);
+            if record_size != expected_record_size {
+                return Err(IndexError::FormatError {
+                    detail: format!(
+                        "record_size mismatch at allocated offset {offset}: \
+                         declared {record_size}, expected {expected_record_size} \
+                         for utxo_count={utxo_count}"
+                    ),
                 });
             }
 
@@ -705,21 +736,33 @@ impl Index {
 // ---------------------------------------------------------------------------
 
 fn serialize_secondary(magic: &[u8; 4], entries: impl Iterator<Item = (u32, TxKey)>) -> Vec<u8> {
-    let collected: Vec<_> = entries.collect();
-    let count = collected.len() as u64;
+    // F-G3-011: stream `entries` straight into `buf` instead of `.collect()`-ing
+    // into an intermediate Vec. A fully-loaded DAH backend with tens of
+    // millions of rows previously paid for the same data twice — once as
+    // the `Vec<(u32, TxKey)>` and once as the serialized bytes.
+    //
+    // The serialized header carries a u64 `count` that has to be written
+    // before the entries. We use `entries.size_hint().0` as a best-effort
+    // capacity hint, reserve the header (with a placeholder count), append
+    // entries one at a time updating a running counter, then patch the
+    // count back into the header bytes at the known offset.
+    let (size_hint_lo, _) = entries.size_hint();
     let header_size = 4 + 4 + 8; // magic + version + count
-    let body_size = collected.len() * SECONDARY_ENTRY_SIZE;
-    let total = header_size + body_size + 4;
-
-    let mut buf = Vec::with_capacity(total);
+    let estimated_body = size_hint_lo * SECONDARY_ENTRY_SIZE;
+    let mut buf = Vec::with_capacity(header_size + estimated_body + 4);
     buf.extend_from_slice(magic);
     buf.extend_from_slice(&SECONDARY_VERSION.to_le_bytes());
-    buf.extend_from_slice(&count.to_le_bytes());
+    let count_offset = buf.len();
+    buf.extend_from_slice(&0u64.to_le_bytes()); // placeholder
 
-    for (height, key) in &collected {
+    let mut count = 0u64;
+    for (height, key) in entries {
         buf.extend_from_slice(&height.to_le_bytes());
         buf.extend_from_slice(&key.txid);
+        count += 1;
     }
+    // Patch the actual count into the header.
+    buf[count_offset..count_offset + 8].copy_from_slice(&count.to_le_bytes());
 
     let checksum = crc32fast::hash(&buf);
     buf.extend_from_slice(&checksum.to_le_bytes());
@@ -728,12 +771,22 @@ fn serialize_secondary(magic: &[u8; 4], entries: impl Iterator<Item = (u32, TxKe
 
 /// Scan the provided slice for a byte window that begins with the unmined
 /// section magic (`UNMI`) AND whose declared `count` + body fits inside the
-/// remaining bytes. Returns the subslice starting at the first candidate that
-/// passes the size sanity-check (which `deserialize_secondary` will then
-/// validate via checksum), or an empty slice if no candidate is found.
+/// remaining bytes AND whose stored CRC verifies. Returns the subslice
+/// starting at the first candidate that passes all three checks, or an
+/// empty slice if no candidate is found.
 ///
 /// Used by [`Index::restore_all`] when the DAH section header is corrupt and
 /// the offset of the unmined section is unknown.
+///
+/// F-G3-012: the pre-fix scan accepted the first candidate that passed the
+/// size check, leaving `deserialize_secondary` to catch a forged section
+/// via the CRC. That worked, but an attacker who could plant `UNMI`
+/// followed by a benign `count` inside the corrupt DAH payload could
+/// divert the scan to a chosen offset before the genuine unmined section
+/// was even considered. Validating the CRC inline here removes that
+/// amplification: we now skip past any candidate whose stored CRC does
+/// not match, so a planted false-magic burst gets stepped over and the
+/// real section (if present) is still found.
 fn locate_unmined_section(data: &[u8]) -> &[u8] {
     let header_size = 4 + 4 + 8;
     let mut idx = 0usize;
@@ -741,10 +794,24 @@ fn locate_unmined_section(data: &[u8]) -> &[u8] {
         if data[idx..idx + 4] == UNMINED_SECTION_MAGIC {
             // Check declared count fits in remaining bytes.
             let count = u64::from_le_bytes(data[idx + 8..idx + 16].try_into().unwrap()) as usize;
-            let body_size = count.saturating_mul(SECONDARY_ENTRY_SIZE);
-            let total = header_size + body_size + 4;
-            if data.len() - idx >= total {
-                return &data[idx..];
+            // Reject ludicrous counts up front so a poisoned u64 cannot
+            // produce a `total` that is large but still within `data.len()`.
+            if count <= MAX_SNAPSHOT_COUNT {
+                let body_size = count.saturating_mul(SECONDARY_ENTRY_SIZE);
+                let total = header_size + body_size + 4;
+                if data.len() - idx >= total {
+                    // Verify the CRC before declaring the match. Pre-fix this
+                    // step happened inside `deserialize_secondary` AFTER the
+                    // scan had already accepted the candidate; doing it here
+                    // means a forged magic burst no longer hides the real
+                    // section behind it.
+                    let stored_checksum =
+                        u32::from_le_bytes(data[idx + total - 4..idx + total].try_into().unwrap());
+                    let computed_checksum = crc32fast::hash(&data[idx..idx + total - 4]);
+                    if stored_checksum == computed_checksum {
+                        return &data[idx..];
+                    }
+                }
             }
         }
         idx += 1;
@@ -1214,6 +1281,52 @@ mod tests {
         assert_eq!(up_to_600.len(), 2);
     }
 
+    // F-G3-012: `locate_unmined_section` must skip over a planted `UNMI`
+    // magic burst whose stored CRC does not verify, and continue scanning
+    // for the genuine unmined section that follows. Pre-fix, the first
+    // candidate that passed the size sanity-check was accepted and the
+    // CRC check happened inside `deserialize_secondary` — by then the
+    // scan had already locked onto the wrong offset.
+    #[test]
+    fn locate_unmined_section_skips_forged_magic_when_real_follows() {
+        // Build a valid serialized unmined section (the "real" one).
+        let real_entries = [(500u32, make_key(1)), (600u32, make_key(2))];
+        let real_bytes = serialize_secondary(&UNMINED_SECTION_MAGIC, real_entries.iter().copied());
+
+        // Build a poisoned prefix: `UNMI` magic + arbitrary version + count
+        // that fits in `data.len()` after the prefix, plus garbage CRC.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&UNMINED_SECTION_MAGIC); // 4
+        blob.extend_from_slice(&SECONDARY_VERSION.to_le_bytes()); // 4
+        // count = 1 — small enough that the entire forged "section"
+        // (header + 1 entry + crc) fits inside the prefix block before
+        // the real section.
+        blob.extend_from_slice(&1u64.to_le_bytes()); // 8
+        // Fake entry (height + txid)
+        blob.extend_from_slice(&[0xAA; SECONDARY_ENTRY_SIZE]);
+        // Wrong CRC — deliberately not the real hash of the bytes above.
+        blob.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
+
+        // Now append the real section right after the forged one.
+        blob.extend_from_slice(&real_bytes);
+
+        // The scan must return the REAL section's start, not the forged
+        // prefix at offset 0.
+        let located = locate_unmined_section(&blob);
+        assert!(
+            !located.is_empty(),
+            "expected the real section to be located"
+        );
+
+        // Confirm by deserializing — if we got the forged prefix, the CRC
+        // check would fail; if we got the real one, it should succeed.
+        let (entries, _) = deserialize_secondary(located, &UNMINED_SECTION_MAGIC)
+            .expect("locate must hand back the real, CRC-valid section, not the forged prefix");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], (500, make_key(1)));
+        assert_eq!(entries[1], (600, make_key(2)));
+    }
+
     #[test]
     fn restore_all_unmined_corrupt_but_dah_intact() {
         // H6 symmetric case: unmined corrupt, DAH intact.
@@ -1427,6 +1540,58 @@ mod tests {
                 assert!(
                     detail.contains("corrupt metadata at allocated offset"),
                     "expected CRC-error detail, got: {detail}"
+                );
+                assert!(detail.contains(&offset.to_string()));
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
+    }
+
+    // F-G3-014: a CRC-valid header whose `record_size` disagrees with the
+    // size implied by `utxo_count` must fail the rebuild rather than
+    // advance the scan by the (wrong) declared size — pre-fix the scan
+    // would skip legitimate records and produce a quiet partial rebuild.
+    #[test]
+    fn rebuild_fails_on_record_size_inconsistent_with_utxo_count() {
+        let (dev, alloc, records) = setup_device_with_records(10);
+
+        let offset = records[3].1;
+        let align = dev.alignment();
+        let mut buf = AlignedBuf::new(align, align);
+        dev.pread_exact_at(&mut buf, offset).unwrap();
+
+        // Read the current record_size, then write a value that disagrees
+        // with the layout implied by `meta.utxo_count`. Restamp CRC so
+        // `TxMetadata::from_bytes` accepts the header and the
+        // record_size cross-check is the gate that fires.
+        // `record_size` is the third u32 in the metadata struct:
+        // magic(4) + schema_version(4) = offset 8.
+        let record_size_offset = 8usize;
+        let original = u32::from_le_bytes(
+            buf[record_size_offset..record_size_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        // Pick a deliberately wrong size — half the original is guaranteed
+        // not to match `record_size_for(utxo_count)` because every record
+        // has a non-zero metadata block.
+        let wrong = (original / 2).max(METADATA_SIZE as u32);
+        buf[record_size_offset..record_size_offset + 4].copy_from_slice(&wrong.to_le_bytes());
+        // Restamp CRC (clear the CRC slot before hashing — matches
+        // `TxMetadata::stamp_crc`).
+        let mut hash_buf = [0u8; METADATA_SIZE];
+        hash_buf.copy_from_slice(&buf[..METADATA_SIZE]);
+        hash_buf[CRC32_OFFSET..CRC32_OFFSET + 4].copy_from_slice(&[0u8; 4]);
+        let crc = crc32fast::hash(&hash_buf);
+        buf[CRC32_OFFSET..CRC32_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        dev.pwrite_all_at(&buf, offset).unwrap();
+
+        let err = Index::rebuild(&*dev, &alloc).unwrap_err();
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(
+                    detail.contains("record_size mismatch"),
+                    "expected record_size mismatch detail, got: {detail}"
                 );
                 assert!(detail.contains(&offset.to_string()));
             }

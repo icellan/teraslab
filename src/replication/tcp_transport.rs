@@ -16,10 +16,15 @@ use std::time::Duration;
 
 use super::manager::ReplicaTransport;
 
-/// ACK response frames are tiny (`ResponseFrame` header + `ReplicaAck`).
-/// Keep this far below the general request-frame cap so a malicious replica
-/// cannot force the master to allocate multi-MiB buffers while waiting for ACKs.
-const MAX_ACK_FRAME_SIZE: usize = 1024;
+/// ACK response frames are mostly tiny (`ResponseFrame` header +
+/// `ReplicaAck::Ok` is ~22 bytes), but `ReplicaAck::Error` carries a
+/// variable-length diagnostic message. F-G7-017 raised the cap from
+/// 1 KiB to 4 KiB after a `format!("flush applied tracker: {e}")`
+/// containing a long path overflowed the previous budget and lost
+/// the diagnostic. The sender additionally truncates messages above
+/// `MAX_ACK_ERROR_MESSAGE_LEN` so a buggy replica cannot push the
+/// master past this cap.
+const MAX_ACK_FRAME_SIZE: usize = 4096;
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Configure TCP keepalive on a stream for fast broken-connection detection.
@@ -287,6 +292,19 @@ impl ReplicaTransport for TcpReplicaTransport {
         let (resp, _) = ResponseFrame::decode(&frame)
             .map_err(|e| ReplicationError::Transport(format!("decode response frame: {e}")))?;
 
+        // F-G7-002: The response's request_id MUST match the outgoing
+        // request_id we incremented in `send_batch`. If a future code
+        // path ever re-caches a transport after a partial-ACK timeout
+        // a stale buffered ACK could otherwise be silently attributed
+        // to the next request. Reject mismatches as a hard transport
+        // error so the caller drops the connection and reconnects.
+        if resp.request_id != self.request_id {
+            return Err(ReplicationError::Transport(format!(
+                "ack request_id mismatch: expected {}, got {}",
+                self.request_id, resp.request_id
+            )));
+        }
+
         if resp.status != STATUS_OK {
             // Try to deserialize as an error ack; otherwise wrap the status
             if let Ok(ack) = ReplicaAck::deserialize(&resp.payload) {
@@ -304,10 +322,20 @@ impl ReplicaTransport for TcpReplicaTransport {
 
     /// Check whether the underlying TCP connection appears healthy.
     ///
-    /// TCP does not provide a clean "is alive" test without writing data, so
-    /// this is intentionally a cheap socket-error probe. It avoids temporarily
-    /// changing read timeouts or consuming/peeking stream bytes; the next
-    /// send/recv remains the authoritative liveness check.
+    /// F-G7-014: this is a BEST-EFFORT probe, NOT a true liveness
+    /// check. It calls `TcpStream::take_error` which consumes the
+    /// asynchronous error flag (SO_ERROR). On macOS the flag only
+    /// surfaces ECONNRESET-class events, not graceful peer FIN: a
+    /// peer that has closed its half of the socket still reports
+    /// `is_connected == true` until the next read returns EOF.
+    /// Concurrent callers also race because `take_error` is consuming.
+    ///
+    /// `check_reconnected` in
+    /// [`crate::replication::manager::ReplicationManager`] uses this
+    /// as a hint to move a sender from Down → CatchingUp; the next
+    /// `send_batch` / `recv_ack` is the authoritative liveness check
+    /// and re-marks the sender Down on hard failure. Do not rely on
+    /// this method as a positive correctness signal.
     fn is_connected(&self) -> bool {
         self.stream
             .take_error()
@@ -408,7 +436,10 @@ mod tests {
                 message: "apply failed".to_string(),
             };
             let resp = ResponseFrame {
-                request_id: 123,
+                // Match the transport's pre-incremented request_id (0)
+                // since this test invokes recv_ack without a prior
+                // send_batch (which would have bumped the counter).
+                request_id: 0,
                 status: STATUS_ERROR,
                 payload: ack.serialize(),
             };
@@ -426,6 +457,67 @@ mod tests {
             },
         );
 
+        handle.join().unwrap();
+    }
+
+    /// F-G7-002: a response whose `request_id` doesn't match the
+    /// transport's outgoing `request_id` must be rejected as a hard
+    /// transport error, even if the body is a well-formed `ReplicaAck`.
+    /// Without this, a stale buffered ACK from a previous request
+    /// could be silently attributed to the next call.
+    #[test]
+    fn recv_ack_rejects_request_id_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Drain the client's request frame so the round-trip
+            // completes (we ignore its contents).
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).unwrap();
+            let total_len = u32::from_le_bytes(len_buf) as usize;
+            let mut body = vec![0u8; total_len];
+            stream.read_exact(&mut body).unwrap();
+
+            // Reply with a wildly mismatched request_id.
+            let ack = ReplicaAck::Ok {
+                through_sequence: 1,
+            };
+            let resp = ResponseFrame {
+                request_id: 999_999,
+                status: STATUS_OK,
+                payload: ack.serialize(),
+            };
+            stream.write_all(&resp.encode()).unwrap();
+        });
+
+        let mut transport =
+            TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5)).unwrap();
+        let batch = ReplicaBatch {
+            first_sequence: 1,
+            ops: vec![ReplicaOp::Freeze {
+                tx_key: key(1),
+                offset: 0,
+                master_generation: 0,
+            }],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+        transport.send_batch(&batch).unwrap();
+        let err = transport
+            .recv_ack(Duration::from_secs(5))
+            .expect_err("must reject ack with mismatched request_id");
+        match err {
+            ReplicationError::Transport(msg) => {
+                assert!(
+                    msg.contains("request_id mismatch"),
+                    "expected request_id mismatch error, got: {msg}",
+                );
+            }
+            other => panic!("expected Transport error, got {other:?}"),
+        }
         handle.join().unwrap();
     }
 
@@ -464,8 +556,12 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// F-G7-017: the master rejects ACK frames larger than
+    /// `MAX_ACK_FRAME_SIZE` (4 KiB after F-G7-017). The test asserts
+    /// the cap is enforced; the constant name stays generic so the
+    /// test survives further raises.
     #[test]
-    fn recv_ack_max_allocation_1kib_for_error_response() {
+    fn recv_ack_max_allocation_capped_for_error_response() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 

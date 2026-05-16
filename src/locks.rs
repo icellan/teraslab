@@ -36,9 +36,18 @@ impl StripedLocks {
     pub fn stripe_index(&self, key: &TxKey) -> usize {
         // Use bytes 16–23 (different from bucket index [0–7] and fingerprint [8–15]).
         // This preserves distribution when operators configure more than 65,536 stripes.
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&key.txid[16..24]);
-        let h = u64::from_le_bytes(bytes) as usize;
+        //
+        // F-G1-018: use the slice→array conversion so the compiler emits a
+        // single 8-byte load instead of the two-step `[0u8; 8]` +
+        // `copy_from_slice` shape. `txid` is always 32 bytes so the
+        // 16..24 slice is statically 8 bytes; the `try_into` will never
+        // fail. `expect` here is correct (a TxKey shorter than 32 bytes
+        // is structurally impossible — it's `[u8; 32]`).
+        let h = u64::from_le_bytes(
+            key.txid[16..24]
+                .try_into()
+                .expect("TxKey::txid is always 32 bytes; 16..24 is 8 bytes"),
+        ) as usize;
         h & self.mask
     }
 

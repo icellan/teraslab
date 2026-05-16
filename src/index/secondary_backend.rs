@@ -175,9 +175,15 @@ impl DahBackend {
     }
 
     /// Remove all entries.
-    pub fn clear(&mut self) {
+    ///
+    /// Returns an [`IndexError`] if the redb backend fails to commit the
+    /// drop+recreate transaction. The in-memory variant is infallible.
+    pub fn clear(&mut self) -> Result<(), IndexError> {
         match self {
-            Self::InMemory(idx) => idx.clear(),
+            Self::InMemory(idx) => {
+                idx.clear();
+                Ok(())
+            }
             Self::OnDisk(redb) => redb.clear(),
         }
     }
@@ -235,8 +241,15 @@ impl UnminedBackend {
     /// Insert a transaction into the unmined index with two-phase durability.
     ///
     /// For on-disk backends, the redo log (if provided) receives a
-    /// [`crate::redo::RedoOp::SecondaryUnminedUpdate`] entry that is fsynced BEFORE the
-    /// redb commit. For in-memory backends, the redo log is ignored.
+    /// [`crate::redo::RedoOp::SecondaryUnminedUpdate`] entry that is
+    /// fsynced BEFORE the redb commit. For in-memory backends, the redo
+    /// log is ignored: the primary record's `meta.unmined_since` is
+    /// already authoritative — see
+    /// [`crate::recovery::reconcile_secondary_indexes_from_metadata`],
+    /// which rebuilds the in-memory unmined index from the primary records
+    /// after replay finishes. The contract is exercised by
+    /// `unmined_in_memory_reconcile_round_trip` below and by the
+    /// `secondary_two_phase_durability` integration test.
     ///
     /// Returns an error only if the redo log flush or the redb commit fails.
     pub fn insert(
@@ -247,10 +260,10 @@ impl UnminedBackend {
     ) -> Result<(), IndexError> {
         match self {
             Self::InMemory(idx) => {
-                // UnminedRedoEntry is no longer propagated — the primary
-                // redo ops (SetMined / MarkOnLongestChain) carry enough
-                // information for recovery to reconstruct in-memory state.
-                let _ = idx.insert(height, key);
+                // No redo entry needed — see method doc: recovery reconciles
+                // the in-memory unmined index from `meta.unmined_since` on
+                // each primary record after the redo replay finishes.
+                idx.insert(height, key);
                 Ok(())
             }
             Self::OnDisk(redb) => redb.insert(height, key, redo_log),
@@ -258,6 +271,11 @@ impl UnminedBackend {
     }
 
     /// Remove a transaction from the unmined index with two-phase durability.
+    ///
+    /// See [`Self::insert`] for the in-memory recovery contract: the
+    /// in-memory removal is not journaled because the primary record's
+    /// `meta.unmined_since` is the source of truth and the reconcile path
+    /// rebuilds the secondary index after replay.
     pub fn remove(
         &mut self,
         key: &TxKey,
@@ -265,7 +283,8 @@ impl UnminedBackend {
     ) -> Result<(), IndexError> {
         match self {
             Self::InMemory(idx) => {
-                let _ = idx.remove(key);
+                // No redo entry needed — see `insert` for the contract.
+                idx.remove(key);
                 Ok(())
             }
             Self::OnDisk(redb) => redb.remove(key, redo_log),
@@ -297,9 +316,15 @@ impl UnminedBackend {
     }
 
     /// Remove all entries.
-    pub fn clear(&mut self) {
+    ///
+    /// Returns an [`IndexError`] if the redb backend fails to commit the
+    /// drop+recreate transaction. The in-memory variant is infallible.
+    pub fn clear(&mut self) -> Result<(), IndexError> {
         match self {
-            Self::InMemory(idx) => idx.clear(),
+            Self::InMemory(idx) => {
+                idx.clear();
+                Ok(())
+            }
             Self::OnDisk(redb) => redb.clear(),
         }
     }
@@ -444,7 +469,7 @@ mod tests {
         with_both_dah_backends(|backend| {
             backend.insert(100, key(1), None).unwrap();
             backend.insert(200, key(2), None).unwrap();
-            backend.clear();
+            backend.clear().unwrap();
             assert!(backend.is_empty());
             assert!(backend.range_query(1000).is_empty());
         });
@@ -553,7 +578,7 @@ mod tests {
         with_both_unmined_backends(|backend| {
             backend.insert(100, key(1), None).unwrap();
             backend.insert(200, key(2), None).unwrap();
-            backend.clear();
+            backend.clear().unwrap();
             assert!(backend.is_empty());
         });
     }
@@ -651,5 +676,37 @@ mod tests {
                 .unwrap();
         let disk = UnminedBackend::OnDisk(redb);
         assert!(format!("{disk:?}").contains("OnDisk"));
+    }
+
+    // F-G3-004: pin the in-memory `UnminedBackend::insert` / `::remove`
+    // contract — the redo entry is intentionally discarded because the
+    // primary record's `meta.unmined_since` is authoritative and the
+    // recovery reconcile path (`reconcile_secondary_indexes_from_metadata`)
+    // rebuilds the in-memory secondary from those metadata fields. If a
+    // future change re-introduces a redo dependency on the in-memory
+    // backend, this test fires.
+    #[test]
+    fn unmined_in_memory_insert_no_redo_dependency() {
+        let mut backend = UnminedBackend::new_in_memory();
+        // No redo log provided AND no error returned. Documents that the
+        // in-memory variant does not require the second-phase journal.
+        backend
+            .insert(100, key(1), None)
+            .expect("in-memory insert must not need a redo log");
+        backend
+            .insert(200, key(2), None)
+            .expect("in-memory insert must not need a redo log");
+        assert_eq!(backend.len(), 2);
+
+        // Remove is the same contract — drops the redo entry returned by
+        // the inner `UnminedIndex::remove`.
+        backend
+            .remove(&key(1), None)
+            .expect("in-memory remove must not need a redo log");
+        assert_eq!(backend.len(), 1);
+        // Range still returns the unremoved entry.
+        let kept = backend.range_query(300);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0], key(2));
     }
 }

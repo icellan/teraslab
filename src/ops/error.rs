@@ -138,4 +138,20 @@ pub enum SpendError {
         /// Configured spendable-after delay (in blocks) the request asked for.
         spendable_after: u32,
     },
+
+    /// F-G2-002: A client attempted to stamp a UTXO using the reserved
+    /// all-`0xFF` sentinel as `spending_data`. That byte pattern is the
+    /// on-disk marker for a frozen slot — accepting it under `status=SPENT`
+    /// would let a malicious spender brick the UTXO against any future
+    /// `unspend` (the frozen-marker check fires before the data-match
+    /// check) and `unfreeze` (rejects non-`UTXO_FROZEN` status), leaving
+    /// the slot permanently unrecoverable. The 36 bytes are also invalid
+    /// BSV `txid(32) + vin(4)` (an all-`0xFF` txid does not exist on the
+    /// network), so rejecting at the request boundary loses no legitimate
+    /// traffic.
+    #[error("INVALID_SPENDING_DATA at offset {offset}: reserved frozen sentinel")]
+    ReservedSpendingData {
+        /// The slot offset the request targeted.
+        offset: u32,
+    },
 }

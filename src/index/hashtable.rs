@@ -472,8 +472,32 @@ impl std::fmt::Debug for HashTable {
     }
 }
 
-// Safety: HashTable owns its mmap allocation exclusively. The contents are
-// plain Copy data with no interior mutability or thread-local state.
+// # Safety
+//
+// `HashTable` owns its `ptr` (an mmap'd region) exclusively and the buckets
+// it points at are plain-`Copy` POD with no interior mutability. The raw
+// pointer prevents the compiler from auto-deriving `Send`/`Sync`, so we
+// assert both unsafely.
+//
+// Concurrency contract — the engine MUST enforce these externally:
+//
+// * `Send` — the table can move between threads only when no thread holds
+//   a borrow of `&self` / `&mut self`. The engine satisfies this by
+//   wrapping the table in `Arc<RwLock<…>>` per dataset.
+// * `Sync` — concurrent `&HashTable` access from multiple threads is sound
+//   ONLY while no thread is mutating (no `&mut HashTable` is live, no
+//   bucket is being rewritten via `bucket_mut`). The engine satisfies
+//   this with a per-dataset `RwLock`: readers hold `read()`, the
+//   `insert`/`remove`/`resize` paths hold `write()`.
+//
+// Violating either contract — e.g. sharing `&HashTable` across threads
+// while another thread holds `&mut HashTable` — is a data race. Bucket
+// writes are 64-byte non-atomic memcpys; a torn read sees a mix of old
+// and new bytes which `is_occupied()` will accept, allowing `register`
+// to find or shadow an entry under the wrong txid.
+//
+// `miri` flags this if a test ever exercises concurrent `&` access during
+// mutation.
 unsafe impl Send for HashTable {}
 unsafe impl Sync for HashTable {}
 
@@ -510,6 +534,18 @@ impl HashTable {
         })
     }
 
+    /// Sidecar suffix appended to the table path to mark a clean shutdown.
+    ///
+    /// F-G3-016: when the table file is reopened, the absence of this
+    /// sentinel indicates that the previous run either crashed or did not
+    /// reach the clean-shutdown path (Drop impl). The bucket bytes alone
+    /// have no header, magic, or per-bucket CRC, so we cannot tell torn
+    /// writes apart from valid state by inspecting the file. The sidecar
+    /// is the only durable signal the caller has — if it is missing, an
+    /// operator-visible `tracing::warn!` fires and the caller should
+    /// consider invoking the rebuild path (`PrimaryBackend::rebuild_file_backed`).
+    pub(crate) const SHUTDOWN_CLEAN_SUFFIX: &'static str = ".shutdown_clean";
+
     /// Open or create a file-backed hash table at `path`.
     ///
     /// If the file exists and its size is a valid power-of-two multiple of
@@ -518,6 +554,15 @@ impl HashTable {
     /// only used when creating a new file.
     ///
     /// The capacity is rounded up to the next power of two (minimum 16).
+    ///
+    /// F-G3-016: a sidecar file at `<path>.shutdown_clean` is written by
+    /// the Drop impl after a final `msync(MS_SYNC)`. On reopen the
+    /// sentinel is checked — if missing, the previous run did not reach
+    /// the clean-shutdown path and the in-memory bucket bytes may include
+    /// torn writes. A `tracing::warn!` fires so operators can decide
+    /// whether to drive a rebuild via `PrimaryBackend::rebuild_file_backed`.
+    /// The open still succeeds (preserving compatibility); the redo log
+    /// remains the canonical safety net for the data plane.
     pub fn open_file_backed(path: &std::path::Path, initial_capacity: usize) -> Result<Self> {
         let bucket_size = std::mem::size_of::<Bucket>();
 
@@ -542,6 +587,27 @@ impl HashTable {
         } else {
             (initial_capacity.next_power_of_two().max(16), false)
         };
+
+        // F-G3-016 sentinel check: only meaningful for existing files.
+        if is_existing {
+            let sentinel = sentinel_path_for(path);
+            if !sentinel.exists() {
+                tracing::warn!(
+                    target: "teraslab::index",
+                    path = %path.display(),
+                    "HashTable::open_file_backed: clean-shutdown sentinel missing — \
+                     previous run may have crashed; bucket bytes may include torn writes. \
+                     Operator should consider PrimaryBackend::rebuild_file_backed if the \
+                     redo log replay does not bring the data plane to a consistent state.",
+                );
+            } else {
+                // Remove the sentinel — its presence implies a clean
+                // shutdown, but the moment we open the file we no longer
+                // have that guarantee. Drop will recreate it on a clean
+                // close.
+                let _ = std::fs::remove_file(&sentinel);
+            }
+        }
 
         let (ptr, mmap_len, fd) = alloc_file_backed_buckets(path, capacity)?;
 
@@ -621,18 +687,36 @@ impl HashTable {
     }
 
     /// Safe accessor for bucket at `idx` (immutable).
+    ///
+    /// # Safety contract enforced by callers
+    ///
+    /// Despite the safe signature, this method only produces sound `&Bucket`
+    /// references when the caller (or the engine wrapper above) guarantees
+    /// no concurrent `bucket_mut(idx)` is live for any `idx`. See the
+    /// module-level `unsafe impl Sync` block for the full discussion —
+    /// `Sync` is asserted on the assumption that the engine wraps the
+    /// table in a `RwLock` so readers and writers do not overlap.
     #[inline]
     fn bucket(&self, idx: usize) -> &Bucket {
         debug_assert!(idx < self.capacity);
         // Safety: idx is within the mmap'd region (checked by caller or mask).
+        // Concurrent &-access from multiple threads is sound only while no
+        // thread is mutating; see the module-level Sync impl contract.
         unsafe { &*self.ptr.add(idx) }
     }
 
     /// Safe accessor for bucket at `idx` (mutable).
+    ///
+    /// `&mut self` provides Rust-level exclusivity within a single thread.
+    /// Across threads the per-dataset `RwLock` documented on the
+    /// module-level `unsafe impl Sync` block must be held in `write()`
+    /// mode by the caller.
     #[inline]
     fn bucket_mut(&mut self, idx: usize) -> &mut Bucket {
         debug_assert!(idx < self.capacity);
-        // Safety: idx is within the mmap'd region, &mut self guarantees exclusivity.
+        // Safety: idx is within the mmap'd region, &mut self guarantees
+        // exclusivity within this thread. Cross-thread exclusivity is the
+        // caller's responsibility (engine RwLock).
         unsafe { &mut *self.ptr.add(idx) }
     }
 
@@ -825,8 +909,29 @@ impl HashTable {
         self.count -= 1;
 
         // Backward-shift: move subsequent entries back to fill the gap.
+        //
+        // F-G3-005: the loop normally terminates when it hits either an
+        // empty bucket or an entry with `probe_distance == 0`. Under a
+        // corrupted in-memory state (e.g. every bucket occupied with
+        // non-zero probe distances) those conditions could never trigger
+        // and the shift would walk forever, re-meeting itself after
+        // wraparound. Cap iterations at `self.capacity` — matches the
+        // bounds used by `get_entry`, `insert`, and `update_cached_fields`.
         let mut empty_idx = idx;
+        let mut steps = 0usize;
         loop {
+            if steps >= self.capacity {
+                // Hard invariant: the shift must terminate within one full
+                // pass over the table. Empty the cell we already vacated
+                // and bail — better to leak a probe than to spin.
+                tracing::error!(
+                    target: "teraslab::index",
+                    capacity = self.capacity,
+                    "HashTable::remove backward-shift exceeded table capacity — \
+                     refusing to continue; in-memory corruption suspected",
+                );
+                break;
+            }
             let next_idx = (empty_idx + 1) & self.mask;
             let next = self.bucket(next_idx);
             if next.is_empty() || (next.is_occupied() && next.probe_distance == 0) {
@@ -842,9 +947,21 @@ impl HashTable {
                 b.probe_distance -= 1;
             }
             empty_idx = next_idx;
+            steps += 1;
         }
         *self.bucket_mut(empty_idx) = Bucket::empty();
-        self.max_probe = self.recompute_max_probe_distance();
+        // F-G3-017: do NOT recompute `self.max_probe` here. Pre-fix the
+        // remove path called `recompute_max_probe_distance` (O(capacity))
+        // on every delete — at 16M buckets that is 16M reads per remove
+        // on a hot path. The cached value is only read by `stats()` /
+        // `max_probe_distance()` and the early-termination check in
+        // `get_entry`, which compares per-bucket `probe_distance`
+        // directly and is correct even when `self.max_probe` is an
+        // over-estimate. Stale-but-larger is safe; stale-but-smaller
+        // is not — and remove can only ever reduce the true maximum.
+        //
+        // `max_probe_distance()` recomputes lazily on read; insert
+        // already maintains the cache on the path that can grow it.
         #[cfg(debug_assertions)]
         self.debug_assert_count_consistent();
 
@@ -872,8 +989,21 @@ impl HashTable {
     }
 
     /// Maximum probe distance observed.
+    ///
+    /// F-G3-017: this method is the slow-but-tight authoritative value.
+    /// The cached `self.max_probe` field is maintained by `insert`
+    /// (which can grow it) but NOT by `remove` (which would force an
+    /// O(capacity) rescan on a hot path). When the cached value is
+    /// stale-larger we tighten by rescanning here; callers that need
+    /// the exact maximum (`stats()`, this method) pay the O(capacity)
+    /// cost. The hot delete path no longer does.
     pub fn max_probe_distance(&self) -> usize {
-        self.max_probe
+        // The cached `self.max_probe` field can be stale-larger after a
+        // remove (the hot path no longer recomputes — see F-G3-017).
+        // Always return the tight value here so callers that need the
+        // exact maximum (stats, this method) pay the O(capacity) cost
+        // explicitly rather than reading a misleading cache.
+        self.recompute_max_probe_distance()
     }
 
     /// Approximate memory usage in bytes (mmap region size).
@@ -1123,15 +1253,34 @@ impl HashTable {
 impl Drop for HashTable {
     fn drop(&mut self) {
         if self.mmap_len > 0 && !self.ptr.is_null() {
-            if let Backing::FileBacked { fd, .. } = &self.backing {
+            if let Backing::FileBacked { fd, path } = &self.backing {
                 unsafe { libc::msync(self.ptr.cast(), self.mmap_len, libc::MS_SYNC) };
                 unsafe { dealloc_mmap_buckets(self.ptr, self.mmap_len) };
                 unsafe { libc::close(*fd) };
+                // F-G3-016: after the msync above durably flushes the
+                // bucket bytes, write the clean-shutdown sentinel so the
+                // next reopen can distinguish "clean close" from
+                // "crash mid-write". Best-effort — if creating the file
+                // fails (e.g. parent dir gone, EROFS) the next reopen
+                // will emit a warn, which is the correct outcome.
+                let sentinel = sentinel_path_for(path);
+                let _ = std::fs::File::create(&sentinel);
             } else {
                 unsafe { dealloc_mmap_buckets(self.ptr, self.mmap_len) };
             }
         }
     }
+}
+
+/// Build the sidecar sentinel path for a file-backed table at `path`.
+///
+/// F-G3-016: appended verbatim with [`HashTable::SHUTDOWN_CLEAN_SUFFIX`]
+/// so it lives in the same directory as the table file (inheriting its
+/// permissions) and is trivially identifiable in `ls`.
+fn sentinel_path_for(path: &std::path::Path) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(HashTable::SHUTDOWN_CLEAN_SUFFIX);
+    std::path::PathBuf::from(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -2044,6 +2193,120 @@ mod tests {
         assert!(
             !path.with_extension("tmp").exists(),
             "tmp file must not leak"
+        );
+    }
+
+    // F-G3-005: the backward-shift loop in `remove` must terminate even if
+    // every bucket on the wraparound chain has `probe_distance > 0` (an
+    // invariant that should hold under correct usage but can be broken by
+    // memory corruption or future bugs). Pre-fix the loop would spin
+    // forever. We manufacture the pathological state by filling every
+    // bucket with a valid-but-non-probe-zero entry, then rewriting bucket 0
+    // with `probe_distance = 1` so the chain wraps without ever meeting
+    // the natural sentinel.
+    #[test]
+    fn remove_backward_shift_terminates_under_corruption() {
+        let mut t = HashTable::new(16).unwrap();
+        // Fill the table so every bucket is occupied.
+        for i in 0..16u64 {
+            t.insert(make_key(i), make_entry(i * 100)).unwrap();
+        }
+        assert_eq!(t.len(), 16, "table must be full for this test");
+
+        // Force every bucket to look like a wraparound chain by setting
+        // probe_distance on every bucket to at least 1. Safety: we hold
+        // `&mut t`, no other reference to the buckets is live.
+        for i in 0..t.capacity {
+            // bucket_mut requires &mut self; we already have it via `t`.
+            let b = t.bucket_mut(i);
+            if b.probe_distance == 0 {
+                b.probe_distance = 1;
+            }
+        }
+
+        // Pick any key the table contains and remove it. With the
+        // pre-fix code this would spin until OOM (or forever).
+        let target = make_key(0);
+        // `get_entry` may return None because we mangled probe distances,
+        // but `remove` walks the probe chain on its own. If it cannot
+        // find the key by hash, that's fine — the assertion below
+        // verifies termination, not removal.
+        let _ = t.remove(&target);
+
+        // Termination check: if we reach this line, the bounded loop fired.
+        // The cached count is allowed to be stale (the corruption broke
+        // the invariant), but the test must not hang.
+        assert!(
+            t.capacity() == 16,
+            "capacity should be unchanged after corrupted remove"
+        );
+    }
+
+    // F-G3-016: the clean-shutdown sentinel is created in Drop and
+    // consumed on the next `open_file_backed`. Pin both halves of the
+    // contract.
+    #[test]
+    fn open_file_backed_writes_and_consumes_shutdown_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sentinel.idx");
+
+        // 1) Create + drop the table.
+        {
+            let mut t = HashTable::open_file_backed(&path, 16).unwrap();
+            t.insert(make_key(1), make_entry(4096)).unwrap();
+        }
+        // Drop has run — sentinel must exist.
+        let sentinel = sentinel_path_for(&path);
+        assert!(
+            sentinel.exists(),
+            "Drop must create the clean-shutdown sentinel: {}",
+            sentinel.display()
+        );
+
+        // 2) Reopen — sentinel must be consumed.
+        {
+            let _t = HashTable::open_file_backed(&path, 16).unwrap();
+            assert!(
+                !sentinel.exists(),
+                "open must remove the sentinel so a subsequent crash is detectable"
+            );
+        }
+        // 3) After drop again, sentinel is back.
+        assert!(
+            sentinel.exists(),
+            "sentinel must be recreated by the second drop"
+        );
+    }
+
+    // F-G3-016: when the sentinel is missing, open must still succeed
+    // (preserving the redo-log-driven recovery contract) but the warn
+    // path must run.
+    #[test]
+    fn open_file_backed_succeeds_when_sentinel_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.idx");
+
+        // First open creates the file but we delete the sentinel before
+        // Drop — simulating a crash that did not reach the Drop path.
+        {
+            let mut t = HashTable::open_file_backed(&path, 16).unwrap();
+            t.insert(make_key(1), make_entry(4096)).unwrap();
+            // Force-remove any pre-existing sentinel before drop so the
+            // drop's recreate is what we observe.
+        }
+        let sentinel = sentinel_path_for(&path);
+        // Drop ran -> sentinel is present. Remove it to simulate crash.
+        if sentinel.exists() {
+            std::fs::remove_file(&sentinel).unwrap();
+        }
+        assert!(!sentinel.exists(), "sentinel should be removed");
+
+        // Reopen must still succeed.
+        let t = HashTable::open_file_backed(&path, 16).unwrap();
+        assert_eq!(
+            t.len(),
+            1,
+            "previously inserted entry must still be recovered from the mmap"
         );
     }
 }
