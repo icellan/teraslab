@@ -534,6 +534,18 @@ impl HashTable {
         })
     }
 
+    /// Sidecar suffix appended to the table path to mark a clean shutdown.
+    ///
+    /// F-G3-016: when the table file is reopened, the absence of this
+    /// sentinel indicates that the previous run either crashed or did not
+    /// reach the clean-shutdown path (Drop impl). The bucket bytes alone
+    /// have no header, magic, or per-bucket CRC, so we cannot tell torn
+    /// writes apart from valid state by inspecting the file. The sidecar
+    /// is the only durable signal the caller has — if it is missing, an
+    /// operator-visible `tracing::warn!` fires and the caller should
+    /// consider invoking the rebuild path (`PrimaryBackend::rebuild_file_backed`).
+    pub(crate) const SHUTDOWN_CLEAN_SUFFIX: &'static str = ".shutdown_clean";
+
     /// Open or create a file-backed hash table at `path`.
     ///
     /// If the file exists and its size is a valid power-of-two multiple of
@@ -542,6 +554,15 @@ impl HashTable {
     /// only used when creating a new file.
     ///
     /// The capacity is rounded up to the next power of two (minimum 16).
+    ///
+    /// F-G3-016: a sidecar file at `<path>.shutdown_clean` is written by
+    /// the Drop impl after a final `msync(MS_SYNC)`. On reopen the
+    /// sentinel is checked — if missing, the previous run did not reach
+    /// the clean-shutdown path and the in-memory bucket bytes may include
+    /// torn writes. A `tracing::warn!` fires so operators can decide
+    /// whether to drive a rebuild via `PrimaryBackend::rebuild_file_backed`.
+    /// The open still succeeds (preserving compatibility); the redo log
+    /// remains the canonical safety net for the data plane.
     pub fn open_file_backed(path: &std::path::Path, initial_capacity: usize) -> Result<Self> {
         let bucket_size = std::mem::size_of::<Bucket>();
 
@@ -566,6 +587,27 @@ impl HashTable {
         } else {
             (initial_capacity.next_power_of_two().max(16), false)
         };
+
+        // F-G3-016 sentinel check: only meaningful for existing files.
+        if is_existing {
+            let sentinel = sentinel_path_for(path);
+            if !sentinel.exists() {
+                tracing::warn!(
+                    target: "teraslab::index",
+                    path = %path.display(),
+                    "HashTable::open_file_backed: clean-shutdown sentinel missing — \
+                     previous run may have crashed; bucket bytes may include torn writes. \
+                     Operator should consider PrimaryBackend::rebuild_file_backed if the \
+                     redo log replay does not bring the data plane to a consistent state.",
+                );
+            } else {
+                // Remove the sentinel — its presence implies a clean
+                // shutdown, but the moment we open the file we no longer
+                // have that guarantee. Drop will recreate it on a clean
+                // close.
+                let _ = std::fs::remove_file(&sentinel);
+            }
+        }
 
         let (ptr, mmap_len, fd) = alloc_file_backed_buckets(path, capacity)?;
 
@@ -1187,15 +1229,34 @@ impl HashTable {
 impl Drop for HashTable {
     fn drop(&mut self) {
         if self.mmap_len > 0 && !self.ptr.is_null() {
-            if let Backing::FileBacked { fd, .. } = &self.backing {
+            if let Backing::FileBacked { fd, path } = &self.backing {
                 unsafe { libc::msync(self.ptr.cast(), self.mmap_len, libc::MS_SYNC) };
                 unsafe { dealloc_mmap_buckets(self.ptr, self.mmap_len) };
                 unsafe { libc::close(*fd) };
+                // F-G3-016: after the msync above durably flushes the
+                // bucket bytes, write the clean-shutdown sentinel so the
+                // next reopen can distinguish "clean close" from
+                // "crash mid-write". Best-effort — if creating the file
+                // fails (e.g. parent dir gone, EROFS) the next reopen
+                // will emit a warn, which is the correct outcome.
+                let sentinel = sentinel_path_for(path);
+                let _ = std::fs::File::create(&sentinel);
             } else {
                 unsafe { dealloc_mmap_buckets(self.ptr, self.mmap_len) };
             }
         }
     }
+}
+
+/// Build the sidecar sentinel path for a file-backed table at `path`.
+///
+/// F-G3-016: appended verbatim with [`HashTable::SHUTDOWN_CLEAN_SUFFIX`]
+/// so it lives in the same directory as the table file (inheriting its
+/// permissions) and is trivially identifiable in `ls`.
+fn sentinel_path_for(path: &std::path::Path) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(HashTable::SHUTDOWN_CLEAN_SUFFIX);
+    std::path::PathBuf::from(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -2154,6 +2215,74 @@ mod tests {
         assert!(
             t.capacity() == 16,
             "capacity should be unchanged after corrupted remove"
+        );
+    }
+
+    // F-G3-016: the clean-shutdown sentinel is created in Drop and
+    // consumed on the next `open_file_backed`. Pin both halves of the
+    // contract.
+    #[test]
+    fn open_file_backed_writes_and_consumes_shutdown_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sentinel.idx");
+
+        // 1) Create + drop the table.
+        {
+            let mut t = HashTable::open_file_backed(&path, 16).unwrap();
+            t.insert(make_key(1), make_entry(4096)).unwrap();
+        }
+        // Drop has run — sentinel must exist.
+        let sentinel = sentinel_path_for(&path);
+        assert!(
+            sentinel.exists(),
+            "Drop must create the clean-shutdown sentinel: {}",
+            sentinel.display()
+        );
+
+        // 2) Reopen — sentinel must be consumed.
+        {
+            let _t = HashTable::open_file_backed(&path, 16).unwrap();
+            assert!(
+                !sentinel.exists(),
+                "open must remove the sentinel so a subsequent crash is detectable"
+            );
+        }
+        // 3) After drop again, sentinel is back.
+        assert!(
+            sentinel.exists(),
+            "sentinel must be recreated by the second drop"
+        );
+    }
+
+    // F-G3-016: when the sentinel is missing, open must still succeed
+    // (preserving the redo-log-driven recovery contract) but the warn
+    // path must run.
+    #[test]
+    fn open_file_backed_succeeds_when_sentinel_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.idx");
+
+        // First open creates the file but we delete the sentinel before
+        // Drop — simulating a crash that did not reach the Drop path.
+        {
+            let mut t = HashTable::open_file_backed(&path, 16).unwrap();
+            t.insert(make_key(1), make_entry(4096)).unwrap();
+            // Force-remove any pre-existing sentinel before drop so the
+            // drop's recreate is what we observe.
+        }
+        let sentinel = sentinel_path_for(&path);
+        // Drop ran -> sentinel is present. Remove it to simulate crash.
+        if sentinel.exists() {
+            std::fs::remove_file(&sentinel).unwrap();
+        }
+        assert!(!sentinel.exists(), "sentinel should be removed");
+
+        // Reopen must still succeed.
+        let t = HashTable::open_file_backed(&path, 16).unwrap();
+        assert_eq!(
+            t.len(),
+            1,
+            "previously inserted entry must still be recovered from the mmap"
         );
     }
 }
