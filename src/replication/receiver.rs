@@ -530,6 +530,38 @@ pub fn handle_replica_batch_with_tracker(
         };
     }
 
+    // F-G7-005: tighten the cluster_key gate for migration batches.
+    // The dedup-bypass path (FLAG_MIGRATION_BATCH) skips the
+    // already-applied skip_count logic and unconditionally re-applies
+    // every op. A buggy or hostile sender that sets the flag bit and
+    // a `cluster_key = 0` wildcard could therefore replay arbitrary
+    // mutations through the dedup-bypass path. When the receiver is
+    // in steady-state clustered mode (`local_cluster_key != 0`) we
+    // require a non-zero `cluster_key` on migration batches so the
+    // sender's epoch is explicit; the wildcard remains accepted only
+    // for normal-replication batches (where the per-stream dedup
+    // tracker plus the generation guard absorb any replay damage).
+    let is_migration_flag = request.flags & FLAG_MIGRATION_BATCH != 0;
+    if is_migration_flag && batch.cluster_key == 0 && local_cluster_key != 0 {
+        if let Some(m) = crate::metrics::replication_metrics() {
+            m.replica_rejected_stale_cluster_key.inc();
+        }
+        tracing::warn!(
+            local_cluster_key,
+            first_sequence = batch.first_sequence,
+            ops_len = batch.ops.len(),
+            "replica rejected migration batch: cluster_key wildcard not allowed in clustered mode"
+        );
+        let mut payload = Vec::with_capacity(6);
+        payload.extend_from_slice(&ERR_STALE_EPOCH.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        return ResponseFrame {
+            request_id: request.request_id,
+            status: STATUS_ERROR,
+            payload,
+        };
+    }
+
     let effective_stream_key = batch
         .source_node_id
         .map(|id| format!("node:{id}"))
@@ -3515,6 +3547,88 @@ mod tests {
             slot2_before, slot2_after,
             "rejected migration batch must not mutate engine state",
         );
+    }
+
+    /// F-G7-005: when the receiver is in clustered mode
+    /// (`local_cluster_key != 0`) a migration batch (`FLAG_MIGRATION_BATCH`)
+    /// stamped with the V1-compat wildcard `cluster_key = 0` must be
+    /// rejected. The dedup-bypass path would otherwise unconditionally
+    /// re-apply arbitrary mutations under a forged migration flag.
+    #[test]
+    fn migration_batch_with_wildcard_cluster_key_rejected_in_clustered_mode() {
+        let engine = make_engine();
+        create_record(&engine, key(80), 4);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let local_cluster_key: u64 = 7;
+
+        let slot1_before = engine.read_slot(&key(80), 1).unwrap().status;
+        // Migration batch stamped with cluster_key = 0 (V1 wildcard).
+        let wildcard_batch = batch_with_cluster_key(0, key(80), 1..2, 1, /* wildcard */ 0);
+        let req = RequestFrame {
+            op_code: OP_REPLICA_BATCH,
+            request_id: 11,
+            flags: FLAG_MIGRATION_BATCH,
+            payload: wildcard_batch.serialize(),
+        };
+
+        let resp = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            &tracker,
+            DEFAULT_STREAM_KEY,
+            local_cluster_key,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "wildcard-cluster_key migration batch must be rejected in clustered mode",
+        );
+        assert_eq!(decode_error_code(&resp.payload), ERR_STALE_EPOCH);
+        let slot1_after = engine.read_slot(&key(80), 1).unwrap().status;
+        assert_eq!(
+            slot1_before, slot1_after,
+            "rejected wildcard migration batch must not mutate engine state",
+        );
+    }
+
+    /// F-G7-005 boundary: a migration batch with cluster_key = 0 must
+    /// still be accepted when `local_cluster_key = 0` (the receiver
+    /// hasn't observed a quorum-committed cluster term yet, e.g.
+    /// post-restart or single-node demo). The wildcard reject only
+    /// applies once the receiver is in clustered steady state.
+    #[test]
+    fn migration_batch_with_wildcard_cluster_key_accepted_when_local_zero() {
+        let engine = make_engine();
+        create_record(&engine, key(81), 2);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+
+        let migration_batch = batch_with_cluster_key(0, key(81), 0..1, 1, /* wildcard */ 0);
+        let req = RequestFrame {
+            op_code: OP_REPLICA_BATCH,
+            request_id: 12,
+            flags: FLAG_MIGRATION_BATCH,
+            payload: migration_batch.serialize(),
+        };
+
+        let resp = handle_replica_batch_with_tracker(
+            &req,
+            &engine,
+            &last_applied,
+            &tracker,
+            DEFAULT_STREAM_KEY,
+            /* local_cluster_key */ 0,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "wildcard migration batch must be accepted when local_cluster_key = 0",
+        );
+        assert_eq!(engine.read_slot(&key(81), 0).unwrap().status, UTXO_SPENT);
     }
 
     #[test]
