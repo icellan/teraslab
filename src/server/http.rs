@@ -1222,8 +1222,7 @@ const READINESS_LAG_CACHE_TTL_MS: u64 = 500;
 /// readiness check. `timestamp_ns == 0` means "no cached verdict yet".
 /// `AtomicU64` packs the bool as the low bit and the timestamp in the
 /// upper 63 bits so the read+verdict observation is atomic.
-static REPLICA_LAG_CACHE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static REPLICA_LAG_CACHE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn cached_replica_lag_exceeds(state: &HttpState) -> bool {
     let now_ns = SystemTime::now()
