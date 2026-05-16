@@ -740,12 +740,22 @@ fn serialize_secondary(magic: &[u8; 4], entries: impl Iterator<Item = (u32, TxKe
 
 /// Scan the provided slice for a byte window that begins with the unmined
 /// section magic (`UNMI`) AND whose declared `count` + body fits inside the
-/// remaining bytes. Returns the subslice starting at the first candidate that
-/// passes the size sanity-check (which `deserialize_secondary` will then
-/// validate via checksum), or an empty slice if no candidate is found.
+/// remaining bytes AND whose stored CRC verifies. Returns the subslice
+/// starting at the first candidate that passes all three checks, or an
+/// empty slice if no candidate is found.
 ///
 /// Used by [`Index::restore_all`] when the DAH section header is corrupt and
 /// the offset of the unmined section is unknown.
+///
+/// F-G3-012: the pre-fix scan accepted the first candidate that passed the
+/// size check, leaving `deserialize_secondary` to catch a forged section
+/// via the CRC. That worked, but an attacker who could plant `UNMI`
+/// followed by a benign `count` inside the corrupt DAH payload could
+/// divert the scan to a chosen offset before the genuine unmined section
+/// was even considered. Validating the CRC inline here removes that
+/// amplification: we now skip past any candidate whose stored CRC does
+/// not match, so a planted false-magic burst gets stepped over and the
+/// real section (if present) is still found.
 fn locate_unmined_section(data: &[u8]) -> &[u8] {
     let header_size = 4 + 4 + 8;
     let mut idx = 0usize;
@@ -753,10 +763,24 @@ fn locate_unmined_section(data: &[u8]) -> &[u8] {
         if data[idx..idx + 4] == UNMINED_SECTION_MAGIC {
             // Check declared count fits in remaining bytes.
             let count = u64::from_le_bytes(data[idx + 8..idx + 16].try_into().unwrap()) as usize;
-            let body_size = count.saturating_mul(SECONDARY_ENTRY_SIZE);
-            let total = header_size + body_size + 4;
-            if data.len() - idx >= total {
-                return &data[idx..];
+            // Reject ludicrous counts up front so a poisoned u64 cannot
+            // produce a `total` that is large but still within `data.len()`.
+            if count <= MAX_SNAPSHOT_COUNT {
+                let body_size = count.saturating_mul(SECONDARY_ENTRY_SIZE);
+                let total = header_size + body_size + 4;
+                if data.len() - idx >= total {
+                    // Verify the CRC before declaring the match. Pre-fix this
+                    // step happened inside `deserialize_secondary` AFTER the
+                    // scan had already accepted the candidate; doing it here
+                    // means a forged magic burst no longer hides the real
+                    // section behind it.
+                    let stored_checksum =
+                        u32::from_le_bytes(data[idx + total - 4..idx + total].try_into().unwrap());
+                    let computed_checksum = crc32fast::hash(&data[idx..idx + total - 4]);
+                    if stored_checksum == computed_checksum {
+                        return &data[idx..];
+                    }
+                }
             }
         }
         idx += 1;
@@ -1224,6 +1248,55 @@ mod tests {
         assert_eq!(up_to_700.len(), 3);
         let up_to_600 = restored_unmined.range_query(600);
         assert_eq!(up_to_600.len(), 2);
+    }
+
+    // F-G3-012: `locate_unmined_section` must skip over a planted `UNMI`
+    // magic burst whose stored CRC does not verify, and continue scanning
+    // for the genuine unmined section that follows. Pre-fix, the first
+    // candidate that passed the size sanity-check was accepted and the
+    // CRC check happened inside `deserialize_secondary` — by then the
+    // scan had already locked onto the wrong offset.
+    #[test]
+    fn locate_unmined_section_skips_forged_magic_when_real_follows() {
+        // Build a valid serialized unmined section (the "real" one).
+        let real_entries = vec![
+            (500u32, make_key(1)),
+            (600u32, make_key(2)),
+        ];
+        let real_bytes =
+            serialize_secondary(&UNMINED_SECTION_MAGIC, real_entries.iter().copied());
+
+        // Build a poisoned prefix: `UNMI` magic + arbitrary version + count
+        // that fits in `data.len()` after the prefix, plus garbage CRC.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&UNMINED_SECTION_MAGIC); // 4
+        blob.extend_from_slice(&SECONDARY_VERSION.to_le_bytes()); // 4
+        // count = 1 — small enough that the entire forged "section"
+        // (header + 1 entry + crc) fits inside the prefix block before
+        // the real section.
+        blob.extend_from_slice(&1u64.to_le_bytes()); // 8
+        // Fake entry (height + txid)
+        blob.extend_from_slice(&[0xAA; SECONDARY_ENTRY_SIZE]);
+        // Wrong CRC — deliberately not the real hash of the bytes above.
+        blob.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
+
+        // Now append the real section right after the forged one.
+        blob.extend_from_slice(&real_bytes);
+
+        // The scan must return the REAL section's start, not the forged
+        // prefix at offset 0.
+        let located = locate_unmined_section(&blob);
+        assert!(!located.is_empty(), "expected the real section to be located");
+
+        // Confirm by deserializing — if we got the forged prefix, the CRC
+        // check would fail; if we got the real one, it should succeed.
+        let (entries, _) =
+            deserialize_secondary(located, &UNMINED_SECTION_MAGIC).expect(
+                "locate must hand back the real, CRC-valid section, not the forged prefix",
+            );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], (500, make_key(1)));
+        assert_eq!(entries[1], (600, make_key(2)));
     }
 
     #[test]
