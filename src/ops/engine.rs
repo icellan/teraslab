@@ -1020,6 +1020,20 @@ impl Engine {
         let mut idempotent_count: u32 = 0;
 
         for item in &req.spends {
+            // F-G2-002: reject the reserved all-`0xFF` sentinel before any
+            // slot read. Recorded as a per-item error so the rest of the
+            // batch can still succeed (deterministic by idx); a single
+            // malformed item must not abort the whole batch.
+            if item.spending_data == [FROZEN_BYTE; 36] {
+                errors.insert(
+                    item.idx,
+                    SpendError::ReservedSpendingData {
+                        offset: item.offset,
+                    },
+                );
+                continue;
+            }
+
             if item.offset >= utxo_count {
                 errors.insert(
                     item.idx,
@@ -1054,8 +1068,13 @@ impl Engine {
 
             match slot.status {
                 UTXO_UNSPENT => {
-                    let spendable_height =
-                        u32::from_le_bytes(slot.spending_data[0..4].try_into().unwrap());
+                    // F-G2-004: avoid `unwrap()` in library code even on
+                    // an infallible 4-byte conversion — future slot-layout
+                    // changes must not silently become a panic on the
+                    // spend hot-path.
+                    let mut buf = [0u8; 4];
+                    buf.copy_from_slice(&slot.spending_data[0..4]);
+                    let spendable_height = u32::from_le_bytes(buf);
                     if spendable_height != 0 && spendable_height >= req.current_block_height {
                         errors.insert(
                             item.idx,
@@ -1144,6 +1163,16 @@ impl Engine {
     /// Inlines the validate-and-apply logic for exactly one UTXO,
     /// avoiding the `Vec` and ordered-map allocations that `spend_multi` uses.
     pub fn spend(&self, req: &SpendRequest) -> Result<SpendResponse, SpendError> {
+        // F-G2-002: reject the all-`0xFF` reserved sentinel up front. That
+        // byte pattern is the on-disk frozen marker; accepting it under
+        // `status=UTXO_SPENT` would let any client permanently brick the
+        // UTXO against unspend (frozen-marker short-circuit) and unfreeze
+        // (rejects non-`UTXO_FROZEN` status). The 36-byte payload is also
+        // not a valid BSV `txid + vin` — txid cannot be all `0xFF`.
+        if req.spending_data == [FROZEN_BYTE; 36] {
+            return Err(SpendError::ReservedSpendingData { offset: req.offset });
+        }
+
         let _guard = self.locks.lock(&req.tx_key);
 
         // 1. Index lookup
@@ -1188,8 +1217,11 @@ impl Engine {
 
         match slot.status {
             UTXO_UNSPENT => {
-                let spendable_height =
-                    u32::from_le_bytes(slot.spending_data[0..4].try_into().unwrap());
+                // F-G2-004: avoid `unwrap()` in library code (see batch
+                // path for rationale).
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(&slot.spending_data[0..4]);
+                let spendable_height = u32::from_le_bytes(buf);
                 if spendable_height != 0 && spendable_height >= req.current_block_height {
                     return Err(SpendError::FrozenUntil {
                         offset: req.offset,
@@ -1493,12 +1525,22 @@ impl Engine {
                 new_dah = patch.new_delete_at_height;
             }
 
-            // Generation is now cached in the index — zero device reads needed.
-            let generation = entry.generation.wrapping_add(1);
             let updated_at = self.now_millis();
 
             // Read-modify-write so CRC covers the full post-state
             // (block-entry-count, inline entry, and footer fields).
+            //
+            // F-G2-011: derive the new generation from `meta.generation`
+            // (the on-device, authoritative value) rather than
+            // `entry.generation` (the cached value). The fast path
+            // already reads metadata for the RMW; consulting it for
+            // the increment basis costs nothing and closes the rare
+            // race where a prior mutation wrote metadata but failed at
+            // `sync_index_cache` — the device sat at N+1 while the
+            // cache showed N, and the next fast-path mutation would
+            // stamp on-device generation as N+1 again, returning that
+            // value to the client even though no advance had occurred.
+            let generation;
             unsafe {
                 let mut meta =
                     io::read_metadata_direct(self.device_ptr, record_offset).map_err(|e| {
@@ -1506,6 +1548,7 @@ impl Engine {
                             detail: format!("{e}"),
                         }
                     })?;
+                generation = { meta.generation }.wrapping_add(1);
                 meta.flags = tf;
                 meta.generation = generation;
                 meta.updated_at = updated_at;
@@ -1579,7 +1622,18 @@ impl Engine {
                             .map_err(|e| SpendError::StorageError {
                                 detail: format!("{e}"),
                             })?;
-                        let last = overflow.pop().unwrap();
+                        // F-G2-004: `count > INLINE_BLOCK_ENTRIES` implies a
+                        // non-empty overflow, so this pop is unreachable-None
+                        // in current code. Surface as a StorageError instead
+                        // of a panic so any future divergence between the
+                        // in-memory count and the on-device overflow list is
+                        // reported, not crashed on.
+                        let last = overflow.pop().ok_or_else(|| SpendError::StorageError {
+                            detail: format!(
+                                "overflow read returned no entries despite \
+                                 block_entry_count={count} > INLINE_BLOCK_ENTRIES"
+                            ),
+                        })?;
                         metadata.block_entries_inline[i] = last;
                         write_overflow_entries(
                             &*self.device,
@@ -1988,7 +2042,7 @@ impl Engine {
     ///
     /// If the caller decides not to finalize (e.g., redo flush fails), it
     /// must free the allocated space via `self.allocator.lock().free(offset, size)`.
-    pub fn pre_allocate_create(&self, req: &CreateRequest) -> Result<(u64, u32), CreateError> {
+    pub fn pre_allocate_create(&self, req: &CreateRequest) -> Result<(u64, u32, u64), CreateError> {
         let utxo_count = req.utxo_hashes.len() as u32;
         if utxo_count == 0 {
             return Err(CreateError::InvalidUtxoCount);
@@ -2019,7 +2073,15 @@ impl Engine {
             .allocate(total_size)
             .map_err(|_| CreateError::DeviceFull)?;
 
-        Ok((record_offset, utxo_count))
+        // F-G2-006: return the computed `total_size` so the caller can
+        // pass it through to `create_at_offset` and we can defend the
+        // implicit contract that both sites recompute the same value.
+        // Pre-fix the two sites both rebuilt `cold_data` independently
+        // from `req`; any future divergence (mutated `req`, swapped
+        // `req`, non-deterministic builder) would silently desync the
+        // on-device `record_size` from the allocator reservation and
+        // corrupt the adjacent record.
+        Ok((record_offset, utxo_count, total_size))
     }
 
     /// Create a transaction record at a pre-allocated device offset.
@@ -2032,6 +2094,32 @@ impl Engine {
         &self,
         req: &CreateRequest,
         record_offset: u64,
+    ) -> Result<CreateResponse, CreateError> {
+        self.create_at_offset_inner(req, record_offset, None)
+    }
+
+    /// Variant of [`Self::create_at_offset`] that verifies the caller's
+    /// reservation size matches the on-device `record_size` this function
+    /// computes from `req`. F-G2-006: the dispatch layer reserves bytes via
+    /// `pre_allocate_create` and then calls `create_at_offset` with what is
+    /// supposed to be the same `req`. The recomputation is now defended
+    /// with a `debug_assert_eq!` so any divergence (mutated request, swapped
+    /// request, non-deterministic cold-data builder) panics in debug builds
+    /// and surfaces a `StorageError` in release.
+    pub fn create_at_offset_verified(
+        &self,
+        req: &CreateRequest,
+        record_offset: u64,
+        expected_total_size: u64,
+    ) -> Result<CreateResponse, CreateError> {
+        self.create_at_offset_inner(req, record_offset, Some(expected_total_size))
+    }
+
+    fn create_at_offset_inner(
+        &self,
+        req: &CreateRequest,
+        record_offset: u64,
+        expected_total_size: Option<u64>,
     ) -> Result<CreateResponse, CreateError> {
         let utxo_count = req.utxo_hashes.len() as u32;
         if utxo_count == 0 {
@@ -2053,6 +2141,30 @@ impl Engine {
         } else {
             build_cold_data(req.inputs, req.outputs, req.inpoints)
         };
+
+        // F-G2-006: if the caller passed `pre_allocate_create`'s
+        // `total_size`, defend the implicit contract that both sites
+        // compute the same record layout. A mismatch means the request
+        // was mutated between the two calls (or a different request
+        // reached us) — the on-device `record_size` would otherwise
+        // disagree with the allocator reservation and writes would
+        // either under-fill or spill into the adjacent record.
+        if let Some(expected) = expected_total_size {
+            let base_size = TxMetadata::record_size_for(utxo_count);
+            let actual = base_size + cold_data.len() as u64;
+            debug_assert_eq!(
+                actual, expected,
+                "create_at_offset record_size diverged from pre_allocate_create \
+                 reservation: pre_allocate={expected}, recomputed={actual}",
+            );
+            if actual != expected {
+                return Err(CreateError::StorageError {
+                    detail: format!(
+                        "create_at_offset record_size {actual} != reservation {expected}",
+                    ),
+                });
+            }
+        }
 
         // Build metadata
         let mut meta = TxMetadata::new(utxo_count);
@@ -2454,8 +2566,26 @@ impl Engine {
         }
         slot.status = UTXO_PRUNED;
         self.write_slot_fast(entry.record_offset, offset, &slot)?;
-        meta.spent_utxos = { meta.spent_utxos }.saturating_sub(1);
-        meta.pruned_utxos = { meta.pruned_utxos }.saturating_add(1);
+        // F-G2-017: switch from `saturating_sub`/`saturating_add` to
+        // `checked_*` so a violation of the per-record invariant
+        // surfaces as a `StorageError` instead of silently clamping.
+        // The earlier `slot.status == UTXO_PRUNED` short-circuit
+        // (line above) and `UTXO_SPENT` guard mean these arithmetic
+        // ops are unreachable-overflow in current code; the explicit
+        // check is defense-in-depth for any future change that
+        // re-orders the guards.
+        meta.spent_utxos =
+            { meta.spent_utxos }
+                .checked_sub(1)
+                .ok_or_else(|| SpendError::StorageError {
+                    detail: "prune_slot_if_spent_by_child: spent_utxos underflow".into(),
+                })?;
+        meta.pruned_utxos =
+            { meta.pruned_utxos }
+                .checked_add(1)
+                .ok_or_else(|| SpendError::StorageError {
+                    detail: "prune_slot_if_spent_by_child: pruned_utxos overflow".into(),
+                })?;
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = self.now_millis();
         self.write_metadata_fast(entry.record_offset, &meta)?;
@@ -2470,6 +2600,14 @@ impl Engine {
     /// Freeze a UTXO (set status to FROZEN, spending_data all 0xFF).
     ///
     /// Does NOT modify metadata counters — frozen does not count as "spent".
+    ///
+    /// F-G2-012: freeze/unfreeze does NOT touch `spent_utxos` and therefore
+    /// cannot cross the all-spent boundary — DAH eval is intentionally
+    /// omitted. `evaluate_delete_at_height` gates eligibility on
+    /// `spent_utxos == utxo_count`; a freeze can never change that
+    /// equality, so re-evaluating after a freeze would be a guaranteed
+    /// no-op that adds an index round-trip. Do not add an eval call here
+    /// without changing the invariant.
     pub fn freeze(&self, req: &FreezeRequest) -> Result<u32, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
@@ -2520,6 +2658,10 @@ impl Engine {
     }
 
     /// Unfreeze a UTXO (set status to UNSPENT, spending_data zeroed).
+    ///
+    /// F-G2-012: like `freeze`, this does NOT touch `spent_utxos` and is
+    /// not a candidate for DAH evaluation. See [`Self::freeze`] for the
+    /// full rationale.
     pub fn unfreeze(&self, req: &UnfreezeRequest) -> Result<u32, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
@@ -2643,7 +2785,15 @@ impl Engine {
         parent_key: &TxKey,
         child_txid: [u8; 32],
     ) -> Result<(), SpendError> {
+        // F-G2-005: bound the retry loop. Pre-fix this loop had no cap;
+        // pathological contention (many simultaneous reorgs against the
+        // same parent) could burn allocator/device cycles indefinitely.
+        // 16 retries with exponential back-off (1us..32ms) gives the
+        // contending writers time to drain while still surfacing the
+        // problem to the operator instead of stalling silently.
+        const MAX_RETRIES: u32 = 16;
         let mut intent_logged = false;
+        let mut attempt: u32 = 0;
         loop {
             let (ro, count, offset, mut children) = {
                 let _guard = self.locks.lock(parent_key);
@@ -2737,6 +2887,22 @@ impl Engine {
             }
 
             self.free_conflicting_children_block(new_offset, children.len())?;
+
+            attempt += 1;
+            if attempt >= MAX_RETRIES {
+                return Err(SpendError::StorageError {
+                    detail: format!(
+                        "append_conflicting_child: CAS contention exceeded \
+                         {MAX_RETRIES} retries on parent — likely concurrent \
+                         reorg storm against the same parent record",
+                    ),
+                });
+            }
+            // Exponential back-off (1us → 2us → ... capped at ~32ms) to
+            // give the contending writer a chance to commit so the next
+            // attempt sees a stable snapshot.
+            let backoff_us = 1u64 << attempt.min(15);
+            std::thread::sleep(std::time::Duration::from_micros(backoff_us));
         }
     }
 
@@ -3017,6 +3183,22 @@ impl Engine {
     }
 
     /// Set or clear the locked flag on a transaction.
+    ///
+    /// Returns the post-mutation generation.
+    ///
+    /// # F-G2-013: rollback hazard for callers that need DAH restore
+    ///
+    /// Locking clears `delete_at_height`; unlocking does NOT restore the
+    /// pre-lock DAH (the engine has no memory of it). Any caller that
+    /// might need to compensate a `set_locked(true)` (e.g. on a
+    /// replication failure) MUST go through
+    /// [`Self::set_locked_with_before_image`] to capture
+    /// `prior_delete_at_height` and use [`Self::restore_set_locked_for_compensation`]
+    /// on rollback. Plain `set_locked(false)` after a failed
+    /// `set_locked(true)` silently drops the DAH and the record becomes
+    /// unprunable on the next sweep. This `u32` return signature exists
+    /// only for callers that have no compensation requirement
+    /// (e.g. benchmarks, idempotent replay).
     pub fn set_locked(&self, req: &SetLockedRequest) -> Result<u32, SpendError> {
         Ok(self.set_locked_with_before_image(req)?.generation)
     }
@@ -3350,6 +3532,17 @@ impl Engine {
             return Err(SpendError::UtxoHashMismatch { offset: req.offset });
         }
 
+        // F-G2-001 (re-verify): re-read metadata after the slot read so a
+        // `delete + create_at_offset` race that landed between the
+        // earlier `read_metadata_for_key` and this `read_slot_fast`
+        // surfaces as `TxNotFound` instead of returning a different
+        // transaction's slot data under `key`. The `slot.hash` check
+        // above catches the *type* of aliasing where utxo_hash differs;
+        // this catches the case where another transaction happens to
+        // share a slot hash by accident (small but not zero given
+        // 32-byte preimage-controllable hashes from upstream).
+        let _meta_check = self.read_metadata_for_key(&req.tx_key, ro)?;
+
         let spending_data = match slot.status {
             UTXO_UNSPENT => None,
             UTXO_SPENT | UTXO_FROZEN => Some(slot.spending_data),
@@ -3427,7 +3620,13 @@ impl Engine {
         // Verify the offset still belongs to this key before reading the slot
         // (F-G2-001 second-line defense; subsumes F-G2-010 doc concern).
         let _meta = self.read_metadata_for_key(key, entry.record_offset)?;
-        self.read_slot_fast(entry.record_offset, offset)
+        let slot = self.read_slot_fast(entry.record_offset, offset)?;
+        // F-G2-001 (re-verify): a `delete + create_at_offset` race that
+        // landed between the metadata check and the slot read can give
+        // us another transaction's slot. Re-confirm tx_id ownership of
+        // the offset; a mismatch surfaces as `TxNotFound`.
+        let _meta_check = self.read_metadata_for_key(key, entry.record_offset)?;
+        Ok(slot)
     }
 
     /// Read every UTXO slot for a transaction.
@@ -3444,11 +3643,19 @@ impl Engine {
             .lookup(key)
             .ok_or(SpendError::TxNotFound)?;
         let meta = self.read_metadata_for_key(key, entry.record_offset)?;
-        io::read_all_utxo_slots(&*self.device, entry.record_offset, meta.utxo_count).map_err(|e| {
-            SpendError::StorageError {
+        let slots = io::read_all_utxo_slots(&*self.device, entry.record_offset, meta.utxo_count)
+            .map_err(|e| SpendError::StorageError {
                 detail: format!("{e}"),
-            }
-        })
+            })?;
+        // F-G2-001 (re-verify): the slot read above is not held under the
+        // stripe lock. A concurrent `delete + create_at_offset` between
+        // the metadata check and the slot read can reuse this offset for
+        // a different transaction. Re-read metadata and confirm the
+        // record at `record_offset` still belongs to `key`. A mismatch
+        // surfaces as `TxNotFound` — same outcome the caller would have
+        // seen had they observed the post-unregister state.
+        let _meta_check = self.read_metadata_for_key(key, entry.record_offset)?;
+        Ok(slots)
     }
 
     /// Read one mined-block entry, including entries stored in overflow.
@@ -3483,6 +3690,11 @@ impl Engine {
                 detail: format!("{e}"),
             }
         })?;
+        // F-G2-001 (re-verify): the overflow read is unlocked; a delete +
+        // create_at_offset race between the metadata read and the
+        // overflow read can give us entries from an unrelated record.
+        // Re-check tx_id ownership.
+        let _meta_check = self.read_metadata_for_key(key, entry.record_offset)?;
         Ok(overflow
             .into_iter()
             .find(|entry| entry.block_id == block_id))
@@ -3618,9 +3830,33 @@ impl<'a> ValidatedSpend<'a> {
 
         crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterDataPwrite);
 
-        // 7. Update metadata
+        // 7. Update metadata. F-G2-007: switch the spent counter to a
+        // checked add and verify it stays within `utxo_count`. Pre-fix
+        // the `wrapping_add` would silently mask a violation of the
+        // invariant `spent_utxos <= utxo_count` (e.g. if on-device
+        // metadata was somehow corrupted with a high `spent_utxos`
+        // value but still passed CRC). The wrap then misled
+        // `delete_eval`'s `all_spent` check and could prematurely
+        // declare the record DAH-eligible. Today no reachable path
+        // produces that input — duplicate offsets are absorbed into
+        // the already-spent branches in `validate_spend_multi` — but
+        // surfacing the invariant violation loudly is cheap insurance.
         let old_dah = { metadata.delete_at_height };
-        metadata.spent_utxos = { metadata.spent_utxos }.wrapping_add(spent_count);
+        let pre_spent = { metadata.spent_utxos };
+        let new_spent = pre_spent.checked_add(spent_count).ok_or_else(|| {
+            SpendError::StorageError {
+                detail: format!("spent_utxos overflow: {pre_spent} + {spent_count} > u32::MAX",),
+            }
+        })?;
+        if new_spent > { metadata.utxo_count } {
+            return Err(SpendError::StorageError {
+                detail: format!(
+                    "spent_utxos invariant violated: {new_spent} > utxo_count={}",
+                    { metadata.utxo_count },
+                ),
+            });
+        }
+        metadata.spent_utxos = new_spent;
         metadata.generation = { metadata.generation }.wrapping_add(1);
         metadata.updated_at = engine.now_millis();
 
@@ -3848,10 +4084,38 @@ fn read_overflow_entries(
     Ok(entries)
 }
 
+/// Compute the on-device byte size of the overflow block that backs the
+/// current `metadata.block_overflow_offset`.
+///
+/// Pre-fix (F-G2-003) the free path always freed exactly `alignment`
+/// bytes — correct for the 4 KiB device alignment in production but a
+/// silent leak on a 512-byte-aligned device (`align_up(252 * 12, 512) =
+/// 3072` allocated, only 512 freed). The new helper rederives the
+/// previously-allocated size from `block_entry_count`: overflow holds
+/// the count past the inline cap, rounded up to the device's alignment.
+/// Callers must invoke this BEFORE mutating `block_entry_count` so the
+/// returned size matches the live allocation.
+#[inline]
+fn overflow_block_size(metadata: &TxMetadata, alignment: usize) -> usize {
+    let total = metadata.block_entry_count as usize;
+    if total <= INLINE_BLOCK_ENTRIES {
+        return 0;
+    }
+    let overflow_count = total - INLINE_BLOCK_ENTRIES;
+    io::align_up(overflow_count * BLOCK_ENTRY_SIZE, alignment)
+}
+
 /// Write overflow block entries to the device.
 ///
-/// Allocates or reuses the overflow block. If `entries` is empty, frees the
-/// overflow block and clears the metadata pointer.
+/// Allocates, reuses, or frees the overflow block.
+///
+/// # F-G2-003: exact-size free + grow-aware reuse
+///
+/// The free path now passes the actual allocated size (rederived from
+/// `metadata.block_entry_count`) to `allocator.free`. The grow path
+/// detects when `new_size > old_size` and reallocates rather than writing
+/// past the existing allocation. The allocator free error is propagated
+/// instead of being silently swallowed via `let _ = ...`.
 fn write_overflow_entries(
     device: &dyn BlockDevice,
     allocator: &parking_lot::Mutex<SlotAllocator>,
@@ -3860,29 +4124,64 @@ fn write_overflow_entries(
 ) -> Result<(), crate::device::DeviceError> {
     let alignment = device.alignment();
     let old_offset = { metadata.block_overflow_offset };
+    let old_block_size = overflow_block_size(metadata, alignment);
 
     if entries.is_empty() {
-        // Free the overflow block if one exists
+        // Free the overflow block if one exists. F-G2-003: free the
+        // *full* allocated size, not just one alignment unit, and
+        // propagate the error instead of swallowing it.
         if old_offset != 0 {
-            let _ = allocator.lock().free(old_offset, alignment as u64);
+            let free_size = if old_block_size > 0 {
+                old_block_size as u64
+            } else {
+                // Defensive: if `block_entry_count` already reflected
+                // the post-shrink state (count <= INLINE) but the
+                // overflow pointer is still live, fall back to one
+                // alignment unit to avoid double-free of unallocated
+                // space. This matches the legacy behaviour for the case
+                // it was correct for.
+                alignment as u64
+            };
+            allocator.lock().free(old_offset, free_size).map_err(|e| {
+                crate::device::DeviceError::Io(std::io::Error::other(format!("allocator: {e}")))
+            })?;
             metadata.block_overflow_offset = 0;
         }
         return Ok(());
     }
 
     let data_size = entries.len() * BLOCK_ENTRY_SIZE;
-    let block_size = io::align_up(data_size, alignment);
+    let new_block_size = io::align_up(data_size, alignment);
 
-    // Allocate new overflow block if needed (or reuse if same size)
-    let offset = if old_offset != 0 {
+    // Decide allocate / reuse / reallocate.
+    // - No prior block: fresh allocation.
+    // - Same alignment-rounded size as prior: reuse in place (writes are
+    //   overwrites, no allocator churn).
+    // - Different size (grow OR shrink across alignment boundary): free
+    //   the old allocation and grab a fresh one. Shrinking-but-reusing
+    //   would leak the trailing alignment unit(s) on the next free
+    //   (which only sees the new, smaller size). The allocator free
+    //   error is propagated; pre-fix it was swallowed via `let _ =`.
+    let offset = if old_offset == 0 {
+        allocator
+            .lock()
+            .allocate(new_block_size as u64)
+            .map_err(|e| {
+                crate::device::DeviceError::Io(std::io::Error::other(format!("allocator: {e}")))
+            })?
+    } else if new_block_size == old_block_size {
         old_offset
     } else {
-        allocator.lock().allocate(block_size as u64).map_err(|e| {
+        let mut a = allocator.lock();
+        a.free(old_offset, old_block_size as u64).map_err(|e| {
+            crate::device::DeviceError::Io(std::io::Error::other(format!("allocator: {e}")))
+        })?;
+        a.allocate(new_block_size as u64).map_err(|e| {
             crate::device::DeviceError::Io(std::io::Error::other(format!("allocator: {e}")))
         })?
     };
 
-    let mut buf = AlignedBuf::new(block_size, alignment);
+    let mut buf = AlignedBuf::new(new_block_size, alignment);
     for (i, entry) in entries.iter().enumerate() {
         let start = i * BLOCK_ENTRY_SIZE;
         entry.to_bytes(&mut buf[start..start + BLOCK_ENTRY_SIZE]);
