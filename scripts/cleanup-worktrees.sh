@@ -79,15 +79,28 @@ for path in "$WORKTREE_DIR"/agent-*; do
         kept=$((kept+1))
         continue
     fi
-    # git worktree remove handles the .git/worktrees/* metadata + the dir.
-    # --force needed because the harness locks worktree dirs.
+    # The harness puts a `locked` file in `.git/worktrees/<name>/` that
+    # blocks both `git worktree remove` and `git worktree prune`. Force-
+    # unlock before either step.
+    name="$(basename "$path")"
+    [[ -f ".git/worktrees/$name/locked" ]] && run rm -f ".git/worktrees/$name/locked"
     run git worktree remove --force "$path" 2>/dev/null || run rm -rf "$path"
     removed=$((removed+1))
 done
 
-# `git worktree prune` cleans dangling metadata for worktree dirs that were
-# rm'd without going through `git worktree remove`. Cheap to always run.
-run git worktree prune
+# Also unlock any orphaned worktree metadata (dir already removed, but
+# `.git/worktrees/agent-*/locked` keeps `git worktree prune` from cleaning
+# the metadata). Skip the active set.
+for meta in .git/worktrees/agent-*; do
+    [[ -d "$meta" ]] || continue
+    name="$(basename "$meta")"
+    if is_kept "$WORKTREE_DIR/$name"; then continue; fi
+    [[ -f "$meta/locked" ]] && run rm -f "$meta/locked"
+done
+
+# `git worktree prune` cleans dangling metadata. With locks cleared above
+# it will sweep every gone-but-registered worktree.
+run git worktree prune -v
 
 # Delete agent branches if requested. We keep them by default so the commits
 # remain reachable for inspection / cherry-pick / merge.
