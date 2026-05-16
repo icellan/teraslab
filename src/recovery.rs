@@ -42,7 +42,19 @@ use crate::storage::blob_gc::{self, BlobGcStats};
 use crate::storage::blobstore::{BlobError, BlobStore};
 use thiserror::Error;
 
-const RECOVERY_PROGRESS_INTERVAL_ENTRIES: u64 = 1024;
+/// F-G4-011: how often `recover_*_progress` writes a durable
+/// recovery-progress marker mid-replay. Each marker is a separate
+/// `RedoLog::mark_recovery_progress` (append + fsync); too frequent a
+/// cadence amplifies recovery latency and exposes one more I/O failure
+/// surface per marker. The original value (1024) was conservatively
+/// fine-grained; widening it to 16 384 cuts the marker count by 16×
+/// without meaningfully growing the worst-case re-replay span if a
+/// crash interrupts the recovery (recovery is idempotent, so re-doing
+/// 16 K entries is not a correctness concern — only a startup-latency
+/// one, dominated by the per-entry I/O which is far larger than the
+/// per-1024 fsync). The final marker is still always written at the
+/// end of the recovered range so the next startup can skip the bulk.
+const RECOVERY_PROGRESS_INTERVAL_ENTRIES: u64 = 16384;
 
 /// Errors during recovery.
 #[derive(Error, Debug)]
@@ -152,6 +164,19 @@ impl RecoveryStats {
     }
 }
 
+/// F-G4-007: classify a replay failure as fatal for the recovery loop.
+///
+/// `MissingPrimary` is benign during idempotent replay (the record was
+/// deleted later in the log, or by a later snapshot) so the loop keeps
+/// going. Any other cause indicates the device or on-disk data is
+/// misbehaving; continuing the replay risks landing later entries on
+/// top of an already-broken intermediate state that
+/// `check_replay_tolerance` cannot roll back.
+#[inline]
+fn is_fatal_replay_cause(cause: ReplayCause) -> bool {
+    !matches!(cause, ReplayCause::MissingPrimary)
+}
+
 /// Replay redo log entries after the last checkpoint.
 ///
 /// For each entry, checks whether the operation has already been applied
@@ -168,7 +193,15 @@ pub fn recover(
         match replay_entry(device, index, entry) {
             ReplayResult::Applied => stats.entries_replayed += 1,
             ReplayResult::Skipped => stats.entries_skipped += 1,
-            ReplayResult::Failed(cause) => stats.record_failure(cause),
+            ReplayResult::Failed(cause) => {
+                stats.record_failure(cause);
+                // F-G4-007: stop on first non-tolerable failure so
+                // subsequent entries cannot land partially-applied
+                // state on top of an already-broken replay.
+                if is_fatal_replay_cause(cause) {
+                    break;
+                }
+            }
         }
     }
 
@@ -400,6 +433,12 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                 | ReplayResult::Skipped
                 | ReplayResult::Failed(ReplayCause::MissingPrimary)
         );
+        // F-G4-007: capture cause BEFORE we move `outcome` into the
+        // match below, so the post-match break can use it.
+        let fatal = matches!(
+            outcome,
+            ReplayResult::Failed(c) if is_fatal_replay_cause(c)
+        );
         match outcome {
             ReplayResult::Applied => stats.entries_replayed += 1,
             ReplayResult::Skipped => stats.entries_skipped += 1,
@@ -416,6 +455,12 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                 last_progress_sequence = entry.sequence;
                 processed_since_progress = 0;
             }
+        }
+        // F-G4-007: stop on first non-tolerable failure so subsequent
+        // entries cannot land partially-applied state on top of an
+        // already-broken intermediate replay.
+        if fatal {
+            break;
         }
     }
 
@@ -660,7 +705,8 @@ fn apply_replay_dah_patch(metadata: &mut TxMetadata, patch: &DahPatch) {
     if patch.last_spent_all {
         metadata.flags |= TxFlags::LAST_SPENT_ALL;
     } else {
-        metadata.flags -= metadata.flags & TxFlags::LAST_SPENT_ALL;
+        // F-G4-015: use the idiomatic bitflags clear pattern.
+        metadata.flags.remove(TxFlags::LAST_SPENT_ALL);
     }
 }
 
@@ -1106,7 +1152,22 @@ fn replay_freeze(
     if slot.status == UTXO_FROZEN {
         return ReplayResult::Skipped;
     }
+    // F-G4-005: a legacy Freeze entry (no expected_hash) cannot verify
+    // that the slot at (record_offset, offset) is still the same UTXO
+    // the original Freeze targeted. Conservatively skip replay over
+    // anything other than UNSPENT — SPENT/PRUNED/LOCKED states have
+    // moved on and re-stamping FROZEN would silently overwrite a
+    // status another replay path depends on. Log the unusual case so
+    // operators can correlate with upstream reorderings.
     if slot.status != UTXO_UNSPENT {
+        if expected_hash.is_none() {
+            tracing::warn!(
+                target: "teraslab::recovery",
+                slot_status = slot.status,
+                offset,
+                "F-G4-005: skipping legacy Freeze replay over non-UNSPENT slot",
+            );
+        }
         return ReplayResult::Skipped;
     }
 
@@ -1184,8 +1245,24 @@ fn replay_create(
     record_offset: u64,
     utxo_count: u32,
 ) -> ReplayResult {
-    // Idempotent: if already in index, skip
-    if index.lookup(tx_key).is_some() {
+    // Idempotent: if already in index, skip — but if the existing
+    // index entry's `record_offset` does NOT match the redo entry's,
+    // surface a warning (F-G4-014). Skipping is still correct (a
+    // later replay of Delete + Create restamped the index entry), but
+    // the reordering may indicate an upstream bug worth investigating.
+    if let Some(existing) = index.lookup(tx_key) {
+        if existing.record_offset != record_offset || existing.utxo_count != utxo_count {
+            tracing::warn!(
+                target: "teraslab::recovery",
+                txid_prefix = ?&tx_key.txid[..4],
+                expected_record_offset = record_offset,
+                actual_record_offset = existing.record_offset,
+                expected_utxo_count = utxo_count,
+                actual_utxo_count = existing.utxo_count,
+                "F-G4-014: replay_create skipped — existing index entry diverges from redo entry; \
+                 likely a delete+recreate that crossed the redo log",
+            );
+        }
         return ReplayResult::Skipped;
     }
 
@@ -1490,7 +1567,8 @@ fn replay_metadata_op(
             if *value {
                 meta.flags |= TxFlags::CONFLICTING;
             } else {
-                meta.flags -= meta.flags & TxFlags::CONFLICTING;
+                // F-G4-015: idiomatic bitflags clear.
+                meta.flags.remove(TxFlags::CONFLICTING);
             }
             // R-013: propagate write failure.
             if io::write_metadata(device, ie.record_offset, &meta).is_err() {
@@ -1517,7 +1595,8 @@ fn replay_metadata_op(
                     meta.delete_at_height = 0;
                 }
             } else {
-                meta.flags -= meta.flags & TxFlags::LOCKED;
+                // F-G4-015: idiomatic bitflags clear.
+                meta.flags.remove(TxFlags::LOCKED);
             }
             // R-013: propagate write failure.
             if io::write_metadata(device, ie.record_offset, &meta).is_err() {
@@ -1907,7 +1986,8 @@ fn replay_compensate_set_locked(
     if prior_locked {
         meta.flags |= TxFlags::LOCKED;
     } else {
-        meta.flags -= meta.flags & TxFlags::LOCKED;
+        // F-G4-015: idiomatic bitflags clear.
+        meta.flags.remove(TxFlags::LOCKED);
     }
     meta.delete_at_height = prior_delete_at_height;
 

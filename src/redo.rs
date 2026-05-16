@@ -97,10 +97,7 @@ pub enum RedoError {
     #[error(
         "redo header magic mismatch: expected {expected:#x?}, found {found:#x?} — log was written by an incompatible version"
     )]
-    HeaderMagicMismatch {
-        expected: [u8; 8],
-        found: [u8; 8],
-    },
+    HeaderMagicMismatch { expected: [u8; 8], found: [u8; 8] },
 
     /// F-G4-001: the header block CRC does not match the rest of the
     /// header bytes. The header was corrupted (torn write, device
@@ -312,7 +309,7 @@ const MAX_CREATE_V2_PARENTS: usize = 64;
 /// `CreateV2` redo entry. The TeraSlab record size is bounded by
 /// `TxMetadata::record_size_for(utxo_count)` plus cold data, which in
 /// the worst case the engine emits is well under 1 MiB.
-const MAX_CREATE_V2_RECORD_BYTES: usize = 1 * 1024 * 1024;
+const MAX_CREATE_V2_RECORD_BYTES: usize = 1024 * 1024;
 
 /// A redo log operation that can be serialized and replayed.
 #[derive(Debug, Clone, PartialEq)]
@@ -1248,8 +1245,7 @@ impl RedoOp {
                     u16::from_le_bytes(data[record_end..record_end + 2].try_into().unwrap())
                         as usize;
                 let parents_start = record_end + 2;
-                let parents_end =
-                    parents_start.checked_add(parents_count_raw.checked_mul(32)?)?;
+                let parents_end = parents_start.checked_add(parents_count_raw.checked_mul(32)?)?;
                 if data.len() < parents_end {
                     return None;
                 }
