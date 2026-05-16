@@ -3872,10 +3872,38 @@ fn read_overflow_entries(
     Ok(entries)
 }
 
+/// Compute the on-device byte size of the overflow block that backs the
+/// current `metadata.block_overflow_offset`.
+///
+/// Pre-fix (F-G2-003) the free path always freed exactly `alignment`
+/// bytes — correct for the 4 KiB device alignment in production but a
+/// silent leak on a 512-byte-aligned device (`align_up(252 * 12, 512) =
+/// 3072` allocated, only 512 freed). The new helper rederives the
+/// previously-allocated size from `block_entry_count`: overflow holds
+/// the count past the inline cap, rounded up to the device's alignment.
+/// Callers must invoke this BEFORE mutating `block_entry_count` so the
+/// returned size matches the live allocation.
+#[inline]
+fn overflow_block_size(metadata: &TxMetadata, alignment: usize) -> usize {
+    let total = metadata.block_entry_count as usize;
+    if total <= INLINE_BLOCK_ENTRIES {
+        return 0;
+    }
+    let overflow_count = total - INLINE_BLOCK_ENTRIES;
+    io::align_up(overflow_count * BLOCK_ENTRY_SIZE, alignment)
+}
+
 /// Write overflow block entries to the device.
 ///
-/// Allocates or reuses the overflow block. If `entries` is empty, frees the
-/// overflow block and clears the metadata pointer.
+/// Allocates, reuses, or frees the overflow block.
+///
+/// # F-G2-003: exact-size free + grow-aware reuse
+///
+/// The free path now passes the actual allocated size (rederived from
+/// `metadata.block_entry_count`) to `allocator.free`. The grow path
+/// detects when `new_size > old_size` and reallocates rather than writing
+/// past the existing allocation. The allocator free error is propagated
+/// instead of being silently swallowed via `let _ = ...`.
 fn write_overflow_entries(
     device: &dyn BlockDevice,
     allocator: &parking_lot::Mutex<SlotAllocator>,
@@ -3884,29 +3912,61 @@ fn write_overflow_entries(
 ) -> Result<(), crate::device::DeviceError> {
     let alignment = device.alignment();
     let old_offset = { metadata.block_overflow_offset };
+    let old_block_size = overflow_block_size(metadata, alignment);
 
     if entries.is_empty() {
-        // Free the overflow block if one exists
+        // Free the overflow block if one exists. F-G2-003: free the
+        // *full* allocated size, not just one alignment unit, and
+        // propagate the error instead of swallowing it.
         if old_offset != 0 {
-            let _ = allocator.lock().free(old_offset, alignment as u64);
+            let free_size = if old_block_size > 0 {
+                old_block_size as u64
+            } else {
+                // Defensive: if `block_entry_count` already reflected
+                // the post-shrink state (count <= INLINE) but the
+                // overflow pointer is still live, fall back to one
+                // alignment unit to avoid double-free of unallocated
+                // space. This matches the legacy behaviour for the case
+                // it was correct for.
+                alignment as u64
+            };
+            allocator.lock().free(old_offset, free_size).map_err(|e| {
+                crate::device::DeviceError::Io(std::io::Error::other(format!("allocator: {e}")))
+            })?;
             metadata.block_overflow_offset = 0;
         }
         return Ok(());
     }
 
     let data_size = entries.len() * BLOCK_ENTRY_SIZE;
-    let block_size = io::align_up(data_size, alignment);
+    let new_block_size = io::align_up(data_size, alignment);
 
-    // Allocate new overflow block if needed (or reuse if same size)
-    let offset = if old_offset != 0 {
+    // Decide allocate / reuse / reallocate.
+    // - No prior block: fresh allocation.
+    // - Same alignment-rounded size as prior: reuse in place (writes are
+    //   overwrites, no allocator churn).
+    // - Different size (grow OR shrink across alignment boundary): free
+    //   the old allocation and grab a fresh one. Shrinking-but-reusing
+    //   would leak the trailing alignment unit(s) on the next free
+    //   (which only sees the new, smaller size). The allocator free
+    //   error is propagated; pre-fix it was swallowed via `let _ =`.
+    let offset = if old_offset == 0 {
+        allocator.lock().allocate(new_block_size as u64).map_err(|e| {
+            crate::device::DeviceError::Io(std::io::Error::other(format!("allocator: {e}")))
+        })?
+    } else if new_block_size == old_block_size {
         old_offset
     } else {
-        allocator.lock().allocate(block_size as u64).map_err(|e| {
+        let mut a = allocator.lock();
+        a.free(old_offset, old_block_size as u64).map_err(|e| {
+            crate::device::DeviceError::Io(std::io::Error::other(format!("allocator: {e}")))
+        })?;
+        a.allocate(new_block_size as u64).map_err(|e| {
             crate::device::DeviceError::Io(std::io::Error::other(format!("allocator: {e}")))
         })?
     };
 
-    let mut buf = AlignedBuf::new(block_size, alignment);
+    let mut buf = AlignedBuf::new(new_block_size, alignment);
     for (i, entry) in entries.iter().enumerate() {
         let start = i * BLOCK_ENTRY_SIZE;
         entry.to_bytes(&mut buf[start..start + BLOCK_ENTRY_SIZE]);
