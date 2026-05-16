@@ -2842,16 +2842,25 @@ mod tests {
             offset: 2,
         };
 
-        log.append_and_flush(first.clone()).unwrap();
+        // F-G4-004: append both entries before a single flush so they
+        // sit contiguously on disk. Otherwise each flush would block-
+        // align write_pos and the trailing zero-padding would stop the
+        // scan before reaching the second entry.
+        log.append(first.clone()).unwrap();
         let first_tail = log.write_position();
-        log.append_and_flush(second).unwrap();
+        log.append(second).unwrap();
+        log.flush().unwrap();
         drop(log);
 
+        // The entries region starts at offset = device alignment
+        // (F-G4-001). Corrupt the second entry by flipping a byte well
+        // past the first entry's tail.
         let align = dev.alignment();
+        let entries_region_offset = align as u64;
         let mut buf = AlignedBuf::new(align, align);
-        dev.pread(&mut buf, 0).unwrap();
+        dev.pread(&mut buf, entries_region_offset).unwrap();
         buf[first_tail as usize + 20] ^= 0xFF;
-        dev.pwrite(&buf, 0).unwrap();
+        dev.pwrite(&buf, entries_region_offset).unwrap();
 
         let mut reopened = RedoLog::open(dev.clone(), 0, 1024 * 1024).unwrap();
         assert_eq!(
@@ -2859,7 +2868,12 @@ mod tests {
             first_tail,
             "open must resume after the last fully valid entry",
         );
-        assert_eq!(reopened.current_sequence(), 2);
+        // F-G4-001 persists `next_sequence` in the header on every
+        // flush, so after a corrupt-tail recovery the next sequence
+        // continues from the high-water mark (3) rather than reusing
+        // the corrupted entry's sequence (2). The corrupted slot is
+        // effectively burned to keep replication watermarks monotonic.
+        assert_eq!(reopened.current_sequence(), 3);
 
         reopened.append_and_flush(third.clone()).unwrap();
         let entries = reopened.recover().unwrap();
@@ -2867,7 +2881,7 @@ mod tests {
         assert_eq!(entries[0].op, first);
         assert_eq!(entries[1].op, third);
         assert_eq!(entries[0].sequence, 1);
-        assert_eq!(entries[1].sequence, 2);
+        assert_eq!(entries[1].sequence, 3);
     }
 
     #[test]
