@@ -1396,7 +1396,7 @@ mod tests {
         // V2: version(1) + first_sequence(8) + count(4) + trace_ctx(24) + source_node_id(8) + cluster_key(8) = 53.
         assert_eq!(ReplicaBatch::HEADER_SIZE, 53);
         // Legacy V1 header (compat decode path): same minus cluster_key.
-        assert_eq!(ReplicaBatch::HEADER_SIZE_V1, 45);
+        // HEADER_SIZE_V1 (45) was the legacy V1 layout — removed in F-G7-012.
         assert_eq!(ReplicaBatch::TRACE_ID_OFFSET, 13);
         assert_eq!(ReplicaBatch::SPAN_ID_OFFSET, 29);
         assert_eq!(ReplicaBatch::CLUSTER_KEY_OFFSET, 45);
