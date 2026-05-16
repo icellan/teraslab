@@ -1390,6 +1390,20 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             .map_err(|e| format!("write metadata for generation sync: {e}"))?;
     }
 
+    // F-G7-016: enforce "apply, fsync data, then journal" by explicitly
+    // syncing the engine's block device BEFORE building the post-apply
+    // redo entry. The engine's mutation paths (spend/freeze/...) write
+    // through `write_slot_fast` / `write_metadata_fast`, which only
+    // promise the writes have left this process — the OS page cache
+    // may still buffer them. A replica crash between the engine write
+    // and the redo append would otherwise leave the on-device state
+    // and the redo log out of sync. The post-apply redo entry then
+    // reads back state we know is durable, so replay sees an entry
+    // whose target state matches the disk.
+    if let Err(e) = engine.device().sync() {
+        return Err(format!("post-apply device sync (F-G7-016): {e}"));
+    }
+
     // R-034 (BC-34): write a local redo entry so the replica can replay
     // through its own crash recovery and a failover does not require a
     // full resync of every surviving replica. The entry captures the
@@ -1414,7 +1428,9 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
 /// master computes these counters from validated state under the per-tx
 /// lock; on the replica we read them back from the device after the
 /// engine's apply_op has already taken and released the lock — ordering
-/// here is "apply, fsync data, then journal" instead of the master's
+/// here is "apply, fsync data, then journal" (the explicit
+/// `engine.device().sync()` call in `apply_op` enforces the data fsync
+/// before this function runs, F-G7-016) instead of the master's
 /// "journal, then apply, then fsync data". Both orderings are correct
 /// because all replica apply paths are idempotent and the redo replay
 /// guards check the device state before re-writing.
