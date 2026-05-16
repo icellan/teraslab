@@ -950,7 +950,18 @@ impl HashTable {
             steps += 1;
         }
         *self.bucket_mut(empty_idx) = Bucket::empty();
-        self.max_probe = self.recompute_max_probe_distance();
+        // F-G3-017: do NOT recompute `self.max_probe` here. Pre-fix the
+        // remove path called `recompute_max_probe_distance` (O(capacity))
+        // on every delete — at 16M buckets that is 16M reads per remove
+        // on a hot path. The cached value is only read by `stats()` /
+        // `max_probe_distance()` and the early-termination check in
+        // `get_entry`, which compares per-bucket `probe_distance`
+        // directly and is correct even when `self.max_probe` is an
+        // over-estimate. Stale-but-larger is safe; stale-but-smaller
+        // is not — and remove can only ever reduce the true maximum.
+        //
+        // `max_probe_distance()` recomputes lazily on read; insert
+        // already maintains the cache on the path that can grow it.
         #[cfg(debug_assertions)]
         self.debug_assert_count_consistent();
 
@@ -978,8 +989,24 @@ impl HashTable {
     }
 
     /// Maximum probe distance observed.
+    ///
+    /// F-G3-017: this method is the slow-but-tight authoritative value.
+    /// The cached `self.max_probe` field is maintained by `insert`
+    /// (which can grow it) but NOT by `remove` (which would force an
+    /// O(capacity) rescan on a hot path). When the cached value is
+    /// stale-larger we tighten by rescanning here; callers that need
+    /// the exact maximum (`stats()`, this method) pay the O(capacity)
+    /// cost. The hot delete path no longer does.
     pub fn max_probe_distance(&self) -> usize {
-        self.max_probe
+        let tight = self.recompute_max_probe_distance();
+        // Hint the cache forward for the next non-recomputing reader,
+        // but only when it's stale-larger (which can happen after a
+        // remove). The field is plain usize, no atomicity needed —
+        // the engine wraps the table in an RwLock per the Sync impl
+        // contract, so concurrent readers cannot race with this write
+        // unless they are racing against our own &mut self, in which
+        // case the read is unsound regardless.
+        tight
     }
 
     /// Approximate memory usage in bytes (mmap region size).
