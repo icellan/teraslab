@@ -100,9 +100,26 @@ impl RedbDahIndex {
         key: TxKey,
         redo_log: Option<&Mutex<RedoLog>>,
     ) -> Result<(), IndexError> {
-        let old_height = self.get_height(&key).unwrap_or(0);
+        // F-G3-013: open the write transaction BEFORE reading the existing
+        // height. Pre-fix, `get_height` ran its own read txn and the value
+        // used for the `RedoOp::SecondaryDahUpdate.old_height` field could
+        // be stale by the time the write actually committed. The replay
+        // path only uses `new_height` so today the redo entry's old_height
+        // was misleading-but-harmless; reading it under the same write
+        // lock makes it TOCTOU-free in case a future replay handler grows
+        // a dependency on it.
+        let txn = self.begin_write().map_err(map_txn_err)?;
+        let (old_height, was_new) = {
+            let rev = txn.open_table(DAH_REVERSE).map_err(map_table_err)?;
+            match rev.get(key.txid).map_err(map_storage_err)? {
+                Some(guard) => (u32::from_le_bytes(guard.value()), false),
+                None => (0u32, true),
+            }
+        };
         if old_height == height {
-            return Ok(()); // No-op; no redo entry needed.
+            // No-op; abort the write txn (no redo entry needed).
+            drop(txn);
+            return Ok(());
         }
 
         if let Some(redo) = redo_log {
@@ -118,23 +135,13 @@ impl RedbDahIndex {
                 })?;
         }
 
-        let txn = self.begin_write().map_err(map_txn_err)?;
-        let was_new;
         {
             let mut fwd = txn.open_table(DAH_FORWARD).map_err(map_table_err)?;
             let mut rev = txn.open_table(DAH_REVERSE).map_err(map_table_err)?;
 
-            match rev.get(key.txid).map_err(map_storage_err)? {
-                Some(guard) => {
-                    let existing_height = u32::from_le_bytes(guard.value());
-                    drop(guard);
-                    was_new = false;
-                    let old_fwd_key = make_forward_key(existing_height, &key);
-                    fwd.remove(old_fwd_key).map_err(map_storage_err)?;
-                }
-                None => {
-                    was_new = true;
-                }
+            if !was_new {
+                let old_fwd_key = make_forward_key(old_height, &key);
+                fwd.remove(old_fwd_key).map_err(map_storage_err)?;
             }
 
             rev.insert(key.txid, height.to_le_bytes())
@@ -958,8 +965,15 @@ mod tests {
     #[test]
     fn redo_flush_failure_blocks_redb_commit() {
         let (_dir, mut idx) = open_temp();
-        let dev = Arc::new(MemoryDevice::new(4096, 4096).unwrap());
-        let log = RedoLog::open(dev.clone(), 0, 256).unwrap();
+        // Device must be at least as large as the redo log's header
+        // requirement (8192 bytes). Pick 16 KiB device + 8 KiB log so the
+        // log fits its own header but fills quickly once we start writing
+        // 64-byte SecondaryDahUpdate records.
+        // Device: 64 KiB, 4 KiB alignment. Log: 16 KiB — fits its own
+        // header (8 KiB) and leaves room for ~80 64-byte redo records
+        // before the log fills.
+        let dev = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let log = RedoLog::open(dev.clone(), 0, 16 * 1024).unwrap();
         let redo = Mutex::new(log);
 
         idx.insert(100, key(1), Some(&redo)).unwrap();
@@ -976,7 +990,7 @@ mod tests {
                     break;
                 }
             }
-            if next > 50 {
+            if next > 200 {
                 panic!("expected redo log to fill up");
             }
         }

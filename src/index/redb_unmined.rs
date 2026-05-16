@@ -108,11 +108,24 @@ impl RedbUnminedIndex {
         key: TxKey,
         redo_log: Option<&Mutex<RedoLog>>,
     ) -> Result<(), IndexError> {
-        let old_height = self.get_height(&key).unwrap_or(0);
+        // F-G3-013: open the write transaction BEFORE reading the existing
+        // height so the value used for `RedoOp::SecondaryUnminedUpdate.old_height`
+        // is TOCTOU-free. See `RedbDahIndex::insert` for the same fix and
+        // the rationale (replay handler only uses `new_height` today, but
+        // a future delta-replay path could grow a dependency on it).
+        let txn = self.begin_write().map_err(map_txn_err)?;
+        let (old_height, was_new) = {
+            let rev = txn.open_table(UNMINED_REVERSE).map_err(map_table_err)?;
+            match rev.get(key.txid).map_err(map_storage_err)? {
+                Some(guard) => (u32::from_le_bytes(guard.value()), false),
+                None => (0u32, true),
+            }
+        };
         if old_height == height {
             // No-op: redb state already matches. No redo entry needed
             // because the primary's current unmined_since equals `height`
             // and recovery will not try to "undo" a no-op.
+            drop(txn);
             return Ok(());
         }
 
@@ -133,23 +146,13 @@ impl RedbUnminedIndex {
 
         // Phase 2: commit redb. At this point the redo log (if any) has a
         // durable record of the intent; recovery can re-apply if this fails.
-        let txn = self.begin_write().map_err(map_txn_err)?;
-        let was_new;
         {
             let mut fwd = txn.open_table(UNMINED_FORWARD).map_err(map_table_err)?;
             let mut rev = txn.open_table(UNMINED_REVERSE).map_err(map_table_err)?;
 
-            match rev.get(key.txid).map_err(map_storage_err)? {
-                Some(guard) => {
-                    let existing_height = u32::from_le_bytes(guard.value());
-                    drop(guard);
-                    was_new = false;
-                    let old_fwd_key = make_forward_key(existing_height, &key);
-                    fwd.remove(old_fwd_key).map_err(map_storage_err)?;
-                }
-                None => {
-                    was_new = true;
-                }
+            if !was_new {
+                let old_fwd_key = make_forward_key(old_height, &key);
+                fwd.remove(old_fwd_key).map_err(map_storage_err)?;
             }
 
             rev.insert(key.txid, height.to_le_bytes())
@@ -1078,11 +1081,11 @@ mod tests {
 
     #[test]
     fn redo_flush_failure_blocks_redb_commit() {
-        // Use a redo log sized so small that a single append fills it,
-        // triggering LogFull on the second call.
+        // Use a redo log just large enough to fit its 8 KiB header and a
+        // handful of records, then keep appending until it runs out.
         let (_dir, mut idx) = open_temp();
-        let dev = Arc::new(MemoryDevice::new(4096, 4096).unwrap());
-        let log = RedoLog::open(dev.clone(), 0, 256).unwrap();
+        let dev = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let log = RedoLog::open(dev.clone(), 0, 16 * 1024).unwrap();
         let redo = Mutex::new(log);
 
         // First insert consumes space in the tiny log.
@@ -1104,7 +1107,7 @@ mod tests {
                     break;
                 }
             }
-            if next > 50 {
+            if next > 200 {
                 panic!("expected redo log to fill up");
             }
         }
