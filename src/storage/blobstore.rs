@@ -295,6 +295,25 @@ pub trait BlobStore: Send + Sync {
     /// without sidecar, or vice versa) are NOT returned — they are unusable
     /// and the caller has no way to reconcile them.
     fn list(&self) -> Result<Vec<[u8; 32]>>;
+
+    /// Enumerate blobs eligible for orphan-blob garbage collection.
+    ///
+    /// F-G9-004 (race mitigation): the periodic blob-GC sweep can race with a
+    /// concurrent create that has just put a blob but whose index
+    /// registration has not landed yet — without a min-age filter the
+    /// freshly-uploaded blob would be classified as an orphan and deleted
+    /// out from under the in-flight create. `list_for_gc(min_age)` filters
+    /// the returned set to blobs whose payload mtime is at least `min_age`
+    /// old (file backend) or to all blobs (in-memory backends used by tests
+    /// where the race cannot manifest).
+    ///
+    /// The default implementation falls back to [`Self::list`] for stores
+    /// without per-blob mtime — recovery and tests are unaffected; only the
+    /// production [`FileBlobStore`] (and other backends that override this)
+    /// pay the grace cost.
+    fn list_for_gc(&self, _min_age: std::time::Duration) -> Result<Vec<[u8; 32]>> {
+        self.list()
+    }
 }
 
 /// File-based blob store organized by hash prefix directories.
@@ -307,6 +326,12 @@ pub struct FileBlobStore {
     base_dir: PathBuf,
     prefix_depth: usize,
     key_locks: Arc<Vec<parking_lot::Mutex<()>>>,
+    /// F-G9-017: count of `walk_dir` errors observed during `list` and
+    /// `list_for_gc` sweeps. Each subdir / entry / metadata failure logs a
+    /// `warn` line AND increments this counter so operators can alert when
+    /// the filesystem state is silently degrading reconciliation results.
+    /// Exposed via [`Self::walk_failures`].
+    walk_failures: Arc<AtomicU64>,
 }
 
 impl FileBlobStore {
@@ -329,7 +354,23 @@ impl FileBlobStore {
             base_dir: base_dir.to_path_buf(),
             prefix_depth,
             key_locks: Arc::new((0..256).map(|_| parking_lot::Mutex::new(())).collect()),
+            walk_failures: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Total number of `walk_dir` errors observed by `list` / `list_for_gc`
+    /// since this store was created (F-G9-017).
+    ///
+    /// A non-zero value indicates the orphan-blob GC sweep produced
+    /// silently-incomplete results: every failed subdir / entry / metadata
+    /// stat means at least one blob was not classified this round. Use as
+    /// an alerting signal: rising values point at filesystem permission or
+    /// I/O degradation that needs operator attention.
+    ///
+    /// Read with [`Ordering::Relaxed`] — this is observability telemetry,
+    /// not a synchronization primitive.
+    pub fn walk_failures(&self) -> u64 {
+        self.walk_failures.load(Ordering::Relaxed)
     }
 
     fn lock_index(key: &[u8; 32]) -> usize {
@@ -357,13 +398,24 @@ impl FileBlobStore {
     /// every txid whose payload **and** sidecar are present, and removing any
     /// `.tmp` upload artefact whose mtime is older than `stale_cutoff`.
     ///
+    /// `min_age_cutoff` is an optional `SystemTime`: when set, blobs whose
+    /// payload mtime is newer than the cutoff are excluded from the returned
+    /// list. Used by the orphan-blob GC sweep (F-G9-004) to skip blobs that
+    /// may belong to an in-flight create whose index registration has not
+    /// landed yet. `None` returns the full set (used by `list()` and
+    /// recovery, which is race-free).
+    ///
     /// Errors from individual directory entries (race with another process
     /// removing the file mid-walk, transient stat failures) are logged at
     /// `warn` and skipped — the GC sweep must make forward progress on
-    /// healthy entries even if one is misbehaving.
+    /// healthy entries even if one is misbehaving. Each such failure also
+    /// increments `walk_failures` so operators can alert on degraded
+    /// filesystem state (F-G9-017).
     fn walk_dir(
         dir: &Path,
         stale_cutoff: std::time::SystemTime,
+        min_age_cutoff: Option<std::time::SystemTime>,
+        walk_failures: &AtomicU64,
         out: &mut Vec<[u8; 32]>,
     ) -> std::io::Result<()> {
         let read_dir = match std::fs::read_dir(dir) {
@@ -375,6 +427,7 @@ impl FileBlobStore {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
+                    walk_failures.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(dir = %dir.display(), err = %e, "blob list: read_dir entry failed");
                     continue;
                 }
@@ -383,12 +436,16 @@ impl FileBlobStore {
             let file_type = match entry.file_type() {
                 Ok(t) => t,
                 Err(e) => {
+                    walk_failures.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(path = %path.display(), err = %e, "blob list: file_type failed");
                     continue;
                 }
             };
             if file_type.is_dir() {
-                if let Err(e) = Self::walk_dir(&path, stale_cutoff, out) {
+                if let Err(e) =
+                    Self::walk_dir(&path, stale_cutoff, min_age_cutoff, walk_failures, out)
+                {
+                    walk_failures.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(path = %path.display(), err = %e, "blob list: subdir walk failed");
                 }
                 continue;
@@ -429,6 +486,29 @@ impl FileBlobStore {
             let meta_path = Self::meta_path_for(&path);
             if !meta_path.exists() {
                 continue;
+            }
+            // F-G9-004: skip blobs that are too fresh to be candidates for
+            // orphan-blob GC. A concurrent create that has just put the blob
+            // but whose index `register` has not landed yet would be
+            // mis-classified as an orphan without this guard.
+            if let Some(cutoff) = min_age_cutoff {
+                let payload_mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
+                // Use the sidecar's mtime too if the payload's is missing or
+                // newer; the later of the two is the right answer (a sidecar
+                // rewrite leaves the payload mtime stale, and vice versa).
+                let meta_mtime = std::fs::metadata(&meta_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                let mtime = match (payload_mtime, meta_mtime) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+                if let Some(mtime) = mtime
+                    && mtime > cutoff
+                {
+                    // Too young — re-examine on the next sweep.
+                    continue;
+                }
             }
             out.push(txid);
         }
@@ -501,51 +581,67 @@ impl FileBlobStore {
 /// then atomically renames to the final blob path on finish. The SHA-256
 /// digest is computed incrementally so streams of arbitrary size do not
 /// require buffering the full payload to hash it at finish time.
+///
+/// `finished` is set true by both [`BlobStreamWriter::finish`] (after a
+/// successful rename) and [`BlobStreamWriter::abort`] (after intentional
+/// teardown), so the `Drop` backstop only removes the `.tmp` file when
+/// neither completion path ran — for example after a panic between
+/// `begin_stream` and the dispatcher's `abort` registration (F-G9-007).
 struct FileStreamWriter {
     key_locks: Arc<Vec<parking_lot::Mutex<()>>>,
     lock_index: usize,
     temp_path: PathBuf,
     final_path: PathBuf,
-    file: std::fs::File,
+    file: Option<std::fs::File>,
     bytes_written: u64,
     hasher: Sha256,
+    finished: bool,
 }
 
 impl BlobStreamWriter for FileStreamWriter {
     fn write_chunk(&mut self, data: &[u8]) -> Result<()> {
-        self.file.write_all(data)?;
+        // F-G9-007: if the underlying write fails (ENOSPC, EIO) the `.tmp`
+        // file is left on disk. The `Drop` impl below removes it as a
+        // backstop if neither `finish` nor `abort` runs. The dispatch path
+        // already calls `abort` on write error (src/server/dispatch.rs).
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| BlobError::Io(std::io::Error::other("stream writer poisoned")))?;
+        file.write_all(data)?;
         self.hasher.update(data);
         self.bytes_written += data.len() as u64;
         Ok(())
     }
 
-    fn finish(self: Box<Self>) -> Result<BlobDigest> {
-        // Decompose the box so we can take ownership of individual fields.
-        let FileStreamWriter {
-            key_locks,
-            lock_index,
-            temp_path,
-            final_path,
-            file,
-            bytes_written,
-            hasher,
-        } = *self;
-        let _guard = key_locks[lock_index].lock();
+    fn finish(mut self: Box<Self>) -> Result<BlobDigest> {
+        let _guard = self.key_locks[self.lock_index].lock();
+        let file = self.file.take().ok_or_else(|| {
+            BlobError::Io(std::io::Error::other("stream writer already finished"))
+        })?;
+        let bytes_written = self.bytes_written;
+        let hasher = std::mem::take(&mut self.hasher);
 
         // 1. fsync the payload temp file, then rename into place.
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temp_path, &final_path)?;
+        std::fs::rename(&self.temp_path, &self.final_path)?;
 
         // 2. Finalize the digest and write the sidecar atomically.
         let mut sha256 = [0u8; 32];
         sha256.copy_from_slice(&hasher.finalize());
         let meta_bytes = encode_meta(&sha256, bytes_written);
-        let meta_path = FileBlobStore::meta_path_for(&final_path);
+        let meta_path = FileBlobStore::meta_path_for(&self.final_path);
         atomic_write_no_dir_fsync(&meta_path, &meta_bytes)?;
 
         // 3. fsync the parent directory so both renames are durable.
-        fsync_parent_dir(&final_path)?;
+        fsync_parent_dir(&self.final_path)?;
+
+        // Mark finished so the Drop backstop does not delete the renamed
+        // payload (the rename moved it out of `temp_path`, but defence in
+        // depth — if a future change keeps the tmp around, the flag
+        // prevents the backstop from racing it).
+        self.finished = true;
 
         Ok(BlobDigest {
             sha256,
@@ -553,10 +649,26 @@ impl BlobStreamWriter for FileStreamWriter {
         })
     }
 
-    fn abort(self: Box<Self>) -> Result<()> {
-        drop(self.file);
+    fn abort(mut self: Box<Self>) -> Result<()> {
+        self.file.take();
         let _ = std::fs::remove_file(&self.temp_path);
+        self.finished = true;
         Ok(())
+    }
+}
+
+/// F-G9-007 backstop: if a `FileStreamWriter` is dropped without `finish`
+/// or `abort` (e.g. after a panic between `begin_stream` and the
+/// dispatcher's stream-registration), remove the `.tmp` file rather than
+/// leaving it on disk until the periodic `list()` sweep collects it five
+/// minutes later. The normal `finish`/`abort` paths set `finished = true`,
+/// so this is purely a safety net.
+impl Drop for FileStreamWriter {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.file.take();
+            let _ = std::fs::remove_file(&self.temp_path);
+        }
     }
 }
 
@@ -586,6 +698,13 @@ impl BlobStore for FileBlobStore {
     }
 
     fn get(&self, key: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        // F-G9-005: take the per-key lock so the payload+sidecar pair we
+        // observe is consistent with whatever writer most recently held the
+        // lock. Without this guard, a concurrent `FileStreamWriter::finish`
+        // that renames the payload before writing its sidecar leaves a brief
+        // window where a reader sees the new payload bytes against a stale
+        // sidecar digest — transient `DigestMismatch` errors.
+        let _guard = self.key_locks[Self::lock_index(key)].lock();
         let path = self.blob_path(key);
         Self::read_and_verify(&path, key)
     }
@@ -594,6 +713,8 @@ impl BlobStore for FileBlobStore {
         // Per the trait doc: verify the full payload digest before slicing.
         // Partial digests would not detect tampering of bytes outside the
         // requested window, so we read+verify the whole payload first.
+        // F-G9-005: per-key lock for the same consistency reason as `get`.
+        let _guard = self.key_locks[Self::lock_index(key)].lock();
         let data = match Self::read_and_verify(&self.blob_path(key), key)? {
             Some(d) => d,
             None => return Ok(None),
@@ -648,17 +769,27 @@ impl BlobStore for FileBlobStore {
 
     fn stream_to(&self, key: &[u8; 32], writer: &mut dyn std::io::Write) -> Result<u64> {
         let path = self.blob_path(key);
-        // Open both the payload and sidecar up front so a missing payload
-        // surfaces NotFound (matching the original behavior) before we try to
-        // verify integrity.
-        let mut file = match std::fs::File::open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(BlobError::NotFound { key: hex_key(key) });
-            }
-            Err(e) => return Err(BlobError::Io(e)),
+        // F-G9-005: take the per-key lock briefly to snapshot a consistent
+        // (open-fd, sidecar) pair. We drop the lock before the long-lived
+        // streaming work — the open file descriptor (inode) is then stable
+        // across any subsequent rename, since Linux's rename-while-open is
+        // inode-based, so the pages we hash in pass 1 and stream in pass 2
+        // are the same bytes as the sidecar read here describes.
+        let (mut file, expected_sha, expected_len) = {
+            let _guard = self.key_locks[Self::lock_index(key)].lock();
+            // Open both the payload and sidecar up front so a missing payload
+            // surfaces NotFound (matching the original behavior) before we try
+            // to verify integrity.
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BlobError::NotFound { key: hex_key(key) });
+                }
+                Err(e) => return Err(BlobError::Io(e)),
+            };
+            let (expected_sha, expected_len) = Self::read_meta(&path, key)?;
+            (file, expected_sha, expected_len)
         };
-        let (expected_sha, expected_len) = Self::read_meta(&path, key)?;
 
         // Pass 1: verify by hashing fixed-size chunks. Do not write to the
         // caller until the full digest has been proven.
@@ -719,9 +850,10 @@ impl BlobStore for FileBlobStore {
             lock_index: Self::lock_index(key),
             temp_path,
             final_path,
-            file,
+            file: Some(file),
             bytes_written: 0,
             hasher: Sha256::new(),
+            finished: false,
         }))
     }
 
@@ -734,7 +866,33 @@ impl BlobStore for FileBlobStore {
         let stale_cutoff = std::time::SystemTime::now()
             .checked_sub(std::time::Duration::from_secs(Self::STALE_TMP_AGE_SECS))
             .unwrap_or(std::time::UNIX_EPOCH);
-        Self::walk_dir(&self.base_dir, stale_cutoff, &mut keys)?;
+        Self::walk_dir(
+            &self.base_dir,
+            stale_cutoff,
+            None,
+            &self.walk_failures,
+            &mut keys,
+        )?;
+        Ok(keys)
+    }
+
+    fn list_for_gc(&self, min_age: std::time::Duration) -> Result<Vec<[u8; 32]>> {
+        let mut keys = Vec::new();
+        let stale_cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(Self::STALE_TMP_AGE_SECS))
+            .unwrap_or(std::time::UNIX_EPOCH);
+        // F-G9-004: blobs whose payload OR sidecar mtime is newer than this
+        // cutoff are excluded from the orphan-blob GC candidate set.
+        let min_age_cutoff = std::time::SystemTime::now()
+            .checked_sub(min_age)
+            .unwrap_or(std::time::UNIX_EPOCH);
+        Self::walk_dir(
+            &self.base_dir,
+            stale_cutoff,
+            Some(min_age_cutoff),
+            &self.walk_failures,
+            &mut keys,
+        )?;
         Ok(keys)
     }
 }
