@@ -63,8 +63,7 @@ fn legacy_freeze_replay_skips_already_spent_slot() {
         .unwrap();
 
     // Append a legacy Freeze entry covering the same slot.
-    let mut log =
-        RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 1024 * 1024).unwrap();
+    let mut log = RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 1024 * 1024).unwrap();
     log.append_and_flush(RedoOp::Freeze {
         tx_key: k,
         offset: 0,
@@ -131,8 +130,7 @@ fn legacy_freeze_replay_applies_on_unspent_slot() {
         )
         .unwrap();
 
-    let mut log =
-        RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 1024 * 1024).unwrap();
+    let mut log = RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 1024 * 1024).unwrap();
     log.append_and_flush(RedoOp::Freeze {
         tx_key: k,
         offset: 0,

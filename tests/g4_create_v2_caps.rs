@@ -22,12 +22,14 @@ fn create_v2_with_too_many_parents_is_rejected_on_reopen() {
     // Append a CreateV2 with parents far above the F-G4-006 cap of 64.
     // The serializer accepts arbitrary lengths (encoder-side trusts
     // callers); the decoder enforces the cap at startup scan.
-    let bad_parents: Vec<[u8; 32]> = (0..200u16).map(|i| {
-        let mut p = [0u8; 32];
-        p[0] = i as u8;
-        p[1] = (i >> 8) as u8;
-        p
-    }).collect();
+    let bad_parents: Vec<[u8; 32]> = (0..200u16)
+        .map(|i| {
+            let mut p = [0u8; 32];
+            p[0] = i as u8;
+            p[1] = (i >> 8) as u8;
+            p
+        })
+        .collect();
 
     log.append_and_flush(RedoOp::CreateV2 {
         tx_key: key(0xAA),

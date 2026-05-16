@@ -135,8 +135,7 @@ fn replay_stops_on_first_fatal_io_error() {
 
     // Two Freeze entries (V2 — has expected_hash to skip the F-G4-005
     // guard so the failure mode we test is pure I/O, not freeze policy).
-    let mut log =
-        RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 1024 * 1024).unwrap();
+    let mut log = RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 1024 * 1024).unwrap();
     log.append_and_flush(RedoOp::FreezeV2 {
         tx_key: key(0xA1),
         offset: 0,
