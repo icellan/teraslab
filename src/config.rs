@@ -1075,7 +1075,8 @@ impl ServerConfig {
         // (`enable_admin_endpoints && enable_remote_bind`), the token must
         // carry enough entropy. A 1-char token over the public internet is
         // brute-forceable in milliseconds. See F-G10-010.
-        if self.enable_admin_endpoints && self.enable_remote_bind
+        if self.enable_admin_endpoints
+            && self.enable_remote_bind
             && let Some(ref t) = self.admin_token
             && !t.is_empty()
             && t.len() < Self::MIN_REMOTE_ADMIN_TOKEN_LEN
@@ -1148,8 +1149,8 @@ impl ServerConfig {
         // device_size must be large enough to hold at least one record's
         // worth of data; the runtime allocator otherwise hits a divide-by-
         // zero. Use UTXO_SLOT_SIZE+METADATA_SIZE as the lower bound here.
-        const MIN_DEVICE_SIZE: u64 = (crate::record::METADATA_SIZE
-            + crate::record::UTXO_SLOT_SIZE) as u64;
+        const MIN_DEVICE_SIZE: u64 =
+            (crate::record::METADATA_SIZE + crate::record::UTXO_SLOT_SIZE) as u64;
         if self.device_size < MIN_DEVICE_SIZE {
             return Err(ConfigError::InvalidSizing(format!(
                 "device_size = {} is below the minimum {} bytes (one record header + slot)",
