@@ -42,10 +42,7 @@ fn build_engine_512_aligned() -> Arc<Engine> {
 }
 
 fn seed_tx(engine: &Engine, tx_id: [u8; 32]) {
-    let hashes: &'static [[u8; 32]] = Box::leak(
-        vec![[0u8; 32]; 1]
-            .into_boxed_slice(),
-    );
+    let hashes: &'static [[u8; 32]] = Box::leak(vec![[0u8; 32]; 1].into_boxed_slice());
     engine
         .create(&CreateRequest {
             tx_id,

@@ -262,7 +262,10 @@ fn delete_does_not_alias_concurrent_create() {
     let cycles = cycles_total.load(Ordering::Relaxed);
     // Guard against a vacuous pass: make sure both sides did real work.
     assert!(reads >= 100, "test did not stress reads enough: {reads}");
-    assert!(cycles >= 20, "test did not stress mutations enough: {cycles}");
+    assert!(
+        cycles >= 20,
+        "test did not stress mutations enough: {cycles}"
+    );
     assert_eq!(
         alias, 0,
         "{alias} reads observed cross-tx aliasing (out of {reads} successful reads, {cycles} delete/create cycles)",

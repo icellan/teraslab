@@ -2042,10 +2042,7 @@ impl Engine {
     ///
     /// If the caller decides not to finalize (e.g., redo flush fails), it
     /// must free the allocated space via `self.allocator.lock().free(offset, size)`.
-    pub fn pre_allocate_create(
-        &self,
-        req: &CreateRequest,
-    ) -> Result<(u64, u32, u64), CreateError> {
+    pub fn pre_allocate_create(&self, req: &CreateRequest) -> Result<(u64, u32, u64), CreateError> {
         let utxo_count = req.utxo_hashes.len() as u32;
         if utxo_count == 0 {
             return Err(CreateError::InvalidUtxoCount);
@@ -2577,16 +2574,18 @@ impl Engine {
         // ops are unreachable-overflow in current code; the explicit
         // check is defense-in-depth for any future change that
         // re-orders the guards.
-        meta.spent_utxos = { meta.spent_utxos }.checked_sub(1).ok_or_else(|| {
-            SpendError::StorageError {
-                detail: "prune_slot_if_spent_by_child: spent_utxos underflow".into(),
-            }
-        })?;
-        meta.pruned_utxos = { meta.pruned_utxos }.checked_add(1).ok_or_else(|| {
-            SpendError::StorageError {
-                detail: "prune_slot_if_spent_by_child: pruned_utxos overflow".into(),
-            }
-        })?;
+        meta.spent_utxos =
+            { meta.spent_utxos }
+                .checked_sub(1)
+                .ok_or_else(|| SpendError::StorageError {
+                    detail: "prune_slot_if_spent_by_child: spent_utxos underflow".into(),
+                })?;
+        meta.pruned_utxos =
+            { meta.pruned_utxos }
+                .checked_add(1)
+                .ok_or_else(|| SpendError::StorageError {
+                    detail: "prune_slot_if_spent_by_child: pruned_utxos overflow".into(),
+                })?;
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = self.now_millis();
         self.write_metadata_fast(entry.record_offset, &meta)?;
@@ -3644,12 +3643,10 @@ impl Engine {
             .lookup(key)
             .ok_or(SpendError::TxNotFound)?;
         let meta = self.read_metadata_for_key(key, entry.record_offset)?;
-        let slots =
-            io::read_all_utxo_slots(&*self.device, entry.record_offset, meta.utxo_count).map_err(
-                |e| SpendError::StorageError {
-                    detail: format!("{e}"),
-                },
-            )?;
+        let slots = io::read_all_utxo_slots(&*self.device, entry.record_offset, meta.utxo_count)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("{e}"),
+            })?;
         // F-G2-001 (re-verify): the slot read above is not held under the
         // stripe lock. A concurrent `delete + create_at_offset` between
         // the metadata check and the slot read can reuse this offset for
@@ -3848,9 +3845,7 @@ impl<'a> ValidatedSpend<'a> {
         let pre_spent = { metadata.spent_utxos };
         let new_spent = pre_spent.checked_add(spent_count).ok_or_else(|| {
             SpendError::StorageError {
-                detail: format!(
-                    "spent_utxos overflow: {pre_spent} + {spent_count} > u32::MAX",
-                ),
+                detail: format!("spent_utxos overflow: {pre_spent} + {spent_count} > u32::MAX",),
             }
         })?;
         if new_spent > { metadata.utxo_count } {
@@ -4168,9 +4163,12 @@ fn write_overflow_entries(
     //   (which only sees the new, smaller size). The allocator free
     //   error is propagated; pre-fix it was swallowed via `let _ =`.
     let offset = if old_offset == 0 {
-        allocator.lock().allocate(new_block_size as u64).map_err(|e| {
-            crate::device::DeviceError::Io(std::io::Error::other(format!("allocator: {e}")))
-        })?
+        allocator
+            .lock()
+            .allocate(new_block_size as u64)
+            .map_err(|e| {
+                crate::device::DeviceError::Io(std::io::Error::other(format!("allocator: {e}")))
+            })?
     } else if new_block_size == old_block_size {
         old_offset
     } else {
