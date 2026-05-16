@@ -222,26 +222,57 @@ impl RedbDahIndex {
     }
 
     /// Return all txids with delete_at_height in `[0, current_height]`.
+    ///
+    /// F-G3-008: every redb read error path now emits a `tracing::error!`
+    /// at `target = "teraslab::index"` before falling back to an empty
+    /// vector. Pre-fix every error was eaten silently — the pruner
+    /// couldn't distinguish "no entries at this height" from "redb read
+    /// failed" and the operator had no log signal of the silent stall.
+    /// The return type stays `Vec<TxKey>` to avoid churning every caller;
+    /// the operator-visible log line is the load-bearing change.
     pub fn range_query(&self, current_height: u32) -> Vec<TxKey> {
         let mut result = Vec::new();
         let txn = match self.db.begin_read() {
             Ok(t) => t,
-            Err(_) => return result,
+            Err(e) => {
+                tracing::error!(
+                    target: "teraslab::index",
+                    err = %e,
+                    "RedbDahIndex::range_query: begin_read failed; returning empty vec",
+                );
+                return result;
+            }
         };
         let table = match txn.open_table(DAH_FORWARD) {
             Ok(t) => t,
-            Err(_) => return result,
+            Err(e) => {
+                tracing::error!(
+                    target: "teraslab::index",
+                    err = %e,
+                    "RedbDahIndex::range_query: open_table failed; returning empty vec",
+                );
+                return result;
+            }
         };
 
         let start = [0u8; 36];
         let end = make_forward_key(current_height, &TxKey { txid: [0xFF; 32] });
 
-        if let Ok(range) = table.range(start..=end) {
-            for (k, _) in range.flatten() {
-                let composite = k.value();
-                let mut txid = [0u8; 32];
-                txid.copy_from_slice(&composite[4..36]);
-                result.push(TxKey { txid });
+        match table.range(start..=end) {
+            Ok(range) => {
+                for (k, _) in range.flatten() {
+                    let composite = k.value();
+                    let mut txid = [0u8; 32];
+                    txid.copy_from_slice(&composite[4..36]);
+                    result.push(TxKey { txid });
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "teraslab::index",
+                    err = %e,
+                    "RedbDahIndex::range_query: table.range failed; returning partial/empty vec",
+                );
             }
         }
         result
