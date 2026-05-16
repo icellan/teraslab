@@ -16,8 +16,11 @@
 //!    blob but the subsequent index registration is rejected (e.g. record
 //!    already exists, replication ACK timeout in `reject` mode).
 //! 3. **Migration cancellation.** A migration target receives the blob bytes
-//!    via `OP_BLOB_PUT` and then the migration is rolled back — the index
-//!    references stamped during apply are reverted, but the blob remains.
+//!    via the streaming opcodes (`OP_STREAM_CHUNK` / `OP_STREAM_END`, see
+//!    `src/protocol/opcodes.rs`) and then the migration is rolled back —
+//!    the index references stamped during apply are reverted, but the blob
+//!    remains. (F-G9-010: there is no separate `OP_BLOB_PUT` opcode; all
+//!    blob ingress uses the streaming path.)
 //!
 //! Without a periodic reconciliation pass these orphans accumulate on disk
 //! forever (audit finding IJK-08). This module implements two reconciliation
