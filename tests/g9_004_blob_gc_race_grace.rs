@@ -41,7 +41,11 @@ fn build_engine() -> Engine {
     Engine::new(device, index, allocator, locks, dah, unmined)
 }
 
-fn blob_path_for(base: &std::path::Path, prefix_depth: usize, key: &[u8; 32]) -> std::path::PathBuf {
+fn blob_path_for(
+    base: &std::path::Path,
+    prefix_depth: usize,
+    key: &[u8; 32],
+) -> std::path::PathBuf {
     let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
     let mut p = base.to_path_buf();
     for i in 0..prefix_depth {
@@ -110,8 +114,7 @@ fn periodic_sweep_deletes_aged_orphan_blob() {
     // Must be classified as orphan and deleted.
     let aged = txid(0xBB);
     store.put(&aged, b"aged orphan").unwrap();
-    let aged_mtime =
-        SystemTime::now() - PERIODIC_GC_MIN_BLOB_AGE - Duration::from_secs(5);
+    let aged_mtime = SystemTime::now() - PERIODIC_GC_MIN_BLOB_AGE - Duration::from_secs(5);
     set_file_mtime(&blob_path_for(&blob_dir, 2, &aged), aged_mtime);
 
     let stats = reconcile_orphan_blobs(&store as &dyn BlobStore, &engine).unwrap();
@@ -133,8 +136,7 @@ fn periodic_sweep_keeps_aged_blob_with_external_flagged_entry() {
 
     let live = txid(0xCC);
     store.put(&live, b"live external").unwrap();
-    let aged_mtime =
-        SystemTime::now() - PERIODIC_GC_MIN_BLOB_AGE - Duration::from_secs(10);
+    let aged_mtime = SystemTime::now() - PERIODIC_GC_MIN_BLOB_AGE - Duration::from_secs(10);
     set_file_mtime(&blob_path_for(&blob_dir, 2, &live), aged_mtime);
 
     // Register the matching primary-index entry with EXTERNAL.

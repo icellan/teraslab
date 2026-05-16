@@ -111,7 +111,9 @@ fn uploader_rolls_back_blob_when_external_ref_write_fails() {
 
     // The upload thread will fail when it tries the device pwrite RMW; the
     // handle surfaces that error.
-    let err = handle.wait().expect_err("upload must fail when device pwrite fails");
+    let err = handle
+        .wait()
+        .expect_err("upload must fail when device pwrite fails");
     let msg = format!("{err}");
     assert!(
         msg.contains("device write failed") || msg.contains("simulated pwrite"),

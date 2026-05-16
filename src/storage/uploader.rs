@@ -140,7 +140,10 @@ impl BlobUploader {
         device: Arc<dyn BlockDevice>,
         capacity: usize,
     ) -> Self {
-        assert!(capacity > 0, "BlobUploader::with_capacity requires capacity > 0");
+        assert!(
+            capacity > 0,
+            "BlobUploader::with_capacity requires capacity > 0"
+        );
         // sync_channel(capacity) is the stdlib's bounded-mpsc primitive. Once
         // `capacity` tasks are queued, additional `send`s block; we use
         // `try_send` in submit() to convert that into an observable

@@ -616,10 +616,9 @@ impl BlobStreamWriter for FileStreamWriter {
 
     fn finish(mut self: Box<Self>) -> Result<BlobDigest> {
         let _guard = self.key_locks[self.lock_index].lock();
-        let file = self
-            .file
-            .take()
-            .ok_or_else(|| BlobError::Io(std::io::Error::other("stream writer already finished")))?;
+        let file = self.file.take().ok_or_else(|| {
+            BlobError::Io(std::io::Error::other("stream writer already finished"))
+        })?;
         let bytes_written = self.bytes_written;
         let hasher = std::mem::take(&mut self.hasher);
 

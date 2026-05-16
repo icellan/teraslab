@@ -53,7 +53,10 @@ fn dropping_stream_writer_without_finish_or_abort_removes_tmp() {
     );
 
     // The blob itself must not be present (we never finished).
-    assert!(store.get(&key).unwrap().is_none(), "blob must not exist after drop without finish");
+    assert!(
+        store.get(&key).unwrap().is_none(),
+        "blob must not exist after drop without finish"
+    );
 }
 
 #[test]
@@ -80,5 +83,8 @@ fn aborted_stream_writer_leaves_no_payload_and_no_tmp() {
     writer.write_chunk(b"will-be-aborted").unwrap();
     writer.abort().unwrap();
 
-    assert!(store.get(&key).unwrap().is_none(), "blob must not exist after abort");
+    assert!(
+        store.get(&key).unwrap().is_none(),
+        "blob must not exist after abort"
+    );
 }
