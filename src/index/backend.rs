@@ -524,12 +524,25 @@ impl PrimaryBackend {
                     detail: format!("zero record_size at allocated offset {offset}"),
                 });
             }
+            // F-G3-014: same record_size/utxo_count cross-check as the
+            // in-memory rebuild path in `Index::rebuild` (src/index/mod.rs).
+            let utxo_count = { meta.utxo_count };
+            let expected_record_size = crate::record::TxMetadata::record_size_for(utxo_count);
+            if record_size != expected_record_size {
+                return Err(IndexError::FormatError {
+                    detail: format!(
+                        "record_size mismatch at allocated offset {offset}: \
+                         declared {record_size}, expected {expected_record_size} \
+                         for utxo_count={utxo_count}"
+                    ),
+                });
+            }
 
             let key = TxKey { txid: meta.tx_id };
             let entry = TxIndexEntry {
                 device_id: 0,
                 record_offset: offset,
-                utxo_count: { meta.utxo_count },
+                utxo_count,
                 block_entry_count: meta.block_entry_count,
                 tx_flags: meta.flags.bits(),
                 spent_utxos: meta.spent_utxos,
@@ -615,12 +628,25 @@ impl PrimaryBackend {
                     detail: format!("zero record_size at allocated offset {offset}"),
                 });
             }
+            // F-G3-014: cross-check `record_size` against the layout
+            // implied by `utxo_count` (same as the other two rebuild paths).
+            let utxo_count = { meta.utxo_count };
+            let expected_record_size = crate::record::TxMetadata::record_size_for(utxo_count);
+            if record_size != expected_record_size {
+                return Err(IndexError::FormatError {
+                    detail: format!(
+                        "record_size mismatch at allocated offset {offset}: \
+                         declared {record_size}, expected {expected_record_size} \
+                         for utxo_count={utxo_count}"
+                    ),
+                });
+            }
 
             let key = TxKey { txid: meta.tx_id };
             let entry = TxIndexEntry {
                 device_id: 0,
                 record_offset: offset,
-                utxo_count: { meta.utxo_count },
+                utxo_count,
                 block_entry_count: meta.block_entry_count,
                 tx_flags: meta.flags.bits(),
                 spent_utxos: meta.spent_utxos,

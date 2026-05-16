@@ -458,12 +458,28 @@ impl Index {
                     detail: format!("zero record_size at allocated offset {offset}"),
                 });
             }
+            // F-G3-014: cross-check `record_size` against the layout
+            // implied by `utxo_count`. A CRC-valid header whose
+            // `record_size` disagrees with `record_size_for(utxo_count)`
+            // is corrupt — advancing by the declared size would skip
+            // legitimate records and produce a quiet partial rebuild.
+            let utxo_count = { meta.utxo_count };
+            let expected_record_size = TxMetadata::record_size_for(utxo_count);
+            if record_size != expected_record_size {
+                return Err(IndexError::FormatError {
+                    detail: format!(
+                        "record_size mismatch at allocated offset {offset}: \
+                         declared {record_size}, expected {expected_record_size} \
+                         for utxo_count={utxo_count}"
+                    ),
+                });
+            }
 
             let key = TxKey { txid: meta.tx_id };
             let entry = TxIndexEntry {
                 device_id: 0,
                 record_offset: offset,
-                utxo_count: { meta.utxo_count },
+                utxo_count,
                 block_entry_count: meta.block_entry_count,
                 tx_flags: meta.flags.bits(),
                 spent_utxos: meta.spent_utxos,
@@ -533,6 +549,21 @@ impl Index {
             if record_size == 0 {
                 return Err(IndexError::FormatError {
                     detail: format!("zero record_size at allocated offset {offset}"),
+                });
+            }
+            // F-G3-014: same cross-check as `Index::rebuild` — a CRC-valid
+            // header whose declared `record_size` disagrees with the
+            // layout implied by `utxo_count` cannot be trusted to advance
+            // the offset correctly.
+            let utxo_count = { meta.utxo_count };
+            let expected_record_size = TxMetadata::record_size_for(utxo_count);
+            if record_size != expected_record_size {
+                return Err(IndexError::FormatError {
+                    detail: format!(
+                        "record_size mismatch at allocated offset {offset}: \
+                         declared {record_size}, expected {expected_record_size} \
+                         for utxo_count={utxo_count}"
+                    ),
                 });
             }
 
@@ -1512,6 +1543,58 @@ mod tests {
                 assert!(
                     detail.contains("corrupt metadata at allocated offset"),
                     "expected CRC-error detail, got: {detail}"
+                );
+                assert!(detail.contains(&offset.to_string()));
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
+    }
+
+    // F-G3-014: a CRC-valid header whose `record_size` disagrees with the
+    // size implied by `utxo_count` must fail the rebuild rather than
+    // advance the scan by the (wrong) declared size — pre-fix the scan
+    // would skip legitimate records and produce a quiet partial rebuild.
+    #[test]
+    fn rebuild_fails_on_record_size_inconsistent_with_utxo_count() {
+        let (dev, alloc, records) = setup_device_with_records(10);
+
+        let offset = records[3].1;
+        let align = dev.alignment();
+        let mut buf = AlignedBuf::new(align, align);
+        dev.pread_exact_at(&mut buf, offset).unwrap();
+
+        // Read the current record_size, then write a value that disagrees
+        // with the layout implied by `meta.utxo_count`. Restamp CRC so
+        // `TxMetadata::from_bytes` accepts the header and the
+        // record_size cross-check is the gate that fires.
+        // `record_size` is the third u32 in the metadata struct:
+        // magic(4) + schema_version(4) = offset 8.
+        let record_size_offset = 8usize;
+        let original = u32::from_le_bytes(
+            buf[record_size_offset..record_size_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        // Pick a deliberately wrong size — half the original is guaranteed
+        // not to match `record_size_for(utxo_count)` because every record
+        // has a non-zero metadata block.
+        let wrong = (original / 2).max(METADATA_SIZE as u32);
+        buf[record_size_offset..record_size_offset + 4].copy_from_slice(&wrong.to_le_bytes());
+        // Restamp CRC (clear the CRC slot before hashing — matches
+        // `TxMetadata::stamp_crc`).
+        let mut hash_buf = [0u8; METADATA_SIZE];
+        hash_buf.copy_from_slice(&buf[..METADATA_SIZE]);
+        hash_buf[CRC32_OFFSET..CRC32_OFFSET + 4].copy_from_slice(&[0u8; 4]);
+        let crc = crc32fast::hash(&hash_buf);
+        buf[CRC32_OFFSET..CRC32_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        dev.pwrite_all_at(&buf, offset).unwrap();
+
+        let err = Index::rebuild(&*dev, &alloc).unwrap_err();
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(
+                    detail.contains("record_size mismatch"),
+                    "expected record_size mismatch detail, got: {detail}"
                 );
                 assert!(detail.contains(&offset.to_string()));
             }
