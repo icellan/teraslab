@@ -353,6 +353,13 @@ impl RedbPrimary {
     ///
     /// **Warning**: For very large indexes (>1M entries), consider using
     /// streaming approaches or batch processing instead.
+    ///
+    /// F-G3-010: the up-front `Vec::with_capacity` is now capped at
+    /// [`Self::ITER_COLLECTED_PREALLOC_CAP`]. The vector still grows on
+    /// demand (so the result is complete), but a multi-billion-entry
+    /// cached `self.count` can no longer reserve `count * 88` bytes in
+    /// a single allocation. Production callers should prefer
+    /// [`Self::iter_streaming`].
     pub fn iter_collected(&self) -> Vec<(TxKey, TxIndexEntry)> {
         if self.count > 1_000_000 {
             tracing::warn!(
@@ -361,7 +368,8 @@ impl RedbPrimary {
                 "redb iter_collected: materializing large entry set in RAM",
             );
         }
-        let mut result = Vec::with_capacity(self.count);
+        let prealloc = self.count.min(Self::ITER_COLLECTED_PREALLOC_CAP);
+        let mut result = Vec::with_capacity(prealloc);
         if let Ok(txn) = self.db.begin_read()
             && let Ok(table) = txn.open_table(PRIMARY_TABLE)
             && let Ok(range) = table.iter()
@@ -374,6 +382,13 @@ impl RedbPrimary {
         }
         result
     }
+
+    /// Hard cap on the up-front `Vec::with_capacity` reservation used by
+    /// [`Self::iter_collected`]. The vector still grows on demand past
+    /// this — the cap only prevents a corrupted-or-attacker-controlled
+    /// `self.count` from driving a single allocation into the tens of
+    /// gigabytes.
+    const ITER_COLLECTED_PREALLOC_CAP: usize = 1_000_000;
 
     /// Iterate over all entries using bounded batches.
     ///
