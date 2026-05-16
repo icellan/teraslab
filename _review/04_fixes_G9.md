@@ -22,7 +22,7 @@ Notes on the baseline (`3c76ecf`):
 ---
 
 ### F-G9-001 — FIXED
-- Commit: pending
+- Commit: 6d8986d
 - Files changed: `tests/g9_001_cold_data_not_found.rs` (new test); code in
   `src/storage/manager.rs:229-253` (new `StorageError::ColdDataNotFound` and
   read-path branch) already present in the baseline snapshot.
@@ -31,3 +31,19 @@ Notes on the baseline (`3c76ecf`):
   `read_cold_data` returns `StorageError::ColdDataNotFound { key: "dead..." }`
   instead of an empty `ColdData`. Matches the recommendation in F-G9-001
   exactly.
+
+### F-G9-002 — FIXED
+- Commit: pending
+- Files changed: `tests/g9_002_content_hash_mismatch.rs` (new test); code
+  (`verify_content_hash` helper + cross-check in `read_cold_data`'s EXTERNAL
+  branch at `src/storage/manager.rs:80-112,251-252`) already present in the
+  baseline snapshot.
+- Tests added:
+  - `tests/g9_002_content_hash_mismatch.rs::blob_payload_disagreeing_with_record_anchored_digest_fails`
+  - `tests/g9_002_content_hash_mismatch.rs::zero_record_anchored_digest_tolerated_for_legacy_records`
+- Notes: the first test simulates a coordinated payload+sidecar swap by
+  stamping the record with the SHA-256 of payload A and then putting payload
+  B in the (Memory) blob store — the in-store digest passes the sidecar
+  check but the record-anchored cross-check catches the swap. The second test
+  confirms the legacy `[0; 32]` placeholder is tolerated with a warn so we do
+  not break upgrades.
