@@ -270,6 +270,11 @@ pub fn decode_spend_batch_checked(
 /// Decode a SpendBatch request payload using the absolute hard cap
 /// [`MAX_DECODE_BATCH`]. Server-side callers should prefer
 /// [`decode_spend_batch_checked`] with the configured `max_batch_size`.
+///
+/// **F-G5-019**: never call this from production server code. The
+/// `dispatch_does_not_use_legacy_unchecked_decoders` regex test enforces
+/// the boundary — production handlers must call the `_checked` variant
+/// so the operator's `max_batch_size` cap is honored.
 pub fn decode_spend_batch(data: &[u8]) -> Option<(SpendBatchParams, Vec<WireSpendItem>)> {
     decode_spend_batch_checked(data, MAX_DECODE_BATCH).ok()
 }
@@ -1179,6 +1184,15 @@ pub fn decode_get_response_checked(
     let count = count as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 4;
+    // F-G5-018: defence-in-depth — track the cumulative sum of per-item
+    // `data_len` and reject when it exceeds the remaining payload. Each
+    // SectionTruncated check below already catches a single oversized
+    // item; the running total catches the corner where every item is
+    // individually small but their sum claims more than the buffer
+    // contains (a hostile server might shape its response this way to
+    // amplify client-side allocation across many small items).
+    let max_total = data.len().saturating_sub(4);
+    let mut total_data_bytes: usize = 0;
     for _ in 0..count {
         if pos + 5 > data.len() {
             return Err(CodecError::SectionTruncated {
@@ -1190,6 +1204,20 @@ pub fn decode_get_response_checked(
         pos += 1;
         let data_len = get_u32(data, pos) as usize;
         pos += 4;
+        // F-G5-018: cumulative tally — see comment above.
+        total_data_bytes =
+            total_data_bytes
+                .checked_add(data_len)
+                .ok_or_else(|| CodecError::SectionTruncated {
+                    need: max_total + 1,
+                    have: max_total,
+                })?;
+        if total_data_bytes > max_total {
+            return Err(CodecError::SectionTruncated {
+                need: 4 + total_data_bytes,
+                have: data.len(),
+            });
+        }
         if pos + data_len > data.len() {
             return Err(CodecError::SectionTruncated {
                 need: pos + data_len,
@@ -1470,7 +1498,12 @@ pub fn decode_redirect(data: &[u8]) -> Option<String> {
     if data.len() < 2 + len {
         return None;
     }
-    Some(String::from_utf8_lossy(&data[2..2 + len]).to_string())
+    // F-G5-021: strict UTF-8 parsing — `from_utf8_lossy` previously
+    // accepted non-UTF-8 bytes by substituting U+FFFD, and the resulting
+    // address then failed `parse::<SocketAddr>()` further down the line.
+    // Match the rest of the codec's strict truncation/parse semantics by
+    // returning `None` on invalid UTF-8.
+    Some(std::str::from_utf8(&data[2..2 + len]).ok()?.to_string())
 }
 
 /// Decode a redirect response payload, recovering the trailing
@@ -1489,7 +1522,8 @@ pub fn decode_redirect_with_version(data: &[u8]) -> Option<(String, Option<u64>)
     if data.len() < 2 + len {
         return None;
     }
-    let addr = String::from_utf8_lossy(&data[2..2 + len]).to_string();
+    // F-G5-021: strict UTF-8 — same fix as decode_redirect above.
+    let addr = std::str::from_utf8(&data[2..2 + len]).ok()?.to_string();
     let tail = &data[2 + len..];
     let version = if tail.is_empty() {
         None
@@ -1792,7 +1826,10 @@ pub fn decode_stream_chunk(payload: &[u8]) -> Option<StreamChunk<'_>> {
     } // 32 + 8 + 4
     let mut txid = [0u8; 32];
     txid.copy_from_slice(&payload[0..32]);
-    let offset = u64::from_le_bytes(payload[32..40].try_into().unwrap());
+    // F-G5-027: use `try_into().ok()?` rather than `.unwrap()` so the
+    // parser hygiene matches the rest of the codec — locally safe today
+    // but unreachable unwraps make future refactors fragile.
+    let offset = u64::from_le_bytes(payload[32..40].try_into().ok()?);
     let data_len = get_u32(payload, 40) as usize;
     if payload.len() < 44 + data_len {
         return None;
@@ -1833,7 +1870,8 @@ pub fn decode_stream_end(payload: &[u8]) -> Option<StreamEnd> {
     }
     let mut txid = [0u8; 32];
     txid.copy_from_slice(&payload[0..32]);
-    let total_size = u64::from_le_bytes(payload[32..40].try_into().unwrap());
+    // F-G5-027: bounds-checked total_size parse — see decode_stream_chunk.
+    let total_size = u64::from_le_bytes(payload[32..40].try_into().ok()?);
     Some(StreamEnd { txid, total_size })
 }
 
@@ -1850,6 +1888,41 @@ mod tests {
         let mut t = [0u8; 32];
         t[0] = n;
         t
+    }
+
+    /// F-G5-019: production server dispatch must never use the legacy
+    /// `Option`-returning wrappers (`decode_spend_batch`, etc.) — those
+    /// fall back to `MAX_DECODE_BATCH = 1 << 20` instead of honoring the
+    /// configured `max_batch_size`. Server code must call the `_checked`
+    /// variants with the operator-supplied cap so an over-large batch is
+    /// rejected before any allocation.
+    ///
+    /// The legacy wrappers stay published for client-side and bench code
+    /// that does not have access to a `ServerConfig`.
+    #[test]
+    fn dispatch_does_not_use_legacy_unchecked_decoders() {
+        let source = include_str!("../server/dispatch.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("dispatch.rs contains production section");
+        let legacy = [
+            "decode_spend_batch(",
+            "decode_set_mined_batch(",
+            "decode_txid_batch(",
+            "decode_slot_item_batch(",
+            "decode_reassign_batch(",
+            "decode_unspend_batch(",
+            "decode_create_batch(",
+            "decode_get_batch(",
+            "decode_get_response(",
+        ];
+        for name in legacy {
+            assert!(
+                !production.contains(name),
+                "production dispatch must use the `_checked` variant, not legacy `{name}`",
+            );
+        }
     }
 
     // -- SpendBatch --

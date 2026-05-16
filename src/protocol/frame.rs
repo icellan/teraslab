@@ -245,6 +245,16 @@ impl ResponseFrame {
 /// Decode multiple frames from a byte stream.
 ///
 /// Returns all complete frames found and the number of bytes consumed.
+///
+/// **Important**: this helper does not distinguish "buffer ends mid-frame
+/// (partial — retry after more bytes arrive)" from "trailing bytes are
+/// invalid (corrupt — caller should disconnect)". Both cases stop the
+/// loop and return `(frames_so_far, pos)`. Callers that need that
+/// distinction should use [`try_decode_frames`], which surfaces the
+/// inner [`FrameError`] for any non-truncated parse failure.
+///
+/// This function is retained only for backwards compatibility with the
+/// existing in-module tests; new code should reach for `try_decode_frames`.
 pub fn decode_frames(data: &[u8]) -> (Vec<RequestFrame>, usize) {
     let mut frames = Vec::new();
     let mut pos = 0;
@@ -258,6 +268,35 @@ pub fn decode_frames(data: &[u8]) -> (Vec<RequestFrame>, usize) {
         }
     }
     (frames, pos)
+}
+
+/// Decode multiple frames from a byte stream, distinguishing partial
+/// reads (retry) from corrupt input (disconnect).
+///
+/// F-G5-020: pre-fix [`decode_frames`] swallowed any inner [`FrameError`],
+/// so a malformed trailing frame was indistinguishable from "the buffer
+/// ends mid-frame, give me more bytes". This helper surfaces the
+/// distinction:
+///
+/// - On [`FrameError::Truncated`] (declared length exceeds the buffer),
+///   returns `Ok((frames_so_far, pos))` — caller refills the buffer.
+/// - On any other [`FrameError`] (`TooShort`, `TooLarge`, `BelowMinimum`),
+///   returns `Err(error)` — the stream is corrupt, the caller must
+///   disconnect rather than retry.
+pub fn try_decode_frames(data: &[u8]) -> Result<(Vec<RequestFrame>, usize)> {
+    let mut frames = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        match RequestFrame::decode(&data[pos..]) {
+            Ok((frame, consumed)) => {
+                frames.push(frame);
+                pos += consumed;
+            }
+            Err(FrameError::Truncated { .. }) => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((frames, pos))
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +447,59 @@ mod tests {
         assert_eq!(frames[0].request_id, 1);
         assert_eq!(frames[1].request_id, 2);
         assert_eq!(consumed, stream.len());
+    }
+
+    /// F-G5-020: `try_decode_frames` returns `Ok` on a truncated tail
+    /// (caller should refill) but propagates other `FrameError`s so a
+    /// corrupt trailing frame is distinguishable from a partial one.
+    #[test]
+    fn try_decode_frames_surfaces_corrupt_trailing_frame() {
+        let f1 = RequestFrame {
+            request_id: 1,
+            op_code: OP_PING,
+            flags: 0,
+            payload: vec![],
+        };
+        let mut stream = f1.encode();
+        // Push a length prefix declaring a frame that exceeds MAX_FRAME_SIZE
+        // — corrupt rather than partial.
+        let too_large_len = (MAX_FRAME_SIZE + 1).to_le_bytes();
+        stream.extend_from_slice(&too_large_len);
+        // Plus a couple of body bytes so the buffer is non-empty after the
+        // length prefix (otherwise the decode reports a different error).
+        stream.extend_from_slice(&[0u8; 32]);
+        match try_decode_frames(&stream) {
+            Err(FrameError::TooLarge { .. }) => {}
+            other => panic!("expected TooLarge error, got {other:?}"),
+        }
+    }
+
+    /// F-G5-020: a real partial tail (declared length exceeds the buffer)
+    /// is reported via `Ok((frames_so_far, pos))` so the caller knows to
+    /// refill the buffer rather than disconnect.
+    #[test]
+    fn try_decode_frames_returns_ok_on_partial_tail() {
+        let f1 = RequestFrame {
+            request_id: 1,
+            op_code: OP_PING,
+            flags: 0,
+            payload: vec![],
+        };
+        let f2_full = RequestFrame {
+            request_id: 2,
+            op_code: OP_HEALTH,
+            flags: 0,
+            payload: vec![42],
+        }
+        .encode();
+        let mut stream = f1.encode();
+        // Append only a prefix of f2 — exercises FrameError::Truncated.
+        stream.extend_from_slice(&f2_full[..f2_full.len() - 2]);
+        let (frames, consumed) =
+            try_decode_frames(&stream).expect("truncated tail should not be a hard error");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].request_id, 1);
+        assert!(consumed < stream.len());
     }
 
     #[test]
