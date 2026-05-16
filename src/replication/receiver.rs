@@ -1855,17 +1855,11 @@ mod tests {
 
         // A reservation that would exceed the cap returns None.
         let huge = reserve_inflight_bytes(RECEIVER_INFLIGHT_BYTES_CAP + 1);
-        assert!(
-            huge.is_none(),
-            "reservation past the cap must fail",
-        );
+        assert!(huge.is_none(), "reservation past the cap must fail",);
 
         // Releasing the small reservation restores the counter.
         drop(small);
-        assert_eq!(
-            RECEIVER_INFLIGHT_BYTES.load(Ordering::Acquire),
-            baseline,
-        );
+        assert_eq!(RECEIVER_INFLIGHT_BYTES.load(Ordering::Acquire), baseline,);
     }
 
     #[test]
@@ -3421,10 +3415,7 @@ mod tests {
             stream_key,
             0,
         );
-        assert_eq!(
-            resp2.status, STATUS_OK,
-            "duplicate batch must still ACK OK",
-        );
+        assert_eq!(resp2.status, STATUS_OK, "duplicate batch must still ACK OK",);
         let meta_after_retry = engine.read_metadata(&k).unwrap();
         assert_eq!(
             { meta_after_retry.spent_utxos },

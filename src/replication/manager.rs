@@ -1495,8 +1495,8 @@ mod tests {
         let metrics_ref = *TEST_METRICS
             .get_or_init(|| Box::leak(Box::new(crate::metrics::ReplicationMetrics::new())));
         crate::metrics::init_replication_metrics(metrics_ref);
-        let metrics = crate::metrics::replication_metrics()
-            .expect("replication metrics installed for test");
+        let metrics =
+            crate::metrics::replication_metrics().expect("replication metrics installed for test");
         let before = metrics.replica_worker_panics_total.get();
 
         let mut mgr = ReplicationManager::new(
