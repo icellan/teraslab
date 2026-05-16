@@ -206,10 +206,7 @@ impl PrimaryBackend {
     /// `Ok(None)` if the key was not present, and an [`IndexError`] if the
     /// redb backend's write transaction fails. The in-memory and
     /// file-backed variants are infallible.
-    pub fn unregister_checked(
-        &mut self,
-        key: &TxKey,
-    ) -> Result<Option<TxIndexEntry>, IndexError> {
+    pub fn unregister_checked(&mut self, key: &TxKey) -> Result<Option<TxIndexEntry>, IndexError> {
         match self {
             Self::InMemory(idx) => Ok(idx.unregister(key)),
             Self::OnDisk(redb) => redb.unregister(key),

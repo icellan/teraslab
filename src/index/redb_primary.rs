@@ -239,10 +239,10 @@ impl RedbPrimary {
         let txn = self.begin_write().map_err(map_redb_txn_err)?;
         let result = {
             let mut table = txn.open_table(PRIMARY_TABLE).map_err(map_redb_table_err)?;
-            match table.remove(key.txid).map_err(map_redb_storage_err)? {
-                Some(guard) => Some(deserialize_entry(&guard.value())),
-                None => None,
-            }
+            table
+                .remove(key.txid)
+                .map_err(map_redb_storage_err)?
+                .map(|guard| deserialize_entry(&guard.value()))
         };
         txn.commit().map_err(map_redb_commit_err)?;
         if result.is_some() {

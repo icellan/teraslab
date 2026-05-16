@@ -331,10 +331,7 @@ impl RedbDahIndex {
     /// Restricted to `pub(crate)` so hot-path callers cannot accidentally
     /// adopt the bulk path and lose the redo-log guarantee that
     /// [`insert`](Self::insert) provides.
-    pub(crate) fn insert_batch(
-        &mut self,
-        entries: &[(u32, TxKey)],
-    ) -> Result<(), IndexError> {
+    pub(crate) fn insert_batch(&mut self, entries: &[(u32, TxKey)]) -> Result<(), IndexError> {
         if entries.is_empty() {
             return Ok(());
         }

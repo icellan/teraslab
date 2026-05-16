@@ -1290,12 +1290,8 @@ mod tests {
     #[test]
     fn locate_unmined_section_skips_forged_magic_when_real_follows() {
         // Build a valid serialized unmined section (the "real" one).
-        let real_entries = vec![
-            (500u32, make_key(1)),
-            (600u32, make_key(2)),
-        ];
-        let real_bytes =
-            serialize_secondary(&UNMINED_SECTION_MAGIC, real_entries.iter().copied());
+        let real_entries = [(500u32, make_key(1)), (600u32, make_key(2))];
+        let real_bytes = serialize_secondary(&UNMINED_SECTION_MAGIC, real_entries.iter().copied());
 
         // Build a poisoned prefix: `UNMI` magic + arbitrary version + count
         // that fits in `data.len()` after the prefix, plus garbage CRC.
@@ -1317,14 +1313,15 @@ mod tests {
         // The scan must return the REAL section's start, not the forged
         // prefix at offset 0.
         let located = locate_unmined_section(&blob);
-        assert!(!located.is_empty(), "expected the real section to be located");
+        assert!(
+            !located.is_empty(),
+            "expected the real section to be located"
+        );
 
         // Confirm by deserializing — if we got the forged prefix, the CRC
         // check would fail; if we got the real one, it should succeed.
-        let (entries, _) =
-            deserialize_secondary(located, &UNMINED_SECTION_MAGIC).expect(
-                "locate must hand back the real, CRC-valid section, not the forged prefix",
-            );
+        let (entries, _) = deserialize_secondary(located, &UNMINED_SECTION_MAGIC)
+            .expect("locate must hand back the real, CRC-valid section, not the forged prefix");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0], (500, make_key(1)));
         assert_eq!(entries[1], (600, make_key(2)));

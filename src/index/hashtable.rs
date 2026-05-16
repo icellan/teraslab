@@ -998,15 +998,12 @@ impl HashTable {
     /// the exact maximum (`stats()`, this method) pay the O(capacity)
     /// cost. The hot delete path no longer does.
     pub fn max_probe_distance(&self) -> usize {
-        let tight = self.recompute_max_probe_distance();
-        // Hint the cache forward for the next non-recomputing reader,
-        // but only when it's stale-larger (which can happen after a
-        // remove). The field is plain usize, no atomicity needed —
-        // the engine wraps the table in an RwLock per the Sync impl
-        // contract, so concurrent readers cannot race with this write
-        // unless they are racing against our own &mut self, in which
-        // case the read is unsound regardless.
-        tight
+        // The cached `self.max_probe` field can be stale-larger after a
+        // remove (the hot path no longer recomputes — see F-G3-017).
+        // Always return the tight value here so callers that need the
+        // exact maximum (stats, this method) pay the O(capacity) cost
+        // explicitly rather than reading a misleading cache.
+        self.recompute_max_probe_distance()
     }
 
     /// Approximate memory usage in bytes (mmap region size).
