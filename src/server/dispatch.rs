@@ -6360,14 +6360,19 @@ fn handle_admin_diagnose_key(
     cluster: Option<&RunningCluster>,
 ) -> ResponseFrame {
     let payload = &req.payload;
-    if payload.len() < 4 {
+    // F-G5-007: route count through the bounds-checked le_u32_at helper
+    // (rather than the panic-on-truncate try_into-expect pattern) so a
+    // future refactor that drops the inline length check cannot panic on
+    // a client-controlled payload. Same change applies to F-G5-009 in
+    // handle_partition_version_report.
+    let Some(count_u32) = le_u32_at(payload, 0) else {
         return error_response(
             req.request_id,
             ERR_INTERNAL,
             "malformed admin diagnose: missing count",
         );
-    }
-    let count = u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes")) as usize;
+    };
+    let count = count_u32 as usize;
     if count as u32 > ADMIN_DIAGNOSE_KEY_MAX_TXIDS {
         return error_response(
             req.request_id,
@@ -6471,14 +6476,18 @@ fn handle_partition_version_report(
 ) -> ResponseFrame {
     // Reject mismatched cluster_key — a stale coordinator must not influence
     // this node's view of the partition map.
-    if req.payload.len() < 8 {
+    // F-G5-009: use le_u64_at instead of the silently-substituted-zero
+    // try_into-unwrap_or pattern that previously parsed a truncated
+    // payload as cluster_key = 0. The preceding length check makes the
+    // path unreachable today but the pattern was inconsistent with the
+    // rest of the dispatcher's helpers.
+    let Some(request_cluster_key) = le_u64_at(&req.payload, 0) else {
         return error_response(
             req.request_id,
             ERR_INTERNAL,
             "malformed partition version report: missing cluster_key",
         );
-    }
-    let request_cluster_key = u64::from_le_bytes(req.payload[0..8].try_into().unwrap_or([0u8; 8]));
+    };
 
     let (self_id, local_cluster_key) = match cluster {
         Some(c) => (c.self_id().0, c.local_cluster_key()),
@@ -6589,6 +6598,19 @@ mod tests {
         assert!(
             !production.contains("try_into().unwrap()"),
             "production dispatch parsers must use checked endian helpers, not try_into().unwrap()",
+        );
+        // F-G5-007: `try_into().expect(...)` is the same panic-on-truncate
+        // pattern under a different macro name; reject both.
+        assert!(
+            !production.contains("try_into().expect("),
+            "production dispatch parsers must use checked endian helpers, not try_into().expect()",
+        );
+        // F-G5-009: `try_into().unwrap_or(...)` silently substitutes the
+        // fallback on a truncated payload, which can bypass downstream
+        // equality / mismatch checks. Use le_u32_at / le_u64_at instead.
+        assert!(
+            !production.contains("try_into().unwrap_or("),
+            "production dispatch parsers must use checked endian helpers, not try_into().unwrap_or()",
         );
     }
 
