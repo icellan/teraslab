@@ -17,9 +17,12 @@ use teraslab::allocator::{
 };
 use teraslab::device::{AlignedBuf, BlockDevice, DeviceError, MemoryDevice};
 use teraslab::index::TxKey;
-use teraslab::io::{read_metadata, write_metadata};
+use teraslab::io::{
+    read_metadata, read_metadata_direct, write_full_record, write_metadata,
+    write_mutation_footer_and_crc_direct, write_mutation_footer_direct,
+};
 use teraslab::locks::StripedLocks;
-use teraslab::record::{GENERATION_ORDER_WINDOW, TxMetadata, generation_target_ahead};
+use teraslab::record::{GENERATION_ORDER_WINDOW, TxMetadata, UtxoSlot, generation_target_ahead};
 
 /// F-G1-007 regression: `MemoryDevice::pread` with an `offset` near
 /// `usize::MAX` plus a non-trivial buffer length must return
@@ -39,6 +42,81 @@ fn memory_device_pread_rejects_offset_buf_overflow() {
             assert_eq!(offset, near_max);
         }
         other => panic!("expected OutOfBounds, got {other:?}"),
+    }
+}
+
+/// F-G1-002 regression: the combined
+/// `write_mutation_footer_and_crc_direct` wrapper must leave the
+/// header in a CRC-validating state — a subsequent
+/// `read_metadata_direct` succeeds rather than returning
+/// `RecordCorruption`. The "primitive footer write WITHOUT CRC
+/// restamp" path leaves the header in a CRC-invalid state if the
+/// caller forgets to follow up; pinning the combined helper's
+/// behaviour ensures the new safe entrypoint cannot regress.
+#[test]
+fn write_mutation_footer_and_crc_round_trips_through_direct_read() {
+    let dev = MemoryDevice::new(64 * 1024, 4096).unwrap();
+
+    // Seed the device with a valid record so the header has a
+    // baseline CRC the read path can validate against later.
+    let mut meta = TxMetadata::new(4);
+    meta.tx_id = [0xA0u8; 32];
+    meta.fee = 1;
+    meta.generation = 1;
+    let slots: Vec<UtxoSlot> = (0..4).map(|i| UtxoSlot::new_unspent([i; 32])).collect();
+    write_full_record(&dev, 0, &meta, &slots).unwrap();
+
+    let raw_ptr = dev.as_raw_ptr().expect("MemoryDevice exposes raw_ptr");
+
+    // Bump generation + updated_at + clear delete_at_height and use the
+    // combined wrapper to write the footer + restamp the CRC.
+    meta.generation = 2;
+    meta.updated_at = 42;
+    meta.delete_at_height = 0;
+    unsafe {
+        write_mutation_footer_and_crc_direct(raw_ptr, 0, &meta);
+    }
+
+    // Direct read must succeed: the CRC-validating read path returns
+    // the new metadata, not RecordCorruption.
+    let read_back = unsafe { read_metadata_direct(raw_ptr as *const u8, 0) }
+        .expect("CRC must validate after combined wrapper");
+    assert_eq!({ read_back.generation }, 2);
+    assert_eq!({ read_back.updated_at }, 42);
+}
+
+/// F-G1-002 regression: the *primitive* footer write WITHOUT the CRC
+/// finalizer leaves the header in a CRC-invalid state — a subsequent
+/// `read_metadata_direct` MUST return `RecordCorruption`. This pins
+/// the failure mode the combined wrapper was introduced to prevent
+/// by omission, and documents why callers must use the
+/// `_and_crc_direct` variant unless they explicitly know they want to
+/// batch several footer writes before stamping the CRC.
+#[test]
+fn primitive_footer_write_without_crc_surfaces_record_corruption() {
+    let dev = MemoryDevice::new(64 * 1024, 4096).unwrap();
+
+    let mut meta = TxMetadata::new(4);
+    meta.tx_id = [0xB0u8; 32];
+    meta.fee = 1;
+    meta.generation = 1;
+    let slots: Vec<UtxoSlot> = (0..4).map(|i| UtxoSlot::new_unspent([i; 32])).collect();
+    write_full_record(&dev, 0, &meta, &slots).unwrap();
+
+    let raw_ptr = dev.as_raw_ptr().expect("MemoryDevice exposes raw_ptr");
+
+    // Mutate generation/updated_at via the primitive — DO NOT stamp
+    // the CRC. The on-disk header bytes change but the CRC slot still
+    // matches the OLD bytes, so the next read must fail loudly.
+    meta.generation = 2;
+    meta.updated_at = 99;
+    unsafe {
+        write_mutation_footer_direct(raw_ptr, 0, &meta);
+    }
+
+    match unsafe { read_metadata_direct(raw_ptr as *const u8, 0) } {
+        Err(DeviceError::RecordCorruption { .. }) => {}
+        other => panic!("primitive footer write without CRC must yield RecordCorruption, got {other:?}"),
     }
 }
 
