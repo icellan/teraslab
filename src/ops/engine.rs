@@ -3533,6 +3533,17 @@ impl Engine {
             return Err(SpendError::UtxoHashMismatch { offset: req.offset });
         }
 
+        // F-G2-001 (re-verify): re-read metadata after the slot read so a
+        // `delete + create_at_offset` race that landed between the
+        // earlier `read_metadata_for_key` and this `read_slot_fast`
+        // surfaces as `TxNotFound` instead of returning a different
+        // transaction's slot data under `key`. The `slot.hash` check
+        // above catches the *type* of aliasing where utxo_hash differs;
+        // this catches the case where another transaction happens to
+        // share a slot hash by accident (small but not zero given
+        // 32-byte preimage-controllable hashes from upstream).
+        let _meta_check = self.read_metadata_for_key(&req.tx_key, ro)?;
+
         let spending_data = match slot.status {
             UTXO_UNSPENT => None,
             UTXO_SPENT | UTXO_FROZEN => Some(slot.spending_data),
@@ -3610,7 +3621,13 @@ impl Engine {
         // Verify the offset still belongs to this key before reading the slot
         // (F-G2-001 second-line defense; subsumes F-G2-010 doc concern).
         let _meta = self.read_metadata_for_key(key, entry.record_offset)?;
-        self.read_slot_fast(entry.record_offset, offset)
+        let slot = self.read_slot_fast(entry.record_offset, offset)?;
+        // F-G2-001 (re-verify): a `delete + create_at_offset` race that
+        // landed between the metadata check and the slot read can give
+        // us another transaction's slot. Re-confirm tx_id ownership of
+        // the offset; a mismatch surfaces as `TxNotFound`.
+        let _meta_check = self.read_metadata_for_key(key, entry.record_offset)?;
+        Ok(slot)
     }
 
     /// Read every UTXO slot for a transaction.
@@ -3627,11 +3644,21 @@ impl Engine {
             .lookup(key)
             .ok_or(SpendError::TxNotFound)?;
         let meta = self.read_metadata_for_key(key, entry.record_offset)?;
-        io::read_all_utxo_slots(&*self.device, entry.record_offset, meta.utxo_count).map_err(|e| {
-            SpendError::StorageError {
-                detail: format!("{e}"),
-            }
-        })
+        let slots =
+            io::read_all_utxo_slots(&*self.device, entry.record_offset, meta.utxo_count).map_err(
+                |e| SpendError::StorageError {
+                    detail: format!("{e}"),
+                },
+            )?;
+        // F-G2-001 (re-verify): the slot read above is not held under the
+        // stripe lock. A concurrent `delete + create_at_offset` between
+        // the metadata check and the slot read can reuse this offset for
+        // a different transaction. Re-read metadata and confirm the
+        // record at `record_offset` still belongs to `key`. A mismatch
+        // surfaces as `TxNotFound` — same outcome the caller would have
+        // seen had they observed the post-unregister state.
+        let _meta_check = self.read_metadata_for_key(key, entry.record_offset)?;
+        Ok(slots)
     }
 
     /// Read one mined-block entry, including entries stored in overflow.
@@ -3666,6 +3693,11 @@ impl Engine {
                 detail: format!("{e}"),
             }
         })?;
+        // F-G2-001 (re-verify): the overflow read is unlocked; a delete +
+        // create_at_offset race between the metadata read and the
+        // overflow read can give us entries from an unrelated record.
+        // Re-check tx_id ownership.
+        let _meta_check = self.read_metadata_for_key(key, entry.record_offset)?;
         Ok(overflow
             .into_iter()
             .find(|entry| entry.block_id == block_id))
