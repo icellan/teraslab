@@ -40,11 +40,23 @@ pub struct SyncFallback {
 }
 
 impl SyncFallback {
-    /// Create a new synchronous fallback. The `_queue_depth` parameter is
-    /// accepted for API compatibility but ignored (no ring to size).
-    pub fn new(_queue_depth: u32) -> Result<Self, std::io::Error> {
+    /// Create a new synchronous fallback.
+    ///
+    /// `queue_depth` pre-sizes the internal pending-op buffer so the first
+    /// batch up to the configured depth does not reallocate. Clamped at
+    /// 4096 to bound worst-case memory if a caller passes an absurd value
+    /// — matches the practical ceiling on the io_uring backend's SQ.
+    ///
+    /// F-G1-011: previously the parameter was ignored entirely
+    /// (`_queue_depth: u32`), so the contract of `create_device_io` —
+    /// where the caller passes a queue depth expecting it to size the
+    /// backend — silently did nothing on the sync path. The cost was a
+    /// few extra `Vec` reallocations on the first batch; the contract
+    /// gap was the bigger concern.
+    pub fn new(queue_depth: u32) -> Result<Self, std::io::Error> {
+        let cap = (queue_depth as usize).min(4096);
         Ok(Self {
-            pending: Vec::new(),
+            pending: Vec::with_capacity(cap),
         })
     }
 }
@@ -335,6 +347,36 @@ mod tests {
     fn sync_submit_noop() {
         let mut io = SyncFallback::new(32).unwrap();
         io.submit().unwrap(); // Should not panic or error
+    }
+
+    /// F-G1-011 regression: `SyncFallback::new(queue_depth)` must
+    /// pre-size the pending-op buffer to honour the documented
+    /// contract that `create_device_io(queue_depth)` sizes the
+    /// backend. Before the fix the parameter was `_queue_depth: u32`
+    /// and the buffer started with capacity zero — the first
+    /// `submit_*` call triggered a `Vec` reallocation that the
+    /// io_uring backend never paid.
+    #[test]
+    fn sync_new_pre_sizes_pending_buffer_to_queue_depth() {
+        let io = SyncFallback::new(128).unwrap();
+        assert!(
+            io.pending.capacity() >= 128,
+            "queue_depth=128 must pre-size pending to >= 128 (got capacity={})",
+            io.pending.capacity()
+        );
+    }
+
+    /// F-G1-011 regression: capacity is clamped at 4096 so a caller
+    /// that passes `queue_depth = u32::MAX` does not try to allocate
+    /// gigabytes of `PendingOp` slots up front.
+    #[test]
+    fn sync_new_clamps_excessive_queue_depth() {
+        let io = SyncFallback::new(u32::MAX).unwrap();
+        assert!(
+            io.pending.capacity() <= 4096,
+            "queue_depth=u32::MAX must clamp to <= 4096 (got capacity={})",
+            io.pending.capacity()
+        );
     }
 
     #[test]
