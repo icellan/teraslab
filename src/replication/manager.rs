@@ -380,6 +380,16 @@ impl ReplicationManager {
             // can fence stale-epoch masters.
             cluster_key: self.current_cluster_key.load(Ordering::Acquire),
         };
+        // F-G7-007: `next_sequence` advances BEFORE the fan-out
+        // result is reconciled. A retry of the same logical ops
+        // therefore lands on a new sequence range (the replica's
+        // dedup tracker stores both ranges as legitimate). This
+        // matches the durable-log invariant — every assigned
+        // sequence is recorded as an intent — and the master's
+        // ReplicationIntentTracker reconciles overlapping ranges
+        // on restart. Do NOT reset `next_sequence` on full failure:
+        // that would let the next batch reuse a sequence the redo
+        // log has already journalled, breaking the invariant.
         self.next_sequence += ops.len() as u64;
 
         let timeout = self.config.replication_timeout;
@@ -1405,6 +1415,52 @@ mod tests {
         .unwrap();
 
         assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
+    }
+
+    /// F-G7-007: when a `WriteAll` batch fails on every replica the
+    /// master's `next_sequence` MUST still advance, so the retried
+    /// ops land on a fresh sequence range. Resetting the cursor on
+    /// failure would let the next batch reuse a sequence the redo
+    /// log has already journalled. The replica's dedup tracker
+    /// stores both ranges as legitimate; the durable-log invariant
+    /// (every assigned sequence recorded as an intent) is preserved.
+    #[test]
+    fn replicate_batch_advances_next_sequence_on_full_failure() {
+        let (mt, _replica_rx) = InMemoryTransport::pair();
+        // Drop the replica side so recv_ack times out.
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteAll,
+                replication_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+            vec![Box::new(mt)],
+        );
+        let initial = mgr.current_sequence();
+        assert_eq!(initial, 1);
+
+        let ops = vec![
+            ReplicaOp::Freeze {
+                tx_key: key(1),
+                offset: 0,
+                master_generation: 0,
+            },
+            ReplicaOp::Freeze {
+                tx_key: key(2),
+                offset: 0,
+                master_generation: 0,
+            },
+        ];
+        let res = mgr.replicate_batch(&ops);
+        assert!(res.is_err(), "fan-out must fail when no replica acks");
+
+        // next_sequence MUST have advanced past the failed batch.
+        assert_eq!(
+            mgr.current_sequence(),
+            initial + ops.len() as u64,
+            "next_sequence must advance even when the fan-out failed",
+        );
     }
 
     /// F-G7-009: a panicking replica worker must:
