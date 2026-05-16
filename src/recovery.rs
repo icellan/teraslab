@@ -1103,7 +1103,22 @@ fn replay_freeze(
     if slot.status == UTXO_FROZEN {
         return ReplayResult::Skipped;
     }
+    // F-G4-005: a legacy Freeze entry (no expected_hash) cannot verify
+    // that the slot at (record_offset, offset) is still the same UTXO
+    // the original Freeze targeted. Conservatively skip replay over
+    // anything other than UNSPENT — SPENT/PRUNED/LOCKED states have
+    // moved on and re-stamping FROZEN would silently overwrite a
+    // status another replay path depends on. Log the unusual case so
+    // operators can correlate with upstream reorderings.
     if slot.status != UTXO_UNSPENT {
+        if expected_hash.is_none() {
+            tracing::warn!(
+                target: "teraslab::recovery",
+                slot_status = slot.status,
+                offset,
+                "F-G4-005: skipping legacy Freeze replay over non-UNSPENT slot",
+            );
+        }
         return ReplayResult::Skipped;
     }
 
