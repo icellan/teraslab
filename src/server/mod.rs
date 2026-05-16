@@ -248,13 +248,12 @@ impl Server {
                         .cluster_secret
                         .as_ref()
                         .map(|s| Arc::new(s.as_bytes().to_vec()));
-                    // F-G5-001 (NEEDS-ORCHESTRATOR): G10 owns
-                    // `ServerConfig::strict_auth` and the `--strict-auth`
-                    // CLI flag. Hardcoded `false` here preserves the
-                    // documented trusted-overlay default; once G10 wires
-                    // the config field, replace this with
-                    // `self.config.strict_auth`.
-                    let strict_auth = false;
+                    // F-G5-001 (CRITICAL): wire G10's `ServerConfig::strict_auth`
+                    // into the connection-handler options. When `true`, any
+                    // inter-node opcode that arrives without a `cluster_secret`
+                    // is rejected with `ERR_CLUSTER_AUTH_FAILED`. Default
+                    // remains `false` (trusted-overlay) per FIX_POLICY §2.
+                    let strict_auth = self.config.strict_auth;
 
                     std::thread::spawn(move || {
                         if let Err(e) = handle_connection_inner(
