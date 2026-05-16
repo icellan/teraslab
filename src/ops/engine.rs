@@ -2686,7 +2686,15 @@ impl Engine {
         parent_key: &TxKey,
         child_txid: [u8; 32],
     ) -> Result<(), SpendError> {
+        // F-G2-005: bound the retry loop. Pre-fix this loop had no cap;
+        // pathological contention (many simultaneous reorgs against the
+        // same parent) could burn allocator/device cycles indefinitely.
+        // 16 retries with exponential back-off (1us..32ms) gives the
+        // contending writers time to drain while still surfacing the
+        // problem to the operator instead of stalling silently.
+        const MAX_RETRIES: u32 = 16;
         let mut intent_logged = false;
+        let mut attempt: u32 = 0;
         loop {
             let (ro, count, offset, mut children) = {
                 let _guard = self.locks.lock(parent_key);
@@ -2780,6 +2788,22 @@ impl Engine {
             }
 
             self.free_conflicting_children_block(new_offset, children.len())?;
+
+            attempt += 1;
+            if attempt >= MAX_RETRIES {
+                return Err(SpendError::StorageError {
+                    detail: format!(
+                        "append_conflicting_child: CAS contention exceeded \
+                         {MAX_RETRIES} retries on parent — likely concurrent \
+                         reorg storm against the same parent record",
+                    ),
+                });
+            }
+            // Exponential back-off (1us → 2us → ... capped at ~32ms) to
+            // give the contending writer a chance to commit so the next
+            // attempt sees a stable snapshot.
+            let backoff_us = 1u64 << attempt.min(15);
+            std::thread::sleep(std::time::Duration::from_micros(backoff_us));
         }
     }
 
