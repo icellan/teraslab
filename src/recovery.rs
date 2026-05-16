@@ -152,6 +152,19 @@ impl RecoveryStats {
     }
 }
 
+/// F-G4-007: classify a replay failure as fatal for the recovery loop.
+///
+/// `MissingPrimary` is benign during idempotent replay (the record was
+/// deleted later in the log, or by a later snapshot) so the loop keeps
+/// going. Any other cause indicates the device or on-disk data is
+/// misbehaving; continuing the replay risks landing later entries on
+/// top of an already-broken intermediate state that
+/// `check_replay_tolerance` cannot roll back.
+#[inline]
+fn is_fatal_replay_cause(cause: ReplayCause) -> bool {
+    !matches!(cause, ReplayCause::MissingPrimary)
+}
+
 /// Replay redo log entries after the last checkpoint.
 ///
 /// For each entry, checks whether the operation has already been applied
@@ -168,7 +181,15 @@ pub fn recover(
         match replay_entry(device, index, entry) {
             ReplayResult::Applied => stats.entries_replayed += 1,
             ReplayResult::Skipped => stats.entries_skipped += 1,
-            ReplayResult::Failed(cause) => stats.record_failure(cause),
+            ReplayResult::Failed(cause) => {
+                stats.record_failure(cause);
+                // F-G4-007: stop on first non-tolerable failure so
+                // subsequent entries cannot land partially-applied
+                // state on top of an already-broken replay.
+                if is_fatal_replay_cause(cause) {
+                    break;
+                }
+            }
         }
     }
 
@@ -400,6 +421,12 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                 | ReplayResult::Skipped
                 | ReplayResult::Failed(ReplayCause::MissingPrimary)
         );
+        // F-G4-007: capture cause BEFORE we move `outcome` into the
+        // match below, so the post-match break can use it.
+        let fatal = matches!(
+            outcome,
+            ReplayResult::Failed(c) if is_fatal_replay_cause(c)
+        );
         match outcome {
             ReplayResult::Applied => stats.entries_replayed += 1,
             ReplayResult::Skipped => stats.entries_skipped += 1,
@@ -416,6 +443,12 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                 last_progress_sequence = entry.sequence;
                 processed_since_progress = 0;
             }
+        }
+        // F-G4-007: stop on first non-tolerable failure so subsequent
+        // entries cannot land partially-applied state on top of an
+        // already-broken intermediate replay.
+        if fatal {
+            break;
         }
     }
 
