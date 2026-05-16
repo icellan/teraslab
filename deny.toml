@@ -1,0 +1,60 @@
+# cargo-deny configuration (F-X-010).
+#
+# Policy guard rails for the dependency graph. Run via:
+#
+#   cargo deny check
+#
+# CI runs this on every PR (see `.github/workflows/ci.yml`). The initial
+# rollout uses `|| true` in CI so this file's rules surface as warnings,
+# not hard failures, while the dependency graph is brought into compliance.
+
+[advisories]
+# Use the staging RustSec advisory database. `cargo audit` runs alongside
+# this; the overlap is intentional defense-in-depth — audit checks the
+# Cargo.lock against the same database, while `deny advisories` enforces
+# the same rules during dependency resolution.
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Yanked crates indicate the maintainer pulled the release for a reason
+# (typically a CVE or correctness bug). Warn so we notice and update.
+yanked = "warn"
+
+[licenses]
+# License allow-list. New crates with licenses outside this list will be
+# flagged. Order matters: more permissive first. Update only after
+# reviewing the new license's terms.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+    "OpenSSL",
+]
+# A confidence threshold below 0.8 usually means the detected license is
+# a fuzzy match — manual review recommended.
+confidence-threshold = 0.8
+
+[bans]
+# Banned crates. None today; placeholder for future policy (e.g. ban
+# `openssl-sys` in favour of `rustls-*`).
+multiple-versions = "warn"
+wildcards = "warn"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# Crates must come from crates.io or an explicitly-allowed git source.
+# This guards against typo-squatting / a malicious git replacement of a
+# well-known crate.
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

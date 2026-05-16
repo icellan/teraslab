@@ -10,7 +10,7 @@
 //! 7. Start TCP server
 //! 8. On shutdown: snapshot index, sync device
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8};
 
@@ -140,9 +140,7 @@ fn main() {
             // operators always see it on bad invocation.
             #[allow(clippy::disallowed_macros)]
             {
-                eprintln!(
-                    "Usage: teraslab-server --config <path.toml> [--strict-auth]"
-                );
+                eprintln!("Usage: teraslab-server --config <path.toml> [--strict-auth]");
             }
             std::process::exit(1);
         }
@@ -601,8 +599,7 @@ fn main() {
     // blobs against the freshly-replayed primary index (R-049). The store is
     // a thin path handle — initialising it does not touch any blob until
     // recovery's `reconcile_blobs_after_recovery` call below.
-    let blob_store: Arc<dyn BlobStore> =
-        Arc::new(FileBlobStore::new(&config.blobstore_path, 2));
+    let blob_store: Arc<dyn BlobStore> = Arc::new(FileBlobStore::new(&config.blobstore_path, 2));
     tracing::info!(path = %config.blobstore_path.display(), "blobstore configured");
 
     // Run recovery if we have a redo log, while indexes are still mutable.
