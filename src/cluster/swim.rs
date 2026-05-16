@@ -36,6 +36,35 @@ const MSG_INDIRECT_ACK: u8 = 5;
 /// any (peer, seq) pair that has been seen before or that falls below
 /// the window's left edge.
 const MAX_MSG_SIZE: usize = 4096;
+
+/// Maximum number of in-flight PING_REQ forwarding entries kept in
+/// [`SwimRunner::ping_req_forwarding`]. Each entry is small (NodeId +
+/// SocketAddr + Instant ≈ 32 bytes) but unbounded growth lets a peer
+/// that floods PING_REQs for non-existent ids drive a slow memory
+/// leak (F-G8-004). At 4096 entries the cap is ~128 KiB, easily two
+/// orders of magnitude beyond a healthy steady-state.
+const PING_REQ_FORWARDING_MAX: usize = 4096;
+
+/// Counter for evicted PING_REQ forwarding entries.
+///
+/// Exposed via [`ping_req_dropped_total`] for observability. Each
+/// time the forwarding map hits [`PING_REQ_FORWARDING_MAX`] and a
+/// new entry pushes out the oldest, this counter increments. A
+/// sustained increase indicates either (a) probes are timing out
+/// without ACKs at scale, or (b) an attacker is flooding PING_REQs
+/// for non-existent NodeIds (F-G8-004).
+static SWIM_PING_REQ_DROPPED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of PING_REQ forwarding entries evicted due to the cap in
+/// [`PING_REQ_FORWARDING_MAX`]. Monotonic counter, process-lifetime.
+///
+/// `target = teraslab::cluster::swim` warn logs are emitted at each
+/// eviction; this counter is the metric form (added locally rather
+/// than touching `metrics.rs`, which is owned by G6).
+pub fn ping_req_dropped_total() -> u64 {
+    SWIM_PING_REQ_DROPPED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
 const MSG_SIZE_WARN_THRESHOLD: usize = MAX_MSG_SIZE * 4 / 5;
 const DEAD_MEMBER_FORGET_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -340,7 +369,14 @@ pub struct SwimRunner {
     probe_round_robin: usize,
     /// Tracks PING_REQ forwarding: maps (original_requester_addr) to pending
     /// indirect probe targets so we can forward ACKs back.
+    ///
+    /// Capped at [`PING_REQ_FORWARDING_MAX`] entries (F-G8-004); when the
+    /// cap is reached, the oldest entry is evicted to make room. The
+    /// FIFO order is tracked by `ping_req_forwarding_order`.
     ping_req_forwarding: HashMap<NodeId, SocketAddr>,
+    /// Insertion-order list parallel to `ping_req_forwarding`, used to
+    /// evict the oldest entry when the cap is hit. Front = oldest.
+    ping_req_forwarding_order: std::collections::VecDeque<NodeId>,
     /// Per-sender monotonic counter for replay defense (F-G8-003).
     ///
     /// Increments once per outgoing SWIM message. The signed payload
@@ -378,6 +414,7 @@ impl SwimRunner {
             pending_probe: None,
             probe_round_robin: 0,
             ping_req_forwarding: HashMap::new(),
+            ping_req_forwarding_order: std::collections::VecDeque::new(),
             next_outbound_seq: 1,
             seen_seq: HashMap::new(),
         }
@@ -627,6 +664,57 @@ impl SwimRunner {
         Ok(())
     }
 
+    /// Bounded-insert wrapper for [`Self::ping_req_forwarding`].
+    ///
+    /// Inserts `(target_id, from_addr)`. If `target_id` was already
+    /// present, replaces the address but does not change FIFO order
+    /// (the existing entry was inserted earlier and will still be
+    /// evicted first when the cap hits). If the map is at the cap
+    /// [`PING_REQ_FORWARDING_MAX`], evicts the oldest entry and
+    /// increments [`SWIM_PING_REQ_DROPPED_TOTAL`].
+    fn ping_req_forwarding_put(&mut self, target_id: NodeId, from_addr: SocketAddr) {
+        if !self.ping_req_forwarding.contains_key(&target_id)
+            && self.ping_req_forwarding.len() >= PING_REQ_FORWARDING_MAX
+        {
+            // Pop oldest until at least one slot is free.
+            while self.ping_req_forwarding.len() >= PING_REQ_FORWARDING_MAX {
+                match self.ping_req_forwarding_order.pop_front() {
+                    Some(oldest) => {
+                        if self.ping_req_forwarding.remove(&oldest).is_some() {
+                            SWIM_PING_REQ_DROPPED_TOTAL
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                evicted = oldest.0,
+                                cap = PING_REQ_FORWARDING_MAX,
+                                "swim: ping_req_forwarding at capacity — evicting oldest entry",
+                            );
+                        }
+                    }
+                    None => break, // Order queue empty (map already drained).
+                }
+            }
+        }
+        if !self.ping_req_forwarding.contains_key(&target_id) {
+            self.ping_req_forwarding_order.push_back(target_id);
+        }
+        self.ping_req_forwarding.insert(target_id, from_addr);
+    }
+
+    /// Remove the entry for `target_id` from the forwarding map and
+    /// the parallel order queue. Returns the requester address if the
+    /// entry existed.
+    fn ping_req_forwarding_take(&mut self, target_id: &NodeId) -> Option<SocketAddr> {
+        let removed = self.ping_req_forwarding.remove(target_id);
+        if removed.is_some() {
+            // O(n) but the queue is bounded by PING_REQ_FORWARDING_MAX
+            // and removal happens once per matched ACK.
+            if let Some(pos) = self.ping_req_forwarding_order.iter().position(|n| n == target_id) {
+                self.ping_req_forwarding_order.remove(pos);
+            }
+        }
+        removed
+    }
+
     fn handle_message(
         &mut self,
         data: &[u8],
@@ -806,7 +894,7 @@ impl SwimRunner {
                 self.pending_probe = None;
             }
             // Check if we should forward this ACK to a requester (PING_REQ flow)
-            if let Some(requester_addr) = self.ping_req_forwarding.remove(&sender_id) {
+            if let Some(requester_addr) = self.ping_req_forwarding_take(&sender_id) {
                 // Forward using MSG_INDIRECT_ACK: header/sender is this relay (UDP source matches),
                 // probed target id is appended so the requester clears pending_probe for the target
                 // without attributing the relay's address to the target in swim_peer_addrs.
@@ -823,8 +911,10 @@ impl SwimRunner {
             // Skip past the piggybacked updates to find the PING_REQ payload
             let target_info = self.parse_ping_req_target(data, ping_req_offset);
             if let Some((target_id, target_swim_addr)) = target_info {
-                // Remember that we need to forward the ACK back to the requester
-                self.ping_req_forwarding.insert(target_id, from_addr);
+                // Remember that we need to forward the ACK back to the requester.
+                // Bounded insert: when the map is at capacity, evict the oldest
+                // entry (F-G8-004) and increment the dropped counter.
+                self.ping_req_forwarding_put(target_id, from_addr);
                 // Send PING to the target
                 let updates = self.collect_member_updates();
                 let ping = self.encode_message(MSG_PING, &updates);
