@@ -490,6 +490,18 @@ pub(crate) fn handle_request(
             if request.flags & FLAG_MIGRATION_BATCH != 0
                 && let Some(cluster) = cluster
             {
+                // F-G5-010: request_id is overloaded to carry the shard
+                // number for migration batches. Reject any caller whose
+                // upper 48 bits are non-zero — that would silently land
+                // on a different shard than the caller intended (typo,
+                // bug, or attacker repurposing the field).
+                if request.request_id >> 16 != 0 {
+                    return error_response(
+                        request.request_id,
+                        ERR_INTERNAL,
+                        "FLAG_MIGRATION_BATCH: request_id must encode shard in low 16 bits",
+                    );
+                }
                 let shard = request.request_id as u16;
                 let already_expected = cluster.inbound_bitmap().test(shard);
                 let should_track_handoff = {
@@ -543,6 +555,17 @@ pub(crate) fn handle_request(
             //   [fence_sequence:8] (optional)    — redo fence sequence for audit
             //   [topology_epoch:8] (optional)    — reject stale migrations
             //   [manifest_hash:32] (optional)    — XOR-hash of (txid, generation) pairs
+            // F-G5-004: reject any caller that sets the upper 48 bits of
+            // request_id. Like FLAG_MIGRATION_BATCH (F-G5-010), the field
+            // is overloaded for shard identity here; a typo or repurposed
+            // id must not silently target an unintended shard.
+            if request.request_id >> 16 != 0 {
+                return error_response(
+                    request.request_id,
+                    ERR_INTERNAL,
+                    "OP_MIGRATION_COMPLETE: request_id must encode shard in low 16 bits",
+                );
+            }
             let shard = request.request_id as u16;
 
             let expected_records = le_u64_at(&request.payload, 0).unwrap_or(0);
