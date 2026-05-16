@@ -842,6 +842,14 @@ pub struct ReplicationMetrics {
     /// diverged from the master without surfacing an error; operators
     /// must investigate any sustained growth.
     pub replica_apply_skipped_missing_tx: PaddedCounter,
+    /// F-G7-008: master-side counter — incremented every time
+    /// `AckTracker::flush_locked` fails to persist the last-ACKed
+    /// map to disk. A non-zero counter means the on-disk view of
+    /// per-replica progress is stale; a master restart will
+    /// re-stream more ops than necessary. Operators should
+    /// investigate disk pressure or permission errors as soon as
+    /// this starts climbing.
+    pub ack_tracker_flush_failures: PaddedCounter,
 }
 
 /// Per-replica drill-down state exposed on `/admin/top`.
@@ -893,6 +901,7 @@ impl ReplicationMetrics {
             leader_sequence: AtomicU64::new(0),
             replica_rejected_stale_cluster_key: PaddedCounter::new(),
             replica_apply_skipped_missing_tx: PaddedCounter::new(),
+            ack_tracker_flush_failures: PaddedCounter::new(),
         }
     }
 
