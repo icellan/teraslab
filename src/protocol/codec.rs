@@ -270,6 +270,11 @@ pub fn decode_spend_batch_checked(
 /// Decode a SpendBatch request payload using the absolute hard cap
 /// [`MAX_DECODE_BATCH`]. Server-side callers should prefer
 /// [`decode_spend_batch_checked`] with the configured `max_batch_size`.
+///
+/// **F-G5-019**: never call this from production server code. The
+/// `dispatch_does_not_use_legacy_unchecked_decoders` regex test enforces
+/// the boundary — production handlers must call the `_checked` variant
+/// so the operator's `max_batch_size` cap is honored.
 pub fn decode_spend_batch(data: &[u8]) -> Option<(SpendBatchParams, Vec<WireSpendItem>)> {
     decode_spend_batch_checked(data, MAX_DECODE_BATCH).ok()
 }
@@ -1860,6 +1865,41 @@ mod tests {
         let mut t = [0u8; 32];
         t[0] = n;
         t
+    }
+
+    /// F-G5-019: production server dispatch must never use the legacy
+    /// `Option`-returning wrappers (`decode_spend_batch`, etc.) — those
+    /// fall back to `MAX_DECODE_BATCH = 1 << 20` instead of honoring the
+    /// configured `max_batch_size`. Server code must call the `_checked`
+    /// variants with the operator-supplied cap so an over-large batch is
+    /// rejected before any allocation.
+    ///
+    /// The legacy wrappers stay published for client-side and bench code
+    /// that does not have access to a `ServerConfig`.
+    #[test]
+    fn dispatch_does_not_use_legacy_unchecked_decoders() {
+        let source = include_str!("../server/dispatch.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("dispatch.rs contains production section");
+        let legacy = [
+            "decode_spend_batch(",
+            "decode_set_mined_batch(",
+            "decode_txid_batch(",
+            "decode_slot_item_batch(",
+            "decode_reassign_batch(",
+            "decode_unspend_batch(",
+            "decode_create_batch(",
+            "decode_get_batch(",
+            "decode_get_response(",
+        ];
+        for name in legacy {
+            assert!(
+                !production.contains(name),
+                "production dispatch must use the `_checked` variant, not legacy `{name}`",
+            );
+        }
     }
 
     // -- SpendBatch --
