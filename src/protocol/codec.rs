@@ -1184,6 +1184,15 @@ pub fn decode_get_response_checked(
     let count = count as usize;
     let mut items = Vec::with_capacity(count);
     let mut pos = 4;
+    // F-G5-018: defence-in-depth — track the cumulative sum of per-item
+    // `data_len` and reject when it exceeds the remaining payload. Each
+    // SectionTruncated check below already catches a single oversized
+    // item; the running total catches the corner where every item is
+    // individually small but their sum claims more than the buffer
+    // contains (a hostile server might shape its response this way to
+    // amplify client-side allocation across many small items).
+    let max_total = data.len().saturating_sub(4);
+    let mut total_data_bytes: usize = 0;
     for _ in 0..count {
         if pos + 5 > data.len() {
             return Err(CodecError::SectionTruncated {
@@ -1195,6 +1204,19 @@ pub fn decode_get_response_checked(
         pos += 1;
         let data_len = get_u32(data, pos) as usize;
         pos += 4;
+        // F-G5-018: cumulative tally — see comment above.
+        total_data_bytes = total_data_bytes.checked_add(data_len).ok_or_else(|| {
+            CodecError::SectionTruncated {
+                need: max_total + 1,
+                have: max_total,
+            }
+        })?;
+        if total_data_bytes > max_total {
+            return Err(CodecError::SectionTruncated {
+                need: 4 + total_data_bytes,
+                have: data.len(),
+            });
+        }
         if pos + data_len > data.len() {
             return Err(CodecError::SectionTruncated {
                 need: pos + data_len,
