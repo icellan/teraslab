@@ -1836,17 +1836,28 @@ impl ClusterCoordinator {
         let preserve_active_workers = migration_workers_can_be_preserved(old_epoch, epoch);
 
         // Determine which existing migrations can be preserved.
+        //
+        // F-G8-005: minimize Mutex hold time during the plan-rebuild.
+        // The dispatch hot path (`dual_write_targets_for_shard`,
+        // `is_migrating_shard`) acquires the same Mutex, and the old
+        // code held it across two full `active_migrations()` scans plus
+        // `cleanup_completed()` (O(NUM_SHARDS)). Refactor: take a single
+        // snapshot under lock, do all filtering / candidate-set
+        // construction with the lock released, then re-acquire only to
+        // apply mutations.
         let preserved_tasks: std::collections::HashSet<(u16, NodeId, NodeId, bool)>;
         {
-            let mut mgr = migration.lock().unwrap();
-            let old_inbound = mgr.inbound_count();
-            let old_active = mgr.active_count();
-            let old_failed = mgr.failed_count();
+            // Phase 1 (short critical section): snapshot the active list
+            // and read counters.
+            let (active_snapshot, old_inbound, old_active, old_failed) = {
+                let mgr = migration.lock().unwrap();
+                let snap: Vec<crate::cluster::migration::MigrationProgress> =
+                    mgr.active_migrations().to_vec();
+                (snap, mgr.inbound_count(), mgr.active_count(), mgr.failed_count())
+            };
 
-            // Identify preservable migrations: active, not complete/failed,
-            // and appearing in the new plan with same source/target.
-            preserved_tasks = mgr
-                .active_migrations()
+            // Phase 2 (no lock held): compute preserved + stale sets.
+            preserved_tasks = active_snapshot
                 .iter()
                 .filter(|p| {
                     preserve_active_workers
@@ -1857,9 +1868,7 @@ impl ClusterCoordinator {
                 .map(|p| (p.shard, p.from_node, p.to_node, p.is_master))
                 .collect();
 
-            // Cancel only non-preserved migrations.
-            let stale_tasks: Vec<MigrationTask> = mgr
-                .active_migrations()
+            let stale_tasks: Vec<MigrationTask> = active_snapshot
                 .iter()
                 .filter(|p| {
                     p.state != crate::cluster::migration::MigrationState::Complete
@@ -1879,15 +1888,15 @@ impl ClusterCoordinator {
                 })
                 .collect();
 
-            for t in &stale_tasks {
-                mgr.mark_failed(t);
+            // Phase 3 (short critical section): apply mutations.
+            {
+                let mut mgr = migration.lock().unwrap();
+                for t in &stale_tasks {
+                    mgr.mark_failed(t);
+                }
+                mgr.clear_inbound();
+                mgr.cleanup_completed();
             }
-
-            // Clear inbound for non-preserved shards only.
-            // We can't selectively clear inbound_migrations easily, so
-            // clear all and re-register preserved ones after.
-            mgr.clear_inbound();
-            mgr.cleanup_completed();
 
             let preserved_count = preserved_tasks.len();
             let cancelled = old_active.saturating_sub(preserved_count);

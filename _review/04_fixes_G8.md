@@ -26,6 +26,12 @@ CRITICAL 1, HIGH 8, MEDIUM 8, LOW 6, INFO 3. Total 26.
 - Test added/extended: `tests/g8_ping_req_cap.rs::ping_req_forwarding_evicts_oldest_under_flood` (4200 inserts → ≥104 evictions).
 - Notes: `ping_req_forwarding` now capped at `PING_REQ_FORWARDING_MAX = 4096`. New parallel `VecDeque<NodeId>` preserves insertion order; when at cap we evict the oldest and increment a process-wide `SWIM_PING_REQ_DROPPED_TOTAL` counter exposed via `cluster::swim::ping_req_dropped_total()`. Counter lives in `swim.rs` rather than `metrics.rs` (owned by G6) — orchestrator can later wire it through the registry.
 
+### F-G8-005 — FIXED
+- Commit: pending
+- Files changed: `src/cluster/coordinator.rs`
+- Test added/extended: `tests/cluster_edge_cases.rs` (existing — same 4 pre-existing failures, 35 pass on baseline and after fix; no new failures).
+- Notes: Refactored `activate_topology_with_view` to release the migration Mutex during the plan-rebuild. Phase 1 takes a single snapshot of `active_migrations()` + counters under lock; phase 2 builds preserved/stale sets with the lock released; phase 3 re-acquires only long enough to call `mark_failed`, `clear_inbound`, `cleanup_completed`. Lock hold time drops from O(NUM_SHARDS) + multiple scans to a single Vec copy + the mutation phase. Dispatch hot path (`dual_write_targets_for_shard`) no longer blocked.
+
 ### F-G8-002 — FIXED
 - Commit: pending
 - Files changed: `tests/g8_split_brain.rs` (covers follower-side check)
