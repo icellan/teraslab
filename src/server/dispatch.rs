@@ -6068,25 +6068,26 @@ fn handle_stream_chunk(
     };
 
     // Get or create the stream session for this txid.
+    //
+    // F-G5-024: collapse the previous Vacant-insert + separate get_mut(...)
+    // .expect("just inserted") pattern into a single branch. The old code
+    // was locally safe (either the entry already existed, or we just
+    // inserted on Ok, or the Err arm returned early) but a future
+    // contributor could add an early return on the Occupied path without
+    // realising the second lookup needs both branches present.
     use std::collections::hash_map::Entry;
-    if let Entry::Vacant(entry) = conn_state.streams.entry(chunk.txid) {
-        match blob_store.begin_stream(&chunk.txid) {
-            Ok(writer) => {
-                entry.insert(super::ActiveStream {
-                    writer,
-                    bytes_received: 0,
-                });
-            }
+    let stream = match conn_state.streams.entry(chunk.txid) {
+        Entry::Occupied(occupied) => occupied.into_mut(),
+        Entry::Vacant(vacant) => match blob_store.begin_stream(&chunk.txid) {
+            Ok(writer) => vacant.insert(super::ActiveStream {
+                writer,
+                bytes_received: 0,
+            }),
             Err(e) => {
                 return error_response(req.request_id, ERR_INTERNAL, &format!("begin_stream: {e}"));
             }
-        }
-    }
-
-    let stream = conn_state
-        .streams
-        .get_mut(&chunk.txid)
-        .expect("just inserted");
+        },
+    };
 
     // Verify chunk offset matches expected position.
     if chunk.offset != stream.bytes_received {
