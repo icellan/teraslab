@@ -11,7 +11,9 @@
 //! ownership scope does not include that file.
 
 use teraslab::device::{AlignedBuf, BlockDevice, DeviceError, MemoryDevice};
+use teraslab::index::TxKey;
 use teraslab::io::{read_metadata, write_metadata};
+use teraslab::locks::StripedLocks;
 use teraslab::record::TxMetadata;
 
 /// F-G1-007 regression: `MemoryDevice::pread` with an `offset` near
@@ -47,6 +49,38 @@ fn memory_device_pwrite_rejects_offset_buf_overflow() {
         }
         other => panic!("expected OutOfBounds, got {other:?}"),
     }
+}
+
+/// F-G1-018 regression: `StripedLocks::stripe_index` must hash off
+/// bytes 16..24 of the txid; replacing the `[0u8; 8] +
+/// copy_from_slice` shape with `try_into().expect(...)` is a pure
+/// codegen change and must not alter the computed stripe for any
+/// txid. Pin a few known inputs against the documented derivation.
+#[test]
+fn stripe_index_matches_documented_byte_range_post_refactor() {
+    let locks = StripedLocks::new(65536);
+
+    // txid with a known little-endian u64 at bytes 16..24.
+    let mut txid = [0u8; 32];
+    txid[16..24].copy_from_slice(&0x0123_4567_89AB_CDEFu64.to_le_bytes());
+    let key = TxKey { txid };
+    let idx = locks.stripe_index(&key);
+    let expected = (0x0123_4567_89AB_CDEFu64 as usize) & (locks.stripe_count() - 1);
+    assert_eq!(
+        idx, expected,
+        "stripe_index must hash bytes 16..24 as u64-LE & mask"
+    );
+
+    // Distinct bytes 0..15 must not affect the stripe (bytes 16..24 are
+    // the only input).
+    let mut txid2 = [0xFFu8; 32];
+    txid2[16..24].copy_from_slice(&0x0123_4567_89AB_CDEFu64.to_le_bytes());
+    let key2 = TxKey { txid: txid2 };
+    assert_eq!(
+        locks.stripe_index(&key2),
+        idx,
+        "stripe_index must ignore bytes outside 16..24"
+    );
 }
 
 /// F-G1-008 regression: `read_metadata` must round-trip a header
