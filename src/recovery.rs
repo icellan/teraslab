@@ -702,7 +702,8 @@ fn apply_replay_dah_patch(metadata: &mut TxMetadata, patch: &DahPatch) {
     if patch.last_spent_all {
         metadata.flags |= TxFlags::LAST_SPENT_ALL;
     } else {
-        metadata.flags -= metadata.flags & TxFlags::LAST_SPENT_ALL;
+        // F-G4-015: use the idiomatic bitflags clear pattern.
+        metadata.flags.remove(TxFlags::LAST_SPENT_ALL);
     }
 }
 
@@ -1563,7 +1564,8 @@ fn replay_metadata_op(
             if *value {
                 meta.flags |= TxFlags::CONFLICTING;
             } else {
-                meta.flags -= meta.flags & TxFlags::CONFLICTING;
+                // F-G4-015: idiomatic bitflags clear.
+                meta.flags.remove(TxFlags::CONFLICTING);
             }
             // R-013: propagate write failure.
             if io::write_metadata(device, ie.record_offset, &meta).is_err() {
@@ -1590,7 +1592,8 @@ fn replay_metadata_op(
                     meta.delete_at_height = 0;
                 }
             } else {
-                meta.flags -= meta.flags & TxFlags::LOCKED;
+                // F-G4-015: idiomatic bitflags clear.
+                meta.flags.remove(TxFlags::LOCKED);
             }
             // R-013: propagate write failure.
             if io::write_metadata(device, ie.record_offset, &meta).is_err() {
@@ -1980,7 +1983,8 @@ fn replay_compensate_set_locked(
     if prior_locked {
         meta.flags |= TxFlags::LOCKED;
     } else {
-        meta.flags -= meta.flags & TxFlags::LOCKED;
+        // F-G4-015: idiomatic bitflags clear.
+        meta.flags.remove(TxFlags::LOCKED);
     }
     meta.delete_at_height = prior_delete_at_height;
 
