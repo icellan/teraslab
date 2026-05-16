@@ -2618,6 +2618,17 @@ pub(crate) fn encode_traceparent(ctx: &WireTraceContext) -> String {
 ///
 /// Returns a guarded span that — when dropped — ends the span. Callers keep
 /// the guard alive for the duration of their handler body.
+///
+/// # Verified — F-G6-013 (positive verification)
+///
+/// The span carries exactly one attribute: `route`, a `&'static str`
+/// constant chosen at the call site (e.g. `"/metrics"`, `"/admin/top"`).
+/// No user-controlled input — txid, peer address, raw header value,
+/// request body — is ever attached to this span. Operators deploying
+/// OTLP exporters can rely on the fact that span attributes do not
+/// leak request payloads. Future PRs that add dynamic span fields
+/// here MUST re-audit (see also `metrics::tests` for the parallel
+/// label-cardinality invariant).
 pub(crate) fn http_span_for(headers: &HeaderMap, route: &'static str) -> tracing::Span {
     use opentelemetry::trace::TraceContextExt;
     use tracing_opentelemetry::OpenTelemetrySpanExt;

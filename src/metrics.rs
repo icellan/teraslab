@@ -2,6 +2,21 @@
 //!
 //! Thread-local counters avoid atomic contention. Cache-line padding
 //! prevents false sharing between cores.
+//!
+//! # Verified — F-G6-022 (positive verification, label-cardinality bound)
+//!
+//! Every labelled metric in this file is keyed by a fixed-cardinality
+//! enum with a `const all()` slice — [`Outcome`], [`OpCode`],
+//! [`MigrationLabel`], [`UringErrClass`], [`SwimChurnKind`]. No metric
+//! is ever labelled by a user-controlled string (client IP, request
+//! path, txid, peer address). Prometheus label cardinality is therefore
+//! bounded at compile time, which is load-bearing for the scrape
+//! cost / dashboard correctness contract.
+//!
+//! Future PRs that add a `.with_label_values(...)` style API or a
+//! `String`-keyed label MUST re-audit this invariant. The matching
+//! HTTP-side check lives in [`crate::server::http::http_span_for`]
+//! (F-G6-013), which keeps OTLP span attributes equally bounded.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
