@@ -824,9 +824,30 @@ impl SlotAllocator {
     fn replay_allocate(&mut self, offset: u64, size: u64) -> bool {
         let aligned_size = self.align_up(size);
         let Some(end) = offset.checked_add(aligned_size) else {
+            tracing::error!(
+                target = "teraslab::allocator",
+                offset,
+                size,
+                "replay_allocate: redo entry has overflowing offset+size — dropped as corrupt",
+            );
             return false;
         };
         if aligned_size == 0 || offset < self.data_region_start || end > self.device_size {
+            // F-G1-015: distinguish "corrupt redo entry rejected" from
+            // "idempotent no-op". A redo entry whose offset/size falls
+            // outside the data region is a sign the log was tampered or
+            // corrupted; recovery should not silently discard it. We
+            // still return `false` (the caller's contract) but emit an
+            // observable error so the operator sees the rejection.
+            tracing::error!(
+                target = "teraslab::allocator",
+                offset,
+                size,
+                aligned_size,
+                data_region_start = self.data_region_start,
+                device_size = self.device_size,
+                "replay_allocate: redo entry outside data region or zero-sized — dropped as corrupt",
+            );
             return false;
         }
 
@@ -889,14 +910,27 @@ impl SlotAllocator {
     fn replay_free(&mut self, offset: u64, size: u64) -> bool {
         let aligned_size = self.align_up(size);
         if aligned_size == 0 {
+            tracing::error!(
+                target = "teraslab::allocator",
+                offset,
+                size,
+                "replay_free: redo entry has zero aligned size — dropped as corrupt",
+            );
             return false;
         }
         let Some(end) = offset.checked_add(aligned_size) else {
+            tracing::error!(
+                target = "teraslab::allocator",
+                offset,
+                size,
+                "replay_free: redo entry has overflowing offset+size — dropped as corrupt",
+            );
             return false;
         };
 
         // Idempotency: if the region is entirely inside an existing free
-        // region, skip.
+        // region, skip. This is the legitimate "already applied" path —
+        // no error log.
         if let Some((prev_off, prev_sz)) = self.freelist.prev_before(offset + 1)
             && prev_off <= offset
             && prev_off.saturating_add(prev_sz) >= end
@@ -904,24 +938,52 @@ impl SlotAllocator {
             return false;
         }
 
-        // Safety: reject frees outside the valid data region silently —
-        // a corrupt redo entry must not bring the allocator to an
-        // inconsistent state.
+        // F-G1-015: reject frees outside the valid data region — distinct
+        // from the idempotent no-op above. Log as a corrupt-entry
+        // rejection so the operator can see that recovery dropped
+        // entries.
         if offset < self.data_region_start || end > self.device_size {
+            tracing::error!(
+                target = "teraslab::allocator",
+                offset,
+                size,
+                aligned_size,
+                data_region_start = self.data_region_start,
+                device_size = self.device_size,
+                "replay_free: redo entry outside data region — dropped as corrupt",
+            );
             return false;
         }
 
-        // Reject partial overlaps. Idempotent contained frees were handled
-        // above; any remaining overlap would create intersecting freelist
-        // regions and allow a later allocation to hand out live space.
+        // F-G1-015: reject partial overlaps with existing free regions.
+        // Idempotent contained frees were handled above; any remaining
+        // overlap would create intersecting freelist regions and allow a
+        // later allocation to hand out live space. Log as a corrupt-
+        // entry rejection rather than the silent return-false in the
+        // earlier code.
         if let Some((prev_off, prev_sz)) = self.freelist.prev_before(offset + 1)
             && prev_off.saturating_add(prev_sz) > offset
         {
+            tracing::error!(
+                target = "teraslab::allocator",
+                offset,
+                size,
+                conflicting_offset = prev_off,
+                conflicting_size = prev_sz,
+                "replay_free: redo entry partially overlaps existing free region (prev) — dropped",
+            );
             return false;
         }
         if let Some((next_off, _)) = self.freelist.next_from(offset)
             && next_off < end
         {
+            tracing::error!(
+                target = "teraslab::allocator",
+                offset,
+                size,
+                conflicting_offset = next_off,
+                "replay_free: redo entry partially overlaps existing free region (next) — dropped",
+            );
             return false;
         }
 
