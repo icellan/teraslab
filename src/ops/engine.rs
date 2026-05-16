@@ -1020,6 +1020,20 @@ impl Engine {
         let mut idempotent_count: u32 = 0;
 
         for item in &req.spends {
+            // F-G2-002: reject the reserved all-`0xFF` sentinel before any
+            // slot read. Recorded as a per-item error so the rest of the
+            // batch can still succeed (deterministic by idx); a single
+            // malformed item must not abort the whole batch.
+            if item.spending_data == [FROZEN_BYTE; 36] {
+                errors.insert(
+                    item.idx,
+                    SpendError::ReservedSpendingData {
+                        offset: item.offset,
+                    },
+                );
+                continue;
+            }
+
             if item.offset >= utxo_count {
                 errors.insert(
                     item.idx,
@@ -1144,6 +1158,16 @@ impl Engine {
     /// Inlines the validate-and-apply logic for exactly one UTXO,
     /// avoiding the `Vec` and ordered-map allocations that `spend_multi` uses.
     pub fn spend(&self, req: &SpendRequest) -> Result<SpendResponse, SpendError> {
+        // F-G2-002: reject the all-`0xFF` reserved sentinel up front. That
+        // byte pattern is the on-disk frozen marker; accepting it under
+        // `status=UTXO_SPENT` would let any client permanently brick the
+        // UTXO against unspend (frozen-marker short-circuit) and unfreeze
+        // (rejects non-`UTXO_FROZEN` status). The 36-byte payload is also
+        // not a valid BSV `txid + vin` — txid cannot be all `0xFF`.
+        if req.spending_data == [FROZEN_BYTE; 36] {
+            return Err(SpendError::ReservedSpendingData { offset: req.offset });
+        }
+
         let _guard = self.locks.lock(&req.tx_key);
 
         // 1. Index lookup

@@ -6228,6 +6228,13 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
         SpendError::StorageError { .. } => (ERR_INTERNAL, vec![]),
         SpendError::DahOverflow { .. } => (ERR_INTERNAL, vec![]),
         SpendError::ReassignOverflow { .. } => (ERR_INTERNAL, vec![]),
+        // F-G2-002: reserved frozen-sentinel rejection. Reuses
+        // `ERR_INVALID_SPEND` — semantically the request is malformed
+        // (caller asked us to write the on-disk frozen marker as the
+        // spender). No new wire opcode is added; the client can
+        // distinguish via the empty payload (real `InvalidSpend` carries
+        // the 36-byte `spending_data`).
+        SpendError::ReservedSpendingData { .. } => (ERR_INVALID_SPEND, vec![]),
     };
     BatchItemError {
         item_index,
@@ -6266,7 +6273,10 @@ pub(crate) fn classify_spend_error(err: &SpendError) -> crate::metrics::Outcome 
         | SpendError::ReassignOverflow { .. } => Outcome::ErrStorage,
         SpendError::CoinbaseImmature { .. }
         | SpendError::UtxoNotFound { .. }
-        | SpendError::UtxoHashMismatch { .. } => Outcome::Other,
+        | SpendError::UtxoHashMismatch { .. }
+        // F-G2-002: reserved-sentinel rejection is a request-shape error,
+        // grouped with the other "Other" bucket entries.
+        | SpendError::ReservedSpendingData { .. } => Outcome::Other,
     }
 }
 
