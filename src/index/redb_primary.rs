@@ -27,6 +27,25 @@ const ITER_BATCH_SIZE: usize = 8;
 ///
 /// Each mutation is a separate write transaction committed to disk. Reads use
 /// MVCC snapshots and do not block writes.
+///
+/// # Concurrency
+///
+/// Every `&mut self` method (`register`, `unregister`, `register_batch`,
+/// `unregister_batch`, `update_cached_fields`, `update_cached_fields_batch`,
+/// etc.) performs a read-modify-write sequence whose `self.count` cache is
+/// updated AFTER the redb commit. Two concurrent writers racing on the same
+/// row would observe each other's redb state via MVCC but could clobber the
+/// cached count.
+///
+/// Callers MUST hold an exclusive lock — e.g. `RwLock::write()` — around the
+/// `PrimaryBackend` for the duration of every `&mut self` call. The engine
+/// satisfies this with a per-dataset `RwLock<PrimaryBackend>`; bare
+/// `RedbPrimary` outside that wrapper is not safe for concurrent mutation.
+///
+/// `&self` methods (`lookup`, `iter_streaming`, `len`) are safe to call
+/// concurrently with each other via redb's MVCC, but the engine still
+/// gates them behind `RwLock::read()` so they cannot race against an
+/// in-flight `&mut self` write.
 pub struct RedbPrimary {
     db: Database,
     /// Cached entry count, maintained on insert/remove to avoid table scans.
