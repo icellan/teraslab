@@ -14,7 +14,7 @@ use teraslab::device::{AlignedBuf, BlockDevice, DeviceError, MemoryDevice};
 use teraslab::index::TxKey;
 use teraslab::io::{read_metadata, write_metadata};
 use teraslab::locks::StripedLocks;
-use teraslab::record::TxMetadata;
+use teraslab::record::{GENERATION_ORDER_WINDOW, TxMetadata, generation_target_ahead};
 
 /// F-G1-007 regression: `MemoryDevice::pread` with an `offset` near
 /// `usize::MAX` plus a non-trivial buffer length must return
@@ -35,6 +35,31 @@ fn memory_device_pread_rejects_offset_buf_overflow() {
         }
         other => panic!("expected OutOfBounds, got {other:?}"),
     }
+}
+
+/// F-G1-019 regression: `generation_target_ahead` must be symmetrically
+/// classified as not-ahead when the two generations are exactly
+/// `GENERATION_ORDER_WINDOW` (2^31) apart in either direction. Existing
+/// in-crate tests pin one direction (`generation_target_ahead(0, 1<<31)`);
+/// this fills in the converse (`generation_target_ahead(1<<31, 0)`) so the
+/// ambiguity-handling contract is locked from both sides.
+///
+/// The constant doc warns that retaining more than `2^31 - 1` outstanding
+/// mutations on a single record makes wrap classification ambiguous. The
+/// test does not assert anything about the warning path (no metric is
+/// wired yet — flagged as a future observability follow-up in the review);
+/// it pins the function's classification only.
+#[test]
+fn generation_symmetric_ambiguity_at_half_window() {
+    let half = GENERATION_ORDER_WINDOW;
+    assert!(
+        !generation_target_ahead(0, half),
+        "delta == 2^31 must be classified as not-ahead (target after local)"
+    );
+    assert!(
+        !generation_target_ahead(half, 0),
+        "delta == 2^31 must be classified as not-ahead in the converse direction too"
+    );
 }
 
 /// F-G1-017 regression: `MemoryDevice::size()` must agree with the
