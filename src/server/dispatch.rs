@@ -13006,10 +13006,16 @@ mod tests {
         );
 
         assert_eq!(resp.status, STATUS_OK);
+        // F-G4-001: each effective flush emits two device syncs (one
+        // for the entries pwrite, one for the persisted-header rewrite
+        // carrying the new `next_sequence`). Two effective flushes
+        // (allocator reservations + CreateV2 WAL) therefore produce
+        // four device syncs.
         assert_eq!(
             redo_dev.sync_count() - before_syncs,
-            2,
-            "create batch should fsync once for allocator reservations and once for CreateV2 WAL"
+            4,
+            "create batch should fsync twice for allocator reservations \
+             and twice for CreateV2 WAL (entries + F-G4-001 header per flush)"
         );
 
         let entries = redo_log.lock().recover().unwrap();
