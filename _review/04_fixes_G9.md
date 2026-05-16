@@ -47,3 +47,20 @@ Notes on the baseline (`3c76ecf`):
   check but the record-anchored cross-check catches the swap. The second test
   confirms the legacy `[0; 32]` placeholder is tolerated with a warn so we do
   not break upgrades.
+
+### F-G9-003 — FIXED
+- Commit: pending
+- Files changed: `src/storage/uploader.rs`, `src/storage/blobstore.rs`,
+  `tests/g9_003_uploader_bounded_queue.rs`.
+- Tests added:
+  - `tests/g9_003_uploader_bounded_queue.rs::submit_returns_uploader_queue_full_when_saturated`
+  - `tests/g9_003_uploader_bounded_queue.rs::default_capacity_matches_documented_constant`
+- Notes: replaced `std::sync::mpsc::channel` with `std::sync::mpsc::sync_channel`
+  bounded by `DEFAULT_UPLOADER_QUEUE_CAPACITY = 1024`. `submit` uses
+  `try_send` and returns the new `BlobError::UploaderQueueFull` variant on a
+  full queue, also incrementing a `queue_full_count` atomic counter (exposed
+  via `BlobUploader::queue_full_count()`) and emitting a `tracing::warn!` at
+  `target = "teraslab::storage::uploader"` so operators can wire it to an
+  alert. The test wedges the background thread with a custom `BlobStore`
+  whose `put` spins on a release flag, then asserts saturation produces the
+  documented error.

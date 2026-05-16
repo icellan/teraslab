@@ -14,6 +14,7 @@ use crate::device::BlockDevice;
 use crate::record::ExternalRef;
 use crate::storage::blobstore::{BlobError, BlobStore};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Handle returned by [`BlobUploader::submit`] to track upload progress.
 ///
@@ -67,25 +68,79 @@ struct UploadTask {
     handle: Arc<UploadHandleInner>,
 }
 
+/// Default bound on the asynchronous upload queue.
+///
+/// F-G9-003: the original implementation used an unbounded
+/// [`std::sync::mpsc::channel`]. Under bursty external-tier load a fast
+/// producer could grow the queue without limit, each task carrying a
+/// multi-MiB `Vec<u8>` payload — memory exhaustion was just a matter of
+/// time. We cap at 1024 in-flight tasks; oversubscribed callers receive
+/// [`BlobError::UploaderQueueFull`] and can apply backpressure (retry,
+/// fail, or fall back to a synchronous upload).
+pub const DEFAULT_UPLOADER_QUEUE_CAPACITY: usize = 1024;
+
 /// Background blob uploader that processes external-tier uploads without
 /// blocking the creation path.
 ///
 /// Spawns a dedicated thread that drains the upload queue. After each
 /// successful upload, the `ExternalRef` fields are pwritten into the
 /// record's metadata region.
+///
+/// # Backpressure (F-G9-003)
+///
+/// The internal channel is bounded by [`DEFAULT_UPLOADER_QUEUE_CAPACITY`] (or
+/// the value passed to [`BlobUploader::with_capacity`]). When `submit` finds
+/// the queue full it returns [`BlobError::UploaderQueueFull`] immediately —
+/// no blocking, no silent buffering — and increments the
+/// [`BlobUploader::queue_full_count`] counter so an operator-visible metric
+/// makes the saturation event observable.
 pub struct BlobUploader {
-    sender: std::sync::mpsc::Sender<UploadTask>,
+    sender: std::sync::mpsc::SyncSender<UploadTask>,
     _handle: std::thread::JoinHandle<()>,
+    /// Configured queue capacity, retained for diagnostic error messages.
+    capacity: usize,
+    /// Monotonic count of [`submit`](Self::submit) calls that were rejected
+    /// because the queue was full. Exposed via [`Self::queue_full_count`] for
+    /// observability dashboards. Storing the counter on the uploader (rather
+    /// than registering it with the global metrics subsystem) keeps the
+    /// uploader self-contained — the parent server can read and expose it as
+    /// it pleases.
+    queue_full_count: Arc<AtomicU64>,
 }
 
 impl BlobUploader {
-    /// Create a new blob uploader with a background upload thread.
+    /// Create a new blob uploader with a background upload thread and the
+    /// default queue capacity ([`DEFAULT_UPLOADER_QUEUE_CAPACITY`]).
     ///
     /// # Parameters
     /// - `blob_store`: the external blob store to upload to
     /// - `device`: the NVMe device (for pwriting ExternalRef into metadata)
     pub fn new(blob_store: Arc<dyn BlobStore>, device: Arc<dyn BlockDevice>) -> Self {
-        let (task_tx, task_rx) = std::sync::mpsc::channel::<UploadTask>();
+        Self::with_capacity(blob_store, device, DEFAULT_UPLOADER_QUEUE_CAPACITY)
+    }
+
+    /// Create a new blob uploader with a custom queue capacity.
+    ///
+    /// `capacity` is the maximum number of in-flight upload tasks; once this
+    /// many tasks are queued, [`submit`](Self::submit) returns
+    /// [`BlobError::UploaderQueueFull`] until the background thread drains
+    /// at least one task. Callers that want to retry should back off — the
+    /// underlying channel does not signal completion via the queue depth.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is zero. Use [`Self::new`] for the safe default.
+    pub fn with_capacity(
+        blob_store: Arc<dyn BlobStore>,
+        device: Arc<dyn BlockDevice>,
+        capacity: usize,
+    ) -> Self {
+        assert!(capacity > 0, "BlobUploader::with_capacity requires capacity > 0");
+        // sync_channel(capacity) is the stdlib's bounded-mpsc primitive. Once
+        // `capacity` tasks are queued, additional `send`s block; we use
+        // `try_send` in submit() to convert that into an observable
+        // backpressure error rather than a hidden producer stall.
+        let (task_tx, task_rx) = std::sync::mpsc::sync_channel::<UploadTask>(capacity);
 
         let handle = std::thread::Builder::new()
             .name("blob-uploader".into())
@@ -97,7 +152,23 @@ impl BlobUploader {
         Self {
             sender: task_tx,
             _handle: handle,
+            capacity,
+            queue_full_count: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Total number of [`submit`](Self::submit) calls that were rejected
+    /// because the upload queue was full.
+    ///
+    /// Read with [`Ordering::Relaxed`] — this is observability telemetry, not
+    /// a synchronization primitive.
+    pub fn queue_full_count(&self) -> u64 {
+        self.queue_full_count.load(Ordering::Relaxed)
+    }
+
+    /// Configured maximum number of in-flight upload tasks.
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Upload processing loop — runs in the background thread.
@@ -185,23 +256,37 @@ impl BlobUploader {
     ) -> std::result::Result<UploadHandle, BlobError> {
         let (handle, inner) = UploadHandle::new();
 
-        self.sender
-            .send(UploadTask {
-                tx_id,
-                record_offset,
-                data,
-                inputs_len,
-                outputs_len,
-                handle: inner,
-            })
-            .map_err(|_| {
-                BlobError::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "uploader thread has exited",
-                ))
-            })?;
+        let task = UploadTask {
+            tx_id,
+            record_offset,
+            data,
+            inputs_len,
+            outputs_len,
+            handle: inner,
+        };
 
-        Ok(handle)
+        // F-G9-003: try_send is non-blocking. A full queue must surface as an
+        // observable backpressure signal (UploaderQueueFull), not silently
+        // block the caller's request thread.
+        match self.sender.try_send(task) {
+            Ok(()) => Ok(handle),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                let prev = self.queue_full_count.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    target: "teraslab::storage::uploader",
+                    capacity = self.capacity,
+                    queue_full_count = prev + 1,
+                    "blob uploader queue full; rejecting submit with backpressure",
+                );
+                Err(BlobError::UploaderQueueFull {
+                    queued: self.capacity,
+                    capacity: self.capacity,
+                })
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(BlobError::Io(
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "uploader thread has exited"),
+            )),
+        }
     }
 }
 

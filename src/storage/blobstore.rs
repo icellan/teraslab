@@ -42,6 +42,15 @@ pub enum BlobError {
     /// The sidecar metadata file is missing, truncated, or malformed.
     #[error("blob meta missing or invalid for {key}")]
     InvalidMeta { key: String },
+    /// The asynchronous blob uploader's bounded task queue is full.
+    ///
+    /// Returned by [`crate::storage::uploader::BlobUploader::submit`] when the
+    /// in-flight queue is saturated. Callers should apply backpressure (retry
+    /// with delay, fail the request, or fall back to a synchronous upload) —
+    /// the original unbounded channel let memory grow without limit under
+    /// bursty external-tier load (F-G9-003).
+    #[error("uploader queue full ({queued} tasks queued; capacity {capacity})")]
+    UploaderQueueFull { queued: usize, capacity: usize },
 }
 
 pub type Result<T> = std::result::Result<T, BlobError>;
