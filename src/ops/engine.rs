@@ -3746,9 +3746,35 @@ impl<'a> ValidatedSpend<'a> {
 
         crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterDataPwrite);
 
-        // 7. Update metadata
+        // 7. Update metadata. F-G2-007: switch the spent counter to a
+        // checked add and verify it stays within `utxo_count`. Pre-fix
+        // the `wrapping_add` would silently mask a violation of the
+        // invariant `spent_utxos <= utxo_count` (e.g. if on-device
+        // metadata was somehow corrupted with a high `spent_utxos`
+        // value but still passed CRC). The wrap then misled
+        // `delete_eval`'s `all_spent` check and could prematurely
+        // declare the record DAH-eligible. Today no reachable path
+        // produces that input — duplicate offsets are absorbed into
+        // the already-spent branches in `validate_spend_multi` — but
+        // surfacing the invariant violation loudly is cheap insurance.
         let old_dah = { metadata.delete_at_height };
-        metadata.spent_utxos = { metadata.spent_utxos }.wrapping_add(spent_count);
+        let pre_spent = { metadata.spent_utxos };
+        let new_spent = pre_spent.checked_add(spent_count).ok_or_else(|| {
+            SpendError::StorageError {
+                detail: format!(
+                    "spent_utxos overflow: {pre_spent} + {spent_count} > u32::MAX",
+                ),
+            }
+        })?;
+        if new_spent > { metadata.utxo_count } {
+            return Err(SpendError::StorageError {
+                detail: format!(
+                    "spent_utxos invariant violated: {new_spent} > utxo_count={}",
+                    { metadata.utxo_count },
+                ),
+            });
+        }
+        metadata.spent_utxos = new_spent;
         metadata.generation = { metadata.generation }.wrapping_add(1);
         metadata.updated_at = engine.now_millis();
 
