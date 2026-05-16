@@ -451,7 +451,7 @@ pub(crate) fn handle_request(
         }
         OP_GET_BATCH => handle_get_batch(request, engine, max_batch_size, cluster),
         OP_GET_SPEND_BATCH => handle_get_spend_batch(request, engine, max_batch_size, cluster),
-        OP_QUERY_OLD_UNMINED => handle_query_old_unmined(request, engine),
+        OP_QUERY_OLD_UNMINED => handle_query_old_unmined(request, engine, cluster),
         OP_PRESERVE_TRANSACTIONS => {
             handle_preserve_transactions(request, engine, max_batch_size, cluster, redo_log)
         }
@@ -5546,7 +5546,20 @@ fn handle_get_batch(
 /// runs. The result is not a read lock over subsequent engine mutations:
 /// concurrent set-mined/mark-longest-chain updates may become visible
 /// immediately after this response is assembled.
-fn handle_query_old_unmined(req: &RequestFrame, engine: &Engine) -> ResponseFrame {
+///
+/// F-G5-003: in cluster mode, the response is filtered to keys whose
+/// shard this node is master of. Pre-fix the handler walked the entire
+/// local unmined index and returned every txid below `cutoff`, which
+/// disclosed the unmined-pool view of shards this node only held as a
+/// replica (or stale data from before a migration). With cluster
+/// information available, only locally-mastered keys are returned;
+/// in single-node mode (`cluster = None`) the full index is returned
+/// as before.
+fn handle_query_old_unmined(
+    req: &RequestFrame,
+    engine: &Engine,
+    cluster: Option<&RunningCluster>,
+) -> ResponseFrame {
     // Payload: [cutoff_height:4]
     if req.payload.len() < 4 {
         return error_response(req.request_id, ERR_INTERNAL, "malformed query");
@@ -5557,6 +5570,14 @@ fn handle_query_old_unmined(req: &RequestFrame, engine: &Engine) -> ResponseFram
     let candidates = engine.unmined_index().range_query(cutoff);
     let mut keys = Vec::with_capacity(candidates.len());
     for key in candidates {
+        // F-G5-003: skip keys this node does not master. Single-node mode
+        // (no cluster) keeps the prior behaviour.
+        if let Some(c) = cluster {
+            match c.is_master(&key) {
+                crate::cluster::coordinator::MasterQueryResult::Yes => {}
+                _ => continue,
+            }
+        }
         match engine.read_metadata(&key) {
             Ok(meta) if { meta.preserve_until } == 0 => keys.push(key),
             Ok(_) => {}
