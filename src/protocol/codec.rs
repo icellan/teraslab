@@ -1792,7 +1792,10 @@ pub fn decode_stream_chunk(payload: &[u8]) -> Option<StreamChunk<'_>> {
     } // 32 + 8 + 4
     let mut txid = [0u8; 32];
     txid.copy_from_slice(&payload[0..32]);
-    let offset = u64::from_le_bytes(payload[32..40].try_into().unwrap());
+    // F-G5-027: use `try_into().ok()?` rather than `.unwrap()` so the
+    // parser hygiene matches the rest of the codec — locally safe today
+    // but unreachable unwraps make future refactors fragile.
+    let offset = u64::from_le_bytes(payload[32..40].try_into().ok()?);
     let data_len = get_u32(payload, 40) as usize;
     if payload.len() < 44 + data_len {
         return None;
@@ -1833,7 +1836,8 @@ pub fn decode_stream_end(payload: &[u8]) -> Option<StreamEnd> {
     }
     let mut txid = [0u8; 32];
     txid.copy_from_slice(&payload[0..32]);
-    let total_size = u64::from_le_bytes(payload[32..40].try_into().unwrap());
+    // F-G5-027: bounds-checked total_size parse — see decode_stream_chunk.
+    let total_size = u64::from_le_bytes(payload[32..40].try_into().ok()?);
     Some(StreamEnd { txid, total_size })
 }
 
