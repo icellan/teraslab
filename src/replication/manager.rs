@@ -178,6 +178,29 @@ impl ReplicaSender {
 }
 
 /// Orchestrates replication to multiple replicas.
+///
+/// # Concurrency contract (F-G7-019)
+///
+/// `ReplicationManager` is **not** internally synchronized. Every
+/// state-mutating method (`replicate_batch`, `run_catchup`,
+/// `check_reconnected`, `mark_replica_live`, `set_replica_node_id`,
+/// `install_resync_request_channel`) takes `&mut self` so Rust's
+/// borrow checker enforces single-threaded access at compile time.
+///
+/// Callers that share a `ReplicationManager` between the
+/// coordinator (which calls `mark_replica_live` from the topology
+/// loop) and the replication hot path (which calls `replicate_batch`
+/// from the dispatch thread) **MUST** wrap it in an external
+/// `Mutex<ReplicationManager>` (or equivalent) so the two paths
+/// observe a consistent sender table. Without that, the compiler
+/// will refuse to compile a shared reference; with it, the lock
+/// linearizes the state transitions.
+///
+/// The manager intentionally does NOT internalize a `Mutex<Senders>`
+/// because (a) callers already need an external mutex to serialize
+/// the dispatch thread's borrow of the senders' transports during
+/// the parallel fan-out, and (b) doubling up locks would force the
+/// hot path to traverse a mutex on every batch.
 pub struct ReplicationManager {
     senders: Vec<ReplicaSender>,
     config: ReplicationConfig,
