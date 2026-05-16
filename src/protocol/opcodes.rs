@@ -365,6 +365,13 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 
 /// Opcodes that carry cluster authority and therefore require HMAC framing
 /// whenever a `cluster_secret` is configured.
+///
+/// F-G5-005: `OP_ADMIN_DIAGNOSE_KEY` and `OP_ADMIN_CLUSTER_HEALTH` are
+/// included because they expose cluster-internal routing state
+/// (per-key master id, topology epoch, pending-inbound flags, SWIM
+/// state). Treating them as inter-node opcodes closes the
+/// reconnaissance surface that previously let any TCP client on the
+/// public port enumerate the cluster's routing tables.
 pub fn is_inter_node_auth_opcode(op_code: u16) -> bool {
     matches!(
         op_code,
@@ -377,6 +384,8 @@ pub fn is_inter_node_auth_opcode(op_code: u16) -> bool {
             | OP_TOPOLOGY_VOTE
             | OP_TOPOLOGY_COMMIT
             | OP_PARTITION_VERSION_REPORT
+            | OP_ADMIN_DIAGNOSE_KEY
+            | OP_ADMIN_CLUSTER_HEALTH
     )
 }
 
