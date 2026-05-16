@@ -111,6 +111,21 @@ impl TopologyTerm {
     }
 
     /// Deserialize from the wire.
+    ///
+    /// F-G5-002: the `count` field is a client-supplied `u32` and the
+    /// subsequent `count * 8` multiplication previously ran without
+    /// `checked_mul`. The size check downstream (`data.len() < members_end
+    /// + 32`) bounded the practical maximum to ~`MAX_FRAME_SIZE / 8` (≈2M
+    /// members), far above any legitimate production cluster (dozens of
+    /// nodes). Combined with F-G5-001's no-secret auth bypass, an
+    /// unauthenticated peer could drive a 16 MiB pre-allocation per
+    /// connection. Two defences:
+    ///
+    ///   1. `MAX_TOPOLOGY_MEMBERS` named cap rejected before any sizing
+    ///      arithmetic.
+    ///   2. `checked_mul` on `count * 8` so 32-bit targets do not
+    ///      silently overflow into a tiny `members_end` that bypasses
+    ///      the size check.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
         if data.len() < 20 {
             return None;
@@ -118,8 +133,11 @@ impl TopologyTerm {
         let term = u64::from_le_bytes(data[0..8].try_into().ok()?);
         let proposer = NodeId(u64::from_le_bytes(data[8..16].try_into().ok()?));
         let count = u32::from_le_bytes(data[16..20].try_into().ok()?) as usize;
-        let members_end = 20 + count * 8;
-        if data.len() < members_end + 32 {
+        if count > MAX_TOPOLOGY_MEMBERS {
+            return None;
+        }
+        let members_end = 20usize.checked_add(count.checked_mul(8)?)?;
+        if data.len() < members_end.checked_add(32)? {
             return None;
         }
         let mut members = Vec::with_capacity(count);
@@ -139,6 +157,14 @@ impl TopologyTerm {
         })
     }
 }
+
+/// F-G5-002: hard cap on the number of cluster members a single
+/// topology frame may declare. Set well above any plausible production
+/// cluster size (dozens of nodes) so legitimate traffic is unaffected,
+/// but well below the per-frame envelope (`MAX_FRAME_SIZE / 8`) so an
+/// attacker who fits within the outer frame cap cannot still drive a
+/// multi-megabyte `Vec<NodeId>` pre-allocation.
+pub const MAX_TOPOLOGY_MEMBERS: usize = 1024;
 
 /// A node's response to a topology proposal.
 #[derive(Debug, Clone)]
@@ -237,13 +263,26 @@ impl TopologyCommit {
     }
 
     /// Deserialize from the wire.
+    ///
+    /// F-G5-002: bound voter count via `MAX_TOPOLOGY_MEMBERS` and use
+    /// `checked_mul` / `checked_add` arithmetic so a client-supplied
+    /// `count` cannot drive unbounded `Vec::with_capacity` or wrap
+    /// `usize` on 32-bit targets. The same defence is applied to
+    /// `TopologyTerm::deserialize` above.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
         let term = TopologyTerm::deserialize(data)?;
-        let voters_pos = 20 + term.members.len() * 8 + 32;
-        let voters = if data.len() >= voters_pos + 4 {
+        let voters_pos = 20usize
+            .checked_add(term.members.len().checked_mul(8)?)?
+            .checked_add(32)?;
+        let voters = if data.len() >= voters_pos.checked_add(4)? {
             let count =
                 u32::from_le_bytes(data[voters_pos..voters_pos + 4].try_into().ok()?) as usize;
-            let voters_end = voters_pos + 4 + count * 8;
+            if count > MAX_TOPOLOGY_MEMBERS {
+                return None;
+            }
+            let voters_end = voters_pos
+                .checked_add(4)?
+                .checked_add(count.checked_mul(8)?)?;
             if data.len() < voters_end {
                 return None;
             }
@@ -2339,5 +2378,49 @@ mod tests {
             retry.is_none(),
             "retry must refuse non-monotonic observed membership",
         );
+    }
+
+    /// F-G5-002: an attacker-supplied member count above
+    /// `MAX_TOPOLOGY_MEMBERS` must be rejected before any
+    /// `Vec::with_capacity` allocation.
+    #[test]
+    fn topology_term_deserialize_rejects_oversized_member_count() {
+        // Build a payload that advertises (MAX_TOPOLOGY_MEMBERS + 1) members
+        // but does not actually carry the bytes for them. The cap should
+        // reject the frame before the size check or the allocation.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&7u64.to_le_bytes()); // term
+        buf.extend_from_slice(&1u64.to_le_bytes()); // proposer
+        let oversized = (MAX_TOPOLOGY_MEMBERS + 1) as u32;
+        buf.extend_from_slice(&oversized.to_le_bytes());
+        // No member bytes, no digest — but the cap rejects before any of
+        // that matters.
+        assert!(TopologyTerm::deserialize(&buf).is_none());
+    }
+
+    /// F-G5-002: a member count exactly at the cap must still succeed
+    /// (round-trip serialise/deserialise) so legitimate large clusters
+    /// are not accidentally broken.
+    #[test]
+    fn topology_term_deserialize_accepts_count_at_cap() {
+        let ids: Vec<u64> = (0..MAX_TOPOLOGY_MEMBERS as u64).collect();
+        let term = TopologyTerm::new(1, members(&ids), NodeId(0));
+        let bytes = term.serialize();
+        let decoded = TopologyTerm::deserialize(&bytes).expect("at-cap term should decode");
+        assert_eq!(decoded.members.len(), MAX_TOPOLOGY_MEMBERS);
+        assert_eq!(decoded.term, 1);
+    }
+
+    /// F-G5-002: voter list in TopologyCommit shares the same cap so a
+    /// commit frame cannot drive a multi-megabyte voter allocation either.
+    #[test]
+    fn topology_commit_deserialize_rejects_oversized_voter_count() {
+        let term = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1));
+        let mut bytes = term.serialize();
+        // Append voter section claiming MAX_TOPOLOGY_MEMBERS + 1 voters
+        // without their bytes.
+        let oversized = (MAX_TOPOLOGY_MEMBERS + 1) as u32;
+        bytes.extend_from_slice(&oversized.to_le_bytes());
+        assert!(TopologyCommit::deserialize(&bytes).is_none());
     }
 }
