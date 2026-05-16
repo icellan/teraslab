@@ -37,6 +37,17 @@ fn memory_device_pread_rejects_offset_buf_overflow() {
     }
 }
 
+/// F-G1-017 regression: `MemoryDevice::size()` must agree with the
+/// underlying Vec's length. Pre-fix the device cached a `raw_len`
+/// snapshot at construction; this test exercises the single-
+/// source-of-truth path that survives any future `resize` because
+/// the field was removed.
+#[test]
+fn memory_device_size_matches_underlying_storage() {
+    let dev = MemoryDevice::new(16 * 1024, 4096).unwrap();
+    assert_eq!(dev.size(), 16 * 1024);
+}
+
 /// F-G1-007 regression: same for `MemoryDevice::pwrite`.
 #[test]
 fn memory_device_pwrite_rejects_offset_buf_overflow() {

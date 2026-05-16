@@ -336,8 +336,13 @@ pub struct MemoryDevice {
     data: parking_lot::RwLock<Vec<u8>>,
     /// Stable pointer into the Vec's heap allocation. Valid for the lifetime
     /// of this device because the Vec is never resized after construction.
+    ///
+    /// F-G1-017: paired `raw_len` was removed — `size()` now derives the
+    /// length from `data.read().len()` so there is one source of truth.
+    /// The Vec is still never resized after construction; the field
+    /// could come back if a future `MemoryDevice::resize` lands, but
+    /// then both pointer AND length must be updated together.
     raw_ptr: *mut u8,
-    raw_len: usize,
     alignment: usize,
 }
 
@@ -362,11 +367,9 @@ impl MemoryDevice {
         validate_alignment(alignment)?;
         let mut data = vec![0u8; size as usize];
         let raw_ptr = data.as_mut_ptr();
-        let raw_len = data.len();
         Ok(Self {
             data: parking_lot::RwLock::new(data),
             raw_ptr,
-            raw_len,
             alignment,
         })
     }
@@ -445,7 +448,12 @@ impl BlockDevice for MemoryDevice {
     }
 
     fn size(&self) -> u64 {
-        self.raw_len as u64
+        // F-G1-017: single source of truth — derive from the Vec's
+        // length. The Vec is never resized after construction, so this
+        // is observationally the same value the construction-time
+        // `raw_len` snapshot used to carry, just without the drift
+        // risk if a future `resize` is added.
+        self.data.read().len() as u64
     }
 
     fn sync(&self) -> Result<()> {
