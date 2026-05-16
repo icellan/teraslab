@@ -20,7 +20,62 @@ use crate::replication::protocol::{ReplicaAck, ReplicaBatch, ReplicaOp};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+/// F-G7-003: cap on aggregate in-flight bytes across all
+/// standalone-receiver connections. The standalone
+/// [`ReplicationReceiver`] does its own inline frame buffering
+/// outside the main server's bytes-limiter. Without an aggregate
+/// cap, N concurrent peers can each force a [`MAX_FRAME_SIZE`]
+/// allocation BEFORE the HMAC verification step runs — trivial
+/// DoS for unauthenticated cluster traffic.
+///
+/// 256 MiB is generous enough for many concurrent replicas while
+/// still bounding worst-case memory pressure. Once the cap is
+/// reached new connection handlers refuse the frame and close
+/// the connection.
+const RECEIVER_INFLIGHT_BYTES_CAP: usize = 256 * 1024 * 1024;
+
+/// Aggregate counter of bytes currently held in the standalone
+/// [`ReplicationReceiver`]'s per-connection frame buffers
+/// (F-G7-003).
+static RECEIVER_INFLIGHT_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII guard that decrements [`RECEIVER_INFLIGHT_BYTES`] on drop.
+/// Returned from [`reserve_inflight_bytes`] when the reservation
+/// succeeds; the per-connection handler holds the guard for the
+/// lifetime of the frame's body buffer.
+struct InflightBytesGuard {
+    bytes: usize,
+}
+
+impl Drop for InflightBytesGuard {
+    fn drop(&mut self) {
+        RECEIVER_INFLIGHT_BYTES.fetch_sub(self.bytes, Ordering::Release);
+    }
+}
+
+/// Attempt to reserve `bytes` against the aggregate cap. Returns
+/// `Some(guard)` on success (caller drops the guard to release),
+/// `None` when the reservation would exceed `RECEIVER_INFLIGHT_BYTES_CAP`.
+fn reserve_inflight_bytes(bytes: usize) -> Option<InflightBytesGuard> {
+    // Use a CAS loop so concurrent reservations stay accurate.
+    let mut current = RECEIVER_INFLIGHT_BYTES.load(Ordering::Acquire);
+    loop {
+        if current.saturating_add(bytes) > RECEIVER_INFLIGHT_BYTES_CAP {
+            return None;
+        }
+        match RECEIVER_INFLIGHT_BYTES.compare_exchange_weak(
+            current,
+            current + bytes,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(InflightBytesGuard { bytes }),
+            Err(actual) => current = actual,
+        }
+    }
+}
 
 /// Default stream key used when a receiver has not been told to
 /// discriminate by peer address. Chosen as a short literal so the
@@ -254,7 +309,24 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
     // own deduplication state. Re-using the same key across reconnects
     // from the same peer intentionally preserves last_applied_seq.
     let stream_key = peer_addr.to_string();
-    let mut body = Vec::new();
+    // F-G7-003: wrap the per-connection body buffer so its growth
+    // is tracked against `RECEIVER_INFLIGHT_BYTES_CAP`. Dropping
+    // `body` (when this function returns) releases the reservation.
+    struct CountedBody {
+        buf: Vec<u8>,
+        reserved: usize,
+    }
+    impl Drop for CountedBody {
+        fn drop(&mut self) {
+            if self.reserved > 0 {
+                RECEIVER_INFLIGHT_BYTES.fetch_sub(self.reserved, Ordering::Release);
+            }
+        }
+    }
+    let mut body = CountedBody {
+        buf: Vec::new(),
+        reserved: 0,
+    };
     let mut frame_bytes = Vec::new();
 
     loop {
@@ -285,10 +357,34 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
 
         // Read the frame body
         let frame_len = total_length as usize;
-        if body.len() < frame_len {
-            body.resize(frame_len, 0);
+        // F-G7-003: when the body Vec needs to grow, reserve the
+        // growth delta against the global inflight cap and absorb
+        // the reservation into the connection-scoped `body.reserved`
+        // counter so the CountedBody Drop releases it on return.
+        let new_bytes = frame_len.saturating_sub(body.buf.len());
+        if new_bytes > 0 {
+            match reserve_inflight_bytes(new_bytes) {
+                Some(guard) => {
+                    // Transfer the reservation from the guard to
+                    // the connection counter — we don't want the
+                    // guard's Drop to fire (it would release the
+                    // bytes we just promised to hold for the
+                    // body Vec).
+                    body.reserved += guard.bytes;
+                    std::mem::forget(guard);
+                }
+                None => {
+                    tracing::warn!(
+                        frame_len,
+                        new_bytes,
+                        "replication receiver: inflight bytes cap exceeded — closing connection",
+                    );
+                    return;
+                }
+            }
+            body.buf.resize(frame_len, 0);
         }
-        if stream.read_exact(&mut body[..frame_len]).is_err() {
+        if stream.read_exact(&mut body.buf[..frame_len]).is_err() {
             return;
         }
 
@@ -296,7 +392,7 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
         frame_bytes.clear();
         frame_bytes.reserve(4 + frame_len);
         frame_bytes.extend_from_slice(&len_buf);
-        frame_bytes.extend_from_slice(&body[..frame_len]);
+        frame_bytes.extend_from_slice(&body.buf[..frame_len]);
 
         let request_id = if frame_bytes.len() >= 12 {
             u64::from_le_bytes(frame_bytes[4..12].try_into().unwrap_or([0; 8]))
@@ -1738,6 +1834,40 @@ mod tests {
         TxKey { txid }
     }
 
+    /// F-G7-003: the per-process inflight-bytes counter must
+    /// refuse reservations that would cross
+    /// `RECEIVER_INFLIGHT_BYTES_CAP`. Guarantees a known DoS bound:
+    /// unauthenticated peers can't collectively force more than
+    /// `RECEIVER_INFLIGHT_BYTES_CAP` bytes of body buffer allocation.
+    #[test]
+    fn inflight_bytes_cap_refuses_oversize_reservations() {
+        // Snapshot the counter so concurrent test threads don't make
+        // us flaky (test threads do not interact with the standalone
+        // receiver, but the static is process-wide).
+        let baseline = RECEIVER_INFLIGHT_BYTES.load(Ordering::Acquire);
+
+        // A reasonable reservation succeeds.
+        let small = reserve_inflight_bytes(1024).expect("1 KiB reservation must succeed");
+        assert_eq!(
+            RECEIVER_INFLIGHT_BYTES.load(Ordering::Acquire),
+            baseline + 1024,
+        );
+
+        // A reservation that would exceed the cap returns None.
+        let huge = reserve_inflight_bytes(RECEIVER_INFLIGHT_BYTES_CAP + 1);
+        assert!(
+            huge.is_none(),
+            "reservation past the cap must fail",
+        );
+
+        // Releasing the small reservation restores the counter.
+        drop(small);
+        assert_eq!(
+            RECEIVER_INFLIGHT_BYTES.load(Ordering::Acquire),
+            baseline,
+        );
+    }
+
     #[test]
     fn receiver_reuses_buffer_per_connection() {
         let source = include_str!("receiver.rs");
@@ -1749,8 +1879,12 @@ mod tests {
             !production.contains("let mut body = vec![0u8; frame_len]"),
             "replication receiver must reuse per-connection frame buffers",
         );
+        // After F-G7-003 the per-connection buffer is wrapped in a
+        // `CountedBody` so the global inflight-bytes counter can
+        // track its growth. The reuse contract is preserved — the
+        // wrapper still lives outside the read loop.
         assert!(
-            production.contains("let mut body = Vec::new();"),
+            production.contains("let mut body = CountedBody {"),
             "replication receiver must allocate the reusable body buffer outside the hot loop",
         );
     }
