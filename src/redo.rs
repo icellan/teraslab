@@ -3633,7 +3633,10 @@ mod tests {
 
     #[test]
     fn redo_append_failure_sequence_gap() {
-        let (_, mut log) = make_log(4096);
+        // F-G4-001: the header block claims the first alignment unit, so
+        // a 4 KiB log holds no entries. Use 8 KiB (4 KiB header + 4 KiB
+        // entries) — still small enough to fill quickly.
+        let (_, mut log) = make_log(8192);
         loop {
             match log.append(RedoOp::Freeze {
                 tx_key: test_key(1),
