@@ -16,6 +16,11 @@ use crate::storage::blobstore::{BlobError, BlobStore};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Format a 32-byte txid as a lowercase hex string for log lines.
+fn hex_tx_id(tx_id: &[u8; 32]) -> String {
+    tx_id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Handle returned by [`BlobUploader::submit`] to track upload progress.
 ///
 /// Call [`wait`](UploadHandle::wait) to block until the upload completes,
@@ -212,10 +217,39 @@ impl BlobUploader {
             outputs_offset: task.inputs_len as u64, // inputs come first in serialized cold data
         };
 
-        // pwrite the ExternalRef into the metadata region
-        Self::write_external_ref(device, task.record_offset, &ext_ref).map_err(|e| {
-            BlobError::Io(std::io::Error::other(format!("device write failed: {e}")))
-        })?;
+        // pwrite the ExternalRef into the metadata region.
+        //
+        // F-G9-008: if this read-modify-write fails (transient device
+        // error, allocator race), the just-uploaded blob would otherwise
+        // remain on disk with the record's `ExternalRef.content_hash`
+        // still zero — a permanently-broken half-state that fails the
+        // record-anchored digest cross-check (F-G9-002) on subsequent
+        // reads, with no foreground signal to the original CREATE caller
+        // (the upload is async). Roll back by deleting the blob we just
+        // wrote so the next upload attempt or recovery scan reconciles
+        // cleanly. Cleanup failure is logged at `error` but the original
+        // device error is what we surface to the caller.
+        if let Err(e) = Self::write_external_ref(device, task.record_offset, &ext_ref) {
+            if let Err(cleanup_err) = blob_store.delete(&task.tx_id) {
+                tracing::error!(
+                    target: "teraslab::storage::uploader",
+                    tx_id = %hex_tx_id(&task.tx_id),
+                    device_err = %e,
+                    cleanup_err = %cleanup_err,
+                    "external_ref write failed AND blob cleanup failed; orphan blob will persist until GC sweep",
+                );
+            } else {
+                tracing::warn!(
+                    target: "teraslab::storage::uploader",
+                    tx_id = %hex_tx_id(&task.tx_id),
+                    device_err = %e,
+                    "external_ref write failed; rolled back uploaded blob",
+                );
+            }
+            return Err(BlobError::Io(std::io::Error::other(format!(
+                "device write failed: {e}"
+            ))));
+        }
 
         Ok(())
     }
