@@ -2733,17 +2733,22 @@ mod tests {
 
     #[test]
     fn reopen_sees_flushed_entries() {
+        // F-G4-004: append both entries before a single flush so they
+        // sit contiguously in one block on disk. Two separate flushes
+        // would block-align write_pos between them and the scan would
+        // stop at the trailing zero padding after the first entry.
         let (dev, mut log) = make_log(1024 * 1024);
-        log.append_and_flush(RedoOp::Freeze {
+        log.append(RedoOp::Freeze {
             tx_key: test_key(1),
             offset: 0,
         })
         .unwrap();
-        log.append_and_flush(RedoOp::Freeze {
+        log.append(RedoOp::Freeze {
             tx_key: test_key(2),
             offset: 1,
         })
         .unwrap();
+        log.flush().unwrap();
         drop(log);
 
         let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
