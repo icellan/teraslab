@@ -37,6 +37,11 @@ pub struct RedbPrimary {
     /// builds — the `#[cfg(test)]` accessor is the only way to flip it.
     #[cfg(test)]
     fail_next_write: bool,
+    /// Test-only counterpart to `fail_next_write` covering the read path.
+    /// `Cell` permits the flag to be flipped/cleared through `&self`
+    /// (lookup is `fn lookup(&self, ...)`). Never set outside tests.
+    #[cfg(test)]
+    fail_next_read: std::cell::Cell<bool>,
 }
 
 /// Batch update parameters for [`RedbPrimary::update_cached_fields_batch`].
@@ -104,6 +109,8 @@ impl RedbPrimary {
             count,
             #[cfg(test)]
             fail_next_write: false,
+            #[cfg(test)]
+            fail_next_read: std::cell::Cell::new(false),
         })
     }
 
@@ -119,6 +126,17 @@ impl RedbPrimary {
     #[cfg(test)]
     pub fn arm_fail_next_write(&mut self) {
         self.fail_next_write = true;
+    }
+
+    /// Test-only: arm a synthetic failure in the next read (`lookup`).
+    ///
+    /// The flag auto-disarms after firing so the next call behaves normally.
+    /// Used by `lookup_propagates_read_failure` to pin the F-G3-007 fix —
+    /// previously a transient redb read error collapsed to `None` which is
+    /// indistinguishable from "key absent" by spend/unspend logic.
+    #[cfg(test)]
+    pub fn arm_fail_next_read(&self) {
+        self.fail_next_read.set(true);
     }
 
     /// Returns `Err` if the test-only fail flag is armed, clearing it.
@@ -137,6 +155,20 @@ impl RedbPrimary {
         Ok(())
     }
 
+    /// Read-side fail-injection check. Used by `lookup` to pin F-G3-007.
+    #[inline]
+    #[allow(clippy::unnecessary_wraps)]
+    fn check_fail_injection_read(&self) -> Result<(), IndexError> {
+        #[cfg(test)]
+        if self.fail_next_read.get() {
+            self.fail_next_read.set(false);
+            return Err(IndexError::FormatError {
+                detail: "redb test-injected read failure".into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Look up a transaction's index entry.
     ///
     /// Returns `Ok(Some(entry))` if the key is present, `Ok(None)` if the key
@@ -146,6 +178,7 @@ impl RedbPrimary {
     /// indistinguishable from a key-miss and can be interpreted as
     /// "transaction absent" by spend/unspend logic.
     pub fn lookup(&self, key: &TxKey) -> Result<Option<TxIndexEntry>, IndexError> {
+        self.check_fail_injection_read()?;
         let txn = self.db.begin_read().map_err(map_redb_txn_err)?;
         let table = txn.open_table(PRIMARY_TABLE).map_err(map_redb_table_err)?;
         match table.get(key.txid).map_err(map_redb_storage_err)? {
@@ -657,7 +690,10 @@ mod tests {
         let entry = make_entry(4096);
         primary.register(key, entry).unwrap();
 
-        let result = primary.lookup(&key).expect("should find entry");
+        let result = primary
+            .lookup(&key)
+            .expect("lookup must not surface a redb read error")
+            .expect("should find entry");
         assert_eq!(result.record_offset, 4096);
         assert_eq!(result.utxo_count, 10);
         assert_eq!(result.block_entry_count, 2);
@@ -671,7 +707,7 @@ mod tests {
     #[test]
     fn lookup_missing_returns_none() {
         let (_dir, primary) = open_temp();
-        assert!(primary.lookup(&make_key(999)).is_none());
+        assert!(primary.lookup(&make_key(999)).unwrap().is_none());
     }
 
     #[test]
@@ -683,7 +719,10 @@ mod tests {
         assert_eq!(primary.len(), 1000);
 
         for i in 0..1000u64 {
-            let e = primary.lookup(&make_key(i)).expect("entry should exist");
+            let e = primary
+                .lookup(&make_key(i))
+                .unwrap()
+                .expect("entry should exist");
             assert_eq!(e.record_offset, i * 100);
         }
     }
@@ -696,16 +735,17 @@ mod tests {
 
         let removed = primary
             .unregister(&key)
+            .expect("unregister must not surface a redb commit error")
             .expect("should return removed entry");
         assert_eq!(removed.record_offset, 8192);
         assert_eq!(primary.len(), 0);
-        assert!(primary.lookup(&key).is_none());
+        assert!(primary.lookup(&key).unwrap().is_none());
     }
 
     #[test]
     fn unregister_missing_returns_none() {
         let (_dir, mut primary) = open_temp();
-        assert!(primary.unregister(&make_key(1)).is_none());
+        assert!(primary.unregister(&make_key(1)).unwrap().is_none());
     }
 
     #[test]
@@ -719,7 +759,7 @@ mod tests {
             .unwrap();
         assert!(updated);
 
-        let e = primary.lookup(&key).unwrap();
+        let e = primary.lookup(&key).unwrap().unwrap();
         assert_eq!(e.tx_flags, 0xFF);
         assert_eq!(e.block_entry_count, 5);
         assert_eq!(e.spent_utxos, 8);
@@ -809,6 +849,7 @@ mod tests {
             for i in 0..100u64 {
                 let e = primary
                     .lookup(&make_key(i))
+                    .unwrap()
                     .expect("entry should survive reopen");
                 assert_eq!(e.record_offset, i * 100);
             }
@@ -872,7 +913,7 @@ mod tests {
         primary.register(key, make_entry(200)).unwrap();
 
         assert_eq!(primary.len(), 1); // Count should not double
-        let e = primary.lookup(&key).unwrap();
+        let e = primary.lookup(&key).unwrap().unwrap();
         assert_eq!(e.record_offset, 200);
     }
 
@@ -891,7 +932,7 @@ mod tests {
         primary.register(make_key(1), make_entry(100)).unwrap();
         assert!(!primary.is_empty());
 
-        primary.unregister(&make_key(1));
+        primary.unregister(&make_key(1)).unwrap();
         assert!(primary.is_empty());
     }
 
@@ -930,9 +971,9 @@ mod tests {
         let key = make_key(1);
 
         primary.register(key, make_entry(100)).unwrap();
-        primary.unregister(&key);
+        primary.unregister(&key).unwrap();
         assert!(primary.is_empty());
-        assert!(primary.lookup(&key).is_none());
+        assert!(primary.lookup(&key).unwrap().is_none());
 
         // Re-register same key with different data
         let new_entry = TxIndexEntry {
@@ -949,7 +990,7 @@ mod tests {
         primary.register(key, new_entry).unwrap();
         assert_eq!(primary.len(), 1);
 
-        let e = primary.lookup(&key).unwrap();
+        let e = primary.lookup(&key).unwrap().unwrap();
         assert_eq!(e.device_id, 2);
         assert_eq!(e.record_offset, 9999);
         assert_eq!(e.utxo_count, 42);
@@ -966,7 +1007,7 @@ mod tests {
 
         // Unregister all
         for i in 0..n {
-            let removed = primary.unregister(&make_key(i));
+            let removed = primary.unregister(&make_key(i)).unwrap();
             assert!(removed.is_some(), "should have removed entry {i}");
         }
         assert_eq!(primary.len(), 0);
@@ -974,7 +1015,7 @@ mod tests {
 
         // Double-unregister should be no-op
         for i in 0..n {
-            assert!(primary.unregister(&make_key(i)).is_none());
+            assert!(primary.unregister(&make_key(i)).unwrap().is_none());
         }
         assert_eq!(primary.len(), 0);
     }
@@ -989,7 +1030,10 @@ mod tests {
 
         assert_eq!(primary.len(), 100);
         for i in 0..100u64 {
-            let e = primary.lookup(&make_key(i)).expect("entry should exist");
+            let e = primary
+                .lookup(&make_key(i))
+                .unwrap()
+                .expect("entry should exist");
             assert_eq!(e.record_offset, i * 100);
         }
     }
@@ -1006,7 +1050,7 @@ mod tests {
         primary.register_batch(&entries).unwrap();
 
         assert_eq!(primary.len(), 1);
-        let e = primary.lookup(&make_key(1)).unwrap();
+        let e = primary.lookup(&make_key(1)).unwrap().unwrap();
         assert_eq!(e.record_offset, 300);
     }
 
@@ -1039,8 +1083,8 @@ mod tests {
         // Both should produce identical results
         assert_eq!(primary1.len(), primary2.len());
         for i in 0..50u64 {
-            let e1 = primary1.lookup(&make_key(i)).unwrap();
-            let e2 = primary2.lookup(&make_key(i)).unwrap();
+            let e1 = primary1.lookup(&make_key(i)).unwrap().unwrap();
+            let e2 = primary2.lookup(&make_key(i)).unwrap().unwrap();
             assert_eq!(e1.record_offset, e2.record_offset);
             assert_eq!(e1.utxo_count, e2.utxo_count);
         }
@@ -1117,7 +1161,7 @@ mod tests {
         assert_eq!(updated, 5);
 
         for i in 0..5u64 {
-            let e = primary.lookup(&make_key(i)).unwrap();
+            let e = primary.lookup(&make_key(i)).unwrap().unwrap();
             assert_eq!(e.tx_flags, 0xAA);
             assert_eq!(e.block_entry_count, (i as u8) + 1);
             assert_eq!(e.spent_utxos, (i as u32) * 10);
@@ -1169,13 +1213,13 @@ mod tests {
         let updated = primary.update_cached_fields_batch(&updates).unwrap();
         assert_eq!(updated, 2);
 
-        let e1 = primary.lookup(&make_key(1)).unwrap();
+        let e1 = primary.lookup(&make_key(1)).unwrap().unwrap();
         assert_eq!(e1.tx_flags, 0xFF);
         assert_eq!(e1.generation, 99);
 
-        assert!(primary.lookup(&make_key(2)).is_none());
+        assert!(primary.lookup(&make_key(2)).unwrap().is_none());
 
-        let e3 = primary.lookup(&make_key(3)).unwrap();
+        let e3 = primary.lookup(&make_key(3)).unwrap().unwrap();
         assert_eq!(e3.tx_flags, 0xBB);
         assert_eq!(e3.generation, 50);
     }
@@ -1187,7 +1231,7 @@ mod tests {
         let updated = primary.update_cached_fields_batch(&[]).unwrap();
         assert_eq!(updated, 0);
         // Original entry unchanged
-        let e = primary.lookup(&make_key(1)).unwrap();
+        let e = primary.lookup(&make_key(1)).unwrap().unwrap();
         assert_eq!(e.record_offset, 100);
     }
 
@@ -1228,8 +1272,8 @@ mod tests {
 
         // Both should produce identical results
         for i in 0..10u64 {
-            let e1 = p1.lookup(&make_key(i)).unwrap();
-            let e2 = p2.lookup(&make_key(i)).unwrap();
+            let e1 = p1.lookup(&make_key(i)).unwrap().unwrap();
+            let e2 = p2.lookup(&make_key(i)).unwrap().unwrap();
             assert_eq!(e1.tx_flags, e2.tx_flags);
             assert_eq!(e1.block_entry_count, e2.block_entry_count);
             assert_eq!(e1.spent_utxos, e2.spent_utxos);
@@ -1268,7 +1312,7 @@ mod tests {
         // Reopen and verify
         let primary = RedbPrimary::open(&db_path, 64 * 1024 * 1024).unwrap();
         for i in 0..3u64 {
-            let e = primary.lookup(&make_key(i)).unwrap();
+            let e = primary.lookup(&make_key(i)).unwrap().unwrap();
             assert_eq!(e.tx_flags, 0xDD);
             assert_eq!(e.generation, 44);
             assert_eq!(e.record_offset, i * 100);
@@ -1296,7 +1340,7 @@ mod tests {
             .update_cached_fields(&key, 0xFF, 10, 20, 300, 700, 50)
             .unwrap();
 
-        let e = primary.lookup(&key).unwrap();
+        let e = primary.lookup(&key).unwrap().unwrap();
         // device_id and record_offset and utxo_count should be unchanged
         assert_eq!(e.device_id, 5);
         assert_eq!(e.record_offset, 4096);
@@ -1318,7 +1362,7 @@ mod tests {
 
         // Reopen and verify the updated fields persisted
         let primary = RedbPrimary::open(&db_path, 64 * 1024 * 1024).unwrap();
-        let e = primary.lookup(&make_key(1)).unwrap();
+        let e = primary.lookup(&make_key(1)).unwrap().unwrap();
         assert_eq!(e.tx_flags, 0xAA);
         assert_eq!(e.block_entry_count, 9);
         assert_eq!(e.spent_utxos, 99);
@@ -1347,12 +1391,12 @@ mod tests {
         assert_eq!(primary.len(), 2);
 
         // Remaining entries still present
-        assert!(primary.lookup(&make_key(0)).is_some());
-        assert!(primary.lookup(&make_key(4)).is_some());
+        assert!(primary.lookup(&make_key(0)).unwrap().is_some());
+        assert!(primary.lookup(&make_key(4)).unwrap().is_some());
         // Removed entries gone
-        assert!(primary.lookup(&make_key(1)).is_none());
-        assert!(primary.lookup(&make_key(2)).is_none());
-        assert!(primary.lookup(&make_key(3)).is_none());
+        assert!(primary.lookup(&make_key(1)).unwrap().is_none());
+        assert!(primary.lookup(&make_key(2)).unwrap().is_none());
+        assert!(primary.lookup(&make_key(3)).unwrap().is_none());
     }
 
     #[test]
@@ -1420,7 +1464,7 @@ mod tests {
         let key = make_key(1);
         primary.register(key, make_entry(4096)).unwrap();
         // Snapshot original cached fields for post-condition check.
-        let before = primary.lookup(&key).unwrap();
+        let before = primary.lookup(&key).unwrap().unwrap();
 
         primary.arm_fail_next_write();
         let result = primary.update_cached_fields(&key, 0xDD, 9, 77, 88, 99, 123);
@@ -1437,7 +1481,7 @@ mod tests {
 
         // Post-condition: the entry is untouched because the write aborted
         // before opening the transaction.
-        let after = primary.lookup(&key).unwrap();
+        let after = primary.lookup(&key).unwrap().unwrap();
         assert_eq!(before.tx_flags, after.tx_flags);
         assert_eq!(before.generation, after.generation);
         assert_eq!(before.dah_or_preserve, after.dah_or_preserve);
@@ -1448,7 +1492,7 @@ mod tests {
             .update_cached_fields(&key, 0xDD, 9, 77, 88, 99, 123)
             .expect("post-failure call must succeed");
         assert!(ok);
-        let final_entry = primary.lookup(&key).unwrap();
+        let final_entry = primary.lookup(&key).unwrap().unwrap();
         assert_eq!(final_entry.tx_flags, 0xDD);
         assert_eq!(final_entry.generation, 123);
     }
@@ -1460,7 +1504,7 @@ mod tests {
             primary.register(make_key(i), make_entry(i * 100)).unwrap();
         }
         let before: Vec<_> = (0..3u64)
-            .map(|i| primary.lookup(&make_key(i)).unwrap())
+            .map(|i| primary.lookup(&make_key(i)).unwrap().unwrap())
             .collect();
 
         let updates: Vec<CachedFieldsUpdate> = (0..3u64)
@@ -1493,7 +1537,7 @@ mod tests {
         // failure and callers saw "nothing to do" even though in-transaction
         // inserts would have been lost.
         for (i, prev) in before.iter().enumerate() {
-            let cur = primary.lookup(&make_key(i as u64)).unwrap();
+            let cur = primary.lookup(&make_key(i as u64)).unwrap().unwrap();
             assert_eq!(prev.tx_flags, cur.tx_flags);
             assert_eq!(prev.generation, cur.generation);
             assert_eq!(prev.dah_or_preserve, cur.dah_or_preserve);
@@ -1506,7 +1550,7 @@ mod tests {
             .expect("post-failure batch must succeed");
         assert_eq!(n, 3);
         for i in 0..3u64 {
-            let e = primary.lookup(&make_key(i)).unwrap();
+            let e = primary.lookup(&make_key(i)).unwrap().unwrap();
             assert_eq!(e.tx_flags, 0xDD);
             assert_eq!(e.generation, 123);
         }
@@ -1540,7 +1584,7 @@ mod tests {
         assert_eq!(primary.len(), before_len);
         for i in 0..3u64 {
             assert!(
-                primary.lookup(&make_key(i)).is_some(),
+                primary.lookup(&make_key(i)).unwrap().is_some(),
                 "entry {i} should still exist after aborted unregister_batch"
             );
         }
@@ -1554,5 +1598,82 @@ mod tests {
             assert!(r.is_some(), "every key should have been found and removed");
         }
         assert_eq!(primary.len(), 0);
+    }
+
+    // F-G3-001: single-row `unregister` must propagate a commit error rather
+    // than swallowing it and returning `None`. Pre-fix, a redb commit failure
+    // was logged via `tracing::warn!` and the function returned `None`,
+    // indistinguishable from "key was not present" — callers skipped the
+    // downstream delete/prune work while the entry remained on disk.
+    #[test]
+    fn unregister_propagates_commit_failure() {
+        let (_dir, mut primary) = open_temp();
+        let key = make_key(7);
+        primary.register(key, make_entry(4096)).unwrap();
+        assert_eq!(primary.len(), 1);
+
+        primary.arm_fail_next_write();
+        let err = primary
+            .unregister(&key)
+            .expect_err("injected failure must propagate");
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(
+                    detail.contains("test-injected"),
+                    "expected injection marker, got: {detail}"
+                );
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
+
+        // Post-condition: cached count is unchanged AND the entry is still
+        // present. Pre-fix this branch returned `None` while leaving the
+        // entry on disk; callers would treat it as "already gone" and skip
+        // cleanup.
+        assert_eq!(primary.len(), 1, "count must not drift on failed commit");
+        assert!(
+            primary.lookup(&key).unwrap().is_some(),
+            "entry must remain on disk after aborted unregister"
+        );
+
+        // Disarmed after firing — retry succeeds.
+        let removed = primary
+            .unregister(&key)
+            .expect("post-failure retry must succeed")
+            .expect("entry should be removed on retry");
+        assert_eq!(removed.record_offset, 4096);
+        assert_eq!(primary.len(), 0);
+    }
+
+    // F-G3-007: `lookup` must propagate a redb read error rather than
+    // collapsing it to `None`. Pre-fix, a transient EIO / open_table failure
+    // returned `None`, which spend/unspend interpret as "TX never existed" —
+    // a silent correctness bug.
+    #[test]
+    fn lookup_propagates_read_failure() {
+        let (_dir, mut primary) = open_temp();
+        let key = make_key(11);
+        primary.register(key, make_entry(2048)).unwrap();
+
+        primary.arm_fail_next_read();
+        let err = primary
+            .lookup(&key)
+            .expect_err("injected read failure must propagate");
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(
+                    detail.contains("test-injected"),
+                    "expected injection marker, got: {detail}"
+                );
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
+
+        // Disarmed after firing — retry returns the actual entry.
+        let entry = primary
+            .lookup(&key)
+            .expect("post-failure lookup must succeed")
+            .expect("entry should still be present");
+        assert_eq!(entry.record_offset, 2048);
     }
 }
