@@ -1068,8 +1068,13 @@ impl Engine {
 
             match slot.status {
                 UTXO_UNSPENT => {
-                    let spendable_height =
-                        u32::from_le_bytes(slot.spending_data[0..4].try_into().unwrap());
+                    // F-G2-004: avoid `unwrap()` in library code even on
+                    // an infallible 4-byte conversion — future slot-layout
+                    // changes must not silently become a panic on the
+                    // spend hot-path.
+                    let mut buf = [0u8; 4];
+                    buf.copy_from_slice(&slot.spending_data[0..4]);
+                    let spendable_height = u32::from_le_bytes(buf);
                     if spendable_height != 0 && spendable_height >= req.current_block_height {
                         errors.insert(
                             item.idx,
@@ -1212,8 +1217,11 @@ impl Engine {
 
         match slot.status {
             UTXO_UNSPENT => {
-                let spendable_height =
-                    u32::from_le_bytes(slot.spending_data[0..4].try_into().unwrap());
+                // F-G2-004: avoid `unwrap()` in library code (see batch
+                // path for rationale).
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(&slot.spending_data[0..4]);
+                let spendable_height = u32::from_le_bytes(buf);
                 if spendable_height != 0 && spendable_height >= req.current_block_height {
                     return Err(SpendError::FrozenUntil {
                         offset: req.offset,
@@ -1603,7 +1611,18 @@ impl Engine {
                             .map_err(|e| SpendError::StorageError {
                                 detail: format!("{e}"),
                             })?;
-                        let last = overflow.pop().unwrap();
+                        // F-G2-004: `count > INLINE_BLOCK_ENTRIES` implies a
+                        // non-empty overflow, so this pop is unreachable-None
+                        // in current code. Surface as a StorageError instead
+                        // of a panic so any future divergence between the
+                        // in-memory count and the on-device overflow list is
+                        // reported, not crashed on.
+                        let last = overflow.pop().ok_or_else(|| SpendError::StorageError {
+                            detail: format!(
+                                "overflow read returned no entries despite \
+                                 block_entry_count={count} > INLINE_BLOCK_ENTRIES"
+                            ),
+                        })?;
                         metadata.block_entries_inline[i] = last;
                         write_overflow_entries(
                             &*self.device,
