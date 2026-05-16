@@ -1144,9 +1144,16 @@ fn write_redo_ops_with_group_window(
         let first_seq = log.current_sequence();
         let mut last_seq = first_seq;
         for op in ops {
-            last_seq = log
-                .append(op.clone())
-                .map_err(|e| format!("redo log append: {e}"))?;
+            last_seq = log.append(op.clone()).map_err(|e| {
+                // F-G5-008: log the underlying I/O error (which may
+                // contain file paths or kernel diagnostic strings) at
+                // `error!` level for operator triage, but return a
+                // sanitized message to the client so internal
+                // deployment topology is not leaked through ERR_INTERNAL
+                // payloads. Same treatment for `redo log flush` below.
+                tracing::error!(err = %e, "redo log append failed");
+                "redo log append failed".to_string()
+            })?;
         }
         (first_seq, last_seq)
     };
@@ -1156,7 +1163,10 @@ fn write_redo_ops_with_group_window(
     }
 
     let mut log = redo.lock();
-    log.flush().map_err(|e| format!("redo log flush: {e}"))?;
+    log.flush().map_err(|e| {
+        tracing::error!(err = %e, "redo log flush failed");
+        "redo log flush failed".to_string()
+    })?;
     Ok((first_seq, last_seq))
 }
 
@@ -1659,12 +1669,18 @@ where
     for range in pending {
         let (entries, earliest_sequence, current_sequence) = {
             let log = redo_log.lock();
-            let entries = log
-                .read_from_sequence(range.first_sequence)
-                .map_err(|e| format!("read redo for pending replication intent: {e}"))?;
-            let earliest = log
-                .earliest_sequence()
-                .map_err(|e| format!("read redo floor for pending replication intent: {e}"))?;
+            // F-G5-008: redo I/O errors carry kernel diagnostic strings
+            // and (depending on the storage backend) file paths. Log
+            // detail for operator triage; return a sanitized message
+            // that does not leak deployment topology to clients.
+            let entries = log.read_from_sequence(range.first_sequence).map_err(|e| {
+                tracing::error!(err = %e, "read redo for pending replication intent failed");
+                "read redo for pending replication intent failed".to_string()
+            })?;
+            let earliest = log.earliest_sequence().map_err(|e| {
+                tracing::error!(err = %e, "read redo floor for pending replication intent failed");
+                "read redo floor for pending replication intent failed".to_string()
+            })?;
             (entries, earliest, log.current_sequence())
         };
         let entries: Vec<_> = entries
