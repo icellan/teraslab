@@ -1525,12 +1525,22 @@ impl Engine {
                 new_dah = patch.new_delete_at_height;
             }
 
-            // Generation is now cached in the index — zero device reads needed.
-            let generation = entry.generation.wrapping_add(1);
             let updated_at = self.now_millis();
 
             // Read-modify-write so CRC covers the full post-state
             // (block-entry-count, inline entry, and footer fields).
+            //
+            // F-G2-011: derive the new generation from `meta.generation`
+            // (the on-device, authoritative value) rather than
+            // `entry.generation` (the cached value). The fast path
+            // already reads metadata for the RMW; consulting it for
+            // the increment basis costs nothing and closes the rare
+            // race where a prior mutation wrote metadata but failed at
+            // `sync_index_cache` — the device sat at N+1 while the
+            // cache showed N, and the next fast-path mutation would
+            // stamp on-device generation as N+1 again, returning that
+            // value to the client even though no advance had occurred.
+            let generation;
             unsafe {
                 let mut meta =
                     io::read_metadata_direct(self.device_ptr, record_offset).map_err(|e| {
@@ -1538,6 +1548,7 @@ impl Engine {
                             detail: format!("{e}"),
                         }
                     })?;
+                generation = { meta.generation }.wrapping_add(1);
                 meta.flags = tf;
                 meta.generation = generation;
                 meta.updated_at = updated_at;
