@@ -824,6 +824,27 @@ fn apply_create_lifecycle_and_blob(
     Ok(())
 }
 
+/// F-G7-006: record that `apply_op` skipped a non-Create/non-Delete
+/// op because the target TX or slot was missing on this replica.
+///
+/// The graceful skip preserves liveness on a replica that joined late
+/// or lost an earlier Create batch, but it ALSO masks real divergence
+/// (lost Create, dropped intent range, dedup-tracker drift). The
+/// metric is the operator-facing signal: a non-zero value means the
+/// master is sending mutations against records the replica never
+/// received and counters such as `spent_utxos` are silently diverging.
+#[inline]
+fn record_apply_skipped_missing_tx(op_name: &'static str, tx_key: &TxKey) {
+    if let Some(m) = crate::metrics::replication_metrics() {
+        m.replica_apply_skipped_missing_tx.inc();
+    }
+    tracing::warn!(
+        op = op_name,
+        tx_key = ?tx_key.txid,
+        "replica apply: tx or slot not found — skipping op; potential replication divergence",
+    );
+}
+
 /// Apply a single `ReplicaOp` to the engine.
 ///
 /// For Spend, Freeze, Unfreeze, and Reassign operations the replica
@@ -870,7 +891,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             let hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
                 Err(_) => {
-                    // TX or slot not found — skip gracefully
+                    // TX or slot not found — skip gracefully but
+                    // surface the divergence via metrics + warn log
+                    // so operators can detect a missing Create.
+                    record_apply_skipped_missing_tx("spend", tx_key);
                     return Ok(());
                 }
             };
@@ -905,7 +929,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
         } => {
             let slot = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    record_apply_skipped_missing_tx("unspend", tx_key);
+                    return Ok(());
+                }
             };
             let req = UnspendRequest {
                 tx_key: *tx_key,
@@ -942,7 +969,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             };
             match engine.set_mined(&req) {
                 Ok(_) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("set_mined", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("set_mined: {e}")),
             }
         }
@@ -965,14 +995,20 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             };
             match engine.set_mined(&req) {
                 Ok(_) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("unset_mined", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("unset_mined: {e}")),
             }
         }
         ReplicaOp::Freeze { tx_key, offset, .. } => {
             let hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    record_apply_skipped_missing_tx("freeze", tx_key);
+                    return Ok(());
+                }
             };
             let req = FreezeRequest {
                 tx_key: *tx_key,
@@ -983,14 +1019,20 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::AlreadyFrozen { .. }) => Ok(()),
                 Err(crate::ops::error::SpendError::AlreadySpent { .. }) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("freeze", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("freeze: {e}")),
             }
         }
         ReplicaOp::Unfreeze { tx_key, offset, .. } => {
             let hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    record_apply_skipped_missing_tx("unfreeze", tx_key);
+                    return Ok(());
+                }
             };
             let req = UnfreezeRequest {
                 tx_key: *tx_key,
@@ -1000,7 +1042,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             match engine.unfreeze(&req) {
                 Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::NotFrozen { .. }) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("unfreeze", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("unfreeze: {e}")),
             }
         }
@@ -1014,7 +1059,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
         } => {
             let old_hash = match engine.read_slot(tx_key, *offset) {
                 Ok(slot) => slot.hash,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    record_apply_skipped_missing_tx("reassign", tx_key);
+                    return Ok(());
+                }
             };
             let req = ReassignRequest {
                 tx_key: *tx_key,
@@ -1027,7 +1075,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             match engine.reassign(&req) {
                 Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::NotFrozen { .. }) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("reassign", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("reassign: {e}")),
             }
         }
@@ -1046,7 +1097,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             };
             match engine.set_conflicting(&req) {
                 Ok(_) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("set_conflicting", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("set_conflicting: {e}")),
             }
         }
@@ -1057,7 +1111,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             };
             match engine.set_locked(&req) {
                 Ok(_) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("set_locked", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("set_locked: {e}")),
             }
         }
@@ -1072,7 +1129,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             };
             match engine.preserve_until(&req) {
                 Ok(_) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("preserve_until", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("preserve_until: {e}")),
             }
         }
@@ -1233,11 +1293,17 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             // slot directly via io, similar to how recovery handles it.
             let entry = match engine.lookup(tx_key) {
                 Some(e) => e,
-                None => return Ok(()), // TX not found — skip
+                None => {
+                    record_apply_skipped_missing_tx("prune_slot", tx_key);
+                    return Ok(()); // TX not found — skip
+                }
             };
             let slot = match io::read_utxo_slot(engine.device(), entry.record_offset, *offset) {
                 Ok(s) => s,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    record_apply_skipped_missing_tx("prune_slot", tx_key);
+                    return Ok(());
+                }
             };
             if slot.status == UTXO_PRUNED {
                 return Ok(()); // already pruned
@@ -1288,7 +1354,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             };
             match engine.mark_on_longest_chain(&req) {
                 Ok(_) => Ok(()),
-                Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("mark_longest_chain", tx_key);
+                    Ok(())
+                }
                 Err(e) => Err(format!("mark_longest_chain: {e}")),
             }
         }
@@ -3629,6 +3698,47 @@ mod tests {
             "wildcard migration batch must be accepted when local_cluster_key = 0",
         );
         assert_eq!(engine.read_slot(&key(81), 0).unwrap().status, UTXO_SPENT);
+    }
+
+    /// F-G7-006: `apply_op` skips a Spend whose TX or slot is missing
+    /// on the replica and returns Ok(()) to keep the batch ACK
+    /// flowing. Silent skips mask real replication divergence (a lost
+    /// Create batch, dropped intent range, dedup-tracker drift). The
+    /// receiver must bump the `replica_apply_skipped_missing_tx`
+    /// metric every time this happens so operators have a
+    /// machine-readable divergence signal.
+    #[test]
+    fn apply_spend_on_missing_tx_increments_divergence_metric() {
+        let engine = make_engine();
+        let k = key(90);
+        // Deliberately do NOT create the record; the replica is missing it.
+
+        static TEST_METRICS: std::sync::OnceLock<&'static crate::metrics::ReplicationMetrics> =
+            std::sync::OnceLock::new();
+        let metrics_ref = *TEST_METRICS
+            .get_or_init(|| Box::leak(Box::new(crate::metrics::ReplicationMetrics::new())));
+        crate::metrics::init_replication_metrics(metrics_ref);
+        let metrics =
+            crate::metrics::replication_metrics().expect("replication metrics installed for test");
+        let before = metrics.replica_apply_skipped_missing_tx.get();
+
+        let op = ReplicaOp::Spend {
+            tx_key: k,
+            offset: 0,
+            spending_data: [0x99; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
+            master_generation: 0,
+        };
+        // Must succeed (silent skip) so the batch ACK isn't aborted.
+        apply_op(&engine, &op).unwrap();
+
+        let after = metrics.replica_apply_skipped_missing_tx.get();
+        assert!(
+            after >= before + 1,
+            "spend on missing TX must bump replica_apply_skipped_missing_tx \
+             (was {before}, now {after})",
+        );
     }
 
     #[test]

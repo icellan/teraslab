@@ -833,6 +833,15 @@ pub struct ReplicationMetrics {
     /// stale-epoch gate). A non-zero value means a master is sending
     /// from a stale epoch and should re-discover the cluster topology.
     pub replica_rejected_stale_cluster_key: PaddedCounter,
+    /// F-G7-006: receiver-side counter — incremented every time
+    /// `apply_op` gracefully skips a non-Create/non-Delete op because
+    /// the target TX or slot was not found. A non-zero value means
+    /// the master is sending mutations against records the replica
+    /// never received (lost Create batch, missing intent range, or
+    /// dedup-tracker drift). The silent skip leaves replica counters
+    /// diverged from the master without surfacing an error; operators
+    /// must investigate any sustained growth.
+    pub replica_apply_skipped_missing_tx: PaddedCounter,
 }
 
 /// Per-replica drill-down state exposed on `/admin/top`.
@@ -883,6 +892,7 @@ impl ReplicationMetrics {
             per_replica: [ZERO_CELL; MAX_REPLICAS],
             leader_sequence: AtomicU64::new(0),
             replica_rejected_stale_cluster_key: PaddedCounter::new(),
+            replica_apply_skipped_missing_tx: PaddedCounter::new(),
         }
     }
 
