@@ -25,8 +25,16 @@ const MSG_PING_REQ: u8 = 4;
 const MSG_INDIRECT_ACK: u8 = 5;
 
 /// On-wire message format:
-/// [msg_type:1][sender_id:8][sender_incarnation:8][sender_addr_len:2][sender_addr:N]
+/// [msg_type:1][sender_id:8][sender_incarnation:8][sender_seq:8][sender_addr_len:2][sender_addr:N]
 /// [update_count:2][ [node_id:8][state:1][incarnation:8][addr_len:2][addr:N] × count ]
+///
+/// `sender_seq` is a per-sender monotonic counter that the recipient
+/// uses for replay defense (F-G8-003). The HMAC envelope covers the
+/// entire payload — including the seq — so an attacker cannot alter the
+/// seq without invalidating the tag. The recipient tracks per-peer
+/// `(highest_seq, window_bitmap)` in [`SwimRunner::seen_seq`] and rejects
+/// any (peer, seq) pair that has been seen before or that falls below
+/// the window's left edge.
 const MAX_MSG_SIZE: usize = 4096;
 const MSG_SIZE_WARN_THRESHOLD: usize = MAX_MSG_SIZE * 4 / 5;
 const DEAD_MEMBER_FORGET_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
@@ -190,6 +198,131 @@ pub fn exponential_seed_backoff(attempt: u32, initial: Duration, max: Duration) 
     Duration::from_millis(scaled.min(max_ms))
 }
 
+/// Size (in bits) of the sliding replay-defense window kept per peer.
+///
+/// 256 bits = 32 bytes per peer. Sufficient for any reasonable
+/// out-of-order UDP delivery window — SWIM messages are small and the
+/// per-sender seq increments monotonically per outgoing message, so the
+/// window only needs to absorb in-flight reordering, not multi-second
+/// gaps. A peer that legitimately falls more than 256 messages behind
+/// is dealing with a network event that warrants rejecting older
+/// messages anyway.
+const REPLAY_WINDOW_BITS: u64 = 256;
+
+/// Per-peer replay-defense window for SWIM message sequence numbers.
+///
+/// Tracks the highest `(sender_id, seq)` seen and a bitmap of the
+/// preceding `REPLAY_WINDOW_BITS` slots. Each accepted seq must be
+/// either:
+///
+///   * strictly higher than `highest` — the common case for fresh
+///     messages; the window slides forward and the previous bit for
+///     `highest` is set, or
+///   * within `[highest - REPLAY_WINDOW_BITS + 1, highest]` AND not yet
+///     marked in the bitmap — covers normal out-of-order UDP delivery.
+///
+/// Any seq below the left edge of the window, or any seq with its bit
+/// already set, is rejected as a replay.
+#[derive(Debug, Clone, Default)]
+struct ReplayWindow {
+    /// Highest seq accepted from this peer.
+    highest: u64,
+    /// Bitmap of accepted seq positions in `[highest - 255, highest - 1]`.
+    /// Bit 0 == `highest - 1`, bit 1 == `highest - 2`, etc.
+    bitmap: [u64; 4], // 4 * 64 = 256 bits
+}
+
+impl ReplayWindow {
+    /// Attempt to record `seq`. Returns true if accepted (not a replay),
+    /// false if `seq` has already been seen or is too old.
+    fn check_and_record(&mut self, seq: u64) -> bool {
+        // First-message-from-peer: always accept and seed `highest`.
+        if self.highest == 0 && self.bitmap == [0u64; 4] {
+            self.highest = seq;
+            return true;
+        }
+
+        match seq.cmp(&self.highest) {
+            std::cmp::Ordering::Greater => {
+                // Fresh seq — slide the window forward by `diff` bits.
+                let diff = seq - self.highest;
+                if diff >= REPLAY_WINDOW_BITS {
+                    // Full shift: drop everything, set only the new
+                    // "highest" position (which lives outside the bitmap).
+                    self.bitmap = [0u64; 4];
+                } else {
+                    // Shift left by `diff` positions, then mark the old
+                    // `highest` position (now at bit index `diff - 1`).
+                    self.shift_left(diff);
+                    self.set_bit(diff - 1);
+                }
+                self.highest = seq;
+                true
+            }
+            std::cmp::Ordering::Equal => false, // exact duplicate
+            std::cmp::Ordering::Less => {
+                let lag = self.highest - seq;
+                if lag > REPLAY_WINDOW_BITS {
+                    return false; // below window's left edge
+                }
+                // `seq` lives at bit index `lag - 1` (0-based from `highest - 1`).
+                let bit = lag - 1;
+                if self.test_bit(bit) {
+                    return false; // already seen
+                }
+                self.set_bit(bit);
+                true
+            }
+        }
+    }
+
+    fn set_bit(&mut self, bit: u64) {
+        let idx = (bit / 64) as usize;
+        let off = bit % 64;
+        if idx < self.bitmap.len() {
+            self.bitmap[idx] |= 1u64 << off;
+        }
+    }
+
+    fn test_bit(&self, bit: u64) -> bool {
+        let idx = (bit / 64) as usize;
+        let off = bit % 64;
+        if idx >= self.bitmap.len() {
+            return false;
+        }
+        self.bitmap[idx] & (1u64 << off) != 0
+    }
+
+    fn shift_left(&mut self, shift: u64) {
+        if shift == 0 {
+            return;
+        }
+        if shift >= REPLAY_WINDOW_BITS {
+            self.bitmap = [0u64; 4];
+            return;
+        }
+        let word_shift = (shift / 64) as usize;
+        let bit_shift = shift % 64;
+        let mut out = [0u64; 4];
+        for i in 0..self.bitmap.len() {
+            let src = i;
+            let dst = i + word_shift;
+            if dst >= out.len() {
+                break;
+            }
+            if bit_shift == 0 {
+                out[dst] |= self.bitmap[src];
+            } else {
+                out[dst] |= self.bitmap[src] << bit_shift;
+                if dst + 1 < out.len() {
+                    out[dst + 1] |= self.bitmap[src] >> (64 - bit_shift);
+                }
+            }
+        }
+        self.bitmap = out;
+    }
+}
+
 /// A running SWIM protocol instance.
 pub struct SwimRunner {
     config: SwimConfig,
@@ -208,6 +341,23 @@ pub struct SwimRunner {
     /// Tracks PING_REQ forwarding: maps (original_requester_addr) to pending
     /// indirect probe targets so we can forward ACKs back.
     ping_req_forwarding: HashMap<NodeId, SocketAddr>,
+    /// Per-sender monotonic counter for replay defense (F-G8-003).
+    ///
+    /// Increments once per outgoing SWIM message. The signed payload
+    /// carries this value so that peers can reject any replayed packet
+    /// whose seq has already been seen (or that falls below their
+    /// sliding window). A reboot resumes from `0` — the
+    /// `sender_incarnation` bump separates new boots from prior runs
+    /// (incarnation is part of the signed payload too, so a replay from
+    /// an old run cannot impersonate the fresh run's seq space).
+    next_outbound_seq: u64,
+    /// Per-peer sliding window of accepted SWIM message seqs. Sized
+    /// at [`REPLAY_WINDOW_BITS`] bits per peer; a peer entry is created
+    /// on first verified message. Bounded growth is enforced indirectly
+    /// by the membership lifecycle: peers that drop out and are forgotten
+    /// after [`DEAD_MEMBER_FORGET_AFTER`] can be GC'd from this map by
+    /// the membership reaper.
+    seen_seq: HashMap<NodeId, ReplayWindow>,
 }
 
 impl SwimRunner {
@@ -228,6 +378,8 @@ impl SwimRunner {
             pending_probe: None,
             probe_round_robin: 0,
             ping_req_forwarding: HashMap::new(),
+            next_outbound_seq: 1,
+            seen_seq: HashMap::new(),
         }
     }
 
@@ -302,8 +454,11 @@ impl SwimRunner {
 
         tracing::info!(bind_addr = %self.config.bind_addr, "SWIM listening");
 
-        // Initial join attempt to seed nodes
-        for seed in &self.config.seed_nodes {
+        // Initial join attempt to seed nodes. Clone the seed list so
+        // we don't hold an immutable borrow on `self.config` while
+        // `encode_message` takes `&mut self` (it bumps the outbound seq).
+        let seeds: Vec<SocketAddr> = self.config.seed_nodes.clone();
+        for seed in seeds {
             let updates = self.collect_member_updates();
             let msg = self.encode_message(MSG_JOIN, &updates);
             let _ = socket.send_to(&msg, seed);
@@ -422,7 +577,9 @@ impl SwimRunner {
                 // (some nodes are dead/suspect) or if we have no peers at all.
                 let degraded = alive_count < total_known + 1 || total_known == 0;
                 if degraded {
-                    for seed in &self.config.seed_nodes {
+                    // Clone seed list so the inner encode_message can take &mut self.
+                    let seeds: Vec<SocketAddr> = self.config.seed_nodes.clone();
+                    for seed in seeds {
                         let updates = self.collect_member_updates();
                         let msg = self.encode_message(MSG_JOIN, &updates);
                         let _ = socket.send_to(&msg, seed);
@@ -486,26 +643,37 @@ impl SwimRunner {
             data
         };
 
-        // Minimum header: msg_type(1) + sender_id(8) + incarnation(8) + addr_len(2) = 19
-        if data.len() < 19 {
+        // Minimum header: msg_type(1) + sender_id(8) + incarnation(8) + seq(8) + addr_len(2) = 27
+        if data.len() < 27 {
             return vec![];
         }
 
         let msg_type = data[0];
         let sender_id = NodeId(u64::from_le_bytes(data[1..9].try_into().unwrap()));
         let sender_incarnation = u64::from_le_bytes(data[9..17].try_into().unwrap());
-        let addr_len = u16::from_le_bytes(data[17..19].try_into().unwrap()) as usize;
+        let sender_seq = u64::from_le_bytes(data[17..25].try_into().unwrap());
+        let addr_len = u16::from_le_bytes(data[25..27].try_into().unwrap()) as usize;
 
         // Ignore our own messages (UDP loopback on Docker bridge networks).
         if sender_id == self.config.self_id {
             return vec![];
         }
 
-        if data.len() < 19 + addr_len {
+        if data.len() < 27 + addr_len {
             return vec![];
         }
 
-        let sender_addr_str = std::str::from_utf8(&data[19..19 + addr_len]).unwrap_or("");
+        // F-G8-003 replay defense: each peer maintains a monotonic seq;
+        // reject anything we've already accepted (or that falls below the
+        // sliding window). Tag verification above guarantees the seq
+        // value is authentic — an attacker cannot forge a fresh seq
+        // without the cluster_secret.
+        let window = self.seen_seq.entry(sender_id).or_default();
+        if !window.check_and_record(sender_seq) {
+            return vec![];
+        }
+
+        let sender_addr_str = std::str::from_utf8(&data[27..27 + addr_len]).unwrap_or("");
         let sender_tcp_addr: SocketAddr = match sender_addr_str.parse() {
             Ok(a) => a,
             Err(_) => from_addr, // fallback
@@ -533,7 +701,7 @@ impl SwimRunner {
         // Process piggybacked membership updates
         // Wire format per entry:
         // [node_id:8][state:1][incarnation:8][tcp_addr_len:2][tcp_addr:N][swim_addr_len:2][swim_addr:M]
-        let updates_offset = 19 + addr_len;
+        let updates_offset = 27 + addr_len;
         let mut pos = updates_offset;
         if data.len() > updates_offset + 2 {
             let update_count =
@@ -651,7 +819,7 @@ impl SwimRunner {
         // Handle PING_REQ: probe the target on behalf of the requester
         if msg_type == MSG_PING_REQ {
             // Parse the appended target info: [target_id:8][target_addr_len:2][target_addr:N]
-            let ping_req_offset = 19 + addr_len;
+            let ping_req_offset = 27 + addr_len;
             // Skip past the piggybacked updates to find the PING_REQ payload
             let target_info = self.parse_ping_req_target(data, ping_req_offset);
             if let Some((target_id, target_swim_addr)) = target_info {
@@ -865,15 +1033,18 @@ impl SwimRunner {
         }
     }
 
-    fn encode_message(&self, msg_type: u8, piggybacked_updates: &[u8]) -> Vec<u8> {
+    fn encode_message(&mut self, msg_type: u8, piggybacked_updates: &[u8]) -> Vec<u8> {
         let addr_str = self.config.self_addr.to_string();
         let addr_bytes = addr_str.as_bytes();
+        let seq = self.next_outbound_seq;
+        self.next_outbound_seq = self.next_outbound_seq.wrapping_add(1);
 
         let mut buf =
-            Vec::with_capacity(19 + addr_bytes.len() + piggybacked_updates.len() + 8 + 32);
+            Vec::with_capacity(27 + addr_bytes.len() + piggybacked_updates.len() + 8 + 32);
         buf.push(msg_type);
         buf.extend_from_slice(&self.config.self_id.0.to_le_bytes());
         buf.extend_from_slice(&self.incarnation.to_le_bytes());
+        buf.extend_from_slice(&seq.to_le_bytes());
         buf.extend_from_slice(&(addr_bytes.len() as u16).to_le_bytes());
         buf.extend_from_slice(addr_bytes);
         buf.extend_from_slice(piggybacked_updates);
@@ -902,18 +1073,21 @@ impl SwimRunner {
     /// clear [`SwimRunner::pending_probe`] without mapping `probed_target` to the relay's UDP
     /// source address.
     fn encode_indirect_ack_message(
-        &self,
+        &mut self,
         piggybacked_updates: &[u8],
         probed_target: NodeId,
     ) -> Vec<u8> {
         let addr_str = self.config.self_addr.to_string();
         let addr_bytes = addr_str.as_bytes();
+        let seq = self.next_outbound_seq;
+        self.next_outbound_seq = self.next_outbound_seq.wrapping_add(1);
 
         let mut buf =
-            Vec::with_capacity(19 + addr_bytes.len() + piggybacked_updates.len() + 8 + 8 + 32);
+            Vec::with_capacity(27 + addr_bytes.len() + piggybacked_updates.len() + 8 + 8 + 32);
         buf.push(MSG_INDIRECT_ACK);
         buf.extend_from_slice(&self.config.self_id.0.to_le_bytes());
         buf.extend_from_slice(&self.incarnation.to_le_bytes());
+        buf.extend_from_slice(&seq.to_le_bytes());
         buf.extend_from_slice(&(addr_bytes.len() as u16).to_le_bytes());
         buf.extend_from_slice(addr_bytes);
         buf.extend_from_slice(piggybacked_updates);
@@ -1009,6 +1183,35 @@ impl SwimRunner {
     /// Signal the SWIM loop to stop.
     pub fn signal_shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Test-only helper: encode a SWIM message identical to one the
+    /// runner would emit at this point in its lifecycle. Exposed to the
+    /// `tests/g8_*` integration tests for F-G8-003 replay-defense
+    /// validation. Production callers must not use this — they go
+    /// through the proper send paths in `start`.
+    #[doc(hidden)]
+    pub fn encode_message_for_test(&mut self, msg_type: u8, piggybacked_updates: &[u8]) -> Vec<u8> {
+        self.encode_message(msg_type, piggybacked_updates)
+    }
+
+    /// Test-only helper: drive a single inbound SWIM message through the
+    /// runner's parsing pipeline. See [`Self::encode_message_for_test`].
+    #[doc(hidden)]
+    pub fn handle_message_for_test(
+        &mut self,
+        data: &[u8],
+        from_addr: SocketAddr,
+        socket: &UdpSocket,
+    ) -> Vec<crate::cluster::membership::ClusterEvent> {
+        self.handle_message(data, from_addr, socket)
+    }
+
+    /// Test-only helper: snapshot the TCP peer-address map. See
+    /// [`Self::encode_message_for_test`].
+    #[doc(hidden)]
+    pub fn peer_addrs_snapshot(&self) -> HashMap<NodeId, SocketAddr> {
+        self.peer_addrs.lock().unwrap().clone()
     }
 
     #[cfg(test)]
@@ -1225,7 +1428,7 @@ mod tests {
             .insert(probed_target, "10.0.0.3:3301".parse().unwrap());
         requester.test_set_pending_probe(probed_target);
 
-        let relay = test_runner_id(NodeId(2), relay_udp, "10.0.0.2:9000".parse().unwrap());
+        let mut relay = test_runner_id(NodeId(2), relay_udp, "10.0.0.2:9000".parse().unwrap());
         let updates = relay.collect_member_updates_for_test();
         let wrong_forward = relay.encode_message(MSG_ACK, &updates);
 
@@ -1260,7 +1463,7 @@ mod tests {
             .insert(probed_target, target_swim);
         requester.test_set_pending_probe(probed_target);
 
-        let relay = test_runner_id(NodeId(2), relay_udp, "10.0.0.2:9000".parse().unwrap());
+        let mut relay = test_runner_id(NodeId(2), relay_udp, "10.0.0.2:9000".parse().unwrap());
         let updates = relay.collect_member_updates_for_test();
         let msg = relay.encode_indirect_ack_message(&updates, probed_target);
 
