@@ -551,51 +551,68 @@ impl FileBlobStore {
 /// then atomically renames to the final blob path on finish. The SHA-256
 /// digest is computed incrementally so streams of arbitrary size do not
 /// require buffering the full payload to hash it at finish time.
+///
+/// `finished` is set true by both [`BlobStreamWriter::finish`] (after a
+/// successful rename) and [`BlobStreamWriter::abort`] (after intentional
+/// teardown), so the `Drop` backstop only removes the `.tmp` file when
+/// neither completion path ran — for example after a panic between
+/// `begin_stream` and the dispatcher's `abort` registration (F-G9-007).
 struct FileStreamWriter {
     key_locks: Arc<Vec<parking_lot::Mutex<()>>>,
     lock_index: usize,
     temp_path: PathBuf,
     final_path: PathBuf,
-    file: std::fs::File,
+    file: Option<std::fs::File>,
     bytes_written: u64,
     hasher: Sha256,
+    finished: bool,
 }
 
 impl BlobStreamWriter for FileStreamWriter {
     fn write_chunk(&mut self, data: &[u8]) -> Result<()> {
-        self.file.write_all(data)?;
+        // F-G9-007: if the underlying write fails (ENOSPC, EIO) the `.tmp`
+        // file is left on disk. The `Drop` impl below removes it as a
+        // backstop if neither `finish` nor `abort` runs. The dispatch path
+        // already calls `abort` on write error (src/server/dispatch.rs).
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| BlobError::Io(std::io::Error::other("stream writer poisoned")))?;
+        file.write_all(data)?;
         self.hasher.update(data);
         self.bytes_written += data.len() as u64;
         Ok(())
     }
 
-    fn finish(self: Box<Self>) -> Result<BlobDigest> {
-        // Decompose the box so we can take ownership of individual fields.
-        let FileStreamWriter {
-            key_locks,
-            lock_index,
-            temp_path,
-            final_path,
-            file,
-            bytes_written,
-            hasher,
-        } = *self;
-        let _guard = key_locks[lock_index].lock();
+    fn finish(mut self: Box<Self>) -> Result<BlobDigest> {
+        let _guard = self.key_locks[self.lock_index].lock();
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| BlobError::Io(std::io::Error::other("stream writer already finished")))?;
+        let bytes_written = self.bytes_written;
+        let hasher = std::mem::take(&mut self.hasher);
 
         // 1. fsync the payload temp file, then rename into place.
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temp_path, &final_path)?;
+        std::fs::rename(&self.temp_path, &self.final_path)?;
 
         // 2. Finalize the digest and write the sidecar atomically.
         let mut sha256 = [0u8; 32];
         sha256.copy_from_slice(&hasher.finalize());
         let meta_bytes = encode_meta(&sha256, bytes_written);
-        let meta_path = FileBlobStore::meta_path_for(&final_path);
+        let meta_path = FileBlobStore::meta_path_for(&self.final_path);
         atomic_write_no_dir_fsync(&meta_path, &meta_bytes)?;
 
         // 3. fsync the parent directory so both renames are durable.
-        fsync_parent_dir(&final_path)?;
+        fsync_parent_dir(&self.final_path)?;
+
+        // Mark finished so the Drop backstop does not delete the renamed
+        // payload (the rename moved it out of `temp_path`, but defence in
+        // depth — if a future change keeps the tmp around, the flag
+        // prevents the backstop from racing it).
+        self.finished = true;
 
         Ok(BlobDigest {
             sha256,
@@ -603,10 +620,26 @@ impl BlobStreamWriter for FileStreamWriter {
         })
     }
 
-    fn abort(self: Box<Self>) -> Result<()> {
-        drop(self.file);
+    fn abort(mut self: Box<Self>) -> Result<()> {
+        self.file.take();
         let _ = std::fs::remove_file(&self.temp_path);
+        self.finished = true;
         Ok(())
+    }
+}
+
+/// F-G9-007 backstop: if a `FileStreamWriter` is dropped without `finish`
+/// or `abort` (e.g. after a panic between `begin_stream` and the
+/// dispatcher's stream-registration), remove the `.tmp` file rather than
+/// leaving it on disk until the periodic `list()` sweep collects it five
+/// minutes later. The normal `finish`/`abort` paths set `finished = true`,
+/// so this is purely a safety net.
+impl Drop for FileStreamWriter {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.file.take();
+            let _ = std::fs::remove_file(&self.temp_path);
+        }
     }
 }
 
@@ -788,9 +821,10 @@ impl BlobStore for FileBlobStore {
             lock_index: Self::lock_index(key),
             temp_path,
             final_path,
-            file,
+            file: Some(file),
             bytes_written: 0,
             hasher: Sha256::new(),
+            finished: false,
         }))
     }
 
