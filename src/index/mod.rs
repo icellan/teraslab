@@ -705,21 +705,33 @@ impl Index {
 // ---------------------------------------------------------------------------
 
 fn serialize_secondary(magic: &[u8; 4], entries: impl Iterator<Item = (u32, TxKey)>) -> Vec<u8> {
-    let collected: Vec<_> = entries.collect();
-    let count = collected.len() as u64;
+    // F-G3-011: stream `entries` straight into `buf` instead of `.collect()`-ing
+    // into an intermediate Vec. A fully-loaded DAH backend with tens of
+    // millions of rows previously paid for the same data twice — once as
+    // the `Vec<(u32, TxKey)>` and once as the serialized bytes.
+    //
+    // The serialized header carries a u64 `count` that has to be written
+    // before the entries. We use `entries.size_hint().0` as a best-effort
+    // capacity hint, reserve the header (with a placeholder count), append
+    // entries one at a time updating a running counter, then patch the
+    // count back into the header bytes at the known offset.
+    let (size_hint_lo, _) = entries.size_hint();
     let header_size = 4 + 4 + 8; // magic + version + count
-    let body_size = collected.len() * SECONDARY_ENTRY_SIZE;
-    let total = header_size + body_size + 4;
-
-    let mut buf = Vec::with_capacity(total);
+    let estimated_body = size_hint_lo * SECONDARY_ENTRY_SIZE;
+    let mut buf = Vec::with_capacity(header_size + estimated_body + 4);
     buf.extend_from_slice(magic);
     buf.extend_from_slice(&SECONDARY_VERSION.to_le_bytes());
-    buf.extend_from_slice(&count.to_le_bytes());
+    let count_offset = buf.len();
+    buf.extend_from_slice(&0u64.to_le_bytes()); // placeholder
 
-    for (height, key) in &collected {
+    let mut count = 0u64;
+    for (height, key) in entries {
         buf.extend_from_slice(&height.to_le_bytes());
         buf.extend_from_slice(&key.txid);
+        count += 1;
     }
+    // Patch the actual count into the header.
+    buf[count_offset..count_offset + 8].copy_from_slice(&count.to_le_bytes());
 
     let checksum = crc32fast::hash(&buf);
     buf.extend_from_slice(&checksum.to_le_bytes());
