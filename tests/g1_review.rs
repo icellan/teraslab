@@ -116,7 +116,9 @@ fn primitive_footer_write_without_crc_surfaces_record_corruption() {
 
     match unsafe { read_metadata_direct(raw_ptr as *const u8, 0) } {
         Err(DeviceError::RecordCorruption { .. }) => {}
-        other => panic!("primitive footer write without CRC must yield RecordCorruption, got {other:?}"),
+        other => {
+            panic!("primitive footer write without CRC must yield RecordCorruption, got {other:?}")
+        }
     }
 }
 

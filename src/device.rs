@@ -401,13 +401,11 @@ impl BlockDevice for MemoryDevice {
         // bypass the bounds check. `None` (overflow) maps to out-of-bounds
         // unconditionally — there is no legitimate caller that wants a
         // wrap-around read.
-        let end = off
-            .checked_add(buf.len())
-            .ok_or(DeviceError::OutOfBounds {
-                offset,
-                len: buf.len() as u64,
-                device_size: data.len() as u64,
-            })?;
+        let end = off.checked_add(buf.len()).ok_or(DeviceError::OutOfBounds {
+            offset,
+            len: buf.len() as u64,
+            device_size: data.len() as u64,
+        })?;
         if end > data.len() {
             return Err(DeviceError::OutOfBounds {
                 offset,
@@ -425,13 +423,11 @@ impl BlockDevice for MemoryDevice {
         let off = offset as usize;
         // F-G1-007: see pread above — checked_add protects against the
         // off + buf.len() wrap case.
-        let end = off
-            .checked_add(buf.len())
-            .ok_or(DeviceError::OutOfBounds {
-                offset,
-                len: buf.len() as u64,
-                device_size: data.len() as u64,
-            })?;
+        let end = off.checked_add(buf.len()).ok_or(DeviceError::OutOfBounds {
+            offset,
+            len: buf.len() as u64,
+            device_size: data.len() as u64,
+        })?;
         if end > data.len() {
             return Err(DeviceError::OutOfBounds {
                 offset,
