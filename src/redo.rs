@@ -3601,8 +3601,10 @@ mod tests {
 
     #[test]
     fn log_full_error_not_panic() {
-        // Use a very small log (4KB) so it fills quickly
-        let (_, mut log) = make_log(4096);
+        // F-G4-001 reserves one alignment block for the header, so the
+        // entries-region capacity is `log_size - alignment`. Use an
+        // 8 KiB log: header takes 4 KiB, entries capacity is 4 KiB.
+        let (_, mut log) = make_log(8192);
         let mut appended = 0u32;
         loop {
             let result = log.append(RedoOp::Delete {
@@ -3614,7 +3616,10 @@ mod tests {
                 Ok(_) => appended += 1,
                 Err(RedoError::LogFull { used, capacity }) => {
                     assert!(used > 0, "used should be > 0 when log is full");
-                    assert_eq!(capacity, 4096, "capacity should match log size");
+                    assert_eq!(
+                        capacity, 4096,
+                        "capacity should match entries-region size (log - header)"
+                    );
                     break;
                 }
                 Err(e) => panic!("expected LogFull, got: {e}"),
