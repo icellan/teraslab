@@ -484,6 +484,16 @@ pub(crate) fn handle_request(
             status: STATUS_OK,
             payload: vec![],
         },
+        // F-G5-015: OP_INCREMENT_SPENT_EXTRA_RECS is a no-op compatibility
+        // shim retained for clients carried over from the pre-TeraSlab Lua
+        // UDF. The old store maintained extra-records counters that
+        // TeraSlab tracks implicitly via UTXO generation. Returning
+        // STATUS_OK with an empty payload is the contract: callers expect
+        // success and do not parse a body. Returning an error here would
+        // break legacy clients; logging on every call would flood the
+        // logs. The constant is retained until all clients have migrated;
+        // a counter would be a better signal, but a counter requires
+        // shared mutable state and the call-site is hot.
         OP_INCREMENT_SPENT_EXTRA_RECS => ResponseFrame {
             request_id: request.request_id,
             status: STATUS_OK,
