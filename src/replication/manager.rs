@@ -178,6 +178,29 @@ impl ReplicaSender {
 }
 
 /// Orchestrates replication to multiple replicas.
+///
+/// # Concurrency contract (F-G7-019)
+///
+/// `ReplicationManager` is **not** internally synchronized. Every
+/// state-mutating method (`replicate_batch`, `run_catchup`,
+/// `check_reconnected`, `mark_replica_live`, `set_replica_node_id`,
+/// `install_resync_request_channel`) takes `&mut self` so Rust's
+/// borrow checker enforces single-threaded access at compile time.
+///
+/// Callers that share a `ReplicationManager` between the
+/// coordinator (which calls `mark_replica_live` from the topology
+/// loop) and the replication hot path (which calls `replicate_batch`
+/// from the dispatch thread) **MUST** wrap it in an external
+/// `Mutex<ReplicationManager>` (or equivalent) so the two paths
+/// observe a consistent sender table. Without that, the compiler
+/// will refuse to compile a shared reference; with it, the lock
+/// linearizes the state transitions.
+///
+/// The manager intentionally does NOT internalize a `Mutex<Senders>`
+/// because (a) callers already need an external mutex to serialize
+/// the dispatch thread's borrow of the senders' transports during
+/// the parallel fan-out, and (b) doubling up locks would force the
+/// hot path to traverse a mutex on every batch.
 pub struct ReplicationManager {
     senders: Vec<ReplicaSender>,
     config: ReplicationConfig,
@@ -357,6 +380,16 @@ impl ReplicationManager {
             // can fence stale-epoch masters.
             cluster_key: self.current_cluster_key.load(Ordering::Acquire),
         };
+        // F-G7-007: `next_sequence` advances BEFORE the fan-out
+        // result is reconciled. A retry of the same logical ops
+        // therefore lands on a new sequence range (the replica's
+        // dedup tracker stores both ranges as legitimate). This
+        // matches the durable-log invariant — every assigned
+        // sequence is recorded as an intent — and the master's
+        // ReplicationIntentTracker reconciles overlapping ranges
+        // on restart. Do NOT reset `next_sequence` on full failure:
+        // that would let the next batch reuse a sequence the redo
+        // log has already journalled, breaking the invariant.
         self.next_sequence += ops.len() as u64;
 
         let timeout = self.config.replication_timeout;
@@ -423,10 +456,33 @@ impl ReplicationManager {
             handles
                 .into_iter()
                 .map(|h| {
-                    h.join()
-                        .unwrap_or(Outcome::TransportErr(ReplicationError::Transport(
-                            "replica worker panicked".into(),
+                    h.join().unwrap_or_else(|payload| {
+                        // F-G7-009: capture the panic payload so the
+                        // diagnostic isn't lost. The scoped worker's
+                        // panic was previously masked behind a
+                        // constant string, hiding correctness bugs in
+                        // send_batch / recv_ack behind a benign-looking
+                        // transport error. Downcast common payload
+                        // shapes (&str, String) and bump a counter so
+                        // operators can alert on the underlying bug.
+                        let detail = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "<non-string panic payload>".to_string()
+                        };
+                        if let Some(m) = replication_metrics() {
+                            m.replica_worker_panics_total.inc();
+                        }
+                        tracing::error!(
+                            panic = %detail,
+                            "replica replication worker panicked",
+                        );
+                        Outcome::TransportErr(ReplicationError::Transport(format!(
+                            "replica worker panicked: {detail}"
                         )))
+                    })
                 })
                 .collect()
         });
@@ -626,7 +682,19 @@ impl ReplicationManager {
                 match sender.transport.recv_ack(timeout) {
                     Ok(ReplicaAck::Ok { through_sequence }) => {
                         let expected_through = batch.last_sequence();
-                        if through_sequence != expected_through {
+                        // F-G7-011: the receiver's `already_applied`
+                        // high-water mark may be AHEAD of this chunk's
+                        // last_sequence (e.g. a normal-replication
+                        // batch landed during catch-up). In that case
+                        // the receiver ACKs with the existing
+                        // high-water mark, which is `>=
+                        // expected_through`. Strict-equality marked
+                        // those replicas Down and caused spurious
+                        // flap. Treat ahead-of-chunk ACKs as success
+                        // (replica is healthy and already covers this
+                        // range) and only fail when the replica is
+                        // strictly BEHIND the chunk's last sequence.
+                        if through_sequence < expected_through {
                             sender.state = ReplicaState::Down;
                             ok = false;
                             break;
@@ -1347,6 +1415,187 @@ mod tests {
         .unwrap();
 
         assert_eq!(*mgr.sender(0).state(), ReplicaState::Live);
+    }
+
+    /// F-G7-007: when a `WriteAll` batch fails on every replica the
+    /// master's `next_sequence` MUST still advance, so the retried
+    /// ops land on a fresh sequence range. Resetting the cursor on
+    /// failure would let the next batch reuse a sequence the redo
+    /// log has already journalled. The replica's dedup tracker
+    /// stores both ranges as legitimate; the durable-log invariant
+    /// (every assigned sequence recorded as an intent) is preserved.
+    #[test]
+    fn replicate_batch_advances_next_sequence_on_full_failure() {
+        let (mt, _replica_rx) = InMemoryTransport::pair();
+        // Drop the replica side so recv_ack times out.
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteAll,
+                replication_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+            vec![Box::new(mt)],
+        );
+        let initial = mgr.current_sequence();
+        assert_eq!(initial, 1);
+
+        let ops = vec![
+            ReplicaOp::Freeze {
+                tx_key: key(1),
+                offset: 0,
+                master_generation: 0,
+            },
+            ReplicaOp::Freeze {
+                tx_key: key(2),
+                offset: 0,
+                master_generation: 0,
+            },
+        ];
+        let res = mgr.replicate_batch(&ops);
+        assert!(res.is_err(), "fan-out must fail when no replica acks");
+
+        // next_sequence MUST have advanced past the failed batch.
+        assert_eq!(
+            mgr.current_sequence(),
+            initial + ops.len() as u64,
+            "next_sequence must advance even when the fan-out failed",
+        );
+    }
+
+    /// F-G7-009: a panicking replica worker must:
+    ///   1. Surface the panic message in the resulting TransportErr
+    ///      so the diagnostic isn't lost,
+    ///   2. Bump `replica_worker_panics_total` so operators can
+    ///      alert on the underlying bug.
+    #[test]
+    fn replicate_batch_panic_captured_with_payload() {
+        struct PanickingTransport;
+        impl ReplicaTransport for PanickingTransport {
+            fn send_batch(
+                &mut self,
+                _batch: &ReplicaBatch,
+            ) -> std::result::Result<(), ReplicationError> {
+                panic!("synthetic send_batch failure: oxidized");
+            }
+            fn recv_ack(
+                &mut self,
+                _t: Duration,
+            ) -> std::result::Result<ReplicaAck, ReplicationError> {
+                unreachable!("send_batch panicked");
+            }
+            fn is_connected(&self) -> bool {
+                true
+            }
+        }
+
+        // Install metrics so the counter has somewhere to live.
+        static TEST_METRICS: std::sync::OnceLock<&'static crate::metrics::ReplicationMetrics> =
+            std::sync::OnceLock::new();
+        let metrics_ref = *TEST_METRICS
+            .get_or_init(|| Box::leak(Box::new(crate::metrics::ReplicationMetrics::new())));
+        crate::metrics::init_replication_metrics(metrics_ref);
+        let metrics =
+            crate::metrics::replication_metrics().expect("replication metrics installed for test");
+        let before = metrics.replica_worker_panics_total.get();
+
+        let mut mgr = ReplicationManager::new(
+            ReplicationConfig {
+                ack_policy: AckPolicy::WriteAll,
+                replication_timeout: Duration::from_millis(50),
+                ..Default::default()
+            },
+            vec![Box::new(PanickingTransport)],
+        );
+        let ops = vec![ReplicaOp::Freeze {
+            tx_key: key(1),
+            offset: 0,
+            master_generation: 0,
+        }];
+        let err = mgr.replicate_batch(&ops).expect_err("must fail");
+        let after = metrics.replica_worker_panics_total.get();
+        assert!(
+            after >= before + 1,
+            "replica_worker_panics_total must bump (was {before}, now {after})",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("oxidized") || msg.contains("synthetic"),
+            "panic payload must propagate into the error message (got: {msg})",
+        );
+    }
+
+    /// F-G7-011: when a catch-up chunk overlaps with normal replication
+    /// the replica's dedup tracker may already cover a higher
+    /// `through_sequence` than the chunk's last sequence. The receiver
+    /// then ACKs with that ahead-of-chunk high-water mark, not the
+    /// chunk's own. Previously the master's strict-equality check
+    /// (`through_sequence != expected_through`) transitioned the
+    /// replica to Down spuriously, causing flap. The fix accepts any
+    /// ACK that is `>= expected_through` as success.
+    #[test]
+    fn catchup_accepts_ack_ahead_of_chunk_last_sequence() {
+        // Custom transport whose recv_ack returns a through_sequence
+        // strictly greater than the most recently sent batch's last_sequence.
+        struct AheadAckTransport {
+            connected: bool,
+            extra_ahead: u64,
+            last_sent_through: u64,
+        }
+        impl ReplicaTransport for AheadAckTransport {
+            fn send_batch(
+                &mut self,
+                batch: &ReplicaBatch,
+            ) -> std::result::Result<(), ReplicationError> {
+                self.last_sent_through = batch.last_sequence();
+                Ok(())
+            }
+            fn recv_ack(
+                &mut self,
+                _timeout: Duration,
+            ) -> std::result::Result<ReplicaAck, ReplicationError> {
+                Ok(ReplicaAck::Ok {
+                    through_sequence: self.last_sent_through + self.extra_ahead,
+                })
+            }
+            fn is_connected(&self) -> bool {
+                self.connected
+            }
+        }
+
+        let transport = AheadAckTransport {
+            connected: true,
+            extra_ahead: 2,
+            last_sent_through: 0,
+        };
+        let mut mgr =
+            ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(transport)]);
+
+        // Drive into CatchingUp with three ops to ship (from_sequence = 1,
+        // master at 4 → ops 1..=3).
+        mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 1 };
+        mgr.next_sequence = 4;
+
+        let _ = mgr
+            .run_catchup(|from_seq| {
+                (from_seq..4)
+                    .map(|i| ReplicaOp::Freeze {
+                        tx_key: key(i as u8),
+                        offset: 0,
+                        master_generation: 0,
+                    })
+                    .collect()
+            })
+            .expect("run_catchup must not error when the replica is ahead");
+
+        // With the F-G7-011 fix the sender stays catching-up or becomes
+        // Live (never Down). Without the fix the strict-equality check
+        // would set it to Down.
+        assert!(
+            !matches!(*mgr.sender(0).state(), ReplicaState::Down),
+            "ahead-of-chunk ACK must not transition replica to Down (was {:?})",
+            mgr.sender(0).state(),
+        );
     }
 
     #[test]

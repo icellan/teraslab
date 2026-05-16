@@ -97,6 +97,16 @@ const INTENT_COMMIT_FLUSH_INTERVAL_MS: u128 = 1000;
 /// forcing a disk flush. `begin()` remains immediately durable; deferred
 /// commit flushes can only leave stale ranges that recovery replays
 /// idempotently.
+///
+/// F-G7-004 contract: the deferred `commit()` durability is safe ONLY
+/// when the master-side recovery replay path consults the receiver's
+/// `ReplicaAppliedTracker` before re-applying each range. Recovery
+/// MUST NOT bypass the dedup tracker (including for batches flagged
+/// `FLAG_MIGRATION_BATCH`; F-G7-005 enforces a non-zero cluster_key
+/// gate on those paths in clustered mode). If a future change to the
+/// recovery loop skips dedup, this constant must be set to 1 to make
+/// every commit immediately durable so stale ranges never reach
+/// recovery replay.
 const INTENT_COMMIT_FLUSH_DIRTY_COUNT_THRESHOLD: u32 = 100;
 
 impl AckTracker {
@@ -164,6 +174,13 @@ impl AckTracker {
 
     fn flush_locked(&self, inner: &mut AckTrackerInner) {
         if let Err(e) = Self::write_to_disk(&self.path, &inner.last_acked) {
+            // F-G7-008: surface the failure on the observability
+            // pipeline. The on-disk state stays behind in-memory
+            // truth until the next successful flush; without a
+            // counter, operators would have to tail logs to notice.
+            if let Some(m) = crate::metrics::replication_metrics() {
+                m.ack_tracker_flush_failures.inc();
+            }
             tracing::warn!(err = %e, "ack_tracker: flush failed");
             return;
         }
@@ -1001,6 +1018,45 @@ mod tests {
 
         let reopened = AckTracker::new(path);
         assert_eq!(reopened.last_acked(&test_addr(5000)), 42);
+    }
+
+    /// F-G7-008: when `flush_locked` cannot persist the per-replica
+    /// ACK map (disk full / permission denied / EIO) the failure was
+    /// only visible in the trace log. Operators have no way to alert
+    /// on it without scraping logs. The receiver-side metric
+    /// `ack_tracker_flush_failures` must increment so the failure is
+    /// observable on the standard metrics pipeline.
+    #[test]
+    fn ack_tracker_flush_failure_bumps_metric() {
+        // Install the metric subsystem so the counter has somewhere
+        // to live (idempotent — any prior test wins).
+        static TEST_METRICS: std::sync::OnceLock<&'static crate::metrics::ReplicationMetrics> =
+            std::sync::OnceLock::new();
+        let metrics_ref = *TEST_METRICS
+            .get_or_init(|| Box::leak(Box::new(crate::metrics::ReplicationMetrics::new())));
+        crate::metrics::init_replication_metrics(metrics_ref);
+        let metrics =
+            crate::metrics::replication_metrics().expect("replication metrics installed for test");
+        let before = metrics.ack_tracker_flush_failures.get();
+
+        // Make the path point to a parent that is a regular file rather
+        // than a directory — `write_to_disk` then fails inside
+        // `ensure_parent_dir`/`create_dir_all` with NotADirectory.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a dir").unwrap();
+        let path = blocker.join("inside").join("ack.dat");
+        let tracker = AckTracker::new(path);
+
+        tracker.record_ack(test_addr(7777), 99);
+        tracker.flush();
+
+        let after = metrics.ack_tracker_flush_failures.get();
+        assert!(
+            after >= before + 1,
+            "ack_tracker_flush_failures must bump on persist error \
+             (was {before}, now {after})",
+        );
     }
 
     #[test]

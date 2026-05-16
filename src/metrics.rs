@@ -860,6 +860,42 @@ pub struct ReplicationMetrics {
     /// stale-epoch gate). A non-zero value means a master is sending
     /// from a stale epoch and should re-discover the cluster topology.
     pub replica_rejected_stale_cluster_key: PaddedCounter,
+    /// F-G7-006: receiver-side counter — incremented every time
+    /// `apply_op` gracefully skips a non-Create/non-Delete op because
+    /// the target TX or slot was not found. A non-zero value means
+    /// the master is sending mutations against records the replica
+    /// never received (lost Create batch, missing intent range, or
+    /// dedup-tracker drift). The silent skip leaves replica counters
+    /// diverged from the master without surfacing an error; operators
+    /// must investigate any sustained growth.
+    pub replica_apply_skipped_missing_tx: PaddedCounter,
+    /// F-G7-008: master-side counter — incremented every time
+    /// `AckTracker::flush_locked` fails to persist the last-ACKed
+    /// map to disk. A non-zero counter means the on-disk view of
+    /// per-replica progress is stale; a master restart will
+    /// re-stream more ops than necessary. Operators should
+    /// investigate disk pressure or permission errors as soon as
+    /// this starts climbing.
+    pub ack_tracker_flush_failures: PaddedCounter,
+    /// F-G7-009: master-side counter — incremented every time the
+    /// `replicate_batch` fan-out's scoped worker panics. The panic
+    /// payload is logged + the replica transitions to Down via the
+    /// outer reconciliation loop. A non-zero counter is a hard
+    /// signal that a real bug in send_batch/recv_ack exists; the
+    /// surrounding error path silently retries on the next batch.
+    pub replica_worker_panics_total: PaddedCounter,
+    /// F-G7-001: receiver-side counter — incremented every time the
+    /// node accepts an inter-node opcode (e.g. `OP_REPLICA_BATCH`)
+    /// without an HMAC layer because `cluster_secret` is unset. The
+    /// trusted-overlay deployment model intentionally allows this in
+    /// single-node demos; multi-node clusters in production should
+    /// see a flat zero. A non-zero counter is an alert signal —
+    /// either the operator forgot to configure cluster_secret or a
+    /// peer is reaching the listener without the configured auth.
+    /// Bumped by the G5-owned auth gate at `server::mod`; the field
+    /// lives here so the G7 replication subsystem owns the metric
+    /// schema and tests can reference it directly.
+    pub replica_unauthenticated_accept_total: PaddedCounter,
 }
 
 /// Per-replica drill-down state exposed on `/admin/top`.
@@ -910,6 +946,10 @@ impl ReplicationMetrics {
             per_replica: [ZERO_CELL; MAX_REPLICAS],
             leader_sequence: AtomicU64::new(0),
             replica_rejected_stale_cluster_key: PaddedCounter::new(),
+            replica_apply_skipped_missing_tx: PaddedCounter::new(),
+            ack_tracker_flush_failures: PaddedCounter::new(),
+            replica_worker_panics_total: PaddedCounter::new(),
+            replica_unauthenticated_accept_total: PaddedCounter::new(),
         }
     }
 
