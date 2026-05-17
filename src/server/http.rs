@@ -3502,12 +3502,15 @@ mod tests {
 
     /// R-055 baseline: when the local `ready` flag is `false`, the
     /// readiness check still rejects regardless of cluster state.
+    /// F-G6-001 refined the NotReady message to distinguish the
+    /// recovery-in-progress case from other readiness failures, so
+    /// operators / load balancers see why the node is degraded.
     #[test]
     fn health_ready_rejects_when_local_ready_flag_false() {
         let state = build_ready_test_state(false, None);
         assert_eq!(
             compute_health_ready(&state),
-            ReadyState::NotReady("not ready"),
+            ReadyState::NotReady("not ready (recovery in progress)"),
         );
     }
 
