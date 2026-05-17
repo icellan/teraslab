@@ -86,6 +86,60 @@ fn create_node_with_replication_runtime(
     rf: u8,
     replication: ReplicationRuntimeConfig,
 ) -> TestNode {
+    create_node_full(
+        node_id,
+        tcp_port,
+        swim_port,
+        seed_swim_ports,
+        rf,
+        replication,
+        &[],
+    )
+}
+
+/// Like [`create_node_with_replication_runtime`] but additionally seeds the
+/// node's `committed_voter_ever_seen` set BEFORE SWIM starts. Tests that
+/// rely on growing a fresh cluster past two members need this: once the
+/// first 2-node topology commits, F-G8-001's `ever_seen_check` rejects any
+/// later proposal that introduces a NodeId not previously observed as a
+/// committed voter. Production wires that allow-list via `cluster_id`;
+/// in-process tests have no orchestrator, so the test fixture must do it
+/// manually. The seed is applied to the freshly-constructed coordinator
+/// before `start()` so SWIM cannot race ahead and commit a 2-node term
+/// before the allow-list is in place.
+fn create_node_with_ever_seen(
+    node_id: u64,
+    tcp_port: u16,
+    swim_port: u16,
+    seed_swim_ports: &[u16],
+    rf: u8,
+    ever_seen: &[NodeId],
+) -> TestNode {
+    create_node_full(
+        node_id,
+        tcp_port,
+        swim_port,
+        seed_swim_ports,
+        rf,
+        ReplicationRuntimeConfig {
+            ack_policy: None,
+            best_effort: true,
+            timeout: Duration::from_secs(3),
+            timeout_during_migration: Duration::from_secs(30),
+        },
+        ever_seen,
+    )
+}
+
+fn create_node_full(
+    node_id: u64,
+    tcp_port: u16,
+    swim_port: u16,
+    seed_swim_ports: &[u16],
+    rf: u8,
+    replication: ReplicationRuntimeConfig,
+    ever_seen: &[NodeId],
+) -> TestNode {
     let tcp_port = if tcp_port == 0 {
         reserve_tcp_port()
     } else {
@@ -135,6 +189,15 @@ fn create_node_with_replication_runtime(
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);
+    if !ever_seen.is_empty() {
+        // Seed the F-G8-001 ever-seen allow-list BEFORE start() so the
+        // SWIM event loop never races against an unseen-member rejection
+        // (which has no retry path once on_membership_changed returns
+        // None).
+        coordinator
+            .topology_authority
+            .set_committed_voter_ever_seen(ever_seen);
+    }
     let running = Arc::new(coordinator.start(engine.clone(), None, None, replication));
 
     let config = ServerConfig {
@@ -549,9 +612,18 @@ fn three_node_cluster_all_shards_assigned() {
 fn add_fourth_node_rebalance_triggers() {
     // Start 3-node cluster on ephemeral ports so unrelated local services
     // cannot collide with this integration test.
-    let node1 = create_node(111, 0, 0, &[], 2);
-    let node2 = create_node(112, 0, 0, &[node1.swim_port], 2);
-    let node3 = create_node(113, 0, 0, &[node1.swim_port], 2);
+    //
+    // Each node pre-seeds the full expected membership (111-114) into its
+    // F-G8-001 ever-seen allow-list BEFORE SWIM starts. Without this
+    // seeding the cluster gets stuck at a 2-node commit: once
+    // ever_seen = {first two nodes} is recorded, on_membership_changed
+    // rejects the [111, 112, 113] proposal and there is no retry path.
+    // Production avoids the issue by wiring cluster_id; the test fixture
+    // mirrors that via direct ever_seen injection.
+    let all_ids = [NodeId(111), NodeId(112), NodeId(113), NodeId(114)];
+    let node1 = create_node_with_ever_seen(111, 0, 0, &[], 2, &all_ids);
+    let node2 = create_node_with_ever_seen(112, 0, 0, &[node1.swim_port], 2, &all_ids);
+    let node3 = create_node_with_ever_seen(113, 0, 0, &[node1.swim_port], 2, &all_ids);
 
     // Wait for the 3-node topology to commit so v_before reflects the
     // pre-add baseline. shard_table_version mirrors the committed term.
@@ -562,13 +634,15 @@ fn add_fourth_node_rebalance_triggers() {
     .expect("3-node topology should commit on node1 before adding the 4th node");
     let v_before = node1.cluster.shard_table_version();
 
-    // Add 4th node
-    let node4 = create_node(
+    // Add 4th node — pre-seed its allow-list too so its votes accept the
+    // existing 3-node members and the upcoming 4-node proposal.
+    let node4 = create_node_with_ever_seen(
         114,
         0,
         0,
         &[node1.swim_port, node2.swim_port, node3.swim_port],
         2,
+        &all_ids,
     );
 
     // Wait for the 4-node topology to commit (proposer is node1 = lowest
@@ -1518,13 +1592,19 @@ fn wait_for_committed_members_len(node: &TestNode, expected: usize, timeout: Dur
     }
     let committed = node.cluster.committed_topology_members();
     let term = node.cluster.committed_topology_term();
+    let addrs = node.cluster.node_addresses();
+    let peak = node.cluster.peak_cluster_size();
+    let alive = node.cluster.alive_node_count();
     panic!(
-        "committed_topology_members().len()={} (expected {}) within {:?}: members={:?}, term={}",
+        "committed_topology_members().len()={} (expected {}) within {:?}: members={:?}, term={}, addrs={:?}, peak={}, alive={}",
         committed.len(),
         expected,
         timeout,
         committed,
         term,
+        addrs.keys().map(|k| k.0).collect::<Vec<_>>(),
+        peak,
+        alive,
     );
 }
 
