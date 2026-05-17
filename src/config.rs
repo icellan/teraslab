@@ -1816,7 +1816,10 @@ node_id = 1
 replication_factor = 3
 "#;
         let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
-        assert!(!cfg.strict_auth, "default config must have strict_auth=false");
+        assert!(
+            !cfg.strict_auth,
+            "default config must have strict_auth=false"
+        );
         cfg.validate_safe_defaults().expect(
             "default-auth multi-node config must validate without cluster_secret \
              (trusted-overlay deployment model — F-X-001)",
@@ -1847,9 +1850,9 @@ replication_factor = 1
 strict_auth = true
 "#;
         let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
-        let err = cfg
-            .validate_safe_defaults()
-            .expect_err("strict_auth + node_id>0 + no cluster_secret must be rejected even at RF=1");
+        let err = cfg.validate_safe_defaults().expect_err(
+            "strict_auth + node_id>0 + no cluster_secret must be rejected even at RF=1",
+        );
         match err {
             ConfigError::StrictAuthRequiresSecret => {}
             other => panic!("expected StrictAuthRequiresSecret, got {other:?}"),
