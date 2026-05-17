@@ -16,7 +16,7 @@ use teraslab::cluster::coordinator::{
     ClusterConfig, ClusterCoordinator, MasterQueryResult, ReplicationRuntimeConfig, RunningCluster,
 };
 use teraslab::cluster::shards::{NUM_SHARDS, NodeId, ShardTable};
-use teraslab::cluster::topology::{TopologyCommit, TopologyTerm};
+use teraslab::cluster::topology::{ClusterId, TopologyCommit, TopologyTerm};
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, MemoryDevice};
 use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
@@ -1873,7 +1873,8 @@ fn tcp_strict_replication_failure_returns_replication_failed() {
         proposer: NodeId(322),
         members: members.clone(),
         voters: members.clone(),
-        digest: TopologyTerm::compute_digest(1, &members),
+        cluster_id: ClusterId::UNSET,
+        digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &members),
     };
     let resp = send_request(
         &mut stream,
