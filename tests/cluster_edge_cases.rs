@@ -772,6 +772,14 @@ fn topology_formation_recovery_blocked_by_outstanding_vote() {
     };
     auth.handle_commit(&commit);
 
+    // F-G8-001: the ever-seen split-brain fallback in `handle_propose`
+    // rejects any proposal introducing a NodeId never previously observed
+    // as a committed voter on this node. Nodes 1 and 3 were never voters
+    // here, so without pre-seeding the proposals below would be rejected
+    // at the ever-seen layer rather than at the outstanding-vote check
+    // this test targets.
+    auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3)]);
+
     // Vote for term 2 via a different proposal (outstanding vote).
     let proposal_2 = TopologyTerm::new(2, vec![NodeId(1), NodeId(2)], NodeId(1));
     let v = auth.handle_propose(&proposal_2);
