@@ -1953,6 +1953,14 @@ mod tests {
         // Set up: allocate and free a region so the next allocate() will
         // come from the freelist. Then inject failure and verify the
         // freelist is restored to its original state.
+        //
+        // F-G4-002: a redo flush failure poisons the log. Subsequent
+        // append/flush calls return RedoError::Poisoned, so we can no
+        // longer assert "the region is reusable by a follow-up
+        // allocate()" — the next allocate() would fail with the
+        // poisoned-log error rather than the freelist's split-fragment
+        // history. Verify the freelist/next_offset invariants directly
+        // instead.
         let data_dev = test_device(16);
         let (redo_dev, redo) = make_failable_redo_log(1024 * 1024);
 
@@ -1985,15 +1993,22 @@ mod tests {
             before_next,
             "next_offset must be unchanged"
         );
-
-        // The original 8KB region must still be allocatable atomically
-        // (no fragmentation left over from the failed split).
-        let reused = alloc.allocate(8192).unwrap();
-        assert_eq!(reused, offset, "the same 8K region must still be reusable");
+        assert_eq!(
+            alloc.stats().total_free_bytes,
+            8192,
+            "the full 8 KiB region must still be intact in the freelist \
+             (no left-over fragmentation from the rolled-back split)"
+        );
     }
 
     #[test]
     fn free_rollback_on_redo_flush_failure() {
+        // F-G4-002: a redo flush failure poisons the log. Subsequent
+        // append/flush calls return RedoError::Poisoned, so we can no
+        // longer assert "the offset is NOT reused by a follow-up
+        // allocate()" — the next allocate() would fail with the
+        // poisoned-log error rather than the freelist's reuse history.
+        // Verify the freelist invariant directly instead.
         let data_dev = test_device(16);
         let (redo_dev, redo) = make_failable_redo_log(1024 * 1024);
 
@@ -2002,6 +2017,8 @@ mod tests {
 
         let offset = alloc.allocate(4096).unwrap();
         let before_count = alloc.free_region_count();
+        let before_free_bytes = alloc.stats().total_free_bytes;
+        let before_next = alloc.next_offset();
 
         redo_dev.set_fail(true);
         let result = alloc.free(offset, 4096);
@@ -2018,11 +2035,16 @@ mod tests {
             before_count,
             "freelist must be unchanged on free redo flush failure"
         );
-
-        // The offset must NOT be reused by the next allocate — the free
-        // never happened.
-        let o2 = alloc.allocate(4096).unwrap();
-        assert_ne!(o2, offset, "failed free must not make the region reusable");
+        assert_eq!(
+            alloc.stats().total_free_bytes,
+            before_free_bytes,
+            "freelist byte count must be unchanged on free redo flush failure"
+        );
+        assert_eq!(
+            alloc.next_offset(),
+            before_next,
+            "next_offset must be unchanged — the free never happened"
+        );
     }
 
     #[test]
