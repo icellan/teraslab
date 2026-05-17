@@ -86,6 +86,60 @@ fn create_node_with_replication_runtime(
     rf: u8,
     replication: ReplicationRuntimeConfig,
 ) -> TestNode {
+    create_node_full(
+        node_id,
+        tcp_port,
+        swim_port,
+        seed_swim_ports,
+        rf,
+        replication,
+        &[],
+    )
+}
+
+/// Like [`create_node_with_replication_runtime`] but additionally seeds the
+/// node's `committed_voter_ever_seen` set BEFORE SWIM starts. Tests that
+/// rely on growing a fresh cluster past two members need this: once the
+/// first 2-node topology commits, F-G8-001's `ever_seen_check` rejects any
+/// later proposal that introduces a NodeId not previously observed as a
+/// committed voter. Production wires that allow-list via `cluster_id`;
+/// in-process tests have no orchestrator, so the test fixture must do it
+/// manually. The seed is applied to the freshly-constructed coordinator
+/// before `start()` so SWIM cannot race ahead and commit a 2-node term
+/// before the allow-list is in place.
+fn create_node_with_ever_seen(
+    node_id: u64,
+    tcp_port: u16,
+    swim_port: u16,
+    seed_swim_ports: &[u16],
+    rf: u8,
+    ever_seen: &[NodeId],
+) -> TestNode {
+    create_node_full(
+        node_id,
+        tcp_port,
+        swim_port,
+        seed_swim_ports,
+        rf,
+        ReplicationRuntimeConfig {
+            ack_policy: None,
+            best_effort: true,
+            timeout: Duration::from_secs(3),
+            timeout_during_migration: Duration::from_secs(30),
+        },
+        ever_seen,
+    )
+}
+
+fn create_node_full(
+    node_id: u64,
+    tcp_port: u16,
+    swim_port: u16,
+    seed_swim_ports: &[u16],
+    rf: u8,
+    replication: ReplicationRuntimeConfig,
+    ever_seen: &[NodeId],
+) -> TestNode {
     let tcp_port = if tcp_port == 0 {
         reserve_tcp_port()
     } else {
@@ -135,6 +189,15 @@ fn create_node_with_replication_runtime(
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);
+    if !ever_seen.is_empty() {
+        // Seed the F-G8-001 ever-seen allow-list BEFORE start() so the
+        // SWIM event loop never races against an unseen-member rejection
+        // (which has no retry path once on_membership_changed returns
+        // None).
+        coordinator
+            .topology_authority
+            .set_committed_voter_ever_seen(ever_seen);
+    }
     let running = Arc::new(coordinator.start(engine.clone(), None, None, replication));
 
     let config = ServerConfig {
@@ -247,8 +310,14 @@ fn two_nodes_discover_each_other() {
     // Start node 2 with node 1 as seed
     let node2 = create_node(2, 13302, 13303, &[13301], 2);
 
-    // Wait for SWIM discovery
-    std::thread::sleep(Duration::from_secs(2));
+    // Wait for SWIM discovery: at least one node must report a non-zero
+    // shard-table version (i.e. the peer was observed and the committed
+    // term advanced past the bootstrap term=0).
+    wait_until(
+        || node1.cluster.shard_table_version() > 0 || node2.cluster.shard_table_version() > 0,
+        Duration::from_secs(2),
+    )
+    .expect("at least one node should have observed the peer and advanced shard_table_version");
 
     // Both nodes should see each other
     let members1 = node1.cluster.shard_table().read().version;
@@ -427,6 +496,27 @@ fn shutdown_node(node: &TestNode) {
     node.server.shutdown();
 }
 
+/// Generic deterministic poll: invoke `predicate` repeatedly until it
+/// returns `true` or `timeout` elapses. Returns `Ok(())` on success and
+/// `Err(())` on timeout — callers add their own diagnostic message via
+/// `.expect(...)` so the panic identifies which signal was being waited
+/// for. Poll interval is 50 ms, short enough that the caller only pays
+/// for the actual settle time (typically far less than the timeout)
+/// while keeping the busy-loop overhead negligible.
+fn wait_until<F: FnMut() -> bool>(
+    mut predicate: F,
+    timeout: Duration,
+) -> std::result::Result<(), ()> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if predicate() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if predicate() { Ok(()) } else { Err(()) }
+}
+
 /// Poll until `node` sees at least one key that routes to a peer (i.e. the
 /// multi-node shard table has been committed and installed). Returns the
 /// first such txid on success, or panics with diagnostics if the cluster
@@ -474,8 +564,19 @@ fn three_node_cluster_all_shards_assigned() {
     let node2 = create_node(102, 13402, 13403, &[13401], 2);
     let node3 = create_node(103, 13404, 13405, &[13401], 2);
 
-    // Wait for SWIM discovery
-    std::thread::sleep(Duration::from_secs(3));
+    // Wait for SWIM discovery: at least one node must advance its shard
+    // table past the bootstrap term=0. The test below tolerates the case
+    // where only two of three nodes converge, so we don't require all
+    // three here.
+    wait_until(
+        || {
+            node1.cluster.shard_table_version() > 0
+                || node2.cluster.shard_table_version() > 0
+                || node3.cluster.shard_table_version() > 0
+        },
+        Duration::from_secs(3),
+    )
+    .expect("at least one node should have advanced shard_table_version after SWIM discovery");
 
     // Verify all nodes see a shard table with non-zero version
     let v1 = node1.cluster.shard_table_version();
@@ -508,24 +609,50 @@ fn three_node_cluster_all_shards_assigned() {
 fn add_fourth_node_rebalance_triggers() {
     // Start 3-node cluster on ephemeral ports so unrelated local services
     // cannot collide with this integration test.
-    let node1 = create_node(111, 0, 0, &[], 2);
-    let node2 = create_node(112, 0, 0, &[node1.swim_port], 2);
-    let node3 = create_node(113, 0, 0, &[node1.swim_port], 2);
+    //
+    // Each node pre-seeds the full expected membership (111-114) into its
+    // F-G8-001 ever-seen allow-list BEFORE SWIM starts. Without this
+    // seeding the cluster gets stuck at a 2-node commit: once
+    // ever_seen = {first two nodes} is recorded, on_membership_changed
+    // rejects the [111, 112, 113] proposal and there is no retry path.
+    // Production avoids the issue by wiring cluster_id; the test fixture
+    // mirrors that via direct ever_seen injection.
+    let all_ids = [NodeId(111), NodeId(112), NodeId(113), NodeId(114)];
+    let node1 = create_node_with_ever_seen(111, 0, 0, &[], 2, &all_ids);
+    let node2 = create_node_with_ever_seen(112, 0, 0, &[node1.swim_port], 2, &all_ids);
+    let node3 = create_node_with_ever_seen(113, 0, 0, &[node1.swim_port], 2, &all_ids);
 
-    std::thread::sleep(Duration::from_secs(4));
+    // Wait for the 3-node topology to commit so v_before reflects the
+    // pre-add baseline. shard_table_version mirrors the committed term.
+    wait_until(
+        || node1.cluster.committed_topology_members().len() == 3,
+        Duration::from_secs(15),
+    )
+    .expect("3-node topology should commit on node1 before adding the 4th node");
     let v_before = node1.cluster.shard_table_version();
 
-    // Add 4th node
-    let node4 = create_node(
+    // Add 4th node — pre-seed its allow-list too so its votes accept the
+    // existing 3-node members and the upcoming 4-node proposal.
+    let node4 = create_node_with_ever_seen(
         114,
         0,
         0,
         &[node1.swim_port, node2.swim_port, node3.swim_port],
         2,
+        &all_ids,
     );
 
-    // Wait for SWIM discovery + rebalance
-    std::thread::sleep(Duration::from_secs(5));
+    // Wait for the 4-node topology to commit (proposer is node1 = lowest
+    // NodeId). The committed term must advance past v_before for the
+    // shard_table_version assertion below to fire.
+    wait_until(
+        || {
+            node1.cluster.committed_topology_members().len() == 4
+                && node1.cluster.shard_table_version() != v_before
+        },
+        Duration::from_secs(15),
+    )
+    .expect("4-node topology should commit and advance shard_table_version after node4 joins");
 
     let v_after = node1.cluster.shard_table_version();
 
@@ -555,13 +682,25 @@ fn remove_node_rebalance_triggers() {
     let node2 = create_node(122, 13422, 13423, &[13421], 2);
     let node3 = create_node(123, 13424, 13425, &[13421], 2);
 
-    std::thread::sleep(Duration::from_secs(3));
+    // Wait for the initial 3-node SWIM discovery so node1 actually sees
+    // node3 as a peer (otherwise the post-kill assertion is vacuous).
+    wait_until(
+        || node1.cluster.node_addresses().contains_key(&NodeId(123)),
+        Duration::from_secs(3),
+    )
+    .expect("node1 should discover node3 via SWIM before the kill");
 
     // Kill node 3
     shutdown_node(&node3);
 
-    // Wait for SWIM to detect the failure and rebalance
-    std::thread::sleep(Duration::from_secs(5));
+    // Wait for SWIM to detect the failure: node3 must be removed from
+    // node1's address map via NodeLeft. probe_interval=100ms +
+    // suspicion_timeout=2s, with headroom for CI load.
+    wait_until(
+        || !node1.cluster.node_addresses().contains_key(&NodeId(123)),
+        Duration::from_secs(5),
+    )
+    .expect("node1 should remove node3 from node_addrs after suspicion_timeout elapses");
 
     // Check that node1's shard table no longer has node 123 as master
     let table = node1.cluster.shard_table();
@@ -702,8 +841,14 @@ fn migrate_shard_with_records_to_new_node() {
     // Add 2nd node — triggers shard rebalancing and migration
     let node2 = create_node(152, 13452, 13453, &[13451], 1);
 
-    // Wait for SWIM + migration to complete
-    std::thread::sleep(Duration::from_secs(5));
+    // Wait for SWIM discovery and the rebalanced shard table to settle
+    // on node2. With RF=1 the new node is the master for ~half the
+    // shards once the topology commits.
+    wait_until(
+        || node2.cluster.committed_topology_members().len() == 2,
+        Duration::from_secs(5),
+    )
+    .expect("2-node topology should commit on node2 after it joins");
 
     // Verify that node2 now owns some shards
     let table2 = node2.cluster.shard_table();
@@ -859,7 +1004,25 @@ fn after_migration_complete_all_ops_go_to_new_node() {
 
     // Add 2nd node
     let node2 = create_node(182, 13482, 13483, &[13481], 2);
-    std::thread::sleep(Duration::from_secs(5));
+    // Wait until node2 is fully wired up for RF=2 writes:
+    //   1. 2-node topology committed on node2.
+    //   2. node2 knows node1's address (SWIM NodeJoined fired).
+    //   3. node2's activated shard table reflects the rebalanced
+    //      assignment — node1 now owns some shards (otherwise the
+    //      replication target resolution returns empty for any key
+    //      node2 owns).
+    wait_until(
+        || {
+            node2.cluster.committed_topology_members().len() == 2
+                && node2.cluster.node_addresses().contains_key(&NodeId(181))
+                && {
+                    let counts = node2.cluster.shard_table().read().shard_counts();
+                    counts.get(&NodeId(181)).copied().unwrap_or(0) > 0
+                }
+        },
+        Duration::from_secs(5),
+    )
+    .expect("node2 should have 2-node topology activated and node1 owning shards before write");
 
     // After migration, verify that node 2 handles operations for its shards
     let mut stream2 = TcpStream::connect(format!("127.0.0.1:{}", node2.tcp_port)).unwrap();
@@ -936,7 +1099,13 @@ fn no_records_lost_during_migration() {
 
     // Add 2nd node
     let node2 = create_node(192, 13492, 13493, &[13491], 1);
-    std::thread::sleep(Duration::from_secs(5));
+    // Wait for the 2-node topology to commit so is_master() reflects the
+    // rebalanced ownership rather than the pre-join single-node table.
+    wait_until(
+        || node2.cluster.committed_topology_members().len() == 2,
+        Duration::from_secs(5),
+    )
+    .expect("2-node topology should commit on node2 before counting record ownership");
 
     // Count records accessible on each node
     let mut n1_accessible = 0u32;
@@ -1006,8 +1175,17 @@ fn migration_of_empty_shard_completes_without_error() {
     let node1 = create_node(211, 13500, 13501, &[], 2);
     let node2 = create_node(212, 13502, 13503, &[13501], 2);
 
-    // Wait for SWIM + rebalance (migration of empty shards)
-    std::thread::sleep(Duration::from_secs(3));
+    // Wait for the 2-node topology to commit — that is the signal that
+    // empty-shard migration (which is a no-op when both nodes have no
+    // records) has run end-to-end without errors.
+    wait_until(
+        || {
+            node1.cluster.committed_topology_members().len() == 2
+                && node2.cluster.committed_topology_members().len() == 2
+        },
+        Duration::from_secs(3),
+    )
+    .expect("2-node topology should commit on both nodes so the migration path has run");
 
     // If we got here without panics, empty shard migration succeeded.
     // Verify both nodes are still responsive.
@@ -1055,7 +1233,15 @@ fn start_three_node_cluster_create_records_distributed() {
     let node2 = create_node(222, 13512, 13513, &[13511], 2);
     let node3 = create_node(223, 13514, 13515, &[13511], 2);
 
-    std::thread::sleep(Duration::from_secs(3));
+    // Wait for at least one peer to be reflected in node1's shard table
+    // so the "redirected > 0" assertion below is satisfiable. The test
+    // does not require all three nodes to commit; a 2-node topology is
+    // enough to produce both local-owned and redirected keys.
+    wait_until(
+        || node1.cluster.shard_table_version() > 0,
+        Duration::from_secs(3),
+    )
+    .expect("node1 should advance shard_table_version past bootstrap");
 
     // Create 100 records via node 1
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
@@ -1154,7 +1340,23 @@ fn spend_routed_to_correct_master() {
     let node1 = create_node(241, 13530, 13531, &[], 2);
     let node2 = create_node(242, 13532, 13533, &[13531], 2);
 
-    std::thread::sleep(Duration::from_secs(2));
+    // Wait until node1 is fully wired up for RF=2 writes: 2-node
+    // topology committed, node2 visible in node_addrs, and node2 owns
+    // some shards in node1's activated table (so replication target
+    // resolution can find a peer). Without all three the create below
+    // races and returns ERR_REPLICATION_FAILED.
+    wait_until(
+        || {
+            node1.cluster.committed_topology_members().len() == 2
+                && node1.cluster.node_addresses().contains_key(&NodeId(242))
+                && {
+                    let counts = node1.cluster.shard_table().read().shard_counts();
+                    counts.get(&NodeId(242)).copied().unwrap_or(0) > 0
+                }
+        },
+        Duration::from_secs(5),
+    )
+    .expect("node1 should have 2-node topology activated and node2 owning shards before write");
 
     // Find a key owned by node 1
     let mut local_txid = None;
@@ -1256,7 +1458,16 @@ fn add_node_all_records_still_accessible() {
 
     // Add 2nd node
     let node2 = create_node(252, 13542, 13543, &[13541], 2);
-    std::thread::sleep(Duration::from_secs(5));
+    // Wait for the 2-node topology to commit so is_master() reflects the
+    // rebalanced ownership rather than the single-node bootstrap table.
+    wait_until(
+        || {
+            node1.cluster.committed_topology_members().len() == 2
+                && node2.cluster.committed_topology_members().len() == 2
+        },
+        Duration::from_secs(5),
+    )
+    .expect("2-node topology should commit on both nodes before checking record ownership");
 
     // Verify all records are accessible from their correct owner
     let mut accessible = 0;
@@ -1285,7 +1496,14 @@ fn kill_node_detection_affected_shards() {
     let node2 = create_node(262, 13552, 13553, &[13551], 2);
     let node3 = create_node(263, 13554, 13555, &[13551], 2);
 
-    std::thread::sleep(Duration::from_secs(3));
+    // Wait until node1 has discovered node3 (so the "before kill" count is
+    // meaningful). The test does not require a committed 3-node topology
+    // here — just SWIM-level visibility of the peer.
+    wait_until(
+        || node1.cluster.node_addresses().contains_key(&NodeId(263)),
+        Duration::from_secs(3),
+    )
+    .expect("node1 should discover node3 via SWIM before the kill");
 
     // Count shards owned by node 3 before killing it
     let table = node1.cluster.shard_table();
@@ -1296,8 +1514,15 @@ fn kill_node_detection_affected_shards() {
     // Kill node 3
     shutdown_node(&node3);
 
-    // Wait for detection (suspicion_timeout=2s + some buffer)
-    std::thread::sleep(Duration::from_secs(6));
+    // Wait for SWIM to mark node3 dead and remove it from node_addrs
+    // (probe_interval=100ms + suspicion_timeout=2s nominal). The
+    // observable signal is that node3 no longer appears in node1's
+    // address map.
+    wait_until(
+        || !node1.cluster.node_addresses().contains_key(&NodeId(263)),
+        Duration::from_secs(6),
+    )
+    .expect("node1 should remove node3 from node_addrs after suspicion_timeout elapses");
 
     // Node 1 should have rebalanced
     let table_after = node1.cluster.shard_table();
@@ -1364,13 +1589,19 @@ fn wait_for_committed_members_len(node: &TestNode, expected: usize, timeout: Dur
     }
     let committed = node.cluster.committed_topology_members();
     let term = node.cluster.committed_topology_term();
+    let addrs = node.cluster.node_addresses();
+    let peak = node.cluster.peak_cluster_size();
+    let alive = node.cluster.alive_node_count();
     panic!(
-        "committed_topology_members().len()={} (expected {}) within {:?}: members={:?}, term={}",
+        "committed_topology_members().len()={} (expected {}) within {:?}: members={:?}, term={}, addrs={:?}, peak={}, alive={}",
         committed.len(),
         expected,
         timeout,
         committed,
         term,
+        addrs.keys().map(|k| k.0).collect::<Vec<_>>(),
+        peak,
+        alive,
     );
 }
 
@@ -1405,9 +1636,16 @@ fn isolated_node_rejects_writes_with_no_quorum() {
     // dead (NodeLeft removes them from node_addrs), then send
     // OP_CREATE_BATCH against the surviving node and assert it rejects
     // with ERR_NO_QUORUM rather than independently committing the write.
-    let node1 = create_node(301, 0, 0, &[], 2);
-    let node2 = create_node(302, 0, 0, &[node1.swim_port], 2);
-    let node3 = create_node(303, 0, 0, &[node1.swim_port], 2);
+    //
+    // Pre-seed each node's F-G8-001 ever-seen allow-list with the full
+    // expected membership: without that, on_membership_changed rejects
+    // the second/third node's addition once a 2-node topology is
+    // committed (see `add_fourth_node_rebalance_triggers` for the same
+    // pattern).
+    let all_ids = [NodeId(301), NodeId(302), NodeId(303)];
+    let node1 = create_node_with_ever_seen(301, 0, 0, &[], 2, &all_ids);
+    let node2 = create_node_with_ever_seen(302, 0, 0, &[node1.swim_port], 2, &all_ids);
+    let node3 = create_node_with_ever_seen(303, 0, 0, &[node1.swim_port], 2, &all_ids);
 
     // Wait for the 3-node topology to commit on the surviving node so
     // that `committed_topology_members` reflects the full peak set
