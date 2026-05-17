@@ -485,6 +485,14 @@ pub struct ClusterConfig {
     /// Persisted SWIM incarnation from a previous run. The SWIM runner will
     /// start from `persisted_incarnation + 1` to guarantee monotonicity.
     pub persisted_incarnation: u64,
+    /// 16-byte cluster instance UUID (see
+    /// [`crate::cluster::topology::ClusterId`]). All nodes in the same
+    /// cluster must use the same value; mismatched ids reject
+    /// cross-cluster topology proposals (P1.1). Defaults to
+    /// [`crate::cluster::topology::ClusterId::UNSET`] for legacy /
+    /// pre-orchestrator deployments — those nodes fall back to the
+    /// F-G8-001 ever-seen heuristic.
+    pub cluster_id: crate::cluster::topology::ClusterId,
 }
 
 /// Runtime replication policy passed to a started cluster coordinator.
@@ -561,6 +569,9 @@ impl ClusterCoordinator {
             config.self_id,
             config.topology_propose_timeout,
         ));
+        // P1.1: stamp the configured cluster_id before SWIM / the event
+        // loop starts so the very first proposal already carries it.
+        topology_authority.set_cluster_id(config.cluster_id);
         let active_topology_members = Arc::new(RwLock::new(members.clone()));
         let swim = SwimRunner::new(SwimConfig {
             self_id: config.self_id,

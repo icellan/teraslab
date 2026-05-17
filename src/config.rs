@@ -201,6 +201,14 @@ pub enum ConfigError {
     #[error("invalid sizing config: {0}")]
     InvalidSizing(String),
 
+    /// `cluster_id` was set but is not exactly 32 hex characters (16 bytes).
+    /// See P1.1.
+    #[error("invalid cluster_id: {reason}")]
+    InvalidClusterId {
+        /// Human-readable reason describing the malformed input.
+        reason: String,
+    },
+
     /// `cluster_secret` was set but is shorter than the minimum required
     /// entropy (16 bytes / 128 bits). See F-G10-011.
     #[error(
@@ -234,6 +242,19 @@ pub enum ConfigError {
 /// Parse the host portion of an `addr` string of the form `host:port`.
 ///
 /// Returns the parsed [`IpAddr`] on success. Used to gate non-loopback binds.
+/// Decode a single hex digit (`0-9`, `a-f`, `A-F`) into its 0-15 value
+/// or return a typed [`ConfigError::InvalidClusterId`] otherwise.
+fn hex_nibble(c: u8) -> Result<u8, ConfigError> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(ConfigError::InvalidClusterId {
+            reason: format!("non-hex byte 0x{c:02x}"),
+        }),
+    }
+}
+
 fn parse_bind_host(addr: &str) -> Result<IpAddr, std::net::AddrParseError> {
     // SocketAddr accepts both IPv4 and bracketed IPv6 forms.
     addr.parse::<std::net::SocketAddr>().map(|sa| sa.ip())
@@ -498,6 +519,19 @@ pub struct ServerConfig {
     /// `max(swim_probe_interval_ms * 3, 500)`.
     pub topology_propose_timeout_ms: u64,
 
+    /// 16-byte cluster instance UUID, encoded as 32 lowercase hex
+    /// characters (no dashes, no `0x` prefix). All nodes in the same
+    /// cluster must use the same value; mismatched ids reject
+    /// cross-cluster topology proposals at the
+    /// [`crate::cluster::topology::TopologyAuthority`] level (P1.1).
+    ///
+    /// `None` (TOML omits the key) maps to
+    /// [`crate::cluster::topology::ClusterId::UNSET`] and falls back to
+    /// the F-G8-001 ever-seen heuristic — only single-node demos and
+    /// pre-orchestrator deployments should leave it unset in a
+    /// multi-node setup.
+    pub cluster_id: Option<String>,
+
     /// Directory for external blob storage (large transaction cold data).
     ///
     /// Default `./teraslab-blobstore` (per F-G10-006). Previously defaulted
@@ -664,6 +698,7 @@ impl Default for ServerConfig {
             swim_probe_interval_ms: 200,
             swim_suspicion_timeout_ms: 5000,
             topology_propose_timeout_ms: 0,
+            cluster_id: None,
             blobstore_path: PathBuf::from("./teraslab-blobstore"),
             blob_gc_interval_secs: 3600,
             cluster_state_path: None,
@@ -712,6 +747,41 @@ impl ServerConfig {
         } else {
             self.topology_propose_timeout_ms
         }
+    }
+
+    /// Parse [`Self::cluster_id`] into a 16-byte
+    /// [`crate::cluster::topology::ClusterId`].
+    ///
+    /// Accepts exactly 32 lowercase or uppercase hex digits (no dashes,
+    /// no `0x` prefix). Returns
+    /// [`crate::cluster::topology::ClusterId::UNSET`] when the field is
+    /// absent. Any malformed value yields a typed error so startup
+    /// refuses rather than silently degrading to UNSET.
+    pub fn resolved_cluster_id(
+        &self,
+    ) -> Result<crate::cluster::topology::ClusterId, ConfigError> {
+        let s = match &self.cluster_id {
+            None => return Ok(crate::cluster::topology::ClusterId::UNSET),
+            Some(s) => s.trim(),
+        };
+        if s.is_empty() {
+            return Ok(crate::cluster::topology::ClusterId::UNSET);
+        }
+        if s.len() != 32 {
+            return Err(ConfigError::InvalidClusterId {
+                reason: format!(
+                    "cluster_id must be 32 hex chars (16 bytes); got {} chars",
+                    s.len()
+                ),
+            });
+        }
+        let mut bytes = [0u8; 16];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            let hi = hex_nibble(s.as_bytes()[2 * i])?;
+            let lo = hex_nibble(s.as_bytes()[2 * i + 1])?;
+            *byte = (hi << 4) | lo;
+        }
+        Ok(crate::cluster::topology::ClusterId(bytes))
     }
 
     /// Resolve the redo log file path. Uses `redo_log_path` if explicitly set,
