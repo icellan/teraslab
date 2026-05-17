@@ -310,3 +310,66 @@ The orchestrator should fix `src/redo.rs` — either:
   by my changes; pre-existing warnings in unrelated files persist.
 - `cargo fmt --all -- --check`: no drift introduced by my changes;
   pre-existing fmt drift in unrelated files persists.
+
+## F-G4-004 NEEDS-ORCHESTRATOR resolution — RESOLVED (`013f4d4`)
+
+The 7 NEEDS-ORCHESTRATOR failures all share the same root cause:
+F-G4-004's block-aligned flush leaves zero-padding between flushes,
+and the post-restart scan in `scan_entries_region_with_tail` stopped
+at the first `length=0` word, losing every entry after the first
+flush in a checkpoint epoch.
+
+**Fix landed**: commit `013f4d4` —
+`fix(redo): scan past alignment pad to recover entries beyond first flush`.
+
+Approach: option 1 from the recommendation list above. The scan now
+distinguishes a "true end-of-log sentinel" (length=0 at the start of
+an alignment unit) from "flush pad" (length=0 mid-block):
+
+- Mid-block length=0: validate every byte from there to the next
+  alignment boundary is zero (corruption check), skip ahead, retry
+  deserialize at the aligned position. Counts skipped pad bytes into
+  `consumed_in_region` so `write_pos` ends aligned and subsequent
+  flushes remain pure aligned appends.
+- Length=0 at an aligned boundary: real end of log.
+- After a pad skip, if the next entry's sequence is non-consecutive
+  (e.g. stale data left behind beyond a `compact_prefix_through`
+  sentinel block), treat it as end-of-log rather than raising
+  `SequenceOutOfOrder` — so a benign post-compaction gap never aborts
+  recovery.
+
+**Tests now passing under this commit**:
+- `redo::tests::reopen_recovers_entries_across_multiple_flushes_with_alignment_pad` (new — pure unit regression for the scan rule)
+- `server::dispatch::tests::acked_creates_survive_crash`
+- `server::dispatch::tests::acked_spends_survive_crash`
+- `server::dispatch::tests::acked_mark_longest_chain_survives_crash`
+- `server::dispatch::tests::spend_redo_carries_real_new_spent_count_for_replay`
+- `server::dispatch::tests::unspend_redo_carries_real_new_spent_count_for_replay`
+- `server::dispatch::tests::crash_mid_rollback_recovers_compensation_from_redo`
+- `index::hashtable::tests::resize_journals_begin_and_commit`
+
+**Collateral test fixes** in the same commit: two adjacent redo tests
+(`corrupted_entry_stops_recovery`, `truncated_entry_stops_recovery`)
+were silently masking real corruption by writing into the header block
+at offset 0 — a stale-since-F-G4-001 assumption. They survived
+F-G4-004 because the pad-gap bug was hiding the second entry "for the
+right reason" by accident. With the scan fix, the second entry IS
+reachable and the bogus header-block corruption no longer truncates
+recovery. Both tests were updated to corrupt the entries region at
+offset = device alignment, with the corrupt payload non-zero so the
+new pad-gap rule does not classify it as benign pad.
+
+**Final cargo numbers under `013f4d4`**:
+- `cargo test --lib`: `1750 passed; 0 failed; 0 ignored`.
+- `cargo test --all`: lib + bin + benches + the unaffected integration
+  tests pass. Pre-existing flaky failures in `tests/cluster_edge_cases.rs`
+  (`split_brain_heal_detects_independent_clusters`,
+  `topology_cluster_formation_three_simultaneous_starts`,
+  `topology_fallback_proposer_superseded_by_second_timeout`,
+  `topology_formation_recovery_blocked_by_outstanding_vote`) are
+  unrelated to this fix and reproduce on the pre-fix base
+  (`8b4306e`).
+- `cargo clippy --all-targets -- -D warnings`: clean on `src/redo.rs`;
+  pre-existing clippy warnings in unrelated files unchanged.
+- `cargo fmt -- --check`: clean on `src/redo.rs`; pre-existing fmt
+  drift in unrelated files unchanged.

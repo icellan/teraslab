@@ -2161,11 +2161,28 @@ impl RedoLog {
     /// entry between chunks. Memory footprint at startup is bounded at
     /// `SCAN_CHUNK_BYTES + entries.size_of` instead of `log_size +
     /// entries.size_of`.
+    ///
+    /// **F-G4-004 pad-gap handling.** `flush()` rounds `write_pos` up to
+    /// the device alignment after every flush, so the bytes between the
+    /// last entry of a flush and the next alignment boundary are zero
+    /// padding. A naive "stop at the first `length=0` word" scan would
+    /// treat that pad as end-of-log and lose every entry written in
+    /// subsequent flushes within the same checkpoint epoch.
+    ///
+    /// Rule: a `length=0` word that sits at the **start of an alignment
+    /// unit** is a true end-of-log sentinel. A `length=0` word mid-block
+    /// is interpreted as flush pad: validate that all bytes from there to
+    /// the next aligned boundary are zero, advance `local_pos` past the
+    /// pad, and retry the deserialize at the aligned position. If the
+    /// next entry's sequence is non-consecutive (e.g. stale data left
+    /// behind beyond a `compact_prefix_through` sentinel block), treat
+    /// that as end-of-log rather than raising `SequenceOutOfOrder`.
     fn scan_entries_region_with_tail(&self) -> Result<(Vec<RedoEntry>, u64)> {
         // 4 MiB working buffer (alignment-rounded). Tunable.
         const SCAN_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
         let align = self.device.alignment();
+        let align_u64 = align as u64;
         let entries_off = self.entries_region_offset();
         let entries_size = self.entries_region_size();
         let total_to_read = entries_size as usize;
@@ -2175,9 +2192,18 @@ impl RedoLog {
         let mut prev_seq: Option<u64> = None;
         // Bytes pending from the previous chunk (partial trailing entry).
         let mut carry: Vec<u8> = Vec::new();
-        // Total bytes consumed within the entries region.
+        // Total bytes consumed within the entries region (relative to
+        // the entries region start). Includes any pad bytes skipped via
+        // the F-G4-004 alignment-pad rule so the resulting tail is
+        // aligned for subsequent appends.
         let mut consumed_in_region: u64 = 0;
         let mut scan_start: u64 = 0;
+        // Set when we have just skipped over flush pad zeros to the next
+        // alignment boundary. Used to soften the strict sequence-order
+        // check at the first post-skip entry: a stale or unrelated entry
+        // beyond the skipped gap is treated as end-of-log instead of a
+        // hard `SequenceOutOfOrder` error.
+        let mut just_skipped_pad = false;
 
         while scan_start < total_to_read as u64 {
             let remaining = total_to_read as u64 - scan_start;
@@ -2208,6 +2234,18 @@ impl RedoLog {
                         if let Some(prev) = prev_seq
                             && prev.checked_add(1) != Some(entry.sequence)
                         {
+                            if just_skipped_pad {
+                                // Non-consecutive sequence past a pad
+                                // skip: this is stale data beyond a
+                                // legitimate end-of-flush boundary
+                                // (e.g. left over from before
+                                // `compact_prefix_through` zeroed the
+                                // sentinel block). Stop here; the tail
+                                // position already points at this stale
+                                // block so future appends overwrite it.
+                                stop_scan = true;
+                                break;
+                            }
                             return Err(RedoError::SequenceOutOfOrder {
                                 offset: consumed_in_region + local_pos as u64,
                                 previous: prev,
@@ -2217,22 +2255,59 @@ impl RedoLog {
                         prev_seq = Some(entry.sequence);
                         entries.push(entry);
                         local_pos += consumed_entry;
+                        just_skipped_pad = false;
                     }
                     None => {
                         // Distinguish "end-of-data marker" (length=0)
                         // from "partial entry split across chunks".
-                        if combined[local_pos..].len() >= ENTRY_HEADER_SIZE {
-                            let lw = u32::from_le_bytes(
-                                combined[local_pos..local_pos + 4].try_into().unwrap(),
-                            );
-                            if lw == 0 {
-                                stop_scan = true;
-                                break;
-                            }
+                        if combined[local_pos..].len() < ENTRY_HEADER_SIZE {
+                            // Partial entry: defer to next chunk.
+                            carry = combined[local_pos..].to_vec();
+                            break;
                         }
-                        // Partial entry: defer to next chunk.
-                        carry = combined[local_pos..].to_vec();
-                        break;
+                        let lw = u32::from_le_bytes(
+                            combined[local_pos..local_pos + 4].try_into().unwrap(),
+                        );
+                        if lw != 0 {
+                            // Truncated or CRC-failing entry: end of log.
+                            carry = combined[local_pos..].to_vec();
+                            break;
+                        }
+                        // length=0. Apply F-G4-004 pad-gap rule.
+                        let abs_pos = consumed_in_region + local_pos as u64;
+                        if abs_pos.is_multiple_of(align_u64) {
+                            // Aligned boundary + length=0 → true end of log.
+                            stop_scan = true;
+                            break;
+                        }
+                        // Mid-block length=0: treat as flush pad. The
+                        // padding region MUST be entirely zero — a
+                        // non-zero byte here is corruption, not legit
+                        // pad, so stop scanning rather than skipping
+                        // into garbage.
+                        let pad_end_abs = abs_pos.next_multiple_of(align_u64);
+                        let pad_skip = (pad_end_abs - abs_pos) as usize;
+                        if combined[local_pos..].len() < pad_skip {
+                            // Not enough bytes in this combined buffer
+                            // to verify the full pad. Defer to next
+                            // chunk; `prev_seq` and entry list carry
+                            // forward unchanged.
+                            carry = combined[local_pos..].to_vec();
+                            break;
+                        }
+                        if !combined[local_pos..local_pos + pad_skip]
+                            .iter()
+                            .all(|b| *b == 0)
+                        {
+                            // Non-zero byte within the pad region: not
+                            // legitimate flush pad. Stop here.
+                            stop_scan = true;
+                            break;
+                        }
+                        local_pos += pad_skip;
+                        just_skipped_pad = true;
+                        // Re-enter loop; deserialize from the new
+                        // aligned position.
                     }
                 }
             }
@@ -2450,28 +2525,41 @@ mod tests {
     #[test]
     fn corrupted_entry_stops_recovery() {
         let (dev, mut log) = make_log(1024 * 1024);
-        log.append_and_flush(RedoOp::Freeze {
+        // F-G4-004: append both entries before a single flush so they
+        // sit contiguously on disk; otherwise the trailing alignment
+        // pad between separate flushes is interpreted (post-fix) as a
+        // pad gap, and the second entry would still be reached past the
+        // corruption-free pad. We want the corruption itself to be the
+        // thing that stops the scan.
+        log.append(RedoOp::Freeze {
             tx_key: test_key(1),
             offset: 0,
         })
         .unwrap();
-        log.append_and_flush(RedoOp::Freeze {
+        log.append(RedoOp::Freeze {
             tx_key: test_key(2),
             offset: 1,
         })
         .unwrap();
+        log.flush().unwrap();
 
-        // Corrupt byte in the second entry
+        // Corrupt a byte well inside the second entry. The entries
+        // region starts at offset = device alignment (the F-G4-001
+        // header block claims the first alignment unit).
         let align = dev.alignment();
+        let entries_region_offset = align as u64;
         let mut buf = AlignedBuf::new(align, align);
-        dev.pread(&mut buf, 0).unwrap();
-        // Find roughly where the second entry is and corrupt it
-        buf[100] ^= 0xFF;
-        dev.pwrite(&buf, 0).unwrap();
+        dev.pread(&mut buf, entries_region_offset).unwrap();
+        // First Freeze entry is 53 bytes (4 length + 8 seq + 1 type +
+        // 32 txid + 4 offset + 4 crc). Corrupt the payload of the
+        // second entry at offset 53 + ~20 from the start of the entries
+        // block.
+        buf[73] ^= 0xFF;
+        dev.pwrite(&buf, entries_region_offset).unwrap();
 
         let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
         let entries = log2.recover().unwrap();
-        // Should get at most the first entry (second is corrupt)
+        // Should get at most the first entry (second is corrupt).
         assert!(entries.len() <= 1);
     }
 
@@ -2757,6 +2845,49 @@ mod tests {
     }
 
     #[test]
+    fn reopen_recovers_entries_across_multiple_flushes_with_alignment_pad() {
+        // Regression test for the F-G4-004 scan/pad interaction.
+        //
+        // F-G4-004 rounds `write_pos` up to the device alignment after
+        // every flush so subsequent flushes are pure aligned appends.
+        // Each flush therefore writes its entries followed by zero
+        // padding up to the next alignment boundary. If the post-restart
+        // scan stops at the first `length=0` word it treats the pad of
+        // the first flush as end-of-log and loses every entry written in
+        // later flushes within the same checkpoint epoch.
+        //
+        // Two separate flushes, no checkpoint in between, then reopen:
+        // both entries MUST survive.
+        let (dev, mut log) = make_log(1024 * 1024);
+
+        log.append(RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        })
+        .unwrap();
+        log.flush().unwrap();
+
+        log.append(RedoOp::Freeze {
+            tx_key: test_key(2),
+            offset: 1,
+        })
+        .unwrap();
+        log.flush().unwrap();
+
+        drop(log);
+
+        let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
+        let entries = log2.recover().unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "both entries must survive the alignment-pad gap between flushes",
+        );
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 2);
+    }
+
+    #[test]
     fn redo_repeated_reads_use_entry_cache_after_open() {
         let dev = Arc::new(ReadFailingDevice::new(1024 * 1024));
         let dev_trait: Arc<dyn BlockDevice> = dev.clone();
@@ -2801,33 +2932,41 @@ mod tests {
     #[test]
     fn truncated_entry_stops_recovery() {
         let (dev, mut log) = make_log(1024 * 1024);
-        log.append_and_flush(RedoOp::Freeze {
+        // F-G4-004: single flush so the entries are contiguous on disk;
+        // the corruption we add below is what should stop the scan, not
+        // an alignment pad.
+        log.append(RedoOp::Freeze {
             tx_key: test_key(1),
             offset: 0,
         })
         .unwrap();
-        log.append_and_flush(RedoOp::Freeze {
+        log.append(RedoOp::Freeze {
             tx_key: test_key(2),
             offset: 1,
         })
         .unwrap();
+        log.flush().unwrap();
 
-        // Simulate truncation: zero out most of the second entry
+        // Simulate truncation: rewrite the second entry's payload area
+        // to a non-zero garbage byte so its CRC fails. Writing zeros
+        // here would (correctly, under the pad-gap rule) be treated as
+        // pad — we want the test to exercise the CRC-failure stop, so
+        // use a non-zero pattern.
         let align = dev.alignment();
+        let entries_region_offset = align as u64;
         let mut buf = AlignedBuf::new(align, align);
-        dev.pread(&mut buf, 0).unwrap();
-        // Write a partial length at the second entry location, then zeros
-        // This simulates a power failure mid-write of the second entry
-        let first_entry_end = 60; // approximate size of first entry
-        // Zero out from midpoint of second entry onward
-        for b in buf[first_entry_end + 10..first_entry_end + 50].iter_mut() {
-            *b = 0;
+        dev.pread(&mut buf, entries_region_offset).unwrap();
+        // First Freeze entry is 53 bytes; corrupt the second entry's
+        // payload bytes 70..100 with a non-zero pattern.
+        for b in buf[70..100].iter_mut() {
+            *b = 0xAA;
         }
-        dev.pwrite(&buf, 0).unwrap();
+        dev.pwrite(&buf, entries_region_offset).unwrap();
 
         let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
         let entries = log2.recover().unwrap();
-        // Should get at most the first entry (second is truncated)
+        // Should get at most the first entry (second is truncated /
+        // corrupt).
         assert!(entries.len() <= 1);
     }
 
