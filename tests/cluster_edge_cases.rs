@@ -637,6 +637,14 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
     };
     auth.handle_commit(&old_commit);
 
+    // F-G8-001: the ever-seen split-brain fallback rejects any proposal
+    // that introduces a NodeId never previously observed as a committed
+    // voter on this node. NodeId(3) was not part of the prior commit, so
+    // both `on_membership_changed` and `check_timeout` would otherwise
+    // short-circuit before the term-overwrite path under test runs.
+    // Pre-seed node 3 to isolate the boundary condition this test targets.
+    auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3)]);
+
     // handle_commit pins observed_membership to the old committed set;
     // check_timeout's `members` arg is only used as a bootstrap fallback
     // when no prior view has been observed. Simulate SWIM detecting the
