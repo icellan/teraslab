@@ -248,8 +248,24 @@ fn delete_does_not_alias_concurrent_create() {
         }));
     }
 
-    let deadline = Instant::now() + Duration::from_millis(1500);
-    while Instant::now() < deadline {
+    // Stop once both sides have done enough work to make the assertion
+    // meaningful, OR after a hard upper bound — whichever comes first.
+    // Hard-coding a fixed duration is flaky under load: the F-X-007
+    // stripe-lock RwLock adds ~35 ns per read, and on a contended box
+    // running cargo test --all in debug, 1.5 s could fail to reach
+    // 100 reads / 20 cycles. Polling on the counters reaches the
+    // sufficiency threshold deterministically when the system is idle
+    // and falls back to a 5 s ceiling under contention.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let reads_now = reads_total.load(Ordering::Relaxed);
+        let cycles_now = cycles_total.load(Ordering::Relaxed);
+        if reads_now >= 200 && cycles_now >= 40 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
         thread::sleep(Duration::from_millis(20));
     }
     stop.store(true, Ordering::Relaxed);
