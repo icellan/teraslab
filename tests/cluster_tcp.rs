@@ -314,10 +314,7 @@ fn two_nodes_discover_each_other() {
     // shard-table version (i.e. the peer was observed and the committed
     // term advanced past the bootstrap term=0).
     wait_until(
-        || {
-            node1.cluster.shard_table_version() > 0
-                || node2.cluster.shard_table_version() > 0
-        },
+        || node1.cluster.shard_table_version() > 0 || node2.cluster.shard_table_version() > 0,
         Duration::from_secs(2),
     )
     .expect("at least one node should have observed the peer and advanced shard_table_version");
