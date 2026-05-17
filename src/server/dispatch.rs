@@ -12871,7 +12871,11 @@ mod tests {
     fn compensation_redo_failure_returns_error() {
         use crate::ops::remaining::FreezeRequest;
 
-        let h = RedoDispatchHarness::new_with_redo_size(4096);
+        // F-G4-001: the redo region must hold a header block (one
+        // device alignment unit) plus at least one entries block, so
+        // 4 KiB is rejected at open. 8 KiB still fills quickly under
+        // the loop below.
+        let h = RedoDispatchHarness::new_with_redo_size(8192);
         let key = rollback_seed_record(&h, DispatchTestHarness::make_txid(157), 1);
         let slot = h.engine.read_slot(&key, 0).expect("slot");
         h.engine
@@ -12918,7 +12922,16 @@ mod tests {
 
     #[test]
     fn create_batch_redo_failure_surfaces_allocator_rollback_failure() {
-        let h = RedoDispatchHarness::new_with_exact_redo_log_size(60);
+        // F-G4-001: the redo region must hold a header block (one
+        // alignment unit) plus at least one entries block. With a
+        // 8 KiB region the entries capacity is exactly one alignment
+        // unit (4 KiB), and because F-G4-004 block-aligns write_pos
+        // after every flush, the very first allocator append+flush
+        // consumes the entire entries region. The next append
+        // (CreateV2) therefore fails with LogFull, exercising the
+        // "create redo write failure + allocator rollback errors"
+        // path the test asserts on.
+        let h = RedoDispatchHarness::new_with_exact_redo_log_size(8192);
         let resp = h.create_tx(DispatchTestHarness::make_txid(158), 1);
 
         assert_eq!(resp.status, STATUS_ERROR);
