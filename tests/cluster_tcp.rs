@@ -1639,9 +1639,16 @@ fn isolated_node_rejects_writes_with_no_quorum() {
     // dead (NodeLeft removes them from node_addrs), then send
     // OP_CREATE_BATCH against the surviving node and assert it rejects
     // with ERR_NO_QUORUM rather than independently committing the write.
-    let node1 = create_node(301, 0, 0, &[], 2);
-    let node2 = create_node(302, 0, 0, &[node1.swim_port], 2);
-    let node3 = create_node(303, 0, 0, &[node1.swim_port], 2);
+    //
+    // Pre-seed each node's F-G8-001 ever-seen allow-list with the full
+    // expected membership: without that, on_membership_changed rejects
+    // the second/third node's addition once a 2-node topology is
+    // committed (see `add_fourth_node_rebalance_triggers` for the same
+    // pattern).
+    let all_ids = [NodeId(301), NodeId(302), NodeId(303)];
+    let node1 = create_node_with_ever_seen(301, 0, 0, &[], 2, &all_ids);
+    let node2 = create_node_with_ever_seen(302, 0, 0, &[node1.swim_port], 2, &all_ids);
+    let node3 = create_node_with_ever_seen(303, 0, 0, &[node1.swim_port], 2, &all_ids);
 
     // Wait for the 3-node topology to commit on the surviving node so
     // that `committed_topology_members` reflects the full peak set
