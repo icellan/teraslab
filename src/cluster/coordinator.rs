@@ -6310,11 +6310,17 @@ impl RunningCluster {
             return Vec::new();
         }
         members.sort();
+        let cluster_id = self.topology_authority.cluster_id();
         crate::cluster::topology::TopologyCommit {
             term,
             proposer: members[0],
             members: members.clone(),
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(term, &members),
+            cluster_id,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                term,
+                &cluster_id,
+                &members,
+            ),
             voters: {
                 let voters = self.topology_authority.committed_voters();
                 if voters.is_empty() {
@@ -6547,11 +6553,17 @@ impl RunningCluster {
         let committed = self.topology_authority.committed_term();
         let new_term = committed + 1;
         let new_members = members_for_new_table.clone();
+        let cluster_id = self.topology_authority.cluster_id();
         let commit = crate::cluster::topology::TopologyCommit {
             term: new_term,
             proposer: new_members[0],
             members: new_members.clone(),
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(new_term, &new_members),
+            cluster_id,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                new_term,
+                &cluster_id,
+                &new_members,
+            ),
             voters: new_members.clone(),
         };
         // Apply locally first.
@@ -6922,12 +6934,15 @@ pub(crate) fn new_test_running_cluster(
         committed_members.to_vec()
     }));
     if !committed_members.is_empty() {
+        let cluster_id = topology_authority.cluster_id();
         let commit = crate::cluster::topology::TopologyCommit {
             term: table.version,
             proposer: self_id,
             members: committed_members.to_vec(),
+            cluster_id,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 table.version,
+                &cluster_id,
                 committed_members,
             ),
             voters: committed_members.to_vec(),
@@ -9154,7 +9169,8 @@ mod tests {
             term: 4,
             proposer: NodeId(1),
             members: next_members.clone(),
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(4, &next_members),
+            cluster_id: crate::cluster::topology::ClusterId::UNSET,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(4, &crate::cluster::topology::ClusterId::UNSET, &next_members),
             voters: next_members.clone(),
         };
         assert_eq!(
@@ -9199,8 +9215,10 @@ mod tests {
             term: routing.shard_table_version,
             proposer: NodeId(1),
             members: committed_members.clone(),
+            cluster_id: crate::cluster::topology::ClusterId::UNSET,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 routing.shard_table_version,
+                &crate::cluster::topology::ClusterId::UNSET,
                 &committed_members,
             ),
             voters: vec![NodeId(1), NodeId(2)],
@@ -9236,7 +9254,8 @@ mod tests {
             term: 4,
             proposer: NodeId(1),
             members: committed_members.clone(),
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(4, &committed_members),
+            cluster_id: crate::cluster::topology::ClusterId::UNSET,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(4, &crate::cluster::topology::ClusterId::UNSET, &committed_members),
             voters: committed_members.clone(),
         };
         assert_eq!(
@@ -9252,7 +9271,7 @@ mod tests {
         assert_eq!(decoded.members, committed_members);
         assert_eq!(
             decoded.digest,
-            crate::cluster::topology::TopologyTerm::compute_digest(4, &committed_members),
+            crate::cluster::topology::TopologyTerm::compute_digest(4, &crate::cluster::topology::ClusterId::UNSET, &committed_members),
         );
     }
 
@@ -9790,7 +9809,8 @@ mod tests {
             term: 5,
             proposer: NodeId(1),
             members: commit_members.clone(),
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(5, &commit_members),
+            cluster_id: crate::cluster::topology::ClusterId::UNSET,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(5, &crate::cluster::topology::ClusterId::UNSET, &commit_members),
             voters: commit_members.clone(),
         };
         let applied = cluster.topology_authority.handle_commit(&commit);
