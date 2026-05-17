@@ -10612,7 +10612,8 @@ mod tests {
 
         let h = DispatchTestHarness::new();
         let self_id = crate::cluster::shards::NodeId(1);
-        let members = vec![self_id, crate::cluster::shards::NodeId(2)];
+        let other = crate::cluster::shards::NodeId(2);
+        let members = vec![self_id, other];
         let table = crate::cluster::shards::ShardTable::compute_with_epoch(&[self_id], 1, 10);
         let cluster = crate::cluster::coordinator::new_test_running_cluster_with_topology_path(
             self_id,
@@ -10625,9 +10626,17 @@ mod tests {
             1,
             Some(path.clone()),
         );
+        // F-G8-001: handle_propose now rejects any proposal that
+        // introduces a NodeId the voter has never seen as a committed
+        // voter. Pre-seed the ever-seen set with both members so the
+        // subsume proposal is accepted and we can exercise the vote-
+        // persist-before-reply path the test actually targets.
+        cluster
+            .topology_authority()
+            .set_committed_voter_ever_seen(&[self_id, other]);
 
         // Propose a new term that subsumes this single-node cluster.
-        let proposer = crate::cluster::shards::NodeId(2);
+        let proposer = other;
         let propose = crate::cluster::topology::TopologyTerm::new(500, members.clone(), proposer);
 
         let req = RequestFrame {
@@ -10678,7 +10687,8 @@ mod tests {
         let bogus = std::path::PathBuf::from("/nonexistent/teraslab-topology-h10/node.topology");
         let h = DispatchTestHarness::new();
         let self_id = crate::cluster::shards::NodeId(1);
-        let members = vec![self_id, crate::cluster::shards::NodeId(2)];
+        let other = crate::cluster::shards::NodeId(2);
+        let members = vec![self_id, other];
         let table = crate::cluster::shards::ShardTable::compute_with_epoch(&[self_id], 1, 10);
         let cluster = crate::cluster::coordinator::new_test_running_cluster_with_topology_path(
             self_id,
@@ -10691,8 +10701,14 @@ mod tests {
             1,
             Some(bogus),
         );
+        // F-G8-001: pre-seed the ever-seen set so the subsume proposal
+        // is accepted by handle_propose and we exercise the persist-
+        // failure path (rather than failing earlier on split-brain).
+        cluster
+            .topology_authority()
+            .set_committed_voter_ever_seen(&[self_id, other]);
 
-        let proposer = crate::cluster::shards::NodeId(2);
+        let proposer = other;
         let propose = crate::cluster::topology::TopologyTerm::new(600, members.clone(), proposer);
 
         let req = RequestFrame {
