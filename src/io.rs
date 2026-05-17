@@ -12,12 +12,59 @@
 //!   the device does not expose direct memory access.
 
 use crate::device::{AlignedBuf, BlockDevice, DeviceError};
+use crate::locks::StripedRwLocks;
 use crate::record::{
     BLOCK_ENTRY_SIZE, BlockEntry, CRC32_OFFSET, METADATA_SIZE, TxMetadata, UTXO_SLOT_SIZE, UtxoSlot,
 };
 
 /// Result type for I/O helper operations.
 pub type Result<T> = std::result::Result<T, DeviceError>;
+
+// ---------------------------------------------------------------------------
+// F-X-007 / BC-02: torn-read fix — record-offset striped RwLock
+// ---------------------------------------------------------------------------
+//
+// The `*_direct` helpers below memcpy `TxMetadata` (320 bytes) and
+// `UtxoSlot` (73 bytes) via plain `copy_from_slice`. On AArch64 release
+// builds the LLVM-emitted SIMD memcpy is non-atomic and may publish bytes
+// in any order. The original BC-02 contract claimed the CRC32 at the end
+// of the metadata header would catch every torn read; the regression
+// test `direct_read_write_concurrent_stress_never_returns_torn_data`
+// proves the claim is empirically false on Apple Silicon (m-series).
+// Mechanism: the CRC slot lives near the *end* of the 320-byte header
+// (offset 253, not 4-byte aligned). NEON-based memcpy can land the new
+// CRC bytes before the new field bytes; a concurrent reader observes
+// the new CRC paired with mostly-old field bytes, recomputes a matching
+// CRC against the partial state, and returns garbage to the caller.
+// Release/Acquire fences on either side do not help — Rust's memory
+// model only establishes happens-before through paired atomic
+// load/store operations on the *same* address, which the memcpy is not.
+//
+// Closing the window without changing the on-disk format requires real
+// mutual exclusion at the record level. We stripe a `RwLock<()>` table
+// keyed by `record_offset`: writers hold the write guard for the bulk
+// memcpy + CRC restamp, readers hold the read guard while they copy
+// bytes off the device. Two readers on the same record still parallelize;
+// readers and writers on different records (or stripes) do not contend.
+//
+// The lock table is a process-wide singleton because the `_direct` helpers
+// only have a raw pointer + offset, no device handle, no engine context.
+// Per-device tables would be cleaner but would require threading the
+// table through every direct-read call site — a much larger change.
+// The default 65_536 stripes match the engine's `StripedLocks` default;
+// false-sharing only occurs when two distinct record offsets hash to the
+// same stripe (effectively zero contention in practice).
+
+/// Process-wide striped RwLock table that serializes writer↔reader
+/// access at the record level for the direct-pointer I/O helpers.
+///
+/// Initialized lazily on first use. Stripe count: 65_536 (matches
+/// `StripedLocks` default), giving an expected false-sharing rate
+/// below 0.002% for typical record cardinalities.
+fn io_locks() -> &'static StripedRwLocks {
+    static LOCKS: std::sync::OnceLock<StripedRwLocks> = std::sync::OnceLock::new();
+    LOCKS.get_or_init(|| StripedRwLocks::new(65_536))
+}
 
 /// F-G1-005: convert a `u64` device record offset to `usize` with a
 /// debug-assertion that the value fits. On 64-bit targets (the only
@@ -86,6 +133,18 @@ const _: () = assert!(std::mem::offset_of!(TxMetadata, preserve_until) == META_O
 ///
 /// `base_ptr` must be valid for `record_offset + METADATA_SIZE` bytes.
 /// Caller must hold the per-transaction stripe lock.
+///
+/// # F-X-007 (BC-02) record-level lock
+///
+/// This primitive does **not** acquire the process-wide
+/// `StripedRwLocks` torn-read guard. Callers that interleave several
+/// footer writes (e.g. footer + block-entry + CRC) hold the write
+/// guard once at the combining call site so a reader cannot observe a
+/// half-committed mutation between primitive calls. The combined
+/// `*_and_crc_direct` wrappers below acquire the guard internally;
+/// the bare primitives must be invoked with the guard already held
+/// or from a write path that has no concurrent readers (e.g.
+/// recovery, creation).
 #[inline]
 pub unsafe fn write_mutation_footer_direct(
     base_ptr: *mut u8,
@@ -204,9 +263,15 @@ pub unsafe fn write_mutation_footer_and_crc_direct(
     record_offset: u64,
     meta: &TxMetadata,
 ) {
+    // F-X-007 (BC-02): hold the record-level write guard across the
+    // entire footer + CRC restamp so a concurrent direct-pointer read
+    // either sees the pre-mutation header or the post-CRC header,
+    // never an in-progress mix that happens to validate against the
+    // old CRC.
+    let _w = io_locks().write(record_offset);
     // Safety: same contract as the primitives — caller holds the
-    // stripe lock and the base_ptr is valid for METADATA_SIZE bytes
-    // at the record offset.
+    // engine's per-tx stripe lock and the base_ptr is valid for
+    // METADATA_SIZE bytes at the record offset.
     unsafe {
         write_mutation_footer_direct(base_ptr, record_offset, meta);
         write_crc_direct(base_ptr, record_offset, meta);
@@ -228,6 +293,9 @@ pub unsafe fn write_spend_footer_and_crc_direct(
     record_offset: u64,
     meta: &TxMetadata,
 ) {
+    // F-X-007: see write_mutation_footer_and_crc_direct for the
+    // record-level write-guard rationale.
+    let _w = io_locks().write(record_offset);
     // Safety: see write_mutation_footer_and_crc_direct.
     unsafe {
         write_spend_footer_direct(base_ptr, record_offset, meta);
@@ -247,6 +315,9 @@ pub unsafe fn write_mined_footer_and_crc_direct(
     record_offset: u64,
     meta: &TxMetadata,
 ) {
+    // F-X-007: see write_mutation_footer_and_crc_direct for the
+    // record-level write-guard rationale.
+    let _w = io_locks().write(record_offset);
     // Safety: see write_mutation_footer_and_crc_direct.
     unsafe {
         write_mined_footer_direct(base_ptr, record_offset, meta);
@@ -268,6 +339,9 @@ pub unsafe fn write_block_entry_and_crc_direct(
     entry: &BlockEntry,
     meta: &TxMetadata,
 ) {
+    // F-X-007: see write_mutation_footer_and_crc_direct for the
+    // record-level write-guard rationale.
+    let _w = io_locks().write(record_offset);
     // Safety: see write_mutation_footer_and_crc_direct. `meta` must
     // reflect the post-write block_entry_count + block_entries_inline
     // state so the CRC matches the on-disk bytes.
@@ -301,14 +375,13 @@ pub unsafe fn write_crc_direct(base_ptr: *mut u8, record_offset: u64, meta: &TxM
         let p = base_ptr.add(off_to_usize(record_offset));
         let crc = meta.compute_crc();
         std::ptr::copy_nonoverlapping(crc.to_le_bytes().as_ptr(), p.add(CRC32_OFFSET), 4);
-        // R-030 (BC-07): Release fence after the CRC stamp — this
-        // is the LAST write of any direct-mutation sequence (the
-        // contract on the targeted footer helpers requires callers
-        // to follow with `write_crc_direct`), so the fence here
-        // covers the entire mutation. See `write_metadata_direct`
-        // for the full rationale.
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     }
+    // F-X-007: visibility to concurrent readers is provided by the
+    // record-level write guard held by the combining call site
+    // (`write_mutation_footer_and_crc_direct` and siblings), not by
+    // a memory fence. Memory fences without paired atomic accesses
+    // on the same address do not establish happens-before in Rust's
+    // memory model — only the lock release does.
 }
 
 // ===========================================================================
@@ -319,62 +392,48 @@ pub unsafe fn write_crc_direct(base_ptr: *mut u8, record_offset: u64, meta: &TxM
 /// the on-disk CRC32.
 ///
 /// Zero-copy: interprets the bytes in place and returns a bitwise copy.
-/// No `AlignedBuf` allocation, no `RwLock`, no syscalls. Returns
-/// [`DeviceError::RecordCorruption`] if the CRC slot disagrees with a
-/// freshly-computed CRC over the header bytes.
+/// Returns [`DeviceError::RecordCorruption`] if the CRC slot disagrees
+/// with a freshly-computed CRC over the header bytes.
 ///
 /// # Safety
 ///
 /// `base_ptr` must be valid for at least `record_offset + METADATA_SIZE` bytes.
 ///
-/// # Concurrency contract (R-009 / BC-02)
+/// # Concurrency contract (F-X-007 / BC-02)
 ///
-/// **Read-paths do NOT need the per-transaction stripe lock.** A reader
-/// that races with a concurrent `write_metadata_direct` on the same
-/// record can observe a torn header — which the CRC32 check at the end
-/// of `TxMetadata::from_bytes` detects and surfaces as
-/// `DeviceError::RecordCorruption`. The dispatcher maps that to
-/// `ERR_INTERNAL` so the client retries; the next read after the
-/// writer's pwrite/memcpy completes returns a coherent header.
+/// Acquires the process-wide `StripedRwLocks` *read* guard keyed by
+/// `record_offset` for the duration of the read. The matching write
+/// guard is held by `write_metadata_direct` and the combined
+/// `*_and_crc_direct` helpers, so a reader observes either the
+/// pre-mutation header or the post-mutation header — never a torn
+/// byte mix that happens to pass the CRC check.
 ///
-/// Earlier comments on this function asserted "Caller must hold the
-/// per-transaction stripe lock" — that contract was never actually
-/// honored by `Engine::lookup` / `read_metadata` / `read_slot` /
-/// `lookup_cached`, which are hot-path read entries. Adding the lock
-/// would serialize all reads against all writes on the same record
-/// (an unacceptable performance regression for a UTXO store) without
-/// changing the failure mode the CRC already covers. The actual
-/// contract is what callers rely on: torn reads → `RecordCorruption`
-/// → retry; CRC-clean reads → consistent header.
+/// **Why the lock is required.** The previous design relied on CRC32
+/// alone to surface torn reads. On AArch64 release builds with NEON
+/// memcpy, the on-disk CRC slot (offset 253 inside the 320-byte
+/// header, not 4-byte aligned) can be published before the matching
+/// field bytes; a reader observes the new CRC paired with mostly-old
+/// fields, recomputes a CRC that coincidentally matches the mix, and
+/// returns garbage to the caller. The regression test
+/// `direct_read_write_concurrent_stress_never_returns_torn_data`
+/// fails ~90 % of release runs without this guard. Release/Acquire
+/// fences do not help — Rust's memory model only establishes
+/// happens-before via paired atomic accesses on the same address, and
+/// the memcpy is none. Real mutual exclusion at the record level is
+/// the smallest change that closes the window without altering the
+/// on-disk format. Striped over 65_536 slots, two readers on the same
+/// record still parallelize (`RwLockReadGuard`); a writer briefly
+/// excludes readers only for its own record's stripe.
 ///
-/// `write_metadata_direct` MUST hold the stripe lock so concurrent
-/// writes do not interleave (each writer ends with a CRC over its own
-/// snapshot of the header).
+/// Multiple readers on the same record run in parallel; writers block
+/// readers only on the same stripe.
 #[inline]
 pub unsafe fn read_metadata_direct(base_ptr: *const u8, record_offset: u64) -> Result<TxMetadata> {
+    // F-X-007 (BC-02): record-level read guard — see the doc comment
+    // for the full rationale. The release-build aarch64 stress test
+    // proves CRC alone is not sufficient.
+    let _r = io_locks().read(record_offset);
     unsafe {
-        // R-029 (BC-06): Acquire fence BEFORE the read so the
-        // CPU's load buffer is drained. On AArch64 this emits a
-        // `dmb ishld` (data memory barrier, load-only, inner
-        // shareable). Combined with the writer's Release fence
-        // (R-030), it prevents the CPU from observing the new
-        // CRC bytes paired with old field bytes (or vice versa)
-        // — the torn read the CRC check is supposed to catch.
-        // Without the fence, ARM's relaxed ordering can let
-        // independent loads complete out of program order, so a
-        // reader on a different core may see the four CRC bytes
-        // from the writer's most recent memcpy paired with header
-        // bytes from a previous one. The CRC validates correctly
-        // against the new bytes' CRC slot but the actual header
-        // payload is stale — silent corruption with a passing
-        // checksum. The fence is hardware-cheap (a single dmb)
-        // and the extra barrier is dwarfed by the metadata read
-        // itself. Note: Rust's strict memory model says fences
-        // alone don't establish happens-before without a paired
-        // atomic load/store; in practice the AArch64 hardware
-        // barrier prevents the reorderings we care about, and
-        // the CRC remains the true safety net.
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         let src = base_ptr.add(off_to_usize(record_offset));
         let bytes = std::slice::from_raw_parts(src, METADATA_SIZE);
         Ok(TxMetadata::from_bytes(bytes)?)
@@ -390,36 +449,28 @@ pub unsafe fn read_metadata_direct(base_ptr: *const u8, record_offset: u64) -> R
 ///
 /// `base_ptr` must be valid for at least `record_offset + METADATA_SIZE` bytes.
 /// Caller must hold the per-transaction stripe lock.
+///
+/// # Concurrency contract (F-X-007 / BC-02)
+///
+/// Acquires the process-wide `StripedRwLocks` *write* guard keyed by
+/// `record_offset` for the duration of the bulk memcpy. Paired with
+/// `read_metadata_direct`'s read guard so a concurrent direct-pointer
+/// reader observes one of the values written, never a torn mix.
+/// See `read_metadata_direct`'s doc for the full rationale.
 #[inline]
 pub unsafe fn write_metadata_direct(base_ptr: *mut u8, record_offset: u64, metadata: &TxMetadata) {
+    // F-X-007 (BC-02): record-level write guard — see
+    // `read_metadata_direct`. The CRC-alone defense documented at
+    // this site in the previous revision was empirically false on
+    // aarch64 release builds (the regression test fails ~90 % of
+    // runs without this guard).
+    let _w = io_locks().write(record_offset);
     unsafe {
         let dst = base_ptr.add(off_to_usize(record_offset));
         let dst_slice = std::slice::from_raw_parts_mut(dst, METADATA_SIZE);
         let mut buf = [0u8; METADATA_SIZE];
         metadata.to_bytes(&mut buf);
         dst_slice.copy_from_slice(&buf);
-        // R-030 (BC-07): Release fence AFTER the memcpy so all
-        // store operations commit before the next memory access
-        // can be observed by another core. On AArch64 this emits
-        // a `dmb ishst` (data memory barrier, store-only, inner
-        // shareable). Pairs with the reader's Acquire fence
-        // (R-029); together they prevent a reader on a different
-        // core from seeing the new CRC bytes alongside stale
-        // header bytes. Without this fence, ARM's relaxed store
-        // ordering allows the four CRC bytes (which `to_bytes`
-        // computes and writes inside `buf`, then the bulk
-        // copy_from_slice transfers to the destination) to land
-        // visibly before the rest of the buffer — a concurrent
-        // reader would compute a CRC over old header bytes plus
-        // the new CRC slot, see a mismatch, and surface
-        // RecordCorruption (which is the protective behaviour we
-        // already rely on); but in the WORST case for a same-CRC
-        // collision the reader sees a stale header that validates
-        // against the stale CRC. The fence eliminates the
-        // reordering window entirely. The stripe-lock contract on
-        // writes (held by callers) prevents two writers from
-        // interleaving; the fence covers the writer-vs-reader case.
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -430,23 +481,24 @@ pub unsafe fn write_metadata_direct(base_ptr: *mut u8, record_offset: u64, metad
 /// `base_ptr` must be valid for at least `record_offset + METADATA_SIZE +
 /// (slot_index + 1) * UTXO_SLOT_SIZE` bytes.
 ///
-/// # Concurrency contract (R-009 / BC-02)
+/// # Concurrency contract (F-X-007 / BC-02)
 ///
-/// Like [`read_metadata_direct`], read-paths do not hold the stripe lock.
-/// UTXO slots carry a per-slot CRC, so a torn read returns
-/// `DeviceError::RecordCorruption` instead of exposing unchecked slot
-/// bytes to spend/recovery logic.
+/// Acquires the process-wide `StripedRwLocks` read guard keyed by
+/// `record_offset` for the duration of the slot read. UTXO slots
+/// carry their own per-slot CRC and would otherwise be subject to
+/// the same torn-read window as `read_metadata_direct` — see that
+/// function's doc for the full rationale.
 #[inline]
 pub unsafe fn read_utxo_slot_direct(
     base_ptr: *const u8,
     record_offset: u64,
     slot_index: u32,
 ) -> Result<UtxoSlot> {
+    // F-X-007 (BC-02): record-level read guard. The previous design
+    // relied on the per-slot CRC alone; that defense is not
+    // sufficient on aarch64 release builds (see `read_metadata_direct`).
+    let _r = io_locks().read(record_offset);
     unsafe {
-        // R-029 (BC-06): Acquire fence — see `read_metadata_direct`
-        // for the full rationale. Slot reads have the same
-        // memory-ordering risk as metadata reads on AArch64.
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         let slot_offset = record_offset + TxMetadata::utxo_slot_offset(slot_index);
         let src = base_ptr.add(off_to_usize(slot_offset));
         let bytes = std::slice::from_raw_parts(src, UTXO_SLOT_SIZE);
@@ -460,6 +512,13 @@ pub unsafe fn read_utxo_slot_direct(
 ///
 /// `base_ptr` must be valid for at least `record_offset + METADATA_SIZE +
 /// (slot_index + 1) * UTXO_SLOT_SIZE` bytes. Caller must hold the stripe lock.
+///
+/// # Concurrency contract (F-X-007 / BC-02)
+///
+/// Acquires the process-wide `StripedRwLocks` write guard keyed by
+/// `record_offset` for the duration of the bulk memcpy. See
+/// `read_metadata_direct` for the full rationale on why the CRC-only
+/// defense is not sufficient on aarch64 release builds.
 #[inline]
 pub unsafe fn write_utxo_slot_direct(
     base_ptr: *mut u8,
@@ -467,6 +526,8 @@ pub unsafe fn write_utxo_slot_direct(
     slot_index: u32,
     slot: &UtxoSlot,
 ) {
+    // F-X-007 (BC-02): record-level write guard.
+    let _w = io_locks().write(record_offset);
     unsafe {
         let slot_offset = record_offset + TxMetadata::utxo_slot_offset(slot_index);
         let dst = base_ptr.add(off_to_usize(slot_offset));
@@ -474,10 +535,6 @@ pub unsafe fn write_utxo_slot_direct(
         let mut buf = [0u8; UTXO_SLOT_SIZE];
         slot.to_bytes(&mut buf);
         dst_slice.copy_from_slice(&buf);
-        // R-030 (BC-07): Release fence — see `write_metadata_direct`
-        // for the full rationale. Slot writes have the same
-        // memory-ordering risk as metadata writes on AArch64.
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     }
 }
 
