@@ -65,3 +65,12 @@ work surfaced while fixing the reviewed findings.
   cheap but the current state has no reachable bug, and the in-crate
   tests would not exercise it. Filing as a forward-looking follow-up
   if interior-mutability is ever introduced to the allocator path.
+
+## From test-perf audit (`_review/08_test_perf_audit.md`)
+
+- **Fix #3 — `tests/cluster_tcp.rs` `wait_until` conversion** — 15 fixed `thread::sleep(Duration::from_secs(2..6))` sites totalling ~59 s of blocking wait. The `wait_until(predicate, timeout)` helper exists at L435 but is barely used. Each sleep needs per-site analysis to identify the actual signal the test is waiting for (state counter, metric increment, log line) before replacement. Out of scope for the 87x lib-test speedup that landed; deferred because cluster_tcp is integration-tier and the per-site context cost is high. Estimated savings: 40–50 s on `cargo test --test cluster_tcp` runs.
+
+- **3 real test failures on `dba8fcd`** (flagged by the audit, not introduced by it):
+  1. `cluster_tcp::isolated_node_rejects_writes_with_no_quorum`
+  2. `cluster_tcp::add_fourth_node_rebalance_triggers`
+  3. `io::tests::direct_read_write_concurrent_stress_never_returns_torn_data` — asserts `"torn read passed CRC"`, which is the BC-02 / F-X-007 stripe-lock-contract issue the review surfaced. Needs root-cause investigation, not a test fix.
