@@ -11051,11 +11051,16 @@ mod tests {
             current_block_height: 1000,
             block_height_retention: 288,
         };
+        // F-G2-002: avoid the reserved all-`0xFF` sentinel for the
+        // request's spending_data; that triggers the
+        // `ReservedSpendingData` rejection (ERR_INVALID_SPEND with
+        // empty payload) before the engine ever reads the slot, so
+        // the pruned-spending-data forensic payload never surfaces.
         let item = WireSpendItem {
             txid,
             vout: 0,
             utxo_hash,
-            spending_data: [0xFF; 36],
+            spending_data: [0xEE; 36],
         };
 
         let resp = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &[item]));
