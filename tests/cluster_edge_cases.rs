@@ -586,7 +586,12 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
     let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
 
     // Vote for term 3 (via handle_propose from another node's proposal).
-    let propose = TopologyTerm::new(3, vec![NodeId(1), NodeId(2), NodeId(3)], NodeId(2), ClusterId::UNSET);
+    let propose = TopologyTerm::new(
+        3,
+        vec![NodeId(1), NodeId(2), NodeId(3)],
+        NodeId(2),
+        ClusterId::UNSET,
+    );
     let vote = auth.handle_propose(&propose);
     assert!(vote.accepted);
 
@@ -612,7 +617,12 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
     );
 
     // A proposal for term 11 should be accepted (> committed=10, > voted=3).
-    let fresh = TopologyTerm::new(11, vec![NodeId(1), NodeId(2), NodeId(3)], NodeId(2), ClusterId::UNSET);
+    let fresh = TopologyTerm::new(
+        11,
+        vec![NodeId(1), NodeId(2), NodeId(3)],
+        NodeId(2),
+        ClusterId::UNSET,
+    );
     let v2 = auth.handle_propose(&fresh);
     assert!(v2.accepted, "proposal for term 11 should be accepted");
 }
@@ -791,7 +801,12 @@ fn topology_formation_recovery_blocked_by_outstanding_vote() {
 
     // Now a formation recovery proposal at term 2 should be rejected
     // because voted_term(2) > committed_term(1).
-    let recovery_proposal = TopologyTerm::new(2, vec![NodeId(1), NodeId(2), NodeId(3)], NodeId(1), ClusterId::UNSET);
+    let recovery_proposal = TopologyTerm::new(
+        2,
+        vec![NodeId(1), NodeId(2), NodeId(3)],
+        NodeId(1),
+        ClusterId::UNSET,
+    );
     let v2 = auth.handle_propose(&recovery_proposal);
     assert!(
         !v2.accepted,
@@ -1237,7 +1252,12 @@ fn topology_restore_then_vote_safety() {
     auth.restore(&state);
 
     // Proposal for term 11: > committed(10) but NOT > voted(12) → reject.
-    let p1 = TopologyTerm::new(11, vec![NodeId(1), NodeId(2), NodeId(3)], NodeId(1), ClusterId::UNSET);
+    let p1 = TopologyTerm::new(
+        11,
+        vec![NodeId(1), NodeId(2), NodeId(3)],
+        NodeId(1),
+        ClusterId::UNSET,
+    );
     let v1 = auth.handle_propose(&p1);
     assert!(
         !v1.accepted,
@@ -1245,7 +1265,12 @@ fn topology_restore_then_vote_safety() {
     );
 
     // Proposal for term 13: > committed(10) AND > voted(12) → accept.
-    let p2 = TopologyTerm::new(13, vec![NodeId(1), NodeId(2), NodeId(3)], NodeId(1), ClusterId::UNSET);
+    let p2 = TopologyTerm::new(
+        13,
+        vec![NodeId(1), NodeId(2), NodeId(3)],
+        NodeId(1),
+        ClusterId::UNSET,
+    );
     let v2 = auth.handle_propose(&p2);
     assert!(v2.accepted, "term 13 should be accepted");
 }

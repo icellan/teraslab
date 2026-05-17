@@ -757,9 +757,7 @@ impl ServerConfig {
     /// [`crate::cluster::topology::ClusterId::UNSET`] when the field is
     /// absent. Any malformed value yields a typed error so startup
     /// refuses rather than silently degrading to UNSET.
-    pub fn resolved_cluster_id(
-        &self,
-    ) -> Result<crate::cluster::topology::ClusterId, ConfigError> {
+    pub fn resolved_cluster_id(&self) -> Result<crate::cluster::topology::ClusterId, ConfigError> {
         let s = match &self.cluster_id {
             None => return Ok(crate::cluster::topology::ClusterId::UNSET),
             Some(s) => s.trim(),

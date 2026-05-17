@@ -81,12 +81,7 @@ pub struct TopologyTerm {
 
 impl TopologyTerm {
     /// Create a new term with auto-computed digest.
-    pub fn new(
-        term: u64,
-        members: Vec<NodeId>,
-        proposer: NodeId,
-        cluster_id: ClusterId,
-    ) -> Self {
+    pub fn new(term: u64, members: Vec<NodeId>, proposer: NodeId, cluster_id: ClusterId) -> Self {
         let digest = Self::compute_digest(term, &cluster_id, &members);
         Self {
             term,
@@ -908,8 +903,7 @@ impl TopologyAuthority {
         let voted = self.voted_term.load(Ordering::Relaxed);
         let new_term = committed.max(voted) + 1;
 
-        let term =
-            TopologyTerm::new(new_term, members.to_vec(), self.self_id, self.cluster_id());
+        let term = TopologyTerm::new(new_term, members.to_vec(), self.self_id, self.cluster_id());
 
         // Self-vote
         self.voted_term.store(new_term, Ordering::Relaxed);
@@ -1191,7 +1185,12 @@ impl TopologyAuthority {
         let voted = self.voted_term.load(Ordering::Relaxed);
         let new_term = committed.max(voted) + 1;
 
-        let term = TopologyTerm::new(new_term, target_members.clone(), self.self_id, self.cluster_id());
+        let term = TopologyTerm::new(
+            new_term,
+            target_members.clone(),
+            self.self_id,
+            self.cluster_id(),
+        );
         self.voted_term.store(new_term, Ordering::Relaxed);
 
         let quorum_needed = (target_members.len() / 2) + 1;
@@ -1279,7 +1278,12 @@ impl TopologyAuthority {
         // (which would mean another proposer is active).
         let new_term = committed.max(voted) + 1;
 
-        let term = TopologyTerm::new(new_term, target_members.clone(), self.self_id, self.cluster_id());
+        let term = TopologyTerm::new(
+            new_term,
+            target_members.clone(),
+            self.self_id,
+            self.cluster_id(),
+        );
         self.voted_term.store(new_term, Ordering::Relaxed);
 
         let quorum_needed = (target_members.len() / 2) + 1;

@@ -1864,7 +1864,12 @@ impl ClusterCoordinator {
                 let mgr = migration.lock().unwrap();
                 let snap: Vec<crate::cluster::migration::MigrationProgress> =
                     mgr.active_migrations().to_vec();
-                (snap, mgr.inbound_count(), mgr.active_count(), mgr.failed_count())
+                (
+                    snap,
+                    mgr.inbound_count(),
+                    mgr.active_count(),
+                    mgr.failed_count(),
+                )
             };
 
             // Phase 2 (no lock held): compute preserved + stale sets.
@@ -9181,7 +9186,11 @@ mod tests {
             proposer: NodeId(1),
             members: next_members.clone(),
             cluster_id: crate::cluster::topology::ClusterId::UNSET,
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(4, &crate::cluster::topology::ClusterId::UNSET, &next_members),
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                4,
+                &crate::cluster::topology::ClusterId::UNSET,
+                &next_members,
+            ),
             voters: next_members.clone(),
         };
         assert_eq!(
@@ -9266,7 +9275,11 @@ mod tests {
             proposer: NodeId(1),
             members: committed_members.clone(),
             cluster_id: crate::cluster::topology::ClusterId::UNSET,
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(4, &crate::cluster::topology::ClusterId::UNSET, &committed_members),
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                4,
+                &crate::cluster::topology::ClusterId::UNSET,
+                &committed_members,
+            ),
             voters: committed_members.clone(),
         };
         assert_eq!(
@@ -9282,7 +9295,11 @@ mod tests {
         assert_eq!(decoded.members, committed_members);
         assert_eq!(
             decoded.digest,
-            crate::cluster::topology::TopologyTerm::compute_digest(4, &crate::cluster::topology::ClusterId::UNSET, &committed_members),
+            crate::cluster::topology::TopologyTerm::compute_digest(
+                4,
+                &crate::cluster::topology::ClusterId::UNSET,
+                &committed_members
+            ),
         );
     }
 
@@ -9821,7 +9838,11 @@ mod tests {
             proposer: NodeId(1),
             members: commit_members.clone(),
             cluster_id: crate::cluster::topology::ClusterId::UNSET,
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(5, &crate::cluster::topology::ClusterId::UNSET, &commit_members),
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                5,
+                &crate::cluster::topology::ClusterId::UNSET,
+                &commit_members,
+            ),
             voters: commit_members.clone(),
         };
         let applied = cluster.topology_authority.handle_commit(&commit);

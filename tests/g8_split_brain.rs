@@ -17,9 +17,7 @@
 
 use std::time::Duration;
 use teraslab::cluster::shards::NodeId;
-use teraslab::cluster::topology::{
-    ClusterId, TopologyAuthority, TopologyCommit, TopologyTerm,
-};
+use teraslab::cluster::topology::{ClusterId, TopologyAuthority, TopologyCommit, TopologyTerm};
 
 fn members(ids: &[u64]) -> Vec<NodeId> {
     ids.iter().map(|&id| NodeId(id)).collect()
@@ -87,10 +85,14 @@ fn handle_propose_rejects_unseen_member_superset() {
     // legitimate-looking `TopologyTerm` for the merged set.
     let mut propose = TopologyTerm::new(2, members(&[1, 2, 3, 4]), NodeId(1), ClusterId::UNSET);
     // Digest is valid by construction. Voter must still reject.
-    propose.digest = TopologyTerm::compute_digest(propose.term, &ClusterId::UNSET, &propose.members);
+    propose.digest =
+        TopologyTerm::compute_digest(propose.term, &ClusterId::UNSET, &propose.members);
 
     let vote = auth.handle_propose(&propose);
-    assert!(!vote.accepted, "follower must reject unseen-member superset");
+    assert!(
+        !vote.accepted,
+        "follower must reject unseen-member superset"
+    );
     // Voter's voted_term must NOT have advanced (we cannot self-vote for
     // an unsafe proposal even if the digest matches).
     assert_eq!(vote.voter, NodeId(2));

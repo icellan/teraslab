@@ -271,8 +271,7 @@ fn two_distinct_cluster_ids_refuse_superset() {
     // authority must reject it on the cluster_id mismatch alone,
     // without ever consulting the ever-seen heuristic.
     let merged_members = vec![NodeId(511), NodeId(512), NodeId(611), NodeId(612)];
-    let foreign_propose =
-        TopologyTerm::new(99, merged_members.clone(), NodeId(611), CLUSTER_B);
+    let foreign_propose = TopologyTerm::new(99, merged_members.clone(), NodeId(611), CLUSTER_B);
     let vote = node_a1
         .cluster
         .topology_authority()
@@ -283,8 +282,7 @@ fn two_distinct_cluster_ids_refuse_superset() {
     );
 
     // Symmetric case: cluster B refuses a cluster A proposal.
-    let foreign_propose_reverse =
-        TopologyTerm::new(99, merged_members, NodeId(511), CLUSTER_A);
+    let foreign_propose_reverse = TopologyTerm::new(99, merged_members, NodeId(511), CLUSTER_A);
     let vote_reverse = node_b1
         .cluster
         .topology_authority()
