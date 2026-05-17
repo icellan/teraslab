@@ -719,6 +719,18 @@ fn topology_cluster_formation_three_simultaneous_starts() {
         assert_eq!(auth.committed_term(), 1);
     }
 
+    // F-G8-001: the ever-seen split-brain fallback rejects any proposal
+    // that introduces a NodeId never previously observed as a committed
+    // voter on this node. Each node's single-node commit only stamps
+    // itself into the ever-seen set, so the formation-recovery proposal
+    // [1,2,3] would otherwise be rejected on both the proposer (a1) and
+    // the followers (a2/a3) before this test's intended path runs.
+    // Pre-seed all three on each authority to isolate the formation-
+    // recovery invariant (the F-G8-001 layer is exercised separately).
+    for auth in [&a1, &a2, &a3] {
+        auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3)]);
+    }
+
     // Node 1 (lowest ID) proposes term 2 with all three members.
     let full_members = vec![NodeId(1), NodeId(2), NodeId(3)];
     let proposal = a1
