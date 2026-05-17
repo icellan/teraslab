@@ -7986,6 +7986,10 @@ mod tests {
             RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024)
                 .expect("redo log opens"),
         ));
+        // Capture sync count after open — F-G4-001's initial header
+        // write at open also syncs, and is not part of the group-commit
+        // accounting under test.
+        let baseline_syncs = redo_dev.sync_count();
         let barrier = Arc::new(std::sync::Barrier::new(3));
 
         let spawn_writer = |byte: u8| {
@@ -8018,10 +8022,16 @@ mod tests {
         ranges.sort_by_key(|range| range.0);
 
         assert_eq!(ranges, vec![(1, 1), (2, 2)]);
+        // F-G4-001 made flush() emit two device syncs per effective
+        // flush: one for the entries pwrite and one for the persisted-
+        // header pwrite. Group commit collapses the two concurrent
+        // writers into one effective flush, so the post-open delta is
+        // exactly 2 syncs.
         assert_eq!(
-            redo_dev.sync_count(),
-            1,
-            "concurrent dispatch writers should share one redo fsync"
+            redo_dev.sync_count() - baseline_syncs,
+            2,
+            "concurrent dispatch writers should share one effective flush \
+             (one entries sync + one header sync under F-G4-001)"
         );
 
         let entries = redo_log.lock().recover().expect("recover grouped entries");
@@ -9150,12 +9160,21 @@ mod tests {
             request_id: shard as u64,
             op_code: OP_REPLICA_BATCH,
             flags: FLAG_MIGRATION_BATCH,
+            // F-G7-005: migration batches arriving at a clustered
+            // receiver (local_cluster_key != 0) MUST carry a matching
+            // non-zero cluster_key — the wildcard is reserved for
+            // normal replication so a buggy/hostile sender cannot
+            // replay arbitrary mutations through the dedup-bypass
+            // path. Stamp the batch with the cluster's current
+            // committed term so it survives the epoch gate and we
+            // actually exercise the settled-shard logic the test
+            // targets.
             payload: ReplicaBatch {
                 first_sequence: 0,
                 ops: vec![],
                 trace_ctx: None,
                 source_node_id: None,
-                cluster_key: 0,
+                cluster_key: cluster.local_cluster_key(),
             }
             .serialize(),
         };
@@ -10602,7 +10621,8 @@ mod tests {
 
         let h = DispatchTestHarness::new();
         let self_id = crate::cluster::shards::NodeId(1);
-        let members = vec![self_id, crate::cluster::shards::NodeId(2)];
+        let other = crate::cluster::shards::NodeId(2);
+        let members = vec![self_id, other];
         let table = crate::cluster::shards::ShardTable::compute_with_epoch(&[self_id], 1, 10);
         let cluster = crate::cluster::coordinator::new_test_running_cluster_with_topology_path(
             self_id,
@@ -10615,9 +10635,17 @@ mod tests {
             1,
             Some(path.clone()),
         );
+        // F-G8-001: handle_propose now rejects any proposal that
+        // introduces a NodeId the voter has never seen as a committed
+        // voter. Pre-seed the ever-seen set with both members so the
+        // subsume proposal is accepted and we can exercise the vote-
+        // persist-before-reply path the test actually targets.
+        cluster
+            .topology_authority()
+            .set_committed_voter_ever_seen(&[self_id, other]);
 
         // Propose a new term that subsumes this single-node cluster.
-        let proposer = crate::cluster::shards::NodeId(2);
+        let proposer = other;
         let propose = crate::cluster::topology::TopologyTerm::new(500, members.clone(), proposer);
 
         let req = RequestFrame {
@@ -10668,7 +10696,8 @@ mod tests {
         let bogus = std::path::PathBuf::from("/nonexistent/teraslab-topology-h10/node.topology");
         let h = DispatchTestHarness::new();
         let self_id = crate::cluster::shards::NodeId(1);
-        let members = vec![self_id, crate::cluster::shards::NodeId(2)];
+        let other = crate::cluster::shards::NodeId(2);
+        let members = vec![self_id, other];
         let table = crate::cluster::shards::ShardTable::compute_with_epoch(&[self_id], 1, 10);
         let cluster = crate::cluster::coordinator::new_test_running_cluster_with_topology_path(
             self_id,
@@ -10681,8 +10710,14 @@ mod tests {
             1,
             Some(bogus),
         );
+        // F-G8-001: pre-seed the ever-seen set so the subsume proposal
+        // is accepted by handle_propose and we exercise the persist-
+        // failure path (rather than failing earlier on split-brain).
+        cluster
+            .topology_authority()
+            .set_committed_voter_ever_seen(&[self_id, other]);
 
-        let proposer = crate::cluster::shards::NodeId(2);
+        let proposer = other;
         let propose = crate::cluster::topology::TopologyTerm::new(600, members.clone(), proposer);
 
         let req = RequestFrame {
@@ -11025,11 +11060,16 @@ mod tests {
             current_block_height: 1000,
             block_height_retention: 288,
         };
+        // F-G2-002: avoid the reserved all-`0xFF` sentinel for the
+        // request's spending_data; that triggers the
+        // `ReservedSpendingData` rejection (ERR_INVALID_SPEND with
+        // empty payload) before the engine ever reads the slot, so
+        // the pruned-spending-data forensic payload never surfaces.
         let item = WireSpendItem {
             txid,
             vout: 0,
             utxo_hash,
-            spending_data: [0xFF; 36],
+            spending_data: [0xEE; 36],
         };
 
         let resp = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &[item]));
@@ -12861,7 +12901,11 @@ mod tests {
     fn compensation_redo_failure_returns_error() {
         use crate::ops::remaining::FreezeRequest;
 
-        let h = RedoDispatchHarness::new_with_redo_size(4096);
+        // F-G4-001: the redo region must hold a header block (one
+        // device alignment unit) plus at least one entries block, so
+        // 4 KiB is rejected at open. 8 KiB still fills quickly under
+        // the loop below.
+        let h = RedoDispatchHarness::new_with_redo_size(8192);
         let key = rollback_seed_record(&h, DispatchTestHarness::make_txid(157), 1);
         let slot = h.engine.read_slot(&key, 0).expect("slot");
         h.engine
@@ -12908,7 +12952,16 @@ mod tests {
 
     #[test]
     fn create_batch_redo_failure_surfaces_allocator_rollback_failure() {
-        let h = RedoDispatchHarness::new_with_exact_redo_log_size(60);
+        // F-G4-001: the redo region must hold a header block (one
+        // alignment unit) plus at least one entries block. With a
+        // 8 KiB region the entries capacity is exactly one alignment
+        // unit (4 KiB), and because F-G4-004 block-aligns write_pos
+        // after every flush, the very first allocator append+flush
+        // consumes the entire entries region. The next append
+        // (CreateV2) therefore fails with LogFull, exercising the
+        // "create redo write failure + allocator rollback errors"
+        // path the test asserts on.
+        let h = RedoDispatchHarness::new_with_exact_redo_log_size(8192);
         let resp = h.create_tx(DispatchTestHarness::make_txid(158), 1);
 
         assert_eq!(resp.status, STATUS_ERROR);
@@ -12996,10 +13049,16 @@ mod tests {
         );
 
         assert_eq!(resp.status, STATUS_OK);
+        // F-G4-001: each effective flush emits two device syncs (one
+        // for the entries pwrite, one for the persisted-header rewrite
+        // carrying the new `next_sequence`). Two effective flushes
+        // (allocator reservations + CreateV2 WAL) therefore produce
+        // four device syncs.
         assert_eq!(
             redo_dev.sync_count() - before_syncs,
-            2,
-            "create batch should fsync once for allocator reservations and once for CreateV2 WAL"
+            4,
+            "create batch should fsync twice for allocator reservations \
+             and twice for CreateV2 WAL (entries + F-G4-001 header per flush)"
         );
 
         let entries = redo_log.lock().recover().unwrap();

@@ -1764,37 +1764,66 @@ otlp_endpoint = "http://set-via-toml:4317"
     }
 
     #[test]
-    fn rf_gt_one_without_cluster_secret_is_rejected() {
-        // Default listen_addr is loopback so we isolate the RF>1 check.
+    fn rf_gt_one_without_cluster_secret_under_strict_auth_is_rejected() {
+        // F-X-001: trusted-overlay deployment model — multi-node mode
+        // without a cluster_secret is fail-open by default (a warn is
+        // logged at boot from the daemon binary). The hard rejection
+        // only fires when the operator opts in with `strict_auth = true`
+        // (or the `--strict-auth` CLI flag).
+        let toml_str = r#"
+node_id = 1
+replication_factor = 3
+strict_auth = true
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        let err = cfg
+            .validate_safe_defaults()
+            .expect_err("strict_auth + RF>1 + no cluster_secret must be rejected");
+        match err {
+            ConfigError::StrictAuthRequiresSecret => {}
+            other => panic!("expected StrictAuthRequiresSecret, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rf_gt_one_with_empty_cluster_secret_under_strict_auth_is_rejected() {
+        // F-X-001: an explicit empty cluster_secret is treated as
+        // "missing" by the strict-auth check.
+        let toml_str = r#"
+node_id = 1
+replication_factor = 2
+cluster_secret = ""
+strict_auth = true
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        let err = cfg
+            .validate_safe_defaults()
+            .expect_err("strict_auth + RF>1 + empty cluster_secret must be rejected");
+        match err {
+            ConfigError::StrictAuthRequiresSecret => {}
+            other => panic!("expected StrictAuthRequiresSecret, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rf_gt_one_without_cluster_secret_under_default_auth_is_accepted() {
+        // F-X-001 warn path: trusted-overlay default lets multi-node
+        // configs come up without a cluster_secret. The daemon emits a
+        // boot-time warn (covered by integration tests against the
+        // CLI binary); validate_safe_defaults must NOT reject here.
         let toml_str = r#"
 node_id = 1
 replication_factor = 3
 "#;
         let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
-        let err = cfg
-            .validate_safe_defaults()
-            .expect_err("RF>1 with no cluster_secret must be rejected");
-        match err {
-            ConfigError::ClusterSecretRequired { rf } => assert_eq!(rf, 3),
-            other => panic!("expected ClusterSecretRequired, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rf_gt_one_with_empty_cluster_secret_is_rejected() {
-        let toml_str = r#"
-node_id = 1
-replication_factor = 2
-cluster_secret = ""
-"#;
-        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
-        let err = cfg
-            .validate_safe_defaults()
-            .expect_err("RF>1 with empty cluster_secret must be rejected");
-        match err {
-            ConfigError::ClusterSecretRequired { rf } => assert_eq!(rf, 2),
-            other => panic!("expected ClusterSecretRequired, got {other:?}"),
-        }
+        assert!(
+            !cfg.strict_auth,
+            "default config must have strict_auth=false"
+        );
+        cfg.validate_safe_defaults().expect(
+            "default-auth multi-node config must validate without cluster_secret \
+             (trusted-overlay deployment model — F-X-001)",
+        );
     }
 
     #[test]
@@ -1810,18 +1839,23 @@ cluster_secret = "0123456789abcdef"
     }
 
     #[test]
-    fn cluster_mode_requires_secret_regardless_of_rf() {
+    fn cluster_mode_requires_secret_under_strict_auth_regardless_of_rf() {
+        // F-X-001: even at RF=1, `is_clustered()` (node_id > 0) makes
+        // the config "multi-node" for the purposes of the strict-auth
+        // check — SWIM frames still flow between members. Rejection
+        // only fires when strict_auth opts into the hard check.
         let toml_str = r#"
 node_id = 1
 replication_factor = 1
+strict_auth = true
 "#;
         let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
-        let err = cfg
-            .validate_safe_defaults()
-            .expect_err("node_id>0 with no cluster_secret must be rejected even at RF=1");
+        let err = cfg.validate_safe_defaults().expect_err(
+            "strict_auth + node_id>0 + no cluster_secret must be rejected even at RF=1",
+        );
         match err {
-            ConfigError::ClusterSecretRequired { rf } => assert_eq!(rf, 1),
-            other => panic!("expected ClusterSecretRequired, got {other:?}"),
+            ConfigError::StrictAuthRequiresSecret => {}
+            other => panic!("expected StrictAuthRequiresSecret, got {other:?}"),
         }
     }
 

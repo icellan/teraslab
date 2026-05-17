@@ -304,17 +304,33 @@ mod tests {
             "checkpoint must write the snapshot file"
         );
 
-        // Log was reset.
+        // Log was reset. Under F-G4-001/004 the on-disk layout
+        // reserves the first alignment unit for a persisted header
+        // (F-G4-001) and `compact_prefix_through` writes one aligned
+        // block worth of zeros (F-G4-013) even when nothing is
+        // retained, so `write_position` lands at one alignment unit
+        // (4 KiB on the in-memory device) rather than 0. The
+        // checkpoint's reclamation effect is observable via the
+        // usage drop below.
         let log = redo.lock();
-        assert_eq!(log.write_position(), 0, "reset must zero write_pos");
+        let post_write_pos = log.write_position();
+        assert!(
+            post_write_pos <= 4096,
+            "checkpoint must reduce write_pos to at most one alignment block, found {post_write_pos}"
+        );
         assert!(
             stats.entries_before > 0,
             "should have observed some entries before checkpoint"
         );
         assert!(stats.reset_performed, "unguarded checkpoint should reset");
+        // Pre-checkpoint we appended 50 entries (~830 bytes plus
+        // alignment padding); the post-compact write_pos is one
+        // 4 KiB aligned block at most, so for the 64 KiB test log
+        // (entries capacity ≈ 60 KiB) usage drops well below 10%.
         assert!(
-            stats.usage_after < 0.01,
-            "usage_fraction must drop near zero after reset"
+            stats.usage_after < 0.10,
+            "usage_fraction must drop sharply after reset, found {}",
+            stats.usage_after
         );
     }
 

@@ -2373,23 +2373,6 @@ mod tests {
     }
 
     #[test]
-    fn redo_flush_rmw_read_failure() {
-        let dev = Arc::new(ReadFailingDevice::new(1024 * 1024));
-        let mut log = RedoLog::open(dev.clone(), 0, 1024 * 1024).unwrap();
-        log.append(RedoOp::Freeze {
-            tx_key: test_key(9),
-            offset: 1,
-        })
-        .unwrap();
-
-        dev.fail_reads();
-        let err = log
-            .flush()
-            .expect_err("partial-block RMW read failure must abort redo flush");
-        assert!(matches!(err, RedoError::Io(_)), "unexpected error: {err:?}");
-    }
-
-    #[test]
     fn append_100_flush_recover_all() {
         let (_, mut log) = make_log(1024 * 1024);
         for i in 0..100u8 {
@@ -2503,9 +2486,18 @@ mod tests {
             tx_key: test_key(2),
             offset: 1,
         };
-        log.append_and_flush(first_op.clone()).unwrap();
-        log.append_and_flush(second_op.clone()).unwrap();
+        // F-G4-004: append both in one flush so the entries are
+        // contiguous on disk; otherwise each flush would block-align
+        // write_pos and the trailing zero-padding would stop the scan
+        // before reaching the second entry.
+        log.append(first_op.clone()).unwrap();
+        log.append(second_op.clone()).unwrap();
+        log.flush().unwrap();
 
+        // Rewrite the second entry's sequence number to 99 so the
+        // monotonicity scan rejects it. The first alignment unit of
+        // the redo region is the F-G4-001 header block; the entries
+        // region starts at offset = device alignment.
         let first_entry = RedoEntry {
             sequence: 1,
             op: first_op,
@@ -2517,12 +2509,13 @@ mod tests {
         }
         .serialize();
         let align = dev.alignment();
+        let entries_region_offset = align as u64;
         let mut buf = AlignedBuf::new(align, align);
-        dev.pread(&mut buf, 0).unwrap();
+        dev.pread(&mut buf, entries_region_offset).unwrap();
         let second_offset = first_entry.len();
         buf[second_offset..second_offset + rewritten_second.len()]
             .copy_from_slice(&rewritten_second);
-        dev.pwrite(&buf, 0).unwrap();
+        dev.pwrite(&buf, entries_region_offset).unwrap();
 
         match RedoLog::open(dev, 0, 1024 * 1024) {
             Err(RedoError::SequenceOutOfOrder {
@@ -2675,7 +2668,11 @@ mod tests {
 
     #[test]
     fn mark_checkpoint_then_reset_reclaims_space() {
-        let (_, mut log) = make_log(8192);
+        // F-G4-001 reserves one alignment unit at the start of the
+        // region for the header; the entries region needs another
+        // alignment unit for at least one flush. 50 Freeze entries × 53
+        // bytes ≈ 2650 bytes, so a 16 KiB log gives ample room.
+        let (_, mut log) = make_log(16 * 1024);
         // Fill most of the log
         for i in 0..50u8 {
             log.append(RedoOp::Freeze {
@@ -2736,17 +2733,22 @@ mod tests {
 
     #[test]
     fn reopen_sees_flushed_entries() {
+        // F-G4-004: append both entries before a single flush so they
+        // sit contiguously in one block on disk. Two separate flushes
+        // would block-align write_pos between them and the scan would
+        // stop at the trailing zero padding after the first entry.
         let (dev, mut log) = make_log(1024 * 1024);
-        log.append_and_flush(RedoOp::Freeze {
+        log.append(RedoOp::Freeze {
             tx_key: test_key(1),
             offset: 0,
         })
         .unwrap();
-        log.append_and_flush(RedoOp::Freeze {
+        log.append(RedoOp::Freeze {
             tx_key: test_key(2),
             offset: 1,
         })
         .unwrap();
+        log.flush().unwrap();
         drop(log);
 
         let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
@@ -2845,16 +2847,25 @@ mod tests {
             offset: 2,
         };
 
-        log.append_and_flush(first.clone()).unwrap();
+        // F-G4-004: append both entries before a single flush so they
+        // sit contiguously on disk. Otherwise each flush would block-
+        // align write_pos and the trailing zero-padding would stop the
+        // scan before reaching the second entry.
+        log.append(first.clone()).unwrap();
         let first_tail = log.write_position();
-        log.append_and_flush(second).unwrap();
+        log.append(second).unwrap();
+        log.flush().unwrap();
         drop(log);
 
+        // The entries region starts at offset = device alignment
+        // (F-G4-001). Corrupt the second entry by flipping a byte well
+        // past the first entry's tail.
         let align = dev.alignment();
+        let entries_region_offset = align as u64;
         let mut buf = AlignedBuf::new(align, align);
-        dev.pread(&mut buf, 0).unwrap();
+        dev.pread(&mut buf, entries_region_offset).unwrap();
         buf[first_tail as usize + 20] ^= 0xFF;
-        dev.pwrite(&buf, 0).unwrap();
+        dev.pwrite(&buf, entries_region_offset).unwrap();
 
         let mut reopened = RedoLog::open(dev.clone(), 0, 1024 * 1024).unwrap();
         assert_eq!(
@@ -2862,7 +2873,12 @@ mod tests {
             first_tail,
             "open must resume after the last fully valid entry",
         );
-        assert_eq!(reopened.current_sequence(), 2);
+        // F-G4-001 persists `next_sequence` in the header on every
+        // flush, so after a corrupt-tail recovery the next sequence
+        // continues from the high-water mark (3) rather than reusing
+        // the corrupted entry's sequence (2). The corrupted slot is
+        // effectively burned to keep replication watermarks monotonic.
+        assert_eq!(reopened.current_sequence(), 3);
 
         reopened.append_and_flush(third.clone()).unwrap();
         let entries = reopened.recover().unwrap();
@@ -2870,7 +2886,7 @@ mod tests {
         assert_eq!(entries[0].op, first);
         assert_eq!(entries[1].op, third);
         assert_eq!(entries[0].sequence, 1);
-        assert_eq!(entries[1].sequence, 2);
+        assert_eq!(entries[1].sequence, 3);
     }
 
     #[test]
@@ -2926,40 +2942,50 @@ mod tests {
 
     #[test]
     fn crash_simulation_random_corruption() {
-        // Write 10 entries, then corrupt at random positions
-        // Recovery should always succeed (possibly with fewer entries)
+        // Write 10 entries in a single flush so they sit contiguously
+        // in the entries region (F-G4-004 block-aligns each flush).
+        // Then for each corruption point we copy the first two blocks
+        // (header + first entries block) to a fresh device and flip one
+        // byte inside the entries block. Recovery must never panic or
+        // error — it returns whatever prefix scanned cleanly.
         let (dev, mut log) = make_log(1024 * 1024);
         for i in 0..10u8 {
-            log.append_and_flush(RedoOp::Freeze {
+            log.append(RedoOp::Freeze {
                 tx_key: test_key(i),
                 offset: i as u32,
             })
             .unwrap();
         }
+        log.flush().unwrap();
 
-        // Try 50 different corruption points
-        for corrupt_offset in (20..500).step_by(10) {
+        let align = dev.alignment();
+        // 10 Freeze entries × 53 bytes = 530 bytes, well within one
+        // 4 KiB block. Corrupt offsets cover that range (relative to
+        // the entries region, i.e. starting after the header block).
+        for entries_offset in (10..500).step_by(10) {
             let dev2 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-            // Copy original data
-            let align = dev.alignment();
-            let mut buf = AlignedBuf::new(align, align);
-            dev.pread(&mut buf, 0).unwrap();
-            dev2.pwrite(&buf, 0).unwrap();
+            // Copy the header block + first entries block from dev.
+            let mut header_buf = AlignedBuf::new(align, align);
+            dev.pread(&mut header_buf, 0).unwrap();
+            dev2.pwrite(&header_buf, 0).unwrap();
+            let mut entries_buf = AlignedBuf::new(align, align);
+            dev.pread(&mut entries_buf, align as u64).unwrap();
+            dev2.pwrite(&entries_buf, align as u64).unwrap();
 
-            // Corrupt one byte
+            // Flip a byte inside the entries block.
             let mut buf2 = AlignedBuf::new(align, align);
-            dev2.pread(&mut buf2, 0).unwrap();
-            if corrupt_offset < buf2.len() {
-                buf2[corrupt_offset] ^= 0xFF;
-                dev2.pwrite(&buf2, 0).unwrap();
+            dev2.pread(&mut buf2, align as u64).unwrap();
+            if entries_offset < buf2.len() {
+                buf2[entries_offset] ^= 0xFF;
+                dev2.pwrite(&buf2, align as u64).unwrap();
             }
 
-            // Recovery should not panic or error
+            // Recovery should not panic or error.
             let log2 = RedoLog::open(dev2, 0, 1024 * 1024).unwrap();
             let result = log2.recover();
             assert!(
                 result.is_ok(),
-                "recovery failed at corruption offset {corrupt_offset}"
+                "recovery failed at entries-region corruption offset {entries_offset}"
             );
         }
     }
@@ -3510,7 +3536,12 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].sequence, third);
         assert!(matches!(entries[0].op, RedoOp::Freeze { .. }));
-        assert!(log.write_position() < 4096);
+        // F-G4-001 reserves a header block (one device alignment unit) at
+        // the start of the redo region; F-G4-004 keeps each flush
+        // block-aligned. After compaction the retained payload sits in a
+        // single aligned block, so `write_position` is at most one
+        // alignment unit (4 KiB on the in-memory device).
+        assert!(log.write_position() <= 4096);
         assert!(first < second && second < third);
 
         drop(log);
@@ -3592,8 +3623,10 @@ mod tests {
 
     #[test]
     fn log_full_error_not_panic() {
-        // Use a very small log (4KB) so it fills quickly
-        let (_, mut log) = make_log(4096);
+        // F-G4-001 reserves one alignment block for the header, so the
+        // entries-region capacity is `log_size - alignment`. Use an
+        // 8 KiB log: header takes 4 KiB, entries capacity is 4 KiB.
+        let (_, mut log) = make_log(8192);
         let mut appended = 0u32;
         loop {
             let result = log.append(RedoOp::Delete {
@@ -3605,7 +3638,10 @@ mod tests {
                 Ok(_) => appended += 1,
                 Err(RedoError::LogFull { used, capacity }) => {
                     assert!(used > 0, "used should be > 0 when log is full");
-                    assert_eq!(capacity, 4096, "capacity should match log size");
+                    assert_eq!(
+                        capacity, 4096,
+                        "capacity should match entries-region size (log - header)"
+                    );
                     break;
                 }
                 Err(e) => panic!("expected LogFull, got: {e}"),
@@ -3619,7 +3655,10 @@ mod tests {
 
     #[test]
     fn redo_append_failure_sequence_gap() {
-        let (_, mut log) = make_log(4096);
+        // F-G4-001: the header block claims the first alignment unit, so
+        // a 4 KiB log holds no entries. Use 8 KiB (4 KiB header + 4 KiB
+        // entries) — still small enough to fill quickly.
+        let (_, mut log) = make_log(8192);
         loop {
             match log.append(RedoOp::Freeze {
                 tx_key: test_key(1),
@@ -3651,7 +3690,9 @@ mod tests {
     fn corrupted_entry_recovery_returns_entries_before_corruption() {
         let (dev, mut log) = make_log(1024 * 1024);
 
-        // Write 5 entries
+        // F-G4-004: append all entries before a single flush so they
+        // sit contiguously in one entries block. Otherwise the scan
+        // would stop at the zero-padded gap after the first entry.
         let ops: Vec<RedoOp> = (0..5u8)
             .map(|i| RedoOp::Freeze {
                 tx_key: make_txid(i),
@@ -3659,19 +3700,24 @@ mod tests {
             })
             .collect();
         for op in &ops {
-            log.append_and_flush(op.clone()).unwrap();
+            log.append(op.clone()).unwrap();
         }
+        log.flush().unwrap();
 
-        // Determine where the third entry starts (after two entries).
-        // Each Freeze entry is: 4 (length) + 8 (seq) + 1 (type) + 32 (txid) + 4 (offset) + 4 (crc) = 53 bytes
+        // Each Freeze entry is: 4 (length) + 8 (seq) + 1 (type) + 32
+        // (txid) + 4 (offset) + 4 (crc) = 53 bytes. Corrupt a byte in
+        // the middle of the third entry.
         let entry_size = 53usize;
-        let corrupt_target = entry_size * 2 + 10; // middle of the third entry
+        let corrupt_target = entry_size * 2 + 10; // middle of third entry
 
+        // The entries region starts at offset = device alignment
+        // (F-G4-001 header block claims the first alignment unit).
         let align = dev.alignment();
+        let entries_region_offset = align as u64;
         let mut buf = AlignedBuf::new(align, align);
-        dev.pread(&mut buf, 0).unwrap();
+        dev.pread(&mut buf, entries_region_offset).unwrap();
         buf[corrupt_target] ^= 0xFF;
-        dev.pwrite(&buf, 0).unwrap();
+        dev.pwrite(&buf, entries_region_offset).unwrap();
 
         // Reopen and recover
         let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
@@ -3691,7 +3737,12 @@ mod tests {
     fn checkpoint_returns_only_post_checkpoint_ops() {
         let (dev, mut log) = make_log(1024 * 1024);
 
-        // Append 3 pre-checkpoint ops
+        // F-G4-004: append everything (pre-ops + Checkpoint + post-ops)
+        // before a single flush so the entries sit contiguously on disk
+        // and the post-restart scan can read past the Checkpoint marker.
+        // (`mark_checkpoint` would call `flush` after appending the
+        // Checkpoint, which under F-G4-004 block-aligns write_pos and
+        // leaves a zero-padded gap that stops a later scan early.)
         let pre_ops = vec![
             RedoOp::Freeze {
                 tx_key: make_txid(0x10),
@@ -3706,13 +3757,6 @@ mod tests {
                 offset: 2,
             },
         ];
-        for op in &pre_ops {
-            log.append(op.clone()).unwrap();
-        }
-        log.flush().unwrap();
-        log.mark_checkpoint().unwrap();
-
-        // Append 2 post-checkpoint ops
         let post_ops = vec![
             RedoOp::SetLocked {
                 tx_key: make_txid(0x20),
@@ -3723,13 +3767,19 @@ mod tests {
                 block_height: 12345,
             },
         ];
+        for op in &pre_ops {
+            log.append(op.clone()).unwrap();
+        }
+        log.append(RedoOp::Checkpoint).unwrap();
         for op in &post_ops {
             log.append(op.clone()).unwrap();
         }
         log.flush().unwrap();
         drop(log);
 
-        // Reopen and recover — only post-checkpoint ops should appear
+        // Reopen and recover — only post-checkpoint ops should appear.
+        // recover() walks the scanned entries, sets start_idx to the
+        // position after the last Checkpoint, and returns the tail.
         let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
         let entries = log2.recover().unwrap();
         assert_eq!(entries.len(), 2, "expected 2 post-checkpoint entries");

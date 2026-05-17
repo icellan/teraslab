@@ -2069,6 +2069,14 @@ mod tests {
             digest: TopologyTerm::compute_digest(1, &old_mems),
             voters: old_mems.clone(),
         });
+        // F-G8-001: pre-seed the ever-seen set with node 3 so the
+        // membership-change-safety check accepts the [1,2,3] proposal.
+        // Without this, on_membership_changed silently bounces the
+        // unseen-voter and `check_timeout` falls back to the prior
+        // observed membership [1,2], which matches the committed set
+        // and returns None — short-circuiting the term-overwrite path
+        // the test actually targets.
+        auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3)]);
         assert!(
             auth.on_membership_changed(&mems).is_none(),
             "node 2 is not the deterministic proposer for [1,2,3]",
@@ -2175,6 +2183,13 @@ mod tests {
             digest: TopologyTerm::compute_digest(1, &single),
             voters: single.clone(),
         });
+        // F-G8-001: the proposal introduces nodes 1 and 3 that were
+        // never committed voters on this node, so the split-brain
+        // fallback would otherwise reject the formation-recovery
+        // proposal at `membership_change_is_safe` before the equal-
+        // term acceptance branch can run. Pre-seed both as known
+        // voters to isolate the boundary condition the test targets.
+        auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3)]);
 
         // Proposal at term 1 (equal, not greater) with multi-node members.
         // Formation recovery: our_cluster_is_single_node=true, proposal subsumes
@@ -2269,6 +2284,12 @@ mod tests {
         let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
         // Cluster A committed: [1, 2, 3].
         commit_membership(&auth, 1, &[1, 2, 3]);
+        // F-G8-001: the ever-seen split-brain fallback rejects any
+        // proposal that introduces a NodeId never previously observed
+        // as a committed voter on this node. Pre-seed node 4 so the
+        // pure-addition sanity case isolates the monotonicity check
+        // (the F-G8-001 layer is exercised separately below).
+        auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)]);
 
         // Sanity: a pure addition (cluster grows by one) is accepted.
         let pure_add = auth.on_membership_changed(&members(&[1, 2, 3, 4]));
@@ -2282,7 +2303,9 @@ mod tests {
         let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
         commit_membership(&auth, 1, &[1, 2, 3]);
 
-        // Sanity: a pure removal (graceful drain) is accepted.
+        // Sanity: a pure removal (graceful drain) is accepted. The
+        // proposed set is a subset of committed, so the ever-seen
+        // check trivially passes without extra seeding.
         let pure_drop = auth.on_membership_changed(&members(&[1, 2]));
         assert!(
             pure_drop.is_some(),
@@ -2293,6 +2316,10 @@ mod tests {
         // showed up, the unmistakable two-clusters-merging pattern.
         let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
         commit_membership(&auth, 1, &[1, 2, 3]);
+        // Pre-seed node 5 so the rejection below is attributable to the
+        // monotonicity check (the test's headline invariant) rather
+        // than the F-G8-001 ever-seen layer, which has its own tests.
+        auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3), NodeId(5)]);
         // After commit, both committed_members AND observed_membership are
         // pinned to [1,2,3] (handle_commit sets both). Capture the
         // baseline so we can pin it across the refusal.
