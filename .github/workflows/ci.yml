@@ -91,6 +91,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests (default features)
+        # NOTE: the `slow-tests` cargo feature gates three hashtable
+        # benchmarks-as-tests in src/index/hashtable.rs that cost ~520s in
+        # debug-mode (see _review/08_test_perf_audit.md). They are NOT
+        # enabled here -- they run on the nightly job via
+        # `cargo test --features slow-tests --lib`. Keep them off this step.
         run: cargo test --all
 
       - name: Run doctests

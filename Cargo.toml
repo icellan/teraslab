@@ -19,6 +19,13 @@ path = "src/bin/cli.rs"
 # `tests/fault_injection.rs` run with `--features fault-injection`.
 fault-injection = []
 
+# Slow benchmarks-as-tests gated behind this so `cargo test` is fast by default.
+# Run them with `cargo test --features slow-tests`. CI nightly should pass it;
+# the per-PR job should not. Currently gates the three big offenders in
+# `src/index/hashtable.rs::tests`: `ten_million_entries`, `bench_lookup_1m`,
+# `bench_insert_throughput` (~520s debug saved on every default test run).
+slow-tests = []
+
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 bitflags = "2"

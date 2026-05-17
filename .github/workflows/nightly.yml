@@ -25,6 +25,14 @@ jobs:
       - name: Full workload tests
         run: cargo test --test e2e_workload --test stress_tests -- --nocapture
 
+      - name: Slow lib tests (slow-tests feature)
+        # Gated behind the `slow-tests` cargo feature so PR runs stay fast.
+        # Currently covers three hashtable benchmarks-as-tests in
+        # src/index/hashtable.rs: ten_million_entries (~508s debug),
+        # bench_lookup_1m and bench_insert_throughput (~6s each debug).
+        # See _review/08_test_perf_audit.md for context.
+        run: cargo test --features slow-tests --lib
+
       - name: Criterion benchmarks
         run: cargo bench -- --output-format bencher | tee bench-output.txt
 

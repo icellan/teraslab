@@ -1762,6 +1762,7 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[cfg(feature = "slow-tests")]
     #[test]
     fn ten_million_entries() {
         let mut t = HashTable::new(1 << 24).unwrap(); // 16M buckets
@@ -1781,6 +1782,7 @@ mod tests {
 
     // -- Performance benchmarks (measured, informational) --
 
+    #[cfg(feature = "slow-tests")]
     #[test]
     fn bench_lookup_1m() {
         let mut t = HashTable::new(1 << 21).unwrap();
@@ -1801,6 +1803,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "slow-tests")]
     #[test]
     fn bench_insert_throughput() {
         let start = std::time::Instant::now();
