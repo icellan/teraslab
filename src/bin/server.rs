@@ -133,6 +133,13 @@ fn main() {
     // deployment model documented in `docs/DEPLOYMENT_ASSUMPTIONS.md`.
     let strict_auth_cli = args.iter().any(|a| a == "--strict-auth");
 
+    // P1.1: `--cluster-id <hex>` overrides TOML / unset. Parsed later
+    // alongside the TOML value via `ServerConfig::resolved_cluster_id()`.
+    let cluster_id_cli: Option<String> = args
+        .windows(2)
+        .find(|w| w[0] == "--cluster-id")
+        .map(|w| w[1].clone());
+
     let mut config = if args.len() > 1 && args[1] == "--config" {
         if args.len() < 3 {
             // CLI usage message goes to stderr before the subscriber is
@@ -162,6 +169,9 @@ fn main() {
     // is absent.
     if strict_auth_cli {
         config.strict_auth = true;
+    }
+    if let Some(s) = cluster_id_cli {
+        config.cluster_id = Some(s);
     }
     let used_defaults = !(args.len() > 1 && args[1] == "--config");
 
@@ -840,6 +850,13 @@ fn main() {
         let initial_peak = topo_state.peak_cluster_size as usize;
         let initial_epoch = topo_state.committed_term;
 
+        let resolved_cluster_id = match config.resolved_cluster_id() {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(err = %e, "FATAL: invalid cluster_id config");
+                std::process::exit(1);
+            }
+        };
         let cluster_config = ClusterConfig {
             self_id: NodeId(config.node_id),
             self_addr,
@@ -859,6 +876,7 @@ fn main() {
             migration_pool_size: config.migration_pool_size,
             migration_batch_size: config.migration_batch_size,
             persisted_incarnation: topo_state.incarnation,
+            cluster_id: resolved_cluster_id,
         };
         if initial_peak > 1 {
             tracing::info!(

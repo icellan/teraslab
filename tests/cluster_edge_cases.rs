@@ -586,7 +586,12 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
     let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
 
     // Vote for term 3 (via handle_propose from another node's proposal).
-    let propose = TopologyTerm::new(3, vec![NodeId(1), NodeId(2), NodeId(3)], NodeId(2));
+    let propose = TopologyTerm::new(
+        3,
+        vec![NodeId(1), NodeId(2), NodeId(3)],
+        NodeId(2),
+        ClusterId::UNSET,
+    );
     let vote = auth.handle_propose(&propose);
     assert!(vote.accepted);
 
@@ -597,13 +602,14 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
         proposer: NodeId(1),
         members: mems.clone(),
         voters: mems.clone(),
-        digest: TopologyTerm::compute_digest(10, &mems),
+        cluster_id: ClusterId::UNSET,
+        digest: TopologyTerm::compute_digest(10, &ClusterId::UNSET, &mems),
     };
     assert_eq!(auth.handle_commit(&commit), Some(10));
 
     // Now a stale proposal for term 5 (between old voted_term=3 and new committed=10)
     // must be rejected: term 5 is not > committed_term 10.
-    let stale = TopologyTerm::new(5, vec![NodeId(1), NodeId(2)], NodeId(2));
+    let stale = TopologyTerm::new(5, vec![NodeId(1), NodeId(2)], NodeId(2), ClusterId::UNSET);
     let v = auth.handle_propose(&stale);
     assert!(
         !v.accepted,
@@ -611,7 +617,12 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
     );
 
     // A proposal for term 11 should be accepted (> committed=10, > voted=3).
-    let fresh = TopologyTerm::new(11, vec![NodeId(1), NodeId(2), NodeId(3)], NodeId(2));
+    let fresh = TopologyTerm::new(
+        11,
+        vec![NodeId(1), NodeId(2), NodeId(3)],
+        NodeId(2),
+        ClusterId::UNSET,
+    );
     let v2 = auth.handle_propose(&fresh);
     assert!(v2.accepted, "proposal for term 11 should be accepted");
 }
@@ -633,7 +644,8 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
         proposer: NodeId(1),
         members: old_mems.clone(),
         voters: old_mems.clone(),
-        digest: TopologyTerm::compute_digest(1, &old_mems),
+        cluster_id: ClusterId::UNSET,
+        digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &old_mems),
     };
     auth.handle_commit(&old_commit);
 
@@ -713,7 +725,8 @@ fn topology_cluster_formation_three_simultaneous_starts() {
             proposer: NodeId(id),
             members: mems.clone(),
             voters: mems.clone(),
-            digest: TopologyTerm::compute_digest(1, &mems),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems),
         };
         auth.handle_commit(&commit);
         assert_eq!(auth.committed_term(), 1);
@@ -768,7 +781,8 @@ fn topology_formation_recovery_blocked_by_outstanding_vote() {
         proposer: NodeId(2),
         members: mems.clone(),
         voters: mems.clone(),
-        digest: TopologyTerm::compute_digest(1, &mems),
+        cluster_id: ClusterId::UNSET,
+        digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems),
     };
     auth.handle_commit(&commit);
 
@@ -781,13 +795,18 @@ fn topology_formation_recovery_blocked_by_outstanding_vote() {
     auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3)]);
 
     // Vote for term 2 via a different proposal (outstanding vote).
-    let proposal_2 = TopologyTerm::new(2, vec![NodeId(1), NodeId(2)], NodeId(1));
+    let proposal_2 = TopologyTerm::new(2, vec![NodeId(1), NodeId(2)], NodeId(1), ClusterId::UNSET);
     let v = auth.handle_propose(&proposal_2);
     assert!(v.accepted);
 
     // Now a formation recovery proposal at term 2 should be rejected
     // because voted_term(2) > committed_term(1).
-    let recovery_proposal = TopologyTerm::new(2, vec![NodeId(1), NodeId(2), NodeId(3)], NodeId(1));
+    let recovery_proposal = TopologyTerm::new(
+        2,
+        vec![NodeId(1), NodeId(2), NodeId(3)],
+        NodeId(1),
+        ClusterId::UNSET,
+    );
     let v2 = auth.handle_propose(&recovery_proposal);
     assert!(
         !v2.accepted,
@@ -1233,7 +1252,12 @@ fn topology_restore_then_vote_safety() {
     auth.restore(&state);
 
     // Proposal for term 11: > committed(10) but NOT > voted(12) → reject.
-    let p1 = TopologyTerm::new(11, vec![NodeId(1), NodeId(2), NodeId(3)], NodeId(1));
+    let p1 = TopologyTerm::new(
+        11,
+        vec![NodeId(1), NodeId(2), NodeId(3)],
+        NodeId(1),
+        ClusterId::UNSET,
+    );
     let v1 = auth.handle_propose(&p1);
     assert!(
         !v1.accepted,
@@ -1241,7 +1265,12 @@ fn topology_restore_then_vote_safety() {
     );
 
     // Proposal for term 13: > committed(10) AND > voted(12) → accept.
-    let p2 = TopologyTerm::new(13, vec![NodeId(1), NodeId(2), NodeId(3)], NodeId(1));
+    let p2 = TopologyTerm::new(
+        13,
+        vec![NodeId(1), NodeId(2), NodeId(3)],
+        NodeId(1),
+        ClusterId::UNSET,
+    );
     let v2 = auth.handle_propose(&p2);
     assert!(v2.accepted, "term 13 should be accepted");
 }
@@ -1569,6 +1598,7 @@ fn topology_full_5_node_quorum_cycle() {
         proposer: commit.proposer,
         members: commit.members.clone(),
         voters: commit.voters.clone(),
+        cluster_id: ClusterId::UNSET,
         digest: commit.digest,
     };
     for node in &nodes {
@@ -1724,7 +1754,8 @@ fn split_brain_heal_detects_independent_clusters() {
         proposer: NodeId(1),
         members: a_members.clone(),
         voters: a_members.clone(),
-        digest: TopologyTerm::compute_digest(5, &a_members),
+        cluster_id: ClusterId::UNSET,
+        digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &a_members),
     });
     assert_eq!(a_proposer.committed_term(), 5);
     assert_eq!(a_proposer.committed_members(), a_members);
@@ -1737,7 +1768,8 @@ fn split_brain_heal_detects_independent_clusters() {
         proposer: NodeId(4),
         members: b_members.clone(),
         voters: b_members.clone(),
-        digest: TopologyTerm::compute_digest(7, &b_members),
+        cluster_id: ClusterId::UNSET,
+        digest: TopologyTerm::compute_digest(7, &ClusterId::UNSET, &b_members),
     });
     assert_eq!(b_proposer.committed_term(), 7);
     assert_eq!(b_proposer.committed_members(), b_members);
@@ -1840,7 +1872,8 @@ fn split_brain_heal_detects_independent_clusters() {
         proposer: NodeId(1),
         members: a_members.clone(),
         voters: a_members.clone(),
-        digest: TopologyTerm::compute_digest(5, &a_members),
+        cluster_id: ClusterId::UNSET,
+        digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &a_members),
     });
 
     // -- Final verification: the regression test would FAIL without R-042

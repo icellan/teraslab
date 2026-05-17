@@ -16,7 +16,7 @@ use teraslab::cluster::coordinator::{
     ClusterConfig, ClusterCoordinator, MasterQueryResult, ReplicationRuntimeConfig, RunningCluster,
 };
 use teraslab::cluster::shards::{NUM_SHARDS, NodeId, ShardTable};
-use teraslab::cluster::topology::{TopologyCommit, TopologyTerm};
+use teraslab::cluster::topology::{ClusterId, TopologyCommit, TopologyTerm};
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, MemoryDevice};
 use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
@@ -49,6 +49,13 @@ fn reserve_udp_port() -> u16 {
     drop(socket);
     port
 }
+
+/// All in-process integration nodes share this cluster_id by default so
+/// the P1.1 `membership_change_is_safe` check takes the
+/// matching-cluster_id fast path (skips the F-G8-001 ever-seen
+/// fallback). Tests that intentionally exercise mismatched clusters
+/// (`tests/g8_cluster_id.rs`) override via `create_node_full`.
+const TEST_CLUSTER_ID: ClusterId = ClusterId([0xA5; 16]);
 
 /// Create a `TestNode` with an explicit replication factor.
 ///
@@ -93,41 +100,7 @@ fn create_node_with_replication_runtime(
         seed_swim_ports,
         rf,
         replication,
-        &[],
-    )
-}
-
-/// Like [`create_node_with_replication_runtime`] but additionally seeds the
-/// node's `committed_voter_ever_seen` set BEFORE SWIM starts. Tests that
-/// rely on growing a fresh cluster past two members need this: once the
-/// first 2-node topology commits, F-G8-001's `ever_seen_check` rejects any
-/// later proposal that introduces a NodeId not previously observed as a
-/// committed voter. Production wires that allow-list via `cluster_id`;
-/// in-process tests have no orchestrator, so the test fixture must do it
-/// manually. The seed is applied to the freshly-constructed coordinator
-/// before `start()` so SWIM cannot race ahead and commit a 2-node term
-/// before the allow-list is in place.
-fn create_node_with_ever_seen(
-    node_id: u64,
-    tcp_port: u16,
-    swim_port: u16,
-    seed_swim_ports: &[u16],
-    rf: u8,
-    ever_seen: &[NodeId],
-) -> TestNode {
-    create_node_full(
-        node_id,
-        tcp_port,
-        swim_port,
-        seed_swim_ports,
-        rf,
-        ReplicationRuntimeConfig {
-            ack_policy: None,
-            best_effort: true,
-            timeout: Duration::from_secs(3),
-            timeout_during_migration: Duration::from_secs(30),
-        },
-        ever_seen,
+        TEST_CLUSTER_ID,
     )
 }
 
@@ -138,7 +111,7 @@ fn create_node_full(
     seed_swim_ports: &[u16],
     rf: u8,
     replication: ReplicationRuntimeConfig,
-    ever_seen: &[NodeId],
+    cluster_id: ClusterId,
 ) -> TestNode {
     let tcp_port = if tcp_port == 0 {
         reserve_tcp_port()
@@ -186,18 +159,10 @@ fn create_node_full(
         migration_pool_size: 4,
         migration_batch_size: 100,
         persisted_incarnation: 0,
+        cluster_id,
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);
-    if !ever_seen.is_empty() {
-        // Seed the F-G8-001 ever-seen allow-list BEFORE start() so the
-        // SWIM event loop never races against an unseen-member rejection
-        // (which has no retry path once on_membership_changed returns
-        // None).
-        coordinator
-            .topology_authority
-            .set_committed_voter_ever_seen(ever_seen);
-    }
     let running = Arc::new(coordinator.start(engine.clone(), None, None, replication));
 
     let config = ServerConfig {
@@ -610,17 +575,14 @@ fn add_fourth_node_rebalance_triggers() {
     // Start 3-node cluster on ephemeral ports so unrelated local services
     // cannot collide with this integration test.
     //
-    // Each node pre-seeds the full expected membership (111-114) into its
-    // F-G8-001 ever-seen allow-list BEFORE SWIM starts. Without this
-    // seeding the cluster gets stuck at a 2-node commit: once
-    // ever_seen = {first two nodes} is recorded, on_membership_changed
-    // rejects the [111, 112, 113] proposal and there is no retry path.
-    // Production avoids the issue by wiring cluster_id; the test fixture
-    // mirrors that via direct ever_seen injection.
-    let all_ids = [NodeId(111), NodeId(112), NodeId(113), NodeId(114)];
-    let node1 = create_node_with_ever_seen(111, 0, 0, &[], 2, &all_ids);
-    let node2 = create_node_with_ever_seen(112, 0, 0, &[node1.swim_port], 2, &all_ids);
-    let node3 = create_node_with_ever_seen(113, 0, 0, &[node1.swim_port], 2, &all_ids);
+    // `create_node` stamps the shared TEST_CLUSTER_ID on every node, so
+    // P1.1's membership_change_is_safe takes the matching-cluster_id
+    // short-circuit instead of falling through to the F-G8-001 ever-seen
+    // heuristic — which is what previously blocked the third-node
+    // proposal in a fresh cluster (no committed voter had seen it).
+    let node1 = create_node(111, 0, 0, &[], 2);
+    let node2 = create_node(112, 0, 0, &[node1.swim_port], 2);
+    let node3 = create_node(113, 0, 0, &[node1.swim_port], 2);
 
     // Wait for the 3-node topology to commit so v_before reflects the
     // pre-add baseline. shard_table_version mirrors the committed term.
@@ -631,15 +593,14 @@ fn add_fourth_node_rebalance_triggers() {
     .expect("3-node topology should commit on node1 before adding the 4th node");
     let v_before = node1.cluster.shard_table_version();
 
-    // Add 4th node — pre-seed its allow-list too so its votes accept the
-    // existing 3-node members and the upcoming 4-node proposal.
-    let node4 = create_node_with_ever_seen(
+    // Add 4th node — its TEST_CLUSTER_ID matches the existing three so
+    // the join is accepted on the cluster_id check alone.
+    let node4 = create_node(
         114,
         0,
         0,
         &[node1.swim_port, node2.swim_port, node3.swim_port],
         2,
-        &all_ids,
     );
 
     // Wait for the 4-node topology to commit (proposer is node1 = lowest
@@ -1233,17 +1194,29 @@ fn start_three_node_cluster_create_records_distributed() {
     let node2 = create_node(222, 13512, 13513, &[13511], 2);
     let node3 = create_node(223, 13514, 13515, &[13511], 2);
 
-    // Wait for at least one peer to be reflected in node1's shard table
-    // so the "redirected > 0" assertion below is satisfiable. The test
-    // does not require all three nodes to commit; a 2-node topology is
-    // enough to produce both local-owned and redirected keys.
+    // Wait for the full 3-node topology to commit AND for any pending
+    // migration handoff to drain on node1. Previously the test only
+    // waited for `shard_table_version() > 0` (true at bootstrap) and
+    // relied on the F-G8-001 ever-seen rejection to stall convergence
+    // at a 2-node state — so node1 owned every shard and the
+    // create-distribution assertions were vacuously satisfied. With
+    // cluster_id wired (P1.1) the 3-node commit lands properly, and
+    // the test now actually exercises distributed routing.
     wait_until(
-        || node1.cluster.shard_table_version() > 0,
-        Duration::from_secs(3),
+        || {
+            node1.cluster.committed_topology_members().len() == 3
+                && !node1.cluster.migration_pressure_active()
+        },
+        Duration::from_secs(30),
     )
-    .expect("node1 should advance shard_table_version past bootstrap");
+    .expect("3-node topology + migration handoff should settle on node1");
 
-    // Create 100 records via node 1
+    // Sweep a large set of txids covering the full 12-bit shard space
+    // so the assertions don't depend on a 100-shard contiguous window
+    // landing on node1's assignments. The pre-P1.1 test could pass
+    // with any 100 contiguous shards because the cluster never
+    // distributed; post-P1.1 we need an input distribution that
+    // actually probes every node's master shards.
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1251,14 +1224,16 @@ fn start_three_node_cluster_create_records_distributed() {
 
     let mut created = 0;
     let mut redirected = 0;
-    for i in 0..100u32 {
-        let txid = make_txid(i + 100000);
-        let hash = make_txid(i + 200000);
+    // 4096 txids = one per shard (seed = shard | (i << 12) hits every shard).
+    // Skip-step of 1 so the low 12 bits cycle through 0..4096 once.
+    for shard in 0..NUM_SHARDS as u32 {
+        let txid = make_txid(shard);
+        let hash = make_txid(shard.wrapping_add(200_000));
         let payload = encode_create_payload(&txid, &hash);
         let resp = send_request(
             &mut stream,
             &RequestFrame {
-                request_id: i as u64,
+                request_id: shard as u64,
                 op_code: OP_CREATE_BATCH,
                 flags: 0,
                 payload,
@@ -1271,14 +1246,16 @@ fn start_three_node_cluster_create_records_distributed() {
         }
     }
 
-    // In a 3-node cluster, ~1/3 of keys should be owned by node 1
+    eprintln!("created={created}, redirected={redirected}");
+
+    // In a 3-node cluster every node owns a fair share of master
+    // shards; both the locally-mastered and redirected counters must
+    // be non-trivial.
     assert!(created > 0, "some records should be created locally");
     assert!(
         redirected > 0,
         "some records should be redirected to other nodes"
     );
-
-    eprintln!("created={created}, redirected={redirected}");
 
     shutdown_node(&node1);
     shutdown_node(&node2);
@@ -1637,15 +1614,12 @@ fn isolated_node_rejects_writes_with_no_quorum() {
     // OP_CREATE_BATCH against the surviving node and assert it rejects
     // with ERR_NO_QUORUM rather than independently committing the write.
     //
-    // Pre-seed each node's F-G8-001 ever-seen allow-list with the full
-    // expected membership: without that, on_membership_changed rejects
-    // the second/third node's addition once a 2-node topology is
-    // committed (see `add_fourth_node_rebalance_triggers` for the same
-    // pattern).
-    let all_ids = [NodeId(301), NodeId(302), NodeId(303)];
-    let node1 = create_node_with_ever_seen(301, 0, 0, &[], 2, &all_ids);
-    let node2 = create_node_with_ever_seen(302, 0, 0, &[node1.swim_port], 2, &all_ids);
-    let node3 = create_node_with_ever_seen(303, 0, 0, &[node1.swim_port], 2, &all_ids);
+    // P1.1: all three nodes share TEST_CLUSTER_ID, so the 3-node commit
+    // happens directly without the previously-required ever-seen
+    // pre-seed.
+    let node1 = create_node(301, 0, 0, &[], 2);
+    let node2 = create_node(302, 0, 0, &[node1.swim_port], 2);
+    let node3 = create_node(303, 0, 0, &[node1.swim_port], 2);
 
     // Wait for the 3-node topology to commit on the surviving node so
     // that `committed_topology_members` reflects the full peak set
@@ -1873,7 +1847,8 @@ fn tcp_strict_replication_failure_returns_replication_failed() {
         proposer: NodeId(322),
         members: members.clone(),
         voters: members.clone(),
-        digest: TopologyTerm::compute_digest(1, &members),
+        cluster_id: ClusterId::UNSET,
+        digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &members),
     };
     let resp = send_request(
         &mut stream,

@@ -10646,7 +10646,12 @@ mod tests {
 
         // Propose a new term that subsumes this single-node cluster.
         let proposer = other;
-        let propose = crate::cluster::topology::TopologyTerm::new(500, members.clone(), proposer);
+        let propose = crate::cluster::topology::TopologyTerm::new(
+            500,
+            members.clone(),
+            proposer,
+            crate::cluster::topology::ClusterId::UNSET,
+        );
 
         let req = RequestFrame {
             request_id: 1,
@@ -10718,7 +10723,12 @@ mod tests {
             .set_committed_voter_ever_seen(&[self_id, other]);
 
         let proposer = other;
-        let propose = crate::cluster::topology::TopologyTerm::new(600, members.clone(), proposer);
+        let propose = crate::cluster::topology::TopologyTerm::new(
+            600,
+            members.clone(),
+            proposer,
+            crate::cluster::topology::ClusterId::UNSET,
+        );
 
         let req = RequestFrame {
             request_id: 1,
@@ -10775,7 +10785,12 @@ mod tests {
 
         // Step 1: accept a proposal (sets voted_term).
         let proposer = crate::cluster::shards::NodeId(2);
-        let propose = crate::cluster::topology::TopologyTerm::new(700, members.clone(), proposer);
+        let propose = crate::cluster::topology::TopologyTerm::new(
+            700,
+            members.clone(),
+            proposer,
+            crate::cluster::topology::ClusterId::UNSET,
+        );
         let req = RequestFrame {
             request_id: 1,
             op_code: OP_TOPOLOGY_PROPOSE,
@@ -10799,7 +10814,12 @@ mod tests {
             term: 700,
             proposer,
             members: members.clone(),
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(700, &members),
+            cluster_id: crate::cluster::topology::ClusterId::UNSET,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                700,
+                &crate::cluster::topology::ClusterId::UNSET,
+                &members,
+            ),
             voters: members.clone(),
         };
         let req = RequestFrame {

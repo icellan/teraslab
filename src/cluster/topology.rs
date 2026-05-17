@@ -68,26 +68,37 @@ pub struct TopologyTerm {
     pub members: Vec<NodeId>,
     /// The node that proposed this term.
     pub proposer: NodeId,
-    /// SHA-256 digest of (term || members), used for vote matching.
+    /// Cluster instance UUID stamped by the proposer (see [`ClusterId`]).
+    /// `ClusterId::UNSET` is permitted for legacy / pre-orchestrator
+    /// nodes; the receiver then falls back to the ever-seen heuristic.
+    pub cluster_id: ClusterId,
+    /// SHA-256 digest of (term || cluster_id || members), used for vote
+    /// matching. Mixing `cluster_id` in means a tampered id changes the
+    /// digest, so the digest check itself rejects a forged
+    /// matching-cluster claim.
     pub digest: [u8; 32],
 }
 
 impl TopologyTerm {
     /// Create a new term with auto-computed digest.
-    pub fn new(term: u64, members: Vec<NodeId>, proposer: NodeId) -> Self {
-        let digest = Self::compute_digest(term, &members);
+    pub fn new(term: u64, members: Vec<NodeId>, proposer: NodeId, cluster_id: ClusterId) -> Self {
+        let digest = Self::compute_digest(term, &cluster_id, &members);
         Self {
             term,
             members,
             proposer,
+            cluster_id,
             digest,
         }
     }
 
-    /// Compute the canonical digest for a (term, members) pair.
-    pub fn compute_digest(term: u64, members: &[NodeId]) -> [u8; 32] {
-        let mut buf = Vec::with_capacity(8 + 4 + members.len() * 8);
+    /// Compute the canonical digest for a (term, cluster_id, members)
+    /// triple. `cluster_id` is mixed in so a forged-but-matching id
+    /// changes the digest.
+    pub fn compute_digest(term: u64, cluster_id: &ClusterId, members: &[NodeId]) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(8 + 16 + 4 + members.len() * 8);
         buf.extend_from_slice(&term.to_le_bytes());
+        buf.extend_from_slice(&cluster_id.0);
         buf.extend_from_slice(&(members.len() as u32).to_le_bytes());
         for m in members {
             buf.extend_from_slice(&m.0.to_le_bytes());
@@ -97,11 +108,12 @@ impl TopologyTerm {
 
     /// Serialize for the wire.
     ///
-    /// Format: `[term:8][proposer:8][member_count:4][member_id:8 * count][digest:32]`
+    /// Format: `[term:8][proposer:8][cluster_id:16][member_count:4][member_id:8 * count][digest:32]`
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(52 + self.members.len() * 8);
+        let mut buf = Vec::with_capacity(68 + self.members.len() * 8);
         buf.extend_from_slice(&self.term.to_le_bytes());
         buf.extend_from_slice(&self.proposer.0.to_le_bytes());
+        buf.extend_from_slice(&self.cluster_id.0);
         buf.extend_from_slice(&(self.members.len() as u32).to_le_bytes());
         for m in &self.members {
             buf.extend_from_slice(&m.0.to_le_bytes());
@@ -128,22 +140,26 @@ impl TopologyTerm {
     ///    silently overflow into a tiny `members_end` that bypasses
     ///    the size check.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        if data.len() < 20 {
+        // Header: [term:8][proposer:8][cluster_id:16][count:4] = 36 bytes.
+        if data.len() < 36 {
             return None;
         }
         let term = u64::from_le_bytes(data[0..8].try_into().ok()?);
         let proposer = NodeId(u64::from_le_bytes(data[8..16].try_into().ok()?));
-        let count = u32::from_le_bytes(data[16..20].try_into().ok()?) as usize;
+        let mut cid = [0u8; 16];
+        cid.copy_from_slice(&data[16..32]);
+        let cluster_id = ClusterId(cid);
+        let count = u32::from_le_bytes(data[32..36].try_into().ok()?) as usize;
         if count > MAX_TOPOLOGY_MEMBERS {
             return None;
         }
-        let members_end = 20usize.checked_add(count.checked_mul(8)?)?;
+        let members_end = 36usize.checked_add(count.checked_mul(8)?)?;
         if data.len() < members_end.checked_add(32)? {
             return None;
         }
         let mut members = Vec::with_capacity(count);
         for i in 0..count {
-            let off = 20 + i * 8;
+            let off = 36 + i * 8;
             members.push(NodeId(u64::from_le_bytes(
                 data[off..off + 8].try_into().ok()?,
             )));
@@ -154,6 +170,7 @@ impl TopologyTerm {
             term,
             members,
             proposer,
+            cluster_id,
             digest,
         })
     }
@@ -223,6 +240,11 @@ pub struct TopologyCommit {
     pub term: u64,
     pub proposer: NodeId,
     pub members: Vec<NodeId>,
+    /// Cluster instance UUID copied from the [`TopologyTerm`] that
+    /// reached quorum. Mixed into [`TopologyTerm::compute_digest`] so a
+    /// commit cannot be re-played against a node configured with a
+    /// different cluster_id.
+    pub cluster_id: ClusterId,
     pub digest: [u8; 32],
     /// Nodes whose accepted votes formed the quorum for this commit.
     pub voters: Vec<NodeId>,
@@ -246,11 +268,12 @@ impl TopologyCommit {
 
     /// Serialize for the wire.
     ///
-    /// Format: `[term:8][proposer:8][member_count:4][member_id:8 * count][digest:32][voter_count:4][voter_id:8 * count]`
+    /// Format: `[term:8][proposer:8][cluster_id:16][member_count:4][member_id:8 * count][digest:32][voter_count:4][voter_id:8 * count]`
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(56 + (self.members.len() + self.voters.len()) * 8);
+        let mut buf = Vec::with_capacity(72 + (self.members.len() + self.voters.len()) * 8);
         buf.extend_from_slice(&self.term.to_le_bytes());
         buf.extend_from_slice(&self.proposer.0.to_le_bytes());
+        buf.extend_from_slice(&self.cluster_id.0);
         buf.extend_from_slice(&(self.members.len() as u32).to_le_bytes());
         for m in &self.members {
             buf.extend_from_slice(&m.0.to_le_bytes());
@@ -272,7 +295,10 @@ impl TopologyCommit {
     /// `TopologyTerm::deserialize` above.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
         let term = TopologyTerm::deserialize(data)?;
-        let voters_pos = 20usize
+        // Header is 36 bytes ([term:8][proposer:8][cluster_id:16][count:4]),
+        // followed by members (count * 8) and the digest (32). Voter list
+        // starts after the digest.
+        let voters_pos = 36usize
             .checked_add(term.members.len().checked_mul(8)?)?
             .checked_add(32)?;
         let voters = if data.len() >= voters_pos.checked_add(4)? {
@@ -302,6 +328,7 @@ impl TopologyCommit {
             term: term.term,
             proposer: term.proposer,
             members: term.members,
+            cluster_id: term.cluster_id,
             digest: term.digest,
             voters,
         })
@@ -667,26 +694,38 @@ impl TopologyAuthority {
     }
 
     /// Decide whether a proposed membership is safe to commit on this
-    /// node, applying both the monotonic-change check and the
-    /// ever-seen-voter check.
+    /// node, applying both the monotonic-change check and either the
+    /// cluster_id match (primary defence, P1.1) or the
+    /// ever-seen-voter check (legacy fallback, F-G8-001).
     ///
     /// `proposal_cluster_id` is `None` when the proposer omitted it
-    /// (legacy / pre-orchestrator) and `Some(id)` when present. When
-    /// both sides have a configured (non-unset) cluster_id and they
-    /// differ, the proposal is rejected outright. When either side is
-    /// unset, the check falls back to the ever-seen-voter heuristic.
+    /// (in-process tests / pre-wire callers) and `Some(id)` when the
+    /// caller has access to the inbound `TopologyTerm::cluster_id`.
+    ///
+    /// Decision matrix:
+    ///   * Either side unset → fall through to `ever_seen_check`
+    ///     (F-G8-001 fallback).
+    ///   * Both sides set, ids differ → reject.
+    ///   * Both sides set, ids match → cluster_id alone is sufficient
+    ///     proof of "same cluster"; skip `ever_seen_check`. This is the
+    ///     P1.1 fix: ever_seen_check otherwise blocks legitimate
+    ///     scale-up because new nodes are unseen by definition.
+    ///
+    /// The monotonic-change check runs in every branch — it catches
+    /// merges-with-drops that the cluster_id check alone cannot
+    /// (because two nodes inside a single configured cluster_id can
+    /// still split-brain).
     pub fn membership_change_is_safe(
         &self,
         proposed_members: &[NodeId],
         proposal_cluster_id: Option<ClusterId>,
     ) -> bool {
-        // cluster_id check: only when both sides are configured.
         let my_id = self.cluster_id();
-        if !my_id.is_unset()
-            && let Some(other) = proposal_cluster_id
-            && !other.is_unset()
-            && other != my_id
-        {
+        let other = proposal_cluster_id.unwrap_or(ClusterId::UNSET);
+        // Both sides configured: cluster_id is the authoritative
+        // split-brain defence.
+        let both_configured = !my_id.is_unset() && !other.is_unset();
+        if both_configured && other != my_id {
             return false;
         }
 
@@ -700,9 +739,21 @@ impl TopologyAuthority {
         }
         drop(committed_members);
 
-        // Fallback split-brain heuristic: any previously-unseen NodeId
-        // is rejected. cluster_id (when wired) overrides this, but the
-        // pure-superset attack (F-G8-001) only requires this check.
+        // When both sides are configured and the ids matched, the
+        // monotonic check above is the only structural defence we need
+        // — a matching cluster_id proves the proposal originates from
+        // an authenticated peer in the same cluster, and rejecting
+        // unseen members at that point would block every legitimate
+        // join (a brand-new node is unseen by definition).
+        if both_configured {
+            return true;
+        }
+
+        // Fallback split-brain heuristic for nodes that have not yet
+        // configured a cluster_id: any previously-unseen NodeId is
+        // rejected. cluster_id (when wired) supersedes this, but in
+        // legacy / mixed-version clusters the pure-superset attack
+        // (F-G8-001) still requires the heuristic.
         self.ever_seen_check(proposed_members)
     }
 
@@ -808,7 +859,12 @@ impl TopologyAuthority {
         // committed voter on this node (F-G8-001 fallback). Run BEFORE
         // updating observed_membership / last_membership_change so the
         // fallback proposer path doesn't pick up the poisoned view either.
-        if !self.membership_change_is_safe(members, None) {
+        //
+        // The local node is the proposer in this code path, so the
+        // "proposal cluster_id" is our own — pass it explicitly so that
+        // a configured cluster_id participates in the safety check
+        // (cluster_id match skips the ever-seen heuristic).
+        if !self.membership_change_is_safe(members, Some(self.cluster_id())) {
             let committed_members = self.committed_members.read().unwrap();
             tracing::error!(
                 self_id = self.self_id.0,
@@ -847,7 +903,7 @@ impl TopologyAuthority {
         let voted = self.voted_term.load(Ordering::Relaxed);
         let new_term = committed.max(voted) + 1;
 
-        let term = TopologyTerm::new(new_term, members.to_vec(), self.self_id);
+        let term = TopologyTerm::new(new_term, members.to_vec(), self.self_id, self.cluster_id());
 
         // Self-vote
         self.voted_term.store(new_term, Ordering::Relaxed);
@@ -874,8 +930,8 @@ impl TopologyAuthority {
         let committed = self.committed_term.load(Ordering::Relaxed);
         let voted = self.voted_term.load(Ordering::Relaxed);
 
-        let valid_digest =
-            propose.digest == TopologyTerm::compute_digest(propose.term, &propose.members);
+        let valid_digest = propose.digest
+            == TopologyTerm::compute_digest(propose.term, &propose.cluster_id, &propose.members);
 
         // F-G8-002: the proposer-side split-brain checks fire in
         // `on_membership_changed`, `retry_proposal`, and `check_timeout`,
@@ -885,7 +941,7 @@ impl TopologyAuthority {
         // followers — apply the same guard on this side so a single
         // round cannot launder a merged membership through the quorum.
         if !valid_digest
-            || !self.membership_change_is_safe(&propose.members, None)
+            || !self.membership_change_is_safe(&propose.members, Some(propose.cluster_id))
         {
             // Even when `voted_term` would normally advance, we refuse to
             // self-vote for an unsafe proposal. Report the voter's last
@@ -975,6 +1031,7 @@ impl TopologyAuthority {
                 term: proposal.term.term,
                 proposer: proposal.term.proposer,
                 members: proposal.term.members.clone(),
+                cluster_id: proposal.term.cluster_id,
                 digest: proposal.term.digest,
                 voters,
             };
@@ -999,8 +1056,11 @@ impl TopologyAuthority {
             return None;
         }
 
-        // Validate digest.
-        let expected_digest = TopologyTerm::compute_digest(commit.term, &commit.members);
+        // Validate digest. The digest is computed over
+        // (term || cluster_id || members) so a forged cluster_id that
+        // happens to match the local one still mismatches the digest.
+        let expected_digest =
+            TopologyTerm::compute_digest(commit.term, &commit.cluster_id, &commit.members);
         if commit.digest != expected_digest {
             return None;
         }
@@ -1095,7 +1155,10 @@ impl TopologyAuthority {
         // a proposal via the retry path. Includes the F-G8-001 ever-seen
         // fallback so pure-superset attacks are caught even if an external
         // caller installed a "monotonic" observation containing unseen ids.
-        if !self.membership_change_is_safe(&target_members, None) {
+        //
+        // We are the proposer in this code path, so the proposal
+        // cluster_id is our own.
+        if !self.membership_change_is_safe(&target_members, Some(self.cluster_id())) {
             let committed_members = self.committed_members.read().unwrap();
             tracing::error!(
                 self_id = self.self_id.0,
@@ -1122,7 +1185,12 @@ impl TopologyAuthority {
         let voted = self.voted_term.load(Ordering::Relaxed);
         let new_term = committed.max(voted) + 1;
 
-        let term = TopologyTerm::new(new_term, target_members.clone(), self.self_id);
+        let term = TopologyTerm::new(
+            new_term,
+            target_members.clone(),
+            self.self_id,
+            self.cluster_id(),
+        );
         self.voted_term.store(new_term, Ordering::Relaxed);
 
         let quorum_needed = (target_members.len() / 2) + 1;
@@ -1170,7 +1238,10 @@ impl TopologyAuthority {
         // socket map, which is updated outside `on_membership_changed`;
         // re-validate here so a non-monotonic view never becomes a proposal.
         // Applies the F-G8-001 ever-seen fallback as well.
-        if !self.membership_change_is_safe(&target_members, None) {
+        //
+        // We are the fallback proposer in this code path; the proposal
+        // cluster_id is our own.
+        if !self.membership_change_is_safe(&target_members, Some(self.cluster_id())) {
             let committed_members = self.committed_members.read().unwrap();
             tracing::error!(
                 self_id = self.self_id.0,
@@ -1207,7 +1278,12 @@ impl TopologyAuthority {
         // (which would mean another proposer is active).
         let new_term = committed.max(voted) + 1;
 
-        let term = TopologyTerm::new(new_term, target_members.clone(), self.self_id);
+        let term = TopologyTerm::new(
+            new_term,
+            target_members.clone(),
+            self.self_id,
+            self.cluster_id(),
+        );
         self.voted_term.store(new_term, Ordering::Relaxed);
 
         let quorum_needed = (target_members.len() / 2) + 1;
@@ -1259,7 +1335,7 @@ mod tests {
     #[test]
     fn vote_accept_valid_proposal() {
         let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
-        let propose = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1));
+        let propose = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET);
         let vote = auth.handle_propose(&propose);
         assert!(vote.accepted);
         assert_eq!(vote.term, 1);
@@ -1272,7 +1348,7 @@ mod tests {
         // Simulate already having voted for term 5
         auth.voted_term.store(5, Ordering::Relaxed);
 
-        let propose = TopologyTerm::new(3, members(&[1, 2, 3]), NodeId(1));
+        let propose = TopologyTerm::new(3, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET);
         let vote = auth.handle_propose(&propose);
         assert!(!vote.accepted);
     }
@@ -1280,7 +1356,7 @@ mod tests {
     #[test]
     fn vote_reject_bad_digest() {
         let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
-        let mut propose = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1));
+        let mut propose = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET);
         propose.digest = [0xFF; 32]; // corrupt
         let vote = auth.handle_propose(&propose);
         assert!(!vote.accepted);
@@ -1316,7 +1392,7 @@ mod tests {
         // 5 members, quorum = 3. Self-vote = 1. Need 2 more.
         let vote1 = TopologyVote {
             term: 1,
-            digest: TopologyTerm::compute_digest(1, &members(&[1, 2, 3, 4, 5])),
+            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &members(&[1, 2, 3, 4, 5])),
             voter: NodeId(2),
             accepted: true,
             voter_current_term: 0,
@@ -1326,7 +1402,7 @@ mod tests {
 
         let vote2 = TopologyVote {
             term: 1,
-            digest: TopologyTerm::compute_digest(1, &members(&[1, 2, 3, 4, 5])),
+            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &members(&[1, 2, 3, 4, 5])),
             voter: NodeId(3),
             accepted: true,
             voter_current_term: 0,
@@ -1343,7 +1419,8 @@ mod tests {
             term: 5,
             proposer: NodeId(1),
             members: mems.clone(),
-            digest: TopologyTerm::compute_digest(5, &mems),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems),
             voters: mems.clone(),
         };
         let result = auth.handle_commit(&commit);
@@ -1377,7 +1454,8 @@ mod tests {
             term: 7,
             proposer: NodeId(1),
             members: mems.clone(),
-            digest: TopologyTerm::compute_digest(7, &mems),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(7, &ClusterId::UNSET, &mems),
             voters: mems.clone(),
         };
         assert_eq!(auth.handle_commit(&commit), Some(7));
@@ -1402,7 +1480,8 @@ mod tests {
             term: 5, // stale
             proposer: NodeId(1),
             members: mems.clone(),
-            digest: TopologyTerm::compute_digest(5, &mems),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems),
             voters: mems.clone(),
         };
         assert!(auth.handle_commit(&commit).is_none());
@@ -1419,7 +1498,8 @@ mod tests {
             term: 5,
             proposer: NodeId(1),
             members: mems.clone(),
-            digest: TopologyTerm::compute_digest(5, &mems),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems),
             voters: mems.clone(),
         };
 
@@ -1446,6 +1526,7 @@ mod tests {
             term: 1,
             proposer: NodeId(1),
             members: mems.clone(),
+            cluster_id: ClusterId::UNSET,
             digest: [0xFF; 32], // corrupt
             voters: mems.clone(),
         };
@@ -1490,7 +1571,7 @@ mod tests {
 
     #[test]
     fn wire_format_round_trip() {
-        let term = TopologyTerm::new(42, members(&[1, 2, 3]), NodeId(1));
+        let term = TopologyTerm::new(42, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET);
         let data = term.serialize();
         let restored = TopologyTerm::deserialize(&data).unwrap();
         assert_eq!(restored.term, 42);
@@ -1516,6 +1597,7 @@ mod tests {
             term: 42,
             proposer: NodeId(1),
             members: term.members.clone(),
+            cluster_id: ClusterId::UNSET,
             digest: term.digest,
             voters: members(&[1, 2]),
         };
@@ -1555,12 +1637,12 @@ mod tests {
     fn cannot_vote_twice_for_same_term() {
         let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
 
-        let p1 = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1));
+        let p1 = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET);
         let v1 = auth.handle_propose(&p1);
         assert!(v1.accepted);
 
         // Second proposal at same term from a different proposer
-        let p2 = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(3));
+        let p2 = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(3), ClusterId::UNSET);
         let v2 = auth.handle_propose(&p2);
         assert!(!v2.accepted); // Already voted for term 1
     }
@@ -1577,6 +1659,7 @@ mod tests {
             term: 1,
             proposer: NodeId(1),
             members: members(&[1, 2, 3]),
+            cluster_id: ClusterId::UNSET,
             digest: t1.digest,
             voters: members(&[1, 2, 3]),
         });
@@ -1601,7 +1684,8 @@ mod tests {
             term: 5,
             proposer: NodeId(1),
             members: remote_members.clone(),
-            digest: TopologyTerm::compute_digest(5, &remote_members),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &remote_members),
             voters: remote_members.clone(),
         };
         let result = auth.handle_commit(&commit);
@@ -1621,7 +1705,8 @@ mod tests {
             term: 5,
             proposer: NodeId(1),
             members: remote_members.clone(),
-            digest: TopologyTerm::compute_digest(5, &remote_members),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &remote_members),
             voters: remote_members.clone(),
         };
         let result = auth.handle_commit(&commit);
@@ -1637,6 +1722,7 @@ mod tests {
             term: 5,
             proposer: NodeId(1),
             members: members(&[1, 2, 3]),
+            cluster_id: ClusterId::UNSET,
             digest: [0xFF; 32], // corrupt
             voters: members(&[1, 2, 3]),
         };
@@ -1656,7 +1742,8 @@ mod tests {
             term: 5,
             proposer: NodeId(1),
             members: mems.clone(),
-            digest: TopologyTerm::compute_digest(5, &mems),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems),
             voters: mems.clone(),
         };
         auth.handle_commit(&commit);
@@ -1678,11 +1765,11 @@ mod tests {
 
         // The original term 5 was committed with members [1, 3].
         let original_members = members(&[1, 3]);
-        let original_digest = TopologyTerm::compute_digest(5, &original_members);
+        let original_digest = TopologyTerm::compute_digest(5, &ClusterId::UNSET, &original_members);
 
         // Synthetic commit with wrong members [1, 2, 3] (SWIM-alive view).
         let wrong_members = members(&[1, 2, 3]);
-        let wrong_digest = TopologyTerm::compute_digest(5, &wrong_members);
+        let wrong_digest = TopologyTerm::compute_digest(5, &ClusterId::UNSET, &wrong_members);
 
         // The digests MUST differ.
         assert_ne!(
@@ -1695,6 +1782,7 @@ mod tests {
             term: 5,
             proposer: NodeId(1),
             members: wrong_members.clone(),
+            cluster_id: ClusterId::UNSET,
             digest: wrong_digest,
             voters: wrong_members,
         };
@@ -1716,6 +1804,7 @@ mod tests {
             term: 5,
             proposer: NodeId(1),
             members: original_members.clone(),
+            cluster_id: ClusterId::UNSET,
             digest: original_digest,
             voters: original_members.clone(),
         };
@@ -1770,7 +1859,8 @@ mod tests {
             term: 5,
             proposer: NodeId(2),
             members: members(&[1, 2, 3, 4]),
-            digest: TopologyTerm::compute_digest(5, &members(&[1, 2, 3, 4])),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &members(&[1, 2, 3, 4])),
             voters: members(&[1, 2, 3, 4]),
         };
         auth.handle_commit(&commit);
@@ -1866,7 +1956,8 @@ mod tests {
             term: 5,
             proposer: NodeId(1),
             members: mems.clone(),
-            digest: TopologyTerm::compute_digest(5, &mems),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &mems),
             voters: mems.clone(),
         };
         auth.handle_commit(&commit);
@@ -1891,14 +1982,16 @@ mod tests {
             term: 4,
             proposer: NodeId(1),
             members: original.clone(),
-            digest: TopologyTerm::compute_digest(4, &original),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(4, &ClusterId::UNSET, &original),
             voters: original.clone(),
         });
         auth.handle_commit(&TopologyCommit {
             term: 5,
             proposer: NodeId(1),
             members: drained.clone(),
-            digest: TopologyTerm::compute_digest(5, &drained),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &drained),
             voters: drained.clone(),
         });
 
@@ -1930,7 +2023,8 @@ mod tests {
             members: members(&[1, 2, 3]),
             // This digest is compute_digest(5, [1,2,3]) which differs
             // from the original compute_digest(5, [1,3]).
-            digest: TopologyTerm::compute_digest(5, &members(&[1, 2, 3])),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &members(&[1, 2, 3])),
             voters: members(&[1, 2, 3]),
         };
 
@@ -1945,7 +2039,8 @@ mod tests {
             term: 5,
             proposer: NodeId(1),
             members: original_members.clone(),
-            digest: TopologyTerm::compute_digest(5, &original_members),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &original_members),
             voters: original_members.clone(),
         };
         let result = auth.handle_commit(&good_commit);
@@ -1965,7 +2060,7 @@ mod tests {
         let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
 
         // Vote for term 3
-        let p = TopologyTerm::new(3, members(&[1, 2, 3]), NodeId(1));
+        let p = TopologyTerm::new(3, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET);
         let v = auth.handle_propose(&p);
         assert!(v.accepted);
         assert_eq!(auth.voted_term.load(Ordering::Relaxed), 3);
@@ -1976,7 +2071,8 @@ mod tests {
             term: 10,
             proposer: NodeId(1),
             members: mems.clone(),
-            digest: TopologyTerm::compute_digest(10, &mems),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(10, &ClusterId::UNSET, &mems),
             voters: mems.clone(),
         };
         auth.handle_commit(&commit);
@@ -1985,7 +2081,7 @@ mod tests {
         assert_eq!(auth.voted_term.load(Ordering::Relaxed), 3);
 
         // Proposal for term 8: > voted(3) but NOT > committed(10) → reject
-        let p2 = TopologyTerm::new(8, members(&[1, 2, 3]), NodeId(1));
+        let p2 = TopologyTerm::new(8, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET);
         let v2 = auth.handle_propose(&p2);
         assert!(!v2.accepted, "term 8 < committed_term 10 → must reject");
     }
@@ -2024,7 +2120,8 @@ mod tests {
             term: 1,
             proposer: NodeId(1),
             members: mems.clone(),
-            digest: TopologyTerm::compute_digest(1, &mems),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems),
             voters: mems.clone(),
         });
         *auth.observed_membership.lock() = mems;
@@ -2066,7 +2163,8 @@ mod tests {
             term: 1,
             proposer: NodeId(1),
             members: old_mems.clone(),
-            digest: TopologyTerm::compute_digest(1, &old_mems),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &old_mems),
             voters: old_mems.clone(),
         });
         // F-G8-001: pre-seed the ever-seen set with node 3 so the
@@ -2112,7 +2210,7 @@ mod tests {
     /// Verify that deserialize rejects truncated data at various boundaries.
     #[test]
     fn topology_term_deserialize_truncation_boundaries() {
-        let term = TopologyTerm::new(42, members(&[1, 2, 3]), NodeId(1));
+        let term = TopologyTerm::new(42, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET);
         let data = term.serialize();
 
         // Truncate at various points — all should return None.
@@ -2180,7 +2278,8 @@ mod tests {
             term: 1,
             proposer: NodeId(2),
             members: single.clone(),
-            digest: TopologyTerm::compute_digest(1, &single),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &single),
             voters: single.clone(),
         });
         // F-G8-001: the proposal introduces nodes 1 and 3 that were
@@ -2197,7 +2296,7 @@ mod tests {
         // Actually after commit, voted_term is still 0 (handle_commit doesn't
         // update it), and committed_term = 1. no_outstanding_vote = (voted <= committed)
         // = (0 <= 1) = true. propose.term >= committed = (1 >= 1) = true.
-        let proposal = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1));
+        let proposal = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET);
         let v = auth.handle_propose(&proposal);
         assert!(
             v.accepted,
@@ -2217,7 +2316,8 @@ mod tests {
             term,
             proposer: NodeId(1),
             members: mems.clone(),
-            digest: TopologyTerm::compute_digest(term, &mems),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(term, &ClusterId::UNSET, &mems),
             voters: mems.clone(),
         };
         auth.handle_commit(&commit);
@@ -2432,7 +2532,7 @@ mod tests {
     #[test]
     fn topology_term_deserialize_accepts_count_at_cap() {
         let ids: Vec<u64> = (0..MAX_TOPOLOGY_MEMBERS as u64).collect();
-        let term = TopologyTerm::new(1, members(&ids), NodeId(0));
+        let term = TopologyTerm::new(1, members(&ids), NodeId(0), ClusterId::UNSET);
         let bytes = term.serialize();
         let decoded = TopologyTerm::deserialize(&bytes).expect("at-cap term should decode");
         assert_eq!(decoded.members.len(), MAX_TOPOLOGY_MEMBERS);
@@ -2443,7 +2543,7 @@ mod tests {
     /// commit frame cannot drive a multi-megabyte voter allocation either.
     #[test]
     fn topology_commit_deserialize_rejects_oversized_voter_count() {
-        let term = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1));
+        let term = TopologyTerm::new(1, members(&[1, 2, 3]), NodeId(1), ClusterId::UNSET);
         let mut bytes = term.serialize();
         // Append voter section claiming MAX_TOPOLOGY_MEMBERS + 1 voters
         // without their bytes.
