@@ -637,6 +637,14 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
     };
     auth.handle_commit(&old_commit);
 
+    // F-G8-001: the ever-seen split-brain fallback rejects any proposal
+    // that introduces a NodeId never previously observed as a committed
+    // voter on this node. NodeId(3) was not part of the prior commit, so
+    // both `on_membership_changed` and `check_timeout` would otherwise
+    // short-circuit before the term-overwrite path under test runs.
+    // Pre-seed node 3 to isolate the boundary condition this test targets.
+    auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3)]);
+
     // handle_commit pins observed_membership to the old committed set;
     // check_timeout's `members` arg is only used as a bootstrap fallback
     // when no prior view has been observed. Simulate SWIM detecting the
@@ -711,6 +719,18 @@ fn topology_cluster_formation_three_simultaneous_starts() {
         assert_eq!(auth.committed_term(), 1);
     }
 
+    // F-G8-001: the ever-seen split-brain fallback rejects any proposal
+    // that introduces a NodeId never previously observed as a committed
+    // voter on this node. Each node's single-node commit only stamps
+    // itself into the ever-seen set, so the formation-recovery proposal
+    // [1,2,3] would otherwise be rejected on both the proposer (a1) and
+    // the followers (a2/a3) before this test's intended path runs.
+    // Pre-seed all three on each authority to isolate the formation-
+    // recovery invariant (the F-G8-001 layer is exercised separately).
+    for auth in [&a1, &a2, &a3] {
+        auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3)]);
+    }
+
     // Node 1 (lowest ID) proposes term 2 with all three members.
     let full_members = vec![NodeId(1), NodeId(2), NodeId(3)];
     let proposal = a1
@@ -751,6 +771,14 @@ fn topology_formation_recovery_blocked_by_outstanding_vote() {
         digest: TopologyTerm::compute_digest(1, &mems),
     };
     auth.handle_commit(&commit);
+
+    // F-G8-001: the ever-seen split-brain fallback in `handle_propose`
+    // rejects any proposal introducing a NodeId never previously observed
+    // as a committed voter on this node. Nodes 1 and 3 were never voters
+    // here, so without pre-seeding the proposals below would be rejected
+    // at the ever-seen layer rather than at the outstanding-vote check
+    // this test targets.
+    auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3)]);
 
     // Vote for term 2 via a different proposal (outstanding vote).
     let proposal_2 = TopologyTerm::new(2, vec![NodeId(1), NodeId(2)], NodeId(1));
@@ -1767,16 +1795,44 @@ fn split_brain_heal_detects_independent_clusters() {
 
     // -- Now exercise the symmetric-merge edge case as a contrast ------
     // When SWIM reports the perfect union {1..=6} to A, A sees a strict
-    // superset of its committed set. The split-brain check alone does
-    // NOT catch this case — by design. Documenting this explicitly so a
-    // future maintainer doesn't misread the test's intent. Catching the
-    // perfect-union case is the job of a separate `cluster_id` mechanism
+    // superset of its committed set. The R-042 monotonicity check alone
+    // does NOT catch this case (a pure superset is the "new members
+    // joined" path). However, F-G8-001 layers an `ever_seen_check` on
+    // top: nodes 4/5/6 were never committed voters on A, so the merge
+    // is rejected at the ever-seen layer even though it slipped past
+    // the monotonicity layer. This is the same defense that catches a
+    // pure-superset attack from a malicious proposer.
+    //
+    // To exercise the R-042-only path (and document the residual
+    // limitation when cluster_id is unset and ever_seen happens to be
+    // a superset of the merged set), we have to pre-seed the ever-seen
+    // set with 4/5/6. Without that seeding, F-G8-001 catches first.
+    let proposal_super_blocked = a_proposer.on_membership_changed(&merged);
+    assert!(
+        proposal_super_blocked.is_none(),
+        "perfect-superset merge IS caught by F-G8-001 ever-seen check (nodes 4/5/6 never observed as committed voters on A)",
+    );
+
+    // R-042-only contrast: pre-seed nodes 4/5/6 as ever-seen voters so
+    // the F-G8-001 layer is bypassed. The R-042 monotonicity check
+    // alone cannot distinguish a perfect-union merge from a legitimate
+    // three-node join, so the proposal goes through. Catching this
+    // residual case is the job of a separate `cluster_id` mechanism
     // (tracked as future work in the R-042 audit notes).
+    a_proposer.set_committed_voter_ever_seen(&[
+        NodeId(1),
+        NodeId(2),
+        NodeId(3),
+        NodeId(4),
+        NodeId(5),
+        NodeId(6),
+    ]);
     let proposal_super = a_proposer.on_membership_changed(&merged);
     assert!(
         proposal_super.is_some(),
-        "perfect-superset merge is NOT caught by R-042 (cluster_id is future work)",
+        "perfect-superset merge is NOT caught by R-042 alone when F-G8-001 ever-seen is bypassed (cluster_id is future work)",
     );
+
     // Reset A back to its committed state so the assertion below is meaningful.
     let a_proposer = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
     a_proposer.handle_commit(&TopologyCommit {
