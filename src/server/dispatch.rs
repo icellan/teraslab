@@ -9160,12 +9160,21 @@ mod tests {
             request_id: shard as u64,
             op_code: OP_REPLICA_BATCH,
             flags: FLAG_MIGRATION_BATCH,
+            // F-G7-005: migration batches arriving at a clustered
+            // receiver (local_cluster_key != 0) MUST carry a matching
+            // non-zero cluster_key — the wildcard is reserved for
+            // normal replication so a buggy/hostile sender cannot
+            // replay arbitrary mutations through the dedup-bypass
+            // path. Stamp the batch with the cluster's current
+            // committed term so it survives the epoch gate and we
+            // actually exercise the settled-shard logic the test
+            // targets.
             payload: ReplicaBatch {
                 first_sequence: 0,
                 ops: vec![],
                 trace_ctx: None,
                 source_node_id: None,
-                cluster_key: 0,
+                cluster_key: cluster.local_cluster_key(),
             }
             .serialize(),
         };
