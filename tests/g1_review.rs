@@ -10,11 +10,6 @@
 //! has pre-existing compile errors that block the lib-test build; G1's
 //! ownership scope does not include that file.
 
-use std::sync::Arc;
-
-use teraslab::allocator::{
-    AllocatorError, DATA_REGION_OFFSET, MAX_PERSISTED_FREE_REGIONS, SlotAllocator,
-};
 use teraslab::device::{AlignedBuf, BlockDevice, DeviceError, MemoryDevice};
 use teraslab::index::TxKey;
 use teraslab::io::{
@@ -122,30 +117,14 @@ fn primitive_footer_write_without_crc_surfaces_record_corruption() {
     }
 }
 
-/// F-G1-009 regression: when the freelist exceeds
-/// `MAX_PERSISTED_FREE_REGIONS`, `persist()` must return
-/// `FreelistOverflow` rather than silently truncating to the first N
-/// entries and leaking the tail regions on the next `recover()`.
-///
-/// Uses the public `__test_force_push_free_region` helper to seed the
-/// freelist past the cap deterministically — a natural workload would
-/// take seconds to reach ~65k entries.
-#[test]
-fn persist_rejects_freelist_overflow_via_integration_path() {
-    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
-    let mut alloc = SlotAllocator::new(dev).unwrap();
-    for i in 0..=MAX_PERSISTED_FREE_REGIONS {
-        let off = DATA_REGION_OFFSET + (i as u64) * 4096;
-        alloc.__test_force_push_free_region(off, 4096);
-    }
-    match alloc.persist() {
-        Err(AllocatorError::FreelistOverflow { entries, max }) => {
-            assert!(entries > max, "entries ({entries}) must exceed max ({max})");
-            assert_eq!(max, MAX_PERSISTED_FREE_REGIONS);
-        }
-        other => panic!("expected FreelistOverflow, got {other:?}"),
-    }
-}
+// F-G1-009 regression: the duplicate `persist_rejects_freelist_overflow_via_integration_path`
+// test that lived here was a near-exact copy of the lib test at
+// `src/allocator.rs::tests::persist_rejects_freelist_overflow`. Both used the same
+// `__test_force_push_free_region` helper to seed 65 537 regions, so both paid the
+// same ~17 s of O(n²) `Vec::insert` + `debug_assert_sorted` cost in debug. The lib
+// test has the closer assertion shape and exercises the same overflow branch, so
+// the duplicate is removed here. See `_review/08_test_perf_audit.md` (smell #1)
+// and `_review/09_perf_fixes.md` for context.
 
 /// F-G1-019 regression: `generation_target_ahead` must be symmetrically
 /// classified as not-ahead when the two generations are exactly

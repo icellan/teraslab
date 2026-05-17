@@ -1320,9 +1320,18 @@ impl SlotAllocator {
     /// can use it — the only callers are F-G1-009 regressions. Do not
     /// use from production code: it bypasses every allocator invariant
     /// (offset/size validation, coalescing, overlap rejection).
+    ///
+    /// Calls `maybe_promote()` after each insert so callers pushing
+    /// thousands of entries do not pay O(n²) `Vec::insert` +
+    /// `debug_assert_sorted` cost on the `Small` variant. Production
+    /// `allocate`/`free` paths already trigger promotion at the same
+    /// threshold, so this matches the realistic insertion shape.
+    /// Without it, seeding 65 537 entries cost ~17 s in debug; with it,
+    /// the same loop is sub-second. See `_review/08_test_perf_audit.md`.
     #[doc(hidden)]
     pub fn __test_force_push_free_region(&mut self, offset: u64, size: u64) {
         self.freelist.insert(offset, size);
+        self.freelist.maybe_promote();
     }
 }
 
