@@ -1259,3 +1259,175 @@ fn mark_longest_chain_replay_idempotent() {
 
     replica_server.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// C-10 / F-G7-018 — WriteMajority early-return on majority ACK.
+//
+// 3-replica fan-out (so RF=4 — master + 3 replicas) where one replica
+// sleeps 500ms before ACKing. With `WriteMajority`, the master needs
+// 2 replica ACKs (master counts as 1; majority of 4 = 3 copies). The
+// two fast replicas ACK in ~5ms, so the master returns in under
+// ~100ms — without the C-10 fix the previous "join all" path waited
+// 500ms.
+//
+// Uses `InMemoryTransport` for determinism — the slow ACK is a literal
+// `thread::sleep` rather than a TCP RTT, which removes scheduler /
+// kernel jitter from the latency assertion.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn write_majority_early_return_does_not_wait_for_slow_replica() {
+    use teraslab::index::TxKey;
+
+    // Helper: replica that sleeps `delay` before ACKing each batch.
+    fn spawn_delayed_ack(
+        rt: InMemoryTransport,
+        delay: Duration,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            while let Ok(batch) = rt.recv_batch(Duration::from_secs(5)) {
+                std::thread::sleep(delay);
+                let ack = ReplicaAck::Ok {
+                    through_sequence: batch.last_sequence(),
+                };
+                if rt.send_ack(&ack).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    let (mt1, rt1) = InMemoryTransport::pair();
+    let (mt2, rt2) = InMemoryTransport::pair();
+    let (mt3, rt3) = InMemoryTransport::pair();
+
+    let slow_delay = Duration::from_millis(500);
+    let fast_delay = Duration::from_millis(5);
+    let h_slow = spawn_delayed_ack(rt1, slow_delay);
+    let h_fast_a = spawn_delayed_ack(rt2, fast_delay);
+    let h_fast_b = spawn_delayed_ack(rt3, fast_delay);
+
+    let mut mgr = ReplicationManager::new(
+        ReplicationConfig {
+            ack_policy: AckPolicy::WriteMajority,
+            // Generous per-replica timeout — the slow replica's 500ms
+            // is well under this so the master would otherwise wait
+            // the full 500ms on the "join all" path.
+            replication_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+        vec![Box::new(mt1), Box::new(mt2), Box::new(mt3)],
+    );
+
+    // 3 replicas + 1 master = RF=4. Majority of 4 = 3 copies. Master
+    // counts as 1, so we need 2 replica ACKs. The two fast replicas
+    // satisfy this; the slow replica becomes a background straggler.
+    assert_eq!(
+        mgr.required_ack_count(),
+        2,
+        "3 replicas + master = RF=4; majority needs 2 replica acks",
+    );
+
+    let ops = vec![ReplicaOp::Freeze {
+        tx_key: TxKey { txid: [1u8; 32] },
+        offset: 0,
+        master_generation: 0,
+    }];
+
+    let start = std::time::Instant::now();
+    mgr.replicate_batch(&ops).expect("majority ACK should succeed");
+    let elapsed = start.elapsed();
+
+    // The two fast replicas ack at ~5ms; the slow one at ~500ms. With
+    // C-10 the master returns after the first fast ack, well under 100ms.
+    // Without C-10 the master would wait 500ms (the slow replica's RTT).
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "C-10 early-return must return < 100ms with one 500ms-slow replica; \
+         observed {elapsed:?} (without the fix this would be ~500ms)",
+    );
+
+    // The next_sequence advances past the batch regardless of which
+    // replicas have acked (durable-log invariant — every assigned
+    // sequence is journalled).
+    assert_eq!(
+        mgr.current_sequence(),
+        2,
+        "next_sequence must advance past the 1-op batch",
+    );
+
+    // Drop the manager — its destructor closes the InMemoryTransport
+    // channels and the replica loops exit cleanly. The slow replica
+    // worker is still running in the background; it ack's into a
+    // (possibly dropped) receiver and exits.
+    drop(mgr);
+    let _ = h_slow.join();
+    let _ = h_fast_a.join();
+    let _ = h_fast_b.join();
+}
+
+/// Sanity: even when the slow replica is index-0 (first in dispatch
+/// order) the master still early-returns on the fast acks. Prevents
+/// regressions where the master accidentally waits for `senders[0]`
+/// first.
+#[test]
+fn write_majority_early_return_with_slow_replica_first() {
+    use teraslab::index::TxKey;
+
+    fn spawn_delayed_ack(
+        rt: InMemoryTransport,
+        delay: Duration,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            while let Ok(batch) = rt.recv_batch(Duration::from_secs(5)) {
+                std::thread::sleep(delay);
+                let ack = ReplicaAck::Ok {
+                    through_sequence: batch.last_sequence(),
+                };
+                if rt.send_ack(&ack).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    let (mt0, rt0) = InMemoryTransport::pair();
+    let (mt1, rt1) = InMemoryTransport::pair();
+    let (mt2, rt2) = InMemoryTransport::pair();
+
+    // Slow replica is at index 0 — the previous "join all" path joined
+    // in sender order so this is the worst-case latency for the old
+    // implementation.
+    let h0 = spawn_delayed_ack(rt0, Duration::from_millis(500));
+    let h1 = spawn_delayed_ack(rt1, Duration::from_millis(5));
+    let h2 = spawn_delayed_ack(rt2, Duration::from_millis(5));
+
+    let mut mgr = ReplicationManager::new(
+        ReplicationConfig {
+            ack_policy: AckPolicy::WriteMajority,
+            replication_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+        vec![Box::new(mt0), Box::new(mt1), Box::new(mt2)],
+    );
+
+    let ops = vec![ReplicaOp::Freeze {
+        tx_key: TxKey { txid: [2u8; 32] },
+        offset: 0,
+        master_generation: 0,
+    }];
+
+    let start = std::time::Instant::now();
+    mgr.replicate_batch(&ops).expect("majority ACK should succeed");
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "early-return must not depend on dispatch order; got {elapsed:?}",
+    );
+
+    drop(mgr);
+    let _ = h0.join();
+    let _ = h1.join();
+    let _ = h2.join();
+}

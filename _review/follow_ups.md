@@ -188,11 +188,36 @@ adapter. Defer until a client team requests it.
 DEFERRED in the G2 fix log as a perf-not-correctness item. Re-evaluate
 after benches; out of scope for the campaign.
 
-### C-10. F-G7-018 — WriteMajority early-return on majority via mpsc
+### C-10. F-G7-018 — WriteMajority early-return on majority via mpsc — RESOLVED 2026-05-18
 
-Today `wait_majority` joins all replicas; switching to "first M acks
-win" via mpsc shaves tail latency on slow followers. Perf, not
-correctness.
+`ReplicationManager::replicate_batch` no longer joins every worker
+before returning. Each live replica now gets a detached worker thread
+that owns its transport for the round-trip and posts the outcome on a
+per-batch `std::sync::mpsc` channel. The master reads from the channel
+until either:
+
+- enough ACKs have arrived to satisfy the `AckPolicy` (`WriteMajority`
+  → `required_ack_count()` replica ACKs; `WriteAll` → all live ACKs),
+  at which point the master **returns early** while the slow followers
+  keep running in detached threads, or
+- enough failures have arrived to make the quota unreachable.
+
+Straggler join handles live in `pending_stragglers` so the next
+state-mutating call drains them, restores the transport, and applies
+the late outcome (idempotent — Ok ACKs only advance `last_acked` if
+strictly higher; Down stays Down). The durable-log invariant is
+preserved: every assigned sequence still reaches every replica
+because (a) the worker continues to its `recv_ack` regardless of the
+master's early-return, and (b) the next batch joins it before touching
+the same transport again.
+
+The new `tests/replication_tcp.rs::write_majority_early_return_*`
+tests prove the win: 3-replica fan-out with one 500ms-slow replica
+returns within ~5ms (master + 2 fast replicas = majority of 4 copies).
+Pre-fix would have waited 500ms.
+
+Files: `src/replication/manager.rs`,
+`tests/replication_tcp.rs`.
 
 ### C-11. Cluster_tcp `wait_until` — done
 

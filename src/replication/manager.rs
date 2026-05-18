@@ -135,8 +135,15 @@ pub struct ResyncRequest {
 }
 
 /// Manages a single replica's transport and state.
+///
+/// `transport` is `Option<_>` because the dispatch hot path (C-10 /
+/// F-G7-018 early-return on majority) moves the transport into a
+/// detached worker thread for the duration of a `replicate_batch`
+/// call. While a straggler worker is still in flight, the slot stays
+/// `None` until [`ReplicationManager::drain_stragglers`] joins it and
+/// restores the transport.
 pub struct ReplicaSender {
-    transport: Box<dyn ReplicaTransport>,
+    transport: Option<Box<dyn ReplicaTransport>>,
     state: ReplicaState,
     last_acked: u64,
     /// Phase H — replica's `NodeId.0`. Stored as raw `u64` to keep
@@ -153,12 +160,19 @@ impl ReplicaSender {
     /// Create a new sender with the given transport.
     pub fn new(transport: Box<dyn ReplicaTransport>) -> Self {
         Self {
-            transport,
+            transport: Some(transport),
             state: ReplicaState::Live,
             last_acked: 0,
             node_id: 0,
             resync_emitted: false,
         }
+    }
+
+    /// Read-only probe — returns `false` when the transport is currently
+    /// held by a straggler worker (rather than panicking), because
+    /// reconnect heuristics call this without first draining.
+    fn transport_is_connected(&self) -> bool {
+        self.transport.as_ref().is_some_and(|t| t.is_connected())
     }
 
     /// Current state of this replica.
@@ -221,6 +235,71 @@ pub struct ReplicationManager {
     /// caller hasn't installed a channel — `NeedsResync` still happens
     /// but nothing is auto-published (legacy / test behaviour).
     resync_request_tx: Option<std::sync::mpsc::Sender<ResyncRequest>>,
+    /// C-10 / F-G7-018 — straggler join handles retained by
+    /// [`Self::replicate_batch`] when it early-returns on majority ACK.
+    /// Each entry owns the transport for its slot until the straggler
+    /// thread completes; the next state-mutating call drains them via
+    /// [`Self::drain_stragglers`] to reclaim transports and apply
+    /// late state transitions. `pending_stragglers[i]` corresponds to
+    /// `senders[i]`; `None` means no straggler is in flight.
+    pending_stragglers: Vec<Option<std::thread::JoinHandle<StragglerOutcome>>>,
+}
+
+/// Per-replica outcome of one batch's `send_batch` + `recv_ack`
+/// round-trip. Sent on the per-batch mpsc channel so the master can
+/// early-return as soon as quorum is reached (C-10 / F-G7-018).
+#[derive(Debug)]
+enum BatchOutcome {
+    Ok { through_sequence: u64 },
+    ReplicaErr { sequence: u64, message: String },
+    TransportErr(ReplicationError),
+}
+
+/// What a straggler worker returns via its `JoinHandle` so the manager
+/// can reclaim the transport and apply late state on the next
+/// [`ReplicationManager::drain_stragglers`].
+struct StragglerOutcome {
+    outcome: BatchOutcome,
+    transport: Box<dyn ReplicaTransport>,
+    /// Serialized-batch size captured by the originating call —
+    /// retained so a late ACK can update the per-replica `bytes_sent`
+    /// metric without recomputing it.
+    batch_bytes: u64,
+}
+
+/// Manual clone — `ReplicationError` is not `Clone` (its sources
+/// aren't), so the early-return path that needs both a channel signal
+/// AND a straggler return value clones with this helper.
+fn clone_outcome(o: &BatchOutcome) -> BatchOutcome {
+    match o {
+        BatchOutcome::Ok { through_sequence } => BatchOutcome::Ok {
+            through_sequence: *through_sequence,
+        },
+        BatchOutcome::ReplicaErr { sequence, message } => BatchOutcome::ReplicaErr {
+            sequence: *sequence,
+            message: message.clone(),
+        },
+        BatchOutcome::TransportErr(e) => BatchOutcome::TransportErr(clone_replication_error(e)),
+    }
+}
+
+/// Manual clone for [`ReplicationError`].
+fn clone_replication_error(e: &ReplicationError) -> ReplicationError {
+    match e {
+        ReplicationError::InsufficientReplicas {
+            available,
+            required,
+        } => ReplicationError::InsufficientReplicas {
+            available: *available,
+            required: *required,
+        },
+        ReplicationError::Timeout(d) => ReplicationError::Timeout(*d),
+        ReplicationError::ReplicaError { sequence, message } => ReplicationError::ReplicaError {
+            sequence: *sequence,
+            message: message.clone(),
+        },
+        ReplicationError::Transport(s) => ReplicationError::Transport(s.clone()),
+    }
 }
 
 impl ReplicationManager {
@@ -264,13 +343,15 @@ impl ReplicationManager {
         transports: Vec<Box<dyn ReplicaTransport>>,
         current_cluster_key: Arc<AtomicU64>,
     ) -> Self {
-        let senders = transports.into_iter().map(ReplicaSender::new).collect();
+        let senders: Vec<_> = transports.into_iter().map(ReplicaSender::new).collect();
+        let n = senders.len();
         Self {
             senders,
             config,
             next_sequence: 1,
             current_cluster_key,
             resync_request_tx: None,
+            pending_stragglers: (0..n).map(|_| None).collect(),
         }
     }
 
@@ -282,13 +363,15 @@ impl ReplicationManager {
         initial_sequence: u64,
         current_cluster_key: Arc<AtomicU64>,
     ) -> Self {
-        let senders = transports.into_iter().map(ReplicaSender::new).collect();
+        let senders: Vec<_> = transports.into_iter().map(ReplicaSender::new).collect();
+        let n = senders.len();
         Self {
             senders,
             config,
             next_sequence: initial_sequence.max(1),
             current_cluster_key,
             resync_request_tx: None,
+            pending_stragglers: (0..n).map(|_| None).collect(),
         }
     }
 
@@ -332,17 +415,29 @@ impl ReplicationManager {
 
     /// Replicate a batch of operations to all live replicas.
     ///
-    /// Sends to every `Live` replica in parallel using
-    /// [`std::thread::scope`] — one scoped worker thread per live sender
-    /// performs the `send_batch` + `recv_ack` round-trip concurrently.
-    /// A slow replica therefore no longer blocks the dispatch of the
-    /// remaining replicas.
+    /// Each `Live` replica gets its own detached worker thread that owns
+    /// the transport for the duration of the round-trip. Workers send
+    /// their outcome on a per-batch mpsc channel; the master reads from
+    /// that channel until either:
     ///
-    /// After all workers join, outcomes are reconciled against the
-    /// configured [`AckPolicy`]: `WriteAll` requires every live replica
-    /// to ACK, `WriteMajority` requires at least `required_ack_count()`.
-    /// On failure, the first error observed (in sender order) is
-    /// returned so the caller has a deterministic diagnostic.
+    /// 1. enough ACKs have arrived to satisfy [`AckPolicy`]
+    ///    (`required_ack_count()` for `WriteMajority`, all live replicas
+    ///    for `WriteAll`), at which point it **returns early** while the
+    ///    remaining slow replicas keep running in the background, or
+    /// 2. enough failures have arrived to make the quota unreachable, at
+    ///    which point it returns the first observed error.
+    ///
+    /// Straggler join handles are retained in `pending_stragglers` so
+    /// the next state-mutating call drains them via
+    /// [`Self::drain_stragglers`], applies the late outcome to sender
+    /// state, and restores the transport. This preserves the durable-log
+    /// invariant — every assigned sequence eventually reaches every
+    /// replica — while removing slow followers from the master's tail
+    /// latency.
+    ///
+    /// **C-10 / F-G7-018** — early-return on majority. The previous
+    /// implementation joined every worker before returning, so a single
+    /// slow follower's RTT dominated `WriteMajority` latency.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn replicate_batch(
         &mut self,
@@ -351,6 +446,12 @@ impl ReplicationManager {
         if ops.is_empty() {
             return Ok(());
         }
+
+        // Reclaim transports + apply state from any straggler threads
+        // left over from prior batches. This must happen BEFORE we
+        // compute `live_count` so a late "transport error" outcome
+        // gets accounted for in this call's quorum decision.
+        self.drain_stragglers();
 
         let required = self.required_ack_count();
         let live_count = self
@@ -394,9 +495,9 @@ impl ReplicationManager {
 
         let timeout = self.config.replication_timeout;
 
-        // Cache the subsystem metrics pointer once so the scoped workers
-        // do not repeatedly pay the `OnceLock::get()` cost. `bytes` is
-        // the serialized-batch size, computed once for all replicas.
+        // Cache the subsystem metrics pointer once so the workers do not
+        // repeatedly pay the `OnceLock::get()` cost. `batch_bytes` is the
+        // serialized-batch size, computed once for all replicas.
         let metrics = replication_metrics();
         let batch_bytes = batch.serialize().len() as u64;
         if let Some(m) = metrics {
@@ -406,157 +507,342 @@ impl ReplicationManager {
         }
         let start = Instant::now();
 
-        // Per-sender outcome produced inside each scoped thread. We do
-        // not mutate `sender.state` or `sender.last_acked` from inside
-        // the thread so the reconciliation loop below can observe the
-        // same deterministic ordering as the previous serial loop.
-        enum Outcome {
-            Ok { through_sequence: u64 },
-            ReplicaErr { sequence: u64, message: String },
-            TransportErr(ReplicationError),
-            Skipped,
-        }
+        // Share the batch with all workers via Arc — the workers each
+        // need an owned reference (`'static`) since they're not scoped.
+        let batch_arc = Arc::new(batch);
+        // Per-batch ack channel. Workers send (idx, outcome) here so the
+        // master can early-return as soon as quorum acks arrive. The
+        // worker also returns the transport via its JoinHandle so the
+        // straggler drain can reclaim it.
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, BatchOutcome)>();
 
-        // Fan out to every live replica in parallel. Using
-        // `std::thread::scope` borrows each sender mutably for the
-        // duration of the scope without requiring 'static bounds.
-        let batch_ref = &batch;
-        let outcomes: Vec<Outcome> = std::thread::scope(|s| {
-            let handles: Vec<_> = self
-                .senders
-                .iter_mut()
-                .enumerate()
-                .map(|(idx, sender)| {
-                    s.spawn(move || {
-                        if *sender.state() != ReplicaState::Live {
-                            return Outcome::Skipped;
-                        }
-                        if let Some(m) = metrics {
-                            m.mark_in_flight(idx);
-                        }
-                        match sender.transport.send_batch(batch_ref) {
-                            Ok(()) => match sender.transport.recv_ack(timeout) {
-                                Ok(ReplicaAck::Ok { through_sequence }) => {
-                                    Outcome::Ok { through_sequence }
-                                }
-                                Ok(ReplicaAck::Error {
-                                    failed_sequence,
-                                    message,
-                                }) => Outcome::ReplicaErr {
-                                    sequence: failed_sequence,
-                                    message,
-                                },
-                                Err(e) => Outcome::TransportErr(e),
+        // Spawn one detached worker per live sender. Non-live senders
+        // are simply skipped — no thread spawn, no ack on the channel.
+        let mut live_count_dispatched = 0usize;
+        for (idx, sender) in self.senders.iter_mut().enumerate() {
+            if *sender.state() != ReplicaState::Live {
+                continue;
+            }
+            live_count_dispatched += 1;
+            // Move transport out of the sender slot into the worker
+            // thread. The slot stays `None` until the straggler joins
+            // (in `drain_stragglers`) and restores it.
+            let transport_box = sender
+                .transport
+                .take()
+                .expect("sender transport already in flight — drain invariant violated");
+            let tx = tx.clone();
+            let batch_arc = batch_arc.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!(
+                    "replica-{idx}-batch-{}",
+                    batch_arc.first_sequence
+                ))
+                .spawn(move || {
+                    let mut transport = transport_box;
+                    if let Some(m) = metrics {
+                        m.mark_in_flight(idx);
+                    }
+                    let outcome = match transport.send_batch(&batch_arc) {
+                        Ok(()) => match transport.recv_ack(timeout) {
+                            Ok(ReplicaAck::Ok { through_sequence }) => {
+                                BatchOutcome::Ok { through_sequence }
+                            }
+                            Ok(ReplicaAck::Error {
+                                failed_sequence,
+                                message,
+                            }) => BatchOutcome::ReplicaErr {
+                                sequence: failed_sequence,
+                                message,
                             },
-                            Err(e) => Outcome::TransportErr(e),
-                        }
-                    })
+                            Err(e) => BatchOutcome::TransportErr(e),
+                        },
+                        Err(e) => BatchOutcome::TransportErr(e),
+                    };
+                    // Best-effort early-return signal. If the master
+                    // already returned, the receiver may be dropped;
+                    // the worker still completes so its straggler
+                    // outcome can be reclaimed by the next drain.
+                    let signal = clone_outcome(&outcome);
+                    let _ = tx.send((idx, signal));
+                    StragglerOutcome {
+                        outcome,
+                        transport,
+                        batch_bytes,
+                    }
                 })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join().unwrap_or_else(|payload| {
-                        // F-G7-009: capture the panic payload so the
-                        // diagnostic isn't lost. The scoped worker's
-                        // panic was previously masked behind a
-                        // constant string, hiding correctness bugs in
-                        // send_batch / recv_ack behind a benign-looking
-                        // transport error. Downcast common payload
-                        // shapes (&str, String) and bump a counter so
-                        // operators can alert on the underlying bug.
-                        let detail = if let Some(s) = payload.downcast_ref::<&'static str>() {
-                            (*s).to_string()
-                        } else if let Some(s) = payload.downcast_ref::<String>() {
-                            s.clone()
-                        } else {
-                            "<non-string panic payload>".to_string()
-                        };
-                        if let Some(m) = replication_metrics() {
-                            m.replica_worker_panics_total.inc();
-                        }
-                        tracing::error!(
-                            panic = %detail,
-                            "replica replication worker panicked",
-                        );
-                        Outcome::TransportErr(ReplicationError::Transport(format!(
-                            "replica worker panicked: {detail}"
-                        )))
-                    })
-                })
-                .collect()
-        });
+                .expect("failed to spawn replication worker thread");
+            self.pending_stragglers[idx] = Some(handle);
+        }
+        // Drop the master's clone of the sender so the channel closes
+        // once every worker exits (used to detect "all done" if every
+        // ack is consumed).
+        drop(tx);
+        debug_assert_eq!(live_count_dispatched, live_count);
 
-        // Record end-to-end latency once for the whole fan-out. Per-replica
-        // drill-down is recorded below alongside the reconciliation loop so
-        // each cell reflects the correct success/failure accounting.
+        // Read acks from the channel until quorum is reached, the
+        // remaining acks can no longer satisfy it, or the timeout
+        // elapses.
+        let mut acks_received = 0usize;
+        let mut successes = 0usize;
+        let mut first_error: Option<ReplicationError> = None;
+        let target_successes = match self.config.ack_policy {
+            AckPolicy::WriteAll => live_count,
+            AckPolicy::WriteMajority => required,
+        };
+
+        let deadline = start + timeout;
+        let result = loop {
+            if successes >= target_successes {
+                break Ok(());
+            }
+            let remaining = live_count - acks_received;
+            if successes + remaining < target_successes {
+                break Err(first_error
+                    .as_ref()
+                    .map(clone_replication_error)
+                    .unwrap_or(ReplicationError::InsufficientReplicas {
+                        available: successes,
+                        required: target_successes,
+                    }));
+            }
+            let now = Instant::now();
+            let wait = deadline.saturating_duration_since(now);
+            if wait.is_zero() {
+                break Err(first_error
+                    .as_ref()
+                    .map(clone_replication_error)
+                    .unwrap_or(ReplicationError::Timeout(timeout)));
+            }
+            match rx.recv_timeout(wait) {
+                Ok((idx, outcome)) => {
+                    acks_received += 1;
+                    match outcome {
+                        BatchOutcome::Ok { through_sequence } => {
+                            successes += 1;
+                            // Apply ACK immediately so subsequent
+                            // batches (and metrics) see the latest
+                            // last_acked even when this is the last
+                            // ack we read before early-return.
+                            self.senders[idx].last_acked = through_sequence;
+                            if let Some(m) = metrics {
+                                m.record_ack(idx, through_sequence, batch_bytes);
+                            }
+                        }
+                        BatchOutcome::ReplicaErr { sequence, message } => {
+                            self.senders[idx].state = ReplicaState::Down;
+                            if let Some(m) = metrics {
+                                m.record_failure(idx);
+                            }
+                            if first_error.is_none() {
+                                first_error = Some(ReplicationError::ReplicaError {
+                                    sequence,
+                                    message,
+                                });
+                            }
+                        }
+                        BatchOutcome::TransportErr(e) => {
+                            self.senders[idx].state = ReplicaState::Down;
+                            if let Some(m) = metrics {
+                                m.record_failure(idx);
+                            }
+                            if first_error.is_none() {
+                                first_error = Some(e);
+                            }
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    break Err(first_error
+                        .as_ref()
+                        .map(clone_replication_error)
+                        .unwrap_or(ReplicationError::Timeout(timeout)));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    if successes >= target_successes {
+                        break Ok(());
+                    }
+                    break Err(first_error.as_ref().map(clone_replication_error).unwrap_or(
+                        ReplicationError::InsufficientReplicas {
+                            available: successes,
+                            required: target_successes,
+                        },
+                    ));
+                }
+            }
+        };
+
+        // Record end-to-end latency for the foreground portion of the
+        // fan-out — straggler RTTs are observed via per-replica lag
+        // metrics, not this histogram.
         if let Some(m) = metrics {
             m.repl_batch_latency_ns.record_since(start);
         }
 
-        // Reconcile outcomes into per-sender state. The ordering here
-        // matches `self.senders` so `first_error` is deterministic.
-        let mut successes = 0usize;
-        let mut first_error: Option<ReplicationError> = None;
-        for (idx, (sender, outcome)) in self
-            .senders
-            .iter_mut()
-            .zip(outcomes.into_iter())
-            .enumerate()
-        {
-            match outcome {
-                Outcome::Ok { through_sequence } => {
-                    sender.last_acked = through_sequence;
-                    successes += 1;
-                    if let Some(m) = metrics {
-                        m.record_ack(idx, through_sequence, batch_bytes);
+        // Two-phase straggler reclamation:
+        //
+        //   - On Ok (success / early-return): only join workers that
+        //     have ALREADY finished. Still-running workers stay in
+        //     `pending_stragglers` so the slow-replica latency win
+        //     survives. The next batch's `drain_stragglers` reclaims
+        //     them.
+        //   - On Err: block-join every remaining worker. The request
+        //     already failed, so latency no longer matters; joining
+        //     synchronously surfaces the worker's true outcome (e.g.
+        //     `BatchOutcome::TransportErr(Timeout)`) and lets us mark
+        //     the sender Down for the next batch's quorum decision.
+        //     This matches the original `thread::scope`-joined
+        //     semantics on the failure path.
+        let force_join = result.is_err();
+        let mut result = result;
+        for idx in 0..self.pending_stragglers.len() {
+            let finished = self
+                .pending_stragglers[idx]
+                .as_ref()
+                .is_some_and(|h| h.is_finished());
+            if !finished && !force_join {
+                continue;
+            }
+            let Some(handle) = self.pending_stragglers[idx].take() else {
+                continue;
+            };
+            match handle.join() {
+                Ok(straggler) => {
+                    self.senders[idx].transport = Some(straggler.transport);
+                    match straggler.outcome {
+                        BatchOutcome::Ok { through_sequence } => {
+                            if through_sequence > self.senders[idx].last_acked {
+                                self.senders[idx].last_acked = through_sequence;
+                                if let Some(m) = metrics {
+                                    m.record_ack(
+                                        idx,
+                                        through_sequence,
+                                        straggler.batch_bytes,
+                                    );
+                                }
+                            }
+                        }
+                        BatchOutcome::ReplicaErr { .. } | BatchOutcome::TransportErr(_) => {
+                            if self.senders[idx].state == ReplicaState::Live {
+                                self.senders[idx].state = ReplicaState::Down;
+                                if let Some(m) = metrics {
+                                    m.record_failure(idx);
+                                }
+                            }
+                        }
                     }
                 }
-                Outcome::ReplicaErr { sequence, message } => {
-                    sender.state = ReplicaState::Down;
+                Err(payload) => {
+                    let detail = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "<non-string panic payload>".to_string()
+                    };
+                    if let Some(m) = replication_metrics() {
+                        m.replica_worker_panics_total.inc();
+                    }
+                    tracing::error!(
+                        panic = %detail,
+                        "replica replication worker panicked",
+                    );
+                    self.senders[idx].state = ReplicaState::Down;
                     if let Some(m) = metrics {
                         m.record_failure(idx);
                     }
-                    if first_error.is_none() {
-                        first_error = Some(ReplicationError::ReplicaError { sequence, message });
-                    }
+                    // Prefer the panic-message error over the generic
+                    // InsufficientReplicas one — the panic detail is
+                    // the actionable diagnostic for the operator.
+                    let panic_err = ReplicationError::Transport(format!(
+                        "replica worker panicked: {detail}"
+                    ));
+                    result = match result {
+                        Ok(()) => Ok(()),
+                        Err(prev @ ReplicationError::InsufficientReplicas { .. })
+                        | Err(prev @ ReplicationError::Timeout(_)) => {
+                            // Override only when the previous error is
+                            // the synthetic placeholder; preserve a real
+                            // first-error variant we already returned.
+                            let _ = prev;
+                            Err(panic_err)
+                        }
+                        Err(other) => Err(other),
+                    };
                 }
-                Outcome::TransportErr(e) => {
-                    sender.state = ReplicaState::Down;
-                    if let Some(m) = metrics {
-                        m.record_failure(idx);
-                    }
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
-                }
-                Outcome::Skipped => {}
             }
         }
 
-        match self.config.ack_policy {
-            AckPolicy::WriteAll => {
-                if successes == live_count {
-                    Ok(())
-                } else {
-                    Err(
-                        first_error.unwrap_or(ReplicationError::InsufficientReplicas {
-                            available: successes,
-                            required: live_count,
-                        }),
-                    )
+        result
+    }
+
+    /// Join any straggler worker threads from prior `replicate_batch`
+    /// calls, applying late outcomes to sender state and restoring the
+    /// transports so the next batch can dispatch on them.
+    ///
+    /// Called at the start of every state-mutating method that touches
+    /// transports directly. Idempotent — no-op when no stragglers are
+    /// pending. Worker panics are caught and downgraded to a Down state
+    /// transition (matching the prior scoped behaviour).
+    fn drain_stragglers(&mut self) {
+        for idx in 0..self.pending_stragglers.len() {
+            let Some(handle) = self.pending_stragglers[idx].take() else {
+                continue;
+            };
+            let result = match handle.join() {
+                Ok(r) => r,
+                Err(payload) => {
+                    let detail = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "<non-string panic payload>".to_string()
+                    };
+                    if let Some(m) = replication_metrics() {
+                        m.replica_worker_panics_total.inc();
+                    }
+                    tracing::error!(
+                        panic = %detail,
+                        "replica replication worker panicked",
+                    );
+                    // Worker panicked — transport is lost. Mark Down
+                    // and leave the slot's `transport = None`. The
+                    // sender is unusable until external code rebuilds
+                    // it.
+                    self.senders[idx].state = ReplicaState::Down;
+                    if let Some(m) = replication_metrics() {
+                        m.record_failure(idx);
+                    }
+                    continue;
                 }
-            }
-            AckPolicy::WriteMajority => {
-                if successes >= required {
-                    Ok(())
-                } else {
-                    Err(
-                        first_error.unwrap_or(ReplicationError::InsufficientReplicas {
-                            available: successes,
-                            required,
-                        }),
-                    )
+            };
+            // Restore the transport so the sender is ready for the next batch.
+            self.senders[idx].transport = Some(result.transport);
+            let metrics = replication_metrics();
+            // Apply the late outcome. `last_acked` only advances; state
+            // transitions to Down on any error. Applying the same ACK
+            // twice (we already applied it in the foreground when the
+            // channel delivered it) is idempotent thanks to the
+            // monotonicity guard below.
+            match result.outcome {
+                BatchOutcome::Ok { through_sequence } => {
+                    if through_sequence > self.senders[idx].last_acked {
+                        self.senders[idx].last_acked = through_sequence;
+                        if let Some(m) = metrics {
+                            m.record_ack(idx, through_sequence, result.batch_bytes);
+                        }
+                    }
+                }
+                BatchOutcome::ReplicaErr { .. } | BatchOutcome::TransportErr(_) => {
+                    if self.senders[idx].state == ReplicaState::Live {
+                        // We early-returned before observing this
+                        // outcome on the foreground channel — apply it now.
+                        self.senders[idx].state = ReplicaState::Down;
+                        if let Some(m) = metrics {
+                            m.record_failure(idx);
+                        }
+                    }
                 }
             }
         }
@@ -590,8 +876,12 @@ impl ReplicationManager {
     /// Call this periodically. Any replica that was `Down` but whose
     /// transport is now connected transitions to `CatchingUp { from_sequence }`.
     pub fn check_reconnected(&mut self) {
+        // Reclaim transports from any straggler workers before probing
+        // `is_connected()` so we observe the post-batch state instead
+        // of returning `false` for a slot still owned by a worker.
+        self.drain_stragglers();
         for sender in &mut self.senders {
-            if sender.state == ReplicaState::Down && sender.transport.is_connected() {
+            if sender.state == ReplicaState::Down && sender.transport_is_connected() {
                 sender.state = ReplicaState::CatchingUp {
                     from_sequence: sender.last_acked + 1,
                 };
@@ -614,6 +904,9 @@ impl ReplicationManager {
     where
         F: Fn(u64) -> Vec<ReplicaOp>,
     {
+        // Reclaim transports from any straggler workers before catch-up
+        // starts a fresh send/recv cycle on each sender's transport.
+        self.drain_stragglers();
         let batch_size = self.config.catchup_batch_size;
         let max_ops_per_pass = self.config.catchup_max_ops_per_pass.max(1);
         let timeout = self.config.replication_timeout;
@@ -674,12 +967,24 @@ impl ReplicationManager {
                     // chunks from a stale leader.
                     cluster_key: self.current_cluster_key.load(Ordering::Acquire),
                 };
-                if let Err(_e) = sender.transport.send_batch(&batch) {
+                // After `drain_stragglers()` at the top of `run_catchup`,
+                // every sender's transport is restored (or `None` only
+                // if a worker panicked, in which case the sender is now
+                // `Down` and we wouldn't reach here for it).
+                let transport = match sender.transport.as_mut() {
+                    Some(t) => t,
+                    None => {
+                        sender.state = ReplicaState::Down;
+                        ok = false;
+                        break;
+                    }
+                };
+                if transport.send_batch(&batch).is_err() {
                     sender.state = ReplicaState::Down;
                     ok = false;
                     break;
                 }
-                match sender.transport.recv_ack(timeout) {
+                match transport.recv_ack(timeout) {
                     Ok(ReplicaAck::Ok { through_sequence }) => {
                         let expected_through = batch.last_sequence();
                         // F-G7-011: the receiver's `already_applied`
