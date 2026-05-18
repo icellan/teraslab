@@ -65,3 +65,23 @@ work surfaced while fixing the reviewed findings.
   cheap but the current state has no reachable bug, and the in-crate
   tests would not exercise it. Filing as a forward-looking follow-up
   if interior-mutability is ever introduced to the allocator path.
+
+## From P1.2 / P2.1 / P2.2 (G5 + G6 + G7 touch)
+
+- **Pre-existing rustfmt drift in G8-owned files** — running
+  `cargo fmt -- --check` from the worktree surfaces unrelated drift
+  in `src/cluster/{coordinator,swim,topology}.rs` and
+  `tests/g8_{ping_req_cap,split_brain,swim_replay}.rs`. None of these
+  files are touched by P1.2/P2.1/P2.2; the orchestrator should sweep
+  them in a single `cargo fmt --all` pass after the parallel wave
+  merges, since each file is owned by a different fix branch.
+
+- **`InflightBytesLimiter` `record_rejection` is sync-only** — the
+  P2.2 bump path is a single `fetch_add` on the per-thread counter
+  reached through `DISPATCH_METRICS`. If `init_dispatch_metrics` has
+  not run (single-binary tests bypass startup), the bump is a no-op.
+  All production paths init it; the contract documents the tolerance.
+  Filed as a follow-up only because a future test harness that asserts
+  on rejection telemetry without calling `init_dispatch_metrics` would
+  silently report zero — a small footgun to surface once a second test
+  needs the counter.
