@@ -2829,6 +2829,52 @@ mod tests {
         assert_eq!(msg.len(), declared);
     }
 
+    // P3.10 / F-G5-017 — every new typed wire error code must round-trip
+    // through `encode_error_payload` / `decode_error_payload` so a client
+    // built against the new protocol version can classify dispatch errors
+    // without substring-matching the human-readable message.
+    #[test]
+    fn typed_wire_error_codes_round_trip() {
+        let cases: &[(u16, &str)] = &[
+            (ERR_PAYLOAD_MALFORMED, "malformed spend batch"),
+            (ERR_OPCODE_UNSUPPORTED, "unknown opcode"),
+            (ERR_STORAGE_IO, "redo log append failed: device EIO"),
+            (ERR_RATE_LIMITED, "in-flight memory limit exceeded"),
+            (ERR_NOT_CLUSTERED, "not clustered"),
+            (
+                ERR_INVARIANT_VIOLATION,
+                "request_id must encode shard in low 16 bits",
+            ),
+            (ERR_STREAM_INVARIANT, "stream byte counter overflow"),
+        ];
+        for (code, msg) in cases {
+            let encoded = encode_error_payload(*code, msg);
+            let (decoded_code, decoded_msg) =
+                decode_error_payload(&encoded).expect("typed error payload must round-trip");
+            assert_eq!(decoded_code, *code, "code mismatch for {msg}");
+            assert_eq!(decoded_msg, *msg, "message mismatch for {msg}");
+        }
+    }
+
+    // P3.10 / F-G5-017 — pin the numeric values so a future renumbering
+    // is caught at test time, before clients in the wild start
+    // misinterpreting codes.
+    #[test]
+    fn typed_wire_error_codes_have_stable_numeric_values() {
+        assert_eq!(ERR_PAYLOAD_MALFORMED, 28);
+        assert_eq!(ERR_OPCODE_UNSUPPORTED, 29);
+        assert_eq!(ERR_STORAGE_IO, 30);
+        assert_eq!(ERR_RATE_LIMITED, 31);
+        assert_eq!(ERR_NOT_CLUSTERED, 32);
+        assert_eq!(ERR_INVARIANT_VIOLATION, 33);
+        assert_eq!(ERR_STREAM_INVARIANT, 34);
+        // ERR_INTERNAL stays at 255 — sentinel for genuinely unclassified
+        // failures so old clients matching on 255 still receive a value.
+        assert_eq!(ERR_INTERNAL, 255);
+        // PROTOCOL_VERSION bumped to 2 for the typed-error revision.
+        assert_eq!(PROTOCOL_VERSION, 2);
+    }
+
     // -- Redirect response --
 
     #[test]

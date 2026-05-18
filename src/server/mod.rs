@@ -347,7 +347,7 @@ impl Server {
                                 request_id: 0,
                                 status: STATUS_ERROR,
                                 payload: encode_error_payload(
-                                    ERR_INTERNAL,
+                                    ERR_RATE_LIMITED,
                                     "max connections reached",
                                 ),
                             };
@@ -572,7 +572,7 @@ fn handle_connection_inner(
                     request_id: 0,
                     status: STATUS_ERROR,
                     payload: encode_error_payload(
-                        ERR_INTERNAL,
+                        ERR_RATE_LIMITED,
                         "aggregate in-flight request memory limit exceeded",
                     ),
                 };

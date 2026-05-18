@@ -529,7 +529,7 @@ pub(crate) fn handle_request(
                 if request.request_id >> 16 != 0 {
                     return error_response(
                         request.request_id,
-                        ERR_INTERNAL,
+                        ERR_INVARIANT_VIOLATION,
                         "FLAG_MIGRATION_BATCH: request_id must encode shard in low 16 bits",
                     );
                 }
@@ -593,7 +593,7 @@ pub(crate) fn handle_request(
             if request.request_id >> 16 != 0 {
                 return error_response(
                     request.request_id,
-                    ERR_INTERNAL,
+                    ERR_INVARIANT_VIOLATION,
                     "OP_MIGRATION_COMPLETE: request_id must encode shard in low 16 bits",
                 );
             }
@@ -879,7 +879,7 @@ pub(crate) fn handle_request(
             if request.payload.len() < 4 {
                 return error_response(
                     request.request_id,
-                    ERR_INTERNAL,
+                    ERR_PAYLOAD_MALFORMED,
                     "batch-complete: too short",
                 );
             }
@@ -888,7 +888,7 @@ pub(crate) fn handle_request(
                 None => {
                     return error_response(
                         request.request_id,
-                        ERR_INTERNAL,
+                        ERR_PAYLOAD_MALFORMED,
                         "batch-complete: malformed shard count",
                     );
                 }
@@ -902,7 +902,7 @@ pub(crate) fn handle_request(
                 None => {
                     return error_response(
                         request.request_id,
-                        ERR_INTERNAL,
+                        ERR_PAYLOAD_MALFORMED,
                         &format!(
                             "batch-complete: shard_count overflow ({shard_count}); rejecting frame"
                         ),
@@ -912,7 +912,7 @@ pub(crate) fn handle_request(
             if request.payload.len() < expected_len {
                 return error_response(
                     request.request_id,
-                    ERR_INTERNAL,
+                    ERR_PAYLOAD_MALFORMED,
                     &format!(
                         "batch-complete: need {expected_len} bytes, got {}",
                         request.payload.len()
@@ -925,7 +925,7 @@ pub(crate) fn handle_request(
                 let Some(shard) = le_u16_at(&request.payload, off) else {
                     return error_response(
                         request.request_id,
-                        ERR_INTERNAL,
+                        ERR_PAYLOAD_MALFORMED,
                         "batch-complete: malformed shard id",
                     );
                 };
@@ -935,7 +935,7 @@ pub(crate) fn handle_request(
             let Some(from_node_id) = le_u64_at(&request.payload, from_node_off) else {
                 return error_response(
                     request.request_id,
-                    ERR_INTERNAL,
+                    ERR_PAYLOAD_MALFORMED,
                     "batch-complete: malformed source node",
                 );
             };
@@ -982,7 +982,7 @@ pub(crate) fn handle_request(
             // proposer treats it as "no vote / retry".
             let cluster = match cluster {
                 Some(c) => c,
-                None => return error_response(request.request_id, ERR_INTERNAL, "not clustered"),
+                None => return error_response(request.request_id, ERR_NOT_CLUSTERED, "not clustered"),
             };
             match crate::cluster::topology::TopologyTerm::deserialize(&request.payload) {
                 Some(propose) => {
@@ -1007,7 +1007,7 @@ pub(crate) fn handle_request(
                 }
                 None => error_response(
                     request.request_id,
-                    ERR_INTERNAL,
+                    ERR_PAYLOAD_MALFORMED,
                     "malformed topology propose",
                 ),
             }
@@ -1019,7 +1019,7 @@ pub(crate) fn handle_request(
             // not here. We just return OK with any resulting commit.
             let cluster = match cluster {
                 Some(c) => c,
-                None => return error_response(request.request_id, ERR_INTERNAL, "not clustered"),
+                None => return error_response(request.request_id, ERR_NOT_CLUSTERED, "not clustered"),
             };
             match crate::cluster::topology::TopologyVote::deserialize(&request.payload) {
                 Some(vote) => {
@@ -1034,7 +1034,7 @@ pub(crate) fn handle_request(
                         payload,
                     }
                 }
-                None => error_response(request.request_id, ERR_INTERNAL, "malformed topology vote"),
+                None => error_response(request.request_id, ERR_PAYLOAD_MALFORMED, "malformed topology vote"),
             }
         }
         OP_TOPOLOGY_COMMIT => {
@@ -1042,7 +1042,7 @@ pub(crate) fn handle_request(
             // Activate the shard table with the committed members.
             let cluster = match cluster {
                 Some(c) => c,
-                None => return error_response(request.request_id, ERR_INTERNAL, "not clustered"),
+                None => return error_response(request.request_id, ERR_NOT_CLUSTERED, "not clustered"),
             };
             match crate::cluster::topology::TopologyCommit::deserialize(&request.payload) {
                 Some(commit) => {
@@ -1080,12 +1080,12 @@ pub(crate) fn handle_request(
                 }
                 None => error_response(
                     request.request_id,
-                    ERR_INTERNAL,
+                    ERR_PAYLOAD_MALFORMED,
                     "malformed topology commit",
                 ),
             }
         }
-        _ => error_response(request.request_id, ERR_INTERNAL, "unknown opcode"),
+        _ => error_response(request.request_id, ERR_OPCODE_UNSUPPORTED, "unknown opcode"),
     };
 
     // Record end-to-end handler latency into the appropriate histogram.
@@ -2895,7 +2895,7 @@ fn handle_spend_batch(
                 Err(e) => {
                     // Redo failure: don't apply, return error.
                     // ValidatedSpend drops here, releasing the lock.
-                    return error_response(req.request_id, ERR_INTERNAL, &e);
+                    return error_response(req.request_id, ERR_STORAGE_IO, &e);
                 }
             }
         }
@@ -2908,8 +2908,8 @@ fn handle_spend_batch(
             Ok(r) => r,
             Err(e) => {
                 // DAH overflow (config misconfiguration) or similar —
-                // surface as ERR_INTERNAL rather than silently clamping.
-                return error_response(req.request_id, ERR_INTERNAL, &e.to_string());
+                // surface as ERR_STORAGE_IO rather than silently clamping.
+                return error_response(req.request_id, ERR_STORAGE_IO, &e.to_string());
             }
         };
 
@@ -3097,7 +3097,7 @@ fn handle_unspend_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
     };
 
     // Phase 3: Apply engine mutations and build repl ops.
@@ -3228,7 +3228,7 @@ fn handle_set_mined_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
     };
 
     // Gap #8: capture pre-apply (block_height, subtree_idx) for the
@@ -3557,7 +3557,7 @@ fn handle_create_batch(
                 Err(_) => {
                     errors.push(BatchItemError {
                         item_index: i as u32,
-                        error_code: ERR_INTERNAL,
+                        error_code: ERR_STORAGE_IO,
                         error_data: vec![],
                     });
                     continue;
@@ -3616,7 +3616,7 @@ fn handle_create_batch(
             Err(_) => {
                 errors.push(BatchItemError {
                     item_index: i as u32,
-                    error_code: ERR_INTERNAL,
+                    error_code: ERR_STORAGE_IO,
                     error_data: vec![],
                 });
                 continue;
@@ -3641,14 +3641,14 @@ fn handle_create_batch(
         .collect();
     let allocated_regions = match engine.allocator().lock().allocate_batch(&reservation_sizes) {
         Ok(regions) => regions,
-        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &format!("{e}")),
+        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &format!("{e}")),
     };
 
     for (pending, allocated) in pending_items.into_iter().zip(allocated_regions) {
         let Some(region) = allocated else {
             errors.push(BatchItemError {
                 item_index: pending.idx as u32,
-                error_code: ERR_INTERNAL,
+                error_code: ERR_STORAGE_IO,
                 error_data: vec![],
             });
             continue;
@@ -3702,7 +3702,7 @@ fn handle_create_batch(
                     rollback_errors.join("; ")
                 )
             };
-            return error_response(req.request_id, ERR_INTERNAL, &msg);
+            return error_response(req.request_id, ERR_STORAGE_IO, &msg);
         }
     };
 
@@ -3803,7 +3803,7 @@ fn handle_create_batch(
                         tracing::error!(err = %e, "create batch rollback failed");
                         errors.push(BatchItemError {
                             item_index: v.idx as u32,
-                            error_code: ERR_INTERNAL,
+                            error_code: ERR_STORAGE_IO,
                             error_data: vec![],
                         });
                     }
@@ -3823,7 +3823,7 @@ fn handle_create_batch(
                 }
                 errors.push(BatchItemError {
                     item_index: v.idx as u32,
-                    error_code: ERR_INTERNAL,
+                    error_code: ERR_STORAGE_IO,
                     error_data: vec![],
                 });
             }
@@ -3912,7 +3912,7 @@ fn handle_freeze_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
     };
 
     // Phase 3: Apply engine mutations and build repl ops from engine results.
@@ -4016,7 +4016,7 @@ fn handle_unfreeze_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
     };
 
     // Phase 3: Apply engine mutations and build repl ops from engine results.
@@ -4122,7 +4122,7 @@ fn handle_reassign_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
     };
 
     // Phase 3: Apply engine mutations and build repl ops from engine results.
@@ -4223,14 +4223,14 @@ fn handle_set_conflicting_batch(
     let Some(cbh) = le_u32_at(&shared, 1) else {
         return error_response(
             req.request_id,
-            ERR_INTERNAL,
+            ERR_PAYLOAD_MALFORMED,
             "malformed set_conflicting shared data",
         );
     };
     let Some(bhr) = le_u32_at(&shared, 5) else {
         return error_response(
             req.request_id,
-            ERR_INTERNAL,
+            ERR_PAYLOAD_MALFORMED,
             "malformed set_conflicting shared data",
         );
     };
@@ -4263,7 +4263,7 @@ fn handle_set_conflicting_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
     };
 
     // Phase 3: Apply engine mutations and build repl ops from engine results.
@@ -4369,7 +4369,7 @@ fn handle_set_locked_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
     };
 
     // Phase 3: Apply engine mutations and build repl ops from engine results.
@@ -4454,7 +4454,7 @@ fn handle_preserve_until_batch(
     let Some(height) = le_u32_at(&shared, 0) else {
         return error_response(
             req.request_id,
-            ERR_INTERNAL,
+            ERR_PAYLOAD_MALFORMED,
             "malformed preserve_until shared data",
         );
     };
@@ -4485,7 +4485,7 @@ fn handle_preserve_until_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
     };
 
     // Phase 3: Apply engine mutations and build repl ops from engine results.
@@ -4688,7 +4688,7 @@ fn handle_delete_batch(
                 Err(e) => {
                     errors.push(BatchItemError {
                         item_index: i as u32,
-                        error_code: ERR_INTERNAL,
+                        error_code: ERR_STORAGE_IO,
                         error_data: format!("delete metadata read failed: {e}").into_bytes(),
                     });
                     continue;
@@ -4772,7 +4772,7 @@ fn handle_delete_batch(
         {
             errors.push(BatchItemError {
                 item_index: i as u32,
-                error_code: ERR_INTERNAL,
+                error_code: ERR_STORAGE_IO,
                 error_data: b"delete external blob snapshot missing".to_vec(),
             });
             continue;
@@ -4791,7 +4791,7 @@ fn handle_delete_batch(
             Err(e) => {
                 errors.push(BatchItemError {
                     item_index: i as u32,
-                    error_code: ERR_INTERNAL,
+                    error_code: ERR_STORAGE_IO,
                     error_data: format!("delete parent-prune input parse failed: {e}").into_bytes(),
                 });
                 continue;
@@ -4801,7 +4801,7 @@ fn handle_delete_batch(
             if let Some(route_err) = check_shard_ownership(&parent_txid, i as u32, cluster, false) {
                 errors.push(BatchItemError {
                     item_index: i as u32,
-                    error_code: ERR_INTERNAL,
+                    error_code: ERR_INVARIANT_VIOLATION,
                     error_data: format!(
                         "delete parent-prune requires local parent master; route error {}",
                         route_err.error_code
@@ -4821,7 +4821,7 @@ fn handle_delete_batch(
                 Err(e) => {
                     errors.push(BatchItemError {
                         item_index: i as u32,
-                        error_code: ERR_INTERNAL,
+                        error_code: ERR_STORAGE_IO,
                         error_data: format!("delete parent-prune scan failed: {e}").into_bytes(),
                     });
                     continue 'items;
@@ -4853,7 +4853,7 @@ fn handle_delete_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
     };
 
     // Phase 3: Apply engine mutations and build repl ops.
@@ -5103,14 +5103,14 @@ fn handle_mark_longest_chain_batch(
     let Some(cbh) = le_u32_at(&shared, 1) else {
         return error_response(
             req.request_id,
-            ERR_INTERNAL,
+            ERR_PAYLOAD_MALFORMED,
             "malformed mark_longest_chain shared data",
         );
     };
     let Some(bhr) = le_u32_at(&shared, 5) else {
         return error_response(
             req.request_id,
-            ERR_INTERNAL,
+            ERR_PAYLOAD_MALFORMED,
             "malformed mark_longest_chain shared data",
         );
     };
@@ -5149,7 +5149,7 @@ fn handle_mark_longest_chain_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
     };
 
     // Phase 3: Apply engine mutations and capture per-item master
@@ -5471,8 +5471,9 @@ fn handle_get_batch(
                 // zeros / length-0 / count-0, so storage corruption
                 // was indistinguishable from a clean read of an
                 // empty record. Now we surface inner failures as
-                // ERR_INTERNAL on the result item — clients can
+                // ERR_STORAGE_IO on the result item — clients can
                 // retry instead of trusting the synthesized bytes.
+                // (P3.10 / F-G5-017; pre-P3.10 the code was ERR_INTERNAL.)
                 let mut inner_read_failed = false;
                 if field_mask.has(FieldMask::UTXO_SLOTS) {
                     let utxo_count = { meta.utxo_count };
@@ -5489,7 +5490,7 @@ fn handle_get_batch(
                             inner_read_failed = true;
                             // Still emit padding bytes so the length declared
                             // in `utxo_count` matches the data length; the
-                            // per-item ERR_INTERNAL status tells the client
+                            // per-item ERR_STORAGE_IO status tells the client
                             // these bytes are unreliable.
                             for _ in 0..utxo_count {
                                 data.extend_from_slice(&[0u8; 69]);
@@ -5535,9 +5536,10 @@ fn handle_get_batch(
                     }
                 }
                 let status = if inner_read_failed {
-                    // ERR_INTERNAL (255) on the wire — distinguishes
-                    // sub-read corruption from a clean `Ok(0)` case.
-                    ERR_INTERNAL as u8
+                    // ERR_STORAGE_IO on the wire — distinguishes sub-read
+                    // corruption from a clean `Ok(0)` case. (P3.10 /
+                    // F-G5-017; pre-P3.10 the code was ERR_INTERNAL.)
+                    ERR_STORAGE_IO as u8
                 } else {
                     0
                 };
@@ -5557,10 +5559,10 @@ fn handle_get_batch(
                 // not distinguish "tx really doesn't exist" from
                 // "tx exists but the device returned bad bytes" —
                 // the natural retry behaviour for the latter never
-                // fired. Surface as ERR_INTERNAL so the client
-                // retries.
+                // fired. Surface as ERR_STORAGE_IO so the client
+                // retries. (P3.10 / F-G5-017; pre-P3.10 ERR_INTERNAL.)
                 results.push(WireGetResult {
-                    status: ERR_INTERNAL as u8,
+                    status: ERR_STORAGE_IO as u8,
                     data: vec![],
                 });
             }
@@ -5641,10 +5643,10 @@ fn handle_query_old_unmined(
 ) -> ResponseFrame {
     // Payload: [cutoff_height:4]
     if req.payload.len() < 4 {
-        return error_response(req.request_id, ERR_INTERNAL, "malformed query");
+        return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed query");
     }
     let Some(cutoff) = le_u32_at(&req.payload, 0) else {
-        return error_response(req.request_id, ERR_INTERNAL, "malformed query");
+        return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed query");
     };
     let candidates = engine.unmined_index().range_query(cutoff);
     let mut keys = Vec::with_capacity(candidates.len());
@@ -5698,7 +5700,7 @@ fn handle_preserve_transactions(
     let Some(height) = le_u32_at(&shared, 0) else {
         return error_response(
             req.request_id,
-            ERR_INTERNAL,
+            ERR_PAYLOAD_MALFORMED,
             "malformed preserve_transactions shared data",
         );
     };
@@ -5728,7 +5730,7 @@ fn handle_preserve_transactions(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_INTERNAL, &e),
+        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
     };
 
     // Phase 3: Apply engine mutations and build repl ops from engine results.
@@ -5825,10 +5827,10 @@ fn handle_process_expired(
 ) -> ResponseFrame {
     // Payload: [current_height:4]
     if req.payload.len() < 4 {
-        return error_response(req.request_id, ERR_INTERNAL, "malformed");
+        return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed");
     }
     let Some(current_height) = le_u32_at(&req.payload, 0) else {
-        return error_response(req.request_id, ERR_INTERNAL, "malformed");
+        return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed");
     };
 
     // Query DAH index for transactions due for deletion. The DAH index
@@ -6045,7 +6047,7 @@ fn handle_get_spend_batch(
             Err(_) => {
                 results.push(WireGetSpendResult {
                     status: 1,
-                    error_code: ERR_INTERNAL,
+                    error_code: ERR_STORAGE_IO,
                     slot_status: 0,
                     spending_data: [0; 36],
                 });
@@ -6106,7 +6108,7 @@ fn handle_stream_chunk(
 ) -> ResponseFrame {
     let chunk = match decode_stream_chunk(&req.payload) {
         Some(c) => c,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed stream chunk"),
+        None => return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed stream chunk"),
     };
 
     // Check shard ownership — streaming writes are mutations on the master.
@@ -6136,7 +6138,7 @@ fn handle_stream_chunk(
                 bytes_received: 0,
             }),
             Err(e) => {
-                return error_response(req.request_id, ERR_INTERNAL, &format!("begin_stream: {e}"));
+                return error_response(req.request_id, ERR_STORAGE_IO, &format!("begin_stream: {e}"));
             }
         },
     };
@@ -6163,7 +6165,7 @@ fn handle_stream_chunk(
             if let Some(s) = conn_state.streams.remove(&chunk.txid) {
                 let _ = s.writer.abort();
             }
-            return error_response(req.request_id, ERR_INTERNAL, "stream byte counter overflow");
+            return error_response(req.request_id, ERR_STREAM_INVARIANT, "stream byte counter overflow");
         }
     };
     let max_stream_total_bytes = conn_state.max_stream_total_bytes;
@@ -6173,7 +6175,7 @@ fn handle_stream_chunk(
         }
         return error_response(
             req.request_id,
-            ERR_INTERNAL,
+            ERR_STREAM_INVARIANT,
             &format!(
                 "stream exceeds maximum total bytes ({max_stream_total_bytes}): would reach {projected}",
             ),
@@ -6186,7 +6188,7 @@ fn handle_stream_chunk(
         if let Some(s) = conn_state.streams.remove(&chunk.txid) {
             let _ = s.writer.abort();
         }
-        return error_response(req.request_id, ERR_INTERNAL, &format!("write_chunk: {e}"));
+        return error_response(req.request_id, ERR_STORAGE_IO, &format!("write_chunk: {e}"));
     }
 
     stream.bytes_received = projected;
@@ -6206,7 +6208,7 @@ fn handle_stream_chunk(
 fn handle_stream_end(req: &RequestFrame, conn_state: &mut super::ConnectionState) -> ResponseFrame {
     let end = match decode_stream_end(&req.payload) {
         Some(e) => e,
-        None => return error_response(req.request_id, ERR_INTERNAL, "malformed stream end"),
+        None => return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed stream end"),
     };
 
     let stream = match conn_state.streams.remove(&end.txid) {
@@ -6225,7 +6227,7 @@ fn handle_stream_end(req: &RequestFrame, conn_state: &mut super::ConnectionState
         let _ = stream.writer.abort();
         return error_response(
             req.request_id,
-            ERR_INTERNAL,
+            ERR_STREAM_INVARIANT,
             &format!(
                 "size mismatch: received {} bytes, expected {}",
                 stream.bytes_received, end.total_size
@@ -6247,7 +6249,7 @@ fn handle_stream_end(req: &RequestFrame, conn_state: &mut super::ConnectionState
                 payload,
             }
         }
-        Err(e) => error_response(req.request_id, ERR_INTERNAL, &format!("finish: {e}")),
+        Err(e) => error_response(req.request_id, ERR_STORAGE_IO, &format!("finish: {e}")),
     }
 }
 
@@ -6268,9 +6270,11 @@ fn error_response(request_id: u64, code: u16, msg: &str) -> ResponseFrame {
 ///
 /// `op_label` is a human-readable label for the operation (e.g.
 /// `"spend batch"`) used in the error message. The response uses
-/// `STATUS_ERROR` and `ERR_INTERNAL`, matching the legacy behaviour of
-/// the pre-`_checked` handlers, so existing clients see no change in
-/// status code on malformed frames.
+/// `STATUS_ERROR` and `ERR_PAYLOAD_MALFORMED` (P3.10 / F-G5-017): every
+/// `CodecError` variant is a wire-decode failure (HeaderTooShort,
+/// BatchTooLarge, TruncatedBatch, SectionTruncated) so callers can route
+/// on the typed code instead of substring-matching the human-readable
+/// message. Pre-P3.10 the code was `ERR_INTERNAL`.
 ///
 /// We deliberately use [`CodecError::Display`] so the wire payload
 /// records the specific failure (`HeaderTooShort`, `BatchTooLarge`,
@@ -6281,7 +6285,7 @@ fn codec_error_response(request_id: u64, op_label: &str, err: CodecError) -> Res
     tracing::debug!(op = op_label, err = %err, "codec rejected request before allocation");
     error_response(
         request_id,
-        ERR_INTERNAL,
+        ERR_PAYLOAD_MALFORMED,
         &format!("malformed {op_label}: {err}"),
     )
 }
@@ -6359,9 +6363,9 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
         SpendError::Pruned { spending_data, .. } => (ERR_INVALID_SPEND, spending_data.to_vec()),
         SpendError::AlreadyFrozen { .. } => (ERR_ALREADY_FROZEN, vec![]),
         SpendError::NotFrozen { .. } => (ERR_UTXO_NOT_FROZEN, vec![]),
-        SpendError::StorageError { .. } => (ERR_INTERNAL, vec![]),
-        SpendError::DahOverflow { .. } => (ERR_INTERNAL, vec![]),
-        SpendError::ReassignOverflow { .. } => (ERR_INTERNAL, vec![]),
+        SpendError::StorageError { .. } => (ERR_STORAGE_IO, vec![]),
+        SpendError::DahOverflow { .. } => (ERR_STORAGE_IO, vec![]),
+        SpendError::ReassignOverflow { .. } => (ERR_STORAGE_IO, vec![]),
         // F-G2-002: reserved frozen-sentinel rejection. Reuses
         // `ERR_INVALID_SPEND` — semantically the request is malformed
         // (caller asked us to write the on-disk frozen marker as the
@@ -6429,7 +6433,19 @@ pub(crate) fn classify_wire_error_code(code: u16) -> crate::metrics::Outcome {
         ERR_LOCKED | ERR_FROZEN | ERR_FROZEN_UNTIL | ERR_ALREADY_FROZEN | ERR_UTXO_NOT_FROZEN => {
             Outcome::ErrFrozen
         }
-        ERR_INTERNAL => Outcome::ErrStorage,
+        // P3.10 / F-G5-017: every typed wire-level failure code that
+        // previously folded into `ERR_INTERNAL` now classifies the same way
+        // — they all surface as `ErrStorage` in the metrics histogram so
+        // existing dashboards keep working. `ERR_INTERNAL` itself is kept
+        // for genuinely unclassified failures.
+        ERR_INTERNAL
+        | ERR_STORAGE_IO
+        | ERR_PAYLOAD_MALFORMED
+        | ERR_OPCODE_UNSUPPORTED
+        | ERR_RATE_LIMITED
+        | ERR_NOT_CLUSTERED
+        | ERR_INVARIANT_VIOLATION
+        | ERR_STREAM_INVARIANT => Outcome::ErrStorage,
         _ => Outcome::Other,
     }
 }
@@ -6477,7 +6493,7 @@ fn handle_get_committed_topology(
             status: STATUS_OK,
             payload: c.encode_committed_topology(),
         },
-        None => error_response(req.request_id, ERR_INTERNAL, "not clustered"),
+        None => error_response(req.request_id, ERR_NOT_CLUSTERED, "not clustered"),
     }
 }
 
@@ -6512,7 +6528,7 @@ fn handle_admin_diagnose_key(
     let Some(count_u32) = le_u32_at(payload, 0) else {
         return error_response(
             req.request_id,
-            ERR_INTERNAL,
+            ERR_PAYLOAD_MALFORMED,
             "malformed admin diagnose: missing count",
         );
     };
@@ -6520,7 +6536,7 @@ fn handle_admin_diagnose_key(
     if count as u32 > ADMIN_DIAGNOSE_KEY_MAX_TXIDS {
         return error_response(
             req.request_id,
-            ERR_INTERNAL,
+            ERR_PAYLOAD_MALFORMED,
             "malformed admin diagnose: count exceeds cap",
         );
     }
@@ -6528,7 +6544,7 @@ fn handle_admin_diagnose_key(
     if payload.len() != expected_len {
         return error_response(
             req.request_id,
-            ERR_INTERNAL,
+            ERR_PAYLOAD_MALFORMED,
             "malformed admin diagnose: length mismatch",
         );
     }
@@ -6628,7 +6644,7 @@ fn handle_partition_version_report(
     let Some(request_cluster_key) = le_u64_at(&req.payload, 0) else {
         return error_response(
             req.request_id,
-            ERR_INTERNAL,
+            ERR_PAYLOAD_MALFORMED,
             "malformed partition version report: missing cluster_key",
         );
     };
@@ -7014,7 +7030,7 @@ mod tests {
         let resp = h.request(OP_QUERY_OLD_UNMINED, vec![0xAA, 0xBB]);
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
-        assert_eq!(code, ERR_INTERNAL);
+        assert_eq!(code, ERR_PAYLOAD_MALFORMED);
         assert!(msg.contains("malformed"), "expected 'malformed' in: {msg}");
     }
 
@@ -7092,7 +7108,7 @@ mod tests {
         let resp = h.request(OP_PRESERVE_TRANSACTIONS, vec![]);
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
-        assert_eq!(code, ERR_INTERNAL);
+        assert_eq!(code, ERR_PAYLOAD_MALFORMED);
         assert!(msg.contains("malformed"), "expected 'malformed' in: {msg}");
     }
 
@@ -7234,7 +7250,7 @@ mod tests {
         let resp = h.request(OP_PROCESS_EXPIRED_PRESERVATIONS, vec![]);
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
-        assert_eq!(code, ERR_INTERNAL);
+        assert_eq!(code, ERR_PAYLOAD_MALFORMED);
         assert!(msg.contains("malformed"), "expected 'malformed' in: {msg}");
     }
 
@@ -7265,7 +7281,7 @@ mod tests {
         let resp = h.request(999, vec![]);
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
-        assert_eq!(code, ERR_INTERNAL);
+        assert_eq!(code, ERR_OPCODE_UNSUPPORTED);
         assert!(
             msg.contains("unknown opcode"),
             "expected 'unknown opcode' in: {msg}"
@@ -7282,7 +7298,7 @@ mod tests {
         let resp = h.request(OP_SPEND_BATCH, vec![0xDE, 0xAD, 0xBE]);
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
-        assert_eq!(code, ERR_INTERNAL);
+        assert_eq!(code, ERR_PAYLOAD_MALFORMED);
         assert!(msg.contains("malformed"), "expected 'malformed' in: {msg}");
     }
 
@@ -7296,7 +7312,7 @@ mod tests {
         let resp = h.request(OP_CREATE_BATCH, vec![0x01, 0x02, 0x03]);
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
-        assert_eq!(code, ERR_INTERNAL);
+        assert_eq!(code, ERR_PAYLOAD_MALFORMED);
         assert!(msg.contains("malformed"), "expected 'malformed' in: {msg}");
     }
 
@@ -7310,7 +7326,7 @@ mod tests {
         let resp = h.request(OP_GET_BATCH, vec![0xAA, 0xBB, 0xCC]);
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
-        assert_eq!(code, ERR_INTERNAL);
+        assert_eq!(code, ERR_PAYLOAD_MALFORMED);
         assert!(msg.contains("malformed"), "expected 'malformed' in: {msg}");
     }
 
@@ -7333,8 +7349,8 @@ mod tests {
         let results = decode_get_response(&resp.payload).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].status, ERR_INTERNAL as u8,
-            "storage read failures must surface as ERR_INTERNAL per-item status"
+            results[0].status, ERR_STORAGE_IO as u8,
+            "storage read failures must surface as ERR_STORAGE_IO per-item status (P3.10 / F-G5-017)"
         );
         assert!(
             results[0].data.is_empty(),
@@ -7352,7 +7368,7 @@ mod tests {
         let resp = h.request(OP_SET_MINED_BATCH, vec![0x01, 0x02, 0x03]);
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
-        assert_eq!(code, ERR_INTERNAL);
+        assert_eq!(code, ERR_PAYLOAD_MALFORMED);
         assert!(msg.contains("malformed"), "expected 'malformed' in: {msg}");
     }
 
@@ -7367,7 +7383,7 @@ mod tests {
         let resp = h.request(OP_DELETE_BATCH, vec![0xAA, 0xBB]);
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
-        assert_eq!(code, ERR_INTERNAL);
+        assert_eq!(code, ERR_PAYLOAD_MALFORMED);
         assert!(msg.contains("malformed"), "expected 'malformed' in: {msg}");
     }
 
@@ -7660,7 +7676,7 @@ mod tests {
         let errors = decode_sparse_errors(&resp.payload).unwrap();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].item_index, 0);
-        assert_eq!(errors[0].error_code, ERR_INTERNAL);
+        assert_eq!(errors[0].error_code, ERR_STORAGE_IO);
         assert!(
             String::from_utf8_lossy(&errors[0].error_data)
                 .contains("external blob snapshot missing")
@@ -7946,7 +7962,7 @@ mod tests {
         let resp = h.request_with_max_batch(OP_CREATE_BATCH, payload, 10);
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
-        assert_eq!(code, ERR_INTERNAL);
+        assert_eq!(code, ERR_PAYLOAD_MALFORMED);
         // The decoder rejects the over-size batch BEFORE allocation, so the
         // error message now identifies the configured limit explicitly. We
         // verify both the count (20) and the configured cap (10) appear so
@@ -10629,7 +10645,7 @@ mod tests {
 
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
-        assert_eq!(code, ERR_INTERNAL);
+        assert_eq!(code, ERR_PAYLOAD_MALFORMED);
         assert!(
             msg.contains("batch-complete"),
             "expected batch-complete rejection, got {msg}"
@@ -12259,7 +12275,8 @@ mod tests {
 
     /// Truncated payloads (count claims more txids than bytes provide) and
     /// counts above the documented cap (64) must be rejected with
-    /// STATUS_ERROR / ERR_INTERNAL.
+    /// STATUS_ERROR / ERR_PAYLOAD_MALFORMED (P3.10; pre-P3.10 this was
+    /// ERR_INTERNAL).
     #[test]
     fn dispatch_admin_diagnose_key_malformed_payload() {
         let h = DispatchTestHarness::new();
@@ -12268,7 +12285,7 @@ mod tests {
         let resp = h.request(OP_ADMIN_DIAGNOSE_KEY, vec![]);
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, _msg) = decode_error_payload(&resp.payload).unwrap();
-        assert_eq!(code, ERR_INTERNAL);
+        assert_eq!(code, ERR_PAYLOAD_MALFORMED);
 
         // Count says 2 but only 1 txid worth of bytes follows.
         let mut short = Vec::new();
@@ -12277,7 +12294,7 @@ mod tests {
         let resp = h.request(OP_ADMIN_DIAGNOSE_KEY, short);
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, _msg) = decode_error_payload(&resp.payload).unwrap();
-        assert_eq!(code, ERR_INTERNAL);
+        assert_eq!(code, ERR_PAYLOAD_MALFORMED);
 
         // Count above cap (65 > 64).
         let mut too_many = Vec::new();
@@ -12286,7 +12303,7 @@ mod tests {
         let resp = h.request(OP_ADMIN_DIAGNOSE_KEY, too_many);
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, _msg) = decode_error_payload(&resp.payload).unwrap();
-        assert_eq!(code, ERR_INTERNAL);
+        assert_eq!(code, ERR_PAYLOAD_MALFORMED);
     }
 
     // ---------------------------------------------------------------------
@@ -13008,7 +13025,7 @@ mod tests {
 
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, msg) = decode_error_payload(&resp.payload).expect("error payload");
-        assert_eq!(code, ERR_INTERNAL);
+        assert_eq!(code, ERR_STORAGE_IO);
         assert!(
             msg.contains("redo log append"),
             "expected primary redo failure in error: {msg}"

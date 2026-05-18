@@ -152,11 +152,23 @@ Pre-existing test failures (NOT caused by G5):
   (16 MiB) and per-connection read timeout. Streaming HMAC verifier
   is a larger refactor; recorded as performance follow-up.
 
-### F-G5-017 — DEFERRED-FOLLOWUP (API)
-- Notes: Introducing `ERR_PAYLOAD_MALFORMED`, `ERR_OPCODE_UNSUPPORTED`,
-  `ERR_STORAGE_IO` etc. is a public-wire API change that touches
-  every client adapter. Logged as follow-up; not addressed in this
-  G5 pass.
+### F-G5-017 — RESOLVED (P3.10)
+- Branch: `p3.10-typed-wire-errors`
+- Files changed: `src/protocol/opcodes.rs`, `src/protocol/codec.rs`,
+  `src/server/dispatch.rs`, `src/server/mod.rs`,
+  `client/rust/src/errors.rs`, `tests/server_tcp.rs`,
+  `phases/10_wire_protocol.md`.
+- Tests added: `protocol::codec::tests::typed_wire_error_codes_round_trip`
+  and `typed_wire_error_codes_have_stable_numeric_values`; ten existing
+  dispatch tests updated to assert the new typed code.
+- Notes: introduced `ERR_PAYLOAD_MALFORMED` (28), `ERR_OPCODE_UNSUPPORTED`
+  (29), `ERR_STORAGE_IO` (30), `ERR_RATE_LIMITED` (31), `ERR_NOT_CLUSTERED`
+  (32), `ERR_INVARIANT_VIOLATION` (33), `ERR_STREAM_INVARIANT` (34). Every
+  generic `ERR_INTERNAL` site in the dispatcher that mapped to one of
+  these classes was reclassified. `PROTOCOL_VERSION` bumped from
+  implicit 1 to 2. `ERR_INTERNAL` kept as the fallback for genuinely
+  unclassified failures (replication-compensation aborts).
+  This corresponds to roadmap item P3.10 and follow-up C-8.
 
 ### F-G5-018 — FIXED
 - Commit: `663ad68`
