@@ -65,3 +65,18 @@ work surfaced while fixing the reviewed findings.
   cheap but the current state has no reachable bug, and the in-crate
   tests would not exercise it. Filing as a forward-looking follow-up
   if interior-mutability is ever introduced to the allocator path.
+
+## From G5
+
+- **F-G5-011 / C-6 — RESOLVED (P3.4, frame zero-copy)**. `RequestFrame`
+  payload is now `bytes::Bytes` and the connection read loop holds a
+  per-connection `BytesMut`. `RequestFrame::decode_bytes` slices the
+  read buffer without copying, so the legacy
+  `data[16..frame_size].to_vec()` allocation in the request hot path
+  is gone. Verified by `tests/p3_4_frame_zero_copy_allocs.rs`: over
+  1000 iterations of `OP_SPEND_BATCH` + `OP_CREATE_BATCH` decode at
+  4 KiB payload, baseline allocates 2000 calls / 8 192 000 bytes for
+  payload copies; zero-copy allocates 2 calls / 48 bytes (only the
+  per-loop `Bytes::clone` ref bump). That is a ~100 % reduction in
+  payload bytes allocated, comfortably above the ≥20 % acceptance
+  threshold.

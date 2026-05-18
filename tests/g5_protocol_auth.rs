@@ -85,7 +85,7 @@ fn heartbeat_returns_status_ok_not_unknown_opcode() {
         request_id: 1,
         op_code: OP_HEARTBEAT,
         flags: 0,
-        payload: Vec::new(),
+        payload: Vec::new().into(),
     };
     let response = send_request(port, request);
     assert_eq!(response.request_id, 1);
@@ -110,7 +110,7 @@ fn fail_open_default_accepts_unsigned_inter_node_frame() {
         request_id: 10,
         op_code: OP_GET_PARTITION_MAP,
         flags: 0,
-        payload: Vec::new(),
+        payload: Vec::new().into(),
     };
     let response = send_request(port, request);
     assert_eq!(response.request_id, 10);
@@ -135,7 +135,7 @@ fn strict_auth_rejects_unsigned_inter_node_frame() {
         request_id: 11,
         op_code: OP_TOPOLOGY_COMMIT,
         flags: 0,
-        payload: Vec::new(),
+        payload: Vec::new().into(),
     };
     let response = send_request(port, request);
     assert_eq!(response.request_id, 11);
@@ -161,7 +161,7 @@ fn strict_auth_gates_admin_opcodes() {
             request_id: 20,
             op_code: op,
             flags: 0,
-            payload: Vec::new(),
+            payload: Vec::new().into(),
         };
         let response = send_request(port, request);
         assert_eq!(response.status, STATUS_ERROR);

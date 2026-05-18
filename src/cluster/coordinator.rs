@@ -2741,7 +2741,7 @@ fn send_topology_frame(
         request_id: 0,
         op_code,
         flags: 0,
-        payload: payload.to_vec(),
+        payload: bytes::Bytes::copy_from_slice(payload),
     };
     let response = exchange_frame(&mut stream, &request, auth_secret)?;
     Ok(response.payload)
@@ -4646,7 +4646,7 @@ fn stream_shard_baseline(
             request_id: task.shard as u64,
             op_code: OP_REPLICA_BATCH,
             flags: FLAG_MIGRATION_BATCH,
-            payload: batch.serialize(),
+            payload: batch.serialize().into(),
         };
 
         let response = exchange_frame(stream, &request, auth_secret)?;
@@ -4746,7 +4746,7 @@ fn send_migration_complete(
         } else {
             0
         },
-        payload,
+        payload: payload.into(),
     };
     let response = exchange_frame(s, &request, auth_secret)?;
 
@@ -4814,7 +4814,7 @@ fn send_completion_only_handshakes(
         request_id: 0,
         op_code: OP_MIGRATION_BATCH_COMPLETE,
         flags: 0,
-        payload,
+        payload: payload.into(),
     };
 
     for attempt in 0..MAX_RETRIES {
@@ -5301,7 +5301,7 @@ fn send_delta_ops(
         request_id: shard as u64,
         op_code: OP_REPLICA_BATCH,
         flags: FLAG_MIGRATION_BATCH,
-        payload: batch.serialize(),
+        payload: batch.serialize().into(),
     };
     let response = exchange_frame(stream, &request, auth_secret)?;
 
@@ -8925,7 +8925,7 @@ mod tests {
             request_id: 0,
             op_code: 0,
             flags: 0,
-            payload: vec![],
+            payload: vec![].into(),
         };
         let result = exchange_frame(&mut stream, &request, None);
         assert!(result.is_err(), "should reject oversized response");
@@ -9494,7 +9494,7 @@ mod tests {
             request_id: 1,
             op_code: OP_REPLICA_BATCH,
             flags: 0,
-            payload: batch.serialize(),
+            payload: batch.serialize().into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = crate::server::dispatch::handle_request(

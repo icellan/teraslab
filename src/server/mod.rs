@@ -15,6 +15,7 @@ use crate::protocol::frame::{RequestFrame, ResponseFrame};
 use crate::protocol::opcodes::*;
 use crate::redo::RedoLog;
 use crate::storage::blobstore::{BlobStore, BlobStreamWriter};
+use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -367,7 +368,14 @@ fn handle_connection_inner(
         .set_write_timeout(Some(opts.write_timeout))
         .map_err(|e| format!("set_write_timeout: {e}"))?;
 
-    let mut read_buf = vec![0u8; READ_BUF_RETAINED_SIZE];
+    // C-6 / F-G5-011 (P3.4): the per-connection read buffer is a
+    // `BytesMut` rather than a `Vec<u8>` so that each completed frame
+    // can be split off and frozen into a zero-copy `Bytes` slice. The
+    // resulting `Bytes` is passed to `RequestFrame::decode_bytes`, which
+    // produces a payload `Bytes` that shares the underlying allocation
+    // — no `to_vec()` copy on the request hot path.
+    let mut read_buf = BytesMut::with_capacity(READ_BUF_RETAINED_SIZE);
+    read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
     let mut conn_state =
         ConnectionState::new().with_max_stream_total_bytes(opts.max_stream_total_bytes);
 
@@ -432,17 +440,28 @@ fn handle_connection_inner(
                 ));
             }
         };
-        if read_buf.len() < frame_len {
-            read_buf.resize(frame_len, 0);
+        // Assemble the full frame (length prefix + body) into a fresh
+        // `BytesMut` carved from the retained `read_buf` allocation.
+        // `split_to` returns ownership of the first 4+frame_len bytes;
+        // `read_buf` retains the tail. We then refill `read_buf` so the
+        // next iteration's `split_to` is cheap.
+        if read_buf.len() < 4 + frame_len {
+            read_buf.resize(4 + frame_len, 0);
         }
+        read_buf[..4].copy_from_slice(&len_buf);
         stream
-            .read_exact(&mut read_buf[..frame_len])
+            .read_exact(&mut read_buf[4..4 + frame_len])
             .map_err(|e| format!("read frame body: {e}"))?;
-
-        // Reconstruct the full frame bytes (length prefix + body)
-        let mut frame_bytes = Vec::with_capacity(4 + frame_len);
-        frame_bytes.extend_from_slice(&len_buf);
-        frame_bytes.extend_from_slice(&read_buf[..frame_len]);
+        let frame_bytes_mut = read_buf.split_to(4 + frame_len);
+        // Top up `read_buf` so subsequent iterations still have spare
+        // capacity for the next frame without growing on every loop.
+        if read_buf.capacity() < READ_BUF_RETAINED_SIZE {
+            read_buf.reserve(READ_BUF_RETAINED_SIZE - read_buf.capacity());
+        }
+        if read_buf.len() < READ_BUF_RETAINED_SIZE {
+            read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
+        }
+        let frame_bytes: Bytes = frame_bytes_mut.freeze();
 
         let request_id = peek_request_id(&frame_bytes).unwrap_or(0);
         let peeked_op = peek_request_op_code(&frame_bytes);
@@ -479,7 +498,12 @@ fn handle_connection_inner(
                 );
             }
         }
-        let request_frame_bytes = if auth_required {
+        // `verify_frame` returns an owned `Vec<u8>` because it strips the
+        // trailing signature; convert to `Bytes` once so the downstream
+        // `decode_bytes` path can do zero-copy payload slicing. In the
+        // common non-auth case, `frame_bytes` is already the zero-copy
+        // `Bytes` carved from the connection read buffer.
+        let request_frame_bytes: Bytes = if auth_required {
             match crate::cluster::auth::verify_frame(
                 opts.cluster_secret
                     .as_ref()
@@ -487,7 +511,7 @@ fn handle_connection_inner(
                     .as_slice(),
                 &frame_bytes,
             ) {
-                Ok(verified) => verified,
+                Ok(verified) => Bytes::from(verified),
                 Err(e) => {
                     let resp = ResponseFrame {
                         request_id,
@@ -505,8 +529,8 @@ fn handle_connection_inner(
             frame_bytes
         };
 
-        let (request, _) =
-            RequestFrame::decode(&request_frame_bytes).map_err(|e| format!("decode frame: {e}"))?;
+        let (request, _) = RequestFrame::decode_bytes(request_frame_bytes)
+            .map_err(|e| format!("decode frame: {e}"))?;
 
         // Dispatch to handler
         let response = dispatch::handle_request(
@@ -554,9 +578,10 @@ fn peek_request_op_code(frame_bytes: &[u8]) -> Option<u16> {
     Some(u16::from_le_bytes(frame_bytes[12..14].try_into().ok()?))
 }
 
-fn reset_read_buf_if_oversized(read_buf: &mut Vec<u8>) {
+fn reset_read_buf_if_oversized(read_buf: &mut BytesMut) {
     if read_buf.capacity() > READ_BUF_RETAINED_SIZE {
-        *read_buf = vec![0u8; READ_BUF_RETAINED_SIZE];
+        *read_buf = BytesMut::with_capacity(READ_BUF_RETAINED_SIZE);
+        read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
     } else if read_buf.len() != READ_BUF_RETAINED_SIZE {
         read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
     }
@@ -586,7 +611,8 @@ mod tests {
 
     #[test]
     fn read_buf_shrinks_after_small_frame() {
-        let mut read_buf = vec![0u8; READ_BUF_RETAINED_SIZE * 4];
+        let mut read_buf = BytesMut::with_capacity(READ_BUF_RETAINED_SIZE * 4);
+        read_buf.resize(READ_BUF_RETAINED_SIZE * 4, 0);
         assert!(read_buf.capacity() > READ_BUF_RETAINED_SIZE);
 
         reset_read_buf_if_oversized(&mut read_buf);
@@ -685,7 +711,7 @@ mod tests {
             request_id: 7,
             op_code,
             flags: 0,
-            payload: Vec::new(),
+            payload: Vec::new().into(),
         };
         client.write_all(&request.encode()).unwrap();
 
@@ -739,7 +765,7 @@ mod tests {
             request_id: 8,
             op_code: OP_GET_PARTITION_MAP,
             flags: 0,
-            payload: Vec::new(),
+            payload: Vec::new().into(),
         };
         let signed = crate::cluster::auth::sign_frame(b"cluster-secret", &request.encode())
             .expect("request signing");
@@ -840,7 +866,7 @@ mod tests {
             request_id: 42,
             op_code: OP_TOPOLOGY_COMMIT,
             flags: 0,
-            payload: Vec::new(),
+            payload: Vec::new().into(),
         };
         client.write_all(&request.encode()).unwrap();
 
@@ -904,7 +930,7 @@ mod tests {
             request_id: 9,
             op_code: OP_GET_PARTITION_MAP,
             flags: 0,
-            payload: Vec::new(),
+            payload: Vec::new().into(),
         };
         client.write_all(&request.encode()).unwrap();
 

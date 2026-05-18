@@ -465,7 +465,7 @@ mod tests {
             request_id: 9,
             op_code: crate::protocol::opcodes::OP_REPLICA_BATCH,
             flags: 2,
-            payload: b"batch".to_vec(),
+            payload: b"batch".to_vec().into(),
         };
         let encoded = frame.encode();
         let signed = sign_frame(b"cluster-secret", &encoded).unwrap();

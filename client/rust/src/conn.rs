@@ -111,7 +111,7 @@ impl PipeConn {
             request_id: req_id,
             op_code,
             flags,
-            payload,
+            payload: payload.into(),
         };
         let encoded = frame.encode();
 

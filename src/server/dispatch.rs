@@ -4976,7 +4976,8 @@ fn handle_delete_batch(
                         // therefore left as the V1-compat sentinel `0`.
                         cluster_key: 0,
                     }
-                    .serialize(),
+                    .serialize()
+                    .into(),
                 };
                 let resp = handle_replica_batch(
                     &create_req,
@@ -5887,7 +5888,7 @@ fn handle_process_expired(
         request_id: req.request_id,
         op_code: crate::protocol::opcodes::OP_DELETE_BATCH,
         flags: req.flags,
-        payload: delete_payload,
+        payload: delete_payload.into(),
     };
     let delete_resp = handle_delete_batch(&delete_req, engine, max_batch, cluster, redo_log);
 
@@ -6806,7 +6807,7 @@ mod tests {
                 request_id: 1,
                 op_code,
                 flags: 0,
-                payload,
+                payload: payload.into(),
             };
             let mut conn_state = crate::server::ConnectionState::new();
             handle_request(
@@ -6830,7 +6831,7 @@ mod tests {
                 request_id: 1,
                 op_code,
                 flags: 0,
-                payload,
+                payload: payload.into(),
             };
             let mut conn_state = crate::server::ConnectionState::new();
             handle_request(
@@ -6854,7 +6855,7 @@ mod tests {
                 request_id: 1,
                 op_code,
                 flags: 0,
-                payload,
+                payload: payload.into(),
             };
             let mut conn_state = crate::server::ConnectionState::new();
             handle_request(
@@ -7478,7 +7479,7 @@ mod tests {
             request_id: 1,
             op_code: OP_STREAM_CHUNK,
             flags: 0,
-            payload: encode_stream_chunk(&txid, 0, &chunk1),
+            payload: encode_stream_chunk(&txid, 0, &chunk1).into(),
         };
         let resp1 = handle_request(
             &req1,
@@ -7505,7 +7506,7 @@ mod tests {
             request_id: 2,
             op_code: OP_STREAM_CHUNK,
             flags: 0,
-            payload: encode_stream_chunk(&txid, 800, &chunk2),
+            payload: encode_stream_chunk(&txid, 800, &chunk2).into(),
         };
         let resp2 = handle_request(
             &req2,
@@ -8100,7 +8101,7 @@ mod tests {
                 request_id: 1,
                 op_code,
                 flags: 0,
-                payload,
+                payload: payload.into(),
             };
             let mut conn_state = crate::server::ConnectionState::new();
             handle_request(
@@ -8929,7 +8930,7 @@ mod tests {
             request_id: shard as u64,
             op_code: OP_MIGRATION_COMPLETE,
             flags: 0,
-            payload,
+            payload: payload.into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -8984,7 +8985,7 @@ mod tests {
             request_id: shard as u64,
             op_code: OP_MIGRATION_COMPLETE,
             flags: 0,
-            payload: 0u64.to_le_bytes().to_vec(),
+            payload: 0u64.to_le_bytes().to_vec().into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -9046,7 +9047,7 @@ mod tests {
             request_id: shard as u64,
             op_code: OP_MIGRATION_COMPLETE,
             flags: 0,
-            payload,
+            payload: payload.into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -9101,7 +9102,7 @@ mod tests {
             request_id: shard as u64,
             op_code: OP_MIGRATION_COMPLETE,
             flags: 0,
-            payload,
+            payload: payload.into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -9157,7 +9158,8 @@ mod tests {
                 source_node_id: None,
                 cluster_key: 0,
             }
-            .serialize(),
+            .serialize()
+            .into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -9727,7 +9729,7 @@ mod tests {
             request_id: 7,
             op_code: OP_DELETE_BATCH,
             flags: 0,
-            payload,
+            payload: payload.into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -9753,7 +9755,7 @@ mod tests {
             request_id: 8,
             op_code: OP_ADMIN_CLUSTER_HEALTH,
             flags: 0,
-            payload: Vec::new(),
+            payload: Vec::new().into(),
         };
         let admin_resp = handle_request(
             &admin_req,
@@ -9789,7 +9791,7 @@ mod tests {
             request_id: 17,
             op_code: OP_ADMIN_CLUSTER_HEALTH,
             flags: 0,
-            payload: Vec::new(),
+            payload: Vec::new().into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -9820,7 +9822,7 @@ mod tests {
             request_id: 99,
             op_code: OP_ADMIN_CLUSTER_HEALTH,
             flags: 0,
-            payload: Vec::new(),
+            payload: Vec::new().into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -10049,7 +10051,7 @@ mod tests {
             request_id: shard as u64,
             op_code: OP_MIGRATION_COMPLETE,
             flags: 0,
-            payload,
+            payload: payload.into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -10121,7 +10123,7 @@ mod tests {
             request_id: shard as u64,
             op_code: OP_MIGRATION_COMPLETE,
             flags: 0,
-            payload,
+            payload: payload.into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -10183,7 +10185,7 @@ mod tests {
             request_id: shard as u64,
             op_code: OP_MIGRATION_COMPLETE,
             flags: 0,
-            payload,
+            payload: payload.into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -10245,7 +10247,7 @@ mod tests {
             request_id: shard as u64,
             op_code: OP_MIGRATION_COMPLETE,
             flags: 0,
-            payload,
+            payload: payload.into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -10305,7 +10307,7 @@ mod tests {
             request_id: shard as u64,
             op_code: OP_MIGRATION_COMPLETE,
             flags: 0,
-            payload,
+            payload: payload.into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -10363,7 +10365,7 @@ mod tests {
             request_id: shard as u64,
             op_code: OP_MIGRATION_COMPLETE,
             flags: FLAG_MIGRATION_VERIFY_ONLY,
-            payload,
+            payload: payload.into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -10425,7 +10427,7 @@ mod tests {
             request_id: shard as u64,
             op_code: OP_MIGRATION_COMPLETE,
             flags: 0,
-            payload,
+            payload: payload.into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -10481,7 +10483,7 @@ mod tests {
             request_id: shard as u64,
             op_code: OP_MIGRATION_COMPLETE,
             flags: 0,
-            payload,
+            payload: payload.into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -10538,7 +10540,7 @@ mod tests {
             request_id: 0,
             op_code: OP_MIGRATION_BATCH_COMPLETE,
             flags: 0,
-            payload,
+            payload: payload.into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -10570,7 +10572,7 @@ mod tests {
             request_id: 0,
             op_code: OP_MIGRATION_BATCH_COMPLETE,
             flags: 0,
-            payload,
+            payload: payload.into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(&req, &h.engine, 8192, None, None, &mut conn_state, None);
@@ -10624,7 +10626,7 @@ mod tests {
             request_id: 1,
             op_code: OP_TOPOLOGY_PROPOSE,
             flags: 0,
-            payload: propose.serialize(),
+            payload: propose.serialize().into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -10689,7 +10691,7 @@ mod tests {
             request_id: 1,
             op_code: OP_TOPOLOGY_PROPOSE,
             flags: 0,
-            payload: propose.serialize(),
+            payload: propose.serialize().into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -10745,7 +10747,7 @@ mod tests {
             request_id: 1,
             op_code: OP_TOPOLOGY_PROPOSE,
             flags: 0,
-            payload: propose.serialize(),
+            payload: propose.serialize().into(),
         };
         let mut conn_state = crate::server::ConnectionState::new();
         let resp = handle_request(
@@ -10771,7 +10773,7 @@ mod tests {
             request_id: 2,
             op_code: OP_TOPOLOGY_COMMIT,
             flags: 0,
-            payload: commit.serialize(),
+            payload: commit.serialize().into(),
         };
         let resp = handle_request(
             &req,
@@ -11947,7 +11949,7 @@ mod tests {
             request_id: 777,
             op_code: OP_SPEND_BATCH,
             flags: 0,
-            payload,
+            payload: payload.into(),
         };
 
         let spans = with_capture(|| {
@@ -11998,7 +12000,7 @@ mod tests {
             request_id: 888,
             op_code: OP_SPEND_BATCH,
             flags: 0,
-            payload,
+            payload: payload.into(),
         };
 
         let spans = with_capture(|| {
@@ -12981,7 +12983,7 @@ mod tests {
             request_id: 1,
             op_code: OP_CREATE_BATCH,
             flags: 0,
-            payload: encode_create_batch(&items),
+            payload: encode_create_batch(&items).into(),
         };
         let before_syncs = redo_dev.sync_count();
         let mut conn_state = crate::server::ConnectionState::new();
