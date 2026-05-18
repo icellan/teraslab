@@ -2367,6 +2367,7 @@ dependencies = [
  "libc",
  "mime_guess",
  "mio",
+ "nix",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",

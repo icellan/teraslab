@@ -9,6 +9,31 @@ use std::ops::{Deref, DerefMut};
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
+// Portable ioctl wrappers (C-1 / F-G1-012 / P3.3)
+// ---------------------------------------------------------------------------
+//
+// `nix::ioctl_read!` computes the correctly encoded ioctl request number for
+// the target triple at compile time, so the same call site works on 32-bit
+// Linux variants where the hard-coded numeric constants previously used here
+// were wrong (and `libc::ioctl` would silently `ENOTTY`).
+//
+//   Linux:
+//     BLKGETSIZE64        = _IOR(0x12, 114, size_t)
+//
+//   macOS:
+//     DKIOCGETBLOCKCOUNT  = _IOR('d', 25, u64)
+//     DKIOCGETBLOCKSIZE   = _IOR('d', 24, u32)
+
+#[cfg(target_os = "linux")]
+nix::ioctl_read!(blkgetsize64, 0x12, 114, u64);
+
+#[cfg(target_os = "macos")]
+nix::ioctl_read!(dkiocgetblockcount, b'd', 25, u64);
+
+#[cfg(target_os = "macos")]
+nix::ioctl_read!(dkiocgetblocksize, b'd', 24, u32);
+
+// ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
 
@@ -605,10 +630,14 @@ impl DirectDevice {
                 use std::os::unix::io::AsRawFd;
                 let fd = file.as_raw_fd();
                 let mut dev_size: u64 = 0;
-                // BLKGETSIZE64 = 0x80081272 — returns byte count as u64.
-                // Safety: fd is a valid open block device; dev_size is a
-                // properly-sized output variable for this ioctl.
-                let rc = unsafe { libc::ioctl(fd, 0x8008_1272 as libc::c_ulong, &mut dev_size) };
+                // Safety: fd is a valid open block device; `blkgetsize64`
+                // writes a single u64 into `dev_size`. The ioctl request
+                // number is computed at compile time from the
+                // `_IOR(0x12, 114, u64)` encoding, so this is portable to
+                // 32-bit Linux variants where the hand-encoded constant
+                // was wrong.
+                let rc = unsafe { blkgetsize64(fd, &mut dev_size) }
+                    .map_err(|e| DeviceError::Io(std::io::Error::from(e)))?;
                 if rc != 0 {
                     return Err(DeviceError::Io(std::io::Error::last_os_error()));
                 }
@@ -618,17 +647,17 @@ impl DirectDevice {
             {
                 use std::os::unix::io::AsRawFd;
                 let fd = file.as_raw_fd();
-                // DKIOCGETBLOCKCOUNT = 0x40086419  (returns u64 block count)
-                // DKIOCGETBLOCKSIZE  = 0x40046418  (returns u32 block size)
                 let mut block_count: u64 = 0;
                 let mut block_size: u32 = 0;
-                // Safety: fd is a valid open block device; the output
-                // variables are correctly sized for the respective ioctls.
-                let rc = unsafe { libc::ioctl(fd, 0x4008_6419 as libc::c_ulong, &mut block_count) };
+                // Safety: fd is a valid open block device; each ioctl
+                // writes exactly the typed scalar into its output variable.
+                let rc = unsafe { dkiocgetblockcount(fd, &mut block_count) }
+                    .map_err(|e| DeviceError::Io(std::io::Error::from(e)))?;
                 if rc != 0 {
                     return Err(DeviceError::Io(std::io::Error::last_os_error()));
                 }
-                let rc = unsafe { libc::ioctl(fd, 0x4004_6418 as libc::c_ulong, &mut block_size) };
+                let rc = unsafe { dkiocgetblocksize(fd, &mut block_size) }
+                    .map_err(|e| DeviceError::Io(std::io::Error::from(e)))?;
                 if rc != 0 {
                     return Err(DeviceError::Io(std::io::Error::last_os_error()));
                 }

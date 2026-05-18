@@ -97,6 +97,14 @@ tracing-opentelemetry = "0.32"
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
 
+# Portable ioctl wrappers for block-device size queries on Linux + macOS.
+# `nix::ioctl_read!` computes the correct encoded ioctl request number per
+# target (including 32-bit Linux variants where the hard-coded
+# `BLKGETSIZE64`/`DKIOCGETBLOCKCOUNT` integer constants in src/device.rs
+# would silently `ENOTTY`). See P3.3 / C-1 in `_review/follow_ups.md`.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["ioctl"] }
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 filetime = "0.2"
