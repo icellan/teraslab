@@ -6768,8 +6768,19 @@ mod tests {
     ///
     /// Creates an in-memory Engine with no network, no Docker. Tests handler
     /// logic directly by calling `handle_request()`.
+    ///
+    /// Every harness holds `metrics_test_lock` for its lifetime so the
+    /// process-wide `DISPATCH_METRICS` singleton is mutated by exactly one
+    /// test at a time. Without this, `snapshot_spend`/`snapshot_unspend`
+    /// delta math races against parallel dispatch tests that don't observe
+    /// metrics (~57 of the 72 harness sites). Holding the guard inside the
+    /// harness means callers cannot accidentally forget to take it — and
+    /// also means tests must NOT take `metrics_test_lock()` themselves
+    /// (stdlib `Mutex` is not re-entrant; doing so deadlocks on the same
+    /// thread).
     struct DispatchTestHarness {
         engine: Engine,
+        _metrics_guard: std::sync::MutexGuard<'static, ()>,
     }
 
     impl DispatchTestHarness {
@@ -6787,7 +6798,10 @@ mod tests {
             let dah = DahIndex::new();
             let unmined = UnminedIndex::new();
             let engine = Engine::new(dev, index, alloc, locks, dah, unmined);
-            Self { engine }
+            Self {
+                engine,
+                _metrics_guard: metrics_test_lock(),
+            }
         }
 
         /// Dispatch a request and return the response.
@@ -7533,7 +7547,6 @@ mod tests {
 
     #[test]
     fn dispatch_external_create_binds_record_to_blob_digest() {
-        let _guard = metrics_test_lock();
         let h = DispatchTestHarness::new();
         let blob_store = crate::storage::blobstore::MemoryBlobStore::new();
         let txid = DispatchTestHarness::make_txid(41);
@@ -7587,7 +7600,6 @@ mod tests {
 
     #[test]
     fn delete_external_blob_missing_rejects_before_wal_and_mutation() {
-        let _guard = metrics_test_lock();
         let mut h = DispatchTestHarness::new();
         let blob_store: Arc<dyn crate::storage::blobstore::BlobStore> =
             Arc::new(crate::storage::blobstore::MemoryBlobStore::new());
@@ -8676,11 +8688,11 @@ mod tests {
         use crate::cluster::shards::NodeId;
         use crate::cluster::shards::ShardTable;
 
-        // Hold the metrics lock so the global `operations` /
-        // `stale_routing_request_total` increments this test causes
-        // do not race with `prometheus_emits_operations_total_with_labels`
+        // DispatchTestHarness::new() holds metrics_test_lock for the
+        // harness lifetime, so the global `operations` /
+        // `stale_routing_request_total` increments this test causes do
+        // not race with `prometheus_emits_operations_total_with_labels`
         // (which compares a rendered snapshot against live counters).
-        let _metrics_guard = metrics_test_lock();
 
         let h = DispatchTestHarness::new();
         let txid = DispatchTestHarness::make_txid(91);
@@ -11002,7 +11014,6 @@ mod tests {
     /// utxo_hash. Assert the per-item counters advance by (3, 2, 0, 1).
     #[test]
     fn handle_spend_batch_increments_items_succeeded_and_failed() {
-        let _guard = metrics_test_lock();
         let m = test_metrics();
         let _ = test_histograms();
 
@@ -11060,7 +11071,6 @@ mod tests {
 
     #[test]
     fn pruned_utxo_spend_returns_original_spending_data() {
-        let _guard = metrics_test_lock();
         let h = DispatchTestHarness::new();
         let txid = DispatchTestHarness::make_txid(44);
         assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
@@ -11105,7 +11115,6 @@ mod tests {
     /// idempotent rather than succeeded or failed.
     #[test]
     fn handle_spend_batch_idempotent_counted_as_idempotent() {
-        let _guard = metrics_test_lock();
         let m = test_metrics();
         let _ = test_histograms();
 
@@ -11156,7 +11165,6 @@ mod tests {
     /// idempotent (already-unspent noop), or failed (hash mismatch).
     #[test]
     fn handle_unspend_batch_ticks_outcome_counters() {
-        let _guard = metrics_test_lock();
         let m = test_metrics();
         let _ = test_histograms();
 
@@ -11284,7 +11292,6 @@ mod tests {
     /// SetMined items should tick attempted/succeeded/failed per item.
     #[test]
     fn handle_set_mined_batch_ticks_outcome_counters() {
-        let _guard = metrics_test_lock();
         let m = test_metrics();
         let _ = test_histograms();
 
@@ -11329,7 +11336,6 @@ mod tests {
     /// and creates_failed once per item.
     #[test]
     fn handle_create_batch_ticks_outcome_counters() {
-        let _guard = metrics_test_lock();
         let m = test_metrics();
         let _ = test_histograms();
 
@@ -11403,7 +11409,6 @@ mod tests {
     /// Freeze items should tick freezes_succeeded / freezes_failed per item.
     #[test]
     fn handle_freeze_batch_ticks_outcome_counters() {
-        let _guard = metrics_test_lock();
         let m = test_metrics();
         let _ = test_histograms();
 
@@ -11440,7 +11445,6 @@ mod tests {
     /// Delete items should tick deletes_succeeded / deletes_failed per item.
     #[test]
     fn handle_delete_batch_ticks_outcome_counters() {
-        let _guard = metrics_test_lock();
         let m = test_metrics();
         let _ = test_histograms();
 
@@ -11468,7 +11472,6 @@ mod tests {
     /// `h.spend_latency` for every spend batch processed.
     #[test]
     fn dispatch_records_spend_latency_histogram() {
-        let _guard = metrics_test_lock();
         let _ = test_metrics();
         let hists = test_histograms();
 
@@ -11528,7 +11531,6 @@ mod tests {
     #[test]
     fn operations_table_counts_spend_ok_and_err() {
         use crate::metrics::{OpCode, Outcome};
-        let _guard = metrics_test_lock();
         let m = test_metrics();
         let _ = test_histograms();
 
@@ -11717,7 +11719,6 @@ mod tests {
     #[test]
     fn prometheus_emits_operations_total_with_labels() {
         use crate::metrics::{OpCode, Outcome};
-        let _guard = metrics_test_lock();
         let m = test_metrics();
         let _ = test_histograms();
 
