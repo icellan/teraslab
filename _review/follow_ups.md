@@ -39,25 +39,45 @@ work surfaced while fixing the reviewed findings.
   `#[must_use]` typestate variant is a follow-up if more callers land
   that genuinely need to split the footer-write from the CRC restamp.
 
-- **F-G1-003 atomic-chunk migration** — the BC-06/BC-07 fences are
-  documented and the CRC remains the safety net, but Rust's strict
-  memory model still flags the unsynchronised metadata read/write as
-  UB-on-paper. A future migration to `AtomicU64::load(Relaxed)` /
-  `AtomicU64::store(Relaxed)` for the metadata field chunks would make
-  the read/write legal racing access. Out of scope for this round
-  because the change touches every direct-path call site (ops/* G2
-  files), not just io.rs.
+- **F-G1-003 atomic-chunk migration — RESOLVED (FIXED, partial)** —
+  `read_metadata_direct`, `write_metadata_direct`, `read_utxo_slot_direct`,
+  and `write_utxo_slot_direct` in `src/io.rs` now perform the bulk
+  byte transfer through `AtomicU64::load(Relaxed)` / `store(Relaxed)`
+  chunks (with `AtomicU8` head/tail for misalignment) via the
+  `atomic_load_into` / `atomic_store_from` helpers. The pre-fix
+  `slice::from_raw_parts(_mut)` retag would race miri's data-race
+  detector against the concurrent writer/reader path in
+  `direct_read_write_concurrent_stress_never_returns_torn_data`;
+  the atomic chunked transfer eliminates the race at the abstract-
+  machine level. Public function signatures are unchanged so the G2
+  `ops/*` call sites are untouched.
 
-- **F-G1-004 MemoryDevice aliasing** — `data: RwLock<Vec<u8>>` paired
-  with `raw_ptr` aliases the same heap allocation, which is UB under
-  Stacked Borrows / Tree Borrows. Production picks one path at a time
-  via `as_raw_ptr().is_some()`, but `cargo miri` against the test
-  suite will fail. Recommendation was to either drop the lock and
-  route everything through `raw_ptr`, or drop `as_raw_ptr` for
-  `MemoryDevice`. Both are wider changes than the review-fix round's
-  surgical budget allows and would interact with G2 callers. Filed as
-  follow-up; F-G1-017 removed the parallel `raw_len` field so the
-  remaining aliasing concern is the only outstanding piece.
+  Still DEFERRED — the targeted "footer" helpers
+  (`write_mutation_footer_direct`, `write_spend_footer_direct`,
+  `write_mined_footer_direct`, `write_block_entry_direct`,
+  `write_crc_direct` and their `_and_crc_direct` wrappers) still use
+  non-atomic `ptr::copy_nonoverlapping` for the 1-21 byte field
+  edits. They are NOT exercised concurrently by any current miri
+  test (the stress test only uses `write_metadata_direct`), but in
+  production they race with the same atomic-chunked `read_*_direct`
+  paths. Atomicising those helpers is a wider change because each
+  field write needs to land at a field-aligned offset with its
+  field-specific width — leaving as a follow-up because the existing
+  test surface stays clean.
+
+- **F-G1-004 MemoryDevice aliasing — RESOLVED (FIXED)** — Option A:
+  `MemoryDevice` no longer holds `parking_lot::RwLock<Vec<u8>>`. The
+  backing allocation is acquired via `vec![...].into_boxed_slice()` +
+  `Box::into_raw`, stored as a raw `*mut u8` with a sibling `len: u64`,
+  and reconstituted into a `Box<[u8]>` inside a new `Drop` impl. The
+  pre-fix double-alias (Vec reborrow through the lock paired with the
+  live `raw_ptr`) is gone, so the Stacked-Borrows tag rooted at
+  `raw_ptr` survives the construction site. `pread` / `pwrite` rebuild
+  a short-lived slice from `raw_ptr` for each call instead of going
+  through the lock; the two `memory_device_lock_*_panic_*` tests now
+  exercise `parking_lot::RwLock` semantics on a side-instance and the
+  device's continued usability post-panic, with their comments
+  updated to match.
 
 - **F-G1-016 rollback coalesce** — review recommendation was to
   coalesce on rollback even though the allocator is single-threaded
