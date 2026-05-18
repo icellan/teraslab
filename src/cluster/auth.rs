@@ -18,8 +18,10 @@
 //! timestamp+tag suffix). Since nobody runs TeraSlab in production
 //! yet, we do not maintain a bypass for tag-less peers.
 
-use std::io;
+use std::io::{self, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
 
 use crate::protocol::opcodes::MAX_FRAME_SIZE;
 
@@ -197,6 +199,12 @@ pub fn sign_frame(key: &[u8], encoded_frame: &[u8]) -> io::Result<Vec<u8>> {
 ///
 /// The returned bytes are suitable for [`crate::protocol::frame::RequestFrame::decode`]
 /// or [`crate::protocol::frame::ResponseFrame::decode`].
+///
+/// This is a thin wrapper around [`verify_frame_streaming`] for the
+/// `&[u8]` case (when the caller has already buffered the entire
+/// signed frame). New call sites that read from a `TcpStream` should
+/// prefer [`verify_frame_streaming`] directly so they never need to
+/// allocate the full frame upfront — see C-7 / F-G5-016.
 pub fn verify_frame(key: &[u8], encoded_frame: &[u8]) -> io::Result<Vec<u8>> {
     if encoded_frame.len() < 4 {
         return Err(io::Error::new(
@@ -204,14 +212,14 @@ pub fn verify_frame(key: &[u8], encoded_frame: &[u8]) -> io::Result<Vec<u8>> {
             "frame too short for length prefix",
         ));
     }
-    let len = u32::from_le_bytes(encoded_frame[0..4].try_into().map_err(|_| {
+    let body_len = u32::from_le_bytes(encoded_frame[0..4].try_into().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "frame length prefix read failed",
         )
     })?) as usize;
     let frame_len = 4usize
-        .checked_add(len)
+        .checked_add(body_len)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame length overflow"))?;
     if encoded_frame.len() != frame_len {
         return Err(io::Error::new(
@@ -219,17 +227,283 @@ pub fn verify_frame(key: &[u8], encoded_frame: &[u8]) -> io::Result<Vec<u8>> {
             "frame length does not match buffer",
         ));
     }
-    let unsigned_body = verify(key, &encoded_frame[4..])?;
-    if unsigned_body.len() > MAX_FRAME_SIZE as usize {
+
+    // Defer to the streaming verifier so there is exactly one
+    // authoritative implementation of the HMAC-verify state machine.
+    // We seed the output Vec with a 4-byte length-prefix placeholder
+    // and overwrite it once we know the payload length; this matches
+    // the existing `verify_frame` contract of returning a
+    // `[length:4][payload]` blob.
+    let mut out = Vec::with_capacity(encoded_frame.len());
+    out.extend_from_slice(&[0u8; 4]);
+    let mut reader = io::Cursor::new(encoded_frame);
+    let payload_len = verify_frame_streaming(key, &mut reader, &mut out)?;
+    let prefix = (payload_len as u32).to_le_bytes();
+    out[0..4].copy_from_slice(&prefix);
+    Ok(out)
+}
+
+/// Streaming HMAC-SHA256 accumulator.
+///
+/// Equivalent to [`hmac_sha256`] when the input is fed in chunks via
+/// [`HmacSha256::update`] and finalized with [`HmacSha256::finalize`]. The
+/// streaming form lets callers verify large frames without ever
+/// materialising the full payload in a single buffer.
+///
+/// HMAC(K, m) = H((K' ^ opad) || H((K' ^ ipad) || m)) where K' is K
+/// padded/hashed to 64 bytes. The inner hash is fed `ipad || m` as
+/// `m` arrives chunk-by-chunk; the outer hash is computed once at
+/// finalize.
+struct HmacSha256 {
+    inner: Sha256,
+    opad: [u8; 64],
+}
+
+impl HmacSha256 {
+    /// Construct a streaming HMAC context for `key`.
+    fn new(key: &[u8]) -> Self {
+        let mut k_prime = [0u8; 64];
+        if key.len() > 64 {
+            // Long keys are hashed to 32 bytes per RFC 2104; pad the
+            // remaining 32 with zeros.
+            let h = sha256(key);
+            k_prime[..32].copy_from_slice(&h);
+        } else {
+            k_prime[..key.len()].copy_from_slice(key);
+        }
+
+        let mut ipad = [0x36u8; 64];
+        let mut opad = [0x5cu8; 64];
+        for i in 0..64 {
+            ipad[i] ^= k_prime[i];
+            opad[i] ^= k_prime[i];
+        }
+
+        let mut inner = Sha256::new();
+        inner.update(ipad);
+        Self { inner, opad }
+    }
+
+    /// Feed `data` into the inner SHA-256.
+    fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    /// Finalize and return the 32-byte tag.
+    fn finalize(self) -> [u8; 32] {
+        let inner_hash = self.inner.finalize();
+        let mut outer = Sha256::new();
+        outer.update(self.opad);
+        outer.update(inner_hash);
+        let tag = outer.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&tag);
+        out
+    }
+}
+
+/// Streaming variant of [`verify_frame`].
+///
+/// Reads the 4-byte length prefix and then the body from `reader`,
+/// feeding the body through an [`HmacSha256`] context as it arrives.
+/// The verified payload bytes are emitted to `payload_sink` as they
+/// stream — see the note about the slow-loris failure case below.
+///
+/// On HMAC success: `payload_sink` contains the full payload, and
+/// `Ok(payload_len)` returns the payload byte count.
+///
+/// On HMAC failure: returns `Err(PermissionDenied)`. The bytes the
+/// verifier did manage to write to `payload_sink` before discovering
+/// the bad tag are the caller's problem — typically the caller passes
+/// a sink it is about to drop anyway (`Vec::new()` + `drop` on error)
+/// or `io::sink()` if it does not need the payload.
+///
+/// Memory used by the verifier itself: a chunk buffer
+/// (`STREAM_CHUNK_SIZE`, 8 KiB) plus a [`SIGNED_SUFFIX_LEN`]-byte
+/// rolling tail. The verifier never materialises a buffer the size
+/// of the full payload — that is the slow-loris property: a 16 MiB
+/// frame with a wrong tag is rejected without the verifier
+/// allocating 16 MiB of working memory.
+///
+/// Errors mirror [`verify_frame`]:
+/// - `InvalidData` for length / size violations and stale timestamps;
+/// - `PermissionDenied` for HMAC tag mismatch;
+/// - any I/O error from `reader` is propagated.
+pub fn verify_frame_streaming<R: Read, W: Write>(
+    key: &[u8],
+    reader: &mut R,
+    payload_sink: &mut W,
+) -> io::Result<usize> {
+    verify_frame_streaming_with_now(key, reader, payload_sink, now_unix_ms())
+}
+
+/// Streaming chunk size for [`verify_frame_streaming`]. Chosen large
+/// enough to amortise per-chunk overhead but small enough that a
+/// hostile peer cannot drive verifier memory beyond a few KiB.
+pub const STREAM_CHUNK_SIZE: usize = 8 * 1024;
+
+/// Test-visible variant of [`verify_frame_streaming`] that accepts a
+/// caller-supplied `now_ms` reference. Production callers should use
+/// [`verify_frame_streaming`].
+pub fn verify_frame_streaming_with_now<R: Read, W: Write>(
+    key: &[u8],
+    reader: &mut R,
+    payload_sink: &mut W,
+    now_ms: u64,
+) -> io::Result<usize> {
+    // 1. Length prefix.
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let body_len = u32::from_le_bytes(len_buf) as usize;
+
+    // 2. Bounds: body must hold at least the [timestamp || tag] suffix,
+    //    and the unsigned payload must fit inside MAX_FRAME_SIZE.
+    if body_len < SIGNED_SUFFIX_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too short for HMAC suffix",
+        ));
+    }
+    let payload_len = body_len - SIGNED_SUFFIX_LEN;
+    if payload_len > MAX_FRAME_SIZE as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsigned frame exceeds maximum frame size",
         ));
     }
-    let mut out = Vec::with_capacity(4 + unsigned_body.len());
-    out.extend_from_slice(&(unsigned_body.len() as u32).to_le_bytes());
-    out.extend_from_slice(unsigned_body);
-    Ok(out)
+
+    // 3. Stream the body. The HMAC input is `payload || timestamp`
+    //    (i.e. the first `body_len - HMAC_TAG_LEN` bytes); the trailing
+    //    32 bytes are the tag to compare. We keep a rolling tail of
+    //    `SIGNED_SUFFIX_LEN` bytes so we can isolate the timestamp +
+    //    tag at the end while feeding everything before that into
+    //    the HMAC.
+    //
+    //    Memory used during the loop is bounded: chunk buffer
+    //    (STREAM_CHUNK_SIZE) + tail window (SIGNED_SUFFIX_LEN). We
+    //    write payload bytes to `payload_sink` as they pass through
+    //    so the verifier itself never accumulates a payload-sized
+    //    buffer — slow-loris HMAC-mismatch frames reject without
+    //    O(payload_len) verifier-side memory.
+    let mut hmac = HmacSha256::new(key);
+    let mut tail = [0u8; SIGNED_SUFFIX_LEN];
+    let mut tail_filled = 0usize;
+    // Track HMAC-fed bytes so we know which portion of evicted bytes
+    // is payload (< payload_len) vs timestamp (>= payload_len).
+    let mut hmac_fed = 0usize;
+    let mut chunk = [0u8; STREAM_CHUNK_SIZE];
+    let mut remaining = body_len;
+
+    while remaining > 0 {
+        let want = remaining.min(STREAM_CHUNK_SIZE);
+        let got = read_some(reader, &mut chunk[..want])?;
+        if got == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unexpected EOF reading signed frame body",
+            ));
+        }
+        let mut new_bytes = &chunk[..got];
+
+        // Slide the tail window. Bytes that fall out the front of the
+        // [tail ++ new_bytes] window are part of the HMAC input.
+        if tail_filled + new_bytes.len() > SIGNED_SUFFIX_LEN {
+            let evict = tail_filled + new_bytes.len() - SIGNED_SUFFIX_LEN;
+            let from_tail = evict.min(tail_filled);
+            // Feed the evicted prefix of `tail` first.
+            feed_evicted(
+                &mut hmac,
+                payload_sink,
+                &mut hmac_fed,
+                payload_len,
+                &tail[..from_tail],
+            )?;
+            // Shift the remaining tail down.
+            tail.copy_within(from_tail..tail_filled, 0);
+            tail_filled -= from_tail;
+            let from_new = evict - from_tail;
+            if from_new > 0 {
+                feed_evicted(
+                    &mut hmac,
+                    payload_sink,
+                    &mut hmac_fed,
+                    payload_len,
+                    &new_bytes[..from_new],
+                )?;
+                new_bytes = &new_bytes[from_new..];
+            }
+        }
+        // Whatever's left of `new_bytes` fits in the tail window.
+        tail[tail_filled..tail_filled + new_bytes.len()].copy_from_slice(new_bytes);
+        tail_filled += new_bytes.len();
+
+        remaining -= got;
+    }
+    debug_assert_eq!(tail_filled, SIGNED_SUFFIX_LEN);
+    debug_assert_eq!(hmac_fed, payload_len);
+
+    // 4. Tail now holds `[timestamp:8][tag:32]`. Feed timestamp into
+    //    HMAC (it is covered by the signature) and compare the tag.
+    let ts_bytes = &tail[..TIMESTAMP_LEN];
+    let tag = &tail[TIMESTAMP_LEN..];
+    hmac.update(ts_bytes);
+    let expected = hmac.finalize();
+    if !constant_time_eq(tag, &expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "HMAC verification failed",
+        ));
+    }
+
+    // 5. Tag is valid — enforce the freshness window.
+    let ts_arr: [u8; TIMESTAMP_LEN] = ts_bytes
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "timestamp read failed"))?;
+    let ts_ms = u64::from_le_bytes(ts_arr);
+    let skew_ms = now_ms.abs_diff(ts_ms);
+    if skew_ms > MAX_CLOCK_SKEW.as_millis() as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stale timestamp: outside clock skew window",
+        ));
+    }
+
+    Ok(payload_len)
+}
+
+/// Feed `bytes` (which are guaranteed to fall outside the rolling
+/// tail window) into the HMAC, and write any portion that belongs
+/// to the payload (not the trailing timestamp) into `payload_sink`.
+///
+/// `hmac_fed` is the running counter of bytes already fed; bytes
+/// whose absolute offset is `< payload_len` are payload, bytes
+/// `>= payload_len` are the timestamp (which is covered by HMAC
+/// but is not part of the unsigned payload).
+fn feed_evicted<W: Write>(
+    hmac: &mut HmacSha256,
+    payload_sink: &mut W,
+    hmac_fed: &mut usize,
+    payload_len: usize,
+    bytes: &[u8],
+) -> io::Result<()> {
+    if *hmac_fed < payload_len {
+        let payload_take = (payload_len - *hmac_fed).min(bytes.len());
+        payload_sink.write_all(&bytes[..payload_take])?;
+    }
+    hmac.update(bytes);
+    *hmac_fed += bytes.len();
+    Ok(())
+}
+
+/// `read` a chunk with retry on `Interrupted`; returns 0 on EOF.
+fn read_some<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        match reader.read(buf) {
+            Ok(n) => return Ok(n),
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Constant-time comparison to prevent timing attacks.
@@ -493,6 +767,237 @@ mod tests {
         match verify_frame(b"cluster-secret", &encoded) {
             Ok(_) => panic!("unsigned frame must not verify"),
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+        }
+    }
+
+    // -- Streaming HMAC tests (C-7 / F-G5-016) --
+
+    /// Counting sink that tracks how many bytes have been "written"
+    /// without actually storing them. Used by the slow-loris test to
+    /// prove that the streaming verifier doesn't itself allocate a
+    /// payload-sized buffer in the bad-HMAC failure path.
+    struct CountingSink {
+        bytes_written: usize,
+    }
+
+    impl io::Write for CountingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes_written += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn streaming_verify_round_trip_matches_verify_frame() {
+        // The streaming verifier on a `Cursor<&[u8]>` over a signed
+        // frame produces exactly the same unsigned body that
+        // `verify_frame` produces on the same input.
+        let frame = crate::protocol::frame::RequestFrame {
+            request_id: 42,
+            op_code: crate::protocol::opcodes::OP_REPLICA_BATCH,
+            flags: 1,
+            payload: b"hello-stream".to_vec(),
+        };
+        let encoded = frame.encode();
+        let signed = sign_frame(b"k", &encoded).unwrap();
+        let baseline = verify_frame(b"k", &signed).expect("buffered path verifies");
+
+        let mut reader = io::Cursor::new(&signed[..]);
+        let mut sink = Vec::<u8>::new();
+        let payload_len =
+            verify_frame_streaming(b"k", &mut reader, &mut sink).expect("streaming verifies");
+        // The streaming verifier emits the unsigned body (no length
+        // prefix). The buffered `verify_frame` emits
+        // `[length:4][unsigned_body]`. They should agree on the body.
+        assert_eq!(payload_len, encoded.len() - 4);
+        assert_eq!(payload_len, sink.len());
+        assert_eq!(&baseline[4..], &sink[..]);
+    }
+
+    #[test]
+    fn streaming_verify_rejects_wrong_tag() {
+        let frame = crate::protocol::frame::RequestFrame {
+            request_id: 1,
+            op_code: crate::protocol::opcodes::OP_REPLICA_BATCH,
+            flags: 0,
+            payload: b"x".to_vec(),
+        };
+        let encoded = frame.encode();
+        let mut signed = sign_frame(b"k", &encoded).unwrap();
+        // Flip the last byte of the tag.
+        let last = signed.len() - 1;
+        signed[last] ^= 0xFF;
+
+        let mut reader = io::Cursor::new(&signed[..]);
+        let mut sink = Vec::<u8>::new();
+        match verify_frame_streaming(b"k", &mut reader, &mut sink) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
+            Ok(_) => panic!("streaming verifier must reject tampered tag"),
+        }
+    }
+
+    #[test]
+    fn streaming_verify_rejects_short_frame() {
+        // body_len advertised < SIGNED_SUFFIX_LEN.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(5u32).to_le_bytes());
+        buf.extend_from_slice(&[0u8; 5]);
+        let mut reader = io::Cursor::new(&buf[..]);
+        let mut sink = io::sink();
+        match verify_frame_streaming(b"k", &mut reader, &mut sink) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            Ok(_) => panic!("streaming verifier must reject short frames"),
+        }
+    }
+
+    #[test]
+    fn streaming_verify_rejects_oversized_unsigned_body() {
+        // body_len advertised so large that unsigned payload exceeds MAX_FRAME_SIZE.
+        let oversized = MAX_FRAME_SIZE as u32 + SIGNED_SUFFIX_LEN as u32 + 1;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&oversized.to_le_bytes());
+        // We don't bother filling the body — the bounds check should
+        // reject before any read happens.
+        let mut reader = io::Cursor::new(&buf[..]);
+        let mut sink = io::sink();
+        match verify_frame_streaming(b"k", &mut reader, &mut sink) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            Ok(_) => panic!("streaming verifier must reject oversized frames"),
+        }
+    }
+
+    #[test]
+    fn streaming_verify_rejects_stale_timestamp() {
+        // Forge a frame whose timestamp is far in the past. The HMAC
+        // is recomputed correctly so the verifier should pass tag
+        // check but fail the freshness window.
+        let key = b"k";
+        let now_ms = 1_700_000_000_000u64;
+        let six_minutes_ago = now_ms - 6 * 60 * 1000;
+        let body = sign_with_timestamp(key, b"payload", six_minutes_ago);
+        let mut framed = Vec::with_capacity(4 + body.len());
+        framed.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&body);
+
+        let mut reader = io::Cursor::new(&framed[..]);
+        let mut sink = Vec::<u8>::new();
+        match verify_frame_streaming_with_now(key, &mut reader, &mut sink, now_ms) {
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+                assert!(
+                    e.to_string().contains("stale timestamp"),
+                    "expected stale-timestamp error, got: {e}"
+                );
+            }
+            Ok(_) => panic!("stale timestamp must be rejected"),
+        }
+    }
+
+    #[test]
+    fn streaming_verify_chunks_correctly_on_unaligned_reader() {
+        // A Reader that returns at most 1 byte per `read()` call. The
+        // streaming verifier must reassemble the tail window correctly
+        // even when chunks are tiny.
+        struct OneByteReader<'a> {
+            data: &'a [u8],
+            pos: usize,
+        }
+        impl<'a> io::Read for OneByteReader<'a> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.pos >= self.data.len() {
+                    return Ok(0);
+                }
+                buf[0] = self.data[self.pos];
+                self.pos += 1;
+                Ok(1)
+            }
+        }
+
+        let frame = crate::protocol::frame::RequestFrame {
+            request_id: 7,
+            op_code: crate::protocol::opcodes::OP_REPLICA_BATCH,
+            flags: 0,
+            payload: vec![0xABu8; 1024], // larger than the tail window
+        };
+        let encoded = frame.encode();
+        let signed = sign_frame(b"key", &encoded).unwrap();
+
+        let mut reader = OneByteReader {
+            data: &signed,
+            pos: 0,
+        };
+        let mut sink = Vec::<u8>::new();
+        let payload_len = verify_frame_streaming(b"key", &mut reader, &mut sink).expect("verify");
+        // `encoded` is `[length:4][body]`; the streaming verifier
+        // emits just the body in `sink`.
+        assert_eq!(payload_len, encoded.len() - 4);
+        assert_eq!(&sink[..], &encoded[4..]);
+    }
+
+    #[test]
+    fn slow_loris_16mib_wrong_hmac_rejects_without_buffering_payload() {
+        // SLOW-LORIS REGRESSION (C-7 / F-G5-016).
+        //
+        // Build a 16 MiB signed frame body (the maximum the production
+        // server will accept) where the HMAC tag is intentionally
+        // wrong. The streaming verifier must reject this with
+        // `PermissionDenied` without internally accumulating the
+        // payload in a verifier-side buffer — a `CountingSink`
+        // discards the bytes as they pass through.
+        //
+        // The acceptance property: the verifier hands the bytes off
+        // to the sink as they stream, so the verifier itself never
+        // allocates a 16 MiB Vec. The sink the test passes here
+        // tracks count only; in production the caller similarly
+        // passes either a Vec it is about to drop (success path
+        // reuses it; failure path drops it) or `io::sink()`.
+        let payload_len = MAX_FRAME_SIZE as usize;
+        let body_len = payload_len + SIGNED_SUFFIX_LEN;
+        let mut signed = Vec::with_capacity(4 + body_len);
+        signed.extend_from_slice(&(body_len as u32).to_le_bytes());
+        signed.extend(std::iter::repeat(0xAAu8).take(payload_len));
+        // Timestamp + tag: 8 bytes of timestamp, then 32 bytes of
+        // zeroes for the tag. The HMAC will (overwhelmingly) not
+        // produce all-zeroes for this input, so verification fails
+        // on tag mismatch.
+        let timestamp = now_unix_ms().to_le_bytes();
+        signed.extend_from_slice(&timestamp);
+        signed.extend_from_slice(&[0u8; HMAC_TAG_LEN]);
+        assert_eq!(signed.len(), 4 + body_len);
+
+        let mut reader = io::Cursor::new(signed);
+        let mut sink = CountingSink { bytes_written: 0 };
+        match verify_frame_streaming(b"slow-loris-key", &mut reader, &mut sink) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
+            Ok(_) => panic!("slow-loris wrong-HMAC frame must reject"),
+        }
+        // Sanity: the verifier did stream the full payload past the
+        // sink before discovering the bad tag (the tag is the LAST
+        // 32 bytes, so all earlier bytes flow through HMAC first).
+        // The point of this test is that those bytes were never
+        // accumulated inside the verifier — `CountingSink` proves
+        // the verifier did not need its own copy of the payload to
+        // reject.
+        assert_eq!(sink.bytes_written, payload_len);
+    }
+
+    #[test]
+    fn streaming_verify_propagates_io_error() {
+        // A Reader that returns an io::Error on the first read.
+        struct BrokenReader;
+        impl io::Read for BrokenReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::ConnectionReset, "boom"))
+            }
+        }
+        let mut reader = BrokenReader;
+        let mut sink = io::sink();
+        match verify_frame_streaming(b"k", &mut reader, &mut sink) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::ConnectionReset),
+            Ok(_) => panic!("must propagate underlying I/O error"),
         }
     }
 

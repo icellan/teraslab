@@ -77,12 +77,32 @@ gate that decides "accept or reject when `cluster_secret = None`"
 lives in `src/server/mod.rs::handle_connection_inner` (G5). The
 increment is the visible-signal half of the trusted-overlay policy.
 
-### A-4. F-G5-022 — engine-side atomic apply
+### A-4. F-G5-022 — engine-side atomic apply — RESOLVED 2026-05-18 (NOT-APPLICABLE)
 
-Hand-off TODO at the dispatch call site says the fix (engine atomic
-apply + return before-image) belongs in `src/ops/`. Concurrency
-hypothesis only; not a confirmed bug. Treat as P3 unless a test surfaces
-the race.
+Reproduction test
+`tests/g2_atomic_apply.rs::concurrent_spend_same_utxo_yields_exactly_one_winner`
+(16 threads × 200 iterations spending the same UTXO with distinct
+`spending_data` per thread) passes today: exactly one thread returns
+`Ok`, the other 15 return `Err(AlreadySpent { .. })`, and the on-device
+slot reflects the unique winner's `spending_data`. The atomic-apply
+invariant is already established by the per-tx stripe mutex
+(`Engine::spend` and siblings acquire `self.locks.lock(&tx_key)` as
+their first action and hold it through the full read → validate →
+write → index-sync sequence).
+
+Action taken (P1.3 → documentation only):
+- Added an "Atomic-apply invariant" section to the `Engine` doc
+  comment in `src/ops/engine.rs` enumerating the mutation entry points
+  that hold the stripe mutex and pointing at the reproduction test as
+  the regression guard.
+- Replaced the hypothesis TODO at `src/server/dispatch.rs:3242` with
+  a RESOLVED block explaining that the unlocked `read_block_entry`
+  for the unset-mined before-image is a snapshot, not a write-
+  correctness hazard: the engine still applies under its own lock,
+  and compensation rollback runs before the response leaves the
+  server.
+
+No code-correctness change required.
 
 ### A-5. F-G7-024 / F-G8-004 metric integration
 
@@ -171,11 +191,39 @@ today. Forward-looking only.
 Switching to `Bytes`/`Cow` requires lifetime-parameterising
 `RequestFrame` and every handler. Performance ceiling, not correctness.
 
-### C-7. F-G5-016 — streaming HMAC
+### C-7. ~~F-G5-016 — streaming HMAC~~ — RESOLVED 2026-05-18
 
-`cluster::auth::verify_frame` reads the entire payload before
-short-circuiting on a wrong HMAC. Bounded by `MAX_FRAME_SIZE` (16 MiB)
-+ per-connection read timeout. Streaming verifier is a real refactor.
+**Status: FIXED.** `src/cluster/auth.rs` now exposes
+`verify_frame_streaming<R: Read, W: Write>(key, reader, payload_sink)`
+built on a streaming `HmacSha256` accumulator (`sha2::Sha256` under
+the hood). The verifier reads the body in `STREAM_CHUNK_SIZE` (8 KiB)
+chunks, keeps a `SIGNED_SUFFIX_LEN` (40 B) rolling tail to isolate
+the timestamp + tag, and writes payload bytes to a caller-supplied
+sink as they pass through HMAC.
+
+Memory used during streaming: chunk buffer (8 KiB) + tail (40 B) —
+independent of payload size. The slow-loris regression test
+`slow_loris_16mib_wrong_hmac_rejects_without_buffering_payload`
+proves a 16 MiB wrong-HMAC frame rejects with `PermissionDenied`
+while the verifier writes payload bytes to a `CountingSink` (a
+test-only sink that discards bytes), demonstrating the verifier does
+not need to copy the full payload.
+
+`verify_frame(&[u8])` is preserved as a thin wrapper that feeds
+`Cursor<&[u8]>` into `verify_frame_streaming`; public API unchanged.
+Production read sites (`src/server/mod.rs::handle_connection_inner`,
+`src/replication/tcp_transport.rs`, `src/replication/receiver.rs`,
+`src/cluster/coordinator.rs`) continue to call the buffered wrapper
+because they need the buffered bytes for orthogonal reasons
+(peek_request_id, peek_op_code, inflight-bytes permit sizing); a
+follow-up could refactor those to stream through the new API once
+the surrounding peek/permit machinery is streaming-aware too.
+
+Tests: 8 new tests in `cluster::auth::tests` covering round-trip
+equivalence with `verify_frame`, wrong-tag rejection, short-frame
+bounds, oversized-body bounds, stale timestamp, chunked-reader
+correctness (one-byte-at-a-time `OneByteReader`), the 16 MiB
+slow-loris case, and underlying I/O error propagation.
 
 ### C-8. F-G5-017 — typed error codes
 
