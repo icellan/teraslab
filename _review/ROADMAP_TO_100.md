@@ -241,12 +241,17 @@ mergeable.
   baseline `c87339c`.
 - **Size**: M.
 
-### P3.7 — F-G7-018 — WriteMajority early-return via mpsc
+### P3.7 — F-G7-018 — WriteMajority early-return via mpsc — RESOLVED 2026-05-18
 
-- **What**: `wait_majority` currently joins all replicas. mpsc let
-  first M acks fire; remaining join in background.
-- **Acceptance**: P99 latency under one-slow-replica fault drops by
-  ≥30 % in `tests/e2e_workload.rs`.
+- **What**: `replicate_batch` joined all live replicas before
+  returning; one slow follower dominated tail latency. Switched to
+  detached worker threads + per-batch mpsc; master returns on first M
+  ACKs, stragglers complete in background and the next batch joins
+  them.
+- **Acceptance**: `tests/replication_tcp.rs::write_majority_early_return_*`
+  prove 3-replica fan-out with one 500ms-slow replica returns in
+  ~5ms; before this fix the path waited 500ms (100x worse). Full
+  details in `_review/follow_ups.md` C-10.
 - **Size**: M.
 
 ### P3.8 — F-G1-002 typestate guard
