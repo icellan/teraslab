@@ -238,3 +238,15 @@ Added this session — see for ordered execution plan.
 - **B-***: telemetry / config wire-up (functional but not visible / not enforced). P2.
 - **C-***: deferred perf or refactor (no current correctness risk). P3.
 - **D-***: doc / repo hygiene. P4.
+
+---
+
+## From P1.2 / P2.1 / P2.2 (G5 + G6 + G7 touch)
+
+- **`InflightBytesLimiter::record_rejection` is sync-only** — the P2.2
+  bump path is a single `fetch_add` on the per-thread counter reached
+  through `DISPATCH_METRICS`. If `init_dispatch_metrics` has not run
+  (single-binary tests bypass startup), the bump is a no-op. All
+  production paths init it; documented at the call site. Footgun
+  surfaces only if a second test harness asserts on this counter
+  without calling `init_dispatch_metrics`.

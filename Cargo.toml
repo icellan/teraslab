@@ -56,6 +56,14 @@ ctrlc = { version = "3", features = ["termination"] }
 getrandom = "0.2"
 libc = "0.2"
 mime_guess = "2"
+# Event-driven accept loop wake-up for graceful shutdown. The TCP listener
+# and a self-pipe are registered with `mio::Poll`; flipping the shutdown
+# flag writes a byte to the pipe so the loop wakes within microseconds
+# instead of waiting for the next 10 ms `thread::sleep` tick. `mio` is a
+# small (~10k LOC), zero-dep epoll/kqueue wrapper already in the tokio
+# transitive graph, so promoting it to a direct dep does not enlarge the
+# build. See P1.2 in `_review/ROADMAP_TO_100.md`.
+mio = { version = "1", features = ["os-poll", "net"] }
 parking_lot = "0.12"
 redb = "2"
 ratatui = "0.29"

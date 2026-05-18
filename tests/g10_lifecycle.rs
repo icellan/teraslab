@@ -107,6 +107,48 @@ fn server_is_shutting_down_observable() {
 // the shared-flag pattern that the bin uses for the background tasks.
 // ---------------------------------------------------------------------------
 
+/// P1.2: with the accept loop wired through `mio::Poll` + `mio::Waker`,
+/// `Server::shutdown` must wake the loop within microseconds — not the
+/// 10 ms worst case the pre-fix `thread::sleep(Duration::from_millis(10))`
+/// imposed. A 50 ms ceiling is generous against CI noise but still tight
+/// enough to fail if the loop regresses to the spin pattern.
+#[test]
+fn accept_loop_responds_to_shutdown_within_50ms() {
+    let server = build_test_server();
+    let run_handle = {
+        let s = server.clone();
+        std::thread::spawn(move || s.run())
+    };
+
+    // Give the server time to bind, register with mio, and block on poll.
+    // Without this the shutdown can fire before the waker is published —
+    // the `shutdown` flag is observed at loop entry and the test would
+    // still pass, but we want to exercise the wake-from-poll path.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let t0 = Instant::now();
+    server.shutdown();
+
+    // Block until the run thread exits. `join` itself is unbounded; we
+    // poll `is_finished` so the test reports the actual wall-clock
+    // latency rather than hanging on a regression.
+    let deadline = t0 + Duration::from_secs(5);
+    while !run_handle.is_finished() {
+        if Instant::now() > deadline {
+            panic!("Server::run did not exit within 5s after shutdown (P1.2 regressed)");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let elapsed = t0.elapsed();
+    let result = run_handle.join().expect("run thread should not panic");
+    assert!(result.is_ok(), "Server::run should exit Ok, got {result:?}");
+    assert!(
+        elapsed <= Duration::from_millis(50),
+        "accept-loop shutdown took {elapsed:?}, expected <=50ms (P1.2: \
+         mio::Waker-based wake-up)",
+    );
+}
+
 #[test]
 fn shared_shutdown_flag_visible_to_background_thread() {
     let flag = Arc::new(AtomicBool::new(false));

@@ -2366,6 +2366,7 @@ dependencies = [
  "io-uring",
  "libc",
  "mime_guess",
+ "mio",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",

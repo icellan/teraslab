@@ -68,13 +68,25 @@ impl InflightBytesLimiter {
             });
         }
         if bytes > self.limit {
+            // P2.2: per-request size exceeds the entire aggregate cap — a
+            // single frame can never be admitted. Counted as a rejection.
+            Self::record_rejection();
             return None;
         }
 
         let mut observed = self.used.load(Ordering::Relaxed);
         loop {
-            let next = observed.checked_add(bytes)?;
+            let Some(next) = observed.checked_add(bytes) else {
+                // Arithmetic overflow on the cumulative byte count. Tens
+                // of millions of in-flight frames before this can happen;
+                // still classify as a rejection rather than silently
+                // dropping the signal.
+                Self::record_rejection();
+                return None;
+            };
             if next > self.limit {
+                // The aggregate cap would be exceeded; reject + record.
+                Self::record_rejection();
                 return None;
             }
             match self.used.compare_exchange_weak(
@@ -91,6 +103,18 @@ impl InflightBytesLimiter {
                 }
                 Err(actual) => observed = actual,
             }
+        }
+    }
+
+    /// P2.2: bump `ThreadMetrics::inflight_bytes_rejected_total` on the
+    /// rejection path. Uses the same `DISPATCH_METRICS` handle every
+    /// other dispatch counter site uses (see `dispatch_metrics_handle`),
+    /// so the counter ticks at the same per-thread cost (~1 ns
+    /// `fetch_add`) as the existing operation counters.
+    #[inline]
+    fn record_rejection() {
+        if let Some(m) = crate::server::dispatch::dispatch_metrics_handle() {
+            m.inflight_bytes_rejected_total.inc();
         }
     }
 
@@ -156,6 +180,13 @@ pub struct Server {
     shutdown: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
     inflight_request_bytes: Arc<InflightBytesLimiter>,
+    /// P1.2: mio `Waker` that, when triggered, wakes the accept-loop
+    /// poller (kqueue on macOS / epoll on Linux). Populated by
+    /// [`Server::run`] just before entering the loop and consumed by
+    /// [`Server::shutdown`]. Pre-fix the loop relied on
+    /// `thread::sleep(10ms)` between `accept()` retries, burning CPU on
+    /// idle listeners and slowing shutdown to one sleep-tick.
+    shutdown_waker: Mutex<Option<Arc<mio::Waker>>>,
 }
 
 impl Server {
@@ -172,6 +203,7 @@ impl Server {
             shutdown: Arc::new(AtomicBool::new(false)),
             active_connections: Arc::new(AtomicUsize::new(0)),
             inflight_request_bytes,
+            shutdown_waker: Mutex::new(None),
         }
     }
 
@@ -205,88 +237,184 @@ impl Server {
 
     /// Start listening for client connections. Blocks until shutdown.
     pub fn run(&self) -> Result<(), String> {
-        let listener = TcpListener::bind(&self.config.listen_addr)
+        // P1.2: bind once with the std listener (it owns the SO_REUSEADDR /
+        // bind-error reporting we already surface in tests), then convert
+        // to a mio source. mio requires the FD to be non-blocking, which
+        // `TcpListener::bind` defaults to *blocking*; flip it before
+        // registering.
+        let std_listener = TcpListener::bind(&self.config.listen_addr)
             .map_err(|e| format!("failed to bind {}: {e}", self.config.listen_addr))?;
-
-        // Set non-blocking so we can check shutdown flag
-        listener
+        std_listener
             .set_nonblocking(true)
             .map_err(|e| format!("failed to set non-blocking: {e}"))?;
+        let mut mio_listener = mio::net::TcpListener::from_std(std_listener);
+
+        // P1.2: build the poller and register both the listener and a
+        // `Waker` (self-pipe abstraction on Linux/macOS — eventfd or
+        // pipe2). `Server::shutdown` calls `Waker::wake`, which posts a
+        // readiness event; the loop exits within microseconds rather than
+        // waiting for the next 10 ms `thread::sleep` tick.
+        const LISTENER_TOKEN: mio::Token = mio::Token(0);
+        const SHUTDOWN_TOKEN: mio::Token = mio::Token(1);
+        let mut poll = mio::Poll::new().map_err(|e| format!("mio::Poll::new: {e}"))?;
+        poll.registry()
+            .register(&mut mio_listener, LISTENER_TOKEN, mio::Interest::READABLE)
+            .map_err(|e| format!("register listener: {e}"))?;
+        let waker = Arc::new(
+            mio::Waker::new(poll.registry(), SHUTDOWN_TOKEN)
+                .map_err(|e| format!("mio::Waker::new: {e}"))?,
+        );
+        // Publish the waker so `Server::shutdown` can wake the loop.
+        // Stored before the loop starts so a fast `shutdown()` immediately
+        // after `run()` enters cannot race past an empty handle. If
+        // `shutdown()` ran *before* publish, the `shutdown` flag is
+        // already true and the initial `if shutdown.load(...)` check
+        // below short-circuits.
+        *self.shutdown_waker.lock() = Some(waker.clone());
+        // Pre-allocate the event buffer outside the loop.
+        let mut events = mio::Events::with_capacity(16);
 
         tracing::info!(listen_addr = %self.config.listen_addr, "TeraSlab server listening");
 
-        while !self.shutdown.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((mut stream, addr)) => {
-                    let active = self.active_connections.load(Ordering::Relaxed);
-                    if active >= self.config.max_connections {
-                        tracing::warn!(peer_addr = %addr, active, "rejecting connection: max connections reached");
-                        let _ = stream.set_write_timeout(Some(CONNECTION_WRITE_TIMEOUT));
-                        let response = ResponseFrame {
-                            request_id: 0,
-                            status: STATUS_ERROR,
-                            payload: encode_error_payload(ERR_INTERNAL, "max connections reached"),
-                        };
-                        let _ = stream.write_all(&response.encode());
-                        drop(stream);
-                        continue;
+        'accept_loop: while !self.shutdown.load(Ordering::Relaxed) {
+            // Block until either the listener becomes readable or the
+            // waker fires. `None` timeout means "wait forever"; the
+            // waker guarantees we'll wake on shutdown, so there is no
+            // CPU spin on an idle listener.
+            if let Err(e) = poll.poll(&mut events, None) {
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(format!("mio poll: {e}"));
+            }
+            let mut listener_ready = false;
+            for event in events.iter() {
+                match event.token() {
+                    LISTENER_TOKEN => listener_ready = true,
+                    SHUTDOWN_TOKEN => {
+                        // Waker fired — re-check the flag at the top of
+                        // the loop. Spurious wakeups are harmless.
                     }
-
-                    self.active_connections.fetch_add(1, Ordering::Relaxed);
-
-                    let engine = self.engine.clone();
-                    let shutdown = self.shutdown.clone();
-                    let active_conns = self.active_connections.clone();
-                    let max_batch = self.config.max_batch_size;
-                    let max_stream_total_bytes = self.config.max_stream_total_bytes;
-                    let cluster = self.cluster.clone();
-                    let redo_log = self.redo_log.clone();
-                    let blob_store = self.blob_store.clone();
-                    let inflight_request_bytes = self.inflight_request_bytes.clone();
-                    let cluster_secret = self
-                        .config
-                        .cluster_secret
-                        .as_ref()
-                        .map(|s| Arc::new(s.as_bytes().to_vec()));
-                    // F-G5-001 (CRITICAL): wire G10's `ServerConfig::strict_auth`
-                    // into the connection-handler options. When `true`, any
-                    // inter-node opcode that arrives without a `cluster_secret`
-                    // is rejected with `ERR_CLUSTER_AUTH_FAILED`. Default
-                    // remains `false` (trusted-overlay) per FIX_POLICY §2.
-                    let strict_auth = self.config.strict_auth;
-
-                    std::thread::spawn(move || {
-                        if let Err(e) = handle_connection_inner(
-                            stream,
-                            &engine,
-                            &shutdown,
-                            ConnectionOptions {
-                                max_batch_size: max_batch,
-                                max_stream_total_bytes,
-                                cluster: cluster.as_deref(),
-                                redo_log: redo_log.as_deref(),
-                                blob_store: blob_store.as_deref(),
-                                inflight_request_bytes,
-                                cluster_secret,
-                                strict_auth,
-                                read_timeout: CONNECTION_READ_TIMEOUT,
-                                write_timeout: CONNECTION_WRITE_TIMEOUT,
-                            },
-                        ) {
-                            tracing::warn!(peer_addr = %addr, err = %e, "connection error");
+                    _ => {}
+                }
+            }
+            if !listener_ready {
+                continue 'accept_loop;
+            }
+            // Drain all pending accepts so a single readiness edge
+            // doesn't leak connections (mio reports edge-triggered on
+            // some platforms).
+            loop {
+                match mio_listener.accept() {
+                    Ok((stream, addr)) => {
+                        // Convert mio stream back to std::net::TcpStream so
+                        // the rest of the connection handler (which uses
+                        // blocking read_exact / write_all) is unchanged.
+                        let std_stream: TcpStream = {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::io::{FromRawFd, IntoRawFd};
+                                // SAFETY: mio::net::TcpStream is a thin
+                                // wrapper around the OS FD; `into_raw_fd`
+                                // transfers ownership of the FD out of mio
+                                // and `from_raw_fd` takes it into std. No
+                                // double-free.
+                                unsafe { TcpStream::from_raw_fd(stream.into_raw_fd()) }
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                // No non-Unix targets currently supported.
+                                compile_error!("server accept loop requires a Unix target");
+                            }
+                        };
+                        // Hand off to the existing accept-handler. Move
+                        // the stream into a local variable named
+                        // `mut stream` so the rest of the body (taken
+                        // verbatim from pre-fix) compiles unchanged.
+                        let mut stream = std_stream;
+                        // Restore blocking mode for the per-connection
+                        // thread; `handle_connection_inner` also flips
+                        // it but flipping back here lets the timeout
+                        // settings in the `max_connections` reject path
+                        // work the same as pre-fix.
+                        let _ = stream.set_nonblocking(false);
+                        let active = self.active_connections.load(Ordering::Relaxed);
+                        if active >= self.config.max_connections {
+                            tracing::warn!(peer_addr = %addr, active, "rejecting connection: max connections reached");
+                            let _ = stream.set_write_timeout(Some(CONNECTION_WRITE_TIMEOUT));
+                            let response = ResponseFrame {
+                                request_id: 0,
+                                status: STATUS_ERROR,
+                                payload: encode_error_payload(
+                                    ERR_INTERNAL,
+                                    "max connections reached",
+                                ),
+                            };
+                            let _ = stream.write_all(&response.encode());
+                            drop(stream);
+                            continue;
                         }
-                        active_conns.fetch_sub(1, Ordering::Relaxed);
-                    });
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No pending connection — sleep briefly and retry
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(e) => {
-                    tracing::warn!(err = %e, "accept error");
+
+                        self.active_connections.fetch_add(1, Ordering::Relaxed);
+
+                        let engine = self.engine.clone();
+                        let shutdown = self.shutdown.clone();
+                        let active_conns = self.active_connections.clone();
+                        let max_batch = self.config.max_batch_size;
+                        let max_stream_total_bytes = self.config.max_stream_total_bytes;
+                        let cluster = self.cluster.clone();
+                        let redo_log = self.redo_log.clone();
+                        let blob_store = self.blob_store.clone();
+                        let inflight_request_bytes = self.inflight_request_bytes.clone();
+                        let cluster_secret = self
+                            .config
+                            .cluster_secret
+                            .as_ref()
+                            .map(|s| Arc::new(s.as_bytes().to_vec()));
+                        // F-G5-001 (CRITICAL): wire G10's `ServerConfig::strict_auth`
+                        // into the connection-handler options. When `true`, any
+                        // inter-node opcode that arrives without a `cluster_secret`
+                        // is rejected with `ERR_CLUSTER_AUTH_FAILED`. Default
+                        // remains `false` (trusted-overlay) per FIX_POLICY §2.
+                        let strict_auth = self.config.strict_auth;
+
+                        std::thread::spawn(move || {
+                            if let Err(e) = handle_connection_inner(
+                                stream,
+                                &engine,
+                                &shutdown,
+                                ConnectionOptions {
+                                    max_batch_size: max_batch,
+                                    max_stream_total_bytes,
+                                    cluster: cluster.as_deref(),
+                                    redo_log: redo_log.as_deref(),
+                                    blob_store: blob_store.as_deref(),
+                                    inflight_request_bytes,
+                                    cluster_secret,
+                                    strict_auth,
+                                    read_timeout: CONNECTION_READ_TIMEOUT,
+                                    write_timeout: CONNECTION_WRITE_TIMEOUT,
+                                },
+                            ) {
+                                tracing::warn!(peer_addr = %addr, err = %e, "connection error");
+                            }
+                            active_conns.fetch_sub(1, Ordering::Relaxed);
+                        });
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // No more pending connections — go back to poll.
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(err = %e, "accept error");
+                        break;
+                    }
                 }
             }
         }
+        // Drop the published waker so a late `shutdown()` after the loop
+        // exits is a harmless no-op (the AtomicBool is already true).
+        *self.shutdown_waker.lock() = None;
 
         tracing::info!(
             active = self.active_connections.load(Ordering::Relaxed),
@@ -302,8 +430,22 @@ impl Server {
     }
 
     /// Signal the server to shut down gracefully.
+    ///
+    /// P1.2: flips the shutdown flag *and* wakes the mio poller (via the
+    /// registered [`mio::Waker`]). The accept loop observes the flag on
+    /// the next iteration and exits, typically within microseconds rather
+    /// than the worst-case 10 ms it used to spin-wait for.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(waker) = self.shutdown_waker.lock().as_ref() {
+            // `Waker::wake` is best-effort: a failure here means the FD
+            // backing it has already been closed (e.g. `run` already
+            // returned), which is the expected race when shutdown is
+            // called after a clean exit.
+            if let Err(e) = waker.wake() {
+                tracing::debug!(err = %e, "Server::shutdown: Waker::wake failed (already shut down?)");
+            }
+        }
     }
 
     /// Whether the server is shutting down.
@@ -468,16 +610,39 @@ fn handle_connection_inner(
                     "strict_auth: rejecting unsigned inter-node op_code={op_code}"
                 ));
             }
-            if !UNAUTHENTICATED_INTER_NODE_WARNED.swap(true, Ordering::AcqRel) {
-                let op_code = peeked_op.unwrap_or(0);
-                tracing::warn!(
-                    target: "teraslab::security",
-                    op_code,
-                    "inter-node opcode received without cluster_secret configured — \
-                     accepting unauthenticated frame (trusted-overlay default). \
-                     Configure `cluster_secret` or pass `--strict-auth` to enforce.",
-                );
+            // P2.1 (F-G7-001): bump the receiver-side counter every time
+            // we accept an inter-node opcode without an HMAC layer. Unlike
+            // the one-shot `warn!` below, the counter must tick on every
+            // such frame so dashboards can compute a *rate* — a slow drip
+            // of unauthenticated frames is the signal pattern this metric
+            // is designed to expose. The counter field is owned by G7's
+            // `ReplicationMetrics` schema (see `metrics.rs`); the bump
+            // site lives here in the G5 auth gate per the cross-cutting
+            // ownership note attached to the field.
+            if let Some(repl) = crate::metrics::replication_metrics() {
+                repl.replica_unauthenticated_accept_total.inc();
             }
+            let op_code = peeked_op.unwrap_or(0);
+            // Per-event `warn` so operators see the peer and opcode that
+            // triggered each accept — silent post-first-event behaviour
+            // before this fix made it impossible to tell whether the
+            // counter spike came from one stuck peer or a flapping fleet.
+            tracing::warn!(
+                target: "teraslab::security",
+                op_code,
+                peer = ?stream.peer_addr().ok(),
+                "unauthenticated replica accept: inter-node opcode \
+                 received without cluster_secret configured — \
+                 accepting frame (trusted-overlay default). Configure \
+                 `cluster_secret` or pass `--strict-auth` to enforce.",
+            );
+            // Preserve the legacy one-shot semantics for the pre-existing
+            // `UNAUTHENTICATED_INTER_NODE_WARNED` flag in case downstream
+            // observers (log scrapers) key off the first-occurrence
+            // marker. The flag flips once; subsequent unauthenticated
+            // accepts still emit the per-event `warn` above plus the
+            // counter bump.
+            let _ = UNAUTHENTICATED_INTER_NODE_WARNED.swap(true, Ordering::AcqRel);
         }
         let request_frame_bytes = if auth_required {
             match crate::cluster::auth::verify_frame(
@@ -917,5 +1082,143 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("server should return after client disconnect");
         assert!(result.is_ok(), "fail-open accepted result was {result:?}");
+    }
+
+    /// P2.1 (F-G7-001): when the auth gate accepts an inter-node frame
+    /// without a configured `cluster_secret` (the trusted-overlay
+    /// fail-open default), it must bump
+    /// `ReplicationMetrics::replica_unauthenticated_accept_total` so
+    /// dashboards can alert on any non-zero rate.
+    ///
+    /// The metric is registered through a process-wide `OnceLock`. We
+    /// install a `&'static` instance here (idempotent for parallel
+    /// tests; the leak is `'static`-scoped and bounded to the process).
+    /// Reading the counter both before and after the connection isolates
+    /// this test from any other test that may have already bumped it.
+    #[test]
+    fn unauthenticated_inter_node_accept_increments_metric() {
+        use crate::metrics::{ReplicationMetrics, init_replication_metrics, replication_metrics};
+
+        // Install a process-wide ReplicationMetrics. `OnceLock` semantics
+        // mean later test threads racing with us share the same handle —
+        // we still observe the delta via before/after snapshots below.
+        static METRICS_CELL: std::sync::OnceLock<ReplicationMetrics> = std::sync::OnceLock::new();
+        let leaked: &'static ReplicationMetrics = METRICS_CELL.get_or_init(ReplicationMetrics::new);
+        init_replication_metrics(leaked);
+        let metrics = replication_metrics().expect("replication metrics installed by init_ above");
+        let before = metrics.replica_unauthenticated_accept_total.get();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(test_engine());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server_engine = engine.clone();
+        let server_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = handle_connection_inner(
+                stream,
+                &server_engine,
+                &server_shutdown,
+                ConnectionOptions {
+                    max_batch_size: 1024,
+                    max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    cluster: None,
+                    redo_log: None,
+                    blob_store: None,
+                    inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
+                    cluster_secret: None,
+                    strict_auth: false,
+                    read_timeout: Duration::from_secs(1),
+                    write_timeout: Duration::from_secs(1),
+                },
+            );
+            tx.send(result).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let request = RequestFrame {
+            request_id: 11,
+            // Any inter-node opcode reaches the auth gate; OP_REPLICA_BATCH
+            // is the canonical example.
+            op_code: OP_REPLICA_BATCH,
+            flags: 0,
+            payload: Vec::new(),
+        };
+        client.write_all(&request.encode()).unwrap();
+
+        // Read the response to ensure the gate has actually executed
+        // before we sample the counter.
+        let response = read_response_frame_for_test(&mut client);
+        assert_eq!(response.request_id, 11);
+        drop(client);
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server should return after client disconnect");
+        assert!(result.is_ok(), "fail-open accepted result was {result:?}");
+
+        let after = metrics.replica_unauthenticated_accept_total.get();
+        assert!(
+            after >= before + 1,
+            "expected replica_unauthenticated_accept_total to advance by \
+             at least 1 (before={before}, after={after})",
+        );
+    }
+
+    /// P2.2: every `InflightBytesLimiter::try_acquire` rejection — whether
+    /// from the single-frame oversize guard, the per-thread arithmetic
+    /// overflow guard, or the aggregate-cap guard — must bump
+    /// `ThreadMetrics::inflight_bytes_rejected_total`. Pre-fix all three
+    /// paths returned `None` silently; operators could not alert on
+    /// backpressure-induced frame rejections.
+    #[test]
+    fn inflight_bytes_rejected_metric_increments_on_overflow() {
+        use crate::metrics::ThreadMetrics;
+        use crate::server::dispatch::init_dispatch_metrics;
+
+        // Install a process-wide ThreadMetrics handle. `OnceLock`
+        // semantics: parallel tests share the same handle — we capture
+        // the before/after delta so concurrent bumps don't false-fail.
+        static METRICS_CELL: std::sync::OnceLock<ThreadMetrics> = std::sync::OnceLock::new();
+        let leaked: &'static ThreadMetrics = METRICS_CELL.get_or_init(ThreadMetrics::new);
+        init_dispatch_metrics(leaked);
+        let metrics = crate::server::dispatch::dispatch_metrics_handle()
+            .expect("dispatch metrics installed above");
+
+        let limiter = Arc::new(InflightBytesLimiter::new(16));
+
+        // Single-frame oversize rejection: 17 > limit 16.
+        let before_oversize = metrics.inflight_bytes_rejected_total.get();
+        assert!(limiter.try_acquire(17).is_none());
+        let after_oversize = metrics.inflight_bytes_rejected_total.get();
+        assert!(
+            after_oversize >= before_oversize + 1,
+            "oversize rejection should advance counter \
+             (before={before_oversize}, after={after_oversize})",
+        );
+
+        // Aggregate-cap rejection: hold 10 bytes, then try 7 more (=17 > 16).
+        let _permit = limiter.try_acquire(10).expect("first permit");
+        let before_aggregate = metrics.inflight_bytes_rejected_total.get();
+        assert!(limiter.try_acquire(7).is_none());
+        let after_aggregate = metrics.inflight_bytes_rejected_total.get();
+        assert!(
+            after_aggregate >= before_aggregate + 1,
+            "aggregate-cap rejection should advance counter \
+             (before={before_aggregate}, after={after_aggregate})",
+        );
+
+        // Negative control: a successful acquire must NOT bump the
+        // counter. With the 10-byte permit held, asking for 6 fits
+        // exactly under the cap.
+        let before_ok = metrics.inflight_bytes_rejected_total.get();
+        let _ok_permit = limiter.try_acquire(6).expect("permit under cap");
+        let after_ok = metrics.inflight_bytes_rejected_total.get();
+        assert_eq!(
+            before_ok, after_ok,
+            "successful acquire must not advance rejection counter",
+        );
     }
 }
