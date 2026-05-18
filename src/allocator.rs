@@ -735,7 +735,18 @@ impl SlotAllocator {
                     let remainder_offset = alloc_offset + aligned_size;
                     self.freelist.remove(remainder_offset);
                 }
-                self.freelist.insert(alloc_offset, region_size);
+                // F-G1-016: coalesce with adjacent free regions on the
+                // way back into the freelist. The allocator is
+                // single-threaded today so the original region's
+                // neighbours cannot have changed between the
+                // `best_fit` split and the rollback — but a future
+                // change that interleaves rollback with other free()
+                // calls would silently leave fragmentation. Coalescing
+                // here keeps the freelist invariant ("no two adjacent
+                // free regions") in lockstep with `free()`.
+                let (final_offset, final_size) =
+                    self.coalesce_adjacent(alloc_offset, region_size);
+                self.freelist.insert(final_offset, final_size);
                 self.freelist.maybe_promote();
             }
             Reservation::FromHighWater {
@@ -744,6 +755,40 @@ impl SlotAllocator {
                 self.next_offset = previous_next_offset;
             }
         }
+    }
+
+    /// F-G1-016: merge `[offset, offset+size)` with any adjacent free
+    /// regions and return the resulting `(offset, size)`.
+    ///
+    /// Removes the merged neighbours from the freelist as a side
+    /// effect; callers must `insert` the returned region themselves so
+    /// the same primitive is reusable from both `free()` (pre-fix,
+    /// inlined) and `rollback_reservation` (post-fix). The freelist
+    /// invariant relied on by binary search and best-fit is "no two
+    /// adjacent free regions" — keep both paths honouring it.
+    fn coalesce_adjacent(&mut self, offset: u64, size: u64) -> (u64, u64) {
+        let mut final_offset = offset;
+        let mut final_size = size;
+
+        // Merge with the next region if adjacent.
+        let next_boundary = offset + size;
+        if let Some((next_off, next_sz)) = self.freelist.next_from(next_boundary)
+            && next_off == next_boundary
+        {
+            self.freelist.remove(next_off);
+            final_size += next_sz;
+        }
+
+        // Merge with the previous region if adjacent.
+        if let Some((prev_off, prev_sz)) = self.freelist.prev_before(offset)
+            && prev_off + prev_sz == offset
+        {
+            self.freelist.remove(prev_off);
+            final_offset = prev_off;
+            final_size += prev_sz;
+        }
+
+        (final_offset, final_size)
     }
 
     fn record_allocation_metrics(&self, count: u64, bytes: u64) {
@@ -2028,6 +2073,130 @@ mod tests {
             8192,
             "the full 8 KiB region must still be intact in the freelist \
              (no left-over fragmentation from the rolled-back split)"
+        );
+    }
+
+    /// F-G1-016 (C-5): on rollback, if the freelist contains free
+    /// regions adjacent to the rolled-back allocation, the rollback
+    /// must coalesce them into a single region — matching the
+    /// invariant `free()` maintains.
+    ///
+    /// Single-threaded today this is unreachable (the freelist
+    /// invariant says "no two adjacent free regions" because every
+    /// `free()` already coalesces, so `best_fit` cannot expose a
+    /// freelist where the selected region has a free neighbour). The
+    /// defensive change is for a future world where rollback could
+    /// race with another `free()` or where someone breaks the
+    /// invariant somehow else. The test stages the invariant
+    /// violation explicitly with `__test_force_push_free_region`,
+    /// then drives the rollback through a redo-flush failure.
+    ///
+    /// We use a 2-region scenario (one neighbour on each side of the
+    /// allocation) so a single forward+backward coalesce pass is
+    /// sufficient — matching what `free()` does. A 3-region adjacent
+    /// chain would require iterative coalescing and is intentionally
+    /// out of scope; the freelist invariant rules it out anyway.
+    #[test]
+    fn rollback_coalesces_adjacent_free_regions() {
+        let data_dev = test_device(16);
+        let (redo_dev, redo) = make_failable_redo_log(1024 * 1024);
+
+        let mut alloc = SlotAllocator::new(data_dev).unwrap();
+
+        // Stage a freelist that breaks the "no adjacent" invariant:
+        // [A=4K at base] [B=4K at base+4K] [C=4K at base+8K]
+        // — all three are contiguous. `__test_force_push_free_region`
+        // bypasses the coalesce step so we can fabricate this state.
+        // Use a high offset to keep the alloc-from-high-water path
+        // away from these fragments.
+        let base = DATA_REGION_OFFSET + 8 * 4096;
+        alloc.__test_force_push_free_region(base, 4096);
+        alloc.__test_force_push_free_region(base + 4096, 4096);
+        alloc.__test_force_push_free_region(base + 2 * 4096, 4096);
+        assert_eq!(
+            alloc.free_region_count(),
+            3,
+            "test setup: three adjacent fragments staged",
+        );
+
+        // Attach the failable redo log AFTER the staging so the
+        // staging itself does not journal.
+        alloc.set_redo_log(redo);
+
+        // Trigger a best-fit allocate of 4 KiB. With three 4 KiB
+        // fragments, `best_fit` picks the first one with waste=0
+        // (region B at `base+4096`)... actually it picks the
+        // lowest-offset hit (region A at `base`). Either way, after
+        // best_fit removes the selected region, the freelist holds
+        // exactly two regions and ONE of them is adjacent to the
+        // selected slot on each side — the realistic forward-looking
+        // shape coalesce_adjacent is designed to handle.
+        redo_dev.set_fail(true);
+        let result = alloc.allocate(4096);
+        redo_dev.set_fail(false);
+
+        match result {
+            Err(AllocatorError::RedoLogFailure { .. }) => {}
+            other => panic!("expected RedoLogFailure, got {other:?}"),
+        }
+
+        // best_fit picked region A (lowest offset, exact fit). After
+        // rollback's forward-coalesce, A+B merge into a single
+        // 8 KiB region at `base`; C remains separate at `base+8192`.
+        // Pre-fix (no rollback coalesce) the freelist would carry
+        // three separate adjacent regions; this assertion would see
+        // `free_region_count == 3`.
+        let stats = alloc.stats();
+        assert_eq!(
+            stats.free_region_count, 2,
+            "rollback must coalesce the two now-adjacent free regions \
+             into a single contiguous region — got {} regions",
+            stats.free_region_count,
+        );
+        assert_eq!(
+            stats.total_free_bytes, 12288,
+            "total free bytes must be conserved by the rollback coalesce",
+        );
+        assert_eq!(
+            stats.largest_free_region, 8192,
+            "the merged region must span the two adjacent fragments",
+        );
+
+        // The merged region starts at `base` and spans 8 KiB; C is
+        // still its own 4 KiB region at `base + 8192`.
+        let mut iter = alloc.freelist.iter_offset_order();
+        let (off1, sz1) = iter.next().unwrap();
+        let (off2, sz2) = iter.next().unwrap();
+        assert!(iter.next().is_none());
+        assert_eq!(off1, base);
+        assert_eq!(sz1, 8192);
+        assert_eq!(off2, base + 8192);
+        assert_eq!(sz2, 4096);
+    }
+
+    /// F-G1-016 negative control: the same scenario without
+    /// `coalesce_adjacent` (i.e. pre-fix behaviour) would leave three
+    /// separate adjacent regions in the freelist. We verify the
+    /// coalesce step is doing real work by directly invoking it on a
+    /// staged state and asserting the merge happens.
+    #[test]
+    fn coalesce_adjacent_merges_neighbours() {
+        let data_dev = test_device(16);
+        let mut alloc = SlotAllocator::new(data_dev).unwrap();
+        let base = DATA_REGION_OFFSET + 8 * 4096;
+
+        // Stage two regions flanking a 4 KiB gap that we'll feed to
+        // `coalesce_adjacent` directly.
+        alloc.__test_force_push_free_region(base, 4096);
+        alloc.__test_force_push_free_region(base + 2 * 4096, 4096);
+
+        let (off, sz) = alloc.coalesce_adjacent(base + 4096, 4096);
+        assert_eq!(off, base, "coalesce must extend backward to the prev region");
+        assert_eq!(sz, 12288, "all three contiguous regions must merge");
+        assert_eq!(
+            alloc.free_region_count(),
+            0,
+            "coalesce_adjacent must remove both neighbours (caller re-inserts)",
         );
     }
 

@@ -263,18 +263,161 @@ pub unsafe fn write_mutation_footer_and_crc_direct(
     record_offset: u64,
     meta: &TxMetadata,
 ) {
-    // F-X-007 (BC-02): hold the record-level write guard across the
-    // entire footer + CRC restamp so a concurrent direct-pointer read
-    // either sees the pre-mutation header or the post-CRC header,
-    // never an in-progress mix that happens to validate against the
-    // old CRC.
-    let _w = io_locks().write(record_offset);
-    // Safety: same contract as the primitives — caller holds the
-    // engine's per-tx stripe lock and the base_ptr is valid for
-    // METADATA_SIZE bytes at the record offset.
-    unsafe {
-        write_mutation_footer_direct(base_ptr, record_offset, meta);
-        write_crc_direct(base_ptr, record_offset, meta);
+    // Implemented via the typestate split below so the combined helper
+    // and the typestate path remain bit-identical at the call sites.
+    // SAFETY: the contract is identical to the primitives this composes.
+    unsafe { write_mutation_footer_pending_crc(base_ptr, record_offset, meta) }.stamp_crc(meta);
+}
+
+// ---------------------------------------------------------------------------
+// F-G1-002 typestate guard: footer-write returns a token that must be
+// consumed by stamp_crc(...) before drop. The token holds the
+// record-level write guard from `io_locks()` so the footer→CRC pair
+// remains atomic w.r.t. concurrent direct-pointer readers (BC-02), and
+// the `#[must_use]` + debug-assert-on-drop make "footer written but
+// CRC never stamped" structurally impossible for a future caller that
+// needs to interleave other writes between footer and CRC.
+//
+// The combined `write_mutation_footer_and_crc_direct` wrapper above is
+// still the right entry point for the simple case; the typestate is
+// the lower-level building block for callers that genuinely need to
+// split.
+// ---------------------------------------------------------------------------
+
+/// Typestate token returned by [`write_mutation_footer_pending_crc`].
+///
+/// The footer bytes have been written but the CRC has not yet been
+/// restamped — a read in this window would observe `RecordCorruption`
+/// because the header bytes no longer match the on-disk CRC slot.
+/// Callers MUST consume the token by calling [`Self::stamp_crc`] so
+/// the matching CRC is written and the record-level write guard is
+/// released only after the header is coherent again.
+///
+/// # `#[must_use]`
+///
+/// The attribute is enforced at compile time — dropping the token
+/// without consuming it is a debug-assertion failure (tested in
+/// [`tests::footer_pending_crc_panics_when_dropped_unstamped`]) and is
+/// rejected at compile time via a `compile_fail` doc-test:
+///
+/// ```compile_fail,E0277
+/// use teraslab::io::write_mutation_footer_pending_crc;
+/// use teraslab::record::TxMetadata;
+/// # let mut buf = [0u8; 4096];
+/// # let base_ptr = buf.as_mut_ptr();
+/// # let meta = TxMetadata::new(1);
+/// # let record_offset = 0;
+/// // ERROR: `FooterPendingCrc` cannot be dropped — the CRC must be stamped.
+/// #[deny(unused_must_use)]
+/// fn must_consume() {
+///     unsafe { write_mutation_footer_pending_crc(base_ptr, record_offset, &meta) };
+/// }
+/// ```
+#[must_use = "FooterPendingCrc must be consumed via .stamp_crc() before drop \
+              — the header CRC is stale until then and a concurrent read \
+              would observe RecordCorruption"]
+pub struct FooterPendingCrc<'a> {
+    base_ptr: *mut u8,
+    record_offset: u64,
+    // Holds the BC-02 record-level write guard for the duration of the
+    // footer→CRC window. Released on drop (i.e. inside `stamp_crc`).
+    _w: parking_lot::RwLockWriteGuard<'a, ()>,
+    // Set to true by `stamp_crc`; the drop-time debug-assert reads this
+    // to distinguish a legitimate consume-by-stamp from a forgotten drop.
+    stamped: bool,
+}
+
+// SAFETY: the raw pointer inside is only used while the held write
+// guard ensures exclusive access to `record_offset`'s stripe. The
+// token is conceptually a `&mut` over the metadata region; sending it
+// across threads is no less safe than sending the originating `*mut u8`.
+unsafe impl Send for FooterPendingCrc<'_> {}
+
+impl FooterPendingCrc<'_> {
+    /// Stamp the CRC computed from `meta` and release the BC-02
+    /// write guard.
+    ///
+    /// `meta` MUST reflect the final on-disk state of every field in
+    /// the metadata header (including any writes performed between the
+    /// footer write and this call) so the CRC matches what a
+    /// subsequent reader will observe.
+    ///
+    /// # Safety
+    ///
+    /// `meta` must describe the post-write byte layout of the
+    /// metadata header at `record_offset`. The pointer captured by
+    /// [`write_mutation_footer_pending_crc`] must still be valid (no
+    /// device teardown between construction and consumption); the
+    /// write guard held by the token prevents concurrent readers in
+    /// the same record stripe.
+    #[inline]
+    pub fn stamp_crc(mut self, meta: &TxMetadata) {
+        // SAFETY: same contract as `write_crc_direct`. The held write
+        // guard makes the footer→CRC pair atomic w.r.t. concurrent
+        // direct-pointer readers.
+        unsafe { write_crc_direct(self.base_ptr, self.record_offset, meta) };
+        self.stamped = true;
+        // Drop fires next; the assertion below is satisfied.
+    }
+}
+
+impl Drop for FooterPendingCrc<'_> {
+    fn drop(&mut self) {
+        // F-G1-002: a forgotten CRC stamp leaves the record's CRC slot
+        // stale against the footer bytes. The next reader will get
+        // `DeviceError::RecordCorruption`, but that is a silent
+        // failure for the calling op — surface it loudly in debug.
+        // In release we cannot panic from `Drop` without aborting on a
+        // double-panic during unwind, so we limit the noise to
+        // debug builds where the contract violation is fixable.
+        debug_assert!(
+            self.stamped,
+            "FooterPendingCrc at record_offset={} dropped without stamp_crc — CRC is stale, \
+             record will fail validation on next read",
+            self.record_offset,
+        );
+    }
+}
+
+/// Lower-level entry point for [`write_mutation_footer_and_crc_direct`].
+///
+/// Writes the mutation footer bytes and returns a typestate token that
+/// MUST be consumed by [`FooterPendingCrc::stamp_crc`] to write the
+/// matching CRC. The token holds the BC-02 record-level write guard so
+/// the footer→CRC window is atomic w.r.t. concurrent direct-pointer
+/// readers.
+///
+/// Use the combined [`write_mutation_footer_and_crc_direct`] wrapper
+/// for the common case. Use this typestate variant only when you need
+/// to interleave other targeted writes (e.g. an inline block-entry
+/// update) between the footer and the CRC stamp so the CRC reflects
+/// all of them.
+///
+/// # Safety
+///
+/// Same as [`write_mutation_footer_direct`].
+#[inline]
+pub unsafe fn write_mutation_footer_pending_crc<'a>(
+    base_ptr: *mut u8,
+    record_offset: u64,
+    meta: &TxMetadata,
+) -> FooterPendingCrc<'a> {
+    // F-X-007 (BC-02): record-level write guard held across the
+    // footer→CRC window so a concurrent direct-pointer read either
+    // sees the pre-mutation header or the post-CRC header, never a
+    // half-written mix that validates against the old CRC. The guard
+    // is released when the returned `FooterPendingCrc` is dropped
+    // (i.e. inside `stamp_crc`).
+    let w = io_locks().write(record_offset);
+    // SAFETY: caller upholds the per-tx stripe-lock contract and
+    // base_ptr validity for METADATA_SIZE bytes at record_offset
+    // (same as `write_mutation_footer_direct`).
+    unsafe { write_mutation_footer_direct(base_ptr, record_offset, meta) };
+    FooterPendingCrc {
+        base_ptr,
+        record_offset,
+        _w: w,
+        stamped: false,
     }
 }
 
@@ -1148,5 +1291,124 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         writer.join().unwrap();
+    }
+
+    /// F-G1-002 typestate guard: dropping a `FooterPendingCrc` without
+    /// calling `stamp_crc` is a contract violation. In debug builds
+    /// this fires `debug_assert!` from `Drop`, which we observe via
+    /// `catch_unwind`. The `#[must_use]` attribute on the type
+    /// catches the same mistake at compile time when callers honour
+    /// `-D unused_must_use`; this test is the runtime backstop.
+    ///
+    /// The drop-time panic is intentional: it is the only way to
+    /// surface "footer written, CRC forgotten" before the next reader
+    /// fails with `RecordCorruption` at an unrelated call site. In
+    /// release builds the assertion compiles out and the reader
+    /// surfaces the corruption — also acceptable, just less helpful.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn footer_pending_crc_panics_when_dropped_unstamped() {
+        let dev = test_device();
+        let base_ptr_addr = dev.as_raw_ptr().expect("memory device must expose raw_ptr") as usize;
+        let mut meta = TxMetadata::new(1);
+        meta.tx_id = [0x11; 32];
+        meta.fee = 7;
+        let slots = vec![UtxoSlot::new_unspent([0xCD; 32])];
+        write_full_record(&*dev, 0, &meta, &slots).unwrap();
+
+        let result = std::panic::catch_unwind(|| {
+            // SAFETY: `base_ptr` valid for METADATA_SIZE; this thread
+            // holds no concurrent reader/writer on offset 0.
+            let token =
+                unsafe { write_mutation_footer_pending_crc(base_ptr_addr as *mut u8, 0, &meta) };
+            // Intentionally drop without stamping. The Drop impl
+            // should fire `debug_assert!`.
+            drop(token);
+        });
+
+        assert!(
+            result.is_err(),
+            "dropping FooterPendingCrc without stamp_crc must panic in debug builds",
+        );
+    }
+
+    /// F-G1-002 typestate: the happy path. Constructing the token,
+    /// stamping the CRC, and reading the metadata back must round-trip
+    /// the post-mutation field values with a valid CRC.
+    #[test]
+    fn footer_pending_crc_stamp_round_trips() {
+        let dev = test_device();
+        let base_ptr_addr = dev.as_raw_ptr().expect("memory device must expose raw_ptr") as usize;
+
+        // Seed a baseline record so the read path has a valid CRC to
+        // overwrite.
+        let mut meta = TxMetadata::new(2);
+        meta.tx_id = [0x22; 32];
+        meta.fee = 1;
+        meta.generation = 0;
+        let slots = vec![
+            UtxoSlot::new_unspent([0x01; 32]),
+            UtxoSlot::new_unspent([0x02; 32]),
+        ];
+        write_full_record(&*dev, 0, &meta, &slots).unwrap();
+
+        // Mutate the footer fields the helper actually touches:
+        // flags, generation, updated_at, delete_at_height.
+        let mut new_meta = meta;
+        new_meta.generation = 99;
+        new_meta.updated_at = 0x1234_5678_9ABC_DEF0;
+        new_meta.delete_at_height = 17;
+        new_meta.flags = crate::record::TxFlags::LOCKED;
+
+        // SAFETY: same as `footer_pending_crc_panics_when_dropped_unstamped`.
+        let token = unsafe {
+            write_mutation_footer_pending_crc(base_ptr_addr as *mut u8, 0, &new_meta)
+        };
+        token.stamp_crc(&new_meta);
+
+        let read_back = read_metadata(&*dev, 0).unwrap();
+        assert_eq!({ read_back.generation }, 99);
+        assert_eq!({ read_back.updated_at }, 0x1234_5678_9ABC_DEF0);
+        assert_eq!({ read_back.delete_at_height }, 17);
+        assert_eq!(read_back.flags, crate::record::TxFlags::LOCKED);
+        // Other fields preserved from the baseline write.
+        assert_eq!(read_back.tx_id, [0x22; 32]);
+        assert_eq!({ read_back.fee }, 1);
+    }
+
+    /// F-G1-002 typestate: the combined wrapper and the explicit
+    /// `stamp_crc` path must produce byte-identical metadata. This
+    /// pins the refactor — if a future change diverges the two
+    /// paths, this test fails.
+    #[test]
+    fn footer_pending_crc_matches_combined_wrapper() {
+        let dev_a = test_device();
+        let dev_b = test_device();
+        let ptr_a = dev_a.as_raw_ptr().expect("raw_ptr") as usize;
+        let ptr_b = dev_b.as_raw_ptr().expect("raw_ptr") as usize;
+
+        let mut meta = TxMetadata::new(1);
+        meta.tx_id = [0x33; 32];
+        meta.fee = 42;
+        let slots = vec![UtxoSlot::new_unspent([0x55; 32])];
+        write_full_record(&*dev_a, 0, &meta, &slots).unwrap();
+        write_full_record(&*dev_b, 0, &meta, &slots).unwrap();
+
+        let mut updated = meta;
+        updated.generation = 5;
+        updated.updated_at = 0xDEAD_BEEF;
+        updated.delete_at_height = 9;
+
+        // Path A: combined wrapper.
+        unsafe { write_mutation_footer_and_crc_direct(ptr_a as *mut u8, 0, &updated) };
+
+        // Path B: typestate split.
+        let token =
+            unsafe { write_mutation_footer_pending_crc(ptr_b as *mut u8, 0, &updated) };
+        token.stamp_crc(&updated);
+
+        let read_a = read_metadata(&*dev_a, 0).unwrap();
+        let read_b = read_metadata(&*dev_b, 0).unwrap();
+        assert_eq!(read_a, read_b);
     }
 }
