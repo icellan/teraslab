@@ -61,7 +61,8 @@ pub const OP_GET_COMMITTED_TOPOLOGY: u16 = 103;
 /// widths are fixed (no varints) so callers can index entries by stride.
 ///
 /// Malformed requests (count > 64, or insufficient trailing bytes) are
-/// rejected with `STATUS_ERROR` + `ERR_INTERNAL`.
+/// rejected with `STATUS_ERROR` + `ERR_PAYLOAD_MALFORMED` (post-P3.10;
+/// pre-P3.10 servers returned `ERR_INTERNAL`).
 pub const OP_ADMIN_DIAGNOSE_KEY: u16 = 104;
 
 /// Maximum number of txids accepted in a single `OP_ADMIN_DIAGNOSE_KEY`
@@ -275,6 +276,47 @@ pub const ERR_INDEX_DEGRADED: u16 = 26;
 /// malformed, stale, or wrongly-signed frame.
 pub const ERR_CLUSTER_AUTH_FAILED: u16 = 27;
 
+/// P3.10 / F-G5-017 — typed wire error codes.
+///
+/// The request payload failed wire-decode (truncated header, malformed
+/// count prefix, oversize batch, invalid UTF-8 in addr, etc.). The client
+/// must not retry blindly: the frame's bytes are wrong.
+///
+/// Pre-P3.10 these failures were reported as `ERR_INTERNAL` with a
+/// free-text message; classifiers now read the typed code directly.
+pub const ERR_PAYLOAD_MALFORMED: u16 = 28;
+
+/// P3.10 / F-G5-017 — the dispatcher does not recognise `op_code`. May
+/// indicate a client built against a newer protocol than the server, or
+/// a corrupted frame. Distinct from `ERR_PAYLOAD_MALFORMED` because the
+/// frame *was* decodable — only the opcode is unknown.
+pub const ERR_OPCODE_UNSUPPORTED: u16 = 29;
+
+/// P3.10 / F-G5-017 — a device read/write failure surfaced from the
+/// engine or blobstore. The mutation was rejected; the client may retry,
+/// but the same I/O failure is likely to recur until the operator
+/// resolves the underlying issue. Distinct from `ERR_INTERNAL` (truly
+/// unknown) and `ERR_REPLICATION_FAILED` (replication ack policy).
+pub const ERR_STORAGE_IO: u16 = 30;
+
+/// P3.10 / F-G5-017 — the listener's aggregate in-flight request memory
+/// limit is exhausted. Retry after backoff: the limit is per-connection
+/// concurrent reservation, not a per-account quota.
+pub const ERR_RATE_LIMITED: u16 = 31;
+
+/// P3.10 / F-G5-017 — a cluster control opcode (topology propose / vote
+/// / commit, partition map, etc.) arrived on a server that has no
+/// `RunningCluster` attached (single-node mode). The client should not
+/// retry against this server — it is structurally incapable of serving
+/// the request.
+pub const ERR_NOT_CLUSTERED: u16 = 32;
+
+/// P3.10 / F-G5-017 — a wire-protocol invariant was violated by the
+/// caller. Currently used by inter-node opcodes that overload `request_id`
+/// to carry a shard number: setting the upper 48 bits is forbidden so a
+/// typo cannot silently target an unintended shard.
+pub const ERR_INVARIANT_VIOLATION: u16 = 33;
+
 // Streaming errors
 /// Blob stream not found for the given txid on this connection.
 pub const ERR_STREAM_NOT_FOUND: u16 = 16;
@@ -282,6 +324,28 @@ pub const ERR_STREAM_NOT_FOUND: u16 = 16;
 pub const ERR_BLOB_NOT_FOUND: u16 = 17;
 /// Chunk offset does not match expected position in stream.
 pub const ERR_STREAM_OFFSET_MISMATCH: u16 = 18;
+
+/// P3.10 / F-G5-017 — a stream-protocol invariant was violated (offset
+/// mismatch on chunk arrival, byte counter overflow, total stream bytes
+/// exceeded the configured maximum). Distinct from `ERR_PAYLOAD_MALFORMED`
+/// because the frame parses correctly — the stream state machine
+/// rejected it.
+pub const ERR_STREAM_INVARIANT: u16 = 34;
+
+/// P3.10 / F-G5-017 — wire protocol revision.
+///
+/// `1` is the historical implicit version: legacy clients and servers do
+/// not exchange a version handshake, so the constant exists for
+/// documentation only. It is bumped to `2` in this revision because the
+/// dispatcher now emits typed `ERR_PAYLOAD_MALFORMED` / `ERR_STORAGE_IO`
+/// / `ERR_OPCODE_UNSUPPORTED` / `ERR_RATE_LIMITED` / `ERR_NOT_CLUSTERED`
+/// / `ERR_INVARIANT_VIOLATION` / `ERR_STREAM_INVARIANT` codes in places
+/// where v1 always returned `ERR_INTERNAL`. Old clients that match on
+/// `ERR_INTERNAL` for specific failures (malformed frames, storage I/O,
+/// unknown opcodes) must be updated to match on the new codes; new
+/// clients must continue to accept `ERR_INTERNAL` as a fallback for
+/// genuinely unclassified failures.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 pub const ERR_INTERNAL: u16 = 255;
 

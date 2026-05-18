@@ -503,7 +503,7 @@ Every opcode handler in `dispatch.rs` was walked:
   per-frame cap on auth-required opcodes specifically.
 - **Confidence**: Medium
 
-### F-G5-017: Dispatch error responses do not include the request `op_code` in their machine-readable payload — operator triage relies on the human-readable string
+### F-G5-017: Dispatch error responses do not include the request `op_code` in their machine-readable payload — operator triage relies on the human-readable string  [RESOLVED in P3.10]
 - **Severity**: INFO
 - **Category**: Maintainability
 - **Location**: `src/server/dispatch.rs:6124-6130`

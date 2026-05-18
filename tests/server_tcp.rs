@@ -1765,7 +1765,9 @@ fn max_connection_rejection_sends_error_frame() {
     assert_eq!(resp.request_id, 0);
     assert_eq!(resp.status, STATUS_ERROR);
     let (code, msg) = decode_error_payload(&resp.payload).unwrap();
-    assert_eq!(code, ERR_INTERNAL);
+    // P3.10 / F-G5-017: max_connections rejection is a rate-limit event,
+    // not a generic ERR_INTERNAL. Pre-P3.10 servers returned ERR_INTERNAL.
+    assert_eq!(code, ERR_RATE_LIMITED);
     assert!(msg.contains("max connections"));
 
     server.shutdown();

@@ -492,6 +492,49 @@ pub const ERR_ALREADY_EXISTS: u16 = 12;      // create for already-existing txid
 pub const ERR_INTERNAL: u16 = 255;           // unexpected server-side error
 ```
 
+**Typed wire error codes (P3.10 / F-G5-017, PROTOCOL_VERSION=2):**
+
+Pre-P3.10 the dispatcher returned `ERR_INTERNAL` for any failure that was
+not one of the named per-item codes. That collapsed wire-decode failures,
+storage I/O failures, unknown opcodes, rate-limiter rejections, and
+invariant violations into a single bucket — clients could only distinguish
+them by substring-matching the free-text message. The P3.10 revision
+introduces typed codes for every distinct dispatch failure class. Clients
+on the new protocol version match on the typed code directly; old clients
+that match on `ERR_INTERNAL` for these specific failures must be updated.
+
+```rust
+pub const ERR_PAYLOAD_MALFORMED:    u16 = 28;  // wire-decode failed
+pub const ERR_OPCODE_UNSUPPORTED:   u16 = 29;  // op_code not recognised
+pub const ERR_STORAGE_IO:           u16 = 30;  // device read/write failure
+pub const ERR_RATE_LIMITED:         u16 = 31;  // in-flight / max-conn cap exceeded
+pub const ERR_NOT_CLUSTERED:        u16 = 32;  // cluster opcode on single-node server
+pub const ERR_INVARIANT_VIOLATION:  u16 = 33;  // request_id shard encoding etc.
+pub const ERR_STREAM_INVARIANT:     u16 = 34;  // stream state-machine violation
+pub const PROTOCOL_VERSION:         u16 = 2;   // bumped from implicit v1
+```
+
+**Routing the new codes to handler sites:**
+
+| Dispatch failure                                    | P3.10 code               | Pre-P3.10 code |
+|-----------------------------------------------------|--------------------------|----------------|
+| `decode_*_checked` rejected the frame               | `ERR_PAYLOAD_MALFORMED`  | `ERR_INTERNAL` |
+| `OP_*` unknown to the dispatcher                    | `ERR_OPCODE_UNSUPPORTED` | `ERR_INTERNAL` |
+| Redo-log write / fsync failed                       | `ERR_STORAGE_IO`         | `ERR_INTERNAL` |
+| `engine.allocator().allocate_batch` failed          | `ERR_STORAGE_IO`         | `ERR_INTERNAL` |
+| `engine.read_metadata` / `read_slots` / blob `Err`  | `ERR_STORAGE_IO`         | `ERR_INTERNAL` |
+| Aggregate in-flight byte limit exceeded             | `ERR_RATE_LIMITED`       | `ERR_INTERNAL` |
+| `max_connections` cap reached on accept             | `ERR_RATE_LIMITED`       | `ERR_INTERNAL` |
+| Topology / partition opcode on non-clustered server | `ERR_NOT_CLUSTERED`      | `ERR_INTERNAL` |
+| `request_id` shard-encoding upper-bits non-zero     | `ERR_INVARIANT_VIOLATION`| `ERR_INTERNAL` |
+| Stream offset / byte-counter / cap violation        | `ERR_STREAM_INVARIANT`   | `ERR_INTERNAL` |
+| Replication compensation aborted, node degraded     | `ERR_INTERNAL`           | `ERR_INTERNAL` |
+
+`ERR_INTERNAL` is retained as the sentinel for genuinely unclassified
+failures (e.g. replication-compensation aborts that leave the node in a
+state the dispatcher cannot prove safe). Clients should always accept
+`ERR_INTERNAL` as a fallback.
+
 **Error data by error code:**
 
 | Error Code | `error_data` Contents | Length |
