@@ -1,5 +1,7 @@
 # Phase 12: Integration testing and benchmarks
 
+**Status:** shipped — integration suites under `tests/`, Docker-based cluster harness under `teraslab-tests/`, criterion benches under `benches/`; `cargo test --all` reports 2092 / 0 / 0 on `c87339c` per `_review/ROADMAP_TO_100.md`.
+
 ## Goal
 
 End-to-end testing of the complete system under realistic workloads. Verify that all components work together correctly, measure performance, and validate against the design targets. This phase produces the evidence that TeraSlab is ready for production.

@@ -1,5 +1,7 @@
 # Phase 10: Wire protocol
 
+**Status:** partial — `src/protocol/` (frame, codec, opcodes) and `src/server/` (TCP dispatch, HTTP observability) in main; F-G5/G6 fix campaigns closed inflight-bytes limiter, HMAC verification, etc. Outstanding production bug: `src/server/mod.rs:264-272` accept loop spins on a 10 ms sleep, burning CPU and slowing shutdown (`_review/follow_ups.md` A-2). Frame zero-copy / streaming HMAC / typed wire error codes are deferred perf items (`_review/follow_ups.md` C-6/C-7/C-8).
+
 ## Goal
 
 Implement a high-performance client-server binary protocol over TCP. At millions of operations per second, individual network round-trips per operation are unacceptable. **Batching is the default, not the exception** — every operation has a batch variant, and the protocol is designed so that the Go client can pack hundreds of operations into a single network frame.

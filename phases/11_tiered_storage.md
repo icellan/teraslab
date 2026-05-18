@@ -1,5 +1,7 @@
 # Phase 11: Tiered storage
 
+**Status:** partial — `src/storage/` hot tier + external blob store shipped, including R-049 orphan-blob GC at recovery + periodic sweep. The separate-NVMe middle tier described in this phase is intentionally not enabled (see the implementation note below) because the fixed `TxMetadata` layout has no durable offset/length fields for it; reintroducing the tier requires a metadata schema migration.
+
 ## Goal
 
 Implement the tiered storage system for transaction inputs/outputs. Small txs have data inline on NVMe, medium txs in a separate NVMe region, and large txs in an external blob store. This completes the storage architecture.

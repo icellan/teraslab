@@ -1,5 +1,10 @@
 # TeraSlab Bulletproofing Audit
 
+> **Status: SUPERSEDED 2026-05-17.** This audit predates the May 2026
+> review campaign. For the authoritative state see `REVIEW_REPORT.md`
+> and `_review/` (in particular `_review/ROADMAP_TO_100.md` and
+> `_review/follow_ups.md`). Kept only as a historical artifact.
+
 **Scope:** Every claim in `README.md`, `docs/`, and `phases/` cross-checked against the code under `src/` and the test suite under `tests/`. Goal: *would I stake real money on this UTXO store under adversarial production load?*
 
 **Date:** 2026-05-06

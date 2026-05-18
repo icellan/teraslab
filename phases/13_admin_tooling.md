@@ -1,5 +1,7 @@
 # Phase 13: Admin CLI and Web UI
 
+**Status:** shipped — `src/bin/cli.rs` (`teraslab-cli` with `status`/`nodes`/`shards`/`storage`/`memory`/`records`/`record`/`index`/`replication`/`redo`/`rebalance`/`drain`/`log-level`/`bench`/`healthcheck`/`top` commands) and embedded web dashboard at `ui/` consuming the HTTP observability endpoints from Phase 10.
+
 ## Goal
 
 Build operator tooling: a command-line tool (`teraslab-cli`) for scripting and ops, and a browser-based dashboard for visual cluster management. Both consume the HTTP observability endpoints built in Phase 10.

@@ -1,5 +1,7 @@
 # Phase 2: Index
 
+**Status:** shipped — `src/index/` with both in-memory hashtable and redb on-disk backends + secondary indexes (DAH, unmined); F-G3-* fixes from the May 2026 campaign landed in main.
+
 ## Goal
 
 Implement the in-memory hash index that maps transaction keys to their on-disk locations. This is the lookup structure that makes every operation O(1) — hash the key, find the device offset, do the I/O.

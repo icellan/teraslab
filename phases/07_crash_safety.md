@@ -1,5 +1,7 @@
 # Phase 7: Crash safety
 
+**Status:** shipped — `src/redo.rs`, `src/recovery.rs`, `src/checkpoint.rs` in main; F-G4-* fix campaign closed the next_sequence + compaction issues; F-G5-022 engine-side atomic apply (`_review/follow_ups.md` A-4) is a concurrency hypothesis with no live repro, tracked as P3 documentation work.
+
 ## Goal
 
 Implement the redo log for crash recovery. After this phase, the system can survive power loss at any point during a write and recover to a consistent state.

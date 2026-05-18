@@ -1,5 +1,7 @@
 # Phase 4: The setMined path
 
+**Status:** shipped — `src/ops/set_mined.rs`, `src/ops/mark_longest_chain.rs` in main, including reorg / unset paths.
+
 ## Goal
 
 Implement `setMined` (including `unsetMined` variant) as a complete, tested, concurrent operation. This is the second-hottest path after spend — called for every transaction in every new block.

@@ -1,5 +1,7 @@
 # Phase 8: Replication
 
+**Status:** partial — `src/replication/` (manager, durable sequencing, batching, TCP transport, receiver) in main; R-034/R-035 (replica WAL durability + metadata-write error propagation) and F-G7-* fixes landed. Outstanding follow-ups: `replica_unauthenticated_accept_total` counter exists but is not incremented at any production site (`_review/follow_ups.md` A-3); `CatchupError` is still stringly-typed across the lib/bin boundary (`_review/follow_ups.md` B-4).
+
 ## Goal
 
 Implement operation-based synchronous replication. The master logs operations, ships them to replicas, and waits for ACK before responding to the client. Replicas apply operations in order using the same idempotent mutation functions.

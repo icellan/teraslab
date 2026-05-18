@@ -16,6 +16,30 @@ TeraSlab pre-allocates UTXO slots at full size during creation and mutates them 
 | SSD wear per spend | 37 bytes per slot + ~256 bytes metadata (vs full record in copy-on-write designs) |
 | Memory per record | 72 bytes in-memory (hash table bucket) or ~0 with on-disk redb backend |
 
+## Status
+
+**Pre-production.** All 14 build phases (0–13) are implemented; phases 1–7, 12, 13 are fully shipped, while phases 0, 8–11 are partial — production code paths work but specific telemetry / lifecycle / scale-up follow-ups remain (see `_review/follow_ups.md`). Each `phases/NN_*.md` carries its own `Status:` header.
+
+| Probe | Result |
+|-------|-------:|
+| `cargo test --all` | 2092 passed / 0 failed / 0 ignored (at `c87339c`, per `_review/ROADMAP_TO_100.md`) |
+| `cargo check --lib` | clean |
+| `cargo check --bins` | clean |
+| `cargo clippy --lib --no-deps` | 8 dead-code warnings in `src/device_io/*` (tracked: ROADMAP P3.1) |
+| `cargo fmt --all -- --check` | clean |
+
+**Known limitations** (production bugs from `_review/follow_ups.md` § A):
+
+- A-2 — accept loop in `src/server/mod.rs` polls a shutdown flag on a 10 ms sleep, burning idle CPU and slowing graceful shutdown.
+- A-2b — shard table can stay at 2-node assignment after a fresh 3-node bootstrap even though `committed_topology_members()` reports three; suspected `topology_commit_already_activated` dedup interaction.
+- A-3 — `replica_unauthenticated_accept_total` counter exists but is not incremented at the auth gate in `handle_connection_inner`.
+- A-4 — engine-side atomic apply (F-G5-022) is a concurrency hypothesis with no live repro yet.
+- A-5 — `SWIM_PING_REQ_DROPPED_TOTAL` lives inside `cluster::swim` instead of the registry exposed by `/metrics`.
+
+See `_review/ROADMAP_TO_100.md` for the sequenced finish plan and `REVIEW_REPORT.md` for the May 2026 review campaign that surfaced these.
+
+**License.** Open BSV License Version 6 — see [`LICENSE`](LICENSE). Not yet certified for production deployment.
+
 ## Building
 
 ```bash
@@ -682,4 +706,4 @@ teraslab/
 
 ## License
 
-See repository for license details.
+Open BSV License Version 6 — see [`LICENSE`](LICENSE).

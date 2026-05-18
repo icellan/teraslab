@@ -202,12 +202,15 @@ test binary now 3 s. **No remaining sleep sites to convert.**
 
 ## D. Doc / repo cleanup
 
-### D-1. Stale audit docs at repo root
+### D-1. ~~Stale audit docs at repo root~~ — RESOLVED 2026-05-18
 
-`AUDIT.md` and `AUDIT_CODEX.md` both dated `2026-05-06` — pre-date the
-review campaign. The campaign's authoritative report is
-`REVIEW_REPORT.md` (+ `_review/*`). Either delete the older files or
-mark them superseded.
+`AUDIT.md` and `AUDIT_CODEX.md` (both dated `2026-05-06`) now carry a
+top-of-file `> **Status: SUPERSEDED 2026-05-17.**` banner pointing
+readers at `REVIEW_REPORT.md` + `_review/`. Kept as historical
+artifacts per the user-preferred non-destructive option.
+
+Resolved together with ROADMAP P4.2 (README "Status" section) and
+P4.3 (per-phase `Status:` ledger in `phases/NN_*.md`).
 
 ### D-2. `_review/ROADMAP_TO_100.md`
 

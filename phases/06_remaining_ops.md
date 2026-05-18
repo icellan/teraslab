@@ -1,5 +1,7 @@
 # Phase 6: Remaining operations
 
+**Status:** shipped — `src/ops/remaining.rs` (freeze/unfreeze/reassign/setConflicting/setLocked/preserveUntil) and `src/ops/delete_eval.rs` in main; F-G2-020 (`delete()` perf) is a P3 optimisation, not a correctness gap (`_review/follow_ups.md` C-9).
+
 ## Goal
 
 Implement all remaining mutation operations: `freeze`, `unfreeze`, `reassign`, `setConflicting`, `setLocked`, `preserveUntil`, and record deletion/pruning. These are lower-frequency than spend/setMined but must be fully correct.

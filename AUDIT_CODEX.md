@@ -1,5 +1,10 @@
 # TeraSlab Bulletproofing Audit
 
+> **Status: SUPERSEDED 2026-05-17.** This audit predates the May 2026
+> review campaign. For the authoritative state see `REVIEW_REPORT.md`
+> and `_review/` (in particular `_review/ROADMAP_TO_100.md` and
+> `_review/follow_ups.md`). Kept only as a historical artifact.
+
 Date: 2026-05-06
 Target: current working tree at repository root
 Output note: supporting audit files, if added later, should live under `audit_codex/`.

@@ -1,5 +1,7 @@
 # Phase 5: Creation path
 
+**Status:** shipped — `src/ops/create.rs` + allocator integration in main.
+
 ## Goal
 
 Implement record creation — the path that allocates space, initializes metadata and UTXO slots, and registers the record in the index. This is the write-once path that sets up the fixed-layout record that all subsequent mutations operate on.

@@ -1,5 +1,7 @@
 # Phase 1: Storage layout and raw device I/O
 
+**Status:** shipped — `src/device.rs`, `src/record.rs`, `src/io.rs` in main; outstanding miri / portability items (`_review/follow_ups.md` C-1/C-3/C-4) are forward-looking refactor work, not unmet deliverables.
+
 ## Goal
 
 Implement the on-disk record format and raw device read/write primitives. No networking, no clustering, no replication, no concurrency. Just bytes on disk with correct alignment and layout.

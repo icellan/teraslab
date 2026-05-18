@@ -1,5 +1,7 @@
 # Phase 0: Validate specification against source repos
 
+**Status:** partial — spec amendments shipped and all of phases 1-13 were implemented against the refined `BSV_UTXO_STORE_SPEC.md` / `BSV_UTXO_STORE_RUST_CRATES.md`; the standalone `SPEC_VALIDATION_REPORT.md` deliverable was rolled into the per-phase docs rather than produced as a separate artifact.
+
 ## Goal
 
 The formal specification (`BSV_UTXO_STORE_SPEC.md`) and crate recommendations (`BSV_UTXO_STORE_RUST_CRATES.md`) already exist and have been refined. Before implementation begins, validate them against the actual Teranode source code and the original UTXO store implementation to catch any gaps, stale assumptions, or missing operations.

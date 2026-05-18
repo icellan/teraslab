@@ -1,5 +1,7 @@
 # Phase 3: The spend path
 
+**Status:** shipped — `src/ops/spend.rs`, `src/ops/unspend.rs`, `src/locks.rs` (striped per-record locking) in main; io_uring backend lives behind a `pub(crate)` boundary as scaffolding (see Phase 10 / `src/device_io/`).
+
 ## Goal
 
 Implement `spend`, `spendMulti`, and `unspend` as complete, tested, concurrent operations. This is the single most performance-critical code path in the entire system. Also introduce io_uring and lock striping in this phase, as both are needed here first.
