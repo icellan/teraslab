@@ -6,21 +6,42 @@ work surfaced while fixing the reviewed findings.
 
 ## From G1
 
-- **F-G1-015 metric** — review recommendation (b) was to also drop a
-  `corrupt_redo_entries_total` counter into `AllocatorMetrics`. Touched
-  files would be `src/metrics.rs` (G6 ownership) plus the call sites.
-  Behaviour-wise the `tracing::error!` already gives the operator the
-  signal; the counter would let dashboards alert on non-zero
-  recovery-time corruption-rejection rates. Out of G1 ownership and
-  small-but-cross-cutting — keep as orchestrator follow-up.
+- **F-G1-015 metric — RESOLVED** (P2.3 / B-1 / A-5). Added
+  `corrupt_redo_entries_total: PaddedCounter` to `AllocatorMetrics` in
+  `src/metrics.rs` and bumped it at every `tracing::error!` rejection
+  site inside `replay_allocate` / `replay_free` in `src/allocator.rs`.
+  Wired into the Prometheus `/metrics` endpoint as
+  `teraslab_allocator_corrupt_redo_entries_total` and into the
+  `/admin/top` JSON shape. Covered by
+  `src/allocator.rs::tests::corrupt_redo_replay_bumps_metric` and the
+  `tests/http_observability.rs::metrics_includes_new_telemetry_counters`
+  regression guard.
 
-- **F-G1-019 metric / warn** — review recommendation was to emit a
-  `warn`-level log + metric when a record's generation jumps by more
-  than `2^30` (approaching the wrap-classification ambiguity window).
-  The classification function itself is correct and now pinned
-  symmetrically by tests; the early-warning telemetry needs the same
-  `AllocatorMetrics`-adjacent counter the G1-015 follow-up wants, so
-  bundle both.
+- **F-G1-019 metric / warn — RESOLVED** (P2.3 / B-1 / A-5). Added
+  `generation_wrap_warn_total: PaddedCounter` to `AllocatorMetrics`
+  and a `GENERATION_WRAP_WARN_DELTA = 1u32 << 30` constant in
+  `src/record.rs`. `generation_target_ahead` now emits a `warn`-level
+  log and bumps the counter whenever the forward delta exceeds the
+  threshold (the classification result is unchanged — telemetry only).
+  Wired into the `/metrics` endpoint as
+  `teraslab_allocator_generation_wrap_warn_total` and into
+  `/admin/top`. Covered by
+  `src/allocator.rs::tests::generation_wrap_bumps_warn_metric` plus
+  the http-observability regression guard.
+
+- **F-G8-004 SWIM ping_req metric — RESOLVED** (P2.4 / B-2 / A-5).
+  Moved the process-wide `AtomicU64` `SWIM_PING_REQ_DROPPED_TOTAL` out
+  of `src/cluster/swim.rs` and onto
+  `SwimMetrics::swim_ping_req_dropped_total` in `src/metrics.rs`. The
+  eviction site in `ping_req_forwarding_put` now bumps the new
+  counter; the legacy `ping_req_dropped_total()` accessor is preserved
+  as a thin wrapper so `tests/g8_ping_req_cap.rs` continues to work
+  without import churn. Wired into the `/metrics` endpoint as
+  `teraslab_swim_ping_req_dropped_total` and into `/admin/top`.
+  Covered by
+  `src/cluster/swim.rs::tests::ping_req_eviction_bumps_metric` and the
+  updated `tests/g8_ping_req_cap.rs` which now installs the test
+  `SwimMetrics` table before asserting eviction counts.
 
 - **F-G1-012 nix/rustix port** — the hard-coded `BLKGETSIZE64` /
   `DKIOCGETBLOCKCOUNT` constants in `src/device.rs` are correct for

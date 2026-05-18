@@ -1028,6 +1028,11 @@ pub(crate) fn render_metrics_text(
                 v
             );
         }
+        prom_counter(
+            &mut out,
+            "teraslab_swim_ping_req_dropped_total",
+            sw.swim_ping_req_dropped_total.get(),
+        );
     }
     if let Some(a) = allocator_metrics() {
         prom_counter(&mut out, "teraslab_alloc_total", a.alloc_total.get());
@@ -1051,6 +1056,16 @@ pub(crate) fn render_metrics_text(
             &mut out,
             "teraslab_freelist_largest_region_bytes",
             a.freelist_largest_region_bytes.load(Ordering::Relaxed),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_allocator_corrupt_redo_entries_total",
+            a.corrupt_redo_entries_total.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_allocator_generation_wrap_warn_total",
+            a.generation_wrap_warn_total.get(),
         );
     }
 
@@ -1864,6 +1879,7 @@ fn swim_metrics_json() -> serde_json::Value {
             "indirect_probes": 0,
             "suspicion_duration": histogram_json(&LatencyHistogram::new()),
             "churn": {},
+            "ping_req_dropped": 0,
         });
     };
     let mut churn = serde_json::Map::new();
@@ -1879,6 +1895,7 @@ fn swim_metrics_json() -> serde_json::Value {
         "indirect_probes": sw.swim_indirect_probes_total.get(),
         "suspicion_duration": histogram_json(&sw.swim_suspicion_duration_ns),
         "churn": serde_json::Value::Object(churn),
+        "ping_req_dropped": sw.swim_ping_req_dropped_total.get(),
     })
 }
 
@@ -1892,6 +1909,8 @@ fn allocator_metrics_json() -> serde_json::Value {
             "free_bytes_total": 0,
             "freelist_region_count": 0,
             "freelist_largest_region_bytes": 0,
+            "corrupt_redo_entries_total": 0,
+            "generation_wrap_warn_total": 0,
         });
     };
     serde_json::json!({
@@ -1901,6 +1920,8 @@ fn allocator_metrics_json() -> serde_json::Value {
         "free_bytes_total": a.free_bytes_total.get(),
         "freelist_region_count": a.freelist_region_count.load(Ordering::Relaxed),
         "freelist_largest_region_bytes": a.freelist_largest_region_bytes.load(Ordering::Relaxed),
+        "corrupt_redo_entries_total": a.corrupt_redo_entries_total.get(),
+        "generation_wrap_warn_total": a.generation_wrap_warn_total.get(),
     })
 }
 
@@ -3143,12 +3164,15 @@ mod tests {
             "teraslab_swim_indirect_probes_total",
             "teraslab_swim_suspicion_duration_ns",
             "teraslab_swim_membership_churn_total",
+            "teraslab_swim_ping_req_dropped_total",
             "teraslab_alloc_total",
             "teraslab_alloc_bytes_total",
             "teraslab_free_total",
             "teraslab_free_bytes_total",
             "teraslab_freelist_region_count",
             "teraslab_freelist_largest_region_bytes",
+            "teraslab_allocator_corrupt_redo_entries_total",
+            "teraslab_allocator_generation_wrap_warn_total",
         ] {
             assert!(
                 text.contains(name),

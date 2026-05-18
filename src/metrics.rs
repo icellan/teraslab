@@ -1295,6 +1295,13 @@ pub struct SwimMetrics {
     pub swim_suspicion_duration_ns: LatencyHistogram,
     /// Membership churn events keyed by [`SwimChurnKind`].
     pub swim_membership_churn_total: LabeledCounter<SWIM_CHURN_CARDINALITY>,
+    /// PING_REQ forwarding entries evicted because the bounded
+    /// forwarding map hit its cap (F-G8-004). Bumped at the eviction
+    /// site in [`crate::cluster::swim::SwimRunner::ping_req_forwarding_put`].
+    /// A sustained increase indicates either (a) probes are timing out
+    /// without ACKs at scale, or (b) a peer is flooding PING_REQs for
+    /// non-existent NodeIds.
+    pub swim_ping_req_dropped_total: PaddedCounter,
 }
 
 /// Number of membership-churn kinds tracked by [`SwimMetrics`].
@@ -1351,6 +1358,7 @@ impl SwimMetrics {
             swim_indirect_probes_total: PaddedCounter::new(),
             swim_suspicion_duration_ns: LatencyHistogram::new(),
             swim_membership_churn_total: LabeledCounter::<SWIM_CHURN_CARDINALITY>::new(),
+            swim_ping_req_dropped_total: PaddedCounter::new(),
         }
     }
 
@@ -1380,6 +1388,22 @@ pub struct AllocatorMetrics {
     pub freelist_region_count: AtomicU32,
     /// Largest contiguous freelist region in bytes (gauge).
     pub freelist_largest_region_bytes: AtomicU64,
+    /// Redo entries dropped during recovery because they were corrupt
+    /// (F-G1-015). Each increment corresponds to a `tracing::error!` at
+    /// the rejection site in
+    /// [`crate::allocator::SlotAllocator::replay_free`] /
+    /// `replay_allocate`. Non-zero values let dashboards alert on
+    /// recovery-time corruption-rejection rates.
+    pub corrupt_redo_entries_total: PaddedCounter,
+    /// Generation-number jumps that approach the wrapping-comparison
+    /// ambiguity window (F-G1-019). Bumped whenever
+    /// [`crate::record::generation_target_ahead`] sees a forward delta
+    /// greater than `2^30` (half of the `2^31` order window). A
+    /// sustained increase means a record is taking more than ~1B
+    /// outstanding mutations between two observed generations and is
+    /// approaching the point where wrapping-serial comparison can no
+    /// longer disambiguate ahead vs. behind.
+    pub generation_wrap_warn_total: PaddedCounter,
 }
 
 impl Default for AllocatorMetrics {
@@ -1398,6 +1422,8 @@ impl AllocatorMetrics {
             free_bytes_total: PaddedCounter::new(),
             freelist_region_count: AtomicU32::new(0),
             freelist_largest_region_bytes: AtomicU64::new(0),
+            corrupt_redo_entries_total: PaddedCounter::new(),
+            generation_wrap_warn_total: PaddedCounter::new(),
         }
     }
 }

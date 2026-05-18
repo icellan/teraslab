@@ -45,25 +45,18 @@ const MAX_MSG_SIZE: usize = 4096;
 /// orders of magnitude beyond a healthy steady-state.
 const PING_REQ_FORWARDING_MAX: usize = 4096;
 
-/// Counter for evicted PING_REQ forwarding entries.
-///
-/// Exposed via [`ping_req_dropped_total`] for observability. Each
-/// time the forwarding map hits [`PING_REQ_FORWARDING_MAX`] and a
-/// new entry pushes out the oldest, this counter increments. A
-/// sustained increase indicates either (a) probes are timing out
-/// without ACKs at scale, or (b) an attacker is flooding PING_REQs
-/// for non-existent NodeIds (F-G8-004).
-static SWIM_PING_REQ_DROPPED_TOTAL: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 /// Number of PING_REQ forwarding entries evicted due to the cap in
 /// [`PING_REQ_FORWARDING_MAX`]. Monotonic counter, process-lifetime.
 ///
-/// `target = teraslab::cluster::swim` warn logs are emitted at each
-/// eviction; this counter is the metric form (added locally rather
-/// than touching `metrics.rs`, which is owned by G6).
+/// Thin backward-compat wrapper around
+/// [`crate::metrics::SwimMetrics::swim_ping_req_dropped_total`] (the
+/// canonical home — P2.4). Returns 0 if `init_swim_metrics` has not
+/// been called yet (pre-boot tests, etc.). Existing callers — chiefly
+/// `tests/g8_ping_req_cap.rs` — keep working without import churn.
 pub fn ping_req_dropped_total() -> u64 {
-    SWIM_PING_REQ_DROPPED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+    crate::metrics::swim_metrics()
+        .map(|m| m.swim_ping_req_dropped_total.get())
+        .unwrap_or(0)
 }
 const MSG_SIZE_WARN_THRESHOLD: usize = MAX_MSG_SIZE * 4 / 5;
 const DEAD_MEMBER_FORGET_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
@@ -671,7 +664,7 @@ impl SwimRunner {
     /// (the existing entry was inserted earlier and will still be
     /// evicted first when the cap hits). If the map is at the cap
     /// [`PING_REQ_FORWARDING_MAX`], evicts the oldest entry and
-    /// increments [`SWIM_PING_REQ_DROPPED_TOTAL`].
+    /// bumps `SwimMetrics::swim_ping_req_dropped_total` (P2.4).
     fn ping_req_forwarding_put(&mut self, target_id: NodeId, from_addr: SocketAddr) {
         if !self.ping_req_forwarding.contains_key(&target_id)
             && self.ping_req_forwarding.len() >= PING_REQ_FORWARDING_MAX
@@ -681,8 +674,9 @@ impl SwimRunner {
                 match self.ping_req_forwarding_order.pop_front() {
                     Some(oldest) => {
                         if self.ping_req_forwarding.remove(&oldest).is_some() {
-                            SWIM_PING_REQ_DROPPED_TOTAL
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if let Some(m) = crate::metrics::swim_metrics() {
+                                m.swim_ping_req_dropped_total.inc();
+                            }
                             tracing::warn!(
                                 evicted = oldest.0,
                                 cap = PING_REQ_FORWARDING_MAX,
@@ -1628,6 +1622,67 @@ mod tests {
         assert_eq!(
             suspect_backoff_delay(base, 100),
             Duration::from_millis(1600)
+        );
+    }
+
+    /// P2.4 / F-G8-004: when `ping_req_forwarding_put` evicts the oldest
+    /// entry to honour the bounded-map cap, it must bump the new
+    /// `SwimMetrics::swim_ping_req_dropped_total` counter (formerly a
+    /// process-wide `AtomicU64`).
+    ///
+    /// Drives `ping_req_forwarding_put` past
+    /// [`PING_REQ_FORWARDING_MAX`] entries with distinct NodeIds and
+    /// observes the counter delta. The legacy `ping_req_dropped_total()`
+    /// accessor is also asserted to remain consistent with the canonical
+    /// metric so existing callers in `tests/g8_ping_req_cap.rs` continue
+    /// to work without import churn.
+    #[test]
+    fn ping_req_eviction_bumps_metric() {
+        use crate::metrics::{SwimMetrics, init_swim_metrics, swim_metrics};
+        use std::sync::OnceLock;
+
+        static TEST_METRICS: OnceLock<SwimMetrics> = OnceLock::new();
+        let m_ref: &'static SwimMetrics = TEST_METRICS.get_or_init(SwimMetrics::new);
+        init_swim_metrics(m_ref);
+        let metrics = swim_metrics().expect("metrics installed");
+        let before = metrics.swim_ping_req_dropped_total.get();
+        let before_accessor = ping_req_dropped_total();
+
+        // Build a runner with throwaway addrs — we never bind or send.
+        let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = SwimConfig {
+            self_id: NodeId(1),
+            self_addr: bind,
+            bind_addr: bind,
+            seed_nodes: vec![],
+            probe_interval: Duration::from_millis(100),
+            suspicion_timeout: Duration::from_secs(5),
+            cluster_secret: None,
+            persisted_incarnation: 0,
+            committed_term: Arc::new(AtomicU64::new(0)),
+        };
+        let mut runner = SwimRunner::new(cfg);
+
+        // Push PING_REQ_FORWARDING_MAX + 5 distinct entries; the last 5
+        // must evict the 5 oldest.
+        let from_addr: std::net::SocketAddr = "127.0.0.1:65001".parse().unwrap();
+        let total = PING_REQ_FORWARDING_MAX as u64 + 5;
+        for i in 0..total {
+            runner.ping_req_forwarding_put(NodeId(10_000 + i), from_addr);
+        }
+
+        let after = metrics.swim_ping_req_dropped_total.get();
+        let after_accessor = ping_req_dropped_total();
+        assert!(
+            after - before >= 5,
+            "swim_ping_req_dropped_total must advance by ≥ 5 evictions, got {}",
+            after - before,
+        );
+        // The legacy accessor must read the same counter.
+        assert_eq!(
+            after_accessor - before_accessor,
+            after - before,
+            "ping_req_dropped_total() wrapper must agree with SwimMetrics counter",
         );
     }
 }
