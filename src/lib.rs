@@ -13,11 +13,23 @@
 //
 // Audit follow-up FUP-G10-014 tracks the broader internal-visibility
 // hygiene work; this commit only fixes the unambiguously-internal modules.
+//
+// P3.1: the `device_io` module (DeviceIo trait + io_uring/sync backends +
+// `create_device_io` factory) is also gated behind the `async-io` Cargo
+// feature. The trait and both backends are fully implemented and tested
+// in isolation, but the production engine still routes through the
+// synchronous `device::BlockDevice` trait; until a later phase wires the
+// spend / setMined paths to the batched `DeviceIo` surface, compiling
+// the module unconditionally produces dead-code warnings under
+// `cargo clippy --lib --no-deps`. The feature gate keeps the code alive
+// for backend tests (`cargo test --lib --features async-io`) without
+// polluting default-build lints.
 pub mod allocator;
 pub mod checkpoint;
 pub mod cluster;
 pub mod config;
 pub mod device;
+#[cfg(feature = "async-io")]
 pub(crate) mod device_io;
 pub mod fault_injection;
 pub mod index;

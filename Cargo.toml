@@ -26,6 +26,18 @@ fault-injection = []
 # `bench_insert_throughput` (~520s debug saved on every default test run).
 slow-tests = []
 
+# Compiles the `device_io` subsystem (the `DeviceIo` trait, the
+# `IoUringBackend` Linux backend, and the `SyncFallback` libc pread/pwrite
+# backend) and its factory `create_device_io`. The trait + backends are
+# fully implemented and tested in isolation but not yet routed through the
+# production engine, which still reads/writes the underlying `BlockDevice`
+# trait synchronously. Until a later phase wires the spend / setMined paths
+# to use `DeviceIo`, leaving this off keeps the code from showing up as
+# dead-code clippy warnings in default builds. Tests that exercise the
+# backends directly (`cargo test --lib --features async-io`) opt in
+# explicitly. See `src/device_io/mod.rs` for the full design rationale.
+async-io = []
+
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 bitflags = "2"
