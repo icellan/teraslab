@@ -2836,13 +2836,13 @@ mod tests {
             op_code: OP_REPLICA_BATCH,
             request_id: 1,
             flags: 0,
-            payload: batch_a.serialize(),
+            payload: batch_a.serialize().into(),
         };
         let req_b = RequestFrame {
             op_code: OP_REPLICA_BATCH,
             request_id: 2,
             flags: 0,
-            payload: batch_b.serialize(),
+            payload: batch_b.serialize().into(),
         };
 
         let resp_a = handle_replica_batch(&req_a, &engine, &last_applied);
@@ -2887,7 +2887,7 @@ mod tests {
             op_code: OP_REPLICA_BATCH,
             request_id: 1,
             flags: 0,
-            payload: batch_1.serialize(),
+            payload: batch_1.serialize().into(),
         };
         handle_replica_batch(&req_1, &engine, &last_applied);
         assert_eq!(last_applied.load(Ordering::Relaxed), 1);
@@ -2911,7 +2911,7 @@ mod tests {
             op_code: OP_REPLICA_BATCH,
             request_id: 2,
             flags: 0,
-            payload: batch_2.serialize(),
+            payload: batch_2.serialize().into(),
         };
         handle_replica_batch(&req_2, &engine, &last_applied);
         assert_eq!(last_applied.load(Ordering::Relaxed), 10);
@@ -2954,7 +2954,7 @@ mod tests {
             op_code: OP_REPLICA_BATCH,
             request_id,
             flags: 0,
-            payload: batch.serialize(),
+            payload: batch.serialize().into(),
         }
     }
 
@@ -3314,7 +3314,7 @@ mod tests {
             op_code: OP_REPLICA_BATCH,
             request_id: 1,
             flags: 0,
-            payload: normal_batch.serialize(),
+            payload: normal_batch.serialize().into(),
         };
         let resp = handle_replica_batch_with_tracker(
             &normal_req,
@@ -3339,7 +3339,7 @@ mod tests {
             op_code: OP_REPLICA_BATCH,
             request_id: /* shard id goes here in prod */ 7,
             flags: FLAG_MIGRATION_BATCH,
-            payload: migration_batch.serialize(),
+            payload: migration_batch.serialize().into(),
         };
         let resp = handle_replica_batch_with_tracker(
             &migration_req,
@@ -3495,7 +3495,7 @@ mod tests {
             op_code: OP_REPLICA_BATCH,
             request_id: 1,
             flags: 0,
-            payload: batch.serialize(),
+            payload: batch.serialize().into(),
         };
 
         // Capture the trace_id observed inside the receiver's span.
@@ -3571,7 +3571,7 @@ mod tests {
             request_id: 55,
             op_code: OP_REPLICA_BATCH,
             flags: 0,
-            payload: Vec::new(),
+            payload: Vec::new().into(),
         };
 
         let resp = handle_replica_batch_with_tracker(
@@ -3811,7 +3811,7 @@ mod tests {
             op_code: OP_REPLICA_BATCH,
             request_id: 9,
             flags: FLAG_MIGRATION_BATCH,
-            payload: migration_batch.serialize(),
+            payload: migration_batch.serialize().into(),
         };
 
         let resp = handle_replica_batch_with_tracker(
@@ -3856,7 +3856,7 @@ mod tests {
             op_code: OP_REPLICA_BATCH,
             request_id: 11,
             flags: FLAG_MIGRATION_BATCH,
-            payload: wildcard_batch.serialize(),
+            payload: wildcard_batch.serialize().into(),
         };
 
         let resp = handle_replica_batch_with_tracker(
@@ -3898,7 +3898,7 @@ mod tests {
             op_code: OP_REPLICA_BATCH,
             request_id: 12,
             flags: FLAG_MIGRATION_BATCH,
-            payload: migration_batch.serialize(),
+            payload: migration_batch.serialize().into(),
         };
 
         let resp = handle_replica_batch_with_tracker(
@@ -4159,7 +4159,7 @@ mod tests {
             request_id: 7,
             op_code: OP_REPLICA_BATCH,
             flags: 0,
-            payload: batch.serialize(),
+            payload: batch.serialize().into(),
         };
         let last = AtomicU64::new(0);
         let resp = handle_replica_batch(&req, &engine, &last);

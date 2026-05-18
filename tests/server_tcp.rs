@@ -177,7 +177,7 @@ fn create_records(stream: &mut TcpStream, items: &[WireCreateItem], req_id: u64)
             request_id: req_id,
             op_code: OP_CREATE_BATCH,
             flags: 0,
-            payload,
+            payload: payload.into(),
         },
     )
 }
@@ -238,7 +238,7 @@ fn ping_pong() {
             request_id: 1,
             op_code: OP_PING,
             flags: 0,
-            payload: vec![],
+            payload: vec![].into(),
         },
     );
 
@@ -276,7 +276,7 @@ fn create_10_then_get_batch_all() {
             request_id: 101,
             op_code: OP_GET_BATCH,
             flags: 0,
-            payload: get_payload,
+            payload: get_payload.into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -316,7 +316,7 @@ fn create_then_get_spend() {
             request_id: 11,
             op_code: OP_GET_SPEND_BATCH,
             flags: 0,
-            payload: get_payload,
+            payload: get_payload.into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -353,7 +353,8 @@ fn get_spend_wire_validates_utxo_hash() {
                 txid,
                 vout: 0,
                 utxo_hash: wrong_hash,
-            }]),
+            }]).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -404,7 +405,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: test_utxo_hash(1312, 9),
                     spending_data: [0x11; 36],
                 }],
-            ),
+            ).into(),
+
         },
     );
     assert_single_sparse_error(&resp, ERR_VOUT_OUT_OF_RANGE);
@@ -425,7 +427,7 @@ fn tcp_error_code_triggerability_core_item_errors() {
             request_id: 1315,
             op_code: OP_FREEZE_BATCH,
             flags: 0,
-            payload: freeze_payload.clone(),
+            payload: freeze_payload.clone().into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -435,7 +437,7 @@ fn tcp_error_code_triggerability_core_item_errors() {
             request_id: 1316,
             op_code: OP_FREEZE_BATCH,
             flags: 0,
-            payload: freeze_payload,
+            payload: freeze_payload.into(),
         },
     );
     assert_single_sparse_error(&resp, ERR_ALREADY_FROZEN);
@@ -466,7 +468,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: reassign_hash,
                     new_utxo_hash: test_utxo_hash(99_999, 0),
                 }],
-            ),
+            ).into(),
+
         },
     );
     assert_single_sparse_error(&resp, ERR_UTXO_NOT_FROZEN);
@@ -500,7 +503,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: unspend_hash,
                     spending_data: good_spending_data,
                 }],
-            ),
+            ).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -521,7 +525,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: unspend_hash,
                     spending_data: [0x33; 36],
                 }],
-            ),
+            ).into(),
+
         },
     );
     let err = assert_single_sparse_error(&err, ERR_INVALID_SPEND);
@@ -547,7 +552,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                 txid: cooldown_txid,
                 vout: 0,
                 utxo_hash: cooldown_hash,
-            }]),
+            }]).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -568,7 +574,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: cooldown_hash,
                     new_utxo_hash: cooldown_new_hash,
                 }],
-            ),
+            ).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -591,7 +598,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: cooldown_new_hash,
                     spending_data: [0x44; 36],
                 }],
-            ),
+            ).into(),
+
         },
     );
     let err = assert_single_sparse_error(&err, ERR_FROZEN_UNTIL);
@@ -623,7 +631,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: spent_hash,
                     spending_data: winner_spending_data,
                 }],
-            ),
+            ).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -646,7 +655,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: spent_hash,
                     spending_data: [0x66; 36],
                 }],
-            ),
+            ).into(),
+
         },
     );
     let err = assert_single_sparse_error(&err, ERR_ALREADY_SPENT);
@@ -678,7 +688,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: frozen_spend_hash,
                     spending_data: [0x77; 36],
                 }],
-            ),
+            ).into(),
+
         },
     );
     assert_single_sparse_error(&err, ERR_FROZEN);
@@ -709,7 +720,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: conflicting_hash,
                     spending_data: [0x88; 36],
                 }],
-            ),
+            ).into(),
+
         },
     );
     assert_single_sparse_error(&err, ERR_CONFLICTING);
@@ -740,7 +752,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: locked_hash,
                     spending_data: [0x99; 36],
                 }],
-            ),
+            ).into(),
+
         },
     );
     assert_single_sparse_error(&err, ERR_LOCKED);
@@ -772,7 +785,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: coinbase_hash,
                     spending_data: [0xAA; 36],
                 }],
-            ),
+            ).into(),
+
         },
     );
     let err = assert_single_sparse_error(&err, ERR_COINBASE_IMMATURE);
@@ -818,7 +832,7 @@ fn create_spend_get_spend() {
             request_id: 21,
             op_code: OP_SPEND_BATCH,
             flags: 0,
-            payload: spend_payload,
+            payload: spend_payload.into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -834,7 +848,8 @@ fn create_spend_get_spend() {
                 txid,
                 vout: 0,
                 utxo_hash: test_utxo_hash(2, 0),
-            }]),
+            }]).into(),
+
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -886,7 +901,8 @@ fn create_spend_across_multiple_txids_then_get() {
                     block_height_retention: 288,
                 },
                 &spend_items,
-            ),
+            ).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -899,7 +915,7 @@ fn create_spend_across_multiple_txids_then_get() {
             request_id: 302,
             op_code: OP_GET_BATCH,
             flags: 0,
-            payload: encode_get_batch(FieldMask::ALL_METADATA | FieldMask::UTXO_SLOTS, &txids),
+            payload: encode_get_batch(FieldMask::ALL_METADATA | FieldMask::UTXO_SLOTS, &txids).into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -947,7 +963,7 @@ fn create_set_mined_delete() {
             request_id: 31,
             op_code: OP_SET_MINED_BATCH,
             flags: 0,
-            payload: mined_payload,
+            payload: mined_payload.into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -959,7 +975,7 @@ fn create_set_mined_delete() {
             request_id: 32,
             op_code: OP_DELETE_BATCH,
             flags: 0,
-            payload: encode_txid_batch(&[txid], &[]),
+            payload: encode_txid_batch(&[txid], &[]).into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -975,7 +991,8 @@ fn create_set_mined_delete() {
                 txid,
                 vout: 0,
                 utxo_hash: test_utxo_hash(3, 0),
-            }]),
+            }]).into(),
+
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -1015,7 +1032,8 @@ fn create_set_mined_mark_longest_chain() {
                     block_height_retention: 288,
                 },
                 &[txid],
-            ),
+            ).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1031,7 +1049,7 @@ fn create_set_mined_mark_longest_chain() {
             request_id: 402,
             op_code: OP_MARK_LONGEST_CHAIN_BATCH,
             flags: 0,
-            payload: encode_txid_batch(&[txid], &shared),
+            payload: encode_txid_batch(&[txid], &shared).into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1043,7 +1061,7 @@ fn create_set_mined_mark_longest_chain() {
             request_id: 403,
             op_code: OP_GET_BATCH,
             flags: 0,
-            payload: encode_get_batch(FieldMask::ALL_METADATA, &[txid]),
+            payload: encode_get_batch(FieldMask::ALL_METADATA, &[txid]).into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1082,7 +1100,8 @@ fn freeze_unfreeze_over_tcp() {
                 txid,
                 vout: 0,
                 utxo_hash: hash0,
-            }]),
+            }]).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1098,7 +1117,8 @@ fn freeze_unfreeze_over_tcp() {
                 txid,
                 vout: 0,
                 utxo_hash: test_utxo_hash(4, 0),
-            }]),
+            }]).into(),
+
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -1115,7 +1135,8 @@ fn freeze_unfreeze_over_tcp() {
                 txid,
                 vout: 0,
                 utxo_hash: hash0,
-            }]),
+            }]).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1131,7 +1152,8 @@ fn freeze_unfreeze_over_tcp() {
                 txid,
                 vout: 0,
                 utxo_hash: test_utxo_hash(4, 0),
-            }]),
+            }]).into(),
+
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -1171,7 +1193,8 @@ fn freeze_reassign_get_spend() {
                 txid,
                 vout: 0,
                 utxo_hash: hash0,
-            }]),
+            }]).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1194,7 +1217,8 @@ fn freeze_reassign_get_spend() {
                     utxo_hash: hash0,
                     new_utxo_hash: new_hash,
                 }],
-            ),
+            ).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1210,7 +1234,8 @@ fn freeze_reassign_get_spend() {
                 txid,
                 vout: 0,
                 utxo_hash: new_hash,
-            }]),
+            }]).into(),
+
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -1246,7 +1271,7 @@ fn create_set_conflicting() {
             request_id: 601,
             op_code: OP_SET_CONFLICTING_BATCH,
             flags: 0,
-            payload: encode_txid_batch(&[txid], &shared),
+            payload: encode_txid_batch(&[txid], &shared).into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1258,7 +1283,7 @@ fn create_set_conflicting() {
             request_id: 602,
             op_code: OP_GET_BATCH,
             flags: 0,
-            payload: encode_get_batch(FieldMask::ALL_METADATA, &[txid]),
+            payload: encode_get_batch(FieldMask::ALL_METADATA, &[txid]).into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1290,8 +1315,9 @@ fn create_set_locked() {
             request_id: 701,
             op_code: OP_SET_LOCKED_BATCH,
             flags: 0,
-            payload: encode_txid_batch(&[txid], &[1u8]), // value=true
+            payload: encode_txid_batch(&[txid], &[1u8]).into(), // value=true
         },
+
     );
     assert_eq!(resp.status, STATUS_OK);
 
@@ -1302,7 +1328,7 @@ fn create_set_locked() {
             request_id: 702,
             op_code: OP_GET_BATCH,
             flags: 0,
-            payload: encode_get_batch(FieldMask::ALL_METADATA, &[txid]),
+            payload: encode_get_batch(FieldMask::ALL_METADATA, &[txid]).into(),
         },
     );
     let results = decode_get_response(&resp.payload).unwrap();
@@ -1331,7 +1357,7 @@ fn create_preserve_until_get() {
             request_id: 801,
             op_code: OP_PRESERVE_UNTIL_BATCH,
             flags: 0,
-            payload: encode_txid_batch(&[txid], &5000u32.to_le_bytes()),
+            payload: encode_txid_batch(&[txid], &5000u32.to_le_bytes()).into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1343,7 +1369,7 @@ fn create_preserve_until_get() {
             request_id: 802,
             op_code: OP_GET_BATCH,
             flags: 0,
-            payload: encode_get_batch(FieldMask::ALL_METADATA, &[txid]),
+            payload: encode_get_batch(FieldMask::ALL_METADATA, &[txid]).into(),
         },
     );
     let results = decode_get_response(&resp.payload).unwrap();
@@ -1400,7 +1426,8 @@ fn batch_spend_1024_items() {
                     block_height_retention: 288,
                 },
                 &items,
-            ),
+            ).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1428,7 +1455,8 @@ fn batch_spend_1024_items() {
                     vout: 1023,
                     utxo_hash: test_utxo_hash(5, 1023),
                 },
-            ]),
+            ]).into(),
+
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -1480,7 +1508,8 @@ fn batch_spend_100_same_txid() {
                     block_height_retention: 288,
                 },
                 &items,
-            ),
+            ).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1510,7 +1539,7 @@ fn batch_exceeding_max_batch_size_rejected() {
             request_id: 1000,
             op_code: OP_DELETE_BATCH,
             flags: 0,
-            payload: encode_txid_batch(&txids, &[]),
+            payload: encode_txid_batch(&txids, &[]).into(),
         },
     );
     assert_eq!(resp.status, STATUS_ERROR);
@@ -1569,7 +1598,8 @@ fn multiple_concurrent_connections() {
                                     utxo_hash: test_utxo_hash(100 + i, v),
                                     spending_data: sd,
                                 }],
-                            ),
+                            ).into(),
+
                         },
                     );
                     assert_eq!(resp.status, STATUS_OK, "spend failed: client {i} vout {v}");
@@ -1603,7 +1633,7 @@ fn invalid_opcode_returns_error() {
             request_id: 1,
             op_code: 999,
             flags: 0,
-            payload: vec![],
+            payload: vec![].into(),
         },
     );
     assert_eq!(resp.status, STATUS_ERROR);
@@ -1615,7 +1645,7 @@ fn invalid_opcode_returns_error() {
             request_id: 2,
             op_code: OP_PING,
             flags: 0,
-            payload: vec![],
+            payload: vec![].into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1638,8 +1668,9 @@ fn malformed_payload_returns_error() {
             request_id: 1,
             op_code: OP_SPEND_BATCH,
             flags: 0,
-            payload: vec![0x01, 0x02], // Way too short
+            payload: vec![0x01, 0x02].into(), // Way too short
         },
+
     );
     assert_eq!(resp.status, STATUS_ERROR);
 
@@ -1686,7 +1717,8 @@ fn request_for_nonexistent_tx_partial_error() {
                         spending_data: [0xBB; 36],
                     },
                 ],
-            ),
+            ).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
@@ -1790,7 +1822,7 @@ fn stream_isolation_per_connection() {
             request_id: 1300,
             op_code: OP_STREAM_CHUNK,
             flags: 0,
-            payload: encode_stream_chunk(&txid, 0, b"hello"),
+            payload: encode_stream_chunk(&txid, 0, b"hello").into(),
         },
     );
     assert_eq!(resp_a.status, STATUS_OK);
@@ -1804,7 +1836,7 @@ fn stream_isolation_per_connection() {
             request_id: 1301,
             op_code: OP_STREAM_CHUNK,
             flags: 0,
-            payload: encode_stream_chunk(&txid, 5, b"world"),
+            payload: encode_stream_chunk(&txid, 5, b"world").into(),
         },
     );
     assert_eq!(resp_b.status, STATUS_ERROR);
@@ -1830,7 +1862,7 @@ fn stream_end_without_active_stream_returns_stream_not_found() {
             request_id: 1302,
             op_code: OP_STREAM_END,
             flags: 0,
-            payload: encode_stream_end(&txid, 0),
+            payload: encode_stream_end(&txid, 0).into(),
         },
     );
     assert_eq!(resp.status, STATUS_ERROR);
@@ -1858,7 +1890,7 @@ fn external_blob_create_without_uploaded_blob_returns_blob_not_found() {
             request_id: 1303,
             op_code: OP_CREATE_BATCH,
             flags: 0,
-            payload: encode_create_batch(&[item]),
+            payload: encode_create_batch(&[item]).into(),
         },
     );
     assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
@@ -1898,7 +1930,8 @@ fn pipelined_requests_5_batches() {
                 txid: test_txid(1200 + i),
                 vout: 0,
                 utxo_hash: test_utxo_hash(1200 + i, 0),
-            }]),
+            }]).into(),
+
         };
         let bytes = frame.encode();
         stream.write_all(&bytes).unwrap();
@@ -1945,7 +1978,7 @@ fn client_disconnect_mid_session_server_survives() {
                 request_id: 1,
                 op_code: OP_PING,
                 flags: 0,
-                payload: vec![],
+                payload: vec![].into(),
             },
         );
         assert_eq!(resp.status, STATUS_OK);
@@ -1965,7 +1998,7 @@ fn client_disconnect_mid_session_server_survives() {
             request_id: 2,
             op_code: OP_PING,
             flags: 0,
-            payload: vec![],
+            payload: vec![].into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -2005,7 +2038,8 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
                     utxo_hash: test_utxo_hash(1500, 0),
                     spending_data: [0xAA; 36],
                 }],
-            ),
+            ).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -2028,7 +2062,8 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
                     block_height_retention: 288,
                 },
                 &[txid],
-            ),
+            ).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -2044,7 +2079,8 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
                 txid,
                 vout: 1,
                 utxo_hash: test_utxo_hash(1500, 1),
-            }]),
+            }]).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -2060,7 +2096,8 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
                 txid,
                 vout: 1,
                 utxo_hash: test_utxo_hash(1500, 1),
-            }]),
+            }]).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -2076,7 +2113,7 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
             request_id: 1505,
             op_code: OP_SET_CONFLICTING_BATCH,
             flags: 0,
-            payload: encode_txid_batch(&[txid], &shared),
+            payload: encode_txid_batch(&[txid], &shared).into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -2088,7 +2125,7 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
             request_id: 1506,
             op_code: OP_SET_LOCKED_BATCH,
             flags: 0,
-            payload: encode_txid_batch(&[txid], &[1u8]),
+            payload: encode_txid_batch(&[txid], &[1u8]).into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -2100,7 +2137,7 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
             request_id: 1507,
             op_code: OP_PRESERVE_UNTIL_BATCH,
             flags: 0,
-            payload: encode_txid_batch(&[txid], &3000u32.to_le_bytes()),
+            payload: encode_txid_batch(&[txid], &3000u32.to_le_bytes()).into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -2116,7 +2153,7 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
             request_id: 1508,
             op_code: OP_MARK_LONGEST_CHAIN_BATCH,
             flags: 0,
-            payload: encode_txid_batch(&[txid], &shared2),
+            payload: encode_txid_batch(&[txid], &shared2).into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -2132,7 +2169,8 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
                 txid,
                 vout: 0,
                 utxo_hash: test_utxo_hash(1500, 0),
-            }]),
+            }]).into(),
+
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -2146,7 +2184,7 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
             request_id: 1510,
             op_code: OP_DELETE_BATCH,
             flags: 0,
-            payload: encode_txid_batch(&[txid], &[]),
+            payload: encode_txid_batch(&[txid], &[]).into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);

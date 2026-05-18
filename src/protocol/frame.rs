@@ -6,6 +6,7 @@
 //! ```
 
 use crate::protocol::opcodes::MAX_FRAME_SIZE;
+use bytes::Bytes;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -48,6 +49,13 @@ pub const REQUEST_HEADER_SIZE: usize = 4 + 8 + 2 + 2; // 16 bytes on wire
 pub const RESPONSE_HEADER_SIZE: usize = 4 + 8 + 1; // 13 bytes on wire
 
 /// A decoded request frame.
+///
+/// `payload` is a [`Bytes`] handle — it can be a zero-copy slice of the
+/// connection's read buffer (`decode_bytes`) or an owned `Vec` (`decode`).
+/// `Bytes` implements `Deref<Target=[u8]>`, so handlers continue to use
+/// it as a byte slice via `&req.payload[..]` or `&*req.payload` without
+/// any code change. C-6 / F-G5-011 (P3.4) — eliminates the per-frame
+/// `Vec<u8>::to_vec()` clone that used to live in `decode`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestFrame {
     /// Client-assigned request ID for pipelining.
@@ -56,8 +64,10 @@ pub struct RequestFrame {
     pub op_code: u16,
     /// Flags (reserved).
     pub flags: u16,
-    /// Operation-specific payload.
-    pub payload: Vec<u8>,
+    /// Operation-specific payload. Held as [`Bytes`] so zero-copy
+    /// slicing from the connection read buffer is possible (see
+    /// [`RequestFrame::decode_bytes`]).
+    pub payload: Bytes,
 }
 
 /// A decoded response frame.
@@ -87,9 +97,13 @@ impl RequestFrame {
         buf
     }
 
-    /// Decode a request frame from bytes.
+    /// Decode a request frame from a borrowed byte slice.
     ///
-    /// Returns the frame and the total number of bytes consumed.
+    /// Returns the frame and the total number of bytes consumed. The
+    /// payload is copied into an owned `Bytes` because the input is
+    /// borrowed. Hot-path callers should prefer [`Self::decode_bytes`],
+    /// which takes a shared [`Bytes`] read buffer and produces a
+    /// zero-copy payload slice (C-6 / F-G5-011 / P3.4).
     ///
     /// # Errors
     ///
@@ -100,61 +114,8 @@ impl RequestFrame {
     /// exceed the buffer, and [`FrameError::TooShort`] when the
     /// remaining body cannot contain the fixed request header fields.
     pub fn decode(data: &[u8]) -> Result<(Self, usize)> {
-        if data.len() < 4 {
-            return Err(FrameError::TooShort {
-                need: 4,
-                have: data.len(),
-            });
-        }
-        let total_length =
-            u32::from_le_bytes(data[0..4].try_into().map_err(|_| FrameError::TooShort {
-                need: 4,
-                have: data.len(),
-            })?);
-        // Absolute minimum frame check BEFORE any allocation — protects
-        // against adversarial inputs with tiny declared lengths.
-        if total_length < MIN_FRAME_BODY {
-            return Err(FrameError::BelowMinimum {
-                total_length,
-                minimum: MIN_FRAME_BODY,
-            });
-        }
-        if total_length > MAX_FRAME_SIZE {
-            return Err(FrameError::TooLarge {
-                size: total_length,
-                max: MAX_FRAME_SIZE,
-            });
-        }
-        let frame_size = 4 + total_length as usize;
-        if data.len() < frame_size {
-            return Err(FrameError::Truncated {
-                declared: frame_size,
-                actual: data.len(),
-            });
-        }
-        if total_length < MIN_REQUEST_BODY {
-            return Err(FrameError::TooShort {
-                need: MIN_REQUEST_BODY as usize,
-                have: total_length as usize,
-            });
-        }
-        let request_id =
-            u64::from_le_bytes(data[4..12].try_into().map_err(|_| FrameError::Truncated {
-                declared: frame_size,
-                actual: data.len(),
-            })?);
-        let op_code =
-            u16::from_le_bytes(data[12..14].try_into().map_err(|_| FrameError::Truncated {
-                declared: frame_size,
-                actual: data.len(),
-            })?);
-        let flags =
-            u16::from_le_bytes(data[14..16].try_into().map_err(|_| FrameError::Truncated {
-                declared: frame_size,
-                actual: data.len(),
-            })?);
-        let payload = data[16..frame_size].to_vec();
-
+        let (request_id, op_code, flags, payload_range, frame_size) = parse_request_header(data)?;
+        let payload = Bytes::copy_from_slice(&data[payload_range]);
         Ok((
             Self {
                 request_id,
@@ -165,6 +126,97 @@ impl RequestFrame {
             frame_size,
         ))
     }
+
+    /// Zero-copy decode of a request frame from a shared [`Bytes`] read
+    /// buffer.
+    ///
+    /// The returned `RequestFrame::payload` is a `Bytes::slice(...)` of
+    /// the input — it shares the underlying allocation via reference
+    /// counting and does not copy. Designed for the server connection
+    /// loop, which holds a per-connection [`bytes::BytesMut`] and freezes
+    /// each completed frame into `Bytes` before decoding.
+    ///
+    /// C-6 / F-G5-011 (P3.4) — replaces the `payload[..].to_vec()` copy
+    /// in [`Self::decode`] for the hot opcode path.
+    ///
+    /// # Errors
+    ///
+    /// Same error variants as [`Self::decode`].
+    pub fn decode_bytes(data: Bytes) -> Result<(Self, usize)> {
+        let (request_id, op_code, flags, payload_range, frame_size) = parse_request_header(&data)?;
+        let payload = data.slice(payload_range);
+        Ok((
+            Self {
+                request_id,
+                op_code,
+                flags,
+                payload,
+            },
+            frame_size,
+        ))
+    }
+}
+
+/// Validate a request frame header and return the parsed fixed fields,
+/// the payload byte range within `data`, and the total frame size on
+/// the wire (length prefix + body). Shared between `decode` (borrowed)
+/// and `decode_bytes` (shared `Bytes`) so the validation logic stays
+/// single-source.
+fn parse_request_header(
+    data: &[u8],
+) -> Result<(u64, u16, u16, std::ops::Range<usize>, usize)> {
+    if data.len() < 4 {
+        return Err(FrameError::TooShort {
+            need: 4,
+            have: data.len(),
+        });
+    }
+    let total_length =
+        u32::from_le_bytes(data[0..4].try_into().map_err(|_| FrameError::TooShort {
+            need: 4,
+            have: data.len(),
+        })?);
+    if total_length < MIN_FRAME_BODY {
+        return Err(FrameError::BelowMinimum {
+            total_length,
+            minimum: MIN_FRAME_BODY,
+        });
+    }
+    if total_length > MAX_FRAME_SIZE {
+        return Err(FrameError::TooLarge {
+            size: total_length,
+            max: MAX_FRAME_SIZE,
+        });
+    }
+    let frame_size = 4 + total_length as usize;
+    if data.len() < frame_size {
+        return Err(FrameError::Truncated {
+            declared: frame_size,
+            actual: data.len(),
+        });
+    }
+    if total_length < MIN_REQUEST_BODY {
+        return Err(FrameError::TooShort {
+            need: MIN_REQUEST_BODY as usize,
+            have: total_length as usize,
+        });
+    }
+    let request_id =
+        u64::from_le_bytes(data[4..12].try_into().map_err(|_| FrameError::Truncated {
+            declared: frame_size,
+            actual: data.len(),
+        })?);
+    let op_code =
+        u16::from_le_bytes(data[12..14].try_into().map_err(|_| FrameError::Truncated {
+            declared: frame_size,
+            actual: data.len(),
+        })?);
+    let flags =
+        u16::from_le_bytes(data[14..16].try_into().map_err(|_| FrameError::Truncated {
+            declared: frame_size,
+            actual: data.len(),
+        })?);
+    Ok((request_id, op_code, flags, 16..frame_size, frame_size))
 }
 
 impl ResponseFrame {
@@ -314,12 +366,31 @@ mod tests {
             request_id: 42,
             op_code: OP_SPEND_BATCH,
             flags: 0,
-            payload: vec![1, 2, 3, 4, 5],
+            payload: Bytes::from_static(&[1, 2, 3, 4, 5]),
         };
         let encoded = frame.encode();
         let (decoded, consumed) = RequestFrame::decode(&encoded).unwrap();
         assert_eq!(decoded, frame);
         assert_eq!(consumed, encoded.len());
+    }
+
+    /// P3.4 / C-6: `decode_bytes` slices the underlying allocation
+    /// without copying. After decoding, the payload `Bytes` and the
+    /// source `Bytes` share the same pointer for the payload range.
+    #[test]
+    fn request_frame_decode_bytes_is_zero_copy() {
+        let frame = RequestFrame {
+            request_id: 42,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload: Bytes::from_static(&[1, 2, 3, 4, 5]),
+        };
+        let encoded = Bytes::from(frame.encode());
+        let payload_start_in_buf = encoded.as_ptr() as usize + 16;
+        let (decoded, _) = RequestFrame::decode_bytes(encoded.clone()).unwrap();
+        // Pointer identity proves the payload shares the source allocation.
+        assert_eq!(decoded.payload.as_ptr() as usize, payload_start_in_buf);
+        assert_eq!(&*decoded.payload, &[1, 2, 3, 4, 5][..]);
     }
 
     #[test]
@@ -343,7 +414,7 @@ mod tests {
                 request_id: 0xA5A5_0000 + payload_len as u64,
                 op_code: OP_GET_BATCH,
                 flags: payload_len as u16,
-                payload: payload.clone(),
+                payload: Bytes::from(payload.clone()),
             };
             let encoded = request.encode();
             let (decoded, consumed) = RequestFrame::decode(&encoded).unwrap();
@@ -368,7 +439,7 @@ mod tests {
             request_id: 1,
             op_code: OP_GET_BATCH,
             flags: 0,
-            payload: vec![0u8; 1024 * 1024], // 1 MB payload
+            payload: Bytes::from(vec![0u8; 1024 * 1024]), // 1 MB payload
         };
         let encoded = frame.encode();
         let (decoded, _) = RequestFrame::decode(&encoded).unwrap();
@@ -381,7 +452,7 @@ mod tests {
             request_id: 1,
             op_code: OP_PING,
             flags: 0,
-            payload: vec![0u8; 100],
+            payload: Bytes::from(vec![0u8; 100]),
         };
         let encoded = frame.encode();
         let result = RequestFrame::decode(&encoded[..encoded.len() / 2]);
@@ -431,13 +502,13 @@ mod tests {
             request_id: 1,
             op_code: OP_PING,
             flags: 0,
-            payload: vec![],
+            payload: Bytes::new(),
         };
         let f2 = RequestFrame {
             request_id: 2,
             op_code: OP_HEALTH,
             flags: 0,
-            payload: vec![42],
+            payload: Bytes::from_static(&[42]),
         };
         let mut stream = f1.encode();
         stream.extend_from_slice(&f2.encode());
@@ -458,7 +529,7 @@ mod tests {
             request_id: 1,
             op_code: OP_PING,
             flags: 0,
-            payload: vec![],
+            payload: Bytes::new(),
         };
         let mut stream = f1.encode();
         // Push a length prefix declaring a frame that exceeds MAX_FRAME_SIZE
@@ -483,13 +554,13 @@ mod tests {
             request_id: 1,
             op_code: OP_PING,
             flags: 0,
-            payload: vec![],
+            payload: Bytes::new(),
         };
         let f2_full = RequestFrame {
             request_id: 2,
             op_code: OP_HEALTH,
             flags: 0,
-            payload: vec![42],
+            payload: Bytes::from_static(&[42]),
         }
         .encode();
         let mut stream = f1.encode();
@@ -535,7 +606,7 @@ mod tests {
             request_id: 0,
             op_code: 0,
             flags: 0,
-            payload: vec![],
+            payload: Bytes::new(),
         };
         let encoded = frame.encode();
         assert_eq!(encoded.len(), REQUEST_HEADER_SIZE); // 16 bytes total for empty payload
@@ -606,7 +677,7 @@ mod tests {
             request_id: 42,
             op_code: OP_SPEND_BATCH,
             flags: 0,
-            payload: vec![0u8; 100],
+            payload: Bytes::from(vec![0u8; 100]),
         };
         let encoded = frame.encode();
         let total_length = u32::from_le_bytes(encoded[0..4].try_into().unwrap());

@@ -391,3 +391,13 @@ Added this session — see for ordered execution plan.
   production paths init it; documented at the call site. Footgun
   surfaces only if a second test harness asserts on this counter
   without calling `init_dispatch_metrics`.
+
+## From P3.4 / G5
+
+- **F-G5-011 / C-6 — RESOLVED (P3.4, frame zero-copy)**. `RequestFrame`
+  payload is now `bytes::Bytes` and the connection read loop holds a
+  per-connection `BytesMut`. `RequestFrame::decode_bytes` slices the
+  read buffer without copying. Verified by
+  `tests/p3_4_frame_zero_copy_allocs.rs`: 1000 iterations of
+  `OP_SPEND_BATCH` + `OP_CREATE_BATCH` decode @ 4 KiB payload — baseline
+  2000 allocs / 8 192 000 bytes vs zero-copy 2 allocs / 48 bytes.

@@ -212,7 +212,7 @@ impl ReplicaTransport for TcpReplicaTransport {
             request_id: self.request_id,
             op_code: OP_REPLICA_BATCH,
             flags: 0,
-            payload: batch.serialize(),
+            payload: batch.serialize().into(),
         };
         let encoded = frame.encode();
         let bytes = if let Some(secret) = self.auth_secret.as_deref() {

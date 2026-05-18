@@ -316,7 +316,7 @@ fn partition_map_served_over_tcp() {
             request_id: 1,
             op_code: OP_GET_PARTITION_MAP,
             flags: 0,
-            payload: vec![],
+            payload: vec![].into(),
         },
     );
 
@@ -379,7 +379,7 @@ fn cluster_node_serves_operations() {
             request_id: 1,
             op_code: OP_CREATE_BATCH,
             flags: 0,
-            payload: cp,
+            payload: cp.into(),
         },
     );
     assert_eq!(
@@ -394,7 +394,7 @@ fn cluster_node_serves_operations() {
             request_id: 2,
             op_code: OP_PING,
             flags: 0,
-            payload: vec![],
+            payload: vec![].into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -789,7 +789,7 @@ fn migrate_shard_with_records_to_new_node() {
                 request_id: 1,
                 op_code: OP_CREATE_BATCH,
                 flags: 0,
-                payload,
+                payload: payload.into(),
             },
         );
         assert!(
@@ -830,7 +830,7 @@ fn migrate_shard_with_records_to_new_node() {
             request_id: 99,
             op_code: OP_PING,
             flags: 0,
-            payload: vec![],
+            payload: vec![].into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -862,7 +862,7 @@ fn during_migration_writes_redirect_to_new_node() {
             request_id: 1,
             op_code: OP_CREATE_BATCH,
             flags: 0,
-            payload,
+            payload: payload.into(),
         },
     );
 
@@ -906,7 +906,7 @@ fn client_redirect_resends_to_new_node() {
             request_id: 1,
             op_code: OP_CREATE_BATCH,
             flags: 0,
-            payload: payload.clone(),
+            payload: payload.clone().into(),
         },
     );
     assert_eq!(resp.status, STATUS_PARTIAL_ERROR, "should get redirect");
@@ -923,7 +923,7 @@ fn client_redirect_resends_to_new_node() {
             request_id: 2,
             op_code: OP_CREATE_BATCH,
             flags: 0,
-            payload,
+            payload: payload.into(),
         },
     );
     assert_eq!(
@@ -958,7 +958,7 @@ fn after_migration_complete_all_ops_go_to_new_node() {
                 request_id: 1,
                 op_code: OP_CREATE_BATCH,
                 flags: 0,
-                payload,
+                payload: payload.into(),
             },
         );
     }
@@ -1011,7 +1011,7 @@ fn after_migration_complete_all_ops_go_to_new_node() {
                 request_id: 3,
                 op_code: OP_CREATE_BATCH,
                 flags: 0,
-                payload,
+                payload: payload.into(),
             },
         );
         assert_eq!(
@@ -1048,7 +1048,7 @@ fn no_records_lost_during_migration() {
                 request_id: i as u64,
                 op_code: OP_CREATE_BATCH,
                 flags: 0,
-                payload,
+                payload: payload.into(),
             },
         );
         if resp.status == STATUS_OK {
@@ -1160,7 +1160,7 @@ fn migration_of_empty_shard_completes_without_error() {
             request_id: 1,
             op_code: OP_PING,
             flags: 0,
-            payload: vec![],
+            payload: vec![].into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1175,7 +1175,7 @@ fn migration_of_empty_shard_completes_without_error() {
             request_id: 1,
             op_code: OP_PING,
             flags: 0,
-            payload: vec![],
+            payload: vec![].into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1248,7 +1248,7 @@ fn start_three_node_cluster_create_records_distributed() {
                 request_id: shard as u64,
                 op_code: OP_CREATE_BATCH,
                 flags: 0,
-                payload,
+                payload: payload.into(),
             },
         );
         if resp.status == STATUS_OK {
@@ -1299,7 +1299,7 @@ fn query_reaches_correct_node_returns_data() {
             request_id: 1,
             op_code: OP_CREATE_BATCH,
             flags: 0,
-            payload,
+            payload: payload.into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1317,7 +1317,7 @@ fn query_reaches_correct_node_returns_data() {
             request_id: 2,
             op_code: OP_GET_SPEND_BATCH,
             flags: 0,
-            payload: query_payload,
+            payload: query_payload.into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1377,7 +1377,7 @@ fn spend_routed_to_correct_master() {
             request_id: 1,
             op_code: OP_CREATE_BATCH,
             flags: 0,
-            payload,
+            payload: payload.into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK, "create should succeed");
@@ -1404,7 +1404,7 @@ fn spend_routed_to_correct_master() {
             request_id: 2,
             op_code: OP_SPEND_BATCH,
             flags: 0,
-            payload: spend_payload,
+            payload: spend_payload.into(),
         },
     );
     assert!(
@@ -1440,7 +1440,7 @@ fn add_node_all_records_still_accessible() {
                 request_id: i as u64,
                 op_code: OP_CREATE_BATCH,
                 flags: 0,
-                payload,
+                payload: payload.into(),
             },
         );
         if resp.status == STATUS_OK {
@@ -1534,7 +1534,7 @@ fn kill_node_detection_affected_shards() {
             request_id: 1,
             op_code: OP_PING,
             flags: 0,
-            payload: vec![],
+            payload: vec![].into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK, "node 1 should still be responsive");
@@ -1721,7 +1721,7 @@ fn isolated_node_rejects_writes_with_no_quorum() {
             request_id: 1,
             op_code: OP_CREATE_BATCH,
             flags: 0,
-            payload,
+            payload: payload.into(),
         },
     );
 
@@ -1779,7 +1779,7 @@ fn single_node_cluster_accepts_writes_without_quorum_check() {
             request_id: 1,
             op_code: OP_CREATE_BATCH,
             flags: 0,
-            payload,
+            payload: payload.into(),
         },
     );
 
@@ -1819,7 +1819,7 @@ fn tcp_write_to_pending_inbound_shard_returns_migration_in_progress() {
             request_id: 19,
             op_code: OP_CREATE_BATCH,
             flags: 0,
-            payload: encode_create_payload(&txid, &hash),
+            payload: encode_create_payload(&txid, &hash).into(),
         },
     );
 
@@ -1872,7 +1872,7 @@ fn tcp_strict_replication_failure_returns_replication_failed() {
             request_id: 1,
             op_code: OP_TOPOLOGY_COMMIT,
             flags: 0,
-            payload: commit.serialize(),
+            payload: commit.serialize().into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK, "topology commit should succeed");
@@ -1894,7 +1894,7 @@ fn tcp_strict_replication_failure_returns_replication_failed() {
             request_id: 20,
             op_code: OP_CREATE_BATCH,
             flags: 0,
-            payload: encode_create_payload(&txid, &hash),
+            payload: encode_create_payload(&txid, &hash).into(),
         },
     );
 

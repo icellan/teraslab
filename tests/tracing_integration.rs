@@ -347,7 +347,7 @@ fn replication_receiver_inherits_wire_trace_context() {
         op_code: OP_REPLICA_BATCH,
         request_id: 1,
         flags: 0,
-        payload: batch.serialize(),
+        payload: batch.serialize().into(),
     };
 
     // Capture the trace_id that the receiver's span propagates. We

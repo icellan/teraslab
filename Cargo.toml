@@ -41,6 +41,11 @@ async-io = []
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 bitflags = "2"
+# Zero-copy byte buffer for the wire-protocol frame decoder. Already a
+# transitive dep via tokio/axum; promoting to a direct dep makes the
+# RequestFrame::payload: Bytes use site explicit. C-6 / F-G5-011 (P3.4) —
+# eliminates per-frame payload Vec allocation in the request hot path.
+bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 comfy-table = "7"
 crc32fast = "1"

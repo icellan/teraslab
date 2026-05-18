@@ -197,7 +197,7 @@ fn tcp_replicate_spend() {
             request_id: 10,
             op_code: OP_SPEND_BATCH,
             flags: 0,
-            payload: spend_payload,
+            payload: spend_payload.into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -710,7 +710,7 @@ fn tcp_concurrent_replicate_and_client() {
                     request_id: 100 + i as u64,
                     op_code: OP_SPEND_BATCH,
                     flags: 0,
-                    payload,
+                    payload: payload.into(),
                 },
             );
             assert_eq!(resp.status, STATUS_OK, "client spend {i} failed");
