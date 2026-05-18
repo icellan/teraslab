@@ -68,13 +68,25 @@ impl InflightBytesLimiter {
             });
         }
         if bytes > self.limit {
+            // P2.2: per-request size exceeds the entire aggregate cap — a
+            // single frame can never be admitted. Counted as a rejection.
+            Self::record_rejection();
             return None;
         }
 
         let mut observed = self.used.load(Ordering::Relaxed);
         loop {
-            let next = observed.checked_add(bytes)?;
+            let Some(next) = observed.checked_add(bytes) else {
+                // Arithmetic overflow on the cumulative byte count. Tens
+                // of millions of in-flight frames before this can happen;
+                // still classify as a rejection rather than silently
+                // dropping the signal.
+                Self::record_rejection();
+                return None;
+            };
             if next > self.limit {
+                // The aggregate cap would be exceeded; reject + record.
+                Self::record_rejection();
                 return None;
             }
             match self.used.compare_exchange_weak(
@@ -91,6 +103,18 @@ impl InflightBytesLimiter {
                 }
                 Err(actual) => observed = actual,
             }
+        }
+    }
+
+    /// P2.2: bump `ThreadMetrics::inflight_bytes_rejected_total` on the
+    /// rejection path. Uses the same `DISPATCH_METRICS` handle every
+    /// other dispatch counter site uses (see `dispatch_metrics_handle`),
+    /// so the counter ticks at the same per-thread cost (~1 ns
+    /// `fetch_add`) as the existing operation counters.
+    #[inline]
+    fn record_rejection() {
+        if let Some(m) = crate::server::dispatch::dispatch_metrics_handle() {
+            m.inflight_bytes_rejected_total.inc();
         }
     }
 
@@ -1144,6 +1168,61 @@ mod tests {
             after >= before + 1,
             "expected replica_unauthenticated_accept_total to advance by \
              at least 1 (before={before}, after={after})",
+        );
+    }
+
+    /// P2.2: every `InflightBytesLimiter::try_acquire` rejection — whether
+    /// from the single-frame oversize guard, the per-thread arithmetic
+    /// overflow guard, or the aggregate-cap guard — must bump
+    /// `ThreadMetrics::inflight_bytes_rejected_total`. Pre-fix all three
+    /// paths returned `None` silently; operators could not alert on
+    /// backpressure-induced frame rejections.
+    #[test]
+    fn inflight_bytes_rejected_metric_increments_on_overflow() {
+        use crate::metrics::ThreadMetrics;
+        use crate::server::dispatch::init_dispatch_metrics;
+
+        // Install a process-wide ThreadMetrics handle. `OnceLock`
+        // semantics: parallel tests share the same handle — we capture
+        // the before/after delta so concurrent bumps don't false-fail.
+        static METRICS_CELL: std::sync::OnceLock<ThreadMetrics> = std::sync::OnceLock::new();
+        let leaked: &'static ThreadMetrics = METRICS_CELL.get_or_init(ThreadMetrics::new);
+        init_dispatch_metrics(leaked);
+        let metrics = crate::server::dispatch::dispatch_metrics_handle()
+            .expect("dispatch metrics installed above");
+
+        let limiter = Arc::new(InflightBytesLimiter::new(16));
+
+        // Single-frame oversize rejection: 17 > limit 16.
+        let before_oversize = metrics.inflight_bytes_rejected_total.get();
+        assert!(limiter.try_acquire(17).is_none());
+        let after_oversize = metrics.inflight_bytes_rejected_total.get();
+        assert!(
+            after_oversize >= before_oversize + 1,
+            "oversize rejection should advance counter \
+             (before={before_oversize}, after={after_oversize})",
+        );
+
+        // Aggregate-cap rejection: hold 10 bytes, then try 7 more (=17 > 16).
+        let _permit = limiter.try_acquire(10).expect("first permit");
+        let before_aggregate = metrics.inflight_bytes_rejected_total.get();
+        assert!(limiter.try_acquire(7).is_none());
+        let after_aggregate = metrics.inflight_bytes_rejected_total.get();
+        assert!(
+            after_aggregate >= before_aggregate + 1,
+            "aggregate-cap rejection should advance counter \
+             (before={before_aggregate}, after={after_aggregate})",
+        );
+
+        // Negative control: a successful acquire must NOT bump the
+        // counter. With the 10-byte permit held, asking for 6 fits
+        // exactly under the cap.
+        let before_ok = metrics.inflight_bytes_rejected_total.get();
+        let _ok_permit = limiter.try_acquire(6).expect("permit under cap");
+        let after_ok = metrics.inflight_bytes_rejected_total.get();
+        assert_eq!(
+            before_ok, after_ok,
+            "successful acquire must not advance rejection counter",
         );
     }
 }

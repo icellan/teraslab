@@ -492,6 +492,16 @@ pub struct ThreadMetrics {
     /// rate is expected during topology changes; a persistently high rate
     /// indicates clients are not refreshing their routing table.
     pub stale_routing_request_total: PaddedCounter,
+    /// P2.2: incremented every time `InflightBytesLimiter::try_acquire`
+    /// in `server::mod` returns `None` because admitting the requested
+    /// frame would exceed `ServerConfig::max_inflight_request_bytes`. The
+    /// server already sends an error response on this path, but pre-fix
+    /// the rejection was silent on the observability surface — operators
+    /// had no way to alert on backpressure-induced rejections. A non-zero
+    /// rate is a clear signal that either the limit is too low for the
+    /// current ingress, the client side is mis-batching, or a slow
+    /// downstream is stretching frame lifetime.
+    pub inflight_bytes_rejected_total: PaddedCounter,
 
     /// Labeled `{op, outcome}` counter table — replaces the scalar
     /// per-op counters above for cardinality-rich dashboards.
@@ -573,6 +583,7 @@ impl ThreadMetrics {
             replication_degraded_acks: PaddedCounter::new(),
             repl_degraded_durability: PaddedCounter::new(),
             stale_routing_request_total: PaddedCounter::new(),
+            inflight_bytes_rejected_total: PaddedCounter::new(),
             operations: OpOutcomeCounters::new(),
         }
     }

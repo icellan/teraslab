@@ -788,6 +788,12 @@ pub(crate) fn render_metrics_text(
         "teraslab_stale_routing_request_total",
         m.stale_routing_request_total.get(),
     );
+    // P2.2: aggregate in-flight request memory cap rejections.
+    prom_counter(
+        &mut out,
+        "teraslab_inflight_bytes_rejected_total",
+        m.inflight_bytes_rejected_total.get(),
+    );
 
     // Labeled {op, outcome} counters — the new Phase 2 surface. Dual-emitted
     // alongside the scalar counters above; existing dashboards stay intact

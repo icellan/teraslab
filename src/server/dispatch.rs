@@ -282,6 +282,16 @@ pub fn init_dispatch_metrics(metrics: &'static crate::metrics::ThreadMetrics) {
     let _ = DISPATCH_METRICS.set(metrics);
 }
 
+/// P2.2: crate-internal accessor for the same `ThreadMetrics` handle that
+/// in-dispatch code reaches via `DISPATCH_METRICS.get()`. Surfaced so
+/// non-dispatch hot paths (e.g. `InflightBytesLimiter::try_acquire` in
+/// `server::mod`) can bump per-thread counters without duplicating the
+/// `OnceLock`. Returns `None` before `init_dispatch_metrics` has been
+/// called, matching every other call site's tolerance for unset state.
+pub(crate) fn dispatch_metrics_handle() -> Option<&'static crate::metrics::ThreadMetrics> {
+    DISPATCH_METRICS.get().copied()
+}
+
 /// Initialize the dispatch histograms reference.
 ///
 /// Must be called once during server startup before any requests are
