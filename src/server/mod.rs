@@ -156,6 +156,13 @@ pub struct Server {
     shutdown: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
     inflight_request_bytes: Arc<InflightBytesLimiter>,
+    /// P1.2: mio `Waker` that, when triggered, wakes the accept-loop
+    /// poller (kqueue on macOS / epoll on Linux). Populated by
+    /// [`Server::run`] just before entering the loop and consumed by
+    /// [`Server::shutdown`]. Pre-fix the loop relied on
+    /// `thread::sleep(10ms)` between `accept()` retries, burning CPU on
+    /// idle listeners and slowing shutdown to one sleep-tick.
+    shutdown_waker: Mutex<Option<Arc<mio::Waker>>>,
 }
 
 impl Server {
@@ -172,6 +179,7 @@ impl Server {
             shutdown: Arc::new(AtomicBool::new(false)),
             active_connections: Arc::new(AtomicUsize::new(0)),
             inflight_request_bytes,
+            shutdown_waker: Mutex::new(None),
         }
     }
 
@@ -205,88 +213,185 @@ impl Server {
 
     /// Start listening for client connections. Blocks until shutdown.
     pub fn run(&self) -> Result<(), String> {
-        let listener = TcpListener::bind(&self.config.listen_addr)
+        // P1.2: bind once with the std listener (it owns the SO_REUSEADDR /
+        // bind-error reporting we already surface in tests), then convert
+        // to a mio source. mio requires the FD to be non-blocking, which
+        // `TcpListener::bind` defaults to *blocking*; flip it before
+        // registering.
+        let std_listener = TcpListener::bind(&self.config.listen_addr)
             .map_err(|e| format!("failed to bind {}: {e}", self.config.listen_addr))?;
-
-        // Set non-blocking so we can check shutdown flag
-        listener
+        std_listener
             .set_nonblocking(true)
             .map_err(|e| format!("failed to set non-blocking: {e}"))?;
+        let mut mio_listener = mio::net::TcpListener::from_std(std_listener);
+
+        // P1.2: build the poller and register both the listener and a
+        // `Waker` (self-pipe abstraction on Linux/macOS — eventfd or
+        // pipe2). `Server::shutdown` calls `Waker::wake`, which posts a
+        // readiness event; the loop exits within microseconds rather than
+        // waiting for the next 10 ms `thread::sleep` tick.
+        const LISTENER_TOKEN: mio::Token = mio::Token(0);
+        const SHUTDOWN_TOKEN: mio::Token = mio::Token(1);
+        let mut poll = mio::Poll::new().map_err(|e| format!("mio::Poll::new: {e}"))?;
+        poll.registry()
+            .register(
+                &mut mio_listener,
+                LISTENER_TOKEN,
+                mio::Interest::READABLE,
+            )
+            .map_err(|e| format!("register listener: {e}"))?;
+        let waker = Arc::new(
+            mio::Waker::new(poll.registry(), SHUTDOWN_TOKEN)
+                .map_err(|e| format!("mio::Waker::new: {e}"))?,
+        );
+        // Publish the waker so `Server::shutdown` can wake the loop.
+        // Stored before the loop starts so a fast `shutdown()` immediately
+        // after `run()` enters cannot race past an empty handle. If
+        // `shutdown()` ran *before* publish, the `shutdown` flag is
+        // already true and the initial `if shutdown.load(...)` check
+        // below short-circuits.
+        *self.shutdown_waker.lock() = Some(waker.clone());
+        // Pre-allocate the event buffer outside the loop.
+        let mut events = mio::Events::with_capacity(16);
 
         tracing::info!(listen_addr = %self.config.listen_addr, "TeraSlab server listening");
 
-        while !self.shutdown.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((mut stream, addr)) => {
-                    let active = self.active_connections.load(Ordering::Relaxed);
-                    if active >= self.config.max_connections {
-                        tracing::warn!(peer_addr = %addr, active, "rejecting connection: max connections reached");
-                        let _ = stream.set_write_timeout(Some(CONNECTION_WRITE_TIMEOUT));
-                        let response = ResponseFrame {
-                            request_id: 0,
-                            status: STATUS_ERROR,
-                            payload: encode_error_payload(ERR_INTERNAL, "max connections reached"),
-                        };
-                        let _ = stream.write_all(&response.encode());
-                        drop(stream);
-                        continue;
+        'accept_loop: while !self.shutdown.load(Ordering::Relaxed) {
+            // Block until either the listener becomes readable or the
+            // waker fires. `None` timeout means "wait forever"; the
+            // waker guarantees we'll wake on shutdown, so there is no
+            // CPU spin on an idle listener.
+            if let Err(e) = poll.poll(&mut events, None) {
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(format!("mio poll: {e}"));
+            }
+            let mut listener_ready = false;
+            for event in events.iter() {
+                match event.token() {
+                    LISTENER_TOKEN => listener_ready = true,
+                    SHUTDOWN_TOKEN => {
+                        // Waker fired — re-check the flag at the top of
+                        // the loop. Spurious wakeups are harmless.
                     }
-
-                    self.active_connections.fetch_add(1, Ordering::Relaxed);
-
-                    let engine = self.engine.clone();
-                    let shutdown = self.shutdown.clone();
-                    let active_conns = self.active_connections.clone();
-                    let max_batch = self.config.max_batch_size;
-                    let max_stream_total_bytes = self.config.max_stream_total_bytes;
-                    let cluster = self.cluster.clone();
-                    let redo_log = self.redo_log.clone();
-                    let blob_store = self.blob_store.clone();
-                    let inflight_request_bytes = self.inflight_request_bytes.clone();
-                    let cluster_secret = self
-                        .config
-                        .cluster_secret
-                        .as_ref()
-                        .map(|s| Arc::new(s.as_bytes().to_vec()));
-                    // F-G5-001 (CRITICAL): wire G10's `ServerConfig::strict_auth`
-                    // into the connection-handler options. When `true`, any
-                    // inter-node opcode that arrives without a `cluster_secret`
-                    // is rejected with `ERR_CLUSTER_AUTH_FAILED`. Default
-                    // remains `false` (trusted-overlay) per FIX_POLICY §2.
-                    let strict_auth = self.config.strict_auth;
-
-                    std::thread::spawn(move || {
-                        if let Err(e) = handle_connection_inner(
-                            stream,
-                            &engine,
-                            &shutdown,
-                            ConnectionOptions {
-                                max_batch_size: max_batch,
-                                max_stream_total_bytes,
-                                cluster: cluster.as_deref(),
-                                redo_log: redo_log.as_deref(),
-                                blob_store: blob_store.as_deref(),
-                                inflight_request_bytes,
-                                cluster_secret,
-                                strict_auth,
-                                read_timeout: CONNECTION_READ_TIMEOUT,
-                                write_timeout: CONNECTION_WRITE_TIMEOUT,
-                            },
-                        ) {
-                            tracing::warn!(peer_addr = %addr, err = %e, "connection error");
+                    _ => {}
+                }
+            }
+            if !listener_ready {
+                continue 'accept_loop;
+            }
+            // Drain all pending accepts so a single readiness edge
+            // doesn't leak connections (mio reports edge-triggered on
+            // some platforms).
+            loop {
+                match mio_listener.accept() {
+                    Ok((stream, addr)) => {
+                        // Convert mio stream back to std::net::TcpStream so
+                        // the rest of the connection handler (which uses
+                        // blocking read_exact / write_all) is unchanged.
+                        let std_stream: TcpStream = {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::io::{FromRawFd, IntoRawFd};
+                                // SAFETY: mio::net::TcpStream is a thin
+                                // wrapper around the OS FD; `into_raw_fd`
+                                // transfers ownership of the FD out of mio
+                                // and `from_raw_fd` takes it into std. No
+                                // double-free.
+                                unsafe { TcpStream::from_raw_fd(stream.into_raw_fd()) }
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                // No non-Unix targets currently supported.
+                                compile_error!("server accept loop requires a Unix target");
+                            }
+                        };
+                        // Hand off to the existing accept-handler. Move
+                        // the stream into a local variable named
+                        // `mut stream` so the rest of the body (taken
+                        // verbatim from pre-fix) compiles unchanged.
+                        let mut stream = std_stream;
+                        // Restore blocking mode for the per-connection
+                        // thread; `handle_connection_inner` also flips
+                        // it but flipping back here lets the timeout
+                        // settings in the `max_connections` reject path
+                        // work the same as pre-fix.
+                        let _ = stream.set_nonblocking(false);
+                        let active = self.active_connections.load(Ordering::Relaxed);
+                        if active >= self.config.max_connections {
+                            tracing::warn!(peer_addr = %addr, active, "rejecting connection: max connections reached");
+                            let _ = stream.set_write_timeout(Some(CONNECTION_WRITE_TIMEOUT));
+                            let response = ResponseFrame {
+                                request_id: 0,
+                                status: STATUS_ERROR,
+                                payload: encode_error_payload(ERR_INTERNAL, "max connections reached"),
+                            };
+                            let _ = stream.write_all(&response.encode());
+                            drop(stream);
+                            continue;
                         }
-                        active_conns.fetch_sub(1, Ordering::Relaxed);
-                    });
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No pending connection — sleep briefly and retry
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(e) => {
-                    tracing::warn!(err = %e, "accept error");
+
+                        self.active_connections.fetch_add(1, Ordering::Relaxed);
+
+                        let engine = self.engine.clone();
+                        let shutdown = self.shutdown.clone();
+                        let active_conns = self.active_connections.clone();
+                        let max_batch = self.config.max_batch_size;
+                        let max_stream_total_bytes = self.config.max_stream_total_bytes;
+                        let cluster = self.cluster.clone();
+                        let redo_log = self.redo_log.clone();
+                        let blob_store = self.blob_store.clone();
+                        let inflight_request_bytes = self.inflight_request_bytes.clone();
+                        let cluster_secret = self
+                            .config
+                            .cluster_secret
+                            .as_ref()
+                            .map(|s| Arc::new(s.as_bytes().to_vec()));
+                        // F-G5-001 (CRITICAL): wire G10's `ServerConfig::strict_auth`
+                        // into the connection-handler options. When `true`, any
+                        // inter-node opcode that arrives without a `cluster_secret`
+                        // is rejected with `ERR_CLUSTER_AUTH_FAILED`. Default
+                        // remains `false` (trusted-overlay) per FIX_POLICY §2.
+                        let strict_auth = self.config.strict_auth;
+
+                        std::thread::spawn(move || {
+                            if let Err(e) = handle_connection_inner(
+                                stream,
+                                &engine,
+                                &shutdown,
+                                ConnectionOptions {
+                                    max_batch_size: max_batch,
+                                    max_stream_total_bytes,
+                                    cluster: cluster.as_deref(),
+                                    redo_log: redo_log.as_deref(),
+                                    blob_store: blob_store.as_deref(),
+                                    inflight_request_bytes,
+                                    cluster_secret,
+                                    strict_auth,
+                                    read_timeout: CONNECTION_READ_TIMEOUT,
+                                    write_timeout: CONNECTION_WRITE_TIMEOUT,
+                                },
+                            ) {
+                                tracing::warn!(peer_addr = %addr, err = %e, "connection error");
+                            }
+                            active_conns.fetch_sub(1, Ordering::Relaxed);
+                        });
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // No more pending connections — go back to poll.
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(err = %e, "accept error");
+                        break;
+                    }
                 }
             }
         }
+        // Drop the published waker so a late `shutdown()` after the loop
+        // exits is a harmless no-op (the AtomicBool is already true).
+        *self.shutdown_waker.lock() = None;
 
         tracing::info!(
             active = self.active_connections.load(Ordering::Relaxed),
@@ -302,8 +407,22 @@ impl Server {
     }
 
     /// Signal the server to shut down gracefully.
+    ///
+    /// P1.2: flips the shutdown flag *and* wakes the mio poller (via the
+    /// registered [`mio::Waker`]). The accept loop observes the flag on
+    /// the next iteration and exits, typically within microseconds rather
+    /// than the worst-case 10 ms it used to spin-wait for.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(waker) = self.shutdown_waker.lock().as_ref() {
+            // `Waker::wake` is best-effort: a failure here means the FD
+            // backing it has already been closed (e.g. `run` already
+            // returned), which is the expected race when shutdown is
+            // called after a clean exit.
+            if let Err(e) = waker.wake() {
+                tracing::debug!(err = %e, "Server::shutdown: Waker::wake failed (already shut down?)");
+            }
+        }
     }
 
     /// Whether the server is shutting down.
