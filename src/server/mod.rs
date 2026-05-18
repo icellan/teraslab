@@ -1171,7 +1171,7 @@ mod tests {
             // is the canonical example.
             op_code: OP_REPLICA_BATCH,
             flags: 0,
-            payload: Vec::new(),
+            payload: bytes::Bytes::new(),
         };
         client.write_all(&request.encode()).unwrap();
 

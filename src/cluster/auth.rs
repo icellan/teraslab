@@ -799,7 +799,7 @@ mod tests {
             request_id: 42,
             op_code: crate::protocol::opcodes::OP_REPLICA_BATCH,
             flags: 1,
-            payload: b"hello-stream".to_vec(),
+            payload: bytes::Bytes::from_static(b"hello-stream"),
         };
         let encoded = frame.encode();
         let signed = sign_frame(b"k", &encoded).unwrap();
@@ -823,7 +823,7 @@ mod tests {
             request_id: 1,
             op_code: crate::protocol::opcodes::OP_REPLICA_BATCH,
             flags: 0,
-            payload: b"x".to_vec(),
+            payload: bytes::Bytes::from_static(b"x"),
         };
         let encoded = frame.encode();
         let mut signed = sign_frame(b"k", &encoded).unwrap();
@@ -920,7 +920,7 @@ mod tests {
             request_id: 7,
             op_code: crate::protocol::opcodes::OP_REPLICA_BATCH,
             flags: 0,
-            payload: vec![0xABu8; 1024], // larger than the tail window
+            payload: bytes::Bytes::from(vec![0xABu8; 1024]), // larger than the tail window
         };
         let encoded = frame.encode();
         let signed = sign_frame(b"key", &encoded).unwrap();
