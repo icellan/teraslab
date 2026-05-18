@@ -1202,17 +1202,18 @@ fn start_three_node_cluster_create_records_distributed() {
     // create-distribution assertions were vacuously satisfied. With
     // cluster_id wired (P1.1) the 3-node commit lands properly, and
     // the test now actually exercises distributed routing.
-    // Wait for the multi-node topology to commit AND for the local
-    // shard table to reflect at least one peer (so the redirect
-    // assertion can be satisfied) — but tolerate a 2-node-converged
-    // cluster too. Even with cluster_id wired (P1.1), the 2→3
-    // shard-table recompute is racy under load (production follow-up
-    // tracked at `_review/follow_ups.md` A-shard-recompute). The
-    // assertion below only needs *some* distribution, not all-3.
+    // A-2b RESOLVED: `apply_master_election` no longer collapses the
+    // round-robin pick when every candidate reports zero data (fresh
+    // empty cluster); the 3-node recompute now lands deterministically.
+    // Strict predicate: every member of the committed topology
+    // appears in node1's shard_counts with > 0 shards.
     wait_until(
         || {
+            if node1.cluster.committed_topology_members().len() != 3 {
+                return false;
+            }
             let counts = node1.cluster.shard_table().read().shard_counts();
-            counts.len() >= 2 && counts.values().all(|&n| n > 0)
+            counts.len() == 3 && counts.values().all(|&n| n > 0)
         },
         Duration::from_secs(30),
     )
@@ -1220,7 +1221,7 @@ fn start_three_node_cluster_create_records_distributed() {
         let counts = node1.cluster.shard_table().read().shard_counts();
         let members = node1.cluster.committed_topology_members();
         panic!(
-            "multi-node shard-table recompute never settled on node1 \
+            "3-node shard-table recompute never settled on node1 \
              (committed_members={members:?}, shard_counts={counts:?})"
         );
     });

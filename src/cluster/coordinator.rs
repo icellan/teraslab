@@ -5698,6 +5698,25 @@ pub fn apply_master_election(
             }
         }
 
+        // A-2b: if the partition view is non-empty but no candidate
+        // reports any data for this shard (every `last_applied_seq`
+        // is 0 — e.g. a fresh scale-up where every node is empty),
+        // the view carries no signal about ownership. `elect_master`'s
+        // `was_previous_master` stickiness tiebreaker would default to
+        // the prev master, silently un-doing the round-robin assignment
+        // to a newcomer. Treat all-zero as "no information" and
+        // preserve the round-robin pick — same shape as `view_empty`.
+        let any_candidate_has_data = candidate_nodes.iter().any(|&node_id| {
+            seq_by_node_shard
+                .get(&(node_id, shard))
+                .copied()
+                .unwrap_or(0)
+                > 0
+        });
+        if !view_empty && !any_candidate_has_data {
+            continue;
+        }
+
         let candidates: Vec<MasterCandidate> = candidate_nodes
             .iter()
             .map(|&node_id| {
