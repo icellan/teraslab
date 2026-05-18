@@ -661,8 +661,8 @@ impl ClusterCoordinator {
         // Phase H — resync request channel. The catchup loop in
         // `bin/server.rs` posts a `ResyncRequest` every time it
         // observes the truncation sentinel (`run_catchup_for_replica`
-        // returning the "redo entries reclaimed" error). The event
-        // loop drains this receiver each iteration and synthesizes
+        // returning `CatchupError::RedoReclaimed`). The event loop
+        // drains this receiver each iteration and synthesizes
         // full-shard backfill tasks via
         // `synthesize_resync_migration_tasks`.
         let (resync_request_tx, resync_request_rx) =
@@ -6770,8 +6770,8 @@ impl RunningCluster {
     ///
     /// Called from `bin/server.rs` whenever
     /// `run_catchup_for_replica` returns the truncation sentinel
-    /// ("redo entries reclaimed; full resync required"). The event
-    /// loop translates each request into one full-shard backfill
+    /// (`CatchupError::RedoReclaimed`). The event loop translates
+    /// each request into one full-shard backfill
     /// `MigrationTask` per shard the named replica should hold, and
     /// runs them through the standard migration pipeline.
     ///

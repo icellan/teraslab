@@ -79,8 +79,22 @@ Per-fix state:
 - File: `src/bin/server.rs:1503-1508` replaced source-string-grep test with a comment pointing to `tests/g10_lifecycle.rs` (runtime coverage of the same invariant)
 - Test: lifecycle integration test covers "no listener answers before recovery completes" via the public shutdown path
 
-### F-G10-017 — NEEDS-ORCHESTRATOR
-- File: `src/replication/durable.rs:728` returns `Err(String)` with substring `"redo entries reclaimed"`; bin in `src/bin/server.rs:1065` dispatches on `e.contains(...)`. Converting this to a structured `CatchupError::RedoReclaimed { ... }` enum needs a signature change in `run_catchup_for_replica` (`src/replication/durable.rs`) which is G7's territory. Bin side will adopt the typed error once G7's branch lands. Flagged in `_review/follow_ups.md` (FUP-G10-017).
+### F-G10-017 — RESOLVED (P2.5 / B-4)
+- Files:
+  - `src/replication/durable.rs:644-693` adds `pub enum CatchupError { RedoReclaimed { from, available }, Transport { addr, detail }, ReplicaError { addr, message } }` (derives `thiserror::Error`).
+  - `src/replication/durable.rs:run_catchup_for_replica` signature changed from `Result<u64, String>` → `Result<u64, CatchupError>`; every `Err(format!(...))` / `Err("...".to_string())` site mapped to a variant. The redo-wrap detection is now exposed structurally via `CatchupError::RedoReclaimed { from, available }` instead of the rendered substring `"redo entries reclaimed"`.
+  - `src/bin/server.rs:1058-1080` replaces `if e.contains("redo entries reclaimed")` with `if let CatchupError::RedoReclaimed { .. } = e`.
+  - `src/cluster/coordinator.rs:661-667, 6769-6775` doc comments updated to reference the typed variant instead of the removed substring.
+- Tests:
+  - `replication::durable::tests::run_catchup_returns_typed_redo_reclaimed_when_log_wrapped` — pins both wrap-detection paths (`check_redo_truncation` short-circuit + `ops_from_seq` returns empty) to `CatchupError::RedoReclaimed { from, available }` with the expected field values.
+  - `replication::durable::tests::run_catchup_already_caught_up_returns_ok` — pins the early-return happy path so a future refactor cannot accidentally fall through into the redo-reclaimed branch.
+- Verification:
+  - `cargo check --lib` clean (8 pre-existing `device_io/*` warnings, unchanged).
+  - `cargo check --bins` clean.
+  - `cargo test --lib replication::durable::` — 26 passed, 0 failed.
+  - `cargo test --test replication_tcp` — 11 passed, 0 failed.
+  - `cargo clippy --lib --no-deps` — 8 warnings, same baseline.
+  - `grep "redo entries reclaimed"` only matches in the new test's doc-comment describing what was removed.
 
 ### F-G10-018 — NOT-APPLICABLE (positive verification)
 - INFO: admin-token gating chain is correctly wired end-to-end. No code change.
