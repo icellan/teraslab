@@ -33,6 +33,59 @@ struct DrainQuery {
     wait_seconds: u64,
 }
 
+/// B-5 / F-G6-025: structured JSON envelope returned by every HTTP error
+/// response on this server.
+///
+/// `code` is a stable, machine-readable identifier that operator dashboards
+/// and future clients can match on (`"unauthorized"`, `"bad_request"`,
+/// `"not_found"`, `"not_in_cluster_mode"`, etc.). `message` is the
+/// human-readable detail string previously sent as a `text/plain` body;
+/// existing operators who script-matched on the status code keep working
+/// because the HTTP status is preserved exactly. `details` is reserved for
+/// optional structured context (e.g., expected length, retry-after seconds)
+/// and is omitted from the JSON when `None`.
+///
+/// Public API: any change to `code` values is a wire-protocol break.
+#[derive(Debug, serde::Serialize)]
+struct HttpErrorBody {
+    code: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<serde_json::Value>,
+}
+
+/// Build an HTTP error response with a [`HttpErrorBody`] JSON body.
+///
+/// All error paths in this module funnel through this helper so the
+/// envelope shape (and `Content-Type: application/json`) stay uniform.
+/// The returned `axum::response::Response` plugs into any handler that
+/// returns `impl IntoResponse` via `.into_response()`.
+fn http_error(
+    status: StatusCode,
+    code: &'static str,
+    message: impl Into<String>,
+) -> axum::response::Response {
+    http_error_with_details(status, code, message, None)
+}
+
+/// Variant of [`http_error`] that attaches a `details` JSON value.
+fn http_error_with_details(
+    status: StatusCode,
+    code: &'static str,
+    message: impl Into<String>,
+    details: Option<serde_json::Value>,
+) -> axum::response::Response {
+    (
+        status,
+        axum::Json(HttpErrorBody {
+            code,
+            message: message.into(),
+            details,
+        }),
+    )
+        .into_response()
+}
+
 /// Log levels for the runtime log level endpoint.
 const LOG_LEVEL_ERROR: u8 = 0;
 const LOG_LEVEL_WARN: u8 = 1;
@@ -393,22 +446,22 @@ async fn require_admin_bearer(
             // Defensive: this branch is only reached if `build_http_router`
             // mounted the gate without a token, which it never does (the
             // builder returns early in that case). Refuse rather than allow.
-            return (
+            return http_error(
                 StatusCode::UNAUTHORIZED,
-                "missing admin token configuration\n",
-            )
-                .into_response();
+                "unauthorized",
+                "missing admin token configuration",
+            );
         }
     };
 
     let supplied = match extract_bearer_token(&headers) {
         Some(t) => t,
         None => {
-            return (
+            return http_error(
                 StatusCode::UNAUTHORIZED,
-                "missing or malformed Authorization: Bearer <token> header\n",
-            )
-                .into_response();
+                "unauthorized",
+                "missing or malformed Authorization: Bearer <token> header",
+            );
         }
     };
 
@@ -426,7 +479,11 @@ async fn require_admin_bearer(
     if supplied_digest.ct_eq(expected_digest.as_slice()).into() {
         next.run(request).await
     } else {
-        (StatusCode::UNAUTHORIZED, "invalid admin bearer token\n").into_response()
+        http_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "invalid admin bearer token",
+        )
     }
 }
 
@@ -1161,10 +1218,14 @@ async fn handle_health_live(State(_state): State<Arc<HttpState>>) -> impl IntoRe
     (StatusCode::OK, "ok")
 }
 
-async fn handle_health_ready(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+async fn handle_health_ready(State(state): State<Arc<HttpState>>) -> axum::response::Response {
     match compute_health_ready(&state) {
-        ReadyState::Ready => (StatusCode::OK, "ready"),
-        ReadyState::NotReady(reason) => (StatusCode::SERVICE_UNAVAILABLE, reason),
+        ReadyState::Ready => (StatusCode::OK, "ready").into_response(),
+        ReadyState::NotReady(reason) => http_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_ready",
+            reason.to_string(),
+        ),
     }
 }
 
@@ -1417,13 +1478,17 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
 
 /// Trigger graceful shard drain (quiesce). All master shards migrate away
 /// from this node so it can be safely stopped.
-async fn handle_admin_quiesce(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+async fn handle_admin_quiesce(State(state): State<Arc<HttpState>>) -> axum::response::Response {
     match state.cluster {
         Some(ref cluster) => {
             cluster.quiesce();
-            (StatusCode::OK, "quiesce initiated".to_string())
+            (StatusCode::OK, "quiesce initiated".to_string()).into_response()
         }
-        None => (StatusCode::BAD_REQUEST, "not in cluster mode".to_string()),
+        None => http_error(
+            StatusCode::BAD_REQUEST,
+            "not_in_cluster_mode",
+            "not in cluster mode",
+        ),
     }
 }
 
@@ -1568,13 +1633,17 @@ async fn handle_admin_replication(State(state): State<Arc<HttpState>>) -> impl I
 }
 
 /// Trigger cluster rebalance (quiesce current node).
-async fn handle_admin_rebalance(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+async fn handle_admin_rebalance(State(state): State<Arc<HttpState>>) -> axum::response::Response {
     match state.cluster {
         Some(ref cluster) => {
             cluster.quiesce();
-            (StatusCode::OK, "rebalance initiated".to_string())
+            (StatusCode::OK, "rebalance initiated".to_string()).into_response()
         }
-        None => (StatusCode::BAD_REQUEST, "not in cluster mode".to_string()),
+        None => http_error(
+            StatusCode::BAD_REQUEST,
+            "not_in_cluster_mode",
+            "not in cluster mode",
+        ),
     }
 }
 
@@ -1583,7 +1652,7 @@ async fn handle_admin_drain(
     State(state): State<Arc<HttpState>>,
     Path(node_id): Path<u64>,
     Query(query): Query<DrainQuery>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     match state.cluster {
         Some(ref cluster) => {
             if cluster.self_id().0 == node_id {
@@ -1591,6 +1660,7 @@ async fn handle_admin_drain(
                 if query.wait_seconds > 0 {
                     if wait_for_cluster_drain(cluster, query.wait_seconds).await {
                         (StatusCode::OK, format!("drain complete for node {node_id}"))
+                            .into_response()
                     } else {
                         (
                             StatusCode::ACCEPTED,
@@ -1599,6 +1669,7 @@ async fn handle_admin_drain(
                                 query.wait_seconds
                             ),
                         )
+                            .into_response()
                     }
                 } else {
                     (
@@ -1607,14 +1678,16 @@ async fn handle_admin_drain(
                             "drain initiated for node {node_id}; use ?wait_seconds=N to wait for completion"
                         ),
                     )
+                        .into_response()
                 }
             } else {
                 // F-G6-011: the path `node_id` only ever has one
                 // legal value — `self_id`. Reject mismatched IDs with
                 // 400 and an unambiguous body so operators do not
                 // silently mis-target a node.
-                (
+                http_error_with_details(
                     StatusCode::BAD_REQUEST,
+                    "drain_node_id_mismatch",
                     format!(
                         "drain path node_id ({}) does not match this server's node_id ({}); \
                          each node drains itself — re-issue the request against the HTTP \
@@ -1622,10 +1695,18 @@ async fn handle_admin_drain(
                         node_id,
                         cluster.self_id().0,
                     ),
+                    Some(serde_json::json!({
+                        "requested_node_id": node_id,
+                        "self_node_id": cluster.self_id().0,
+                    })),
                 )
             }
         }
-        None => (StatusCode::BAD_REQUEST, "not in cluster mode".to_string()),
+        None => http_error(
+            StatusCode::BAD_REQUEST,
+            "not_in_cluster_mode",
+            "not in cluster mode",
+        ),
     }
 }
 
@@ -2403,17 +2484,23 @@ async fn handle_debug_redo(State(state): State<Arc<HttpState>>) -> impl IntoResp
 async fn handle_set_log_level(
     State(state): State<Arc<HttpState>>,
     body: String,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let level = match body.trim().to_lowercase().as_str() {
         "error" => LOG_LEVEL_ERROR,
         "warn" => LOG_LEVEL_WARN,
         "info" => LOG_LEVEL_INFO,
         "debug" => LOG_LEVEL_DEBUG,
         "trace" => LOG_LEVEL_TRACE,
-        _ => return (StatusCode::BAD_REQUEST, "invalid log level".to_string()),
+        _ => {
+            return http_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_log_level",
+                "invalid log level",
+            );
+        }
     };
     state.log_level.store(level, Ordering::Relaxed);
-    (StatusCode::OK, format!("log level set to {}", body.trim()))
+    (StatusCode::OK, format!("log level set to {}", body.trim())).into_response()
 }
 
 async fn handle_get_log_level(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
@@ -2432,15 +2519,25 @@ async fn handle_get_log_level(State(state): State<Arc<HttpState>>) -> impl IntoR
 async fn handle_debug_record(
     State(state): State<Arc<HttpState>>,
     Path(txid_hex): Path<String>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     if txid_hex.len() > TXID_HEX_LEN {
-        return (StatusCode::BAD_REQUEST, "invalid txid length".to_string());
+        return http_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_txid_length",
+            "invalid txid length",
+        );
     }
 
     // Parse hex txid
     let txid_bytes = match parse_hex_txid(&txid_hex) {
         Some(b) => b,
-        None => return (StatusCode::BAD_REQUEST, "invalid txid hex".to_string()),
+        None => {
+            return http_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_txid_hex",
+                "invalid txid hex",
+            );
+        }
     };
 
     let key = TxKey { txid: txid_bytes };
@@ -2474,9 +2571,9 @@ async fn handle_debug_record(
                 "block_entry_count": block_entry_count,
                 "flags": format!("{:#04x}", flags),
             });
-            (StatusCode::OK, body.to_string())
+            (StatusCode::OK, body.to_string()).into_response()
         }
-        Err(_) => (StatusCode::NOT_FOUND, "tx not found".to_string()),
+        Err(_) => http_error(StatusCode::NOT_FOUND, "tx_not_found", "tx not found"),
     }
 }
 

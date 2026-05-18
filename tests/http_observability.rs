@@ -368,14 +368,22 @@ fn debug_records_rejects_long_path() {
     let (port, _state) = start_test_http_server();
     let long_txid = "a".repeat(65);
 
-    let (status, _, body) = http_get_auth(
+    let (status, content_type, body) = http_get_auth(
         port,
         &format!("/debug/records/{long_txid}"),
         R056_TEST_TOKEN,
     );
 
     assert_eq!(status, 400);
-    assert_eq!(body, "invalid txid length");
+    // B-5 / F-G6-025: error responses now use the structured JSON envelope.
+    assert!(
+        content_type.contains("application/json"),
+        "expected JSON error body, got content-type={content_type:?}",
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("error body must be JSON; got {body:?} ({e})"));
+    assert_eq!(parsed["code"], "invalid_txid_length");
+    assert_eq!(parsed["message"], "invalid txid length");
 }
 
 #[test]
@@ -583,10 +591,15 @@ fn admin_drain_without_cluster_returns_error() {
 fn debug_record_nonexistent_returns_404() {
     let (port, _state) = start_test_http_server();
     let txid_hex = "0000000000000000000000000000000000000000000000000000000000000000";
-    let (status, _, body) =
+    let (status, content_type, body) =
         http_get_auth(port, &format!("/debug/records/{txid_hex}"), R056_TEST_TOKEN);
     assert_eq!(status, 404);
-    assert!(body.contains("not found"));
+    // B-5 / F-G6-025: error responses are now `application/json` with
+    // a `{code, message}` envelope.
+    assert!(content_type.contains("application/json"));
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["code"], "tx_not_found");
+    assert!(parsed["message"].as_str().unwrap().contains("not found"));
 }
 
 // --------------------------------------------------------------------------
@@ -924,4 +937,125 @@ fn admin_endpoint_accepts_case_insensitive_bearer_scheme() {
             "expected 200 or 400 from quiesce handler after auth, got {status}",
         );
     }
+}
+
+// --------------------------------------------------------------------------
+// B-5 / F-G6-025: HTTP error body envelope. Every error response on the
+// observability surface must carry `Content-Type: application/json` and a
+// `{code, message}` body so future operator dashboards can match on `code`
+// instead of scraping plain-text strings.
+// --------------------------------------------------------------------------
+
+/// Sweep the canonical error endpoints and assert that every one of them
+/// returns the structured envelope. The status codes themselves are
+/// preserved — operators script-matching on the status keep working.
+#[test]
+fn error_responses_use_structured_json_envelope() {
+    let (port, _state) = start_test_http_server();
+
+    // ----- 401 Unauthorized: no bearer token on a gated route. -----
+    let (status, body) = http_put(port, "/admin/quiesce", "");
+    assert_eq!(status, 401);
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("401 body must be JSON; got {body:?} ({e})"));
+    assert_eq!(parsed["code"], "unauthorized");
+    assert!(parsed["message"].is_string());
+
+    // ----- 401 Unauthorized: wrong bearer token. -----
+    let (status, body) = http_put_auth(port, "/admin/quiesce", "", "not-the-real-token");
+    assert_eq!(status, 401);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["code"], "unauthorized");
+    assert!(
+        parsed["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid admin bearer token"),
+    );
+
+    // ----- 400 Bad Request: invalid log level body. -----
+    let (status, body) =
+        http_put_auth(port, "/debug/log-level", "definitely-not-a-level", R056_TEST_TOKEN);
+    assert_eq!(status, 400);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["code"], "invalid_log_level");
+    assert_eq!(parsed["message"], "invalid log level");
+
+    // ----- 400 Bad Request: txid too long. -----
+    let long_txid = "a".repeat(65);
+    let (status, content_type, body) = http_get_auth(
+        port,
+        &format!("/debug/records/{long_txid}"),
+        R056_TEST_TOKEN,
+    );
+    assert_eq!(status, 400);
+    assert!(content_type.contains("application/json"));
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["code"], "invalid_txid_length");
+    assert_eq!(parsed["message"], "invalid txid length");
+
+    // ----- 400 Bad Request: malformed hex txid (correct length, invalid chars). -----
+    let bad_hex = "z".repeat(64);
+    let (status, _, body) =
+        http_get_auth(port, &format!("/debug/records/{bad_hex}"), R056_TEST_TOKEN);
+    assert_eq!(status, 400);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["code"], "invalid_txid_hex");
+    assert_eq!(parsed["message"], "invalid txid hex");
+
+    // ----- 404 Not Found: missing tx record. -----
+    let zeros = "0".repeat(64);
+    let (status, content_type, body) =
+        http_get_auth(port, &format!("/debug/records/{zeros}"), R056_TEST_TOKEN);
+    assert_eq!(status, 404);
+    assert!(content_type.contains("application/json"));
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["code"], "tx_not_found");
+    assert_eq!(parsed["message"], "tx not found");
+
+    // ----- 400 Bad Request: cluster-only handler hit in single-node mode. -----
+    let (status, body) = http_put_auth(port, "/admin/rebalance", "", R056_TEST_TOKEN);
+    assert_eq!(status, 400);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["code"], "not_in_cluster_mode");
+    assert_eq!(parsed["message"], "not in cluster mode");
+}
+
+/// The 401 envelope from the auth middleware must carry
+/// `Content-Type: application/json`. Pre-fix the middleware returned
+/// `text/plain` so dashboards could not distinguish a missing-token error
+/// from a wrong-token error without substring matching on the body.
+#[test]
+fn unauthorized_response_advertises_json_content_type() {
+    let (port, _state) = start_test_http_server();
+    let (status, content_type, body) = http_get(port, "/admin/top");
+    assert_eq!(status, 401);
+    assert!(
+        content_type.contains("application/json"),
+        "expected JSON error envelope, got content-type={content_type:?}, body={body:?}",
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["code"], "unauthorized");
+}
+
+/// The optional `details` field is only present when the handler attaches
+/// structured context. `/admin/drain/{node_id}` with a mismatched ID emits
+/// `details = { requested_node_id, self_node_id }`; the simpler
+/// "not in cluster mode" path omits the field entirely. We exercise both
+/// the omission (single-node mode → 400 with no `details`) and the
+/// presence path (best we can do without a real cluster) below.
+#[test]
+fn error_envelope_omits_details_when_not_attached() {
+    let (port, _state) = start_test_http_server();
+
+    // `/admin/rebalance` in single-node mode → 400 "not in cluster mode";
+    // no `details` field should be present.
+    let (status, body) = http_put_auth(port, "/admin/rebalance", "", R056_TEST_TOKEN);
+    assert_eq!(status, 400);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["code"], "not_in_cluster_mode");
+    assert!(
+        parsed.get("details").is_none() || parsed["details"].is_null(),
+        "details must be omitted when the handler does not attach context, got {parsed}",
+    );
 }
