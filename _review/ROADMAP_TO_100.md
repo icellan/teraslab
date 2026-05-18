@@ -254,17 +254,25 @@ mergeable.
   details in `_review/follow_ups.md` C-10.
 - **Size**: M.
 
-### P3.8 — F-G1-002 typestate guard
+### P3.8 — F-G1-002 typestate guard — RESOLVED 2026-05-18
 
 - **What**: `#[must_use]` typestate variant for footer+CRC split.
 - **Acceptance**: Compile-time prevents footer-without-CRC bug class.
 - **Size**: S. Optional — only if a future caller surfaces the need.
+- **Status**: Shipped as `FooterPendingCrc` +
+  `write_mutation_footer_pending_crc` in `src/io.rs`; compile-time
+  enforcement via `#[must_use]` + `compile_fail` doctest, runtime
+  backstop via `debug_assert!` on Drop. See `follow_ups.md` C-2.
 
-### P3.9 — F-G1-016 rollback coalesce
+### P3.9 — F-G1-016 rollback coalesce — RESOLVED 2026-05-18
 
 - **What**: Defensive forward-looking only; no reachable bug today.
 - **Acceptance**: Internal cleanup; doc the invariant.
 - **Size**: S.
+- **Status**: `SlotAllocator::rollback_reservation` now calls
+  `coalesce_adjacent`; covered by
+  `rollback_coalesces_adjacent_free_regions` +
+  `coalesce_adjacent_merges_neighbours`. See `follow_ups.md` C-5.
 
 ### P3.10 — F-G5-017 typed wire error codes
 

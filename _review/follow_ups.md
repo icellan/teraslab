@@ -166,10 +166,21 @@ See P3.3 in `_review/ROADMAP_TO_100.md`. Verified by
 `cargo check --lib`, `cargo clippy --lib -- -D warnings`, and
 `cargo test --lib device::tests::` (36/36 passing on macOS host).
 
-### C-2. F-G1-002 — `#[must_use]` typestate guard for footer + CRC
+### C-2. F-G1-002 — `#[must_use]` typestate guard for footer + CRC — RESOLVED 2026-05-18
 
-Helper `write_footer_and_crc_direct` is in. The typestate variant is
-only needed if more callers genuinely split footer-write from CRC.
+**Status: FIXED.** `src/io.rs` now ships a `FooterPendingCrc<'a>`
+typestate token marked `#[must_use]` and returned from a new
+`write_mutation_footer_pending_crc(...)` entry point. Consumers MUST
+call `.stamp_crc(meta)` to release the BC-02 record-level write guard;
+dropping the token without stamping fires `debug_assert!` (release
+builds still surface the bug via `RecordCorruption` on the next read).
+The combined `write_mutation_footer_and_crc_direct` now delegates to
+the typestate path so both spellings stay bit-identical. Coverage:
+`io::tests::footer_pending_crc_panics_when_dropped_unstamped`,
+`footer_pending_crc_stamp_round_trips`,
+`footer_pending_crc_matches_combined_wrapper`, plus a `compile_fail`
+doctest on `FooterPendingCrc` proving `unused_must_use` rejects a
+forgotten token at compile time.
 
 ### C-3. F-G1-003 — atomic-chunk migration
 
@@ -187,10 +198,19 @@ test suite will fail. Either drop the lock and route everything
 through `raw_ptr`, or drop `as_raw_ptr` for `MemoryDevice`. F-G1-017
 removed the parallel `raw_len` so this is the last aliasing piece.
 
-### C-5. F-G1-016 — rollback coalesce
+### C-5. F-G1-016 — rollback coalesce — RESOLVED 2026-05-18
 
-Coalesce on rollback even though the allocator is single-threaded
-today. Forward-looking only.
+**Status: FIXED.** `SlotAllocator::rollback_reservation` now calls a
+new `coalesce_adjacent(offset, size)` helper that merges the
+re-inserted region with any adjacent free regions (matching the
+invariant `free()` maintains). Unreachable under today's
+single-threaded allocator — pure forward-looking hardening for any
+future world where rollback could race with another `free()`.
+Coverage:
+`allocator::tests::rollback_coalesces_adjacent_free_regions`
+(end-to-end via a redo-flush failure on a staged adjacent freelist)
+plus `allocator::tests::coalesce_adjacent_merges_neighbours`
+(direct invocation of the new helper).
 
 ### C-6. F-G5-011 — frame zero-copy
 
