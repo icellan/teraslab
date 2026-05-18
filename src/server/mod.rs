@@ -587,16 +587,39 @@ fn handle_connection_inner(
                     "strict_auth: rejecting unsigned inter-node op_code={op_code}"
                 ));
             }
-            if !UNAUTHENTICATED_INTER_NODE_WARNED.swap(true, Ordering::AcqRel) {
-                let op_code = peeked_op.unwrap_or(0);
-                tracing::warn!(
-                    target: "teraslab::security",
-                    op_code,
-                    "inter-node opcode received without cluster_secret configured — \
-                     accepting unauthenticated frame (trusted-overlay default). \
-                     Configure `cluster_secret` or pass `--strict-auth` to enforce.",
-                );
+            // P2.1 (F-G7-001): bump the receiver-side counter every time
+            // we accept an inter-node opcode without an HMAC layer. Unlike
+            // the one-shot `warn!` below, the counter must tick on every
+            // such frame so dashboards can compute a *rate* — a slow drip
+            // of unauthenticated frames is the signal pattern this metric
+            // is designed to expose. The counter field is owned by G7's
+            // `ReplicationMetrics` schema (see `metrics.rs`); the bump
+            // site lives here in the G5 auth gate per the cross-cutting
+            // ownership note attached to the field.
+            if let Some(repl) = crate::metrics::replication_metrics() {
+                repl.replica_unauthenticated_accept_total.inc();
             }
+            let op_code = peeked_op.unwrap_or(0);
+            // Per-event `warn` so operators see the peer and opcode that
+            // triggered each accept — silent post-first-event behaviour
+            // before this fix made it impossible to tell whether the
+            // counter spike came from one stuck peer or a flapping fleet.
+            tracing::warn!(
+                target: "teraslab::security",
+                op_code,
+                peer = ?stream.peer_addr().ok(),
+                "unauthenticated replica accept: inter-node opcode \
+                 received without cluster_secret configured — \
+                 accepting frame (trusted-overlay default). Configure \
+                 `cluster_secret` or pass `--strict-auth` to enforce.",
+            );
+            // Preserve the legacy one-shot semantics for the pre-existing
+            // `UNAUTHENTICATED_INTER_NODE_WARNED` flag in case downstream
+            // observers (log scrapers) key off the first-occurrence
+            // marker. The flag flips once; subsequent unauthenticated
+            // accepts still emit the per-event `warn` above plus the
+            // counter bump.
+            let _ = UNAUTHENTICATED_INTER_NODE_WARNED.swap(true, Ordering::AcqRel);
         }
         let request_frame_bytes = if auth_required {
             match crate::cluster::auth::verify_frame(
@@ -1036,5 +1059,91 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("server should return after client disconnect");
         assert!(result.is_ok(), "fail-open accepted result was {result:?}");
+    }
+
+    /// P2.1 (F-G7-001): when the auth gate accepts an inter-node frame
+    /// without a configured `cluster_secret` (the trusted-overlay
+    /// fail-open default), it must bump
+    /// `ReplicationMetrics::replica_unauthenticated_accept_total` so
+    /// dashboards can alert on any non-zero rate.
+    ///
+    /// The metric is registered through a process-wide `OnceLock`. We
+    /// install a `&'static` instance here (idempotent for parallel
+    /// tests; the leak is `'static`-scoped and bounded to the process).
+    /// Reading the counter both before and after the connection isolates
+    /// this test from any other test that may have already bumped it.
+    #[test]
+    fn unauthenticated_inter_node_accept_increments_metric() {
+        use crate::metrics::{
+            ReplicationMetrics, init_replication_metrics, replication_metrics,
+        };
+
+        // Install a process-wide ReplicationMetrics. `OnceLock` semantics
+        // mean later test threads racing with us share the same handle —
+        // we still observe the delta via before/after snapshots below.
+        static METRICS_CELL: std::sync::OnceLock<ReplicationMetrics> = std::sync::OnceLock::new();
+        let leaked: &'static ReplicationMetrics = METRICS_CELL.get_or_init(ReplicationMetrics::new);
+        init_replication_metrics(leaked);
+        let metrics =
+            replication_metrics().expect("replication metrics installed by init_ above");
+        let before = metrics.replica_unauthenticated_accept_total.get();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(test_engine());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server_engine = engine.clone();
+        let server_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = handle_connection_inner(
+                stream,
+                &server_engine,
+                &server_shutdown,
+                ConnectionOptions {
+                    max_batch_size: 1024,
+                    max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    cluster: None,
+                    redo_log: None,
+                    blob_store: None,
+                    inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
+                    cluster_secret: None,
+                    strict_auth: false,
+                    read_timeout: Duration::from_secs(1),
+                    write_timeout: Duration::from_secs(1),
+                },
+            );
+            tx.send(result).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let request = RequestFrame {
+            request_id: 11,
+            // Any inter-node opcode reaches the auth gate; OP_REPLICA_BATCH
+            // is the canonical example.
+            op_code: OP_REPLICA_BATCH,
+            flags: 0,
+            payload: Vec::new(),
+        };
+        client.write_all(&request.encode()).unwrap();
+
+        // Read the response to ensure the gate has actually executed
+        // before we sample the counter.
+        let response = read_response_frame_for_test(&mut client);
+        assert_eq!(response.request_id, 11);
+        drop(client);
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server should return after client disconnect");
+        assert!(result.is_ok(), "fail-open accepted result was {result:?}");
+
+        let after = metrics.replica_unauthenticated_accept_total.get();
+        assert!(
+            after >= before + 1,
+            "expected replica_unauthenticated_accept_total to advance by \
+             at least 1 (before={before}, after={after})",
+        );
     }
 }
