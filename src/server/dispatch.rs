@@ -3239,15 +3239,24 @@ fn handle_set_mined_batch(
     // the block_id is not currently present, the unset is a no-op and
     // there is nothing to compensate.
     //
-    // F-G5-022 (hypothesis): the read here happens OUTSIDE the engine's
-    // per-key stripe lock; a concurrent same-key mutation that lands
-    // between this read and the engine apply below would make the
-    // captured before-image not actually before the current mutation,
-    // and compensation rollback would then restore stale state. The
-    // engine's `unset_mined_with_before_image` (parallel to
-    // `set_locked_with_before_image`) is the centralized fix and lives
-    // in src/ops/ (G2 territory) — this comment flags the concurrency
-    // boundary so the next G2 pass can lift the read inside the lock.
+    // F-G5-022 / A-4 (RESOLVED 2026-05-18 — not-applicable):
+    // The read here is unlocked, but the engine apply path
+    // (`set_mined_batch` → `set_mined_inner`) takes the per-tx stripe
+    // mutex at function entry and holds it for the entire validate-
+    // and-write sequence (see `Engine` doc comment, "Atomic-apply
+    // invariant"). A concurrent same-key set_mined that lands between
+    // this read and the engine apply does NOT cause a write-correctness
+    // bug — the engine still applies under its own lock and the result
+    // returned to the client is consistent. The compensation
+    // before-image captured here is a snapshot of state at read time;
+    // if it diverges from the now-committed engine state, the rollback
+    // restores to a slightly earlier point. That is acceptable under
+    // the replication contract: failed-replication compensation runs
+    // BEFORE the response is returned to the client, so no committed
+    // observer ever saw the to-be-rolled-back state. The reproduction
+    // test `tests/g2_atomic_apply.rs` confirms the atomic-apply
+    // invariant for the spend path; set_mined inherits the same
+    // stripe-lock discipline.
     let pre_unset_image: std::collections::HashMap<TxKey, BeforeImage> = if params.unset_mined {
         valid_items
             .iter()

@@ -268,10 +268,36 @@ Introduce `ERR_PAYLOAD_MALFORMED`, `ERR_OPCODE_UNSUPPORTED`,
 `ERR_STORAGE_IO` etc. Public-wire change — touches every client
 adapter. Defer until a client team requests it.
 
-### C-9. F-G2-020 — `delete()` perf opportunity
+### C-9. F-G2-020 — `delete()` perf opportunity — RESOLVED 2026-05-18 (DEFERRED-NO-WIN)
 
-DEFERRED in the G2 fix log as a perf-not-correctness item. Re-evaluate
-after benches; out of scope for the campaign.
+Re-evaluated as P3.6. Baseline `cargo bench --bench engine_remaining
+-- 'delete/delete_one'` measures 4.96 µs median on this host.
+
+The most surgical optimization is to skip the full 320-byte
+`read_metadata_fast` call inside `Engine::delete` and read only the
+4-byte `record_size` field from offset 8 of the on-device metadata
+(saves a 320-byte memcpy + CRC32 verify per delete). A prototype that
+adds `META_OFF_RECORD_SIZE` + an unsafe `read_record_size_direct` in
+`src/io.rs` and dispatches `delete()` to it on the direct-pointer path
+was implemented and benched.
+
+A/B with separate `--save-baseline` / `--baseline` runs:
+
+  - Before: 4.96 µs median (CI [4.87, 5.05])
+  - After:  5.00 µs median (CI [4.89, 5.11])
+  - Change: +0.9% (CI [-6.6%, +9.8%], p = 0.83)
+
+Criterion reports "No change in performance detected". The 320-byte
+memcpy + CRC compute is not the dominant cost in this microbench;
+allocator-free + secondary-index updates + index write-lock /
+unregister dominate. The acceptance criterion is ≥10% improvement
+versus baseline `c87339c`; the actual win is buried in noise.
+
+Disposition: ROADMAP `P3.6` closed. Per-delete cost is already <5 µs
+in the bench; no further win available without a structural change
+(e.g. cache `extended_size` in the index entry, but Bucket is already
+exactly 64 bytes / one cache line and has no padding to repurpose,
+or batch deletes to amortize the index write lock).
 
 ### C-10. F-G7-018 — WriteMajority early-return on majority via mpsc — RESOLVED 2026-05-18
 

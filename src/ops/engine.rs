@@ -28,6 +28,39 @@ use std::sync::Arc;
 /// All mutation operations acquire a per-transaction stripe lock, ensuring
 /// that concurrent operations on different transactions run in parallel
 /// while operations on the same transaction are serialized.
+///
+/// # Atomic-apply invariant (F-G5-022 / A-4)
+///
+/// Each mutation entry point ([`Self::spend`], [`Self::unspend`],
+/// [`Self::set_mined`] / [`Self::set_mined_inner`], [`Self::set_locked`],
+/// [`Self::create`], [`Self::delete`], [`Self::freeze`], [`Self::unfreeze`],
+/// [`Self::reassign`], [`Self::mark_on_longest_chain`], etc.) acquires the
+/// per-tx stripe mutex *as its first action* and holds it for the entire
+/// read → validate → write → index-sync sequence. The mutex is released
+/// only after every observable side effect (slot write, metadata write,
+/// primary-index cache update, secondary-index two-phase update) has
+/// landed.
+///
+/// Consequence: there is no validate-then-apply window where two
+/// concurrent same-key spends could both observe `UTXO_UNSPENT` and both
+/// commit. The reproduction test
+/// `tests/g2_atomic_apply.rs::concurrent_spend_same_utxo_yields_exactly_one_winner`
+/// runs 16 threads × 200 iterations against the same UTXO and asserts
+/// exactly one `Ok` and `N-1` `AlreadySpent`. Any future refactor that
+/// splits the validate-and-apply sequence across the lock boundary, or
+/// downgrades the stripe mutex to an RwLock with shared validation, will
+/// surface as ≥2 winners and a panicking test.
+///
+/// Read-only paths ([`Self::read_metadata`], [`Self::read_slot`],
+/// [`Self::read_slots`], [`Self::read_block_entry`], [`Self::get_spend`])
+/// are intentionally lock-free for throughput and rely on (a) the CRC32
+/// over `TxMetadata` to detect torn headers and (b) the `meta.tx_id ==
+/// key.txid` check in `read_metadata_for_key` (F-G2-001) to defend
+/// against `delete + create_at_offset` aliasing. Callers that need a
+/// mutation-stable view (e.g. dispatch-side before-image capture for
+/// replication compensation) MUST either already hold the appropriate
+/// stripe lock or accept that the snapshot may be staler than the
+/// committed engine state by the time their follow-up mutation runs.
 pub struct Engine {
     device: Arc<dyn BlockDevice>,
     /// Raw pointer to device memory for zero-copy I/O on the hot path.
