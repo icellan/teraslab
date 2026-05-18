@@ -258,11 +258,7 @@ impl Server {
         const SHUTDOWN_TOKEN: mio::Token = mio::Token(1);
         let mut poll = mio::Poll::new().map_err(|e| format!("mio::Poll::new: {e}"))?;
         poll.registry()
-            .register(
-                &mut mio_listener,
-                LISTENER_TOKEN,
-                mio::Interest::READABLE,
-            )
+            .register(&mut mio_listener, LISTENER_TOKEN, mio::Interest::READABLE)
             .map_err(|e| format!("register listener: {e}"))?;
         let waker = Arc::new(
             mio::Waker::new(poll.registry(), SHUTDOWN_TOKEN)
@@ -349,7 +345,10 @@ impl Server {
                             let response = ResponseFrame {
                                 request_id: 0,
                                 status: STATUS_ERROR,
-                                payload: encode_error_payload(ERR_INTERNAL, "max connections reached"),
+                                payload: encode_error_payload(
+                                    ERR_INTERNAL,
+                                    "max connections reached",
+                                ),
                             };
                             let _ = stream.write_all(&response.encode());
                             drop(stream);
@@ -1098,9 +1097,7 @@ mod tests {
     /// this test from any other test that may have already bumped it.
     #[test]
     fn unauthenticated_inter_node_accept_increments_metric() {
-        use crate::metrics::{
-            ReplicationMetrics, init_replication_metrics, replication_metrics,
-        };
+        use crate::metrics::{ReplicationMetrics, init_replication_metrics, replication_metrics};
 
         // Install a process-wide ReplicationMetrics. `OnceLock` semantics
         // mean later test threads racing with us share the same handle —
@@ -1108,8 +1105,7 @@ mod tests {
         static METRICS_CELL: std::sync::OnceLock<ReplicationMetrics> = std::sync::OnceLock::new();
         let leaked: &'static ReplicationMetrics = METRICS_CELL.get_or_init(ReplicationMetrics::new);
         init_replication_metrics(leaked);
-        let metrics =
-            replication_metrics().expect("replication metrics installed by init_ above");
+        let metrics = replication_metrics().expect("replication metrics installed by init_ above");
         let before = metrics.replica_unauthenticated_accept_total.get();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
