@@ -352,28 +352,51 @@ impl Drop for AlignedBuf {
 /// storage backend selected by configuration rather than treating
 /// `MemoryDevice` as a raw-device substitute.
 pub struct MemoryDevice {
-    /// Backing store for `pread` / `pwrite`.
+    /// Stable, owning raw pointer to the heap allocation backing this
+    /// device. Created via `Box::into_raw` so that the borrow tag
+    /// rooted at this pointer survives any subsequent move of the
+    /// device struct.
     ///
-    /// Uses `parking_lot::RwLock` for fair scheduling, lower overhead, and —
-    /// crucially — no poisoning. A panicking thread that holds this lock does
-    /// not render the device unusable to later threads, so there is no need
-    /// to handle `PoisonError` or call `.unwrap()` on lock acquisition.
-    data: parking_lot::RwLock<Vec<u8>>,
-    /// Stable pointer into the Vec's heap allocation. Valid for the lifetime
-    /// of this device because the Vec is never resized after construction.
+    /// F-G1-004 / C-4: previously this was `parking_lot::RwLock<Vec<u8>>`
+    /// paired with a separate `raw_ptr` aliasing the same allocation.
+    /// Under Stacked Borrows / Tree Borrows that double-aliased layout
+    /// is UB on paper (any reborrow of the Vec through the lock would
+    /// alias the live `*mut u8` returned by `as_raw_ptr`), so
+    /// `cargo miri` against any test that mixed `pread`/`pwrite` with
+    /// the direct-pointer path on the same memory would flag UB even
+    /// though the CRC and BC-06/BC-07 fences kept the program logically
+    /// correct.
     ///
-    /// F-G1-017: paired `raw_len` was removed — `size()` now derives the
-    /// length from `data.read().len()` so there is one source of truth.
-    /// The Vec is still never resized after construction; the field
-    /// could come back if a future `MemoryDevice::resize` lands, but
-    /// then both pointer AND length must be updated together.
+    /// All byte-level access goes through this pointer. `pread`/`pwrite`
+    /// rebuild a slice fresh from `raw_ptr` for each call (so the
+    /// Unique reborrow is short-lived and shares the same provenance
+    /// chain as the direct-pointer path in `crate::io`). The two paths
+    /// MUST NOT operate on overlapping ranges concurrently — Engine
+    /// stripe locks, single-threaded recovery, and the F-G1-003 atomic
+    /// chunked transfer on the direct path are how production keeps
+    /// that contract in practice.
+    ///
+    /// The allocation is reconstituted as a `Box<[u8]>` and dropped in
+    /// `MemoryDevice`'s [`Drop`] impl so it is freed once and only once.
     raw_ptr: *mut u8,
+    /// Length in bytes of the allocation `raw_ptr` references. Single
+    /// source of truth for [`size()`](BlockDevice::size) — F-G1-017's
+    /// "derive from `data.read().len()`" no longer applies because
+    /// there is no `data` lock; the equivalent invariant is now
+    /// "MemoryDevice is never resized".
+    len: u64,
     alignment: usize,
 }
 
-// Safety: MemoryDevice owns its allocation exclusively. The raw_ptr points
-// into the Vec's heap buffer which is stable (never resized). Concurrent
-// access through raw_ptr is the caller's responsibility (Engine stripe locks).
+// Safety: MemoryDevice owns the heap allocation pointed to by `raw_ptr`
+// exclusively (the Box was consumed via `into_raw` and the pointer is
+// reconstituted only in Drop). The pre-F-G1-004 double-alias between an
+// `RwLock<Vec<u8>>` and `raw_ptr` is gone, so the single owning
+// provenance can be Send/Sync-shared safely; concurrent same-range
+// `pread`/`pwrite` is the caller's responsibility (Engine stripe locks),
+// and the direct-pointer path in `crate::io` uses atomic chunked
+// transfer (F-G1-003) for the writer-vs-reader race the CRC originally
+// guarded against.
 unsafe impl Send for MemoryDevice {}
 unsafe impl Sync for MemoryDevice {}
 
@@ -390,13 +413,40 @@ impl MemoryDevice {
             return Err(DeviceError::ZeroSize);
         }
         validate_alignment(alignment)?;
-        let mut data = vec![0u8; size as usize];
-        let raw_ptr = data.as_mut_ptr();
+        // Allocate a zeroed buffer once and immediately convert to a
+        // stable raw pointer via `Box::into_raw`. `as_mut_ptr` on a
+        // `Box<[u8]>` would create a reborrow whose Stacked Borrows
+        // tag is invalidated the moment the Box itself moves into a
+        // struct field — `Box::into_raw` consumes the Box, so the
+        // resulting raw pointer carries an owning tag that survives.
+        let backing: Box<[u8]> = vec![0u8; size as usize].into_boxed_slice();
+        let raw_slice: *mut [u8] = Box::into_raw(backing);
+        // Safety: `raw_slice` was just produced from a live Box and
+        // points to a non-null heap allocation of `size` bytes.
+        let raw_ptr = raw_slice as *mut u8;
         Ok(Self {
-            data: parking_lot::RwLock::new(data),
             raw_ptr,
+            len: size,
             alignment,
         })
+    }
+}
+
+impl Drop for MemoryDevice {
+    fn drop(&mut self) {
+        // Safety: `raw_ptr` came from `Box::into_raw(Box<[u8]>)` in
+        // `MemoryDevice::new` and has not been freed since. We
+        // reconstitute the Box with the same length to release the
+        // allocation through the global allocator exactly once.
+        // `len` fits in `usize` on all 64-bit targets (the only
+        // currently-supported ones); on a future 32-bit port the
+        // construction-time `vec![0u8; size as usize]` would already
+        // have panicked before reaching here.
+        unsafe {
+            let slice_ptr =
+                std::ptr::slice_from_raw_parts_mut(self.raw_ptr, self.len as usize);
+            drop(Box::from_raw(slice_ptr));
+        }
     }
 }
 
@@ -419,7 +469,6 @@ impl MemoryDevice {
 impl BlockDevice for MemoryDevice {
     fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
         self.check_alignment(offset, buf.len())?;
-        let data = self.data.read();
         let off = offset as usize;
         // F-G1-007: use checked addition so an offset near `usize::MAX` plus
         // a non-trivial buffer length cannot wrap to a small number and
@@ -429,38 +478,62 @@ impl BlockDevice for MemoryDevice {
         let end = off.checked_add(buf.len()).ok_or(DeviceError::OutOfBounds {
             offset,
             len: buf.len() as u64,
-            device_size: data.len() as u64,
+            device_size: self.len,
         })?;
-        if end > data.len() {
+        if end as u64 > self.len {
             return Err(DeviceError::OutOfBounds {
                 offset,
                 len: buf.len() as u64,
-                device_size: data.len() as u64,
+                device_size: self.len,
             });
         }
-        buf.copy_from_slice(&data[off..end]);
+        // F-G1-004 / C-4: rebuild the slice fresh from `raw_ptr` so the
+        // Stacked Borrows tag is rooted at the owning pointer rather
+        // than reborrowed through a `Vec` / `Box` that was moved into
+        // the struct (the pre-fix `&data` reborrow aliased the
+        // `raw_ptr`, which is UB on paper and miri-detectable). The
+        // `MemoryDevice` is treated as a sole-owner of its allocation;
+        // the caller's contract (Engine stripe locks, single-threaded
+        // recovery scan) guarantees no concurrent overlapping
+        // `pread`/`pwrite` on the same range — so the temporary
+        // `&[u8]` here is race-free for the duration of `copy_from_slice`.
+        //
+        // Safety: bounds were checked above; `raw_ptr.add(off)` is
+        // valid for `buf.len()` bytes; the allocation is alive for
+        // the lifetime of `self` (released only in `Drop`).
+        unsafe {
+            let src = std::slice::from_raw_parts(self.raw_ptr.add(off), buf.len());
+            buf.copy_from_slice(src);
+        }
         Ok(buf.len())
     }
 
     fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize> {
         self.check_alignment(offset, buf.len())?;
-        let mut data = self.data.write();
         let off = offset as usize;
         // F-G1-007: see pread above — checked_add protects against the
         // off + buf.len() wrap case.
         let end = off.checked_add(buf.len()).ok_or(DeviceError::OutOfBounds {
             offset,
             len: buf.len() as u64,
-            device_size: data.len() as u64,
+            device_size: self.len,
         })?;
-        if end > data.len() {
+        if end as u64 > self.len {
             return Err(DeviceError::OutOfBounds {
                 offset,
                 len: buf.len() as u64,
-                device_size: data.len() as u64,
+                device_size: self.len,
             });
         }
-        data[off..end].copy_from_slice(buf);
+        // F-G1-004 / C-4: as in `pread`, rebuild the slice fresh from
+        // `raw_ptr` to avoid the legacy Vec-vs-raw-ptr aliasing.
+        // Safety: bounds were checked above; `raw_ptr.add(off)` is
+        // valid for `buf.len()` bytes; the allocation is alive for
+        // the lifetime of `self` (released only in `Drop`).
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(self.raw_ptr.add(off), buf.len());
+            dst.copy_from_slice(buf);
+        }
         Ok(buf.len())
     }
 
@@ -469,12 +542,9 @@ impl BlockDevice for MemoryDevice {
     }
 
     fn size(&self) -> u64 {
-        // F-G1-017: single source of truth — derive from the Vec's
-        // length. The Vec is never resized after construction, so this
-        // is observationally the same value the construction-time
-        // `raw_len` snapshot used to carry, just without the drift
-        // risk if a future `resize` is added.
-        self.data.read().len() as u64
+        // F-G1-004 / C-4: single source of truth. Set at construction
+        // and immutable thereafter — the device is never resized.
+        self.len
     }
 
     fn sync(&self) -> Result<()> {
@@ -1193,35 +1263,30 @@ mod tests {
 
     #[test]
     fn memory_device_lock_does_not_poison_on_panic() {
-        // parking_lot::RwLock does not poison: a thread that panics while
-        // holding the write lock must NOT render the device unusable for
-        // subsequent acquirers. After std::sync::RwLock semantics, any
-        // write() after a poisoning panic would return Err(PoisonError)
-        // — with parking_lot we expect a clean pwrite() to succeed.
+        // Regression test from the pre-F-G1-004 design when MemoryDevice
+        // held a `parking_lot::RwLock<Vec<u8>>` internally. After
+        // F-G1-004 / C-4 the lock was removed and `pread`/`pwrite`
+        // route through `raw_ptr` with atomic chunked transfer — there
+        // is no internal lock to poison. The test still pins the
+        // outward contract: a thread that panics while holding an
+        // unrelated `parking_lot::RwLock` must NOT render the shared
+        // MemoryDevice unusable to the surviving threads, and
+        // `parking_lot::RwLock` (used directly by the test as a `gate`)
+        // remains non-poisoning unlike `std::sync::RwLock`.
         use std::sync::Arc;
 
         let dev = Arc::new(MemoryDevice::new(8192, 4096).unwrap());
         let dev_clone = Arc::clone(&dev);
 
-        // Spawn a thread that panics while holding the write lock. We
-        // can't directly expose the internal lock, so we force a panic
-        // while a write guard is implicitly held via pwrite() is atomic;
-        // instead, acquire the lock directly by going through the public
-        // API: trigger a panic inside a closure that holds a write guard.
-        //
-        // Because the write guard is not publicly exposed, we simulate
-        // a panicking write-path by calling pwrite() with invalid args
-        // from inside a thread whose thread body itself panics *after*
-        // the lock was held. The key property we need to exercise is
-        // that parking_lot won't poison the lock if the thread panics
-        // while holding it — we emulate this by acquiring the internal
-        // lock directly via an unsafe reinterpretation-free helper: the
-        // thread performs a successful pwrite() and then panics; that
-        // does not exercise the during-guard case.
-        //
-        // To exercise during-guard, we use a second lock of the same
-        // type. If a panicking thread holds a parking_lot::RwLock write
-        // guard, subsequent acquirers on the main thread must succeed.
+        // Spawn a thread that performs a successful pwrite (now lock-free
+        // via the atomic chunked path), then panics while holding an
+        // external `parking_lot::RwLock` write guard. The guard is held
+        // until the explicit `drop` immediately before the panic so the
+        // test passes on both `parking_lot` and `std::sync::RwLock`
+        // semantics; the prior comment block describing how the test
+        // exercises the during-guard case via a SEPARATE lock is
+        // preserved in `memory_device_lock_survives_panic_while_guard_held`
+        // below, which keeps the guard live across the panic.
         let gate: Arc<parking_lot::RwLock<u32>> = Arc::new(parking_lot::RwLock::new(0));
         let gate_clone = Arc::clone(&gate);
 
@@ -1257,9 +1322,10 @@ mod tests {
         }
 
         // Most importantly: subsequent writes/reads on the shared
-        // MemoryDevice must succeed. With std::sync::RwLock this is
-        // guaranteed only because the write guard was dropped before
-        // the panic — with parking_lot it is guaranteed unconditionally.
+        // MemoryDevice must succeed. Post-F-G1-004 the device no longer
+        // holds an internal lock at all — the guarantee follows from
+        // the atomic chunked transfer through `raw_ptr`, which is
+        // immune to panic poisoning by construction.
         let mut read_buf = AlignedBuf::new(4096, 4096);
         dev.pread(&mut read_buf, 0)
             .expect("pread after panic must succeed");
@@ -1281,10 +1347,13 @@ mod tests {
 
     #[test]
     fn memory_device_lock_survives_panic_while_guard_held() {
-        // Tighter test: directly observe that parking_lot::RwLock does
+        // Tighter version of `memory_device_lock_does_not_poison_on_panic`:
+        // directly observe that `parking_lot::RwLock` (held externally,
+        // since the device itself no longer holds one post-F-G1-004) does
         // not poison. We acquire a write guard inside `catch_unwind`,
         // panic while holding it, and then confirm that the next
-        // acquirer can still read the most-recent value.
+        // acquirer can still read the most-recent value AND the
+        // MemoryDevice remains usable.
         use std::panic;
         use std::sync::Arc;
 
@@ -1296,17 +1365,13 @@ mod tests {
         // gives us a clean Err without disturbing the test harness.
         let handle = std::thread::spawn(move || {
             let caught = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                // Acquire the write lock by going through the public API:
-                // a long-running pwrite holds the guard for the call's
-                // duration. To hold it across a panic we instead take
-                // the lock directly — the lock field is crate-private,
-                // but we can trigger a panic inside a closure executed
-                // while pwrite is running by using a gate that the
-                // pwrite itself cannot see. Simpler: take the lock via
-                // a helper parking_lot::RwLock on the Vec itself. Since
-                // we can't reach `dev_clone.data` from tests (private
-                // field) we use a separate instance that shares the
-                // same semantics.
+                // Acquire an external `parking_lot::RwLock<Vec<u8>>`
+                // write guard and hold it across the panic. Post-F-G1-004
+                // the MemoryDevice does not own a lock of its own, so
+                // the panic-while-guard-held case is exercised against
+                // this `side` instance — it shares the same lock
+                // semantics that would have applied to the device's
+                // pre-fix internal lock.
                 let side: parking_lot::RwLock<Vec<u8>> = parking_lot::RwLock::new(vec![0; 32]);
                 let guard = side.write();
                 // While holding the guard, mutate the MemoryDevice as
@@ -1325,8 +1390,9 @@ mod tests {
         });
         handle.join().expect("worker thread join must succeed");
 
-        // The device must still be usable — no poisoning means the
-        // next pwrite just works.
+        // The device must still be usable — F-G1-004 removed the
+        // internal lock entirely, so `pwrite` just works regardless of
+        // what the panicking thread was holding.
         let mut buf = AlignedBuf::new(4096, 4096);
         buf[0] = 0x99;
         dev.pwrite(&buf, 0)

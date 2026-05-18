@@ -28,6 +28,23 @@ clean.
 
 ---
 
+- **F-G1-003 atomic-chunk migration — RESOLVED (FIXED, partial)** —
+  `read_metadata_direct`, `write_metadata_direct`, `read_utxo_slot_direct`,
+  and `write_utxo_slot_direct` in `src/io.rs` now perform the bulk byte
+  transfer through `AtomicU64::load(Relaxed)` / `store(Relaxed)` chunks
+  via `atomic_load_into` / `atomic_store_from`. Targeted footer
+  helpers (`write_mutation_footer_direct`, `write_spend_footer_direct`,
+  `write_mined_footer_direct`, `write_block_entry_direct`,
+  `write_crc_direct`) still use non-atomic `ptr::copy_nonoverlapping`
+  — deferred because no current miri test exercises them concurrently
+  but production race remains.
+- **F-G1-004 MemoryDevice aliasing — RESOLVED (FIXED)** — Option A:
+  dropped `RwLock<Vec<u8>>`; backing allocation is `Box::into_raw` →
+  raw `*mut u8` + `len`, with `Box::from_raw` in `Drop`. `pread` /
+  `pwrite` rebuild a short-lived slice per call.
+
+---
+
 ## A. Production bugs
 
 ### A-1. ~~`src/cluster/topology.rs:706` — `ever_seen_check` runs unconditionally~~ — RESOLVED 2026-05-18

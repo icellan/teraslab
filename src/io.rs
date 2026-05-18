@@ -84,6 +84,101 @@ fn off_to_usize(record_offset: u64) -> usize {
 }
 
 // ===========================================================================
+// F-G1-003 / C-3: atomic chunked byte transfer between a raw device pointer
+// and a stack buffer.
+//
+// `cargo miri test` treats `slice::from_raw_parts` / `from_raw_parts_mut`
+// against the SAME backing memory on different threads as a data race even
+// when the CRC + BC-06/BC-07 fences keep the program logically correct.
+// The fix is to perform the bulk byte transfer through `AtomicU64::load /
+// store` (with an `AtomicU8` head/tail for misaligned spans) so miri sees
+// the racing accesses as atomic — no data-race UB. Relaxed ordering is
+// sufficient: the CRC, not the memory-order tag, provides the consistency
+// guarantee, and the existing Release/Acquire fences in the calling
+// helpers remain in place for AArch64 hardware barriers.
+// ===========================================================================
+
+/// Atomically read `dst.len()` bytes from the device pointer `src` into the
+/// stack buffer `dst`. Uses `AtomicU64::load(Relaxed)` for the 8-byte body
+/// chunks (when `src` reaches 8-byte alignment) and `AtomicU8::load(Relaxed)`
+/// for the head and tail misalignment.
+///
+/// # Safety
+///
+/// `src` must be valid for `dst.len()` bytes; the bytes must be initialized;
+/// and any concurrent writer must access the same range exclusively through
+/// `atomic_store_from` or another atomic write path (no non-atomic stores).
+#[inline(always)]
+unsafe fn atomic_load_into(src: *const u8, dst: &mut [u8]) {
+    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+    let n = dst.len();
+    let mut i = 0;
+    // Head bytes until `src.add(i)` reaches 8-byte alignment.
+    //
+    // `align_offset(8)` returns `usize::MAX` only on zero-sized
+    // allocations, where this loop body is a no-op anyway (n==0).
+    let head = src.align_offset(8).min(n);
+    while i < head {
+        // Safety: src.add(i) is within the caller-promised range and
+        // AtomicU8::from_ptr accepts any 1-byte aligned pointer.
+        let v = unsafe { AtomicU8::from_ptr(src.add(i).cast_mut()) }.load(Ordering::Relaxed);
+        dst[i] = v;
+        i += 1;
+    }
+    // 8-byte body chunks. Pointer is 8-byte aligned at this point.
+    while i + 8 <= n {
+        // Safety: src.add(i) is 8-byte aligned, within range, and
+        // AtomicU64::from_ptr accepts any 8-byte aligned pointer.
+        let v = unsafe { AtomicU64::from_ptr(src.add(i).cast_mut().cast()) }
+            .load(Ordering::Relaxed);
+        dst[i..i + 8].copy_from_slice(&v.to_ne_bytes());
+        i += 8;
+    }
+    // Tail bytes when `n` is not a multiple of 8.
+    while i < n {
+        // Safety: same as the head loop.
+        let v = unsafe { AtomicU8::from_ptr(src.add(i).cast_mut()) }.load(Ordering::Relaxed);
+        dst[i] = v;
+        i += 1;
+    }
+}
+
+/// Atomically write `src.len()` bytes from the stack buffer `src` to the
+/// device pointer `dst`. Mirrors [`atomic_load_into`] — see that function's
+/// doc-comment for the rationale and ordering choice.
+///
+/// # Safety
+///
+/// `dst` must be valid for `src.len()` bytes and any concurrent reader must
+/// access the same range exclusively through `atomic_load_into` or another
+/// atomic read path (no non-atomic loads).
+#[inline(always)]
+unsafe fn atomic_store_from(dst: *mut u8, src: &[u8]) {
+    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+    let n = src.len();
+    let mut i = 0;
+    let head = dst.align_offset(8).min(n);
+    while i < head {
+        // Safety: dst.add(i) is within the caller-promised range.
+        unsafe { AtomicU8::from_ptr(dst.add(i)) }.store(src[i], Ordering::Relaxed);
+        i += 1;
+    }
+    while i + 8 <= n {
+        let mut chunk = [0u8; 8];
+        chunk.copy_from_slice(&src[i..i + 8]);
+        // Safety: dst.add(i) is 8-byte aligned and within range.
+        unsafe { AtomicU64::from_ptr(dst.add(i).cast()) }
+            .store(u64::from_ne_bytes(chunk), Ordering::Relaxed);
+        i += 8;
+    }
+    while i < n {
+        // Safety: same as the head loop.
+        unsafe { AtomicU8::from_ptr(dst.add(i)) }.store(src[i], Ordering::Relaxed);
+        i += 1;
+    }
+}
+
+// ===========================================================================
 // TxMetadata byte-offset constants (repr(C, packed), 256 bytes)
 // ===========================================================================
 
@@ -578,8 +673,17 @@ pub unsafe fn read_metadata_direct(base_ptr: *const u8, record_offset: u64) -> R
     let _r = io_locks().read(record_offset);
     unsafe {
         let src = base_ptr.add(off_to_usize(record_offset));
-        let bytes = std::slice::from_raw_parts(src, METADATA_SIZE);
-        Ok(TxMetadata::from_bytes(bytes)?)
+        // F-G1-003 / C-3: copy the 256 header bytes via atomic
+        // chunked load (AtomicU64 body + AtomicU8 head/tail) into a
+        // local stack buffer. This eliminates the data race miri
+        // flags when a concurrent `write_metadata_direct` (which
+        // performs atomic chunked stores) targets the same record.
+        // The local buffer is a non-aliased stack value so the
+        // subsequent `TxMetadata::from_bytes(&buf)` slice deref
+        // does not retag racing references.
+        let mut buf = [0u8; METADATA_SIZE];
+        atomic_load_into(src, &mut buf);
+        Ok(TxMetadata::from_bytes(&buf)?)
     }
 }
 
@@ -610,10 +714,22 @@ pub unsafe fn write_metadata_direct(base_ptr: *mut u8, record_offset: u64, metad
     let _w = io_locks().write(record_offset);
     unsafe {
         let dst = base_ptr.add(off_to_usize(record_offset));
-        let dst_slice = std::slice::from_raw_parts_mut(dst, METADATA_SIZE);
+        // F-G1-003 / C-3: serialize to a local stack buffer first,
+        // then atomic-chunked-store into the device memory. See
+        // `read_metadata_direct` for the rationale on why the bulk
+        // copy must go through atomics rather than `from_raw_parts_mut`
+        // + `copy_from_slice` (which retag races miri's data-race
+        // detector against the reader on a different thread).
         let mut buf = [0u8; METADATA_SIZE];
         metadata.to_bytes(&mut buf);
-        dst_slice.copy_from_slice(&buf);
+        atomic_store_from(dst, &buf);
+        // R-030 (BC-07): Release fence AFTER the memcpy so all
+        // store operations commit before the next memory access
+        // can be observed by another core. Pairs with the reader's
+        // Acquire fence (R-029); together they prevent a reader on
+        // a different core from seeing the new CRC bytes alongside
+        // stale header bytes.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -644,8 +760,11 @@ pub unsafe fn read_utxo_slot_direct(
     unsafe {
         let slot_offset = record_offset + TxMetadata::utxo_slot_offset(slot_index);
         let src = base_ptr.add(off_to_usize(slot_offset));
-        let bytes = std::slice::from_raw_parts(src, UTXO_SLOT_SIZE);
-        Ok(UtxoSlot::from_bytes(bytes)?)
+        // F-G1-003 / C-3: atomic chunked load into a local stack
+        // buffer — see `read_metadata_direct`.
+        let mut buf = [0u8; UTXO_SLOT_SIZE];
+        atomic_load_into(src, &mut buf);
+        Ok(UtxoSlot::from_bytes(&buf)?)
     }
 }
 
@@ -674,10 +793,15 @@ pub unsafe fn write_utxo_slot_direct(
     unsafe {
         let slot_offset = record_offset + TxMetadata::utxo_slot_offset(slot_index);
         let dst = base_ptr.add(off_to_usize(slot_offset));
-        let dst_slice = std::slice::from_raw_parts_mut(dst, UTXO_SLOT_SIZE);
+        // F-G1-003 / C-3: atomic chunked store from a local stack
+        // buffer — see `write_metadata_direct`.
         let mut buf = [0u8; UTXO_SLOT_SIZE];
         slot.to_bytes(&mut buf);
-        dst_slice.copy_from_slice(&buf);
+        atomic_store_from(dst, &buf);
+        // R-030 (BC-07): Release fence — see `write_metadata_direct`
+        // for the full rationale. Slot writes have the same
+        // memory-ordering risk as metadata writes on AArch64.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     }
 }
 
