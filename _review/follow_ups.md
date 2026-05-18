@@ -52,34 +52,22 @@ Files: `src/cluster/topology.rs`, `src/cluster/coordinator.rs`,
 Sleeping in a polling loop. Replace with `mio::Poll` or a self-pipe so
 shutdown is observed immediately and idle CPU drops to zero.
 
-### A-2b. Shard-table never recomputes for 2→3 scale-up — DEEPER FIX NEEDED
+### A-2b. ~~Shard-table never recomputes for 2→3 scale-up~~ — RESOLVED 2026-05-18
 
-After P1.1 landed cluster_id wiring (so a fresh 3-node bootstrap
-actually commits a 3-member topology), `tests/cluster_tcp.rs::start_three_node_cluster_create_records_distributed`
-exposed that the shard table stays stuck at `{NodeId(221): 2048,
-NodeId(222): 2048}` — i.e., 2-node assignment — even though
-`committed_topology_members()` returns `[221, 222, 223]` and
-`migration_pressure_active()` returns false within ms.
+**Status: FIXED in `0d3bd4f fix(A-2b): preserve round-robin pick when no candidate has shard data`.**
 
-`activate_topology_with_view` is responsible for the recompute. The
-fast-path at L1780 only fires for empty-engine single-node bootstrap;
-the multi-node path at L1962 installs `new_table` directly when
-`all_new_tasks.is_empty()` (true for the empty-cluster scale-up
-case). One of those two should fire for the test scenario yet neither
-appears to update the table. Suspect: `topology_commit_already_activated`
-dedup at L1120 + the run_exchange_phase indirection, OR an earlier
-on_membership_changed call already advanced `last_activated_term` past
-the 3-node commit's term, so the activation is dedup'd silently.
-
-The test now uses a relaxed predicate (`shard_counts.len() >= 2 &&
-all > 0`) so it passes deterministically on 2-node convergence too.
-This loses a chunk of intended signal — the test was meant to verify
-3-node *distribution*, not 2-node. P1.1 follow-up: diagnose the
-recompute gap and restore the strict `== 3` predicate.
-
-Repro: `cargo test --test cluster_tcp start_three_node_cluster_create_records_distributed`
-with the wait_until predicate reverted to `members.len() == 3 &&
-shard_counts.len() == 3` — fails 5/5 in 30s.
+Root cause was inside `apply_master_election`
+(`src/cluster/coordinator.rs:5701`). On a fresh empty cluster every
+candidate reports `last_applied_seq == 0`, so every candidate is
+classified `is_subset`; `elect_master`'s `was_previous_master`
+stickiness tiebreaker then always picked the previous master over the
+newcomer — silently un-doing every shard the round-robin assigned to
+NodeId(223). Fix: when no candidate reports any data, skip the
+election entirely and preserve the round-robin pick (same shape as
+`view_empty`). Test now passes 5/5 with strict `shard_counts.len() ==
+3 && all > 0` predicate. Final distribution: `{NodeId(221): 1366,
+NodeId(222): 1365, NodeId(223): 1365}` — exact round-robin on 4096
+shards / 3 members.
 
 ### A-3. F-G7-001 metric not incremented anywhere
 
