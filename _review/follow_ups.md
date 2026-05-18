@@ -132,12 +132,19 @@ clients depend on it. Public-API touch; defer until a consumer exists.
 
 ## C. Deferred performance / refactor
 
-### C-1. F-G1-012 — `nix`/`rustix` port for ioctl portability
+### C-1. F-G1-012 — `nix`/`rustix` port for ioctl portability — RESOLVED
 
 Hard-coded `BLKGETSIZE64` / `DKIOCGETBLOCKCOUNT` in `src/device.rs`
-are correct for x86_64 / aarch64 Linux + macOS. Port to `nix` or
-`rustix` so 32-bit Linux variants don't silently `ENOTTY`. Adds one
-small dep (allowed per FIX_POLICY item 4).
+were correct for x86_64 / aarch64 Linux + macOS but wrong on 32-bit
+Linux (where `size_t` is 32-bit and the encoded ioctl number differs).
+Ported to `nix::ioctl_read!` macros which compute the encoding from
+`(magic, num, type)` at compile time per target, so the same call
+site is portable across all Linux ABIs and macOS. The bare numeric
+constants are gone. Added `nix = "0.31"` with only the `ioctl`
+feature (no-std, libc-only) under `[target.'cfg(unix)'.dependencies]`.
+See P3.3 in `_review/ROADMAP_TO_100.md`. Verified by
+`cargo check --lib`, `cargo clippy --lib -- -D warnings`, and
+`cargo test --lib device::tests::` (36/36 passing on macOS host).
 
 ### C-2. F-G1-002 — `#[must_use]` typestate guard for footer + CRC
 

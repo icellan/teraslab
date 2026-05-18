@@ -203,12 +203,20 @@ mergeable.
 - **Size**: L (touches every G2 call site).
 - **Refs**: `_review/follow_ups.md` C-3, C-4.
 
-### P3.3 — `nix`/`rustix` port for ioctl portability (F-G1-012)
+### P3.3 — `nix`/`rustix` port for ioctl portability (F-G1-012) — RESOLVED
 
 - **What**: 32-bit Linux silently `ENOTTY`s. Currently no live target.
 - **Acceptance**: Compile + run on `i686-unknown-linux-gnu` reports
   device size correctly.
 - **Size**: S.
+- **Resolution**: Ported `src/device.rs` to `nix::ioctl_read!` for
+  `BLKGETSIZE64` (Linux) and `DKIOCGETBLOCKCOUNT` / `DKIOCGETBLOCKSIZE`
+  (macOS). Hard-coded numeric constants deleted; the macro computes
+  the correct encoding per target at compile time. Added
+  `nix = "0.31"` (ioctl-only feature) under `[target.'cfg(unix)'.dependencies]`.
+  `cargo check --lib` + `cargo clippy --lib -- -D warnings` clean,
+  `cargo test --lib device::tests::` 36/36 pass on macOS host. See
+  C-1 in `_review/follow_ups.md`.
 
 ### P3.4 — Frame zero-copy (F-G5-011)
 
