@@ -77,12 +77,32 @@ gate that decides "accept or reject when `cluster_secret = None`"
 lives in `src/server/mod.rs::handle_connection_inner` (G5). The
 increment is the visible-signal half of the trusted-overlay policy.
 
-### A-4. F-G5-022 — engine-side atomic apply
+### A-4. F-G5-022 — engine-side atomic apply — RESOLVED 2026-05-18 (NOT-APPLICABLE)
 
-Hand-off TODO at the dispatch call site says the fix (engine atomic
-apply + return before-image) belongs in `src/ops/`. Concurrency
-hypothesis only; not a confirmed bug. Treat as P3 unless a test surfaces
-the race.
+Reproduction test
+`tests/g2_atomic_apply.rs::concurrent_spend_same_utxo_yields_exactly_one_winner`
+(16 threads × 200 iterations spending the same UTXO with distinct
+`spending_data` per thread) passes today: exactly one thread returns
+`Ok`, the other 15 return `Err(AlreadySpent { .. })`, and the on-device
+slot reflects the unique winner's `spending_data`. The atomic-apply
+invariant is already established by the per-tx stripe mutex
+(`Engine::spend` and siblings acquire `self.locks.lock(&tx_key)` as
+their first action and hold it through the full read → validate →
+write → index-sync sequence).
+
+Action taken (P1.3 → documentation only):
+- Added an "Atomic-apply invariant" section to the `Engine` doc
+  comment in `src/ops/engine.rs` enumerating the mutation entry points
+  that hold the stripe mutex and pointing at the reproduction test as
+  the regression guard.
+- Replaced the hypothesis TODO at `src/server/dispatch.rs:3242` with
+  a RESOLVED block explaining that the unlocked `read_block_entry`
+  for the unset-mined before-image is a snapshot, not a write-
+  correctness hazard: the engine still applies under its own lock,
+  and compensation rollback runs before the response leaves the
+  server.
+
+No code-correctness change required.
 
 ### A-5. F-G7-024 / F-G8-004 metric integration
 
@@ -183,10 +203,36 @@ Introduce `ERR_PAYLOAD_MALFORMED`, `ERR_OPCODE_UNSUPPORTED`,
 `ERR_STORAGE_IO` etc. Public-wire change — touches every client
 adapter. Defer until a client team requests it.
 
-### C-9. F-G2-020 — `delete()` perf opportunity
+### C-9. F-G2-020 — `delete()` perf opportunity — RESOLVED 2026-05-18 (DEFERRED-NO-WIN)
 
-DEFERRED in the G2 fix log as a perf-not-correctness item. Re-evaluate
-after benches; out of scope for the campaign.
+Re-evaluated as P3.6. Baseline `cargo bench --bench engine_remaining
+-- 'delete/delete_one'` measures 4.96 µs median on this host.
+
+The most surgical optimization is to skip the full 320-byte
+`read_metadata_fast` call inside `Engine::delete` and read only the
+4-byte `record_size` field from offset 8 of the on-device metadata
+(saves a 320-byte memcpy + CRC32 verify per delete). A prototype that
+adds `META_OFF_RECORD_SIZE` + an unsafe `read_record_size_direct` in
+`src/io.rs` and dispatches `delete()` to it on the direct-pointer path
+was implemented and benched.
+
+A/B with separate `--save-baseline` / `--baseline` runs:
+
+  - Before: 4.96 µs median (CI [4.87, 5.05])
+  - After:  5.00 µs median (CI [4.89, 5.11])
+  - Change: +0.9% (CI [-6.6%, +9.8%], p = 0.83)
+
+Criterion reports "No change in performance detected". The 320-byte
+memcpy + CRC compute is not the dominant cost in this microbench;
+allocator-free + secondary-index updates + index write-lock /
+unregister dominate. The acceptance criterion is ≥10% improvement
+versus baseline `c87339c`; the actual win is buried in noise.
+
+Disposition: ROADMAP `P3.6` closed. Per-delete cost is already <5 µs
+in the bench; no further win available without a structural change
+(e.g. cache `extended_size` in the index entry, but Bucket is already
+exactly 64 bytes / one cache line and has no padding to repurpose,
+or batch deletes to amortize the index write lock).
 
 ### C-10. F-G7-018 — WriteMajority early-return on majority via mpsc
 
