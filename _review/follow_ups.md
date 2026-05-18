@@ -12,6 +12,20 @@ State of `main` at `c87339c`: `cargo test --all` = 2092 passed / 0 failed
 across 54 binaries; `cargo check --lib` clean; `cargo check --bins`
 clean.
 
+## Recently resolved (2026-05-18)
+
+- **F-G1-015 metric — RESOLVED** (P2.3 / B-1). Added
+  `corrupt_redo_entries_total: PaddedCounter` to `AllocatorMetrics` in
+  `src/metrics.rs` and bumped it at every `tracing::error!` rejection
+  site inside `replay_allocate` / `replay_free` in `src/allocator.rs`.
+  Wired into `/metrics` and `/admin/top`.
+- **F-G1-019 metric / warn — RESOLVED** (P2.3 / B-2). Added
+  `generation_wrap_warn_total: PaddedCounter` to `AllocatorMetrics`
+  + `GENERATION_WRAP_WARN_DELTA = 1u32 << 30` in `src/record.rs`.
+- **F-G8-004 SWIM ping_req metric — RESOLVED** (P2.4 / A-5). Moved
+  `SWIM_PING_REQ_DROPPED_TOTAL` from `cluster::swim` to
+  `SwimMetrics::swim_ping_req_dropped_total`.
+
 ---
 
 ## A. Production bugs

@@ -12,9 +12,21 @@
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::OnceLock;
 use std::time::Duration;
 use teraslab::cluster::shards::NodeId;
 use teraslab::cluster::swim::{ping_req_dropped_total, SwimConfig, SwimRunner};
+use teraslab::metrics::{init_swim_metrics, SwimMetrics};
+
+/// P2.4: the `swim_ping_req_dropped_total` counter now lives on
+/// `SwimMetrics` rather than as a process-wide static. Install a test
+/// metrics table once per process so the eviction site can record into
+/// it; `init_swim_metrics` is idempotent so this is safe to call from
+/// every test that depends on the counter.
+fn ensure_swim_metrics_installed() {
+    static TEST_METRICS: OnceLock<SwimMetrics> = OnceLock::new();
+    init_swim_metrics(TEST_METRICS.get_or_init(SwimMetrics::new));
+}
 
 fn bind_localhost() -> (SocketAddr, UdpSocket) {
     let socket = UdpSocket::bind("127.0.0.1:0").expect("bind");
@@ -55,6 +67,8 @@ fn encode_ping_req(sender: &mut SwimRunner, target_id: NodeId, target_swim: Sock
 
 #[test]
 fn ping_req_forwarding_evicts_oldest_under_flood() {
+    ensure_swim_metrics_installed();
+
     let (addr_a, _sock_a) = bind_localhost();
     let (addr_b, sock_b) = bind_localhost();
     let mut peer_a = SwimRunner::new(config(NodeId(1), addr_a));

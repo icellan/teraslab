@@ -830,6 +830,9 @@ impl SlotAllocator {
                 size,
                 "replay_allocate: redo entry has overflowing offset+size — dropped as corrupt",
             );
+            if let Some(m) = allocator_metrics() {
+                m.corrupt_redo_entries_total.inc();
+            }
             return false;
         };
         if aligned_size == 0 || offset < self.data_region_start || end > self.device_size {
@@ -848,6 +851,9 @@ impl SlotAllocator {
                 device_size = self.device_size,
                 "replay_allocate: redo entry outside data region or zero-sized — dropped as corrupt",
             );
+            if let Some(m) = allocator_metrics() {
+                m.corrupt_redo_entries_total.inc();
+            }
             return false;
         }
 
@@ -916,6 +922,9 @@ impl SlotAllocator {
                 size,
                 "replay_free: redo entry has zero aligned size — dropped as corrupt",
             );
+            if let Some(m) = allocator_metrics() {
+                m.corrupt_redo_entries_total.inc();
+            }
             return false;
         }
         let Some(end) = offset.checked_add(aligned_size) else {
@@ -925,6 +934,9 @@ impl SlotAllocator {
                 size,
                 "replay_free: redo entry has overflowing offset+size — dropped as corrupt",
             );
+            if let Some(m) = allocator_metrics() {
+                m.corrupt_redo_entries_total.inc();
+            }
             return false;
         };
 
@@ -952,6 +964,9 @@ impl SlotAllocator {
                 device_size = self.device_size,
                 "replay_free: redo entry outside data region — dropped as corrupt",
             );
+            if let Some(m) = allocator_metrics() {
+                m.corrupt_redo_entries_total.inc();
+            }
             return false;
         }
 
@@ -972,6 +987,9 @@ impl SlotAllocator {
                 conflicting_size = prev_sz,
                 "replay_free: redo entry partially overlaps existing free region (prev) — dropped",
             );
+            if let Some(m) = allocator_metrics() {
+                m.corrupt_redo_entries_total.inc();
+            }
             return false;
         }
         if let Some((next_off, _)) = self.freelist.next_from(offset)
@@ -984,6 +1002,9 @@ impl SlotAllocator {
                 conflicting_offset = next_off,
                 "replay_free: redo entry partially overlaps existing free region (next) — dropped",
             );
+            if let Some(m) = allocator_metrics() {
+                m.corrupt_redo_entries_total.inc();
+            }
             return false;
         }
 
@@ -2643,5 +2664,103 @@ mod tests {
             }
             other => panic!("expected FreelistOverflow, got {other:?}"),
         }
+    }
+
+    /// P2.3 / F-G1-015: replaying a corrupt redo entry (offset outside the
+    /// data region) must bump
+    /// `AllocatorMetrics::corrupt_redo_entries_total` so dashboards can
+    /// alert on a non-zero recovery-time corruption-rejection rate.
+    ///
+    /// Drives `replay_redo` with three differently-shaped corrupt
+    /// `RedoOp` values — an out-of-range free, an overflowing
+    /// offset+size on a free, and an out-of-range allocate — and asserts
+    /// the counter advances by ≥ 3. The metric global is shared with
+    /// other tests so the delta is bounded by ≥ 3, not == 3.
+    #[test]
+    fn corrupt_redo_replay_bumps_metric() {
+        use crate::metrics::{AllocatorMetrics, allocator_metrics, init_allocator_metrics};
+        use std::sync::OnceLock;
+
+        static TEST_METRICS: OnceLock<AllocatorMetrics> = OnceLock::new();
+        let m_ref: &'static AllocatorMetrics = TEST_METRICS.get_or_init(AllocatorMetrics::new);
+        init_allocator_metrics(m_ref);
+        let metrics = allocator_metrics().expect("metrics installed");
+        let before = metrics.corrupt_redo_entries_total.get();
+
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+
+        // 1) FreeRegion at offset 0 — below `data_region_start`, must be
+        //    rejected as corrupt (not as idempotent no-op).
+        let op1 = RedoOp::FreeRegion {
+            offset: 0,
+            size: 4096,
+            device_id: 0,
+        };
+        assert!(!alloc.replay_redo(&op1));
+
+        // 2) FreeRegion with offset+size overflowing u64.
+        let op2 = RedoOp::FreeRegion {
+            offset: u64::MAX - 1024,
+            size: 8192,
+            device_id: 0,
+        };
+        assert!(!alloc.replay_redo(&op2));
+
+        // 3) AllocateRegion past device end — must be rejected as corrupt.
+        let op3 = RedoOp::AllocateRegion {
+            offset: alloc.device_size + 4096,
+            size: 4096,
+            device_id: 0,
+        };
+        assert!(!alloc.replay_redo(&op3));
+
+        let after = metrics.corrupt_redo_entries_total.get();
+        assert!(
+            after - before >= 3,
+            "corrupt_redo_entries_total must advance by ≥ 3, got {}",
+            after - before,
+        );
+    }
+
+    /// P2.3 / F-G1-019: when a record's generation jumps forward by more
+    /// than `2^30`, the classifier emits a warn-level log AND bumps
+    /// `AllocatorMetrics::generation_wrap_warn_total`. Below the
+    /// threshold the counter must NOT advance.
+    ///
+    /// The classifier lives in `src/record.rs` but the metric lives on
+    /// `AllocatorMetrics`, so the test goes here next to the
+    /// corrupt-redo coverage where both metrics share an init dance.
+    #[test]
+    fn generation_wrap_bumps_warn_metric() {
+        use crate::metrics::{AllocatorMetrics, allocator_metrics, init_allocator_metrics};
+        use crate::record::{GENERATION_WRAP_WARN_DELTA, generation_target_ahead};
+        use std::sync::OnceLock;
+
+        static TEST_METRICS: OnceLock<AllocatorMetrics> = OnceLock::new();
+        let m_ref: &'static AllocatorMetrics = TEST_METRICS.get_or_init(AllocatorMetrics::new);
+        init_allocator_metrics(m_ref);
+        let metrics = allocator_metrics().expect("metrics installed");
+
+        // Below threshold: must not bump.
+        let before_below = metrics.generation_wrap_warn_total.get();
+        assert!(generation_target_ahead(0, GENERATION_WRAP_WARN_DELTA));
+        assert!(generation_target_ahead(0, GENERATION_WRAP_WARN_DELTA - 1));
+        let after_below = metrics.generation_wrap_warn_total.get();
+        assert_eq!(
+            after_below, before_below,
+            "deltas at or below 2^30 must NOT bump generation_wrap_warn_total",
+        );
+
+        // Above threshold: must bump twice (two calls).
+        let before_above = metrics.generation_wrap_warn_total.get();
+        assert!(generation_target_ahead(0, GENERATION_WRAP_WARN_DELTA + 1));
+        assert!(generation_target_ahead(0, GENERATION_WRAP_WARN_DELTA + 2));
+        let after_above = metrics.generation_wrap_warn_total.get();
+        assert!(
+            after_above - before_above >= 2,
+            "generation_wrap_warn_total must advance by ≥ 2 when delta > 2^30, got {}",
+            after_above - before_above,
+        );
     }
 }

@@ -221,6 +221,47 @@ fn metrics_includes_gauges() {
     assert!(body.contains("teraslab_unmined_index_entries"));
 }
 
+/// P2.3 + P2.4: the three new operator-visible counters must appear in
+/// the Prometheus `/metrics` text after their respective metric tables
+/// are installed via the `init_*_metrics` accessors.
+///
+/// * `teraslab_allocator_corrupt_redo_entries_total` — F-G1-015 bump
+///   from `replay_allocate` / `replay_free` on corrupt redo entries.
+/// * `teraslab_allocator_generation_wrap_warn_total` — F-G1-019 bump
+///   when `generation_target_ahead` sees a delta within `2^30` of the
+///   wrap-ambiguity window.
+/// * `teraslab_swim_ping_req_dropped_total` — F-G8-004 bump at the
+///   bounded-PING_REQ-map eviction site.
+#[test]
+fn metrics_includes_new_telemetry_counters() {
+    use std::sync::OnceLock;
+    use teraslab::metrics::{
+        AllocatorMetrics, SwimMetrics, init_allocator_metrics, init_swim_metrics,
+    };
+
+    // OnceLock-guarded singletons so parallel tests sharing the same
+    // process do not collide on `init_*` (which is idempotent but races
+    // on the underlying static install otherwise).
+    static ALLOC: OnceLock<AllocatorMetrics> = OnceLock::new();
+    static SWIM: OnceLock<SwimMetrics> = OnceLock::new();
+    init_allocator_metrics(ALLOC.get_or_init(AllocatorMetrics::new));
+    init_swim_metrics(SWIM.get_or_init(SwimMetrics::new));
+
+    let (port, _state) = start_test_http_server();
+    let (_, _, body) = http_get(port, "/metrics");
+
+    for name in [
+        "teraslab_allocator_corrupt_redo_entries_total",
+        "teraslab_allocator_generation_wrap_warn_total",
+        "teraslab_swim_ping_req_dropped_total",
+    ] {
+        assert!(
+            body.contains(name),
+            "/metrics output missing {name}\n--- output ---\n{body}",
+        );
+    }
+}
+
 #[test]
 fn health_live_returns_200() {
     let (port, _state) = start_test_http_server();

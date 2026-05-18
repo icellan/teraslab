@@ -718,10 +718,39 @@ const _: () = assert!(CRC32_OFFSET + 4 <= METADATA_SIZE);
 /// mutations for one record.
 pub const GENERATION_ORDER_WINDOW: u32 = 1u32 << 31;
 
+/// Early-warning threshold for the wrapping generation ordering.
+///
+/// When the forward delta `target.wrapping_sub(local)` exceeds this value
+/// (half of [`GENERATION_ORDER_WINDOW`]) the record is within `2^30`
+/// mutations of the ambiguity boundary at `2^31`. F-G1-019: emit a
+/// `warn`-level log and bump
+/// [`crate::metrics::AllocatorMetrics::generation_wrap_warn_total`] so
+/// operators can see the approach long before the comparison flips.
+pub const GENERATION_WRAP_WARN_DELTA: u32 = 1u32 << 30;
+
 /// Return true when `target` is newer than `local` under wrapping generation
 /// ordering.
+///
+/// F-G1-019: when the forward delta exceeds [`GENERATION_WRAP_WARN_DELTA`]
+/// the function emits a `warn`-level log and bumps the
+/// `generation_wrap_warn_total` counter on `AllocatorMetrics`. The
+/// classification result is unchanged — only telemetry.
 pub fn generation_target_ahead(local: u32, target: u32) -> bool {
     let delta = target.wrapping_sub(local);
+    if delta != 0 && delta < GENERATION_ORDER_WINDOW && delta > GENERATION_WRAP_WARN_DELTA {
+        tracing::warn!(
+            target = "teraslab::record",
+            local,
+            target,
+            delta,
+            threshold = GENERATION_WRAP_WARN_DELTA,
+            window = GENERATION_ORDER_WINDOW,
+            "generation_target_ahead: forward delta within 2^30 of wrap-ambiguity window",
+        );
+        if let Some(m) = crate::metrics::allocator_metrics() {
+            m.generation_wrap_warn_total.inc();
+        }
+    }
     delta != 0 && delta < GENERATION_ORDER_WINDOW
 }
 
