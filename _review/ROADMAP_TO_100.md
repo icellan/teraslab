@@ -280,10 +280,15 @@ mergeable.
 - **Acceptance**: Bumped wire-protocol version; clients tagged.
 - **Size**: L. Defer until a client requests it.
 
-### P3.11 — F-G6-025 HTTP error body envelope
+### P3.11 — F-G6-025 HTTP error body envelope — RESOLVED
 
-- **What**: `HttpErrorBody { code, message }` envelope.
-- **Size**: M. Defer until a client depends on the body shape.
+- **What**: `HttpErrorBody { code, message, details? }` envelope.
+- **Status**: Shipped. Every error path in `src/server/http.rs` now
+  returns `Content-Type: application/json` with a `{code, message}`
+  body (and optional `details`). HTTP status codes are preserved
+  unchanged so existing operator dashboards that script-match on the
+  status keep working. Coverage and tests are summarised in B-5 of
+  `_review/follow_ups.md`.
 
 ---
 

@@ -141,12 +141,22 @@ with a `CatchupError::RedoReclaimed { ... }` enum variant. Signature
 change in `run_catchup_for_replica`. Bin call site adopts the typed
 arm once the lib side lands.
 
-### B-5. F-G6-025 — HTTP error body envelope
+### B-5. F-G6-025 — HTTP error body envelope — RESOLVED
 
-Define `HttpErrorBody { code, message }` JSON envelope across all
-error paths in `src/server/http.rs`. Operator dashboards script-match
-status codes today, but exposing a consistent body shape lets future
-clients depend on it. Public-API touch; defer until a consumer exists.
+`HttpErrorBody { code, message, details? }` JSON envelope is defined in
+`src/server/http.rs` and every error path on the observability surface
+now returns `Content-Type: application/json` with that shape. Status
+codes are preserved exactly so existing dashboards keep working.
+Coverage: 401 (auth middleware: missing / wrong / malformed bearer);
+400 (`not in cluster mode` on rebalance/quiesce/drain, drain node_id
+mismatch with structured `details`, invalid log level, invalid txid
+length, invalid txid hex); 404 (`tx not found`); 503
+(`/health/ready` reason). The embedded `/ui/*` static-asset 404 path is
+unchanged (it is not an API surface; SPA-fallback semantics remain).
+Integration coverage in `tests/http_observability.rs::
+error_responses_use_structured_json_envelope` plus the two companion
+tests `unauthorized_response_advertises_json_content_type` and
+`error_envelope_omits_details_when_not_attached`.
 
 ---
 
