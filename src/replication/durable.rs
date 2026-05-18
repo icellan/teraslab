@@ -645,6 +645,46 @@ use crate::replication::manager::ReplicaTransport;
 use crate::replication::protocol::{ReplicaBatch, ReplicaOp};
 use crate::replication::tcp_transport::TcpReplicaTransport;
 
+/// Structured failure modes for [`run_catchup_for_replica`].
+///
+/// Replaces the previous `Result<u64, String>` contract that forced callers
+/// to substring-match on error messages to recover the "redo log wrapped past
+/// the replica" signal that triggers a full-shard resync. With the typed
+/// variant, the bin-side dispatch becomes an exhaustive `match` and a future
+/// refactor of an error message can no longer silently disable resync
+/// requests.
+///
+/// Per the project convention (`CLAUDE.md` — "All error types must be enums
+/// with descriptive variants"). The `RedoReclaimed` variant is the only
+/// load-bearing variant for control flow today; the rest preserve the
+/// fidelity of the underlying transport / replica failure for logging and
+/// future programmatic handling.
+#[derive(Debug, thiserror::Error)]
+pub enum CatchupError {
+    /// The circular redo log has wrapped past `from`, so the entries needed
+    /// to bring the replica up to date are no longer available. The caller
+    /// must fall back to a full-shard resync.
+    ///
+    /// `from` is the first sequence number the catch-up needed to stream.
+    /// `available` is the earliest sequence still present in the redo log
+    /// (when known — `None` indicates the wrap was detected because the
+    /// `ops_from_seq` callback returned an empty vec without the log
+    /// reporting its earliest sequence separately).
+    #[error(
+        "redo log wrapped past replica position: requested from sequence {from}, \
+         earliest available {available:?}; full resync required"
+    )]
+    RedoReclaimed { from: u64, available: Option<u64> },
+
+    /// The TCP transport to the replica failed at connect / send / recv time.
+    #[error("transport to {addr}: {detail}")]
+    Transport { addr: SocketAddr, detail: String },
+
+    /// The replica returned an `ERR` ack instead of `OK`.
+    #[error("replica {addr} returned error: {message}")]
+    ReplicaError { addr: SocketAddr, message: String },
+}
+
 /// Check whether the redo log has been truncated past a requested sequence.
 ///
 /// Returns `Ok(())` if the entries start at or before `requested_seq`,
@@ -700,8 +740,11 @@ pub fn build_catchup_batch(
 /// Run catch-up replication for a single replica, streaming redo-derived
 /// ops from `from_seq` to the current master sequence.
 ///
-/// Returns `Ok(through_seq)` on success with the final ACKed sequence,
-/// `Err(msg)` if the catch-up fails (transport error, reclaimed redo, etc.).
+/// Returns `Ok(through_seq)` on success with the final ACKed sequence, or
+/// a [`CatchupError`] variant identifying the failure mode. Callers that
+/// need to dispatch on the failure (e.g. "redo wrapped — request a full
+/// resync") MUST `match` on the variant rather than substring-matching on
+/// the rendered message — see `bin/server.rs` for the canonical pattern.
 ///
 /// `local_cluster_key` is the master's current topology epoch (snapshot of
 /// [`RunningCluster::local_cluster_key`]); every batch is stamped with it so
@@ -730,19 +773,32 @@ pub fn run_catchup_for_replica(
     ops_from_seq: &dyn Fn(u64) -> Vec<ReplicaOp>,
     first_available_seq: Option<u64>,
     local_cluster_key: u64,
-) -> std::result::Result<u64, String> {
+) -> std::result::Result<u64, CatchupError> {
     if from_seq >= current_seq {
         return Ok(from_seq); // already caught up
     }
 
     // Detect redo log truncation before attempting to stream.
     // If the circular redo log has wrapped past `from_seq`, the entries
-    // we need are gone and the replica needs a full resync.
-    check_redo_truncation(first_available_seq, from_seq)?;
+    // we need are gone and the replica needs a full resync. We use
+    // `check_redo_truncation` for the comparison but discard its
+    // string-typed error and reconstruct the structured variant from
+    // the inputs we already have — the underlying helper is shared with
+    // the migration delta path which still consumes a string-typed
+    // contract.
+    if check_redo_truncation(first_available_seq, from_seq).is_err() {
+        return Err(CatchupError::RedoReclaimed {
+            from: from_seq,
+            available: first_available_seq,
+        });
+    }
 
     let mut ops = ops_from_seq(from_seq);
     if ops.is_empty() {
-        return Err("redo entries reclaimed; full resync required".to_string());
+        return Err(CatchupError::RedoReclaimed {
+            from: from_seq,
+            available: first_available_seq,
+        });
     }
     let max_ops_per_pass = max_ops_per_pass.max(1);
     if ops.len() > max_ops_per_pass {
@@ -751,23 +807,35 @@ pub fn run_catchup_for_replica(
 
     let mut transport =
         TcpReplicaTransport::connect(&addr.to_string(), std::time::Duration::from_secs(5))
-            .map_err(|e| format!("catchup connect to {addr}: {e}"))?;
+            .map_err(|e| CatchupError::Transport {
+                addr: *addr,
+                detail: format!("connect: {e}"),
+            })?;
 
     let mut last_acked = from_seq;
     for chunk in ops.chunks(batch_size) {
         let batch = build_catchup_batch(last_acked, chunk, local_cluster_key);
         transport
             .send_batch(&batch)
-            .map_err(|e| format!("catchup send to {addr}: {e}"))?;
+            .map_err(|e| CatchupError::Transport {
+                addr: *addr,
+                detail: format!("send_batch: {e}"),
+            })?;
         match transport.recv_ack(std::time::Duration::from_secs(5)) {
             Ok(crate::replication::protocol::ReplicaAck::Ok { through_sequence }) => {
                 last_acked = through_sequence;
             }
             Ok(crate::replication::protocol::ReplicaAck::Error { message, .. }) => {
-                return Err(format!("catchup: replica error: {message}"));
+                return Err(CatchupError::ReplicaError {
+                    addr: *addr,
+                    message,
+                });
             }
             Err(e) => {
-                return Err(format!("catchup recv_ack from {addr}: {e}"));
+                return Err(CatchupError::Transport {
+                    addr: *addr,
+                    detail: format!("recv_ack: {e}"),
+                });
             }
         }
     }
@@ -1394,5 +1462,86 @@ mod tests {
         let batch = build_catchup_batch(1, &ops, 0);
 
         assert_eq!(batch.cluster_key, 0);
+    }
+
+    /// F-G10-017 / B-4 — `run_catchup_for_replica` MUST surface a typed
+    /// `CatchupError::RedoReclaimed { from, available }` when the circular
+    /// redo log has wrapped past the replica's resume position, so the
+    /// bin-side dispatch can match on the variant instead of a fragile
+    /// `String::contains("redo entries reclaimed")` substring check.
+    ///
+    /// Two wrap-detection paths exist in the function and both must lower
+    /// to the same variant:
+    ///
+    /// 1. `check_redo_truncation` sees `first_available_seq > from_seq` —
+    ///    detectable WITHOUT reading any entries.
+    /// 2. `ops_from_seq` returns an empty vec — happens when the redo
+    ///    helper cannot reify the requested sequence for any reason.
+    #[test]
+    fn run_catchup_returns_typed_redo_reclaimed_when_log_wrapped() {
+        let addr: SocketAddr = "127.0.0.1:65535".parse().unwrap();
+        let no_ops: &dyn Fn(u64) -> Vec<ReplicaOp> = &|_| Vec::new();
+
+        // Path 1: explicit truncation signal — `first_available_seq` is
+        // ahead of `from_seq` so `check_redo_truncation` short-circuits
+        // before any transport work happens. `from = 10`, `available = 50`.
+        let err1 = run_catchup_for_replica(&addr, 10, 100, 16, 100, no_ops, Some(50), 0)
+            .expect_err("must error when redo wrapped past from_seq");
+        match err1 {
+            CatchupError::RedoReclaimed { from, available } => {
+                assert_eq!(from, 10, "RedoReclaimed.from must echo the requested seq");
+                assert_eq!(
+                    available,
+                    Some(50),
+                    "RedoReclaimed.available must echo the earliest available seq",
+                );
+            }
+            other => panic!("expected CatchupError::RedoReclaimed, got {other:?}"),
+        }
+
+        // Path 2: `first_available_seq = None` — log reports it has no
+        // earliest entry yet `ops_from_seq` returns nothing. This is the
+        // wrap-without-witness case the original string error covered.
+        let err2 = run_catchup_for_replica(&addr, 7, 42, 16, 100, no_ops, None, 0)
+            .expect_err("must error when ops_from_seq returns empty");
+        match err2 {
+            CatchupError::RedoReclaimed { from, available } => {
+                assert_eq!(from, 7);
+                assert_eq!(available, None);
+            }
+            other => panic!("expected CatchupError::RedoReclaimed, got {other:?}"),
+        }
+
+        // Sanity: the rendered Display message still mentions the
+        // replica position — but consumers MUST NOT depend on substring
+        // matching on it. This assertion is purely an operator-log
+        // sanity check.
+        let display = format!(
+            "{}",
+            CatchupError::RedoReclaimed {
+                from: 7,
+                available: Some(3),
+            }
+        );
+        assert!(
+            display.contains("redo log wrapped"),
+            "Display impl should describe the wrap condition: {display}",
+        );
+    }
+
+    /// Companion to the test above: when `from_seq >= current_seq` the
+    /// catch-up is a no-op and returns `Ok(from_seq)`. This pins the
+    /// happy-path early-return so a future refactor cannot accidentally
+    /// fall through into the redo-reclaimed branch.
+    #[test]
+    fn run_catchup_already_caught_up_returns_ok() {
+        let addr: SocketAddr = "127.0.0.1:65534".parse().unwrap();
+        let no_ops: &dyn Fn(u64) -> Vec<ReplicaOp> = &|_| Vec::new();
+
+        let result = run_catchup_for_replica(&addr, 100, 100, 16, 100, no_ops, Some(50), 0);
+        assert_eq!(result.unwrap(), 100);
+
+        let result = run_catchup_for_replica(&addr, 200, 100, 16, 100, no_ops, Some(50), 0);
+        assert_eq!(result.unwrap(), 200);
     }
 }

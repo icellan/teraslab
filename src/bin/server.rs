@@ -1075,9 +1075,14 @@ fn main() {
                             // Phase H — when catchup returns the
                             // truncation sentinel, post a resync
                             // request so the coordinator synthesizes a
-                            // full-shard backfill. The error string
-                            // contract is fixed by `run_catchup_for_replica`.
-                            if e.contains("redo entries reclaimed") {
+                            // full-shard backfill. The match is on the
+                            // typed `CatchupError::RedoReclaimed` variant
+                            // (was previously a `String::contains` on the
+                            // rendered message — F-G10-017 / B-4).
+                            if let teraslab::replication::durable::CatchupError::RedoReclaimed {
+                                ..
+                            } = e
+                            {
                                 let queued = resync_handle.signal_for_addr(addr, Vec::new());
                                 if queued {
                                     tracing::info!(
