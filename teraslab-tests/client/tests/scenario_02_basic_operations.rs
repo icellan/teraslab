@@ -296,6 +296,10 @@ async fn scenario_02_basic_operations() {
             txid: unspend_txid,
             vout: 0,
             utxo_hash: unspend_rec.utxo_hashes[0],
+            // R-XXX: unspend now requires the spending_data marker
+            // recorded by the original spend so the server can
+            // confirm we're undoing the right outcome.
+            spending_data: [0u8; 36],
         };
         client
             .unspend_batch(&unspend_params, &[unspend_item])

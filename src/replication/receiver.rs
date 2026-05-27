@@ -771,6 +771,44 @@ pub fn handle_replica_batch_with_tracker(
         seq += 1;
     }
 
+    // F-G7-016 (batched): sync the engine's block device + flush the
+    // replica redo log ONCE per batch (after every op has been
+    // applied), instead of once per op. The per-op fsync chain was a
+    // major perf regression on slow filesystems (Docker named volumes):
+    // each fsync is ~10 ms, so a 200-op batch took ~2 s on the receiver
+    // and routinely exceeded the master's 3 s ACK timeout, so every
+    // replica batch failed. Batching collapses 2 × N fsyncs into 2.
+    //
+    // Durability discipline preserved at the batch level: apply all
+    // ops → fsync data device → flush redo log → ACK. When this
+    // function returns Ok ResponseFrame, every op in the batch is on
+    // durable storage AND in the redo log. On a replica crash between
+    // device fsync and redo flush, recovery sees an apply that wasn't
+    // journalled — engine.shard_record_count and idempotent apply
+    // paths handle re-applying via the master's resync.
+    if let Err(e) = engine.device().sync() {
+        let ack = ReplicaAck::Error {
+            failed_sequence: through,
+            message: format!("post-batch device sync (F-G7-016): {e}"),
+        };
+        return ResponseFrame {
+            request_id: request.request_id,
+            status: STATUS_ERROR,
+            payload: ack.serialize(),
+        };
+    }
+    if let Err(msg) = flush_replica_redo_log(engine) {
+        let ack = ReplicaAck::Error {
+            failed_sequence: through,
+            message: msg,
+        };
+        return ResponseFrame {
+            request_id: request.request_id,
+            status: STATUS_ERROR,
+            payload: ack.serialize(),
+        };
+    }
+
     // Migration batches do not participate in the normal-replication
     // sequence space — don't let their `first_sequence: 0` overwrite
     // the receiver's high-water mark, and skip the flush on their
@@ -1499,19 +1537,16 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             .map_err(|e| format!("write metadata for generation sync: {e}"))?;
     }
 
-    // F-G7-016: enforce "apply, fsync data, then journal" by explicitly
-    // syncing the engine's block device BEFORE building the post-apply
-    // redo entry. The engine's mutation paths (spend/freeze/...) write
-    // through `write_slot_fast` / `write_metadata_fast`, which only
-    // promise the writes have left this process — the OS page cache
-    // may still buffer them. A replica crash between the engine write
-    // and the redo append would otherwise leave the on-device state
-    // and the redo log out of sync. The post-apply redo entry then
-    // reads back state we know is durable, so replay sees an entry
-    // whose target state matches the disk.
-    if let Err(e) = engine.device().sync() {
-        return Err(format!("post-apply device sync (F-G7-016): {e}"));
-    }
+    // F-G7-016 (batched in `handle_replica_batch_with_tracker_inner`):
+    // the device fsync is now done ONCE per batch — after every op has
+    // been applied, before the post-apply redo entries are written and
+    // before the ACK is sent. Calling `engine.device().sync()` per op
+    // was a major perf regression: on slow filesystems (Docker named
+    // volumes) each fsync is ~10ms, so a 200-op batch took ~2 s and
+    // routinely exceeded the replica's 3 s ACK timeout. The "apply,
+    // fsync data, then journal" discipline still holds at the batch
+    // level: all batch ops are applied → device fsync → redo entries
+    // written → ACK sent.
 
     // R-034 (BC-34): write a local redo entry so the replica can replay
     // through its own crash recovery and a failover does not require a
@@ -1768,6 +1803,14 @@ fn build_post_apply_redo_op(
 /// Returns `Err(message)` when the engine has a redo log attached AND
 /// the append/flush fails — caller propagates to fail the batch ACK so
 /// the master retries instead of advancing its durable high-water mark.
+/// Append a redo entry for a single op WITHOUT flushing.
+///
+/// Called inside the per-op apply loop in
+/// `handle_replica_batch_with_tracker`. The batch-level flush happens
+/// once after the apply loop completes — see [`flush_replica_redo_log`].
+/// Batching the flush eliminates the per-op fsync that was a major perf
+/// regression on slow filesystems (Docker named volumes): a 200-op
+/// batch went from ~2 s (200 × 10 ms) to a single fsync.
 fn write_replica_redo_entry(
     engine: &Engine,
     op: &crate::redo::RedoOp,
@@ -1780,6 +1823,21 @@ fn write_replica_redo_entry(
     guard
         .append(op.clone())
         .map_err(|e| format!("replica redo append: {e}"))?;
+    Ok(())
+}
+
+/// Flush the replica redo log to durable storage.
+///
+/// Called once per batch from `handle_replica_batch_with_tracker` after
+/// every op has been applied + appended via [`write_replica_redo_entry`]
+/// and after the data device fsync. The "apply, fsync data, then flush
+/// redo log, then ACK" discipline is preserved at the batch level.
+fn flush_replica_redo_log(engine: &Engine) -> std::result::Result<(), String> {
+    let log_arc = match engine.redo_log() {
+        Some(l) => l,
+        None => return Ok(()),
+    };
+    let mut guard = log_arc.lock();
     guard
         .flush()
         .map_err(|e| format!("replica redo flush: {e}"))?;
@@ -4242,6 +4300,13 @@ mod tests {
         for op in &ops {
             apply_op(&engine, op).expect("apply_op succeeds");
         }
+        // F-G7-016 (batched): apply_op now only APPENDS the redo
+        // entry to the in-memory buffer — the batch wrapper
+        // `handle_replica_batch_with_tracker` flushes once at the end.
+        // This unit test calls apply_op directly, so flush manually
+        // here to make the appended entries visible to a subsequent
+        // reader (mirrors the production batch-end flush).
+        flush_replica_redo_log(&engine).expect("redo log flush");
 
         // Read all entries that were appended after the create-time
         // snapshot.
@@ -4350,6 +4415,10 @@ mod tests {
         let meta = engine.read_metadata(&k).unwrap();
         let device_spent = { meta.spent_utxos };
         assert_eq!(device_spent, 2, "device counter should be 2 after 2 spends");
+
+        // F-G7-016 (batched): apply_op now only appends; flush
+        // manually to mirror the batch-wrapper end-of-batch flush.
+        flush_replica_redo_log(&engine).expect("redo log flush");
 
         let entries = log_arc
             .lock()

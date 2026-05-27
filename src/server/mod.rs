@@ -339,6 +339,21 @@ impl Server {
                         // settings in the `max_connections` reject path
                         // work the same as pre-fix.
                         let _ = stream.set_nonblocking(false);
+                        // Disable Nagle. Without this, the server's small
+                        // response frames (e.g. ReplicaAck::Ok at 9 bytes)
+                        // are held in the kernel TCP send buffer waiting
+                        // for more data or a peer ACK — interacting with
+                        // delayed-ACK on the master side to add 40 ms-3 s
+                        // of latency per RPC. The master side already sets
+                        // TCP_NODELAY on TcpReplicaTransport (see
+                        // src/replication/tcp_transport.rs); without the
+                        // server-side mirror, every OP_REPLICA_BATCH ACK
+                        // sat in Nagle's buffer long enough that the
+                        // master's 3 s recv_ack timeout fired before the
+                        // response arrived. Per-RPC latency drops from
+                        // seconds back to single-digit milliseconds with
+                        // this on.
+                        let _ = stream.set_nodelay(true);
                         let active = self.active_connections.load(Ordering::Relaxed);
                         if active >= self.config.max_connections {
                             tracing::warn!(peer_addr = %addr, active, "rejecting connection: max connections reached");
