@@ -74,6 +74,14 @@ lock_stripes = 65536
 max_batch_size = 8192
 max_connections = 1024
 block_height_retention = 288
+
+# Required for the Docker test cluster: nodes bind to per-scenario subnet
+# IPs (172.{{30+scenario_id}}.0.{{10+n}}), which are non-loopback. The
+# safe-defaults check (commit 96b4fc4) fatals on non-loopback binds
+# without an explicit opt-in. Test cluster only — production must use
+# mTLS / non-default secret.
+enable_remote_bind = true
+cluster_secret = "docker-test-cluster-shared-secret-do-not-use-in-prod"
 "#
     )
 }
