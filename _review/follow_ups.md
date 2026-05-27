@@ -28,16 +28,23 @@ clean.
 
 ---
 
-- **F-G1-003 atomic-chunk migration — RESOLVED (FIXED, partial)** —
-  `read_metadata_direct`, `write_metadata_direct`, `read_utxo_slot_direct`,
-  and `write_utxo_slot_direct` in `src/io.rs` now perform the bulk byte
-  transfer through `AtomicU64::load(Relaxed)` / `store(Relaxed)` chunks
-  via `atomic_load_into` / `atomic_store_from`. Targeted footer
-  helpers (`write_mutation_footer_direct`, `write_spend_footer_direct`,
+- **F-G1-003 atomic-chunk migration — RESOLVED (FIXED, fully) 2026-05-27** —
+  Bulk paths (`read_metadata_direct`, `write_metadata_direct`,
+  `read_utxo_slot_direct`, `write_utxo_slot_direct`) use `atomic_load_into`
+  / `atomic_store_from` with `AtomicU64` chunks. Targeted footer helpers
+  (`write_mutation_footer_direct`, `write_spend_footer_direct`,
   `write_mined_footer_direct`, `write_block_entry_direct`,
-  `write_crc_direct`) still use non-atomic `ptr::copy_nonoverlapping`
-  — deferred because no current miri test exercises them concurrently
-  but production race remains.
+  `write_crc_direct`) now use a new `atomic_store_u64_rmw` helper that
+  load-modifies-stores each affected u64 chunk — so every store has the
+  SAME atomic width (u64) as the bulk path. Without matching width,
+  miri's weak-memory model rejected the mix with "cannot have partially
+  overlapping store buffer when previous write was atomic". Verified
+  miri-clean via `direct_footer_helpers_atomic_widths_match_bulk_smoke`
+  (`MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --lib
+  io::tests::direct_footer_helpers_atomic_widths_match_bulk_smoke`).
+  Full native stress test
+  `direct_footer_helpers_concurrent_stress_never_returns_torn_data`
+  also green (2000 writer × 5000 reader × 3 readers, no torn reads).
 - **F-G1-004 MemoryDevice aliasing — RESOLVED (FIXED)** — Option A:
   dropped `RwLock<Vec<u8>>`; backing allocation is `Box::into_raw` →
   raw `*mut u8` + `len`, with `Box::from_raw` in `Drop`. `pread` /

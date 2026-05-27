@@ -143,6 +143,64 @@ unsafe fn atomic_load_into(src: *const u8, dst: &mut [u8]) {
     }
 }
 
+/// F-G1-003: atomic targeted write that operates on whole u64 chunks via
+/// read-modify-write. Required because the bulk `write_metadata_direct`
+/// path writes [0..256) as `AtomicU64` chunks; if a targeted helper writes
+/// the same byte address with a narrower atomic (u8/u32), miri's
+/// weak-memory model panics with "partially overlapping store buffer".
+///
+/// Algorithm: for each u64-aligned chunk in `[dst..dst+src.len())`, load
+/// the chunk as `AtomicU64::load(Relaxed)`, splice the field bytes into
+/// the chunk-local position, then `AtomicU64::store(Relaxed)`. The bytes
+/// outside the field within the chunk are preserved (they round-trip
+/// through the RMW).
+///
+/// `dst` does NOT need to be u64-aligned, but `dst` and the *base record
+/// pointer* must share an 8-byte alignment so each affected chunk is the
+/// same chunk the bulk path writes. All records in TeraSlab start at
+/// `base_ptr.add(record_offset)` where both terms are u64-aligned
+/// (RECORD_SIZE is 4096), so every field offset within a record produces
+/// chunks aligned to the bulk path's chunks.
+///
+/// # Safety
+///
+/// `dst` must be valid for `src.len()` bytes. Caller must hold the
+/// per-record write lock (the RMW is per-chunk atomic but the cross-chunk
+/// field write is observably non-atomic to concurrent readers without
+/// the lock; the CRC check still catches the resulting tear at read
+/// time).
+#[inline(always)]
+unsafe fn atomic_store_u64_rmw(dst: *mut u8, src: &[u8]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let n = src.len();
+    if n == 0 {
+        return;
+    }
+    let dst_addr = dst as usize;
+    let head_chunk_addr = dst_addr & !7;
+    let tail_byte = dst_addr + n - 1;
+    let tail_chunk_addr = tail_byte & !7;
+    let mut chunk_addr = head_chunk_addr;
+    while chunk_addr <= tail_chunk_addr {
+        // Safety: chunk_addr is 8-byte aligned (forced by `& !7`) and
+        // lies within the caller-promised range of `dst`.
+        let chunk_ptr = chunk_addr as *mut u8;
+        let atomic = unsafe { AtomicU64::from_ptr(chunk_ptr.cast::<u64>()) };
+        let mut chunk_bytes = atomic.load(Ordering::Relaxed).to_ne_bytes();
+        let chunk_start = chunk_addr;
+        let chunk_end = chunk_addr + 8;
+        let overlap_start = dst_addr.max(chunk_start);
+        let overlap_end = (dst_addr + n).min(chunk_end);
+        let chunk_off = overlap_start - chunk_start;
+        let src_off = overlap_start - dst_addr;
+        let span = overlap_end - overlap_start;
+        chunk_bytes[chunk_off..chunk_off + span]
+            .copy_from_slice(&src[src_off..src_off + span]);
+        atomic.store(u64::from_ne_bytes(chunk_bytes), Ordering::Relaxed);
+        chunk_addr += 8;
+    }
+}
+
 /// Atomically write `src.len()` bytes from the stack buffer `src` to the
 /// device pointer `dst`. Mirrors [`atomic_load_into`] — see that function's
 /// doc-comment for the rationale and ordering choice.
@@ -248,25 +306,23 @@ pub unsafe fn write_mutation_footer_direct(
 ) {
     unsafe {
         let p = base_ptr.add(off_to_usize(record_offset));
+        // F-G1-003: every field write goes through `atomic_store_from`
+        // so the abstract-machine memory model sees the same atomic
+        // accesses as the bulk `write_metadata_direct` path. Without
+        // this, the targeted `ptr::copy_nonoverlapping` writes would
+        // alias the bulk path's `AtomicU64::store` at the same byte
+        // address with a non-atomic store, surfacing as UB under miri
+        // / Stacked Borrows / Tree Borrows.
         // flags (1 byte)
-        p.add(META_OFF_FLAGS).write(meta.flags.bits());
+        atomic_store_u64_rmw(p.add(META_OFF_FLAGS), &[meta.flags.bits()]);
         // generation (4 bytes LE)
-        std::ptr::copy_nonoverlapping(
-            meta.generation.to_le_bytes().as_ptr(),
-            p.add(META_OFF_GENERATION),
-            4,
-        );
+        atomic_store_u64_rmw(p.add(META_OFF_GENERATION), &meta.generation.to_le_bytes());
         // updated_at (8 bytes LE)
-        std::ptr::copy_nonoverlapping(
-            meta.updated_at.to_le_bytes().as_ptr(),
-            p.add(META_OFF_UPDATED_AT),
-            8,
-        );
+        atomic_store_u64_rmw(p.add(META_OFF_UPDATED_AT), &meta.updated_at.to_le_bytes());
         // delete_at_height (4 bytes LE)
-        std::ptr::copy_nonoverlapping(
-            meta.delete_at_height.to_le_bytes().as_ptr(),
+        atomic_store_u64_rmw(
             p.add(META_OFF_DELETE_AT_HEIGHT),
-            4,
+            &meta.delete_at_height.to_le_bytes(),
         );
     }
     // Callers MUST follow with [`write_crc_direct`] using a meta snapshot
@@ -285,11 +341,8 @@ pub unsafe fn write_spend_footer_direct(base_ptr: *mut u8, record_offset: u64, m
     unsafe {
         write_mutation_footer_direct(base_ptr, record_offset, meta);
         let p = base_ptr.add(off_to_usize(record_offset));
-        std::ptr::copy_nonoverlapping(
-            meta.spent_utxos.to_le_bytes().as_ptr(),
-            p.add(META_OFF_SPENT_UTXOS),
-            4,
-        );
+        // F-G1-003: atomic chunked store — see `write_mutation_footer_direct`.
+        atomic_store_u64_rmw(p.add(META_OFF_SPENT_UTXOS), &meta.spent_utxos.to_le_bytes());
     }
 }
 
@@ -303,10 +356,10 @@ pub unsafe fn write_mined_footer_direct(base_ptr: *mut u8, record_offset: u64, m
     unsafe {
         write_mutation_footer_direct(base_ptr, record_offset, meta);
         let p = base_ptr.add(off_to_usize(record_offset));
-        std::ptr::copy_nonoverlapping(
-            meta.unmined_since.to_le_bytes().as_ptr(),
+        // F-G1-003: atomic chunked store — see `write_mutation_footer_direct`.
+        atomic_store_u64_rmw(
             p.add(META_OFF_UNMINED_SINCE),
-            4,
+            &meta.unmined_since.to_le_bytes(),
         );
     }
 }
@@ -326,13 +379,14 @@ pub unsafe fn write_block_entry_direct(
 ) {
     unsafe {
         let p = base_ptr.add(off_to_usize(record_offset));
+        // F-G1-003: atomic chunked store — see `write_mutation_footer_direct`.
         // block_entry_count (1 byte)
-        p.add(META_OFF_BLOCK_ENTRY_COUNT).write(count);
+        atomic_store_u64_rmw(p.add(META_OFF_BLOCK_ENTRY_COUNT), &[count]);
         // BlockEntry at inline_index (12 bytes)
         let entry_offset = META_OFF_BLOCK_ENTRIES + inline_index * BLOCK_ENTRY_SIZE;
         let mut buf = [0u8; BLOCK_ENTRY_SIZE];
         entry.to_bytes(&mut buf);
-        std::ptr::copy_nonoverlapping(buf.as_ptr(), p.add(entry_offset), BLOCK_ENTRY_SIZE);
+        atomic_store_u64_rmw(p.add(entry_offset), &buf);
     }
     // Callers MUST follow with [`write_crc_direct`] using a meta snapshot
     // that reflects the final disk state.
@@ -612,7 +666,8 @@ pub unsafe fn write_crc_direct(base_ptr: *mut u8, record_offset: u64, meta: &TxM
     unsafe {
         let p = base_ptr.add(off_to_usize(record_offset));
         let crc = meta.compute_crc();
-        std::ptr::copy_nonoverlapping(crc.to_le_bytes().as_ptr(), p.add(CRC32_OFFSET), 4);
+        // F-G1-003: atomic chunked store — see `write_mutation_footer_direct`.
+        atomic_store_u64_rmw(p.add(CRC32_OFFSET), &crc.to_le_bytes());
     }
     // F-X-007: visibility to concurrent readers is provided by the
     // record-level write guard held by the combining call site
@@ -1534,5 +1589,132 @@ mod tests {
         let read_a = read_metadata(&*dev_a, 0).unwrap();
         let read_b = read_metadata(&*dev_b, 0).unwrap();
         assert_eq!(read_a, read_b);
+    }
+
+    /// F-G1-003: the targeted footer helpers (`write_mutation_footer_direct`,
+    /// `write_spend_footer_direct`, `write_mined_footer_direct`,
+    /// `write_block_entry_direct`, `write_crc_direct`) now route through
+    /// `atomic_store_u64_rmw` so every store uses the SAME atomic width
+    /// (u64) as the bulk `write_metadata_direct` path. Without this,
+    /// miri's weak-memory model panics with "cannot have partially
+    /// overlapping store buffer when previous write was atomic" — a
+    /// narrower atomic (u8/u32) cannot retag an address previously
+    /// written by a u64 atomic.
+    ///
+    /// `_smoke` test runs miri-sized iterations (10 writer × 5 × 1 reader)
+    /// — fast enough for the abstract-machine model check.
+    /// The `_stress` test runs full iterations (2000 × 5000 × 3 readers)
+    /// — native-only because miri interpretation is too slow for it.
+    ///
+    /// Run under miri to verify the atomic-width invariant:
+    ///   `MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --lib io::tests::direct_footer_helpers_atomic_widths_match_bulk_smoke`
+    #[test]
+    fn direct_footer_helpers_atomic_widths_match_bulk_smoke() {
+        run_footer_helpers_stress(10, 5, 1);
+    }
+
+    #[test]
+    fn direct_footer_helpers_concurrent_stress_never_returns_torn_data() {
+        run_footer_helpers_stress(2_000, 5_000, 3);
+    }
+
+    fn run_footer_helpers_stress(
+        writer_iters: usize,
+        reader_iters: u64,
+        reader_count: usize,
+    ) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dev = test_device();
+        let record_offset: u64 = 0;
+        let mut meta_a = TxMetadata::new(4);
+        meta_a.tx_id = [0xAAu8; 32];
+        meta_a.tx_version = 0xA1A2A3A4;
+        meta_a.fee = 0xAAAA_AAAA_AAAA_AAAA;
+        meta_a.spent_utxos = 0xA1A1_A1A1;
+        meta_a.generation = 0xA2A2_A2A2;
+        meta_a.updated_at = 0xA3A3_A3A3_A3A3_A3A3;
+        meta_a.delete_at_height = 0xA4A4_A4A4;
+        let mut meta_b = meta_a;
+        meta_b.spent_utxos = 0xB1B1_B1B1;
+        meta_b.generation = 0xB2B2_B2B2;
+        meta_b.updated_at = 0xB3B3_B3B3_B3B3_B3B3;
+        meta_b.delete_at_height = 0xB4B4_B4B4;
+
+        let slots: Vec<UtxoSlot> = (0..4)
+            .map(|i| UtxoSlot::new_unspent([i as u8; 32]))
+            .collect();
+        write_full_record(&*dev, record_offset, &meta_a, &slots).unwrap();
+
+        let base_ptr_addr = dev.as_raw_ptr().expect("memory device must expose raw_ptr") as usize;
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Writer thread alternates between bulk `write_metadata_direct`
+        // and the targeted `write_spend_footer_and_crc_direct` helper.
+        // After every write, the on-disk record must remain coherent
+        // (CRC-validated) and the (spent_utxos, generation) pair must
+        // match one of the two we wrote.
+        let writer_stop = stop.clone();
+        let writer = std::thread::spawn(move || {
+            let local_a = meta_a;
+            let local_b = meta_b;
+            for i in 0..writer_iters {
+                if writer_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let m = if i % 2 == 0 { &local_a } else { &local_b };
+                unsafe {
+                    let p = base_ptr_addr as *mut u8;
+                    if i % 4 == 0 {
+                        // Bulk path — exercises the [0..256) u64 chunks.
+                        write_metadata_direct(p, record_offset, m);
+                        write_crc_direct(p, record_offset, m);
+                    } else {
+                        // Targeted path — exercises the footer helpers
+                        // at offsets 80, 93, 101, 105, ...  The atomic
+                        // widths must agree with the bulk path's u64
+                        // chunks for the same bytes; without that,
+                        // miri's data-race detector / weak-memory
+                        // model would flag mixed-width access.
+                        write_spend_footer_direct(p, record_offset, m);
+                        write_crc_direct(p, record_offset, m);
+                    }
+                }
+            }
+        });
+
+        let mut readers = Vec::new();
+        for _ in 0..reader_count {
+            let reader_stop = stop.clone();
+            readers.push(std::thread::spawn(move || {
+                let mut iterations = 0u64;
+                while iterations < reader_iters && !reader_stop.load(Ordering::Relaxed) {
+                    let result = unsafe {
+                        let p = base_ptr_addr as *const u8;
+                        read_metadata_direct(p, record_offset)
+                    };
+                    if let Ok(m) = result {
+                        let s = { m.spent_utxos };
+                        let g = { m.generation };
+                        let is_a = s == 0xA1A1_A1A1 && g == 0xA2A2_A2A2;
+                        let is_b = s == 0xB1B1_B1B1 && g == 0xB2B2_B2B2;
+                        assert!(
+                            is_a || is_b,
+                            "torn footer-helper read passed CRC: spent_utxos={s:#x}, generation={g:#x}",
+                        );
+                    }
+                    iterations += 1;
+                }
+                iterations
+            }));
+        }
+
+        for r in readers {
+            let iters = r.join().unwrap();
+            assert!(iters > 0, "reader thread must observe at least one read");
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
     }
 }
