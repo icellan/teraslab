@@ -35,6 +35,14 @@ use std::time::Duration;
 static UNAUTHENTICATED_INTER_NODE_WARNED: AtomicBool = AtomicBool::new(false);
 
 const READ_BUF_RETAINED_SIZE: usize = 256 * 1024;
+
+/// Bytes peeked off the wire AFTER the 4-byte length prefix but BEFORE
+/// committing to a buffered vs. streaming read of the body: 8-byte
+/// `request_id` + 2-byte `op_code`. The peeked head is used to compute
+/// `is_inter_node_op` so that signed inter-node frames can route into
+/// `verify_signed_body_streaming` (slow-loris-resistant) instead of
+/// materialising the entire body in `read_buf` before HMAC verify.
+const HEAD_PEEK_LEN: usize = 10;
 const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -694,41 +702,33 @@ fn handle_connection_inner(
                 ));
             }
         };
-        // Assemble the full frame (length prefix + body) into a fresh
-        // `BytesMut` carved from the retained `read_buf` allocation.
-        // `split_to` returns ownership of the first 4+frame_len bytes;
-        // `read_buf` retains the tail. We then refill `read_buf` so the
-        // next iteration's `split_to` is cheap.
-        if read_buf.len() < 4 + frame_len {
-            read_buf.resize(4 + frame_len, 0);
-        }
-        read_buf[..4].copy_from_slice(&len_buf);
+        // Peek the request_id (8 bytes) and op_code (2 bytes) directly off
+        // the wire WITHOUT first buffering the entire frame body. This is
+        // the slow-loris fix (F-G5-016 / re-review P2): for inter-node
+        // signed frames we MUST be able to start streaming the body
+        // through `verify_frame_streaming_*` instead of materialising
+        // `frame_len` bytes in the connection buffer before HMAC verify.
+        // Without it, the per-IP connection cap (`max_connections_per_ip`
+        // = 64 by default) lets a malicious peer keep 64 × peak-frame
+        // bytes pinned per IP just by sending wrong-tag garbage.
+        let mut head_buf = [0u8; HEAD_PEEK_LEN];
+        let head_to_read = HEAD_PEEK_LEN.min(frame_len);
         stream
-            .read_exact(&mut read_buf[4..4 + frame_len])
-            .map_err(|e| format!("read frame body: {e}"))?;
-        let frame_bytes_mut = read_buf.split_to(4 + frame_len);
-        // Shrink read_buf IMMEDIATELY after split_to so a giant frame
-        // does not pin peak-frame capacity on the connection during
-        // dispatch + response write. Under the per-IP connection cap
-        // (`max_connections_per_ip = 64` by default) a 16 MiB peak
-        // frame would otherwise hold 64 × 16 MiB = 1 GiB pinned
-        // across concurrent slow-loris-ish clients until each
-        // connection's iteration completed. Moving the reset here
-        // (rather than at the bottom of the loop after `write_all`)
-        // closes that amplifier window. Re-review P1.
-        reset_read_buf_if_oversized(&mut read_buf);
-        // Top up `read_buf` so subsequent iterations still have spare
-        // capacity for the next frame without growing on every loop.
-        if read_buf.capacity() < READ_BUF_RETAINED_SIZE {
-            read_buf.reserve(READ_BUF_RETAINED_SIZE - read_buf.capacity());
-        }
-        if read_buf.len() < READ_BUF_RETAINED_SIZE {
-            read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
-        }
-        let frame_bytes: Bytes = frame_bytes_mut.freeze();
+            .read_exact(&mut head_buf[..head_to_read])
+            .map_err(|e| format!("read frame head: {e}"))?;
 
-        let request_id = peek_request_id(&frame_bytes).unwrap_or(0);
-        let peeked_op = peek_request_op_code(&frame_bytes);
+        let request_id = if head_to_read >= 8 {
+            u64::from_le_bytes(head_buf[..8].try_into().unwrap_or([0; 8]))
+        } else {
+            0
+        };
+        let peeked_op = if head_to_read >= 10 {
+            Some(u16::from_le_bytes(
+                head_buf[8..10].try_into().unwrap_or([0; 2]),
+            ))
+        } else {
+            None
+        };
         let is_inter_node_op = peeked_op.map(is_inter_node_auth_opcode).unwrap_or(false);
         let auth_required = is_inter_node_op && opts.cluster_secret.is_some();
         // F-G5-001 (CRITICAL): inter-node opcode arrived with no
@@ -785,21 +785,49 @@ fn handle_connection_inner(
             // counter bump.
             let _ = UNAUTHENTICATED_INTER_NODE_WARNED.swap(true, Ordering::AcqRel);
         }
-        // `verify_frame` returns an owned `Vec<u8>` because it strips the
-        // trailing signature; convert to `Bytes` once so the downstream
-        // `decode_bytes` path can do zero-copy payload slicing. In the
-        // common non-auth case, `frame_bytes` is already the zero-copy
-        // `Bytes` carved from the connection read buffer.
+        // Two body-read paths now diverge based on whether the frame
+        // must be HMAC-verified:
+        //
+        // - `auth_required` → streaming verify. The remainder of the
+        //   body is read by `verify_signed_body_streaming` in 8 KiB
+        //   chunks, never materialising the full `frame_len` bytes.
+        //   The verified payload is written into a fresh, disposable
+        //   `Vec<u8>` sink which is `drop()`ped on
+        //   `Err(PermissionDenied)` — unauthenticated partial-write
+        //   bytes NEVER leak into the persistent `read_buf` or to
+        //   dispatch. This is the slow-loris fix (F-G5-016): a 16 MiB
+        //   wrong-tag frame now rejects with ~48 KiB of total
+        //   verifier-side allocation (8 KiB chunk + 40 B tail + sink
+        //   that never exceeds ~32 KiB before HMAC reject) instead of
+        //   the previous 16 MiB connection-buffer materialisation.
+        //
+        // - non-auth (the common client-traffic case) → assemble the
+        //   full frame in the persistent `read_buf` and freeze a zero-
+        //   copy `Bytes`. The 4-byte length-prefix + 10-byte head we
+        //   already peeked off the wire are spliced back into the
+        //   buffer before reading the remainder.
         let request_frame_bytes: Bytes = if auth_required {
-            match crate::cluster::auth::verify_frame(
-                opts.cluster_secret
-                    .as_ref()
-                    .expect("checked above")
-                    .as_slice(),
-                &frame_bytes,
+            let key = opts.cluster_secret.as_ref().expect("checked above");
+            let head_slice = &head_buf[..head_to_read];
+            let mut chained = std::io::Cursor::new(head_slice).chain(&mut stream);
+            // Disposable sink: pre-seed a 4-byte length-prefix slot
+            // (overwritten with `payload_len` on success) so the
+            // returned `Bytes` matches the `[length:4][payload]` shape
+            // that `RequestFrame::decode_bytes` expects.
+            let mut sink: Vec<u8> = Vec::with_capacity(4 + frame_len);
+            sink.extend_from_slice(&[0u8; 4]);
+            let payload_len = match crate::cluster::auth::verify_signed_body_streaming(
+                key.as_slice(),
+                frame_len,
+                &mut chained,
+                &mut sink,
             ) {
-                Ok(verified) => Bytes::from(verified),
+                Ok(n) => n,
                 Err(e) => {
+                    // SECURITY: drop the sink before responding so
+                    // the partially-written unauthenticated bytes
+                    // never escape this scope.
+                    drop(sink);
                     let resp = ResponseFrame {
                         request_id,
                         status: STATUS_ERROR,
@@ -811,9 +839,41 @@ fn handle_connection_inner(
                     let _ = stream.write_all(&resp.encode());
                     return Err(format!("cluster frame authentication failed: {e}"));
                 }
-            }
+            };
+            sink[0..4].copy_from_slice(&(payload_len as u32).to_le_bytes());
+            sink.truncate(4 + payload_len);
+            Bytes::from(sink)
         } else {
-            frame_bytes
+            // Assemble the full frame (length prefix + body) into the
+            // persistent `read_buf`. The 4-byte length prefix and the
+            // `head_to_read` peeked bytes are spliced in first; the
+            // remainder is read from the stream.
+            if read_buf.len() < 4 + frame_len {
+                read_buf.resize(4 + frame_len, 0);
+            }
+            read_buf[..4].copy_from_slice(&len_buf);
+            read_buf[4..4 + head_to_read].copy_from_slice(&head_buf[..head_to_read]);
+            if frame_len > head_to_read {
+                stream
+                    .read_exact(&mut read_buf[4 + head_to_read..4 + frame_len])
+                    .map_err(|e| format!("read frame body: {e}"))?;
+            }
+            let frame_bytes_mut = read_buf.split_to(4 + frame_len);
+            // Shrink read_buf IMMEDIATELY after split_to so a giant
+            // frame does not pin peak-frame capacity on the connection
+            // during dispatch + response write. Under the per-IP
+            // connection cap (`max_connections_per_ip = 64` by default)
+            // a 16 MiB peak frame would otherwise hold 64 × 16 MiB
+            // = 1 GiB pinned across concurrent slow-loris-ish clients
+            // until each connection's iteration completed.
+            reset_read_buf_if_oversized(&mut read_buf);
+            if read_buf.capacity() < READ_BUF_RETAINED_SIZE {
+                read_buf.reserve(READ_BUF_RETAINED_SIZE - read_buf.capacity());
+            }
+            if read_buf.len() < READ_BUF_RETAINED_SIZE {
+                read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
+            }
+            frame_bytes_mut.freeze()
         };
 
         let (request, _) = RequestFrame::decode_bytes(request_frame_bytes)
@@ -852,20 +912,6 @@ fn handle_connection_inner(
         // capacity through the dispatch + response window. Reset
         // again here is redundant.)
     }
-}
-
-fn peek_request_id(frame_bytes: &[u8]) -> Option<u64> {
-    if frame_bytes.len() < 12 {
-        return None;
-    }
-    Some(u64::from_le_bytes(frame_bytes[4..12].try_into().ok()?))
-}
-
-fn peek_request_op_code(frame_bytes: &[u8]) -> Option<u16> {
-    if frame_bytes.len() < 14 {
-        return None;
-    }
-    Some(u16::from_le_bytes(frame_bytes[12..14].try_into().ok()?))
 }
 
 fn reset_read_buf_if_oversized(read_buf: &mut BytesMut) {

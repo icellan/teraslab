@@ -355,58 +355,78 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
             return;
         }
 
-        // Read the frame body
+        // Read the frame body.
+        //
+        // Two paths:
+        // - `auth_secret.is_some()` → streaming verify. The body is
+        //   read in 8 KiB chunks by `verify_signed_body_streaming` into
+        //   a disposable `Vec<u8>` sink. On HMAC tag mismatch the sink
+        //   is dropped and the connection is closed; the receiver
+        //   NEVER materialises a `frame_len`-sized `body.buf` for
+        //   wrong-tag frames. This is the slow-loris fix
+        //   (F-G5-016 / re-review P2): without it, a malicious peer
+        //   could feed 16 MiB of wrong-tag garbage per connection and
+        //   drive the receiver's per-connection allocator up to peak
+        //   frame size before the HMAC verify ran.
+        // - `auth_secret.is_none()` → legacy buffered path. The
+        //   `RECEIVER_INFLIGHT_BYTES_CAP` aggregate guard still bounds
+        //   total exposure (F-G7-003).
         let frame_len = total_length as usize;
-        // F-G7-003: when the body Vec needs to grow, reserve the
-        // growth delta against the global inflight cap and absorb
-        // the reservation into the connection-scoped `body.reserved`
-        // counter so the CountedBody Drop releases it on return.
-        let new_bytes = frame_len.saturating_sub(body.buf.len());
-        if new_bytes > 0 {
-            match reserve_inflight_bytes(new_bytes) {
-                Some(guard) => {
-                    // Transfer the reservation from the guard to
-                    // the connection counter — we don't want the
-                    // guard's Drop to fire (it would release the
-                    // bytes we just promised to hold for the
-                    // body Vec).
-                    body.reserved += guard.bytes;
-                    std::mem::forget(guard);
-                }
-                None => {
-                    tracing::warn!(
-                        frame_len,
-                        new_bytes,
-                        "replication receiver: inflight bytes cap exceeded — closing connection",
-                    );
-                    return;
-                }
+        let request_id;
+        // `verified_frame` carries the verified `[payload_len:4][payload]`
+        // buffer when the auth path runs. The non-auth path leaves it
+        // empty and `request_frame_bytes` borrows from `frame_bytes`.
+        let mut verified_frame: Vec<u8> = Vec::new();
+        let request_frame_bytes: &[u8];
+        if let Some(secret) = auth_secret.as_deref() {
+            // Streaming verify path. Steps:
+            //   1. Peek 8 bytes (`request_id`) directly off the wire
+            //      so the auth-fail response can echo it (matches the
+            //      pre-fix contract where `request_id` was peeked from
+            //      the buffered body).
+            //   2. Splice the peeked head back onto the stream via
+            //      `Cursor::chain` so the streaming verifier sees the
+            //      full body without our re-reading any bytes.
+            //   3. Stream the body through
+            //      `verify_signed_body_streaming` into a disposable
+            //      `Vec<u8>` sink — dropped on `Err(PermissionDenied)`
+            //      so partially-written unauthenticated bytes never
+            //      reach `RequestFrame::decode`.
+            const REQ_ID_PEEK: usize = 8;
+            let head_to_read = REQ_ID_PEEK.min(frame_len);
+            let mut head_buf = [0u8; REQ_ID_PEEK];
+            if stream
+                .read_exact(&mut head_buf[..head_to_read])
+                .is_err()
+            {
+                return;
             }
-            body.buf.resize(frame_len, 0);
-        }
-        if stream.read_exact(&mut body.buf[..frame_len]).is_err() {
-            return;
-        }
-
-        // Reconstruct and decode full frame
-        frame_bytes.clear();
-        frame_bytes.reserve(4 + frame_len);
-        frame_bytes.extend_from_slice(&len_buf);
-        frame_bytes.extend_from_slice(&body.buf[..frame_len]);
-
-        let request_id = if frame_bytes.len() >= 12 {
-            u64::from_le_bytes(frame_bytes[4..12].try_into().unwrap_or([0; 8]))
-        } else {
-            0
-        };
-        let verified_frame;
-        let request_frame_bytes: &[u8] = if let Some(secret) = auth_secret.as_deref() {
-            match crate::cluster::auth::verify_frame(secret.as_slice(), &frame_bytes) {
-                Ok(verified) => {
-                    verified_frame = verified;
-                    &verified_frame
-                }
+            request_id = if head_to_read >= 8 {
+                u64::from_le_bytes(head_buf[..8].try_into().unwrap_or([0; 8]))
+            } else {
+                0
+            };
+            let head_slice = &head_buf[..head_to_read];
+            let mut chained = std::io::Cursor::new(&len_buf)
+                .chain(std::io::Cursor::new(head_slice))
+                .chain(&mut stream);
+            // Pre-seed a 4-byte length-prefix slot so the resulting
+            // buffer matches the `[payload_len:4][payload]` shape
+            // `RequestFrame::decode` expects.
+            let mut sink: Vec<u8> = Vec::with_capacity(4 + frame_len);
+            sink.extend_from_slice(&[0u8; 4]);
+            let payload_len = match crate::cluster::auth::verify_signed_body_streaming(
+                secret.as_slice(),
+                frame_len,
+                &mut chained,
+                &mut sink,
+            ) {
+                Ok(n) => n,
                 Err(e) => {
+                    // SECURITY: drop the sink BEFORE writing the
+                    // error response so the unauthenticated partial-
+                    // write bytes never escape this scope.
+                    drop(sink);
                     let response = ResponseFrame {
                         request_id,
                         status: STATUS_ERROR,
@@ -418,10 +438,53 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
                     let _ = stream.write_all(&response.encode());
                     return;
                 }
-            }
+            };
+            sink[0..4].copy_from_slice(&(payload_len as u32).to_le_bytes());
+            sink.truncate(4 + payload_len);
+            verified_frame = sink;
+            request_frame_bytes = &verified_frame;
         } else {
-            &frame_bytes
-        };
+            // F-G7-003: when the body Vec needs to grow, reserve the
+            // growth delta against the global inflight cap and absorb
+            // the reservation into the connection-scoped `body.reserved`
+            // counter so the CountedBody Drop releases it on return.
+            let new_bytes = frame_len.saturating_sub(body.buf.len());
+            if new_bytes > 0 {
+                match reserve_inflight_bytes(new_bytes) {
+                    Some(guard) => {
+                        body.reserved += guard.bytes;
+                        std::mem::forget(guard);
+                    }
+                    None => {
+                        tracing::warn!(
+                            frame_len,
+                            new_bytes,
+                            "replication receiver: inflight bytes cap exceeded — closing connection",
+                        );
+                        return;
+                    }
+                }
+                body.buf.resize(frame_len, 0);
+            }
+            if stream.read_exact(&mut body.buf[..frame_len]).is_err() {
+                return;
+            }
+            frame_bytes.clear();
+            frame_bytes.reserve(4 + frame_len);
+            frame_bytes.extend_from_slice(&len_buf);
+            frame_bytes.extend_from_slice(&body.buf[..frame_len]);
+            request_id = if frame_bytes.len() >= 12 {
+                u64::from_le_bytes(frame_bytes[4..12].try_into().unwrap_or([0; 8]))
+            } else {
+                0
+            };
+            request_frame_bytes = &frame_bytes;
+        }
+        // Silence the `unused_assignments` warning when the non-auth path
+        // never writes to `verified_frame`; it's still used to anchor the
+        // borrow of `request_frame_bytes` on the auth path above.
+        let _ = &verified_frame;
+        let _ = request_id; // currently only consumed on the auth-fail path
 
         let (request, _) = match RequestFrame::decode(request_frame_bytes) {
             Ok(r) => r,
