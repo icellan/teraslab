@@ -483,6 +483,11 @@ pub(crate) fn handle_request(
             status: STATUS_OK,
             payload: b"ok".to_vec(),
         },
+        OP_HELLO => ResponseFrame {
+            request_id: request.request_id,
+            status: STATUS_OK,
+            payload: PROTOCOL_VERSION.to_le_bytes().to_vec(),
+        },
         // F-G5-006: SWIM heartbeats use the dedicated UDP gossip port, not
         // this TCP data port. The OP_HEARTBEAT constant exists for clients
         // that have not been updated to use the gossip transport — respond
@@ -7953,6 +7958,27 @@ mod tests {
         let resp = h.request(OP_HEALTH, vec![]);
         assert_eq!(resp.status, STATUS_OK);
         assert_eq!(resp.payload, b"ok", "HEALTH payload should be b\"ok\"");
+    }
+
+    /// OP_HELLO returns the server's `PROTOCOL_VERSION` as a 2-byte LE u16.
+    /// The handshake lets clients negotiate the typed error-code surface
+    /// added in PROTOCOL_VERSION=2 (and any future bumps). See
+    /// `OP_HELLO` doc-comment for the compatibility contract.
+    #[test]
+    fn dispatch_hello_returns_protocol_version() {
+        let h = DispatchTestHarness::new();
+        let resp = h.request(OP_HELLO, vec![]);
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            resp.payload.len(),
+            2,
+            "HELLO payload must be exactly 2 bytes (u16 LE)"
+        );
+        let observed = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
+        assert_eq!(
+            observed, PROTOCOL_VERSION,
+            "HELLO must report the server's compiled-in PROTOCOL_VERSION"
+        );
     }
 
     // -----------------------------------------------------------------------

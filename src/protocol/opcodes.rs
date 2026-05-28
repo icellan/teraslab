@@ -65,6 +65,41 @@ pub const OP_GET_COMMITTED_TOPOLOGY: u16 = 103;
 /// pre-P3.10 servers returned `ERR_INTERNAL`).
 pub const OP_ADMIN_DIAGNOSE_KEY: u16 = 104;
 
+/// On-wire protocol-version handshake.
+///
+/// Request payload: empty.
+///
+/// Response payload (STATUS_OK, 2 bytes):
+/// ```text
+///   protocol_version: u16 LE   // server's PROTOCOL_VERSION
+/// ```
+///
+/// Clients SHOULD call this once at connection setup before issuing any
+/// mutation opcode. The reported version determines:
+///
+/// - Whether the typed error codes added in v2 (`ERR_PAYLOAD_MALFORMED`,
+///   `ERR_STORAGE_IO`, `ERR_OPCODE_UNSUPPORTED`, `ERR_RATE_LIMITED`,
+///   `ERR_NOT_CLUSTERED`, `ERR_INVARIANT_VIOLATION`, `ERR_STREAM_INVARIANT`)
+///   are available. Pre-v2 servers return `ERR_INTERNAL` for those
+///   cases; v2+ servers return the typed code.
+/// - Whether new opcodes added after the client was built are present.
+///
+/// Compatibility contract:
+///
+/// - Old clients (v1) issuing `OP_HELLO` against a v1 server receive
+///   `ERR_OPCODE_UNSUPPORTED` (or `ERR_INTERNAL` on pre-P3.10 servers);
+///   either way the response is parseable as "no v2 features".
+/// - New clients (v2+) issuing `OP_HELLO` against a v2 server receive
+///   `STATUS_OK` with the 2-byte version payload.
+/// - If a client receives a version HIGHER than its compiled-in
+///   `PROTOCOL_VERSION`, it MUST cap its expectations at its own
+///   version — servers preserve backward compatibility for v1 wire
+///   formats.
+///
+/// Lightweight by design: no authentication, no allocation, no
+/// dependency on cluster state. Safe to spam on every reconnect.
+pub const OP_HELLO: u16 = 107;
+
 /// Maximum number of txids accepted in a single `OP_ADMIN_DIAGNOSE_KEY`
 /// request. The barrier in integration tests only ever inspects the
 /// first ~32 failing records, so 64 is comfortably above expected use
