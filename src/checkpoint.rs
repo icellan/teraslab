@@ -198,7 +198,7 @@ where
     // `checkpoint_duration_ms` field of the returned `CheckpointStats`
     // exposes this so operators can alert when it crosses
     // `poll_interval`.
-    let _visibility_guard = engine.acquire_dispatch_visibility_guard();
+    let _visibility_guard = engine.acquire_checkpoint_visibility_guard();
     let entries_before = redo_log.lock().current_sequence();
     let snapshot_fence_sequence = entries_before.saturating_sub(1);
     let started_at = std::time::Instant::now();

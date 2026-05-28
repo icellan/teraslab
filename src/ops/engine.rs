@@ -80,7 +80,16 @@ pub struct Engine {
     /// The barrier deliberately lives on the engine, not in a process-global
     /// static, because integration tests and embedded deployments can host
     /// multiple independent nodes in one process.
-    dispatch_visibility_barrier: parking_lot::Mutex<()>,
+    /// Read-shared, write-exclusive lock. Dispatches take the SHARED
+    /// (read) side so they run concurrently with each other; the
+    /// checkpoint task takes the EXCLUSIVE (write) side so it can
+    /// snapshot a quiescent engine without waiting on individual op
+    /// locks. Previously a plain `Mutex<()>` here serialized every
+    /// dispatch through a single global mutex — a 100-op create batch
+    /// thus ran sequentially, and replicas added a 3 s per-RPC stall
+    /// because OP_REPLICA_BATCH also acquires this guard. RwLock keeps
+    /// the checkpoint guarantee while restoring per-op parallelism.
+    dispatch_visibility_barrier: parking_lot::RwLock<()>,
     /// Shared redo log used by secondary indexes for two-phase durability.
     ///
     /// When `Some`, the engine appends and fsyncs a
@@ -155,7 +164,7 @@ impl Engine {
             locks,
             dah_index: parking_lot::Mutex::new(dah_index.into()),
             unmined_index: parking_lot::Mutex::new(unmined_index.into()),
-            dispatch_visibility_barrier: parking_lot::Mutex::new(()),
+            dispatch_visibility_barrier: parking_lot::RwLock::new(()),
             redo_log: std::sync::OnceLock::new(),
             blob_store: None,
             shard_counts,
@@ -200,9 +209,23 @@ impl Engine {
         self.redo_log_handle()
     }
 
-    /// Acquire this engine's dispatch/checkpoint visibility barrier.
-    pub(crate) fn acquire_dispatch_visibility_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.dispatch_visibility_barrier.lock()
+    /// Acquire the SHARED (read-side) dispatch/checkpoint visibility
+    /// barrier — used by every dispatch op so many requests run
+    /// concurrently while still being mutually exclusive with a
+    /// checkpoint.
+    pub(crate) fn acquire_dispatch_visibility_guard(
+        &self,
+    ) -> parking_lot::RwLockReadGuard<'_, ()> {
+        self.dispatch_visibility_barrier.read()
+    }
+
+    /// Acquire the EXCLUSIVE (write-side) dispatch/checkpoint visibility
+    /// barrier — used by the checkpoint task to wait for in-flight
+    /// dispatches to drain and block new ones for the snapshot window.
+    pub(crate) fn acquire_checkpoint_visibility_guard(
+        &self,
+    ) -> parking_lot::RwLockWriteGuard<'_, ()> {
+        self.dispatch_visibility_barrier.write()
     }
 
     /// Update the DAH secondary index with two-phase durability.

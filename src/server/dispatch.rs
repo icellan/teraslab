@@ -2520,7 +2520,7 @@ fn needs_dispatch_visibility_barrier(op: u16) -> bool {
 fn acquire_dispatch_visibility_guard(
     engine: &Engine,
     op: u16,
-) -> Option<parking_lot::MutexGuard<'_, ()>> {
+) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
     needs_dispatch_visibility_barrier(op).then(|| engine.acquire_dispatch_visibility_guard())
 }
 
