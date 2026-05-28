@@ -281,27 +281,37 @@ fn install_http_panic_hook_once() {
 /// Build the axum [`Router`] for the HTTP observability server.
 ///
 /// Always registers the unauthenticated observability surface: `/metrics`,
-/// `/health/live`, `/health/ready`, `/status`, the read-only `/admin/*`
-/// dashboards (`migration_status`, `nodes`, `memory`, `records`,
-/// `replication`, `top`), the read-only `/debug/*` endpoints
-/// (`freelist`, `GET /debug/log-level`), the `/ws/top` WebSocket, and the
-/// embedded `/ui/...` assets. These routes have no auth so load balancers,
-/// Prometheus, and Grafana keep working without operator-issued credentials.
+/// `/health/live`, `/health/ready`, `/status`, and the embedded `/ui/...`
+/// assets. These routes have no auth so load balancers, Prometheus, and
+/// Grafana keep working without operator-issued credentials, and so the
+/// SPA can bootstrap before the operator authenticates.
 ///
-/// When `enable_admin_endpoints` is `true`, the mutating sub-router is built
-/// (`/admin/quiesce|rebalance|drain/{node_id}`, `/debug/index|redo|records/{txid}`,
-/// `PUT /debug/log-level`) and merged behind an
+/// **F-X-002 hardening — gated routes**
+///
+/// When `enable_admin_endpoints` is `true`, the full `/admin/*` and
+/// `/debug/*` surface is merged into the router behind an
 /// [`axum::middleware::from_fn_with_state`] guard that checks
-/// `Authorization: Bearer <admin_token>` on every request, comparing against
-/// the configured token in constant time via [`subtle::ConstantTimeEq`].
-/// If the caller passes `enable_admin_endpoints = true` with `None` or an
-/// empty `admin_token`, the gated sub-router is omitted entirely (so nothing
-/// is exposed unauthenticated) and a `tracing::error!` is logged — this path
-/// is expected to be unreachable because [`crate::config::ServerConfig::validate_safe_defaults`]
-/// rejects the combination at startup.
+/// `Authorization: Bearer <admin_token>` on every request, comparing
+/// against the configured token in constant time. The gated set now
+/// includes BOTH the mutating routes (`PUT /admin/quiesce|rebalance|drain`,
+/// `PUT /debug/log-level`, `GET /debug/index|redo|records/{txid}`,
+/// `GET /admin/top`, `GET /ws/top`) AND the read-only dashboards
+/// (`GET /admin/nodes|memory|records|replication|migration_status`,
+/// `GET /debug/freelist`, `GET /debug/log-level`). Before F-X-002 the
+/// read-only dashboards were unauthenticated — but `/admin/nodes` leaks
+/// every peer's IP + shard assignment (reconnaissance for the
+/// `OP_TOPOLOGY_COMMIT` forgery chain), so they now require an operator
+/// token like the rest of the admin surface.
 ///
-/// When `enable_admin_endpoints` is `false`, the gated routes are not part
-/// of the router and requests to them return 404.
+/// If the caller passes `enable_admin_endpoints = true` with `None` or an
+/// empty `admin_token`, the gated sub-router is omitted entirely (so
+/// nothing is exposed unauthenticated) and a `tracing::error!` is logged —
+/// this path is expected to be unreachable because
+/// [`crate::config::ServerConfig::validate_safe_defaults`] rejects the
+/// combination at startup.
+///
+/// When `enable_admin_endpoints` is `false`, the gated routes are not
+/// part of the router and requests to them return 404.
 ///
 /// Split out from [`start_http_server`] so unit tests can construct the
 /// router without binding a TCP listener.
@@ -310,35 +320,16 @@ pub(crate) fn build_http_router(
     enable_admin_endpoints: bool,
     admin_token: Option<String>,
 ) -> Router {
-    // Always-on routes: metrics, health, status, and read-only WS/UI surface.
-    // Build the public router with `state` so the read-only handlers can
-    // share the engine / metrics state.
-    //
-    // F-G6-002 / F-G6-003: `/admin/top` and `/ws/top` USED to live here.
-    // They expose internal counters and (in cluster mode) fan out to every
-    // peer over plaintext HTTP, so they now sit in the gated sub-router
-    // below behind the same bearer-token middleware as the mutating
-    // routes. When admin endpoints are disabled they return 404 to
-    // unauthenticated callers, which matches every other sensitive
-    // surface in this server.
+    // Always-on routes: metrics, health, status, and embedded UI assets.
+    // Everything else (read-only or mutating /admin/* and /debug/*) is
+    // F-X-002-gated below. The SPA's `/ui/*` assets stay public so the
+    // operator can load the login screen before authenticating.
     let public = Router::new()
         .route("/metrics", get(handle_metrics))
         .route("/health/live", get(handle_health_live))
         .route("/health/ready", get(handle_health_ready))
         .route("/status", get(handle_status))
-        // Read-only surface: gauge endpoints used by load balancers and the UI.
-        .route(
-            "/admin/migration_status",
-            get(handle_admin_migration_status),
-        )
-        .route("/admin/nodes", get(handle_admin_nodes))
-        .route("/admin/memory", get(handle_admin_memory))
-        .route("/admin/records", get(handle_admin_records))
-        .route("/admin/replication", get(handle_admin_replication))
-        // Read-only debug surface (no state mutation, no record contents).
-        .route("/debug/freelist", get(handle_debug_freelist))
-        .route("/debug/log-level", get(handle_get_log_level))
-        // Web UI
+        // Web UI (static assets — no engine state leakage)
         .route("/ui/", get(handle_ui_root))
         .route("/ui/{*path}", get(handle_ui))
         .with_state(state.clone());
@@ -401,12 +392,37 @@ pub(crate) fn build_http_router(
         // bearer-token middleware below covers `/admin/top` and `/ws/top`.
         .route("/admin/top", get(handle_admin_top))
         .route("/ws/top", get(handle_ws_top))
+        // F-X-002: read-only `/admin/*` dashboards are now gated. Pre-fix
+        // `/admin/nodes` was unauthenticated and leaked every peer's
+        // (ip, swim_port, http_port, shard set) tuple — exactly the
+        // reconnaissance an attacker needs to forge `OP_TOPOLOGY_COMMIT`
+        // frames against the data port. The other dashboards
+        // (memory, records, replication, migration_status) leak counters
+        // and shard ownership for the same fan-out, so they sit behind
+        // the same gate.
+        .route(
+            "/admin/migration_status",
+            get(handle_admin_migration_status),
+        )
+        .route("/admin/nodes", get(handle_admin_nodes))
+        .route("/admin/memory", get(handle_admin_memory))
+        .route("/admin/records", get(handle_admin_records))
+        .route("/admin/replication", get(handle_admin_replication))
         // Debug mutation / sensitive read
         .route("/debug/index", get(handle_debug_index))
         .route("/debug/redo", get(handle_debug_redo))
+        // F-X-002: `/debug/freelist` exposes allocator internals
+        // (used_bytes, free_region_count, alignment) and `GET
+        // /debug/log-level` exposes the live tracing level — both leak
+        // operator-side state that should require a token. The mutating
+        // `PUT /debug/log-level` was already gated; the GET is now
+        // siblings with it.
+        .route("/debug/freelist", get(handle_debug_freelist))
         .route(
             "/debug/log-level",
-            put(handle_set_log_level).layer(axum::extract::DefaultBodyLimit::max(64)),
+            get(handle_get_log_level)
+                .put(handle_set_log_level)
+                .layer(axum::extract::DefaultBodyLimit::max(64)),
         )
         .route("/debug/records/{txid}", get(handle_debug_record))
         .layer(middleware::from_fn_with_state(
@@ -1004,6 +1020,25 @@ pub(crate) fn render_metrics_text(
             &mut out,
             "teraslab_redo_flush_errors_total",
             r.redo_flush_errors_total.get(),
+        );
+        // BC-01: background-checkpoint observability. `triggered_total`
+        // increments at the START of each checkpoint, `failed_total`
+        // only on error — so `triggered - failed` is the successful
+        // checkpoint count. Alert on any rate of `failed_total`.
+        prom_counter(
+            &mut out,
+            "teraslab_redo_checkpoint_triggered_total",
+            r.redo_checkpoint_triggered_total.get(),
+        );
+        prom_counter(
+            &mut out,
+            "teraslab_redo_checkpoint_failed_total",
+            r.redo_checkpoint_failed_total.get(),
+        );
+        prom_histogram_ns(
+            &mut out,
+            "teraslab_redo_checkpoint_duration_ns",
+            &r.redo_checkpoint_duration_ns,
         );
     }
     if let Some(mm) = migration_metrics() {

@@ -304,13 +304,13 @@ fn status_returns_json() {
 fn debug_log_level_put_changes_level() {
     let (port, state) = start_test_http_server();
 
-    // PUT is gated: send the bearer token. GET is read-only / unauthenticated.
+    // F-X-002: both PUT and GET are now gated. PUT writes, GET reads back.
     let (status, _) = http_put_auth(port, "/debug/log-level", "debug", R056_TEST_TOKEN);
     assert_eq!(status, 200);
     assert_eq!(state.log_level.load(Ordering::Relaxed), 3); // DEBUG
 
-    // Verify via GET
-    let (status, _, body) = http_get(port, "/debug/log-level");
+    // Verify via GET (gated under F-X-002 — log-level leaks operator state)
+    let (status, _, body) = http_get_auth(port, "/debug/log-level", R056_TEST_TOKEN);
     assert_eq!(status, 200);
     assert_eq!(body, "debug");
 }
@@ -420,7 +420,8 @@ fn metrics_includes_new_operation_counters() {
 #[test]
 fn freelist_returns_real_stats() {
     let (port, _state) = start_test_http_server();
-    let (status, _, body) = http_get(port, "/debug/freelist");
+    // F-X-002: /debug/freelist is gated (leaks allocator internals).
+    let (status, _, body) = http_get_auth(port, "/debug/freelist", R056_TEST_TOKEN);
     assert_eq!(status, 200);
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
 
@@ -450,7 +451,9 @@ fn redo_endpoint_returns_not_available_without_redo_log() {
 #[test]
 fn admin_nodes_returns_json_array() {
     let (port, _state) = start_test_http_server();
-    let (status, content_type, body) = http_get(port, "/admin/nodes");
+    // F-X-002: /admin/nodes is gated — leaks every peer's IP + shard set,
+    // which is the reconnaissance step in the topology-forgery chain.
+    let (status, content_type, body) = http_get_auth(port, "/admin/nodes", R056_TEST_TOKEN);
     assert_eq!(status, 200);
     assert!(content_type.contains("application/json"));
 
@@ -463,7 +466,8 @@ fn admin_nodes_returns_json_array() {
 #[test]
 fn admin_memory_returns_json() {
     let (port, _state) = start_test_http_server();
-    let (status, _, body) = http_get(port, "/admin/memory");
+    // F-X-002: gated read-only dashboard.
+    let (status, _, body) = http_get_auth(port, "/admin/memory", R056_TEST_TOKEN);
     assert_eq!(status, 200);
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(parsed["index_bytes"].is_number());
@@ -473,7 +477,8 @@ fn admin_memory_returns_json() {
 #[test]
 fn admin_records_returns_json() {
     let (port, _state) = start_test_http_server();
-    let (status, _, body) = http_get(port, "/admin/records");
+    // F-X-002: gated read-only dashboard.
+    let (status, _, body) = http_get_auth(port, "/admin/records", R056_TEST_TOKEN);
     assert_eq!(status, 200);
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(parsed["total_records"].is_number());
@@ -484,7 +489,8 @@ fn admin_records_returns_json() {
 #[test]
 fn admin_replication_returns_json() {
     let (port, _state) = start_test_http_server();
-    let (status, _, body) = http_get(port, "/admin/replication");
+    // F-X-002: gated read-only dashboard.
+    let (status, _, body) = http_get_auth(port, "/admin/replication", R056_TEST_TOKEN);
     assert_eq!(status, 200);
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
     // Single-node mode: replication disabled
@@ -688,11 +694,18 @@ fn health_live_still_works_when_admin_disabled() {
 }
 
 #[test]
-fn read_only_debug_log_level_still_works_when_admin_disabled() {
-    // GET /debug/log-level is read-only; only the PUT sibling is gated.
+fn read_only_debug_log_level_404_when_admin_disabled() {
+    // F-X-002: GET /debug/log-level is gated alongside its PUT sibling.
+    // When admin endpoints are disabled the whole route is unregistered,
+    // so axum returns 404 (or 405 if the GET method-table is empty but
+    // the path matches a parent route).
     let (port, _state) = start_test_http_server_with_admin(false, None);
     let (status, _, _) = http_get(port, "/debug/log-level");
-    assert_eq!(status, 200);
+    assert!(
+        status == 404 || status == 405,
+        "F-X-002: GET /debug/log-level must be unrouted when admin endpoints \
+         are disabled, got {status}",
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -786,15 +799,15 @@ fn health_endpoints_unauthenticated_remain_accessible_with_admin_auth_enabled() 
     assert_eq!(ready_status, 200);
 }
 
-/// Read-only `/admin/*` dashboards (used by the operator UI and load
-/// balancers) must remain unauthenticated.
+/// F-X-002: read-only `/admin/*` dashboards now require the admin bearer
+/// token. Pre-F-X-002 they were unauthenticated, but `/admin/nodes`
+/// leaks every peer's (ip, swim_port, http_port, shard set) tuple —
+/// exactly the reconnaissance the topology-forgery attack chain needs.
+/// `/status` stays public because it only exposes process-wide gauges
+/// (record count, throughput counters, ready flag) that load balancers
+/// and Prometheus need without credentials.
 #[test]
-fn read_only_admin_dashboards_remain_unauthenticated() {
-    // F-G6-002: `/admin/top` was moved to the gated sub-router because
-    // its payload leaks internal counters / redo offsets / replication
-    // progress and triggers a cluster-wide HTTP fan-out. The remaining
-    // read-only dashboards stay unauthenticated so a load balancer or a
-    // Grafana JSON datasource can hit them without operator credentials.
+fn read_only_admin_dashboards_require_bearer_token() {
     let (port, _state) = start_test_http_server();
     for path in [
         "/admin/migration_status",
@@ -802,14 +815,26 @@ fn read_only_admin_dashboards_remain_unauthenticated() {
         "/admin/memory",
         "/admin/records",
         "/admin/replication",
-        "/status",
     ] {
         let (status, _, _) = http_get(port, path);
         assert_eq!(
-            status, 200,
-            "read-only dashboard {path} must stay unauthenticated, got {status}",
+            status, 401,
+            "F-X-002: read-only dashboard {path} must require admin bearer token, got {status}",
+        );
+        // With the token, the same path must reach the handler.
+        let (status_ok, _, _) = http_get_auth(port, path, R056_TEST_TOKEN);
+        assert_eq!(
+            status_ok, 200,
+            "{path} must succeed when the admin bearer token is supplied, got {status_ok}",
         );
     }
+    // /status is the only read-only endpoint that stays public — pinned
+    // here so a future router refactor cannot accidentally regate it.
+    let (status, _, _) = http_get(port, "/status");
+    assert_eq!(
+        status, 200,
+        "/status must remain unauthenticated (load-balancer compatibility)",
+    );
 }
 
 /// F-G6-002: the moved `/admin/top` and `/ws/top` routes must reject
@@ -833,18 +858,24 @@ fn admin_top_requires_bearer_token() {
 }
 
 #[test]
-fn read_only_debug_routes_remain_unauthenticated() {
+fn read_only_debug_routes_require_bearer_token() {
+    // F-X-002: /debug/freelist and GET /debug/log-level were previously
+    // unauthenticated. They leak allocator internals and the live
+    // tracing level respectively — operator-visible state that should
+    // require a token like every other /debug/* sibling.
     let (port, _state) = start_test_http_server();
-    let (freelist_status, _, _) = http_get(port, "/debug/freelist");
-    assert_eq!(
-        freelist_status, 200,
-        "/debug/freelist is read-only and must stay unauthenticated",
-    );
-    let (loglevel_status, _, _) = http_get(port, "/debug/log-level");
-    assert_eq!(
-        loglevel_status, 200,
-        "GET /debug/log-level is read-only and must stay unauthenticated",
-    );
+    for path in ["/debug/freelist", "/debug/log-level"] {
+        let (status, _, _) = http_get(port, path);
+        assert_eq!(
+            status, 401,
+            "F-X-002: {path} must require admin bearer token, got {status}",
+        );
+        let (status_ok, _, _) = http_get_auth(port, path, R056_TEST_TOKEN);
+        assert_eq!(
+            status_ok, 200,
+            "{path} must succeed when the admin bearer token is supplied, got {status_ok}",
+        );
+    }
 }
 
 /// PUT /debug/log-level + GET /debug/index, /debug/redo, /debug/records
