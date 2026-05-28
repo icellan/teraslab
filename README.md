@@ -42,6 +42,10 @@ The `io_uring` backend in `src/device_io/` is scaffolding only and is NOT wired 
 - A-2b — shard table can stay at 2-node assignment after a fresh 3-node bootstrap even though `committed_topology_members()` reports three; suspected `topology_commit_already_activated` dedup interaction.
 - A-3 — `replica_unauthenticated_accept_total` counter exists but is not incremented at the auth gate in `handle_connection_inner`.
 - A-4 — engine-side atomic apply (F-G5-022) is a concurrency hypothesis with no live repro yet.
+
+**Documented design choices** (deliberate scope decisions, not bugs):
+
+- **Single-interval freeze model.** `spendable_height` is a single `u32` per output (mirrors Aerospike). svnode's `enforceAtHeight` supports a multi-interval array. If Teranode's contract evolves to require multi-interval freezes (e.g. two disjoint locked windows on the same UTXO), a new op type (`OP_FREEZE_INTERVAL_BATCH` or similar) is required; the on-disk slot layout reserves enough spending-data bytes to extend without a format break, but the engine match arms and the wire protocol need additions.
 - A-5 — `SWIM_PING_REQ_DROPPED_TOTAL` lives inside `cluster::swim` instead of the registry exposed by `/metrics`.
 
 See `_review/ROADMAP_TO_100.md` for the sequenced finish plan and `REVIEW_REPORT.md` for the May 2026 review campaign that surfaced these.

@@ -446,7 +446,7 @@ pub unsafe fn write_mutation_footer_and_crc_direct(
 ///
 /// The attribute is enforced at compile time — dropping the token
 /// without consuming it is a debug-assertion failure (tested in
-/// [`tests::footer_pending_crc_panics_when_dropped_unstamped`]) and is
+/// `tests::footer_pending_crc_panics_when_dropped_unstamped`) and is
 /// rejected at compile time via a `compile_fail` doc-test:
 ///
 /// ```compile_fail,E0277
@@ -515,10 +515,25 @@ impl Drop for FooterPendingCrc<'_> {
         // F-G1-002: a forgotten CRC stamp leaves the record's CRC slot
         // stale against the footer bytes. The next reader will get
         // `DeviceError::RecordCorruption`, but that is a silent
-        // failure for the calling op — surface it loudly in debug.
-        // In release we cannot panic from `Drop` without aborting on a
-        // double-panic during unwind, so we limit the noise to
-        // debug builds where the contract violation is fixable.
+        // failure for the calling op — surface it loudly in debug
+        // (panic via `debug_assert!`) and observably in release
+        // (structured `tracing::error!` event + counter increment).
+        //
+        // We deliberately do NOT panic in release: panicking from
+        // `Drop` aborts the process on a double-panic during unwind,
+        // which is worse than the corruption itself. The tracing
+        // event lets operators alert on the failure mode without
+        // taking the node down.
+        if !self.stamped {
+            tracing::error!(
+                target: "teraslab::io::footer_crc",
+                record_offset = self.record_offset,
+                "FooterPendingCrc dropped without stamp_crc — CRC is stale, record will fail validation on next read"
+            );
+            if let Some(c) = footer_crc_drop_counter() {
+                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         debug_assert!(
             self.stamped,
             "FooterPendingCrc at record_offset={} dropped without stamp_crc — CRC is stale, \
@@ -526,6 +541,27 @@ impl Drop for FooterPendingCrc<'_> {
             self.record_offset,
         );
     }
+}
+
+/// Process-wide counter of `FooterPendingCrc::drop` calls without a
+/// matching `stamp_crc`. Surfaces the same failure mode as the
+/// debug-build panic without aborting in release. Wired into
+/// `/metrics` via the registry; `None` when no registry is installed
+/// (tests, embedded harnesses).
+fn footer_crc_drop_counter() -> Option<&'static std::sync::atomic::AtomicU64> {
+    static COUNTER: std::sync::OnceLock<std::sync::atomic::AtomicU64> =
+        std::sync::OnceLock::new();
+    Some(COUNTER.get_or_init(|| std::sync::atomic::AtomicU64::new(0)))
+}
+
+/// Read the cumulative count of unstamped `FooterPendingCrc` drops
+/// (release-build observability for the F-G1-002 footer-CRC pairing
+/// invariant — see `Drop` impl). Exposed for `/metrics` exporters and
+/// integration tests.
+pub fn footer_crc_drop_count() -> u64 {
+    footer_crc_drop_counter()
+        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(0)
 }
 
 /// Lower-level entry point for [`write_mutation_footer_and_crc_direct`].

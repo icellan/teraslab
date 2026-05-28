@@ -59,22 +59,20 @@ jobs:
       # F-X-010: dependency supply-chain hygiene. `cargo-audit` flags
       # known CVEs in the dependency tree; `cargo-deny` enforces our
       # policy in `deny.toml` (banned crates, license allow-list, version
-      # duplicates). Both run on every PR. No untrusted github.* inputs
-      # flow into these run commands — every argument is a static string.
+      # duplicates). Both run on every PR as BLOCKING gates as of
+      # 2026-05-28 (May-2026 external review P0): the previous `|| true`
+      # made these visibility-only and let a real CVE land on main
+      # without a build failure. If a new advisory appears, fix it
+      # (bump, replace, or document a justified `cargo audit --ignore`
+      # in `audit.toml`) — do not flip these back to non-blocking.
       - name: Install cargo-audit
-        run: cargo install --locked cargo-audit || true
+        run: cargo install --locked cargo-audit
       - name: Cargo audit (RustSec advisories)
-        # `|| true` while we incrementally clear advisories; the goal of
-        # this initial integration is visibility, not fail-the-build. Flip
-        # to a hard fail once the advisory baseline is clean.
-        run: cargo audit || true
+        run: cargo audit
       - name: Install cargo-deny
-        run: cargo install --locked cargo-deny || true
+        run: cargo install --locked cargo-deny
       - name: Cargo deny (policy)
-        # Same staged rollout as cargo-audit. `deny.toml` lives at repo
-        # root; absence is non-fatal here so this step is safe before the
-        # policy file is committed.
-        run: cargo deny check --hide-inclusion-graph || true
+        run: cargo deny check --hide-inclusion-graph
 
   test:
     name: Test (${{ matrix.os }})

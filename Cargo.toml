@@ -27,16 +27,15 @@ fault-injection = []
 slow-tests = []
 
 # Compiles the `device_io` subsystem (the `DeviceIo` trait, the
-# `IoUringBackend` Linux backend, and the `SyncFallback` libc pread/pwrite
-# backend) and its factory `create_device_io`. The trait + backends are
-# fully implemented and tested in isolation but not yet routed through the
-# production engine, which still reads/writes the underlying `BlockDevice`
-# trait synchronously. Until a later phase wires the spend / setMined paths
-# to use `DeviceIo`, leaving this off keeps the code from showing up as
-# dead-code clippy warnings in default builds. Tests that exercise the
-# backends directly (`cargo test --lib --features async-io`) opt in
-# explicitly. See `src/device_io/mod.rs` for the full design rationale.
-async-io = []
+# (removed 2026-05-28) The `async-io` feature previously gated an
+# unfinished `device_io` module (DeviceIo trait + io_uring/sync
+# fallback backends) that was never wired into the production engine
+# and existed only behind this feature flag to silence clippy. Per
+# the May-2026 external review's code-reviewer P0 finding, the module
+# has been deleted rather than kept as scaffolding indefinitely. If a
+# future phase needs an io_uring-backed write path, reintroduce the
+# trait + backend with a real caller already wired in (don't land
+# dead scaffolding first).
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
@@ -114,7 +113,6 @@ nix = { version = "0.31", default-features = false, features = ["ioctl"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 filetime = "0.2"
 prometheus-parse = "0.2"
-proptest = "1"
 tempfile = "3"
 
 [[bench]]

@@ -32,18 +32,22 @@ fn put_stream_and_readers_never_observe_mismatch() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let mismatches = Arc::new(AtomicU64::new(0));
+    let put_iterations = Arc::new(AtomicU64::new(0));
+    let stream_iterations = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::new();
 
     // Writer 1 — `put` loop on the same key.
     {
         let s = store.clone();
         let stop = stop.clone();
+        let put_iterations = put_iterations.clone();
         handles.push(thread::spawn(move || {
             let mut i = 0u32;
             while !stop.load(Ordering::Relaxed) {
                 let payload = vec![(i & 0xFF) as u8; 2048 + (i as usize % 1024)];
                 s.put(&key, &payload).unwrap();
                 i = i.wrapping_add(1);
+                put_iterations.fetch_add(1, Ordering::Relaxed);
             }
         }));
     }
@@ -52,6 +56,7 @@ fn put_stream_and_readers_never_observe_mismatch() {
     {
         let s = store.clone();
         let stop = stop.clone();
+        let stream_iterations = stream_iterations.clone();
         handles.push(thread::spawn(move || {
             let mut i = 0u32;
             while !stop.load(Ordering::Relaxed) {
@@ -61,6 +66,7 @@ fn put_stream_and_readers_never_observe_mismatch() {
                 writer.write_chunk(&chunk).unwrap();
                 writer.finish().unwrap();
                 i = i.wrapping_add(1);
+                stream_iterations.fetch_add(1, Ordering::Relaxed);
             }
         }));
     }
@@ -85,12 +91,43 @@ fn put_stream_and_readers_never_observe_mismatch() {
         }));
     }
 
-    // Let the contention run a bit, then quiesce.
-    thread::sleep(Duration::from_millis(400));
+    // Let the contention run a bit, then quiesce. On loaded CI runners
+    // the 400 ms soak can complete zero writer iterations and the
+    // mismatch == 0 check passes vacuously — defend against that by
+    // extending the soak until both writers have completed at least
+    // `MIN_ITERATIONS` cycles, capped at a hard ceiling so a genuinely
+    // wedged writer eventually fails the test rather than hanging CI.
+    const MIN_ITERATIONS: u64 = 10;
+    const HARD_CEILING: Duration = Duration::from_secs(10);
+    let start = std::time::Instant::now();
+    loop {
+        thread::sleep(Duration::from_millis(50));
+        let p = put_iterations.load(Ordering::Relaxed);
+        let s = stream_iterations.load(Ordering::Relaxed);
+        if p >= MIN_ITERATIONS
+            && s >= MIN_ITERATIONS
+            && start.elapsed() >= Duration::from_millis(400)
+        {
+            break;
+        }
+        if start.elapsed() >= HARD_CEILING {
+            break;
+        }
+    }
     stop.store(true, Ordering::Relaxed);
     for h in handles {
         h.join().unwrap();
     }
+
+    let put = put_iterations.load(Ordering::Relaxed);
+    let stream = stream_iterations.load(Ordering::Relaxed);
+    assert!(
+        put >= MIN_ITERATIONS && stream >= MIN_ITERATIONS,
+        "vacuous-pass guard: each writer must complete at least \
+         {MIN_ITERATIONS} cycles; got put={put}, stream={stream}. \
+         A wedged writer would otherwise let the mismatch=0 assertion \
+         pass without actually exercising the race."
+    );
 
     let observed = mismatches.load(Ordering::Relaxed);
     assert_eq!(

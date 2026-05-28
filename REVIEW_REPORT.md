@@ -1,3 +1,17 @@
+> # SUPERSEDED
+>
+> **Status as of 2026-05-28.** The headline CRITICAL/HIGH findings of
+> this May-2026 review have been remediated. See `_review/04_fixes_G*.md`
+> for the per-group fix logs and `_review/follow_ups.md` for the open
+> backlog. The 2026-05-28 consolidated external re-review is the current
+> authoritative document.
+>
+> This file is preserved verbatim as a historical record of the
+> point-in-time security posture (see `Date:` below) and the
+> remediation campaign it triggered. Do NOT cite individual findings
+> as still-open without first checking the fix logs and follow-ups
+> index — most criticals are closed.
+
 # TeraSlab — Independent Code Review
 
 **Date:** 2026-05-16

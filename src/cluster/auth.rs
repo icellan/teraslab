@@ -311,18 +311,35 @@ impl HmacSha256 {
 /// Streaming variant of [`verify_frame`].
 ///
 /// Reads the 4-byte length prefix and then the body from `reader`,
-/// feeding the body through an [`HmacSha256`] context as it arrives.
+/// feeding the body through an `HmacSha256` context as it arrives.
 /// The verified payload bytes are emitted to `payload_sink` as they
-/// stream — see the note about the slow-loris failure case below.
+/// stream — see the **WRITES BEFORE VERIFY** hazard note below.
 ///
 /// On HMAC success: `payload_sink` contains the full payload, and
 /// `Ok(payload_len)` returns the payload byte count.
 ///
-/// On HMAC failure: returns `Err(PermissionDenied)`. The bytes the
-/// verifier did manage to write to `payload_sink` before discovering
-/// the bad tag are the caller's problem — typically the caller passes
-/// a sink it is about to drop anyway (`Vec::new()` + `drop` on error)
-/// or `io::sink()` if it does not need the payload.
+/// # SAFETY: WRITES BEFORE VERIFY — read this before passing a live sink
+///
+/// This function writes payload chunks to `payload_sink` BEFORE the
+/// HMAC tag is verified. On `Err(PermissionDenied)` the sink contains
+/// **partially-written unauthenticated bytes**. Callers MUST treat
+/// the sink as poisoned on error.
+///
+/// Safe patterns (all current callers):
+/// - Pass a disposable `Vec::new()` (or `BytesMut`) and `drop` it on
+///   error — the bytes never reach the application.
+/// - Pass `io::sink()` if the caller does not need the payload at all.
+///
+/// Hazardous patterns:
+/// - Passing a live `TcpStream`, `File`, or any sink the caller does
+///   not control. The caller has handed an attacker a *write
+///   primitive* for the duration of the frame.
+/// - Passing a `BufWriter` over a network socket that may have
+///   already flushed partial bytes by the time HMAC fails.
+///
+/// If you need a sink semantic where the bytes are guaranteed
+/// post-verification, buffer into a `Vec` first and copy out on
+/// success only.
 ///
 /// Memory used by the verifier itself: a chunk buffer
 /// (`STREAM_CHUNK_SIZE`, 8 KiB) plus a [`SIGNED_SUFFIX_LEN`]-byte
@@ -333,7 +350,7 @@ impl HmacSha256 {
 ///
 /// Errors mirror [`verify_frame`]:
 /// - `InvalidData` for length / size violations and stale timestamps;
-/// - `PermissionDenied` for HMAC tag mismatch;
+/// - `PermissionDenied` for HMAC tag mismatch (sink is poisoned);
 /// - any I/O error from `reader` is propagated.
 pub fn verify_frame_streaming<R: Read, W: Write>(
     key: &[u8],

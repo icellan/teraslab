@@ -25,13 +25,12 @@ fn blobstore_path_is_pathbuf_default_relative_and_writable() {
 }
 
 // ---------------------------------------------------------------------------
-// F-G10-014: lib.rs internals — `device_io` must be `pub(crate)`, not `pub`.
-// We cannot import `pub(crate)` items from an integration test (different
-// crate), so the contract is: the import path that previously worked from
-// downstream must now fail to compile. We assert that intent indirectly via
-// the still-pub modules we DO rely on — if F-G10-014 regressed by widening
-// `device_io` back to `pub`, the audit would surface it independently.
-// Here we lock down the still-public surface that the bins/tests/benches use.
+// F-G10-014: lib.rs internals — historically `device_io` was widened to
+// `pub` and demoted back to `pub(crate)` in this finding. The module was
+// deleted entirely on 2026-05-28 per the May-2026 external review (it was
+// unused scaffolding gated behind a feature). The test below now only
+// locks down the remaining `pub` surface the bins/tests/benches consume;
+// the device_io-specific assertion is moot.
 // ---------------------------------------------------------------------------
 
 #[test]

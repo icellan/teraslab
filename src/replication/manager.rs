@@ -651,6 +651,16 @@ impl ReplicationManager {
                     match outcome {
                         BatchOutcome::Ok { through_sequence } => {
                             successes += 1;
+                            // Clamp to `self.next_sequence` so a buggy
+                            // or malicious replica cannot artificially
+                            // advance `last_acked` past sequences the
+                            // master has actually assigned. Without the
+                            // clamp a replica reporting `u64::MAX` would
+                            // permanently mark the sender "caught up"
+                            // and suppress catch-up on legitimate
+                            // future divergence.
+                            let through_sequence =
+                                through_sequence.min(self.next_sequence);
                             // Apply ACK immediately so subsequent
                             // batches (and metrics) see the latest
                             // last_acked even when this is the last
@@ -742,6 +752,10 @@ impl ReplicationManager {
                     self.senders[idx].transport = Some(straggler.transport);
                     match straggler.outcome {
                         BatchOutcome::Ok { through_sequence } => {
+                            // Same buggy/malicious replica clamp as the
+                            // foreground ack path above.
+                            let through_sequence =
+                                through_sequence.min(self.next_sequence);
                             if through_sequence > self.senders[idx].last_acked {
                                 self.senders[idx].last_acked = through_sequence;
                                 if let Some(m) = metrics {
@@ -901,6 +915,10 @@ impl ReplicationManager {
             // monotonicity guard below.
             match result.outcome {
                 BatchOutcome::Ok { through_sequence } => {
+                    // Buggy/malicious replica clamp — see foreground ack
+                    // path.
+                    let through_sequence =
+                        through_sequence.min(self.next_sequence);
                     if through_sequence > self.senders[idx].last_acked {
                         self.senders[idx].last_acked = through_sequence;
                         if let Some(m) = metrics {
