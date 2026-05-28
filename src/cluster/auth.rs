@@ -17,12 +17,16 @@
 //! a payload through `sign`/`verify` unchanged (except for the
 //! timestamp+tag suffix). Since nobody runs TeraSlab in production
 //! yet, we do not maintain a bypass for tag-less peers.
+//!
+//! The cryptographic primitives are provided by the RustCrypto
+//! [`sha2`] and [`hmac`] crates. Constant-time tag comparison is
+//! provided by [`hmac::Mac::verify_slice`].
 
 use std::io::{self, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
 
 use crate::protocol::opcodes::MAX_FRAME_SIZE;
 
@@ -41,6 +45,9 @@ pub const SIGNED_SUFFIX_LEN: usize = TIMESTAMP_LEN + HMAC_TAG_LEN;
 /// is generous enough to accommodate reasonable NTP drift.
 pub const MAX_CLOCK_SKEW: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
+/// HMAC-SHA256 instance type.
+type HmacSha256 = Hmac<Sha256>;
+
 /// Return the current Unix time in milliseconds, clamped to `u64`.
 fn now_unix_ms() -> u64 {
     SystemTime::now()
@@ -49,40 +56,26 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Compute SHA-256 over `data`. Thin wrapper over [`sha2::Sha256`].
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&Sha256::digest(data));
+    out
+}
+
 /// Compute HMAC-SHA256 over `data` using the given `key`.
 ///
-/// Uses a minimal hand-rolled HMAC-SHA256 built on top of the OS
-/// CommonCrypto (macOS) or a pure-Rust fallback. This avoids pulling
-/// in a heavy crypto crate for a single function.
+/// Delegates to the RustCrypto [`hmac`] crate. `Hmac::new_from_slice`
+/// accepts any key length (RFC 2104), so this never fails on input
+/// shape; the `expect` documents the impossible-by-contract case.
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    // HMAC(K, m) = H((K' ^ opad) || H((K' ^ ipad) || m))
-    // where K' = H(K) if len(K) > 64, else K padded to 64 bytes.
-    let mut k_prime = [0u8; 64];
-    if key.len() > 64 {
-        let h = sha256(key);
-        k_prime[..32].copy_from_slice(&h);
-    } else {
-        k_prime[..key.len()].copy_from_slice(key);
-    }
-
-    let mut ipad = [0x36u8; 64];
-    let mut opad = [0x5cu8; 64];
-    for i in 0..64 {
-        ipad[i] ^= k_prime[i];
-        opad[i] ^= k_prime[i];
-    }
-
-    // inner = H(ipad || data)
-    let mut inner_input = Vec::with_capacity(64 + data.len());
-    inner_input.extend_from_slice(&ipad);
-    inner_input.extend_from_slice(data);
-    let inner = sha256(&inner_input);
-
-    // outer = H(opad || inner)
-    let mut outer_input = Vec::with_capacity(64 + 32);
-    outer_input.extend_from_slice(&opad);
-    outer_input.extend_from_slice(&inner);
-    sha256(&outer_input)
+    let mut mac = HmacSha256::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts keys of any length per RFC 2104");
+    mac.update(data);
+    let result = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
 }
 
 /// Sign `data` by appending an 8-byte timestamp and a 32-byte HMAC tag.
@@ -96,13 +89,16 @@ pub fn sign(key: &[u8], data: &[u8]) -> Vec<u8> {
 /// Sign `data` using a caller-supplied timestamp. Exposed for tests;
 /// production callers should use [`sign`].
 pub fn sign_with_timestamp(key: &[u8], data: &[u8], timestamp_ms: u64) -> Vec<u8> {
-    let mut to_sign = Vec::with_capacity(data.len() + TIMESTAMP_LEN);
-    to_sign.extend_from_slice(data);
-    to_sign.extend_from_slice(&timestamp_ms.to_le_bytes());
-    let tag = hmac_sha256(key, &to_sign);
+    let ts_le = timestamp_ms.to_le_bytes();
+    let mut mac = HmacSha256::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts keys of any length per RFC 2104");
+    mac.update(data);
+    mac.update(&ts_le);
+    let tag = mac.finalize().into_bytes();
+
     let mut signed = Vec::with_capacity(data.len() + SIGNED_SUFFIX_LEN);
     signed.extend_from_slice(data);
-    signed.extend_from_slice(&timestamp_ms.to_le_bytes());
+    signed.extend_from_slice(&ts_le);
     signed.extend_from_slice(&tag);
     signed
 }
@@ -130,18 +126,19 @@ pub fn verify_with_now<'a>(key: &[u8], data: &'a [u8], now_ms: u64) -> io::Resul
     let (head, tag) = data.split_at(data.len() - HMAC_TAG_LEN);
     // head = payload || timestamp_ms_le
     let (payload, ts_bytes) = head.split_at(head.len() - TIMESTAMP_LEN);
-    let expected = hmac_sha256(key, head);
-    // `subtle::ConstantTimeEq` ct_eq is the same primitive the HTTP token
-    // path uses (`server/http.rs`) — no early length-mismatch return,
-    // no short-circuit on first byte. Both inputs are 32 bytes here so
-    // the length-oracle concern is theoretical, but consistency with the
-    // HTTP path matters and the cost is zero.
-    if tag.ct_eq(&expected).unwrap_u8() != 1 {
+
+    // `Mac::verify_slice` performs constant-time comparison internally,
+    // matching the previous `subtle::ConstantTimeEq` behaviour.
+    let mut mac = HmacSha256::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts keys of any length per RFC 2104");
+    mac.update(head);
+    if mac.verify_slice(tag).is_err() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "HMAC verification failed",
         ));
     }
+
     // Tag is valid — now enforce the freshness window. The timestamp is
     // covered by the HMAC so an attacker cannot shift it without
     // invalidating the tag above.
@@ -249,69 +246,10 @@ pub fn verify_frame(key: &[u8], encoded_frame: &[u8]) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Streaming HMAC-SHA256 accumulator.
-///
-/// Equivalent to [`hmac_sha256`] when the input is fed in chunks via
-/// [`HmacSha256::update`] and finalized with [`HmacSha256::finalize`]. The
-/// streaming form lets callers verify large frames without ever
-/// materialising the full payload in a single buffer.
-///
-/// HMAC(K, m) = H((K' ^ opad) || H((K' ^ ipad) || m)) where K' is K
-/// padded/hashed to 64 bytes. The inner hash is fed `ipad || m` as
-/// `m` arrives chunk-by-chunk; the outer hash is computed once at
-/// finalize.
-struct HmacSha256 {
-    inner: Sha256,
-    opad: [u8; 64],
-}
-
-impl HmacSha256 {
-    /// Construct a streaming HMAC context for `key`.
-    fn new(key: &[u8]) -> Self {
-        let mut k_prime = [0u8; 64];
-        if key.len() > 64 {
-            // Long keys are hashed to 32 bytes per RFC 2104; pad the
-            // remaining 32 with zeros.
-            let h = sha256(key);
-            k_prime[..32].copy_from_slice(&h);
-        } else {
-            k_prime[..key.len()].copy_from_slice(key);
-        }
-
-        let mut ipad = [0x36u8; 64];
-        let mut opad = [0x5cu8; 64];
-        for i in 0..64 {
-            ipad[i] ^= k_prime[i];
-            opad[i] ^= k_prime[i];
-        }
-
-        let mut inner = Sha256::new();
-        inner.update(ipad);
-        Self { inner, opad }
-    }
-
-    /// Feed `data` into the inner SHA-256.
-    fn update(&mut self, data: &[u8]) {
-        self.inner.update(data);
-    }
-
-    /// Finalize and return the 32-byte tag.
-    fn finalize(self) -> [u8; 32] {
-        let inner_hash = self.inner.finalize();
-        let mut outer = Sha256::new();
-        outer.update(self.opad);
-        outer.update(inner_hash);
-        let tag = outer.finalize();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&tag);
-        out
-    }
-}
-
 /// Streaming variant of [`verify_frame`].
 ///
 /// Reads the 4-byte length prefix and then the body from `reader`,
-/// feeding the body through an `HmacSha256` context as it arrives.
+/// feeding the body through an [`HmacSha256`] context as it arrives.
 /// The verified payload bytes are emitted to `payload_sink` as they
 /// stream — see the **WRITES BEFORE VERIFY** hazard note below.
 ///
@@ -358,6 +296,53 @@ pub fn verify_frame_streaming<R: Read, W: Write>(
     payload_sink: &mut W,
 ) -> io::Result<usize> {
     verify_frame_streaming_with_now(key, reader, payload_sink, now_unix_ms())
+}
+
+/// Streaming verifier variant for callers that have **already** read
+/// the 4-byte length prefix off the wire.
+///
+/// This is the production entry point used by `src/server/mod.rs` and
+/// `src/replication/receiver.rs`: both peek the length prefix first to
+/// enforce the per-frame size cap *before* any verifier-side allocation
+/// is committed, and would otherwise have to construct an awkward
+/// `Cursor::new(&len_buf).chain(stream)` reader just to satisfy
+/// [`verify_frame_streaming`]'s "I read the prefix" contract.
+///
+/// `body_len` MUST equal the `u32::from_le_bytes` of the prefix the
+/// caller already consumed. The function does not re-validate the size
+/// cap against `MAX_FRAME_SIZE` at the WIRE level (that is the caller's
+/// responsibility, performed BEFORE this call to bound peer memory),
+/// but it does enforce that the unsigned payload portion fits
+/// `MAX_FRAME_SIZE`.
+///
+/// All `# SAFETY: WRITES BEFORE VERIFY` hazard notes from
+/// [`verify_frame_streaming`] apply unchanged.
+pub fn verify_signed_body_streaming<R: Read, W: Write>(
+    key: &[u8],
+    body_len: usize,
+    reader: &mut R,
+    payload_sink: &mut W,
+) -> io::Result<usize> {
+    verify_signed_body_streaming_with_now(key, body_len, reader, payload_sink, now_unix_ms())
+}
+
+/// Test-visible variant of [`verify_signed_body_streaming`] accepting a
+/// caller-supplied `now_ms` reference.
+pub fn verify_signed_body_streaming_with_now<R: Read, W: Write>(
+    key: &[u8],
+    body_len: usize,
+    reader: &mut R,
+    payload_sink: &mut W,
+    now_ms: u64,
+) -> io::Result<usize> {
+    // Synthesise the length-prefix bytes and stream them in via the
+    // same code path as [`verify_frame_streaming_with_now`]. This keeps
+    // exactly ONE authoritative implementation of the HMAC state machine
+    // (D-RY: don't duplicate the eviction/tail logic) at the cost of a
+    // single 4-byte Cursor + Chain adapter.
+    let len_buf = (body_len as u32).to_le_bytes();
+    let mut chained = io::Cursor::new(len_buf).chain(reader);
+    verify_frame_streaming_with_now(key, &mut chained, payload_sink, now_ms)
 }
 
 /// Streaming chunk size for [`verify_frame_streaming`]. Chosen large
@@ -408,7 +393,8 @@ pub fn verify_frame_streaming_with_now<R: Read, W: Write>(
     //    so the verifier itself never accumulates a payload-sized
     //    buffer — slow-loris HMAC-mismatch frames reject without
     //    O(payload_len) verifier-side memory.
-    let mut hmac = HmacSha256::new(key);
+    let mut mac = HmacSha256::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts keys of any length per RFC 2104");
     let mut tail = [0u8; SIGNED_SUFFIX_LEN];
     let mut tail_filled = 0usize;
     // Track HMAC-fed bytes so we know which portion of evicted bytes
@@ -435,7 +421,7 @@ pub fn verify_frame_streaming_with_now<R: Read, W: Write>(
             let from_tail = evict.min(tail_filled);
             // Feed the evicted prefix of `tail` first.
             feed_evicted(
-                &mut hmac,
+                &mut mac,
                 payload_sink,
                 &mut hmac_fed,
                 payload_len,
@@ -447,7 +433,7 @@ pub fn verify_frame_streaming_with_now<R: Read, W: Write>(
             let from_new = evict - from_tail;
             if from_new > 0 {
                 feed_evicted(
-                    &mut hmac,
+                    &mut mac,
                     payload_sink,
                     &mut hmac_fed,
                     payload_len,
@@ -466,12 +452,12 @@ pub fn verify_frame_streaming_with_now<R: Read, W: Write>(
     debug_assert_eq!(hmac_fed, payload_len);
 
     // 4. Tail now holds `[timestamp:8][tag:32]`. Feed timestamp into
-    //    HMAC (it is covered by the signature) and compare the tag.
+    //    HMAC (it is covered by the signature) and compare the tag
+    //    via `Mac::verify_slice` (constant-time internally).
     let ts_bytes = &tail[..TIMESTAMP_LEN];
     let tag = &tail[TIMESTAMP_LEN..];
-    hmac.update(ts_bytes);
-    let expected = hmac.finalize();
-    if tag.ct_eq(&expected).unwrap_u8() != 1 {
+    mac.update(ts_bytes);
+    if mac.verify_slice(tag).is_err() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "HMAC verification failed",
@@ -503,7 +489,7 @@ pub fn verify_frame_streaming_with_now<R: Read, W: Write>(
 /// `>= payload_len` are the timestamp (which is covered by HMAC
 /// but is not part of the unsigned payload).
 fn feed_evicted<W: Write>(
-    hmac: &mut HmacSha256,
+    mac: &mut HmacSha256,
     payload_sink: &mut W,
     hmac_fed: &mut usize,
     payload_len: usize,
@@ -513,7 +499,7 @@ fn feed_evicted<W: Write>(
         let payload_take = (payload_len - *hmac_fed).min(bytes.len());
         payload_sink.write_all(&bytes[..payload_take])?;
     }
-    hmac.update(bytes);
+    mac.update(bytes);
     *hmac_fed += bytes.len();
     Ok(())
 }
@@ -527,93 +513,6 @@ fn read_some<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
             Err(e) => return Err(e),
         }
     }
-}
-
-/// Minimal SHA-256 implementation (FIPS 180-4).
-pub fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-
-    let k: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-
-    // Pre-processing: pad message
-    let bit_len = (data.len() as u64) * 8;
-    let mut padded = data.to_vec();
-    padded.push(0x80);
-    while (padded.len() % 64) != 56 {
-        padded.push(0);
-    }
-    padded.extend_from_slice(&bit_len.to_be_bytes());
-
-    // Process each 64-byte block
-    for block in padded.chunks_exact(64) {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] =
-                u32::from_be_bytes(block[i * 4..(i + 1) * 4].try_into().expect(
-                    "invariant: 64-byte block sliced in 4-byte windows always yields 4 bytes",
-                ));
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let t1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(k[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
-    }
-
-    let mut out = [0u8; 32];
-    for (i, val) in h.iter().enumerate() {
-        out[i * 4..(i + 1) * 4].copy_from_slice(&val.to_be_bytes());
-    }
-    out
 }
 
 #[cfg(test)]
@@ -867,7 +766,7 @@ mod tests {
     #[test]
     fn streaming_verify_rejects_oversized_unsigned_body() {
         // body_len advertised so large that unsigned payload exceeds MAX_FRAME_SIZE.
-        let oversized = MAX_FRAME_SIZE as u32 + SIGNED_SUFFIX_LEN as u32 + 1;
+        let oversized = MAX_FRAME_SIZE + SIGNED_SUFFIX_LEN as u32 + 1;
         let mut buf = Vec::new();
         buf.extend_from_slice(&oversized.to_le_bytes());
         // We don't bother filling the body — the bounds check should
@@ -969,7 +868,7 @@ mod tests {
         let body_len = payload_len + SIGNED_SUFFIX_LEN;
         let mut signed = Vec::with_capacity(4 + body_len);
         signed.extend_from_slice(&(body_len as u32).to_le_bytes());
-        signed.extend(std::iter::repeat(0xAAu8).take(payload_len));
+        signed.extend(std::iter::repeat_n(0xAAu8, payload_len));
         // Timestamp + tag: 8 bytes of timestamp, then 32 bytes of
         // zeroes for the tag. The HMAC will (overwhelmingly) not
         // produce all-zeroes for this input, so verification fails

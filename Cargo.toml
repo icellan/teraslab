@@ -76,6 +76,10 @@ rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# HMAC-SHA256 for cluster authentication (see src/cluster/auth.rs). The
+# maintained RustCrypto `hmac` crate handles constant-time tag comparison
+# via `Mac::verify_slice` and reuses the existing `sha2` dependency.
+hmac = "0.12"
 # Constant-time byte comparison for the HTTP admin bearer-token middleware.
 # A naive `==` on tokens leaks the matching prefix length through reply timing
 # (the comparison short-circuits on first mismatch). `subtle::ConstantTimeEq`
