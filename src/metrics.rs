@@ -1168,6 +1168,18 @@ pub struct RedoMetrics {
     pub redo_append_total: PaddedCounter,
     /// Total flushes that returned an error.
     pub redo_flush_errors_total: PaddedCounter,
+    /// Total checkpoints triggered by the background watermark task
+    /// (BC-01). Incremented at the START of each checkpoint, so the
+    /// counter advances as soon as the trigger fires even if the
+    /// checkpoint itself later errors.
+    pub redo_checkpoint_triggered_total: PaddedCounter,
+    /// Total checkpoints that returned an error. Operators should
+    /// alert on any non-zero rate: a sustained failure means the redo
+    /// log will fill and the master will brick.
+    pub redo_checkpoint_failed_total: PaddedCounter,
+    /// Wall-clock duration of each background checkpoint (log₂ ns
+    /// buckets, reused from `LatencyHistogram`).
+    pub redo_checkpoint_duration_ns: LatencyHistogram,
 }
 
 impl Default for RedoMetrics {
@@ -1185,6 +1197,9 @@ impl RedoMetrics {
             redo_entries_per_flush: LatencyHistogram::new(),
             redo_append_total: PaddedCounter::new(),
             redo_flush_errors_total: PaddedCounter::new(),
+            redo_checkpoint_triggered_total: PaddedCounter::new(),
+            redo_checkpoint_failed_total: PaddedCounter::new(),
+            redo_checkpoint_duration_ns: LatencyHistogram::new(),
         }
     }
 }

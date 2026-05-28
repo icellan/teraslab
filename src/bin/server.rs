@@ -1181,7 +1181,17 @@ fn main() {
     // known replica's durable ACK is below the redo floor that reset
     // would erase.
     let checkpoint_handle = redo_log.as_ref().map(|log| {
-        let cfg = teraslab::checkpoint::CheckpointConfig::new(config.index_snapshot_path.clone());
+        let mut cfg =
+            teraslab::checkpoint::CheckpointConfig::new(config.index_snapshot_path.clone());
+        // BC-01: honour operator-configured hysteresis band and poll
+        // cadence rather than the library defaults. Config validation
+        // guarantees `0 < low_water < high_water < 1` and
+        // `poll_interval_ms > 0`, so the values below are safe to plug
+        // in unchecked.
+        cfg.high_water = config.checkpoint_high_water;
+        cfg.low_water = config.checkpoint_low_water;
+        cfg.poll_interval =
+            std::time::Duration::from_millis(config.checkpoint_poll_interval_ms);
         if let Some(tracker) = teraslab::server::dispatch::ack_tracker_handle() {
             let reset_guard: std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync + 'static> =
                 std::sync::Arc::new(move |floor_sequence| {

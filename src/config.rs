@@ -565,6 +565,24 @@ pub struct ServerConfig {
     /// sweep (recovery-time reconciliation still runs on every startup).
     pub blob_gc_interval_secs: u64,
 
+    /// Redo-log usage fraction (0.0..1.0) at or above which the
+    /// background checkpoint task triggers a checkpoint (BC-01).
+    /// Default: 0.75. Must satisfy
+    /// `0.0 < checkpoint_low_water < checkpoint_high_water < 1.0`.
+    pub checkpoint_high_water: f64,
+
+    /// Redo-log usage fraction (0.0..1.0) at or below which the
+    /// background checkpoint trigger re-arms after a previous
+    /// checkpoint (BC-01, hysteresis). Default: 0.25.
+    pub checkpoint_low_water: f64,
+
+    /// Cadence in milliseconds at which the background checkpoint
+    /// task samples redo-log usage (BC-01). Default: 1000 ms. The
+    /// sample itself is a single mutex acquire + atomic load on the
+    /// redo log, so this can be lowered for tests without measurable
+    /// production cost.
+    pub checkpoint_poll_interval_ms: u64,
+
     /// Path for persisted cluster state (peak cluster size for quorum safety).
     /// If not set, derived from the first device path by appending `.cluster`.
     pub cluster_state_path: Option<PathBuf>,
@@ -720,6 +738,9 @@ impl Default for ServerConfig {
             cluster_id: None,
             blobstore_path: PathBuf::from("./teraslab-blobstore"),
             blob_gc_interval_secs: 3600,
+            checkpoint_high_water: 0.75,
+            checkpoint_low_water: 0.25,
+            checkpoint_poll_interval_ms: 1000,
             cluster_state_path: None,
             cluster_secret: None,
             // F-X-002 (production default): strict_auth defaults to `true`
@@ -1241,6 +1262,32 @@ impl ServerConfig {
         nonzero_usize("expected_records", self.expected_records)?;
         nonzero_u32("max_batch_size", self.max_batch_size)?;
         nonzero_usize("max_connections", self.max_connections)?;
+
+        // BC-01: checkpoint watermarks must form a valid hysteresis
+        // band (0 < low < high < 1) so the background trigger has
+        // somewhere to fall back to between consecutive checkpoints.
+        if !(0.0..1.0).contains(&self.checkpoint_high_water) {
+            return Err(ConfigError::InvalidSizing(format!(
+                "checkpoint_high_water = {} must be in [0.0, 1.0)",
+                self.checkpoint_high_water
+            )));
+        }
+        if !(0.0..1.0).contains(&self.checkpoint_low_water) {
+            return Err(ConfigError::InvalidSizing(format!(
+                "checkpoint_low_water = {} must be in [0.0, 1.0)",
+                self.checkpoint_low_water
+            )));
+        }
+        if self.checkpoint_low_water >= self.checkpoint_high_water {
+            return Err(ConfigError::InvalidSizing(format!(
+                "checkpoint_low_water ({}) must be strictly less than checkpoint_high_water ({})",
+                self.checkpoint_low_water, self.checkpoint_high_water
+            )));
+        }
+        nonzero_u64(
+            "checkpoint_poll_interval_ms",
+            self.checkpoint_poll_interval_ms,
+        )?;
 
         // device_size must be large enough to hold at least one record's
         // worth of data; the runtime allocator otherwise hits a divide-by-

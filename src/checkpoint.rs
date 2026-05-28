@@ -49,25 +49,56 @@ use crate::redo::RedoLog;
 type ResetGuard = Arc<dyn Fn(u64) -> bool + Send + Sync + 'static>;
 
 /// Configuration for the background checkpoint task.
+///
+/// BC-01: the task uses hysteresis to avoid back-to-back checkpoints
+/// during a sustained mutation burst. Once usage crosses `high_water`
+/// and a checkpoint runs, the task will not arm a second checkpoint
+/// until usage falls below `low_water`. With single-flight enforcement
+/// in the loop body, this guarantees at most one in-flight checkpoint
+/// per engine.
 #[derive(Debug, Clone)]
 pub struct CheckpointConfig {
     /// Usage fraction (0.0..1.0) at or above which the next tick triggers
-    /// a checkpoint. Default: 0.5.
-    pub trigger_usage: f64,
-    /// How often the task wakes to sample usage. Default: 100 ms.
+    /// a checkpoint. Default: 0.75.
+    pub high_water: f64,
+    /// Usage fraction (0.0..1.0) at or below which the trigger re-arms
+    /// after a previous checkpoint. Default: 0.25.
+    pub low_water: f64,
+    /// How often the task wakes to sample usage. Default: 1 second.
     pub poll_interval: Duration,
+    /// Initial back-off after a failed checkpoint. Doubles each
+    /// successive failure up to `max_backoff`. Reset to 0 on a
+    /// successful checkpoint. Default: 1 second.
+    pub initial_backoff: Duration,
+    /// Cap on the exponential back-off interval. Default: 60 seconds.
+    pub max_backoff: Duration,
     /// Where to write the index/dah/unmined snapshot. Must be on the same
     /// filesystem so the tempfile + rename is atomic.
     pub snapshot_path: PathBuf,
 }
 
 impl CheckpointConfig {
+    /// Construct a checkpoint config with sensible production defaults
+    /// (75 % high water / 25 % low water, 1 s poll, 1 s → 60 s
+    /// exponential back-off on failure).
     pub fn new(snapshot_path: PathBuf) -> Self {
         Self {
-            trigger_usage: 0.5,
-            poll_interval: Duration::from_millis(100),
+            high_water: 0.75,
+            low_water: 0.25,
+            poll_interval: Duration::from_secs(1),
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(60),
             snapshot_path,
         }
+    }
+
+    /// Backwards-compat shim: the previous API exposed a single
+    /// `trigger_usage` threshold. Treat that as the high water mark
+    /// and derive a low water mark roughly one-third below it.
+    pub fn with_trigger_usage(mut self, trigger_usage: f64) -> Self {
+        self.high_water = trigger_usage;
+        self.low_water = (trigger_usage / 3.0).clamp(0.0, trigger_usage);
+        self
     }
 }
 
@@ -101,52 +132,175 @@ pub fn spawn_checkpoint_task_with_reset_guard(
     std::thread::Builder::new()
         .name("teraslab-checkpoint".to_string())
         .spawn(move || {
-            tracing::info!(
-                trigger_usage = config.trigger_usage,
-                poll_interval_ms = config.poll_interval.as_millis() as u64,
-                "checkpoint task started",
-            );
-            while !shutdown.load(Ordering::Relaxed) {
-                std::thread::sleep(config.poll_interval);
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let usage = redo_log.lock().usage_fraction();
-                if usage < config.trigger_usage {
-                    continue;
-                }
-
-                tracing::info!(
-                    usage_fraction = usage,
-                    threshold = config.trigger_usage,
-                    "redo log above watermark — checkpointing",
-                );
-                let started = std::time::Instant::now();
-                match perform_checkpoint_with_reset_guard(
-                    &config,
-                    &engine,
-                    &redo_log,
-                    |floor_sequence| reset_guard(floor_sequence),
-                ) {
-                    Ok(stats) => {
-                        tracing::info!(
-                            elapsed_ms = started.elapsed().as_millis() as u64,
-                            entries_before = stats.entries_before,
-                            usage_after = stats.usage_after,
-                            reset_performed = stats.reset_performed,
-                            checkpoint_duration_ms = stats.checkpoint_duration_ms,
-                            "checkpoint complete",
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(err = %e, "checkpoint failed");
-                    }
-                }
-            }
-            tracing::info!("checkpoint task exiting");
+            run_checkpoint_loop(config, engine, redo_log, shutdown, reset_guard)
         })
         .expect("spawn checkpoint thread")
+}
+
+/// Body of the checkpoint thread, factored out so unit tests can drive
+/// the loop directly without spawning.
+///
+/// The loop implements three production-critical behaviours on top of
+/// `perform_checkpoint_with_reset_guard`:
+///
+/// 1. **Hysteresis (debounce).** A sustained mutation burst pushes
+///    `usage_fraction` past `high_water` for many polls in a row.
+///    Without hysteresis we would launch a checkpoint per poll.
+///    Instead we set `armed = false` after triggering and only
+///    re-arm once usage drops below `low_water`. Combined with the
+///    synchronous `perform_checkpoint_*` call (no concurrent
+///    checkpoint can start while one is running), this gives the
+///    required single-flight semantics.
+/// 2. **Exponential back-off on error.** A persistently failing
+///    checkpoint (e.g. snapshot directory missing) would otherwise
+///    flood logs and metrics every `poll_interval`. We double the
+///    wait after each failure up to `max_backoff`, and reset to zero
+///    on the next success.
+/// 3. **Observable.** Each checkpoint emits a `tracing::info!` at
+///    start with the usage fraction and at completion with the
+///    elapsed wall-clock time, plus updates to
+///    `redo_checkpoint_{triggered,failed}_total` and the
+///    `redo_checkpoint_duration_ns` histogram.
+fn run_checkpoint_loop(
+    config: CheckpointConfig,
+    engine: Arc<Engine>,
+    redo_log: Arc<Mutex<RedoLog>>,
+    shutdown: Arc<AtomicBool>,
+    reset_guard: ResetGuard,
+) {
+    tracing::info!(
+        high_water = config.high_water,
+        low_water = config.low_water,
+        poll_interval_ms = config.poll_interval.as_millis() as u64,
+        "checkpoint task started",
+    );
+
+    let mut armed = true;
+    let mut backoff = Duration::ZERO;
+
+    while !shutdown.load(Ordering::Relaxed) {
+        // Wait at least poll_interval, plus any pending back-off, but
+        // check the shutdown flag in small slices so the task stops
+        // within ~poll_interval on shutdown rather than within
+        // `backoff` (which can be up to `max_backoff` = 60 s by
+        // default).
+        let wait = config.poll_interval + backoff;
+        if !sleep_with_shutdown(wait, &shutdown, config.poll_interval) {
+            break;
+        }
+
+        let usage = redo_log.lock().usage_fraction();
+
+        // Hysteresis: re-arm when usage drops below low water.
+        if !armed && usage <= config.low_water {
+            tracing::debug!(
+                usage_fraction = usage,
+                low_water = config.low_water,
+                "checkpoint trigger re-armed",
+            );
+            armed = true;
+        }
+
+        if !armed || usage < config.high_water {
+            continue;
+        }
+
+        // Trip the trigger.
+        armed = false;
+
+        if let Some(m) = crate::metrics::redo_metrics() {
+            m.redo_checkpoint_triggered_total.inc();
+        }
+        tracing::info!(
+            usage_fraction = usage,
+            high_water = config.high_water,
+            "redo log above high-water — checkpointing",
+        );
+
+        let started = std::time::Instant::now();
+        let outcome = perform_checkpoint_with_reset_guard(
+            &config,
+            &engine,
+            &redo_log,
+            |floor_sequence| reset_guard(floor_sequence),
+        );
+        let elapsed = started.elapsed();
+        if let Some(m) = crate::metrics::redo_metrics() {
+            m.redo_checkpoint_duration_ns.record_ns(elapsed.as_nanos() as u64);
+        }
+
+        match outcome {
+            Ok(stats) => {
+                backoff = Duration::ZERO;
+                tracing::info!(
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    entries_before = stats.entries_before,
+                    usage_after = stats.usage_after,
+                    reset_performed = stats.reset_performed,
+                    checkpoint_duration_ms = stats.checkpoint_duration_ms,
+                    "checkpoint complete",
+                );
+            }
+            Err(e) => {
+                if let Some(m) = crate::metrics::redo_metrics() {
+                    m.redo_checkpoint_failed_total.inc();
+                }
+                backoff = next_backoff(backoff, &config);
+                tracing::error!(
+                    err = %e,
+                    next_backoff_ms = backoff.as_millis() as u64,
+                    "checkpoint failed",
+                );
+                // After a failure, leave the trigger armed so the next
+                // tick retries — usage has not actually been reclaimed
+                // and waiting for low_water would deadlock the loop.
+                armed = true;
+            }
+        }
+    }
+    tracing::info!("checkpoint task exiting");
+}
+
+/// Compute the next exponential back-off, doubling up to `max_backoff`.
+fn next_backoff(current: Duration, config: &CheckpointConfig) -> Duration {
+    let next = if current.is_zero() {
+        config.initial_backoff
+    } else {
+        current.saturating_mul(2)
+    };
+    if next > config.max_backoff {
+        config.max_backoff
+    } else {
+        next
+    }
+}
+
+/// Sleep up to `total` in `slice`-sized chunks, returning early if
+/// `shutdown` is set. Returns `false` if shutdown was observed
+/// (caller should exit), `true` if the full duration elapsed.
+fn sleep_with_shutdown(
+    total: Duration,
+    shutdown: &Arc<AtomicBool>,
+    slice: Duration,
+) -> bool {
+    if total.is_zero() {
+        return !shutdown.load(Ordering::Relaxed);
+    }
+    let slice = if slice.is_zero() {
+        total
+    } else {
+        slice.min(total)
+    };
+    let mut remaining = total;
+    while remaining > Duration::ZERO {
+        if shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
+        let step = remaining.min(slice);
+        std::thread::sleep(step);
+        remaining = remaining.saturating_sub(step);
+    }
+    !shutdown.load(Ordering::Relaxed)
 }
 
 /// Result of a successful checkpoint, returned for logging.
@@ -397,6 +551,248 @@ mod tests {
         assert!(
             log.recover().unwrap().is_empty(),
             "startup recovery must skip entries covered by the durable snapshot fence"
+        );
+    }
+
+    // -- BC-01 background-task tests --
+
+    #[test]
+    fn next_backoff_doubles_then_caps() {
+        let cfg = CheckpointConfig {
+            high_water: 0.75,
+            low_water: 0.25,
+            poll_interval: Duration::from_millis(10),
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_millis(400),
+            snapshot_path: PathBuf::from("/dev/null"),
+        };
+        let b0 = next_backoff(Duration::ZERO, &cfg);
+        assert_eq!(b0, Duration::from_millis(100), "first failure → initial");
+        let b1 = next_backoff(b0, &cfg);
+        assert_eq!(b1, Duration::from_millis(200), "second → double");
+        let b2 = next_backoff(b1, &cfg);
+        assert_eq!(b2, Duration::from_millis(400), "third → at cap");
+        let b3 = next_backoff(b2, &cfg);
+        assert_eq!(b3, Duration::from_millis(400), "fourth → still capped");
+    }
+
+    #[test]
+    fn sleep_with_shutdown_returns_early_on_flag() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s2 = shutdown.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            s2.store(true, Ordering::Relaxed);
+        });
+        let start = std::time::Instant::now();
+        let finished_full =
+            sleep_with_shutdown(Duration::from_secs(5), &shutdown, Duration::from_millis(5));
+        let elapsed = start.elapsed();
+        handle.join().unwrap();
+        assert!(!finished_full, "must report shutdown observed");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "must return within ~slice of shutdown, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn background_task_triggers_checkpoint_when_high_water_crossed() {
+        // BC-01 acceptance test: install a tiny redo log, push usage
+        // above the high-water mark, and confirm the background task
+        // runs a checkpoint that drops usage well below low-water.
+        let (engine, redo, dir) = make_engine_and_redo();
+        let snap_path = dir.path().join("bg-trigger.snap");
+        // The 64 KiB test redo log has a ~60 KiB entries region and
+        // each `RedoOp::Checkpoint` serialises to ~21 bytes, so we
+        // need enough appends to push usage well past the high
+        // water mark. After a successful `compact_prefix_through`
+        // the write_position lands at one alignment block (4 KiB ≈
+        // 6.7 % of the entries region), so the low water mark must
+        // be ABOVE that floor — otherwise no checkpoint outcome
+        // could clear the trigger.
+        let cfg = CheckpointConfig {
+            high_water: 0.50,
+            low_water: 0.20,
+            poll_interval: Duration::from_millis(10),
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(40),
+            snapshot_path: snap_path.clone(),
+        };
+
+        {
+            let mut log = redo.lock();
+            // 2000 appends × ~21 B ≈ 42 KB which is ~70 % of the
+            // 60 KB entries region — well above the 50 % high water.
+            for _ in 0..2000 {
+                log.append(RedoOp::Checkpoint).unwrap();
+            }
+            log.flush().unwrap();
+            assert!(
+                log.usage_fraction() >= cfg.high_water,
+                "test setup: usage must be above high water, got {}",
+                log.usage_fraction()
+            );
+        }
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = spawn_checkpoint_task(cfg.clone(), engine, redo.clone(), shutdown.clone());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut final_usage = 1.0;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            final_usage = redo.lock().usage_fraction();
+            if final_usage <= cfg.low_water {
+                break;
+            }
+        }
+        shutdown.store(true, Ordering::Relaxed);
+
+        let join_start = std::time::Instant::now();
+        handle.join().expect("checkpoint thread must not panic");
+        let join_elapsed = join_start.elapsed();
+
+        assert!(snap_path.exists(), "checkpoint must have written snapshot");
+        assert!(
+            final_usage <= cfg.low_water,
+            "background checkpoint must reduce usage below low water, got {final_usage}"
+        );
+        assert!(
+            join_elapsed < Duration::from_secs(1),
+            "task must shut down within 1 s, took {join_elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn background_task_does_not_re_trigger_below_low_water() {
+        // Hysteresis (debounce) regression test: with usage far below
+        // high water at all times, the task must NOT take a single
+        // checkpoint over many polls.
+        let (engine, redo, dir) = make_engine_and_redo();
+        let snap_path = dir.path().join("no-trigger.snap");
+        let cfg = CheckpointConfig {
+            high_water: 0.95,
+            low_water: 0.10,
+            poll_interval: Duration::from_millis(10),
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(40),
+            snapshot_path: snap_path.clone(),
+        };
+
+        {
+            let mut log = redo.lock();
+            for _ in 0..5 {
+                log.append(RedoOp::Checkpoint).unwrap();
+            }
+            log.flush().unwrap();
+            assert!(log.usage_fraction() < cfg.high_water);
+        }
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = spawn_checkpoint_task(cfg, engine, redo, shutdown.clone());
+
+        std::thread::sleep(Duration::from_millis(200));
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().expect("thread must not panic");
+
+        assert!(
+            !snap_path.exists(),
+            "task must not have taken a checkpoint when usage stayed below high water"
+        );
+    }
+
+    #[test]
+    fn sustained_mutations_never_brick_when_task_is_running() {
+        // BC-01 acceptance: with the background task running, a
+        // mutation workload that would brick the master pre-fix
+        // (every `append` after the redo log fills returns
+        // `RedoError::LogFull`) must complete with zero `LogFull`
+        // errors observed by the caller.
+        //
+        // Without the background task, the 64 KiB test redo log
+        // (~60 KiB entries region, ~21 B/entry) bricks after about
+        // 3000 appends — every subsequent append returns
+        // `RedoError::LogFull`. We push 8000 here in paced bursts
+        // (well past the brick threshold) and assert that the
+        // checkpointer keeps space available so the caller never
+        // observes `LogFull`.
+        //
+        // The pacing models the production reality: the dispatcher
+        // doesn't try to write 64 MiB in 0 seconds — it produces
+        // entries at finite rate while the checkpointer reclaims
+        // them in the background. The test fails (pre-fix) with
+        // thousands of `LogFull` errors if you delete the
+        // `spawn_checkpoint_task` line below.
+        let (engine, redo, dir) = make_engine_and_redo();
+        let cfg = CheckpointConfig {
+            high_water: 0.50,
+            low_water: 0.20,
+            poll_interval: Duration::from_millis(5),
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(40),
+            snapshot_path: dir.path().join("sustained.snap"),
+        };
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = spawn_checkpoint_task(cfg, engine, redo.clone(), shutdown.clone());
+
+        let mut log_full_errors = 0usize;
+        // 16 bursts of 500 entries each, with a 25 ms gap. That's
+        // 8000 total entries — comfortably past the 3000-entry
+        // bricking threshold for the pre-fix code path. Each burst
+        // pushes usage past high_water; the gap gives the
+        // checkpointer enough wall-clock to reclaim before the next
+        // burst.
+        for _burst in 0..16 {
+            for _ in 0..500 {
+                let result = {
+                    let mut log = redo.lock();
+                    log.append(RedoOp::Checkpoint)
+                };
+                if let Err(crate::redo::RedoError::LogFull { .. }) = result {
+                    log_full_errors += 1;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().expect("checkpoint thread must not panic");
+
+        assert_eq!(
+            log_full_errors, 0,
+            "with the background checkpoint task running, no mutation should observe LogFull",
+        );
+    }
+
+    #[test]
+    fn background_task_shuts_down_within_bounded_time() {
+        // Even with no work to do, the task must stop quickly on
+        // shutdown — verified separately so a regression in
+        // sleep_with_shutdown wiring is caught even when the trigger
+        // never fires.
+        let (engine, redo, dir) = make_engine_and_redo();
+        let cfg = CheckpointConfig {
+            high_water: 0.99,
+            low_water: 0.10,
+            poll_interval: Duration::from_millis(50),
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(40),
+            snapshot_path: dir.path().join("shutdown.snap"),
+        };
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = spawn_checkpoint_task(cfg, engine, redo, shutdown.clone());
+        std::thread::sleep(Duration::from_millis(20));
+
+        let start = std::time::Instant::now();
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().expect("thread must not panic");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "task must shut down within 1 s, took {elapsed:?}"
         );
     }
 }
