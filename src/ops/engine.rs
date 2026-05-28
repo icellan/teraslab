@@ -7191,6 +7191,30 @@ mod tests {
         assert_eq!({ meta.deleted_children_offset }, 0);
     }
 
+    /// rust-engineer P0: a failed `free_conflicting_children_block` must be
+    /// SURFACED as a typed `SpendError::StorageError`, never silently
+    /// dropped. The pre-fix code did `let _ = self.free_conflicting_children_block(...)`
+    /// at two sites, leaking device space permanently. The fix makes the
+    /// method return a meaningful `Result` that the call sites act on — two
+    /// propagate it with `?` (parent-gone rollback, CAS-retry rollback) and
+    /// the post-commit cleanup logs it as an orphan-blob leak for the R-049
+    /// sweep. This test pins the contract the whole fix rests on: the error
+    /// reaches the caller. An out-of-range offset is the deterministic
+    /// allocator-error trigger — `SlotAllocator::free` rejects it with
+    /// `AllocatorError::InvalidFree` (offset + size overflows `u64`).
+    #[test]
+    fn free_conflicting_children_block_surfaces_allocator_error() {
+        let h = TestHarness::new(3, TxFlags::empty());
+        let err = h
+            .engine
+            .free_conflicting_children_block(u64::MAX, 1)
+            .expect_err("freeing an out-of-range offset must error, not swallow");
+        assert!(
+            matches!(err, SpendError::StorageError { .. }),
+            "allocator free failure must surface as SpendError::StorageError, got {err:?}",
+        );
+    }
+
     /// F-X-022: pruning a parent slot via `prune_slot_if_spent_by_child`
     /// must append the child txid to the parent's deleted-children list,
     /// observable through `read_deleted_children`. The primary UTXO_PRUNED

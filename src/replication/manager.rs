@@ -1714,6 +1714,53 @@ mod tests {
         assert_eq!(through, 10);
     }
 
+    /// Re-review P2: a buggy or malicious replica that ACKs a
+    /// `through_sequence` beyond what the master has actually assigned
+    /// must not be able to advance `last_acked` past `next_sequence`.
+    /// Without the `through_sequence.min(self.next_sequence)` clamp, a
+    /// replica reporting `u64::MAX` would be permanently flagged
+    /// "caught up", suppressing catch-up on legitimate future
+    /// divergence. The clamp is identical at all three application
+    /// sites (foreground recv loop, post-batch finished-drain,
+    /// straggler late-outcome); this exercises the foreground path.
+    #[test]
+    fn malicious_replica_through_sequence_is_clamped_to_next_sequence() {
+        let (mt, rt) = InMemoryTransport::pair();
+
+        // Replica lies: ACKs u64::MAX regardless of the batch sequence.
+        let handle = std::thread::spawn(move || {
+            let _batch = rt.recv_batch(Duration::from_secs(1)).unwrap();
+            rt.send_ack(&ReplicaAck::Ok {
+                through_sequence: u64::MAX,
+            })
+            .unwrap();
+        });
+
+        let mut mgr = ReplicationManager::new(ReplicationConfig::default(), vec![Box::new(mt)]);
+
+        let ops: Vec<ReplicaOp> = (0..10u8)
+            .map(|i| ReplicaOp::Freeze {
+                tx_key: key(i),
+                offset: i as u32,
+                master_generation: 0,
+            })
+            .collect();
+        mgr.replicate_batch(&ops).unwrap();
+
+        // next_sequence advanced 1 -> 11 (initial 1 + 10 ops). The lying
+        // ACK of u64::MAX must be clamped down to 11, not accepted verbatim.
+        assert_eq!(mgr.next_sequence, 11);
+        assert_eq!(
+            mgr.senders[0].last_acked(),
+            11,
+            "through_sequence must be clamped to next_sequence (11), \
+             not the replica's u64::MAX claim",
+        );
+
+        drop(mgr);
+        handle.join().unwrap();
+    }
+
     // -- Idempotency under replication --
 
     #[test]

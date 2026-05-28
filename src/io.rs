@@ -1547,6 +1547,48 @@ mod tests {
         );
     }
 
+    /// Re-review P2: in RELEASE builds the drop-time `debug_assert!`
+    /// compiles out, so the only observable signal of a forgotten CRC
+    /// stamp is the `tracing::error!` event plus the
+    /// `footer_crc_drop_count()` counter. Verify the counter increments
+    /// on an unstamped drop. The counter bump happens BEFORE the
+    /// `debug_assert!` in the `Drop` impl, so this test works in both
+    /// build modes: in debug the drop panics (caught by `catch_unwind`)
+    /// after the increment; in release it just runs. The counter is
+    /// process-wide and monotonic, so we assert a relative increase
+    /// (`>= before + 1`) to stay robust against other tests dropping
+    /// unstamped tokens concurrently.
+    #[test]
+    fn footer_pending_crc_drop_increments_release_counter() {
+        let dev = test_device();
+        let base_ptr_addr = dev.as_raw_ptr().expect("memory device must expose raw_ptr") as usize;
+        let mut meta = TxMetadata::new(1);
+        meta.tx_id = [0x44; 32];
+        meta.fee = 3;
+        let slots = vec![UtxoSlot::new_unspent([0xEE; 32])];
+        write_full_record(&*dev, 0, &meta, &slots).unwrap();
+
+        let before = footer_crc_drop_count();
+
+        // `catch_unwind` covers both modes: debug drop panics after the
+        // counter bump; release drop returns normally.
+        let _ = std::panic::catch_unwind(|| {
+            // SAFETY: `base_ptr` valid for METADATA_SIZE; this thread
+            // holds no concurrent reader/writer on offset 0.
+            let token =
+                unsafe { write_mutation_footer_pending_crc(base_ptr_addr as *mut u8, 0, &meta) };
+            // Intentionally drop without stamping.
+            drop(token);
+        });
+
+        let after = footer_crc_drop_count();
+        assert!(
+            after >= before + 1,
+            "unstamped FooterPendingCrc drop must increment the release-build \
+             observability counter (before={before}, after={after})",
+        );
+    }
+
     /// F-G1-002 typestate: the happy path. Constructing the token,
     /// stamping the CRC, and reading the metadata back must round-trip
     /// the post-mutation field values with a valid CRC.
