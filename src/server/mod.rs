@@ -171,6 +171,43 @@ impl Drop for ConnectionState {
     }
 }
 
+/// Per-source-IP connection counter shared with the accept loop.
+///
+/// Maps the peer's [`std::net::IpAddr`] (NOT `SocketAddr` — the source port
+/// changes on every connection, the IP does not) to the number of
+/// currently-active connections from that IP. Used to enforce
+/// [`ServerConfig::max_connections_per_ip`] before a per-connection thread
+/// is spawned.
+pub(crate) type PerIpCounter = Arc<Mutex<HashMap<std::net::IpAddr, usize>>>;
+
+/// RAII guard that decrements the per-IP connection counter exactly once
+/// when the connection thread exits.
+///
+/// The accept loop increments the counter when a connection is admitted
+/// and constructs this guard, which it moves into the spawned
+/// per-connection thread. Whether the thread exits normally, returns
+/// `Err`, or panics, the guard's `Drop` impl removes the connection from
+/// the per-IP tally — preventing the count from leaking over the
+/// lifetime of the process.
+pub(crate) struct PerIpGuard {
+    counter: PerIpCounter,
+    ip: std::net::IpAddr,
+}
+
+impl Drop for PerIpGuard {
+    fn drop(&mut self) {
+        let mut map = self.counter.lock();
+        if let Some(count) = map.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            // GC empty entries so a never-returning attacker can't grow
+            // the map without bound.
+            if *count == 0 {
+                map.remove(&self.ip);
+            }
+        }
+    }
+}
+
 /// Running TeraSlab server instance.
 pub struct Server {
     engine: Arc<Engine>,
@@ -180,6 +217,10 @@ pub struct Server {
     blob_store: Option<Arc<dyn BlobStore>>,
     shutdown: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
+    /// Per-source-IP connection counter for DoS-resistance against a
+    /// single hostile peer pinning all `max_connections` slots with
+    /// slow-loris reads. See [`PerIpCounter`].
+    connections_per_ip: PerIpCounter,
     inflight_request_bytes: Arc<InflightBytesLimiter>,
     /// P1.2: mio `Waker` that, when triggered, wakes the accept-loop
     /// poller (kqueue on macOS / epoll on Linux). Populated by
@@ -203,6 +244,7 @@ impl Server {
             blob_store: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            connections_per_ip: Arc::new(Mutex::new(HashMap::new())),
             inflight_request_bytes,
             shutdown_waker: Mutex::new(None),
         }
@@ -354,6 +396,46 @@ impl Server {
                         // seconds back to single-digit milliseconds with
                         // this on.
                         let _ = stream.set_nodelay(true);
+
+                        // Per-source-IP cap (DoS hardening). Enforced
+                        // BEFORE the global cap, BEFORE any frame
+                        // parsing, and BEFORE any bytes are written to
+                        // the socket. A single hostile peer that drains
+                        // its quota gets a silent close — no per-reject
+                        // frame is sent because writing one would let
+                        // the attacker measure the cap and slow-loris
+                        // around it.
+                        //
+                        // `max_connections_per_ip == 0` disables the
+                        // cap (operators behind a single egress NAT may
+                        // legitimately need this).
+                        let per_ip_guard = if self.config.max_connections_per_ip > 0 {
+                            let peer_ip = addr.ip();
+                            let mut map = self.connections_per_ip.lock();
+                            let count = map.entry(peer_ip).or_insert(0);
+                            if *count >= self.config.max_connections_per_ip {
+                                let observed = *count;
+                                drop(map);
+                                tracing::info!(
+                                    peer_addr = %addr,
+                                    peer_ip = %peer_ip,
+                                    count = observed,
+                                    limit = self.config.max_connections_per_ip,
+                                    "rejecting connection: per-IP cap reached",
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                            *count += 1;
+                            drop(map);
+                            Some(PerIpGuard {
+                                counter: self.connections_per_ip.clone(),
+                                ip: peer_ip,
+                            })
+                        } else {
+                            None
+                        };
+
                         let active = self.active_connections.load(Ordering::Relaxed);
                         if active >= self.config.max_connections {
                             tracing::warn!(peer_addr = %addr, active, "rejecting connection: max connections reached");
@@ -368,6 +450,11 @@ impl Server {
                             };
                             let _ = stream.write_all(&response.encode());
                             drop(stream);
+                            // `per_ip_guard` drops here, releasing the
+                            // slot we reserved a moment ago — the
+                            // global-cap reject must not leak per-IP
+                            // count.
+                            drop(per_ip_guard);
                             continue;
                         }
 
@@ -394,7 +481,16 @@ impl Server {
                         // remains `false` (trusted-overlay) per FIX_POLICY §2.
                         let strict_auth = self.config.strict_auth;
 
+                        // Move the per-IP guard into the spawned
+                        // thread so its `Drop` runs exactly once when
+                        // the connection thread exits (normal return,
+                        // error, or panic). This is the RAII half of
+                        // the per-IP accounting — the increment
+                        // happened in the accept loop above; the
+                        // decrement happens here.
+                        let per_ip_guard_moved = per_ip_guard;
                         std::thread::spawn(move || {
+                            let _per_ip_guard = per_ip_guard_moved;
                             if let Err(e) = handle_connection_inner(
                                 stream,
                                 &engine,
@@ -415,6 +511,7 @@ impl Server {
                                 tracing::warn!(peer_addr = %addr, err = %e, "connection error");
                             }
                             active_conns.fetch_sub(1, Ordering::Relaxed);
+                            // `_per_ip_guard` drops here.
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {

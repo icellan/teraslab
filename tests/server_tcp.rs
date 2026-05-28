@@ -2193,3 +2193,223 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
 
     server.shutdown();
 }
+
+/// Spin up a server with `max_connections_per_ip` set to the given value
+/// (other limits left at safe defaults) and return `(server, port)`.
+fn start_test_server_with_max_per_ip(max_per_ip: usize) -> (Arc<Server>, u16) {
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+    let alloc = SlotAllocator::new(dev.clone()).unwrap();
+    let index = Index::new(10_000).unwrap();
+    let engine = Arc::new(Engine::new(
+        dev,
+        index,
+        alloc,
+        StripedLocks::new(1024),
+        DahIndex::new(),
+        UnminedIndex::new(),
+    ));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let config = ServerConfig {
+        listen_addr: format!("127.0.0.1:{port}"),
+        max_connections: 1024,
+        max_connections_per_ip: max_per_ip,
+        max_batch_size: 8192,
+        ..Default::default()
+    };
+
+    let server = Arc::new(Server::new(engine, config));
+    let server_clone = server.clone();
+
+    std::thread::spawn(move || {
+        server_clone.run().unwrap();
+    });
+
+    // Wait for the server to bind + start its accept loop.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    (server, port)
+}
+
+/// DoS hardening: the per-source-IP connection cap rejects connections
+/// from an IP that already holds `max_connections_per_ip` connections.
+///
+/// Before the fix, a single attacker IP could pin all `max_connections`
+/// slots with slow-loris reads. This test asserts:
+///
+/// 1. The first `N` connections from a single IP are admitted.
+/// 2. Connection `N+1` from the same IP is rejected: the server closes
+///    the socket without writing any response bytes (a silent close so
+///    the attacker cannot measure the cap and slow-loris around it).
+/// 3. Closing one of the admitted connections frees a per-IP slot so the
+///    next connect from the same IP succeeds — the RAII decrement is
+///    correctly tied to the connection lifetime.
+#[test]
+fn per_ip_connection_cap_rejects_excess_and_recovers_on_close() {
+    const MAX_PER_IP: usize = 4;
+    let (server, port) = start_test_server_with_max_per_ip(MAX_PER_IP);
+    let addr = format!("127.0.0.1:{port}");
+
+    // 1. Open MAX_PER_IP connections from the same IP. Each must be
+    //    accepted by the server. We send a ping on each to confirm the
+    //    server is actually servicing the connection (rather than the
+    //    OS having only completed the TCP handshake).
+    let mut conns: Vec<TcpStream> = Vec::with_capacity(MAX_PER_IP);
+    for i in 0..MAX_PER_IP {
+        let mut stream = TcpStream::connect(&addr)
+            .unwrap_or_else(|e| panic!("connect {i} failed: {e}"));
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let ping = RequestFrame {
+            request_id: 100 + i as u64,
+            op_code: OP_PING,
+            flags: 0,
+            payload: Vec::new().into(),
+        };
+        stream.write_all(&ping.encode()).unwrap();
+        let resp = read_response_or_panic(&mut stream);
+        assert_eq!(
+            resp.request_id,
+            100 + i as u64,
+            "ping {i} on connection within per-IP cap should be served",
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        conns.push(stream);
+    }
+
+    // 2. The next connect from the same IP must be rejected. The server
+    //    closes the socket without writing any response bytes, so the
+    //    client either gets an error on write, or a 0-byte read on its
+    //    first attempt to read the response. Either is a valid
+    //    silent-close signal.
+    let mut over_quota = TcpStream::connect(&addr)
+        .expect("TCP connect itself should succeed — the listener still accepts");
+    over_quota
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    over_quota
+        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+
+    let ping_over = RequestFrame {
+        request_id: 999,
+        op_code: OP_PING,
+        flags: 0,
+        payload: Vec::new().into(),
+    };
+    // Writing may or may not succeed depending on how fast the server
+    // closes the socket. What matters is that the read returns 0 bytes
+    // (clean close, no response frame written).
+    let _ = over_quota.write_all(&ping_over.encode());
+
+    let mut buf = [0u8; 64];
+    let n = over_quota.read(&mut buf).unwrap_or(0);
+    assert_eq!(
+        n, 0,
+        "over-quota connection should be silently closed with no bytes written, \
+         but read {n} bytes: {:?}",
+        &buf[..n.min(buf.len())],
+    );
+    drop(over_quota);
+
+    // 3. Close one of the admitted connections; the per-IP guard's Drop
+    //    impl should release one slot. After the server reaps the
+    //    closed connection, the next connect from the same IP must
+    //    succeed.
+    let dropped = conns.pop().unwrap();
+    drop(dropped);
+
+    // Poll until the server reaps the closed connection and frees a
+    // per-IP slot. The reap is driven by the per-connection thread
+    // returning from `read_exact` with a clean EOF, which runs the
+    // `PerIpGuard::drop`.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let recovered_stream = loop {
+        if let Ok(mut s) = TcpStream::connect(&addr) {
+            s.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            let ping_post = RequestFrame {
+                request_id: 4242,
+                op_code: OP_PING,
+                flags: 0,
+                payload: Vec::new().into(),
+            };
+            if s.write_all(&ping_post.encode()).is_ok() {
+                let mut head = [0u8; 4];
+                if s.peek(&mut head).is_ok() && head != [0u8; 4] {
+                    break s;
+                }
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "after closing one slot, a new connection from the same IP \
+                 still could not get served within 3 s — per-IP guard Drop \
+                 is not decrementing the counter",
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let mut s = recovered_stream;
+    let resp = read_response_or_panic(&mut s);
+    assert_eq!(resp.request_id, 4242, "post-recovery ping must be served");
+    assert_eq!(resp.status, STATUS_OK);
+
+    server.shutdown();
+}
+
+/// Read a single `ResponseFrame` from the stream, panicking on I/O error
+/// or short read. Used by per-IP cap tests where the connection should be
+/// healthy.
+fn read_response_or_panic(stream: &mut TcpStream) -> ResponseFrame {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).expect("read response length");
+    let total_length = u32::from_le_bytes(len_buf) as usize;
+    let mut body = vec![0u8; total_length];
+    stream.read_exact(&mut body).expect("read response body");
+    let mut full = Vec::with_capacity(4 + total_length);
+    full.extend_from_slice(&len_buf);
+    full.extend_from_slice(&body);
+    let (response, _) = ResponseFrame::decode(&full).expect("decode response");
+    response
+}
+
+/// `max_connections_per_ip = 0` disables the per-IP cap.
+///
+/// Operators behind a single egress NAT need this escape hatch — without
+/// it they cannot run more than `max_connections_per_ip` clients through
+/// the same outbound IP. The disabled path must NOT touch the per-IP map
+/// at all (verified indirectly: many connections from the same IP all
+/// succeed, exceeding any reasonable cap).
+#[test]
+fn per_ip_connection_cap_disabled_when_set_to_zero() {
+    const NUM_CONNS: usize = 16; // well above any plausible default cap
+    let (server, port) = start_test_server_with_max_per_ip(0);
+    let addr = format!("127.0.0.1:{port}");
+
+    let mut conns: Vec<TcpStream> = Vec::with_capacity(NUM_CONNS);
+    for i in 0..NUM_CONNS {
+        let mut stream = TcpStream::connect(&addr)
+            .unwrap_or_else(|e| panic!("connect {i} failed: {e}"));
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let ping = RequestFrame {
+            request_id: 200 + i as u64,
+            op_code: OP_PING,
+            flags: 0,
+            payload: Vec::new().into(),
+        };
+        stream.write_all(&ping.encode()).unwrap();
+        let resp = read_response_or_panic(&mut stream);
+        assert_eq!(resp.request_id, 200 + i as u64);
+        assert_eq!(resp.status, STATUS_OK, "conn {i}: per-IP cap disabled but request failed");
+        conns.push(stream);
+    }
+
+    server.shutdown();
+}

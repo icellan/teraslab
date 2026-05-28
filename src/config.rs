@@ -442,6 +442,24 @@ pub struct ServerConfig {
     /// Maximum concurrent client connections.
     pub max_connections: usize,
 
+    /// Maximum concurrent client connections from a single source IP.
+    ///
+    /// Before this cap existed, a single attacker IP could pin all
+    /// `max_connections` slots with slow-loris reads and starve every
+    /// other client. The accept loop now tracks connection counts per
+    /// source IP and rejects new connections from an IP that already
+    /// holds `max_connections_per_ip` connections — the reject closes
+    /// the socket without spawning a thread or reading any bytes.
+    ///
+    /// The default (64) is comfortably above what a legitimate client
+    /// with connection pooling will open (Teranode-side pools sit at 8
+    /// to 32 connections) but well below the global cap, so a single
+    /// hostile peer can never drown out the rest of the fleet. Operators
+    /// who run all clients behind a single egress NAT may need to raise
+    /// this; setting it to `0` disables per-IP enforcement entirely (not
+    /// recommended outside trusted overlay networks).
+    pub max_connections_per_ip: usize,
+
     /// Maximum cumulative payload bytes accepted for one streaming blob
     /// upload on a single connection before the stream is aborted.
     pub max_stream_total_bytes: u64,
@@ -684,6 +702,7 @@ impl Default for ServerConfig {
             lock_stripes: 65536,
             max_batch_size: 8192,
             max_connections: 1024,
+            max_connections_per_ip: 64,
             max_stream_total_bytes: Self::DEFAULT_MAX_STREAM_TOTAL_BYTES,
             max_inflight_request_bytes: 256 * 1024 * 1024,
             http_listen_addr: "127.0.0.1:9100".to_string(),
@@ -1483,6 +1502,7 @@ backend = ""
         assert_eq!(cfg.replica_lag_warn_threshold_ops, 10_000);
         assert_eq!(cfg.recovery_missing_primary_tolerance, 65_536);
         assert_eq!(cfg.max_inflight_request_bytes, 256 * 1024 * 1024);
+        assert_eq!(cfg.max_connections_per_ip, 64);
     }
 
     #[test]
