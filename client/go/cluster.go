@@ -156,6 +156,10 @@ func (c *cluster) poolForShard(shard uint16) (*connPool, error) {
 // Returns the pool for the target node and triggers an async refresh.
 func (c *cluster) handleRedirect(addr string) (*connPool, error) {
 	c.mu.Lock()
+	if c.pools == nil {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("cluster closed")
+	}
 	// Check if we already have a pool for this address.
 	if nodeID, ok := c.addrToNode[addr]; ok {
 		if pool, ok := c.pools[nodeID]; ok {
@@ -212,8 +216,14 @@ func (c *cluster) refreshPartitionMap(ctx context.Context) error {
 		}
 		c.partMap.Store(pm)
 
-		// Update pools for new nodes.
+		// Update pools for new nodes. Skip if the cluster has been closed
+		// (closeAllPools sets c.pools = nil), which races against in-flight
+		// tryRefresh goroutines started by handleRedirect.
 		c.mu.Lock()
+		if c.pools == nil {
+			c.mu.Unlock()
+			return nil
+		}
 		for _, node := range pm.Nodes {
 			if _, ok := c.pools[node.ID]; !ok {
 				c.pools[node.ID] = newPool(node.Addr, c.config.PoolConfig)

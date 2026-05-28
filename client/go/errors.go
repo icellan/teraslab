@@ -55,6 +55,20 @@ func (e *RedirectError) Error() string {
 	return fmt.Sprintf("redirect to %s", e.Addr)
 }
 
+// TooManyRedirectsError is returned when the cluster-mode redirect retry
+// loop exceeds ClusterConfig.MaxRedirects. The most likely causes are:
+// (1) a stale partition map combined with a slow refresh, (2) a routing
+// loop on the server side, or (3) MaxRedirects set too low for a churning
+// cluster. LastAddr is the final redirect target the client was pointed at.
+type TooManyRedirectsError struct {
+	Hops     int
+	LastAddr string
+}
+
+func (e *TooManyRedirectsError) Error() string {
+	return fmt.Sprintf("too many redirects: %d hops, last addr=%s", e.Hops, e.LastAddr)
+}
+
 // NotFoundError indicates the requested record was not found (response status = 2).
 type NotFoundError struct{}
 

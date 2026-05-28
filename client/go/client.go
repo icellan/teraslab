@@ -96,24 +96,6 @@ func (c *Client) getConn(ctx context.Context) (*pipeConn, error) {
 	return nil, fmt.Errorf("no default pool in cluster mode; use txid-routed methods")
 }
 
-func (c *Client) getConnForTxID(ctx context.Context, txid TxID) (*pipeConn, error) {
-	if c.cluster != nil {
-		pool, err := c.cluster.poolForTxID(txid)
-		if err != nil {
-			return nil, err
-		}
-		return pool.get(ctx)
-	}
-	return c.pool.get(ctx)
-}
-
-func (c *Client) getConnForAnyTxID(ctx context.Context, txids []TxID) (*pipeConn, error) {
-	if c.cluster != nil && len(txids) > 0 {
-		return c.getConnForTxID(ctx, txids[0])
-	}
-	return c.getConn(ctx)
-}
-
 // sendAndRecycle sends a request using a pooled payload buffer, then returns
 // the buffer to the pool after the write is complete.
 func (c *Client) sendAndRecycle(ctx context.Context, conn *pipeConn, opCode uint16, payload []byte) (responseFrame, error) {
@@ -121,6 +103,96 @@ func (c *Client) sendAndRecycle(ctx context.Context, conn *pipeConn, opCode uint
 	putBuf(payload)
 	return resp, err
 }
+
+// maxRedirectsFor returns the configured per-request redirect cap.
+// Defaults to 3 when ClusterConfig.MaxRedirects is not set.
+func (c *Client) maxRedirectsFor() int {
+	if c.cluster == nil {
+		return 0
+	}
+	n := c.cluster.config.MaxRedirects
+	if n <= 0 {
+		return 3
+	}
+	return n
+}
+
+// txidRoutedRoundTrip performs a roundTrip routed by txid in cluster mode,
+// transparently following StatusRedirect replies up to MaxRedirects. The
+// payload is owned by the caller (typically a pooled getBuf slice) and is
+// re-sent verbatim on each redirect attempt.
+//
+// On success it returns the final responseFrame as-is; the caller is
+// responsible for status-handling and payload recycling exactly as before.
+// If the redirect chain exceeds MaxRedirects, returns *TooManyRedirectsError.
+//
+// In single-node mode (c.cluster == nil) it falls back to a single round trip
+// against the default pool and does NOT follow redirects — single-node
+// callers historically receive *RedirectError directly, and that contract
+// is preserved.
+func (c *Client) txidRoutedRoundTrip(ctx context.Context, txid TxID, opCode uint16, payload []byte) (responseFrame, error) {
+	if c.cluster == nil {
+		conn, err := c.getConn(ctx)
+		if err != nil {
+			return responseFrame{}, err
+		}
+		return conn.roundTrip(ctx, opCode, 0, payload)
+	}
+
+	pool, err := c.cluster.poolForTxID(txid)
+	if err != nil {
+		return responseFrame{}, err
+	}
+	return c.followRedirects(ctx, pool, opCode, payload)
+}
+
+// followRedirects sends a request to pool and, while the server replies with
+// StatusRedirect, refreshes the partition map and retries against the new
+// owner up to MaxRedirects times. Each retry recycles the previous redirect
+// reply payload before issuing the next request.
+//
+// Cluster mode only; single-node callers must not invoke this.
+func (c *Client) followRedirects(ctx context.Context, pool *connPool, opCode uint16, payload []byte) (responseFrame, error) {
+	if c.cluster == nil {
+		// Defensive: single-node mode should never reach here, but if it does
+		// we issue a single round-trip and bubble any redirect verbatim.
+		conn, err := pool.get(ctx)
+		if err != nil {
+			return responseFrame{}, err
+		}
+		return conn.roundTrip(ctx, opCode, 0, payload)
+	}
+	maxHops := c.maxRedirectsFor()
+	lastAddr := ""
+	for hop := 0; hop <= maxHops; hop++ {
+		conn, err := pool.get(ctx)
+		if err != nil {
+			return responseFrame{}, err
+		}
+		resp, err := conn.roundTrip(ctx, opCode, 0, payload)
+		if err != nil {
+			return responseFrame{}, err
+		}
+		if resp.Status != StatusRedirect {
+			return resp, nil
+		}
+		// Decode the redirect target, recycle the response payload, and route
+		// the next attempt to the new owner.
+		addr, decErr := decodeRedirect(resp.Payload)
+		recyclePayload(resp.Payload)
+		if decErr != nil {
+			return responseFrame{}, fmt.Errorf("decode redirect: %w", decErr)
+		}
+		lastAddr = addr
+		newPool, hrErr := c.cluster.handleRedirect(addr)
+		if hrErr != nil {
+			return responseFrame{}, fmt.Errorf("handle redirect to %s: %w", addr, hrErr)
+		}
+		pool = newPool
+	}
+	return responseFrame{}, &TooManyRedirectsError{Hops: maxHops, LastAddr: lastAddr}
+}
+
 
 func handleMutationResponse(resp responseFrame) (*BatchResult, error) {
 	defer recyclePayload(resp.Payload)
@@ -276,12 +348,8 @@ func (c *Client) spendBatchCluster(ctx context.Context, params SpendBatchParams,
 		for _, g := range groups {
 			buf := getBuf(spendBatchSize(len(g.items)))
 			payload := encodeSpendBatch(buf, params, g.items)
-			conn, err := g.pool.get(ctx)
-			if err != nil {
-				putBuf(payload)
-				return nil, err
-			}
-			resp, err := c.sendAndRecycle(ctx, conn, OpSpendBatch, payload)
+			resp, err := c.followRedirects(ctx, g.pool, OpSpendBatch, payload)
+			putBuf(payload)
 			if err != nil {
 				return nil, err
 			}
@@ -306,15 +374,8 @@ func (c *Client) spendBatchCluster(ctx context.Context, params SpendBatchParams,
 			defer wg.Done()
 			buf := getBuf(spendBatchSize(len(g.items)))
 			payload := encodeSpendBatch(buf, params, g.items)
-			conn, err := g.pool.get(ctx)
-			if err != nil {
-				putBuf(payload)
-				mu.Lock()
-				results = append(results, subResult{err: err, group: g})
-				mu.Unlock()
-				return
-			}
-			resp, err := c.sendAndRecycle(ctx, conn, OpSpendBatch, payload)
+			resp, err := c.followRedirects(ctx, g.pool, OpSpendBatch, payload)
+			putBuf(payload)
 			if err != nil {
 				mu.Lock()
 				results = append(results, subResult{err: err, group: g})
@@ -413,6 +474,8 @@ func remapBatchErrors(errs []BatchItemError, indexMap []int) []BatchItemError {
 }
 
 // sendTxIDBatch is a helper for cluster-aware txid-list batch operations.
+// In cluster mode each shard's sub-batch follows StatusRedirect replies up
+// to MaxRedirects.
 func (c *Client) sendTxIDBatch(ctx context.Context, opCode uint16, txids []TxID, encodePayload func([]byte, []TxID) []byte) (*BatchResult, error) {
 	if c.cluster != nil {
 		return c.sendTxIDBatchCluster(ctx, opCode, txids, encodePayload)
@@ -436,18 +499,27 @@ func (c *Client) sendTxIDBatchCluster(ctx context.Context, opCode uint16, txids 
 	if groups == nil || len(groups) <= 1 {
 		buf := getBuf(4 + 16 + len(txids)*32)
 		payload := encodePayload(buf, txids)
-		conn, err := c.getConn(ctx)
-		if err != nil {
-			for _, g := range groups {
-				conn, err = g.pool.get(ctx)
-				if err != nil {
-					putBuf(payload)
-					return nil, err
-				}
+		// Pick a pool — either the single group's pool or any seed.
+		var pool *connPool
+		for _, g := range groups {
+			pool = g.pool
+			break
+		}
+		if pool == nil {
+			// No groups (empty txids); fall back to any pool for the request.
+			c.cluster.mu.RLock()
+			for _, p := range c.cluster.pools {
+				pool = p
 				break
 			}
+			c.cluster.mu.RUnlock()
+			if pool == nil {
+				putBuf(payload)
+				return nil, fmt.Errorf("no pools available")
+			}
 		}
-		resp, err := c.sendAndRecycle(ctx, conn, opCode, payload)
+		resp, err := c.followRedirects(ctx, pool, opCode, payload)
+		putBuf(payload)
 		if err != nil {
 			return nil, err
 		}
@@ -473,15 +545,7 @@ func (c *Client) sendTxIDBatchCluster(ctx context.Context, opCode uint16, txids 
 			}
 			buf := getBuf(4 + 16 + len(subTxids)*32)
 			payload := encodePayload(buf, subTxids)
-			conn, err := g.pool.get(ctx)
-			if err != nil {
-				putBuf(payload)
-				mu.Lock()
-				results = append(results, subResult{err: err, idxMap: idxMap})
-				mu.Unlock()
-				return
-			}
-			resp, err := conn.roundTrip(ctx, opCode, 0, payload)
+			resp, err := c.followRedirects(ctx, g.pool, opCode, payload)
 			putBuf(payload)
 			if err != nil {
 				mu.Lock()
@@ -513,38 +577,91 @@ func (c *Client) sendTxIDBatchCluster(ctx context.Context, opCode uint16, txids 
 	return &BatchResult{}, nil
 }
 
-// UnspendBatch sends a batch unspend request.
+// UnspendBatch sends a batch unspend request. In cluster mode the call
+// follows StatusRedirect replies up to MaxRedirects.
 func (c *Client) UnspendBatch(ctx context.Context, params UnspendBatchParams, items []UnspendItem) (*BatchResult, error) {
 	buf := getBuf(unspendBatchSize(len(items)))
 	payload := encodeUnspendBatch(buf, params, items)
-	var conn *pipeConn
-	var err error
-	if c.cluster != nil && len(items) > 0 {
-		conn, err = c.getConnForTxID(ctx, items[0].TxID)
-	} else {
-		conn, err = c.getConn(ctx)
-	}
-	if err != nil {
-		putBuf(payload)
-		return nil, err
-	}
-	resp, err := c.sendAndRecycle(ctx, conn, OpUnspendBatch, payload)
+	resp, err := c.roundTripWithFirstTxID(ctx, OpUnspendBatch, payload, txidOfUnspendItems(items))
+	putBuf(payload)
 	if err != nil {
 		return nil, err
 	}
 	return handleMutationResponse(resp)
 }
 
-// SetMinedBatch marks transactions as mined in a specific block.
+// roundTripWithFirstTxID dispatches a single-payload request using the given
+// txid for cluster routing (if present) and follows redirects. When txid is
+// the zero value, it routes via the default single-node pool path.
+//
+// In cluster mode with a nil/empty txid, the request is sent to an arbitrary
+// node; the caller should provide a real txid for correct routing.
+func (c *Client) roundTripWithFirstTxID(ctx context.Context, opCode uint16, payload []byte, txid *TxID) (responseFrame, error) {
+	if c.cluster != nil && txid != nil {
+		return c.txidRoutedRoundTrip(ctx, *txid, opCode, payload)
+	}
+	conn, err := c.getConn(ctx)
+	if err != nil {
+		return responseFrame{}, err
+	}
+	return conn.roundTrip(ctx, opCode, 0, payload)
+}
+
+func txidOfUnspendItems(items []UnspendItem) *TxID {
+	if len(items) == 0 {
+		return nil
+	}
+	t := items[0].TxID
+	return &t
+}
+
+func txidOfFreezeItems(items []FreezeItem) *TxID {
+	if len(items) == 0 {
+		return nil
+	}
+	t := items[0].TxID
+	return &t
+}
+
+func txidOfReassignItems(items []ReassignItem) *TxID {
+	if len(items) == 0 {
+		return nil
+	}
+	t := items[0].TxID
+	return &t
+}
+
+func txidOfCreateItems(items []CreateItem) *TxID {
+	if len(items) == 0 {
+		return nil
+	}
+	t := items[0].TxID
+	return &t
+}
+
+func txidOfGetSpendItems(items []GetSpendItem) *TxID {
+	if len(items) == 0 {
+		return nil
+	}
+	t := items[0].TxID
+	return &t
+}
+
+func firstTxID(txids []TxID) *TxID {
+	if len(txids) == 0 {
+		return nil
+	}
+	t := txids[0]
+	return &t
+}
+
+// SetMinedBatch marks transactions as mined in a specific block. Follows
+// StatusRedirect replies in cluster mode up to MaxRedirects.
 func (c *Client) SetMinedBatch(ctx context.Context, params SetMinedBatchParams, txids []TxID) (*SpendBatchResponse, error) {
 	buf := getBuf(26 + len(txids)*32)
 	payload := encodeSetMinedBatch(buf, params, txids)
-	conn, err := c.getConnForAnyTxID(ctx, txids)
-	if err != nil {
-		putBuf(payload)
-		return nil, err
-	}
-	resp, err := c.sendAndRecycle(ctx, conn, OpSetMinedBatch, payload)
+	resp, err := c.roundTripWithFirstTxID(ctx, OpSetMinedBatch, payload, firstTxID(txids))
+	putBuf(payload)
 	if err != nil {
 		return nil, err
 	}
@@ -567,17 +684,8 @@ func (c *Client) CreateBatch(ctx context.Context, items []CreateItem) (*BatchRes
 
 	buf := getBuf(4 + len(items)*128)
 	payload := encodeCreateBatch(buf, items)
-	var conn *pipeConn
-	if c.cluster != nil && len(items) > 0 {
-		conn, err = c.getConnForTxID(ctx, items[0].TxID)
-	} else {
-		conn, err = c.getConn(ctx)
-	}
-	if err != nil {
-		putBuf(payload)
-		return nil, err
-	}
-	resp, err := c.sendAndRecycle(ctx, conn, OpCreateBatch, payload)
+	resp, err := c.roundTripWithFirstTxID(ctx, OpCreateBatch, payload, txidOfCreateItems(items))
+	putBuf(payload)
 	if err != nil {
 		return nil, err
 	}
@@ -627,8 +735,9 @@ func (c *Client) uploadLargeBlobs(ctx context.Context, items []CreateItem) ([]Cr
 // uploadBlob uploads large cold_data in chunks via OP_STREAM_CHUNK / OP_STREAM_END.
 // All chunks are sent to the shard master for the given txid. Each chunk is
 // sent as an independent request-response round trip; the server accumulates
-// them keyed by txid.
+// them keyed by txid. Follows StatusRedirect in cluster mode.
 func (c *Client) uploadBlob(ctx context.Context, txid TxID, data []byte) error {
+	t := txid // local copy for firstTxID-style pointer
 	var offset uint64
 	for offset < uint64(len(data)) {
 		end := offset + BlobChunkSize
@@ -639,13 +748,8 @@ func (c *Client) uploadBlob(ctx context.Context, txid TxID, data []byte) error {
 
 		buf := getBuf(32 + 8 + 4 + len(chunk))
 		payload := encodeStreamChunk(buf, txid, offset, chunk)
-
-		conn, err := c.connForBlob(ctx, txid)
-		if err != nil {
-			putBuf(payload)
-			return err
-		}
-		resp, err := c.sendAndRecycle(ctx, conn, OpStreamChunk, payload)
+		resp, err := c.roundTripWithFirstTxID(ctx, OpStreamChunk, payload, &t)
+		putBuf(payload)
 		if err != nil {
 			return fmt.Errorf("stream chunk at offset %d: %w", offset, err)
 		}
@@ -665,12 +769,8 @@ func (c *Client) uploadBlob(ctx context.Context, txid TxID, data []byte) error {
 	// Finalize the upload.
 	buf := getBuf(40)
 	payload := encodeStreamEnd(buf, txid, uint64(len(data)))
-	conn, err := c.connForBlob(ctx, txid)
-	if err != nil {
-		putBuf(payload)
-		return err
-	}
-	resp, err := c.sendAndRecycle(ctx, conn, OpStreamEnd, payload)
+	resp, err := c.roundTripWithFirstTxID(ctx, OpStreamEnd, payload, &t)
+	putBuf(payload)
 	if err != nil {
 		return fmt.Errorf("stream end: %w", err)
 	}
@@ -687,74 +787,37 @@ func (c *Client) uploadBlob(ctx context.Context, txid TxID, data []byte) error {
 	return nil
 }
 
-// connForBlob returns a connection routed to the correct node for the given txid.
-func (c *Client) connForBlob(ctx context.Context, txid TxID) (*pipeConn, error) {
-	if c.cluster != nil {
-		return c.getConnForTxID(ctx, txid)
-	}
-	return c.getConn(ctx)
-}
-
-// FreezeBatch freezes specific UTXO slots.
+// FreezeBatch freezes specific UTXO slots. Follows StatusRedirect in cluster mode.
 func (c *Client) FreezeBatch(ctx context.Context, items []FreezeItem) (*BatchResult, error) {
 	buf := getBuf(4 + len(items)*68)
 	payload := encodeSlotItemBatch(buf, items)
-	var conn *pipeConn
-	var err error
-	if c.cluster != nil && len(items) > 0 {
-		conn, err = c.getConnForTxID(ctx, items[0].TxID)
-	} else {
-		conn, err = c.getConn(ctx)
-	}
-	if err != nil {
-		putBuf(payload)
-		return nil, err
-	}
-	resp, err := c.sendAndRecycle(ctx, conn, OpFreezeBatch, payload)
+	resp, err := c.roundTripWithFirstTxID(ctx, OpFreezeBatch, payload, txidOfFreezeItems(items))
+	putBuf(payload)
 	if err != nil {
 		return nil, err
 	}
 	return handleMutationResponse(resp)
 }
 
-// UnfreezeBatch unfreezes specific UTXO slots.
+// UnfreezeBatch unfreezes specific UTXO slots. Follows StatusRedirect in cluster mode.
 func (c *Client) UnfreezeBatch(ctx context.Context, items []FreezeItem) (*BatchResult, error) {
 	buf := getBuf(4 + len(items)*68)
 	payload := encodeSlotItemBatch(buf, items)
-	var conn *pipeConn
-	var err error
-	if c.cluster != nil && len(items) > 0 {
-		conn, err = c.getConnForTxID(ctx, items[0].TxID)
-	} else {
-		conn, err = c.getConn(ctx)
-	}
-	if err != nil {
-		putBuf(payload)
-		return nil, err
-	}
-	resp, err := c.sendAndRecycle(ctx, conn, OpUnfreezeBatch, payload)
+	resp, err := c.roundTripWithFirstTxID(ctx, OpUnfreezeBatch, payload, txidOfFreezeItems(items))
+	putBuf(payload)
 	if err != nil {
 		return nil, err
 	}
 	return handleMutationResponse(resp)
 }
 
-// ReassignBatch reassigns frozen UTXO slots with new hashes.
+// ReassignBatch reassigns frozen UTXO slots with new hashes. Follows
+// StatusRedirect in cluster mode.
 func (c *Client) ReassignBatch(ctx context.Context, params ReassignBatchParams, items []ReassignItem) (*BatchResult, error) {
 	buf := getBuf(12 + len(items)*100)
 	payload := encodeReassignBatch(buf, params, items)
-	var conn *pipeConn
-	var err error
-	if c.cluster != nil && len(items) > 0 {
-		conn, err = c.getConnForTxID(ctx, items[0].TxID)
-	} else {
-		conn, err = c.getConn(ctx)
-	}
-	if err != nil {
-		putBuf(payload)
-		return nil, err
-	}
-	resp, err := c.sendAndRecycle(ctx, conn, OpReassignBatch, payload)
+	resp, err := c.roundTripWithFirstTxID(ctx, OpReassignBatch, payload, txidOfReassignItems(items))
+	putBuf(payload)
 	if err != nil {
 		return nil, err
 	}
@@ -807,12 +870,8 @@ func (c *Client) MarkLongestChainBatch(ctx context.Context, params MarkLongestCh
 func (c *Client) GetBatch(ctx context.Context, fieldMask uint32, txids []TxID) (*GetBatchResult, error) {
 	buf := getBuf(8 + len(txids)*32)
 	payload := encodeGetBatch(buf, fieldMask, txids)
-	conn, err := c.getConnForAnyTxID(ctx, txids)
-	if err != nil {
-		putBuf(payload)
-		return nil, err
-	}
-	resp, err := c.sendAndRecycle(ctx, conn, OpGetBatch, payload)
+	resp, err := c.roundTripWithFirstTxID(ctx, OpGetBatch, payload, firstTxID(txids))
+	putBuf(payload)
 	if err != nil {
 		return nil, err
 	}
@@ -832,6 +891,9 @@ func (c *Client) GetBatch(ctx context.Context, fieldMask uint32, txids []TxID) (
 		}
 		return nil, &ServerError{Code: code, Message: msg}
 	case StatusRedirect:
+		// In cluster mode roundTripWithFirstTxID already follows redirects;
+		// reaching this branch means single-node mode received a redirect or
+		// the redirect cap was exceeded (in which case we returned earlier).
 		addr, err := decodeRedirect(resp.Payload)
 		recyclePayload(resp.Payload)
 		if err != nil {
@@ -844,22 +906,13 @@ func (c *Client) GetBatch(ctx context.Context, fieldMask uint32, txids []TxID) (
 	}
 }
 
-// GetSpendBatch looks up spend status for specific UTXO slots.
+// GetSpendBatch looks up spend status for specific UTXO slots. Follows
+// StatusRedirect in cluster mode up to MaxRedirects.
 func (c *Client) GetSpendBatch(ctx context.Context, items []GetSpendItem) ([]GetSpendResult, error) {
 	buf := getBuf(getSpendBatchSize(len(items)))
 	payload := encodeGetSpendBatch(buf, items)
-	var conn *pipeConn
-	var err error
-	if c.cluster != nil && len(items) > 0 {
-		conn, err = c.getConnForTxID(ctx, items[0].TxID)
-	} else {
-		conn, err = c.getConn(ctx)
-	}
-	if err != nil {
-		putBuf(payload)
-		return nil, err
-	}
-	resp, err := c.sendAndRecycle(ctx, conn, OpGetSpendBatch, payload)
+	resp, err := c.roundTripWithFirstTxID(ctx, OpGetSpendBatch, payload, txidOfGetSpendItems(items))
+	putBuf(payload)
 	if err != nil {
 		return nil, err
 	}
@@ -875,6 +928,13 @@ func (c *Client) GetSpendBatch(ctx context.Context, items []GetSpendItem) ([]Get
 			return nil, fmt.Errorf("decode error: %w", err)
 		}
 		return nil, &ServerError{Code: code, Message: msg}
+	case StatusRedirect:
+		addr, err := decodeRedirect(resp.Payload)
+		recyclePayload(resp.Payload)
+		if err != nil {
+			return nil, fmt.Errorf("decode redirect: %w", err)
+		}
+		return nil, &RedirectError{Addr: addr}
 	default:
 		recyclePayload(resp.Payload)
 		return nil, fmt.Errorf("unexpected status: %d", resp.Status)
@@ -910,15 +970,12 @@ func (c *Client) QueryOldUnmined(ctx context.Context, cutoffHeight uint32) ([]Tx
 }
 
 // PreserveTransactions preserves transactions until the given block height.
+// Follows StatusRedirect in cluster mode.
 func (c *Client) PreserveTransactions(ctx context.Context, blockHeight uint32, txids []TxID) (*BatchResult, error) {
 	buf := getBuf(8 + len(txids)*32)
 	payload := encodePreserveTransactions(buf, blockHeight, txids)
-	conn, err := c.getConnForAnyTxID(ctx, txids)
-	if err != nil {
-		putBuf(payload)
-		return nil, err
-	}
-	resp, err := c.sendAndRecycle(ctx, conn, OpPreserveTransactions, payload)
+	resp, err := c.roundTripWithFirstTxID(ctx, OpPreserveTransactions, payload, firstTxID(txids))
+	putBuf(payload)
 	if err != nil {
 		return nil, err
 	}
