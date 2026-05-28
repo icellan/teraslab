@@ -924,7 +924,7 @@ fn tcp_consistency_verification() {
         let txid = test_txid(1000 + i);
         let key = key_from_txid(txid);
         master_engine
-            .set_locked(&teraslab::ops::remaining::SetLockedRequest {
+            .set_locked_idempotent(&teraslab::ops::remaining::SetLockedRequest {
                 tx_key: key,
                 value: true,
             })

@@ -840,7 +840,7 @@ fn locked_cleared_by_set_mined() {
     let key = create_tx(&engine, 1, 3);
 
     engine
-        .set_locked(&SetLockedRequest {
+        .set_locked_idempotent(&SetLockedRequest {
             tx_key: key,
             value: true,
         })
