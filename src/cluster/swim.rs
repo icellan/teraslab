@@ -46,7 +46,7 @@ const MAX_MSG_SIZE: usize = 4096;
 const PING_REQ_FORWARDING_MAX: usize = 4096;
 
 /// Number of PING_REQ forwarding entries evicted due to the cap in
-/// [`PING_REQ_FORWARDING_MAX`]. Monotonic counter, process-lifetime.
+/// `PING_REQ_FORWARDING_MAX`. Monotonic counter, process-lifetime.
 ///
 /// Thin backward-compat wrapper around
 /// [`crate::metrics::SwimMetrics::swim_ping_req_dropped_total`] (the

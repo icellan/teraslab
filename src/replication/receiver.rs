@@ -488,7 +488,7 @@ pub fn handle_replica_batch(
 /// even when no persistent applied tracker is available.
 ///
 /// Used by [`crate::server::dispatch`] when
-/// [`init_replica_applied_tracker`] has not been called (e.g. test
+/// `init_replica_applied_tracker` has not been called (e.g. test
 /// harnesses, single-stream setups). The tracker remains thread-local
 /// (so parallel tests do not collide on a process-wide high-water
 /// mark) but the cluster-key view propagates from the

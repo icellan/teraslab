@@ -5787,7 +5787,7 @@ impl ResyncSenderHandle {
 ///
 /// Returned by [`RunningCluster::cluster_health`] and serialized over
 /// the wire by the
-/// [`OP_ADMIN_CLUSTER_HEALTH`](crate::protocol::opcodes::OP_ADMIN_CLUSTER_HEALTH)
+/// [`OP_ADMIN_CLUSTER_HEALTH`]
 /// dispatch handler. Clients (and the integration test harness) use it
 /// to refuse seeding against a node that is part of the SWIM
 /// membership but has not yet observed its first quorum-committed
@@ -5834,9 +5834,9 @@ pub enum ClusterHealthSwimState {
 
 impl ClusterHealth {
     /// Wire-encode the snapshot into the
-    /// [`ADMIN_CLUSTER_HEALTH_PAYLOAD_SIZE`](crate::protocol::opcodes::ADMIN_CLUSTER_HEALTH_PAYLOAD_SIZE)
+    /// [`ADMIN_CLUSTER_HEALTH_PAYLOAD_SIZE`]
     /// byte payload returned by the
-    /// [`OP_ADMIN_CLUSTER_HEALTH`](crate::protocol::opcodes::OP_ADMIN_CLUSTER_HEALTH)
+    /// [`OP_ADMIN_CLUSTER_HEALTH`]
     /// dispatch handler.
     pub fn serialize(&self) -> [u8; 17] {
         let mut buf = [0u8; 17];
@@ -6054,7 +6054,7 @@ impl RunningCluster {
     /// Note: when the local shard table is *behind* the committed topology
     /// term (e.g. a freshly-rejoined node), this still returns
     /// [`MasterQueryResult::No`]. That case is handled inside
-    /// [`Self::authoritative_master_for_shard`], which returns `NodeId(0)`
+    /// `Self::authoritative_master_for_shard`, which returns `NodeId(0)`
     /// (a sentinel that never matches `self_id`) so the dispatcher
     /// redirects with `NodeId(0)` and the client refetches its partition
     /// map.
@@ -6651,7 +6651,7 @@ impl RunningCluster {
 
     /// Phase I — point-in-time snapshot of this node's readiness, used
     /// by the
-    /// [`OP_ADMIN_CLUSTER_HEALTH`](crate::protocol::opcodes::OP_ADMIN_CLUSTER_HEALTH)
+    /// [`OP_ADMIN_CLUSTER_HEALTH`]
     /// admin endpoint and by integration tests that pre-flight a node
     /// before seeding records.
     ///

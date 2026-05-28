@@ -56,7 +56,7 @@ const IMPORT_BATCH_SIZE: usize = 4096;
 /// Compute the import-sentinel path derived from the redb primary path.
 ///
 /// The sentinel lives next to the primary redb file with the
-/// [`IMPORT_SENTINEL_SUFFIX`] suffix. Storing it in the same directory
+/// `IMPORT_SENTINEL_SUFFIX` suffix. Storing it in the same directory
 /// keeps the rename / fsync atomic with respect to the redb files
 /// themselves on the typical single-mount deployment, and means an
 /// operator who relocates the redb files automatically relocates the

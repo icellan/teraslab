@@ -350,7 +350,7 @@ impl ShardTable {
     /// preserved.
     ///
     /// Intended to run on a freshly built target table (e.g. immediately
-    /// after [`compute_with_epoch`]) BEFORE [`begin_handoff_with`] is
+    /// after `compute_with_epoch`) BEFORE `begin_handoff_with` is
     /// invoked, so the per-shard `master_subset` flag is computed against
     /// the elected master rather than the round-robin master.
     ///

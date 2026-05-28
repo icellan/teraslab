@@ -140,7 +140,7 @@ pub struct ResyncRequest {
 /// F-G7-018 early-return on majority) moves the transport into a
 /// detached worker thread for the duration of a `replicate_batch`
 /// call. While a straggler worker is still in flight, the slot stays
-/// `None` until [`ReplicationManager::drain_stragglers`] joins it and
+/// `None` until `ReplicationManager::drain_stragglers` joins it and
 /// restores the transport.
 pub struct ReplicaSender {
     transport: Option<Box<dyn ReplicaTransport>>,
@@ -460,7 +460,7 @@ impl ReplicationManager {
     ///
     /// Straggler join handles are retained in `pending_stragglers` so
     /// the next state-mutating call drains them via
-    /// [`Self::drain_stragglers`], applies the late outcome to sender
+    /// `Self::drain_stragglers`, applies the late outcome to sender
     /// state, and restores the transport. This preserves the durable-log
     /// invariant — every assigned sequence eventually reaches every
     /// replica — while removing slow followers from the master's tail

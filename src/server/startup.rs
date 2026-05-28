@@ -41,7 +41,7 @@ use crate::recovery::{RecoveryStats, ReplayCause};
 
 use super::dispatch::SecondaryStatus;
 
-/// Errors raised by [`load_primary_index_*`] when neither restore nor
+/// Errors raised by `load_primary_index_*` when neither restore nor
 /// rebuild can produce a valid primary index.
 ///
 /// Each variant carries the operator-facing context (file path,
@@ -487,7 +487,7 @@ pub enum RedoOpenError {
     },
 }
 
-/// Open or create the redo log at `path` and prepare a [`RedoLog`].
+/// Open or create the redo log at `path` and prepare a [`crate::redo::RedoLog`].
 ///
 /// This is the gap #2 mandatory-redo entry point: any failure surfaces
 /// as a [`RedoOpenError`] that the binary turns into a non-zero exit.

@@ -277,7 +277,7 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts(
 }
 
 /// Full recovery with durable progress markers written every
-/// [`RECOVERY_PROGRESS_INTERVAL_ENTRIES`] safely processed entries and once
+/// `RECOVERY_PROGRESS_INTERVAL_ENTRIES` safely processed entries and once
 /// at the end of the recovered range.
 pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
     device: &dyn BlockDevice,

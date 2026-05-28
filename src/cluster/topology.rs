@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 /// `[0u8; 16]` is the "unset" sentinel — used by single-node test setups and
 /// by pre-orchestrator code paths. When `cluster_id` is unset on either
 /// side of a comparison the check falls back to the
-/// [`TopologyAuthority::committed_voter_ever_seen`] heuristic
+/// `TopologyAuthority::committed_voter_ever_seen` heuristic
 /// (track-and-reject unseen members).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ClusterId(pub [u8; 16]);

@@ -16,7 +16,7 @@
 //!
 //! ## On-disk layout (F-G4-001)
 //!
-//! The redo region starts with a fixed-size [`RedoHeader`] occupying the
+//! The redo region starts with a fixed-size `RedoHeader` occupying the
 //! first aligned block (`HEADER_BLOCK_SIZE` bytes, equal to the device's
 //! alignment, typically 4 KiB). The header carries:
 //!

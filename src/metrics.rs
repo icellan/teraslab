@@ -15,7 +15,7 @@
 //!
 //! Future PRs that add a `.with_label_values(...)` style API or a
 //! `String`-keyed label MUST re-audit this invariant. The matching
-//! HTTP-side check lives in [`crate::server::http::http_span_for`]
+//! HTTP-side check lives in `crate::server::http::http_span_for`
 //! (F-G6-013), which keeps OTLP span attributes equally bounded.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -1323,7 +1323,7 @@ pub struct SwimMetrics {
     pub swim_membership_churn_total: LabeledCounter<SWIM_CHURN_CARDINALITY>,
     /// PING_REQ forwarding entries evicted because the bounded
     /// forwarding map hit its cap (F-G8-004). Bumped at the eviction
-    /// site in [`crate::cluster::swim::SwimRunner::ping_req_forwarding_put`].
+    /// site in `crate::cluster::swim::SwimRunner::ping_req_forwarding_put`.
     /// A sustained increase indicates either (a) probes are timing out
     /// without ACKs at scale, or (b) a peer is flooding PING_REQs for
     /// non-existent NodeIds.
@@ -1417,7 +1417,7 @@ pub struct AllocatorMetrics {
     /// Redo entries dropped during recovery because they were corrupt
     /// (F-G1-015). Each increment corresponds to a `tracing::error!` at
     /// the rejection site in
-    /// [`crate::allocator::SlotAllocator::replay_free`] /
+    /// `crate::allocator::SlotAllocator::replay_free` /
     /// `replay_allocate`. Non-zero values let dashboards alert on
     /// recovery-time corruption-rejection rates.
     pub corrupt_redo_entries_total: PaddedCounter,

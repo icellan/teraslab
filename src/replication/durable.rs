@@ -128,7 +128,7 @@ impl AckTracker {
 
     /// Record a successful ACK from a replica. Flushes to disk on
     /// EITHER the 1-second time threshold OR an accumulated burst of
-    /// [`FLUSH_DIRTY_COUNT_THRESHOLD`] ACKs since the last flush
+    /// `FLUSH_DIRTY_COUNT_THRESHOLD` ACKs since the last flush
     /// (R-067 / D-03). The 1-second window alone could lose a
     /// thousand-ACK burst on a master that crashes ~999 ms after the
     /// previous flush; the burst-count threshold caps the at-risk
@@ -722,7 +722,7 @@ pub fn check_redo_truncation(
 /// `chunk` is non-empty (an empty chunk would still produce a valid batch
 /// but the catch-up loop never builds one).
 ///
-/// [`ERR_STALE_EPOCH`]: crate::replication::protocol::ERR_STALE_EPOCH
+/// [`ERR_STALE_EPOCH`]: crate::protocol::opcodes::ERR_STALE_EPOCH
 pub fn build_catchup_batch(
     first_sequence: u64,
     chunk: &[ReplicaOp],

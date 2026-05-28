@@ -32,7 +32,7 @@ use std::sync::Arc;
 /// # Atomic-apply invariant (F-G5-022 / A-4)
 ///
 /// Each mutation entry point ([`Self::spend`], [`Self::unspend`],
-/// [`Self::set_mined`] / [`Self::set_mined_inner`], [`Self::set_locked`],
+/// [`Self::set_mined`] / `Self::set_mined_inner`, [`Self::set_locked`],
 /// [`Self::create`], [`Self::delete`], [`Self::freeze`], [`Self::unfreeze`],
 /// [`Self::reassign`], [`Self::mark_on_longest_chain`], etc.) acquires the
 /// per-tx stripe mutex *as its first action* and holds it for the entire
@@ -1881,7 +1881,7 @@ impl Engine {
     /// varies per item. This avoids copying 28 bytes of params per item.
     ///
     /// Atomicity is per transaction, not per batch: each key takes its own
-    /// stripe lock inside [`Self::set_mined_inner`], and earlier items remain
+    /// stripe lock inside `Self::set_mined_inner`, and earlier items remain
     /// visible if a later item fails.
     ///
     /// Returns one `Result` per key, in the same order as `keys`.
@@ -3313,7 +3313,7 @@ impl Engine {
     /// might need to compensate a `set_locked(true)` (e.g. on a
     /// replication failure) MUST go through
     /// [`Self::set_locked_with_before_image`] to capture
-    /// `prior_delete_at_height` and use [`Self::restore_set_locked_for_compensation`]
+    /// `prior_delete_at_height` and use `Self::restore_set_locked_for_compensation`
     /// on rollback. Plain `set_locked(false)` after a failed
     /// `set_locked(true)` silently drops the DAH and the record becomes
     /// unprunable on the next sweep. This `u32` return signature exists

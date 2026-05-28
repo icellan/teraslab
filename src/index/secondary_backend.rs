@@ -245,7 +245,7 @@ impl UnminedBackend {
     /// fsynced BEFORE the redb commit. For in-memory backends, the redo
     /// log is ignored: the primary record's `meta.unmined_since` is
     /// already authoritative — see
-    /// [`crate::recovery::reconcile_secondary_indexes_from_metadata`],
+    /// `crate::recovery::reconcile_secondary_indexes_from_metadata`,
     /// which rebuilds the in-memory unmined index from the primary records
     /// after replay finishes. The contract is exercised by
     /// `unmined_in_memory_reconcile_round_trip` below and by the

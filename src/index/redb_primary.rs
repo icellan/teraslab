@@ -374,7 +374,7 @@ impl RedbPrimary {
     /// streaming approaches or batch processing instead.
     ///
     /// F-G3-010: the up-front `Vec::with_capacity` is now capped at
-    /// [`Self::ITER_COLLECTED_PREALLOC_CAP`]. The vector still grows on
+    /// `Self::ITER_COLLECTED_PREALLOC_CAP`. The vector still grows on
     /// demand (so the result is complete), but a multi-billion-entry
     /// cached `self.count` can no longer reserve `count * 88` bytes in
     /// a single allocation. Production callers should prefer
@@ -413,7 +413,7 @@ impl RedbPrimary {
     ///
     /// Unlike [`Self::iter_collected`], this never materializes the full redb
     /// table. Each refill opens a short read transaction, copies at most
-    /// [`ITER_BATCH_SIZE`] rows, and resumes from the next lexicographic txid.
+    /// `ITER_BATCH_SIZE` rows, and resumes from the next lexicographic txid.
     pub fn iter_streaming(&self) -> RedbPrimaryIter<'_> {
         RedbPrimaryIter {
             primary: self,
