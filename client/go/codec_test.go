@@ -207,10 +207,42 @@ func TestReassignBatchRoundTrip(t *testing.T) {
 
 func TestUnspendBatch1ItemRoundTrip(t *testing.T) {
 	params := UnspendBatchParams{CurrentBlockHeight: 500, BlockHeightRetention: 288}
-	items := []UnspendItem{{TxID: testTxID(1), Vout: 3, UtxoHash: testUtxoHash(2)}}
+	var sd SpendingData
+	for i := range sd {
+		sd[i] = byte(i + 1)
+	}
+	items := []UnspendItem{{
+		TxID:         testTxID(1),
+		Vout:         3,
+		UtxoHash:     testUtxoHash(2),
+		SpendingData: sd,
+	}}
 	encoded := encodeUnspendBatch(nil, params, items)
-	if len(encoded) != 12+68 {
-		t.Fatalf("encoded length = %d, want %d", len(encoded), 12+68)
+	// Header = 12 bytes, per-item = 104 bytes (txid32 + vout4 + utxo32 + spending36).
+	if len(encoded) != 12+104 {
+		t.Fatalf("encoded length = %d, want %d", len(encoded), 12+104)
+	}
+	// Parse fields back out and verify each one round-trips byte-for-byte.
+	if got := getU32(encoded[0:4]); got != 1 {
+		t.Errorf("count = %d, want 1", got)
+	}
+	if got := getU32(encoded[4:8]); got != 500 {
+		t.Errorf("cbh = %d, want 500", got)
+	}
+	if got := getU32(encoded[8:12]); got != 288 {
+		t.Errorf("bhr = %d, want 288", got)
+	}
+	if !bytes.Equal(encoded[12:44], items[0].TxID[:]) {
+		t.Errorf("txid mismatch")
+	}
+	if got := getU32(encoded[44:48]); got != 3 {
+		t.Errorf("vout = %d, want 3", got)
+	}
+	if !bytes.Equal(encoded[48:80], items[0].UtxoHash[:]) {
+		t.Errorf("utxo_hash mismatch")
+	}
+	if !bytes.Equal(encoded[80:116], items[0].SpendingData[:]) {
+		t.Errorf("spending_data mismatch")
 	}
 }
 
@@ -218,8 +250,23 @@ func TestUnspendBatch512Items(t *testing.T) {
 	params := UnspendBatchParams{CurrentBlockHeight: 1000, BlockHeightRetention: 144}
 	items := make([]UnspendItem, 512)
 	encoded := encodeUnspendBatch(nil, params, items)
-	if len(encoded) != 12+512*68 {
-		t.Fatalf("encoded length = %d, want %d", len(encoded), 12+512*68)
+	if len(encoded) != 12+512*104 {
+		t.Fatalf("encoded length = %d, want %d", len(encoded), 12+512*104)
+	}
+}
+
+// TestUnspendBatchMatchesRustWireSize is a regression guard for the A-04 fix.
+// The Rust server decode (src/protocol/codec.rs::decode_unspend_batch) requires
+// each item to be exactly 104 bytes. Anything shorter is rejected as
+// CodecError::TruncatedBatch.
+func TestUnspendBatchMatchesRustWireSize(t *testing.T) {
+	const rustPerItemBytes = 104
+	const rustHeaderBytes = 12
+	if unspendBatchSize(0) != rustHeaderBytes {
+		t.Errorf("unspendBatchSize(0) = %d, want %d", unspendBatchSize(0), rustHeaderBytes)
+	}
+	if unspendBatchSize(7) != rustHeaderBytes+7*rustPerItemBytes {
+		t.Errorf("unspendBatchSize(7) = %d, want %d", unspendBatchSize(7), rustHeaderBytes+7*rustPerItemBytes)
 	}
 }
 
@@ -324,10 +371,56 @@ func TestGetSpendBatch1024Items(t *testing.T) {
 		items[i].TxID[0] = byte(i)
 		items[i].TxID[1] = byte(i >> 8)
 		items[i].Vout = uint32(i)
+		items[i].UtxoHash[0] = byte(i >> 16)
+		items[i].UtxoHash[31] = byte(i)
 	}
 	encoded := encodeGetSpendBatch(nil, items)
-	if len(encoded) != 4+1024*36 {
-		t.Fatalf("encoded length = %d, want %d", len(encoded), 4+1024*36)
+	if len(encoded) != 4+1024*68 {
+		t.Fatalf("encoded length = %d, want %d", len(encoded), 4+1024*68)
+	}
+}
+
+// TestGetSpendBatchByteLayout parses encoded payload back field-by-field,
+// matching the Rust server's decode logic in
+// src/protocol/codec.rs::decode_get_spend_batch.
+func TestGetSpendBatchByteLayout(t *testing.T) {
+	items := []GetSpendItem{
+		{TxID: testTxID(0xAA), Vout: 0, UtxoHash: testUtxoHash(0x11)},
+		{TxID: testTxID(0xBB), Vout: 0xDEADBEEF, UtxoHash: testUtxoHash(0x22)},
+	}
+	encoded := encodeGetSpendBatch(nil, items)
+
+	if len(encoded) != 4+2*68 {
+		t.Fatalf("encoded length = %d, want %d", len(encoded), 4+2*68)
+	}
+	if got := getU32(encoded[0:4]); got != 2 {
+		t.Errorf("count = %d, want 2", got)
+	}
+	for i, item := range items {
+		base := 4 + i*68
+		if !bytes.Equal(encoded[base:base+32], item.TxID[:]) {
+			t.Errorf("item %d txid mismatch", i)
+		}
+		if got := getU32(encoded[base+32 : base+36]); got != item.Vout {
+			t.Errorf("item %d vout = %d, want %d", i, got, item.Vout)
+		}
+		if !bytes.Equal(encoded[base+36:base+68], item.UtxoHash[:]) {
+			t.Errorf("item %d utxo_hash mismatch", i)
+		}
+	}
+}
+
+// TestGetSpendBatchMatchesRustWireSize is a regression guard. Rust decode
+// requires 68 bytes/item; the pre-fix Go client emitted 36, so every batch
+// failed with TruncatedBatch.
+func TestGetSpendBatchMatchesRustWireSize(t *testing.T) {
+	const rustPerItemBytes = 68
+	const rustHeaderBytes = 4
+	if getSpendBatchSize(0) != rustHeaderBytes {
+		t.Errorf("getSpendBatchSize(0) = %d, want %d", getSpendBatchSize(0), rustHeaderBytes)
+	}
+	if getSpendBatchSize(11) != rustHeaderBytes+11*rustPerItemBytes {
+		t.Errorf("getSpendBatchSize(11) = %d, want %d", getSpendBatchSize(11), rustHeaderBytes+11*rustPerItemBytes)
 	}
 }
 

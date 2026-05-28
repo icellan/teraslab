@@ -515,7 +515,7 @@ func (c *Client) sendTxIDBatchCluster(ctx context.Context, opCode uint16, txids 
 
 // UnspendBatch sends a batch unspend request.
 func (c *Client) UnspendBatch(ctx context.Context, params UnspendBatchParams, items []UnspendItem) (*BatchResult, error) {
-	buf := getBuf(12 + len(items)*68)
+	buf := getBuf(unspendBatchSize(len(items)))
 	payload := encodeUnspendBatch(buf, params, items)
 	var conn *pipeConn
 	var err error
@@ -846,7 +846,7 @@ func (c *Client) GetBatch(ctx context.Context, fieldMask uint32, txids []TxID) (
 
 // GetSpendBatch looks up spend status for specific UTXO slots.
 func (c *Client) GetSpendBatch(ctx context.Context, items []GetSpendItem) ([]GetSpendResult, error) {
-	buf := getBuf(4 + len(items)*36)
+	buf := getBuf(getSpendBatchSize(len(items)))
 	payload := encodeGetSpendBatch(buf, items)
 	var conn *pipeConn
 	var err error

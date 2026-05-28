@@ -26,10 +26,16 @@ type SpendBatchParams struct {
 }
 
 // UnspendItem is a single item in an UnspendBatch request.
+//
+// SpendingData must match the spending_data recorded when the UTXO was spent
+// (or be all-zero if no enforcement is required). The server uses this field
+// to authorize the unspend: an unspend request with a mismatching
+// spending_data is rejected. See audit fix A-04 ("unauthorized erasure").
 type UnspendItem struct {
-	TxID     TxID
-	Vout     uint32
-	UtxoHash UtxoHash
+	TxID         TxID
+	Vout         uint32
+	UtxoHash     UtxoHash
+	SpendingData SpendingData
 }
 
 // UnspendBatchParams are shared parameters for an UnspendBatch request.
@@ -117,9 +123,14 @@ type MarkLongestChainParams struct {
 }
 
 // GetSpendItem is a single item in a GetSpendBatch request.
+//
+// UtxoHash identifies the specific UTXO slot to look up; the server uses
+// it (alongside txid+vout) to disambiguate slots and detect stale lookups.
+// Wire layout: txid(32) + vout(4 LE) + utxo_hash(32) = 68 bytes per item.
 type GetSpendItem struct {
-	TxID TxID
-	Vout uint32
+	TxID     TxID
+	Vout     uint32
+	UtxoHash UtxoHash
 }
 
 // BatchItemSuccess is a per-item success result with signal and block IDs,

@@ -35,7 +35,13 @@ func spendBatchSize(n int) int { return 14 + n*104 }
 // ---------------------------------------------------------------------------
 
 // encodeUnspendBatch appends an UnspendBatch request payload to buf.
-// Format: [count:4][cbh:4][bhr:4][items: txid(32)+vout(4)+hash(32) x count]
+// Format: [count:4][cbh:4][bhr:4][items: txid(32)+vout(4 LE)+utxo_hash(32)+spending_data(36) x count]
+// Per-item size = 104 bytes. Header = 12 bytes.
+//
+// The spending_data field was added by audit fix A-04 to prevent unauthorized
+// erasure: the server rejects unspend items whose spending_data does not match
+// the recorded value. Wire layout must match src/protocol/codec.rs
+// encode_unspend_batch.
 func encodeUnspendBatch(buf []byte, params UnspendBatchParams, items []UnspendItem) []byte {
 	buf = appendU32(buf, uint32(len(items)))
 	buf = appendU32(buf, params.CurrentBlockHeight)
@@ -44,9 +50,13 @@ func encodeUnspendBatch(buf []byte, params UnspendBatchParams, items []UnspendIt
 		buf = append(buf, items[i].TxID[:]...)
 		buf = appendU32(buf, items[i].Vout)
 		buf = append(buf, items[i].UtxoHash[:]...)
+		buf = append(buf, items[i].SpendingData[:]...)
 	}
 	return buf
 }
+
+// unspendBatchSize returns the exact payload size for an UnspendBatch request.
+func unspendBatchSize(n int) int { return 12 + n*104 }
 
 // ---------------------------------------------------------------------------
 // SetMined batch
@@ -241,14 +251,21 @@ func encodeGetBatch(buf []byte, fieldMask uint32, txids []TxID) []byte {
 // ---------------------------------------------------------------------------
 
 // encodeGetSpendBatch appends a GetSpendBatch request payload to buf.
+// Format: [count:4][items: txid(32)+vout(4 LE)+utxo_hash(32) x count]
+// Per-item size = 68 bytes. Header = 4 bytes.
+// Wire layout must match src/protocol/codec.rs encode_get_spend_batch.
 func encodeGetSpendBatch(buf []byte, items []GetSpendItem) []byte {
 	buf = appendU32(buf, uint32(len(items)))
 	for i := range items {
 		buf = append(buf, items[i].TxID[:]...)
 		buf = appendU32(buf, items[i].Vout)
+		buf = append(buf, items[i].UtxoHash[:]...)
 	}
 	return buf
 }
+
+// getSpendBatchSize returns the exact payload size for a GetSpendBatch request.
+func getSpendBatchSize(n int) int { return 4 + n*68 }
 
 // ---------------------------------------------------------------------------
 // Pruner operations
