@@ -703,7 +703,16 @@ impl Default for ServerConfig {
             blob_gc_interval_secs: 3600,
             cluster_state_path: None,
             cluster_secret: None,
-            strict_auth: false,
+            // F-X-002 (production default): strict_auth defaults to `true`
+            // so a fresh install rejects unsigned inter-node frames on the
+            // data port whenever a `cluster_secret` is configured, and
+            // refuses to start a clustered config (`node_id > 0` OR
+            // `replication_factor > 1`) without a secret. Trusted-overlay
+            // / single-host-demo deployments that intentionally run
+            // without a secret can opt back out by setting
+            // `strict_auth = false` in TOML (see
+            // `docs/DEPLOYMENT_ASSUMPTIONS.md`).
+            strict_auth: true,
             max_migration_threads: 16,
             ack_policy: "auto".to_string(),
             replication_timeout_ms: 3000,
@@ -1874,23 +1883,51 @@ strict_auth = true
     }
 
     #[test]
-    fn rf_gt_one_without_cluster_secret_under_default_auth_is_accepted() {
-        // F-X-001 warn path: trusted-overlay default lets multi-node
-        // configs come up without a cluster_secret. The daemon emits a
-        // boot-time warn (covered by integration tests against the
-        // CLI binary); validate_safe_defaults must NOT reject here.
+    fn rf_gt_one_without_cluster_secret_under_default_auth_is_rejected() {
+        // F-X-002: production default flipped strict_auth to `true`, so a
+        // clustered config (RF>1 or node_id>0) without a cluster_secret
+        // now refuses to start out of the box. The pre-F-X-002 trusted-
+        // overlay behaviour is preserved as an explicit
+        // `strict_auth = false` opt-out (see
+        // `strict_auth_false_opts_back_into_trusted_overlay`).
         let toml_str = r#"
 node_id = 1
 replication_factor = 3
 "#;
         let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
         assert!(
+            cfg.strict_auth,
+            "F-X-002: default config must have strict_auth=true",
+        );
+        let err = cfg.validate_safe_defaults().expect_err(
+            "F-X-002: default-auth multi-node config without cluster_secret must be rejected",
+        );
+        match err {
+            ConfigError::StrictAuthRequiresSecret => {}
+            other => panic!("expected StrictAuthRequiresSecret, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_auth_false_opts_back_into_trusted_overlay() {
+        // F-X-002 opt-out: operators that deliberately run a trusted-
+        // overlay cluster without a cluster_secret can set
+        // `strict_auth = false` in TOML. The hard reject is gone, the
+        // boot-time warn in `src/bin/server.rs` still fires (covered
+        // by separate daemon integration coverage).
+        let toml_str = r#"
+node_id = 1
+replication_factor = 3
+strict_auth = false
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(
             !cfg.strict_auth,
-            "default config must have strict_auth=false"
+            "explicit strict_auth = false must round-trip",
         );
         cfg.validate_safe_defaults().expect(
-            "default-auth multi-node config must validate without cluster_secret \
-             (trusted-overlay deployment model — F-X-001)",
+            "strict_auth = false multi-node config without cluster_secret must validate \
+             (legacy trusted-overlay opt-out)",
         );
     }
 

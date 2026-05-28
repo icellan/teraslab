@@ -247,17 +247,13 @@ fn main() {
         "TeraSlab server starting",
     );
 
-    // F-X-001: trusted-overlay deployment model — when the cluster is
-    // multi-node (RF>1 OR node_id>0) AND no `cluster_secret` is
-    // configured, the wire protocol authenticates nothing. Single-node
-    // demos rely on this fail-open default; production clusters running
-    // on a private network are expected to set a secret. Emit a prominent
-    // boot-time warning under the `teraslab::security` target so
-    // operators always see the missing-secret state in the audit trail.
-    //
-    // `validate_safe_defaults` already converted the same condition into
-    // a hard error when `strict_auth = true` (or `--strict-auth` on the
-    // CLI). See `docs/DEPLOYMENT_ASSUMPTIONS.md` for the full rationale.
+    // F-X-002: with `strict_auth = true` as the production default,
+    // `validate_safe_defaults` already refused this combination above —
+    // the only way to reach this branch is the explicit opt-out
+    // `strict_auth = false` in TOML (trusted-overlay legacy mode). Emit a
+    // prominent boot-time warning under the `teraslab::security` target
+    // so operators always see the missing-secret state in the audit
+    // trail. See `docs/DEPLOYMENT_ASSUMPTIONS.md` for the full rationale.
     let multi_node = config.node_id > 0 || config.replication_factor > 1;
     let cluster_secret_missing = config
         .cluster_secret
@@ -271,10 +267,11 @@ fn main() {
             replication_factor = config.replication_factor,
             "cluster is multi-node but no cluster_secret is configured: inter-node SWIM, \
              topology, replication, and migration frames will be ACCEPTED UNAUTHENTICATED. \
-             This is the documented trusted-overlay default (see \
-             docs/DEPLOYMENT_ASSUMPTIONS.md). For hard-mode production deployments set \
-             `strict_auth = true` in TOML or pass `--strict-auth` on the daemon CLI to \
-             refuse startup in this state.",
+             You explicitly opted out of the F-X-002 production default by setting \
+             `strict_auth = false`. This is the legacy trusted-overlay mode (see \
+             docs/DEPLOYMENT_ASSUMPTIONS.md); only safe on a fully audited private \
+             network. Remove `strict_auth = false` from your TOML AND configure \
+             `cluster_secret` to restore the production-safe default.",
         );
     }
 
