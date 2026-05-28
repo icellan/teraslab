@@ -9,8 +9,9 @@ use crate::cluster::shards::NodeId;
 use crate::metrics::swim_metrics;
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// SWIM protocol message types.
@@ -425,7 +426,7 @@ impl SwimRunner {
 
     /// Get the current alive members.
     pub fn alive_members(&self) -> Vec<NodeId> {
-        self.membership.lock().unwrap().alive_members()
+        self.membership.lock().alive_members()
     }
 
     /// Get the address of a node.
@@ -433,7 +434,7 @@ impl SwimRunner {
         if *node == self.config.self_id {
             return Some(self.config.self_addr);
         }
-        self.peer_addrs.lock().unwrap().get(node).copied()
+        self.peer_addrs.lock().get(node).copied()
     }
 
     /// Start the SWIM protocol loop in a background thread.
@@ -558,7 +559,7 @@ impl SwimRunner {
                 if let Some(m) = swim_metrics() {
                     m.swim_probe_timeouts_total.inc();
                 }
-                let mut mem = self.membership.lock().unwrap();
+                let mut mem = self.membership.lock();
                 // Use the member's current incarnation for local suspicion.
                 // This is not a gossipped suspicion — it's our own probe
                 // failure, so we always know the current incarnation.
@@ -582,7 +583,7 @@ impl SwimRunner {
                 next_probe_delay = jittered_probe_interval(probe_interval);
 
                 // Expire suspects
-                let events = self.membership.lock().unwrap().expire_suspects();
+                let events = self.membership.lock().expire_suspects();
                 for event in events {
                     let _ = event_tx.send(event);
                 }
@@ -601,8 +602,8 @@ impl SwimRunner {
             if !self.config.seed_nodes.is_empty()
                 && last_seed_retry.elapsed() >= next_seed_retry_delay
             {
-                let alive_count = self.membership.lock().unwrap().alive_members().len();
-                let total_known = self.peer_addrs.lock().unwrap().len();
+                let alive_count = self.membership.lock().alive_members().len();
+                let total_known = self.peer_addrs.lock().len();
                 // Retry seeds if we have fewer alive members than known peers
                 // (some nodes are dead/suspect) or if we have no peers at all.
                 let degraded = alive_count < total_known + 1 || total_known == 0;
@@ -635,11 +636,10 @@ impl SwimRunner {
                 let forgotten = self
                     .membership
                     .lock()
-                    .unwrap()
                     .forget_dead_older_than(DEAD_MEMBER_FORGET_AFTER);
                 if !forgotten.is_empty() {
-                    let mut peers = self.peer_addrs.lock().unwrap();
-                    let mut swim = self.swim_peer_addrs.lock().unwrap();
+                    let mut peers = self.peer_addrs.lock();
+                    let mut swim = self.swim_peer_addrs.lock();
                     for id in &forgotten {
                         peers.remove(id);
                         swim.remove(id);
@@ -764,16 +764,14 @@ impl SwimRunner {
         // Register the sender's TCP address (for client routing / migration)
         self.peer_addrs
             .lock()
-            .unwrap()
             .insert(sender_id, sender_tcp_addr);
 
         // Register the sender's SWIM address (from the actual UDP source)
         self.swim_peer_addrs
             .lock()
-            .unwrap()
             .insert(sender_id, from_addr);
 
-        let mut events = self.membership.lock().unwrap().mark_alive(
+        let mut events = self.membership.lock().mark_alive(
             sender_id,
             sender_tcp_addr,
             sender_incarnation,
@@ -826,13 +824,13 @@ impl SwimRunner {
                     if nid == self.config.self_id {
                         continue;
                     }
-                    self.peer_addrs.lock().unwrap().insert(nid, tcp_addr);
+                    self.peer_addrs.lock().insert(nid, tcp_addr);
                     store_piggybacked_swim_if_routable(
-                        &mut self.swim_peer_addrs.lock().unwrap(),
+                        &mut self.swim_peer_addrs.lock(),
                         nid,
                         swim_str,
                     );
-                    let mut mem = self.membership.lock().unwrap();
+                    let mut mem = self.membership.lock();
                     let evts = match state {
                         0 => mem.mark_alive(nid, tcp_addr, inc, false),
                         1 => mem.mark_suspect(nid, inc),
@@ -996,12 +994,11 @@ impl SwimRunner {
         // Nodes discovered via gossip but never contacted directly have no
         // swim address yet — including them wastes the probe slot because
         // we can't send a UDP packet without a destination.
-        let membership = self.membership.lock().unwrap();
-        let swim_addrs = self.swim_peer_addrs.lock().unwrap();
+        let membership = self.membership.lock();
+        let swim_addrs = self.swim_peer_addrs.lock();
         let peers: Vec<(NodeId, SocketAddr)> = self
             .peer_addrs
             .lock()
-            .unwrap()
             .iter()
             .filter(|&(&id, _)| {
                 membership
@@ -1059,11 +1056,10 @@ impl SwimRunner {
 
         // Filter out the suspect itself and dead nodes — dead peers
         // cannot relay probes on our behalf.
-        let membership = self.membership.lock().unwrap();
+        let membership = self.membership.lock();
         let peers: Vec<(NodeId, SocketAddr)> = self
             .peer_addrs
             .lock()
-            .unwrap()
             .iter()
             .filter(|&(&id, _)| {
                 id != suspect_id
@@ -1086,7 +1082,6 @@ impl SwimRunner {
         let suspect_swim_addr = match self
             .swim_peer_addrs
             .lock()
-            .unwrap()
             .get(&suspect_id)
             .copied()
         {
@@ -1108,7 +1103,7 @@ impl SwimRunner {
 
         // Send to up to K random other peers using their SWIM addresses.
         // Skip peers whose swim address is unknown.
-        let swim_addrs = self.swim_peer_addrs.lock().unwrap();
+        let swim_addrs = self.swim_peer_addrs.lock();
         let k = INDIRECT_PROBE_K.min(peers.len());
         for &(peer_id, _tcp_addr) in peers.iter().take(k) {
             if let Some(&addr) = swim_addrs.get(&peer_id) {
@@ -1193,9 +1188,9 @@ impl SwimRunner {
     fn collect_member_updates(&self) -> Vec<u8> {
         use crate::cluster::membership::NodeState;
 
-        let membership = self.membership.lock().unwrap();
-        let peers = self.peer_addrs.lock().unwrap();
-        let swim_addrs = self.swim_peer_addrs.lock().unwrap();
+        let membership = self.membership.lock();
+        let peers = self.peer_addrs.lock();
+        let swim_addrs = self.swim_peer_addrs.lock();
 
         let mut buf = Vec::new();
         let mut entries: Vec<(NodeId, u8, u64, String, String)> = Vec::new();
@@ -1295,7 +1290,7 @@ impl SwimRunner {
     /// [`Self::encode_message_for_test`].
     #[doc(hidden)]
     pub fn peer_addrs_snapshot(&self) -> HashMap<NodeId, SocketAddr> {
-        self.peer_addrs.lock().unwrap().clone()
+        self.peer_addrs.lock().clone()
     }
 
     #[cfg(test)]
@@ -1315,7 +1310,7 @@ impl SwimRunner {
 
     #[cfg(test)]
     fn test_swim_addr(&self, id: NodeId) -> Option<SocketAddr> {
-        self.swim_peer_addrs.lock().unwrap().get(&id).copied()
+        self.swim_peer_addrs.lock().get(&id).copied()
     }
 }
 
@@ -1508,7 +1503,6 @@ mod tests {
         requester
             .swim_peer_addrs
             .lock()
-            .unwrap()
             .insert(probed_target, "10.0.0.3:3301".parse().unwrap());
         requester.test_set_pending_probe(probed_target);
 
@@ -1543,7 +1537,6 @@ mod tests {
         requester
             .swim_peer_addrs
             .lock()
-            .unwrap()
             .insert(probed_target, target_swim);
         requester.test_set_pending_probe(probed_target);
 
