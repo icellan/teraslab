@@ -2077,6 +2077,11 @@ fn operations_json(counters: &OpOutcomeCounters) -> serde_json::Value {
 }
 
 /// Convert a `LatencyHistogram` to JSON with percentiles.
+///
+/// Includes `p99_9_ns` (p99.9) so operators can verify the README's
+/// "low p99.9" claim against real data — until this commit only p99
+/// was exported, which left the README's claim unverifiable. See
+/// May-2026 external review P1 "Latency monitoring absent".
 fn histogram_json(h: &crate::metrics::LatencyHistogram) -> serde_json::Value {
     serde_json::json!({
         "count": h.count(),
@@ -2084,6 +2089,7 @@ fn histogram_json(h: &crate::metrics::LatencyHistogram) -> serde_json::Value {
         "p50_ns": h.percentile_ns(0.50),
         "p95_ns": h.percentile_ns(0.95),
         "p99_ns": h.percentile_ns(0.99),
+        "p99_9_ns": h.percentile_ns(0.999),
     })
 }
 
