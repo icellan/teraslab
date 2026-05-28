@@ -2,19 +2,28 @@
 
 A purpose-built Rust database server designed as a UTXO store backend for BSV Teranode.
 
-TeraSlab exploits the fixed, known workload patterns of UTXO storage to achieve dramatically better performance than general-purpose databases. By using in-place mutation on raw block devices instead of copy-on-write, it targets **10M+ ops/sec sustained throughput**, **10-50x less SSD wear**, and significantly better tail latency.
+TeraSlab exploits the fixed, known workload patterns of UTXO storage to achieve dramatically better performance than general-purpose databases. By using in-place mutation on raw block devices instead of copy-on-write, it **targets** 10M+ ops/sec sustained throughput, dramatically lower SSD wear, and better tail latency than a general-purpose KV store.
+
+> **Performance claims are design targets, not measured production numbers.** The 10M+ ops/sec figure is observed on `MemoryDevice` (anonymous `mmap`, no `O_DIRECT`, no `fsync`, no redo log). The same workload on `DirectDevice` + redo durability is bounded by NVMe sector writes and fsync, and is expected to deliver low-100s of K ops/sec per core in current form. NVMe bench results are not yet published — see [Performance methodology](#performance-methodology) below.
 
 ## Key design
 
-TeraSlab pre-allocates UTXO slots at full size during creation and mutates them in place. A spend writes 37 bytes per slot (1-byte status + 36-byte spending data) plus a metadata update, eliminating copy-on-write overhead entirely.
+TeraSlab pre-allocates UTXO slots at full size during creation and mutates them in place. The logical mutation footprint of a spend is small (1-byte status + 36-byte spending data + 4-byte slot CRC, then a metadata bump), but the on-device write is bounded below by the device sector size.
 
 | Property | Value |
 |----------|-------|
-| Spend write size | 37 bytes per UTXO slot (status + spending data) + metadata update |
-| p99.9 latency | Low (no copy-on-write, no defrag spikes) |
-| Replication bandwidth | ~120 MB/s (operation-based, not full-record) |
-| SSD wear per spend | 37 bytes per slot + ~256 bytes metadata (vs full record in copy-on-write designs) |
+| Logical spend payload | 41 bytes per slot (1-byte status + 36-byte spending data + 4-byte slot CRC) + 256-byte metadata update |
+| Slot total size on disk | 73 bytes (32-byte hash + slot payload + CRC) |
+| On-device write size | One device sector per touched slot, one per metadata block. On `MemoryDevice` this is the exact byte range; on `DirectDevice` with `O_DIRECT` it amplifies to 4096-byte sectors. |
+| p99.9 latency target | Low (no copy-on-write, no defrag spikes) — not yet measured on production hardware |
+| Replication bandwidth | ~120 MB/s target (operation-based, not full-record) |
 | Memory per record | 72 bytes in-memory (hash table bucket) or ~0 with on-disk redb backend |
+
+### Performance methodology
+
+The published benchmarks (`benches/`) all run against `MemoryDevice` (anonymous `mmap`). They measure the in-memory throughput ceiling — useful for catching algorithmic regressions, but **not** representative of production deployment on NVMe + `O_DIRECT` + redo-log durability. NVMe bench results, fault-injection numbers, and tail-latency histograms on a real device are tracked as outstanding work; the README will be updated to cite them when they exist. Until then, treat any throughput figure as "MemoryDevice ceiling, no fsync."
+
+The `io_uring` backend in `src/device_io/` is scaffolding only and is NOT wired into the production write path today; every device write goes through the synchronous `pwrite` fallback at queue-depth-1.
 
 ## Status
 
@@ -28,9 +37,8 @@ TeraSlab pre-allocates UTXO slots at full size during creation and mutates them 
 | `cargo clippy --lib --no-deps` | 8 dead-code warnings in `src/device_io/*` (tracked: ROADMAP P3.1) |
 | `cargo fmt --all -- --check` | clean |
 
-**Known limitations** (production bugs from `_review/follow_ups.md` § A):
+**Known limitations** (production bugs from `_review/follow_ups.md` § A — refresh this list when items close):
 
-- A-2 — accept loop in `src/server/mod.rs` polls a shutdown flag on a 10 ms sleep, burning idle CPU and slowing graceful shutdown.
 - A-2b — shard table can stay at 2-node assignment after a fresh 3-node bootstrap even though `committed_topology_members()` reports three; suspected `topology_commit_already_activated` dedup interaction.
 - A-3 — `replica_unauthenticated_accept_total` counter exists but is not incremented at the auth gate in `handle_connection_inner`.
 - A-4 — engine-side atomic apply (F-G5-022) is a concurrency hypothesis with no live repro yet.
@@ -552,7 +560,7 @@ Each transaction occupies a contiguous region on the block device:
 
 **TxMetadata** (256 bytes, padded for alignment) contains: txid, version, locktime, fee, size, extended size, flags (conflicting, locked, external, coinbase, last_spent_all), block entries (up to 3 inline, overflow stored separately), spending height, creation timestamp, generation counter, update timestamp, unmined_since, delete_at_height, preserve_until, reassignment tracking, external storage reference, and conflicting children tracking.
 
-**UtxoSlot** (69 bytes each): 32-byte hash, 1-byte status (unspent/spent/frozen/pruned), 36-byte spending data (spending txid + vout). Slots are pre-allocated at full size during creation. A spend writes the 37-byte status+spending region in place, plus updates the 256-byte metadata (generation, counters, timestamps).
+**UtxoSlot** (73 bytes each): 32-byte hash, 1-byte status (unspent/spent/frozen/pruned), 36-byte spending data (spending txid + vout), 4-byte CRC32 (torn-write protection per slot — BC-02 / F-X-007). Slots are pre-allocated at full size during creation. A spend writes the 41-byte status+spending+CRC region in place, plus updates the 256-byte metadata (generation, counters, timestamps). On `DirectDevice` (`O_DIRECT`), each in-place write amplifies to the device's sector size (4096 bytes on most NVMe drives).
 
 ### Tiered storage
 
@@ -574,7 +582,7 @@ TeraSlab supports two index backends for the primary index and secondary indexes
 
 ### In-memory (default)
 
-The default backend stores the index in a Robin Hood hash table backed by anonymous `mmap`. This is the fastest option, delivering the full 10M+ ops/sec throughput target. It requires approximately **72 bytes per record** of RAM. For 100M records, this means ~7.2 GB of RAM for the index alone.
+The default backend stores the index in a Robin Hood hash table backed by anonymous `mmap`. This is the fastest option, targeting the 10M+ ops/sec design ceiling on `MemoryDevice` (not yet measured on NVMe — see [Performance methodology](#performance-methodology)). It requires approximately **72 bytes per record** of RAM. For 100M records, this means ~7.2 GB of RAM for the index alone.
 
 On clean shutdown the index is snapshotted to `index_snapshot_path` and restored on next startup. On crash, the index is rebuilt from the device scan + redo log replay.
 
@@ -612,7 +620,7 @@ redb_cache_size = 268435456  # 256 MiB (default)
 
 | | In-memory | redb |
 |--|-----------|------|
-| **Throughput** | 10M+ ops/sec | ~100K-500K ops/sec (I/O bound) |
+| **Throughput** | 10M+ ops/sec target on `MemoryDevice`; lower on NVMe (not yet measured) | ~100K-500K ops/sec (I/O bound) |
 | **RAM per 10M records** | ~720 MB | ~256 MB (page cache only) |
 | **Crash recovery** | Rebuild from device + redo replay | Instant (already on disk) |
 | **Startup time** | Seconds (snapshot restore) to minutes (full rebuild) | Instant (open existing files) |

@@ -92,6 +92,13 @@ cluster_id = "ababababababababababababababab01"
 # default (no secret) is fail-open with a per-event warn — exactly
 # what we want for in-process docker integration tests. RF>1 also
 # emits a warn but accepts the config in non-strict mode.
+#
+# F-X-002 (production default flipped strict_auth to `true`): explicit
+# opt-out is required to keep the trusted-overlay shape this test
+# harness relies on. The daemon still emits a prominent boot-time
+# warn naming the opt-out so the audit trail surfaces the missing
+# secret.
+strict_auth = false
 "#
     )
 }
@@ -845,5 +852,69 @@ mod tests {
         assert!(config.contains("migration_pool_size = 96"));
         assert!(config.contains("migration_batch_size = 2048"));
         assert!(config.contains("seed_nodes = [\"172.38.0.11:3301\", \"172.38.0.13:3301\"]"));
+    }
+
+    /// F-X-002 regression: the rendered docker-test config must pass
+    /// `ServerConfig::validate_safe_defaults` even though it leaves
+    /// `cluster_secret` unset. Pre-F-X-002 this was the trusted-overlay
+    /// default; post-flip the test config has to explicitly emit
+    /// `strict_auth = false` to opt back into that shape. If a future
+    /// edit drops the opt-out, the safe-defaults gate would refuse to
+    /// start every docker test node — this assertion catches that
+    /// regression before the docker cycle takes 30+ seconds to fail.
+    #[test]
+    fn rendered_node_config_passes_safe_defaults_under_fx002_default() {
+        use teraslab::config::ServerConfig;
+
+        let rendered = render_node_config(
+            1,
+            "172.38.0.11",
+            "\"172.38.0.12:3301\", \"172.38.0.13:3301\"",
+            128,
+            500,
+        );
+        let cfg: ServerConfig = toml::from_str(&rendered).expect(
+            "rendered docker node config must be a valid ServerConfig TOML payload",
+        );
+        // The opt-out must be present in the rendered TOML and must
+        // round-trip through `serde::Deserialize` into the in-memory
+        // struct. Without it, `validate_safe_defaults` would reject
+        // the clustered config below for the missing `cluster_secret`.
+        assert!(
+            !cfg.strict_auth,
+            "rendered docker config must emit `strict_auth = false` (F-X-002 opt-out); \
+             without it, the multi-node test cluster cannot start without a cluster_secret",
+        );
+        cfg.validate_safe_defaults().expect(
+            "rendered docker node config must pass safe-defaults validation under the \
+             F-X-002 production default (strict_auth = true) via the explicit \
+             `strict_auth = false` opt-out",
+        );
+    }
+
+    /// Pin a single-node (non-clustered) config through the same gate.
+    /// This is the other half of the F-X-002 contract — single-node
+    /// configs need no opt-out because the multi-node check does not
+    /// fire.
+    #[test]
+    fn single_node_default_config_passes_safe_defaults_under_fx002_default() {
+        use teraslab::config::ServerConfig;
+
+        // Mirrors the daemon's behaviour when launched without a
+        // --config flag: `ServerConfig::default()` carries the
+        // F-X-002 production default (`strict_auth = true`) and must
+        // still validate at single-node.
+        let cfg = ServerConfig::default();
+        assert!(
+            cfg.strict_auth,
+            "F-X-002: default config must have strict_auth = true",
+        );
+        assert_eq!(
+            cfg.node_id, 0,
+            "default config must be single-node (node_id = 0)",
+        );
+        cfg.validate_safe_defaults().expect(
+            "F-X-002: single-node default config must validate without a cluster_secret",
+        );
     }
 }

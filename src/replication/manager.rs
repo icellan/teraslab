@@ -284,6 +284,37 @@ fn clone_outcome(o: &BatchOutcome) -> BatchOutcome {
 }
 
 /// Manual clone for [`ReplicationError`].
+/// Poll `handle.is_finished()` until it returns true or `deadline` elapses.
+///
+/// `std::thread::JoinHandle::join` has no built-in timeout, so the drain
+/// path uses this helper to avoid blocking the master write path on a
+/// permanently stuck worker (see `drain_stragglers`). The poll cadence
+/// starts at 100µs and grows exponentially to a 50ms cap — fast enough
+/// that a worker that finishes "just now" is reclaimed promptly, slow
+/// enough that a multi-second wait does not burn a core.
+fn wait_for_finish_until(
+    handle: Option<&std::thread::JoinHandle<StragglerOutcome>>,
+    deadline: Instant,
+) -> bool {
+    let Some(handle) = handle else {
+        return true;
+    };
+    let mut backoff = Duration::from_micros(100);
+    let max_backoff = Duration::from_millis(50);
+    loop {
+        if handle.is_finished() {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return handle.is_finished();
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        std::thread::sleep(backoff.min(remaining));
+        backoff = (backoff * 2).min(max_backoff);
+    }
+}
+
 fn clone_replication_error(e: &ReplicationError) -> ReplicationError {
     match e {
         ReplicationError::InsufficientReplicas {
@@ -785,7 +816,50 @@ impl ReplicationManager {
     /// pending. Worker panics are caught and downgraded to a Down state
     /// transition (matching the prior scoped behaviour).
     fn drain_stragglers(&mut self) {
+        // Bound the wait per straggler. A worker's recv_ack already
+        // honours `replication_timeout`, so a healthy straggler is
+        // either already finished or finishes within one timeout
+        // window. We add the same window again as a generous slack
+        // for the worker's epilogue (channel send, transport
+        // teardown). Anything beyond that means the worker is stuck
+        // on a non-cancellable I/O — e.g. a blocked socket write
+        // because the OS hasn't surfaced the peer reset yet, or a
+        // pathological replica that holds the connection open without
+        // ACKing. Joining forever in that state would stall the
+        // master write path on every subsequent batch (the very
+        // latency win C-10 / F-G7-018 introduced). Mark the sender
+        // Down and defer the handle to a future drain.
+        let join_deadline =
+            std::time::Instant::now() + (self.config.replication_timeout * 2);
         for idx in 0..self.pending_stragglers.len() {
+            // Wait for the worker to finish OR for the deadline. The
+            // wait MUST be bounded: an unbounded `JoinHandle::join`
+            // here is the bug — see C-10 follow-up.
+            let finished = wait_for_finish_until(
+                self.pending_stragglers[idx].as_ref(),
+                join_deadline,
+            );
+            if !finished {
+                if let Some(m) = replication_metrics() {
+                    m.replica_worker_panics_total.inc();
+                }
+                tracing::warn!(
+                    target: "teraslab::replication::drain",
+                    replica = idx,
+                    "straggler did not finish within 2×replication_timeout; marking Down, deferring join"
+                );
+                if self.senders[idx].state == ReplicaState::Live {
+                    self.senders[idx].state = ReplicaState::Down;
+                    if let Some(m) = replication_metrics() {
+                        m.record_failure(idx);
+                    }
+                }
+                // Leave the handle in `pending_stragglers[idx]` so a
+                // future drain reclaims it once the worker finally
+                // unsticks. The transport slot stays `None`; the
+                // sender is Down so dispatch will skip it.
+                continue;
+            }
             let Some(handle) = self.pending_stragglers[idx].take() else {
                 continue;
             };

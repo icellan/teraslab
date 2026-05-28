@@ -2517,11 +2517,43 @@ fn needs_dispatch_visibility_barrier(op: u16) -> bool {
         )
 }
 
+/// True for ops whose state must NOT be observed by concurrent reads:
+/// every mutation opcode plus `OP_REPLICA_BATCH` (which APPLIES master-
+/// originated mutations locally). These take the exclusive (write) side
+/// of the barrier; client reads take the shared (read) side and are
+/// blocked while a mutation/replica-batch is in flight.
+fn needs_exclusive_visibility_barrier(op: u16) -> bool {
+    is_mutation_opcode(op) || matches!(op, OP_REPLICA_BATCH)
+}
+
+/// Owns whichever side of the `dispatch_visibility_barrier` rwlock is
+/// appropriate for the opcode. Dropping it releases the guard; the
+/// underlying enum keeps the borrow checker honest without exposing
+/// `RwLockReadGuard`/`RwLockWriteGuard` to every call site. Both
+/// variants exist for their RAII side effect (the inner guards are
+/// never read).
+#[allow(clippy::large_enum_variant, dead_code)]
+enum DispatchVisibilityGuard<'a> {
+    Shared(parking_lot::RwLockReadGuard<'a, ()>),
+    Exclusive(parking_lot::RwLockWriteGuard<'a, ()>),
+}
+
 fn acquire_dispatch_visibility_guard(
     engine: &Engine,
     op: u16,
-) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
-    needs_dispatch_visibility_barrier(op).then(|| engine.acquire_dispatch_visibility_guard())
+) -> Option<DispatchVisibilityGuard<'_>> {
+    if !needs_dispatch_visibility_barrier(op) {
+        return None;
+    }
+    if needs_exclusive_visibility_barrier(op) {
+        Some(DispatchVisibilityGuard::Exclusive(
+            engine.acquire_mutation_visibility_guard(),
+        ))
+    } else {
+        Some(DispatchVisibilityGuard::Shared(
+            engine.acquire_dispatch_visibility_guard(),
+        ))
+    }
 }
 
 /// Phase I — true if `op` is a client-facing read or write that must

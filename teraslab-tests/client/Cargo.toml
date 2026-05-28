@@ -16,3 +16,10 @@ thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
+# F-X-002 regression test (`helpers::tests::
+# rendered_node_config_passes_safe_defaults_under_fx002_default`)
+# round-trips the rendered docker-node TOML through `serde::Deserialize`
+# so `ServerConfig::validate_safe_defaults` can assert the production
+# default still accepts the test config via the explicit
+# `strict_auth = false` opt-out.
+toml = "0.8"

@@ -2888,6 +2888,201 @@ mod tests {
     }
 
     #[test]
+    fn pad_gap_followed_by_adjacent_sequence_does_not_lose_entries() {
+        // External-review P0 boundary case for the F-G4-004 pad-gap rule.
+        //
+        // Hand-craft the entries region so the byte layout is exactly:
+        //
+        //   [entry seq=1 (Freeze, 53 bytes)][zeros to next align boundary]
+        //   [entry seq=2 (Freeze, 53 bytes)][trailing zeros]
+        //
+        // The pre-gap entry has sequence N and the post-gap entry has the
+        // genuinely-adjacent sequence N+1. The QA hazard: a scanner that
+        // either (a) stops at the first length=0 pad word, or (b) over-
+        // eagerly classifies the N+1 entry as "ambiguous stale data past
+        // the pad" and drops it, would silently lose the second entry —
+        // exactly the data-loss path flagged by review.
+        //
+        // Contract: scanner returns BOTH entries. `prev=1`, `entry.seq=2`,
+        // `prev.checked_add(1) == Some(2)` so the `just_skipped_pad`
+        // softening branch is NOT taken; the entry is accepted normally.
+        let (dev, log) = make_log(1024 * 1024);
+
+        let first_op = RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        };
+        let second_op = RedoOp::Freeze {
+            tx_key: test_key(2),
+            offset: 1,
+        };
+        // Use the real serializer so the on-disk bytes (CRC, length,
+        // sequence, op type, payload) match exactly what the scanner
+        // expects to deserialize.
+        let first_bytes = RedoEntry {
+            sequence: 1,
+            op: first_op.clone(),
+        }
+        .serialize();
+        let second_bytes = RedoEntry {
+            sequence: 2,
+            op: second_op.clone(),
+        }
+        .serialize();
+
+        // Drop the runtime log so its in-memory entries_cache cannot mask
+        // a scan regression — recovery must come exclusively from the
+        // device.
+        drop(log);
+
+        // The entries region starts at offset = device alignment
+        // (the F-G4-001 header block claims the first alignment unit).
+        let align = dev.alignment();
+        let entries_region_offset = align as u64;
+
+        // Layout the two entries across two alignment units so the
+        // pad gap between them is the structure under test.
+        let mut block0 = AlignedBuf::new(align, align);
+        block0[..first_bytes.len()].copy_from_slice(&first_bytes);
+        // Bytes from first_bytes.len()..align stay zero — this is the
+        // pad gap.
+        dev.pwrite(&block0, entries_region_offset).unwrap();
+
+        let mut block1 = AlignedBuf::new(align, align);
+        block1[..second_bytes.len()].copy_from_slice(&second_bytes);
+        // Trailing bytes after second_bytes stay zero — that pad ends at
+        // an aligned boundary and acts as the true end-of-log sentinel.
+        dev.pwrite(&block1, entries_region_offset + align as u64)
+            .unwrap();
+
+        // Re-open against the modified device and recover.
+        let log2 = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
+        let entries = log2.recover().unwrap();
+
+        assert_eq!(
+            entries.len(),
+            2,
+            "pad-gap scanner must return BOTH entries when the post-gap \
+             sequence is genuinely adjacent (N+1); dropping the second \
+             entry is silent data loss",
+        );
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 2);
+        assert_eq!(entries[0].op, first_op);
+        assert_eq!(entries[1].op, second_op);
+    }
+
+    #[test]
+    fn pad_gap_followed_by_truncated_entry_terminates_cleanly() {
+        // External-review P0 boundary case for the F-G4-004 pad-gap rule.
+        //
+        // Layout:
+        //
+        //   [entry seq=1 (Freeze, 53 bytes)][zeros to next align boundary]
+        //   [4-byte length header claiming a huge body][no body bytes]
+        //
+        // The post-gap "entry" has a valid-looking nonzero length word but
+        // its declared body extends past every following byte in the log
+        // region — every subsequent chunk read keeps producing the same
+        // partial-entry state. The QA hazard: a scanner that loops trying
+        // to assemble the entry could hang indefinitely (each iteration
+        // makes no forward progress past the truncated header).
+        //
+        // Contract: scanner returns the pre-gap entry only, and the call
+        // returns synchronously (well under 100 ms on any reasonable host)
+        // — no infinite loop. We enforce the timing in-process via a
+        // watchdog thread so a regression cannot hang CI.
+        let (dev, log) = make_log(1024 * 1024);
+
+        let first_op = RedoOp::Freeze {
+            tx_key: test_key(7),
+            offset: 0,
+        };
+        let first_bytes = RedoEntry {
+            sequence: 1,
+            op: first_op.clone(),
+        }
+        .serialize();
+
+        drop(log);
+
+        let align = dev.alignment();
+        let entries_region_offset = align as u64;
+
+        // Block 0: pre-gap entry + zero pad to next align boundary.
+        let mut block0 = AlignedBuf::new(align, align);
+        block0[..first_bytes.len()].copy_from_slice(&first_bytes);
+        dev.pwrite(&block0, entries_region_offset).unwrap();
+
+        // Block 1: a 4-byte length header whose value is far larger than
+        // anything that follows. The deserializer returns None on the
+        // "data.len() < total" check; the scanner then sees `lw != 0`
+        // and stashes the bytes into `carry`. As `scan_start` advances
+        // through the rest of the (zero-filled) log region, carry keeps
+        // accumulating zeros that never satisfy the CRC, until the loop
+        // exits cleanly at `scan_start >= total_to_read`.
+        //
+        // Pick a length that is plausibly an entry (passes the
+        // `length >= ENTRY_OVERHEAD` sanity check inside `deserialize`)
+        // so the truncation path — not the structural-rejection path —
+        // is exercised. ENTRY_OVERHEAD = 13; we use a value well above
+        // that.
+        let mut block1 = AlignedBuf::new(align, align);
+        let truncated_len: u32 = 1_000_000; // far larger than remaining bytes
+        block1[..4].copy_from_slice(&truncated_len.to_le_bytes());
+        // Leave bytes 4..align zero so they cannot accidentally form a
+        // valid entry under any interpretation.
+        dev.pwrite(&block1, entries_region_offset + align as u64)
+            .unwrap();
+
+        // Wrap the scan in a watchdog: spawn a background thread that
+        // panics the test if the scan does not complete within 100 ms.
+        // The scan itself is single-threaded and synchronous, so a true
+        // infinite-loop regression would deadlock without this guard.
+        let dev_for_scan: Arc<dyn BlockDevice> = dev;
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<RedoEntry>>();
+        let handle = std::thread::spawn(move || {
+            let log2 = RedoLog::open(dev_for_scan, 0, 1024 * 1024).unwrap();
+            let entries = log2.recover().unwrap();
+            // If the channel send fails the parent already gave up on us;
+            // that is the only acceptable "ignore" because the test has
+            // already declared failure.
+            let _ = tx.send(entries);
+        });
+
+        let entries = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(entries) => entries,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!(
+                    "pad-gap scanner did not terminate within 100 ms on a \
+                     truncated post-gap entry — likely an infinite loop in \
+                     the scan/carry path",
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!(
+                    "scan worker disconnected without producing a result \
+                     — recover() likely panicked",
+                );
+            }
+        };
+        // Join the worker so a successful scan still cleans up the
+        // thread before the test exits. The thread has already sent, so
+        // join completes immediately.
+        handle.join().expect("scan worker panicked");
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "pad-gap scanner must return the pre-gap entry and stop when \
+             the post-gap entry is truncated (cannot satisfy its declared \
+             length / CRC)",
+        );
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[0].op, first_op);
+    }
+
+    #[test]
     fn redo_repeated_reads_use_entry_cache_after_open() {
         let dev = Arc::new(ReadFailingDevice::new(1024 * 1024));
         let dev_trait: Arc<dyn BlockDevice> = dev.clone();

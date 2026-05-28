@@ -209,19 +209,39 @@ impl Engine {
         self.redo_log_handle()
     }
 
-    /// Acquire the SHARED (read-side) dispatch/checkpoint visibility
-    /// barrier — used by every dispatch op so many requests run
-    /// concurrently while still being mutually exclusive with a
-    /// checkpoint.
+    /// Acquire the SHARED (read-side) dispatch visibility barrier — used
+    /// by client READ ops so they run concurrently with each other while
+    /// remaining mutually exclusive with mutations, replica-batch applies,
+    /// and checkpoints (all of which take the EXCLUSIVE side).
+    ///
+    /// The barrier discipline preserves the "no observable rollback
+    /// window" invariant: a client read MUST NOT observe a mutation that
+    /// the master might still compensate. Mutations therefore hold the
+    /// exclusive side from before-apply through replication-ack /
+    /// compensation, and reads are blocked for the full window. Among
+    /// themselves, reads are concurrent.
     pub(crate) fn acquire_dispatch_visibility_guard(
         &self,
     ) -> parking_lot::RwLockReadGuard<'_, ()> {
         self.dispatch_visibility_barrier.read()
     }
 
-    /// Acquire the EXCLUSIVE (write-side) dispatch/checkpoint visibility
-    /// barrier — used by the checkpoint task to wait for in-flight
-    /// dispatches to drain and block new ones for the snapshot window.
+    /// Acquire the EXCLUSIVE (write-side) dispatch visibility barrier —
+    /// used by mutation ops and `OP_REPLICA_BATCH` apply so the apply +
+    /// replicate + (optional) compensation window cannot be observed by
+    /// concurrent reads. Also used by the checkpoint task to drain
+    /// in-flight dispatches before snapshotting a quiescent engine.
+    pub(crate) fn acquire_mutation_visibility_guard(
+        &self,
+    ) -> parking_lot::RwLockWriteGuard<'_, ()> {
+        self.dispatch_visibility_barrier.write()
+    }
+
+    /// Backwards-compatible alias of [`Self::acquire_mutation_visibility_guard`]
+    /// kept for the checkpoint task, which needs the same exclusive side
+    /// but for a different reason (snapshot quiescence). The two callers
+    /// share a lock so a checkpoint cannot start mid-mutation, and a
+    /// mutation cannot start mid-checkpoint.
     pub(crate) fn acquire_checkpoint_visibility_guard(
         &self,
     ) -> parking_lot::RwLockWriteGuard<'_, ()> {
@@ -1131,7 +1151,13 @@ impl Engine {
                     let mut buf = [0u8; 4];
                     buf.copy_from_slice(&slot.spending_data[0..4]);
                     let spendable_height = u32::from_le_bytes(buf);
-                    if spendable_height != 0 && spendable_height >= req.current_block_height {
+                    // Spendable AT stop: half-open interval `[0, spendable_height)`.
+                    // At `current_block_height == spendable_height` the UTXO is
+                    // unfrozen — matches Teranode PR #949 / svnode / Aerospike
+                    // post-fix. Pre-fix this used `>=` which false-rejected at
+                    // the exact unlock height — i.e. accepting txs the network
+                    // would reject.
+                    if spendable_height != 0 && spendable_height > req.current_block_height {
                         errors.insert(
                             item.idx,
                             SpendError::FrozenUntil {
@@ -1278,7 +1304,8 @@ impl Engine {
                 let mut buf = [0u8; 4];
                 buf.copy_from_slice(&slot.spending_data[0..4]);
                 let spendable_height = u32::from_le_bytes(buf);
-                if spendable_height != 0 && spendable_height >= req.current_block_height {
+                // Spendable AT stop — see batch path for rationale.
+                if spendable_height != 0 && spendable_height > req.current_block_height {
                     return Err(SpendError::FrozenUntil {
                         offset: req.offset,
                         spendable_at_height: spendable_height,
@@ -2806,7 +2833,7 @@ impl Engine {
         // R-063 (A-13): use checked_add. Pre-fix the engine used
         // `saturating_add`, which silently clamped to `u32::MAX` and
         // pinned the UTXO unspendable forever — the
-        // `spendable_height >= req.current_block_height` gate in the
+        // `spendable_height > req.current_block_height` gate in the
         // spend path would always be true. Now surfaces as
         // `SpendError::ReassignOverflow` so the operator catches the
         // pathological input.
@@ -2937,7 +2964,26 @@ impl Engine {
 
             if committed {
                 if count > 0 && offset != 0 {
-                    let _ = self.free_conflicting_children_block(offset, count);
+                    // Post-commit cleanup: parent metadata now points at
+                    // `new_offset`; the old block at `offset` is orphaned
+                    // until freed. If `free` fails we cannot propagate
+                    // because the user-visible append SUCCEEDED — surface
+                    // the leak via a high-cardinality tracing event so
+                    // operators can correlate and reclaim manually (see
+                    // R-049 orphan-blob GC for the periodic sweep).
+                    if let Err(err) =
+                        self.free_conflicting_children_block(offset, count)
+                    {
+                        tracing::error!(
+                            target: "teraslab::engine::orphan",
+                            orphan = true,
+                            kind = "conflicting_children_old_block",
+                            offset = offset,
+                            bytes = (count * 32) as u64,
+                            error = %err,
+                            "post-commit free of old conflicting-children block failed; bytes leaked until R-049 sweep"
+                        );
+                    }
                 }
                 return Ok(());
             }
@@ -3013,7 +3059,25 @@ impl Engine {
             wbuf[intra + i * 32..intra + (i + 1) * 32].copy_from_slice(child);
         }
         if let Err(err) = self.device.pwrite_all_at(&wbuf, aligned_base) {
-            let _ = self.free_conflicting_children_block(new_offset, children.len());
+            // pwrite failed — roll back the freshly-allocated extent so
+            // we don't leak it. If the rollback itself fails, surface
+            // the leak via tracing (we still need to return the
+            // original pwrite error to the caller) so operators can
+            // correlate against the R-049 orphan-blob sweep.
+            if let Err(free_err) =
+                self.free_conflicting_children_block(new_offset, children.len())
+            {
+                tracing::error!(
+                    target: "teraslab::engine::orphan",
+                    orphan = true,
+                    kind = "conflicting_children_alloc_rollback",
+                    offset = new_offset,
+                    bytes = (children.len() * 32) as u64,
+                    pwrite_error = %err,
+                    free_error = %free_err,
+                    "rollback free after failed conflicting-children pwrite also failed; bytes leaked until R-049 sweep"
+                );
+            }
             return Err(SpendError::StorageError {
                 detail: format!("{err}"),
             });
@@ -4842,8 +4906,12 @@ mod tests {
         }
     }
 
+    /// Spendable AT stop — half-open interval `[0, spendable_height)`.
+    /// At `current_block_height == spendable_height` the UTXO MUST be
+    /// spendable. See `reassign_spendable_height_boundary_at_exact_height`
+    /// for the matching reassign-side boundary test.
     #[test]
-    fn spend_frozen_until_equal_height() {
+    fn spend_frozen_until_equal_height_is_spendable() {
         let h = TestHarness::new(10, TxFlags::empty());
         let entry = h.engine.lookup(&h.key).unwrap();
         let mut slot = UtxoSlot::new_unspent(h.slot_hash(2));
@@ -4852,9 +4920,28 @@ mod tests {
 
         let mut req = h.spend_req(2);
         req.current_block_height = 1000;
+        h.engine
+            .spend(&req)
+            .expect("spend at exact spendable_height must succeed");
+    }
+
+    /// One block below `spendable_height` is still frozen.
+    #[test]
+    fn spend_frozen_until_one_below_height() {
+        let h = TestHarness::new(10, TxFlags::empty());
+        let entry = h.engine.lookup(&h.key).unwrap();
+        let mut slot = UtxoSlot::new_unspent(h.slot_hash(2));
+        slot.spending_data[0..4].copy_from_slice(&1000u32.to_le_bytes());
+        io::write_utxo_slot(&*h.engine.device, entry.record_offset, 2, &slot).unwrap();
+
+        let mut req = h.spend_req(2);
+        req.current_block_height = 999;
         match h.engine.spend(&req) {
-            Err(SpendError::FrozenUntil { .. }) => {}
-            other => panic!("expected FrozenUntil (>= check), got {other:?}"),
+            Err(SpendError::FrozenUntil {
+                spendable_at_height: 1000,
+                ..
+            }) => {}
+            other => panic!("expected FrozenUntil(1000), got {other:?}"),
         }
     }
 
@@ -9334,7 +9421,7 @@ mod tests {
     /// `block_height + spendable_after` would overflow `u32`, reassign
     /// MUST return `SpendError::ReassignOverflow` instead of silently
     /// clamping with `saturating_add` and pinning the UTXO unspendable
-    /// forever (the spend path's `spendable_height >= current_block_height`
+    /// forever (the spend path's `spendable_height > current_block_height`
     /// gate would always be true).
     #[test]
     fn reassign_overflow_checked_add_rejects_u32_max() {
@@ -9529,6 +9616,11 @@ mod tests {
         }
     }
 
+    /// Boundary semantics — spendable AT stop (half-open `[start, stop)`).
+    /// At `current_block_height == spendable_height` the UTXO MUST be
+    /// spendable. Matches Teranode PR #949 fix to `teranode.lua:373`
+    /// and svnode/Aerospike post-fix behaviour. Pre-2026-05 this asserted
+    /// the inverse (FrozenUntil at exact height) — that was the bug.
     #[test]
     fn reassign_spendable_height_boundary_at_exact_height() {
         let engine = create_engine();
@@ -9557,21 +9649,55 @@ mod tests {
 
         let mut sd = [0u8; 36];
         sd[0] = 0xF0;
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: new_hash,
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1100,
+                block_height_retention: 288,
+            })
+            .expect("spend at exact spendable_height must succeed");
+
+        // And one block below — still frozen.
+        let (_, req2) = make_create_req(86, 5);
+        let key2 = req2.tx_key();
+        engine.create(&req2).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key2,
+                offset: 0,
+                utxo_hash: req2.utxo_hashes[0],
+            })
+            .unwrap();
+        engine
+            .reassign(&ReassignRequest {
+                tx_key: key2,
+                offset: 0,
+                utxo_hash: req2.utxo_hashes[0],
+                new_utxo_hash: new_hash,
+                block_height: 1000,
+                spendable_after: 100,
+            })
+            .unwrap();
         match engine.spend(&SpendRequest {
-            tx_key: key,
+            tx_key: key2,
             offset: 0,
             utxo_hash: new_hash,
             spending_data: sd,
             ignore_conflicting: false,
             ignore_locked: false,
-            current_block_height: 1100,
+            current_block_height: 1099,
             block_height_retention: 288,
         }) {
             Err(SpendError::FrozenUntil {
                 spendable_at_height: 1100,
                 ..
             }) => {}
-            other => panic!("exact spendable_height remains frozen; got {other:?}"),
+            other => panic!("one block below spendable_height must be frozen; got {other:?}"),
         }
     }
 

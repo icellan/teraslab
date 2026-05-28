@@ -22,6 +22,7 @@ use std::io::{self, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::protocol::opcodes::MAX_FRAME_SIZE;
 
@@ -130,7 +131,12 @@ pub fn verify_with_now<'a>(key: &[u8], data: &'a [u8], now_ms: u64) -> io::Resul
     // head = payload || timestamp_ms_le
     let (payload, ts_bytes) = head.split_at(head.len() - TIMESTAMP_LEN);
     let expected = hmac_sha256(key, head);
-    if !constant_time_eq(tag, &expected) {
+    // `subtle::ConstantTimeEq` ct_eq is the same primitive the HTTP token
+    // path uses (`server/http.rs`) — no early length-mismatch return,
+    // no short-circuit on first byte. Both inputs are 32 bytes here so
+    // the length-oracle concern is theoretical, but consistency with the
+    // HTTP path matters and the cost is zero.
+    if tag.ct_eq(&expected).unwrap_u8() != 1 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "HMAC verification failed",
@@ -448,7 +454,7 @@ pub fn verify_frame_streaming_with_now<R: Read, W: Write>(
     let tag = &tail[TIMESTAMP_LEN..];
     hmac.update(ts_bytes);
     let expected = hmac.finalize();
-    if !constant_time_eq(tag, &expected) {
+    if tag.ct_eq(&expected).unwrap_u8() != 1 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "HMAC verification failed",
@@ -504,18 +510,6 @@ fn read_some<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
             Err(e) => return Err(e),
         }
     }
-}
-
-/// Constant-time comparison to prevent timing attacks.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Minimal SHA-256 implementation (FIPS 180-4).
