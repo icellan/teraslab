@@ -249,7 +249,7 @@ pub fn verify_frame(key: &[u8], encoded_frame: &[u8]) -> io::Result<Vec<u8>> {
 /// Streaming variant of [`verify_frame`].
 ///
 /// Reads the 4-byte length prefix and then the body from `reader`,
-/// feeding the body through an [`HmacSha256`] context as it arrives.
+/// feeding the body through an `HmacSha256` (`Hmac<Sha256>`) context as it arrives.
 /// The verified payload bytes are emitted to `payload_sink` as they
 /// stream — see the **WRITES BEFORE VERIFY** hazard note below.
 ///
