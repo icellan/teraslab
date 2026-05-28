@@ -1330,6 +1330,24 @@ impl Engine {
                     // (lines above) — which also returns the unchanged
                     // generation — eliminates the WAL gap entirely:
                     // no write means nothing to recover.
+                    //
+                    // KNOWN GAP — `addDeletedChildren` parity with
+                    // Aerospike. The Aerospike Lua UDF also consults a
+                    // `deleted_children` list at this point: if the
+                    // child tx that originally consumed this output has
+                    // since been pruned (resurrected-then-pruned), the
+                    // idempotent re-spend MUST be rejected because the
+                    // chain history has been altered. Teraslab's
+                    // `TxMetadata` does not yet carry a `deleted_children`
+                    // count/offset pair — adding it is a schema change
+                    // (new metadata fields + new redo op + new test
+                    // coverage). Until then, callers that need parent
+                    // re-spend protection should issue an explicit
+                    // `OP_UNSPEND_BATCH` before retrying the spend; the
+                    // engine's normal unspent path then re-runs full
+                    // validation. Tracked as P1 follow-up F-X-022 in
+                    // `_review/follow_ups.md` (May-2026 external review
+                    // — bitcoin-expert).
                     let block_ids = collect_block_ids(&metadata).to_vec();
                     return Ok(SpendResponse {
                         signal: Signal::None,

@@ -134,6 +134,43 @@ No code-correctness change required.
 rather than in the registry. Promote to `metrics.rs` so the operator
 dashboard can observe SWIM-flood drops.
 
+### F-X-022. `addDeletedChildren` parent re-spend guard (Aerospike Lua parity)
+
+External review (bitcoin-expert P1, May-2026 wave 1): the Aerospike
+Lua UDF tracks a `deleted_children` list per record so an
+idempotent re-spend on the parent can be rejected after the child
+that originally consumed the parent's output has been pruned
+("resurrected-then-pruned" pattern). Teraslab's idempotent-respend
+short-circuit at `src/ops/engine.rs` UTXO_SPENT-match-spending_data
+returns OK unconditionally, missing this safety net.
+
+Implementation requires:
+
+1. Extend `TxMetadata` with `deleted_children_count: u8` +
+   `deleted_children_offset: u64` (mirrors the existing
+   `conflicting_children_*` pair).
+2. New redo op `RedoOp::AppendDeletedChild { parent_key, child_txid }`.
+3. New engine method `append_deleted_child(parent_key, child_txid)`
+   parallelling the existing `append_conflicting_child`.
+4. Wire the `OP_DELETE_BATCH` / `OP_PROCESS_EXPIRED_PRESERVATIONS`
+   handlers so that pruning a child also appends its txid to the
+   parent's `deleted_children` list.
+5. Consult the list at the idempotent-respend short-circuit and
+   return `SpendError::DeletedChildren { offset, child_count }`
+   (new variant) when non-empty.
+
+Scope: schema change + new redo op + new opcode + cross-cutting
+update to delete / prune paths + test coverage. Estimate
+2–3 engineer-days. Deferred from the May-2026 wave because the
+gap is a parity item with Aerospike, not a live correctness bug
+in any current Teranode workflow — operators that need the guard
+today can issue an explicit `OP_UNSPEND_BATCH` before retrying a
+spend, which re-runs full validation.
+
+Engine-side stub: the idempotent-respend comment in `engine.rs`
+calls out the gap inline so a future implementer can locate the
+exact integration point.
+
 ---
 
 ## B. Wire-up follow-ups (telemetry / config)
