@@ -139,6 +139,10 @@ fn create_node_with_cluster_id(
         max_connections: 64,
         max_batch_size: 4096,
         node_id,
+        // F-X-002: opt out of the strict_auth=true default so a
+        // cluster_secret-less test cluster doesn't get fataled at
+        // safe-defaults validation.
+        strict_auth: false,
         ..Default::default()
     };
 

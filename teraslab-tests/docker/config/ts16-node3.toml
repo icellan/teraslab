@@ -27,3 +27,10 @@ block_height_retention = 288
 cluster_secret = "teraslab-docker-test-secret-not-for-production"
 enable_remote_bind = true
 enable_admin_endpoints = true
+# F-X-002 (production default): strict_auth=true. These static configs
+# match the docker test cluster, which deliberately does NOT configure
+# a cluster_secret (the test client doesn't HMAC-sign frames). Stay on
+# the trusted-overlay opt-out so the safe-defaults check accepts the
+# config; the daemon will emit a prominent boot-time warn under
+# teraslab::security so operators know they're on the legacy path.
+strict_auth = false

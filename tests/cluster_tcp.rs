@@ -170,6 +170,13 @@ fn create_node_full(
         max_connections: 64,
         max_batch_size: 4096,
         node_id,
+        // F-X-002 (commit 12e0643) flipped the production default to
+        // `strict_auth = true`. These cluster tests run multi-node
+        // (`node_id > 0`) but use `cluster_secret: None` in the
+        // ClusterConfig because they assert SWIM/topology behaviour,
+        // not auth. Stay on the trusted-overlay opt-out so safe-defaults
+        // doesn't fatal the test process.
+        strict_auth: false,
         ..Default::default()
     };
 

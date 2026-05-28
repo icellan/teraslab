@@ -56,6 +56,12 @@ fn start_test_server() -> (Arc<Server>, Arc<Engine>, u16) {
         listen_addr: format!("127.0.0.1:{port}"),
         max_connections: 10,
         max_batch_size: 8192,
+        // F-X-002: tests exercise the replication wire without a
+        // cluster_secret (no HMAC signing). With the production
+        // `strict_auth = true` default, the data-port gate would
+        // reject every OP_REPLICA_BATCH frame. Stay on the trusted-
+        // overlay opt-out.
+        strict_auth: false,
         ..Default::default()
     };
 
