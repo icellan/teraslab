@@ -200,10 +200,69 @@ impl Bucket {
 // Hash functions
 // ---------------------------------------------------------------------------
 
-/// Compute the bucket index from a TxKey. Uses bytes 0–7 of txid.
-fn bucket_index(key: &TxKey, mask: usize) -> usize {
+/// Compute the bucket index from a TxKey, mixed with a per-process random
+/// `seed`.
+///
+/// # Why a seed
+///
+/// Before the seed was introduced, the bucket index was just
+/// `txid[0..8] & mask` — fully deterministic across processes. An attacker
+/// who can pick txid prefixes (e.g. by grinding nonces in BSV transactions)
+/// could pre-compute thousands of txids that all map to the same bucket
+/// region, submit them via `OP_CREATE_BATCH`, and force the Robin Hood
+/// probe length to explode. Every honest lookup that hashes into the same
+/// region then degrades from O(1) to O(N).
+///
+/// Mixing in a 64-bit `seed` generated once per process via [`getrandom`]
+/// makes the bucket placement unpredictable to an outside attacker without
+/// breaking the on-disk layout assumptions: the seed is process-local and
+/// never persisted — entries loaded from a file-backed table are rehashed
+/// on open under the freshly generated seed (see
+/// [`HashTable::rehash_to_seed`]).
+///
+/// # Mix function
+///
+/// The mix is the avalanche step from Wyhash / SplitMix64: XOR the txid
+/// prefix with the seed, then a 64-bit multiply-xor mix. ~2 ns per call,
+/// excellent diffusion (one bit flip in either input flips ~32 bits of
+/// output on average), and crucially it makes "find an input that collides
+/// to bucket B" require knowing the seed — a remote attacker can't.
+///
+/// # Determinism
+///
+/// For a fixed `seed`, the function is pure and deterministic. Every code
+/// path that reads, writes, or rebuilds the table threads the same
+/// `self.seed` through this call, so a `lookup(seed, x)` always lands on
+/// the same bucket as the prior `insert(seed, x)`.
+#[inline(always)]
+fn bucket_index(key: &TxKey, seed: u64, mask: usize) -> usize {
     let h = u64::from_le_bytes(key.txid[0..8].try_into().unwrap());
-    (h as usize) & mask
+    let mut x = h ^ seed;
+    // SplitMix64 finalizer — 2 multiplies + 2 xorshifts, ~2 ns.
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
+    (x as usize) & mask
+}
+
+/// Generate a fresh per-process random seed via the OS CSPRNG.
+///
+/// Uses [`getrandom`] (which routes to `getrandom(2)` on Linux,
+/// `getentropy(2)` on macOS/BSD) for cryptographic unpredictability.
+///
+/// # Panics
+///
+/// `getrandom` is documented as essentially infallible on supported
+/// platforms — it only errors if the OS entropy source is broken, which
+/// is unrecoverable at this layer. Falling back to a non-random seed
+/// would silently re-enable the DoS this seed exists to prevent, so we
+/// surface the failure as a panic. The single panic site is at startup
+/// (one per `HashTable::new` / `open_file_backed` call), not on the hot
+/// path.
+fn fresh_seed() -> u64 {
+    let mut buf = [0u8; 8];
+    getrandom::getrandom(&mut buf).expect("getrandom failed to produce a bucket seed");
+    u64::from_le_bytes(buf)
 }
 
 /// Derive the fingerprint from a txid. Uses bytes 8–15 (same region that
@@ -442,6 +501,13 @@ pub struct HashTable {
     hugepage: bool,
     /// Maximum probe distance observed so far.
     max_probe: usize,
+    /// Per-process random seed mixed into [`bucket_index`] to defeat
+    /// directed Robin Hood DoS attacks. Generated once at table creation
+    /// via [`fresh_seed`]; never persisted. For file-backed tables
+    /// reopened with existing contents, the on-disk entries are rehashed
+    /// under the freshly generated seed in
+    /// [`HashTable::rehash_to_seed`].
+    seed: u64,
     /// Whether this table is anonymous or file-backed.
     backing: Backing,
     /// Optional redo log for journaling file-backed resize (crash atomicity).
@@ -529,6 +595,7 @@ impl HashTable {
             mmap_len,
             hugepage,
             max_probe: 0,
+            seed: fresh_seed(),
             backing: Backing::Anonymous,
             redo_log: None,
         })
@@ -624,7 +691,12 @@ impl HashTable {
                     }
                 }
             }
-            Ok(Self {
+            // The on-disk bucket positions were computed with the previous
+            // run's seed (or seed=0 pre-fix). Generate a fresh seed and
+            // rehash the loaded entries into their new bucket positions so
+            // every subsequent operation runs under the new, unpredictable
+            // seed. This is a one-shot O(capacity) cost at startup.
+            let mut table = Self {
                 ptr,
                 capacity,
                 count,
@@ -632,12 +704,15 @@ impl HashTable {
                 mmap_len,
                 hugepage: false,
                 max_probe,
+                seed: fresh_seed(),
                 backing: Backing::FileBacked {
                     fd,
                     path: path.to_path_buf(),
                 },
                 redo_log: None,
-            })
+            };
+            table.rehash_to_seed()?;
+            Ok(table)
         } else {
             // Initialize all buckets to empty sentinel.
             unsafe {
@@ -653,6 +728,7 @@ impl HashTable {
                 mmap_len,
                 hugepage: false,
                 max_probe: 0,
+                seed: fresh_seed(),
                 backing: Backing::FileBacked {
                     fd,
                     path: path.to_path_buf(),
@@ -756,7 +832,7 @@ impl HashTable {
     /// Look up a transaction by key, returning the entry by value. O(1) expected.
     pub fn get_entry(&self, key: &TxKey) -> Option<TxIndexEntry> {
         let fp = txid_fingerprint(&key.txid);
-        let mut idx = bucket_index(key, self.mask);
+        let mut idx = bucket_index(key, self.seed, self.mask);
         let mut dist: u16 = 0;
 
         loop {
@@ -789,7 +865,7 @@ impl HashTable {
         // Check for update of existing key first.
         let fp = txid_fingerprint(&key.txid);
         {
-            let mut idx = bucket_index(&key, self.mask);
+            let mut idx = bucket_index(&key, self.seed, self.mask);
             let mut dist: u16 = 0;
             loop {
                 let bucket = self.bucket(idx);
@@ -818,7 +894,7 @@ impl HashTable {
         }
 
         // New insert — Robin Hood insertion.
-        let mut idx = bucket_index(&key, self.mask);
+        let mut idx = bucket_index(&key, self.seed, self.mask);
         let mut dist: u16 = 0;
         let mut cur_key = key;
         let mut cur_entry = entry;
@@ -874,12 +950,52 @@ impl HashTable {
         Ok(())
     }
 
+    /// Rehash every occupied bucket into the position dictated by the
+    /// current `self.seed`.
+    ///
+    /// Called by [`HashTable::open_file_backed`] when an existing file is
+    /// reopened: the on-disk bucket positions were chosen under whatever
+    /// seed the previous run used (or `seed=0` pre-fix), but the running
+    /// table operates under a freshly generated process-local seed. To
+    /// reconcile the two, we drain every occupied bucket into a scratch
+    /// vector, wipe the table back to the empty sentinel, reset
+    /// bookkeeping, and re-insert each entry under the new seed.
+    ///
+    /// This is O(capacity) at startup and does not run on the hot path.
+    fn rehash_to_seed(&mut self) -> Result<()> {
+        // Collect every occupied (key, entry) pair before mutating any
+        // bucket so the scan sees a consistent view.
+        let mut entries: Vec<(TxKey, TxIndexEntry)> = Vec::with_capacity(self.count);
+        for i in 0..self.capacity {
+            let bucket = self.bucket(i);
+            if bucket.is_occupied() {
+                entries.push((TxKey { txid: bucket.txid }, bucket.entry()));
+            }
+        }
+
+        // Wipe the mmap region back to the empty sentinel (0xFF). Safety:
+        // we own the mapping exclusively (`&mut self`) and `mmap_len`
+        // matches the allocation returned by the constructor.
+        unsafe {
+            std::ptr::write_bytes(self.ptr as *mut u8, BUCKET_EMPTY_SENTINEL, self.mmap_len);
+        }
+        self.count = 0;
+        self.max_probe = 0;
+
+        // Re-insert under `self.seed`. Each `insert` uses the current
+        // `self.seed`, so every entry lands at its post-mix position.
+        for (key, entry) in entries {
+            self.insert(key, entry)?;
+        }
+        Ok(())
+    }
+
     /// Remove an entry by key. Returns the removed entry if it existed.
     ///
     /// Uses backward-shift deletion for better probe-chain performance.
     pub fn remove(&mut self, key: &TxKey) -> Option<TxIndexEntry> {
         let fp = txid_fingerprint(&key.txid);
-        let mut idx = bucket_index(key, self.mask);
+        let mut idx = bucket_index(key, self.seed, self.mask);
         let mut dist: u16 = 0;
 
         // Find the entry.
@@ -1033,7 +1149,7 @@ impl HashTable {
         generation: u32,
     ) -> bool {
         let fp = txid_fingerprint(&key.txid);
-        let mut idx = bucket_index(key, self.mask);
+        let mut idx = bucket_index(key, self.seed, self.mask);
         let mut dist: u16 = 0;
 
         loop {
@@ -1165,6 +1281,12 @@ impl HashTable {
         // allocation is purely in-memory; a crash loses the table anyway.
         if matches!(self.backing, Backing::Anonymous) {
             let mut new_table = HashTable::new(new_cap)?;
+            // Preserve the per-process bucket seed across the resize so
+            // every operation in this process continues to use the same
+            // mix function. Without this, a resize would shift every
+            // entry to a new bucket under a fresh seed — internally
+            // consistent, but unnecessary work and harder to reason about.
+            new_table.seed = self.seed;
             self.copy_entries_into(&mut new_table)?;
             new_table.redo_log = self.redo_log.clone();
             return Ok(new_table);
@@ -1194,6 +1316,12 @@ impl HashTable {
         // Remove any stale tmp file from a prior aborted resize.
         let _ = std::fs::remove_file(&tmp_path);
         let mut new_table = HashTable::open_file_backed(&tmp_path, new_cap)?;
+        // Preserve the per-process bucket seed across the resize so all
+        // operations in this process keep using the same mix function.
+        // `copy_entries_into` re-inserts every entry below, so the
+        // on-disk bucket positions in the tmp file end up consistent
+        // with `self.seed`.
+        new_table.seed = self.seed;
         self.copy_entries_into(&mut new_table)?;
 
         // Step 3: msync + fsync the tmp file so its contents are durable
@@ -1464,9 +1592,11 @@ mod tests {
         let k1 = make_colliding_key(42, 1, 1023);
         let k2 = make_colliding_key(42, 2, 1023);
 
+        // Both keys share txid[0..8], so they always hash to the same
+        // bucket under any seed — verify with the live table's seed.
         assert_eq!(
-            bucket_index(&k1, 1023),
-            bucket_index(&k2, 1023),
+            bucket_index(&k1, t.seed, 1023),
+            bucket_index(&k2, t.seed, 1023),
             "keys should collide"
         );
         assert_ne!(txid_fingerprint(&k1.txid), txid_fingerprint(&k2.txid));
@@ -1479,6 +1609,91 @@ mod tests {
         assert_eq!(t.get_entry(&k1), Some(e1));
         assert_eq!(t.get_entry(&k2), Some(e2));
         assert_eq!(t.len(), 2);
+    }
+
+    // -- Bucket-seed DoS-hardening tests (security fix) --
+
+    /// Each `HashTable::new` call must generate a fresh, unpredictable
+    /// seed via the OS CSPRNG. With two independent tables (each with
+    /// their own seed), the bucket index for the same txid must differ
+    /// in the overwhelming majority of cases — false-match probability
+    /// is ~`mask / 2^64`, indistinguishable from zero for any realistic
+    /// table size.
+    ///
+    /// Without this property, an attacker who can grind txids with chosen
+    /// 8-byte prefixes can pre-compute thousands of colliding txids and
+    /// pin the Robin Hood probe length, degrading O(1) lookups to O(N).
+    #[test]
+    fn bucket_seed_differs_across_instances() {
+        // Use a moderately-sized table so the mask is large enough to
+        // give the seed real entropy to spread across (1024-bucket tables
+        // have only 10 bits of bucket entropy, so we use 2^20).
+        let t1 = HashTable::new(1 << 20).unwrap();
+        let t2 = HashTable::new(1 << 20).unwrap();
+
+        // Sanity: the two tables must have different seeds. Probability
+        // of a collision under a real CSPRNG: 2^-64. If this fails the
+        // seed source is deterministic — the DoS fix is broken.
+        assert_ne!(
+            t1.seed, t2.seed,
+            "two independent HashTables share the same bucket seed — \
+             seed source is not random (DoS fix broken)",
+        );
+
+        // Probe a batch of distinct keys; with independent seeds the
+        // post-mix bucket positions diverge ~`capacity - 1` times in
+        // `capacity` cases. We require strictly more than half the
+        // probed keys to land in different buckets — this is a wildly
+        // conservative bound (true expected mismatch is >99.99% for
+        // 2^20 buckets) but it's robust against the worst-case
+        // birthday-style chance accumulation.
+        let mut mismatches = 0;
+        const PROBES: u64 = 1024;
+        for i in 0..PROBES {
+            let k = make_key(i);
+            let b1 = bucket_index(&k, t1.seed, t1.mask);
+            let b2 = bucket_index(&k, t2.seed, t2.mask);
+            if b1 != b2 {
+                mismatches += 1;
+            }
+        }
+        assert!(
+            mismatches > PROBES as usize / 2,
+            "only {mismatches}/{PROBES} keys hashed to different buckets across \
+             two independent tables — bucket seed is not effective",
+        );
+    }
+
+    /// For a fixed seed, `bucket_index` must be pure: the same key must
+    /// always map to the same bucket so `lookup(seed, x)` and
+    /// `register(seed, x)` agree.
+    #[test]
+    fn bucket_seed_deterministic_within_instance() {
+        let t = HashTable::new(1 << 12).unwrap();
+        for i in 0..256u64 {
+            let k = make_key(i);
+            let b1 = bucket_index(&k, t.seed, t.mask);
+            let b2 = bucket_index(&k, t.seed, t.mask);
+            assert_eq!(b1, b2, "bucket_index is not deterministic for seed={}", t.seed);
+        }
+    }
+
+    /// The seed is generated via `getrandom` — verify the helper returns
+    /// non-zero (with overwhelming probability) and varies across calls.
+    /// A trivial smoke test that the seed source is wired up; the broader
+    /// distribution guarantee is the CSPRNG's responsibility.
+    #[test]
+    fn fresh_seed_is_random() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..16 {
+            seen.insert(fresh_seed());
+        }
+        assert_eq!(
+            seen.len(),
+            16,
+            "fresh_seed produced a duplicate over 16 calls — \
+             seed source is not random",
+        );
     }
 
     // -- Capacity and resize tests --
