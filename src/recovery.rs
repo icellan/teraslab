@@ -500,8 +500,20 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
     // through their own paths (snapshot on shutdown / per-op redb commit).
     if let Some(alloc) = allocator {
         // Failure here is non-fatal for recovery — the next startup will
-        // simply replay the same entries again, which is idempotent.
-        let _ = alloc.persist();
+        // simply replay the same entries again, which is idempotent. But
+        // it is NOT silent: surface the error so operators can spot
+        // chronic snapshot-persist failures (disk full, permission drift)
+        // before they compound into a multi-second replay on next boot.
+        if let Err(err) = alloc.persist() {
+            if let Some(m) = crate::metrics::allocator_metrics() {
+                m.snapshot_persist_failures_total.inc();
+            }
+            tracing::warn!(
+                target: "teraslab::recovery::allocator",
+                error = %err,
+                "recovery: allocator snapshot persist failed — next startup will replay allocator redo entries (idempotent, but a sustained climb in `allocator_snapshot_persist_failures_total` indicates a real disk/permission problem)"
+            );
+        }
     }
 
     Ok((stats, pending_conflicting_children))

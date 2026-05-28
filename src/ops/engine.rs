@@ -3314,13 +3314,44 @@ impl Engine {
     /// replication failure) MUST go through
     /// [`Self::set_locked_with_before_image`] to capture
     /// `prior_delete_at_height` and use `Self::restore_set_locked_for_compensation`
-    /// on rollback. Plain `set_locked(false)` after a failed
-    /// `set_locked(true)` silently drops the DAH and the record becomes
-    /// unprunable on the next sweep. This `u32` return signature exists
-    /// only for callers that have no compensation requirement
-    /// (e.g. benchmarks, idempotent replay).
-    pub fn set_locked(&self, req: &SetLockedRequest) -> Result<u32, SpendError> {
+    /// on rollback. Plain `set_locked_idempotent(false)` after a failed
+    /// `set_locked_idempotent(true)` silently drops the DAH and the record
+    /// becomes unprunable on the next sweep. This `u32` return signature
+    /// exists only for callers that have no compensation requirement
+    /// (e.g. benchmarks, idempotent replica replay).
+    ///
+    /// # Foot-gun
+    ///
+    /// Do NOT use this on master-side replication paths or anywhere a
+    /// failure could trigger a rollback. The function is named
+    /// `_idempotent` (not the historical `set_locked`) precisely to
+    /// trip compile-time review of any new call site — see
+    /// May-2026 external review P1 "set_locked plain variant DAH-loss
+    /// foot-gun" and `_review/follow_ups.md`.
+    pub fn set_locked_idempotent(&self, req: &SetLockedRequest) -> Result<u32, SpendError> {
         Ok(self.set_locked_with_before_image(req)?.generation)
+    }
+
+    /// Backwards-compat alias for [`Self::set_locked_idempotent`].
+    ///
+    /// Deprecated 2026-05-28: the original `set_locked` name was a
+    /// foot-gun — callers reaching for the "obvious" name on a
+    /// compensation path would silently drop DAH. New code MUST pick
+    /// either [`Self::set_locked_with_before_image`] (compensation-safe)
+    /// or [`Self::set_locked_idempotent`] (the explicit idempotent
+    /// shorthand). This alias exists only to ease the in-tree call-
+    /// site migration; remove it once `_review/follow_ups.md` records
+    /// zero remaining callers.
+    #[deprecated(
+        since = "0.4.0",
+        note = "use `set_locked_idempotent` for replica-replay / benches, or \
+                `set_locked_with_before_image` for any path that can trigger \
+                a compensation rollback. The unqualified `set_locked` name \
+                makes the DAH-compensation requirement invisible at the call \
+                site."
+    )]
+    pub fn set_locked(&self, req: &SetLockedRequest) -> Result<u32, SpendError> {
+        self.set_locked_idempotent(req)
     }
 
     /// Set or clear the locked flag and return the pre-apply lock/DAH state.
@@ -9885,7 +9916,7 @@ mod tests {
             assert_ne!({ after_conflict.delete_at_height }, 0);
 
             let locked_generation = engine
-                .set_locked(&SetLockedRequest {
+                .set_locked_idempotent(&SetLockedRequest {
                     tx_key: key,
                     value: true,
                 })
@@ -9921,7 +9952,7 @@ mod tests {
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine
-            .set_locked(&SetLockedRequest {
+            .set_locked_idempotent(&SetLockedRequest {
                 tx_key: key,
                 value: true,
             })
@@ -9951,7 +9982,7 @@ mod tests {
 
         // Lock clears DAH
         engine
-            .set_locked(&SetLockedRequest {
+            .set_locked_idempotent(&SetLockedRequest {
                 tx_key: key,
                 value: true,
             })
@@ -9968,7 +9999,7 @@ mod tests {
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine
-            .set_locked(&SetLockedRequest {
+            .set_locked_idempotent(&SetLockedRequest {
                 tx_key: key,
                 value: false,
             })
@@ -9985,7 +10016,7 @@ mod tests {
         let key = req.tx_key();
         engine.create(&req).unwrap();
         engine
-            .set_locked(&SetLockedRequest {
+            .set_locked_idempotent(&SetLockedRequest {
                 tx_key: key,
                 value: true,
             })
@@ -10554,7 +10585,7 @@ mod tests {
 
         // Set locked
         engine
-            .set_locked(&SetLockedRequest {
+            .set_locked_idempotent(&SetLockedRequest {
                 tx_key: key,
                 value: true,
             })

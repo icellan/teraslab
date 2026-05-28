@@ -880,6 +880,18 @@ pub struct ReplicationMetrics {
     /// diverged from the master without surfacing an error; operators
     /// must investigate any sustained growth.
     pub replica_apply_skipped_missing_tx: PaddedCounter,
+    /// External-review P1 follow-up — receiver-side counter incremented
+    /// every time `apply_op` aborts a batch because the local slot state
+    /// contradicts what the master's mutation expected (e.g. master
+    /// sent a Spend but the replica's slot is Frozen / Pruned /
+    /// AlreadySpent with different `spending_data`). Unlike the soft
+    /// "tx not found" skip these are hard divergences; the master will
+    /// observe the resulting NACK, mark the replica Down, and trigger
+    /// catch-up. A non-zero value means a real master/replica state
+    /// disagreement was detected and forced a resync — operators
+    /// should investigate root cause (lost intent range, redo gap,
+    /// dedup-tracker drift) before the next sustained climb.
+    pub replica_apply_divergence_total: PaddedCounter,
     /// F-G7-008: master-side counter — incremented every time
     /// `AckTracker::flush_locked` fails to persist the last-ACKed
     /// map to disk. A non-zero counter means the on-disk view of
@@ -958,6 +970,7 @@ impl ReplicationMetrics {
             leader_sequence: AtomicU64::new(0),
             replica_rejected_stale_cluster_key: PaddedCounter::new(),
             replica_apply_skipped_missing_tx: PaddedCounter::new(),
+            replica_apply_divergence_total: PaddedCounter::new(),
             ack_tracker_flush_failures: PaddedCounter::new(),
             replica_worker_panics_total: PaddedCounter::new(),
             replica_unauthenticated_accept_total: PaddedCounter::new(),
@@ -1430,6 +1443,14 @@ pub struct AllocatorMetrics {
     /// approaching the point where wrapping-serial comparison can no
     /// longer disambiguate ahead vs. behind.
     pub generation_wrap_warn_total: PaddedCounter,
+    /// Failures to persist the allocator snapshot at the end of crash
+    /// recovery. The failure is non-fatal — the next startup re-replays
+    /// the same allocator redo entries (idempotent) — but a sustained
+    /// climb indicates a real disk/permission problem that will compound
+    /// into multi-second replay latencies on subsequent boots. Replaces
+    /// the previous `let _ = alloc.persist()` silent drop site at
+    /// `recovery.rs:504` per the May-2026 external review.
+    pub snapshot_persist_failures_total: PaddedCounter,
 }
 
 impl Default for AllocatorMetrics {
@@ -1450,6 +1471,7 @@ impl AllocatorMetrics {
             freelist_largest_region_bytes: AtomicU64::new(0),
             corrupt_redo_entries_total: PaddedCounter::new(),
             generation_wrap_warn_total: PaddedCounter::new(),
+            snapshot_persist_failures_total: PaddedCounter::new(),
         }
     }
 }

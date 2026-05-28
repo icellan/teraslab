@@ -326,7 +326,7 @@ fn bench_set_locked(c: &mut Criterion) {
             let key = TxKey {
                 txid: make_tx_id(tx_idx),
             };
-            let _ = engine.set_locked(&SetLockedRequest {
+            let _ = engine.set_locked_idempotent(&SetLockedRequest {
                 tx_key: key,
                 value: toggle,
             });

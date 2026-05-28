@@ -707,6 +707,16 @@ fn handle_connection_inner(
             .read_exact(&mut read_buf[4..4 + frame_len])
             .map_err(|e| format!("read frame body: {e}"))?;
         let frame_bytes_mut = read_buf.split_to(4 + frame_len);
+        // Shrink read_buf IMMEDIATELY after split_to so a giant frame
+        // does not pin peak-frame capacity on the connection during
+        // dispatch + response write. Under the per-IP connection cap
+        // (`max_connections_per_ip = 64` by default) a 16 MiB peak
+        // frame would otherwise hold 64 × 16 MiB = 1 GiB pinned
+        // across concurrent slow-loris-ish clients until each
+        // connection's iteration completed. Moving the reset here
+        // (rather than at the bottom of the loop after `write_all`)
+        // closes that amplifier window. Re-review P1.
+        reset_read_buf_if_oversized(&mut read_buf);
         // Top up `read_buf` so subsequent iterations still have spare
         // capacity for the next frame without growing on every loop.
         if read_buf.capacity() < READ_BUF_RETAINED_SIZE {
@@ -837,7 +847,10 @@ fn handle_connection_inner(
         stream
             .write_all(&response_bytes)
             .map_err(|e| format!("write response: {e}"))?;
-        reset_read_buf_if_oversized(&mut read_buf);
+        // (The per-iteration read_buf reset has moved up to right
+        // after `split_to` so a giant frame does not pin per-IP
+        // capacity through the dispatch + response window. Reset
+        // again here is redundant.)
     }
 }
 

@@ -992,6 +992,29 @@ fn record_apply_skipped_missing_tx(op_name: &'static str, tx_key: &TxKey) {
     );
 }
 
+/// Record a HARD divergence — the replica's local slot state contradicts
+/// what the master's mutation expected (e.g. master sent a Spend on what
+/// it observed as Unspent, but the replica's slot is Frozen, Pruned, or
+/// already Spent with different `spending_data`). Unlike the soft "tx
+/// not found" skip, this is a state mismatch that the engine itself
+/// surfaced — silently advancing the high-water mark would let the
+/// replica drift further from the master on every subsequent op.
+///
+/// Caller MUST return Err from `apply_op` immediately so the batch is
+/// NACKed: the master will mark this replica Down and trigger catch-up.
+#[inline]
+fn record_apply_divergence(op_name: &'static str, tx_key: &TxKey, detail: &str) {
+    if let Some(m) = crate::metrics::replication_metrics() {
+        m.replica_apply_divergence_total.inc();
+    }
+    tracing::error!(
+        op = op_name,
+        tx_key = ?tx_key.txid,
+        detail = detail,
+        "replica apply: local slot state contradicts master — aborting batch to force catch-up",
+    );
+}
+
 /// Apply a single `ReplicaOp` to the engine.
 ///
 /// For Spend, Freeze, Unfreeze, and Reassign operations the replica
@@ -1057,12 +1080,51 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             };
             match engine.spend(&req) {
                 Ok(_) => Ok(()),
-                // Already spent with same data is idempotent
-                Err(crate::ops::error::SpendError::AlreadySpent { .. }) => Ok(()),
-                // Frozen is expected if the slot was frozen and we're replaying
-                Err(crate::ops::error::SpendError::Frozen { .. }) => Ok(()),
-                // Pruned slots cannot be spent
-                Err(crate::ops::error::SpendError::Pruned { .. }) => Ok(()),
+                // Engine returns AlreadySpent ONLY when the slot is
+                // UTXO_SPENT with `spending_data != req.spending_data`
+                // — the engine's idempotent-respend short-circuits the
+                // matching case at the top of the spend path. So if
+                // we see AlreadySpent here, the replica's local
+                // spending_data disagrees with the master's: hard
+                // divergence. NACK so the master can mark us Down
+                // and resync.
+                Err(crate::ops::error::SpendError::AlreadySpent { spending_data, .. }) => {
+                    record_apply_divergence(
+                        "spend",
+                        tx_key,
+                        &format!(
+                            "AlreadySpent with different spending_data on replica (local={:02x?})",
+                            &spending_data[..8],
+                        ),
+                    );
+                    Err(format!(
+                        "spend divergence: replica slot AlreadySpent with different spending_data ({:02x?}...)",
+                        &spending_data[..8],
+                    ))
+                }
+                // Master sent a Spend on what it observed as Unspent
+                // but the replica's slot is Frozen — the master's
+                // pre-spend validation would have rejected Frozen, so
+                // the local Frozen state is real divergence.
+                Err(crate::ops::error::SpendError::Frozen { .. }) => {
+                    record_apply_divergence(
+                        "spend",
+                        tx_key,
+                        "local slot Frozen but master sent Spend",
+                    );
+                    Err("spend divergence: local slot Frozen but master sent Spend".to_string())
+                }
+                // Same shape for Pruned — master would not have sent
+                // Spend on a pruned slot if its local state matched
+                // ours.
+                Err(crate::ops::error::SpendError::Pruned { .. }) => {
+                    record_apply_divergence(
+                        "spend",
+                        tx_key,
+                        "local slot Pruned but master sent Spend",
+                    );
+                    Err("spend divergence: local slot Pruned but master sent Spend".to_string())
+                }
                 Err(e) => Err(format!("spend: {e}")),
             }
         }
@@ -1256,7 +1318,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
                 tx_key: *tx_key,
                 value: *value,
             };
-            match engine.set_locked(&req) {
+            match engine.set_locked_idempotent(&req) {
                 Ok(_) => Ok(()),
                 Err(crate::ops::error::SpendError::TxNotFound) => {
                     record_apply_skipped_missing_tx("set_locked", tx_key);

@@ -405,7 +405,7 @@ impl StateVerifier {
                 };
 
                 engine
-                    .set_locked(&req)
+                    .set_locked_idempotent(&req)
                     .map_err(|e| format!("set_locked failed: {e}"))?;
 
                 if let Some(rec) = self.records.get_mut(tx_key) {

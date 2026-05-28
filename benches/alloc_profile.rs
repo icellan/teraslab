@@ -356,7 +356,7 @@ fn main() {
         let key = TxKey {
             txid: make_tx_id(tx_i),
         };
-        let _ = engine.set_locked(&SetLockedRequest {
+        let _ = engine.set_locked_idempotent(&SetLockedRequest {
             tx_key: key,
             value: true,
         });
