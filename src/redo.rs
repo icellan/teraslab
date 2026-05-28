@@ -297,6 +297,13 @@ const OP_UNSPEND_V2: u8 = 31;
 const OP_FREEZE_V2: u8 = 32;
 /// F-G4-008: explicit V2 tag for unfreeze entries that carry `utxo_hash`.
 const OP_UNFREEZE_V2: u8 = 33;
+/// F-X-022: durable intent to append a child txid to a parent's
+/// deleted-children list. Mirrors [`OP_APPEND_CONFLICTING_CHILD`] —
+/// the engine writes and fsyncs this before allocating/writing the
+/// replacement deleted-child-list block. Full startup recovery
+/// collects these entries and drains them after constructing the
+/// engine.
+const OP_APPEND_DELETED_CHILD: u8 = 34;
 
 /// F-G4-006: hard cap on the number of parent_txids decoded from a single
 /// `CreateV2` redo entry. Bitcoin transactions in practice rarely have
@@ -471,6 +478,27 @@ pub enum RedoOp {
     /// [child_txid:32]
     /// ```
     AppendConflictingChild {
+        parent_key: TxKey,
+        child_txid: [u8; 32],
+    },
+    /// F-X-022: durable intent to append a child txid to a parent's
+    /// deleted-children list. Aerospike `addDeletedChildren` parity.
+    ///
+    /// Emitted from `Engine::append_deleted_child` after the prune-slot
+    /// mutation, so the chain of redo entries is:
+    /// `PruneSlotIfSpentBy` (logically primary) →
+    /// `AppendDeletedChild` (audit/diagnostic + defense-in-depth at
+    /// idempotent-respend). The replay handler defers the append to a
+    /// post-engine-construction draining pass for the same reason as
+    /// [`Self::AppendConflictingChild`] — the operation needs the engine
+    /// allocator and stripe locks.
+    ///
+    /// Wire layout (after the type byte):
+    /// ```text
+    /// [parent_key:32]
+    /// [child_txid:32]
+    /// ```
+    AppendDeletedChild {
         parent_key: TxKey,
         child_txid: [u8; 32],
     },
@@ -698,6 +726,7 @@ impl RedoOp {
             RedoOp::Delete { .. } => OP_DELETE,
             RedoOp::SetConflicting { .. } => OP_SET_CONFLICTING,
             RedoOp::AppendConflictingChild { .. } => OP_APPEND_CONFLICTING_CHILD,
+            RedoOp::AppendDeletedChild { .. } => OP_APPEND_DELETED_CHILD,
             RedoOp::SetLocked { .. } => OP_SET_LOCKED,
             RedoOp::PreserveUntil { .. } => OP_PRESERVE_UNTIL,
             RedoOp::MarkOnLongestChain { .. } => OP_MARK_LONGEST_CHAIN,
@@ -746,7 +775,8 @@ impl RedoOp {
             | RedoOp::CompensateReassign { tx_key, .. }
             | RedoOp::CompensatePrune { tx_key, .. }
             | RedoOp::CompensateSetLocked { tx_key, .. } => Some(tx_key),
-            RedoOp::AppendConflictingChild { parent_key, .. } => Some(parent_key),
+            RedoOp::AppendConflictingChild { parent_key, .. }
+            | RedoOp::AppendDeletedChild { parent_key, .. } => Some(parent_key),
             RedoOp::AllocateRegion { .. }
             | RedoOp::FreeRegion { .. }
             | RedoOp::HashtableResizeBegin { .. }
@@ -929,6 +959,10 @@ impl RedoOp {
                 buf.extend_from_slice(&block_height_retention.to_le_bytes());
             }
             RedoOp::AppendConflictingChild {
+                parent_key,
+                child_txid,
+            }
+            | RedoOp::AppendDeletedChild {
                 parent_key,
                 child_txid,
             } => {
@@ -1299,6 +1333,16 @@ impl RedoOp {
                 let mut child_txid = [0u8; 32];
                 child_txid.copy_from_slice(&data[32..64]);
                 Some(RedoOp::AppendConflictingChild {
+                    parent_key: TxKey { txid: parent_txid },
+                    child_txid,
+                })
+            }
+            OP_APPEND_DELETED_CHILD if data.len() >= 64 => {
+                let mut parent_txid = [0u8; 32];
+                parent_txid.copy_from_slice(&data[..32]);
+                let mut child_txid = [0u8; 32];
+                child_txid.copy_from_slice(&data[32..64]);
+                Some(RedoOp::AppendDeletedChild {
                     parent_key: TxKey { txid: parent_txid },
                     child_txid,
                 })
@@ -2687,6 +2731,10 @@ mod tests {
                 parent_key: test_key(111),
                 child_txid: [0xDD; 32],
             },
+            RedoOp::AppendDeletedChild {
+                parent_key: test_key(112),
+                child_txid: [0xDE; 32],
+            },
             RedoOp::SetLocked {
                 tx_key: test_key(12),
                 value: false,
@@ -3568,6 +3616,14 @@ mod tests {
         assert_round_trip(RedoOp::AppendConflictingChild {
             parent_key: make_txid(0x3D),
             child_txid: make_txid(0x3E).txid,
+        });
+    }
+
+    #[test]
+    fn append_deleted_child_redo_round_trip() {
+        assert_round_trip(RedoOp::AppendDeletedChild {
+            parent_key: make_txid(0x4D),
+            child_txid: make_txid(0x4E).txid,
         });
     }
 

@@ -6410,6 +6410,14 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
         // distinguish via the empty payload (real `InvalidSpend` carries
         // the 36-byte `spending_data`).
         SpendError::ReservedSpendingData { .. } => (ERR_INVALID_SPEND, vec![]),
+        // F-X-022: Aerospike `addDeletedChildren` parity. Distinct wire
+        // code (`ERR_DELETED_CHILDREN = 35`) so clients can distinguish
+        // the resurrected-then-pruned rejection from the regular
+        // `UTXO_PRUNED` slot-status rejection (`ERR_INVALID_SPEND`).
+        // Payload is the single-byte child_count for client diagnostics.
+        SpendError::DeletedChildren { child_count, .. } => {
+            (ERR_DELETED_CHILDREN, vec![*child_count])
+        }
     };
     BatchItemError {
         item_index,
@@ -6437,7 +6445,11 @@ pub(crate) fn classify_spend_error(err: &SpendError) -> crate::metrics::Outcome 
         SpendError::Conflicting
         | SpendError::AlreadySpent { .. }
         | SpendError::InvalidSpend { .. }
-        | SpendError::Pruned { .. } => Outcome::ErrConflicting,
+        | SpendError::Pruned { .. }
+        // F-X-022: deleted-children rejection is the same conflict class
+        // as a regular pruned/conflicting failure — the chain history
+        // diverged under the parent.
+        | SpendError::DeletedChildren { .. } => Outcome::ErrConflicting,
         SpendError::Locked
         | SpendError::Frozen { .. }
         | SpendError::FrozenUntil { .. }
@@ -6464,7 +6476,11 @@ pub(crate) fn classify_wire_error_code(code: u16) -> crate::metrics::Outcome {
     match code {
         ERR_REDIRECT => Outcome::Redirect,
         ERR_TX_NOT_FOUND => Outcome::ErrNotFound,
-        ERR_CONFLICTING | ERR_ALREADY_SPENT | ERR_INVALID_SPEND | ERR_ALREADY_EXISTS => {
+        ERR_CONFLICTING
+        | ERR_ALREADY_SPENT
+        | ERR_INVALID_SPEND
+        | ERR_ALREADY_EXISTS
+        | ERR_DELETED_CHILDREN => {
             Outcome::ErrConflicting
         }
         ERR_LOCKED | ERR_FROZEN | ERR_FROZEN_UNTIL | ERR_ALREADY_FROZEN | ERR_UTXO_NOT_FROZEN => {
@@ -11797,6 +11813,13 @@ mod tests {
                     retention: 288,
                 },
                 Outcome::ErrStorage,
+            ),
+            (
+                SpendError::DeletedChildren {
+                    offset: 0,
+                    child_count: 1,
+                },
+                Outcome::ErrConflicting,
             ),
         ];
         for (err, expected) in cases {

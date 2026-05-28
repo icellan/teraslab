@@ -1174,6 +1174,32 @@ impl Engine {
                 }
                 UTXO_SPENT => {
                     if slot.spending_data == item.spending_data {
+                        // F-X-022: same defense-in-depth check as the
+                        // single-spend path. See `Engine::spend` for
+                        // the full rationale. The metadata read at
+                        // step 2 above already carries
+                        // `deleted_children_count`; the on-device list
+                        // is only read when count > 0.
+                        let deleted_count = { metadata.deleted_children_count };
+                        if deleted_count > 0 {
+                            let deleted_offset = { metadata.deleted_children_offset };
+                            let deleted = self.read_deleted_children_at(
+                                deleted_count as usize,
+                                deleted_offset,
+                            )?;
+                            let mut child_txid = [0u8; 32];
+                            child_txid.copy_from_slice(&item.spending_data[..32]);
+                            if deleted.contains(&child_txid) {
+                                errors.insert(
+                                    item.idx,
+                                    SpendError::DeletedChildren {
+                                        offset: item.offset,
+                                        child_count: deleted_count,
+                                    },
+                                );
+                                continue;
+                            }
+                        }
                         idempotent_count += 1;
                         continue;
                     }
@@ -1331,23 +1357,39 @@ impl Engine {
                     // generation — eliminates the WAL gap entirely:
                     // no write means nothing to recover.
                     //
-                    // KNOWN GAP — `addDeletedChildren` parity with
-                    // Aerospike. The Aerospike Lua UDF also consults a
-                    // `deleted_children` list at this point: if the
-                    // child tx that originally consumed this output has
-                    // since been pruned (resurrected-then-pruned), the
-                    // idempotent re-spend MUST be rejected because the
-                    // chain history has been altered. Teraslab's
-                    // `TxMetadata` does not yet carry a `deleted_children`
-                    // count/offset pair — adding it is a schema change
-                    // (new metadata fields + new redo op + new test
-                    // coverage). Until then, callers that need parent
-                    // re-spend protection should issue an explicit
-                    // `OP_UNSPEND_BATCH` before retrying the spend; the
-                    // engine's normal unspent path then re-runs full
-                    // validation. Tracked as P1 follow-up F-X-022 in
-                    // `_review/follow_ups.md` (May-2026 external review
-                    // — bitcoin-expert).
+                    // F-X-022 — `addDeletedChildren` parity with
+                    // Aerospike. Before returning the no-op, consult
+                    // the parent record's `deleted_children` list. If
+                    // the requesting child txid is present, the
+                    // chain history has been altered ("resurrected-
+                    // then-pruned") and the re-spend MUST be rejected
+                    // even though the slot still reads SPENT by this
+                    // exact child. The PRIMARY defense remains the
+                    // slot's `UTXO_PRUNED` status (matched in the arm
+                    // below); this check is defense-in-depth for the
+                    // unusual code path where the slot was flipped
+                    // back to SPENT after a prune. The lookup is
+                    // cheap: `deleted_children_count` is already in the
+                    // metadata we read in step 2, and the on-device
+                    // list is read only when count > 0. The first 32
+                    // bytes of `spending_data` are the child txid
+                    // (BSV spending data is `txid(32) + vin(4)`).
+                    let deleted_count = { metadata.deleted_children_count };
+                    if deleted_count > 0 {
+                        let deleted_offset = { metadata.deleted_children_offset };
+                        let deleted = self.read_deleted_children_at(
+                            deleted_count as usize,
+                            deleted_offset,
+                        )?;
+                        let mut child_txid = [0u8; 32];
+                        child_txid.copy_from_slice(&req.spending_data[..32]);
+                        if deleted.contains(&child_txid) {
+                            return Err(SpendError::DeletedChildren {
+                                offset: req.offset,
+                                child_count: deleted_count,
+                            });
+                        }
+                    }
                     let block_ids = collect_block_ids(&metadata).to_vec();
                     return Ok(SpendResponse {
                         signal: Signal::None,
@@ -2691,6 +2733,26 @@ impl Engine {
         meta.updated_at = self.now_millis();
         self.write_metadata_fast(entry.record_offset, &meta)?;
         self.sync_index_cache(parent_key, &meta)?;
+        // F-X-022: Aerospike `addDeletedChildren` parity. The prune above
+        // is the PRIMARY defense (UTXO_PRUNED is the on-disk slot status
+        // every spend path checks first). The append below is the
+        // SECONDARY audit/diagnostic trail + defense-in-depth at the
+        // idempotent-respend short-circuit in `spend`. Best-effort: a
+        // failure here logs but does NOT roll back the prune — the prune
+        // is the safety-critical mutation and `UTXO_PRUNED` already
+        // protects against re-spend. Replicas receive the prune via the
+        // existing `ReplicaOp::PruneSlotIfSpentBy` path and run the same
+        // `prune_slot_if_spent_by_child` here, so they each append to
+        // their own local deleted-children list (no separate replicated
+        // op needed — the append is derived state).
+        //
+        // Lock ordering: this is OUTSIDE the parent's stripe lock guard
+        // (the `let _guard = ...` at the top of this function dropped at
+        // the natural `}` below). `append_deleted_child` re-acquires
+        // the parent lock internally via the same CAS-retry pattern as
+        // `append_conflicting_child` (R-143).
+        drop(_guard);
+        self.append_deleted_child_best_effort(parent_key, child_txid, "prune_slot_if_spent_by_child");
         Ok(true)
     }
 
@@ -3141,6 +3203,277 @@ impl Engine {
                 ?err,
                 source,
                 "failed to append conflicting child"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // F-X-022 — Deleted children list (Aerospike `addDeletedChildren` parity)
+    //
+    // The deleted-children list is a per-parent-record audit/diagnostic of
+    // every child txid that has been pruned against the parent. It mirrors
+    // the conflicting-children list bit-for-bit (count u8 + offset u64 in
+    // metadata, separately-allocated block of 32-byte txids on device), and
+    // the engine methods below are intentional clones of the
+    // `conflicting_children` variants — same CAS retry loop, same
+    // allocate-out-of-lock pattern, same orphan-blob tracing on rollback.
+    //
+    // The list is the SECONDARY defense against the
+    // resurrected-then-pruned re-spend pattern. The PRIMARY defense remains
+    // the slot's `UTXO_PRUNED` status flipped by `prune_slot_if_spent_by_child`
+    // — every spend path consults the slot status first and rejects PRUNED
+    // outright. The deleted-children list adds (1) operator-visible audit of
+    // which children pruned which parent slots, and (2) defense-in-depth at
+    // the idempotent-respend short-circuit where the slot LOOKS spent (so
+    // the PRUNED check has already passed) but the spending child has been
+    // pruned by some unusual code path that flipped the slot back to SPENT.
+    // -----------------------------------------------------------------------
+
+    /// Append a child txid to a parent record's deleted-children list.
+    /// Deduplicates: if the child already exists, this is a no-op.
+    /// Returns Ok(()) if the parent is not found (may be on another node).
+    ///
+    /// F-X-022: Aerospike `addDeletedChildren` parity. Mirrors
+    /// [`Self::append_conflicting_child`] — see that method for the full
+    /// rationale on the CAS retry loop, the allocate-out-of-lock pattern,
+    /// and the orphan-blob tracing fall-back on rollback.
+    pub fn append_deleted_child(
+        &self,
+        parent_key: &TxKey,
+        child_txid: [u8; 32],
+    ) -> Result<(), SpendError> {
+        const MAX_RETRIES: u32 = 16;
+        let mut intent_logged = false;
+        let mut attempt: u32 = 0;
+        loop {
+            let (ro, count, offset, mut children) = {
+                let _guard = self.locks.lock(parent_key);
+                let entry = match self.index.read().lookup(parent_key) {
+                    Some(e) => e,
+                    None => return Ok(()),
+                };
+                let ro = entry.record_offset;
+                let meta = self.read_metadata_fast(ro)?;
+                let count = { meta.deleted_children_count } as usize;
+                let offset = { meta.deleted_children_offset };
+
+                let children = self.read_deleted_children_at(count, offset)?;
+                if children.contains(&child_txid) {
+                    return Ok(());
+                }
+
+                (ro, count, offset, children)
+            };
+
+            children.push(child_txid);
+            if children.len() > u8::MAX as usize {
+                return Err(SpendError::StorageError {
+                    detail: "deleted children limit exceeded".into(),
+                });
+            }
+
+            // Persist the high-level append intent before any
+            // allocator/new-block work so a crash after the replacement
+            // block write but before the metadata write can be recovered
+            // by replaying this idempotent append. The redo entry is
+            // emitted AFTER the prune entry (the prune is logically
+            // primary — UTXO_PRUNED remains the primary defense).
+            if !intent_logged {
+                if let Some(log) = self.redo_log_handle() {
+                    log.lock()
+                        .append_and_flush(crate::redo::RedoOp::AppendDeletedChild {
+                            parent_key: *parent_key,
+                            child_txid,
+                        })
+                        .map_err(|e| SpendError::StorageError {
+                            detail: format!("append deleted child redo: {e}"),
+                        })?;
+                }
+                intent_logged = true;
+            }
+
+            let new_offset = self.allocate_deleted_children_block(&children)?;
+
+            let mut parent_gone = false;
+            let committed = {
+                let _guard = self.locks.lock(parent_key);
+                match self.index.read().lookup(parent_key) {
+                    None => {
+                        parent_gone = true;
+                        false
+                    }
+                    Some(entry) if entry.record_offset != ro => false,
+                    Some(_) => {
+                        let mut meta = self.read_metadata_fast(ro)?;
+                        let latest_count = { meta.deleted_children_count } as usize;
+                        let latest_offset = { meta.deleted_children_offset };
+                        if latest_count != count || latest_offset != offset {
+                            false
+                        } else {
+                            meta.deleted_children_count = children.len() as u8;
+                            meta.deleted_children_offset = new_offset;
+                            meta.generation = { meta.generation }.wrapping_add(1);
+                            meta.updated_at = self.now_millis();
+                            self.write_metadata_fast(ro, &meta)?;
+                            true
+                        }
+                    }
+                }
+            };
+
+            if parent_gone {
+                self.free_deleted_children_block(new_offset, children.len())?;
+                return Ok(());
+            }
+
+            if committed {
+                if count > 0
+                    && offset != 0
+                    && let Err(err) = self.free_deleted_children_block(offset, count)
+                {
+                    tracing::error!(
+                        target: "teraslab::engine::orphan",
+                        orphan = true,
+                        kind = "deleted_children_old_block",
+                        offset = offset,
+                        bytes = (count * 32) as u64,
+                        error = %err,
+                        "post-commit free of old deleted-children block failed; bytes leaked until R-049 sweep"
+                    );
+                }
+                return Ok(());
+            }
+
+            self.free_deleted_children_block(new_offset, children.len())?;
+
+            attempt += 1;
+            if attempt >= MAX_RETRIES {
+                return Err(SpendError::StorageError {
+                    detail: format!(
+                        "append_deleted_child: CAS contention exceeded \
+                         {MAX_RETRIES} retries on parent — likely concurrent \
+                         prune storm against the same parent record",
+                    ),
+                });
+            }
+            let backoff_us = 1u64 << attempt.min(15);
+            std::thread::sleep(std::time::Duration::from_micros(backoff_us));
+        }
+    }
+
+    fn read_deleted_children_at(
+        &self,
+        count: usize,
+        offset: u64,
+    ) -> Result<Vec<[u8; 32]>, SpendError> {
+        let mut children: Vec<[u8; 32]> = Vec::with_capacity(count + 1);
+        if count == 0 || offset == 0 {
+            return Ok(children);
+        }
+
+        let align = self.device.alignment();
+        let aligned_base = offset / align as u64 * align as u64;
+        let intra = (offset - aligned_base) as usize;
+        let read_len = (intra + count * 32).div_ceil(align) * align;
+        let mut buf = crate::device::AlignedBuf::new(read_len, align);
+        self.device
+            .pread_exact_at(&mut buf, aligned_base)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("{e}"),
+            })?;
+        for i in 0..count {
+            let start = intra + i * 32;
+            let mut txid = [0u8; 32];
+            txid.copy_from_slice(&buf[start..start + 32]);
+            children.push(txid);
+        }
+        Ok(children)
+    }
+
+    fn allocate_deleted_children_block(
+        &self,
+        children: &[[u8; 32]],
+    ) -> Result<u64, SpendError> {
+        let new_size = (children.len() * 32) as u64;
+        let new_offset =
+            self.allocator
+                .lock()
+                .allocate(new_size)
+                .map_err(|_| SpendError::StorageError {
+                    detail: "device full for deleted children".into(),
+                })?;
+
+        let align = self.device.alignment();
+        let aligned_base = new_offset / align as u64 * align as u64;
+        let intra = (new_offset - aligned_base) as usize;
+        let write_len = (intra + children.len() * 32).div_ceil(align) * align;
+        let mut wbuf = crate::device::AlignedBuf::new(write_len, align);
+        for (i, child) in children.iter().enumerate() {
+            wbuf[intra + i * 32..intra + (i + 1) * 32].copy_from_slice(child);
+        }
+        if let Err(err) = self.device.pwrite_all_at(&wbuf, aligned_base) {
+            if let Err(free_err) =
+                self.free_deleted_children_block(new_offset, children.len())
+            {
+                tracing::error!(
+                    target: "teraslab::engine::orphan",
+                    orphan = true,
+                    kind = "deleted_children_alloc_rollback",
+                    offset = new_offset,
+                    bytes = (children.len() * 32) as u64,
+                    pwrite_error = %err,
+                    free_error = %free_err,
+                    "rollback free after failed deleted-children pwrite also failed; bytes leaked until R-049 sweep"
+                );
+            }
+            return Err(SpendError::StorageError {
+                detail: format!("{err}"),
+            });
+        }
+
+        Ok(new_offset)
+    }
+
+    fn free_deleted_children_block(&self, offset: u64, count: usize) -> Result<(), SpendError> {
+        self.allocator
+            .lock()
+            .free(offset, (count * 32) as u64)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("allocator free for deleted children failed: {e}"),
+            })
+    }
+
+    /// Read all deleted children txids for a transaction.
+    ///
+    /// F-X-022: Aerospike `addDeletedChildren` parity. Returns an empty
+    /// vec when the parent has never had a child pruned against it.
+    pub fn read_deleted_children(&self, key: &TxKey) -> Result<Vec<[u8; 32]>, SpendError> {
+        let entry = self
+            .index
+            .read()
+            .lookup(key)
+            .ok_or(SpendError::TxNotFound)?;
+        let ro = entry.record_offset;
+        let meta = self.read_metadata_fast(ro)?;
+
+        let count = { meta.deleted_children_count } as usize;
+        let offset = { meta.deleted_children_offset };
+        self.read_deleted_children_at(count, offset)
+    }
+
+    fn append_deleted_child_best_effort(
+        &self,
+        parent_key: &TxKey,
+        child_txid: [u8; 32],
+        source: &'static str,
+    ) {
+        if let Err(err) = self.append_deleted_child(parent_key, child_txid) {
+            tracing::warn!(
+                ?parent_key,
+                ?child_txid,
+                ?err,
+                source,
+                "failed to append deleted child"
             );
         }
     }
@@ -6838,6 +7171,174 @@ mod tests {
             read_back[32..].iter().all(|b| *b == 0),
             "children-list padding must be zeroed, not stale bytes from the freed block"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // F-X-022 — Aerospike `addDeletedChildren` parity tests
+    // -----------------------------------------------------------------------
+
+    /// F-X-022: a fresh record has no deleted children — `read_deleted_children`
+    /// must return an empty vec without doing any device reads against
+    /// `deleted_children_offset = 0`.
+    #[test]
+    fn read_deleted_children_returns_empty_vec_when_count_zero() {
+        let h = TestHarness::new(3, TxFlags::empty());
+        let children = h.engine.read_deleted_children(&h.key).unwrap();
+        assert!(children.is_empty(), "fresh record must have no deleted children");
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!({ meta.deleted_children_count }, 0);
+        assert_eq!({ meta.deleted_children_offset }, 0);
+    }
+
+    /// F-X-022: pruning a parent slot via `prune_slot_if_spent_by_child`
+    /// must append the child txid to the parent's deleted-children list,
+    /// observable through `read_deleted_children`. The primary UTXO_PRUNED
+    /// transition still fires (verified separately by
+    /// `prune_slot_if_spent_by_child_updates_counters_once`); this test
+    /// pins the SECONDARY audit-trail invariant.
+    #[test]
+    fn prune_slot_if_spent_by_child_appends_to_deleted_children_list() {
+        let h = TestHarness::new(3, TxFlags::empty());
+        h.engine.spend(&h.spend_req(1)).unwrap();
+        let mut child_txid = [0u8; 32];
+        child_txid.copy_from_slice(&h.make_spending_data(0xAB)[..32]);
+
+        let applied = h
+            .engine
+            .prune_slot_if_spent_by_child(&h.key, 1, child_txid)
+            .unwrap();
+        assert!(applied, "prune must apply against a SPENT slot");
+
+        let deleted = h.engine.read_deleted_children(&h.key).unwrap();
+        assert_eq!(
+            deleted,
+            vec![child_txid],
+            "pruning the child must append its txid to the deleted-children list"
+        );
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!({ meta.deleted_children_count }, 1);
+        assert_ne!(
+            { meta.deleted_children_offset },
+            0,
+            "deleted_children_offset must point at a real allocation"
+        );
+
+        // Idempotent re-prune: slot already PRUNED so the prune is a
+        // no-op (returns false) and must not re-append the same child.
+        let applied_again = h
+            .engine
+            .prune_slot_if_spent_by_child(&h.key, 1, child_txid)
+            .unwrap();
+        assert!(!applied_again);
+        let deleted_after = h.engine.read_deleted_children(&h.key).unwrap();
+        assert_eq!(
+            deleted_after,
+            vec![child_txid],
+            "idempotent re-prune must not duplicate the child entry"
+        );
+    }
+
+    /// F-X-022: multiple distinct children pruned against different slots
+    /// must all be preserved in the deleted-children list in declaration
+    /// order. Exercises the CAS retry loop in `append_deleted_child` across
+    /// sequential appends.
+    #[test]
+    fn deleted_children_list_survives_multiple_appends() {
+        let h = TestHarness::new(3, TxFlags::empty());
+
+        // Spend three distinct slots, each by a distinct child txid.
+        let mut child_txids = Vec::with_capacity(3);
+        for (i, marker) in [0xA1u8, 0xB2, 0xC3].iter().enumerate() {
+            let sd = h.make_spending_data(*marker);
+            let req = SpendRequest {
+                tx_key: h.key,
+                offset: i as u32,
+                utxo_hash: h.slot_hash(i as u32),
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            };
+            h.engine.spend(&req).unwrap();
+            let mut child = [0u8; 32];
+            child.copy_from_slice(&sd[..32]);
+            child_txids.push(child);
+        }
+
+        // Prune each slot by its respective child.
+        for (i, child) in child_txids.iter().enumerate() {
+            let applied = h
+                .engine
+                .prune_slot_if_spent_by_child(&h.key, i as u32, *child)
+                .unwrap();
+            assert!(applied, "prune {i} must apply");
+        }
+
+        let deleted = h.engine.read_deleted_children(&h.key).unwrap();
+        assert_eq!(
+            deleted, child_txids,
+            "all three pruned child txids must be preserved in declaration order"
+        );
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!({ meta.deleted_children_count }, 3);
+    }
+
+    /// F-X-022: the idempotent-respend short-circuit in `spend` must
+    /// reject the request when the spending child txid is present in
+    /// the parent's deleted-children list. This is the defense-in-depth
+    /// guard for the resurrected-then-pruned re-spend pattern — the
+    /// slot LOOKS spent by the requesting child (so the regular
+    /// PRUNED-slot rejection has been bypassed by some unusual code
+    /// path) but the audit list contradicts it.
+    #[test]
+    fn idempotent_respend_rejects_when_child_in_deleted_list() {
+        let h = TestHarness::new(3, TxFlags::empty());
+
+        // Spend the slot, then prune it (slot → PRUNED, child appended
+        // to deleted-children list).
+        h.engine.spend(&h.spend_req(1)).unwrap();
+        let mut child_txid = [0u8; 32];
+        child_txid.copy_from_slice(&h.make_spending_data(0xAB)[..32]);
+        h.engine
+            .prune_slot_if_spent_by_child(&h.key, 1, child_txid)
+            .unwrap();
+
+        // Sanity: deleted-children list now contains the child.
+        let deleted = h.engine.read_deleted_children(&h.key).unwrap();
+        assert_eq!(deleted, vec![child_txid]);
+
+        // Manually flip the slot back to SPENT-by-this-child to simulate
+        // the unusual code path where the slot was reverted after the
+        // prune. The deleted-children list is the only thing standing
+        // between this re-spend and an accidental accept.
+        let entry = h.engine.index.read().lookup(&h.key).unwrap();
+        let mut slot = h
+            .engine
+            .read_slot_fast(entry.record_offset, 1)
+            .unwrap();
+        slot.status = UTXO_SPENT;
+        slot.spending_data = h.make_spending_data(0xAB);
+        h.engine
+            .write_slot_fast(entry.record_offset, 1, &slot)
+            .unwrap();
+
+        // Re-spend with the same (now-deleted) child txid. The
+        // idempotent-respend short-circuit must consult the
+        // deleted-children list and reject.
+        let resp = h.engine.spend(&h.spend_req(1));
+        match resp {
+            Err(SpendError::DeletedChildren { offset, child_count }) => {
+                assert_eq!(offset, 1);
+                assert_eq!(child_count, 1);
+            }
+            other => panic!(
+                "expected SpendError::DeletedChildren, got {other:?}"
+            ),
+        }
     }
 
     /// R-021 (BC-25 / BC-35) regression: an idempotent re-spend (same

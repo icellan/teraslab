@@ -5251,6 +5251,7 @@ pub fn redo_entry_to_replica_op(
         | RedoOp::SecondaryUnminedUpdate { .. }
         | RedoOp::SecondaryDahUpdate { .. }
         | RedoOp::AppendConflictingChild { .. }
+        | RedoOp::AppendDeletedChild { .. }
         | RedoOp::AllocateRegion { .. }
         | RedoOp::FreeRegion { .. }
         | RedoOp::HashtableResizeBegin { .. }

@@ -134,7 +134,7 @@ No code-correctness change required.
 rather than in the registry. Promote to `metrics.rs` so the operator
 dashboard can observe SWIM-flood drops.
 
-### F-X-022. `addDeletedChildren` parent re-spend guard (Aerospike Lua parity)
+### F-X-022. `addDeletedChildren` parent re-spend guard (Aerospike Lua parity) — RESOLVED
 
 External review (bitcoin-expert P1, May-2026 wave 1): the Aerospike
 Lua UDF tracks a `deleted_children` list per record so an
@@ -142,34 +142,70 @@ idempotent re-spend on the parent can be rejected after the child
 that originally consumed the parent's output has been pruned
 ("resurrected-then-pruned" pattern). Teraslab's idempotent-respend
 short-circuit at `src/ops/engine.rs` UTXO_SPENT-match-spending_data
-returns OK unconditionally, missing this safety net.
+previously returned OK unconditionally, missing this safety net.
 
-Implementation requires:
+**Resolution.** Implemented in full as a parallel mechanism to the
+existing `UTXO_PRUNED` slot-status defense:
 
-1. Extend `TxMetadata` with `deleted_children_count: u8` +
+1. `TxMetadata` extended with `deleted_children_count: u8` +
    `deleted_children_offset: u64` (mirrors the existing
-   `conflicting_children_*` pair).
-2. New redo op `RedoOp::AppendDeletedChild { parent_key, child_txid }`.
-3. New engine method `append_deleted_child(parent_key, child_txid)`
-   parallelling the existing `append_conflicting_child`.
-4. Wire the `OP_DELETE_BATCH` / `OP_PROCESS_EXPIRED_PRESERVATIONS`
-   handlers so that pruning a child also appends its txid to the
-   parent's `deleted_children` list.
-5. Consult the list at the idempotent-respend short-circuit and
-   return `SpendError::DeletedChildren { offset, child_count }`
-   (new variant) when non-empty.
+   `conflicting_children_*` pair). `METADATA_VERSION` bumped 1 → 2.
+   `METADATA_SIZE` unchanged (320 bytes) — the 9 new bytes come out
+   of the existing trailing padding. No on-disk migration required
+   (pre-production).
+2. New redo op `RedoOp::AppendDeletedChild { parent_key, child_txid }`
+   on op-code `34`, with the same wire layout as
+   `AppendConflictingChild`. Coordinator skips it from the cluster
+   replication delta (derived state); recovery skips it at the
+   metadata-replay layer (audit info, not safety-critical — the
+   primary `PruneSlotIfSpentBy` entry still replays and re-establishes
+   `UTXO_PRUNED`).
+3. New engine methods `append_deleted_child`, `read_deleted_children`,
+   and private helpers `read_deleted_children_at`,
+   `allocate_deleted_children_block`, `free_deleted_children_block` —
+   each mirrors the `conflicting_children` variant bit-for-bit
+   (CAS retry loop, allocate-out-of-lock, orphan-blob tracing on
+   rollback).
+4. `prune_slot_if_spent_by_child` calls
+   `append_deleted_child_best_effort` AFTER the prune commits.
+   Best-effort because the prune itself is the safety-critical
+   mutation — `UTXO_PRUNED` is the primary defense. Replicas
+   automatically build their own deleted-children lists when they
+   replay `ReplicaOp::PruneSlotIfSpentBy` through the same engine
+   path (no separate replicated op).
+5. Defense-in-depth at the idempotent-respend short-circuit in
+   both `Engine::spend` (single) and `Engine::validate_spend_multi`
+   (batch). When the slot status is `UTXO_SPENT` and the spending
+   data matches the request, we now consult `deleted_children_count`
+   (already in the metadata we read in step 2); if non-zero, we
+   read the on-device list and reject with the new
+   `SpendError::DeletedChildren { offset, child_count }` when the
+   requesting child txid is present.
+6. New wire error code `ERR_DELETED_CHILDREN = 35` (one-byte payload
+   carrying `child_count` for client diagnostics). Mapped through
+   `spend_error_to_batch_error`, `classify_spend_error`,
+   `classify_wire_error_code` so dashboards continue to bucket it
+   as `ErrConflicting`.
 
-Scope: schema change + new redo op + new opcode + cross-cutting
-update to delete / prune paths + test coverage. Estimate
-2–3 engineer-days. Deferred from the May-2026 wave because the
-gap is a parity item with Aerospike, not a live correctness bug
-in any current Teranode workflow — operators that need the guard
-today can issue an explicit `OP_UNSPEND_BATCH` before retrying a
-spend, which re-runs full validation.
+Tests: 4 new unit tests in `src/ops/engine.rs::tests` exercise
+`read_deleted_children_returns_empty_vec_when_count_zero`,
+`prune_slot_if_spent_by_child_appends_to_deleted_children_list`,
+`deleted_children_list_survives_multiple_appends`, and
+`idempotent_respend_rejects_when_child_in_deleted_list`. Round-trip
+encoding test for the new redo op added to `src/redo.rs::tests`.
+Classification stability test in `src/server/dispatch.rs` extended
+to cover the new variant. Full lib + integration suites pass
+(1782 lib tests, 0 failures, 0 ignored).
 
-Engine-side stub: the idempotent-respend comment in `engine.rs`
-calls out the gap inline so a future implementer can locate the
-exact integration point.
+Spec note: `BSV_UTXO_STORE_SPEC.md:246-249` originally argued that
+the `UTXO_PRUNED` slot status SUBSUMES `addDeletedChildren`. That
+remains correct as a correctness statement — `UTXO_PRUNED` is
+checked first on every spend path and rejects the re-spend cleanly
+before the idempotent-respend short-circuit runs. The new list is
+SECONDARY: it provides (a) operator-visible audit of which children
+pruned which parent slots, and (b) defense-in-depth for the unusual
+code path where the slot LOOKS `SPENT` by the requesting child but
+the audit list contradicts the slot.
 
 ---
 

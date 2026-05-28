@@ -367,6 +367,20 @@ pub const ERR_STREAM_OFFSET_MISMATCH: u16 = 18;
 /// rejected it.
 pub const ERR_STREAM_INVARIANT: u16 = 34;
 
+/// F-X-022 — Aerospike `addDeletedChildren` parity. The idempotent
+/// re-spend short-circuit consulted the parent record's
+/// `deleted_children` list and found the requested child txid present
+/// (the spending child was pruned after originally consuming this
+/// output — "resurrected-then-pruned"). Distinct from
+/// `ERR_INVALID_SPEND` (which reuses the slot's `UTXO_PRUNED` payload):
+/// `ERR_DELETED_CHILDREN` fires at the idempotent-respend path where
+/// the slot itself still reads `UTXO_SPENT` by the requesting child,
+/// but the deleted-children audit list contradicts the slot. Wire
+/// payload is the single-byte child_count (count of entries in the
+/// deleted-children list at the time of rejection — useful for client
+/// observability and reorg-storm detection).
+pub const ERR_DELETED_CHILDREN: u16 = 35;
+
 /// P3.10 / F-G5-017 — wire protocol revision.
 ///
 /// `1` is the historical implicit version: legacy clients and servers do

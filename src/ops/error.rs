@@ -139,6 +139,26 @@ pub enum SpendError {
         spendable_after: u32,
     },
 
+    /// F-X-022: defense-in-depth at the idempotent-respend short-circuit.
+    /// The spending child txid is present in the parent record's
+    /// `deleted_children` list, meaning the chain history has been
+    /// altered (the child was pruned after originally consuming this
+    /// output — "resurrected-then-pruned"). The primary defense remains
+    /// the slot's `UTXO_PRUNED` status; this variant fires only on the
+    /// idempotent-respend short-circuit where the slot LOOKS `SPENT` by
+    /// the requested child but the deleted-children list contradicts
+    /// it. Callers MUST treat this as a hard rejection and re-validate
+    /// chain state before retrying.
+    #[error("DELETED_CHILDREN at offset {offset}: child txid present in deleted_children list ({child_count} total)")]
+    DeletedChildren {
+        /// The slot offset the request targeted.
+        offset: u32,
+        /// Total number of children currently in the deleted-children
+        /// list (for diagnostics — the matching child txid itself is in
+        /// the request).
+        child_count: u8,
+    },
+
     /// F-G2-002: A client attempted to stamp a UTXO using the reserved
     /// all-`0xFF` sentinel as `spending_data`. That byte pattern is the
     /// on-disk marker for a frozen slot — accepting it under `status=SPENT`

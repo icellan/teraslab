@@ -40,7 +40,7 @@ pub const INLINE_BLOCK_ENTRIES: usize = 3;
 pub const METADATA_MAGIC: u32 = 0x534C_4142;
 
 /// Current schema version.
-pub const METADATA_VERSION: u32 = 1;
+pub const METADATA_VERSION: u32 = 2;
 
 /// UTXO status: the output is unspent and available.
 pub const UTXO_UNSPENT: u8 = 0x00;
@@ -397,6 +397,8 @@ struct TxMetadataRaw {
     _external_ref: ExternalRef,
     _conflicting_children_count: u8,
     _conflicting_children_offset: u64,
+    _deleted_children_count: u8,
+    _deleted_children_offset: u64,
     _crc32: u32,
 }
 
@@ -475,8 +477,23 @@ pub struct TxMetadata {
     /// Device offset to a separately-allocated block of txids (0 = none).
     pub conflicting_children_offset: u64,
 
-    /// CRC32 checksum over the entire 256-byte header, computed with this
-    /// field zeroed. Guards against torn writes and on-disk corruption.
+    /// Number of deleted children txids stored for this transaction.
+    ///
+    /// F-X-022: parity with Aerospike Lua `addDeletedChildren`. Populated
+    /// whenever a child tx is pruned against this parent — the child's
+    /// txid is appended to the per-record list referenced by
+    /// `deleted_children_offset`. Consulted by the idempotent-respend
+    /// short-circuit as defense-in-depth against the
+    /// resurrected-then-pruned re-spend pattern (the primary spend
+    /// rejection still flows through `UTXO_PRUNED` on the slot).
+    pub deleted_children_count: u8,
+    /// Device offset to a separately-allocated block of deleted-child
+    /// txids (0 = none). See [`Self::deleted_children_count`].
+    pub deleted_children_offset: u64,
+
+    /// CRC32 checksum over the entire `METADATA_SIZE`-byte header,
+    /// computed with this field zeroed. Guards against torn writes and
+    /// on-disk corruption.
     ///
     /// Populated by [`TxMetadata::to_bytes`]; validated by
     /// [`TxMetadata::from_bytes`]. Callers should never write this field
@@ -524,6 +541,8 @@ impl TxMetadata {
             external_ref: ExternalRef::zeroed(),
             conflicting_children_count: 0,
             conflicting_children_offset: 0,
+            deleted_children_count: 0,
+            deleted_children_offset: 0,
             crc32: 0,
             _padding: [0u8; METADATA_PADDING],
         }

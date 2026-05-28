@@ -859,6 +859,16 @@ fn replay_entry(
             record_size,
         } => replay_delete(device, index, tx_key, *record_offset, *record_size),
         RedoOp::AppendConflictingChild { .. } => ReplayResult::Skipped,
+        // F-X-022: `AppendDeletedChild` is audit/diagnostic + defense-in-depth
+        // at the idempotent-respend short-circuit. The primary spend-rejection
+        // path is the slot's `UTXO_PRUNED` status, which the
+        // `PruneSlotIfSpentBy` redo entry (logically prior) already replays.
+        // A crash between the prune and the deleted-child append loses only
+        // the audit/diagnostic information for the lost append — the spend
+        // still gets rejected via UTXO_PRUNED. Future work: drain pending
+        // appends after engine construction the same way
+        // `AppendConflictingChild` is drained today.
+        RedoOp::AppendDeletedChild { .. } => ReplayResult::Skipped,
         RedoOp::Checkpoint | RedoOp::RecoveryProgress { .. } => ReplayResult::Skipped,
         // SecondaryUnminedUpdate / SecondaryDahUpdate are durability-intent
         // records for redb secondary indexes — the primary index has no
