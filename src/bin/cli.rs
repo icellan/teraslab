@@ -34,6 +34,10 @@ enum CliError {
     #[error("server error ({status}): {message}")]
     ServerError { status: u16, message: String },
 
+    /// Index backend / migration error (offline export-index / import-index).
+    #[error("index error: {0}")]
+    Index(#[from] teraslab::index::IndexError),
+
     /// Generic error.
     #[error("{0}")]
     Other(String),
@@ -161,6 +165,26 @@ enum Command {
     Healthcheck,
     /// Real-time activity monitor (like top).
     Top,
+    /// Export the index to a portable migration file (OFFLINE — stop the
+    /// server first; redb's file lock will refuse a live database).
+    ExportIndex {
+        /// Server TOML config (the same file passed to `teraslab-server`).
+        #[arg(long)]
+        config: std::path::PathBuf,
+        /// Destination file for the portable snapshot.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Import a portable migration file into the configured index backend
+    /// (OFFLINE — stop the server first).
+    ImportIndex {
+        /// Server TOML config (the same file passed to `teraslab-server`).
+        #[arg(long)]
+        config: std::path::PathBuf,
+        /// Source file produced by `export-index`.
+        #[arg(long)]
+        input: std::path::PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1238,6 +1262,153 @@ fn render_waiting(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
 }
 
 // ---------------------------------------------------------------------------
+// Offline index migration (export-index / import-index)
+// ---------------------------------------------------------------------------
+
+/// Open the configured index backend read-only-ish and export it to the
+/// portable migration format (`src/index/migration.rs`, magic `TSMI`).
+///
+/// OFFLINE operation: the server must be stopped. For the redb backend,
+/// redb's own file lock enforces this (opening a live database fails);
+/// for the memory backend the export reads the on-disk snapshot, which
+/// only reflects the last checkpoint / clean shutdown.
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout/stderr
+fn cmd_export_index(
+    config_path: &std::path::Path,
+    output: &std::path::Path,
+    json: bool,
+) -> Result<(), CliError> {
+    use teraslab::config::{IndexBackendMode, ServerConfig};
+    use teraslab::index::{DahBackend, PrimaryBackend, UnminedBackend, migration};
+
+    let cfg = ServerConfig::load(config_path).map_err(CliError::Other)?;
+    let (primary, dah, unmined) = match cfg.index.backend {
+        IndexBackendMode::Redb => {
+            if migration::import_in_progress(&cfg.index) {
+                return Err(CliError::Other(format!(
+                    "a previous import-index was interrupted (sentinel present next to {}); \
+                     re-run import-index to overwrite the partial state, or remove the \
+                     sentinel after verifying the redb files are consistent",
+                    cfg.index.redb_path.display()
+                )));
+            }
+            let primary = PrimaryBackend::restore_redb(&cfg.index)?;
+            let dah = DahBackend::OnDisk(teraslab::index::redb_dah::RedbDahIndex::open(
+                &cfg.index.redb_dah_path,
+                cfg.index.redb_cache_size,
+            )?);
+            let unmined =
+                UnminedBackend::OnDisk(teraslab::index::redb_unmined::RedbUnminedIndex::open(
+                    &cfg.index.redb_unmined_path,
+                    cfg.index.redb_cache_size,
+                )?);
+            (primary, dah, unmined)
+        }
+        IndexBackendMode::Memory => {
+            let (primary, dah, unmined, flags) =
+                PrimaryBackend::restore_all(&cfg.index_snapshot_path)?;
+            if flags.dah_needs_rebuild || flags.unmined_needs_rebuild {
+                return Err(CliError::Other(
+                    "the snapshot's secondary index sections need a device-scan rebuild; \
+                     start the server once and shut it down cleanly, then retry"
+                        .to_string(),
+                ));
+            }
+            eprintln!(
+                "note: exporting from the snapshot at {} — redo entries written after the \
+                 last clean shutdown/checkpoint are NOT included; stop the server cleanly \
+                 before exporting",
+                cfg.index_snapshot_path.display()
+            );
+            (primary, DahBackend::from(dah), UnminedBackend::from(unmined))
+        }
+        IndexBackendMode::FileBacked => {
+            return Err(CliError::Other(
+                "export-index does not support the file_backed backend (its secondaries \
+                 can only be rebuilt from a device scan); migrate via memory or redb"
+                    .to_string(),
+            ));
+        }
+    };
+
+    let stats = migration::export_index(&primary, &dah, &unmined, output)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "output": output.display().to_string(),
+                "primary_entries": stats.primary_entries,
+                "dah_entries": stats.dah_entries,
+                "unmined_entries": stats.unmined_entries,
+            })
+        );
+    } else {
+        println!(
+            "exported {} primary, {} DAH, {} unmined entries to {}",
+            stats.primary_entries,
+            stats.dah_entries,
+            stats.unmined_entries,
+            output.display()
+        );
+    }
+    Ok(())
+}
+
+/// Import a portable migration file into the configured backend.
+///
+/// OFFLINE operation. For redb the R-047 sentinel inside
+/// `migration::import_index` makes an interrupted import refuse the next
+/// server startup instead of silently loading partial state. For the
+/// memory backend the imported indexes exist only in this process, so
+/// they are persisted via `snapshot_all` — without that the import would
+/// be a silent no-op.
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout/stderr
+fn cmd_import_index(
+    config_path: &std::path::Path,
+    input: &std::path::Path,
+    json: bool,
+) -> Result<(), CliError> {
+    use teraslab::config::{IndexBackendMode, ServerConfig};
+    use teraslab::index::migration;
+
+    let cfg = ServerConfig::load(config_path).map_err(CliError::Other)?;
+    if matches!(cfg.index.backend, IndexBackendMode::FileBacked) {
+        return Err(CliError::Other(
+            "import-index does not support the file_backed backend; configure memory \
+             or redb"
+                .to_string(),
+        ));
+    }
+
+    let (primary, dah, unmined, stats) = migration::import_index(&cfg.index, input)?;
+    if matches!(cfg.index.backend, IndexBackendMode::Memory) {
+        primary.snapshot_all(&dah, &unmined, &cfg.index_snapshot_path)?;
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "input": input.display().to_string(),
+                "primary_entries": stats.primary_entries,
+                "dah_entries": stats.dah_entries,
+                "unmined_entries": stats.unmined_entries,
+            })
+        );
+    } else {
+        println!(
+            "imported {} primary, {} DAH, {} unmined entries from {}",
+            stats.primary_entries,
+            stats.dah_entries,
+            stats.unmined_entries,
+            input.display()
+        );
+        println!("verify the counts above before restarting the server");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1272,6 +1443,8 @@ fn main() -> ExitCode {
             }
         },
         Command::Top => cmd_top(&http),
+        Command::ExportIndex { config, output } => cmd_export_index(&config, &output, cli.json),
+        Command::ImportIndex { config, input } => cmd_import_index(&config, &input, cli.json),
     };
 
     match result {

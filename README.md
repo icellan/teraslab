@@ -642,17 +642,17 @@ Secondary redb indexes (DAH and unmined) are isolated from the primary. If a sec
 
 #### Migration between backends
 
-Use `teraslab-cli` to export and import index data between backends:
+Use `teraslab-cli` to export and import index data between backends. Both commands are OFFLINE: stop the server first (redb's file lock refuses a live database). They read the index layout from the same TOML config the server uses.
 
 ```bash
-# Export current index (any backend) to a portable snapshot
-teraslab-cli export-index --output /tmp/index-export.snap
+# Export current index (memory or redb backend) to a portable snapshot
+teraslab-cli export-index --config /etc/teraslab/server.toml --output /tmp/index-export.snap
 
 # Import into a redb-configured instance
-teraslab-cli import-index --input /tmp/index-export.snap
+teraslab-cli import-index --config /etc/teraslab/server-redb.toml --input /tmp/index-export.snap
 ```
 
-The export format is the same binary snapshot format used for in-memory index persistence, making it backend-agnostic.
+The export format is the same binary snapshot format used for in-memory index persistence, making it backend-agnostic. For the memory backend, export reads the on-disk index snapshot (shut the server down cleanly first so it is current) and import persists the result back to `index_snapshot_path`. The `file_backed` backend is not supported (its secondaries can only be rebuilt from a device scan).
 
 ## Admin CLI
 

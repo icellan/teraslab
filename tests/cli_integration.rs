@@ -277,3 +277,118 @@ fn cli_all_commands_json_valid() {
         );
     }
 }
+
+/// Roundtrip the offline index-migration commands (5c, 2026-05-29 audit:
+/// the README runbook documented these subcommands but they did not
+/// exist). Populate an in-memory index snapshot, `export-index` it to
+/// the portable format, `import-index` into a fresh redb-configured
+/// layout, and verify entry counts and a spot-checked entry survive
+/// byte-for-byte.
+#[test]
+fn export_import_index_roundtrip() {
+    use teraslab::config::ServerConfig;
+    use teraslab::index::{DahBackend, PrimaryBackend, TxIndexEntry, TxKey, UnminedBackend};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    // Source: memory backend with a populated snapshot on disk.
+    let snap_path = tmp.path().join("src-index.snap");
+    {
+        let mut primary = PrimaryBackend::new_in_memory(100).unwrap();
+        for n in 0..25u8 {
+            let mut txid = [0u8; 32];
+            txid[0] = n;
+            txid[1] = 0xAB;
+            primary
+                .register(
+                    TxKey { txid },
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: 4096 * n as u64,
+                        utxo_count: 3,
+                        block_entry_count: 0,
+                        tx_flags: 0,
+                        spent_utxos: 1,
+                        dah_or_preserve: 0,
+                        unmined_since: 0,
+                        generation: n as u32,
+                    },
+                )
+                .unwrap();
+        }
+        let dah = DahBackend::new_in_memory();
+        let unmined = UnminedBackend::new_in_memory();
+        primary.snapshot_all(&dah, &unmined, &snap_path).unwrap();
+    }
+    let src_cfg_path = tmp.path().join("src.toml");
+    std::fs::write(
+        &src_cfg_path,
+        format!("index_snapshot_path = {:?}\n", snap_path),
+    )
+    .unwrap();
+
+    // Export through the CLI binary.
+    let export_path = tmp.path().join("portable.tsmi");
+    let out = Command::new(cli_bin())
+        .arg("export-index")
+        .arg("--config")
+        .arg(&src_cfg_path)
+        .arg("--output")
+        .arg(&export_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "export-index failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(export_path.exists(), "portable file must exist");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("25 primary"),
+        "export must report 25 primary entries, got: {stdout}"
+    );
+
+    // Destination: redb backend in a fresh directory.
+    let dst_dir = tmp.path().join("dst");
+    std::fs::create_dir(&dst_dir).unwrap();
+    let dst_cfg_path = tmp.path().join("dst.toml");
+    std::fs::write(
+        &dst_cfg_path,
+        format!(
+            "[index]\nbackend = \"redb\"\nredb_path = {:?}\nredb_dah_path = {:?}\nredb_unmined_path = {:?}\n",
+            dst_dir.join("primary.redb"),
+            dst_dir.join("dah.redb"),
+            dst_dir.join("unmined.redb"),
+        ),
+    )
+    .unwrap();
+    let out = Command::new(cli_bin())
+        .arg("import-index")
+        .arg("--config")
+        .arg(&dst_cfg_path)
+        .arg("--input")
+        .arg(&export_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "import-index failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Verify through the library: counts match and an entry survives intact.
+    let dst_cfg = ServerConfig::load(&dst_cfg_path).unwrap();
+    let primary = PrimaryBackend::restore_redb(&dst_cfg.index).unwrap();
+    assert_eq!(primary.len(), 25, "all entries must survive the roundtrip");
+    let mut txid = [0u8; 32];
+    txid[0] = 7;
+    txid[1] = 0xAB;
+    let e = primary
+        .lookup(&TxKey { txid })
+        .expect("entry 7 survives roundtrip");
+    assert_eq!(e.record_offset, 4096 * 7);
+    assert_eq!(e.utxo_count, 3);
+    assert_eq!(e.spent_utxos, 1);
+    assert_eq!(e.generation, 7);
+}

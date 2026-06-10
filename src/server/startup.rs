@@ -109,7 +109,7 @@ pub enum RebuildError {
     #[error(
         "redb import was interrupted: in-progress sentinel present at \
          {sentinel_path}; redb files may contain a partial import. \
-         Re-run `teraslab import-index` to overwrite the partial state, \
+         Re-run `teraslab-cli import-index` to overwrite the partial state, \
          or remove the sentinel manually after verifying the on-disk \
          redb files are consistent"
     )]
