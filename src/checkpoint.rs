@@ -1,6 +1,8 @@
 //! Background redo-log checkpoint task.
 //!
-//! The redo log is a fixed-size circular-by-checkpoint write-ahead log.
+//! The redo log is a fixed-size linear-with-reset write-ahead log (see
+//! [`crate::redo`] — there is no in-place wrap; `write_pos` advances
+//! monotonically until a checkpoint resets it back to zero).
 //! Without a reclamation mechanism it would fill (~750k mutations at a
 //! 64 MiB default + ~85 B/entry) and the master would brick: `append` would
 //! return [`crate::redo::RedoError::LogFull`] and every mutation would error
@@ -8,7 +10,8 @@
 //!
 //! This module wires the missing reclamation cadence. A background thread
 //! periodically samples the log's usage fraction; when it crosses the
-//! configured threshold (default 0.5), the thread takes a checkpoint:
+//! configured `high_water` threshold (default 0.75), the thread takes a
+//! checkpoint:
 //!
 //! 1. Quiesce dispatch long enough to establish a stable redo fence.
 //! 2. Snapshot the in-memory primary, DAH, and unmined indexes to disk

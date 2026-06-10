@@ -54,6 +54,11 @@ pub type Result<T> = std::result::Result<T, DeviceError>;
 // The default 65_536 stripes match the engine's `StripedLocks` default;
 // false-sharing only occurs when two distinct record offsets hash to the
 // same stripe (effectively zero contention in practice).
+//
+// The torn-read-safety doc on `ops::engine::Engine` (read-only paths
+// section) references this block: these read-side guards are the load-
+// bearing defense for the engine's lock-free read paths and must not be
+// removed as a "redundant given CRC" optimization.
 
 /// Process-wide striped RwLock table that serializes writer↔reader
 /// access at the record level for the direct-pointer I/O helpers.

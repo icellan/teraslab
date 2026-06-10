@@ -320,6 +320,7 @@ All operations are batch-oriented. Single-item operations are batches of size 1.
 | 104 | `AdminDiagnoseKey` | Diagnose per-key routing and local shard state |
 | 105 | `PartitionVersionReport` | Inter-node shard version report after topology commit |
 | 106 | `AdminClusterHealth` | Cluster readiness snapshot for clients/tests |
+| 107 | `Hello` | Protocol-version handshake; empty request, response is the server's 2-byte LE protocol version (pre-v2 servers reject with `OPCODE_UNSUPPORTED` or `INTERNAL`) |
 
 **Inter-node replication, migration, and topology:**
 
@@ -367,6 +368,14 @@ All operations are batch-oriented. Single-item operations are batches of size 1.
 | 25 | `CLUSTER_NOT_READY` | Node has not observed its first quorum-committed topology |
 | 26 | `INDEX_DEGRADED` | Required secondary index is unavailable after startup rebuild/open failure |
 | 27 | `CLUSTER_AUTH_FAILED` | Inter-node HMAC frame authentication failed |
+| 28 | `PAYLOAD_MALFORMED` | Request payload failed wire-decode (truncated header, malformed count prefix, oversize batch, invalid UTF-8); do not retry blindly |
+| 29 | `OPCODE_UNSUPPORTED` | Dispatcher does not recognise the opcode (frame itself was decodable) |
+| 30 | `STORAGE_IO` | Device read/write failure surfaced from the engine or blobstore; likely to recur until the operator resolves the underlying issue |
+| 31 | `RATE_LIMITED` | Listener's aggregate in-flight request memory limit exhausted; retry after backoff |
+| 32 | `NOT_CLUSTERED` | Cluster control opcode sent to a server running in single-node mode; do not retry against this server |
+| 33 | `INVARIANT_VIOLATION` | Wire-protocol invariant violated by the caller (e.g. upper 48 bits set in a shard-carrying `request_id`) |
+| 34 | `STREAM_INVARIANT` | Stream-protocol invariant violated (chunk offset mismatch, byte counter overflow, stream byte cap exceeded) |
+| 35 | `DELETED_CHILDREN` | Idempotent re-spend rejected: the child txid is present in the parent's deleted-children audit list (error data: 1-byte child_count) |
 | 255 | `INTERNAL` | Unexpected server error |
 
 ### Response status codes
