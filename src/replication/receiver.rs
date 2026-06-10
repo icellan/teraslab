@@ -2429,6 +2429,321 @@ mod tests {
         assert_eq!(meta.block_entry_count, 1);
     }
 
+    // ------------------------------------------------------------------
+    // Coverage-matrix hole (2026-05-29 audit): the apply path for
+    // unspend / unfreeze / reassign / set_conflicting / set_locked /
+    // preserve_until / delete was implemented but never exercised by a
+    // test. Each test below asserts the exact post-state AND that
+    // re-applying the same op (replica crash + master resend, or redo
+    // replay) is idempotent.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn apply_unspend_op_and_idempotent_reapply() {
+        let engine = make_engine();
+        let k = key(50);
+        create_record(&engine, k, 3);
+
+        apply_op(
+            &engine,
+            &ReplicaOp::Spend {
+                tx_key: k,
+                offset: 0,
+                spending_data: [0xAB; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
+                master_generation: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!({ engine.read_metadata(&k).unwrap().spent_utxos }, 1);
+
+        let unspend = ReplicaOp::Unspend {
+            tx_key: k,
+            offset: 0,
+            spending_data: [0xAB; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
+            master_generation: 1,
+        };
+        apply_op(&engine, &unspend).unwrap();
+
+        let slot = engine.read_slot(&k, 0).unwrap();
+        assert_eq!(slot.status, UTXO_UNSPENT);
+        let meta = engine.read_metadata(&k).unwrap();
+        assert_eq!({ meta.spent_utxos }, 0);
+        let gen_after = { meta.generation };
+
+        // Re-apply (resend after replica crash): already-unspent is a
+        // no-op — no error, no counter change, no generation bump.
+        apply_op(&engine, &unspend).unwrap();
+        let meta = engine.read_metadata(&k).unwrap();
+        assert_eq!({ meta.spent_utxos }, 0);
+        assert_eq!({ meta.generation }, gen_after);
+        assert_eq!(engine.read_slot(&k, 0).unwrap().status, UTXO_UNSPENT);
+    }
+
+    #[test]
+    fn apply_unspend_wrong_spending_data_rejected_without_mutation() {
+        let engine = make_engine();
+        let k = key(51);
+        create_record(&engine, k, 1);
+
+        apply_op(
+            &engine,
+            &ReplicaOp::Spend {
+                tx_key: k,
+                offset: 0,
+                spending_data: [0xAB; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
+                master_generation: 0,
+            },
+        )
+        .unwrap();
+
+        // An unspend whose spending_data does not match the recorded
+        // spend must fail loudly (divergence), not erase the spend.
+        let err = apply_op(
+            &engine,
+            &ReplicaOp::Unspend {
+                tx_key: k,
+                offset: 0,
+                spending_data: [0xCD; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
+                master_generation: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("unspend"), "unexpected error: {err}");
+
+        let slot = engine.read_slot(&k, 0).unwrap();
+        assert_eq!(slot.status, UTXO_SPENT);
+        assert_eq!(slot.spending_data, [0xAB; 36]);
+        assert_eq!({ engine.read_metadata(&k).unwrap().spent_utxos }, 1);
+    }
+
+    #[test]
+    fn apply_unfreeze_idempotent_reapply() {
+        let engine = make_engine();
+        let k = key(52);
+        create_record(&engine, k, 2);
+
+        apply_op(
+            &engine,
+            &ReplicaOp::Freeze {
+                tx_key: k,
+                offset: 0,
+                master_generation: 0,
+            },
+        )
+        .unwrap();
+        let unfreeze = ReplicaOp::Unfreeze {
+            tx_key: k,
+            offset: 0,
+            master_generation: 1,
+        };
+        apply_op(&engine, &unfreeze).unwrap();
+        assert_eq!(engine.read_slot(&k, 0).unwrap().status, UTXO_UNSPENT);
+
+        // Second unfreeze hits NotFrozen — graceful skip, slot unchanged.
+        apply_op(&engine, &unfreeze).unwrap();
+        assert_eq!(engine.read_slot(&k, 0).unwrap().status, UTXO_UNSPENT);
+    }
+
+    #[test]
+    fn apply_reassign_op_and_idempotent_reapply() {
+        let engine = make_engine();
+        let k = key(53);
+        create_record(&engine, k, 2);
+
+        apply_op(
+            &engine,
+            &ReplicaOp::Freeze {
+                tx_key: k,
+                offset: 0,
+                master_generation: 0,
+            },
+        )
+        .unwrap();
+
+        let new_hash = [0x5A; 32];
+        let reassign = ReplicaOp::Reassign {
+            tx_key: k,
+            offset: 0,
+            new_hash,
+            block_height: 800_000,
+            spendable_after: 1_000,
+            master_generation: 1,
+        };
+        apply_op(&engine, &reassign).unwrap();
+
+        let slot = engine.read_slot(&k, 0).unwrap();
+        assert_eq!(slot.status, UTXO_UNSPENT);
+        assert_eq!(slot.hash, new_hash);
+        // Reassign stamps the cooldown height into spending_data[0..4].
+        assert_eq!(
+            u32::from_le_bytes(slot.spending_data[0..4].try_into().unwrap()),
+            801_000,
+        );
+        let meta = engine.read_metadata(&k).unwrap();
+        assert_eq!({ meta.reassignment_count }, 1);
+
+        // Re-apply: the slot is no longer frozen, so the handler maps
+        // NotFrozen to a graceful skip — count and hash unchanged.
+        apply_op(&engine, &reassign).unwrap();
+        let meta = engine.read_metadata(&k).unwrap();
+        assert_eq!({ meta.reassignment_count }, 1);
+        assert_eq!(engine.read_slot(&k, 0).unwrap().hash, new_hash);
+    }
+
+    #[test]
+    fn apply_set_conflicting_op_set_and_clear() {
+        use crate::record::TxFlags;
+        let engine = make_engine();
+        let k = key(54);
+        create_record(&engine, k, 1);
+
+        let set = ReplicaOp::SetConflicting {
+            tx_key: k,
+            value: true,
+            current_block_height: 700_000,
+            retention: 288,
+            master_generation: 0,
+        };
+        apply_op(&engine, &set).unwrap();
+        let meta = engine.read_metadata(&k).unwrap();
+        assert!(meta.flags.contains(TxFlags::CONFLICTING));
+
+        // Re-apply: flag already set, no error.
+        apply_op(&engine, &set).unwrap();
+        assert!(
+            engine
+                .read_metadata(&k)
+                .unwrap()
+                .flags
+                .contains(TxFlags::CONFLICTING)
+        );
+
+        apply_op(
+            &engine,
+            &ReplicaOp::SetConflicting {
+                tx_key: k,
+                value: false,
+                current_block_height: 700_000,
+                retention: 288,
+                master_generation: 1,
+            },
+        )
+        .unwrap();
+        assert!(
+            !engine
+                .read_metadata(&k)
+                .unwrap()
+                .flags
+                .contains(TxFlags::CONFLICTING)
+        );
+    }
+
+    #[test]
+    fn apply_set_locked_op_set_and_clear() {
+        use crate::record::TxFlags;
+        let engine = make_engine();
+        let k = key(55);
+        create_record(&engine, k, 1);
+
+        let lock = ReplicaOp::SetLocked {
+            tx_key: k,
+            value: true,
+            master_generation: 0,
+        };
+        apply_op(&engine, &lock).unwrap();
+        assert!(
+            engine
+                .read_metadata(&k)
+                .unwrap()
+                .flags
+                .contains(TxFlags::LOCKED)
+        );
+
+        // Idempotent re-apply.
+        apply_op(&engine, &lock).unwrap();
+        assert!(
+            engine
+                .read_metadata(&k)
+                .unwrap()
+                .flags
+                .contains(TxFlags::LOCKED)
+        );
+
+        apply_op(
+            &engine,
+            &ReplicaOp::SetLocked {
+                tx_key: k,
+                value: false,
+                master_generation: 1,
+            },
+        )
+        .unwrap();
+        assert!(
+            !engine
+                .read_metadata(&k)
+                .unwrap()
+                .flags
+                .contains(TxFlags::LOCKED)
+        );
+    }
+
+    #[test]
+    fn apply_preserve_until_op_and_idempotent_reapply() {
+        use crate::record::TxFlags;
+        let engine = make_engine();
+        let k = key(56);
+        create_record(&engine, k, 1);
+
+        let preserve = ReplicaOp::PreserveUntil {
+            tx_key: k,
+            block_height: 900_000,
+            master_generation: 0,
+        };
+        apply_op(&engine, &preserve).unwrap();
+        let meta = engine.read_metadata(&k).unwrap();
+        assert_eq!({ meta.preserve_until }, 900_000);
+        assert_eq!({ meta.delete_at_height }, 0);
+        // HAS_PRESERVE_UNTIL is an index-only discriminant bit (it marks
+        // the cached dah_or_preserve as a preserve height, R-019); it is
+        // never written to on-device meta.flags.
+        let entry = engine.lookup(&k).unwrap();
+        assert_ne!(
+            entry.tx_flags & TxFlags::HAS_PRESERVE_UNTIL.bits(),
+            0,
+            "index cache must carry the preserve discriminant so fast \
+             paths skip DAH eviction (R-019)"
+        );
+
+        // Re-apply: same preserve height lands in the same state.
+        apply_op(&engine, &preserve).unwrap();
+        let meta = engine.read_metadata(&k).unwrap();
+        assert_eq!({ meta.preserve_until }, 900_000);
+        assert_eq!({ meta.delete_at_height }, 0);
+    }
+
+    #[test]
+    fn apply_delete_idempotent_reapply() {
+        let engine = make_engine();
+        let k = key(57);
+        create_record(&engine, k, 2);
+
+        let delete = ReplicaOp::Delete { tx_key: k };
+        apply_op(&engine, &delete).unwrap();
+        assert!(engine.lookup(&k).is_none());
+
+        // Resend after replica crash: TxNotFound is a graceful skip.
+        apply_op(&engine, &delete).unwrap();
+        assert!(engine.lookup(&k).is_none());
+    }
+
     #[test]
     fn apply_missing_tx_gracefully_skipped() {
         let engine = make_engine();

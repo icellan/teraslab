@@ -328,6 +328,253 @@ fn boundary_after_replication_before_intent_clear_is_idempotent() {
 // Sanity: full-pipeline recovery still works with allocator threading.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// SetMined / MarkOnLongestChain crash boundaries (2026-05-29 audit,
+// coverage-matrix hole #3). Both ops mutate the DAH/unmined secondary
+// state that gates pruning — a non-idempotent replay here resurrects or
+// vanishes a UTXO. Each test replays once (crash after WAL fsync,
+// before the metadata write) and then runs a SECOND recovery pass over
+// the same device + log (restart after a crash mid-recovery) asserting
+// the state converges instead of double-applying.
+// ---------------------------------------------------------------------------
+
+/// Crash after the SetMined WAL fsync but before the metadata write:
+/// replay must reconstruct the block entry; a second recovery pass must
+/// observe the duplicate block_id and skip without a second generation
+/// bump or a duplicate entry.
+#[test]
+fn boundary_set_mined_after_wal_replays_and_second_pass_is_idempotent() {
+    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (key, meta, slots) = make_record(0xD4, 2);
+    let record_bytes = build_record_bytes(&meta, &slots);
+    let utxo_count: u32 = slots.len() as u32;
+    let record_offset = alloc
+        .allocate(TxMetadata::record_size_for(utxo_count))
+        .unwrap();
+
+    // WAL carries the create AND the set_mined; the device has neither
+    // (crash before any device write).
+    redo.append_and_flush(RedoOp::CreateV2 {
+        tx_key: key,
+        record_offset,
+        utxo_count,
+        is_conflicting: false,
+        record_bytes,
+        parent_txids: Vec::new(),
+    })
+    .unwrap();
+    redo.append_and_flush(RedoOp::SetMined {
+        tx_key: key,
+        block_id: 42,
+        block_height: 800_000,
+        subtree_idx: 7,
+        unset: false,
+    })
+    .unwrap();
+
+    let mut dah = teraslab::index::DahBackend::new_in_memory();
+    let mut unmined = teraslab::index::UnminedBackend::new_in_memory();
+    let stats = recover_all_with_allocator(
+        &*data_dev as &dyn BlockDevice,
+        &redo,
+        &mut index,
+        &mut dah,
+        &mut unmined,
+        Some(&mut alloc),
+    )
+    .unwrap();
+    assert_eq!(stats.entries_replayed, 2, "create + set_mined both apply");
+    assert_eq!(stats.entries_failed, 0);
+
+    let m = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
+    assert_eq!({ m.block_entry_count }, 1);
+    let be = { m.block_entries_inline[0] };
+    assert_eq!({ be.block_id }, 42);
+    assert_eq!({ be.block_height }, 800_000);
+    assert_eq!({ be.subtree_idx }, 7);
+    let gen_after_first = { m.generation };
+
+    // Second recovery pass (restart after crash mid-recovery): fresh
+    // index/secondaries, same device + WAL. SetMined replay must see
+    // the duplicate block_id and skip — same entry count, no further
+    // generation bump.
+    let mut index2 = PrimaryBackend::new_in_memory(1000).unwrap();
+    let mut dah2 = teraslab::index::DahBackend::new_in_memory();
+    let mut unmined2 = teraslab::index::UnminedBackend::new_in_memory();
+    let stats2 = recover_all_with_allocator(
+        &*data_dev as &dyn BlockDevice,
+        &redo,
+        &mut index2,
+        &mut dah2,
+        &mut unmined2,
+        Some(&mut alloc),
+    )
+    .unwrap();
+    assert_eq!(stats2.entries_failed, 0);
+
+    let m2 = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
+    assert_eq!(
+        { m2.block_entry_count },
+        1,
+        "duplicate block_id must be skipped, not appended twice"
+    );
+    assert_eq!(
+        { m2.generation },
+        gen_after_first,
+        "second replay pass must not bump generation again"
+    );
+}
+
+/// Crash after the MarkOnLongestChain(off) WAL fsync but before the
+/// metadata write (a reorg knocked the tx off the longest chain):
+/// replay must set `unmined_since` and the reconciled unmined secondary
+/// must track the record; the generation token (H7) makes a second
+/// pass a no-op.
+#[test]
+fn boundary_mark_longest_chain_off_after_wal_replays_and_is_idempotent() {
+    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (key, meta, slots) = make_record(0xD5, 1);
+    let record_bytes = build_record_bytes(&meta, &slots);
+    let utxo_count: u32 = slots.len() as u32;
+    let record_offset = alloc
+        .allocate(TxMetadata::record_size_for(utxo_count))
+        .unwrap();
+
+    redo.append_and_flush(RedoOp::CreateV2 {
+        tx_key: key,
+        record_offset,
+        utxo_count,
+        is_conflicting: false,
+        record_bytes,
+        parent_txids: Vec::new(),
+    })
+    .unwrap();
+    redo.append_and_flush(RedoOp::MarkOnLongestChain {
+        tx_key: key,
+        on_longest_chain: false,
+        current_block_height: 850_000,
+        block_height_retention: 288,
+        generation: 1,
+    })
+    .unwrap();
+
+    let mut dah = teraslab::index::DahBackend::new_in_memory();
+    let mut unmined = teraslab::index::UnminedBackend::new_in_memory();
+    let stats = recover_all_with_allocator(
+        &*data_dev as &dyn BlockDevice,
+        &redo,
+        &mut index,
+        &mut dah,
+        &mut unmined,
+        Some(&mut alloc),
+    )
+    .unwrap();
+    assert_eq!(stats.entries_failed, 0);
+
+    let m = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
+    assert_eq!({ m.unmined_since }, 850_000, "off-chain sets unmined_since");
+    assert_eq!({ m.generation }, 1, "replay syncs the generation token");
+    assert_eq!(
+        unmined.len(),
+        1,
+        "reconciled unmined secondary must track the off-chain record"
+    );
+
+    // Second pass: generation 1 is at-or-ahead of the token — replay
+    // must skip, leaving unmined_since/generation/secondary unchanged.
+    let mut index2 = PrimaryBackend::new_in_memory(1000).unwrap();
+    let mut dah2 = teraslab::index::DahBackend::new_in_memory();
+    let mut unmined2 = teraslab::index::UnminedBackend::new_in_memory();
+    let stats2 = recover_all_with_allocator(
+        &*data_dev as &dyn BlockDevice,
+        &redo,
+        &mut index2,
+        &mut dah2,
+        &mut unmined2,
+        Some(&mut alloc),
+    )
+    .unwrap();
+    assert_eq!(stats2.entries_failed, 0);
+    let m2 = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
+    assert_eq!({ m2.unmined_since }, 850_000);
+    assert_eq!({ m2.generation }, 1);
+    assert_eq!(unmined2.len(), 1);
+}
+
+/// The inverse reorg direction: a record already off the longest chain
+/// (unmined_since set in its created bytes) is marked back ON the
+/// longest chain. Replay must clear `unmined_since`; the reconciled
+/// unmined secondary must drop the record; second pass is a no-op.
+#[test]
+fn boundary_mark_longest_chain_on_clears_unmined_and_is_idempotent() {
+    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (key, mut meta, slots) = make_record(0xD6, 1);
+    // The record was off-chain at create time.
+    meta.unmined_since = 850_000;
+    let record_bytes = build_record_bytes(&meta, &slots);
+    let utxo_count: u32 = slots.len() as u32;
+    let record_offset = alloc
+        .allocate(TxMetadata::record_size_for(utxo_count))
+        .unwrap();
+
+    redo.append_and_flush(RedoOp::CreateV2 {
+        tx_key: key,
+        record_offset,
+        utxo_count,
+        is_conflicting: false,
+        record_bytes,
+        parent_txids: Vec::new(),
+    })
+    .unwrap();
+    redo.append_and_flush(RedoOp::MarkOnLongestChain {
+        tx_key: key,
+        on_longest_chain: true,
+        current_block_height: 860_000,
+        block_height_retention: 288,
+        generation: 1,
+    })
+    .unwrap();
+
+    let mut dah = teraslab::index::DahBackend::new_in_memory();
+    let mut unmined = teraslab::index::UnminedBackend::new_in_memory();
+    let stats = recover_all_with_allocator(
+        &*data_dev as &dyn BlockDevice,
+        &redo,
+        &mut index,
+        &mut dah,
+        &mut unmined,
+        Some(&mut alloc),
+    )
+    .unwrap();
+    assert_eq!(stats.entries_failed, 0);
+
+    let m = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
+    assert_eq!({ m.unmined_since }, 0, "back-on-chain clears unmined_since");
+    assert_eq!({ m.generation }, 1);
+    assert!(
+        unmined.is_empty(),
+        "reconciled unmined secondary must drop the on-chain record"
+    );
+
+    let mut index2 = PrimaryBackend::new_in_memory(1000).unwrap();
+    let mut dah2 = teraslab::index::DahBackend::new_in_memory();
+    let mut unmined2 = teraslab::index::UnminedBackend::new_in_memory();
+    let stats2 = recover_all_with_allocator(
+        &*data_dev as &dyn BlockDevice,
+        &redo,
+        &mut index2,
+        &mut dah2,
+        &mut unmined2,
+        Some(&mut alloc),
+    )
+    .unwrap();
+    assert_eq!(stats2.entries_failed, 0);
+    let m2 = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
+    assert_eq!({ m2.unmined_since }, 0);
+    assert_eq!({ m2.generation }, 1);
+    assert!(unmined2.is_empty());
+}
+
 /// A thin smoke test: drive a CreateV2 entry through
 /// `recover_all_with_allocator` to make sure the full pipeline (which is
 /// what production startup uses) still reconstructs the record
