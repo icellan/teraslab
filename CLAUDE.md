@@ -124,7 +124,7 @@ Confirm: zero failures, zero ignored tests.
 ### Naming conventions
 
 - Crate name: `teraslab`
-- Module names match the phase topics: `device`, `record`, `allocator`, `index`, `ops`, `uring`, `locks`, `redo`, `replication`, `cluster`, `protocol`, `storage`
+- Module names match the phase topics: `device`, `record`, `allocator`, `index`, `ops`, `locks`, `redo`, `replication`, `cluster`, `protocol`, `storage` (the `uring` module was removed 2026-05-28 — I/O is synchronous O_DIRECT via `device`)
 - Test modules inside each source file: `#[cfg(test)] mod tests { ... }`
 - Integration tests in `tests/` directory for cross-module tests
 

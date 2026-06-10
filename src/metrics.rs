@@ -7,7 +7,7 @@
 //!
 //! Every labelled metric in this file is keyed by a fixed-cardinality
 //! enum with a `const all()` slice — [`Outcome`], [`OpCode`],
-//! [`MigrationLabel`], [`UringErrClass`], [`SwimChurnKind`]. No metric
+//! [`MigrationLabel`], [`SwimChurnKind`]. No metric
 //! is ever labelled by a user-controlled string (client IP, request
 //! path, txid, peer address). Prometheus label cardinality is therefore
 //! bounded at compile time, which is load-bearing for the scrape
@@ -1043,126 +1043,6 @@ impl ReplicationMetrics {
     }
 }
 
-/// io_uring backend metrics.
-///
-/// Every SQE push records a start timestamp in a fixed-size ring indexed by
-/// `user_data & (RING_SIZE − 1)`. On completion, the ring is read to compute
-/// submit→complete latency. Hot-path cost is two `AtomicU64::store` calls and
-/// one `record_ns`.
-#[repr(align(128))]
-pub struct IoUringMetrics {
-    /// Time from SQE push to `submit()` return.
-    pub uring_submit_latency_ns: LatencyHistogram,
-    /// Time from SQE push to CQE drain.
-    pub uring_completion_latency_ns: LatencyHistogram,
-    /// Pending SQE count (gauge — exposed via `pending()` on the backend).
-    pub uring_pending: AtomicU32,
-    /// Total submission errors (from `submit`/`submit_and_wait`).
-    pub uring_submit_errors_total: PaddedCounter,
-    /// Completion errors keyed by errno class
-    /// (eio, enomem, enospc, eagain, eperm, einval, eintr, other).
-    pub uring_completion_errors_total: LabeledCounter<URING_ERR_CARDINALITY>,
-}
-
-/// Number of errno-class buckets tracked by [`IoUringMetrics`].
-pub const URING_ERR_CARDINALITY: usize = 8;
-
-/// Errno-class bucket labels for `uring_completion_errors_total`.
-///
-/// The discriminant doubles as the index into the underlying
-/// [`LabeledCounter`] cells — do **not** reorder.
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UringErrClass {
-    /// I/O error (`EIO`).
-    Eio = 0,
-    /// Out of memory (`ENOMEM`).
-    Enomem = 1,
-    /// No space left on device (`ENOSPC`).
-    Enospc = 2,
-    /// Resource temporarily unavailable (`EAGAIN`/`EWOULDBLOCK`).
-    Eagain = 3,
-    /// Permission denied (`EPERM`/`EACCES`).
-    Eperm = 4,
-    /// Invalid argument (`EINVAL`).
-    Einval = 5,
-    /// Interrupted system call (`EINTR`).
-    Eintr = 6,
-    /// Any other errno not captured above.
-    Other = 7,
-}
-
-impl UringErrClass {
-    /// Stable Prometheus label value.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            UringErrClass::Eio => "eio",
-            UringErrClass::Enomem => "enomem",
-            UringErrClass::Enospc => "enospc",
-            UringErrClass::Eagain => "eagain",
-            UringErrClass::Eperm => "eperm",
-            UringErrClass::Einval => "einval",
-            UringErrClass::Eintr => "eintr",
-            UringErrClass::Other => "other",
-        }
-    }
-
-    /// All variants in discriminant order.
-    pub fn all() -> &'static [UringErrClass] {
-        &[
-            UringErrClass::Eio,
-            UringErrClass::Enomem,
-            UringErrClass::Enospc,
-            UringErrClass::Eagain,
-            UringErrClass::Eperm,
-            UringErrClass::Einval,
-            UringErrClass::Eintr,
-            UringErrClass::Other,
-        ]
-    }
-
-    /// Classify a negative errno (as returned by io_uring CQE `res`).
-    pub fn from_neg_errno(neg_errno: i32) -> Self {
-        let e = -neg_errno;
-        match e {
-            5 => UringErrClass::Eio,          // EIO
-            12 => UringErrClass::Enomem,      // ENOMEM
-            28 => UringErrClass::Enospc,      // ENOSPC
-            11 | 35 => UringErrClass::Eagain, // EAGAIN (Linux 11; macOS 35)
-            1 | 13 => UringErrClass::Eperm,   // EPERM (1), EACCES (13)
-            22 => UringErrClass::Einval,      // EINVAL
-            4 => UringErrClass::Eintr,        // EINTR
-            _ => UringErrClass::Other,
-        }
-    }
-}
-
-impl Default for IoUringMetrics {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl IoUringMetrics {
-    /// Create a new, zero-initialized io_uring metrics table.
-    pub const fn new() -> Self {
-        Self {
-            uring_submit_latency_ns: LatencyHistogram::new(),
-            uring_completion_latency_ns: LatencyHistogram::new(),
-            uring_pending: AtomicU32::new(0),
-            uring_submit_errors_total: PaddedCounter::new(),
-            uring_completion_errors_total: LabeledCounter::<URING_ERR_CARDINALITY>::new(),
-        }
-    }
-
-    /// Record a completion error by errno class.
-    #[inline(always)]
-    pub fn record_completion_error(&self, neg_errno: i32) {
-        let cls = UringErrClass::from_neg_errno(neg_errno);
-        self.uring_completion_errors_total.inc(cls as u8 as usize);
-    }
-}
-
 /// Redo log metrics.
 ///
 /// Recorded around every `flush`/fsync call. Hot-path recording lives inside
@@ -1483,7 +1363,6 @@ impl AllocatorMetrics {
 use std::sync::OnceLock;
 
 static REPLICATION_METRICS: OnceLock<&'static ReplicationMetrics> = OnceLock::new();
-static IO_URING_METRICS: OnceLock<&'static IoUringMetrics> = OnceLock::new();
 static REDO_METRICS: OnceLock<&'static RedoMetrics> = OnceLock::new();
 static MIGRATION_METRICS: OnceLock<&'static MigrationMetrics> = OnceLock::new();
 static SWIM_METRICS: OnceLock<&'static SwimMetrics> = OnceLock::new();
@@ -1500,16 +1379,6 @@ pub fn init_replication_metrics(m: &'static ReplicationMetrics) {
 /// Borrow the process-wide replication metrics, if installed.
 pub fn replication_metrics() -> Option<&'static ReplicationMetrics> {
     REPLICATION_METRICS.get().copied()
-}
-
-/// Install the process-wide io_uring metrics reference.
-pub fn init_io_uring_metrics(m: &'static IoUringMetrics) {
-    let _ = IO_URING_METRICS.set(m);
-}
-
-/// Borrow the process-wide io_uring metrics, if installed.
-pub fn io_uring_metrics() -> Option<&'static IoUringMetrics> {
-    IO_URING_METRICS.get().copied()
 }
 
 /// Install the process-wide redo metrics reference.

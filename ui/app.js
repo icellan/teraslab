@@ -661,7 +661,7 @@
     }
 
     // ---------------------------------------------------------------------------
-    // Page: Observability — per-op outcomes, latencies, replication, io_uring,
+    // Page: Observability — per-op outcomes, latencies, replication,
     //                     redo, migrations, swim, allocator
     //
     // Each panel is guarded against missing data: `fmt()` returns '-' for null,
@@ -717,7 +717,6 @@
         return [
             opsOutcomePanel(agg),
             replicationPanel(local),
-            uringPanel(local),
             redoPanel(local),
             migrationPanel(local),
             swimPanel(local),
@@ -928,74 +927,6 @@
         </div>`;
     }
     function totalFailures(per) { return (per || []).reduce((s, p) => s + (p.batches_failed || 0), 0); }
-
-    // --- Panel: io_uring ----------------------------------------------------
-    function uringPanel(local) {
-        const u = local?.uring_metrics;
-        if (!u) {
-            return panel('io_uring', 'not populated', '<div style="padding:14px;color:var(--ts-text-3)">io_uring metrics not available.</div>');
-        }
-        const subCount = u.submit_latency?.count || 0;
-        const cmpCount = u.completion_latency?.count || 0;
-        const anyActivity = subCount + cmpCount + (u.pending || 0) + (u.submit_errors || 0);
-        if (anyActivity === 0) {
-            return panel('io_uring', 'no activity', '<div style="padding:14px;color:var(--ts-text-3)">No io_uring traffic recorded yet.</div>');
-        }
-        const errs = u.completion_errors || {};
-        const ERR_KEYS = ['eio', 'enomem', 'enospc', 'eagain', 'eperm', 'einval', 'eintr', 'other'];
-        const totalErrs = ERR_KEYS.reduce((s, k) => s + (errs[k] || 0), 0);
-
-        const latRow = (label, h) => `<div style="display:grid;grid-template-columns:90px 1fr 1fr 1fr;gap:8px;padding:6px 0;font-family:var(--ts-mono);font-size:11px;border-bottom:1px solid var(--ts-line)">
-            <span class="ts-label">${label}</span>
-            <span><span class="ts-label">count</span> ${fmt(h?.count)}</span>
-            <span><span class="ts-label">p50</span> ${fmtNs(h?.p50_ns)}</span>
-            <span><span class="ts-label">p99</span> ${fmtNs(h?.p99_ns)}</span>
-        </div>`;
-
-        const errRows = ERR_KEYS.map(k => {
-            const v = errs[k] || 0;
-            if (v === 0) return `<div style="display:flex;justify-content:space-between;padding:4px 0;"><span class="ts-label">${k.toUpperCase()}</span><span style="color:var(--ts-text-4)">-</span></div>`;
-            const color = k === 'eio' || k === 'enospc' ? 'var(--ts-bad)' : k === 'enomem' || k === 'eagain' ? 'var(--ts-warn)' : 'var(--ts-text)';
-            return `<div style="display:flex;justify-content:space-between;padding:4px 0;"><span class="ts-label">${k.toUpperCase()}</span><span style="color:${color}">${fmt(v)}</span></div>`;
-        }).join('');
-
-        return `<div class="ts-panel">
-            <div class="ts-panel__head">
-                <div class="ts-panel__title"><span class="ts-dot"></span>io_uring</div>
-                <div class="ts-panel__meta">pending ${fmt(u.pending)} · submit errors ${fmt(u.submit_errors)} · completion errors ${fmt(totalErrs)}</div>
-            </div>
-            <div class="ts-panel__body">
-                <div class="grid" style="grid-template-columns:repeat(3,1fr);gap:10px;">
-                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
-                        <div class="ts-label">PENDING</div>
-                        <div class="ts-num" style="font-size:22px">${fmt(u.pending)}</div>
-                        <div class="ts-label" style="margin-top:6px">in-flight SQEs</div>
-                    </div>
-                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
-                        <div class="ts-label">SUBMIT ERRORS</div>
-                        <div class="ts-num" style="font-size:22px;${(u.submit_errors || 0) > 0 ? 'color:var(--ts-bad)' : ''}">${fmt(u.submit_errors)}</div>
-                        <div class="ts-label" style="margin-top:6px">total since boot</div>
-                    </div>
-                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
-                        <div class="ts-label">COMPLETION ERRORS</div>
-                        <div class="ts-num" style="font-size:22px;${totalErrs > 0 ? 'color:var(--ts-bad)' : ''}">${fmt(totalErrs)}</div>
-                        <div class="ts-label" style="margin-top:6px">across all errno classes</div>
-                    </div>
-                </div>
-                <div class="grid" style="grid-template-columns:1.6fr 1fr;gap:10px;margin-top:10px;">
-                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
-                        <div class="ts-label" style="margin-bottom:6px">LATENCY</div>
-                        ${latRow('SUBMIT', u.submit_latency)}
-                        ${latRow('COMPLETION', u.completion_latency)}
-                    </div>
-                    <div class="ts-panel" style="padding:10px 14px;margin:0;">
-                        <div class="ts-label" style="margin-bottom:6px">COMPLETION ERRORS BY ERRNO</div>
-                        ${errRows}
-                    </div>
-                </div>
-            </div>
-        </div>`;
-    }
 
     // --- Panel: redo log ----------------------------------------------------
     function redoPanel(local) {

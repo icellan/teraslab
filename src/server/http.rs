@@ -8,8 +8,8 @@ use crate::cluster::shards::{NUM_SHARDS, NodeId, ShardTable};
 use crate::index::TxKey;
 use crate::metrics::{
     LatencyHistogram, MAX_REPLICAS, MigrationLabel, OpCode, OpOutcomeCounters, Outcome,
-    SwimChurnKind, ThreadHistograms, ThreadMetrics, UringErrClass, allocator_metrics,
-    io_uring_metrics, migration_metrics, redo_metrics, replication_metrics, swim_metrics,
+    SwimChurnKind, ThreadHistograms, ThreadMetrics, allocator_metrics,
+    migration_metrics, redo_metrics, replication_metrics, swim_metrics,
 };
 use crate::observability::WireTraceContext;
 use crate::ops::engine::Engine;
@@ -962,39 +962,6 @@ pub(crate) fn render_metrics_text(
             );
         }
     }
-    if let Some(u) = io_uring_metrics() {
-        prom_histogram_ns(
-            &mut out,
-            "teraslab_uring_submit_latency_ns",
-            &u.uring_submit_latency_ns,
-        );
-        prom_histogram_ns(
-            &mut out,
-            "teraslab_uring_completion_latency_ns",
-            &u.uring_completion_latency_ns,
-        );
-        prom_gauge(
-            &mut out,
-            "teraslab_uring_pending",
-            u.uring_pending.load(Ordering::Relaxed) as u64,
-        );
-        prom_counter(
-            &mut out,
-            "teraslab_uring_submit_errors_total",
-            u.uring_submit_errors_total.get(),
-        );
-        use std::fmt::Write as _;
-        let _ = writeln!(out, "# TYPE teraslab_uring_completion_errors_total counter");
-        for &cls in UringErrClass::all() {
-            let v = u.uring_completion_errors_total.get(cls as u8 as usize);
-            let _ = writeln!(
-                out,
-                "teraslab_uring_completion_errors_total{{errno=\"{}\"}} {}",
-                cls.as_str(),
-                v
-            );
-        }
-    }
     if let Some(r) = redo_metrics() {
         prom_histogram_ns(
             &mut out,
@@ -1833,7 +1800,6 @@ fn build_local_top_snapshot(state: &HttpState) -> serde_json::Value {
         "connections": state.active_connections.load(Ordering::Relaxed),
         "ready": state.ready.load(Ordering::Relaxed),
         "replication_metrics": replication_metrics_json(),
-        "uring_metrics": uring_metrics_json(),
         "redo_metrics": redo_metrics_json(),
         "migration_metrics": migration_metrics_json(state),
         "swim_metrics": swim_metrics_json(),
@@ -1870,33 +1836,6 @@ fn replication_metrics_json() -> serde_json::Value {
         "leader_sequence": r.leader_sequence.load(Ordering::Relaxed),
         "latency": histogram_json(&r.repl_batch_latency_ns),
         "per_replica": per_replica,
-    })
-}
-
-/// Build the `uring_metrics` sub-shape for `/admin/top` and `/ws/top`.
-fn uring_metrics_json() -> serde_json::Value {
-    let Some(u) = io_uring_metrics() else {
-        return serde_json::json!({
-            "submit_latency": histogram_json(&LatencyHistogram::new()),
-            "completion_latency": histogram_json(&LatencyHistogram::new()),
-            "pending": 0,
-            "submit_errors": 0,
-            "completion_errors": {},
-        });
-    };
-    let mut errs = serde_json::Map::new();
-    for &cls in UringErrClass::all() {
-        errs.insert(
-            cls.as_str().to_string(),
-            serde_json::json!(u.uring_completion_errors_total.get(cls as u8 as usize)),
-        );
-    }
-    serde_json::json!({
-        "submit_latency": histogram_json(&u.uring_submit_latency_ns),
-        "completion_latency": histogram_json(&u.uring_completion_latency_ns),
-        "pending": u.uring_pending.load(Ordering::Relaxed),
-        "submit_errors": u.uring_submit_errors_total.get(),
-        "completion_errors": serde_json::Value::Object(errs),
     })
 }
 
@@ -3253,8 +3192,8 @@ mod tests {
     #[test]
     fn prometheus_emits_all_new_metrics() {
         use crate::metrics::{
-            AllocatorMetrics, IoUringMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
-            SwimMetrics, init_allocator_metrics, init_io_uring_metrics, init_migration_metrics,
+            AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
+            SwimMetrics, init_allocator_metrics, init_migration_metrics,
             init_redo_metrics, init_replication_metrics, init_swim_metrics,
         };
         use std::sync::OnceLock;
@@ -3262,13 +3201,11 @@ mod tests {
         // Install metrics so `/metrics` emits the series (OnceLock makes this
         // a no-op if a prior test already installed them).
         static REPL: OnceLock<ReplicationMetrics> = OnceLock::new();
-        static URING: OnceLock<IoUringMetrics> = OnceLock::new();
         static REDO: OnceLock<RedoMetrics> = OnceLock::new();
         static MIG: OnceLock<MigrationMetrics> = OnceLock::new();
         static SWIM: OnceLock<SwimMetrics> = OnceLock::new();
         static ALLOC: OnceLock<AllocatorMetrics> = OnceLock::new();
         init_replication_metrics(REPL.get_or_init(ReplicationMetrics::new));
-        init_io_uring_metrics(URING.get_or_init(IoUringMetrics::new));
         init_redo_metrics(REDO.get_or_init(RedoMetrics::new));
         init_migration_metrics(MIG.get_or_init(MigrationMetrics::new));
         init_swim_metrics(SWIM.get_or_init(SwimMetrics::new));
@@ -3286,11 +3223,6 @@ mod tests {
             "teraslab_repl_batches_failed_total",
             "teraslab_repl_batch_latency_ns",
             "teraslab_repl_lag_sequences",
-            "teraslab_uring_submit_latency_ns",
-            "teraslab_uring_completion_latency_ns",
-            "teraslab_uring_pending",
-            "teraslab_uring_submit_errors_total",
-            "teraslab_uring_completion_errors_total",
             "teraslab_redo_flush_latency_ns",
             "teraslab_redo_bytes_per_flush",
             "teraslab_redo_entries_per_flush",
@@ -3334,8 +3266,8 @@ mod tests {
         use crate::index::{DahIndex, Index, UnminedIndex};
         use crate::locks::StripedLocks;
         use crate::metrics::{
-            AllocatorMetrics, IoUringMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
-            SwimMetrics, init_allocator_metrics, init_io_uring_metrics, init_migration_metrics,
+            AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
+            SwimMetrics, init_allocator_metrics, init_migration_metrics,
             init_redo_metrics, init_replication_metrics, init_swim_metrics,
         };
         use crate::ops::engine::Engine;
@@ -3343,13 +3275,11 @@ mod tests {
         use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 
         static REPL: OnceLock<ReplicationMetrics> = OnceLock::new();
-        static URING: OnceLock<IoUringMetrics> = OnceLock::new();
         static REDO: OnceLock<RedoMetrics> = OnceLock::new();
         static MIG: OnceLock<MigrationMetrics> = OnceLock::new();
         static SWIM: OnceLock<SwimMetrics> = OnceLock::new();
         static ALLOC: OnceLock<AllocatorMetrics> = OnceLock::new();
         init_replication_metrics(REPL.get_or_init(ReplicationMetrics::new));
-        init_io_uring_metrics(URING.get_or_init(IoUringMetrics::new));
         init_redo_metrics(REDO.get_or_init(RedoMetrics::new));
         init_migration_metrics(MIG.get_or_init(MigrationMetrics::new));
         init_swim_metrics(SWIM.get_or_init(SwimMetrics::new));
@@ -3386,7 +3316,6 @@ mod tests {
         let snap = build_local_top_snapshot(&state);
         for field in [
             "replication_metrics",
-            "uring_metrics",
             "redo_metrics",
             "migration_metrics",
             "swim_metrics",
@@ -3400,8 +3329,6 @@ mod tests {
         // Sub-field sanity checks on each section.
         assert!(snap["replication_metrics"]["per_replica"].is_array());
         assert!(snap["replication_metrics"]["latency"]["count"].is_u64());
-        assert!(snap["uring_metrics"]["submit_latency"]["count"].is_u64());
-        assert!(snap["uring_metrics"]["completion_errors"].is_object());
         assert!(snap["redo_metrics"]["flush_latency"]["count"].is_u64());
         assert!(snap["migration_metrics"]["bytes_transferred"].is_object());
         assert!(snap["migration_metrics"]["phase"]["preparing"].is_u64());
@@ -3424,8 +3351,8 @@ mod tests {
         use crate::index::{DahIndex, Index, UnminedIndex};
         use crate::locks::StripedLocks;
         use crate::metrics::{
-            AllocatorMetrics, IoUringMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
-            SwimMetrics, init_allocator_metrics, init_io_uring_metrics, init_migration_metrics,
+            AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
+            SwimMetrics, init_allocator_metrics, init_migration_metrics,
             init_redo_metrics, init_replication_metrics, init_swim_metrics,
         };
         use crate::ops::engine::Engine;
@@ -3433,13 +3360,11 @@ mod tests {
         use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 
         static REPL: OnceLock<ReplicationMetrics> = OnceLock::new();
-        static URING: OnceLock<IoUringMetrics> = OnceLock::new();
         static REDO: OnceLock<RedoMetrics> = OnceLock::new();
         static MIG: OnceLock<MigrationMetrics> = OnceLock::new();
         static SWIM: OnceLock<SwimMetrics> = OnceLock::new();
         static ALLOC: OnceLock<AllocatorMetrics> = OnceLock::new();
         init_replication_metrics(REPL.get_or_init(ReplicationMetrics::new));
-        init_io_uring_metrics(URING.get_or_init(IoUringMetrics::new));
         init_redo_metrics(REDO.get_or_init(RedoMetrics::new));
         init_migration_metrics(MIG.get_or_init(MigrationMetrics::new));
         init_swim_metrics(SWIM.get_or_init(SwimMetrics::new));
@@ -3484,7 +3409,6 @@ mod tests {
         // Serialized body must contain every new top-level section key.
         for field in [
             "replication_metrics",
-            "uring_metrics",
             "redo_metrics",
             "migration_metrics",
             "swim_metrics",

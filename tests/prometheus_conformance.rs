@@ -29,9 +29,9 @@ use teraslab::device::{BlockDevice, MemoryDevice};
 use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{
-    AllocatorMetrics, IoUringMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
+    AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
     SwimMetrics, ThreadHistograms, ThreadMetrics, allocator_metrics, init_allocator_metrics,
-    init_io_uring_metrics, init_migration_metrics, init_redo_metrics, init_replication_metrics,
+    init_migration_metrics, init_redo_metrics, init_replication_metrics,
     init_swim_metrics, migration_metrics, redo_metrics, replication_metrics, swim_metrics,
 };
 use teraslab::ops::create::CreateRequest;
@@ -49,7 +49,6 @@ static TEST_HISTOGRAMS: ThreadHistograms = ThreadHistograms::new();
 // this test. The `init_*` setters are idempotent so running in parallel with
 // other tests that also install these is safe.
 static REPL_METRICS: ReplicationMetrics = ReplicationMetrics::new();
-static URING_METRICS: IoUringMetrics = IoUringMetrics::new();
 static REDOM_METRICS: RedoMetrics = RedoMetrics::new();
 static MIGR_METRICS: MigrationMetrics = MigrationMetrics::new();
 static SWIMM_METRICS: SwimMetrics = SwimMetrics::new();
@@ -63,7 +62,6 @@ static ALLOCM_METRICS: AllocatorMetrics = AllocatorMetrics::new();
 /// getters return `Some`." The asserts below verify that.
 fn install_phase5_metric_surfaces() {
     init_replication_metrics(&REPL_METRICS);
-    init_io_uring_metrics(&URING_METRICS);
     init_redo_metrics(&REDOM_METRICS);
     init_migration_metrics(&MIGR_METRICS);
     init_swim_metrics(&SWIMM_METRICS);
@@ -100,11 +98,6 @@ fn seed_phase5_metric_surfaces() {
     r.repl_batches_sent_total.inc();
     r.repl_bytes_sent_total.add(1024);
     r.repl_batch_latency_ns.record_ns(50_000);
-
-    let u = teraslab::metrics::io_uring_metrics().expect("io_uring seeded");
-    u.uring_submit_latency_ns.record_ns(1_000);
-    u.uring_completion_latency_ns.record_ns(2_000);
-    u.uring_submit_errors_total.inc();
 
     let rd = redo_metrics().expect("redo seeded");
     rd.redo_append_total.inc();

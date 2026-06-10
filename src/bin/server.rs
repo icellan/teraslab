@@ -22,7 +22,7 @@ use teraslab::device::{BlockDevice, DirectDevice};
 use teraslab::index::{DahBackend, PrimaryBackend, UnminedBackend};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{
-    AllocatorMetrics, IoUringMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
+    AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
     SwimMetrics, ThreadHistograms, ThreadMetrics,
 };
 use teraslab::ops::engine::Engine;
@@ -107,8 +107,6 @@ static SERVER_HISTOGRAMS: ThreadHistograms = ThreadHistograms::new();
 /// Replication subsystem metrics (Phase 5).
 static REPLICATION_METRICS: ReplicationMetrics = ReplicationMetrics::new();
 
-/// io_uring backend metrics (Phase 5).
-static IO_URING_METRICS: IoUringMetrics = IoUringMetrics::new();
 
 /// Redo log metrics (Phase 5).
 static REDO_METRICS: RedoMetrics = RedoMetrics::new();
@@ -230,7 +228,6 @@ fn main() {
     // Phase 5: wire up subsystem metrics. Each `init_*_metrics` uses a
     // process-wide `OnceLock`, so subsequent calls (from tests) are no-ops.
     teraslab::metrics::init_replication_metrics(&REPLICATION_METRICS);
-    teraslab::metrics::init_io_uring_metrics(&IO_URING_METRICS);
     teraslab::metrics::init_redo_metrics(&REDO_METRICS);
     teraslab::metrics::init_migration_metrics(&MIGRATION_METRICS);
     teraslab::metrics::init_swim_metrics(&SWIM_METRICS);
