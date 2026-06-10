@@ -794,6 +794,87 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_unclean_shutdown_triggers_device_rebuild() {
+        // G-01: an existing file-backed index whose clean-shutdown
+        // sentinel is missing may contain torn bucket bytes. The restore
+        // must fail closed and `load_primary_index_file_backed` must
+        // auto-fall back to the device-scan rebuild, so the booted index
+        // reflects the device — not the possibly-torn file.
+        use crate::index::{TxIndexEntry, TxKey};
+        use crate::io::write_full_record;
+        use crate::record::{TxMetadata, UtxoSlot};
+
+        // Ground truth: 5 real records on the device.
+        let dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut records = Vec::new();
+        for i in 0..5u64 {
+            let mut meta = TxMetadata::new(5);
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            txid[8..16].copy_from_slice(&i.wrapping_mul(0x9E3779B97F4A7C15).to_le_bytes());
+            meta.tx_id = txid;
+            let offset = alloc.allocate(TxMetadata::record_size_for(5)).unwrap();
+            let slots: Vec<UtxoSlot> = (0..5)
+                .map(|s| {
+                    let mut h = [0u8; 32];
+                    h[0] = s;
+                    UtxoSlot::new_unspent(h)
+                })
+                .collect();
+            write_full_record(&*dev, offset, &meta, &slots).unwrap();
+            records.push((TxKey { txid }, offset));
+        }
+
+        // Previous run: file-backed index holding a bogus entry that is
+        // NOT on the device. Drop writes the sentinel; removing it
+        // simulates the crash.
+        let tmp = TempDir::new().unwrap();
+        let fb_path = tmp.path().join("primary.idx");
+        let bogus_key = TxKey { txid: [0xAB; 32] };
+        {
+            let mut backend = PrimaryBackend::new_file_backed(&fb_path, 100).unwrap();
+            let entry = TxIndexEntry {
+                device_id: 0,
+                record_offset: 0xDEAD_0000,
+                utxo_count: 1,
+                block_entry_count: 0,
+                tx_flags: 0,
+                spent_utxos: 0,
+                dah_or_preserve: 0,
+                unmined_since: 0,
+                generation: 0,
+            };
+            backend.register(bogus_key, entry).unwrap();
+        }
+        let mut sentinel_os = fb_path.as_os_str().to_owned();
+        sentinel_os.push(crate::index::hashtable::HashTable::SHUTDOWN_CLEAN_SUFFIX);
+        let sentinel = std::path::PathBuf::from(sentinel_os);
+        assert!(sentinel.exists(), "clean drop must have written sentinel");
+        std::fs::remove_file(&sentinel).unwrap();
+
+        // Boot: restore fails closed (unclean shutdown), rebuild kicks in.
+        let loaded = load_primary_index_file_backed(&fb_path, 100, &*dev, &alloc)
+            .expect("unclean shutdown must fall back to device-scan rebuild");
+        assert_eq!(loaded.backend_name(), "file_backed");
+        assert_eq!(
+            loaded.len(),
+            5,
+            "rebuilt index must hold the device records"
+        );
+        for (key, offset) in &records {
+            let e = loaded
+                .lookup(key)
+                .expect("device record must be present after rebuild");
+            assert_eq!(e.record_offset, *offset);
+        }
+        assert!(
+            loaded.lookup(&bogus_key).is_none(),
+            "stale pre-crash entry must not survive the device rebuild"
+        );
+    }
+
+    #[test]
     fn in_memory_primary_rebuild_error_includes_underlying_cause() {
         let err = RebuildError::InMemoryPrimary {
             rebuild_err: "device error: short read".to_string(),
