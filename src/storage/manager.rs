@@ -63,6 +63,17 @@ pub enum StorageError {
     /// here as defence-in-depth.
     #[error("cold data size {size} exceeds maximum {max}")]
     ColdDataTooLarge { size: u64, max: u64 },
+    /// I-02: an inline-tier cold-data write would extend past the record's
+    /// allocated extent and silently overwrite the neighbouring allocation
+    /// (another transaction's metadata/slots).
+    ///
+    /// `write_cold_data` re-derives the tier from the payload size on every
+    /// call, so without this guard a second, larger inline write for the
+    /// same record would land at `inline_cold_offset(utxo_count)` and run
+    /// past the bytes allocated at create time. No production caller does
+    /// this today; the bound makes the public API safe regardless.
+    #[error("inline cold data end {required} exceeds allocated record capacity {capacity}")]
+    ColdDataExceedsRecord { required: u64, capacity: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -163,15 +174,22 @@ impl StorageManager {
     ///
     /// For inline tier: the caller must have already allocated space for
     /// the cold data at the end of the record. This writes it there.
+    /// `record_capacity` is the total byte length of that allocation
+    /// (metadata + UTXO slots + inline cold region); an inline write whose
+    /// end would exceed it is rejected with
+    /// [`StorageError::ColdDataExceedsRecord`] instead of silently
+    /// overwriting the neighbouring allocation (I-02).
     ///
-    /// For external: writes to the blob store synchronously. For async
-    /// upload, use [`BlobUploader`](super::uploader::BlobUploader) instead.
+    /// For external: writes to the blob store synchronously and
+    /// `record_capacity` is not consulted. For async upload, use
+    /// [`BlobUploader`](super::uploader::BlobUploader) instead.
     pub fn write_cold_data(
         &self,
         tx_id: &[u8; 32],
         cold: &ColdData,
         utxo_count: u32,
         record_offset: u64,
+        record_capacity: u64,
     ) -> Result<ColdDataRef> {
         if cold.is_empty() {
             return Ok(ColdDataRef::None);
@@ -183,7 +201,15 @@ impl StorageManager {
 
         match tier {
             StorageTier::Inline => {
-                let cold_offset = record_offset + Self::inline_cold_offset(utxo_count);
+                let inline_off = Self::inline_cold_offset(utxo_count);
+                let required = inline_off + data_size as u64;
+                if required > record_capacity {
+                    return Err(StorageError::ColdDataExceedsRecord {
+                        required,
+                        capacity: record_capacity,
+                    });
+                }
+                let cold_offset = record_offset + inline_off;
                 self.write_aligned(&serialized, cold_offset)?;
                 Ok(ColdDataRef::Inline {
                     cold_size: data_size as u32,
@@ -552,13 +578,100 @@ mod tests {
 
         // Write cold data
         let result = mgr
-            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset, total)
             .unwrap();
         assert!(matches!(result, ColdDataRef::Inline { .. }));
 
         // Read back
         let read = mgr.read_cold_data(offset, utxo_count, &meta).unwrap();
         assert_eq!(read, cold);
+    }
+
+    #[test]
+    fn inline_write_exceeding_record_capacity_rejected() {
+        let (dev, mgr) = setup();
+
+        // Record A: 1 UTXO + a small inline cold payload, allocated exactly.
+        let utxo_count = 1u32;
+        let small = ColdData {
+            inputs: vec![0x11; 38],
+            outputs: vec![],
+            inpoints: vec![],
+        };
+        let capacity = TxMetadata::record_size_for(utxo_count) + small.serialized_size() as u64;
+        let offset_a = mgr.allocator.lock().allocate(capacity).unwrap();
+
+        let mut meta_a = TxMetadata::new(utxo_count);
+        meta_a.record_size = capacity as u32;
+        meta_a.tx_id[0] = 0xA1;
+        let slots = vec![UtxoSlot::new_unspent([0x0A; 32])];
+        io::write_full_record(&*dev, offset_a, &meta_a, &slots).unwrap();
+        mgr.write_cold_data(&meta_a.tx_id, &small, utxo_count, offset_a, capacity)
+            .unwrap();
+
+        // Record B: the neighbouring allocation an unbounded second write
+        // would clobber.
+        let cap_b = TxMetadata::record_size_for(utxo_count);
+        let offset_b = mgr.allocator.lock().allocate(cap_b).unwrap();
+        let meta_b = write_test_record(&*dev, offset_b, utxo_count, TxFlags::empty());
+
+        // A second, larger inline write for record A must be rejected with
+        // the typed error, not run past A's extent.
+        let big = ColdData {
+            inputs: vec![0x22; 5000],
+            outputs: vec![],
+            inpoints: vec![],
+        };
+        let required =
+            StorageManager::inline_cold_offset(utxo_count) + big.serialized_size() as u64;
+        let err = mgr
+            .write_cold_data(&meta_a.tx_id, &big, utxo_count, offset_a, capacity)
+            .unwrap_err();
+        match err {
+            StorageError::ColdDataExceedsRecord {
+                required: r,
+                capacity: c,
+            } => {
+                assert_eq!(r, required);
+                assert_eq!(c, capacity);
+            }
+            other => panic!("expected ColdDataExceedsRecord, got {other:?}"),
+        }
+
+        // Record B untouched (metadata CRC-valid with its tx_id) and record
+        // A's original cold data still reads back byte-for-byte.
+        let read_b = io::read_metadata(&*dev, offset_b).unwrap();
+        assert_eq!(read_b.tx_id, meta_b.tx_id);
+        let read_a = mgr.read_cold_data(offset_a, utxo_count, &meta_a).unwrap();
+        assert_eq!(read_a, small);
+    }
+
+    #[test]
+    fn inline_write_exact_capacity_fit_succeeds() {
+        let (dev, mgr) = setup();
+        let utxo_count = 2u32;
+        let cold = ColdData {
+            inputs: vec![0x33; 100],
+            outputs: vec![0x44; 60],
+            inpoints: vec![],
+        };
+        let capacity = TxMetadata::record_size_for(utxo_count) + cold.serialized_size() as u64;
+        let offset = mgr.allocator.lock().allocate(capacity).unwrap();
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.record_size = capacity as u32;
+        meta.tx_id[0] = 0xA2;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|_| UtxoSlot::new_unspent([0; 32]))
+            .collect();
+        io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+
+        // required == capacity exactly: must succeed (the bound rejects only
+        // writes that EXCEED the extent).
+        let result = mgr
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset, capacity)
+            .unwrap();
+        assert!(matches!(result, ColdDataRef::Inline { .. }));
+        assert_eq!(mgr.read_cold_data(offset, utxo_count, &meta).unwrap(), cold);
     }
 
     #[test]
@@ -591,7 +704,7 @@ mod tests {
         io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
 
         let result = mgr
-            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset, total)
             .unwrap();
         if let ColdDataRef::Inline { cold_size: cs } = result {
             assert_eq!(cs, cold_size as u32);
@@ -629,7 +742,7 @@ mod tests {
             })
             .collect();
         io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
-        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset, total)
             .unwrap();
 
         // Simulate a spend (write to slot 2)
@@ -662,7 +775,7 @@ mod tests {
             .map(|_| UtxoSlot::new_unspent([0; 32]))
             .collect();
         io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
-        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset, total)
             .unwrap();
 
         // Simulate setMined (modify metadata only)
@@ -735,7 +848,7 @@ mod tests {
         io::write_full_record(&*dev, record_offset, &meta, &slots).unwrap();
 
         let result = mgr
-            .write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset)
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset, hot_size)
             .unwrap();
         assert!(matches!(result, ColdDataRef::External { .. }));
 
@@ -785,7 +898,7 @@ mod tests {
         io::write_full_record(&*dev, record_offset, &meta, &slots).unwrap();
 
         let result = mgr
-            .write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset)
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset, hot_size)
             .unwrap();
         assert!(matches!(result, ColdDataRef::External { .. }));
         assert!(mgr.blob_store.exists(&meta.tx_id).unwrap());
@@ -831,7 +944,7 @@ mod tests {
             inpoints: vec![],
         };
         let result = mgr
-            .write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset)
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset, hot_size)
             .unwrap();
         assert!(matches!(result, ColdDataRef::External { .. }));
 
@@ -869,7 +982,7 @@ mod tests {
             outputs: vec![],
             inpoints: vec![],
         };
-        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset)
+        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, record_offset, hot_size)
             .unwrap();
 
         // UTXO should still be readable
@@ -896,7 +1009,7 @@ mod tests {
         };
 
         let result = mgr
-            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset, record_size)
             .unwrap();
         let digest = match result {
             ColdDataRef::External { digest } => digest,
@@ -947,7 +1060,7 @@ mod tests {
         };
 
         let result = mgr
-            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset, hot_size)
             .unwrap();
         let digest = match result {
             ColdDataRef::External { digest } => digest,
@@ -976,7 +1089,7 @@ mod tests {
             outputs: vec![],
             inpoints: vec![],
         };
-        mgr.write_cold_data(&meta.tx_id, &cold, 1, 0).unwrap();
+        mgr.write_cold_data(&meta.tx_id, &cold, 1, 0, TxMetadata::record_size_for(1)).unwrap();
 
         mgr.delete_cold_data(&meta).unwrap();
         assert!(!mgr.blob_store.exists(&meta.tx_id).unwrap());
@@ -1001,7 +1114,7 @@ mod tests {
             outputs: vec![0xBB; 1000],
             inpoints: vec![],
         };
-        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset, hot_size)
             .unwrap();
 
         let mut output = Vec::new();
@@ -1037,7 +1150,7 @@ mod tests {
             outputs: vec![],
             inpoints: vec![],
         };
-        let result = mgr.write_cold_data(&[0; 32], &cold, 1, 0).unwrap();
+        let result = mgr.write_cold_data(&[0; 32], &cold, 1, 0, TxMetadata::record_size_for(1)).unwrap();
         assert_eq!(result, ColdDataRef::None);
     }
 
@@ -1058,7 +1171,7 @@ mod tests {
         meta.tx_id[0] = 0x99;
         let slots = vec![UtxoSlot::new_unspent([0; 32]); utxo_count as usize];
         io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
-        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset, total)
             .unwrap();
 
         let inputs = mgr.read_inputs(offset, utxo_count, &meta).unwrap();
@@ -1093,7 +1206,7 @@ mod tests {
         meta.record_size = total as u32;
         let slots = vec![UtxoSlot::new_unspent([0; 32]); utxo_count as usize];
         io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
-        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset, total)
             .unwrap();
 
         let output = mgr.read_output_at(offset, utxo_count, &meta, 0).unwrap();
@@ -1128,7 +1241,7 @@ mod tests {
         meta.record_size = total as u32;
         let slots = vec![UtxoSlot::new_unspent([0; 32]); utxo_count as usize];
         io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
-        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+        mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset, total)
             .unwrap();
 
         let mut output = Vec::new();
@@ -1162,7 +1275,7 @@ mod tests {
         let slots = vec![UtxoSlot::new_unspent([0; 32]); small_utxo as usize];
         io::write_full_record(&*dev, small_offset, &small_meta, &slots).unwrap();
         let small_ref = mgr
-            .write_cold_data(&small_meta.tx_id, &small_cold, small_utxo, small_offset)
+            .write_cold_data(&small_meta.tx_id, &small_cold, small_utxo, small_offset, small_total)
             .unwrap();
         assert!(matches!(small_ref, ColdDataRef::Inline { .. }));
 
@@ -1183,7 +1296,7 @@ mod tests {
         let slots = vec![UtxoSlot::new_unspent([0; 32]); med_utxo as usize];
         io::write_full_record(&*dev, med_offset, &med_meta, &slots).unwrap();
         let med_result = mgr
-            .write_cold_data(&med_meta.tx_id, &med_cold, med_utxo, med_offset)
+            .write_cold_data(&med_meta.tx_id, &med_cold, med_utxo, med_offset, med_hot)
             .unwrap();
         assert!(matches!(med_result, ColdDataRef::External { .. }));
 
@@ -1203,7 +1316,7 @@ mod tests {
         let slots = vec![UtxoSlot::new_unspent([0; 32]); large_utxo as usize];
         io::write_full_record(&*dev, large_offset, &large_meta, &slots).unwrap();
         let large_result = mgr
-            .write_cold_data(&large_meta.tx_id, &large_cold, large_utxo, large_offset)
+            .write_cold_data(&large_meta.tx_id, &large_cold, large_utxo, large_offset, large_hot)
             .unwrap();
         assert!(matches!(large_result, ColdDataRef::External { .. }));
 
@@ -1238,7 +1351,7 @@ mod tests {
         meta1.record_size = total1 as u32;
         meta1.tx_id[0] = 0xA1;
         io::write_full_record(&*dev, off1, &meta1, &[UtxoSlot::new_unspent([0; 32])]).unwrap();
-        mgr.write_cold_data(&meta1.tx_id, &cold1, 1, off1).unwrap();
+        mgr.write_cold_data(&meta1.tx_id, &cold1, 1, off1, total1).unwrap();
 
         // Medium non-inline payload: external blob tier.
         let cold2 = ColdData {
@@ -1253,7 +1366,7 @@ mod tests {
         meta2.flags = TxFlags::EXTERNAL;
         meta2.tx_id[0] = 0xA2;
         io::write_full_record(&*dev, off2, &meta2, &[UtxoSlot::new_unspent([0; 32])]).unwrap();
-        let medium_ref = mgr.write_cold_data(&meta2.tx_id, &cold2, 1, off2).unwrap();
+        let medium_ref = mgr.write_cold_data(&meta2.tx_id, &cold2, 1, off2, hot2).unwrap();
         assert!(matches!(medium_ref, ColdDataRef::External { .. }));
 
         // External
@@ -1269,7 +1382,7 @@ mod tests {
         meta3.tx_id[0] = 0xA3;
         meta3.flags = TxFlags::EXTERNAL;
         io::write_full_record(&*dev, off3, &meta3, &[UtxoSlot::new_unspent([0; 32])]).unwrap();
-        mgr.write_cold_data(&meta3.tx_id, &cold3, 1, off3).unwrap();
+        mgr.write_cold_data(&meta3.tx_id, &cold3, 1, off3, hot3).unwrap();
 
         // Prune all
         mgr.delete_cold_data(&meta1).unwrap(); // inline: no-op
@@ -1301,7 +1414,7 @@ mod tests {
             meta.tx_id[0] = (i & 0xFF) as u8;
             meta.tx_id[1] = 0x01; // category marker
             io::write_full_record(&*dev, offset, &meta, &[UtxoSlot::new_unspent([0; 32])]).unwrap();
-            let result = mgr.write_cold_data(&meta.tx_id, &cold, 1, offset).unwrap();
+            let result = mgr.write_cold_data(&meta.tx_id, &cold, 1, offset, total).unwrap();
             assert!(matches!(result, ColdDataRef::Inline { .. }));
 
             let read = mgr.read_cold_data(offset, 1, &meta).unwrap();
@@ -1322,7 +1435,7 @@ mod tests {
             meta.tx_id[0] = (i & 0xFF) as u8;
             meta.tx_id[1] = 0x02;
             io::write_full_record(&*dev, offset, &meta, &[UtxoSlot::new_unspent([0; 32])]).unwrap();
-            let result = mgr.write_cold_data(&meta.tx_id, &cold, 1, offset).unwrap();
+            let result = mgr.write_cold_data(&meta.tx_id, &cold, 1, offset, hot_size).unwrap();
             assert!(matches!(result, ColdDataRef::External { .. }));
             let read = mgr.read_cold_data(offset, 1, &meta).unwrap();
             assert_eq!(read, cold);
@@ -1342,7 +1455,7 @@ mod tests {
             meta.tx_id[1] = 0x03;
             meta.flags = TxFlags::EXTERNAL;
             io::write_full_record(&*dev, offset, &meta, &[UtxoSlot::new_unspent([0; 32])]).unwrap();
-            let result = mgr.write_cold_data(&meta.tx_id, &cold, 1, offset).unwrap();
+            let result = mgr.write_cold_data(&meta.tx_id, &cold, 1, offset, hot_size).unwrap();
             assert!(matches!(result, ColdDataRef::External { .. }));
             let read = mgr.read_cold_data(offset, 1, &meta).unwrap();
             assert_eq!(read, cold);
@@ -1369,7 +1482,7 @@ mod tests {
                 .map(|_| UtxoSlot::new_unspent([0; 32]))
                 .collect();
             io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
-            mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            mgr.write_cold_data(&meta.tx_id, &cold, utxo_count, offset, total)
                 .unwrap();
 
             // Verify the cold data offset matches the formula
@@ -1464,7 +1577,7 @@ mod tests {
         let expected_sha = sha256_bytes(&serialized);
 
         let result = mgr
-            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset, hot_size)
             .unwrap();
         let digest = match result {
             ColdDataRef::External { digest } => digest,
@@ -1537,7 +1650,7 @@ mod tests {
             inpoints: vec![],
         };
         let result = mgr
-            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset)
+            .write_cold_data(&meta.tx_id, &cold, utxo_count, offset, hot_size)
             .unwrap();
         let digest = match result {
             ColdDataRef::External { digest } => digest,
