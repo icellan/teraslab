@@ -195,7 +195,17 @@ fn seed_record(engine: &Engine, tx_n: u32, utxo_count: u32) {
 ///     top-level dispatch hop (stand-in for `handle_request`, which is
 ///     `pub(crate)` and not reachable from integration tests — the
 ///     internal crate test `dispatch::tests` already covers it directly).
+// Flake fix (2026-05-29 audit): the tests in this file install SCOPED
+// (`with_default`) subscribers, but tracing's per-callsite interest
+// cache and global max-level hint are process-global. When one test's
+// dispatcher drops (triggering a callsite-interest rebuild) while a
+// sibling test's thread is mid-span-creation, the `#[instrument]`
+// callsite can be evaluated as disabled and the span silently skipped
+// — observed as `apply span missing` roughly 1-in-5 full-suite runs.
+// `#[serial]` removes the cross-test rebuild race; the subscriber
+// scoping itself was already correct.
 #[test]
+#[serial_test::serial]
 fn spend_multi_emits_debug_level_child_spans() {
     let engine = make_engine();
     seed_record(&engine, 7, 4);
@@ -296,6 +306,7 @@ fn spend_multi_emits_debug_level_child_spans() {
 /// that honours the `set_parent` hand-off. This mirrors exactly the
 /// bridge that the production OTLP exporter observes.
 #[test]
+#[serial_test::serial]
 fn replication_receiver_inherits_wire_trace_context() {
     use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
     use teraslab::observability::WireTraceContext;
@@ -414,6 +425,7 @@ fn replication_receiver_inherits_wire_trace_context() {
 /// This guards against any future regression where a tracing mistake
 /// (e.g. a `skip` mis-applied) causes the function body to skip work.
 #[test]
+#[serial_test::serial]
 fn spend_multi_still_applies_ops_when_tracing_is_dormant() {
     let engine = make_engine();
     seed_record(&engine, 8, 2);
