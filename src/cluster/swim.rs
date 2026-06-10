@@ -605,7 +605,8 @@ impl SwimRunner {
                 let alive_count = self.membership.lock().alive_members().len();
                 let total_known = self.peer_addrs.lock().len();
                 // Retry seeds if we have fewer alive members than known peers
-                // (some nodes are dead/suspect) or if we have no peers at all.
+                // (some nodes are dead — suspects still count as members
+                // until declared dead, E-03) or if we have no peers at all.
                 let degraded = alive_count < total_known + 1 || total_known == 0;
                 if degraded {
                     // Clone seed list so the inner encode_message can take &mut self.

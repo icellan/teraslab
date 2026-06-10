@@ -1358,7 +1358,7 @@ mod tests {
 
         let after = metrics.replica_unauthenticated_accept_total.get();
         assert!(
-            after >= before + 1,
+            after > before,
             "expected replica_unauthenticated_accept_total to advance by \
              at least 1 (before={before}, after={after})",
         );
@@ -1391,7 +1391,7 @@ mod tests {
         assert!(limiter.try_acquire(17).is_none());
         let after_oversize = metrics.inflight_bytes_rejected_total.get();
         assert!(
-            after_oversize >= before_oversize + 1,
+            after_oversize > before_oversize,
             "oversize rejection should advance counter \
              (before={before_oversize}, after={after_oversize})",
         );
@@ -1402,7 +1402,7 @@ mod tests {
         assert!(limiter.try_acquire(7).is_none());
         let after_aggregate = metrics.inflight_bytes_rejected_total.get();
         assert!(
-            after_aggregate >= before_aggregate + 1,
+            after_aggregate > before_aggregate,
             "aggregate-cap rejection should advance counter \
              (before={before_aggregate}, after={after_aggregate})",
         );

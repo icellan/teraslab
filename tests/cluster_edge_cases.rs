@@ -145,17 +145,17 @@ fn stress_concurrent_membership_mutations() {
         assert!(w[0] <= w[1], "alive list not sorted: {:?}", alive);
     }
 
-    // Verify no alive member is also suspect or dead
+    // Verify no Dead member is in the alive view. (E-03: Suspects remain
+    // members until declared Dead, so Alive and Suspect are both valid.)
     for &id in &alive {
         if id == NodeId(0) {
             continue;
         } // self
         if let Some(info) = mem.member_info(&id) {
-            assert_eq!(
+            assert_ne!(
                 info.state,
-                NodeState::Alive,
-                "node {id:?} in alive list but state is {:?}",
-                info.state
+                NodeState::Dead,
+                "node {id:?} in alive list but state is Dead"
             );
         }
     }
@@ -1073,9 +1073,11 @@ fn migration_serialize_outbound_preserves_fenced_state() {
 // Deep edge case analysis: membership state machine
 // ===========================================================================
 
-/// mark_suspect does NOT emit MembershipChanged — but the alive list DOES
-/// change. When the suspect recovers (mark_alive), MembershipChanged IS
-/// emitted. Verify this asymmetry is handled correctly.
+/// E-03: mark_suspect does NOT emit MembershipChanged — and the alive
+/// view does not change either (a Suspect remains a member until declared
+/// Dead), so consumers polling `alive_count()` and consumers on the event
+/// stream always agree. When the suspect recovers (mark_alive),
+/// MembershipChanged IS emitted with a payload equal to the polled view.
 #[test]
 fn membership_suspect_alive_cycle_events() {
     let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
@@ -1084,12 +1086,12 @@ fn membership_suspect_alive_cycle_events() {
     m.mark_alive(NodeId(2), addr, 1, true);
     assert_eq!(m.alive_count(), 2);
 
-    // Suspect: alive_count drops but no MembershipChanged
+    // Suspect: no MembershipChanged AND no polled-view change.
     let suspect_events = m.mark_suspect(NodeId(2), 1);
     assert_eq!(
         m.alive_count(),
-        1,
-        "suspect node should be removed from alive list"
+        2,
+        "suspect node must remain in the alive view until declared dead"
     );
     assert!(
         !suspect_events
@@ -1103,15 +1105,22 @@ fn membership_suspect_alive_cycle_events() {
             .any(|e| matches!(e, ClusterEvent::NodeSuspect(_)))
     );
 
-    // Recovery: alive_count restored AND MembershipChanged emitted
+    // Recovery: alive view unchanged, MembershipChanged emitted with a
+    // payload that equals the polled view.
     // Direct probe ACK: clears Suspect even at same incarnation.
     let recover_events = m.mark_alive(NodeId(2), addr, 1, true);
     assert_eq!(m.alive_count(), 2);
-    assert!(
-        recover_events
-            .iter()
-            .any(|e| matches!(e, ClusterEvent::MembershipChanged(_))),
-        "suspect recovery should emit MembershipChanged"
+    let payload = recover_events
+        .iter()
+        .find_map(|e| match e {
+            ClusterEvent::MembershipChanged(members) => Some(members.clone()),
+            _ => None,
+        })
+        .expect("suspect recovery should emit MembershipChanged");
+    assert_eq!(
+        payload,
+        m.alive_members(),
+        "recovery event payload must equal the polled view"
     );
 }
 

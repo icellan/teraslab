@@ -571,6 +571,12 @@ impl ClusterCoordinator {
         // P1.1: stamp the configured cluster_id before SWIM / the event
         // loop starts so the very first proposal already carries it.
         topology_authority.set_cluster_id(config.cluster_id);
+        // E-01: seed the authority's peak from the persisted value so a
+        // node that restarts into a partition derives its activation
+        // quorum from the cluster size it once belonged to. (The server
+        // additionally calls `restore()`, which re-observes the persisted
+        // peak — both paths are monotonic fetch_max, order-independent.)
+        topology_authority.observe_peak_cluster_size(initial_peak as u64);
         let active_topology_members = Arc::new(RwLock::new(members.clone()));
         let swim = SwimRunner::new(SwimConfig {
             self_id: config.self_id,
@@ -736,6 +742,11 @@ impl ClusterCoordinator {
                         if let ClusterEvent::MembershipChanged(members) = &event {
                             let current = members.len();
                             peak_size_event.fetch_max(current, Ordering::Relaxed);
+                            // E-01: mirror the peak into the topology
+                            // authority BEFORE handle_event runs the
+                            // propose path, so the activation quorum is
+                            // derived from the same observation.
+                            topo_authority_event.observe_peak_cluster_size(current as u64);
                         }
                         Self::handle_event(
                             &event,
@@ -6554,6 +6565,22 @@ impl RunningCluster {
     /// causing all master shards to migrate to other nodes. Uses
     /// two-phase handoff so the old masters continue serving each shard
     /// until data has been durably migrated to the new owner.
+    ///
+    /// # Interaction with the peak-derived quorum (E-01)
+    ///
+    /// This path applies the shrink directly via `handle_commit` (the
+    /// commit below is fabricated by the departing node, NOT ratified by
+    /// collected votes), so it is unaffected by the peak-derived
+    /// *activation* quorum that gates the SWIM propose/vote path — a
+    /// graceful N → N-1 drain keeps working. The peak itself is
+    /// deliberately NEVER lowered, not even here: the fabricated voter
+    /// list carries no cryptographic proof of an old-majority
+    /// ratification, so trusting it to lower the peak would let a single
+    /// buggy or compromised peer erase the split-brain safety floor.
+    /// Consequence (pre-existing at HEAD, enforced by `check_quorum` in
+    /// `server/dispatch.rs`): draining a cluster below the majority of
+    /// its peak size (e.g. 3 → 1) leaves the survivor write-gated with
+    /// `ERR_NO_QUORUM` until enough nodes rejoin.
     pub fn quiesce(&self) {
         let addrs = self.node_addrs.read();
         let other_members: Vec<NodeId> = addrs

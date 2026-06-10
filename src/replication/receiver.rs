@@ -4450,7 +4450,7 @@ mod tests {
 
         let after = metrics.replica_apply_skipped_missing_tx.get();
         assert!(
-            after >= before + 1,
+            after > before,
             "spend on missing TX must bump replica_apply_skipped_missing_tx \
              (was {before}, now {after})",
         );

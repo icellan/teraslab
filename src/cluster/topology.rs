@@ -611,6 +611,16 @@ pub struct TopologyAuthority {
     /// endpoint can distinguish a `Joining` node (no commit yet) from a
     /// settled `Alive` one.
     last_commit_at_unix_ms: AtomicU64,
+    /// E-01 defense-in-depth — highest cluster size this authority has
+    /// ever observed (proposed member sets, applied commits, restored
+    /// persisted state, and the coordinator's SWIM-derived peak all feed
+    /// it via [`TopologyAuthority::observe_peak_cluster_size`]).
+    /// Monotonic non-decreasing (`fetch_max` only), so a partitioned
+    /// minority remnant cannot lower it. The activation quorum for a new
+    /// topology term is `max((proposal_len/2)+1, (peak/2)+1)` — a 1-of-3
+    /// remnant therefore needs 2 votes and can never self-commit a
+    /// single-node topology.
+    peak_cluster_size: AtomicU64,
 }
 
 impl TopologyAuthority {
@@ -629,7 +639,37 @@ impl TopologyAuthority {
             last_membership_change: Mutex::new(Instant::now()),
             observed_membership: Mutex::new(Vec::new()),
             last_commit_at_unix_ms: AtomicU64::new(0),
+            peak_cluster_size: AtomicU64::new(1),
         }
+    }
+
+    /// E-01 — record an observed cluster size. Monotonic: only raises the
+    /// stored peak (`fetch_max`), never lowers it. Fed from proposed
+    /// member sets, applied commits, restored persisted state, and the
+    /// coordinator's SWIM membership events.
+    pub fn observe_peak_cluster_size(&self, observed: u64) {
+        self.peak_cluster_size
+            .fetch_max(observed, Ordering::Relaxed);
+    }
+
+    /// E-01 — highest cluster size ever observed by this authority
+    /// (minimum 1). The activation quorum for new topology terms is
+    /// derived from this value, not from the live (possibly
+    /// SWIM-shrunken) member set alone.
+    pub fn peak_cluster_size(&self) -> u64 {
+        self.peak_cluster_size.load(Ordering::Relaxed).max(1)
+    }
+
+    /// E-01 — votes needed to activate a proposal with `proposal_len`
+    /// members: the stricter of the proposal majority and the
+    /// peak-derived majority. A minority remnant of a previously larger
+    /// cluster (peak) can therefore never reach quorum on its own votes,
+    /// while bootstrap (peak=1) and growth (peak raised from the proposed
+    /// set before this is computed) keep their natural majorities.
+    fn activation_quorum_needed(&self, proposal_len: usize) -> usize {
+        let proposal_majority = (proposal_len / 2) + 1;
+        let peak_majority = (self.peak_cluster_size() as usize / 2) + 1;
+        proposal_majority.max(peak_majority)
     }
 
     /// Set this authority's cluster_id.
@@ -768,6 +808,9 @@ impl TopologyAuthority {
 
     /// Restore from persisted state on startup.
     pub fn restore(&self, state: &PersistedTopologyState) {
+        // E-01: reinstate the persisted peak so a node that reboots into
+        // a partition cannot self-activate a shrunken topology.
+        self.observe_peak_cluster_size(state.peak_cluster_size);
         self.committed_term
             .store(state.committed_term, Ordering::Relaxed);
         self.voted_term.store(state.voted_term, Ordering::Relaxed);
@@ -908,7 +951,12 @@ impl TopologyAuthority {
         // Self-vote
         self.voted_term.store(new_term, Ordering::Relaxed);
 
-        let quorum_needed = (members.len() / 2) + 1;
+        // E-01: raise the peak from the proposed set BEFORE deriving the
+        // quorum, so growth (1 → N) is gated on the majority of the new,
+        // larger cluster, and a later shrink is gated on the majority of
+        // the peak — never on the shrunken set alone.
+        self.observe_peak_cluster_size(members.len() as u64);
+        let quorum_needed = self.activation_quorum_needed(members.len());
         let mut votes = std::collections::HashMap::new();
         votes.insert(self.self_id, true);
 
@@ -1070,6 +1118,10 @@ impl TopologyAuthority {
         }
 
         // Apply commit.
+        // E-01: a committed term with N members is direct evidence the
+        // cluster reached size N — raise the peak so any later
+        // SWIM-observed shrink is gated on the majority of this size.
+        self.observe_peak_cluster_size(commit.members.len() as u64);
         self.committed_term.store(commit.term, Ordering::Relaxed);
         *self.committed_members.write().unwrap() = commit.members.clone();
         *self.committed_voters.write().unwrap() = commit.voters.clone();
@@ -1193,7 +1245,9 @@ impl TopologyAuthority {
         );
         self.voted_term.store(new_term, Ordering::Relaxed);
 
-        let quorum_needed = (target_members.len() / 2) + 1;
+        // E-01: peak-derived activation quorum (see on_membership_changed).
+        self.observe_peak_cluster_size(target_members.len() as u64);
+        let quorum_needed = self.activation_quorum_needed(target_members.len());
         let mut votes = std::collections::HashMap::new();
         votes.insert(self.self_id, true);
 
@@ -1286,7 +1340,9 @@ impl TopologyAuthority {
         );
         self.voted_term.store(new_term, Ordering::Relaxed);
 
-        let quorum_needed = (target_members.len() / 2) + 1;
+        // E-01: peak-derived activation quorum (see on_membership_changed).
+        self.observe_peak_cluster_size(target_members.len() as u64);
+        let quorum_needed = self.activation_quorum_needed(target_members.len());
         let mut votes = std::collections::HashMap::new();
         votes.insert(self.self_id, true);
 
