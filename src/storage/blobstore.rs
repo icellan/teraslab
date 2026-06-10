@@ -719,13 +719,14 @@ impl BlobStore for FileBlobStore {
             Some(d) => d,
             None => return Ok(None),
         };
-        let start = offset as usize;
-        if start >= data.len() {
+        if offset >= data.len() as u64 {
             return Ok(Some(vec![]));
         }
-        let end = (offset + length) as usize;
-        let actual_end = end.min(data.len());
-        Ok(Some(data[start..actual_end].to_vec()))
+        let start = offset as usize;
+        // I-03: saturate the sum in u64 before clamping — a wrapping
+        // `offset + length` produced `end < start` and a panicking slice.
+        let end = offset.saturating_add(length).min(data.len() as u64) as usize;
+        Ok(Some(data[start..end].to_vec()))
     }
 
     fn delete(&self, key: &[u8; 32]) -> Result<()> {
@@ -964,12 +965,13 @@ impl BlobStore for MemoryBlobStore {
             Some(d) => d,
             None => return Ok(None),
         };
-        let start = offset as usize;
-        if start >= data.len() {
+        if offset >= data.len() as u64 {
             return Ok(Some(vec![]));
         }
-        let end = (offset + length) as usize;
-        Ok(Some(data[start..end.min(data.len())].to_vec()))
+        let start = offset as usize;
+        // I-03: saturate the sum in u64 before clamping — see FileBlobStore.
+        let end = offset.saturating_add(length).min(data.len() as u64) as usize;
+        Ok(Some(data[start..end].to_vec()))
     }
 
     fn delete(&self, key: &[u8; 32]) -> Result<()> {
@@ -1139,6 +1141,31 @@ mod tests {
         store.put(&test_key(4), b"0123456789").unwrap();
         let range = store.get_range(&test_key(4), 3, 4).unwrap().unwrap();
         assert_eq!(range, b"3456");
+    }
+
+    #[test]
+    fn file_get_range_overflowing_length_clamps_no_panic() {
+        // I-03: `offset + length` used to wrap, producing a reverse slice
+        // range that panicked. A near-end offset with `u64::MAX` length must
+        // clamp to the end of the blob instead.
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileBlobStore::new(dir.path(), 2);
+        store.put(&test_key(40), b"0123456789").unwrap();
+        let range = store
+            .get_range(&test_key(40), 9, u64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(range, b"9");
+    }
+
+    #[test]
+    fn file_get_range_exact_end_boundary() {
+        // `offset + length == len` exactly must return the full tail.
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileBlobStore::new(dir.path(), 2);
+        store.put(&test_key(41), b"0123456789").unwrap();
+        let range = store.get_range(&test_key(41), 3, 7).unwrap().unwrap();
+        assert_eq!(range, b"3456789");
     }
 
     #[test]
@@ -1458,6 +1485,27 @@ mod tests {
         store.put(&test_key(3), b"abcdefgh").unwrap();
         let range = store.get_range(&test_key(3), 2, 3).unwrap().unwrap();
         assert_eq!(range, b"cde");
+    }
+
+    #[test]
+    fn memory_get_range_overflowing_length_clamps_no_panic() {
+        // I-03: same wrap-around guard as the file-backed impl.
+        let store = MemoryBlobStore::new();
+        store.put(&test_key(30), b"abcdefgh").unwrap();
+        let range = store
+            .get_range(&test_key(30), 7, u64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(range, b"h");
+    }
+
+    #[test]
+    fn memory_get_range_exact_end_boundary() {
+        // `offset + length == len` exactly must return the full tail.
+        let store = MemoryBlobStore::new();
+        store.put(&test_key(31), b"abcdefgh").unwrap();
+        let range = store.get_range(&test_key(31), 2, 6).unwrap().unwrap();
+        assert_eq!(range, b"cdefgh");
     }
 
     // -- Streaming write tests --

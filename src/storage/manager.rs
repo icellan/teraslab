@@ -114,8 +114,11 @@ fn verify_content_hash(
 /// Manages tiered storage for cold data (inputs, outputs, inpoints).
 ///
 /// Coordinates the production tiers:
-/// - **Inline**: cold data appended to record at `METADATA_SIZE + utxo_count * 69`
-/// - **External**: cold data in an external blob store (file or S3)
+/// - **Inline** (serialized size `<=` 8 KiB, i.e. `<=` 8192 bytes including
+///   the 12-byte `ColdData` length prefixes — 8180 bytes of user data):
+///   cold data appended to record at `METADATA_SIZE + utxo_count * 69`
+/// - **External** (serialized size `>` 8192 bytes): cold data in an external
+///   blob store (file or S3)
 pub struct StorageManager {
     device: Arc<dyn BlockDevice>,
     /// Retained for tests and constructor compatibility; production cold data
@@ -123,8 +126,6 @@ pub struct StorageManager {
     #[allow(dead_code)]
     allocator: parking_lot::Mutex<crate::allocator::SlotAllocator>,
     blob_store: Arc<dyn BlobStore>,
-    /// Configurable inline threshold (defaults to `INLINE_THRESHOLD`).
-    inline_threshold: usize,
 }
 
 impl StorageManager {
@@ -138,17 +139,15 @@ impl StorageManager {
             device,
             allocator: parking_lot::Mutex::new(allocator),
             blob_store,
-            inline_threshold: INLINE_THRESHOLD,
         }
     }
 
-    /// Determine which tier to use for the given cold data size.
+    /// Determine which tier to use for the given serialized cold data size.
+    ///
+    /// Sizes `<=` [`INLINE_THRESHOLD`] (8192 bytes) are [`StorageTier::Inline`];
+    /// larger sizes are [`StorageTier::External`].
     pub fn tier_for_size(&self, data_size: usize) -> StorageTier {
-        if data_size <= self.inline_threshold {
-            StorageTier::Inline
-        } else {
-            StorageTier::External
-        }
+        crate::storage::tiers::tier_for_size(data_size)
     }
 
     /// Compute the deterministic inline cold data offset for a record.
@@ -498,6 +497,15 @@ mod tests {
     fn tier_8000_bytes_inline() {
         let (_, mgr) = setup();
         assert_eq!(mgr.tier_for_size(8000), StorageTier::Inline);
+    }
+
+    #[test]
+    fn tier_8192_bytes_inline() {
+        // Boundary: exactly INLINE_THRESHOLD serialized bytes is Inline
+        // (inclusive `<=` semantics; 8180 bytes of user data + 12-byte
+        // ColdData length prefixes).
+        let (_, mgr) = setup();
+        assert_eq!(mgr.tier_for_size(8192), StorageTier::Inline);
     }
 
     #[test]

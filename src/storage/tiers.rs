@@ -2,12 +2,15 @@
 
 use crate::storage::blobstore::BlobDigest;
 
-/// Cold data up to this size is stored inline in the same NVMe allocation
-/// as the hot record (metadata + UTXO slots + cold data in one write).
-pub const INLINE_THRESHOLD: usize = 8 * 1024; // 8 KiB
+/// Cold data up to and including this serialized size (`<=` 8 KiB = 8192
+/// bytes, i.e. 8180 bytes of user data plus the 12-byte `ColdData` length
+/// prefixes) is stored inline in the same NVMe allocation as the hot record
+/// (metadata + UTXO slots + cold data in one write).
+pub const INLINE_THRESHOLD: usize = 8 * 1024; // 8 KiB, inclusive
 
-/// Which storage tier to use for the given cold data size.
-/// Above [`INLINE_THRESHOLD`], cold data goes to an external blob store.
+/// Which storage tier to use for the given serialized cold data size.
+/// Exactly [`INLINE_THRESHOLD`] bytes is still [`StorageTier::Inline`];
+/// above it, cold data goes to an external blob store.
 ///
 /// Earlier phase documents described a middle "separate NVMe" tier. The
 /// production record metadata has no durable fields for a separate cold-data
@@ -21,7 +24,8 @@ pub enum StorageTier {
     External,
 }
 
-/// Determine the storage tier for a given cold data size.
+/// Determine the storage tier for a given serialized cold data size
+/// (inclusive boundary: `data_size <= INLINE_THRESHOLD` is Inline).
 pub fn tier_for_size(data_size: usize) -> StorageTier {
     if data_size <= INLINE_THRESHOLD {
         StorageTier::Inline
