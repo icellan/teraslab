@@ -200,6 +200,7 @@ Node 1:
 listen_addr = "0.0.0.0:3300"
 node_id = 1
 swim_port = 3301
+cluster_secret = "change-me-shared-cluster-secret"  # required: strict_auth (default on) rejects clustered configs without one
 seed_nodes = ["10.0.0.2:3301", "10.0.0.3:3301"]
 replication_factor = 2
 device_paths = ["/dev/disk/by-id/nvme-Samsung_990_PRO_S73WNJ0X000001-part1"]
@@ -211,6 +212,7 @@ Node 2:
 listen_addr = "0.0.0.0:3300"
 node_id = 2
 swim_port = 3301
+cluster_secret = "change-me-shared-cluster-secret"  # required: strict_auth (default on) rejects clustered configs without one
 seed_nodes = ["10.0.0.1:3301", "10.0.0.3:3301"]
 replication_factor = 2
 device_paths = ["/dev/disk/by-id/nvme-Samsung_990_PRO_S73WNJ0X000002-part1"]
@@ -222,6 +224,7 @@ Node 3:
 listen_addr = "0.0.0.0:3300"
 node_id = 3
 swim_port = 3301
+cluster_secret = "change-me-shared-cluster-secret"  # required: strict_auth (default on) rejects clustered configs without one
 seed_nodes = ["10.0.0.1:3301", "10.0.0.2:3301"]
 replication_factor = 2
 device_paths = ["/dev/disk/by-id/nvme-Samsung_990_PRO_S73WNJ0X000003-part1"]
@@ -559,7 +562,7 @@ When the shard table changes (node join/leave), data migrates automatically:
 Each transaction occupies a contiguous region on the block device:
 
 ```
-[TxMetadata: 256 bytes][UtxoSlot 0: 69 bytes][UtxoSlot 1: 69 bytes]...[UtxoSlot N-1: 69 bytes]
+[TxMetadata: 256 bytes][UtxoSlot 0: 73 bytes][UtxoSlot 1: 73 bytes]...[UtxoSlot N-1: 73 bytes]
 ```
 
 **TxMetadata** (256 bytes, padded for alignment) contains: txid, version, locktime, fee, size, extended size, flags (conflicting, locked, external, coinbase, last_spent_all), block entries (up to 3 inline, overflow stored separately), spending height, creation timestamp, generation counter, update timestamp, unmined_since, delete_at_height, preserve_until, reassignment tracking, external storage reference, and conflicting children tracking.
