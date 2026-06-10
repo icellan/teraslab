@@ -223,3 +223,212 @@ fn committed_voter_ever_seen_persistence_round_trip() {
     let after = restored.committed_voter_ever_seen_snapshot();
     assert_eq!(after, snap, "persistence must round-trip exactly");
 }
+
+// ---------------------------------------------------------------------------
+// E-01 defense-in-depth — peak-derived topology-activation quorum
+// ---------------------------------------------------------------------------
+//
+// The write path independently gates every mutation on
+// `(peak/2)+1 → ERR_NO_QUORUM` (see `check_quorum` in `server/dispatch.rs`
+// and the live-cluster regression in `tests/cluster_tcp.rs`,
+// "isolated remnant must reject with ERR_NO_QUORUM"). These tests cover
+// the activation side: a minority remnant must not even self-commit a
+// shrunken topology, because `TopologyAuthority` derives the activation
+// quorum from the peak cluster size it has observed — not from the
+// SWIM-shrunken proposal alone.
+
+/// Helper: build an accepting vote for `term` from `voter`.
+fn vote_for(term: &TopologyTerm, voter: u64) -> teraslab::cluster::topology::TopologyVote {
+    teraslab::cluster::topology::TopologyVote {
+        term: term.term,
+        digest: term.digest,
+        voter: NodeId(voter),
+        accepted: true,
+        voter_current_term: 0,
+    }
+}
+
+/// (headline) A partitioned 1-of-3 remnant with observed peak 3 must NOT
+/// self-commit a single-node topology: the membership-change → propose →
+/// self-vote path must not produce a commit, and the committed topology
+/// must remain unchanged.
+#[test]
+fn minority_remnant_cannot_self_activate_after_partition() {
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    commit_membership(&auth, 1, &[1, 2, 3]); // peak observed: 3
+    assert_eq!(auth.peak_cluster_size(), 3);
+
+    // Partition: SWIM expires nodes 2 and 3; only self remains.
+    let proposal = auth.on_membership_changed(&members(&[1]));
+    // The pure-subset change is structurally safe, so a proposal MAY be
+    // produced — but the self-vote alone must never reach quorum.
+    if let Some(term) = proposal {
+        let commit = auth.handle_vote(&vote_for(&term, 1));
+        assert!(
+            commit.is_none(),
+            "1-of-3 remnant must not reach activation quorum on its self-vote",
+        );
+    }
+    assert_eq!(auth.committed_term(), 1, "no new term may commit");
+    assert_eq!(
+        auth.committed_members(),
+        members(&[1, 2, 3]),
+        "committed membership must remain the full cluster",
+    );
+}
+
+/// A 2-of-3 majority remnant still activates: peak=3 → quorum=2, and the
+/// two surviving voters reach it.
+#[test]
+fn majority_remnant_still_activates() {
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    commit_membership(&auth, 1, &[1, 2, 3]);
+
+    let term = auth
+        .on_membership_changed(&members(&[1, 2]))
+        .expect("proposer must propose the 2-node shrink");
+    assert!(
+        auth.handle_vote(&vote_for(&term, 1)).is_none(),
+        "self-vote alone is below the peak-derived quorum of 2",
+    );
+    let commit = auth
+        .handle_vote(&vote_for(&term, 2))
+        .expect("2 of peak-3 voters must reach quorum");
+    assert_eq!(commit.members, members(&[1, 2]));
+    assert_eq!(auth.handle_commit(&commit), Some(term.term));
+    assert_eq!(auth.committed_members(), members(&[1, 2]));
+}
+
+/// Single-node bootstrap (peak=1) still activates on the self-vote alone.
+#[test]
+fn single_node_bootstrap_still_activates() {
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    assert_eq!(auth.peak_cluster_size(), 1);
+
+    let term = auth
+        .on_membership_changed(&members(&[1]))
+        .expect("bootstrap node proposes itself");
+    let commit = auth
+        .handle_vote(&vote_for(&term, 1))
+        .expect("peak=1: self-vote is quorum");
+    assert_eq!(commit.members, members(&[1]));
+    assert_eq!(auth.handle_commit(&commit), Some(term.term));
+}
+
+/// Cluster growth 1 → 3: the peak grows from the proposed member set
+/// itself (fetch_max before the quorum is computed), so the 3-node
+/// proposal needs 2 votes — obtainable because all 3 nodes are alive.
+#[test]
+fn growth_one_to_three_activates_as_peak_grows() {
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    // Production sets a cluster_id, which lets brand-new (never-seen)
+    // members join; mirror that here so the F-G8-001 fallback does not
+    // reject the legitimate scale-up.
+    auth.set_cluster_id(ClusterId([0x42; 16]));
+
+    // Bootstrap as a single node.
+    let t1 = auth
+        .on_membership_changed(&members(&[1]))
+        .expect("bootstrap proposal");
+    let c1 = auth
+        .handle_vote(&vote_for(&t1, 1))
+        .expect("single-node quorum");
+    auth.handle_commit(&c1);
+    assert_eq!(auth.peak_cluster_size(), 1);
+
+    // Nodes 2 and 3 join.
+    let t2 = auth
+        .on_membership_changed(&members(&[1, 2, 3]))
+        .expect("growth proposal");
+    assert_eq!(
+        auth.peak_cluster_size(),
+        3,
+        "peak must grow from the proposed member set before quorum is computed",
+    );
+    assert!(
+        auth.handle_vote(&vote_for(&t2, 1)).is_none(),
+        "3-node growth needs 2 votes, self-vote alone is not enough",
+    );
+    let c2 = auth
+        .handle_vote(&vote_for(&t2, 2))
+        .expect("2 of 3 voters reach quorum during growth");
+    assert_eq!(c2.members, members(&[1, 2, 3]));
+    assert_eq!(auth.handle_commit(&c2), Some(t2.term));
+}
+
+/// Restart-into-partition: `restore()` reinstates the persisted peak, so
+/// a node that reboots isolated (SWIM sees only self) cannot self-commit.
+#[test]
+fn restored_peak_blocks_minority_after_restart() {
+    use teraslab::cluster::topology::PersistedTopologyState;
+
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    auth.restore(&PersistedTopologyState {
+        peak_cluster_size: 3,
+        committed_term: 7,
+        committed_members: members(&[1, 2, 3]),
+        committed_voters: members(&[1, 2, 3]),
+        voted_term: 7,
+        incarnation: 0,
+        committed_voter_ever_seen: members(&[1, 2, 3]),
+    });
+    assert_eq!(auth.peak_cluster_size(), 3, "restore must reinstate peak");
+
+    if let Some(term) = auth.on_membership_changed(&members(&[1])) {
+        assert!(
+            auth.handle_vote(&vote_for(&term, 1)).is_none(),
+            "restored peak=3 must block single-node self-activation",
+        );
+    }
+    assert_eq!(auth.committed_term(), 7);
+    assert_eq!(auth.committed_members(), members(&[1, 2, 3]));
+}
+
+/// The fallback-proposer path (`check_timeout`) uses the same
+/// peak-derived quorum: a 2-of-4 remnant cannot commit with 2 votes.
+#[test]
+fn fallback_proposer_minority_blocked_by_peak() {
+    let auth = TopologyAuthority::new(NodeId(2), Duration::from_millis(1));
+    commit_membership(&auth, 1, &[1, 2, 3, 4]); // peak observed: 4
+
+    // SWIM reports the shrink; node 2 is not the deterministic proposer.
+    assert!(auth.on_membership_changed(&members(&[1, 2])).is_none());
+
+    // Node 1's proposal never arrives → node 2 steps up as fallback.
+    std::thread::sleep(Duration::from_millis(5));
+    let term = auth
+        .check_timeout(&members(&[1, 2]))
+        .expect("fallback proposer must step up after the timeout");
+
+    // peak=4 → quorum=3; the 2 surviving voters cannot reach it.
+    assert!(auth.handle_vote(&vote_for(&term, 2)).is_none());
+    assert!(
+        auth.handle_vote(&vote_for(&term, 1)).is_none(),
+        "2 of peak-4 voters must NOT reach the activation quorum",
+    );
+    assert_eq!(auth.committed_term(), 1);
+    assert_eq!(auth.committed_members(), members(&[1, 2, 3, 4]));
+}
+
+/// The retry path (`retry_proposal`) uses the same peak-derived quorum.
+#[test]
+fn retry_proposal_minority_blocked_by_peak() {
+    let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+    commit_membership(&auth, 1, &[1, 2, 3, 4]); // peak observed: 4
+
+    let first = auth
+        .on_membership_changed(&members(&[1, 2]))
+        .expect("proposer proposes the shrink");
+    assert!(auth.handle_vote(&vote_for(&first, 1)).is_none());
+
+    // First round failed (no quorum) → retry with a fresh term.
+    let retried = auth.retry_proposal().expect("retry must produce a term");
+    assert!(retried.term > first.term);
+    assert!(auth.handle_vote(&vote_for(&retried, 1)).is_none());
+    assert!(
+        auth.handle_vote(&vote_for(&retried, 2)).is_none(),
+        "retried 2-of-peak-4 proposal must NOT reach the activation quorum",
+    );
+    assert_eq!(auth.committed_term(), 1);
+    assert_eq!(auth.committed_members(), members(&[1, 2, 3, 4]));
+}
