@@ -425,6 +425,25 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                 *block_height,
                 *subtree_idx,
             ),
+            // SetMined may need the overflow region (4th+ block entry,
+            // or unset of an overflow-resident entry) — route through
+            // the allocator-aware replay so it can allocate/free it.
+            RedoOp::SetMined {
+                tx_key,
+                block_id,
+                block_height,
+                subtree_idx,
+                unset,
+            } => replay_set_mined_with_allocator(
+                device,
+                index,
+                allocator.as_deref_mut(),
+                tx_key,
+                *block_id,
+                *block_height,
+                *subtree_idx,
+                *unset,
+            ),
             _ => replay_entry(device, index, entry),
         };
         let progress_safe = matches!(
@@ -1085,6 +1104,44 @@ fn replay_set_mined(
     subtree_idx: u32,
     unset: bool,
 ) -> ReplayResult {
+    replay_set_mined_with_allocator(
+        device,
+        index,
+        None,
+        tx_key,
+        block_id,
+        block_height,
+        subtree_idx,
+        unset,
+    )
+}
+
+/// Allocator-aware `SetMined` replay, mirroring the live `set_mined`
+/// path's overflow handling: the 4th+ block entry spills to the
+/// separately-allocated overflow region, dedup checks scan inline AND
+/// overflow entries, and unset can remove an overflow-resident entry
+/// (pulling the last overflow entry into a vacated inline slot, exactly
+/// like `ops/engine.rs`).
+///
+/// Pre-fix the inline-only version silently dropped the 4th+ entry on
+/// the append path (a crash in the WAL-to-device window lost block
+/// entries past the inline cap on replay) and could not find
+/// overflow-resident entries on the unset path. When overflow storage
+/// must be touched but no allocator is available (the legacy
+/// single-backend `recover` path), the entry fails closed with
+/// `LogicError` instead of silently diverging — production startup
+/// always supplies the allocator via `recover_all_with_allocator`.
+#[allow(clippy::too_many_arguments)]
+fn replay_set_mined_with_allocator(
+    device: &dyn BlockDevice,
+    index: &PrimaryBackend,
+    mut allocator: Option<&mut SlotAllocator>,
+    tx_key: &TxKey,
+    block_id: u32,
+    block_height: u32,
+    subtree_idx: u32,
+    unset: bool,
+) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
         None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
@@ -1101,11 +1158,46 @@ fn replay_set_mined(
 
     let count = meta.block_entry_count as usize;
     let inline = count.min(INLINE_BLOCK_ENTRIES);
+    let has_overflow = count > INLINE_BLOCK_ENTRIES;
 
     if unset {
-        let mut found = false;
+        let mut found_inline = None;
         for i in 0..inline {
             if { meta.block_entries_inline[i].block_id } == block_id {
+                found_inline = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = found_inline {
+            if has_overflow {
+                // Mirror live set_mined: pull the last overflow entry
+                // into the vacated inline slot, shrink the overflow.
+                let mut overflow = match read_recovery_overflow_entries(device, &meta) {
+                    Ok(v) => v,
+                    Err(RecoveryOverflowError::Io) => {
+                        return ReplayResult::Failed(ReplayCause::IoError);
+                    }
+                    Err(RecoveryOverflowError::Logic) => {
+                        return ReplayResult::Failed(ReplayCause::LogicError);
+                    }
+                };
+                let Some(last) = overflow.pop() else {
+                    return ReplayResult::Failed(ReplayCause::LogicError);
+                };
+                meta.block_entries_inline[i] = last;
+                let Some(alloc) = allocator.as_deref_mut() else {
+                    return ReplayResult::Failed(ReplayCause::LogicError);
+                };
+                match write_recovery_overflow_entries(device, alloc, &mut meta, &overflow) {
+                    Ok(()) => {}
+                    Err(RecoveryOverflowError::Io) => {
+                        return ReplayResult::Failed(ReplayCause::IoError);
+                    }
+                    Err(RecoveryOverflowError::Logic) => {
+                        return ReplayResult::Failed(ReplayCause::LogicError);
+                    }
+                }
+            } else {
                 if i < inline - 1 {
                     meta.block_entries_inline[i] = meta.block_entries_inline[inline - 1];
                 }
@@ -1115,17 +1207,56 @@ fn replay_set_mined(
                     subtree_idx: 0,
                 };
                 meta.block_entry_count -= 1;
-                found = true;
-                break;
             }
-        }
-        if !found {
+        } else if has_overflow {
+            let mut overflow = match read_recovery_overflow_entries(device, &meta) {
+                Ok(v) => v,
+                Err(RecoveryOverflowError::Io) => {
+                    return ReplayResult::Failed(ReplayCause::IoError);
+                }
+                Err(RecoveryOverflowError::Logic) => {
+                    return ReplayResult::Failed(ReplayCause::LogicError);
+                }
+            };
+            let Some(pos) = overflow.iter().position(|e| { e.block_id } == block_id) else {
+                return ReplayResult::Skipped;
+            };
+            overflow.swap_remove(pos);
+            let Some(alloc) = allocator.as_deref_mut() else {
+                return ReplayResult::Failed(ReplayCause::LogicError);
+            };
+            match write_recovery_overflow_entries(device, alloc, &mut meta, &overflow) {
+                Ok(()) => {}
+                Err(RecoveryOverflowError::Io) => {
+                    return ReplayResult::Failed(ReplayCause::IoError);
+                }
+                Err(RecoveryOverflowError::Logic) => {
+                    return ReplayResult::Failed(ReplayCause::LogicError);
+                }
+            }
+        } else {
             return ReplayResult::Skipped;
         }
     } else {
-        // Check duplicate
+        // Duplicate check: inline entries first, then overflow — a
+        // replayed SetMined whose entry already lives in overflow must
+        // be a Skipped no-op (no second generation bump).
         for i in 0..inline {
             if { meta.block_entries_inline[i].block_id } == block_id {
+                return ReplayResult::Skipped;
+            }
+        }
+        if has_overflow {
+            let overflow = match read_recovery_overflow_entries(device, &meta) {
+                Ok(v) => v,
+                Err(RecoveryOverflowError::Io) => {
+                    return ReplayResult::Failed(ReplayCause::IoError);
+                }
+                Err(RecoveryOverflowError::Logic) => {
+                    return ReplayResult::Failed(ReplayCause::LogicError);
+                }
+            };
+            if overflow.iter().any(|e| { e.block_id } == block_id) {
                 return ReplayResult::Skipped;
             }
         }
@@ -1136,6 +1267,31 @@ fn replay_set_mined(
                 subtree_idx,
             };
             meta.block_entry_count += 1;
+        } else {
+            // 4th+ entry: needs the overflow region. Pre-fix this case
+            // fell through silently (entry dropped, generation still
+            // bumped). Fail closed when no allocator is available.
+            let Some(alloc) = allocator else {
+                return ReplayResult::Failed(ReplayCause::LogicError);
+            };
+            match append_recovery_overflow_block_entry(
+                device,
+                alloc,
+                &mut meta,
+                BlockEntry {
+                    block_id,
+                    block_height,
+                    subtree_idx,
+                },
+            ) {
+                Ok(()) => {}
+                Err(RecoveryOverflowError::Io) => {
+                    return ReplayResult::Failed(ReplayCause::IoError);
+                }
+                Err(RecoveryOverflowError::Logic) => {
+                    return ReplayResult::Failed(ReplayCause::LogicError);
+                }
+            }
         }
     }
 
@@ -1748,6 +1904,7 @@ fn replay_compensate_unset_mined_with_allocator(
     block_height: u32,
     subtree_idx: u32,
 ) -> ReplayResult {
+    let mut allocator = allocator;
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
         // Compensation against a record that was deleted later in the log
@@ -1780,6 +1937,50 @@ fn replay_compensate_unset_mined_with_allocator(
                 block_height,
                 subtree_idx,
             };
+            if io::write_metadata(device, ie.record_offset, &meta).is_err() {
+                return ReplayResult::Failed(ReplayCause::IoError);
+            }
+            return ReplayResult::Applied;
+        }
+    }
+
+    // Idempotency must also cover OVERFLOW-resident entries: pre-fix
+    // the dup-check stopped at the inline cap, so re-replaying a
+    // compensation for an entry that lives in overflow appended a
+    // duplicate.
+    if count > INLINE_BLOCK_ENTRIES {
+        let mut overflow = match read_recovery_overflow_entries(device, &meta) {
+            Ok(v) => v,
+            Err(RecoveryOverflowError::Io) => return ReplayResult::Failed(ReplayCause::IoError),
+            Err(RecoveryOverflowError::Logic) => {
+                return ReplayResult::Failed(ReplayCause::LogicError);
+            }
+        };
+        if let Some(pos) = overflow.iter().position(|e| { e.block_id } == block_id) {
+            let existing = overflow[pos];
+            if { existing.block_height } == block_height && { existing.subtree_idx } == subtree_idx
+            {
+                return ReplayResult::Skipped;
+            }
+            // Divergence: overwrite in place (same entry count, so the
+            // region size is unchanged and the rewrite reuses it).
+            overflow[pos] = BlockEntry {
+                block_id,
+                block_height,
+                subtree_idx,
+            };
+            let Some(alloc) = allocator.as_deref_mut() else {
+                return ReplayResult::Failed(ReplayCause::LogicError);
+            };
+            match write_recovery_overflow_entries(device, alloc, &mut meta, &overflow) {
+                Ok(()) => {}
+                Err(RecoveryOverflowError::Io) => {
+                    return ReplayResult::Failed(ReplayCause::IoError);
+                }
+                Err(RecoveryOverflowError::Logic) => {
+                    return ReplayResult::Failed(ReplayCause::LogicError);
+                }
+            }
             if io::write_metadata(device, ie.record_offset, &meta).is_err() {
                 return ReplayResult::Failed(ReplayCause::IoError);
             }
@@ -1848,20 +2049,81 @@ fn append_recovery_overflow_block_entry(
         return Err(RecoveryOverflowError::Logic);
     }
     overflow.push(entry);
+    write_recovery_overflow_entries(device, allocator, metadata, &overflow)
+}
 
+/// Rewrite a record's overflow block-entry region during replay.
+///
+/// Mirrors the live `write_overflow_entries` in `ops/engine.rs`,
+/// including the F-G2-003 exact-size free + realloc-on-size-change
+/// discipline: growing the region across an alignment boundary
+/// REALLOCATES instead of writing past the existing allocation into
+/// whatever the allocator placed next (silent neighbour corruption —
+/// the pre-fix recovery-side writer reused the old offset
+/// unconditionally). An emptied region is freed and the overflow
+/// pointer cleared.
+///
+/// Precondition: the inline slots are full (`block_entry_count >=
+/// INLINE_BLOCK_ENTRIES` on entry — overflow only exists past the
+/// inline cap). On success `block_overflow_offset` and
+/// `block_entry_count` reflect `entries`.
+fn write_recovery_overflow_entries(
+    device: &dyn BlockDevice,
+    allocator: &mut SlotAllocator,
+    metadata: &mut TxMetadata,
+    entries: &[BlockEntry],
+) -> std::result::Result<(), RecoveryOverflowError> {
     let alignment = device.alignment();
-    let data_size = overflow.len() * BLOCK_ENTRY_SIZE;
-    let block_size = io::align_up(data_size, alignment);
-    let offset = if metadata.block_overflow_offset == 0 {
-        allocator
-            .allocate(block_size as u64)
-            .map_err(|_| RecoveryOverflowError::Logic)?
+    let old_offset = { metadata.block_overflow_offset };
+    // Derive the OLD allocation size from the pre-mutation count (the
+    // caller has not touched `block_entry_count` yet). Defensive
+    // fallback to one alignment unit matches `overflow_block_size`'s
+    // contract in ops/engine.rs for a live pointer with a stale count.
+    let old_total = metadata.block_entry_count as usize;
+    let old_block_size = if old_total <= INLINE_BLOCK_ENTRIES {
+        alignment
     } else {
-        metadata.block_overflow_offset
+        io::align_up((old_total - INLINE_BLOCK_ENTRIES) * BLOCK_ENTRY_SIZE, alignment)
     };
 
-    let mut buf = AlignedBuf::new(block_size, alignment);
-    for (i, overflow_entry) in overflow.iter().enumerate() {
+    let new_total = INLINE_BLOCK_ENTRIES
+        .checked_add(entries.len())
+        .filter(|&t| t <= u8::MAX as usize)
+        .ok_or(RecoveryOverflowError::Logic)?;
+
+    if entries.is_empty() {
+        if old_offset != 0 {
+            allocator
+                .free(old_offset, old_block_size as u64)
+                .map_err(|_| RecoveryOverflowError::Logic)?;
+            metadata.block_overflow_offset = 0;
+        }
+        metadata.block_entry_count = INLINE_BLOCK_ENTRIES as u8;
+        return Ok(());
+    }
+
+    let data_size = entries.len() * BLOCK_ENTRY_SIZE;
+    let new_block_size = io::align_up(data_size, alignment);
+    let offset = if old_offset == 0 {
+        allocator
+            .allocate(new_block_size as u64)
+            .map_err(|_| RecoveryOverflowError::Logic)?
+    } else if new_block_size == old_block_size {
+        // Same alignment-rounded size: overwrite in place.
+        old_offset
+    } else {
+        // Grow or shrink across an alignment boundary: exact-size free
+        // of the old region, fresh allocation for the new size.
+        allocator
+            .free(old_offset, old_block_size as u64)
+            .map_err(|_| RecoveryOverflowError::Logic)?;
+        allocator
+            .allocate(new_block_size as u64)
+            .map_err(|_| RecoveryOverflowError::Logic)?
+    };
+
+    let mut buf = AlignedBuf::new(new_block_size, alignment);
+    for (i, overflow_entry) in entries.iter().enumerate() {
         let start = i * BLOCK_ENTRY_SIZE;
         overflow_entry.to_bytes(&mut buf[start..start + BLOCK_ENTRY_SIZE]);
     }
@@ -1869,10 +2131,7 @@ fn append_recovery_overflow_block_entry(
         .pwrite_all_at(&buf, offset)
         .map_err(|_| RecoveryOverflowError::Io)?;
     metadata.block_overflow_offset = offset;
-    metadata.block_entry_count = metadata
-        .block_entry_count
-        .checked_add(1)
-        .ok_or(RecoveryOverflowError::Logic)?;
+    metadata.block_entry_count = new_total as u8;
     Ok(())
 }
 

@@ -616,3 +616,351 @@ fn full_pipeline_recovery_reconstructs_create_v2() {
         "full pipeline must register the index",
     );
 }
+
+// ---------------------------------------------------------------------------
+// SetMined overflow block entries (follow-up from the 2026-05-29 sim
+// rewiring): live `set_mined` spills the 4th+ block entry to a
+// separately-allocated overflow region, but `replay_set_mined` only
+// reconstructed inline entries — a crash in the WAL-to-device window
+// silently dropped block entries past the inline cap on replay, and
+// unset-replay could not find overflow-resident entries.
+// ---------------------------------------------------------------------------
+
+/// Read a record's overflow block entries straight from the device.
+fn read_overflow_block_entries(
+    dev: &dyn BlockDevice,
+    meta: &TxMetadata,
+) -> Vec<teraslab::record::BlockEntry> {
+    use teraslab::device::AlignedBuf;
+    use teraslab::record::{BLOCK_ENTRY_SIZE, BlockEntry, INLINE_BLOCK_ENTRIES};
+    let count = { meta.block_entry_count } as usize;
+    let overflow_count = count.saturating_sub(INLINE_BLOCK_ENTRIES);
+    if overflow_count == 0 {
+        return Vec::new();
+    }
+    let off = { meta.block_overflow_offset };
+    assert_ne!(off, 0, "count > inline cap requires a live overflow region");
+    let align = dev.alignment();
+    let size = (overflow_count * BLOCK_ENTRY_SIZE).div_ceil(align) * align;
+    let mut buf = AlignedBuf::new(size, align);
+    dev.pread_exact_at(&mut buf, off).unwrap();
+    (0..overflow_count)
+        .map(|i| BlockEntry::from_bytes(&buf[i * BLOCK_ENTRY_SIZE..(i + 1) * BLOCK_ENTRY_SIZE]))
+        .collect()
+}
+
+fn inline_block_ids(meta: &TxMetadata) -> Vec<u32> {
+    use teraslab::record::INLINE_BLOCK_ENTRIES;
+    let inline = ({ meta.block_entry_count } as usize).min(INLINE_BLOCK_ENTRIES);
+    (0..inline)
+        .map(|i| {
+            let e = { meta.block_entries_inline[i] };
+            { e.block_id }
+        })
+        .collect()
+}
+
+/// Append CreateV2 for a fresh record plus `n` SetMined entries
+/// (block_ids 1..=n) to the WAL. Returns (key, record_offset).
+fn wal_create_plus_set_mined(
+    alloc: &mut SlotAllocator,
+    redo: &mut RedoLog,
+    txid_byte: u8,
+    n: u32,
+) -> (TxKey, u64) {
+    let (key, meta, slots) = make_record(txid_byte, 1);
+    let record_bytes = build_record_bytes(&meta, &slots);
+    let record_offset = alloc.allocate(TxMetadata::record_size_for(1)).unwrap();
+    redo.append_and_flush(RedoOp::CreateV2 {
+        tx_key: key,
+        record_offset,
+        utxo_count: 1,
+        is_conflicting: false,
+        record_bytes,
+        parent_txids: Vec::new(),
+    })
+    .unwrap();
+    for id in 1..=n {
+        redo.append_and_flush(RedoOp::SetMined {
+            tx_key: key,
+            block_id: id,
+            block_height: 800_000 + id,
+            subtree_idx: 10 + id,
+            unset: false,
+        })
+        .unwrap();
+    }
+    (key, record_offset)
+}
+
+/// Crash after the WAL fsync of a 4th SetMined: replay must spill the
+/// 4th entry to the overflow region exactly like live `set_mined`
+/// would, and a second recovery pass must dedup against the
+/// overflow-resident entry (no duplicate, no extra generation bump).
+#[test]
+fn boundary_set_mined_fourth_entry_replays_into_overflow() {
+    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (_key, record_offset) = wal_create_plus_set_mined(&mut alloc, &mut redo, 0xE0, 4);
+
+    let mut dah = teraslab::index::DahBackend::new_in_memory();
+    let mut unmined = teraslab::index::UnminedBackend::new_in_memory();
+    let stats = recover_all_with_allocator(
+        &*data_dev as &dyn BlockDevice,
+        &redo,
+        &mut index,
+        &mut dah,
+        &mut unmined,
+        Some(&mut alloc),
+    )
+    .unwrap();
+    assert_eq!(stats.entries_failed, 0);
+
+    let m = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
+    assert_eq!(
+        { m.block_entry_count },
+        4,
+        "the 4th block entry must survive replay (spilled to overflow), not be dropped"
+    );
+    assert_eq!(inline_block_ids(&m), vec![1, 2, 3]);
+    let overflow = read_overflow_block_entries(&*data_dev, &m);
+    assert_eq!(overflow.len(), 1);
+    assert_eq!({ overflow[0].block_id }, 4);
+    assert_eq!({ overflow[0].block_height }, 800_004);
+    assert_eq!({ overflow[0].subtree_idx }, 14);
+    let gen_after_first = { m.generation };
+
+    // Second recovery pass: every SetMined must dedup — including the
+    // overflow-resident one — leaving count and generation unchanged.
+    let mut index2 = PrimaryBackend::new_in_memory(1000).unwrap();
+    let mut dah2 = teraslab::index::DahBackend::new_in_memory();
+    let mut unmined2 = teraslab::index::UnminedBackend::new_in_memory();
+    let stats2 = recover_all_with_allocator(
+        &*data_dev as &dyn BlockDevice,
+        &redo,
+        &mut index2,
+        &mut dah2,
+        &mut unmined2,
+        Some(&mut alloc),
+    )
+    .unwrap();
+    assert_eq!(stats2.entries_failed, 0);
+    let m2 = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
+    assert_eq!({ m2.block_entry_count }, 4);
+    assert_eq!({ m2.generation }, gen_after_first);
+    let overflow2 = read_overflow_block_entries(&*data_dev, &m2);
+    assert_eq!(overflow2.len(), 1);
+    assert_eq!({ overflow2[0].block_id }, 4);
+}
+
+/// Unset-replay of an overflow-resident entry: pass 1 builds the
+/// 3-inline + 1-overflow state; pass 2 replays an unset of the overflow
+/// entry and must remove it, shrink the count, and free the overflow
+/// region (offset back to 0).
+#[test]
+fn boundary_unset_mined_removes_overflow_resident_entry() {
+    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (key, record_offset) = wal_create_plus_set_mined(&mut alloc, &mut redo, 0xE1, 4);
+
+    let mut dah = teraslab::index::DahBackend::new_in_memory();
+    let mut unmined = teraslab::index::UnminedBackend::new_in_memory();
+    recover_all_with_allocator(
+        &*data_dev as &dyn BlockDevice,
+        &redo,
+        &mut index,
+        &mut dah,
+        &mut unmined,
+        Some(&mut alloc),
+    )
+    .unwrap();
+    let m = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
+    assert_eq!({ m.block_entry_count }, 4, "precondition: overflow built");
+
+    // Crash after the unset's WAL fsync, before the metadata write.
+    redo.append_and_flush(RedoOp::SetMined {
+        tx_key: key,
+        block_id: 4,
+        block_height: 800_004,
+        subtree_idx: 14,
+        unset: true,
+    })
+    .unwrap();
+
+    let mut index2 = PrimaryBackend::new_in_memory(1000).unwrap();
+    let mut dah2 = teraslab::index::DahBackend::new_in_memory();
+    let mut unmined2 = teraslab::index::UnminedBackend::new_in_memory();
+    let stats = recover_all_with_allocator(
+        &*data_dev as &dyn BlockDevice,
+        &redo,
+        &mut index2,
+        &mut dah2,
+        &mut unmined2,
+        Some(&mut alloc),
+    )
+    .unwrap();
+    assert_eq!(stats.entries_failed, 0);
+
+    let m2 = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
+    assert_eq!(
+        { m2.block_entry_count },
+        3,
+        "unset of an overflow-resident entry must apply on replay"
+    );
+    assert_eq!(inline_block_ids(&m2), vec![1, 2, 3]);
+    assert_eq!(
+        { m2.block_overflow_offset },
+        0,
+        "emptied overflow region must be freed"
+    );
+}
+
+/// Unset-replay of an INLINE entry while overflow exists: the last
+/// overflow entry must be pulled into the vacated inline slot (same
+/// semantics as live `set_mined`), and the emptied overflow freed.
+#[test]
+fn boundary_unset_mined_inline_entry_pulls_overflow_into_inline() {
+    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (key, record_offset) = wal_create_plus_set_mined(&mut alloc, &mut redo, 0xE2, 4);
+    redo.append_and_flush(RedoOp::SetMined {
+        tx_key: key,
+        block_id: 2,
+        block_height: 800_002,
+        subtree_idx: 12,
+        unset: true,
+    })
+    .unwrap();
+
+    let mut dah = teraslab::index::DahBackend::new_in_memory();
+    let mut unmined = teraslab::index::UnminedBackend::new_in_memory();
+    let stats = recover_all_with_allocator(
+        &*data_dev as &dyn BlockDevice,
+        &redo,
+        &mut index,
+        &mut dah,
+        &mut unmined,
+        Some(&mut alloc),
+    )
+    .unwrap();
+    assert_eq!(stats.entries_failed, 0);
+
+    let m = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
+    assert_eq!({ m.block_entry_count }, 3);
+    let mut ids = inline_block_ids(&m);
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 3, 4], "overflow entry 4 pulled inline after 2 removed");
+    assert_eq!({ m.block_overflow_offset }, 0);
+}
+
+/// CompensateUnsetMined replay must dedup against OVERFLOW-resident
+/// entries too: a compensation for a block already present in overflow
+/// (matching values) is a Skipped no-op, not a duplicate append.
+#[test]
+fn boundary_compensate_unset_mined_skips_overflow_resident_duplicate() {
+    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (key, record_offset) = wal_create_plus_set_mined(&mut alloc, &mut redo, 0xE3, 4);
+    redo.append_and_flush(RedoOp::CompensateUnsetMined {
+        tx_key: key,
+        block_id: 4,
+        block_height: 800_004,
+        subtree_idx: 14,
+    })
+    .unwrap();
+
+    let mut dah = teraslab::index::DahBackend::new_in_memory();
+    let mut unmined = teraslab::index::UnminedBackend::new_in_memory();
+    let stats = recover_all_with_allocator(
+        &*data_dev as &dyn BlockDevice,
+        &redo,
+        &mut index,
+        &mut dah,
+        &mut unmined,
+        Some(&mut alloc),
+    )
+    .unwrap();
+    assert_eq!(stats.entries_failed, 0);
+
+    let m = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
+    assert_eq!(
+        { m.block_entry_count },
+        4,
+        "compensation for an overflow-resident entry must not duplicate it"
+    );
+    let overflow = read_overflow_block_entries(&*data_dev, &m);
+    assert_eq!(overflow.len(), 1);
+    assert_eq!({ overflow[0].block_id }, 4);
+}
+
+/// Growing the overflow region across an alignment boundary during
+/// replay must REALLOCATE, not write past the existing allocation into
+/// the neighbouring record (the live path has this via F-G2-003; the
+/// recovery-side writer reused the old offset unconditionally).
+///
+/// Uses a 512-byte-aligned device so the boundary is reachable: 42
+/// overflow entries fill 504 of 512 bytes; the 43rd needs 1024. Record
+/// B is allocated between the two states — an in-place overgrow would
+/// clobber B's metadata.
+#[test]
+fn boundary_set_mined_overflow_realloc_does_not_clobber_neighbor() {
+    let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 512).unwrap());
+    let redo_dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 512).unwrap());
+    let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+    let mut index = PrimaryBackend::new_in_memory(1000).unwrap();
+    let mut redo =
+        RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024).unwrap();
+
+    // Record A: 3 inline + 42 overflow entries (504 bytes, fits one
+    // 512-byte unit).
+    let (key_a, offset_a) = wal_create_plus_set_mined(&mut alloc, &mut redo, 0xE4, 45);
+
+    // Record B: allocated AFTER A's overflow will be (replay order), so
+    // it sits adjacent to the overflow region in the device layout.
+    let (key_b, meta_b, slots_b) = make_record(0xE5, 2);
+    let record_bytes_b = build_record_bytes(&meta_b, &slots_b);
+    let offset_b = alloc.allocate(TxMetadata::record_size_for(2)).unwrap();
+    redo.append_and_flush(RedoOp::CreateV2 {
+        tx_key: key_b,
+        record_offset: offset_b,
+        utxo_count: 2,
+        is_conflicting: false,
+        record_bytes: record_bytes_b,
+        parent_txids: Vec::new(),
+    })
+    .unwrap();
+
+    // The 46th entry for A: overflow grows 42 -> 43 entries, 516 bytes,
+    // crossing the 512-byte boundary.
+    redo.append_and_flush(RedoOp::SetMined {
+        tx_key: key_a,
+        block_id: 46,
+        block_height: 800_046,
+        subtree_idx: 56,
+        unset: false,
+    })
+    .unwrap();
+
+    let mut dah = teraslab::index::DahBackend::new_in_memory();
+    let mut unmined = teraslab::index::UnminedBackend::new_in_memory();
+    let stats = recover_all_with_allocator(
+        &*data_dev as &dyn BlockDevice,
+        &redo,
+        &mut index,
+        &mut dah,
+        &mut unmined,
+        Some(&mut alloc),
+    )
+    .unwrap();
+    assert_eq!(stats.entries_failed, 0);
+
+    // A has all 46 entries, the 46th readable from the (re-located)
+    // overflow region.
+    let m_a = io::read_metadata(&*data_dev as &dyn BlockDevice, offset_a).unwrap();
+    assert_eq!({ m_a.block_entry_count }, 46);
+    let overflow = read_overflow_block_entries(&*data_dev, &m_a);
+    assert_eq!(overflow.len(), 43);
+    assert!(overflow.iter().any(|e| { e.block_id } == 46));
+
+    // B's metadata is intact — the overflow growth did not write past
+    // its old allocation into B.
+    let m_b = io::read_metadata(&*data_dev as &dyn BlockDevice, offset_b).unwrap();
+    assert_eq!({ m_b.tx_id }, key_b.txid);
+    assert_eq!({ m_b.utxo_count }, 2);
+}
