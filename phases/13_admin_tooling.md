@@ -179,7 +179,6 @@ Displayed in dashboard alerts panel and node status indicators:
 - [ ] teraslab-cli memory: shows memory breakdown
 - [ ] teraslab-cli records: shows record inventory with slot breakdown
 - [ ] teraslab-cli record <txid>: shows metadata for existing record
-- [ ] teraslab-cli record <txid> --slots: includes UTXO slot details
 - [ ] teraslab-cli record <nonexistent>: shows "not found" error
 - [ ] teraslab-cli index: shows index stats
 - [ ] teraslab-cli replication: shows per-replica lag and state

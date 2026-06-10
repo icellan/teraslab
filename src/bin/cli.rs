@@ -85,10 +85,7 @@ enum Command {
     /// List cluster nodes.
     Nodes,
     /// Shard distribution.
-    Shards {
-        #[arg(long)]
-        node: Option<String>,
-    },
+    Shards,
     /// Storage capacity per device.
     Storage,
     /// Memory breakdown.
@@ -99,12 +96,6 @@ enum Command {
     Record {
         /// Transaction ID (64-char hex string).
         txid: String,
-        /// Include UTXO slot details.
-        #[arg(long)]
-        slots: bool,
-        /// Show raw metadata.
-        #[arg(long)]
-        raw: bool,
     },
     /// Index statistics.
     Index {
@@ -113,41 +104,24 @@ enum Command {
         secondary: bool,
     },
     /// Replication status.
-    Replication {
-        /// Show history.
-        #[arg(long)]
-        history: bool,
-    },
+    Replication,
     /// Redo log info.
-    Redo {
-        /// Tail N entries.
-        #[arg(long)]
-        tail: Option<u32>,
-    },
+    Redo,
     /// Trigger cluster rebalance.
     Rebalance {
         /// Preview without executing.
         #[arg(long)]
         dry_run: bool,
-        /// Execute the rebalance.
-        #[arg(long)]
-        execute: bool,
     },
     /// Drain a node (migrate shards off).
     Drain {
         /// Node ID to drain.
         node_id: String,
-        /// Cancel an active drain.
-        #[arg(long)]
-        cancel: bool,
     },
     /// Log level management.
     LogLevel {
         /// New log level to set (omit to show current).
         level: Option<String>,
-        /// Target module (optional).
-        #[arg(long)]
-        target: Option<String>,
     },
     /// Quick benchmark / smoke test.
     Bench {
@@ -411,7 +385,7 @@ fn cmd_nodes(http: &HttpClient, json: bool) -> Result<(), CliError> {
 }
 
 #[allow(clippy::disallowed_macros)] // CLI user-facing stdout
-fn cmd_shards(http: &HttpClient, json: bool, _node: Option<String>) -> Result<(), CliError> {
+fn cmd_shards(http: &HttpClient, json: bool) -> Result<(), CliError> {
     let status = http.get_json("/status")?;
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
@@ -527,13 +501,7 @@ fn cmd_records(http: &HttpClient, json: bool) -> Result<(), CliError> {
 }
 
 #[allow(clippy::disallowed_macros)] // CLI user-facing stdout
-fn cmd_record(
-    http: &HttpClient,
-    json: bool,
-    txid: &str,
-    _slots: bool,
-    _raw: bool,
-) -> Result<(), CliError> {
+fn cmd_record(http: &HttpClient, json: bool, txid: &str) -> Result<(), CliError> {
     let data = http.get_json(&format!("/debug/records/{txid}"))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&data)?);
@@ -1249,17 +1217,17 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Status => cmd_status(&http, cli.json),
         Command::Nodes => cmd_nodes(&http, cli.json),
-        Command::Shards { node } => cmd_shards(&http, cli.json, node),
+        Command::Shards => cmd_shards(&http, cli.json),
         Command::Storage => cmd_storage(&http, cli.json),
         Command::Memory => cmd_memory(&http, cli.json),
         Command::Records => cmd_records(&http, cli.json),
-        Command::Record { txid, slots, raw } => cmd_record(&http, cli.json, &txid, slots, raw),
+        Command::Record { txid } => cmd_record(&http, cli.json, &txid),
         Command::Index { secondary } => cmd_index(&http, cli.json, secondary),
-        Command::Replication { .. } => cmd_replication(&http, cli.json),
-        Command::Redo { .. } => cmd_redo(&http, cli.json),
-        Command::Rebalance { dry_run, .. } => cmd_rebalance(&http, cli.json, dry_run),
-        Command::Drain { node_id, .. } => cmd_drain(&http, cli.json, &node_id),
-        Command::LogLevel { level, .. } => cmd_log_level(&http, cli.json, level.as_deref()),
+        Command::Replication => cmd_replication(&http, cli.json),
+        Command::Redo => cmd_redo(&http, cli.json),
+        Command::Rebalance { dry_run } => cmd_rebalance(&http, cli.json, dry_run),
+        Command::Drain { node_id } => cmd_drain(&http, cli.json, &node_id),
+        Command::LogLevel { level } => cmd_log_level(&http, cli.json, level.as_deref()),
         Command::Bench { operation, count } => {
             cmd_bench(&http, &cli.data_addr, cli.json, &operation, count)
         }

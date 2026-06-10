@@ -1583,7 +1583,7 @@ mod tests {
 
         let after = footer_crc_drop_count();
         assert!(
-            after >= before + 1,
+            after > before,
             "unstamped FooterPendingCrc drop must increment the release-build \
              observability counter (before={before}, after={after})",
         );

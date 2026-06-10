@@ -1959,7 +1959,7 @@ mod tests {
         let err = mgr.replicate_batch(&ops).expect_err("must fail");
         let after = metrics.replica_worker_panics_total.get();
         assert!(
-            after >= before + 1,
+            after > before,
             "replica_worker_panics_total must bump (was {before}, now {after})",
         );
         let msg = err.to_string();
@@ -2020,17 +2020,16 @@ mod tests {
         mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 1 };
         mgr.next_sequence = 4;
 
-        let _ = mgr
-            .run_catchup(|from_seq| {
-                (from_seq..4)
-                    .map(|i| ReplicaOp::Freeze {
-                        tx_key: key(i as u8),
-                        offset: 0,
-                        master_generation: 0,
-                    })
-                    .collect()
-            })
-            .expect("run_catchup must not error when the replica is ahead");
+        mgr.run_catchup(|from_seq| {
+            (from_seq..4)
+                .map(|i| ReplicaOp::Freeze {
+                    tx_key: key(i as u8),
+                    offset: 0,
+                    master_generation: 0,
+                })
+                .collect()
+        })
+        .expect("run_catchup must not error when the replica is ahead");
 
         // With the F-G7-011 fix the sender stays catching-up or becomes
         // Live (never Down). Without the fix the strict-equality check

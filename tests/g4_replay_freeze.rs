@@ -28,7 +28,7 @@ fn legacy_freeze_replay_skips_already_spent_slot() {
 
     // Allocate a record region for one tx with one UTXO.
     let utxo_count = 1u32;
-    let record_size = TxMetadata::record_size_for(utxo_count) as u64;
+    let record_size = TxMetadata::record_size_for(utxo_count);
     let record_offset = alloc.allocate(record_size).unwrap();
 
     // Build a metadata header + one SPENT slot on the device.
@@ -100,7 +100,7 @@ fn legacy_freeze_replay_applies_on_unspent_slot() {
     let mut index = PrimaryBackend::new_in_memory(128).unwrap();
 
     let utxo_count = 1u32;
-    let record_size = TxMetadata::record_size_for(utxo_count) as u64;
+    let record_size = TxMetadata::record_size_for(utxo_count);
     let record_offset = alloc.allocate(record_size).unwrap();
 
     let mut meta = TxMetadata::new(utxo_count);

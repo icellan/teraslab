@@ -121,35 +121,32 @@ mod tests {
     fn should_flush_at_threshold() {
         let mut acc = ReplicaBatchAccumulator::new(3);
         // First two pushes stay below the soft threshold.
-        assert_eq!(
-            acc.push(ReplicaOp::Freeze {
+        assert!(
+            !acc.push(ReplicaOp::Freeze {
                 tx_key: key(1),
                 offset: 0,
                 master_generation: 0,
             })
             .unwrap(),
-            false,
         );
-        assert_eq!(
-            acc.push(ReplicaOp::Freeze {
+        assert!(
+            !acc.push(ReplicaOp::Freeze {
                 tx_key: key(2),
                 offset: 1,
                 master_generation: 0,
             })
             .unwrap(),
-            false,
         );
         assert!(!acc.should_flush());
 
         // The push that reaches the soft threshold returns true.
-        assert_eq!(
+        assert!(
             acc.push(ReplicaOp::Freeze {
                 tx_key: key(3),
                 offset: 2,
                 master_generation: 0,
             })
             .unwrap(),
-            true,
         );
         assert!(acc.should_flush());
     }
