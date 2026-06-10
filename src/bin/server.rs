@@ -1127,7 +1127,13 @@ fn main() {
         engine: engine.clone(),
         metrics: &SERVER_METRICS,
         histograms: &SERVER_HISTOGRAMS,
-        ready: Arc::new(AtomicBool::new(true)),
+        // M-02: constructed not-ready; flipped to `true` below once
+        // recovery + engine attach are known-complete. Constructing the
+        // flag `true` made readiness correctness depend solely on the
+        // HTTP thread spawning after synchronous recovery — a future
+        // refactor that starts HTTP earlier would silently re-introduce
+        // the "ready before recovery" bug (F-G6-001).
+        ready: Arc::new(AtomicBool::new(false)),
         log_level: Arc::new(AtomicU8::new(2)), // INFO
         cluster: cluster.clone(),
         redo_log: redo_log.clone(),
@@ -1135,6 +1141,12 @@ fn main() {
         http_port,
         replica_lag_warn_threshold_ops: config.replica_lag_warn_threshold_ops,
     });
+    // M-02: recovery (step 4) and engine construction completed
+    // synchronously above, so this node can serve traffic — mark ready
+    // before the HTTP listener starts answering probes.
+    http_state
+        .ready
+        .store(true, std::sync::atomic::Ordering::Release);
     let http_addr = config.http_listen_addr.clone();
     let admin_endpoints_enabled = config.enable_admin_endpoints;
     // R-056: when admin endpoints are on, the bearer token has been validated

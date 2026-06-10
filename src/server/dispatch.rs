@@ -1604,10 +1604,16 @@ fn replicate_all_ops(
             if let Some(metrics) = DISPATCH_METRICS.get() {
                 metrics.replication_degraded_acks.inc();
             }
+            // D-01: `PartialAck` is also the legitimate quorum-met-but-not-
+            // all outcome for a non-best-effort WriteMajority policy, so the
+            // ack policy is reported as a structured field instead of a
+            // hard-coded "(best_effort)" parenthetical.
             tracing::warn!(
                 ack_count,
                 total_targets,
-                "replication: degraded ack (best_effort)",
+                best_effort,
+                ack_policy = ?ack_policy,
+                "replication: degraded ack",
             );
             clear_replication_intents_after_success(intent_ranges);
             Ok(ReplicationOutcome::Full)
@@ -2932,6 +2938,28 @@ fn handle_spend_batch(
                 Err(e) => {
                     // Redo failure: don't apply, return error.
                     // ValidatedSpend drops here, releasing the lock.
+                    // M-01: `attempted` already ticked for the whole batch;
+                    // classify every item before the early return so the
+                    // storage failure is visible in op metrics. Items from
+                    // this group and any unprocessed group count as
+                    // ErrStorage-failed; prior groups keep their tallies.
+                    if let Some(m) = DISPATCH_METRICS.get() {
+                        use crate::metrics::OpCode;
+                        let failed = tally_storage_abort(
+                            m,
+                            OpCode::Spend,
+                            items.len() as u64,
+                            succeeded,
+                            idempotent,
+                            &errors,
+                        );
+                        m.spends_succeeded.inc_by(succeeded);
+                        m.spends_idempotent.inc_by(idempotent);
+                        m.spends_failed.inc_by(failed);
+                        m.spend_multi_items_succeeded.inc_by(succeeded);
+                        m.spend_multi_items_idempotent.inc_by(idempotent);
+                        m.spend_multi_items_failed.inc_by(failed);
+                    }
                     return error_response(req.request_id, ERR_STORAGE_IO, &e);
                 }
             }
@@ -2946,6 +2974,32 @@ fn handle_spend_batch(
             Err(e) => {
                 // DAH overflow (config misconfiguration) or similar —
                 // surface as ERR_STORAGE_IO rather than silently clamping.
+                // M-01: classify outcomes before the early return. This
+                // group's validation errors keep their real classification;
+                // its would-be transitions and all unprocessed groups count
+                // as ErrStorage-failed. Note `idempotent` already includes
+                // this group (added above) — idempotent items are no-ops,
+                // so the failed apply does not invalidate them.
+                for (idx, err) in &validation_errors {
+                    errors.push(spend_error_to_batch_error(*idx, err));
+                }
+                if let Some(m) = DISPATCH_METRICS.get() {
+                    use crate::metrics::OpCode;
+                    let failed = tally_storage_abort(
+                        m,
+                        OpCode::Spend,
+                        items.len() as u64,
+                        succeeded,
+                        idempotent,
+                        &errors,
+                    );
+                    m.spends_succeeded.inc_by(succeeded);
+                    m.spends_idempotent.inc_by(idempotent);
+                    m.spends_failed.inc_by(failed);
+                    m.spend_multi_items_succeeded.inc_by(succeeded);
+                    m.spend_multi_items_idempotent.inc_by(idempotent);
+                    m.spend_multi_items_failed.inc_by(failed);
+                }
                 return error_response(req.request_id, ERR_STORAGE_IO, &e.to_string());
             }
         };
@@ -3134,7 +3188,18 @@ fn handle_unspend_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
+        Err(e) => {
+            // M-01: `attempted` already ticked; nothing has applied yet, so
+            // every non-redirected item counts as ErrStorage-failed.
+            if let Some(m) = DISPATCH_METRICS.get() {
+                use crate::metrics::OpCode;
+                let failed =
+                    tally_storage_abort(m, OpCode::Unspend, items.len() as u64, 0, 0, &errors);
+                m.unspends_failed.inc_by(failed);
+                m.unspend_multi_items_failed.inc_by(failed);
+            }
+            return error_response(req.request_id, ERR_STORAGE_IO, &e);
+        }
     };
 
     // Phase 3: Apply engine mutations and build repl ops.
@@ -3265,7 +3330,17 @@ fn handle_set_mined_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
+        Err(e) => {
+            // M-01: `attempted` already ticked; nothing has applied yet, so
+            // every non-redirected item counts as ErrStorage-failed.
+            if let Some(m) = DISPATCH_METRICS.get() {
+                use crate::metrics::OpCode;
+                let failed =
+                    tally_storage_abort(m, OpCode::SetMined, txids.len() as u64, 0, 0, &errors);
+                m.set_mined_items_failed.inc_by(failed);
+            }
+            return error_response(req.request_id, ERR_STORAGE_IO, &e);
+        }
     };
 
     // Gap #8: capture pre-apply (block_height, subtree_idx) for the
@@ -3678,7 +3753,17 @@ fn handle_create_batch(
         .collect();
     let allocated_regions = match engine.allocator().lock().allocate_batch(&reservation_sizes) {
         Ok(regions) => regions,
-        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &format!("{e}")),
+        Err(e) => {
+            // M-01: `attempted` already ticked; nothing has applied yet, so
+            // every item not already in `errors` counts as ErrStorage-failed.
+            if let Some(m) = DISPATCH_METRICS.get() {
+                use crate::metrics::OpCode;
+                let failed =
+                    tally_storage_abort(m, OpCode::Create, items.len() as u64, 0, 0, &errors);
+                m.creates_failed.inc_by(failed);
+            }
+            return error_response(req.request_id, ERR_STORAGE_IO, &format!("{e}"));
+        }
     };
 
     for (pending, allocated) in pending_items.into_iter().zip(allocated_regions) {
@@ -3739,6 +3824,14 @@ fn handle_create_batch(
                     rollback_errors.join("; ")
                 )
             };
+            // M-01: `attempted` already ticked; nothing has applied yet, so
+            // every item not already in `errors` counts as ErrStorage-failed.
+            if let Some(m) = DISPATCH_METRICS.get() {
+                use crate::metrics::OpCode;
+                let failed =
+                    tally_storage_abort(m, OpCode::Create, items.len() as u64, 0, 0, &errors);
+                m.creates_failed.inc_by(failed);
+            }
             return error_response(req.request_id, ERR_STORAGE_IO, &msg);
         }
     };
@@ -3949,7 +4042,16 @@ fn handle_freeze_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
+        Err(e) => {
+            // M-01: nothing has applied yet — classify every non-redirected
+            // item as ErrStorage-failed before the early return.
+            if let Some(m) = DISPATCH_METRICS.get() {
+                use crate::metrics::OpCode;
+                let failed = tally_storage_abort(m, OpCode::Freeze, total_items, 0, 0, &errors);
+                m.freezes_failed.inc_by(failed);
+            }
+            return error_response(req.request_id, ERR_STORAGE_IO, &e);
+        }
     };
 
     // Phase 3: Apply engine mutations and build repl ops from engine results.
@@ -4053,7 +4155,16 @@ fn handle_unfreeze_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
+        Err(e) => {
+            // M-01: nothing has applied yet — classify every non-redirected
+            // item as ErrStorage-failed before the early return.
+            if let Some(m) = DISPATCH_METRICS.get() {
+                use crate::metrics::OpCode;
+                let failed = tally_storage_abort(m, OpCode::Unfreeze, total_items, 0, 0, &errors);
+                m.unfreezes_failed.inc_by(failed);
+            }
+            return error_response(req.request_id, ERR_STORAGE_IO, &e);
+        }
     };
 
     // Phase 3: Apply engine mutations and build repl ops from engine results.
@@ -4159,7 +4270,16 @@ fn handle_reassign_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
+        Err(e) => {
+            // M-01: nothing has applied yet — classify every non-redirected
+            // item as ErrStorage-failed before the early return.
+            if let Some(m) = DISPATCH_METRICS.get() {
+                use crate::metrics::OpCode;
+                let failed = tally_storage_abort(m, OpCode::Reassign, total_items, 0, 0, &errors);
+                m.reassign_failed.inc_by(failed);
+            }
+            return error_response(req.request_id, ERR_STORAGE_IO, &e);
+        }
     };
 
     // Phase 3: Apply engine mutations and build repl ops from engine results.
@@ -4300,7 +4420,17 @@ fn handle_set_conflicting_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
+        Err(e) => {
+            // M-01: nothing has applied yet — classify every non-redirected
+            // item as ErrStorage-failed before the early return.
+            if let Some(m) = DISPATCH_METRICS.get() {
+                use crate::metrics::OpCode;
+                let failed =
+                    tally_storage_abort(m, OpCode::SetConflicting, total_items, 0, 0, &errors);
+                m.set_conflicting_failed.inc_by(failed);
+            }
+            return error_response(req.request_id, ERR_STORAGE_IO, &e);
+        }
     };
 
     // Phase 3: Apply engine mutations and build repl ops from engine results.
@@ -4406,7 +4536,16 @@ fn handle_set_locked_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
+        Err(e) => {
+            // M-01: nothing has applied yet — classify every non-redirected
+            // item as ErrStorage-failed before the early return.
+            if let Some(m) = DISPATCH_METRICS.get() {
+                use crate::metrics::OpCode;
+                let failed = tally_storage_abort(m, OpCode::SetLocked, total_items, 0, 0, &errors);
+                m.set_locked_failed.inc_by(failed);
+            }
+            return error_response(req.request_id, ERR_STORAGE_IO, &e);
+        }
     };
 
     // Phase 3: Apply engine mutations and build repl ops from engine results.
@@ -4522,7 +4661,17 @@ fn handle_preserve_until_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
+        Err(e) => {
+            // M-01: nothing has applied yet — classify every non-redirected
+            // item as ErrStorage-failed before the early return.
+            if let Some(m) = DISPATCH_METRICS.get() {
+                use crate::metrics::OpCode;
+                let failed =
+                    tally_storage_abort(m, OpCode::PreserveUntil, total_items, 0, 0, &errors);
+                m.preserve_until_failed.inc_by(failed);
+            }
+            return error_response(req.request_id, ERR_STORAGE_IO, &e);
+        }
     };
 
     // Phase 3: Apply engine mutations and build repl ops from engine results.
@@ -4890,7 +5039,16 @@ fn handle_delete_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
+        Err(e) => {
+            // M-01: nothing has applied yet — classify every non-redirected
+            // item as ErrStorage-failed before the early return.
+            if let Some(m) = DISPATCH_METRICS.get() {
+                use crate::metrics::OpCode;
+                let failed = tally_storage_abort(m, OpCode::Delete, total_items, 0, 0, &errors);
+                m.deletes_failed.inc_by(failed);
+            }
+            return error_response(req.request_id, ERR_STORAGE_IO, &e);
+        }
     };
 
     // Phase 3: Apply engine mutations and build repl ops.
@@ -5186,7 +5344,17 @@ fn handle_mark_longest_chain_batch(
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => range,
-        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
+        Err(e) => {
+            // M-01: nothing has applied yet — classify every non-redirected
+            // item as ErrStorage-failed before the early return.
+            if let Some(m) = DISPATCH_METRICS.get() {
+                use crate::metrics::OpCode;
+                let failed =
+                    tally_storage_abort(m, OpCode::MarkLongestChain, total_items, 0, 0, &errors);
+                m.mark_longest_chain_failed.inc_by(failed);
+            }
+            return error_response(req.request_id, ERR_STORAGE_IO, &e);
+        }
     };
 
     // Phase 3: Apply engine mutations and capture per-item master
@@ -6501,6 +6669,46 @@ pub(crate) fn classify_wire_error_code(code: u16) -> crate::metrics::Outcome {
         | ERR_STREAM_INVARIANT => Outcome::ErrStorage,
         _ => Outcome::Other,
     }
+}
+
+/// M-01: terminal metrics tally for a mutating batch handler that aborts
+/// with a batch-wide `ERR_STORAGE_IO` early return BEFORE reaching its
+/// normal post-loop tally block.
+///
+/// The handler's `*_attempted` counters tick when the batch is decoded, so
+/// an early return must still classify every item exactly once — otherwise
+/// `attempted == succeeded + idempotent + failed` silently breaks and the
+/// storage failure is invisible in `/metrics` (`Outcome::ErrStorage` would
+/// have no incrementing call site on the write path).
+///
+/// Items the caller already classified keep their real outcome: `succeeded`
+/// and `idempotent` tick `Outcome::Ok` / `Outcome::Idempotent`, and each
+/// entry in `errors` (validation/redirect failures collected so far) is
+/// classified through [`classify_wire_error_code`]. Every remaining item in
+/// the batch — the one that hit the storage error plus any item not yet
+/// processed — is counted as failed with [`crate::metrics::Outcome::ErrStorage`].
+///
+/// Returns the total failed count (`errors.len()` + the storage-failed
+/// remainder) so the caller can bump its op-specific `*_failed` scalar(s)
+/// by the same amount before returning the error response.
+fn tally_storage_abort(
+    m: &crate::metrics::ThreadMetrics,
+    op: crate::metrics::OpCode,
+    total_items: u64,
+    succeeded: u64,
+    idempotent: u64,
+    errors: &[BatchItemError],
+) -> u64 {
+    use crate::metrics::Outcome;
+    let classified = succeeded + idempotent + errors.len() as u64;
+    let storage_failed = total_items.saturating_sub(classified);
+    m.operations.inc_by(op, Outcome::Ok, succeeded);
+    m.operations.inc_by(op, Outcome::Idempotent, idempotent);
+    for e in errors {
+        m.operations.inc(op, classify_wire_error_code(e.error_code));
+    }
+    m.operations.inc_by(op, Outcome::ErrStorage, storage_failed);
+    errors.len() as u64 + storage_failed
 }
 
 // ---------------------------------------------------------------------------
@@ -8052,11 +8260,21 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Test harness with redo log support for crash-recovery testing.
+    ///
+    /// Like [`DispatchTestHarness`], holds `metrics_test_lock` for its
+    /// lifetime: dispatch requests issued through this harness mutate the
+    /// process-wide `DISPATCH_METRICS` singleton, and without the guard
+    /// they race the metrics-delta tests (e.g.
+    /// `prometheus_emits_operations_total_with_labels`, which compares a
+    /// rendered snapshot against live counters). Tests using this harness
+    /// must NOT take `metrics_test_lock()` themselves (stdlib `Mutex` is
+    /// not re-entrant; doing so deadlocks on the same thread).
     struct RedoDispatchHarness {
         engine: Engine,
         redo_log: Arc<Mutex<crate::redo::RedoLog>>,
         data_dev: Arc<MemoryDevice>,
         redo_dev: Arc<MemoryDevice>,
+        _metrics_guard: std::sync::MutexGuard<'static, ()>,
     }
 
     struct CountingSyncDevice {
@@ -8194,6 +8412,7 @@ mod tests {
                 redo_log: Arc::new(Mutex::new(redo_log)),
                 data_dev,
                 redo_dev,
+                _metrics_guard: metrics_test_lock(),
             }
         }
 
@@ -8223,6 +8442,7 @@ mod tests {
                 redo_log,
                 data_dev,
                 redo_dev,
+                _metrics_guard: metrics_test_lock(),
             }
         }
 
@@ -8323,6 +8543,9 @@ mod tests {
                 redo_log: Arc::new(Mutex::new(redo_log)),
                 data_dev,
                 redo_dev,
+                // Safe to reacquire: `drop(self)` above released the
+                // original harness's guard.
+                _metrics_guard: metrics_test_lock(),
             }
         }
     }
@@ -11577,6 +11800,301 @@ mod tests {
             "deletes_succeeded += 1 (A deleted)"
         );
         assert_eq!(after_fail - before_fail, 1, "deletes_failed += 1 (missing)");
+    }
+
+    // -----------------------------------------------------------------------
+    // M-01: batch-wide storage errors (early `ERR_STORAGE_IO` returns) must
+    // still classify every attempted item, so `attempted == succeeded +
+    // idempotent + failed` holds and `Outcome::ErrStorage` ticks on the
+    // write path.
+    // -----------------------------------------------------------------------
+
+    /// Append filler redo entries until the log reports `LogFull`, so the
+    /// next handler-side `write_replicated_redo_ops` call fails and the
+    /// handler takes its batch-wide `ERR_STORAGE_IO` early return.
+    fn fill_redo_log(h: &RedoDispatchHarness) {
+        for i in 0..2048u64 {
+            let r = write_redo_ops(
+                Some(&h.redo_log),
+                &[RedoOp::Delete {
+                    tx_key: TxKey { txid: [0xFE; 32] },
+                    record_offset: i * 4096,
+                    record_size: 4096,
+                }],
+            );
+            if r.is_err() {
+                return;
+            }
+        }
+        panic!("redo log did not fill within 2048 filler appends");
+    }
+
+    /// M-01 (apply path): a mid-batch `validated.apply()` failure — here a
+    /// DAH overflow from `current_block_height + retention > u32::MAX` —
+    /// returns batch-wide `ERR_STORAGE_IO`. The early return must still
+    /// tick `spends_failed` and `operations{spend,err_storage}` so the
+    /// `attempted == succeeded + idempotent + failed` invariant holds.
+    #[test]
+    fn handle_spend_batch_apply_storage_error_ticks_err_storage() {
+        use crate::metrics::{OpCode, Outcome};
+        let m = test_metrics();
+        let _ = test_histograms();
+
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(190);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            // u32::MAX + 1 overflows the DAH computation inside apply().
+            current_block_height: u32::MAX,
+            block_height_retention: 1,
+        };
+        let item = WireSpendItem {
+            txid,
+            vout: 0,
+            utxo_hash: [0u8; 32],
+            spending_data: [0xD1; 36],
+        };
+
+        let before = snapshot_spend(m);
+        let before_scalar_failed = m.spends_failed.get();
+        let before_err_storage = m.operations.get(OpCode::Spend, Outcome::ErrStorage);
+        let resp = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &[item]));
+        let after = snapshot_spend(m);
+
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, _msg) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_STORAGE_IO);
+
+        assert_eq!(after.0 - before.0, 1, "items_attempted += 1");
+        assert_eq!(after.1 - before.1, 0, "no item succeeded");
+        assert_eq!(after.2 - before.2, 0, "no item idempotent");
+        assert_eq!(after.3 - before.3, 1, "items_failed += 1 (storage error)");
+        assert_eq!(
+            m.spends_failed.get() - before_scalar_failed,
+            1,
+            "spends_failed += 1 (storage error)"
+        );
+        assert_eq!(
+            m.operations.get(OpCode::Spend, Outcome::ErrStorage) - before_err_storage,
+            1,
+            "operations{{spend,err_storage}} += 1"
+        );
+        assert_eq!(
+            after.0 - before.0,
+            (after.1 - before.1) + (after.2 - before.2) + (after.3 - before.3),
+            "attempted == succeeded + idempotent + failed must hold on the early return"
+        );
+    }
+
+    /// M-01 (WAL path): a redo-log append failure during spend takes the
+    /// batch-wide `ERR_STORAGE_IO` early return BEFORE the terminal tally.
+    /// The metrics must still classify every attempted item.
+    #[test]
+    fn handle_spend_batch_redo_log_full_ticks_err_storage() {
+        use crate::metrics::{OpCode, Outcome};
+        let m = test_metrics();
+        let _ = test_histograms();
+
+        let h = RedoDispatchHarness::new_with_redo_size(64 * 1024);
+        let txid = DispatchTestHarness::make_txid(191);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+        fill_redo_log(&h);
+
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let item = WireSpendItem {
+            txid,
+            vout: 0,
+            utxo_hash: [0u8; 32],
+            spending_data: [0xD2; 36],
+        };
+
+        let before = snapshot_spend(m);
+        let before_err_storage = m.operations.get(OpCode::Spend, Outcome::ErrStorage);
+        let resp = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &[item]));
+        let after = snapshot_spend(m);
+
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, msg) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_STORAGE_IO);
+        assert!(
+            msg.contains("redo log append failed"),
+            "expected redo append failure, got: {msg}"
+        );
+
+        assert_eq!(after.0 - before.0, 1, "items_attempted += 1");
+        assert_eq!(after.3 - before.3, 1, "items_failed += 1 (redo full)");
+        assert_eq!(
+            m.operations.get(OpCode::Spend, Outcome::ErrStorage) - before_err_storage,
+            1,
+            "operations{{spend,err_storage}} += 1"
+        );
+        assert_eq!(
+            after.0 - before.0,
+            (after.1 - before.1) + (after.2 - before.2) + (after.3 - before.3),
+            "attempted == succeeded + idempotent + failed must hold on the early return"
+        );
+    }
+
+    /// M-01 (WAL path, set_mined): a redo-log append failure during
+    /// set_mined must tick `set_mined_items_failed` and
+    /// `operations{set_mined,err_storage}` for every item in the batch.
+    #[test]
+    fn handle_set_mined_batch_redo_log_full_ticks_err_storage() {
+        use crate::metrics::{OpCode, Outcome};
+        let m = test_metrics();
+        let _ = test_histograms();
+
+        let h = RedoDispatchHarness::new_with_redo_size(64 * 1024);
+        let txid_a = DispatchTestHarness::make_txid(192);
+        let txid_b = DispatchTestHarness::make_txid(193);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+        fill_redo_log(&h);
+
+        let params = SetMinedBatchParams {
+            block_id: 7,
+            block_height: 100,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let before_att = m.set_mined_items_attempted.get();
+        let before_succ = m.set_mined_items_succeeded.get();
+        let before_fail = m.set_mined_items_failed.get();
+        let before_err_storage = m.operations.get(OpCode::SetMined, Outcome::ErrStorage);
+
+        let payload = encode_set_mined_batch(&params, &[txid_a, txid_b]);
+        let resp = h.request(OP_SET_MINED_BATCH, payload);
+
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, _msg) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_STORAGE_IO);
+
+        let att = m.set_mined_items_attempted.get() - before_att;
+        let succ = m.set_mined_items_succeeded.get() - before_succ;
+        let fail = m.set_mined_items_failed.get() - before_fail;
+        assert_eq!(att, 2, "set_mined_items_attempted += 2");
+        assert_eq!(succ, 0, "no item succeeded");
+        assert_eq!(fail, 2, "set_mined_items_failed += 2 (redo full)");
+        assert_eq!(att, succ + fail, "attempted == succeeded + failed");
+        assert_eq!(
+            m.operations.get(OpCode::SetMined, Outcome::ErrStorage) - before_err_storage,
+            2,
+            "operations{{set_mined,err_storage}} += 2"
+        );
+    }
+
+    /// M-01 (create): both batch-wide `ERR_STORAGE_IO` early returns in
+    /// handle_create_batch — the CreateV2 redo-append failure and the
+    /// allocator `allocate_batch` failure — must tick `creates_failed`
+    /// and `operations{create,err_storage}`.
+    #[test]
+    fn handle_create_batch_redo_log_full_ticks_err_storage() {
+        use crate::metrics::{OpCode, Outcome};
+        let m = test_metrics();
+        let _ = test_histograms();
+
+        // 8 KiB region = header block + one entries block; the allocator
+        // append+flush consumes the entire entries region, so the CreateV2
+        // append fails (see `create_batch_redo_write_failure_surfaces_...`).
+        let h = RedoDispatchHarness::new_with_exact_redo_log_size(8192);
+
+        let before_att = m.creates_attempted.get();
+        let before_succ = m.creates_succeeded.get();
+        let before_fail = m.creates_failed.get();
+        let before_err_storage = m.operations.get(OpCode::Create, Outcome::ErrStorage);
+
+        // First create: allocator reservation WAL succeeds (fills the log),
+        // CreateV2 WAL append fails → redo-failure early return.
+        let resp = h.create_tx(DispatchTestHarness::make_txid(194), 1);
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, _msg) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_STORAGE_IO);
+
+        assert_eq!(m.creates_attempted.get() - before_att, 1);
+        assert_eq!(m.creates_succeeded.get() - before_succ, 0);
+        assert_eq!(
+            m.creates_failed.get() - before_fail,
+            1,
+            "creates_failed += 1 (CreateV2 redo append failed)"
+        );
+        assert_eq!(
+            m.operations.get(OpCode::Create, Outcome::ErrStorage) - before_err_storage,
+            1,
+            "operations{{create,err_storage}} += 1"
+        );
+
+        // Second create: the allocator's own redo append now fails inside
+        // `allocate_batch` → the other early return.
+        let before_att2 = m.creates_attempted.get();
+        let before_fail2 = m.creates_failed.get();
+        let before_err_storage2 = m.operations.get(OpCode::Create, Outcome::ErrStorage);
+        let resp2 = h.create_tx(DispatchTestHarness::make_txid(195), 1);
+        assert_eq!(resp2.status, STATUS_ERROR);
+        let (code2, _msg2) = decode_error_payload(&resp2.payload).unwrap();
+        assert_eq!(code2, ERR_STORAGE_IO);
+        assert_eq!(m.creates_attempted.get() - before_att2, 1);
+        assert_eq!(
+            m.creates_failed.get() - before_fail2,
+            1,
+            "creates_failed += 1 (allocate_batch failed)"
+        );
+        assert_eq!(
+            m.operations.get(OpCode::Create, Outcome::ErrStorage) - before_err_storage2,
+            1,
+            "operations{{create,err_storage}} += 1 on allocate_batch failure"
+        );
+    }
+
+    /// M-01 (WAL path, freeze): freeze's `*_attempted` scalar is per batch,
+    /// but the per-item `freezes_failed` and the labeled operations table
+    /// must still classify every item when the redo append fails.
+    #[test]
+    fn handle_freeze_batch_redo_log_full_ticks_err_storage() {
+        use crate::metrics::{OpCode, Outcome};
+        let m = test_metrics();
+        let _ = test_histograms();
+
+        let h = RedoDispatchHarness::new_with_redo_size(64 * 1024);
+        let txid = DispatchTestHarness::make_txid(196);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+        fill_redo_log(&h);
+
+        let items = vec![WireSlotItem {
+            txid,
+            vout: 0,
+            utxo_hash: [0u8; 32],
+        }];
+        let before_fail = m.freezes_failed.get();
+        let before_succ = m.freezes_succeeded.get();
+        let before_err_storage = m.operations.get(OpCode::Freeze, Outcome::ErrStorage);
+
+        let resp = h.request(OP_FREEZE_BATCH, encode_slot_item_batch(&items));
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, _msg) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_STORAGE_IO);
+
+        assert_eq!(m.freezes_succeeded.get() - before_succ, 0);
+        assert_eq!(
+            m.freezes_failed.get() - before_fail,
+            1,
+            "freezes_failed += 1 (redo full)"
+        );
+        assert_eq!(
+            m.operations.get(OpCode::Freeze, Outcome::ErrStorage) - before_err_storage,
+            1,
+            "operations{{freeze,err_storage}} += 1"
+        );
     }
 
     /// Dispatch must record an end-to-end latency sample into
