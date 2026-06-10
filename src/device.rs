@@ -92,6 +92,14 @@ pub enum DeviceError {
         "write stalled at offset {offset}: 0 bytes written with {remaining} bytes still pending"
     )]
     WriteStalled { offset: u64, remaining: usize },
+
+    /// The kernel-reported geometry of a raw block device is unusable:
+    /// a total size of zero bytes, a zero block count/size, or a
+    /// `block_count * block_size` product that overflows `u64`.
+    /// Trusting such a value would let the allocator hand out offsets
+    /// past the real end of the device or refuse the whole device.
+    #[error("invalid block device geometry: {detail}")]
+    InvalidBlockDeviceGeometry { detail: String },
 }
 
 /// Minimum supported I/O alignment for block-device-backed storage.
@@ -111,6 +119,97 @@ pub const MIN_ALIGNMENT: usize = 512;
 fn validate_alignment(alignment: usize) -> Result<()> {
     if alignment < MIN_ALIGNMENT || !alignment.is_power_of_two() {
         return Err(DeviceError::InvalidAlignment { alignment });
+    }
+    Ok(())
+}
+
+/// Validate a kernel-reported block-device size in bytes (Linux
+/// `BLKGETSIZE64` passthrough).
+///
+/// Pure helper extracted from the `DirectDevice::open` block-device
+/// branch (J-03) so the size arithmetic the bounds checks trust is
+/// unit-testable without root/loop-device access.
+///
+/// # Errors
+///
+/// Returns [`DeviceError::InvalidBlockDeviceGeometry`] if the kernel
+/// reported a size of `0` bytes — a zero-size device is never usable
+/// and almost certainly indicates a wrong ioctl or a mis-detected
+/// device node.
+#[cfg(any(target_os = "linux", test))]
+fn validate_block_device_size(dev_size: u64) -> Result<u64> {
+    if dev_size == 0 {
+        return Err(DeviceError::InvalidBlockDeviceGeometry {
+            detail: "kernel reported a device size of 0 bytes".to_string(),
+        });
+    }
+    Ok(dev_size)
+}
+
+/// Compute the total byte size of a block device from its macOS
+/// geometry (`DKIOCGETBLOCKCOUNT` x `DKIOCGETBLOCKSIZE`).
+///
+/// Pure helper extracted from the `DirectDevice::open` block-device
+/// branch (J-03) so the size arithmetic the bounds checks trust is
+/// unit-testable without a real block device.
+///
+/// # Errors
+///
+/// Returns [`DeviceError::InvalidBlockDeviceGeometry`] if
+/// `block_count * block_size` overflows `u64`, or if the product is
+/// `0` (zero block count or zero block size).
+#[cfg(any(target_os = "macos", test))]
+fn block_device_size_from_geometry(block_count: u64, block_size: u32) -> Result<u64> {
+    let total = block_count
+        .checked_mul(u64::from(block_size))
+        .ok_or_else(|| DeviceError::InvalidBlockDeviceGeometry {
+            detail: format!(
+                "block count {block_count} x block size {block_size} overflows u64"
+            ),
+        })?;
+    if total == 0 {
+        return Err(DeviceError::InvalidBlockDeviceGeometry {
+            detail: format!(
+                "block count {block_count} x block size {block_size} is 0 bytes"
+            ),
+        });
+    }
+    Ok(total)
+}
+
+/// Shared J-01 alignment validation for [`MemoryDevice`] and
+/// [`DirectDevice`]: `offset`, `len`, and the buffer's memory address
+/// must all be multiples of `alignment`.
+///
+/// The buffer-address rule mirrors the Linux `O_DIRECT` contract,
+/// which requires the user buffer to be block-aligned and otherwise
+/// fails with an opaque `EINVAL`. Returns
+/// [`DeviceError::AlignmentViolation`] with a `detail` string naming
+/// which of the three constraints was violated.
+#[inline]
+fn check_alignment_impl(
+    offset: u64,
+    buf_ptr: *const u8,
+    len: usize,
+    alignment: usize,
+) -> Result<()> {
+    if !(offset as usize).is_multiple_of(alignment) {
+        return Err(DeviceError::AlignmentViolation {
+            detail: format!("offset {offset} not aligned to {alignment}"),
+        });
+    }
+    if !len.is_multiple_of(alignment) {
+        return Err(DeviceError::AlignmentViolation {
+            detail: format!("buffer length {len} not aligned to {alignment}"),
+        });
+    }
+    // A zero-length transfer touches no memory, so the address is
+    // irrelevant — and empty buffers (e.g. `AlignedBuf::new(0, _)`)
+    // legitimately carry a dangling, unaligned sentinel pointer.
+    if len > 0 && !(buf_ptr as usize).is_multiple_of(alignment) {
+        return Err(DeviceError::AlignmentViolation {
+            detail: format!("buffer address {buf_ptr:p} not aligned to {alignment}"),
+        });
     }
     Ok(())
 }
@@ -138,12 +237,20 @@ pub type Result<T> = std::result::Result<T, DeviceError>;
 pub trait BlockDevice: Send + Sync {
     /// Read `buf.len()` bytes starting at `offset`.
     ///
-    /// Both `offset` and `buf.len()` must be multiples of [`alignment()`](Self::alignment).
+    /// `offset`, `buf.len()`, AND the buffer's memory address
+    /// (`buf.as_ptr()`) must all be multiples of
+    /// [`alignment()`](Self::alignment). The address requirement comes
+    /// from Linux `O_DIRECT`, which rejects non-block-aligned user
+    /// buffers with `EINVAL`; allocate buffers via [`AlignedBuf`].
     fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize>;
 
     /// Write `buf` starting at `offset`.
     ///
-    /// Both `offset` and `buf.len()` must be multiples of [`alignment()`](Self::alignment).
+    /// `offset`, `buf.len()`, AND the buffer's memory address
+    /// (`buf.as_ptr()`) must all be multiples of
+    /// [`alignment()`](Self::alignment). The address requirement comes
+    /// from Linux `O_DIRECT`, which rejects non-block-aligned user
+    /// buffers with `EINVAL`; allocate buffers via [`AlignedBuf`].
     fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize>;
 
     /// Minimum I/O alignment for this device (512 or 4096 bytes).
@@ -188,6 +295,8 @@ pub trait BlockDevice: Send + Sync {
     ///
     /// - [`DeviceError::ShortRead`] — the underlying `pread` returned `0`
     ///   bytes (EOF) before the requested range had been fully transferred.
+    /// - [`DeviceError::OutOfBounds`] — a per-iteration continuation
+    ///   offset (`offset + bytes_already_read`) would overflow `u64`.
     /// - Any error returned by the underlying [`pread`](Self::pread)
     ///   (alignment violations, out-of-bounds, libc errors, etc.) is
     ///   propagated unchanged.
@@ -202,9 +311,18 @@ pub trait BlockDevice: Send + Sync {
         let total = buf.len();
         let mut done = 0usize;
         while done < total {
+            // J-02: checked continuation offset, consistent with the
+            // module-wide checked_add hardening (F-G1-007).
+            let cur = offset
+                .checked_add(done as u64)
+                .ok_or(DeviceError::OutOfBounds {
+                    offset,
+                    len: total as u64,
+                    device_size: self.size(),
+                })?;
             // Safety on slicing: `done < total` and `total == buf.len()` so
             // the slice is non-empty and in-bounds.
-            let n = self.pread(&mut buf[done..], offset + done as u64)?;
+            let n = self.pread(&mut buf[done..], cur)?;
             if n == 0 {
                 return Err(DeviceError::ShortRead {
                     expected: total,
@@ -236,13 +354,24 @@ pub trait BlockDevice: Send + Sync {
     /// - [`DeviceError::WriteStalled`] — the underlying `pwrite` returned
     ///   `0` bytes with bytes still pending; recovery is unsafe because
     ///   the write may already be partially applied (torn).
+    /// - [`DeviceError::OutOfBounds`] — a per-iteration continuation
+    ///   offset (`offset + bytes_already_written`) would overflow `u64`.
     /// - Any error returned by the underlying [`pwrite`](Self::pwrite) is
     ///   propagated unchanged.
     fn pwrite_all_at(&self, buf: &[u8], offset: u64) -> Result<()> {
         let total = buf.len();
         let mut done = 0usize;
         while done < total {
-            let n = self.pwrite(&buf[done..], offset + done as u64)?;
+            // J-02: checked continuation offset, consistent with the
+            // module-wide checked_add hardening (F-G1-007).
+            let cur = offset
+                .checked_add(done as u64)
+                .ok_or(DeviceError::OutOfBounds {
+                    offset,
+                    len: total as u64,
+                    device_size: self.size(),
+                })?;
+            let n = self.pwrite(&buf[done..], cur)?;
             if n == 0 {
                 return Err(DeviceError::WriteStalled {
                     offset,
@@ -451,24 +580,22 @@ impl Drop for MemoryDevice {
 }
 
 impl MemoryDevice {
-    fn check_alignment(&self, offset: u64, len: usize) -> Result<()> {
-        if !(offset as usize).is_multiple_of(self.alignment) {
-            return Err(DeviceError::AlignmentViolation {
-                detail: format!("offset {offset} not aligned to {}", self.alignment),
-            });
-        }
-        if !len.is_multiple_of(self.alignment) {
-            return Err(DeviceError::AlignmentViolation {
-                detail: format!("buffer length {len} not aligned to {}", self.alignment),
-            });
-        }
-        Ok(())
+    /// Validate the J-01 triple alignment contract (offset, length,
+    /// buffer address) against `self.alignment`.
+    ///
+    /// MemoryDevice has no O_DIRECT requirement of its own, but it
+    /// deliberately enforces the same buffer-address rule as
+    /// [`DirectDevice`] so the CI suite (which runs almost entirely
+    /// against MemoryDevice) catches callers that would `EINVAL` on a
+    /// real O_DIRECT NVMe device.
+    fn check_alignment(&self, offset: u64, buf_ptr: *const u8, len: usize) -> Result<()> {
+        check_alignment_impl(offset, buf_ptr, len, self.alignment)
     }
 }
 
 impl BlockDevice for MemoryDevice {
     fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
-        self.check_alignment(offset, buf.len())?;
+        self.check_alignment(offset, buf.as_ptr(), buf.len())?;
         let off = offset as usize;
         // F-G1-007: use checked addition so an offset near `usize::MAX` plus
         // a non-trivial buffer length cannot wrap to a small number and
@@ -509,7 +636,7 @@ impl BlockDevice for MemoryDevice {
     }
 
     fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize> {
-        self.check_alignment(offset, buf.len())?;
+        self.check_alignment(offset, buf.as_ptr(), buf.len())?;
         let off = offset as usize;
         // F-G1-007: see pread above — checked_add protects against the
         // off + buf.len() wrap case.
@@ -659,6 +786,9 @@ impl DirectDevice {
     /// cannot be queried, or pre-allocation fails.
     /// Returns [`DeviceError::InvalidAlignment`] if `alignment` is not a
     /// power-of-two or is below [`MIN_ALIGNMENT`] (512).
+    /// Returns [`DeviceError::InvalidBlockDeviceGeometry`] if the kernel
+    /// reports a zero-byte block device or a block count x block size
+    /// product that overflows `u64`.
     pub fn open(path: &std::path::Path, size: u64, alignment: usize) -> Result<Self> {
         validate_alignment(alignment)?;
         use std::fs::OpenOptions;
@@ -711,7 +841,7 @@ impl DirectDevice {
                 if rc != 0 {
                     return Err(DeviceError::Io(std::io::Error::last_os_error()));
                 }
-                dev_size
+                validate_block_device_size(dev_size)?
             }
             #[cfg(target_os = "macos")]
             {
@@ -731,7 +861,7 @@ impl DirectDevice {
                 if rc != 0 {
                     return Err(DeviceError::Io(std::io::Error::last_os_error()));
                 }
-                block_count * u64::from(block_size)
+                block_device_size_from_geometry(block_count, block_size)?
             }
             #[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
             {
@@ -769,24 +899,20 @@ impl DirectDevice {
         })
     }
 
-    fn check_alignment(&self, offset: u64, len: usize) -> Result<()> {
-        if !(offset as usize).is_multiple_of(self.alignment) {
-            return Err(DeviceError::AlignmentViolation {
-                detail: format!("offset {offset} not aligned to {}", self.alignment),
-            });
-        }
-        if !len.is_multiple_of(self.alignment) {
-            return Err(DeviceError::AlignmentViolation {
-                detail: format!("buffer length {len} not aligned to {}", self.alignment),
-            });
-        }
-        Ok(())
+    /// Validate the J-01 triple alignment contract (offset, length,
+    /// buffer address) against `self.alignment`. The buffer-address
+    /// check is mandatory here: Linux `O_DIRECT` (set at open time)
+    /// rejects non-block-aligned user buffers with an opaque `EINVAL`,
+    /// so we surface a typed [`DeviceError::AlignmentViolation`]
+    /// before any syscall instead.
+    fn check_alignment(&self, offset: u64, buf_ptr: *const u8, len: usize) -> Result<()> {
+        check_alignment_impl(offset, buf_ptr, len, self.alignment)
     }
 }
 
 impl BlockDevice for DirectDevice {
     fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
-        self.check_alignment(offset, buf.len())?;
+        self.check_alignment(offset, buf.as_ptr(), buf.len())?;
         // F-G1-007: checked_add against u64::MAX so a near-MAX offset plus
         // a non-trivial buffer length cannot wrap to a small number and
         // bypass the bounds check.
@@ -833,16 +959,19 @@ impl BlockDevice for DirectDevice {
         }
         #[cfg(not(unix))]
         {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut file = &self.file;
-            file.seek(SeekFrom::Start(offset))?;
-            file.read_exact(buf)?;
-            Ok(buf.len())
+            // J-05: no supported non-unix target exists. A seek+read
+            // fallback here would be non-atomic (shared file cursor
+            // races between threads) and would mis-type short reads as
+            // `UnexpectedEof` instead of the typed `ShortRead`. Fail
+            // the build instead so a future port has to implement
+            // positional I/O with proper error mapping. Same pattern
+            // as the server accept loop (src/server/mod.rs).
+            compile_error!("DirectDevice requires a unix target (positional pread/pwrite)");
         }
     }
 
     fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize> {
-        self.check_alignment(offset, buf.len())?;
+        self.check_alignment(offset, buf.as_ptr(), buf.len())?;
         // F-G1-007: checked_add — see DirectDevice::pread for rationale.
         let end = offset
             .checked_add(buf.len() as u64)
@@ -882,11 +1011,9 @@ impl BlockDevice for DirectDevice {
         }
         #[cfg(not(unix))]
         {
-            use std::io::{Seek, SeekFrom, Write};
-            let mut file = &self.file;
-            file.seek(SeekFrom::Start(offset))?;
-            file.write_all(buf)?;
-            Ok(buf.len())
+            // J-05: see the matching branch in `pread` — a seek+write
+            // fallback would be non-atomic and mis-type short writes.
+            compile_error!("DirectDevice requires a unix target (positional pread/pwrite)");
         }
     }
 
@@ -1618,6 +1745,264 @@ mod tests {
         match dev.pread_exact_at(&mut buf, 1) {
             Err(DeviceError::AlignmentViolation { .. }) => {}
             other => panic!("expected AlignmentViolation, got {other:?}"),
+        }
+    }
+
+    // -- J-01: buffer ADDRESS alignment (O_DIRECT requirement) --
+
+    #[test]
+    fn direct_device_rejects_misaligned_buffer_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("addr_align.dat");
+        let dev = DirectDevice::open(&path, 65536, 4096).unwrap();
+
+        // Slice an aligned allocation at +1: the length stays 4096
+        // (aligned) and offset 0 is aligned, so ONLY the buffer's
+        // memory address violates the O_DIRECT contract.
+        let mut backing = AlignedBuf::new(8192, 4096);
+        match dev.pread(&mut backing[1..4097], 0) {
+            Err(DeviceError::AlignmentViolation { detail }) => {
+                assert!(
+                    detail.contains("buffer address"),
+                    "detail must identify the buffer address as the violation: {detail}"
+                );
+            }
+            other => panic!("expected AlignmentViolation, got {other:?}"),
+        }
+        match dev.pwrite(&backing[1..4097], 0) {
+            Err(DeviceError::AlignmentViolation { detail }) => {
+                assert!(
+                    detail.contains("buffer address"),
+                    "detail must identify the buffer address as the violation: {detail}"
+                );
+            }
+            other => panic!("expected AlignmentViolation, got {other:?}"),
+        }
+
+        // The same allocation used from its aligned start still works.
+        backing[0] = 0x5A;
+        dev.pwrite(&backing[..4096], 0).unwrap();
+        let mut read_buf = AlignedBuf::new(4096, 4096);
+        dev.pread_exact_at(&mut read_buf, 0).unwrap();
+        assert_eq!(&backing[..4096], &*read_buf);
+    }
+
+    #[test]
+    fn memory_device_rejects_misaligned_buffer_address() {
+        // MemoryDevice enforces the same buffer-address rule as
+        // DirectDevice so CI (which runs against MemoryDevice) catches
+        // callers that would EINVAL on a real O_DIRECT NVMe device.
+        let dev = MemoryDevice::new(65536, 4096).unwrap();
+        let mut backing = AlignedBuf::new(8192, 4096);
+        match dev.pread(&mut backing[1..4097], 0) {
+            Err(DeviceError::AlignmentViolation { detail }) => {
+                assert!(
+                    detail.contains("buffer address"),
+                    "detail must identify the buffer address as the violation: {detail}"
+                );
+            }
+            other => panic!("expected AlignmentViolation, got {other:?}"),
+        }
+        match dev.pwrite(&backing[1..4097], 0) {
+            Err(DeviceError::AlignmentViolation { detail }) => {
+                assert!(
+                    detail.contains("buffer address"),
+                    "detail must identify the buffer address as the violation: {detail}"
+                );
+            }
+            other => panic!("expected AlignmentViolation, got {other:?}"),
+        }
+
+        // The aligned start of the same allocation still round-trips.
+        backing[0] = 0xC3;
+        dev.pwrite(&backing[..4096], 0).unwrap();
+        let mut read_buf = AlignedBuf::new(4096, 4096);
+        dev.pread_exact_at(&mut read_buf, 0).unwrap();
+        assert_eq!(&backing[..4096], &*read_buf);
+    }
+
+    #[test]
+    fn zero_length_buffer_is_exempt_from_address_check() {
+        // `AlignedBuf::new(0, _)` carries a dangling sentinel pointer
+        // (address 0x1); a zero-length transfer touches no memory so
+        // the buffer-address rule must not reject it.
+        let mem = MemoryDevice::new(8192, 4096).unwrap();
+        let mut empty = AlignedBuf::new(0, 4096);
+        assert_eq!(mem.pread(&mut empty, 0).unwrap(), 0);
+        assert_eq!(mem.pwrite(&empty, 0).unwrap(), 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty_io.dat");
+        let dev = DirectDevice::open(&path, 8192, 4096).unwrap();
+        assert_eq!(dev.pread(&mut empty, 0).unwrap(), 0);
+        assert_eq!(dev.pwrite(&empty, 0).unwrap(), 0);
+    }
+
+    // -- J-02: exact-loop helpers must use checked per-iteration offsets --
+
+    /// Device that ignores `offset` entirely and always transfers
+    /// `chunk` bytes. This lets the exact-loop helpers run with a
+    /// starting offset near `u64::MAX` without the inner
+    /// `pread`/`pwrite` bounds check rejecting the request first, so
+    /// the helpers' own per-iteration offset arithmetic is what gets
+    /// exercised.
+    struct OffsetBlindDevice {
+        chunk: usize,
+    }
+
+    impl BlockDevice for OffsetBlindDevice {
+        fn pread(&self, buf: &mut [u8], _offset: u64) -> Result<usize> {
+            let take = self.chunk.min(buf.len());
+            for b in &mut buf[..take] {
+                *b = 0xEE;
+            }
+            Ok(take)
+        }
+
+        fn pwrite(&self, buf: &[u8], _offset: u64) -> Result<usize> {
+            Ok(self.chunk.min(buf.len()))
+        }
+
+        fn alignment(&self) -> usize {
+            1
+        }
+
+        fn size(&self) -> u64 {
+            u64::MAX
+        }
+
+        fn sync(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pread_exact_at_rejects_offset_overflow_mid_loop() {
+        // First inner pread at u64::MAX - 3 succeeds (4 bytes), then
+        // the helper must compute (u64::MAX - 3) + 4 for the second
+        // iteration — which overflows u64 and must surface as a typed
+        // OutOfBounds, never a wrap (release) or panic (debug).
+        let dev = OffsetBlindDevice { chunk: 4 };
+        let mut buf = [0u8; 8];
+        let start = u64::MAX - 3;
+        match dev.pread_exact_at(&mut buf, start) {
+            Err(DeviceError::OutOfBounds {
+                offset,
+                len,
+                device_size,
+            }) => {
+                assert_eq!(offset, start, "offset must reflect the original request");
+                assert_eq!(len, 8, "len must reflect the total request length");
+                assert_eq!(device_size, u64::MAX);
+            }
+            other => panic!("expected OutOfBounds, got {other:?}"),
+        }
+    }
+
+    // -- J-03: block-device size-query arithmetic (pure helpers) --
+    //
+    // The ioctl syscalls themselves still require a real block device
+    // (root-only loop device / RAM disk) and are NOT covered here;
+    // these tests pin the arithmetic and validation the `is_block`
+    // branch of `DirectDevice::open` performs on the ioctl results.
+
+    #[test]
+    fn validate_block_device_size_passes_through_nonzero() {
+        assert_eq!(validate_block_device_size(512).unwrap(), 512);
+        assert_eq!(
+            validate_block_device_size(3_840_755_982_336).unwrap(),
+            3_840_755_982_336,
+            "BLKGETSIZE64 result must pass through unchanged"
+        );
+        assert_eq!(validate_block_device_size(u64::MAX).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn validate_block_device_size_rejects_zero() {
+        match validate_block_device_size(0) {
+            Err(DeviceError::InvalidBlockDeviceGeometry { detail }) => {
+                assert!(
+                    detail.contains("0 bytes"),
+                    "detail must name the zero size: {detail}"
+                );
+            }
+            other => panic!("expected InvalidBlockDeviceGeometry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_device_size_from_geometry_multiplies() {
+        // 7_501_476_528 sectors x 512 bytes = a real 3.84 TB NVMe.
+        assert_eq!(
+            block_device_size_from_geometry(7_501_476_528, 512).unwrap(),
+            3_840_755_982_336
+        );
+        assert_eq!(
+            block_device_size_from_geometry(1, 4096).unwrap(),
+            4096,
+            "single-block device must compute exactly one block"
+        );
+    }
+
+    #[test]
+    fn block_device_size_from_geometry_rejects_overflow() {
+        match block_device_size_from_geometry(u64::MAX, 2) {
+            Err(DeviceError::InvalidBlockDeviceGeometry { detail }) => {
+                assert!(
+                    detail.contains("overflows"),
+                    "detail must name the overflow: {detail}"
+                );
+            }
+            other => panic!("expected InvalidBlockDeviceGeometry, got {other:?}"),
+        }
+        // Boundary: (2^32) x (2^32 - 1) = 2^64 - 2^32 still fits in
+        // u64 and must NOT be rejected.
+        assert_eq!(
+            block_device_size_from_geometry(1 << 32, u32::MAX).unwrap(),
+            (1u64 << 32) * u64::from(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn block_device_size_from_geometry_rejects_zero_count_and_zero_size() {
+        match block_device_size_from_geometry(0, 512) {
+            Err(DeviceError::InvalidBlockDeviceGeometry { detail }) => {
+                assert!(
+                    detail.contains("is 0 bytes"),
+                    "detail must name the zero product: {detail}"
+                );
+            }
+            other => panic!("expected InvalidBlockDeviceGeometry, got {other:?}"),
+        }
+        match block_device_size_from_geometry(1_000_000, 0) {
+            Err(DeviceError::InvalidBlockDeviceGeometry { detail }) => {
+                assert!(
+                    detail.contains("is 0 bytes"),
+                    "detail must name the zero product: {detail}"
+                );
+            }
+            other => panic!("expected InvalidBlockDeviceGeometry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pwrite_all_at_rejects_offset_overflow_mid_loop() {
+        // Same shape as the pread case: the second iteration's offset
+        // computation overflows and must surface as typed OutOfBounds.
+        let dev = OffsetBlindDevice { chunk: 4 };
+        let buf = [0xABu8; 8];
+        let start = u64::MAX - 3;
+        match dev.pwrite_all_at(&buf, start) {
+            Err(DeviceError::OutOfBounds {
+                offset,
+                len,
+                device_size,
+            }) => {
+                assert_eq!(offset, start, "offset must reflect the original request");
+                assert_eq!(len, 8, "len must reflect the total request length");
+                assert_eq!(device_size, u64::MAX);
+            }
+            other => panic!("expected OutOfBounds, got {other:?}"),
         }
     }
 }

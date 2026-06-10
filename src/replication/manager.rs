@@ -1959,7 +1959,7 @@ mod tests {
         let err = mgr.replicate_batch(&ops).expect_err("must fail");
         let after = metrics.replica_worker_panics_total.get();
         assert!(
-            after >= before + 1,
+            after > before,
             "replica_worker_panics_total must bump (was {before}, now {after})",
         );
         let msg = err.to_string();
@@ -2020,7 +2020,7 @@ mod tests {
         mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 1 };
         mgr.next_sequence = 4;
 
-        let _ = mgr
+        mgr
             .run_catchup(|from_seq| {
                 (from_seq..4)
                     .map(|i| ReplicaOp::Freeze {
