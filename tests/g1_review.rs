@@ -31,7 +31,7 @@ fn memory_device_pread_rejects_offset_buf_overflow() {
     let mut buf = AlignedBuf::new(4096, 4096);
     // Largest aligned offset is `u64::MAX & !4095` — the alignment
     // check passes, so the bounds-check path is the one we exercise.
-    let near_max = !4095u64;
+    let near_max = !4095u64; // == u64::MAX & !4095: largest 4096-aligned offset
     match dev.pread(&mut buf, near_max) {
         Err(DeviceError::OutOfBounds { offset, .. }) => {
             assert_eq!(offset, near_max);
@@ -167,7 +167,7 @@ fn memory_device_size_matches_underlying_storage() {
 fn memory_device_pwrite_rejects_offset_buf_overflow() {
     let dev = MemoryDevice::new(8192, 4096).unwrap();
     let buf = AlignedBuf::new(4096, 4096);
-    let near_max = !4095u64;
+    let near_max = !4095u64; // == u64::MAX & !4095: largest 4096-aligned offset
     match dev.pwrite(&buf, near_max) {
         Err(DeviceError::OutOfBounds { offset, .. }) => {
             assert_eq!(offset, near_max);

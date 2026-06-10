@@ -583,7 +583,9 @@ fn corrupt_trailing_entries_bytes(
     );
     let corrupt_off = entries_off + preserve_bytes;
     let corrupt_len = (entries_len - preserve_bytes) as usize;
-    let zeros = vec![0u8; corrupt_len];
+    // J-01: the device enforces buffer-ADDRESS alignment (O_DIRECT
+    // contract), so a plain Vec is not acceptable here.
+    let zeros = teraslab::device::AlignedBuf::new(corrupt_len, dev.alignment());
     dev.pwrite_all_at(&zeros, corrupt_off)
         .expect("zeroing trailing entries bytes must succeed");
 }
