@@ -77,6 +77,8 @@ fn encode_frame(op_code: u16, payload_len: usize) -> Vec<u8> {
 /// allocation of `payload_len` bytes for the legacy path, so the delta
 /// is much larger than 20%.
 #[test]
+// Test diagnostic eprintln below — tracing is not initialized in this test.
+#[allow(clippy::disallowed_macros)]
 fn decode_bytes_allocates_strictly_less_than_decode() {
     const ITERATIONS: usize = 1000;
     const PAYLOAD_SIZE: usize = 4096; // representative batch payload
