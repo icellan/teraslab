@@ -565,10 +565,7 @@ impl ReplicationManager {
             let tx = tx.clone();
             let batch_arc = batch_arc.clone();
             let handle = std::thread::Builder::new()
-                .name(format!(
-                    "replica-{idx}-batch-{}",
-                    batch_arc.first_sequence
-                ))
+                .name(format!("replica-{idx}-batch-{}", batch_arc.first_sequence))
                 .spawn(move || {
                     let mut transport = transport_box;
                     if let Some(m) = metrics {
@@ -629,13 +626,12 @@ impl ReplicationManager {
             }
             let remaining = live_count - acks_received;
             if successes + remaining < target_successes {
-                break Err(first_error
-                    .as_ref()
-                    .map(clone_replication_error)
-                    .unwrap_or(ReplicationError::InsufficientReplicas {
+                break Err(first_error.as_ref().map(clone_replication_error).unwrap_or(
+                    ReplicationError::InsufficientReplicas {
                         available: successes,
                         required: target_successes,
-                    }));
+                    },
+                ));
             }
             let now = Instant::now();
             let wait = deadline.saturating_duration_since(now);
@@ -659,8 +655,7 @@ impl ReplicationManager {
                             // permanently mark the sender "caught up"
                             // and suppress catch-up on legitimate
                             // future divergence.
-                            let through_sequence =
-                                through_sequence.min(self.next_sequence);
+                            let through_sequence = through_sequence.min(self.next_sequence);
                             // Apply ACK immediately so subsequent
                             // batches (and metrics) see the latest
                             // last_acked even when this is the last
@@ -676,10 +671,8 @@ impl ReplicationManager {
                                 m.record_failure(idx);
                             }
                             if first_error.is_none() {
-                                first_error = Some(ReplicationError::ReplicaError {
-                                    sequence,
-                                    message,
-                                });
+                                first_error =
+                                    Some(ReplicationError::ReplicaError { sequence, message });
                             }
                         }
                         BatchOutcome::TransportErr(e) => {
@@ -737,8 +730,7 @@ impl ReplicationManager {
         let force_join = result.is_err();
         let mut result = result;
         for idx in 0..self.pending_stragglers.len() {
-            let finished = self
-                .pending_stragglers[idx]
+            let finished = self.pending_stragglers[idx]
                 .as_ref()
                 .is_some_and(|h| h.is_finished());
             if !finished && !force_join {
@@ -754,16 +746,11 @@ impl ReplicationManager {
                         BatchOutcome::Ok { through_sequence } => {
                             // Same buggy/malicious replica clamp as the
                             // foreground ack path above.
-                            let through_sequence =
-                                through_sequence.min(self.next_sequence);
+                            let through_sequence = through_sequence.min(self.next_sequence);
                             if through_sequence > self.senders[idx].last_acked {
                                 self.senders[idx].last_acked = through_sequence;
                                 if let Some(m) = metrics {
-                                    m.record_ack(
-                                        idx,
-                                        through_sequence,
-                                        straggler.batch_bytes,
-                                    );
+                                    m.record_ack(idx, through_sequence, straggler.batch_bytes);
                                 }
                             }
                         }
@@ -799,9 +786,8 @@ impl ReplicationManager {
                     // Prefer the panic-message error over the generic
                     // InsufficientReplicas one — the panic detail is
                     // the actionable diagnostic for the operator.
-                    let panic_err = ReplicationError::Transport(format!(
-                        "replica worker panicked: {detail}"
-                    ));
+                    let panic_err =
+                        ReplicationError::Transport(format!("replica worker panicked: {detail}"));
                     result = match result {
                         Ok(()) => Ok(()),
                         Err(prev @ ReplicationError::InsufficientReplicas { .. })
@@ -843,16 +829,13 @@ impl ReplicationManager {
         // master write path on every subsequent batch (the very
         // latency win C-10 / F-G7-018 introduced). Mark the sender
         // Down and defer the handle to a future drain.
-        let join_deadline =
-            std::time::Instant::now() + (self.config.replication_timeout * 2);
+        let join_deadline = std::time::Instant::now() + (self.config.replication_timeout * 2);
         for idx in 0..self.pending_stragglers.len() {
             // Wait for the worker to finish OR for the deadline. The
             // wait MUST be bounded: an unbounded `JoinHandle::join`
             // here is the bug — see C-10 follow-up.
-            let finished = wait_for_finish_until(
-                self.pending_stragglers[idx].as_ref(),
-                join_deadline,
-            );
+            let finished =
+                wait_for_finish_until(self.pending_stragglers[idx].as_ref(), join_deadline);
             if !finished {
                 if let Some(m) = replication_metrics() {
                     m.replica_worker_panics_total.inc();
@@ -917,8 +900,7 @@ impl ReplicationManager {
                 BatchOutcome::Ok { through_sequence } => {
                     // Buggy/malicious replica clamp — see foreground ack
                     // path.
-                    let through_sequence =
-                        through_sequence.min(self.next_sequence);
+                    let through_sequence = through_sequence.min(self.next_sequence);
                     if through_sequence > self.senders[idx].last_acked {
                         self.senders[idx].last_acked = through_sequence;
                         if let Some(m) = metrics {
@@ -1959,7 +1941,7 @@ mod tests {
         let err = mgr.replicate_batch(&ops).expect_err("must fail");
         let after = metrics.replica_worker_panics_total.get();
         assert!(
-            after >= before + 1,
+            after > before,
             "replica_worker_panics_total must bump (was {before}, now {after})",
         );
         let msg = err.to_string();
@@ -2020,17 +2002,16 @@ mod tests {
         mgr.senders[0].state = ReplicaState::CatchingUp { from_sequence: 1 };
         mgr.next_sequence = 4;
 
-        let _ = mgr
-            .run_catchup(|from_seq| {
-                (from_seq..4)
-                    .map(|i| ReplicaOp::Freeze {
-                        tx_key: key(i as u8),
-                        offset: 0,
-                        master_generation: 0,
-                    })
-                    .collect()
-            })
-            .expect("run_catchup must not error when the replica is ahead");
+        mgr.run_catchup(|from_seq| {
+            (from_seq..4)
+                .map(|i| ReplicaOp::Freeze {
+                    tx_key: key(i as u8),
+                    offset: 0,
+                    master_generation: 0,
+                })
+                .collect()
+        })
+        .expect("run_catchup must not error when the replica is ahead");
 
         // With the F-G7-011 fix the sender stays catching-up or becomes
         // Live (never Down). Without the fix the strict-equality check

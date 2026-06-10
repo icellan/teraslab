@@ -129,8 +129,8 @@ unsafe fn atomic_load_into(src: *const u8, dst: &mut [u8]) {
     while i + 8 <= n {
         // Safety: src.add(i) is 8-byte aligned, within range, and
         // AtomicU64::from_ptr accepts any 8-byte aligned pointer.
-        let v = unsafe { AtomicU64::from_ptr(src.add(i).cast_mut().cast()) }
-            .load(Ordering::Relaxed);
+        let v =
+            unsafe { AtomicU64::from_ptr(src.add(i).cast_mut().cast()) }.load(Ordering::Relaxed);
         dst[i..i + 8].copy_from_slice(&v.to_ne_bytes());
         i += 8;
     }
@@ -194,8 +194,7 @@ unsafe fn atomic_store_u64_rmw(dst: *mut u8, src: &[u8]) {
         let chunk_off = overlap_start - chunk_start;
         let src_off = overlap_start - dst_addr;
         let span = overlap_end - overlap_start;
-        chunk_bytes[chunk_off..chunk_off + span]
-            .copy_from_slice(&src[src_off..src_off + span]);
+        chunk_bytes[chunk_off..chunk_off + span].copy_from_slice(&src[src_off..src_off + span]);
         atomic.store(u64::from_ne_bytes(chunk_bytes), Ordering::Relaxed);
         chunk_addr += 8;
     }
@@ -549,8 +548,7 @@ impl Drop for FooterPendingCrc<'_> {
 /// `/metrics` via the registry; `None` when no registry is installed
 /// (tests, embedded harnesses).
 fn footer_crc_drop_counter() -> Option<&'static std::sync::atomic::AtomicU64> {
-    static COUNTER: std::sync::OnceLock<std::sync::atomic::AtomicU64> =
-        std::sync::OnceLock::new();
+    static COUNTER: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
     Some(COUNTER.get_or_init(|| std::sync::atomic::AtomicU64::new(0)))
 }
 
@@ -1583,7 +1581,7 @@ mod tests {
 
         let after = footer_crc_drop_count();
         assert!(
-            after >= before + 1,
+            after > before,
             "unstamped FooterPendingCrc drop must increment the release-build \
              observability counter (before={before}, after={after})",
         );
@@ -1618,9 +1616,8 @@ mod tests {
         new_meta.flags = crate::record::TxFlags::LOCKED;
 
         // SAFETY: same as `footer_pending_crc_panics_when_dropped_unstamped`.
-        let token = unsafe {
-            write_mutation_footer_pending_crc(base_ptr_addr as *mut u8, 0, &new_meta)
-        };
+        let token =
+            unsafe { write_mutation_footer_pending_crc(base_ptr_addr as *mut u8, 0, &new_meta) };
         token.stamp_crc(&new_meta);
 
         let read_back = read_metadata(&*dev, 0).unwrap();
@@ -1660,8 +1657,7 @@ mod tests {
         unsafe { write_mutation_footer_and_crc_direct(ptr_a as *mut u8, 0, &updated) };
 
         // Path B: typestate split.
-        let token =
-            unsafe { write_mutation_footer_pending_crc(ptr_b as *mut u8, 0, &updated) };
+        let token = unsafe { write_mutation_footer_pending_crc(ptr_b as *mut u8, 0, &updated) };
         token.stamp_crc(&updated);
 
         let read_a = read_metadata(&*dev_a, 0).unwrap();
@@ -1696,11 +1692,7 @@ mod tests {
         run_footer_helpers_stress(2_000, 5_000, 3);
     }
 
-    fn run_footer_helpers_stress(
-        writer_iters: usize,
-        reader_iters: u64,
-        reader_count: usize,
-    ) {
+    fn run_footer_helpers_stress(writer_iters: usize, reader_iters: u64, reader_count: usize) {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 

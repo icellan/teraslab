@@ -395,10 +395,7 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
             const REQ_ID_PEEK: usize = 8;
             let head_to_read = REQ_ID_PEEK.min(frame_len);
             let mut head_buf = [0u8; REQ_ID_PEEK];
-            if stream
-                .read_exact(&mut head_buf[..head_to_read])
-                .is_err()
-            {
+            if stream.read_exact(&mut head_buf[..head_to_read]).is_err() {
                 return;
             }
             request_id = if head_to_read >= 8 {
@@ -4135,7 +4132,7 @@ mod tests {
 
         let after = metrics.replica_apply_skipped_missing_tx.get();
         assert!(
-            after >= before + 1,
+            after > before,
             "spend on missing TX must bump replica_apply_skipped_missing_tx \
              (was {before}, now {after})",
         );
