@@ -3036,7 +3036,7 @@ mod tests {
         // Global gauge: delta-only — neighbours may also be active.
         let active_after_start = metrics.migration_active.load(Ordering::Relaxed);
         assert!(
-            active_after_start >= active_before + 1,
+            active_after_start > active_before,
             "migration_active gauge must advance by ≥ 1 after start_outbound \
              (before={active_before}, after={active_after_start})",
         );
