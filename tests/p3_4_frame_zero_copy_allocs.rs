@@ -109,11 +109,14 @@ fn decode_bytes_allocates_strictly_less_than_decode() {
         }
     });
 
-    eprintln!(
-        "P3.4 decode allocations (ITERATIONS={ITERATIONS}, PAYLOAD_SIZE={PAYLOAD_SIZE}): \
-         baseline count={baseline_count} bytes={baseline_bytes}; \
-         zero_copy count={zero_copy_count} bytes={zero_copy_bytes}"
-    );
+    #[allow(clippy::disallowed_macros)] // test-harness diagnostic output, no tracing subscriber
+    {
+        eprintln!(
+            "P3.4 decode allocations (ITERATIONS={ITERATIONS}, PAYLOAD_SIZE={PAYLOAD_SIZE}): \
+             baseline count={baseline_count} bytes={baseline_bytes}; \
+             zero_copy count={zero_copy_count} bytes={zero_copy_bytes}"
+        );
+    }
 
     // The legacy path must allocate at least once per decode for the
     // payload Bytes::copy_from_slice; the zero-copy path performs no

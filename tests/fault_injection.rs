@@ -422,10 +422,24 @@ fn kill_before_secondary_redb_commit_reconciles_via_redo() {
         RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap(),
     ));
 
-    // Primary with an authoritative unmined_since=500 entry.
+    // Primary with an authoritative unmined_since=500 entry, backed by a
+    // real on-device record: `recover_all` finishes by reconciling the
+    // secondary indexes from on-device metadata
+    // (`reconcile_secondary_indexes_from_metadata` reads every index
+    // entry's metadata and fails recovery if a read fails), so the data
+    // device must actually contain the record the index points at.
+    let data_dev = MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap();
     let mut primary = PrimaryBackend::new_in_memory(100).unwrap();
     let key = make_key(3);
-    primary.register(key, make_entry(4096, 500, 0)).unwrap();
+    let record_offset = 4096u64;
+    let mut meta = teraslab::record::TxMetadata::new(1);
+    meta.tx_id = key.txid;
+    meta.unmined_since = 500;
+    let slot = teraslab::record::UtxoSlot::new_unspent([0x33u8; 32]);
+    teraslab::io::write_full_record(&data_dev, record_offset, &meta, &[slot]).unwrap();
+    primary
+        .register(key, make_entry(record_offset, 500, 0))
+        .unwrap();
 
     // Arm the panic at BeforeSecondaryRedbCommit, then call insert on
     // the on-disk unmined backend. The redo flush completes, the
@@ -463,9 +477,6 @@ fn kill_before_secondary_redb_commit_reconciles_via_redo() {
     let mut unmined_backend =
         UnminedBackend::OnDisk(RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap());
 
-    // Throwaway data device — the SecondaryUnminedUpdate replay doesn't
-    // touch it.
-    let data_dev = MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap();
     let stats = teraslab::recovery::recover_all(
         &data_dev,
         &redo_reopened,

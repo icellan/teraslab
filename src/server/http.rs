@@ -3682,6 +3682,26 @@ mod tests {
         );
     }
 
+    /// M-02: the server boots with `ready = false` and flips it to `true`
+    /// only after recovery + engine attach complete (`src/bin/server.rs`).
+    /// This test pins the lifecycle the flag is meant to defend: not-ready
+    /// until the post-recovery `store(true, Release)`, ready afterwards.
+    /// Pre-fix the flag was constructed `true`, so an HTTP server started
+    /// before recovery would have reported ready (the F-G6-001 bug).
+    #[test]
+    fn health_ready_flips_only_after_recovery_completes() {
+        let state = build_ready_test_state(false, None);
+        assert_eq!(
+            compute_health_ready(&state),
+            ReadyState::NotReady("not ready (recovery in progress)"),
+            "boot-time default must be not-ready until recovery completes",
+        );
+        // The exact store the binary performs once recovery + engine
+        // attach are done.
+        state.ready.store(true, Ordering::Release);
+        assert_eq!(compute_health_ready(&state), ReadyState::Ready);
+    }
+
     /// R-055 regression: in clustered mode, before the node has
     /// observed a committed topology, `/health/ready` must return
     /// SERVICE_UNAVAILABLE so a load balancer does not route traffic
