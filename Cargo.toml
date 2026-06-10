@@ -117,6 +117,10 @@ nix = { version = "0.31", default-features = false, features = ["ioctl"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 filetime = "0.2"
 prometheus-parse = "0.2"
+# Property-based UTXO-conservation tests (tests/property_utxo.rs, N-03 /
+# LMNH-16). Default-features-off keeps the fork-based runner out of the
+# build; the in-process runner is sufficient and faster for CI.
+proptest = { version = "1", default-features = false, features = ["std"] }
 tempfile = "3"
 
 [[bench]]

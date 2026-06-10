@@ -17,6 +17,8 @@
 //! criterion "Hot opcodes bench shows ≥20% fewer allocations vs baseline"
 //! without requiring `dhat` / criterion-perf integration.
 
+#![allow(clippy::disallowed_macros)] // integration tests may eprintln! diagnostics
+
 use bytes::Bytes;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
