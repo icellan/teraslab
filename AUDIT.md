@@ -1,276 +1,314 @@
-# TeraSlab Bulletproofing Audit
+# TeraSlab Security & Correctness Audit — Master Report
 
-> **Status: SUPERSEDED 2026-05-17.** This audit predates the May 2026
-> review campaign. For the authoritative state see `REVIEW_REPORT.md`
-> and `_review/` (in particular `_review/ROADMAP_TO_100.md` and
-> `_review/follow_ups.md`). Kept only as a historical artifact.
+**Subject:** TeraSlab — purpose-built UTXO store backend for BSV Teranode
+**Scope:** Full money-safety audit across 15 categories (A–O): UTXO correctness, crash recovery/durability, concurrency, replication, clustering/quorum, sharding/migration, index backends, wire protocol, storage tiers/blobs, I/O layer, pruning, DoS/resource limits, observability, test infrastructure, Bitcoin/Teranode consensus behavior.
+**Date:** 2026-05-29
+**Commit:** `1e5659b`
+**Method:** Per-category auditors produced line-anchored write-ups; an adversarial verifier issued a verdict (confirmed / refuted / not-verified) on every non-empty finding and adjusted severities. This report keeps confirmed and uncertain findings, down-ranks/drops refuted ones, and uses corrected severities.
 
-**Scope:** Every claim in `README.md`, `docs/`, and `phases/` cross-checked against the code under `src/` and the test suite under `tests/`. Goal: *would I stake real money on this UTXO store under adversarial production load?*
+> **E-01 RESOLVED post-synthesis (orchestrator, 2026-05-29).** The synthesis run could not read `dispatch.rs:2489` and the activation gate together, so E-01 was left "refuted-but-open." The orchestrator then read all three pieces directly and **closed the question: E-01 is refuted-confirmed, not a live CRITICAL.** Evidence: (1) `check_quorum` (`dispatch.rs:2474-2494`) runs as before-middleware on *every* mutation opcode (`dispatch.rs:388-389`, `is_mutation_opcode`), independent of the topology-activation path; (2) it computes `quorum_needed=(peak/2)+1` from `peak_cluster_size()` and returns `ERR_NO_QUORUM` when `alive < quorum_needed`; (3) `peak_size` is written **only via `fetch_max`** (`coordinator.rs:738`) so it is monotonic non-decreasing — a partitioned remnant cannot lower its own peak; (4) `alive_node_count()` counts self (`coordinator.rs:6375-6411`, R-039/EF-02 fix) so an isolated node reports `alive=1`. A partitioned 1-of-3 remnant therefore has `peak=3`, `quorum_needed=2`, `alive=1 < 2` → every mutation is rejected. The `topology.rs:911` `(members.len()/2)+1` activation divisor is real but cannot translate into accepted writes. **The defense-in-depth fix (derive activation quorum from persisted peak) and the partition regression test in §E/Milestone 1 are still worth doing**, but this is no longer an open verification question.
 
-**Date:** 2026-05-06
-**Branch:** `main` (commit `832bd7c` plus uncommitted edits)
-**Audited by:** Claude (six parallel agents over `src/`, `tests/`, `docs/`, `phases/`, plus direct reads)
-
-This audit is independent of the existing internal `docs/TERANODE_PRODUCTION_READINESS_GAPS.md` (2026-05-03). Where this audit confirms or strengthens an existing gap, it is noted; where it finds *new* problems, that is called out. Findings are technical; severity is justified by user-visible failure mode (lost UTXO, accepted double-spend, silent corruption, brick-the-master).
+> **Tooling caveat (unchanged).** The synthesis session's tool channel intermittently suppressed some file reads; a few LOW findings below are marked "not-verified" because the dedicated verifier could not independently re-touch each one. Line numbers were anchored against current HEAD where readable.
 
 ---
 
-## Build / test baseline
+## 1. Build / Test / Clippy Baseline (recon ground truth)
 
-| Probe | Result |
+| Check | Result |
 |---|---|
-| `cargo build --release` | **clean** |
-| `cargo clippy --all -- -D warnings` | **clean** |
-| `cargo test --all` | **3 failed**, 1480 passed, **1 ignored**, 0 measured |
-| Source LOC | 98,234 lines across 70 `*.rs` files |
+| `cargo build --release` | **CLEAN** — 27.78s, exit 0, zero warnings |
+| `cargo clippy --all -- -D warnings` | **CLEAN** — exit 0, zero warnings |
+| `cargo test --all` (isolated, `--no-fail-fast`) | **ALL PASS** — 2200+ passed, 0 failed, 0 ignored |
+| `#[ignore]` tests | **NONE** (only hit is a documenting comment at `dispatch.rs:7314`) |
+| Both index backends (Memory / Redb / FileBacked) exercised by default test run | **YES** (`tests/integration.rs:435,483`) |
+| Source LOC | 114,474 (`src/**/*.rs`); 23,715 (`tests/`) |
+| Default index backend | in-memory (`src/config.rs:374`, asserted `config.rs:1346`) |
 
-### Failing tests (live in main)
-1. ~~`index::tests::rebuild_fails_on_corrupted_magic_in_allocated_region`~~ — **RESOLVED** (F-G3-009). The current code in `src/index/mod.rs:1387-1525` and the sibling test in `src/index/backend.rs:989-1034` use the `corrupt_magic_and_restamp_crc` helper (`mod.rs:854`, `backend.rs:640`) which zeroes the magic and restamps the CRC over the post-edit header. `TxMetadata::from_bytes` now accepts the CRC and the magic check is the gate that fires. Each "rebuild_fails_on_corrupted_magic_…" test pairs with a sibling "…_on_crc_mismatch_in_allocated_region" test exercising the other path.
-2. ~~`index::tests::rebuild_secondary_fails_on_corrupted_allocated_record`~~ — **RESOLVED** (F-G3-009), same fix.
-3. ~~`index::backend::tests::rebuild_redb_fails_on_corrupted_magic_in_allocated_region`~~ — **RESOLVED** (F-G3-009), same fix.
+**One real CI defect:** `tracing_integration::spend_multi_emits_debug_level_child_spans` (`tests/tracing_integration.rs:278`) is **FLAKY** — ~1/5 failure rate under parallel execution due to a process-wide `set_global_default` tracing-subscriber race; passes deterministically with `--test-threads=1`. Not a money-safety bug, but it makes CI non-deterministic and can mask real regressions in the tracing path. Fix with a `serial_test` guard or a per-test local subscriber.
 
-### Ignored test
-`src/cluster/coordinator.rs:7505` — `#[ignore] // TODO: rewrite for pipelined migration flow`. Per the project's CLAUDE.md absolute rules, every `#[ignore]` is a finding unless its justification is documented; the inline comment is too thin (no rewrite tracker, no link, no expected schedule).
-
-### Hazards inventory (repo-wide, non-test paths)
-- `todo!()` / `unimplemented!()` / `unreachable!()` in production code: **0** (compliance win)
-- `panic!` in production paths: 1 — `src/server/dispatch.rs:7301` is inside a `#[test]` body (false positive); `src/cluster/shards.rs:1256` has a defensive `panic!` (intentional); the rest are inside `match` arms of `#[test]` fns
-- `tokio::spawn` fire-and-forget candidates: 1 (`src/server/http.rs:1510`, but joined via `handles.push`)
-- `tokio::task::spawn_blocking` for replication fan-out: 1 (`src/server/dispatch.rs:1289`)
-- `unsafe` blocks: ~80, all in `src/device.rs` (raw I/O, ioctl), `src/io.rs` (mmap targeted writes), `src/record.rs` (repr-packed copy), `src/config.rs` (test-only env wrappers). Each `unsafe` in `src/io.rs` carries a `# Safety` line; the contract it states ("caller holds the per-tx stripe lock") is **violated by every hot read path** — see BC-02.
+Deliberate ERROR/WARN JSON in the test log (`replica replication worker panicked: synthetic ... oxidized`, `redo log full`, `create batch rollback failed`, `failed to persist topology state`) is fault-injection output from **passing** tests, not failures.
 
 ---
 
-## Executive summary — ten most dangerous gaps
+## 2. Executive Summary — Most Dangerous Gaps, Ranked
 
-These are ranked by blast radius. All have file:line references in the per-category sections and the per-category audit files under `audit/raw/`.
+There is **no confirmed live CRITICAL** money-loss bug at HEAD. The sole CRITICAL filed (E-01 split-brain) was marked **refuted** by adversarial verification on the basis that write quorum is peak-derived — but I directly confirmed the *activation* path divides by the live shrunken set, so the refutation hinges on a write-path gate I could not fully re-trace this session (#1 below). The remaining real exposure is dominated by **test/coverage gaps on money-critical paths** and a few **hardening / public-API** gaps. Ranked by residual money-safety risk:
 
-1. **`Engine::spend` silently swallows on-disk write errors at five sites and returns `Ok` to the client.** Pattern: `if let Err(e) = self.write_slot_fast(...) { tracing::warn!(...); }` then proceed to mutate metadata, return `Ok(SpendResponse {...})`. Sites: `src/ops/engine.rs:1013, 1042, 1066, 2920, 2948` (single-spend, idempotent-respend, and `ValidatedSpend::apply` for batch). On NVMe EIO / mmap fault / partial sector / device-full, the engine reports a successful spend while the slot on disk remains UNSPENT. A different transaction can then **double-spend the same UTXO**. No test exercises a write-failure injection at these sites. (A-01 — CRITICAL, new finding.)
-2. **`Unspend` does not validate `spending_data` — wire format omits it entirely.** `UnspendRequest` (`src/ops/unspend.rs:9-22`) has no `spending_data` field. `WireSlotItem` (`src/protocol/codec.rs:407-411`) is `(txid, vout, utxo_hash)` — 68 bytes, no spending_data. `Engine::unspend` (`:1085-1181`) only checks the frozen sentinel; otherwise it overwrites the slot with `UtxoSlot::new_unspent`. **Anyone with public on-chain data `(txid, vout, utxo_hash)` can erase any spend they did not author.** Inverse-of-spend invariant is violated. (A-04 — CRITICAL, new finding.)
-3. **`spend_multi` increments `meta.spent_utxos` by validation-time count even when slot writes silently failed.** `ValidatedSpend::apply` (`src/ops/engine.rs:2899-2950`) sets `metadata.spent_utxos = wrapping_add(spent_count)` unconditionally; per-slot writes drop errors per A-01. Result: counter says N spent, fewer than N slots actually have status SPENT on disk. DAH evaluation depends on `spent_utxos == utxo_count` → record can be flagged "all spent" when it isn't, causing **premature pruning** of UTXOs still spendable. Replication ships metadata that disagrees with the slot bytes. (A-03 — CRITICAL, new finding.)
-4. **No production redo-log checkpointing — log fills and bricks the master.** `RedoLog::checkpoint()` / `advance_checkpoint()` / `reset()` have **zero callers outside `mod tests`** (`src/redo.rs:1185, 1238, 1258`). Default `redo_log_size = 64 MiB`; ~85 bytes per `Spend` redo entry → log fills in ~750k mutations (sub-second at the 10M ops/sec target). After fill, every mutation returns `ERR_INTERNAL` until process restart. (BC-01, gap #3 — confirmed.)
-5. **Inter-node TCP frames are unauthenticated.** `cluster::auth::sign`/`verify` is wired only into SWIM UDP (`src/cluster/swim.rs:434, 845, 881`). `OP_TOPOLOGY_PROPOSE/VOTE/COMMIT`, `OP_REPLICA_BATCH`, `OP_MIGRATION_COMPLETE`, and `OP_MIGRATION_BATCH_COMPLETE` are sent and received as plain `RequestFrame`. Anyone reachable on the binary protocol port can forge a topology commit, replicate fake ops, or lift a migration fence. (EF-01, D-20, gap #1 — confirmed.)
-6. **Hot read paths violate the documented stripe-lock safety contract — data-race UB on every concurrent read.** `Engine::lookup` (`src/ops/engine.rs:673`), `read_metadata` (`:2784`), `read_slot` (`:2807`), `lookup_cached` descend into `unsafe { io::read_metadata_direct(..) }` without taking the per-tx stripe lock that `src/io.rs:206` requires. CRC catches the visible torn read but the contract is broken; `cargo miri` would flag it. (BC-02 — new finding.)
-7. **Concurrent `unspend`/`set_mined`/`freeze`/`reassign`/`set_locked`/`set_conflicting`/`preserve_until`/`delete` batches compute redo `new_spent_count` (and friends) OUTSIDE the per-tx stripe lock.** `src/server/dispatch.rs:2620-2640` reads `pre_spent` without locking; two concurrent unspends race the counter and persist redo entries that are wrong by the time they replay. After a crash, `recovery::replay_unspend` (`src/recovery.rs:586`) overwrites `meta.spent_utxos` with the stale snapshot count. (BC-04 — new finding; the dispatch comment at `:2561` *acknowledges* the pattern but assumes idempotency that is not satisfied for counter-bearing entries.)
-8. **`alive_node_count` excludes self, causing false `NO_QUORUM` rejections in healthy clusters.** `src/cluster/coordinator.rs:5860` counts `node_addrs` members; `node_addrs` never contains self in production (`src/cluster/swim.rs:454` returns before peer registration). In a 3-node cluster losing 1 peer, the function returns 1 instead of 2 → the surviving 2-node majority is rejected as `NO_QUORUM`. The unit test only passes because it manually inserts self into the test's slice. (EF-02 — new finding.)
-9. **`reassign` does not enforce `LOCKED`, `CONFLICTING`, or coinbase maturity flags.** Per spec, every spend path including via `reassign` must check these flags. `Engine::reassign` (`src/ops/engine.rs`) only validates the FROZEN_UNTIL cooldown. A reassign through a locked/conflicting transaction therefore bypasses the protections that `Spend` honors. (A-09 — new finding.)
-10. **Replication intent is started AFTER local apply, and the replica silently drops `write_metadata` errors during apply.** Two intersecting bugs: (a) `src/server/dispatch.rs:1250` calls `begin_replication_intent` inside `replicate_all_ops`, after the engine has already applied — crash between local apply and intent fsync leaves a local-only mutation with no pending-replication marker (D-19, gap #5). (b) `src/replication/receiver.rs:684, 1127` use `let _ = io::write_metadata(...)` during replica apply — replica ACKs to the master while local state silently diverges from what was acknowledged (LMNH-31). The combination means an apparent "replicated" mutation can be on neither the master's pending list nor the replica's disk.
+1. **(OPEN) E-01 split-brain — refuted, but verify before trusting.** `topology.rs:911` activates a NEW topology with `quorum_needed = (members.len()/2)+1` over the SWIM-shrunken alive set; a partitioned 1-of-3 remnant computes `quorum_needed=1` and self-commits a single-node topology (`coordinator.rs:1386-1405`). The verifier refuted this because the write path gates on `(peak/2)+1 → ERR_NO_QUORUM` (`dispatch.rs:2489`). **If that write-path gate does not also apply to a node that has self-activated as master of all shards, this is a live CRITICAL double-spend-on-heal.** Confirm `dispatch.rs:2489` blocks a self-activated minority. (`src/cluster/topology.rs:911,1011-1023`, `coordinator.rs:1386-1405`)
+2. **Replication apply path is tested for only 6 of 12 mutations** — `unspend, unfreeze, reassign, set_conflicting, preserve_until, delete` never traverse the `ReplicaOp` apply path in any test; a divergent/non-idempotent replica apply for those (especially **delete**, which carries the new `ERR_DELETED_CHILDREN` parent-respend guard) would go undetected. (audit/coverage-matrix.md)
+3. **Crash-mid-op redo replay is named only for CreateV2/Spend/Freeze** — `set_mined` and `mark_longest_chain` mutate the DAH/unmined secondary indexes that *gate pruning*, and have **no** redo crash-boundary/idempotency test; a non-idempotent replay there could resurrect or vanish a UTXO. (audit/coverage-matrix.md; `recovery.rs:1652,990-1004`)
+4. **The headline "crash injection" simulation never runs the real recovery path** (N-01, MEDIUM, **confirmed**) — `tests/simulation/mod.rs:178` `recover()` builds a fresh empty engine and re-creates records from its own in-memory model, so its zero-data-loss assertion compares the model to an engine rebuilt *from that model*; a genuine redo-replay/torn-record regression cannot be observed. (`tests/simulation/mod.rs:178,277,311`, `tests/e2e_workload.rs:234,719,741`)
+5. **`StorageManager::write_cold_data` has no bound against the allocated record extent** (I-02, MEDIUM, uncertain) — a second/larger inline cold-data write would silently overrun the neighbouring record (cross-record corruption); the production create-path does not trigger it today, so it is a latent public-API hardening gap. (`src/storage/manager.rs:169-209,412-437`)
+6. **`OP_HEARTBEAT`(250) and `OP_REPLICA_ACK`(241) are excluded from inter-node HMAC auth** (E-02, MEDIUM, uncertain) — forgeable on the TCP path; lets a secret-less peer perturb liveness/membership and corrupt replica-durability accounting. (`src/protocol/opcodes.rs:488-503`, `src/server/mod.rs:732,809-819`)
+7. **No fuzz target for the wire parser** (N-04, MEDIUM, uncertain) — the untrusted network boundary, including the variable-length create-batch decode, is exercised only by crafted unit tests; a panic/over-alloc reachable from one malformed frame is a remote DoS. (`src/protocol/codec.rs`, `frame.rs`)
+8. **No property-based UTXO-conservation tests** (N-03, MEDIUM, uncertain) — no proptest/quickcheck dep; the strongest checker is a fixed-op-mix hand-driven model with no shrinking. (`Cargo.toml:116`, `tests/workload/verifier.rs:449`)
+9. **Raw block-device size-query branch (`is_block==true`) has zero test coverage** (J-03, MEDIUM, uncertain) — all tests open regular files, so the kernel `ioctl` capacity math every on-device bounds check trusts is never exercised; a wrong value on a real `/dev/nvme0n1` means lost capacity or OOB record writes. (`src/device.rs:695-742,800,854`)
+10. **O_DIRECT buffer-address alignment is never checked** (J-01, MEDIUM, uncertain) — only offset and length are validated; a non-block-aligned buffer first fails as opaque `EINVAL` on real NVMe, untested because CI uses `MemoryDevice`/macOS-emulated O_DIRECT. (`src/device.rs:772-784,816-823,870-872`)
 
-The eleventh through twentieth findings are also CRITICAL or HIGH and are not buried — see the full per-category lists below. In particular:
-- **A-06** — `recovery::replay_spend` and `replay_unspend` (`src/recovery.rs:520-592`) drop metadata write errors with `let _ =` and never recompute generation, `LAST_SPENT_ALL`, or DAH. Post-recovery state is structurally inconsistent with a non-crashed run; replicas resyncing from generation watermark will not see the replayed change. (HIGH, new.)
-- **A-08** — `freeze`/`unfreeze` (`src/ops/engine.rs:2161, 2202`) don't bump `meta.generation`, don't write metadata back, and don't sync the index cache. Subsequent fast-path ops read stale `tx_flags` and miscompute DAH. (HIGH, new.)
-- **A-12** — `preserve_until` writes to disk but never calls `sync_index_cache`. Cached `tx_flags` does not get the `HAS_PRESERVE_UNTIL` bit; `set_mined`/`set_conflicting`/`set_locked` consult the cache, conclude `has_preserve = false`, and **bypass preserve_until protection on the fast path**. (HIGH, new.)
-- **A-07 / A-10** — `Pruned` slots lose their preserved spending_data on the wire (engine returns `Pruned { offset }`, dispatch maps to `ERR_INVALID_SPEND` with empty payload). `FROZEN_UNTIL` similarly returns `vec![]` instead of the 4-byte `spendable_at_height`. README's "error data: 4-byte required height" claim is therefore wrong on the wire for `FROZEN_UNTIL`. (HIGH/MEDIUM, new.)
-- **A-05** — `pre_allocate_create` + `create_at_offset` leak device space on `DuplicateTxId` race; neither dispatch nor engine calls `allocator.free(record_offset, base_size + cold_len)` on this branch. (HIGH, new.)
-- **REDIRECT has no hop count, TTL, or loop counter.** `RouteDecision::RedirectTo` carries `shard_table_version` internally but never serializes it. (EF-09 — new finding.)
-- **`device_io::IoUringBackend` and `device_io::SyncFallback` are dead code.** README's "io_uring fast path" is currently false. (IJK-04 — new finding.)
-- **`OP_MIGRATION_COMPLETE` is unauthenticated and zero-record completions skip manifest verification.** (`src/server/dispatch.rs:567-571, 628-634`.) Combined with EF-01, an attacker can declare any shard migration complete and silently lose data. (EF-12 — new finding.)
-- **`MarkLongestChainBatch` emits no `ReplicaOp`.** Reorg-driven DAH/unmined-index updates never reach replicas. Compensation rollback also doesn't restore the DAH index. (IJK-20, IJK-22 — new findings.)
-- **LMNH-07** — `/health/ready` is hard-coded to `true` at boot in `src/bin/server.rs:894` and never consults `cluster.is_ready()`. Load balancers will route traffic to a node that immediately rejects it during cluster bootstrap.
-- BC-03 (UTXO slot torn writes are undetectable, no slot CRC), BC-30 (hash table bucket bytes can tear under concurrent writers).
-- GH-04 / GH-G1 (unchecked multiplications in `OP_MIGRATION_COMPLETE` and snapshot deserialize allow large allocations from poisoned input).
-- IJK-01 (external-blob `content_hash` is permanently zero on the sync create path so reads always reject).
-- IJK-08 (no GC for orphaned blobs — disk fills with failed creates / aborted replications).
-- LMNH-01 (no write timeout on response stream — slow-reader pins a server thread forever).
-- LMNH-08 (`/admin/quiesce`, `/admin/drain/N`, `/admin/rebalance` have no authentication once the registration flag is on).
+Two systemic observations: (a) the **engine itself is robust** — UTXO invariants, WAL-first ordering, fail-closed recovery, concurrency, coinbase maturity, pruning, and quorum *math* are all verified-correct with value-asserting tests; (b) residual risk lives almost entirely in **cross-cutting test harnesses** and **defensive bounds on public APIs**, plus the one unresolved cluster-activation question.
 
 ---
 
-## Spec-vs-implementation diff
+## 3. Findings by Category
 
-### Documented but not implemented (or implemented differently)
+Severity legend: CRITICAL (money loss / corruption), HIGH, MEDIUM, LOW. "Verdict" is the adversarial verifier's result: **confirmed**, **refuted**, or **not-verified** (uncertain — flagged explicitly).
 
-| Claim | Reality | Reference |
-|---|---|---|
-| README "io_uring fast path" / `device_io/` module | Dead code; production uses `libc::pread`/`pwrite` one syscall per op | IJK-04 |
-| README `ack_policy = "auto"`, `"write_all"`, `"write_majority"`, `"best_effort"` (4 values) | `AckPolicy` enum has only `WriteAll` and `WriteMajority`. `"auto"` and `"best_effort"` are resolved in `config.rs::resolved_ack_policy`. **Unknown strings (typos like `"writeall"`) silently fall through to "auto" behavior** — `src/config.rs:497` `_ => match replication_factor { ... }`. There is no `ConfigError::InvalidAckPolicy` variant. | direct |
-| README error codes 0–20 + 255 | Code defines additional error codes 16–18 (stream/blob errors, also documented), 21 (`MIGRATION_MANIFEST_REQUIRED`), 22 (`MIGRATION_MANIFEST_MISMATCH`), 23 (`TOPOLOGY_PERSIST_FAILED`), 24 (`STALE_EPOCH`), 25 (`CLUSTER_NOT_READY`), 26 (`INDEX_DEGRADED`). README is missing 21–26. | `src/protocol/opcodes.rs:195-236` |
-| README opcode list 1–12, 20–21, 30–32, 100–102, 200–201 | Code defines additional opcodes 103 (`GET_COMMITTED_TOPOLOGY`), 104 (`ADMIN_DIAGNOSE_KEY`), 105 (`PARTITION_VERSION_REPORT`), 106 (`ADMIN_CLUSTER_HEALTH`), 240 (`REPLICA_BATCH`), 241 (`REPLICA_ACK`), 242 (`MIGRATION_COMPLETE`), 243 (`MIGRATION_BATCH_COMPLETE`), 250 (`HEARTBEAT`), 251–253 (topology), 255 (`INCREMENT_SPENT_EXTRA_RECS`). README is silent on all of these — internal opcodes are not documented even where they impact migration / cluster admin. | `src/protocol/opcodes.rs:32-162` |
-| README single STATUS_OK / STATUS_ERROR / STATUS_NOT_FOUND / STATUS_REDIRECT (4 values) | Code defines additional `STATUS_PARTIAL_ERROR = 4` and `STATUS_DEGRADED_DURABILITY = 5`. | `src/protocol/opcodes.rs:249-270` |
-| README "redb falls back to in-memory if corrupt" | **Not implemented by design.** Code fails closed and preserves the corrupt file for forensics. The README claim is wrong. (Defensible behavior — but the README must be updated.) | GH-G5, `src/index/backend.rs` |
-| `cluster_secret` "authenticates inter-node TCP" (per `src/config.rs` and `src/cluster/auth.rs` doc comments) | Only authenticates SWIM UDP. TCP frames go plain. | EF-01, D-20, gap #1 |
-| README "peak cluster size is persisted to disk" | Confirmed: `src/cluster/coordinator.rs` writes `committed_members` to a `*.topo` file. **But** losing the `*.topo` file (operator error / disk swap) lets a remnant re-bootstrap as a fresh single-node cluster — the `committed_members.len() <= 1` clause is the only guard. | EF-04 |
-| README cluster "rebalances automatically" | Migration zero-record fast-path skips manifest verification (`src/server/dispatch.rs:567-571`). No source authentication. An adversary on the cluster network can declare any shard migrated. | EF-12 |
-| README "stream is bound to the connection that started it" | Confirmed via per-`ConnectionState` `streams: HashMap<txid, ActiveStream>` with `Drop` cleanup — but **no integration test verifies cross-connection isolation** (all coverage is unit-level on the dispatch helper). | GH-08 |
-| README "replication ACK policy `write_majority`" | For RF=2 with `write_majority`, the formula yields `required_ack_count = 0` (`src/replication/manager.rs:487-496` returns `floor(rf/2)+1 - 1 = 0`). Effectively single-node durability under any replica loss. | D-02 |
-| README `replica_lag_check_interval_secs` config option | Dead code. `spawn_lag_monitor` (`src/replication/durable.rs:679`) has zero callers. The config field is read nowhere. The `AckTracker` is updated on every ACK but no consumer reads it. | D-01 |
-| README "Setting `replication_degraded_mode = "best_effort"` … " | Only allowed for RF≤1 (`src/config.rs:523`). RF>1 + `best_effort` is rejected at validation. | matches README |
-| Compaction / pruning during reorg | `MarkLongestChainBatch` emits no `ReplicaOp` (IJK-20). Pruning during reorg can therefore diverge between master and replica without any protocol-level signal. | IJK-20 |
-| README admin endpoints (`/admin/quiesce`, `/admin/drain/N`, `/admin/rebalance`) | **Unauthenticated** beyond the registration flag `enable_admin_endpoints`. Once enabled (which any operator must do for normal admin work), any HTTP client on the bind address can call them. | direct, `src/server/http.rs:142-147, 965-973, 1116, 1127` |
+### A. UTXO correctness invariants — **0 findings**
 
-### Documented but clean (verified working as described)
+Verified-correct surface (value-asserting tests, not `is_ok()`):
 
-- `shard = u16_le(txid[0..2]) & 0x0FFF` — confirmed at `src/cluster/shards.rs:314-317`. Mask, byte order, and shard count (4096) all correct.
-- Length-prefix max enforced before allocation — confirmed at `src/server/mod.rs:240-250` with `MAX_FRAME_SIZE` ceiling and pre-resize check.
-- `max_batch_size` enforced in batch decoders — `validate_batch_count` is centralized and called before every `Vec::with_capacity`.
-- Per-connection stream isolation — `ConnectionState` is per-connection; aborted on drop.
-- `TxMetadata` carries CRC32 — `src/record.rs:540-545, 569-572`. Caught for torn metadata writes; **does not cover the 69-byte UTXO slots** (BC-03).
-- Allocator journals `AllocateRegion` / `FreeRegion` BEFORE returning offsets — `src/allocator.rs:455-564`.
-- Replication wire protocol versioned (V1 / V2) — explicit `UnknownVersion` rejection on unknown bytes.
-- Compensation captures real before-images for `unset_mined`, `reassign`, `prune` — recent gap #8 work, verified.
-- `MAX_FRAME_SIZE` on replication / migration TCP — same ceiling.
-- `Robin Hood probe distance` bounded; high-load-factor tested.
-- Snapshot atomicity (tempfile + rename + fsync); snapshot format versioned.
-- Loopback bind defaults; `validate_safe_defaults` rejects non-loopback without `enable_remote_bind = true`.
-- RF>1 requires non-empty `cluster_secret` (config validation).
-- `MultipleDevicePaths` rejected at config validation — closes gap #10 by validation rather than implementation.
+- Spend-at-most-once via stripe mutex held read→validate→write through the `ValidatedSpend` type-state move-of-guard (`spend.rs:138-169`, `engine.rs:32-63`); 99-thread test at `engine.rs:11460-11491` asserts exactly 1 Ok + 99 `AlreadySpent` **and** the winning `spending_data`.
+- `AlreadySpent` returns the winner's stored 36-byte `spending_data` (`engine.rs:1404-1405` single, `1217-1219` multi).
+- Idempotent identical-data re-spend is a no-op that does **not** bump the counter (`engine.rs:1342/1176`).
+- **Unspend enforces authorship** — `UTXO_SPENT` branch returns without mutation when `slot.spending_data != req.spending_data` (`engine.rs:1512-1515`), wire struct carries the field (`unspend.rs:20`); no double-spend-via-unspend (test `unspend_rejects_wrong_spending_data_without_mutating_slot`, 5891).
+- Slot-write failure propagates and `spent_utxos` does **not** advance (`spend_propagates_slot_write_failure` 4979, `_multi` 5033); apply uses checked overflow (`engine.rs:4347-4350`) and a `new_spent>utxo_count` invariant guard (`4355-4356`).
+- Create rejects duplicate txid / zero utxos / external-without-ref (`create.rs:17-31`). Delete re-spend guard F-X-022 via `prune_slot_if_spent_by_child` status+txid match + checked underflow (`engine.rs:2676,2707,2720-2724`), `SpendError::DeletedChildren` (`error.rs:142-160`). Coinbase maturity, frozen/locked/conflicting, UTXO-hash-mismatch-no-mutation, DAH/reassign checked (not saturating) — all tested.
 
----
+**Residual (no defect evidence, tool-channel-limited reads):** exact device-write-vs-counter ordering inside `apply` (`engine.rs:4288-4400`); whether a slot is allocated before the duplicate-txid check (possible freelist leak on error path, low risk); `>=` vs `>` in reassign cooldown (`engine.rs:2862`, appears covered by `reassign_spendable_height_boundary_at_exact_height` 10199). A follow-up read of `engine.rs:4288-4400` and `2862-2990` in a stable session closes these; no reason to believe either is broken.
 
-## Findings by category
+### B. Crash recovery and durability — 3 findings (all LOW)
 
-**Total: ~258 findings across 8,568 lines of per-category reports under `audit/raw/`.** The rest of this document indexes those files. Each linked file contains the full set of findings with reproduction steps and suggested fixes.
+Verified-correct: append-before-data WAL ordering (`redo.rs:1816-1903`); every replay handler maps device read/write failures to `IoError` and short/corrupt records to `CorruptEntry`/`MissingRecordBytes`; **production fails closed** — `server.rs:649-662` `std::process::exit(1)` on any `failed_io/failed_corrupt/failed_logic/failed_missing_record_bytes > 0` (or `failed_missing_primary` over cap), plus top-level `exit(1)` on recovery `Err` (`server.rs:664-671`); torn 4 KiB DATA-block writes detected via CRC32 (`record.rs:576-605,185-197`, `io.rs:907-925`) → fatal boot; spent counter re-derived ±1 from slot transition on replay; redo-full rejects cleanly before buffering; compaction/reset preserve high-water `next_sequence`. The brief's "checkpoint task never spawned / log bricks the master" concern is **resolved** — the task IS spawned in production (`server.rs:1211/1219`, gated by `checkpoint_high_water` default 0.75) with a clustered reset-guard deferring reset until `min_acked>=floor`. An early draft "recovery swallows all apply errors" was **FALSE and withdrawn**.
 
-- **Category A — UTXO correctness invariants:** `audit/raw/category_A_utxo_correctness.md` (3 CRITICAL, 7 HIGH, 5 MEDIUM, 18 LOW = 33 findings). **Also**: `specs/teranode.lua` referenced by CLAUDE.md is missing from the repo; Lua-parity claims could not be cross-checked.
-- **Category B+C — Crash recovery & concurrency:** `audit/raw/category_BC_recovery_concurrency.md` (4 CRITICAL, 15 HIGH, 22 MEDIUM, 22 LOW = 82 findings)
-- **Category D — Replication:** `audit/raw/category_D_replication.md` (22 findings)
-- **Category E+F — Cluster, quorum, sharding, migration:** `audit/raw/category_EF_cluster_migration.md` (30 findings)
-- **Category G+H — Index backends & wire protocol DoS:** `audit/raw/category_GH_index_protocol.md` (19 + 17 sub-findings)
-- **Category I+J+K — Storage tiers, I/O layer, pruning:** `audit/raw/category_IJK_storage_io_pruning.md` (5 HIGH, 6 MEDIUM, 5 LOW + sub-findings = 23 findings)
-- **Category L+M+N — DoS limits, observability, test infra, repo-wide hazards:** `audit/raw/category_LMN_safety_obs_tests.md` (5 HIGH, 6 MEDIUM, 17 LOW, 4 INFO)
+**B-02 — Module doc states wrong default threshold (0.5) and stale 'circular' log description.** Sev LOW, **not-verified**. `src/checkpoint.rs:3,11,63,86`.
+*What's wrong:* `checkpoint.rs:3` calls the redo log a "fixed-size circular-by-checkpoint WAL" and `:11` says the trigger default is 0.5; the actual default is `high_water` 0.75 (`:63,:86`) and the log is linear-with-reset (`redo.rs:6-15` was rewritten to kill the "circular/wrap" model).
+*Why it matters:* doc/code drift only; "default 0.5" contradicts the field's own `Default: 0.75` fifty lines below, and "circular" reintroduces the exact false model the redo module warns against.
+*Fix:* change `:11` to "default 0.75" and `:3` to "linear-with-reset WAL".
 
-### Severity-ranked highlights from the per-category files
+**B-03 — Checkpoint-thread `JoinHandle` does not appear to be joined on shutdown.** Sev LOW, **not-verified**. `src/bin/server.rs:1183-1226,1235`. The handle is captured into `checkpoint_handle` but, unlike `blob_gc_handle` (joined at `:1235`), was not observed to be `join()`ed on shutdown. *Why it matters:* low — each checkpoint step is independently durable (`checkpoint.rs:24-30`), so a torn checkpoint at exit is fully recoverable next boot; only cost is no clean, bounded shutdown of the checkpointer. *Fix:* bind and `join()` it (bounded) on shutdown, mirroring `blob_gc_handle`.
 
-#### CRITICAL
-- A-01 — Spend silently swallows on-disk write errors at 5 sites; client sees `Ok` while UTXO remains UNSPENT.
-- A-03 — `spend_multi` increments counter even when slot writes silently fail; metadata diverges from slot bytes.
-- A-04 — Unspend has no `spending_data` field; anyone with public on-chain triple can erase any spend.
-- BC-01 — No production redo-log checkpointing.
-- BC-02 — Hot read paths violate stripe-lock contract (data-race UB).
-- BC-04 — Concurrent unspend/freeze/etc. compute redo payload outside lock.
-- EF-01 — Inter-node TCP unauthenticated.
-- D-20 — Replication socket lacks `cluster_secret`/TLS auth (same root cause as EF-01).
+**B-04 — Missing test for the snapshot-deletion device-scan rebuild path.** Sev LOW, **not-verified**. `src/server/startup.rs:255-263`, `tests/integration.rs:435,483`. The rebuild-from-device-scan path is documented and CRC-validates every header, but no test deletes the index snapshot to force it. *Why it matters:* this is the last-resort recovery when the snapshot is lost/corrupt; a regression could silently drop/mis-register UTXOs unnoticed. *Fix:* add a test that deletes the snapshot, restarts, asserts every record re-registers with correct cached fields, and asserts a CRC-corrupted header causes fail-closed `RebuildError` (not an empty index).
 
-#### HIGH
-- A-05 (pre_allocate_create leak on DuplicateTxId), A-06 (recovery replay swallows metadata write + skips derived state), A-07 (Pruned drops spending_data on wire), A-08 (freeze/unfreeze don't bump generation or sync cache), A-09 (reassign skips LOCKED/CONFLICTING/coinbase checks), A-10 (FROZEN_UNTIL drops 4-byte payload), A-12 (preserve_until doesn't sync cache → fast path bypasses protection).
-- BC-03, BC-05 (gen wrap), BC-06/07 (no memory ordering on direct reads), BC-09 (`append_conflicting_child` no redo entry), BC-10 (allocate-before-redo), BC-11 (replay_spend not idempotent), BC-13 (linear redo log naming), BC-30 (torn buckets), BC-34 (replica skips local redo).
-- D-01 (lag monitor dead), D-02 (RF=2 majority math = 0 ACKs).
-- EF-02 (alive_node_count excludes self), EF-03 (no isolated-remnant test), EF-09 (REDIRECT loop), EF-10 (no split-brain heal), EF-12 (zero-record migration unauthed).
-- GH-04 (migration_complete `entry_count*36` unchecked), GH-06/09 (stream chunk total cap missing), GH-G1 (snapshot deserialize unchecked multiplication), GH-G3 (`import_index` not transactional).
-- IJK-01 (external blob hash always zero), IJK-02 (no orphan-blob GC), IJK-04 (device_io dead code), IJK-05 (silent zero-write of head bytes), IJK-20/22 (`MarkLongestChainBatch` no ReplicaOp).
-- LMNH-01 (no write timeout on response — slow-reader pins thread), LMNH-07 (`/health/ready` always true), LMNH-08 (admin endpoints unauthenticated), LMNH-16/17/18 (no proptest, no fuzz, redb backend uncovered at server level), LMNH-31 (replica silently drops `write_metadata` errors during apply).
+> Note: one Read returned a hallucinated `unreachable_placeholder()` body for `startup.rs:255-272`; a verbatim grep confirmed **no** such stub/`unreachable!`/`todo!` exists — tool-channel artifact.
 
-#### MEDIUM
-- A-02 (concurrent-spend test never asserts winner spending_data), A-11 (wire GetSpend skips utxo_hash check), A-13 (`reassign` uses `saturating_add` for spendable_height — overflow pins UTXO unspendable forever), A-21 (`set_conflicting` fast path skips parent propagation), A-29 (delete tombstone vs allocator.free crash boundaries).
-- BC-08, BC-12, BC-14–19, BC-22, BC-24–29, BC-31–33.
-- D-03, D-05, D-06, D-11, D-15, D-19.
-- EF-04, EF-05, EF-06, EF-08, EF-21, EF-29.
-- GH-05, GH-08, GH-13, GH-14, GH-16, GH-G2, GH-G4, GH-G14, GH-G15, GH-G16.
-- IJK-03, IJK-07, IJK-09, IJK-10, IJK-11, IJK-12, IJK-15, IJK-19, IJK-23.
-- LMNH-04, LMNH-05, LMNH-09, LMNH-19, LMNH-22 (see Category L+M+N file).
+### C. Concurrency — 1 finding (LOW)
 
-#### LOW
-A-14 through A-34 (18 LOW from Category A, mostly polish: boundary tests, generation u32 wrap, idempotent-respend write amplification, HashMap-vs-BTreeMap determinism, etc.); BC LOW set; D LOW set; EF LOW set; GH LOW set; IJK LOW set; LMNH LOW set. See per-category files; ~80+ in aggregate.
+Verified-OK: striped locks round to next power-of-two (floor 16) and index with `& mask` (no panic/modulo skew); default `lock_stripes=65536` is PoT; txid stripe bytes `[16..24]` disjoint from index bucket `[0..8]`/fingerprint `[8..16]`. Same-key double-spend window does not exist (one stripe locked through apply; `tests/g2_atomic_apply.rs` 16×200-thread exactly-one-winner). No multi-key ABBA (engine mutation API is strictly single-key). `new_spent_count` computed **inside** the stripe lock with `pre_generation` captured while guard held. No `.await` while holding a non-async lock (engine/dispatch have zero `async fn`). Lock-free hot reads are torn-read-safe because **all four `io.rs *_direct` helpers acquire the record-keyed `StripedRwLocks`** (`io.rs:760,764,799,805,842,850,876,883`), plus a `meta.tx_id==key` re-check defends the delete+`create_at_offset` aliasing race; regression tests at `io.rs:1409,1695`.
 
----
+**C-03 — Stale/contradictory torn-read comment (Rule 6 cleanup).** Sev LOW, **not-verified**. `src/ops/engine.rs:54-63` vs `src/io.rs:24-56`.
+*What's wrong:* the Engine doc-comment (`engine.rs:54-63`) claims the lock-free read paths "rely on the CRC32 over `TxMetadata` to detect torn headers." `io.rs:24-56` + the regression test `direct_read_write_concurrent_stress_never_returns_torn_data` prove CRC alone is **empirically insufficient on aarch64** (NEON memcpy can publish new CRC bytes before new field bytes). The real defense is the record-keyed `StripedRwLocks` every `*_direct` helper acquires.
+*Why it matters:* a future maintainer optimizing read contention could read `engine.rs:54-63`, conclude the `io.rs` lock is redundant ("CRC already detects torn headers"), remove the read guard, and reopen the aarch64 torn-read window on `get_spend` — a double-spend-acceptance path. No runtime bug today; this is a documentation hazard that could induce a future CRITICAL regression.
+*Fix:* rewrite `engine.rs:54-63` to credit the `io.rs` record-level `StripedRwLocks` for torn-read safety; CRC32 handles on-disk corruption; the `meta.tx_id==key.txid` re-check handles aliasing. Optionally annotate the `io_locks().read()` sites so the locks are not removed.
 
-## Test coverage matrix
+### D. Replication — 1 finding (LOW)
 
-The full per-opcode × scenario matrix is at `audit/coverage-matrix.md`. Each opcode is crossed against {happy, error codes, batch boundaries, crash mid-op, replication-failure mid-op, migration-in-progress, single-node vs cluster}. The summary below highlights only the error-code triggerability table.
+ACK-policy math, dual-write fan-out, WAL-first ordering with local-apply rollback, and the receiver apply/dedup path are all **correct**. `ack_policy=auto`: RF0|1→None, RF2→WriteAll, RF≥3→WriteMajority. `write_majority` RF=2 = 1 replica ACK = 2-of-2 counting master (`manager.rs:76-85`, asserted `manager.rs:1520-1540`). `best_effort` never returns `REPLICATION_FAILED` (guarded `dispatch.rs:1823`); `degraded_mode=reject` genuinely rejects + rolls back. **The key crash-window risk is resolved:** `handle_spend_batch` order is local apply → `write_replicated_redo_ops` (redo append+fsync, then begin intent) → `replicate_all_ops`; on redo failure or PolicyViolation, `rollback_spends` reverses local state via compensating `Unspend` redo op and clears intents, returning `ServerError` — a client that gets an error can safely retry. Master-crash-before-ACK is retry-safe (generation-aware idempotent spend + `ReplicationIntentTracker`, `next_sequence` never reused). Replicas apply in master order despite out-of-order ACKs; mid-batch replica crash returns `ReplicaAck::Error{failed_sequence}` without advancing the cursor; replica apply does **not** swallow `write_metadata` errors (`?`-propagated at `receiver.rs:1019,1661`).
 
-### Error-code triggerability
+**D-01 — PartialAck durability warn log is hard-coded `(best_effort)` even on the non-best-effort WriteMajority quorum path.** Sev LOW, **not-verified**. `src/server/dispatch.rs:1600-1611`.
+*What's wrong:* `classify_replication_outcome` returns `PartialAck` for any `required <= ack_count < total_targets`, including a legitimate non-best-effort WriteMajority that met quorum but not all replicas; the warn line logs `"(best_effort)"` unconditionally.
+*Why it matters:* purely cosmetic/operability — an operator triaging a durability incident on a `best_effort`-disabled cluster sees log lines claiming `best_effort` is active, misdirecting diagnosis. Behavior is correct (`STATUS_OK`, ticks `replication_degraded_acks`).
+*Fix:* branch the message on the in-scope `best_effort` flag, or drop the parenthetical.
 
-| Code | Name | Test that triggers it |
-|---|---|---|
-| 0 | OK | all happy paths |
-| 1 | TX_NOT_FOUND | `engine.rs:tx_not_found` family |
-| 2 | UTXO_HASH_MISMATCH | `engine.rs:hash_mismatch` family |
-| 3 | ALREADY_SPENT | `engine.rs:already_spent` — payload-shape (36 bytes spending data) **not** asserted in any *integration* test; only unit-tested at engine level |
-| 4 | ALREADY_FROZEN | covered at engine layer |
-| 5 | UTXO_NOT_FROZEN | covered |
-| 6 | INVALID_SPEND | covered |
-| 7 | FROZEN | covered |
-| 8 | CONFLICTING | covered |
-| 9 | LOCKED | covered |
-| 10 | COINBASE_IMMATURE | covered (engine-level); 4-byte payload shape not integration-asserted |
-| 11 | VOUT_OUT_OF_RANGE | covered |
-| 12 | ALREADY_EXISTS | covered |
-| 13 | FROZEN_UNTIL | covered |
-| 14 | REDIRECT | covered in cluster_*.rs |
-| 15 | NO_QUORUM | **MISSING** integration test for "isolated 1-node remnant rejects" — EF-03 |
-| 16 | STREAM_NOT_FOUND | covered at codec level only |
-| 17 | BLOB_NOT_FOUND | covered |
-| 18 | STREAM_OFFSET_MISMATCH | covered |
-| 19 | MIGRATION_IN_PROGRESS | partial — covered for spend; not asserted for every write op separately |
-| 20 | REPLICATION_FAILED | covered, but no test asserts no compensation leak |
-| 21 | MIGRATION_MANIFEST_REQUIRED | covered |
-| 22 | MIGRATION_MANIFEST_MISMATCH | covered |
-| 23 | TOPOLOGY_PERSIST_FAILED | partial |
-| 24 | STALE_EPOCH | covered (replication_tcp.rs) |
-| 25 | CLUSTER_NOT_READY | partial |
-| 26 | INDEX_DEGRADED | covered (degraded readiness gate) |
-| 255 | INTERNAL | covered |
+**Unverified (low money-safety relevance):** `replica_lag_check_interval_secs` action path was not located this session.
 
-### Test infra deficits
-- No `proptest` / `quickcheck` dep in `Cargo.toml` → **no property-based tests** for UTXO conservation invariants. (LMNH-16)
-- No `cargo-fuzz` target → **no fuzz coverage** on the wire protocol parser. (LMNH-17)
-- Integration tests instantiate only `IndexBackendMode::Memory`. The `Redb` and `FileBacked` backends have crash-injection coverage in `tests/fault_injection.rs` and `tests/secondary_two_phase_durability.rs`, but no full-stack server/cluster/replication coverage. (LMNH-18)
-- Stress tests in `tests/stress_tests.rs` are gated behind `TERASLAB_FULL_WORKLOAD=1` env var → never run in default CI.
-- Cluster chaos tests are in-process and deterministic; the only end-to-end chaos exists in `teraslab-tests/docker/`.
+### E. Clustering and quorum — 1 down-ranked (refuted-but-open) CRITICAL + 1 MEDIUM + 1 LOW
 
----
+> **E-01 verdict: REFUTED by the adversarial verifier, but with an unresolved verification question that I am flagging as the #1 follow-up.** I directly confirmed this session that `src/cluster/topology.rs:911` is `let quorum_needed = (members.len() / 2) + 1;` over the **live, SWIM-shrunken** member set — exactly as the original CRITICAL claimed for the topology-*activation* path. The refutation rests on the independent spec-vs-impl finding that the *write*-path quorum gate is **peak-derived** (`dispatch.rs:2489` computes `(peak/2)+1` and returns `ERR_NO_QUORUM(15)` when unmet). The two are different code paths. The refutation is only valid if that write-path gate actually fires for a node that has unilaterally self-activated as master of all shards. I could not re-read `dispatch.rs:2489` together with the activation path this session (channel suppression). **Action: confirm a self-activated single-node minority is blocked at `dispatch.rs:2489` before accepting any write; also read `topology.rs:851-923,703-739,542-551`.**
 
-## Action plan (milestones, in priority order)
+**E-01 (REFUTED / open) — Isolated minority remnant self-commits a single-node topology (split-brain).** Claimed CRITICAL, **refuted** (open question above). `topology.rs:911,1011-1023,542-551,703-739,851-923`, `coordinator.rs:738,1386-1405,5367-5527`.
+*Claim:* on SWIM shrink, `on_membership_changed` proposes a new topology with `quorum_needed = (members.len()/2)+1` over the live alive set (confirmed at `topology.rs:911`); the split-brain guard treats a pure-subset shrink as SAFE (`is_safe_membership_change` `:542-551`; `membership_change_is_safe` `:703-739` only rejects cluster_id mismatch / non-monotonic / unseen NodeIds); a partitioned 1-of-3 remnant computes `quorum_needed=1`, its self-vote satisfies quorum (`handle_vote` `:1011-1023`), it commits a single-node topology and becomes master of all shards (`coordinator.rs:1386-1405`) while the real majority {2,3} keeps serving → two disjoint masters → double-spend on heal. The persisted peak (`coordinator.rs:738,5367,5514`) is written/read but **not** used as the activation quorum divisor — confirmed.
+*Why refuted (per verifier):* the write path gates on `(peak/2)+1 → ERR_NO_QUORUM` at `dispatch.rs:2489`; a minority cannot meet that, so it cannot accept the spends/creates the scenario depends on.
+*Suggested fix (defense-in-depth, worth doing regardless):* derive the topology-activation `quorum_needed` from the persisted peak `(peak/2)+1`, and/or gate `activate_topology` on `alive_count >= (peak/2)+1`. `peak` must only decrease through a quorum-ratified drain commit. Note `membership.rs:88` self-inclusion makes an isolated node report `alive_count==1`, correctly below `(3/2)+1==2`, so the alive-vs-peak comparison is the clean guard — it is simply absent from the activation path. Add the missing integration test (form 3-node cluster, partition node 1, wait past `swim_suspicion_timeout_ms`, assert node 1 does NOT activate and a write returns `ERR_NO_QUORUM`/`ERR_CLUSTER_NOT_READY`).
 
-### Milestone 0 — "do not lose UTXO data"
-Pre-requisite: cannot ship until all of these are closed.
+**E-02 — `OP_HEARTBEAT`(250) and `OP_REPLICA_ACK`(241) excluded from inter-node HMAC auth — forgeable on TCP.** Sev MEDIUM, **not-verified (uncertain)**. `src/protocol/opcodes.rs:488-503`, `src/server/mod.rs:732,809-819`.
+*What's wrong:* `is_inter_node_auth_opcode` omits both opcodes, so `mod.rs:732` sets `is_inter_node_op=false` for them and the body bypasses `verify_signed_body_streaming` even with a `cluster_secret` configured. All other inter-node opcodes are verified fail-closed.
+*Why it matters:* a peer that knows only node addresses (not the secret) can inject forged `OP_HEARTBEAT` over TCP (perturbing liveness/membership) and forged `OP_REPLICA_ACK` (corrupting replica-durability accounting / `ack_policy` / degraded-durability). SWIM UDP membership **is** authed (`swim.rs:718-726`), so this is specifically a TCP-path spoofing gap. Not a direct double-spend (heartbeat cannot activate a topology or spend; transitions stay incarnation-guarded at `membership.rs:125,208,238`), hence MEDIUM. Interaction with E-01: forged heartbeats keeping a partitioned node looking alive only *delay* the bad proposal, not cause it.
+*Reproduction:* with a `cluster_secret` set, send a well-formed `OP_HEARTBEAT`(250) frame without the `[timestamp||tag]` suffix to the data port — it is processed (no `ERR_CLUSTER_AUTH_FAILED`), whereas the same unsigned `OP_TOPOLOGY_PROPOSE` is rejected.
+*Fix:* add both opcodes to `is_inter_node_auth_opcode`; one HMAC per heartbeat. If exclusion is an intentional perf tradeoff, document the threat model (the current rationale comment references a "below" that does not exist).
 
-1. **A-01 — Stop swallowing slot/metadata write errors in `Engine::spend`.** Replace every `tracing::warn!` / `let _ =` site at `src/ops/engine.rs:1013, 1042, 1066, 2920, 2948` with `?` propagation. The dispatcher must return `ERR_INTERNAL` on failure and trust the redo log to drive replay.
-2. **A-03 — Track `actually_written` count in `ValidatedSpend::apply`.** Increment `meta.spent_utxos` only by the count of slots that successfully wrote. Best done together with A-01.
-3. **A-04 — Add `spending_data: [u8; 36]` to `UnspendRequest` and `WireUnspendItem`.** In `Engine::unspend`, after the hash check, `if slot.spending_data != req.spending_data { return Err(SpendingDataMismatch) }`. New protocol-version-bumping change.
-4. **A-06 — Make recovery replay update derived state (`generation`, `LAST_SPENT_ALL`, DAH/unmined indexes, `updated_at`)** or capture every derived field in the redo entry.
-5. **A-08 — `freeze`/`unfreeze` must bump generation, write metadata back, and call `sync_index_cache`.**
-6. **A-09 — `reassign` must check `LOCKED`, `CONFLICTING`, and coinbase maturity** before mutating.
-7. **A-12 — `preserve_until` must call `sync_index_cache`** so fast paths see `HAS_PRESERVE_UNTIL`.
-8. **Fix the failing tests.** `index::tests::rebuild_*` and `index::backend::tests::rebuild_redb_*` — either rewrite the corruption or update assertions.
-9. **BC-01 — Wire redo-log checkpoint to a production cadence.** Background task: when `write_pos / log_size > 0.5`, snapshot index + persist allocator + DAH + unmined → `checkpoint()` → `reset()`. Reject mutations cleanly with a backoff status when watermark exceeded.
-10. **BC-04 — Move `engine.lookup` + `running_spent` computation INSIDE the per-tx stripe lock.** Or change redo entries to carry deltas instead of absolute counts and make `replay_*` re-derive from on-device state under a lock.
-11. **BC-02 — Either take stripe read-locks in `read_metadata`/`read_slot`/`lookup_cached`, or document the "torn read returns RecordCorruption; client must retry" contract and remove the misleading safety doc on `io.rs`.**
-12. **BC-03 — Add a 4-byte CRC or generation-counter to `UtxoSlot`.** 69 → 73 bytes; recovery falls back to redo replay on torn detection.
-13. **EF-02 — Fix `alive_node_count` to include self.** This is a one-line bug producing false `NO_QUORUM` rejections in healthy clusters. Add the integration test EF-03 calls out.
-14. **D-19 / LMNH-31 / gap #5 — Begin and fsync the replication intent BEFORE local engine apply** (or fold pending-replication into the same redo entry). fsync the intent file and parent dir. Stop swallowing replica-side `write_metadata` errors at `src/replication/receiver.rs:684, 1127`.
-15. **IJK-01 — Stop discarding `BlobStore::put` digest on the sync create path.** The current code makes every external-blob read fail integrity check.
-16. **IJK-20 / IJK-22 — Emit `ReplicaOp` for `MarkLongestChainBatch`** so reorg DAH/unmined updates propagate. Add generation idempotency token.
-17. **A-05 — `dispatch.rs:3271` (and the `Err(_)` branch at `:3278`) must call `engine.allocator().lock().free(...)` on `DuplicateTxId`** so device space does not leak under concurrent create races.
+**E-03 — `mark_suspect` mutates the alive set but emits no `MembershipChanged`.** Sev LOW, **not-verified**. `membership.rs:203-225,893-901`. `mark_suspect` calls `rebuild_alive_cache()` (removing the suspect from `cached_alive`) but pushes only `NodeSuspect`, unlike `mark_dead`/`mark_alive` which emit `MembershipChanged`. *Why it matters:* for the suspicion-timeout window (default 5000ms), a consumer polling `alive_count()` sees the suspect excluded while a consumer on the event stream still treats it as alive — two divergent "who is alive" views; latent footgun for any future quorum guard mixing the polled count with the event stream (directly relevant given E-01). *Fix:* pick one source of truth — emit `MembershipChanged` on suspect, or keep Suspect nodes in `cached_alive` until Dead.
 
-### Milestone 1 — "do not get rooted"
-1. **EF-01 / D-20 / gap #1 — Apply `cluster::auth::sign`/`verify` to *every* TCP frame** (replication, topology, migration), or move to mTLS with role separation. Until this is done, the cluster is one trusted peer away from forged topology commits.
-2. **EF-12 — Authenticate `OP_MIGRATION_COMPLETE`** sender; require manifest verification even on zero-record completions, or reject zero-record completions for non-empty source claims.
-3. **Admin endpoints** — gate behind a token / mTLS / loopback-only by default; the `enable_admin_endpoints` flag is exposure control, not authentication.
-4. **GH-G1, GH-04 — Bound checked-multiplications in `OP_MIGRATION_COMPLETE` and snapshot deserialize** before `Vec::with_capacity`.
+### F. Sharding and migration — 3 findings (all LOW)
 
-### Milestone 2 — "do not brick on edge cases"
-1. **EF-09 — REDIRECT hop count / TTL** in the wire format.
-2. **EF-10 — Split-brain heal protection.** Two formerly-independent multi-node clusters that gossip with each other have no rejection path.
-3. **BC-05 — Generation counter wrap.** Use u64 or detect wrap in recovery comparator.
-4. **BC-30 — Torn hash-table buckets** under concurrent writers; align bucket access with versioning.
-5. **IJK-08 — Orphan-blob GC.** Failed creates / aborted replications / dropped uploads currently leak forever.
-6. **L-1 — Slow-Loris timeout.** Replace per-read timeout with a connection idle/total deadline.
-7. **L-2 — Add a write timeout** on the response path.
-8. **GH-G3 — Make `import_index` transactional across primary/dah/unmined files.**
+Verified-correct: shard mask `u16_le(txid[0..2]) & 0x0FFF` (4096 shards, `shards.rs:314-317`); deterministic round-robin assignment given sorted members; the **write fence returns `ERR_MIGRATION_IN_PROGRESS` for every mutating opcode** via `RunningCluster::is_master` returning `Transitioning` (`coordinator.rs:6060-6074`) — empty/no-local-data master-changed shards are still fenced until handoff proves completion (driven by the inbound-migration tracker, not a master-only flag, `migration.rs:505-555`); a wall-clock timeout never reopens a shard for writes; late/duplicate batches cannot reopen a completed inbound shard (tombstones); index-migration mid-import crash across the 3 redb files is guarded by a durable sentinel + CRC + count checks.
 
-### Milestone 3 — performance + observability
-1. **IJK-04 — Wire `IoUringBackend` (or remove the dead module + correct README's "io_uring fast path" claim).**
-2. **D-01 — Spawn the lag monitor; expose ack tracker via `/metrics`.**
-3. **GH-G14, GH-G15 — Stream redb iter / `import_index` instead of materializing into Vec.**
-4. **ConfigError::InvalidAckPolicy** — reject typos in `ack_policy`. Currently any unknown string silently behaves as `"auto"`.
-5. **README sync** — document error codes 21–26, status codes 4–5, opcodes 103–106 / 240–253, the `STATUS_DEGRADED_DURABILITY` semantics, and remove the "redb falls back to in-memory if corrupt" claim.
+**F-01 — `compute_with_epoch` trusts caller-sorted members with no defensive sort/assert (split-brain landmine).** Sev LOW, **not-verified**. `src/cluster/shards.rs:103-134`.
+*What's wrong:* it assigns `master=members[shard % n]` directly over the input slice, relying on the documented "members is sorted" precondition without sorting a local copy or asserting. All tests sort first, so the hazard is invisible in CI.
+*Why it matters:* the no-consensus design requires every node to derive the identical table from identical (sorted) membership. One call site passing an unsorted list → two masters for one shard → double-spend window.
+*Fix:* sort a local copy at the top of `compute_with_epoch`, or `debug_assert!` sortedness.
 
----
+**F-02 — No end-to-end integration test of the subset-master write-reject + read-passthrough pair.** Sev LOW, **not-verified**. `coordinator.rs:6060-6074`, `migration.rs:655-660`, `dispatch.rs:627-829`. The `Transitioning → ERR_MIGRATION_IN_PROGRESS` path is unit-tested and bookkeeping heavily unit-tested, but no `tests/` integration test asserts, on a live mid-migration cluster, **both** that a SPEND to a fenced shard returns code 19 **and** that a GET on the same key still succeeds. *Why it matters:* this fence is the barrier against writes to a not-yet-authoritative master; a regression leaking writes through (or wrongly fencing reads) passes CI silently. *Fix:* add the two-node mid-migration test exercising both arms plus post-completion SPEND success.
 
-## What this audit did NOT cover (and why)
+**F-03 — `/admin/drain` completion semantics could not be verified.** Sev LOW, **not-verified**. `src/server/http.rs:1686-1718`, `src/cluster/topology.rs`. `handle_admin_drain` calls `cluster.drain_node`, defined in `topology.rs`, which could not be reliably read this session; cannot confirm it blocks until the drained node's shards have fully migrated. *Why it matters:* if `drain_node` returns success before handoff completes, an operator could shut the node down while it holds the only copy of some shards → data loss. *Fix:* confirm `drain_node` awaits migration completion; add a regression test.
 
-- **Performance behavior under sustained load:** out of scope; this is a code-read, not a benchmark or chaos run.
-- **Teranode adapter (`../teranode/stores/utxo/teraslab`):** referenced in the existing gap doc as incomplete; that worktree was not part of this audit.
-- **Cryptographic primitives:** `cluster::auth::hmac_sha256` is hand-rolled with RFC 4231 test vectors. Adequate for a non-adversarial threat model; should be replaced with `ring` or `RustCrypto` if exposed to attackers.
-- **OpenTelemetry / tracing pipeline correctness:** verified at the configuration / route level; trace fan-out under fault not exercised.
-- **Web UI under `ui/`:** XSS / template-injection review out of scope.
-- **Go client correctness:** out of scope.
+**Flagged for re-audit (tool channel):** source-side delete-after-commit ordering during crash-mid-migration, and the GET read-wait/timeout contract.
+
+### G. Index backends — 2 findings (both LOW)
+
+Verified-correct: in-memory Robin Hood primary index has bounded probe distance with hard capacity-bounded termination in every probe loop; backward-shift delete cannot spin under corruption (`hashtable.rs:1036-1067`); per-process random hash seed (DoS-hardened); file-backed resize is crash-atomic via redo journaling (begin/commit + tmp + atomic rename + parent-dir fsync, orphan tmp cleaned in `recovery.rs:480-496`). Serialized snapshot is versioned + CRC'd with tests for truncation/unknown-version/poisoned-counts; corrupt sections fall back to targeted device-scan rebuild. Secondary DAH/unmined indexes **are** rebuilt from device scan and reconciled from primary metadata after redo replay. An earlier draft "secondaries are NOT rebuilt" (citing a nonexistent `src/storage/engine.rs`) was **wrong and retracted**.
+
+**G-01 — File-backed primary index on-disk bucket bytes have no checksum/version; reopen accepts possibly-torn state with only a warn.** Sev LOW, **not-verified**. `src/index/hashtable.rs:608-614,633-677,1381-1412`.
+*What's wrong:* the raw 64-byte bucket array has no header/magic/per-bucket CRC; the only integrity signal is a `.shutdown_clean` sidecar written in `Drop`. On reopen, a missing sentinel only `tracing::warn!`s and the open still succeeds with the possibly-torn bytes — it does **not** auto-drive `rebuild_file_backed`.
+*Why it matters:* a crash during a file-backed resize/op can leave torn bucket bytes; reopen accepts them (modulo a log line); if the redo window advanced past the affected mutations, a torn bucket yields a wrong `record_offset` → lookup resolves to the wrong on-device record → wrong UTXO served.
+*Fix:* on missing sentinel, fail closed and require explicit rebuild, or auto-invoke `rebuild_file_backed`; add a test for the missing-sentinel reopen behavior.
+
+**G-02 — `unreachable!()` on the resize path is sound today but a future-edit panic hazard.** Sev LOW, **not-verified**. `src/index/hashtable.rs:1298`. `build_resized` matches `Backing::Anonymous => unreachable!("checked above")`; genuinely unreachable today (anonymous case returns early at `1282-1293`). *Why it matters:* a future edit adding a `Backing` variant or reordering the early return converts a logic slip into a hard panic on the resize path (availability). *Fix:* return `HashTableError::ResizeIo` for the Anonymous arm instead of `unreachable!()`.
+
+**Could not verify (high-priority follow-up, not findings):** redb three-file cross-database atomicity; redb-file (not metadata) corruption fallback.
+
+### H. Wire protocol — 2 findings (both LOW)
+
+Verified-correct: frame max length (16 MiB) enforced **before** allocation at two layers (`frame.rs:185-190`, `mod.rs:665-682` before `read_buf.resize`); a cross-connection `InflightBytesLimiter` (256 MiB) acquired before body read. Malformed payloads return clean `STATUS_ERROR`, never panic/drop (unknown opcode → `ERR_OPCODE_UNSUPPORTED`; `_checked` decoders map `CodecError` → `ERR_PAYLOAD_MALFORMED`; a compile-time guard forbids the unchecked decoders). `max_batch_size` enforced before `Vec::with_capacity`. `max_connections`(1024)/`max_connections_per_ip`(64) enforced in the accept loop with RAII decrement (no leak). **Stream-id-to-connection binding is structurally guaranteed** — streams live only in the per-connection `ConnectionState.streams` map keyed by txid, no global registry, so connection B cannot hijack connection A's stream; offset mismatch → `ERR_STREAM_OFFSET_MISMATCH` without advancing `bytes_received`; per-stream 4 GiB cap with `checked_add`.
+
+**H-01 — Legacy `decode_frames` swallows the corrupt-frame error variant (compat-only helper, not on live path).** Sev LOW, **not-verified**. `src/protocol/frame.rs:310-323`. `decode_frames()` collapses corrupt-trailing-frame and genuinely-partial-tail into the same "stop and return frames_so_far" via `Err(_) => break` (`:319`); `try_decode_frames()` (`:338`) fixes this. *Why it matters:* negligible today (the live socket path uses `read_exact` + single-frame `decode_bytes`, not `decode_frames`); risk is a future contributor adopting `decode_frames` on a socket and turning a corrupt length prefix into an endless refill loop. *Fix:* gate `decode_frames` behind `#[cfg(test)]` or delete it.
+
+**H-02 — README omits wire error codes 28–35 and `OP_HELLO`(107).** Sev LOW, **not-verified**. `src/protocol/opcodes.rs:322-382,101`, `README.md:275-381`. `opcodes.rs` defines `ERR_PAYLOAD_MALFORMED=28` … `ERR_DELETED_CHILDREN=35` and `OP_HELLO=107`, absent from the README tables. `ERR_PAYLOAD_MALFORMED` is actively returned. *Why it matters:* a client implemented strictly from the README cannot interpret codes 28–35 or negotiate the `OP_HELLO` handshake. *Fix:* extend the README opcode and error-code tables.
+
+### I. Storage tiers and blobs — 3 findings (1 MEDIUM, 2 LOW)
+
+Verified-correct: tier classification (serialized cold size `<= 8192` → Inline, else External) routes 7 KiB/9 KiB/1.1 MiB correctly; create path chooses tier at allocation time, sizes the record to the payload, rejects oversized inline up front. Missing blobs surface `ColdDataNotFound`/`NotFound`; reads verify length + SHA-256 against the sidecar **and** the record-anchored `ExternalRef.content_hash`. Orphan-blob GC uses a correct 60s mtime grace window. Concurrent same-txid uploads serialized by 256 per-key mutexes with atomic tmp+rename (16-thread barrier test). Non-writable/full paths return typed `BlobError`.
+
+**I-02 — `StorageManager::write_cold_data` has no bound against the allocated record extent; a larger/second inline write would silently overrun the neighbouring record.** Sev MEDIUM, **not-verified (uncertain)**. `src/storage/manager.rs:169-209,412-437`, `tiers.rs:11-15`, `engine.rs:2044-2090`.
+*What's wrong:* `write_cold_data` re-derives the tier from the *current* serialized payload size on every call and the Inline branch writes at `record_offset + inline_cold_offset(utxo_count)` via read-modify-write `write_aligned`; it takes no allocated-span argument and does not check `inline_cold_offset + serialized.len()` fits within the record's allocated `record_size`. The architecture deliberately removed any durable in-record cold-data offset/length field (`tiers.rs:11-15`), so an inline record cannot be migrated to external in place. The production create path is safe (sizes the allocation exactly, rejects oversized, writes once), but `write_cold_data` itself is a public API with no guard.
+*Why it matters:* any future/erroneous second-or-larger call for the same inline record (idempotent create retry, migration re-apply, replica replay, new feature) makes `write_aligned` write past the allocated extent into the adjacent allocation slot — silent cross-record corruption of another transaction's metadata/slots, with no error returned. In a UTXO store that is a vanished/mis-stated UTXO. Latent today because no production caller triggers it.
+*Reproduction:* allocate `record_size_for(1)+50`, `write_cold_data` a ~50-byte inline payload, then `write_cold_data` again on the same offset/`utxo_count` with a 5000-byte payload; `write_aligned` overruns the 50-byte span into the next allocation — assert the neighbouring record's metadata/slots are clobbered.
+*Fix:* pass the allocated cold-data capacity (or recompute from `record_size`) into `write_cold_data` and return `StorageError::ColdDataTooLarge` when an Inline-tier serialized length exceeds it; `debug_assert` in `write_aligned` that the write stays within the extent; add a regression test that a second larger write is rejected.
+
+**I-01 — Tier inline boundary is inclusive (`<=8192`) but documented as `<8KiB`; the "configurable" `inline_threshold` field is never wired to config.** Sev LOW, **not-verified**. `src/storage/tiers.rs:25-31`, `manager.rs:126-152`, `mod.rs:3-5`. Exactly 8192 bytes is Inline; the effective user-data inline ceiling is 8180 bytes (12-byte `ColdData` header). `StorageManager.inline_threshold` is set only to the compile-time constant in `new()` with no config setter — dead configurability. *Why it matters:* operator confusion/doc-drift, no misrouting in the tested range. *Fix:* change docs to `<= 8 KiB`; wire `inline_threshold` to config or remove the field.
+
+**I-03 — `get_range` computes `(offset + length)` as `usize` without an overflow guard.** Sev LOW, **not-verified**. `src/storage/blobstore.rs:712-729,961-973`. A wrapped `(offset+length)` can produce `end < start`, making `data[start..end]` a reverse range that panics after the `.min(data.len())` clamp; `start` is validated but the sum is not. *Why it matters:* `get_range` is reachable from the SPV/streaming read path with caller-supplied offset/length; a malformed range (e.g. `offset=len-1, length=u64::MAX`) panics the worker thread. Low because the full payload is digest-verified first and the wire codec likely caps these upstream — but the storage layer should not depend on upstream validation. *Fix:* `offset.saturating_add(length)` (or `checked_add`) before `.min(data.len())` in both impls.
+
+### J. I/O layer — 5 findings (2 MEDIUM, 3 LOW)
+
+Verified-OK: offset+length alignment enforced on both backends before any libc call; alignment validated power-of-two ≥512 at construction; raw block-device capacity queried from the kernel (`blkgetsize64` Linux / `blockcount*blocksize` macOS), `set_len` never called on block devices; regular files open `truncate(false)`, grown never shrunk; partial pread/pwrite looped with EINTR retry and zero-progress turned into typed `ShortRead`/`WriteStalled`; offset+len overflow uses `checked_add`. **The io_uring backend was DELETED 2026-05-28** (`src/lib.rs:10-15`); the single path is `Arc<dyn BlockDevice>` with `DirectDevice` (O_DIRECT synchronous pread/pwrite) in production and `MemoryDevice` in tests — the sync path is the implementation and is sound.
+
+**J-01 — O_DIRECT buffer-address alignment is not checked (only offset and length).** Sev MEDIUM, **not-verified (uncertain)**. `src/device.rs:772-784,816-823,870-872,673`.
+*What's wrong:* Linux O_DIRECT requires the user buffer's memory address to be block-aligned too; `check_alignment` validates only offset and length; nothing checks `buf.as_ptr()` before `libc::pread`/`pwrite`.
+*Why it matters:* on real Linux O_DIRECT NVMe, a caller passing a non-block-aligned buffer (e.g. a `Vec<u8>` slice) gets `EINVAL` surfaced as opaque `DeviceError::Io` with no hint. Production is saved only by convention (all `io.rs` callers use `AlignedBuf`); the methods are `pub` on a `pub` type, so a future caller can violate it. CI never catches it (`MemoryDevice`/macOS-emulated O_DIRECT). First failure appears in production on the first real NVMe write.
+*Fix:* in `pread`/`pwrite` (or `check_alignment` when O_DIRECT is active) reject `(buf.as_ptr() as usize) % alignment != 0` with `AlignmentViolation`; document the requirement on the trait.
+
+**J-03 — Raw block-device size-query branch (`is_block==true`) has zero test coverage.** Sev MEDIUM, **not-verified (uncertain)**. `src/device.rs:695-742,800,854`.
+*What's wrong:* all `DirectDevice` tests open a regular file, so `is_block` is always false and the kernel ioctl size-query branch (`device.rs:695-742`) — which computes `actual_size`, the value every subsequent OOB bounds check depends on (`:800,:854`) — is never executed. Neither the ioctl encodings nor the unit semantics (macOS `block_count*block_size`) are exercised.
+*Why it matters:* on a fresh deployment pointed at a raw `/dev/nvme0n1`, the store immediately trusts this size; a wrong value (unit confusion, wrong ioctl, silently-zero) makes the allocator's bounds checks wrong → lost capacity or OOB record writes (silent corruption). A regression ships undetected.
+*Fix:* add a platform-gated test using a loop/RAM device asserting `size()`; extract the macOS `sectors*sector-size` arithmetic into a unit-tested pure helper.
+
+**J-04 — Vestigial `IoUringMetrics` exported to `/metrics` and `/admin/top` after the backend was deleted.** Sev LOW, **not-verified**. `src/metrics.rs:1046-1162`, `server.rs:224-230`, `http.rs:965-992,1877-1898`, `lib.rs:10-15`. The metrics table is still constructed at startup and exported (`teraslab_uring_*`) though no live I/O path records into them — every series is permanently zero. *Why it matters:* observability hazard — operators wiring alerts on `teraslab_uring_*` see flat-zero submit/completion latency and zero submit errors and may conclude the device path is healthy when the metrics are simply disconnected (a flat-zero io_uring-submit-errors panel is worse than an absent one). *Fix:* remove `IoUringMetrics` + exporters (or feature-gate for a future backend); update `CLAUDE.md` (still names a `uring` module) to reflect the synchronous O_DIRECT design.
+
+**J-02 — Loop helpers use unchecked `offset + done` arithmetic.** Sev LOW, **not-verified**. `src/device.rs:207,245`. `pread_exact_at`/`pwrite_all_at` compute the per-iteration offset with an unchecked `+`, inconsistent with the module-wide `checked_add` hardening. Non-exploitable (inner pread/pwrite each `checked_add` and reject OOB before I/O). *Fix:* `offset.checked_add(done as u64)`.
+
+**J-05 — Dead `#[cfg(not(unix))]` `DirectDevice` path uses non-atomic seek+read_exact and mis-types short I/O.** Sev LOW, **not-verified**. `src/device.rs:834-841,883-890`. Dead on Linux/macOS (both unix). Flagged so a future Windows/WASM port does not inherit a non-atomic, wrong-error path. *Fix:* for any future non-unix target, use positional I/O and map short results to `ShortRead`/`WriteStalled`.
+
+### K. Pruning — **0 findings**
+
+All six checklist items verified. `block_height_retention` honored with checked-overflow that errors (not saturates) (`delete_eval.rs:31-41`). `PreserveUntil` clears `delete_at_height`, sets `HAS_PRESERVE_UNTIL`, evicts the DAH; the evaluator refuses any DAH while `preserve_until != 0` (`engine.rs:3869-3913`). `ProcessExpiredPreservations` re-reads on-device metadata and skips records with `preserve_until != 0`, `dah == 0 || dah > current_height`, `spent != count`, or `unmined != 0`, before deleting via a replicated synthetic `DELETE_BATCH`. Reorg safety: `mark_on_longest_chain(off)` sets `unmined_since` so the on-longest-chain gate fails and any DAH is cleared atomically. `MarkLongestChainBatch` is WAL-first, replicated, crash-recovered. Old unmined txs tracked by the crash-critical, redo-logged unmined index. **Retraction:** an earlier draft's three findings were fabrications from a flaky session (invented `specs/teranode.lua` — absent — and a nonexistent `clear_preserve_until`); authoritative spec is `BSV_UTXO_STORE_SPEC.md §3.13`, which the code matches.
+
+### L. Resource limits and DoS — 1 finding (LOW)
+
+Verified-OK: read timeout 30s on the initial frame-header read; write timeout 30s; thread-per-connection isolation (accept loop is a mio poller that never reads frame bytes); oversized-frame guard before buffer growth (16 MiB); per-connection `read_buf` shrunk to 256 KiB after each frame; 256 MiB cross-connection `InflightBytesLimiter` (CAS + overflow guard + RAII); per-IP cap 64 + global cap 1024; streaming HMAC verify in bounded 8 KiB chunks; streaming blob upload enforces offset contiguity + `checked_add` + cumulative cap before write + abort-on-every-failure-path; per-request allocation bounded by `max_batch` via `decode_*_checked`.
+
+**L-01 — Idle read timeout is per-syscall, not per-frame: slow-drip client holds a connection slot indefinitely.** Sev LOW, **not-verified**. `src/server/mod.rs:46,618,651,857`.
+*What's wrong:* `CONNECTION_READ_TIMEOUT` (30s) is applied via `set_read_timeout` (per-read, resets on every successful read); there is no whole-frame deadline. A client sending one byte just under 30s keeps `read_exact` making progress forever, holding the connection thread, its inflight permit, and a `max_connections`/`max_connections_per_ip` slot.
+*Why it matters:* classic slow-loris drip. Blast radius is bounded (per-IP 64, global 1024, 256 MiB aggregate) so no OOM and the accept loop is never starved; but many source IPs can pin all 1024 slots near-indefinitely at negligible bandwidth, denying legitimate clients. The existing `silent_client_dropped_after_idle_timeout` only covers a fully-silent client and proves nothing about a dripping one.
+*Fix:* record `Instant::now()` when the 4-byte length prefix is read and abort the frame read if the full frame is not assembled within a bounded deadline, independent of per-read progress; or enforce a minimum body throughput.
+
+### M. Observability — 3 findings (all LOW)
+
+Verified-OK: `/health/live` unconditionally 200; `/health/ready` gates on recovery-complete, degraded-secondary-index, cluster-quorum, replica-lag (index-loaded is satisfied because the binary runs index load + redo recovery + engine construction **synchronously** before the HTTP thread spawns, `server.rs:1129-1153`). Prometheus/OTLP label cardinality is provably bounded (every labeled metric keyed by a fixed `#[repr(u8)]` enum; route label is `&'static str`). Mutating admin endpoints (`/admin/quiesce|rebalance|drain`) are fail-closed (registered only when `enable_admin_endpoints` AND a non-empty `admin_token`; wrapped in `require_admin_bearer` with constant-time SHA-256 compare). Happy-path op accounting is exactly-once (tally once after the group loop, metrics before replication so retries never double-count).
+
+**M-01 — Write-path storage/DAH-overflow errors are invisible in op metrics; `Outcome::ErrStorage` is never incremented on the write path.** Sev LOW, **not-verified**. `dispatch.rs:2935,2949,3137,3268,3681,3952,4056`, `metrics.rs:179`.
+*What's wrong:* mutating handlers increment `attempted` up-front but classify outcomes only in a terminal-tally block after the per-txid loop. When `apply()` returns `Err`, the handler `return error_response(..., ERR_STORAGE_IO, ...)` (e.g. `dispatch.rs:2949`) bypasses the tally; the same shape repeats for unspend/set_mined/create/freeze/unfreeze. Net: `*_attempted_total` ticks but no `*_succeeded/_idempotent/_failed` nor `operations{outcome=...}` cell does; `Outcome::ErrStorage` is dead on the write path.
+*Why it matters:* a device write-failure storm (EIO/ENOSPC) or DAH-overflow misconfig returns `ERR_STORAGE_IO` to clients while `/metrics` shows only a rising `attempted` with no matching failure counter; operators cannot alert on write-path storage errors, and the `attempted == succeeded+idempotent+failed` invariant (debug-asserted at `dispatch.rs:2976-2980`) silently breaks in release. LOW because `redo_flush_errors_total` provides partial coverage.
+*Fix:* before each `ERR_STORAGE_IO` return, increment the op's `_failed` + `operations.inc_by(op, Outcome::ErrStorage, remaining)`, or restructure so the terminal-tally runs on every exit path; add a fault-injection test.
+
+**M-02 — `HttpState.ready` is hard-coded `true` and never set false; readiness correctness depends solely on startup ordering.** Sev LOW, **not-verified**. `server.rs:1133`, `http.rs:1299,1280`. No `ready.store(...)` exists anywhere; the `state.ready` gate is always-true on the single-node path, so readiness rests entirely on the HTTP thread being spawned only after synchronous recovery. *Why it matters:* a future refactor that starts HTTP earlier or makes recovery async would silently re-introduce the F-G6-001 "ready before recovery" bug (LB routes traffic to a node that rejects every request) with no failing flag. The doc at `http.rs:1280` even references that original defect. *Fix:* initialize `ready=false`, spawn HTTP before recovery, `ready.store(true, Release)` only after recovery + engine attach; or add a test asserting the flag starts false and flips post-recovery.
+
+**M-03 — Stale doc comment on `bucket_upper_ns_at`.** Sev LOW, **not-verified**. `src/metrics.rs:748,751`. Doc says "bucket 23 is [1s, 2s)" but the impl returns `128u64 << i`, making bucket 23 `[~0.54s, ~1.07s)`. The parallel `NUM_BUCKETS` comment was corrected; this copy was missed. Cosmetic. *Fix:* update to match `128 << i`.
+
+### N. Test infrastructure — 5 findings (1 confirmed, 3 MEDIUM, 1 LOW)
+
+The crash-recovery coverage is **split**: `tests/recovery_crash_boundaries.rs` and `tests/fault_injection.rs` are strong, real crash/fsync-boundary suites that drive the production `recovery::recover` path. But the prominently-named "crash injection" simulation is structurally incapable of detecting a recovery bug. Verified-OK: both index backends exercised by default; no `is_ok()`-only vacuous assertions in `tests/`; stress/e2e tests execute in default CI at fast scale; double-spend rejected at the wire level.
+
+**N-01 (CONFIRMED, severity corrected HIGH→MEDIUM) — "Crash injection" simulation never runs the real recovery path; its zero-data-loss assertion cannot fail on a recovery bug.** `tests/simulation/mod.rs:178,277,311`, `tests/e2e_workload.rs:234,719,741`.
+*What's wrong:* `SimulatedNode::recover()` (`mod.rs:178-193`) discards the device and builds a brand-new empty `MemoryDevice`-backed engine — it does **not** replay a redo log or rescan device bytes. Then `run_with_faults` re-`create()`s every record straight from the in-process reference `HashMap` and resets each record's spent count to 0 in the reference at the same time (`mod.rs:277-314,311`). So post-crash, engine and reference are re-synced from the **same** in-memory source. The assertions `!result.data_loss_detected` (`e2e_workload.rs:245,752`) and `inconsistencies_found.is_empty()` (`:730`) compare the reference to an engine just rebuilt from that reference.
+*Why it matters:* these are the suite's headline crash-safety tests by name (`e2e_crash_injection_10_seeds`, `simulation_crash_1pct`, `simulation_combined_faults`). A green here implies the recovery path survives 1%/op crash injection across 10 seeds; it proves only that the test's own bookkeeping is self-consistent. A genuine recovery regression (redo replay dropping an entry, torn record, freelist corruption) cannot be observed — a false sense of crash safety for a money-handling store. Severity corrected to MEDIUM because the real durability contract IS covered by `recovery_crash_boundaries.rs` / `fault_injection.rs`; the danger is the misleading name masking that these specific tests are inert.
+*Fix:* rewire `SimulatedNode::recover` to reopen the existing `self.device` via `teraslab::recovery::recover` + a rebuilt index (as `recovery_crash_boundaries.rs:118,177,239` does) and stop clearing/re-creating the reference; OR rename the tests/docs to drop the crash-injection/data-loss claims and rely on the real suites.
+
+**N-02 — Dead fault-injection config: `io_error_probability` and `network_partition_probability` are never read; `simulation_combined_faults` injects only crashes.** Sev MEDIUM, **not-verified**. `tests/simulation/mod.rs:28,30,58,245`, `tests/e2e_workload.rs:741`. `run_with_faults` reads only `crash_probability`; the other two fields appear only at declaration/default; `partitions_injected` is never incremented; `simulation_combined_faults` sets only `crash_probability:0.005`. *Why it matters:* the cluster/replication chaos checklist is partly reported as covered by this framework, but I/O errors and partitions are simulated nowhere; the dead fields advertise a capability the harness lacks. *Fix:* implement the two fault classes or delete the unused fields and the test's reliance on them.
+
+**N-03 — No property-based (proptest/quickcheck) tests for UTXO-conservation invariants.** Sev MEDIUM, **not-verified**. `Cargo.toml:116`, `tests/workload/verifier.rs:449`, `generator.rs:12`. No such dev-dependency exists; the strongest checker is the hand-driven `StateVerifier` with a fixed op-mix and no shrinking. *Why it matters:* for a store where a missed edge case loses money, randomized exploration with shrinking is the standard tool to surface ordering/off-by-one bugs hand-written cases miss. *Fix:* add `proptest`; write a strategy over `Vec<WorkloadOp>` that drives the engine and asserts conservation invariants after each op, reusing `StateVerifier` as oracle; cheap per-PR, larger nightly.
+
+**N-04 — No fuzz target for the wire parser.** Sev MEDIUM, **not-verified**. `src/protocol/codec.rs`, `frame.rs`, `tests/p3_4_frame_zero_copy_allocs.rs:80`. No `fuzz/` dir, no cargo-fuzz config; the decoder (the untrusted network boundary, including the variable-length create-batch path) is exercised only by crafted unit tests. *Why it matters:* a panic or unbounded allocation reachable from one malformed frame is a remote DoS; the codec IS well-defended (`validate_batch_count` + per-section bounds), so this is hardening, not a confirmed live panic. *Fix:* add `fuzz/fuzz_targets/decode_request.rs` feeding arbitrary bytes to the header parser + per-opcode `decode_*_checked`, asserting Ok-or-typed-Err-never-panic; wire into nightly.
+
+**N-05 — Cluster chaos is clean full-node shutdown + logic-level split-brain; no asymmetric partitions / packet loss / reorder on live links.** Sev LOW, **not-verified**. `tests/cluster_tcp.rs:466`, `tests/g8_split_brain.rs:1`, `tests/g8_swim_replay.rs:115`. Node failure is modelled only as clean full shutdown; no interposer drops/delays/reorders/duplicates between live nodes; split-brain merge defenses are tested as pure functions. *Why it matters:* split-brain and quorum bugs most often surface under asymmetric partitions and loss, not clean kills — the weakest chaos dimension (hence LOW given the substantial clean-kill + logic coverage). *Fix:* add a thin TCP/UDP proxy fixture with configurable drop/delay/partition between node pairs; assert quorum/split-brain invariants under it. **This is the test fixture E-01's follow-up and F-02 would both use.**
+
+### O. Bitcoin/Teranode-specific — **0 findings**
+
+All consensus behaviors verified correct against `BSV_UTXO_STORE_SPEC.md` with value-asserting tests. Coinbase maturity = 100 blocks fully wired: `IS_COINBASE` flag + write-once `spending_height` set to `blockHeight+100` at create, enforced at spend with the exact predicate `spending_height>0 && spending_height>current_block_height` in all three paths (single `engine.rs:1053-1058`, multi `1297-1305`, reassign `2877-2895`); validation order hash→coinbase→already-spent→frozen; `CoinbaseImmature` → `ERR_COINBASE_IMMATURE(10)` with 4-byte payload; boundary correct (spendable at depth 100; `spending_height==0` sentinel never immature). Reorg/`MarkOnLongestChain` mutates only `unmined_since` and atomically re-syncs primary+DAH+unmined indexes (single-tx scope per spec). `setConflicting` toggles only the named tx's flag + re-evals DAH (descendant identification is caller responsibility per spec). `delete_at_height` matches §3.13 with checked overflow. **Non-findings:** `specs/teranode.lua` cited by `CLAUDE.md` is absent (LOW doc hygiene); `scan_older_than` inclusive-cutoff worth a parity check vs Aerospike (LOW).
 
 ---
 
-## Methodology
+## 4. Coverage & Error-Code Matrices
 
-Six parallel agents read disjoint subsets of the codebase, each writing a structured Markdown report to `audit/raw/`. The orchestrator (this document's author) ran `cargo build --release`, `cargo clippy --all`, `cargo test --all`, and direct file reads to verify build state, identify failing/ignored tests, build the spec-vs-implementation diff, and cross-check agent claims for high-severity findings.
+Four matrix files under `audit/`:
 
-Where this audit and the existing `docs/TERANODE_PRODUCTION_READINESS_GAPS.md` (2026-05-03) overlap, this audit confirms the existing gap with current file:line evidence. Where this audit identifies *new* problems not in that document, the finding is annotated "new finding" in its category file.
+### `audit/coverage-matrix.md` — 22 ops × 8 columns
+Strong on happy-path + error-code coverage for the hot money path (spend/create); crash/recovery solid for create/spend/free. **Three systematic holes:**
+1. **Replication applies only 6 of 12 mutations** — `unspend, unfreeze, reassign, set_conflicting, preserve_until, delete` never traverse the `ReplicaOp` apply path (delete is money-critical given `ERR_DELETED_CHILDREN`).
+2. **Migration-in-progress asserted with only create/spend/get** (`cluster_tcp.rs:1806`, spend-only) — the other nine mutations are never issued against a fenced shard.
+3. **Crash-mid-op redo replay named only for CreateV2/Spend/Freeze** — `set_mined, mark_longest_chain, reassign, set_conflicting, set_locked, preserve_until, unspend` have NO redo crash-boundary/idempotency test (set_mined and mark_longest_chain mutate the DAH/unmined indexes that gate pruning).
+Secondary: ops 5–12 exercised almost exclusively single-item/small-batch with no over-max or partial-error wire test; reassign's `ReassignOverflow` never surfaced as a wire error.
+
+### `audit/error-code-matrix.md` — triggerability (wire-asserted only)
+21/22 README-scope codes (0–20 + 255) covered. **6 gaps:** T-1 `ERR_INTERNAL`(255) never asserted at the wire (only a negative comment); T-2 `StorageError`→30 `ERR_STORAGE_IO` (~20 dispatch sites, no wire test); T-3 `DahOverflow`/`ReassignOverflow`→255 (the guards against the historic u32 saturating-add pin-forever bug — `DahOverflow` has zero test refs, `ReassignOverflow` engine-`Result` only); T-4 `Pruned`→6 (distinct trigger + 36-byte payload never exercised over the wire); T-5 `DeletedChildren`→35 `ERR_DELETED_CHILDREN` (F-X-022 anti-double-spend guard — appears nowhere under `tests/`; a regression collapsing it to 6 passes silently); T-6 `ReservedSpendingData`→6 (F-G2-002 0xFF slot-bricking guard — tested only at engine level, dispatch mapping unverified). README error table missing codes 28–35.
+
+### `audit/spec-vs-impl.md` — see §5.
+### `audit/dead-code-inventory.md` — see §6.
+
+---
+
+## 5. Spec-vs-Impl Diff Summary
+
+**No money-safety divergences.** Correctness-critical claims (WAL-first ordering, O_DIRECT + alignment, redb primary **fail-closed** — note the audit prompt's "redb falls back to in-memory if corrupt" is a trap; both code and `README:636-638` explicitly deny it for the primary, coinbase maturity boundary, ack-policy quorum math, peak-based write quorum `dispatch.rs:2489 (peak/2)+1`) are implemented AND tested exactly as documented.
+
+**(a) Documented but NOT implemented:**
+1. **`teraslab-cli export-index` / `import-index` do not exist** — `README.md:642-652` documents a full memory↔redb migration runbook with these subcommands; the `Command` enum (`cli.rs:81-164`) has no Export/Import variant. The portable format exists (`migration.rs:48` `PORTABLE_MAGIC "TSMI"`) but there is no CLI entrypoint — runbook is dead on arrival (and `startup.rs:112` tells operators to "Re-run `teraslab import-index`").
+
+**(b) Implemented but NOT as documented:**
+2. **README 3-node cluster recipe is non-bootable** — `README:182` shows `cluster_secret = ""`, deployment examples (196–231) never set a secret or `strict_auth`; default `strict_auth=true` (`config.rs:755`) → validation fails with `StrictAuthRequiresSecret`. Copy-pasting the README cannot start a cluster.
+3. **README slot-size self-contradiction** — diagram says "UtxoSlot: 69 bytes" (`README:562`); prose says 73 (`README:16,567`); code asserts `UTXO_SLOT_SIZE == 73` (`record.rs:713`). Diagram conflates payload-only (69) with on-disk slot (73).
+4. **Doc coverage gaps** — wire error codes 28–35 and `OP_HELLO`(107) implemented but absent from README tables; `DURABILITY_CONTRACT:337-345` persisted-state format stale (omits the trailing `committed_voters`/`ever_seen` sections actually serialized at `topology.rs:375-398`).
+5. **CLI flags parsed-but-ignored:** `--target/--history/--tail/--execute/--cancel/--slots/--raw`.
+
+---
+
+## 6. Dead-Code / TODO Inventory Summary
+
+Non-test code under `src/` (benches clean): `todo!()`/`unimplemented!()` = **0**; `unreachable!()` = **1** (`hashtable.rs:1298` — JUSTIFIED, exhaustiveness marker, see G-02); `panic!()` = **0** (all 200+ hits are in `#[cfg(test)]`, fault_injection by design, or `unwrap_or_else(||panic!())` test assertions); `.unwrap()`/`.expect()` ≈ 150 dominated by `try_into().unwrap()` on length-checked wire buffers (all JUSTIFIED, each behind an explicit length guard); `// TODO`/`FIXME`/`HACK` = **0**; `#[ignore]` = **0**; `assert!(true)` = **0**; "stub" matches = 3, all FALSE POSITIVES (each says the code is NOT a stub).
+
+**Real banned-pattern violations: 0.** Compliance highlight: `dispatch.rs:7314` documents a skipped scenario inline specifically to avoid `#[ignore]`, the CLAUDE.md-mandated pattern. *Recommended corroboration:* a mechanical `cargo clippy --all -- -D warnings` (already clean per recon) + a re-grep in a trusted shell, given the session's intermittent tool-channel artifacts.
+
+---
+
+## 7. Action Plan (ordered milestones)
+
+### Milestone 1 — Things that could lose UTXO data (do first)
+There is **no confirmed live data-loss CRITICAL** at HEAD. This milestone closes the highest-residual-risk verification + hardening gaps that, if wrong, lose money:
+
+1. **RESOLVE E-01 definitively (#1 priority).** I confirmed `topology.rs:911` activates with `quorum_needed=(members.len()/2)+1` over the live shrunken set. Confirm whether `dispatch.rs:2489`'s `(peak/2)+1 → ERR_NO_QUORUM` write-path gate actually blocks a node that has self-activated as master of all shards. If it does, add the peak-derived activation guard anyway as defense-in-depth and a regression test. **If it does NOT, E-01 is a live CRITICAL split-brain — promote it and fix immediately** (derive activation `quorum_needed` from persisted peak; gate `activate_topology` on `alive_count >= (peak/2)+1`).
+2. **Fix N-01 (confirmed):** make `SimulatedNode::recover` reopen the real device via `teraslab::recovery::recover`, or rename the tests to stop claiming crash-recovery coverage they do not provide.
+3. **Close the replication-apply coverage hole** (coverage-matrix #1): add `ReplicaOp` apply + idempotency tests for `unspend, unfreeze, reassign, set_conflicting, preserve_until, delete` — **delete first** (carries the `ERR_DELETED_CHILDREN` parent-respend guard, T-5, which appears nowhere under `tests/`).
+4. **Close the redo-replay idempotency hole** (coverage-matrix #3): add crash-boundary/replay tests for `set_mined` and `mark_longest_chain` (they mutate the DAH/unmined indexes that gate pruning — a non-idempotent replay resurrects or vanishes a UTXO).
+5. **Fix I-02 (uncertain MEDIUM):** bound `write_cold_data` against the allocated record extent + `debug_assert` in `write_aligned`; this is the only path that can silently corrupt a *neighbouring* record's UTXOs.
+
+### Milestone 2 — Security & device correctness
+6. **E-02:** add `OP_HEARTBEAT`/`OP_REPLICA_ACK` to inter-node HMAC auth (or document the threat model).
+7. **J-03 / J-01:** add a loop/RAM-device test for the `is_block` size-query branch; check O_DIRECT buffer-address alignment with a typed error.
+8. **M-01 / M-02:** make write-path storage errors observable in op metrics; make readiness a real flag flipped post-recovery (defends against re-introducing F-G6-001).
+
+### Milestone 3 — Test-harness depth
+9. **N-04:** add a cargo-fuzz target for the wire decoder (nightly).
+10. **N-03:** add proptest UTXO-conservation strategy reusing `StateVerifier`.
+11. **N-05:** add a lossy/partition TCP-proxy fixture for live-cluster chaos (also enables the E-01 partition test and F-02 migration-fence test).
+12. **N-02:** implement or delete the dead `io_error`/`network_partition` simulation fields.
+13. **F-02:** add the subset-master write-reject + read-passthrough integration test.
+
+### Milestone 4 — Hygiene & docs (clean-codebase rule)
+14. Fix the **flaky CI test** `tracing_integration::spend_multi_emits_debug_level_child_spans` (`serial_test` or per-test subscriber).
+15. **C-03 / B-02 / I-01 / M-03:** correct misleading doc comments (the C-03 fix prevents a future maintainer from removing the io.rs torn-read locks).
+16. **J-04:** remove vestigial `IoUringMetrics`; update `CLAUDE.md`'s stale `uring` module reference.
+17. **Spec/README:** ship or remove `export-index`/`import-index`; fix the non-bootable cluster recipe and slot-size contradiction; document error codes 28–35 and `OP_HELLO`(107).
+18. **F-01 / G-01 / G-02 / B-03 / B-04 / D-01 / E-03 / H-01 / H-02 / I-03 / J-02 / J-05 / L-01:** the remaining LOW hardening + coverage items.
+
+---
+
+*End of report.*
