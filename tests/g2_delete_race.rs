@@ -124,7 +124,6 @@ fn delete_does_not_alias_concurrent_create() {
         let engine = engine.clone();
         let stop = stop.clone();
         let cycles_total = cycles_total.clone();
-        let hashes_a = hashes_a;
         let tx_a_inner = tx_a;
         handles.push(thread::spawn(move || {
             let mut local_cycle: u32 = 0;
@@ -181,8 +180,6 @@ fn delete_does_not_alias_concurrent_create() {
         let stop = stop.clone();
         let alias_errors = alias_errors.clone();
         let reads_total = reads_total.clone();
-        let key_a = key_a;
-        let hashes_a = hashes_a;
         handles.push(thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 match engine.read_metadata(&key_a) {

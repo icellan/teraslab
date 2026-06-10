@@ -1121,7 +1121,7 @@ mod tests {
 
         let after = metrics.ack_tracker_flush_failures.get();
         assert!(
-            after >= before + 1,
+            after > before,
             "ack_tracker_flush_failures must bump on persist error \
              (was {before}, now {after})",
         );
