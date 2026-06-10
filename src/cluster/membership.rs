@@ -78,11 +78,18 @@ impl Membership {
     }
 
     /// Recompute the cached sorted list of alive members (including self).
+    ///
+    /// E-03: Suspect nodes are retained — a suspect is still a cluster
+    /// member until the suspicion timeout declares it Dead (SWIM
+    /// convention). This keeps the polled view (`alive_count` /
+    /// `alive_members`) consistent with the `MembershipChanged` event
+    /// stream, which is only emitted when the set actually changes
+    /// (join, death, revival) — never on suspicion.
     fn rebuild_alive_cache(&mut self) {
         let mut members: Vec<NodeId> = self
             .members
             .iter()
-            .filter(|(_, info)| info.state == NodeState::Alive)
+            .filter(|(_, info)| info.state != NodeState::Dead)
             .map(|(&id, _)| id)
             .collect();
         members.push(self.self_id);
@@ -214,7 +221,10 @@ impl Membership {
                 .entry(node)
                 .and_modify(|max| *max = (*max).max(incarnation))
                 .or_insert(incarnation);
-            self.rebuild_alive_cache();
+            // E-03: the alive view intentionally does NOT change here —
+            // a Suspect remains a member until declared Dead, matching
+            // the absence of a MembershipChanged event. No cache rebuild
+            // is needed (Alive → Suspect keeps the node in the cache).
             events.push(ClusterEvent::NodeSuspect(node));
             if let Some(m) = swim_metrics() {
                 m.record_churn(SwimChurnKind::Suspect);
@@ -293,6 +303,10 @@ impl Membership {
 
     /// Get the sorted list of alive members (including self).
     ///
+    /// Suspect nodes are included: a suspect is still a member until the
+    /// suspicion timeout declares it Dead (E-03 — this keeps the polled
+    /// view consistent with the `MembershipChanged` event stream).
+    ///
     /// Returns a clone of the internally cached list. The cache is rebuilt
     /// whenever membership state changes, so this is O(n) only in the clone
     /// cost, not in filtering/sorting.
@@ -305,7 +319,8 @@ impl Membership {
         self.members.len() + 1 // +1 for self
     }
 
-    /// Number of alive members (including self).
+    /// Number of alive members (including self). Suspect nodes count as
+    /// alive until declared Dead — see [`Membership::alive_members`].
     pub fn alive_count(&self) -> usize {
         self.cached_alive.len()
     }
@@ -403,7 +418,9 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ClusterEvent::NodeSuspect(NodeId(2))))
         );
-        assert_eq!(m.alive_count(), 1);
+        // E-03: a Suspect is still a member until declared Dead, so the
+        // polled alive view does not shrink during the suspicion window.
+        assert_eq!(m.alive_count(), 2);
 
         std::thread::sleep(Duration::from_millis(15));
         let events = m.expire_suspects();
@@ -453,14 +470,24 @@ mod tests {
         assert_eq!(m.total_members(), 1); // Just self
     }
 
+    /// E-03: Suspect nodes remain in the alive view until declared Dead
+    /// (SWIM convention) — so the polled view never diverges from the
+    /// `MembershipChanged` event stream, which is only emitted on real
+    /// alive-set changes (join, death, revival).
     #[test]
-    fn suspect_not_in_alive_list() {
+    fn suspect_stays_in_alive_list_until_dead() {
         let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
         m.mark_alive(NodeId(2), addr(3001), 1, true);
         m.mark_suspect(NodeId(2), 1);
 
-        let alive = m.alive_members();
-        assert!(!alive.contains(&NodeId(2)));
+        assert!(
+            m.alive_members().contains(&NodeId(2)),
+            "suspect must remain in the alive view until declared dead"
+        );
+        assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Suspect);
+
+        m.mark_dead(NodeId(2), 1);
+        assert!(!m.alive_members().contains(&NodeId(2)));
     }
 
     #[test]
@@ -887,9 +914,10 @@ mod tests {
     // Deep edge cases: state transition interactions
     // -----------------------------------------------------------------------
 
-    /// mark_suspect does NOT emit MembershipChanged. The alive list changes
-    /// but the topology authority is not notified. This verifies the exact
-    /// event sequence during the Alive → Suspect → Dead → Alive cycle.
+    /// mark_suspect does NOT emit MembershipChanged — and (E-03) the alive
+    /// view does not change either: a Suspect remains a member until
+    /// declared Dead. This verifies the exact event sequence during the
+    /// Alive → Suspect → Dead → Alive cycle.
     #[test]
     fn full_lifecycle_event_sequence() {
         let mut m = Membership::new(NodeId(1), Duration::from_millis(5));
@@ -1144,5 +1172,91 @@ mod tests {
         // This could be a problem if a node restarts on a different port
         // with the same incarnation, but that's prevented by incarnation
         // monotonicity (restart → higher incarnation).
+    }
+
+    // -----------------------------------------------------------------------
+    // E-03: polled alive view and MembershipChanged event stream agree
+    // -----------------------------------------------------------------------
+
+    /// Extract the member list of the last `MembershipChanged` in `events`,
+    /// if any.
+    fn last_membership_changed(events: &[ClusterEvent]) -> Option<Vec<NodeId>> {
+        events.iter().rev().find_map(|e| match e {
+            ClusterEvent::MembershipChanged(m) => Some(m.clone()),
+            _ => None,
+        })
+    }
+
+    /// mark_suspect must not desynchronize the polled view from the event
+    /// stream: no `MembershipChanged` is emitted AND the polled alive view
+    /// is unchanged (the suspect is still a member).
+    #[test]
+    fn suspect_polled_view_matches_event_stream() {
+        let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
+        m.mark_alive(NodeId(2), addr(3001), 1, true);
+        let view_before = m.alive_members();
+        assert_eq!(view_before, vec![NodeId(1), NodeId(2)]);
+
+        let events = m.mark_suspect(NodeId(2), 1);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ClusterEvent::NodeSuspect(NodeId(2))));
+        assert_eq!(
+            last_membership_changed(&events),
+            None,
+            "suspicion must not emit MembershipChanged"
+        );
+        assert_eq!(
+            m.alive_members(),
+            view_before,
+            "no event ⇒ no polled-view change: both must still include the suspect"
+        );
+        assert_eq!(m.alive_count(), 2);
+    }
+
+    /// Suspect → Dead: the `MembershipChanged` payload must equal the
+    /// polled view at the moment the event is emitted.
+    #[test]
+    fn suspect_to_dead_polled_view_matches_event_stream() {
+        let mut m = Membership::new(NodeId(1), Duration::from_millis(5));
+        m.mark_alive(NodeId(2), addr(3001), 1, true);
+        m.mark_suspect(NodeId(2), 1);
+
+        std::thread::sleep(Duration::from_millis(10));
+        let events = m.expire_suspects();
+        let payload = last_membership_changed(&events)
+            .expect("suspect expiry must emit MembershipChanged");
+        assert_eq!(payload, vec![NodeId(1)], "dead node removed from payload");
+        assert_eq!(
+            payload,
+            m.alive_members(),
+            "event payload must equal the polled view"
+        );
+        assert_eq!(m.alive_count(), 1);
+    }
+
+    /// Suspect → Alive refutation (direct probe ACK): the polled view never
+    /// changed during the suspicion window, and the recovery event's payload
+    /// equals the polled view.
+    #[test]
+    fn suspect_refute_polled_view_matches_event_stream() {
+        let mut m = Membership::new(NodeId(1), Duration::from_secs(5));
+        m.mark_alive(NodeId(2), addr(3001), 1, true);
+        m.mark_suspect(NodeId(2), 1);
+        assert_eq!(
+            m.alive_count(),
+            2,
+            "suspect still counted during the suspicion window"
+        );
+
+        let events = m.mark_alive(NodeId(2), addr(3001), 1, true);
+        assert_eq!(m.member_info(&NodeId(2)).unwrap().state, NodeState::Alive);
+        if let Some(payload) = last_membership_changed(&events) {
+            assert_eq!(
+                payload,
+                m.alive_members(),
+                "recovery event payload must equal the polled view"
+            );
+        }
+        assert_eq!(m.alive_members(), vec![NodeId(1), NodeId(2)]);
     }
 }
