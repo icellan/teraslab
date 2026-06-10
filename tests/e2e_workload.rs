@@ -737,7 +737,8 @@ fn simulation_crash_1pct() {
     }
 }
 
-/// Combined faults: zero data loss. fast=10K/seed, full=100K/seed.
+/// Combined faults (random crashes + injected device I/O errors): zero
+/// data loss. fast=10K/seed, full=100K/seed.
 #[test]
 fn simulation_combined_faults() {
     let ops = scale(10_000, 100_000);
@@ -747,6 +748,8 @@ fn simulation_combined_faults() {
         let result = sim.run_with_faults(SimulationConfig {
             operations: ops,
             crash_probability: 0.005,
+            io_error_probability: 0.002,
+            seed: seed + 300,
             ..SimulationConfig::default()
         });
         assert!(
