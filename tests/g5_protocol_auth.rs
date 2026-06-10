@@ -97,6 +97,45 @@ fn heartbeat_returns_status_ok_not_unknown_opcode() {
     server.shutdown();
 }
 
+/// E-02: OP_HEARTBEAT is intentionally NOT in the inter-node auth set —
+/// it is a legacy client-facing liveness shim (F-G5-006) that mutates
+/// nothing and feeds no membership state. An unsigned heartbeat must
+/// keep working even on a fully locked-down cluster (cluster_secret set,
+/// strict_auth on); this test pins that contract so a future "add it to
+/// is_inter_node_auth_opcode" change fails here instead of silently
+/// breaking legacy probes.
+#[test]
+fn heartbeat_unsigned_accepted_with_cluster_secret_strict() {
+    assert!(
+        !is_inter_node_auth_opcode(OP_HEARTBEAT),
+        "OP_HEARTBEAT must stay out of the inter-node auth set (E-02)"
+    );
+    assert!(
+        !is_inter_node_auth_opcode(OP_REPLICA_ACK),
+        "OP_REPLICA_ACK is a response payload; response frames are \
+         verified in tcp_transport::recv_ack, not via the request gate"
+    );
+
+    let (server, port) = start_test_server_with_config(|c| {
+        c.strict_auth = true;
+        c.cluster_secret = Some("e02-pin-secret".to_string().into());
+    });
+    let request = RequestFrame {
+        request_id: 7,
+        op_code: OP_HEARTBEAT,
+        flags: 0,
+        payload: Vec::new().into(),
+    };
+    let response = send_request(port, request);
+    assert_eq!(response.request_id, 7);
+    assert_eq!(
+        response.status, STATUS_OK,
+        "unsigned OP_HEARTBEAT must still be accepted under strict auth"
+    );
+    assert!(response.payload.is_empty());
+    server.shutdown();
+}
+
 /// F-G5-001: with strict_auth = false (default trusted-overlay), an
 /// unsigned inter-node frame is accepted (single-node dispatch returns
 /// STATUS_OK).

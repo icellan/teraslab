@@ -485,6 +485,27 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 /// state). Treating them as inter-node opcodes closes the
 /// reconnaissance surface that previously let any TCP client on the
 /// public port enumerate the cluster's routing tables.
+///
+/// E-02 (2026-05-29 audit): two opcodes are *intentionally* excluded:
+///
+/// - `OP_HEARTBEAT`(250) — a client-facing liveness shim kept for
+///   legacy clients that have not moved to the gossip UDP transport
+///   (F-G5-006). Its handler returns `STATUS_OK` with an empty payload,
+///   mutates nothing, and feeds no membership state (SWIM liveness is
+///   UDP and HMAC-authenticated separately in `cluster::swim`). Gating
+///   it would break exactly the legacy probes it exists for while
+///   protecting nothing — it discloses as little as the equally
+///   unauthenticated `OP_PING`/`OP_HEALTH`.
+/// - `OP_REPLICA_ACK`(241) — never arrives as a request frame: the ack
+///   is the *response payload* of `OP_REPLICA_BATCH`, and response
+///   frames are HMAC-verified by the sender when a `cluster_secret` is
+///   configured (see `verify_frame` in
+///   `replication::tcp_transport::recv_ack`). Listing it here would be
+///   dead code on the request path.
+///
+/// `tests/g5_protocol_auth.rs` pins both exclusions so a future edit
+/// that adds them fails a test instead of silently breaking legacy
+/// probes or implying request-path coverage that does not exist.
 pub fn is_inter_node_auth_opcode(op_code: u16) -> bool {
     matches!(
         op_code,
