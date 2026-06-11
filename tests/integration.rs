@@ -600,6 +600,110 @@ fn full_lifecycle_single_tx() {
     assert!(engine.lookup(&key).is_none());
 }
 
+/// Full create → spend → unspend → setMined → delete lifecycle exercised
+/// against every index backend (Memory, redb, file-backed).
+///
+/// Audit N-5 / G-6: the engine suite otherwise only ever constructs an
+/// in-memory index. A step that succeeds on Memory but fails on
+/// redb/file-backed is a real backend defect (see
+/// `audit/raw/G-index-backends.md`), not a test artifact.
+fn engine_lifecycle_for_backend(mode: IndexBackendMode) {
+    const TX_N: u32 = 0x4C00;
+    const UTXO_COUNT: u32 = 4;
+
+    let case = BackendCase::new(mode.clone());
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+    let alloc = SlotAllocator::new(dev.clone()).unwrap();
+    let (primary, dah, unmined) = case.fresh_indexes();
+    let engine = create_engine_with_backends(dev, alloc, primary, dah, unmined);
+
+    let key = create_tx(&engine, TX_N, UTXO_COUNT as usize);
+    assert!(engine.lookup(&key).is_some(), "created on {mode:?}");
+
+    // Spend every UTXO. `spend_utxo` records a deterministic spending_data
+    // marker that `unspend` must match exactly to clear the slot.
+    let spending_data = |vout: u32| {
+        let mut sd = [0u8; 36];
+        sd[0..4].copy_from_slice(&(TX_N + 10000).to_le_bytes());
+        sd[32..36].copy_from_slice(&vout.to_le_bytes());
+        sd
+    };
+    for v in 0..UTXO_COUNT {
+        spend_utxo(&engine, key, TX_N, v);
+    }
+    assert_eq!(
+        { engine.read_metadata(&key).unwrap().spent_utxos },
+        UTXO_COUNT,
+        "all UTXOs spent on {mode:?}"
+    );
+
+    // Unspend every UTXO back.
+    for v in 0..UTXO_COUNT {
+        engine
+            .unspend(&UnspendRequest {
+                tx_key: key,
+                offset: v,
+                utxo_hash: make_utxo_hash(TX_N, v),
+                spending_data: spending_data(v),
+                current_block_height: 2000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        { engine.read_metadata(&key).unwrap().spent_utxos },
+        0,
+        "spent count returns to zero after unspend on {mode:?}"
+    );
+    let slot = engine.read_slot(&key, 0).unwrap();
+    assert_eq!(
+        slot.status, UTXO_UNSPENT,
+        "slot 0 unspent again after unspend on {mode:?}"
+    );
+
+    // SetMined.
+    engine
+        .set_mined(&SetMinedRequest {
+            tx_key: key,
+            block_id: 77,
+            block_height: 2000,
+            subtree_idx: 0,
+            current_block_height: 2000,
+            block_height_retention: 288,
+            on_longest_chain: true,
+            unset_mined: false,
+        })
+        .unwrap();
+    assert_eq!(
+        engine.read_metadata(&key).unwrap().block_entry_count,
+        1,
+        "set_mined records a block entry on {mode:?}"
+    );
+
+    // Delete.
+    engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+    assert!(engine.lookup(&key).is_none(), "deleted on {mode:?}");
+    assert!(
+        engine.read_metadata(&key).is_err(),
+        "metadata gone after delete on {mode:?}"
+    );
+}
+
+#[test]
+fn engine_lifecycle_backend_memory() {
+    engine_lifecycle_for_backend(IndexBackendMode::Memory);
+}
+
+#[test]
+fn engine_lifecycle_backend_redb() {
+    engine_lifecycle_for_backend(IndexBackendMode::Redb);
+}
+
+#[test]
+fn engine_lifecycle_backend_file_backed() {
+    engine_lifecycle_for_backend(IndexBackendMode::FileBacked);
+}
+
 /// Block arrival: create many txs, mine them all, spend some UTXOs.
 #[test]
 fn simulate_block_arrival() {

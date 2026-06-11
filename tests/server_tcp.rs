@@ -7,10 +7,13 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 
+use tempfile::TempDir;
 use teraslab::allocator::SlotAllocator;
-use teraslab::config::ServerConfig;
+use teraslab::config::{IndexBackendMode, IndexConfig, ServerConfig};
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, UnminedIndex};
+use teraslab::index::redb_dah::RedbDahIndex;
+use teraslab::index::redb_unmined::RedbUnminedIndex;
+use teraslab::index::{DahBackend, DahIndex, Index, PrimaryBackend, UnminedBackend, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
 use teraslab::protocol::codec::*;
@@ -19,7 +22,110 @@ use teraslab::protocol::opcodes::*;
 use teraslab::server::Server;
 use teraslab::storage::blobstore::{BlobStore, MemoryBlobStore};
 
+/// A running test server plus the temp directory backing its on-disk index
+/// files (if any). The [`TempDir`] is held so that redb / file-backed index
+/// files are not deleted out from under the running server; it is cleaned up
+/// automatically when the guard is dropped.
+struct TestServerGuard {
+    server: Arc<Server>,
+    port: u16,
+    /// Backing directory for on-disk backends. `None` for the in-memory
+    /// backend, which needs no on-disk files.
+    _index_dir: Option<TempDir>,
+}
+
+/// Build an [`Engine`] over the requested index backend, allocating any
+/// on-disk index files inside `dir`.
+///
+/// Returns the constructed engine. For [`IndexBackendMode::Memory`] no index
+/// files are written, so `dir` is left empty.
+fn build_engine_for_backend(mode: &IndexBackendMode, dir: &TempDir) -> Arc<Engine> {
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+    let alloc = SlotAllocator::new(dev.clone()).unwrap();
+
+    let config = IndexConfig {
+        backend: mode.clone(),
+        redb_path: dir.path().join("primary.redb"),
+        redb_dah_path: dir.path().join("dah.redb"),
+        redb_unmined_path: dir.path().join("unmined.redb"),
+        redb_cache_size: 16 * 1024 * 1024,
+        file_backed_path: dir.path().join("primary.index"),
+    };
+
+    let (primary, dah, unmined): (PrimaryBackend, DahBackend, UnminedBackend) = match mode {
+        IndexBackendMode::Memory => (
+            PrimaryBackend::new_in_memory(10_000).unwrap(),
+            DahBackend::new_in_memory(),
+            UnminedBackend::new_in_memory(),
+        ),
+        IndexBackendMode::Redb => (
+            PrimaryBackend::new_on_disk(&config).unwrap(),
+            DahBackend::OnDisk(
+                RedbDahIndex::open(&config.redb_dah_path, config.redb_cache_size).unwrap(),
+            ),
+            UnminedBackend::OnDisk(
+                RedbUnminedIndex::open(&config.redb_unmined_path, config.redb_cache_size).unwrap(),
+            ),
+        ),
+        IndexBackendMode::FileBacked => (
+            PrimaryBackend::new_file_backed(&config.file_backed_path, 10_000).unwrap(),
+            DahBackend::new_in_memory(),
+            UnminedBackend::new_in_memory(),
+        ),
+    };
+
+    Arc::new(Engine::new(
+        dev,
+        primary,
+        alloc,
+        StripedLocks::new(1024),
+        dah,
+        unmined,
+    ))
+}
+
+/// Start a server on a random port over the given index backend and return a
+/// guard bundling the server handle, the bound port, and (for on-disk
+/// backends) the temp directory holding the index files. Dropping the guard
+/// cleans up the temp directory.
+fn start_test_server_with_backend(mode: &IndexBackendMode) -> TestServerGuard {
+    let index_dir = TempDir::new().unwrap();
+    let engine = build_engine_for_backend(mode, &index_dir);
+
+    // Bind to port 0 to get a random available port
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let config = ServerConfig {
+        listen_addr: format!("127.0.0.1:{port}"),
+        max_connections: 10,
+        max_batch_size: 8192,
+        ..Default::default()
+    };
+
+    let server = Arc::new(Server::new(engine, config));
+    let server_clone = server.clone();
+
+    std::thread::spawn(move || {
+        server_clone.run().unwrap();
+    });
+
+    // Wait for server to start
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    TestServerGuard {
+        server,
+        port,
+        _index_dir: Some(index_dir),
+    }
+}
+
 /// Start a server on a random port and return (server_handle, port).
+///
+/// Uses the in-memory index backend. For coverage across all three index
+/// backends (Memory, redb, file-backed) see [`start_test_server_with_backend`]
+/// and the `backend_matrix!`-generated tests near the end of this file.
 fn start_test_server() -> (Arc<Server>, u16) {
     let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
@@ -2403,4 +2509,382 @@ fn per_ip_connection_cap_disabled_when_set_to_zero() {
     }
 
     server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Per-backend coverage (Memory / redb / file-backed)
+//
+// Audit N-5 / G-6: almost the entire TCP integration surface only ever ran a
+// server on the in-memory index backend. The `backend_matrix!` macro below
+// generates one test per backend from each shared body so the core wire paths
+// — round-trip, error codes, and the full create → spend → set_mined → delete
+// and unspend lifecycle — also run against redb and file-backed servers.
+//
+// A failure that reproduces only on `redb`/`file_backed` (and not `memory`)
+// is a real backend bug, not a test artifact (see audit/raw/G-index-backends.md).
+// ---------------------------------------------------------------------------
+
+/// Connect a client to a backend-parametrized test server with a read timeout.
+fn connect(port: u16) -> TcpStream {
+    let stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    stream
+}
+
+/// PING/PONG round-trip over the given backend.
+fn backend_ping_pong(mode: &IndexBackendMode) {
+    let guard = start_test_server_with_backend(mode);
+    let mut stream = connect(guard.port);
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1,
+            op_code: OP_PING,
+            flags: 0,
+            payload: vec![].into(),
+        },
+    );
+    assert_eq!(resp.request_id, 1, "{mode:?}");
+    assert_eq!(resp.status, STATUS_OK, "{mode:?}");
+    guard.server.shutdown();
+}
+
+/// Create a record, GetSpend it (unspent), spend a UTXO, then GetSpend it
+/// again (spent) — exercising the create + spend + read paths on the backend.
+fn backend_create_spend_get_spend(mode: &IndexBackendMode) {
+    let guard = start_test_server_with_backend(mode);
+    let mut stream = connect(guard.port);
+
+    let txid = test_txid(2);
+    let resp = create_records(&mut stream, &[make_create_item(txid, 5, 2)], 20);
+    assert_eq!(resp.status, STATUS_OK, "create {mode:?}");
+
+    // Unspent before spend.
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 21,
+            op_code: OP_GET_SPEND_BATCH,
+            flags: 0,
+            payload: encode_get_spend_batch(&[WireGetSpendItem {
+                txid,
+                vout: 0,
+                utxo_hash: test_utxo_hash(2, 0),
+            }])
+            .into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK, "get_spend(pre) {mode:?}");
+    let results = decode_get_spend_response(&resp.payload).unwrap();
+    assert_eq!(results[0].slot_status, 0x00, "unspent {mode:?}");
+
+    // Spend UTXO 0.
+    let mut sd = [0u8; 36];
+    sd[0] = 0xAB;
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 22,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload: encode_spend_batch(
+                &SpendBatchParams {
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                },
+                &[WireSpendItem {
+                    txid,
+                    vout: 0,
+                    utxo_hash: test_utxo_hash(2, 0),
+                    spending_data: sd,
+                }],
+            )
+            .into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK, "spend {mode:?}");
+
+    // Spent after spend, spending_data preserved.
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 23,
+            op_code: OP_GET_SPEND_BATCH,
+            flags: 0,
+            payload: encode_get_spend_batch(&[WireGetSpendItem {
+                txid,
+                vout: 0,
+                utxo_hash: test_utxo_hash(2, 0),
+            }])
+            .into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK, "get_spend(post) {mode:?}");
+    let results = decode_get_spend_response(&resp.payload).unwrap();
+    assert_eq!(results[0].slot_status, 0x01, "spent {mode:?}");
+    assert_eq!(results[0].spending_data[0], 0xAB, "spending_data {mode:?}");
+
+    guard.server.shutdown();
+}
+
+/// Exercise the item-level error codes on the backend: ALREADY_EXISTS on a
+/// duplicate create, VOUT_OUT_OF_RANGE on an over-range spend, and
+/// UTXO_HASH_MISMATCH on a wrong-hash GetSpend.
+fn backend_error_codes(mode: &IndexBackendMode) {
+    let guard = start_test_server_with_backend(mode);
+    let mut stream = connect(guard.port);
+
+    // ALREADY_EXISTS: duplicate create of the same txid.
+    let dup_txid = test_txid(1310);
+    let item = make_create_item(dup_txid, 1, 1310);
+    let resp = create_records(&mut stream, std::slice::from_ref(&item), 1310);
+    assert_eq!(resp.status, STATUS_OK, "first create {mode:?}");
+    let resp = create_records(&mut stream, &[item], 1311);
+    let err = assert_single_sparse_error(&resp, ERR_ALREADY_EXISTS);
+    assert_eq!(err.error_code, ERR_ALREADY_EXISTS, "{mode:?}");
+
+    // VOUT_OUT_OF_RANGE: spend an output beyond the slot count.
+    let range_txid = test_txid(1312);
+    let resp = create_records(&mut stream, &[make_create_item(range_txid, 1, 1312)], 1312);
+    assert_eq!(resp.status, STATUS_OK, "range create {mode:?}");
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1313,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload: encode_spend_batch(
+                &SpendBatchParams {
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                },
+                &[WireSpendItem {
+                    txid: range_txid,
+                    vout: 5, // only vout 0 exists
+                    utxo_hash: test_utxo_hash(1312, 5),
+                    spending_data: [0u8; 36],
+                }],
+            )
+            .into(),
+        },
+    );
+    assert_single_sparse_error(&resp, ERR_VOUT_OUT_OF_RANGE);
+
+    // UTXO_HASH_MISMATCH: GetSpend with the wrong hash.
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1314,
+            op_code: OP_GET_SPEND_BATCH,
+            flags: 0,
+            payload: encode_get_spend_batch(&[WireGetSpendItem {
+                txid: range_txid,
+                vout: 0,
+                utxo_hash: test_utxo_hash(9999, 0), // wrong hash
+            }])
+            .into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK, "hash-mismatch get_spend {mode:?}");
+    let results = decode_get_spend_response(&resp.payload).unwrap();
+    assert_eq!(results[0].status, 1, "{mode:?}");
+    assert_eq!(
+        results[0].error_code, ERR_UTXO_HASH_MISMATCH,
+        "hash mismatch {mode:?}"
+    );
+
+    guard.server.shutdown();
+}
+
+/// Full create → set_mined → delete lifecycle on the backend; the deleted tx
+/// must then GetSpend as TX_NOT_FOUND.
+fn backend_create_set_mined_delete(mode: &IndexBackendMode) {
+    let guard = start_test_server_with_backend(mode);
+    let mut stream = connect(guard.port);
+
+    let txid = test_txid(3);
+    let resp = create_records(&mut stream, &[make_create_item(txid, 2, 3)], 30);
+    assert_eq!(resp.status, STATUS_OK, "create {mode:?}");
+
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 31,
+            op_code: OP_SET_MINED_BATCH,
+            flags: 0,
+            payload: encode_set_mined_batch(
+                &SetMinedBatchParams {
+                    block_id: 42,
+                    block_height: 1000,
+                    subtree_idx: 0,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                },
+                &[txid],
+            )
+            .into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK, "set_mined {mode:?}");
+
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 32,
+            op_code: OP_DELETE_BATCH,
+            flags: 0,
+            payload: encode_txid_batch(&[txid], &[]).into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK, "delete {mode:?}");
+
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 33,
+            op_code: OP_GET_SPEND_BATCH,
+            flags: 0,
+            payload: encode_get_spend_batch(&[WireGetSpendItem {
+                txid,
+                vout: 0,
+                utxo_hash: test_utxo_hash(3, 0),
+            }])
+            .into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK, "get_spend(deleted) {mode:?}");
+    let results = decode_get_spend_response(&resp.payload).unwrap();
+    assert_eq!(results[0].status, 1, "{mode:?}");
+    assert_eq!(
+        results[0].error_code, ERR_TX_NOT_FOUND,
+        "delete-then-get {mode:?}"
+    );
+
+    guard.server.shutdown();
+}
+
+/// Create → spend → unspend round-trip on the backend; after unspend the
+/// UTXO is reported unspent again.
+fn backend_create_spend_unspend(mode: &IndexBackendMode) {
+    let guard = start_test_server_with_backend(mode);
+    let mut stream = connect(guard.port);
+
+    let txid = test_txid(4);
+    let resp = create_records(&mut stream, &[make_create_item(txid, 2, 4)], 40);
+    assert_eq!(resp.status, STATUS_OK, "create {mode:?}");
+
+    let mut sd = [0u8; 36];
+    sd[0] = 0xCD;
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 41,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload: encode_spend_batch(
+                &SpendBatchParams {
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                },
+                &[WireSpendItem {
+                    txid,
+                    vout: 0,
+                    utxo_hash: test_utxo_hash(4, 0),
+                    spending_data: sd,
+                }],
+            )
+            .into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK, "spend {mode:?}");
+
+    // Unspend it back. The spending_data must match what was recorded.
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 42,
+            op_code: OP_UNSPEND_BATCH,
+            flags: 0,
+            payload: encode_unspend_batch(
+                &UnspendBatchParams {
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                },
+                &[WireUnspendItem {
+                    txid,
+                    vout: 0,
+                    utxo_hash: test_utxo_hash(4, 0),
+                    spending_data: sd,
+                }],
+            )
+            .into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK, "unspend {mode:?}");
+
+    // Unspent again.
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 43,
+            op_code: OP_GET_SPEND_BATCH,
+            flags: 0,
+            payload: encode_get_spend_batch(&[WireGetSpendItem {
+                txid,
+                vout: 0,
+                utxo_hash: test_utxo_hash(4, 0),
+            }])
+            .into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK, "get_spend(post-unspend) {mode:?}");
+    let results = decode_get_spend_response(&resp.payload).unwrap();
+    assert_eq!(results[0].slot_status, 0x00, "unspent after unspend {mode:?}");
+
+    guard.server.shutdown();
+}
+
+/// Generate, for each index backend, a `#[test]` per shared body so the core
+/// TCP wire paths run on Memory, redb, and file-backed servers.
+macro_rules! backend_matrix {
+    ($($name:ident => $body:path),+ $(,)?) => {
+        $(
+            mod $name {
+                use super::*;
+
+                #[test]
+                fn memory() {
+                    $body(&IndexBackendMode::Memory);
+                }
+
+                #[test]
+                fn redb() {
+                    $body(&IndexBackendMode::Redb);
+                }
+
+                #[test]
+                fn file_backed() {
+                    $body(&IndexBackendMode::FileBacked);
+                }
+            }
+        )+
+    };
+}
+
+backend_matrix! {
+    matrix_ping_pong => backend_ping_pong,
+    matrix_create_spend_get_spend => backend_create_spend_get_spend,
+    matrix_error_codes => backend_error_codes,
+    matrix_create_set_mined_delete => backend_create_set_mined_delete,
+    matrix_create_spend_unspend => backend_create_spend_unspend,
 }
