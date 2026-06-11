@@ -117,6 +117,14 @@ pub enum SyncPoint {
     /// freelist.
     MidAllocatorPersist,
 
+    /// Inside the checkpoint, after the snapshot + allocator persist but
+    /// BEFORE the data-device durability barrier and the recovery-progress
+    /// fence (B-1/G-1). Panicking here simulates a crash with the
+    /// snapshot written but the redo log untouched (no fence appended,
+    /// no compaction). Post-recovery: every redo entry is still
+    /// replayable and idempotent replay reproduces all acked mutations.
+    BeforeCheckpointDataSync,
+
     /// Just before the secondary-index redb transaction commits in
     /// [`crate::index::redb_dah`] or [`crate::index::redb_unmined`].
     /// Alias of [`SyncPoint::BeforeIndexCommit`] for readability when
@@ -240,6 +248,7 @@ mod tests {
         check(SyncPoint::AfterIndexCommit);
         check(SyncPoint::MidHashtableResize);
         check(SyncPoint::MidAllocatorPersist);
+        check(SyncPoint::BeforeCheckpointDataSync);
         check(SyncPoint::BeforeSecondaryRedbCommit);
         check(SyncPoint::AfterSecondaryRedbCommit);
         assert_eq!(current(), FaultMode::None);

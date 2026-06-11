@@ -4272,6 +4272,27 @@ impl Engine {
     pub fn persist_allocator(&self) -> crate::allocator::Result<()> {
         self.allocator.lock().persist()
     }
+
+    /// Force the primary, DAH, and unmined index backends durable on
+    /// their own storage (G-1 audit fix).
+    ///
+    /// On-disk (redb) backends commit with `Durability::Eventual` per op,
+    /// relying on the redo log for crash recovery — that is only sound
+    /// while the covering redo entries remain replayable. The checkpoint
+    /// task calls this BEFORE writing its recovery-progress fence and
+    /// compacting the redo prefix; a failure here MUST abort the
+    /// checkpoint (no fence, no compaction). In-memory backends are
+    /// no-ops (their durability comes from the snapshot file).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::index::IndexError`] if any backend's durability
+    /// flush fails; the caller must treat all index state as NOT durable.
+    pub fn flush_index_durable(&self) -> crate::index::Result<()> {
+        self.index.read().flush_durable()?;
+        self.dah_index.lock().flush_durable()?;
+        self.unmined_index.lock().flush_durable()
+    }
 }
 
 impl<'a> ValidatedSpend<'a> {

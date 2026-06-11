@@ -195,6 +195,22 @@ impl DahBackend {
             Self::OnDisk(redb) => DahIter::Redb(redb.iter_streaming()),
         }
     }
+
+    /// Force all backend state durable (G-1 audit fix). No-op for the
+    /// in-memory variant; fsyncs all prior `Durability::Eventual` commits
+    /// for the redb variant. See
+    /// [`crate::index::PrimaryBackend::flush_durable`] for the checkpoint
+    /// contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the redb flush transaction fails.
+    pub fn flush_durable(&self) -> Result<(), IndexError> {
+        match self {
+            Self::InMemory(_) => Ok(()),
+            Self::OnDisk(redb) => redb.flush_durable(),
+        }
+    }
 }
 
 impl Default for DahBackend {
@@ -347,6 +363,22 @@ impl UnminedBackend {
             Self::OnDisk(redb) => redb.replay_redo(entry),
         }
     }
+
+    /// Force all backend state durable (G-1 audit fix). No-op for the
+    /// in-memory variant; fsyncs all prior `Durability::Eventual` commits
+    /// for the redb variant. See
+    /// [`crate::index::PrimaryBackend::flush_durable`] for the checkpoint
+    /// contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the redb flush transaction fails.
+    pub fn flush_durable(&self) -> Result<(), IndexError> {
+        match self {
+            Self::InMemory(_) => Ok(()),
+            Self::OnDisk(redb) => redb.flush_durable(),
+        }
+    }
 }
 
 impl Default for UnminedBackend {
@@ -409,6 +441,28 @@ mod tests {
     // -----------------------------------------------------------------------
     // DahBackend: parameterized tests
     // -----------------------------------------------------------------------
+
+    /// G-1: `flush_durable` must succeed on every backend variant (no-op
+    /// in-memory, `Durability::Immediate` empty commit for redb) and leave
+    /// the backend fully usable for subsequent reads and writes.
+    #[test]
+    fn flush_durable_succeeds_and_backend_stays_usable() {
+        with_both_dah_backends(|backend| {
+            backend.insert(100, key(1), None).unwrap();
+            backend.flush_durable().expect("DAH flush must succeed");
+            assert_eq!(backend.len(), 1);
+            assert_eq!(backend.range_query(100), vec![key(1)]);
+            backend.insert(200, key(2), None).unwrap();
+            assert_eq!(backend.len(), 2, "backend must stay writable after flush");
+        });
+        with_both_unmined_backends(|backend| {
+            backend.insert(100, key(1), None).unwrap();
+            backend.flush_durable().expect("unmined flush must succeed");
+            assert_eq!(backend.len(), 1);
+            backend.insert(200, key(2), None).unwrap();
+            assert_eq!(backend.len(), 2, "backend must stay writable after flush");
+        });
+    }
 
     #[test]
     fn dah_both_insert_and_range_query() {

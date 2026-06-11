@@ -61,6 +61,12 @@ pub struct RedbPrimary {
     /// (lookup is `fn lookup(&self, ...)`). Never set outside tests.
     #[cfg(test)]
     fail_next_read: std::cell::Cell<bool>,
+    /// Test-only: fail the next [`Self::flush_durable`] call. Used to
+    /// verify that the checkpoint aborts (no fence, no redo compaction)
+    /// when the redb durability flush fails. `Cell` for the same reason
+    /// as `fail_next_read` — `flush_durable` takes `&self`.
+    #[cfg(test)]
+    fail_next_flush: std::cell::Cell<bool>,
 }
 
 /// Batch update parameters for [`RedbPrimary::update_cached_fields_batch`].
@@ -130,7 +136,49 @@ impl RedbPrimary {
             fail_next_write: false,
             #[cfg(test)]
             fail_next_read: std::cell::Cell::new(false),
+            #[cfg(test)]
+            fail_next_flush: std::cell::Cell::new(false),
         })
+    }
+
+    /// Make every previously committed (`Durability::Eventual`) write
+    /// transaction durable by committing an empty transaction with
+    /// `Durability::Immediate` — redb fsyncs the database file as part of
+    /// that commit, which covers all earlier non-fsynced commits.
+    ///
+    /// The checkpoint task MUST call this (via
+    /// [`crate::ops::engine::Engine::flush_index_durable`]) before it
+    /// fences and compacts the redo log: the per-op `Eventual` commits are
+    /// only crash-safe while the redo entries covering them remain
+    /// replayable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the transaction cannot be started or
+    /// committed; callers must treat that as "redb state is NOT durable"
+    /// and abort any redo reclamation.
+    pub fn flush_durable(&self) -> Result<(), IndexError> {
+        #[cfg(test)]
+        if self.fail_next_flush.get() {
+            self.fail_next_flush.set(false);
+            return Err(IndexError::FormatError {
+                detail: "redb test-injected flush failure".into(),
+            });
+        }
+        let mut txn = self.db.begin_write().map_err(map_redb_txn_err)?;
+        txn.set_durability(redb::Durability::Immediate);
+        txn.commit().map_err(map_redb_commit_err)?;
+        Ok(())
+    }
+
+    /// Test-only: arm a synthetic failure in the next [`Self::flush_durable`].
+    ///
+    /// The flag auto-disarms after firing so subsequent flushes behave
+    /// normally. Used to verify the checkpoint aborts cleanly (fence not
+    /// written, redo not compacted) when the durability flush fails.
+    #[cfg(test)]
+    pub fn arm_fail_next_flush(&self) {
+        self.fail_next_flush.set(true);
     }
 
     /// Test-only: arm a synthetic failure in the next write transaction.
@@ -742,6 +790,46 @@ mod tests {
     fn lookup_missing_returns_none() {
         let (_dir, primary) = open_temp();
         assert!(primary.lookup(&make_key(999)).unwrap().is_none());
+    }
+
+    /// G-1: `flush_durable` commits an empty `Durability::Immediate`
+    /// transaction so all prior `Eventual` commits are fsynced. After the
+    /// flush, a reopen of the database file must observe the entries.
+    #[test]
+    fn flush_durable_persists_eventual_commits_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("flush.redb");
+        {
+            let mut primary = RedbPrimary::open(&db_path, 64 * 1024 * 1024).unwrap();
+            for i in 0..50u64 {
+                primary.register(make_key(i), make_entry(i * 4096)).unwrap();
+            }
+            primary.flush_durable().expect("flush must succeed");
+        }
+        let primary = RedbPrimary::open(&db_path, 64 * 1024 * 1024).unwrap();
+        assert_eq!(primary.len(), 50, "all flushed entries must survive reopen");
+        let e = primary.lookup(&make_key(7)).unwrap().expect("entry present");
+        assert_eq!(e.record_offset, 7 * 4096);
+    }
+
+    /// G-1: the test-only flush fail hook fires exactly once and surfaces
+    /// the documented error variant; the next flush succeeds.
+    #[test]
+    fn arm_fail_next_flush_fires_once_with_format_error() {
+        let (_dir, primary) = open_temp();
+        primary.arm_fail_next_flush();
+        match primary.flush_durable() {
+            Err(IndexError::FormatError { detail }) => {
+                assert!(
+                    detail.contains("test-injected flush failure"),
+                    "detail must identify the injected failure: {detail}"
+                );
+            }
+            other => panic!("expected injected FormatError, got {other:?}"),
+        }
+        primary
+            .flush_durable()
+            .expect("flag must auto-disarm after firing");
     }
 
     #[test]

@@ -384,6 +384,35 @@ impl PrimaryBackend {
         }
     }
 
+    /// Force all backend state durable on its own storage (G-1 audit fix).
+    ///
+    /// For the `OnDisk` (redb) backend this commits an empty
+    /// `Durability::Immediate` transaction, fsyncing every prior
+    /// `Durability::Eventual` commit. Per-op redb commits are only
+    /// crash-safe while their covering redo entries are replayable, so
+    /// the checkpoint MUST call this — and abort on failure — before it
+    /// fences and compacts the redo log.
+    ///
+    /// `InMemory` is a no-op (its durability comes from the snapshot
+    /// file the checkpoint writes). `FileBacked` schedules an mmap
+    /// writeback; its crash story is the unclean-shutdown sentinel +
+    /// device-scan rebuild, not this flush.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the redb flush transaction fails;
+    /// the caller must treat the backend state as NOT durable.
+    pub fn flush_durable(&self) -> Result<(), IndexError> {
+        match self {
+            Self::InMemory(_) => Ok(()),
+            Self::OnDisk(redb) => redb.flush_durable(),
+            Self::FileBacked(idx) => {
+                idx.sync();
+                Ok(())
+            }
+        }
+    }
+
     /// Attach a redo log for journaling crash-atomic file-backed hash
     /// table resizes.
     ///

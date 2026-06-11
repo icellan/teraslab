@@ -515,6 +515,21 @@ pub struct MemoryDevice {
     /// "MemoryDevice is never resized".
     len: u64,
     alignment: usize,
+    /// Volatile write-cache simulation (B-1 audit fix). `None` (the
+    /// default) keeps the historical behavior: every write is
+    /// immediately "durable" and [`sync`](BlockDevice::sync) is a
+    /// no-op — which is exactly why pre-fix durability tests could not
+    /// distinguish "synced" from "merely pwritten".
+    ///
+    /// `Some(shadow)` (via [`MemoryDevice::new_volatile`]) models a
+    /// drive with a volatile write cache: `shadow` holds the bytes as
+    /// of the last `sync()`, while `raw_ptr` holds the live (cached)
+    /// bytes. [`MemoryDevice::simulate_power_loss`] reverts the live
+    /// bytes to the shadow, dropping everything written since the last
+    /// `sync()` — including writes made through the zero-copy
+    /// [`as_raw_ptr`](BlockDevice::as_raw_ptr) path, because that
+    /// pointer aliases the live allocation.
+    durable_shadow: Option<parking_lot::Mutex<Box<[u8]>>>,
 }
 
 // Safety: MemoryDevice owns the heap allocation pointed to by `raw_ptr`
@@ -557,7 +572,58 @@ impl MemoryDevice {
             raw_ptr,
             len: size,
             alignment,
+            durable_shadow: None,
         })
+    }
+
+    /// Create an in-memory device that simulates a volatile drive write
+    /// cache (test scaffolding for durability-barrier tests).
+    ///
+    /// Writes land in the live buffer (visible to subsequent reads, as
+    /// on a real drive) but are only made "durable" by a
+    /// [`sync`](BlockDevice::sync) call. A subsequent
+    /// [`simulate_power_loss`](Self::simulate_power_loss) reverts the
+    /// device to its state at the last `sync()`, modeling power failure
+    /// with an unflushed write cache.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`MemoryDevice::new`]: [`DeviceError::ZeroSize`] for a
+    /// zero-byte device, [`DeviceError::InvalidAlignment`] for a
+    /// non-power-of-two or sub-512 alignment.
+    pub fn new_volatile(size: u64, alignment: usize) -> Result<Self> {
+        let mut dev = Self::new(size, alignment)?;
+        dev.durable_shadow =
+            Some(parking_lot::Mutex::new(vec![0u8; size as usize].into_boxed_slice()));
+        Ok(dev)
+    }
+
+    /// Drop every write issued since the last successful
+    /// [`sync`](BlockDevice::sync), simulating a power failure with a
+    /// volatile write cache.
+    ///
+    /// Returns `true` if the device was created with
+    /// [`new_volatile`](Self::new_volatile) and the revert was
+    /// performed, `false` for a default (always-durable) device, on
+    /// which this call has no effect. Callers in tests should assert
+    /// the return value so a test cannot silently run against a
+    /// non-volatile device.
+    ///
+    /// Must not race concurrent `pread`/`pwrite`/raw-pointer access —
+    /// the same single-writer contract every other whole-device
+    /// operation on `MemoryDevice` already requires.
+    pub fn simulate_power_loss(&self) -> bool {
+        let Some(shadow) = &self.durable_shadow else {
+            return false;
+        };
+        let shadow = shadow.lock();
+        // Safety: `raw_ptr` is valid for `len` bytes for the lifetime of
+        // `self`; the caller guarantees no concurrent access (see doc).
+        unsafe {
+            let live = std::slice::from_raw_parts_mut(self.raw_ptr, self.len as usize);
+            live.copy_from_slice(&shadow);
+        }
+        true
     }
 }
 
@@ -675,6 +741,17 @@ impl BlockDevice for MemoryDevice {
     }
 
     fn sync(&self) -> Result<()> {
+        if let Some(shadow) = &self.durable_shadow {
+            let mut shadow = shadow.lock();
+            // Safety: `raw_ptr` is valid for `len` bytes for the lifetime
+            // of `self`; the caller guarantees no concurrent writes during
+            // a sync (same single-writer contract as
+            // `simulate_power_loss`).
+            unsafe {
+                let live = std::slice::from_raw_parts(self.raw_ptr, self.len as usize);
+                shadow.copy_from_slice(live);
+            }
+        }
         Ok(())
     }
 
@@ -2004,5 +2081,83 @@ mod tests {
             }
             other => panic!("expected OutOfBounds, got {other:?}"),
         }
+    }
+
+    // -- B-1 volatile write-cache mode ------------------------------------
+
+    /// Helper: read one aligned block back from the device into a Vec.
+    fn read_block(dev: &MemoryDevice, offset: u64) -> Vec<u8> {
+        let mut buf = AlignedBuf::new(4096, 4096);
+        dev.pread_exact_at(&mut buf, offset).unwrap();
+        buf.to_vec()
+    }
+
+    #[test]
+    fn volatile_device_drops_unsynced_writes_on_power_loss() {
+        let dev = MemoryDevice::new_volatile(16 * 4096, 4096).unwrap();
+        let mut buf = AlignedBuf::new(4096, 4096);
+        buf.fill(0xAB);
+        dev.pwrite_all_at(&buf, 4096).unwrap();
+
+        // Before power loss, reads see the cached (live) bytes.
+        assert_eq!(read_block(&dev, 4096), vec![0xAB; 4096]);
+
+        assert!(
+            dev.simulate_power_loss(),
+            "volatile device must report the revert was performed"
+        );
+
+        // The unsynced write is gone — back to the all-zero durable state.
+        assert_eq!(read_block(&dev, 4096), vec![0u8; 4096]);
+    }
+
+    #[test]
+    fn volatile_device_preserves_synced_writes_across_power_loss() {
+        let dev = MemoryDevice::new_volatile(16 * 4096, 4096).unwrap();
+        let mut buf = AlignedBuf::new(4096, 4096);
+        buf.fill(0xCD);
+        dev.pwrite_all_at(&buf, 0).unwrap();
+        dev.sync().unwrap();
+
+        // A second, unsynced write to a different block.
+        let mut buf2 = AlignedBuf::new(4096, 4096);
+        buf2.fill(0xEF);
+        dev.pwrite_all_at(&buf2, 8192).unwrap();
+
+        assert!(dev.simulate_power_loss());
+
+        // Synced block survives; unsynced block reverts.
+        assert_eq!(read_block(&dev, 0), vec![0xCD; 4096]);
+        assert_eq!(read_block(&dev, 8192), vec![0u8; 4096]);
+    }
+
+    #[test]
+    fn volatile_device_power_loss_drops_raw_pointer_writes_too() {
+        // The engine hot path writes through `as_raw_ptr`, bypassing
+        // `pwrite`. Power loss must drop those writes as well, because
+        // the durability question is per-device, not per-API.
+        let dev = MemoryDevice::new_volatile(4 * 4096, 4096).unwrap();
+        let ptr = dev.as_raw_ptr().unwrap();
+        // Safety: in-bounds single-threaded write to the live allocation.
+        unsafe {
+            *ptr.add(100) = 0x77;
+        }
+        assert!(dev.simulate_power_loss());
+        assert_eq!(read_block(&dev, 0)[100], 0, "raw-ptr write must be dropped");
+    }
+
+    #[test]
+    fn default_device_power_loss_is_noop_and_reports_false() {
+        let dev = MemoryDevice::new(4 * 4096, 4096).unwrap();
+        let mut buf = AlignedBuf::new(4096, 4096);
+        buf.fill(0x55);
+        dev.pwrite_all_at(&buf, 0).unwrap();
+
+        assert!(
+            !dev.simulate_power_loss(),
+            "default device must report it performed no revert"
+        );
+        // Historical behavior unchanged: the write survives without sync.
+        assert_eq!(read_block(&dev, 0), vec![0x55; 4096]);
     }
 }

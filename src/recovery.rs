@@ -10,8 +10,14 @@
 //! 1. Validate under lock.
 //! 2. Append the redo entry and fsync the log (`RedoLog::append` +
 //!    `flush`).
-//! 3. Apply the mutation to the block device via `pwrite_all_at`
-//!    (durable on return for `DirectDevice` via `O_DIRECT`).
+//! 3. Apply the mutation to the block device via `pwrite_all_at`. This
+//!    write is NOT necessarily durable on return — even with `O_DIRECT`
+//!    it can sit in the drive's volatile write cache (and, for
+//!    file-backed devices, in unjournalled filesystem extent
+//!    allocations). That is acceptable only because the fsynced redo
+//!    entry from step 2 can replay it; the checkpoint therefore issues a
+//!    data-device sync barrier before it fences/compacts any redo entry
+//!    (see [`crate::checkpoint`]).
 //! 4. Replicate.
 //!
 //! On crash, the redo log is the single durable source of truth for

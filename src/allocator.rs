@@ -1095,6 +1095,17 @@ impl SlotAllocator {
     /// The CRC32 at bytes 44..48 is stamped last. During computation the
     /// CRC field is treated as zero so [`SlotAllocator::recover`] can
     /// reproduce the value by zeroing the field before hashing.
+    ///
+    /// The header write is followed by a device sync, so the persisted
+    /// state is durable (not merely in the drive's write cache) when this
+    /// returns. Checkpointing relies on that barrier before it reclaims
+    /// the redo entries covering the freelist delta.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AllocatorError::FreelistOverflow`] if the freelist does
+    /// not fit in the on-device header, or [`AllocatorError::Device`] if
+    /// the header write or the sync fails.
     pub fn persist(&self) -> Result<()> {
         // F-G1-009: refuse to silently truncate a freelist that does not
         // fit in the on-device header. Pre-fix this branch was
@@ -1143,6 +1154,14 @@ impl SlotAllocator {
         buf[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 
         self.device.pwrite_all_at(&buf, 0)?;
+        // B-1 audit fix: barrier the header write. Without this the pwrite
+        // can sit in the drive's volatile write cache; the checkpoint then
+        // compacts the AllocateRegion/FreeRegion redo entries covering the
+        // delta, and a power loss reverts the header with no replayable
+        // copy left — the next boot double-allocates live regions. The
+        // checkpoint doc has always claimed "allocator persist is fsynced
+        // before returning"; this makes that claim true.
+        self.device.sync()?;
         Ok(())
     }
 
@@ -1535,6 +1554,41 @@ mod tests {
         let o4 = alloc2.allocate(4096).unwrap();
         assert_ne!(o4, o2);
         assert!(o4 >= o2 + 4096 || o4 + 4096 <= o2);
+    }
+
+    /// B-1 audit fix: `persist()` must issue a device sync barrier so the
+    /// header survives power loss with a volatile drive write cache. The
+    /// checkpoint doc ("allocator persist is fsynced before returning")
+    /// relied on this; pre-fix the pwrite sat in the cache and a power
+    /// loss after redo compaction reverted the header while its covering
+    /// `AllocateRegion` entries were already reclaimed.
+    #[test]
+    fn persist_survives_simulated_power_loss() {
+        let dev = Arc::new(MemoryDevice::new_volatile(16 * 1024 * 1024, 4096).unwrap());
+
+        let o1;
+        let next_offset;
+        {
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            o1 = alloc.allocate(8192).unwrap();
+            let _o2 = alloc.allocate(4096).unwrap();
+            alloc.free(o1, 8192).unwrap();
+            next_offset = alloc.next_offset();
+            alloc.persist().unwrap();
+        }
+
+        assert!(dev.simulate_power_loss(), "device must be volatile");
+
+        let mut alloc2 = SlotAllocator::recover(dev)
+            .expect("persisted allocator header must survive power loss");
+        assert_eq!(
+            alloc2.next_offset(),
+            next_offset,
+            "high-water mark must match the persisted state"
+        );
+        // The freed region survived persist + power loss and is reusable.
+        let o3 = alloc2.allocate(8192).unwrap();
+        assert_eq!(o3, o1, "freelist must match the persisted state");
     }
 
     #[test]

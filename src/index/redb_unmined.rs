@@ -74,6 +74,22 @@ impl RedbUnminedIndex {
         Ok(Self { db, count })
     }
 
+    /// Make every previously committed (`Durability::Eventual`) write
+    /// transaction durable by committing an empty `Durability::Immediate`
+    /// transaction. See [`crate::index::redb_primary::RedbPrimary::flush_durable`]
+    /// for the checkpoint contract this supports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the transaction cannot be started or
+    /// committed; callers must treat that as "redb state is NOT durable".
+    pub fn flush_durable(&self) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write().map_err(map_txn_err)?;
+        txn.set_durability(redb::Durability::Immediate);
+        txn.commit().map_err(map_commit_err)?;
+        Ok(())
+    }
+
     /// Look up the current height for a key using a cheap read transaction.
     ///
     /// Returns `None` if the key is not in the index.

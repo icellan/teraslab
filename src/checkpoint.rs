@@ -19,18 +19,28 @@
 //!    tempfile + rename).
 //! 3. Persist the allocator's freelist + high-water mark via
 //!    [`crate::ops::engine::Engine::persist_allocator`].
-//! 4. Append a [`crate::redo::RedoOp::RecoveryProgress`] fence through the
+//! 4. Durability barrier: flush the on-disk (redb) index backends via
+//!    [`crate::ops::engine::Engine::flush_index_durable`] and sync the
+//!    data device. Redo reclamation is only legal after this barrier —
+//!    per-op redb commits use `Durability::Eventual` and data pwrites may
+//!    sit in the drive's volatile write cache, so the redo entries are the
+//!    only durable copy of those mutations until the barrier completes.
+//!    A barrier failure aborts the checkpoint with no fence written and
+//!    no compaction performed.
+//! 5. Append a [`crate::redo::RedoOp::RecoveryProgress`] fence through the
 //!    snapshotted sequence.
-//! 5. Compact redo entries through that fence when replica ACK watermarks
+//! 6. Compact redo entries through that fence when replica ACK watermarks
 //!    allow reclamation; post-fence entries are preserved.
 //!
 //! Crash safety: each step's effects are durable independently of the
 //! others. Snapshot is fsynced before the rename; allocator persist is
-//! fsynced before returning; recovery-progress marker is fsynced; prefix
-//! compaction fsyncs the rewritten log. After a crash at any point recovery
-//! either replays all un-fenced entries on top of the most recent snapshot
-//! (safe — recovery is idempotent) or, if compaction already ran, sees only
-//! entries newer than the snapshot fence.
+//! fsynced before returning; the barrier makes index backends and data
+//! device durable before any redo entry is fenced or reclaimed;
+//! recovery-progress marker is fsynced; prefix compaction fsyncs the
+//! rewritten log. After a crash at any point recovery either replays all
+//! un-fenced entries on top of the most recent snapshot (safe — recovery
+//! is idempotent) or, if compaction already ran, sees only entries newer
+//! than the snapshot fence — whose covered state the barrier made durable.
 //!
 //! Concurrency: the redo mutex is held only while sampling the fence and
 //! while appending/compacting the marker. Snapshot file I/O no longer holds
@@ -319,7 +329,8 @@ pub struct CheckpointStats {
     pub checkpoint_duration_ms: u64,
 }
 
-/// Perform a single checkpoint: snapshot, persist, fence, compact.
+/// Perform a single checkpoint: snapshot, persist, durability barrier,
+/// fence, compact.
 ///
 /// The redo log mutex is held only for the initial fence sample and final
 /// marker/compaction step. Dispatch is quiesced across the snapshot so every
@@ -365,12 +376,36 @@ where
         .snapshot_index(&config.snapshot_path)
         .map_err(|e| format!("snapshot_index: {e}"))?;
 
-    // 2. Persist allocator state to its on-disk header.
+    // 2. Persist allocator state to its on-disk header (fsynced before
+    //    returning).
     engine
         .persist_allocator()
         .map_err(|e| format!("persist_allocator: {e}"))?;
 
-    // 3. Fence recovery at the sequence covered by the snapshot. This is not
+    // 3. Durability barrier (B-1/G-1 audit fixes). Redo reclamation is
+    //    only legal once every store the fenced entries cover is durable:
+    //
+    //    * On-disk (redb) index backends commit with Durability::Eventual
+    //      per op — crash-safe only while their redo entries are
+    //      replayable. Flush them durably NOW; a failure aborts the
+    //      checkpoint before any fence or compaction (the redo log is
+    //      untouched, so nothing is lost and the next attempt retries).
+    //    * Data-device pwrites (slots, metadata) can sit in the drive's
+    //      volatile write cache; sync the device so a power loss after
+    //      compaction cannot silently revert acked mutations whose only
+    //      durable copy was the just-reclaimed redo prefix.
+    crate::fault_injection::check(
+        crate::fault_injection::SyncPoint::BeforeCheckpointDataSync,
+    );
+    engine
+        .flush_index_durable()
+        .map_err(|e| format!("index durable flush: {e}"))?;
+    engine
+        .device()
+        .sync()
+        .map_err(|e| format!("data device sync: {e}"))?;
+
+    // 4. Fence recovery at the sequence covered by the snapshot. This is not
     //    a Checkpoint marker: recovery must still replay post-fence entries
     //    that can exist when non-dispatch redo producers append while the
     //    snapshot is being written.
@@ -378,7 +413,7 @@ where
     log.mark_recovery_progress(snapshot_fence_sequence)
         .map_err(|e| format!("redo checkpoint fence: {e}"))?;
 
-    // 4. Reclaim only the covered prefix. Sequence numbers continue
+    // 5. Reclaim only the covered prefix. Sequence numbers continue
     //    monotonically, and entries after the fence remain available.
     let reset_performed = if can_reset(snapshot_fence_sequence) {
         log.compact_prefix_through(snapshot_fence_sequence)
@@ -555,6 +590,358 @@ mod tests {
             log.recover().unwrap().is_empty(),
             "startup recovery must skip entries covered by the durable snapshot fence"
         );
+    }
+
+    // -- B-1 / G-1 durability-barrier tests --
+
+    /// Seed a volatile data device + redo log with two acked, WAL-first
+    /// mutations: a 2-output create followed by a spend of slot 0.
+    /// Returns everything a restart needs to verify the mutations.
+    ///
+    /// The sequence mirrors the dispatch path exactly: redo append +
+    /// fsync FIRST, then the data-device pwrite (which on the volatile
+    /// device stays in the simulated drive cache until a sync).
+    fn seed_acked_create_and_spend(
+        data_dev: &MemoryDevice,
+        alloc: &mut SlotAllocator,
+        log: &mut RedoLog,
+    ) -> (crate::index::TxKey, u64, [u8; 36]) {
+        use crate::record::{TxMetadata, UtxoSlot};
+
+        let mut txid = [0u8; 32];
+        txid[0] = 0xB1;
+        let key = crate::index::TxKey { txid };
+        let utxo_count = 2u32;
+
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        meta.record_size = TxMetadata::record_size_for(utxo_count) as u32;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i as u8 + 1;
+                UtxoSlot::new_unspent(h)
+            })
+            .collect();
+        let record_offset = alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
+
+        // Acked mutation 1: create (WAL-first).
+        let mut record_bytes =
+            Vec::with_capacity(crate::record::METADATA_SIZE + slots.len() * crate::record::UTXO_SLOT_SIZE);
+        let mut meta_bytes = [0u8; crate::record::METADATA_SIZE];
+        meta.to_bytes(&mut meta_bytes);
+        record_bytes.extend_from_slice(&meta_bytes);
+        for slot in &slots {
+            let mut sb = [0u8; crate::record::UTXO_SLOT_SIZE];
+            slot.to_bytes(&mut sb);
+            record_bytes.extend_from_slice(&sb);
+        }
+        log.append_and_flush(RedoOp::CreateV2 {
+            tx_key: key,
+            record_offset,
+            utxo_count,
+            is_conflicting: false,
+            record_bytes,
+            parent_txids: Vec::new(),
+        })
+        .unwrap();
+        crate::io::write_full_record(data_dev, record_offset, &meta, &slots).unwrap();
+
+        // Acked mutation 2: spend slot 0 (WAL-first).
+        let mut spending_data = [0u8; 36];
+        spending_data[..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        log.append_and_flush(RedoOp::SpendV2 {
+            tx_key: key,
+            offset: 0,
+            spending_data,
+            new_spent_count: 1,
+            current_block_height: 0,
+            block_height_retention: 0,
+            target_generation: 1,
+            updated_at: 0,
+        })
+        .unwrap();
+        let spent = UtxoSlot::new_spent(slots[0].hash, spending_data);
+        crate::io::write_utxo_slot(data_dev, record_offset, 0, &spent).unwrap();
+        meta.spent_utxos = 1;
+        crate::io::write_metadata(data_dev, record_offset, &meta).unwrap();
+
+        (key, record_offset, spending_data)
+    }
+
+    /// B-1 (CRITICAL): the checkpoint must issue a data-device
+    /// durability barrier BEFORE fencing/compacting the redo log.
+    /// Pre-fix, the slot/metadata/allocator-header pwrites for every
+    /// acked mutation sat in the (simulated) volatile drive cache while
+    /// the only durable copy — the redo entries — was reclaimed; a power
+    /// loss then silently reverted acked spends and creates.
+    #[test]
+    fn checkpoint_makes_acked_mutations_durable_before_redo_reclamation() {
+        use crate::index::{DahBackend, PrimaryBackend, TxIndexEntry, UnminedBackend};
+        use crate::recovery::recover_all_with_allocator;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("powerloss.snap");
+
+        // Data device with a simulated volatile write cache.
+        let data_dev = Arc::new(MemoryDevice::new_volatile(16 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap();
+
+        // Redo log on its own always-durable device (RedoLog::flush syncs it).
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut log = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
+
+        let (key, record_offset, spending_data) =
+            seed_acked_create_and_spend(&data_dev, &mut alloc, &mut log);
+
+        // Engine over the same device/allocator with the record registered,
+        // so the checkpoint snapshot covers it.
+        let mut index = PrimaryBackend::new_in_memory(128).unwrap();
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset,
+                    utxo_count: 2,
+                    block_entry_count: 0,
+                    tx_flags: 0,
+                    spent_utxos: 1,
+                    dah_or_preserve: 0,
+                    unmined_since: 0,
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        let engine = Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let redo = Mutex::new(log);
+
+        let cfg = CheckpointConfig::new(snap_path.clone());
+        let stats = perform_checkpoint(&cfg, &engine, &redo).expect("checkpoint must succeed");
+        assert!(stats.reset_performed, "redo prefix must have been reclaimed");
+
+        // Power loss: every data-device write not covered by a sync is gone.
+        assert!(data_dev.simulate_power_loss(), "device must be volatile");
+
+        // Restart: allocator from its header, index from the snapshot,
+        // then redo replay (empty — the fence covers everything).
+        let mut alloc2 = SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>)
+            .expect("allocator header must be durable after checkpoint");
+        let (mut index2, dah2, unmined2, _flags) =
+            PrimaryBackend::restore_all(&snap_path).expect("snapshot must restore");
+        let mut dah_b = DahBackend::from(dah2);
+        let mut unmined_b = UnminedBackend::from(unmined2);
+        let log2 = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+        recover_all_with_allocator(
+            &*data_dev,
+            &log2,
+            &mut index2,
+            &mut dah_b,
+            &mut unmined_b,
+            Some(&mut alloc2),
+        )
+        .expect("recovery must succeed");
+
+        // Both acked mutations must be reproduced.
+        let entry = index2.lookup(&key).expect("record must still be indexed");
+        assert_eq!(entry.record_offset, record_offset);
+        let meta_after = crate::io::read_metadata(&*data_dev, record_offset)
+            .expect("record metadata must be durable after checkpoint + power loss");
+        assert_eq!({ meta_after.tx_id }, key.txid, "metadata must belong to the record");
+        assert_eq!({ meta_after.spent_utxos }, 1, "acked spend count must survive");
+        let slot0 = crate::io::read_utxo_slot(&*data_dev, record_offset, 0).unwrap();
+        assert!(slot0.is_spent(), "acked spend must not silently revert");
+        assert_eq!(slot0.spending_data, spending_data, "spending data must survive");
+        let slot1 = crate::io::read_utxo_slot(&*data_dev, record_offset, 1).unwrap();
+        assert!(slot1.is_unspent(), "untouched slot must stay unspent");
+    }
+
+    /// G-1 (CRITICAL): with the redb (`OnDisk`) primary backend, per-op
+    /// commits use `Durability::Eventual` and rely on the redo log for
+    /// crash recovery. The checkpoint must therefore make redb durable
+    /// BEFORE fencing/compacting — and a flush failure must abort the
+    /// checkpoint cleanly: no fence written, no redo compaction, error
+    /// surfaced. A subsequent checkpoint (flush healthy again) succeeds.
+    #[test]
+    fn checkpoint_aborts_and_preserves_redo_when_redb_flush_fails() {
+        use crate::index::PrimaryBackend;
+        use crate::index::redb_primary::RedbPrimary;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("redb-gate.snap");
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let primary = RedbPrimary::open(&dir.path().join("primary.redb"), 1024 * 1024).unwrap();
+        primary.arm_fail_next_flush();
+        let engine = Engine::new(
+            dev,
+            PrimaryBackend::OnDisk(primary),
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let log = RedoLog::open(redo_dev, 0, 64 * 1024).unwrap();
+        let redo = Mutex::new(log);
+        {
+            let mut log = redo.lock();
+            for i in 0..4u64 {
+                log.append(RedoOp::AllocateRegion {
+                    offset: 4096 * (i + 1),
+                    size: 4096,
+                    device_id: 0,
+                })
+                .unwrap();
+            }
+            log.flush().unwrap();
+        }
+        let write_pos_before = redo.lock().write_position();
+
+        let cfg = CheckpointConfig::new(snap_path.clone());
+        let err = perform_checkpoint(&cfg, &engine, &redo)
+            .expect_err("checkpoint must abort when the redb durability flush fails");
+        assert!(
+            err.contains("index durable flush"),
+            "error must name the failing step, got: {err}"
+        );
+
+        {
+            let log = redo.lock();
+            assert_eq!(
+                log.write_position(),
+                write_pos_before,
+                "aborted checkpoint must append no fence and compact nothing"
+            );
+            let recovered = log.recover().unwrap();
+            assert_eq!(
+                recovered.len(),
+                4,
+                "every redo entry must remain replayable after the aborted checkpoint"
+            );
+        }
+
+        // The fail flag auto-disarms: the next checkpoint must succeed,
+        // flush redb durably, fence, and reclaim the prefix.
+        let stats =
+            perform_checkpoint(&cfg, &engine, &redo).expect("subsequent checkpoint must succeed");
+        assert!(stats.reset_performed, "healthy checkpoint must compact");
+        assert!(
+            redo.lock().recover().unwrap().is_empty(),
+            "the fence must now cover the previously appended entries"
+        );
+    }
+
+    /// Crash inside the checkpoint at the new
+    /// [`crate::fault_injection::SyncPoint::BeforeCheckpointDataSync`]
+    /// boundary (after snapshot + allocator persist, before the
+    /// durability barrier and the fence): no fence was written, so after
+    /// power loss every redo entry must still be replayable and recovery
+    /// must reproduce all acked mutations.
+    #[test]
+    fn crash_before_checkpoint_data_sync_keeps_all_mutations_replayable() {
+        use crate::fault_injection::{self, FaultMode, SyncPoint};
+        use crate::index::{DahBackend, PrimaryBackend, TxIndexEntry, UnminedBackend};
+        use crate::recovery::recover_all_with_allocator;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("ckpt-crash.snap");
+
+        let data_dev = Arc::new(MemoryDevice::new_volatile(16 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap();
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut log = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
+
+        let (key, record_offset, spending_data) =
+            seed_acked_create_and_spend(&data_dev, &mut alloc, &mut log);
+
+        let mut index = PrimaryBackend::new_in_memory(128).unwrap();
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset,
+                    utxo_count: 2,
+                    block_entry_count: 0,
+                    tx_flags: 0,
+                    spent_utxos: 1,
+                    dah_or_preserve: 0,
+                    unmined_since: 0,
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        let engine = Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let redo = Mutex::new(log);
+        let cfg = CheckpointConfig::new(snap_path);
+
+        // Crash mid-checkpoint, before the barrier and the fence.
+        fault_injection::arm(FaultMode::PanicAt(SyncPoint::BeforeCheckpointDataSync));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = perform_checkpoint(&cfg, &engine, &redo);
+        }));
+        fault_injection::disarm();
+        assert!(result.is_err(), "checkpoint must have crashed at the sync point");
+
+        // Power loss on top of the crash.
+        assert!(data_dev.simulate_power_loss(), "device must be volatile");
+
+        // Restart. No fence was written, so the full redo log replays and
+        // must reproduce both acked mutations regardless of which data
+        // writes survived.
+        let log2 = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+        let entries = log2.recover().unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "no fence may exist — both entries must still be replayable"
+        );
+        let mut alloc2 = SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>)
+            .expect("allocator persist (fsynced) preceded the crash point");
+        let mut index2 = PrimaryBackend::new_in_memory(128).unwrap();
+        let mut dah_b = DahBackend::new_in_memory();
+        let mut unmined_b = UnminedBackend::new_in_memory();
+        recover_all_with_allocator(
+            &*data_dev,
+            &log2,
+            &mut index2,
+            &mut dah_b,
+            &mut unmined_b,
+            Some(&mut alloc2),
+        )
+        .expect("recovery must succeed");
+
+        let entry = index2.lookup(&key).expect("replay must re-register the record");
+        assert_eq!(entry.record_offset, record_offset);
+        let meta_after = crate::io::read_metadata(&*data_dev, record_offset).unwrap();
+        assert_eq!({ meta_after.tx_id }, key.txid);
+        assert_eq!({ meta_after.spent_utxos }, 1);
+        let slot0 = crate::io::read_utxo_slot(&*data_dev, record_offset, 0).unwrap();
+        assert!(slot0.is_spent(), "acked spend must be reproduced by replay");
+        assert_eq!(slot0.spending_data, spending_data);
     }
 
     // -- BC-01 background-task tests --
