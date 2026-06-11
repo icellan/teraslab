@@ -529,6 +529,19 @@ impl PrimaryBackend {
             let mut buf = crate::device::AlignedBuf::new(aligned_read, align);
             device.pread_exact_at(&mut buf, offset)?;
 
+            // Skip fully-zeroed metadata headers: a deleted-record tombstone
+            // or a never-written reservation, NOT corruption. See the matching
+            // comment in `crate::index::mod`'s in-memory rebuild — a crash
+            // after a delete but before the next allocator-header checkpoint
+            // leaves a zeroed region in the recovered high-water range whose
+            // `FreeRegion` redo entry has not yet been replayed; aborting here
+            // would boot-loop the node. A torn/garbage (non-zero) header is
+            // still rejected below.
+            if buf[..crate::record::METADATA_SIZE].iter().all(|&b| b == 0) {
+                offset += align as u64;
+                continue;
+            }
+
             let meta =
                 match crate::record::TxMetadata::from_bytes(&buf[..crate::record::METADATA_SIZE]) {
                     Ok(m) => m,
@@ -632,6 +645,19 @@ impl PrimaryBackend {
 
             let mut buf = crate::device::AlignedBuf::new(aligned_read, align);
             device.pread_exact_at(&mut buf, offset)?;
+
+            // Skip fully-zeroed metadata headers: a deleted-record tombstone
+            // or a never-written reservation, NOT corruption. See the matching
+            // comment in `crate::index::mod`'s in-memory rebuild — a crash
+            // after a delete but before the next allocator-header checkpoint
+            // leaves a zeroed region in the recovered high-water range whose
+            // `FreeRegion` redo entry has not yet been replayed; aborting here
+            // would boot-loop the node. A torn/garbage (non-zero) header is
+            // still rejected below.
+            if buf[..crate::record::METADATA_SIZE].iter().all(|&b| b == 0) {
+                offset += align as u64;
+                continue;
+            }
 
             let meta =
                 match crate::record::TxMetadata::from_bytes(&buf[..crate::record::METADATA_SIZE]) {
