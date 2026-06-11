@@ -1873,6 +1873,10 @@ fn build_post_apply_redo_op(
                 Err(_) => return Ok(None),
             };
             let new_spent_count = { meta.spent_utxos };
+            // B-5: carry the slot hash (V3) so a torn slot can self-heal
+            // on the replica too; fall back to V2 (no hash) if the slot
+            // cannot be read.
+            let utxo_hash = engine.read_slot(tx_key, *offset).ok().map(|s| s.hash);
             Ok(Some(RedoOp::SpendV2 {
                 tx_key: *tx_key,
                 offset: *offset,
@@ -1882,6 +1886,7 @@ fn build_post_apply_redo_op(
                 block_height_retention: *block_height_retention,
                 target_generation: { meta.generation },
                 updated_at: { meta.updated_at },
+                utxo_hash,
             }))
         }
         ReplicaOp::Unspend {
@@ -1897,6 +1902,8 @@ fn build_post_apply_redo_op(
                 Err(_) => return Ok(None),
             };
             let new_spent_count = { meta.spent_utxos };
+            // B-5: carry the slot hash (V3) for replica self-heal.
+            let utxo_hash = engine.read_slot(tx_key, *offset).ok().map(|s| s.hash);
             Ok(Some(RedoOp::UnspendV2 {
                 tx_key: *tx_key,
                 offset: *offset,
@@ -1906,6 +1913,7 @@ fn build_post_apply_redo_op(
                 block_height_retention: *block_height_retention,
                 target_generation: { meta.generation },
                 updated_at: { meta.updated_at },
+                utxo_hash,
             }))
         }
         ReplicaOp::SetMined {

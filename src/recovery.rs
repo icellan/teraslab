@@ -36,7 +36,7 @@
 //! across multiple recovery passes (e.g. crash mid-replay).
 
 use crate::allocator::SlotAllocator;
-use crate::device::{AlignedBuf, BlockDevice};
+use crate::device::{AlignedBuf, BlockDevice, DeviceError};
 use crate::index::{
     DahBackend, DahRedoEntry, PrimaryBackend, TxIndexEntry, TxKey, UnminedBackend, UnminedRedoEntry,
 };
@@ -143,6 +143,20 @@ pub struct RecoveryStats {
     pub failed_missing_record_bytes: u64,
 }
 
+/// B-7: how recovery reconciles the DAH / unmined secondary indexes
+/// after replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecondaryReconcile {
+    /// Clear both secondaries and re-derive them by scanning EVERY primary
+    /// index entry. Correct but O(store size); used when a secondary
+    /// backend was not cleanly closed / its snapshot section is missing.
+    FullScan,
+    /// Reconcile only the keys touched by replayed redo entries against
+    /// the durable (crash-safe) secondaries. O(redo size). Used when the
+    /// secondaries were loaded clean.
+    TouchedOnly,
+}
+
 /// Engine-level conflicting-child append intent collected during recovery.
 ///
 /// Low-level recovery cannot replay this safely because the operation needs
@@ -183,6 +197,39 @@ fn is_fatal_replay_cause(cause: ReplayCause) -> bool {
     !matches!(cause, ReplayCause::MissingPrimary)
 }
 
+/// B-6: append a recovery-progress marker, treating a full redo log as a
+/// non-fatal condition.
+///
+/// A crash is most likely precisely when the redo log is nearly full
+/// (checkpoint pressure). On the next boot the marker append can hit
+/// [`RedoError::LogFull`] — and since nothing reclaims space before
+/// recovery runs, propagating that error would abort startup on every
+/// restart (a deterministic boot-loop). The marker is only an
+/// optimization that bounds *repeated* recovery work; recovery itself is
+/// idempotent, so a missing marker merely means a subsequent crash
+/// re-replays some already-applied (idempotent) entries. We therefore
+/// log-and-skip on `LogFull` and let recovery finish. Any other redo
+/// error (a real device fault) still propagates.
+fn mark_recovery_progress_non_fatal(
+    log: &mut RedoLog,
+    through_sequence: u64,
+) -> Result<(), RecoveryError> {
+    match log.mark_recovery_progress(through_sequence) {
+        Ok(()) => Ok(()),
+        Err(crate::redo::RedoError::LogFull { used, capacity }) => {
+            tracing::warn!(
+                through_sequence,
+                used,
+                capacity,
+                "recovery: redo log full while writing progress marker — skipping \
+                 marker (recovery is idempotent, will complete without it)",
+            );
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Replay redo log entries after the last checkpoint.
 ///
 /// For each entry, checks whether the operation has already been applied
@@ -212,6 +259,116 @@ pub fn recover(
     }
 
     Ok(stats)
+}
+
+/// Outcome of an offline [`repair_torn_slots`] pass.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RepairReport {
+    /// Spend/Unspend redo entries inspected.
+    pub entries_scanned: u64,
+    /// CRC-failing slots that were rebuilt from a V3 redo entry's
+    /// `utxo_hash`.
+    pub slots_repaired: u64,
+    /// CRC-failing slots covered only by a legacy V2/V1 redo entry (no
+    /// `utxo_hash`) — the WAL cannot rebuild them. Reported as
+    /// `(txid, slot_index)` so an operator can target them manually.
+    pub unrecoverable: Vec<([u8; 32], u32)>,
+    /// Entries whose primary-index key was absent (record deleted later
+    /// in the log / by a snapshot). Benign.
+    pub missing_primary: u64,
+}
+
+/// B-5: offline repair pass that rebuilds CRC-failing UTXO slots from the
+/// redo log.
+///
+/// Walks every `SpendV2`/`UnspendV2` redo entry. For each, reads the
+/// target slot; when the slot fails its CRC (a torn intra-sector write in
+/// the WAL-protected window, or latent bitrot) the slot is reconstructed
+/// from the entry's `utxo_hash` (V3 entries) exactly as recovery does
+/// inline. Slots covered only by a legacy entry without the hash are
+/// reported in [`RepairReport::unrecoverable`] rather than silently
+/// skipped, so a torn slot becomes operator-recoverable instead of a
+/// permanent boot-loop brick.
+///
+/// This is an OFFLINE tool: the server must be stopped so no concurrent
+/// mutation races the slot rewrites. It does not mutate the redo log.
+///
+/// # Errors
+///
+/// Returns [`RecoveryError`] only if reading the redo log itself fails;
+/// per-slot device errors are recorded in the report, not propagated, so
+/// a single bad region does not abort the whole pass.
+pub fn repair_torn_slots(
+    device: &dyn BlockDevice,
+    redo_log: &RedoLog,
+    index: &PrimaryBackend,
+) -> Result<RepairReport, RecoveryError> {
+    let entries = redo_log.recover()?;
+    let mut report = RepairReport::default();
+
+    for entry in &entries {
+        let (tx_key, offset, spending_data, hash, is_unspend) = match &entry.op {
+            RedoOp::SpendV2 {
+                tx_key,
+                offset,
+                spending_data,
+                utxo_hash,
+                ..
+            } => (tx_key, *offset, *spending_data, *utxo_hash, false),
+            RedoOp::UnspendV2 {
+                tx_key,
+                offset,
+                spending_data,
+                utxo_hash,
+                ..
+            } => (tx_key, *offset, *spending_data, *utxo_hash, true),
+            _ => continue,
+        };
+        report.entries_scanned += 1;
+
+        let ie = match index.lookup(tx_key) {
+            Some(e) => e,
+            None => {
+                report.missing_primary += 1;
+                continue;
+            }
+        };
+
+        // Only act on a CRC-failing slot — a readable slot needs no
+        // repair (normal recovery already handles its state).
+        match io::read_utxo_slot(device, ie.record_offset, offset) {
+            Ok(_) => continue,
+            Err(DeviceError::RecordCorruption { .. }) => {}
+            // A non-corruption device error is a hardware problem the WAL
+            // cannot fix; surface it as unrecoverable for this slot.
+            Err(_) => {
+                report.unrecoverable.push((tx_key.txid, offset));
+                continue;
+            }
+        }
+
+        let Some(hash) = hash else {
+            report.unrecoverable.push((tx_key.txid, offset));
+            continue;
+        };
+
+        let rebuilt = if is_unspend {
+            UtxoSlot::new_unspent(hash)
+        } else {
+            UtxoSlot::new_spent(hash, spending_data)
+        };
+        if io::write_utxo_slot(device, ie.record_offset, offset, &rebuilt).is_ok() {
+            report.slots_repaired += 1;
+        } else {
+            report.unrecoverable.push((tx_key.txid, offset));
+        }
+    }
+
+    // The rewrites land in the device's write cache; make them durable
+    // before returning so a crash right after repair does not lose the
+    // reconstructed slots.
+    device.sync()?;
+    Ok(report)
 }
 
 /// Replay redo log entries, reconciling secondary indexes as well.
@@ -278,13 +435,30 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts(
 ) -> Result<(RecoveryStats, Vec<PendingAppendConflictingChild>), RecoveryError> {
     let entries = redo_log.recover()?;
     recover_entries_with_allocator_collecting_pending_conflicts(
-        device, entries, index, dah, unmined, allocator, None,
+        device,
+        entries,
+        index,
+        dah,
+        unmined,
+        allocator,
+        None,
+        // Conservative default: callers of this entry point do not signal
+        // secondary cleanliness, so re-derive from a full scan.
+        SecondaryReconcile::FullScan,
     )
 }
 
 /// Full recovery with durable progress markers written every
 /// `RECOVERY_PROGRESS_INTERVAL_ENTRIES` safely processed entries and once
 /// at the end of the recovered range.
+///
+/// `full_secondary_rebuild` (B-7): when `true` the DAH / unmined
+/// secondaries are re-derived by scanning the entire primary index
+/// (O(store size)); pass this when a secondary backend was not cleanly
+/// closed or its snapshot section is missing. When `false` — the common
+/// crash-of-a-clean-store case — only the keys the redo log touched are
+/// reconciled against the durable secondaries (O(redo size)), so boot
+/// time is bounded by the redo log, not the store.
 pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
     device: &dyn BlockDevice,
     redo_log: &mut RedoLog,
@@ -292,8 +466,14 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
     allocator: Option<&mut SlotAllocator>,
+    full_secondary_rebuild: bool,
 ) -> Result<(RecoveryStats, Vec<PendingAppendConflictingChild>), RecoveryError> {
     let entries = redo_log.recover()?;
+    let secondary_reconcile = if full_secondary_rebuild {
+        SecondaryReconcile::FullScan
+    } else {
+        SecondaryReconcile::TouchedOnly
+    };
     recover_entries_with_allocator_collecting_pending_conflicts(
         device,
         entries,
@@ -302,9 +482,11 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
         unmined,
         allocator,
         Some((redo_log, RECOVERY_PROGRESS_INTERVAL_ENTRIES)),
+        secondary_reconcile,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recover_entries_with_allocator_collecting_pending_conflicts(
     device: &dyn BlockDevice,
     entries: Vec<RedoEntry>,
@@ -313,12 +495,17 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
     unmined: &mut UnminedBackend,
     mut allocator: Option<&mut SlotAllocator>,
     mut progress: Option<(&mut RedoLog, u64)>,
+    secondary_reconcile: SecondaryReconcile,
 ) -> Result<(RecoveryStats, Vec<PendingAppendConflictingChild>), RecoveryError> {
     let mut stats = RecoveryStats::default();
     let mut pending_conflicting_children = Vec::new();
     let mut processed_since_progress = 0u64;
     let mut last_progress_sequence = 0u64;
     let mut last_safe_sequence = 0u64;
+    // B-7: keys touched by replayed entries. On a clean recovery only
+    // these are reconciled against the durable secondaries, instead of
+    // re-scanning the whole primary index.
+    let mut touched_keys: std::collections::HashSet<TxKey> = std::collections::HashSet::new();
 
     // Track pending hash-table-resize intents by capacity. A Begin adds an
     // entry; a matching Commit removes it. After the replay loop, any
@@ -328,6 +515,11 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
         std::collections::HashMap::new();
 
     for entry in &entries {
+        // B-7: record every key the redo log touches so a clean recovery
+        // can reconcile just these against the durable secondaries.
+        if let Some(key) = entry.op.tx_key() {
+            touched_keys.insert(*key);
+        }
         let outcome = match &entry.op {
             RedoOp::SecondaryUnminedUpdate {
                 tx_key,
@@ -476,7 +668,7 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                 && *interval > 0
                 && processed_since_progress >= *interval
             {
-                log.mark_recovery_progress(entry.sequence)?;
+                mark_recovery_progress_non_fatal(log, entry.sequence)?;
                 last_progress_sequence = entry.sequence;
                 processed_since_progress = 0;
             }
@@ -492,10 +684,17 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
     if let Some((log, _)) = progress.as_mut()
         && last_safe_sequence > last_progress_sequence
     {
-        log.mark_recovery_progress(last_safe_sequence)?;
+        mark_recovery_progress_non_fatal(log, last_safe_sequence)?;
     }
 
-    reconcile_secondary_indexes_from_metadata(device, index, dah, unmined)?;
+    match secondary_reconcile {
+        SecondaryReconcile::FullScan => {
+            reconcile_secondary_indexes_from_metadata(device, index, dah, unmined)?;
+        }
+        SecondaryReconcile::TouchedOnly => {
+            reconcile_secondary_indexes_for_keys(device, index, dah, unmined, &touched_keys)?;
+        }
+    }
 
     // Clean up any orphan tmp files from resizes that started but never
     // committed. The original index file is intact (rename is atomic and
@@ -576,6 +775,68 @@ fn reconcile_secondary_indexes_from_metadata(
         let unmined_height = { meta.unmined_since };
         if unmined_height != 0 {
             unmined.insert(unmined_height, key, None)?;
+        }
+    }
+    Ok(())
+}
+
+/// B-7: reconcile the DAH / unmined secondaries for ONLY the keys the
+/// redo replay touched, against the durable (crash-safe) secondary state.
+///
+/// This is the O(redo) counterpart to
+/// [`reconcile_secondary_indexes_from_metadata`]'s O(store) full scan. It
+/// is sound only when the secondaries were loaded clean (they already
+/// reflect every key the redo log did NOT touch); the touched keys are
+/// the only ones whose secondary state may be stale w.r.t. the just
+/// replayed primary metadata.
+///
+/// For each touched key the primary index is authoritative: if the record
+/// is gone, any secondary entry for it is removed; otherwise the
+/// secondaries are set to exactly the record's `delete_at_height` /
+/// `unmined_since` (removing first so a height *change* does not leave a
+/// stale entry under the old height bucket).
+fn reconcile_secondary_indexes_for_keys(
+    device: &dyn BlockDevice,
+    index: &PrimaryBackend,
+    dah: &mut DahBackend,
+    unmined: &mut UnminedBackend,
+    keys: &std::collections::HashSet<TxKey>,
+) -> Result<(), RecoveryError> {
+    for key in keys {
+        let entry = match index.lookup(key) {
+            Some(e) => e,
+            None => {
+                // Record no longer exists — drop any stale secondary
+                // entries keyed on it.
+                dah.remove(key, None).map_err(RecoveryError::Index)?;
+                unmined.remove(key, None).map_err(RecoveryError::Index)?;
+                continue;
+            }
+        };
+        let meta = match io::read_metadata(device, entry.record_offset) {
+            Ok(meta) => meta,
+            Err(_) => {
+                return Err(RecoveryError::Index(
+                    crate::index::IndexError::FormatError {
+                        detail: format!(
+                            "secondary reconcile failed to read metadata for {:?}",
+                            key.txid
+                        ),
+                    },
+                ));
+            }
+        };
+        // Remove first so a changed height does not leave a stale entry
+        // under the previous bucket, then re-insert the current value.
+        dah.remove(key, None).map_err(RecoveryError::Index)?;
+        unmined.remove(key, None).map_err(RecoveryError::Index)?;
+        let dah_height = { meta.delete_at_height };
+        if dah_height != 0 {
+            dah.insert(dah_height, *key, None)?;
+        }
+        let unmined_height = { meta.unmined_since };
+        if unmined_height != 0 {
+            unmined.insert(unmined_height, *key, None)?;
         }
     }
     Ok(())
@@ -791,6 +1052,7 @@ fn replay_entry(
             spending_data,
             *new_spent_count,
             None,
+            None,
         ),
         RedoOp::SpendV2 {
             tx_key,
@@ -801,6 +1063,7 @@ fn replay_entry(
             block_height_retention,
             target_generation,
             updated_at,
+            utxo_hash,
         } => replay_spend(
             device,
             index,
@@ -814,6 +1077,7 @@ fn replay_entry(
                 target_generation: *target_generation,
                 updated_at: *updated_at,
             }),
+            utxo_hash.as_ref(),
         ),
         RedoOp::Unspend {
             tx_key,
@@ -828,6 +1092,7 @@ fn replay_entry(
             spending_data.as_ref(),
             *new_spent_count,
             None,
+            None,
         ),
         RedoOp::UnspendV2 {
             tx_key,
@@ -838,6 +1103,7 @@ fn replay_entry(
             block_height_retention,
             target_generation,
             updated_at,
+            utxo_hash,
         } => replay_unspend(
             device,
             index,
@@ -851,6 +1117,7 @@ fn replay_entry(
                 target_generation: *target_generation,
                 updated_at: *updated_at,
             }),
+            utxo_hash.as_ref(),
         ),
         RedoOp::SetMined {
             tx_key,
@@ -985,6 +1252,7 @@ fn replay_entry(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replay_spend(
     device: &dyn BlockDevice,
     index: &PrimaryBackend,
@@ -993,24 +1261,47 @@ fn replay_spend(
     spending_data: &[u8; 36],
     _new_spent_count: u32,
     derived: Option<ReplayDerivedContext>,
+    utxo_hash: Option<&[u8; 32]>,
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
         None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
     };
 
-    let slot = match io::read_utxo_slot(device, ie.record_offset, offset) {
-        Ok(s) => s,
+    // B-5: a CRC-failing (torn) slot in the WAL window is exactly the
+    // artifact this redo entry exists to cover. If the V3 entry carries
+    // the slot's `utxo_hash`, rebuild the slot from the durable intent
+    // instead of fail-closed-bricking the node (boot loop). A
+    // non-corruption device I/O error still fails — that is not something
+    // the WAL can repair.
+    let read = match io::read_utxo_slot(device, ie.record_offset, offset) {
+        Ok(s) => Some(s),
+        Err(DeviceError::RecordCorruption { .. }) => None,
         Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
     };
 
-    // Idempotent check: already spent with same data?
-    if slot.status == UTXO_SPENT && slot.spending_data == *spending_data {
-        return ReplayResult::Skipped;
-    }
+    // Determine the slot hash to write. On a healthy slot it is the
+    // slot's existing hash; on a CRC-failing slot it comes from the V3
+    // redo entry (slot rebuilt from the durable intent).
+    let hash = match read {
+        Some(slot) => {
+            // Idempotent check: already spent with same data?
+            if slot.status == UTXO_SPENT && slot.spending_data == *spending_data {
+                return ReplayResult::Skipped;
+            }
+            slot.hash
+        }
+        None => match utxo_hash {
+            // Reconstruct the spent slot directly from the redo entry.
+            Some(h) => *h,
+            // Legacy V2/V1 entry without the hash: unrepairable here.
+            // Fail closed so the operator can run the repair CLI.
+            None => return ReplayResult::Failed(ReplayCause::IoError),
+        },
+    };
 
     // Apply: write spent slot
-    let new_slot = UtxoSlot::new_spent(slot.hash, *spending_data);
+    let new_slot = UtxoSlot::new_spent(hash, *spending_data);
     if io::write_utxo_slot(device, ie.record_offset, offset, &new_slot).is_err() {
         return ReplayResult::Failed(ReplayCause::IoError);
     }
@@ -1067,6 +1358,7 @@ fn replay_spend(
     ReplayResult::Applied
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replay_unspend(
     device: &dyn BlockDevice,
     index: &PrimaryBackend,
@@ -1075,31 +1367,46 @@ fn replay_unspend(
     expected_spending_data: Option<&[u8; 36]>,
     _new_spent_count: u32,
     derived: Option<ReplayDerivedContext>,
+    utxo_hash: Option<&[u8; 32]>,
 ) -> ReplayResult {
     let ie = match index.lookup(tx_key) {
         Some(e) => e,
         None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
     };
 
-    let slot = match io::read_utxo_slot(device, ie.record_offset, offset) {
-        Ok(s) => s,
+    // B-5: a CRC-failing slot is rebuilt to UNSPENT from the V3 redo
+    // entry's `utxo_hash` rather than fail-closed-bricking. A
+    // non-corruption I/O error still fails.
+    let read = match io::read_utxo_slot(device, ie.record_offset, offset) {
+        Ok(s) => Some(s),
+        Err(DeviceError::RecordCorruption { .. }) => None,
         Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
     };
 
-    if slot.status == UTXO_UNSPENT {
-        return ReplayResult::Skipped;
-    }
-    if slot.status != UTXO_SPENT {
-        return ReplayResult::Skipped;
-    }
+    let hash = match read {
+        Some(slot) => {
+            if slot.status == UTXO_UNSPENT {
+                return ReplayResult::Skipped;
+            }
+            if slot.status != UTXO_SPENT {
+                return ReplayResult::Skipped;
+            }
+            if let Some(expected_spending_data) = expected_spending_data
+                && slot.spending_data != *expected_spending_data
+            {
+                return ReplayResult::Skipped;
+            }
+            slot.hash
+        }
+        None => match utxo_hash {
+            // Rebuild the slot's hash from the durable intent; the slot
+            // is then written UNSPENT below.
+            Some(h) => *h,
+            None => return ReplayResult::Failed(ReplayCause::IoError),
+        },
+    };
 
-    if let Some(expected_spending_data) = expected_spending_data
-        && slot.spending_data != *expected_spending_data
-    {
-        return ReplayResult::Skipped;
-    }
-
-    let new_slot = UtxoSlot::new_unspent(slot.hash);
+    let new_slot = UtxoSlot::new_unspent(hash);
     if io::write_utxo_slot(device, ie.record_offset, offset, &new_slot).is_err() {
         return ReplayResult::Failed(ReplayCause::IoError);
     }
@@ -2401,6 +2708,388 @@ mod tests {
         fn redo_log(&self) -> RedoLog {
             RedoLog::open(self.redo_dev.clone(), 0, 1024 * 1024).unwrap()
         }
+
+        /// Write `delete_at_height` / `unmined_since` into a record's
+        /// on-device metadata (for secondary-reconcile tests).
+        fn set_record_heights(&self, key: &TxKey, dah: u32, unmined: u32) {
+            let ie = self.index.lookup(key).unwrap();
+            let mut meta = io::read_metadata(&*self.data_dev, ie.record_offset).unwrap();
+            meta.delete_at_height = dah;
+            meta.unmined_since = unmined;
+            io::write_metadata(&*self.data_dev, ie.record_offset, &meta).unwrap();
+        }
+
+        /// Return the deterministic UTXO hash `create_record` wrote for a
+        /// given slot index.
+        fn slot_hash(&self, slot: u32) -> [u8; 32] {
+            let mut h = [0u8; 32];
+            h[0] = slot as u8;
+            h
+        }
+
+        /// Corrupt a UTXO slot's bytes on the device so its CRC fails
+        /// (simulating an intra-sector tear inside the WAL-protected
+        /// window). Flips a byte in the slot's hash field while leaving
+        /// the stored CRC unchanged.
+        fn corrupt_slot(&self, key: &TxKey, slot: u32) {
+            let ie = self.index.lookup(key).unwrap();
+            let align = self.data_dev.alignment();
+            let slot_off = ie.record_offset + TxMetadata::utxo_slot_offset(slot);
+            let aligned = slot_off / align as u64 * align as u64;
+            let intra = (slot_off - aligned) as usize;
+            let mut buf = AlignedBuf::new(align, align);
+            self.data_dev.pread_exact_at(&mut buf, aligned).unwrap();
+            // Flip the first hash byte; the stored CRC no longer matches.
+            buf[intra] ^= 0xFF;
+            self.data_dev.pwrite_all_at(&buf, aligned).unwrap();
+        }
+    }
+
+    /// B-5: a SpendV2 entry WITHOUT the slot hash (legacy V2) cannot
+    /// rebuild a CRC-failing slot — recovery fails closed (fatal). This is
+    /// the boot-loop reproduction the fix must avoid for V3 entries.
+    #[test]
+    fn corrupt_slot_with_legacy_v2_entry_fails_closed() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xE0, 2);
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SpendV2 {
+            tx_key: key,
+            offset: 0,
+            spending_data: [0xAA; 36],
+            new_spent_count: 1,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            target_generation: 1,
+            updated_at: 10,
+            utxo_hash: None, // legacy V2: no hash, unrepairable
+        })
+        .unwrap();
+        drop(redo);
+
+        h.corrupt_slot(&key, 0);
+
+        let redo = h.redo_log();
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(
+            stats.failed_io, 1,
+            "legacy V2 entry over a torn slot must fail closed (boot-loop)",
+        );
+        assert_eq!(stats.entries_replayed, 0);
+    }
+
+    /// B-5: a SpendV2 V3 entry carrying the slot hash rebuilds a
+    /// CRC-failing slot from the durable redo intent — no fatal brick.
+    #[test]
+    fn corrupt_slot_with_v3_entry_self_heals() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xE1, 2);
+        let hash0 = h.slot_hash(0);
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SpendV2 {
+            tx_key: key,
+            offset: 0,
+            spending_data: [0xAB; 36],
+            new_spent_count: 1,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            target_generation: 1,
+            updated_at: 10,
+            utxo_hash: Some(hash0), // V3: carries the slot hash
+        })
+        .unwrap();
+        drop(redo);
+
+        h.corrupt_slot(&key, 0);
+
+        let redo = h.redo_log();
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.failed_io, 0, "V3 entry must not fail closed");
+        assert_eq!(stats.entries_replayed, 1, "torn slot rebuilt and applied");
+
+        // The rebuilt slot reads back SPENT with the correct hash and
+        // spending data.
+        let ie = h.index.lookup(&key).unwrap();
+        let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        assert_eq!(slot.status, UTXO_SPENT);
+        assert_eq!(slot.hash, hash0, "rebuilt slot carries the redo-entry hash");
+        assert_eq!(slot.spending_data, [0xAB; 36]);
+        // The counter recomputed from on-device slots equals 1.
+        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        let spent_utxos = meta.spent_utxos;
+        assert_eq!(spent_utxos, 1);
+    }
+
+    /// B-7: a touched-keys-only secondary reconcile produces the SAME
+    /// secondary state as a full primary-index scan, and leaves an
+    /// untouched (already-correct) secondary entry in place rather than
+    /// re-deriving the whole store.
+    #[test]
+    fn touched_only_reconcile_matches_full_scan() {
+        let mut h = RecoveryTestHarness::new();
+        let a = h.create_record(0xA0, 1); // touched, has DAH
+        let b = h.create_record(0xA1, 1); // touched, has unmined
+        let c = h.create_record(0xA2, 1); // NOT touched, has DAH
+        h.set_record_heights(&a, 900, 0);
+        h.set_record_heights(&b, 0, 800);
+        h.set_record_heights(&c, 950, 0);
+
+        // Redo log touches only A and B.
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Freeze { tx_key: a, offset: 0 })
+            .unwrap();
+        redo.append_and_flush(RedoOp::Freeze { tx_key: b, offset: 0 })
+            .unwrap();
+        drop(redo);
+        let entries = h.redo_log().recover().unwrap();
+
+        // Reference: a FULL scan over a fresh pair of secondaries. The
+        // Freeze replays do not mutate the primary index, so the same
+        // `h.index` can drive both passes.
+        let mut dah_full = DahBackend::new_in_memory();
+        let mut unmined_full = UnminedBackend::new_in_memory();
+        recover_entries_with_allocator_collecting_pending_conflicts(
+            &*h.data_dev,
+            entries.clone(),
+            &mut h.index,
+            &mut dah_full,
+            &mut unmined_full,
+            None,
+            None,
+            SecondaryReconcile::FullScan,
+        )
+        .unwrap();
+        // Full scan derives all three: A(900)+C(950) in DAH, B(800) unmined.
+        let sort_keys = |v: &mut Vec<TxKey>| v.sort_by_key(|k| k.txid);
+        let mut dah_full_keys = dah_full.range_query(u32::MAX);
+        sort_keys(&mut dah_full_keys);
+        assert_eq!(dah_full_keys.len(), 2, "full scan finds A and C in DAH");
+
+        // Touched-only: start from durable secondaries that already hold
+        // the correct entries for ALL keys (as a clean redb load would),
+        // then reconcile only A and B.
+        let mut dah_touch = DahBackend::new_in_memory();
+        let mut unmined_touch = UnminedBackend::new_in_memory();
+        dah_touch.insert(900, a, None).unwrap();
+        dah_touch.insert(950, c, None).unwrap();
+        unmined_touch.insert(800, b, None).unwrap();
+        recover_entries_with_allocator_collecting_pending_conflicts(
+            &*h.data_dev,
+            entries.clone(),
+            &mut h.index,
+            &mut dah_touch,
+            &mut unmined_touch,
+            None,
+            None,
+            SecondaryReconcile::TouchedOnly,
+        )
+        .unwrap();
+
+        // Equivalence: the touched-only result matches the full scan.
+        let mut dah_touch_keys = dah_touch.range_query(u32::MAX);
+        sort_keys(&mut dah_touch_keys);
+        assert_eq!(
+            dah_touch_keys.iter().map(|k| k.txid).collect::<Vec<_>>(),
+            dah_full_keys.iter().map(|k| k.txid).collect::<Vec<_>>(),
+            "touched-only DAH must equal full-scan DAH",
+        );
+        let mut un_full = unmined_full.range_query(u32::MAX);
+        sort_keys(&mut un_full);
+        let mut un_touch = unmined_touch.range_query(u32::MAX);
+        sort_keys(&mut un_touch);
+        assert_eq!(
+            un_touch.iter().map(|k| k.txid).collect::<Vec<_>>(),
+            un_full.iter().map(|k| k.txid).collect::<Vec<_>>(),
+            "touched-only unmined must equal full-scan",
+        );
+        // C is still present in the touched-only DAH even though it was
+        // never scanned — proving the reconcile is O(redo), not O(store).
+        assert!(
+            dah_touch_keys.iter().any(|k| k.txid == c.txid),
+            "untouched C preserved",
+        );
+    }
+
+    /// B-6: the recovery-progress marker append is non-fatal on a full
+    /// log. `mark_recovery_progress_non_fatal` returns Ok even when the
+    /// underlying append hits `LogFull`.
+    #[test]
+    fn recovery_progress_marker_non_fatal_on_full_log() {
+        // Small dedicated redo log so we can fill it cheaply.
+        let dev = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let mut log = RedoLog::open(dev.clone(), 0, 64 * 1024).unwrap();
+
+        // Fill to within a hair of capacity.
+        let mut last_seq = 0;
+        loop {
+            match log.append_and_flush(RedoOp::Freeze {
+                tx_key: TxKey { txid: [7u8; 32] },
+                offset: 0,
+            }) {
+                Ok(seq) => last_seq = seq,
+                Err(crate::redo::RedoError::LogFull { .. }) => break,
+                Err(e) => panic!("unexpected redo error: {e:?}"),
+            }
+        }
+        assert!(last_seq > 0, "log should have accepted some entries");
+        // A direct marker append now fails LogFull.
+        assert!(matches!(
+            log.mark_recovery_progress(last_seq),
+            Err(crate::redo::RedoError::LogFull { .. })
+        ));
+        // But the non-fatal wrapper swallows it.
+        let r = mark_recovery_progress_non_fatal(&mut log, last_seq);
+        assert!(r.is_ok(), "marker append must be non-fatal on a full log: {r:?}");
+    }
+
+    /// B-6: a full recovery on a near-full redo log completes instead of
+    /// aborting with LogFull when the final progress marker cannot be
+    /// appended.
+    #[test]
+    fn recovery_completes_on_full_log() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xB6, 1);
+
+        // Use a small redo log device so we can fill it.
+        let redo_dev = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let mut log = RedoLog::open(redo_dev.clone(), 0, 64 * 1024).unwrap();
+
+        // One genuinely replayable, progress-safe entry.
+        log.append_and_flush(RedoOp::Freeze { tx_key: key, offset: 0 })
+            .unwrap();
+
+        // Pad the rest of the log to capacity so the end-of-recovery
+        // marker append will hit LogFull.
+        loop {
+            match log.append_and_flush(RedoOp::Freeze {
+                tx_key: key,
+                offset: 0,
+            }) {
+                Ok(_) => {}
+                Err(crate::redo::RedoError::LogFull { .. }) => break,
+                Err(e) => panic!("unexpected redo error: {e:?}"),
+            }
+        }
+
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+        // Must NOT return Err(LogFull); recovery must finish.
+        let result = recover_all_with_allocator_collecting_pending_conflicts_progress(
+            &*h.data_dev,
+            &mut log,
+            &mut h.index,
+            &mut dah,
+            &mut unmined,
+            Some(&mut h.alloc),
+            true,
+        );
+        let (stats, _pending) =
+            result.expect("recovery must complete on a full log, not abort with LogFull");
+        // The freeze entries replayed/skipped; none failed fatally.
+        assert_eq!(stats.failed_io, 0);
+        assert_eq!(stats.failed_corrupt, 0);
+    }
+
+    /// B-5: the offline repair pass rebuilds a torn slot from a V3 entry
+    /// and reports a torn slot covered only by a legacy V2 entry as
+    /// unrecoverable.
+    #[test]
+    fn repair_torn_slots_rebuilds_v3_and_reports_v2() {
+        let mut h = RecoveryTestHarness::new();
+        let key_v3 = h.create_record(0xF0, 2);
+        let key_v2 = h.create_record(0xF1, 2);
+        let hash_v3 = h.slot_hash(0);
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SpendV2 {
+            tx_key: key_v3,
+            offset: 0,
+            spending_data: [0x11; 36],
+            new_spent_count: 1,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            target_generation: 1,
+            updated_at: 10,
+            utxo_hash: Some(hash_v3),
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::SpendV2 {
+            tx_key: key_v2,
+            offset: 0,
+            spending_data: [0x22; 36],
+            new_spent_count: 1,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            target_generation: 1,
+            updated_at: 10,
+            utxo_hash: None, // legacy — unrepairable
+        })
+        .unwrap();
+        drop(redo);
+
+        h.corrupt_slot(&key_v3, 0);
+        h.corrupt_slot(&key_v2, 0);
+
+        let redo = h.redo_log();
+        let report = repair_torn_slots(&*h.data_dev, &redo, &h.index).unwrap();
+        assert_eq!(report.entries_scanned, 2);
+        assert_eq!(report.slots_repaired, 1, "V3 slot rebuilt");
+        assert_eq!(
+            report.unrecoverable,
+            vec![(key_v2.txid, 0)],
+            "legacy V2 torn slot reported unrecoverable",
+        );
+
+        // The repaired V3 slot now reads back cleanly as SPENT.
+        let ie = h.index.lookup(&key_v3).unwrap();
+        let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        assert_eq!(slot.status, UTXO_SPENT);
+        assert_eq!(slot.hash, hash_v3);
+        // The V2 slot is still corrupt (untouched).
+        let ie2 = h.index.lookup(&key_v2).unwrap();
+        assert!(io::read_utxo_slot(&*h.data_dev, ie2.record_offset, 0).is_err());
+    }
+
+    /// B-5: an UnspendV2 V3 entry rebuilds a CRC-failing slot to UNSPENT.
+    #[test]
+    fn corrupt_slot_with_v3_unspend_self_heals() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xE2, 2);
+        let hash0 = h.slot_hash(0);
+
+        // Spend slot 0 durably first so unspend has a SPENT slot intent.
+        let spent = UtxoSlot::new_spent(hash0, [0xCD; 36]);
+        let ie = h.index.lookup(&key).unwrap();
+        io::write_utxo_slot(&*h.data_dev, ie.record_offset, 0, &spent).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::UnspendV2 {
+            tx_key: key,
+            offset: 0,
+            spending_data: [0xCD; 36],
+            new_spent_count: 0,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            target_generation: 2,
+            updated_at: 20,
+            utxo_hash: Some(hash0),
+        })
+        .unwrap();
+        drop(redo);
+
+        h.corrupt_slot(&key, 0);
+
+        let redo = h.redo_log();
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.failed_io, 0);
+        assert_eq!(stats.entries_replayed, 1);
+
+        let ie = h.index.lookup(&key).unwrap();
+        let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        assert_eq!(slot.status, UTXO_UNSPENT);
+        assert_eq!(slot.hash, hash0);
     }
 
     #[test]
@@ -2667,6 +3356,7 @@ mod tests {
                 block_height_retention: 288,
                 target_generation: 1,
                 updated_at: 10,
+                utxo_hash: None,
             })
             .unwrap();
             redo.append_and_flush(RedoOp::UnspendV2 {
@@ -2678,6 +3368,7 @@ mod tests {
                 block_height_retention: 288,
                 target_generation: 2,
                 updated_at: 20,
+                utxo_hash: None,
             })
             .unwrap();
             redo.append_and_flush(RedoOp::SpendV2 {
@@ -2689,6 +3380,7 @@ mod tests {
                 block_height_retention: 288,
                 target_generation: 3,
                 updated_at: 30,
+                utxo_hash: None,
             })
             .unwrap();
             redo
@@ -2770,6 +3462,7 @@ mod tests {
             block_height_retention: 288,
             target_generation: 5,
             updated_at: 50,
+            utxo_hash: None,
         })
         .unwrap();
 
@@ -4514,6 +5207,7 @@ mod tests {
             block_height_retention: 288,
             target_generation: 7,
             updated_at: 123_456,
+            utxo_hash: None,
         })
         .unwrap();
 

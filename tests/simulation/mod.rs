@@ -602,6 +602,7 @@ impl Simulation {
                         block_height_retention: 288,
                         target_generation,
                         updated_at: self.clock.now_ms(),
+                        utxo_hash: Some(utxo_hash),
                     })
                     .is_err()
                 {
