@@ -591,6 +591,18 @@ pub struct TopologyAuthority {
     committed_voter_ever_seen: Arc<RwLock<HashSet<NodeId>>>,
     /// Highest term this node voted for (persisted before responding).
     voted_term: AtomicU64,
+    /// C-2: serializes the `voted_term` read-compare-store so the
+    /// at-most-one-vote-per-term invariant holds across concurrent
+    /// `handle_propose` calls (each TCP connection runs on its own thread,
+    /// and `OP_TOPOLOGY_PROPOSE` is not gated by the dispatch barrier).
+    /// Without it, two same-term proposals can both load the pre-vote
+    /// value, both pass the `term > voted` check, and both be accepted —
+    /// a double-vote, the precondition for conflicting commits. Held only
+    /// for the (cold-path) vote decision; never across I/O. The
+    /// self-vote stores in `on_membership_changed` and the recovery paths
+    /// take it too so a follower vote cannot interleave a proposer's
+    /// self-vote.
+    vote_decision: Mutex<()>,
     /// Pending proposal (if this node is the proposer).
     pending_proposal: Mutex<Option<PendingProposal>>,
     /// Timeout before a non-proposer becomes a fallback proposer.
@@ -634,6 +646,7 @@ impl TopologyAuthority {
             committed_voters: Arc::new(RwLock::new(Vec::new())),
             committed_voter_ever_seen: Arc::new(RwLock::new(HashSet::new())),
             voted_term: AtomicU64::new(0),
+            vote_decision: Mutex::new(()),
             pending_proposal: Mutex::new(None),
             propose_timeout,
             last_membership_change: Mutex::new(Instant::now()),
@@ -942,14 +955,22 @@ impl TopologyAuthority {
             return None; // Not our turn to propose
         }
 
-        let committed = self.committed_term.load(Ordering::Relaxed);
-        let voted = self.voted_term.load(Ordering::Relaxed);
-        let new_term = committed.max(voted) + 1;
+        // C-2: derive the new term and record the self-vote under the
+        // same `vote_decision` lock that `handle_propose` holds, so a
+        // proposer self-vote cannot interleave a concurrent follower vote
+        // and let this node back two different proposals at the same term.
+        let (committed, new_term) = {
+            let _vote_guard = self.vote_decision.lock();
+            let committed = self.committed_term.load(Ordering::Relaxed);
+            let voted = self.voted_term.load(Ordering::Relaxed);
+            let new_term = committed.max(voted) + 1;
+            // Self-vote.
+            self.voted_term.store(new_term, Ordering::Relaxed);
+            (committed, new_term)
+        };
+        let _ = committed;
 
         let term = TopologyTerm::new(new_term, members.to_vec(), self.self_id, self.cluster_id());
-
-        // Self-vote
-        self.voted_term.store(new_term, Ordering::Relaxed);
 
         // E-01: raise the peak from the proposed set BEFORE deriving the
         // quorum, so growth (1 → N) is gated on the majority of the new,
@@ -976,7 +997,6 @@ impl TopologyAuthority {
     /// before sending the vote (safety requirement).
     pub fn handle_propose(&self, propose: &TopologyTerm) -> TopologyVote {
         let committed = self.committed_term.load(Ordering::Relaxed);
-        let voted = self.voted_term.load(Ordering::Relaxed);
 
         let valid_digest = propose.digest
             == TopologyTerm::compute_digest(propose.term, &propose.cluster_id, &propose.members);
@@ -1009,40 +1029,53 @@ impl TopologyAuthority {
             };
         }
 
-        // Accept if the term is strictly higher than anything we've seen.
-        let mut accepted = propose.term > committed && propose.term > voted && valid_digest;
+        // C-2: the load-of-`voted` → decide → store-of-`voted` sequence
+        // must be atomic against other voters. Hold `vote_decision` for the
+        // entire decision so two concurrent same-term proposals cannot both
+        // read the pre-vote value and both be accepted (double-vote). Only
+        // CPU work runs under the lock — no I/O. The membership-safety and
+        // digest checks above are pure and idempotent, so they correctly
+        // sit outside.
+        let accepted = {
+            let _vote_guard = self.vote_decision.lock();
+            let voted = self.voted_term.load(Ordering::Relaxed);
 
-        // Cluster formation recovery: when a node is in a single-node cluster
-        // (either from fresh start or after losing all peers), a multi-node
-        // proposal that includes this node should be accepted so the cluster
-        // can converge. This handles several scenarios:
-        //
-        // 1. Simultaneous start: each node commits single-node terms, then
-        //    discovers peers and needs to form a joint cluster.
-        //
-        // 2. Voted-but-not-committed: a node voted for a term that never
-        //    got committed (proposer crashed or network partition). The
-        //    outstanding vote should not permanently block convergence.
-        //
-        // 3. Sequential restarts: node3 restarts, commits single-node term,
-        //    then node1 proposes a 2-node term. Node3 must accept even if
-        //    the proposal term equals its voted term.
-        //
-        // Safety: the proposal must have more members (larger cluster) and
-        // must include this node, preventing acceptance of foreign proposals.
-        if !accepted && valid_digest && propose.members.len() > 1 {
-            let committed_members = self.committed_members.read().unwrap();
-            let our_cluster_is_single_node = committed > 0 && committed_members.len() <= 1;
-            let proposal_subsumes_us = propose.members.contains(&self.self_id);
-            if our_cluster_is_single_node && proposal_subsumes_us && propose.term > voted {
-                accepted = true;
+            // Accept if the term is strictly higher than anything we've seen.
+            let mut accepted = propose.term > committed && propose.term > voted && valid_digest;
+
+            // Cluster formation recovery: when a node is in a single-node cluster
+            // (either from fresh start or after losing all peers), a multi-node
+            // proposal that includes this node should be accepted so the cluster
+            // can converge. This handles several scenarios:
+            //
+            // 1. Simultaneous start: each node commits single-node terms, then
+            //    discovers peers and needs to form a joint cluster.
+            //
+            // 2. Voted-but-not-committed: a node voted for a term that never
+            //    got committed (proposer crashed or network partition). The
+            //    outstanding vote should not permanently block convergence.
+            //
+            // 3. Sequential restarts: node3 restarts, commits single-node term,
+            //    then node1 proposes a 2-node term. Node3 must accept even if
+            //    the proposal term equals its voted term.
+            //
+            // Safety: the proposal must have more members (larger cluster) and
+            // must include this node, preventing acceptance of foreign proposals.
+            if !accepted && valid_digest && propose.members.len() > 1 {
+                let committed_members = self.committed_members.read().unwrap();
+                let our_cluster_is_single_node = committed > 0 && committed_members.len() <= 1;
+                let proposal_subsumes_us = propose.members.contains(&self.self_id);
+                if our_cluster_is_single_node && proposal_subsumes_us && propose.term > voted {
+                    accepted = true;
+                }
             }
-        }
 
-        if accepted {
-            // Record vote (must be persisted by caller before sending).
-            self.voted_term.store(propose.term, Ordering::Relaxed);
-        }
+            if accepted {
+                // Record vote (must be persisted by caller before sending).
+                self.voted_term.store(propose.term, Ordering::Relaxed);
+            }
+            accepted
+        };
 
         TopologyVote {
             term: propose.term,
@@ -1114,6 +1147,36 @@ impl TopologyAuthority {
         }
 
         if !commit.has_quorum_voter_proof() {
+            return None;
+        }
+
+        // E-2: mirror the propose/vote-side split-brain guard set on the
+        // commit-apply path. Without this, a foreign higher-term commit
+        // (a peer in a *different* cluster that shares the cluster_secret,
+        // or a same-cluster split-brain merge) is broadcast straight into
+        // committed state — the very split-brain-heal hole `cluster_id`
+        // was introduced to close, left open on the one path that mutates
+        // committed topology. `membership_change_is_safe` rejects when:
+        //   * both cluster_ids are configured and differ (P1.1), or
+        //   * the change is non-monotonic w.r.t. the local committed set
+        //     (a merge-with-drops that two nodes inside one cluster_id can
+        //     still produce), or
+        //   * (cluster_id unset on either side) the change introduces a
+        //     NodeId never seen as a committed voter here (F-G8-001).
+        // The commit carries its own `cluster_id`, so we pass it through;
+        // the local side is read from `self.cluster_id()`.
+        if !self.membership_change_is_safe(&commit.members, Some(commit.cluster_id)) {
+            let committed_members = self.committed_members.read().unwrap();
+            tracing::error!(
+                self_id = self.self_id.0,
+                local_cluster_id = ?self.cluster_id(),
+                commit_cluster_id = ?commit.cluster_id,
+                committed = ?committed_members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                proposed = ?commit.members.iter().map(|n| n.0).collect::<Vec<_>>(),
+                term = commit.term,
+                "cluster: refusing topology commit — split-brain heal signature \
+                 (cluster_id mismatch, non-monotonic change, or unseen members).",
+            );
             return None;
         }
 
@@ -2606,5 +2669,243 @@ mod tests {
         let oversized = (MAX_TOPOLOGY_MEMBERS + 1) as u32;
         bytes.extend_from_slice(&oversized.to_le_bytes());
         assert!(TopologyCommit::deserialize(&bytes).is_none());
+    }
+
+    // ── C-2: at-most-one-vote-per-term under concurrency ───────────────────
+
+    /// C-2: two (or more) concurrent `handle_propose` calls carrying the
+    /// SAME term but distinct proposers must grant AT MOST ONE accepted
+    /// vote. The voter's `voted_term` read-compare-store must be atomic.
+    ///
+    /// On the old `Ordering::Relaxed` load → compare → store code the two
+    /// threads can both load the pre-vote `voted_term`, both observe
+    /// `propose.term > voted`, and both store — yielding two accepts for
+    /// one term. With many iterations this reproduces intermittently; the
+    /// barrier maximises the overlap of the decision windows.
+    #[test]
+    fn handle_propose_grants_at_most_one_vote_per_term_concurrently() {
+        use std::sync::atomic::AtomicU64 as TestAtomicU64;
+        use std::sync::Barrier;
+
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 2_000;
+
+        for round in 0..ROUNDS {
+            let auth = Arc::new(TopologyAuthority::new(NodeId(99), Duration::from_secs(1)));
+            // A fresh, strictly-higher term each round so the proposal is a
+            // genuine candidate (term > committed && term > voted == 0).
+            let term = (round as u64) + 1;
+            let accepts = Arc::new(TestAtomicU64::new(0));
+            let barrier = Arc::new(Barrier::new(THREADS));
+
+            let mut handles = Vec::with_capacity(THREADS);
+            for t in 0..THREADS {
+                let auth = Arc::clone(&auth);
+                let accepts = Arc::clone(&accepts);
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    // Distinct proposer/member set per thread, same term —
+                    // models two proposers computing the same next term
+                    // after a partition heal. self_id (99) is included so
+                    // the recovery branch cannot fire (committed == 0).
+                    let proposer = NodeId(100 + t as u64);
+                    let propose = TopologyTerm::new(
+                        term,
+                        vec![proposer, NodeId(99)],
+                        proposer,
+                        ClusterId::UNSET,
+                    );
+                    barrier.wait();
+                    let vote = auth.handle_propose(&propose);
+                    if vote.accepted {
+                        accepts.fetch_add(1, Ordering::SeqCst);
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("vote thread panicked");
+            }
+
+            let granted = accepts.load(Ordering::SeqCst);
+            assert!(
+                granted <= 1,
+                "round {round}: granted {granted} votes for term {term}, expected at most 1 \
+                 (double-vote is the split-brain precondition)",
+            );
+            // And the persisted vote must reflect exactly the term voted on.
+            assert_eq!(
+                auth.voted_term.load(Ordering::Relaxed),
+                term,
+                "round {round}: voted_term must settle at the proposed term",
+            );
+        }
+    }
+
+    // ── E-2: handle_commit must enforce the propose-side guard set ─────────
+
+    /// E-2: a commit whose `cluster_id` differs from the local authority's
+    /// configured `cluster_id` must be REJECTED — the local committed
+    /// topology must be left untouched. This is the split-brain-heal hole:
+    /// the propose/vote path checked cluster_id but the commit-apply path
+    /// did not, so a foreign higher-term commit could overwrite local
+    /// topology.
+    #[test]
+    fn handle_commit_rejects_mismatched_cluster_id() {
+        let cluster_a = ClusterId([0xAA; 16]);
+        let cluster_b = ClusterId([0xBB; 16]);
+
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        auth.set_cluster_id(cluster_a);
+
+        // Establish a local cluster-A topology at term 5.
+        let local_members = members(&[1, 2, 3]);
+        let local_commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: local_members.clone(),
+            cluster_id: cluster_a,
+            digest: TopologyTerm::compute_digest(5, &cluster_a, &local_members),
+            voters: local_members.clone(),
+        };
+        assert_eq!(auth.handle_commit(&local_commit), Some(5));
+
+        // A foreign cluster-B proposer broadcasts a higher-term commit for
+        // a disjoint member set, with a self-consistent digest and a valid
+        // quorum proof over its OWN members.
+        let foreign_members = members(&[4, 5, 6]);
+        let foreign_commit = TopologyCommit {
+            term: 7,
+            proposer: NodeId(4),
+            members: foreign_members.clone(),
+            cluster_id: cluster_b,
+            digest: TopologyTerm::compute_digest(7, &cluster_b, &foreign_members),
+            voters: foreign_members.clone(),
+        };
+
+        assert!(
+            auth.handle_commit(&foreign_commit).is_none(),
+            "foreign cluster_id commit must be rejected",
+        );
+        // Local topology unchanged — no split-brain adoption.
+        assert_eq!(auth.committed_term(), 5);
+        assert_eq!(auth.committed_members(), local_members);
+    }
+
+    /// E-2: a same-cluster_id commit whose membership change is NOT a
+    /// monotonic superset/subset of the local committed set (a split-brain
+    /// merge with drops) must be rejected by `membership_change_is_safe`,
+    /// even though cluster_id matches.
+    #[test]
+    fn handle_commit_rejects_unsafe_membership_change() {
+        let cid = ClusterId([0xCC; 16]);
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        auth.set_cluster_id(cid);
+
+        let local_members = members(&[1, 2, 3]);
+        let local_commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: local_members.clone(),
+            cluster_id: cid,
+            digest: TopologyTerm::compute_digest(5, &cid, &local_members),
+            voters: local_members.clone(),
+        };
+        assert_eq!(auth.handle_commit(&local_commit), Some(5));
+
+        // {1,2,3} → {3,4,5}: shares only node 3, neither superset nor
+        // subset — a split-brain merge that is_safe_membership_change
+        // rejects.
+        let merged_members = members(&[3, 4, 5]);
+        let merged_commit = TopologyCommit {
+            term: 7,
+            proposer: NodeId(3),
+            members: merged_members.clone(),
+            cluster_id: cid,
+            digest: TopologyTerm::compute_digest(7, &cid, &merged_members),
+            voters: merged_members.clone(),
+        };
+
+        assert!(
+            auth.handle_commit(&merged_commit).is_none(),
+            "non-monotonic same-cluster merge must be rejected",
+        );
+        assert_eq!(auth.committed_term(), 5);
+        assert_eq!(auth.committed_members(), local_members);
+    }
+
+    /// E-2: the happy path must survive the new guards — a valid,
+    /// same-cluster_id, monotonic, higher-term commit is still adopted.
+    #[test]
+    fn handle_commit_accepts_valid_same_cluster_growth() {
+        let cid = ClusterId([0xDD; 16]);
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        auth.set_cluster_id(cid);
+
+        let local_members = members(&[1, 2, 3]);
+        let local_commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: local_members.clone(),
+            cluster_id: cid,
+            digest: TopologyTerm::compute_digest(5, &cid, &local_members),
+            voters: local_members.clone(),
+        };
+        assert_eq!(auth.handle_commit(&local_commit), Some(5));
+
+        // Pure growth (superset) within the same cluster — must be adopted.
+        let grown_members = members(&[1, 2, 3, 4, 5]);
+        let grown_commit = TopologyCommit {
+            term: 7,
+            proposer: NodeId(1),
+            members: grown_members.clone(),
+            cluster_id: cid,
+            digest: TopologyTerm::compute_digest(7, &cid, &grown_members),
+            voters: grown_members.clone(),
+        };
+        assert_eq!(
+            auth.handle_commit(&grown_commit),
+            Some(7),
+            "valid same-cluster growth must still be adopted",
+        );
+        assert_eq!(auth.committed_term(), 7);
+        assert_eq!(auth.committed_members(), grown_members);
+    }
+
+    /// E-2: when both sides leave cluster_id UNSET (legacy / pre-orchestrator
+    /// path), the commit guard must fall back to the ever-seen heuristic and
+    /// reject a foreign commit that introduces never-before-seen members.
+    #[test]
+    fn handle_commit_rejects_unseen_members_when_cluster_id_unset() {
+        let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
+        // cluster_id stays UNSET on both sides.
+
+        let local_members = members(&[1, 2, 3]);
+        let local_commit = TopologyCommit {
+            term: 5,
+            proposer: NodeId(1),
+            members: local_members.clone(),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &local_members),
+            voters: local_members.clone(),
+        };
+        assert_eq!(auth.handle_commit(&local_commit), Some(5));
+
+        // Foreign superset introducing unseen nodes {7,8} — ever_seen_check
+        // rejects because 7 and 8 were never committed voters here.
+        let foreign_members = members(&[1, 2, 3, 7, 8]);
+        let foreign_commit = TopologyCommit {
+            term: 7,
+            proposer: NodeId(7),
+            members: foreign_members.clone(),
+            cluster_id: ClusterId::UNSET,
+            digest: TopologyTerm::compute_digest(7, &ClusterId::UNSET, &foreign_members),
+            voters: foreign_members.clone(),
+        };
+        assert!(
+            auth.handle_commit(&foreign_commit).is_none(),
+            "unset-cluster_id commit introducing unseen members must be rejected",
+        );
+        assert_eq!(auth.committed_term(), 5);
+        assert_eq!(auth.committed_members(), local_members);
     }
 }
