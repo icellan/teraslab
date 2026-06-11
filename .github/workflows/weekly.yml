@@ -1,0 +1,60 @@
+name: Weekly E2E
+
+on:
+  schedule:
+    # Every Sunday at 04:00 UTC. Runs the long-tail crash / migration /
+    # split-brain / chaos scenarios that don't fit the nightly 90-min budget.
+    - cron: "0 4 * * 0"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  docker-e2e-release:
+    name: Docker cluster E2E (release tier)
+    runs-on: ubuntu-latest
+    # The release tier adds the only real-SIGKILL crash/chaos scenarios
+    # (12 Concurrent Failures, 13 Migration Under Load, 14 Split-Brain
+    # Prevention, 15 Crash Recovery, 16 CHAOS) on top of the nightly set.
+    # Their worst-case per-scenario timeout caps in run_all.sh sum to ~170
+    # min; real runs finish well under that, but the job timeout is set
+    # generously so a slow-but-progressing chaos run is never killed by CI.
+    # These scenarios are deliberately NOT folded into the nightly
+    # docker-e2e job: nightly already sits at a 90-min budget, and the
+    # crash trio alone would blow it.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Docker image
+        run: docker build -t teraslab:test -f teraslab-tests/docker/Dockerfile .
+
+      - name: Build test client
+        working-directory: teraslab-tests/client
+        run: cargo build --release
+
+      - name: Run release-tier scenarios (01-16, 17)
+        working-directory: teraslab-tests
+        run: ./run_all.sh --tier release
+
+      - name: Collect logs on failure
+        if: failure()
+        working-directory: teraslab-tests
+        run: |
+          mkdir -p ci-logs
+          for dir in results/*/; do
+            cp -r "$dir" ci-logs/ 2>/dev/null || true
+          done
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-e2e-weekly-logs
+          path: teraslab-tests/ci-logs/
+          if-no-files-found: ignore

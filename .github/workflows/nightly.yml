@@ -44,6 +44,39 @@ jobs:
             bench-output.txt
             target/criterion/
 
+  fuzz:
+    name: Wire-protocol fuzz (time-boxed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # libFuzzer instrumentation requires nightly Rust.
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+
+      - name: Fuzz decode_request (5 min cap)
+        # Coverage-guided exploration of the untrusted wire decoders. The
+        # deterministic half (tests/wire_fuzz_smoke.rs) runs on every PR;
+        # this is the time-boxed coverage-guided complement. A crash/timeout
+        # input fails the job and leaves a repro under fuzz/artifacts/.
+        # The fuzz crate is detached from the workspace, so it builds with
+        # the nightly toolchain here; `cargo +nightly fuzz` is used to be
+        # explicit even though nightly is the active toolchain on this job.
+        run: cargo +nightly fuzz run decode_request -- -max_total_time=300 -timeout=10
+
+      - name: Upload crash artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
   docker-e2e:
     name: Docker cluster E2E (nightly tier)
     runs-on: ubuntu-latest
