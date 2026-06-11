@@ -340,8 +340,12 @@ File format:
 [committed_term:8 LE]
 [voted_term:8 LE]
 [member_count:4 LE]
-[member_ids:8*N LE]     (N = member_count)
+[member_ids:8*N LE]       (N = member_count)
 [incarnation:8 LE]
+[voter_count:4 LE]
+[voter_ids:8*N LE]        (N = voter_count)
+[ever_seen_count:4 LE]
+[ever_seen_ids:8*N LE]    (N = ever_seen_count)
 ```
 
 Persisted on every membership change. On restart:
@@ -352,6 +356,13 @@ Persisted on every membership change. On restart:
 - Member list restores the last committed membership view
 - Incarnation counter ensures SWIM refutation numbers are monotonic
   across restarts (loaded value + 1)
+- Voter list restores the set of nodes whose quorum approved the last
+  committed term
+- Ever-seen list restores every node ever observed as a committed voter,
+  used as the fallback split-brain heal defence (F-G8-001) when
+  `cluster_id` is unset. Older payloads without the
+  `[voter_count]`/`[ever_seen_count]` trailers decode with empty lists
+  and the loader seeds the ever-seen set from the committed voters
 
 ### Ownership Safety Properties
 

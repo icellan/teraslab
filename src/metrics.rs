@@ -748,7 +748,9 @@ impl LatencyHistogram {
     /// Upper bound (exclusive) of bucket `i`, in nanoseconds.
     ///
     /// Bucket 0 is `[0, 128)`, bucket 1 is `[128, 256)`, … bucket 23 is
-    /// `[1s, 2s)`. The final bucket (`i == NUM_BUCKETS - 1`) is open-ended
+    /// `[536_870_912, 1_073_741_824)` ns (~0.54s, ~1.07s) — upper bound
+    /// `128 << i`, matching the corrected `NUM_BUCKETS` layout comment
+    /// (F-G6-023). The final bucket (`i == NUM_BUCKETS - 1`) is open-ended
     /// and reported as `u64::MAX` (rendered as `+Inf` in Prometheus output).
     pub fn bucket_upper_ns_at(&self, i: usize) -> u64 {
         if i == 0 {

@@ -53,10 +53,28 @@ use std::sync::Arc;
 ///
 /// Read-only paths ([`Self::read_metadata`], [`Self::read_slot`],
 /// [`Self::read_slots`], [`Self::read_block_entry`], [`Self::get_spend`])
-/// are intentionally lock-free for throughput and rely on (a) the CRC32
-/// over `TxMetadata` to detect torn headers and (b) the `meta.tx_id ==
-/// key.txid` check in `read_metadata_for_key` (F-G2-001) to defend
-/// against `delete + create_at_offset` aliasing. Callers that need a
+/// intentionally skip the per-tx stripe mutex for throughput. Torn-read
+/// safety on these paths comes from the record-keyed [`crate::locks::StripedRwLocks`]
+/// table inside [`crate::io`] (F-X-007 / BC-02): every `*_direct` helper
+/// acquires a record-level read guard while copying bytes off the device,
+/// and every writer holds the corresponding write guard for the bulk
+/// memcpy + CRC restamp. The CRC32 over `TxMetadata` does NOT provide
+/// torn-read protection — its role is detecting on-disk corruption. The
+/// regression test `direct_read_write_concurrent_stress_never_returns_torn_data`
+/// (in `io.rs`) proves CRC alone is empirically insufficient on AArch64:
+/// NEON memcpy can publish the new CRC bytes before the new field bytes,
+/// so a concurrent reader can observe a CRC that validates against
+/// partially-old state. See the F-X-007 / BC-02 commentary at the top of
+/// [`crate::io`] for the full mechanism.
+///
+/// WARNING: the read-side `io_locks()` acquisitions in the `io.rs`
+/// `*_direct` helpers MUST NOT be removed as a "redundant given CRC"
+/// optimization — that exact reasoning was the original BC-02 contract
+/// and it is disproven by the stress test above.
+///
+/// In addition, the `meta.tx_id == key.txid` re-check in
+/// `read_metadata_for_key` (F-G2-001) defends against
+/// `delete + create_at_offset` aliasing. Callers that need a
 /// mutation-stable view (e.g. dispatch-side before-image capture for
 /// replication compensation) MUST either already hold the appropriate
 /// stripe lock or accept that the snapshot may be staler than the

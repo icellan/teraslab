@@ -71,7 +71,11 @@ Files: `src/cluster/topology.rs`, `src/cluster/coordinator.rs`,
 `tests/cluster_tcp.rs`, `tests/cluster_edge_cases.rs`,
 `tests/g8_split_brain.rs`, `tests/g8_cluster_id.rs` (new).
 
-### A-2. `src/server/mod.rs:264-272` — 10 ms spin in accept loop (F-G6-019)
+### A-2. ~~`src/server/mod.rs:264-272` — 10 ms spin in accept loop (F-G6-019)~~ — RESOLVED 2026-06-10
+
+**Status: FIXED.** Accept loop is event-driven via `mio::Poll` +
+`mio::Waker` (`src/server/mod.rs:310`); shutdown wakes the loop
+immediately and idle CPU drops to zero.
 
 Sleeping in a polling loop. Replace with `mio::Poll` or a self-pipe so
 shutdown is observed immediately and idle CPU drops to zero.
@@ -93,7 +97,11 @@ election entirely and preserve the round-robin pick (same shape as
 NodeId(222): 1365, NodeId(223): 1365}` — exact round-robin on 4096
 shards / 3 members.
 
-### A-3. F-G7-001 metric not incremented anywhere
+### A-3. ~~F-G7-001 metric not incremented anywhere~~ — RESOLVED 2026-06-10
+
+**Status: FIXED.** `replica_unauthenticated_accept_total` is incremented
+at `src/server/mod.rs:764` and asserted by the regression test at
+`src/server/mod.rs:1306-1362`.
 
 `replica_unauthenticated_accept_total` counter exists in `metrics.rs`
 (G7 added the schema) but no production site increments it. The auth
@@ -224,13 +232,22 @@ allocator call sites in `src/allocator.rs`.
 (approaching the wrap-classification ambiguity window). Bundle with
 B-1 — same metric module, same operator-dashboard target.
 
-### B-3. F-G6-020 — `inflight_bytes_rejected_total`
+### B-3. ~~F-G6-020 — `inflight_bytes_rejected_total`~~ — RESOLVED 2026-06-10
+
+**Status: FIXED (P2.2).** Counter incremented in `InflightBytesLimiter`
+(`src/server/mod.rs:126`) and exported as
+`teraslab_inflight_bytes_rejected_total` (`src/server/http.rs:867`).
 
 Increment a counter in `InflightBytesLimiter::try_acquire` (lives in
 `src/server/mod.rs:53-85`, G5 territory). Counter slot is G6's
 responsibility but the call site is G5's. Land in a single commit.
 
-### B-4. F-G10-017 — typed `CatchupError`
+### B-4. ~~F-G10-017 — typed `CatchupError`~~ — RESOLVED 2026-06-10
+
+**Status: FIXED.** `CatchupError::RedoReclaimed { from, available }`
+exists in `src/replication/durable.rs:677` (referenced at
+`src/cluster/coordinator.rs:6817`); the bin call site matches the typed
+variant at `src/bin/server.rs:1079`.
 
 Replace `Err(String)` + substring match (`"redo entries reclaimed"`)
 between `src/replication/durable.rs:728` and `src/bin/server.rs:1065`
@@ -359,7 +376,12 @@ bounds, oversized-body bounds, stale timestamp, chunked-reader
 correctness (one-byte-at-a-time `OneByteReader`), the 16 MiB
 slow-loris case, and underlying I/O error propagation.
 
-### C-8. F-G5-017 — typed error codes
+### C-8. ~~F-G5-017 — typed error codes~~ — RESOLVED 2026-06-10
+
+**Status: FIXED (P3.10).** Shipped as wire codes 28-35
+(`ERR_PAYLOAD_MALFORMED` … `ERR_DELETED_CHILDREN`) in
+`src/protocol/opcodes.rs:322-382`, with `PROTOCOL_VERSION = 2` and the
+`OP_HELLO` (107) handshake for client negotiation.
 
 Introduce `ERR_PAYLOAD_MALFORMED`, `ERR_OPCODE_UNSUPPORTED`,
 `ERR_STORAGE_IO` etc. Public-wire change — touches every client
