@@ -107,6 +107,23 @@ pub enum SpendError {
         detail: String,
     },
 
+    /// F-IJ-001: an `EXTERNAL`-flagged record exists in the index but its
+    /// cold-data blob is absent (lost / GC'd / bit-rotted / never uploaded)
+    /// or no blob store is configured to resolve it.
+    ///
+    /// This is a data-integrity violation, NOT a missing transaction: the
+    /// record and its UTXOs are present and spendable, only the external cold
+    /// data is unreachable. It MUST surface distinctly from
+    /// [`SpendError::TxNotFound`] (which the dispatcher maps to
+    /// `ERR_TX_NOT_FOUND`) — pre-fix a missing blob was reported as
+    /// `TX_NOT_FOUND`, telling callers the tx never existed and masking the
+    /// loss. The dispatcher maps this to `ERR_BLOB_NOT_FOUND` (17).
+    #[error("BLOB_NOT_FOUND")]
+    BlobNotFound {
+        /// The txid whose external cold-data blob is missing.
+        txid: [u8; 32],
+    },
+
     /// `current_block_height + block_height_retention` would overflow a `u32`.
     ///
     /// This indicates a misconfiguration: either `block_height_retention` is
