@@ -7993,11 +7993,17 @@ fn encode_key_diagnosis(d: &crate::cluster::migration::KeyDiagnosis, out: &mut V
 mod tests {
     use super::*;
     use crate::allocator::SlotAllocator;
+    use crate::config::{IndexBackendMode, IndexConfig};
     use crate::device::{BlockDevice, MemoryDevice, ReadFailingDevice};
-    use crate::index::{DahIndex, Index, UnminedIndex};
+    use crate::index::redb_dah::RedbDahIndex;
+    use crate::index::redb_unmined::RedbUnminedIndex;
+    use crate::index::{
+        DahBackend, DahIndex, Index, PrimaryBackend, UnminedBackend, UnminedIndex,
+    };
     use crate::locks::StripedLocks;
     use crate::ops::engine::Engine;
     use std::sync::Arc;
+    use tempfile::TempDir;
 
     #[test]
     fn dispatch_parsers_use_take_helper() {
@@ -8068,6 +8074,10 @@ mod tests {
     struct DispatchTestHarness {
         engine: Engine,
         _metrics_guard: std::sync::MutexGuard<'static, ()>,
+        /// Backing directory for on-disk index backends (redb / file-backed).
+        /// `None` for the in-memory backend. Held so the index files outlive
+        /// the engine and are cleaned up on drop.
+        _index_dir: Option<TempDir>,
     }
 
     impl DispatchTestHarness {
@@ -8088,6 +8098,56 @@ mod tests {
             Self {
                 engine,
                 _metrics_guard: metrics_test_lock(),
+                _index_dir: None,
+            }
+        }
+
+        /// Create a harness whose engine runs over the given index backend.
+        ///
+        /// For [`IndexBackendMode::Redb`] / [`IndexBackendMode::FileBacked`]
+        /// the on-disk index files live in a temp directory held by the
+        /// returned harness; the in-memory backend needs none.
+        fn with_backend(mode: &IndexBackendMode) -> Self {
+            let dev: Arc<dyn BlockDevice> =
+                Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+            let alloc = SlotAllocator::new(dev.clone()).unwrap();
+            let locks = StripedLocks::new(1024);
+            let dir = TempDir::new().unwrap();
+            let config = IndexConfig {
+                backend: mode.clone(),
+                redb_path: dir.path().join("primary.redb"),
+                redb_dah_path: dir.path().join("dah.redb"),
+                redb_unmined_path: dir.path().join("unmined.redb"),
+                redb_cache_size: 16 * 1024 * 1024,
+                file_backed_path: dir.path().join("primary.index"),
+            };
+            let (primary, dah, unmined): (PrimaryBackend, DahBackend, UnminedBackend) = match mode {
+                IndexBackendMode::Memory => (
+                    PrimaryBackend::new_in_memory(10000).unwrap(),
+                    DahBackend::new_in_memory(),
+                    UnminedBackend::new_in_memory(),
+                ),
+                IndexBackendMode::Redb => (
+                    PrimaryBackend::new_on_disk(&config).unwrap(),
+                    DahBackend::OnDisk(
+                        RedbDahIndex::open(&config.redb_dah_path, config.redb_cache_size).unwrap(),
+                    ),
+                    UnminedBackend::OnDisk(
+                        RedbUnminedIndex::open(&config.redb_unmined_path, config.redb_cache_size)
+                            .unwrap(),
+                    ),
+                ),
+                IndexBackendMode::FileBacked => (
+                    PrimaryBackend::new_file_backed(&config.file_backed_path, 10000).unwrap(),
+                    DahBackend::new_in_memory(),
+                    UnminedBackend::new_in_memory(),
+                ),
+            };
+            let engine = Engine::new(dev, primary, alloc, locks, dah, unmined);
+            Self {
+                engine,
+                _metrics_guard: metrics_test_lock(),
+                _index_dir: Some(dir),
             }
         }
 
@@ -8503,6 +8563,134 @@ mod tests {
         let (code, msg) = decode_error_payload(&resp.payload).unwrap();
         assert_eq!(code, ERR_PAYLOAD_MALFORMED);
         assert!(msg.contains("malformed"), "expected 'malformed' in: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Backend matrix — full lifecycle on Memory / redb / file-backed
+    //
+    // Audit N-5 / G-6: the dispatch suite otherwise only ever builds an engine
+    // over the in-memory index. This drives the create → spend → unspend →
+    // set_mined → delete lifecycle through `handle_request` on all three
+    // backends so a redb/file-backed-only defect (lossy lookup shim, durability
+    // gap) is caught here. A failure that reproduces only on redb/file_backed
+    // and not Memory is a real backend bug.
+    // -----------------------------------------------------------------------
+
+    fn lifecycle_over_dispatch(mode: &IndexBackendMode) {
+        let h = DispatchTestHarness::with_backend(mode);
+        let txid = DispatchTestHarness::make_txid(0x4D);
+        let key = TxKey { txid };
+        const N: u32 = 3;
+
+        // Create.
+        assert_eq!(
+            h.create_tx(txid, N).status,
+            STATUS_OK,
+            "create must succeed on {mode:?}"
+        );
+        assert!(
+            h.engine.lookup(&key).is_some(),
+            "created tx must be present in {mode:?} index"
+        );
+
+        // Spend all N UTXOs. Use the real on-device slot hashes.
+        let hashes: Vec<[u8; 32]> = (0..N)
+            .map(|v| h.engine.read_slot(&key, v).unwrap().hash)
+            .collect();
+        let spend_params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 100,
+            block_height_retention: 288,
+        };
+        let spend_items: Vec<WireSpendItem> = (0..N)
+            .map(|i| WireSpendItem {
+                txid,
+                vout: i,
+                utxo_hash: hashes[i as usize],
+                spending_data: [(0xC0 + i as u8); 36],
+            })
+            .collect();
+        let resp = h.request(OP_SPEND_BATCH, encode_spend_batch(&spend_params, &spend_items));
+        assert_eq!(resp.status, STATUS_OK, "spend must succeed on {mode:?}");
+        assert_eq!(
+            { h.engine.read_metadata(&key).unwrap().spent_utxos },
+            N,
+            "all UTXOs must read as spent on {mode:?}"
+        );
+
+        // Unspend all N UTXOs back. spending_data must match what was recorded.
+        let unspend_params = UnspendBatchParams {
+            current_block_height: 100,
+            block_height_retention: 288,
+        };
+        let unspend_items: Vec<WireUnspendItem> = (0..N)
+            .map(|i| WireUnspendItem {
+                txid,
+                vout: i,
+                utxo_hash: hashes[i as usize],
+                spending_data: [(0xC0 + i as u8); 36],
+            })
+            .collect();
+        let resp = h.request(
+            OP_UNSPEND_BATCH,
+            encode_unspend_batch(&unspend_params, &unspend_items),
+        );
+        assert_eq!(resp.status, STATUS_OK, "unspend must succeed on {mode:?}");
+        assert_eq!(
+            { h.engine.read_metadata(&key).unwrap().spent_utxos },
+            0,
+            "spent count must return to zero after unspend on {mode:?}"
+        );
+
+        // SetMined.
+        let resp = h.request(
+            OP_SET_MINED_BATCH,
+            encode_set_mined_batch(
+                &SetMinedBatchParams {
+                    block_id: 7,
+                    block_height: 50,
+                    subtree_idx: 0,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                    current_block_height: 100,
+                    block_height_retention: 288,
+                },
+                &[txid],
+            ),
+        );
+        assert_eq!(resp.status, STATUS_OK, "set_mined must succeed on {mode:?}");
+        assert!(
+            { h.engine.read_metadata(&key).unwrap().block_entry_count } >= 1,
+            "set_mined must record a block entry on {mode:?}"
+        );
+
+        // Delete.
+        let resp = h.request(OP_DELETE_BATCH, encode_txid_batch(&[txid], &[]));
+        assert_eq!(resp.status, STATUS_OK, "delete must succeed on {mode:?}");
+        assert!(
+            h.engine.lookup(&key).is_none(),
+            "deleted tx must be absent from {mode:?} index"
+        );
+        assert!(
+            h.engine.read_metadata(&key).is_err(),
+            "metadata for a deleted tx must not be readable on {mode:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_lifecycle_backend_memory() {
+        lifecycle_over_dispatch(&IndexBackendMode::Memory);
+    }
+
+    #[test]
+    fn dispatch_lifecycle_backend_redb() {
+        lifecycle_over_dispatch(&IndexBackendMode::Redb);
+    }
+
+    #[test]
+    fn dispatch_lifecycle_backend_file_backed() {
+        lifecycle_over_dispatch(&IndexBackendMode::FileBacked);
     }
 
     // -----------------------------------------------------------------------
