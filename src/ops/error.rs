@@ -127,8 +127,10 @@ pub enum SpendError {
     /// operation would overflow a `u32`. Pre-fix the engine used
     /// `saturating_add`, which silently clamped to `u32::MAX` and pinned
     /// the UTXO unspendable forever. Now surfaces as an explicit error
-    /// the dispatcher maps to `ERR_INTERNAL` so the operator catches the
-    /// pathological input instead of silently corrupting state.
+    /// the dispatcher maps to `ERR_STORAGE_IO` (P3.10 / F-G5-017; it was
+    /// `ERR_INTERNAL` before the typed wire codes) so the operator
+    /// catches the pathological input instead of silently corrupting
+    /// state.
     #[error(
         "REASSIGN_OVERFLOW: block_height={block_height} + spendable_after={spendable_after} exceeds u32::MAX"
     )]
