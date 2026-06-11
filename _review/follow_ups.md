@@ -511,7 +511,9 @@ Added this session — see for ordered execution plan.
 New observations made by the remediation agents — none are audit
 findings; all are deferred follow-ups.
 
-### E-1. Replication receiver lacks the L-01 whole-frame deadline
+### E-1. ~~Replication receiver lacks the L-01 whole-frame deadline~~ — RESOLVED 2026-06-11
+
+**Resolved:** `DeadlineReader` extracted to `src/protocol/deadline.rs` (`pub(crate)`) and applied to the receiver frame-read loop; drip test pins it. Also fixed a latent double-length-prefix bug in the receiver's streaming-HMAC verify uncovered here (see AUDIT.md §8 Wave 3).
 
 `src/replication/receiver.rs:302-469` has the same per-syscall-timeout
 frame-read pattern the server accept path had before the L-01 fix
@@ -520,7 +522,9 @@ Exposure is lower (inter-node, HMAC-authenticated peers), but a
 compromised or wedged peer can pin a receiver thread the same way.
 Port the `DeadlineReader` treatment.
 
-### E-2. `cluster_secret` split between `ServerConfig` and `ClusterConfig`
+### E-2. ~~`cluster_secret` split between `ServerConfig` and `ClusterConfig`~~ — RESOLVED 2026-06-11
+
+**Resolved:** fail-closed `ConfigError::ClusterSecretMismatch` at startup when clustering is active and the two secrets disagree (no more silent cluster-formation hang).
 
 `Server`/dispatch read `cluster_secret` from `ServerConfig`, not from
 the attached `RunningCluster`. Setting it only in `ClusterConfig`
@@ -530,14 +534,18 @@ with no surfaced error. Production TOML loading sets both, so this is
 a programmatic-construction footgun. Add a cross-check (validation or
 single source of truth).
 
-### E-3. `client/rust` crate is stale
+### E-3. ~~`client/rust` crate is stale~~ — RESOLVED 2026-06-11
+
+**Resolved:** crate restored to compile + pass against current `teraslab`; CI already gates it via `--manifest-path`.
 
 `client/rust/src/lib.rs:2280` constructs `ClusterConfig` without the
 `cluster_id` field and no longer compiles against the current
 `teraslab` crate (pre-existing before the campaign). Fix or mark the
 crate's build status explicitly.
 
-### E-4. `quiesce()` fabricated-voter commits trust the sender
+### E-4. ~~`quiesce()` fabricated-voter commits trust the sender~~ — RESOLVED 2026-06-11 (DOCUMENT+PIN)
+
+**Resolved:** documented as trusting authenticated peers by design (membership is the trust boundary; peak floor never lowers) and pinned the drain path with a test. A real-vote guard was considered and declined — it added a transient legitimate-commit-rejection window under asymmetric peak observation. Revisit only if the threat model includes malicious members.
 
 `ClusterCoordinator::quiesce()` fabricates a `TopologyCommit` whose
 voter list satisfies `has_quorum_voter_proof` without any real votes —
