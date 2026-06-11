@@ -47,21 +47,11 @@ const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// L-01: whole-frame assembly deadline, measured from the moment the
-/// 4-byte length prefix has been read off the wire.
-///
-/// `CONNECTION_READ_TIMEOUT` is a per-syscall timeout — it resets on
-/// every successful read, so a slow-drip client delivering one byte
-/// every ~29 s keeps each individual read "succeeding" and could pin a
-/// connection thread, its inflight-bytes permit, and a
-/// `max_connections` / per-IP slot indefinitely at negligible
-/// bandwidth. This deadline bounds total frame assembly time
-/// regardless of per-read progress.
-///
-/// Value: 2 × `CONNECTION_READ_TIMEOUT`. Generous for legitimate
-/// peers — a worst-case `MAX_FRAME_SIZE` (16 MiB) frame completes in
-/// time at ~280 KiB/s — while capping how long a drip-feed can hold a
-/// connection slot.
-const FRAME_ASSEMBLY_TIMEOUT: Duration = Duration::from_secs(60);
+/// 4-byte length prefix has been read off the wire. Shared with the
+/// replication receiver (follow-up E-1) — see
+/// [`crate::protocol::deadline`] for the rationale and the
+/// [`DeadlineReader`] adapter that enforces it.
+use crate::protocol::deadline::{DeadlineReader, FRAME_ASSEMBLY_TIMEOUT};
 
 /// Shared aggregate cap for request-frame memory across all connection
 /// threads. The single-frame `MAX_FRAME_SIZE` guard bounds one allocation;
@@ -741,12 +731,11 @@ fn handle_connection_inner(
         // client (one byte every ~29 s) would otherwise pin this thread,
         // its inflight permit, and a connection slot indefinitely. All
         // post-prefix reads below go through `deadline_stream`.
-        let mut deadline_stream = DeadlineReader {
-            stream: &stream,
-            deadline: Instant::now() + opts.frame_deadline,
-            base_timeout: opts.read_timeout,
-            timeout_shrunk: false,
-        };
+        let mut deadline_stream = DeadlineReader::new(
+            &stream,
+            Instant::now() + opts.frame_deadline,
+            opts.read_timeout,
+        );
         let mut head_buf = [0u8; HEAD_PEEK_LEN];
         let head_to_read = HEAD_PEEK_LEN.min(frame_len);
         deadline_stream
@@ -960,47 +949,6 @@ fn handle_connection_inner(
         // after `split_to` so a giant frame does not pin per-IP
         // capacity through the dispatch + response window. Reset
         // again here is redundant.)
-    }
-}
-
-/// L-01: `Read` adapter that enforces a whole-frame assembly deadline on
-/// top of the socket's per-syscall read timeout.
-///
-/// `set_read_timeout` resets on every successful read, so it cannot bound
-/// the *total* time a multi-read frame assembly takes — a slow-drip
-/// client defeats it byte by byte. This adapter checks the deadline
-/// before every read (returning an [`std::io::ErrorKind::TimedOut`]
-/// error once it has passed) and, when less than `base_timeout` remains,
-/// shrinks the socket read timeout to the remainder so a single blocking
-/// read cannot overshoot the deadline either.
-///
-/// If `timeout_shrunk` is `true` after use, the caller must restore the
-/// socket's read timeout to `base_timeout` before the next frame's
-/// length-prefix read — the idle-client drop path relies on it.
-struct DeadlineReader<'a> {
-    stream: &'a TcpStream,
-    deadline: Instant,
-    base_timeout: Duration,
-    timeout_shrunk: bool,
-}
-
-impl Read for DeadlineReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "frame assembly deadline exceeded",
-            ));
-        }
-        if remaining < self.base_timeout {
-            // `remaining` is non-zero here, so this never trips the
-            // `set_read_timeout(Some(ZERO)) == Err` contract.
-            self.stream.set_read_timeout(Some(remaining))?;
-            self.timeout_shrunk = true;
-        }
-        let mut inner = self.stream;
-        inner.read(buf)
     }
 }
 

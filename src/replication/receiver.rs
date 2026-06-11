@@ -12,6 +12,7 @@ use crate::ops::remaining::*;
 use crate::ops::set_mined::*;
 use crate::ops::spend::*;
 use crate::ops::unspend::*;
+use crate::protocol::deadline::{DeadlineReader, FRAME_ASSEMBLY_TIMEOUT};
 use crate::protocol::frame::{RequestFrame, ResponseFrame};
 use crate::protocol::opcodes::*;
 use crate::record::*;
@@ -21,6 +22,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 /// F-G7-003: cap on aggregate in-flight bytes across all
 /// standalone-receiver connections. The standalone
@@ -35,6 +37,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 /// reached new connection handlers refuse the frame and close
 /// the connection.
 const RECEIVER_INFLIGHT_BYTES_CAP: usize = 256 * 1024 * 1024;
+
+/// Per-syscall read timeout applied to an accepted replication socket.
+/// Like the server accept path's `CONNECTION_READ_TIMEOUT`, this resets
+/// on every successful read, so it cannot bound total frame-assembly
+/// time on its own — see [`FRAME_ASSEMBLY_TIMEOUT`] and follow-up E-1.
+const RECEIVER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Aggregate counter of bytes currently held in the standalone
 /// [`ReplicationReceiver`]'s per-connection frame buffers
@@ -236,6 +244,7 @@ impl ReplicationReceiver {
                                 applied: ap,
                                 local_cluster_key: ck,
                                 auth_secret: secret,
+                                frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                             };
                             handle_connection(stream, peer_addr, ctx);
                         });
@@ -286,6 +295,11 @@ struct ConnectionContext<'a> {
     applied: Arc<ReplicaAppliedTracker>,
     local_cluster_key: Arc<AtomicU64>,
     auth_secret: Option<Arc<Vec<u8>>>,
+    /// E-1: whole-frame assembly deadline applied to all post-length-prefix
+    /// reads (see [`FRAME_ASSEMBLY_TIMEOUT`]). Injectable so tests can drive
+    /// the deadline without a 60-second sleep; production wiring in
+    /// [`ReplicationReceiver::start`] always passes the constant.
+    frame_deadline: Duration,
 }
 
 fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: ConnectionContext<'_>) {
@@ -296,10 +310,11 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
         applied,
         local_cluster_key,
         auth_secret,
+        frame_deadline,
     } = ctx;
 
     let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let _ = stream.set_read_timeout(Some(RECEIVER_READ_TIMEOUT));
     // Disable Nagle's algorithm on the accepted replication socket so
     // ACK frames flush immediately. Best-effort — a failure here does
     // not prevent handling the connection, just re-enables Nagle.
@@ -373,6 +388,17 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
         //   total exposure (F-G7-003).
         let frame_len = total_length as usize;
         let request_id;
+        // E-1: every read that assembles the rest of this frame (head
+        // peek, HMAC-streaming verify, and the buffered body) must
+        // complete within `frame_deadline` of the length prefix arriving.
+        // The per-syscall `RECEIVER_READ_TIMEOUT` alone cannot enforce
+        // this — it resets on every successful read, so a slow-drip peer
+        // delivering one byte per interval keeps each read "succeeding"
+        // and would otherwise pin this handler thread and its
+        // inflight-bytes reservation indefinitely. Mirrors the server
+        // accept path's L-01 fix.
+        let mut deadline_stream =
+            DeadlineReader::new(&stream, Instant::now() + frame_deadline, RECEIVER_READ_TIMEOUT);
         // `verified_frame` carries the verified `[payload_len:4][payload]`
         // buffer when the auth path runs. The non-auth path leaves it
         // empty and `request_frame_bytes` borrows from `frame_bytes`.
@@ -395,7 +421,12 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
             const REQ_ID_PEEK: usize = 8;
             let head_to_read = REQ_ID_PEEK.min(frame_len);
             let mut head_buf = [0u8; REQ_ID_PEEK];
-            if stream.read_exact(&mut head_buf[..head_to_read]).is_err() {
+            // E-1: head peek runs through the deadline reader so a
+            // drip-fed signed head cannot outlive the assembly deadline.
+            if deadline_stream
+                .read_exact(&mut head_buf[..head_to_read])
+                .is_err()
+            {
                 return;
             }
             request_id = if head_to_read >= 8 {
@@ -404,9 +435,11 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
                 0
             };
             let head_slice = &head_buf[..head_to_read];
+            // E-1: the chunked verify reads also run through the deadline
+            // reader so a drip-fed signed body cannot outlive the deadline.
             let mut chained = std::io::Cursor::new(&len_buf)
                 .chain(std::io::Cursor::new(head_slice))
-                .chain(&mut stream);
+                .chain(&mut deadline_stream);
             // Pre-seed a 4-byte length-prefix slot so the resulting
             // buffer matches the `[payload_len:4][payload]` shape
             // `RequestFrame::decode` expects.
@@ -463,7 +496,12 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
                 }
                 body.buf.resize(frame_len, 0);
             }
-            if stream.read_exact(&mut body.buf[..frame_len]).is_err() {
+            // E-1: read the buffered body through the deadline reader so a
+            // drip-fed unsigned body cannot outlive the assembly deadline.
+            if deadline_stream
+                .read_exact(&mut body.buf[..frame_len])
+                .is_err()
+            {
                 return;
             }
             frame_bytes.clear();
@@ -476,6 +514,13 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
                 0
             };
             request_frame_bytes = &frame_bytes;
+        }
+        // E-1: a deadline-capped read may have shrunk the socket read
+        // timeout below `RECEIVER_READ_TIMEOUT`. Restore it so the next
+        // iteration's length-prefix read keeps the original idle-peer
+        // semantics (a clean 30 s drop, treated as a `continue`).
+        if deadline_stream.timeout_shrunk {
+            let _ = stream.set_read_timeout(Some(RECEIVER_READ_TIMEOUT));
         }
         // Silence the `unused_assignments` warning when the non-auth path
         // never writes to `verified_frame`; it's still used to anchor the
@@ -2061,6 +2106,203 @@ mod tests {
             production.contains("let mut body = CountedBody {"),
             "replication receiver must allocate the reusable body buffer outside the hot loop",
         );
+    }
+
+    /// Build the on-wire `RequestFrame` bytes for a single-Create
+    /// `OP_REPLICA_BATCH`, used by the E-1 frame-assembly-deadline tests.
+    fn replica_create_frame_bytes(request_id: u64, tx_key: TxKey) -> Vec<u8> {
+        let batch = ReplicaBatch {
+            // Sequence tied to request_id so successive frames on the same
+            // connection are not deduplicated as already-applied.
+            first_sequence: request_id,
+            ops: vec![ReplicaOp::Create {
+                tx_key,
+                metadata_bytes: vec![0; 64],
+                utxo_hashes: vec![[0xAA; 32]; 2],
+                cold_data: None,
+                is_external: false,
+            }],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+        RequestFrame {
+            request_id,
+            op_code: OP_REPLICA_BATCH,
+            flags: 0,
+            payload: batch.serialize().into(),
+        }
+        .encode()
+    }
+
+    /// Spawn `handle_connection` against a freshly accepted socket with an
+    /// injected `frame_deadline`. Returns the connected client stream, the
+    /// engine, and a join handle that completes once the handler returns.
+    fn spawn_receiver_with_deadline(
+        frame_deadline: Duration,
+    ) -> (TcpStream, Arc<Engine>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = make_engine();
+
+        let server_engine = engine.clone();
+        let handle = std::thread::spawn(move || {
+            let (stream, peer_addr) = listener.accept().unwrap();
+            let running = AtomicBool::new(true);
+            let last_applied = AtomicU64::new(0);
+            let applied = Arc::new(ReplicaAppliedTracker::in_memory());
+            let local_cluster_key = Arc::new(AtomicU64::new(0));
+            let ctx = ConnectionContext {
+                engine: &server_engine,
+                running: &running,
+                last_applied: &last_applied,
+                applied,
+                local_cluster_key,
+                auth_secret: None,
+                frame_deadline,
+            };
+            handle_connection(stream, peer_addr, ctx);
+        });
+
+        let client = TcpStream::connect(addr).unwrap();
+        (client, engine, handle)
+    }
+
+    /// E-1: the per-syscall `RECEIVER_READ_TIMEOUT` resets on every
+    /// successful read, so a peer dripping one byte per interval keeps
+    /// each individual read "succeeding" forever. The whole-frame
+    /// assembly deadline must abort the connection once it expires,
+    /// independent of per-read progress. Mirrors the server accept
+    /// path's `dripping_client_disconnected_at_frame_assembly_deadline`.
+    #[test]
+    fn dripping_peer_disconnected_at_frame_assembly_deadline() {
+        // Deadline far shorter than the time the drip below needs to
+        // deliver the whole frame, yet each drip lands well within the
+        // 30 s per-read timeout — so only the assembly deadline can end
+        // this connection.
+        let (mut client, _engine, handle) =
+            spawn_receiver_with_deadline(Duration::from_millis(400));
+
+        // Declare a 16-byte frame body, then drip it one byte per 150 ms.
+        // 16 bytes × 150 ms = 2.4 s ≫ the 400 ms assembly deadline, so a
+        // handler honoring the deadline must close the socket after a few
+        // drips — long before the full body is delivered. A handler that
+        // resets its per-read timeout on each drip assembles the whole
+        // frame and only finishes after ~2.4 s.
+        client.write_all(&16u32.to_le_bytes()).unwrap();
+        let drip_started = Instant::now();
+        let drip = std::thread::spawn(move || {
+            for _ in 0..16 {
+                // The write may succeed even after the server hangs up
+                // (bytes buffer locally), so socket errors are not a
+                // reliable signal — the handler-return timing below is.
+                if client.write_all(&[0u8]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        });
+
+        // Load-bearing assertion: the handler must return shortly after
+        // the 400 ms deadline and strictly before the ~2.4 s drip would
+        // finish. A pre-fix handler resets its per-read timeout on every
+        // drip and only returns once the whole body has arrived.
+        let joined = wait_for_join(&handle, Duration::from_secs(2));
+        let elapsed = drip_started.elapsed();
+        assert!(
+            joined,
+            "receiver handler did not return after the frame-assembly deadline \
+             (still running {elapsed:?} after the prefix arrived)"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "handler returned only after {elapsed:?}; the 400 ms deadline should have \
+             closed the connection long before the 2.4 s drip completed — it reset \
+             its per-read timeout on every drip",
+        );
+        let _ = drip.join();
+    }
+
+    /// E-1 counterpart: a peer that delivers a frame in several chunks
+    /// well within the deadline must still be applied. Also exercises the
+    /// base-timeout restore: the second frame arrives after an idle gap
+    /// longer than the (test-shortened) deadline, which a handler that
+    /// failed to restore `RECEIVER_READ_TIMEOUT` would drop on its
+    /// length-prefix read.
+    #[test]
+    fn chunked_frame_within_deadline_applies() {
+        // 1.5 s deadline: comfortably longer than the chunked send below
+        // (~0.4 s) yet short enough that the socket read timeout shrunk by
+        // the deadline reader (~1 s remaining when the body completes)
+        // would, if not restored, trip the second frame's prefix read
+        // during the 1.3 s idle.
+        let (mut client, engine, handle) =
+            spawn_receiver_with_deadline(Duration::from_millis(1500));
+
+        let tx_key = key(70);
+        let frame = replica_create_frame_bytes(1, tx_key);
+        // Send the wire frame in 32-byte chunks 50 ms apart (~0.4 s total,
+        // well inside the 1.5 s deadline). Chunk boundaries straddle the
+        // length prefix, the head peek, and the body.
+        for chunk in frame.chunks(32) {
+            client.write_all(chunk).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Read the ACK response frame so we know the batch was applied.
+        let ack = read_ack_frame(&mut client);
+        assert_eq!(ack.request_id, 1, "ack should echo the request_id");
+        assert_eq!(ack.status, STATUS_OK, "batch should apply successfully");
+
+        let slot = engine.read_slot(&tx_key, 0).unwrap();
+        assert_eq!(slot.status, UTXO_UNSPENT);
+        assert_eq!(slot.hash, [0xAA; 32]);
+
+        // Idle longer than the timeout the deadline reader shrank the
+        // socket to while assembling the first frame, then send a second
+        // frame in one piece. The handler must have restored the base read
+        // timeout (30 s) after the first frame; otherwise this length-
+        // prefix read inherits the shrunken timeout and drops the
+        // connection during the idle gap.
+        std::thread::sleep(Duration::from_millis(1300));
+        let tx_key2 = key(71);
+        let frame2 = replica_create_frame_bytes(2, tx_key2);
+        client.write_all(&frame2).unwrap();
+        let ack2 = read_ack_frame(&mut client);
+        assert_eq!(ack2.request_id, 2);
+        assert_eq!(ack2.status, STATUS_OK);
+        let slot2 = engine.read_slot(&tx_key2, 0).unwrap();
+        assert_eq!(slot2.status, UTXO_UNSPENT);
+
+        drop(client);
+        let joined = wait_for_join(&handle, Duration::from_secs(2));
+        assert!(joined, "handler should return after the client disconnects");
+    }
+
+    /// Read a single length-prefixed `ResponseFrame` (the receiver's ACK)
+    /// off `stream`.
+    fn read_ack_frame(stream: &mut TcpStream) -> ResponseFrame {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).unwrap();
+        let mut full = Vec::with_capacity(4 + len);
+        full.extend_from_slice(&len_buf);
+        full.extend_from_slice(&body);
+        let (frame, _) = ResponseFrame::decode(&full).unwrap();
+        frame
+    }
+
+    /// Poll a join handle until it finishes or `timeout` elapses.
+    fn wait_for_join(handle: &std::thread::JoinHandle<()>, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if handle.is_finished() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        handle.is_finished()
     }
 
     fn create_record(engine: &Engine, k: TxKey, utxo_count: u32) {
