@@ -21,7 +21,7 @@ use teraslab::device::{BlockDevice, DirectDevice};
 use teraslab::index::{DahBackend, PrimaryBackend, UnminedBackend};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{
-    AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
+    AllocatorMetrics, ClusterAuthMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
     SwimMetrics, ThreadHistograms, ThreadMetrics,
 };
 use teraslab::ops::engine::Engine;
@@ -243,6 +243,10 @@ fn run_one_catchup_pass(
     }
 }
 
+/// Inter-node authentication metrics (E-4 / E-5): distinct HMAC-failure
+/// vs clock-skew rejection counters.
+static CLUSTER_AUTH_METRICS: ClusterAuthMetrics = ClusterAuthMetrics::new();
+
 fn main() {
     // Parse config first so the observability section can drive the
     // subscriber (OTLP endpoint, sampling ratio, service name).
@@ -355,6 +359,7 @@ fn main() {
     teraslab::metrics::init_migration_metrics(&MIGRATION_METRICS);
     teraslab::metrics::init_swim_metrics(&SWIM_METRICS);
     teraslab::metrics::init_allocator_metrics(&ALLOCATOR_METRICS);
+    teraslab::metrics::init_cluster_auth_metrics(&CLUSTER_AUTH_METRICS);
 
     tracing::info!(
         service = "teraslab",

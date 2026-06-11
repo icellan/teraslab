@@ -21,8 +21,51 @@
 //! The cryptographic primitives are provided by the RustCrypto
 //! [`sha2`] and [`hmac`] crates. Constant-time tag comparison is
 //! provided by [`hmac::Mac::verify_slice`].
+//!
+//! # Replay defense (E-4)
+//!
+//! The HMAC + timestamp-skew window does NOT by itself prevent replay:
+//! an on-path attacker who has captured a valid frame can re-send the
+//! identical bytes and they will re-verify for as long as the embedded
+//! timestamp stays inside the [`max_clock_skew`] window (5 minutes by
+//! default). There is intentionally no per-connection nonce / monotonic
+//! sequence number folded into the authenticated bytes here.
+//!
+//! Adding one is not free: the signed-input layout
+//! (`payload || timestamp`) is shared by *every* inter-node caller
+//! (`src/cluster/swim.rs`, `src/cluster/coordinator.rs`,
+//! `src/replication/{tcp_transport,receiver}.rs`, `src/server/mod.rs`)
+//! and a sequence number would have to be threaded through each
+//! sender's outbound loop and tracked per-connection on each receiver,
+//! including a SWIM-incarnation-style reset on legitimate reconnect /
+//! peer restart. That is a cross-cutting wire-format change touching
+//! several independently-owned modules.
+//!
+//! Instead, replay defense is **delegated to per-opcode idempotency**,
+//! which every mutating inter-node opcode already enforces independently
+//! of this layer for crash-recovery and retry correctness. Re-delivering
+//! a captured frame therefore produces the same observable state as the
+//! original delivery — a replay is indistinguishable from a benign retry.
+//! The audit below lists each mutating inter-node opcode and the
+//! mechanism that makes it idempotent under replay; the integration test
+//! `tests/g8_swim_replay::replica_batch_replay_is_idempotent` exercises
+//! the representative `OP_REPLICA_BATCH` path end-to-end.
+//!
+//! | Opcode | Idempotency mechanism (replay ⇒ no-op) |
+//! |---|---|
+//! | `OP_REPLICA_BATCH` (240) | Per-stream applied-sequence journal (`ReplicaAppliedTracker`) skips any batch whose sequence ≤ `last_applied_seq`; below that, the per-record generation guard + create-payload dedup absorb re-deliveries. |
+//! | `OP_MIGRATION_COMPLETE` (242) | `cluster_key` epoch gate discards stale completions; the shard-manifest hash check rejects content that does not match the committed shard; a second completion for an already-migrated shard is a skip. |
+//! | `OP_MIGRATION_BATCH_COMPLETE` (243) | Same gates as `OP_MIGRATION_COMPLETE`, applied per shard in the batch. |
+//! | `OP_TOPOLOGY_PROPOSE` (251) / `OP_TOPOLOGY_VOTE` (252) / `OP_TOPOLOGY_COMMIT` (253) | Strictly-monotonic `term`: a replayed proposal/vote/commit for a term `≤` the node's current term is rejected (`commit.term <= local_term`), and `topology_commit_already_activated` makes re-committing an active term a no-op. |
+//! | `OP_INCREMENT_SPENT_EXTRA_RECS` (255) | Operates through the same per-record generation-guarded mutation path as the spend ops; a replay re-asserts an already-recorded count rather than double-incrementing. |
+//! | `OP_HEARTBEAT` (250) / SWIM gossip (`MSG_*`) | Non-mutating w.r.t. durable UTXO state — they update soft liveness/membership. The SWIM UDP path additionally has its OWN replay defense (F-G8-003): a per-peer monotonic seq + sliding window rejects a replayed signed datagram before processing, keyed by `(NodeId, incarnation)` so a legitimate restart resets cleanly. That seq layer lives in `src/cluster/swim.rs`, not here. |
+//!
+//! If a future change introduces a mutating inter-node opcode that is
+//! NOT idempotent under replay, it MUST either gain its own dedup guard
+//! or this layer MUST be upgraded to a sequenced/nonce scheme first.
 
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
@@ -39,11 +82,46 @@ pub const TIMESTAMP_LEN: usize = 8;
 /// Total overhead appended to every signed message: `[timestamp_ms:8][tag:32]`.
 pub const SIGNED_SUFFIX_LEN: usize = TIMESTAMP_LEN + HMAC_TAG_LEN;
 
-/// Maximum tolerated clock skew between peers. Messages whose timestamp
-/// differs from local time by more than this are rejected as stale /
-/// replayed. Five minutes matches the wording in the security task and
-/// is generous enough to accommodate reasonable NTP drift.
-pub const MAX_CLOCK_SKEW: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// Default maximum tolerated clock skew between peers. Messages whose
+/// timestamp differs from local time by more than this are rejected as
+/// stale / replayed. Five minutes matches the wording in the security
+/// task and is generous enough to accommodate reasonable NTP drift.
+///
+/// The effective window is read via [`max_clock_skew`] and can be
+/// overridden at startup with [`set_max_clock_skew`] (E-5) — e.g. an
+/// operator running without reliable NTP can widen it, or a
+/// security-hardened deployment can narrow it to shrink the replay
+/// window. The override is process-wide and applies to every signed
+/// SWIM/TCP frame.
+pub const DEFAULT_MAX_CLOCK_SKEW: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Backwards-compatible alias for [`DEFAULT_MAX_CLOCK_SKEW`].
+///
+/// Retained so existing references keep compiling; new code that needs
+/// the *effective* window (honouring any [`set_max_clock_skew`]
+/// override) should call [`max_clock_skew`] instead.
+pub const MAX_CLOCK_SKEW: std::time::Duration = DEFAULT_MAX_CLOCK_SKEW;
+
+/// Process-wide effective clock-skew window, in milliseconds. Initialised
+/// to [`DEFAULT_MAX_CLOCK_SKEW`]; mutated only by [`set_max_clock_skew`].
+static MAX_CLOCK_SKEW_MS: AtomicU64 = AtomicU64::new(5 * 60 * 1000);
+
+/// Override the process-wide clock-skew window (E-5).
+///
+/// Call once at startup from config before any peer traffic is accepted.
+/// A `skew` of zero is clamped up to 1 ms so a misconfiguration cannot
+/// reject every frame (including the node's own freshly-stamped ones).
+/// Idempotent and thread-safe; later calls simply replace the value.
+pub fn set_max_clock_skew(skew: std::time::Duration) {
+    let ms = (skew.as_millis() as u64).max(1);
+    MAX_CLOCK_SKEW_MS.store(ms, Ordering::Relaxed);
+}
+
+/// Return the effective clock-skew window (honouring any
+/// [`set_max_clock_skew`] override).
+pub fn max_clock_skew() -> std::time::Duration {
+    std::time::Duration::from_millis(MAX_CLOCK_SKEW_MS.load(Ordering::Relaxed))
+}
 
 /// HMAC-SHA256 instance type.
 type HmacSha256 = Hmac<Sha256>;
@@ -109,7 +187,9 @@ pub fn sign_with_timestamp(key: &[u8], data: &[u8], timestamp_ms: u64) -> Vec<u8
 /// - `data` is shorter than [`SIGNED_SUFFIX_LEN`] (`InvalidData`);
 /// - the HMAC tag does not match (`PermissionDenied`);
 /// - the embedded timestamp differs from local wall-clock time by more
-///   than [`MAX_CLOCK_SKEW`] (`InvalidData`, message "stale timestamp").
+///   than the effective [`max_clock_skew`] window (`InvalidData`, message
+///   "stale timestamp"); this path also bumps `auth_skew_rejections_total`
+///   and emits a distinct `warn` log (E-5).
 pub fn verify<'a>(key: &[u8], data: &'a [u8]) -> io::Result<&'a [u8]> {
     verify_with_now(key, data, now_unix_ms())
 }
@@ -133,10 +213,7 @@ pub fn verify_with_now<'a>(key: &[u8], data: &'a [u8], now_ms: u64) -> io::Resul
         .expect("HMAC-SHA256 accepts keys of any length per RFC 2104");
     mac.update(head);
     if mac.verify_slice(tag).is_err() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "HMAC verification failed",
-        ));
+        return Err(hmac_rejection());
     }
 
     // Tag is valid — now enforce the freshness window. The timestamp is
@@ -147,11 +224,8 @@ pub fn verify_with_now<'a>(key: &[u8], data: &'a [u8], now_ms: u64) -> io::Resul
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "timestamp read failed"))?;
     let ts_ms = u64::from_le_bytes(ts_arr);
     let skew_ms = now_ms.abs_diff(ts_ms);
-    if skew_ms > MAX_CLOCK_SKEW.as_millis() as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "stale timestamp: outside clock skew window",
-        ));
+    if skew_ms > max_clock_skew().as_millis() as u64 {
+        return Err(skew_rejection(skew_ms, now_ms, ts_ms));
     }
     Ok(payload)
 }
@@ -458,10 +532,7 @@ pub fn verify_frame_streaming_with_now<R: Read, W: Write>(
     let tag = &tail[TIMESTAMP_LEN..];
     mac.update(ts_bytes);
     if mac.verify_slice(tag).is_err() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "HMAC verification failed",
-        ));
+        return Err(hmac_rejection());
     }
 
     // 5. Tag is valid — enforce the freshness window.
@@ -470,11 +541,8 @@ pub fn verify_frame_streaming_with_now<R: Read, W: Write>(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "timestamp read failed"))?;
     let ts_ms = u64::from_le_bytes(ts_arr);
     let skew_ms = now_ms.abs_diff(ts_ms);
-    if skew_ms > MAX_CLOCK_SKEW.as_millis() as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "stale timestamp: outside clock skew window",
-        ));
+    if skew_ms > max_clock_skew().as_millis() as u64 {
+        return Err(skew_rejection(skew_ms, now_ms, ts_ms));
     }
 
     Ok(payload_len)
@@ -502,6 +570,49 @@ fn feed_evicted<W: Write>(
     mac.update(bytes);
     *hmac_fed += bytes.len();
     Ok(())
+}
+
+/// Build the `PermissionDenied` error for an HMAC-tag mismatch and
+/// bump the distinct `auth_hmac_rejections_total` metric (E-5).
+///
+/// Separated from the skew path so a dashboard can tell a wrong/rotated
+/// secret (or forgery) apart from a clock-skew partition.
+fn hmac_rejection() -> io::Error {
+    if let Some(m) = crate::metrics::cluster_auth_metrics() {
+        m.auth_hmac_rejections_total.inc();
+    }
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "HMAC verification failed",
+    )
+}
+
+/// Build the `InvalidData` "stale timestamp" error, bump the distinct
+/// `auth_skew_rejections_total` metric, and emit a `warn` log (E-5).
+///
+/// `skew_ms` is the absolute observed skew; `now_ms`/`ts_ms` are logged
+/// so an operator can see the direction (peer ahead vs behind) and the
+/// magnitude relative to the effective window. This is deliberately a
+/// DISTINCT signal from [`hmac_rejection`]: a spike here means peer
+/// clocks disagree, not that the secret is wrong — the two have opposite
+/// remediations (fix NTP vs rotate/realign the secret).
+fn skew_rejection(skew_ms: u64, now_ms: u64, ts_ms: u64) -> io::Error {
+    if let Some(m) = crate::metrics::cluster_auth_metrics() {
+        m.auth_skew_rejections_total.inc();
+    }
+    let window_ms = max_clock_skew().as_millis() as u64;
+    tracing::warn!(
+        skew_ms,
+        window_ms,
+        now_ms,
+        peer_ts_ms = ts_ms,
+        "cluster auth: rejected frame on clock skew (peer timestamp outside window); \
+         check NTP/clock sync — this is NOT a wrong-secret rejection"
+    );
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "stale timestamp: outside clock skew window",
+    )
 }
 
 /// `read` a chunk with retry on `Interrupted`; returns 0 on EOF.
@@ -914,4 +1025,14 @@ mod tests {
     fn hex(data: &[u8]) -> String {
         data.iter().map(|b| format!("{b:02x}")).collect()
     }
+
+    // NOTE: the E-5 distinct-metric tests (which assert on the
+    // process-wide `ClusterAuthMetrics` deltas) live in
+    // `tests/e5_auth_metrics.rs`. They are deliberately kept OUT of this
+    // lib test binary: many tests here exercise the same `verify*` reject
+    // paths in parallel and would race the shared global counters. In a
+    // dedicated integration binary only those tests touch the metric, so
+    // `#[serial]` makes the deltas exact. The `set_max_clock_skew`
+    // override is likewise tested there to avoid mutating the global
+    // window underneath the stale-timestamp tests above.
 }
