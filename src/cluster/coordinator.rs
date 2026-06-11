@@ -186,6 +186,44 @@ fn complete_migration_task_current_epoch(
     topology_epoch: u64,
     commit: bool,
 ) -> bool {
+    complete_migration_task_current_epoch_with_midpoint(
+        migration,
+        shard_table,
+        fenced_bm,
+        migrating_bm,
+        task,
+        topology_epoch,
+        commit,
+        || {},
+    )
+}
+
+/// Body of [`complete_migration_task_current_epoch`] with a sync-point
+/// between its two state transitions, used by tests to interleave a
+/// racing client write deterministically. Production callers go through
+/// the wrapper, which passes a no-op closure (inlined to nothing).
+///
+/// Ordering invariant (acked-write safety): the shard-table commit
+/// (ownership transfer to the new master) MUST happen BEFORE the write
+/// fence is lifted and the dual-write window is closed. The target has
+/// already verified the manifest by the time this runs, so a client
+/// write accepted by this node after that point would never reach the
+/// new master and would be destroyed by orphan cleanup. With the
+/// commit-first order every racing write either hits the fence
+/// (`ERR_MIGRATION_IN_PROGRESS`) or observes the committed table and is
+/// redirected to the new master — there is no instant where the shard
+/// is unfenced and still routed to this node.
+#[allow(clippy::too_many_arguments)]
+fn complete_migration_task_current_epoch_with_midpoint(
+    migration: &Arc<Mutex<MigrationManager>>,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    fenced_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    task: &MigrationTask,
+    topology_epoch: u64,
+    commit: bool,
+    commit_unfence_midpoint: impl FnOnce(),
+) -> bool {
     if !migration_epoch_current(shard_table, topology_epoch) {
         if let Some(m) = crate::metrics::migration_metrics() {
             m.topology_epoch_mismatch.inc();
@@ -199,7 +237,7 @@ fn complete_migration_task_current_epoch(
         return false;
     }
     {
-        let mut mgr = migration.lock();
+        let mgr = migration.lock();
         let tracked = mgr.active_migrations().iter().any(|p| {
             p.shard == task.shard
                 && p.from_node == task.from_node
@@ -214,14 +252,24 @@ fn complete_migration_task_current_epoch(
             );
             return false;
         }
+    }
+    // Ownership transfer FIRST: from here the source routes the shard to
+    // the new master (REDIRECT), so a write can no longer be applied
+    // locally. Committing while the fence is still up means every racing
+    // write is either fenced or redirected — never ACKed on stale data.
+    // (The migration mutex is not held across the shard-table write lock;
+    // see `drain_in_flight_mutations` for the dispatch lock order.)
+    if commit {
+        shard_table.write().commit_shard(task.shard);
+    }
+    commit_unfence_midpoint();
+    {
+        let mut mgr = migration.lock();
         mgr.mark_complete(task);
         if !mgr.is_shard_fenced(task.shard) {
             fenced_bm.clear(task.shard);
         }
         migrating_bm.clear(task.shard);
-    }
-    if commit {
-        shard_table.write().commit_shard(task.shard);
     }
     true
 }
@@ -3039,6 +3087,30 @@ fn compute_manifest_for_entries(entries: &[(TxKey, u32)]) -> [u8; 32] {
 // Batched migration
 // ---------------------------------------------------------------------------
 
+/// Wait for in-flight client mutations to drain after raising a shard fence.
+///
+/// Every mutating dispatch holds the EXCLUSIVE side of the engine's
+/// dispatch-visibility barrier from before its shard-fence check until
+/// after its engine apply + redo append (see
+/// `dispatch::acquire_dispatch_visibility_guard`). Acquiring — and
+/// immediately releasing — the SHARED side therefore blocks until every
+/// mutation that passed the fence check *before* the fence was raised has
+/// fully applied and journaled. Any mutation that begins after this
+/// returns runs its fence check against the already-set fence bit and is
+/// rejected with `ERR_MIGRATION_IN_PROGRESS`.
+///
+/// Called between raising a shard fence and capturing `fence_seq` /
+/// re-reading shard keys, so that no mutation can apply after the
+/// migration delta/manifest cutoff while the shard is still fenced
+/// (the apply-after-fence-check TOCTOU).
+///
+/// MUST NOT be called while holding the migration-manager mutex: mutating
+/// dispatches acquire that mutex (dual-write fan-out) while holding the
+/// exclusive barrier, so nesting the two would deadlock.
+fn drain_in_flight_mutations(engine: &Engine) {
+    drop(engine.acquire_dispatch_visibility_guard());
+}
+
 /// 1. Streams baseline records
 /// 2. Fences source writes
 /// 3. Streams redo deltas
@@ -3186,7 +3258,14 @@ fn run_migration_batch(
                 mgr.fence_shard(task.shard);
                 fenced_bm.set(task.shard);
             }
-
+        }
+        // Drain mutations that passed the fence check before the fence
+        // was raised, so the emptiness recheck below cannot miss an
+        // in-flight straggler create (released between locks — see
+        // `drain_in_flight_mutations` for the lock-order constraint).
+        drain_in_flight_mutations(&engine);
+        {
+            let mut mgr = migration.lock();
             let fenced_keys_by_shard = engine.keys_by_shard_filtered(&empty_shards);
 
             for task in &empty_tasks {
@@ -3484,6 +3563,14 @@ fn run_migration_batch(
                             }
                         }
                     }
+                    // Drain mutations that passed the fence check before
+                    // the fence was raised so their redo appends land
+                    // strictly below `fence_seq` and their records are
+                    // visible to the late-key/manifest collection below.
+                    // Without this, a stalled in-flight write could apply
+                    // after manifest collection and be silently lost at
+                    // orphan cleanup.
+                    drain_in_flight_mutations(&engine);
                     let fence_seq = redo_log
                         .as_ref()
                         .map(|rl| rl.lock().current_sequence())
@@ -6287,6 +6374,53 @@ impl RunningCluster {
         if !mgr.is_shard_fenced(shard) {
             self.fenced_bitmap.clear(shard);
         }
+    }
+
+    /// Test-only — register `task` as a tracked outbound migration in the
+    /// Fenced state, exactly as the pipelined migration worker does after
+    /// baseline streaming (`MigrationManager::start_outbound` +
+    /// `mark_fenced` + atomic-bitmap sync). Lets integration tests drive
+    /// the production completion path against a deterministically fenced
+    /// shard. The task's `from_node` must be this node.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn test_track_outbound_fenced(&self, task: &MigrationTask) {
+        let mut mgr = self.migration.lock();
+        mgr.start_outbound(
+            std::slice::from_ref(task),
+            self.self_id,
+            &std::collections::HashSet::new(),
+        );
+        mgr.mark_fenced(task, 0);
+        self.fenced_bitmap.set(task.shard);
+        self.migrating_bitmap.set(task.shard);
+    }
+
+    /// Test-only — run the production migration-completion transition
+    /// (`complete_migration_task_current_epoch_with_midpoint`) for a task
+    /// previously registered via
+    /// [`RunningCluster::test_track_outbound_fenced`], invoking `midpoint`
+    /// between the completion's two state transitions (ownership commit
+    /// and fence lift). No locks are held while `midpoint` runs, so it may
+    /// perform live client requests against this node to probe the
+    /// completion window. Returns what the production helper returns.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn test_complete_outbound_migration_with_midpoint(
+        &self,
+        task: &MigrationTask,
+        commit: bool,
+        midpoint: impl FnOnce(),
+    ) -> bool {
+        let epoch = self.shard_table.read().version;
+        complete_migration_task_current_epoch_with_midpoint(
+            &self.migration,
+            &self.shard_table,
+            &self.fenced_bitmap,
+            &self.migrating_bitmap,
+            task,
+            epoch,
+            commit,
+            midpoint,
+        )
     }
 
     /// Get the address of a node.
@@ -9665,6 +9799,153 @@ mod tests {
         assert_eq!(
             after, before,
             "matching-epoch completion must NOT bump `topology_epoch_mismatch`",
+        );
+    }
+
+    /// Regression for the acked-write-loss window at migration completion:
+    /// the shard-table commit (ownership transfer) must happen BEFORE the
+    /// write fence is lifted. The midpoint sync-point between the
+    /// completion's two state transitions observes exactly the state a
+    /// racing client write would see at `check_shard_ownership`: if the
+    /// fence is already down while the table still routes the shard to the
+    /// old master, the write is applied and ACKed on the source AFTER the
+    /// manifest was collected — and is then destroyed by orphan cleanup.
+    #[test]
+    fn completion_commits_ownership_before_lifting_fence() {
+        // Old topology: node1 masters everything. New topology at the
+        // same epoch: node2 masters half the shards. Handoff in flight.
+        let old_table = ShardTable::compute_with_epoch(&[NodeId(1)], 1, 10);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 1, 10);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| new_table.target_assignment(s).master == NodeId(2))
+            .expect("two-member table must assign some shard to node2");
+        let mut table = old_table;
+        table.begin_handoff(&new_table);
+        assert_eq!(
+            table.effective_assignment(shard).master,
+            NodeId(1),
+            "pre-commit: handoff must keep the old master effective",
+        );
+        let shard_table: Arc<ShardTableLock<ShardTable>> = Arc::new(ShardTableLock::new(table));
+
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let task = make_outbound_master_task(shard, NodeId(1), NodeId(2));
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        {
+            let mut mgr = migration.lock();
+            mgr.start_outbound(
+                std::slice::from_ref(&task),
+                NodeId(1),
+                &std::collections::HashSet::new(),
+            );
+            mgr.mark_fenced(&task, 0);
+        }
+        fenced.set(shard);
+        migrating.set(shard);
+
+        // What a racing write would observe at the interior point of the
+        // completion transition.
+        let observed: std::cell::Cell<Option<(bool, NodeId)>> = std::cell::Cell::new(None);
+        let accepted = complete_migration_task_current_epoch_with_midpoint(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            /* task_epoch */ 10,
+            /* commit */ true,
+            || {
+                let effective = shard_table.read().effective_assignment(shard).master;
+                observed.set(Some((fenced.test(shard), effective)));
+            },
+        );
+        assert!(accepted, "tracked current-epoch completion must succeed");
+
+        let (fence_up_at_midpoint, effective_at_midpoint) =
+            observed.get().expect("midpoint must have run");
+        assert!(
+            fence_up_at_midpoint || effective_at_midpoint == NodeId(2),
+            "lost-ack window: between the completion's two transitions the \
+             fence was down ({fence_up_at_midpoint}) while the shard was still \
+             routed to the old master ({effective_at_midpoint:?}) — a racing \
+             write would be applied + ACKed here and deleted by orphan cleanup",
+        );
+
+        // Final state: ownership committed, fence lifted, bitmaps clear.
+        let table = shard_table.read();
+        assert_eq!(
+            table.effective_assignment(shard).master,
+            NodeId(2),
+            "completion must commit the shard to the new master",
+        );
+        assert!(!fenced.test(shard), "fence must be lifted after completion");
+        assert!(
+            !migrating.test(shard),
+            "migrating bit must clear after completion",
+        );
+    }
+
+    /// The post-fence drain (`drain_in_flight_mutations`) must not return
+    /// while a mutating dispatch still holds the exclusive side of the
+    /// dispatch-visibility barrier — closing the TOCTOU where a write that
+    /// passed the fence check before the fence was raised applies its
+    /// mutation after `fence_seq` capture / manifest collection.
+    #[test]
+    fn fence_drain_waits_for_in_flight_mutation() {
+        let engine = Arc::new(test_engine());
+
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let applied = Arc::new(AtomicBool::new(false));
+
+        // Simulated in-flight mutation: passed the fence check (i.e. holds
+        // the exclusive barrier), stalls, then applies and releases.
+        let writer = {
+            let engine = engine.clone();
+            let applied = applied.clone();
+            std::thread::spawn(move || {
+                let guard = engine.acquire_mutation_visibility_guard();
+                acquired_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                // The "apply + redo append" happens strictly before the
+                // guard is released.
+                applied.store(true, Ordering::SeqCst);
+                drop(guard);
+            })
+        };
+        acquired_rx.recv().unwrap();
+
+        // Migration worker: fence is up, now drain before fence_seq capture.
+        let drain = {
+            let engine = engine.clone();
+            let applied = applied.clone();
+            std::thread::spawn(move || {
+                drain_in_flight_mutations(&engine);
+                // Observed at the instant the drain returned.
+                applied.load(Ordering::SeqCst)
+            })
+        };
+
+        // Bounded negative check: while the writer holds the exclusive
+        // barrier the drain must stay blocked.
+        let hold_deadline = std::time::Instant::now() + Duration::from_millis(200);
+        while std::time::Instant::now() < hold_deadline {
+            assert!(
+                !drain.is_finished(),
+                "drain returned while a mutation still held the exclusive \
+                 dispatch-visibility barrier",
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let applied_when_drained = drain.join().unwrap();
+        assert!(
+            applied_when_drained,
+            "the in-flight mutation's apply must be visible by the time the \
+             drain returns (fence_seq capture / manifest collection ordering)",
         );
     }
 
