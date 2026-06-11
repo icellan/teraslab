@@ -441,6 +441,24 @@ impl Index {
             let mut buf = AlignedBuf::new(aligned_read, align);
             device.pread_exact_at(&mut buf, offset)?;
 
+            // A fully-zeroed metadata header is a deleted-record tombstone
+            // (`Engine::delete` zeroes `METADATA_SIZE` bytes and syncs) or a
+            // never-written reservation — NOT corruption. `delete` frees the
+            // region and journals a `FreeRegion` redo entry, but the persisted
+            // allocator header is only refreshed at the next checkpoint, so a
+            // crash after a delete but before that checkpoint leaves a zeroed
+            // region inside the recovered high-water range with no freelist
+            // entry to skip it (the `FreeRegion` replay runs AFTER this device
+            // scan). Treating it as corruption would abort startup
+            // (boot-loop) for a benign, WAL-covered state. Skip it: advance
+            // one alignment block; the subsequent redo replay re-applies the
+            // free. A genuinely torn/garbage header (non-zero, CRC-failing) is
+            // still rejected below.
+            if buf[..METADATA_SIZE].iter().all(|&b| b == 0) {
+                offset += align as u64;
+                continue;
+            }
+
             let meta = match TxMetadata::from_bytes(&buf[..METADATA_SIZE]) {
                 Ok(m) => m,
                 Err(e) => {
@@ -533,6 +551,24 @@ impl Index {
 
             let mut buf = AlignedBuf::new(aligned_read, align);
             device.pread_exact_at(&mut buf, offset)?;
+
+            // A fully-zeroed metadata header is a deleted-record tombstone
+            // (`Engine::delete` zeroes `METADATA_SIZE` bytes and syncs) or a
+            // never-written reservation — NOT corruption. `delete` frees the
+            // region and journals a `FreeRegion` redo entry, but the persisted
+            // allocator header is only refreshed at the next checkpoint, so a
+            // crash after a delete but before that checkpoint leaves a zeroed
+            // region inside the recovered high-water range with no freelist
+            // entry to skip it (the `FreeRegion` replay runs AFTER this device
+            // scan). Treating it as corruption would abort startup
+            // (boot-loop) for a benign, WAL-covered state. Skip it: advance
+            // one alignment block; the subsequent redo replay re-applies the
+            // free. A genuinely torn/garbage header (non-zero, CRC-failing) is
+            // still rejected below.
+            if buf[..METADATA_SIZE].iter().all(|&b| b == 0) {
+                offset += align as u64;
+                continue;
+            }
 
             let meta = match TxMetadata::from_bytes(&buf[..METADATA_SIZE]) {
                 Ok(m) => m,
