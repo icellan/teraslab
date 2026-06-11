@@ -1051,19 +1051,48 @@ fn apply_create_lifecycle_and_blob(
     // batch-level error so the master retries instead of advancing its
     // durable high-water mark.
     if metadata_bytes.len() >= 70 {
-        let mut meta = engine
-            .read_metadata(tx_key)
-            .map_err(|e| format!("read metadata for lifecycle update: {e}"))?;
-        meta.generation = u32::from_le_bytes(metadata_bytes[46..50].try_into().unwrap());
-        meta.updated_at = u64::from_le_bytes(metadata_bytes[50..58].try_into().unwrap());
-        meta.unmined_since = u32::from_le_bytes(metadata_bytes[58..62].try_into().unwrap());
-        meta.delete_at_height = u32::from_le_bytes(metadata_bytes[62..66].try_into().unwrap());
-        meta.preserve_until = u32::from_le_bytes(metadata_bytes[66..70].try_into().unwrap());
-        let entry = engine
-            .lookup(tx_key)
-            .ok_or_else(|| format!("lookup after create for lifecycle update: tx {tx_key:?}"))?;
-        crate::io::write_metadata(engine.device(), entry.record_offset, &meta)
-            .map_err(|e| format!("write extended-lifecycle metadata: {e}"))?;
+        let generation = u32::from_le_bytes(
+            metadata_bytes[46..50]
+                .try_into()
+                .map_err(|_| "lifecycle metadata generation slice".to_string())?,
+        );
+        let updated_at = u64::from_le_bytes(
+            metadata_bytes[50..58]
+                .try_into()
+                .map_err(|_| "lifecycle metadata updated_at slice".to_string())?,
+        );
+        let unmined_since = u32::from_le_bytes(
+            metadata_bytes[58..62]
+                .try_into()
+                .map_err(|_| "lifecycle metadata unmined_since slice".to_string())?,
+        );
+        let delete_at_height = u32::from_le_bytes(
+            metadata_bytes[62..66]
+                .try_into()
+                .map_err(|_| "lifecycle metadata delete_at_height slice".to_string())?,
+        );
+        let preserve_until = u32::from_le_bytes(
+            metadata_bytes[66..70]
+                .try_into()
+                .map_err(|_| "lifecycle metadata preserve_until slice".to_string())?,
+        );
+        // R-035 + F-2: route the lifecycle patch through the engine entry point
+        // that updates the device footer AND the DAH/unmined secondary indexes
+        // and primary-index cached fields atomically — the same machinery the
+        // normal create/mutation path uses. A raw `write_metadata` here left the
+        // migration target's secondaries stale until its next restart (DAH sweep
+        // skipped migrated records, QUERY_OLD_UNMINED missed them, cached-vs-slow
+        // GET disagreed).
+        engine
+            .restore_migrated_lifecycle(
+                tx_key,
+                generation,
+                updated_at,
+                unmined_since,
+                delete_at_height,
+                preserve_until,
+            )
+            .map_err(|e| format!("restore migrated lifecycle metadata: {e}"))?;
     }
 
     // Store cold data in the blobstore if provided. Blob persistence is part
@@ -2020,7 +2049,7 @@ mod tests {
     use super::*;
     use crate::allocator::SlotAllocator;
     use crate::device::{BlockDevice, MemoryDevice};
-    use crate::index::{DahIndex, Index, TxKey, UnminedIndex};
+    use crate::index::{DahIndex, Index, TxIndexEntry, TxKey, UnminedIndex};
     use crate::locks::StripedLocks;
 
     fn make_engine() -> Arc<Engine> {
@@ -5233,5 +5262,219 @@ mod tests {
             }
             other => panic!("entry[0] should be SpendV2, got {other:?}"),
         }
+    }
+
+    /// Build a 70-byte migration `metadata_bytes` blob carrying the master's
+    /// lifecycle state (the layout the baseline migration path streams). Bytes
+    /// 0..46 are the core create header (all zero here except tx_version=1);
+    /// bytes 46..70 are generation/updated_at/unmined_since/delete_at_height/
+    /// preserve_until.
+    fn migration_metadata_bytes(
+        generation: u32,
+        updated_at: u64,
+        unmined_since: u32,
+        delete_at_height: u32,
+        preserve_until: u32,
+    ) -> Vec<u8> {
+        let mut m = vec![0u8; 70];
+        // tx_version = 1 (offset 0..4); the rest of the core header stays zero.
+        m[0..4].copy_from_slice(&1u32.to_le_bytes());
+        m[46..50].copy_from_slice(&generation.to_le_bytes());
+        m[50..58].copy_from_slice(&updated_at.to_le_bytes());
+        m[58..62].copy_from_slice(&unmined_since.to_le_bytes());
+        m[62..66].copy_from_slice(&delete_at_height.to_le_bytes());
+        m[66..70].copy_from_slice(&preserve_until.to_le_bytes());
+        m
+    }
+
+    /// Apply a migrated Create exactly as the receiver does for a streamed
+    /// baseline record, with the supplied lifecycle metadata.
+    fn apply_migrated_create(
+        engine: &Engine,
+        k: TxKey,
+        metadata_bytes: Vec<u8>,
+    ) -> std::result::Result<(), String> {
+        let op = ReplicaOp::Create {
+            tx_key: k,
+            metadata_bytes,
+            utxo_hashes: vec![[0xAA; 32]; 2],
+            cold_data: None,
+            is_external: false,
+        };
+        apply_op(engine, &op)
+    }
+
+    /// Decode the cached `delete_at_height` / `preserve_until` from a primary
+    /// index entry exactly as the fully-cached GET fast path
+    /// (`handle_get_batch`) does, so the test asserts what a client would see.
+    fn cached_dah_preserve(entry: &TxIndexEntry) -> (u32, u32) {
+        let has_preserve =
+            entry.tx_flags & crate::record::TxFlags::HAS_PRESERVE_UNTIL.bits() != 0;
+        if has_preserve {
+            (0, entry.dah_or_preserve)
+        } else {
+            (entry.dah_or_preserve, 0)
+        }
+    }
+
+    /// F-2: a migrated unmined record must land in the unmined secondary index
+    /// (so `QUERY_OLD_UNMINED` finds it) AND have its primary cached
+    /// `unmined_since` populated — both WITHOUT restarting the target.
+    #[test]
+    fn migrated_unmined_record_visible_in_unmined_index_and_cache() {
+        let engine = make_engine();
+        let k = key(1);
+        let unmined_since = 700_000u32;
+
+        apply_migrated_create(
+            &engine,
+            k,
+            migration_metadata_bytes(7, 12_345, unmined_since, 0, 0),
+        )
+        .unwrap();
+
+        // Device footer carries the real value.
+        let meta = engine.read_metadata(&k).unwrap();
+        assert_eq!({ meta.unmined_since }, unmined_since);
+        assert_eq!({ meta.generation }, 7);
+
+        // Unmined secondary index contains it (QUERY_OLD_UNMINED-style lookup).
+        let unmined_keys = engine.unmined_index().range_query(unmined_since + 1);
+        assert!(
+            unmined_keys.contains(&k),
+            "migrated unmined record must be in the unmined index without restart",
+        );
+
+        // Primary cached field matches the slow path.
+        let entry = engine.lookup(&k).expect("entry present after migrated create");
+        assert_eq!(
+            entry.unmined_since,
+            { meta.unmined_since },
+            "cached unmined_since must match the device footer",
+        );
+    }
+
+    /// F-2: a migrated record with `delete_at_height` set must land in the DAH
+    /// secondary index (so the DAH sweep picks it up via the same range query)
+    /// and have its primary cached field populated — without restart.
+    #[test]
+    fn migrated_dah_record_visible_in_dah_index_and_cache() {
+        let engine = make_engine();
+        let k = key(2);
+        let dah = 800_000u32;
+
+        apply_migrated_create(
+            &engine,
+            k,
+            migration_metadata_bytes(3, 999, 0, dah, 0),
+        )
+        .unwrap();
+
+        let meta = engine.read_metadata(&k).unwrap();
+        assert_eq!({ meta.delete_at_height }, dah);
+
+        // DAH sweep query (OP_PROCESS_EXPIRED_PRESERVATIONS) at a height past the
+        // DAH must return the migrated key.
+        let due = engine.dah_index().range_query(dah);
+        assert!(
+            due.contains(&k),
+            "migrated DAH record must be swept-visible without restart",
+        );
+        // At a height before the DAH, it must NOT be due yet.
+        let not_due = engine.dah_index().range_query(dah - 1);
+        assert!(!not_due.contains(&k), "DAH record not due before its height");
+
+        // Primary cached field reflects the DAH.
+        let entry = engine.lookup(&k).expect("entry present");
+        let (cached_dah, cached_preserve) = cached_dah_preserve(&entry);
+        assert_eq!(cached_dah, dah, "cached delete_at_height must match footer");
+        assert_eq!(cached_preserve, 0);
+    }
+
+    /// F-2: a migrated preserved record must surface `preserve_until` through
+    /// the cached primary path (HAS_PRESERVE_UNTIL discriminant set) and must
+    /// NOT appear in the DAH index.
+    #[test]
+    fn migrated_preserved_record_visible_through_cache() {
+        let engine = make_engine();
+        let k = key(3);
+        let preserve = 900_000u32;
+
+        apply_migrated_create(
+            &engine,
+            k,
+            migration_metadata_bytes(5, 555, 0, 0, preserve),
+        )
+        .unwrap();
+
+        let meta = engine.read_metadata(&k).unwrap();
+        assert_eq!({ meta.preserve_until }, preserve);
+        assert_eq!({ meta.delete_at_height }, 0);
+
+        // Preserved record carries delete_at_height = 0, so it must be absent
+        // from the DAH sweep even at u32::MAX.
+        let due = engine.dah_index().range_query(u32::MAX);
+        assert!(
+            !due.contains(&k),
+            "preserved record must not be DAH-swept",
+        );
+
+        // Cached path surfaces preserve_until via the HAS_PRESERVE_UNTIL bit.
+        let entry = engine.lookup(&k).expect("entry present");
+        assert!(
+            entry.tx_flags & crate::record::TxFlags::HAS_PRESERVE_UNTIL.bits() != 0,
+            "HAS_PRESERVE_UNTIL discriminant must be set in the cached flags",
+        );
+        let (cached_dah, cached_preserve) = cached_dah_preserve(&entry);
+        assert_eq!(cached_preserve, preserve, "cached preserve_until must match");
+        assert_eq!(cached_dah, 0);
+    }
+
+    /// F-2 specific symptom: for a migrated record the fully-cached GET fast
+    /// path and the slow (device-metadata) path must agree on
+    /// `unmined_since` / `delete_at_height` / `preserve_until`. Before the fix
+    /// the cached entry held zeros while the device footer held the real
+    /// values, so the same key answered differently by field mask.
+    #[test]
+    fn migrated_record_cached_matches_slow_path() {
+        let engine = make_engine();
+        let k = key(4);
+        let unmined_since = 0u32; // mined record that also has a DAH set
+        let dah = 750_000u32;
+
+        apply_migrated_create(
+            &engine,
+            k,
+            migration_metadata_bytes(9, 4242, unmined_since, dah, 0),
+        )
+        .unwrap();
+
+        // Slow path: device metadata.
+        let meta = engine.read_metadata(&k).unwrap();
+        // Cached path: primary index entry decoded like the GET fast path.
+        let entry = engine.lookup(&k).expect("entry present");
+        let (cached_dah, cached_preserve) = cached_dah_preserve(&entry);
+
+        assert_eq!(
+            entry.unmined_since,
+            { meta.unmined_since },
+            "cached vs slow-path unmined_since must match",
+        );
+        assert_eq!(
+            cached_dah,
+            { meta.delete_at_height },
+            "cached vs slow-path delete_at_height must match",
+        );
+        assert_eq!(
+            cached_preserve,
+            { meta.preserve_until },
+            "cached vs slow-path preserve_until must match",
+        );
+
+        // And the DAH index agrees with both.
+        assert!(
+            engine.dah_index().range_query(dah).contains(&k),
+            "DAH index must agree with the cached + slow paths",
+        );
     }
 }
