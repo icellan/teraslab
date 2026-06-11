@@ -6700,6 +6700,20 @@ impl RunningCluster {
         self.repl_ack_policy
     }
 
+    /// Test-only: override the resolved replication ACK policy and the
+    /// best-effort flag so dispatch tests can drive
+    /// `replicate_all_ops` / `replicate_all_ops_with_barrier` under a
+    /// specific quorum policy without standing up a full configured node.
+    #[cfg(test)]
+    pub fn set_replication_policy_for_test(
+        &mut self,
+        ack_policy: Option<crate::replication::manager::AckPolicy>,
+        best_effort: bool,
+    ) {
+        self.repl_ack_policy = ack_policy;
+        self.repl_best_effort = best_effort;
+    }
+
     /// Whether replication failures should be tolerated (best_effort degraded mode).
     pub fn is_replication_best_effort(&self) -> bool {
         self.repl_best_effort

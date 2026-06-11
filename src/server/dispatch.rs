@@ -405,7 +405,16 @@ pub(crate) fn handle_request(
         return err_resp;
     }
 
-    let _visibility_guard = acquire_dispatch_visibility_guard(engine, request.op_code);
+    let mut _visibility_guard = acquire_dispatch_visibility_guard(engine, request.op_code);
+    // C-1: for mutation ops, borrow the exclusive barrier out as a
+    // releasable handle so the handler can drop it after local apply +
+    // redo durability, before the replication network round-trip. Read
+    // and barrier-less ops get `None` and keep the guard for their full
+    // scope. The handle borrows the same `Option` `_visibility_guard`
+    // owns; it is moved by value into the handler and dropped (or
+    // released) there, before `_visibility_guard` itself goes out of
+    // scope at the end of this function.
+    let mutation_barrier = mutation_barrier_from(&mut _visibility_guard);
 
     // Refresh the cached wall-clock time once per request so that all
     // individual operations within the batch share the same timestamp.
@@ -438,13 +447,30 @@ pub(crate) fn handle_request(
     let start = std::time::Instant::now();
 
     let response = match request.op_code {
-        OP_SPEND_BATCH => handle_spend_batch(request, engine, max_batch_size, cluster, redo_log),
-        OP_UNSPEND_BATCH => {
-            handle_unspend_batch(request, engine, max_batch_size, cluster, redo_log)
-        }
-        OP_SET_MINED_BATCH => {
-            handle_set_mined_batch(request, engine, max_batch_size, cluster, redo_log)
-        }
+        OP_SPEND_BATCH => handle_spend_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            mutation_barrier,
+        ),
+        OP_UNSPEND_BATCH => handle_unspend_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            mutation_barrier,
+        ),
+        OP_SET_MINED_BATCH => handle_set_mined_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            mutation_barrier,
+        ),
         OP_CREATE_BATCH => handle_create_batch(
             request,
             engine,
@@ -452,36 +478,91 @@ pub(crate) fn handle_request(
             cluster,
             redo_log,
             blob_store,
+            mutation_barrier,
         ),
-        OP_FREEZE_BATCH => handle_freeze_batch(request, engine, max_batch_size, cluster, redo_log),
-        OP_UNFREEZE_BATCH => {
-            handle_unfreeze_batch(request, engine, max_batch_size, cluster, redo_log)
-        }
-        OP_REASSIGN_BATCH => {
-            handle_reassign_batch(request, engine, max_batch_size, cluster, redo_log)
-        }
-        OP_SET_CONFLICTING_BATCH => {
-            handle_set_conflicting_batch(request, engine, max_batch_size, cluster, redo_log)
-        }
-        OP_SET_LOCKED_BATCH => {
-            handle_set_locked_batch(request, engine, max_batch_size, cluster, redo_log)
-        }
-        OP_PRESERVE_UNTIL_BATCH => {
-            handle_preserve_until_batch(request, engine, max_batch_size, cluster, redo_log)
-        }
-        OP_DELETE_BATCH => handle_delete_batch(request, engine, max_batch_size, cluster, redo_log),
-        OP_MARK_LONGEST_CHAIN_BATCH => {
-            handle_mark_longest_chain_batch(request, engine, max_batch_size, cluster, redo_log)
-        }
+        OP_FREEZE_BATCH => handle_freeze_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            mutation_barrier,
+        ),
+        OP_UNFREEZE_BATCH => handle_unfreeze_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            mutation_barrier,
+        ),
+        OP_REASSIGN_BATCH => handle_reassign_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            mutation_barrier,
+        ),
+        OP_SET_CONFLICTING_BATCH => handle_set_conflicting_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            mutation_barrier,
+        ),
+        OP_SET_LOCKED_BATCH => handle_set_locked_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            mutation_barrier,
+        ),
+        OP_PRESERVE_UNTIL_BATCH => handle_preserve_until_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            mutation_barrier,
+        ),
+        OP_DELETE_BATCH => handle_delete_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            mutation_barrier,
+        ),
+        OP_MARK_LONGEST_CHAIN_BATCH => handle_mark_longest_chain_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            mutation_barrier,
+        ),
         OP_GET_BATCH => handle_get_batch(request, engine, max_batch_size, cluster),
         OP_GET_SPEND_BATCH => handle_get_spend_batch(request, engine, max_batch_size, cluster),
         OP_QUERY_OLD_UNMINED => handle_query_old_unmined(request, engine, cluster),
-        OP_PRESERVE_TRANSACTIONS => {
-            handle_preserve_transactions(request, engine, max_batch_size, cluster, redo_log)
-        }
-        OP_PROCESS_EXPIRED_PRESERVATIONS => {
-            handle_process_expired(request, engine, max_batch_size, cluster, redo_log)
-        }
+        OP_PRESERVE_TRANSACTIONS => handle_preserve_transactions(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            mutation_barrier,
+        ),
+        OP_PROCESS_EXPIRED_PRESERVATIONS => handle_process_expired(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            mutation_barrier,
+        ),
         OP_GET_PARTITION_MAP => handle_get_partition_map(request, cluster),
         OP_GET_COMMITTED_TOPOLOGY => handle_get_committed_topology(request, cluster),
         OP_ADMIN_DIAGNOSE_KEY => handle_admin_diagnose_key(request, engine, cluster),
@@ -1399,6 +1480,14 @@ fn clear_replication_intents_after_success(ranges: &[(u64, u64)]) {
 pub(crate) struct ReplicationPlan {
     pub by_addr: HashMap<SocketAddr, Vec<ReplicaOp>>,
     pub dual_write_only: std::collections::HashSet<SocketAddr>,
+    /// D-6: per-key set of *regular* replica addresses this key was sent
+    /// to (the shard's replica set, excluding dual-write-only migration
+    /// extras and excluding `self`). Used to evaluate the ACK policy
+    /// **per key** instead of over the union of all fan-out addresses:
+    /// a key is durable only when a quorum of ITS own replicas ACK.
+    /// Keys appear in input order; a key whose shard has no resolvable
+    /// regular replica addresses carries an empty set.
+    pub key_targets: Vec<(TxKey, Vec<SocketAddr>)>,
 }
 
 pub(crate) fn build_replication_targets(
@@ -1415,9 +1504,12 @@ pub(crate) fn build_replication_targets(
         std::collections::HashSet::new();
     let mut target_errors: Vec<String> = Vec::new();
     let self_id = cluster.self_id();
+    // D-6: per-key regular replica address set, in input order.
+    let mut key_targets: Vec<(TxKey, Vec<SocketAddr>)> = Vec::with_capacity(ops_by_key.len());
 
     for (key, ops) in ops_by_key {
         let shard = ShardTable::shard_for_key(key);
+        let mut this_key_regular: Vec<SocketAddr> = Vec::new();
         // Use target_assignment (new topology) rather than effective_assignment
         // (old topology during handoff). Replication must go to nodes in the
         // NEW member list — the old assignment may reference dead nodes whose
@@ -1447,6 +1539,9 @@ pub(crate) fn build_replication_targets(
                 Some(addr) => {
                     by_addr.entry(addr).or_default().extend(ops.clone());
                     regular_addrs.insert(addr);
+                    if !this_key_regular.contains(&addr) {
+                        this_key_regular.push(addr);
+                    }
                 }
                 None if rf > 1 => {
                     target_errors.push(format!(
@@ -1466,6 +1561,7 @@ pub(crate) fn build_replication_targets(
                 dual_write_addrs.insert(addr);
             }
         }
+        key_targets.push((*key, this_key_regular));
     }
     drop(table_guard);
 
@@ -1487,6 +1583,7 @@ pub(crate) fn build_replication_targets(
     Ok(ReplicationPlan {
         by_addr,
         dual_write_only: dual_write_addrs,
+        key_targets,
     })
 }
 
@@ -1495,6 +1592,35 @@ fn replicate_all_ops(
     ops_by_key: &[(TxKey, Vec<ReplicaOp>)],
     redo_seq_range: (u64, u64),
     intent_ranges: &[(u64, u64)],
+) -> std::result::Result<ReplicationOutcome, String> {
+    replicate_all_ops_with_barrier(cluster, ops_by_key, redo_seq_range, intent_ranges, None)
+}
+
+/// Replication fan-out with C-1 barrier handoff.
+///
+/// `barrier` is the exclusive visibility barrier held by the mutation
+/// handler. The local engine apply and redo-log fsync are already
+/// complete by the time this is called (see the WAL-first contract in the
+/// mutation handlers); this function therefore **releases the barrier
+/// before the synchronous replication round-trip** so the network RTT
+/// does not stall concurrent client reads or the peer's
+/// `OP_REPLICA_BATCH` apply (which needs its own exclusive barrier).
+/// See [`MutationBarrier`] for the visibility/crash-safety argument.
+///
+/// `barrier` is `None` for recovery / intent re-replication (no client is
+/// blocked) and for unit tests that drive the fan-out directly.
+///
+/// R-D1/D-3 (preserved): each replica address still receives batches on
+/// its own dense per-replica sequence stream via [`send_replica_ops_to`].
+/// D-6 (added): the ACK policy is evaluated **per key** against the
+/// replica set each key was actually sent to, not over the union of all
+/// fan-out addresses.
+fn replicate_all_ops_with_barrier(
+    cluster: Option<&RunningCluster>,
+    ops_by_key: &[(TxKey, Vec<ReplicaOp>)],
+    redo_seq_range: (u64, u64),
+    intent_ranges: &[(u64, u64)],
+    mut barrier: Option<MutationBarrier<'_>>,
 ) -> std::result::Result<ReplicationOutcome, String> {
     let cluster = match cluster {
         Some(c) => c,
@@ -1512,6 +1638,7 @@ fn replicate_all_ops(
     let ReplicationPlan {
         by_addr,
         dual_write_only,
+        key_targets,
     } = plan;
     let rf = cluster.shard_table().read().replication_factor();
 
@@ -1524,6 +1651,18 @@ fn replicate_all_ops(
         }
         clear_replication_intents_after_success(intent_ranges);
         return Ok(ReplicationOutcome::NotApplicable);
+    }
+
+    // C-1: the local apply + redo durability are complete and every
+    // replica target has been resolved; release the engine-wide
+    // exclusive visibility barrier now so the synchronous replication
+    // round-trip below does not hold it. Reads resume immediately (they
+    // observe the fully-applied, locally-committed batch — never a torn
+    // one) and a peer master↔master apply can acquire its own barrier
+    // instead of deadlocking until the ack timeout. If replication later
+    // fails, compensation is a separate durable mutation.
+    if let Some(b) = barrier.as_mut() {
+        b.release();
     }
 
     // Send to all replica targets in parallel using the shared replication
@@ -1580,13 +1719,14 @@ fn replicate_all_ops(
             results
         });
 
-    let mut ack_count: usize = 0;
     let mut last_error: Option<String> = None;
     let mut dual_write_acks: usize = 0;
+    // D-6: the set of addresses that ACKed, used for per-key quorum.
+    let mut acked: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
     for (addr, result) in &results {
         match result {
             Ok(()) => {
-                ack_count += 1;
+                acked.insert(*addr);
                 if dual_write_only.contains(addr) {
                     dual_write_acks += 1;
                 }
@@ -1599,14 +1739,16 @@ fn replicate_all_ops(
     }
     let total_targets = results.len();
     let dual_write_total = dual_write_only.len();
+    let ack_policy = cluster.ack_policy();
+    let best_effort = cluster.is_replication_best_effort();
+
     // Phase E per-set ACK invariant: when at least one shard in this
     // batch is migrating outbound, require ≥1 ACK from the dual-write
     // set so the new master observes writes during the migration
     // window. Otherwise a `WriteMajority` policy could ACK on the OLD
     // replicas alone, leaving the post-handoff record set divergent.
     if dual_write_total > 0 && dual_write_acks == 0 {
-        let best_effort_now = cluster.is_replication_best_effort();
-        if best_effort_now {
+        if best_effort {
             tracing::warn!(
                 dual_write_total,
                 "replication: dual-write set produced 0 ACKs (best_effort — write proceeds, new master may need full resync)",
@@ -1620,58 +1762,84 @@ fn replicate_all_ops(
         }
     }
 
-    let ack_policy = cluster.ack_policy();
-    let best_effort = cluster.is_replication_best_effort();
-    let classification =
-        classify_replication_outcome(ack_count, total_targets, ack_policy, best_effort);
-
-    match classification {
-        ReplicationClassification::PolicyViolation { required } => Err(format!(
-            "replication: {ack_count}/{total_targets} replicas ACKed, need {required}: {}",
-            last_error.unwrap_or_default()
-        )),
-        ReplicationClassification::PartialAck => {
-            // At least one replica ACKed but not all — multi-node durability
-            // partially preserved. Tick the existing "degraded acks" counter
-            // but still return `Full`, so the client sees STATUS_OK.
-            if let Some(metrics) = DISPATCH_METRICS.get() {
-                metrics.replication_degraded_acks.inc();
-            }
-            // D-01: `PartialAck` is also the legitimate quorum-met-but-not-
-            // all outcome for a non-best-effort WriteMajority policy, so the
-            // ack policy is reported as a structured field instead of a
-            // hard-coded "(best_effort)" parenthetical.
-            tracing::warn!(
-                ack_count,
-                total_targets,
-                best_effort,
-                ack_policy = ?ack_policy,
-                "replication: degraded ack",
-            );
-            clear_replication_intents_after_success(intent_ranges);
-            Ok(ReplicationOutcome::Full)
+    // D-6: evaluate the ACK policy PER KEY against the replica set each
+    // key was actually sent to — not over the union of all fan-out
+    // addresses. A multi-shard client batch fans out disjoint per-key op
+    // subsets to different replica sets; the union count would let a key
+    // be reported durable while a quorum of ITS OWN replicas never ACKed
+    // (e.g. RF=2 WriteMajority with key A's replica up and key B's
+    // replica down: union ack_count=1 satisfies the union "majority", but
+    // key B has zero replica copies). Per-key accounting fails the batch
+    // when ANY key misses its own quorum.
+    let mut any_degraded = false;
+    let mut first_failure: Option<(TxKey, KeyReplicationVerdict)> = None;
+    for (key, targets) in &key_targets {
+        let verdict = classify_per_key_replication(targets, &acked, ack_policy, best_effort);
+        if verdict.is_failure() && first_failure.is_none() {
+            first_failure = Some((*key, verdict));
         }
-        ReplicationClassification::ZeroAckBestEffort => {
-            // Zero replicas ACKed in best-effort mode: durability collapsed
-            // to single-node. Escalate to `Degraded` so the caller responds
-            // with STATUS_DEGRADED_DURABILITY and the dedicated metric
-            // (`repl_degraded_durability`) ticks.
-            if let Some(metrics) = DISPATCH_METRICS.get() {
-                metrics.repl_degraded_durability.inc();
-            }
-            tracing::warn!(
-                total_targets,
-                err = %last_error.clone().unwrap_or_default(),
-                "replication: DEGRADED DURABILITY — 0 replicas ACKed, client will receive STATUS_DEGRADED_DURABILITY (best_effort)",
-            );
-            clear_replication_intents_after_success(intent_ranges);
-            Ok(ReplicationOutcome::Degraded)
-        }
-        ReplicationClassification::FullAck => {
-            clear_replication_intents_after_success(intent_ranges);
-            Ok(ReplicationOutcome::Full)
+        if verdict.is_degraded() {
+            any_degraded = true;
         }
     }
+
+    if let Some((
+        key,
+        KeyReplicationVerdict::Failed {
+            required,
+            acked: key_acks,
+            targets,
+        },
+    )) = first_failure
+    {
+        // At least one key did not reach a quorum of its own replicas and
+        // best-effort is disabled: the whole batch fails so the caller
+        // compensates and returns ERR_REPLICATION_FAILED. The key is named
+        // in the error for triage but not surfaced to the client.
+        return Err(format!(
+            "replication: key {:02x}{:02x}{:02x}{:02x}.. reached {key_acks}/{targets} of its own replicas, need {required}: {}",
+            key.txid[0],
+            key.txid[1],
+            key.txid[2],
+            key.txid[3],
+            last_error.unwrap_or_default()
+        ));
+    }
+
+    if any_degraded {
+        // best_effort: some key(s) missed their own quorum but the write
+        // proceeds with degraded durability rather than failing. Escalate
+        // to `Degraded` so the caller responds STATUS_DEGRADED_DURABILITY.
+        if let Some(metrics) = DISPATCH_METRICS.get() {
+            metrics.repl_degraded_durability.inc();
+        }
+        tracing::warn!(
+            best_effort,
+            err = %last_error.clone().unwrap_or_default(),
+            "replication: DEGRADED DURABILITY — a key missed its replica quorum (best_effort), client will receive STATUS_DEGRADED_DURABILITY",
+        );
+        clear_replication_intents_after_success(intent_ranges);
+        return Ok(ReplicationOutcome::Degraded);
+    }
+
+    // Every key met its own quorum. If some replica nonetheless failed (a
+    // key's set was larger than its quorum and a non-quorum-critical
+    // replica did not ACK), tick the degraded-acks counter but still
+    // report Full so the client sees STATUS_OK.
+    if acked.len() < total_targets {
+        if let Some(metrics) = DISPATCH_METRICS.get() {
+            metrics.replication_degraded_acks.inc();
+        }
+        tracing::warn!(
+            acked = acked.len(),
+            total_targets,
+            best_effort,
+            ack_policy = ?ack_policy,
+            "replication: per-key quorum met with some replica ACKs missing",
+        );
+    }
+    clear_replication_intents_after_success(intent_ranges);
+    Ok(ReplicationOutcome::Full)
 }
 
 fn replication_ack_timeout_for(
@@ -1809,10 +1977,19 @@ where
     Ok(())
 }
 
-/// Classification of an ACK tally against the configured ACK policy.
+/// Classification of an *aggregate* ACK tally against the configured ACK
+/// policy.
 ///
-/// This is a pure function of the ACK counts, the policy, and the
-/// best-effort flag, so it can be tested without a live cluster.
+/// D-6 superseded this on the production path: `replicate_all_ops`
+/// previously counted ACKs once over the union of all fan-out addresses,
+/// which let a key be reported durable while a quorum of *its own*
+/// replicas never ACKed. Production now evaluates quorum per key via
+/// [`classify_per_key_replication`]. This aggregate classifier is
+/// retained only as a `#[cfg(test)]` reference that pins the
+/// [`crate::replication::manager::required_replica_acks`] policy math
+/// (the same math the per-key path consumes) — there is intentionally no
+/// second production quorum implementation (Rule 6).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplicationClassification {
     /// Every replica target ACKed successfully.
@@ -1848,6 +2025,10 @@ pub(crate) enum ReplicationClassification {
 ///   whether zero-ACK triggers the degraded-durability escalation.
 ///
 /// See [`ReplicationClassification`] for semantics.
+///
+/// Superseded on the production path by [`classify_per_key_replication`]
+/// (D-6); retained as a `#[cfg(test)]` reference for the policy math.
+#[cfg(test)]
 pub(crate) fn classify_replication_outcome(
     ack_count: usize,
     total_targets: usize,
@@ -1872,6 +2053,123 @@ pub(crate) fn classify_replication_outcome(
     }
 
     ReplicationClassification::FullAck
+}
+
+/// D-6: per-key replication verdict.
+///
+/// A key is *durable* when a quorum of the replicas **it was actually
+/// sent to** ACKed; otherwise it failed (or, under best-effort, is
+/// degraded). This is the per-key analogue of the aggregate
+/// `ReplicationClassification` — see [`classify_per_key_replication`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyReplicationVerdict {
+    /// A quorum of this key's own replica set ACKed (or the key had no
+    /// regular replica targets — single-node / RF=1 — so durability is
+    /// trivially satisfied by the local copy).
+    Durable,
+    /// This key did not reach a quorum of its own replica set, and
+    /// best-effort is disabled: the batch must surface
+    /// `ERR_REPLICATION_FAILED`.
+    Failed {
+        /// Replica ACKs this key required from its own set.
+        required: usize,
+        /// Replica ACKs this key actually received from its own set.
+        acked: usize,
+        /// Size of this key's regular replica target set.
+        targets: usize,
+    },
+    /// This key did not reach a quorum, but best-effort is enabled: the
+    /// write proceeds with degraded durability rather than failing.
+    DegradedBestEffort {
+        /// ACKs received from this key's own set.
+        acked: usize,
+        /// Size of this key's regular replica target set.
+        targets: usize,
+    },
+}
+
+impl KeyReplicationVerdict {
+    /// True when this key failed its own quorum with best-effort disabled
+    /// — the batch must return `ERR_REPLICATION_FAILED`.
+    pub(crate) fn is_failure(&self) -> bool {
+        matches!(self, KeyReplicationVerdict::Failed { .. })
+    }
+
+    /// True when this key did not reach full durability under best-effort
+    /// (it proceeded best-effort with a missing copy).
+    pub(crate) fn is_degraded(&self) -> bool {
+        matches!(self, KeyReplicationVerdict::DegradedBestEffort { .. })
+    }
+}
+
+/// D-6: evaluate the ACK policy **per key** against the replica set the
+/// key was actually sent to, instead of over the union of every fan-out
+/// address.
+///
+/// Inputs:
+/// - `targets`: this key's regular replica addresses (from
+///   [`ReplicationPlan::key_targets`]). Empty means RF=1 / single-node —
+///   the local copy alone satisfies durability.
+/// - `acked`: the set of addresses that ACKed in this fan-out (any
+///   address in the whole batch; only this key's targets are consulted).
+/// - `ack_policy`: `Some(policy)` to enforce, `None` for best-effort with
+///   no minimum.
+/// - `best_effort`: whether a per-key quorum miss is downgraded to
+///   degraded-durability instead of a hard failure.
+///
+/// The previous implementation counted ACKs once over `by_addr.len()` —
+/// the *union* of all addresses, including dual-write extras and the
+/// disjoint replica sets of unrelated shards — so a key could be reported
+/// `STATUS_OK` while zero of its own replicas held a copy. This function
+/// closes that hole.
+pub(crate) fn classify_per_key_replication(
+    targets: &[SocketAddr],
+    acked: &std::collections::HashSet<SocketAddr>,
+    ack_policy: Option<crate::replication::manager::AckPolicy>,
+    best_effort: bool,
+) -> KeyReplicationVerdict {
+    // A key with no regular replica targets (RF=1 / single-node, or a key
+    // that only ever fanned out to dual-write migration extras) is durable
+    // on the local copy alone — there is no replica quorum to meet.
+    // Dual-write durability is enforced separately by the per-set
+    // invariant in `replicate_all_ops_with_barrier`.
+    if targets.is_empty() {
+        return KeyReplicationVerdict::Durable;
+    }
+
+    let target_count = targets.len();
+    let key_acks = targets.iter().filter(|a| acked.contains(*a)).count();
+
+    // best_effort mode (RF=1-only in valid configs) imposes no per-key
+    // minimum: the write proceeds regardless. But when this key's own
+    // replica set produced ZERO ACKs while it had targets, durability
+    // silently collapsed to the local copy — surface that as
+    // `DegradedBestEffort` so the caller emits STATUS_DEGRADED_DURABILITY
+    // (mirrors the old aggregate `ZeroAckBestEffort`).
+    if best_effort {
+        if key_acks == 0 {
+            return KeyReplicationVerdict::DegradedBestEffort {
+                acked: key_acks,
+                targets: target_count,
+            };
+        }
+        return KeyReplicationVerdict::Durable;
+    }
+
+    let required = match ack_policy {
+        Some(policy) => crate::replication::manager::required_replica_acks(target_count, policy),
+        None => 0, // no policy configured (RF<=1): no minimum
+    };
+
+    if key_acks >= required {
+        KeyReplicationVerdict::Durable
+    } else {
+        KeyReplicationVerdict::Failed {
+            required,
+            acked: key_acks,
+            targets: target_count,
+        }
+    }
 }
 
 /// Gap #8 (TERANODE_PRODUCTION_READINESS_GAPS.md): pre-apply state
@@ -2776,13 +3074,61 @@ fn needs_exclusive_visibility_barrier(op: u16) -> bool {
 /// Owns whichever side of the `dispatch_visibility_barrier` rwlock is
 /// appropriate for the opcode. Dropping it releases the guard; the
 /// underlying enum keeps the borrow checker honest without exposing
-/// `RwLockReadGuard`/`RwLockWriteGuard` to every call site. Both
-/// variants exist for their RAII side effect (the inner guards are
-/// never read).
+/// `RwLockReadGuard`/`RwLockWriteGuard` to every call site.
+///
+/// The exclusive (mutation) side is held in an `Option` so it can be
+/// moved out into a [`MutationBarrier`] and released *early* — see the
+/// C-1 fix. The shared (read) side has no early-release path; it is held
+/// for the full duration of the read so a reader never observes a
+/// partially-applied batch.
 #[allow(clippy::large_enum_variant, dead_code)]
 enum DispatchVisibilityGuard<'a> {
     Shared(parking_lot::RwLockReadGuard<'a, ()>),
-    Exclusive(parking_lot::RwLockWriteGuard<'a, ()>),
+    /// Exclusive write side. `None` once the guard has been moved out
+    /// into a [`MutationBarrier`] (the handle then owns and releases it).
+    Exclusive(Option<parking_lot::RwLockWriteGuard<'a, ()>>),
+}
+
+/// C-1: a borrowed handle to the exclusive visibility barrier that a
+/// mutation handler can **release early** — after the local engine apply
+/// and redo-log durability are complete, but before the replication
+/// network round-trip begins.
+///
+/// # Visibility / crash-safety contract
+///
+/// The exclusive barrier exists to make a mutation's *local apply*
+/// atomically visible: no concurrent reader (which holds the shared
+/// side) may observe a partially-applied — i.e. torn — batch. Once the
+/// handler has fully applied every op to the engine and fsynced the redo
+/// log, the local commit is complete and durable. From that point the
+/// replication fan-out is a *separate phase* that must not hold the
+/// engine-wide barrier: holding it across the synchronous network RTT
+/// (a) lets bidirectional master↔master write load form a cross-node
+/// circular wait broken only by the multi-second ack timeout (the peer's
+/// `OP_REPLICA_BATCH` apply needs *its* exclusive barrier), and (b)
+/// stalls every concurrent client read for the full replication RTT.
+///
+/// Releasing the barrier before fan-out keeps the no-torn-read invariant
+/// (the batch is fully applied before release) while relaxing the older
+/// "no observable rollback window" property: a reader may now observe a
+/// locally-committed value that a subsequent replication failure
+/// compensates away. That is sound because the local apply *is* a
+/// durable commit (the redo log is the source of truth) and replication-
+/// failure compensation is a distinct logical mutation recorded in the
+/// redo log, recoverable across a crash by the existing
+/// compensation/intent machinery.
+pub(crate) struct MutationBarrier<'a> {
+    guard: Option<parking_lot::RwLockWriteGuard<'a, ()>>,
+}
+
+impl MutationBarrier<'_> {
+    /// Release the exclusive visibility barrier. Idempotent — a second
+    /// call is a no-op. Called by mutation handlers at the
+    /// local-apply-complete / pre-replication boundary so the
+    /// replication round-trip does not hold the engine-wide barrier.
+    pub(crate) fn release(&mut self) {
+        self.guard = None;
+    }
 }
 
 fn acquire_dispatch_visibility_guard(
@@ -2793,13 +3139,37 @@ fn acquire_dispatch_visibility_guard(
         return None;
     }
     if needs_exclusive_visibility_barrier(op) {
-        Some(DispatchVisibilityGuard::Exclusive(
+        Some(DispatchVisibilityGuard::Exclusive(Some(
             engine.acquire_mutation_visibility_guard(),
-        ))
+        )))
     } else {
         Some(DispatchVisibilityGuard::Shared(
             engine.acquire_dispatch_visibility_guard(),
         ))
+    }
+}
+
+/// Move the exclusive write guard out of a [`DispatchVisibilityGuard`]
+/// into a [`MutationBarrier`] so a mutation handler can release it early
+/// (C-1).
+///
+/// Returns `None` for read-side (shared) ops, ops that take no barrier,
+/// or an exclusive guard whose write guard has already been taken. The
+/// lock guard is transferred into the returned handle (the outer
+/// `Exclusive` slot is left empty), so dropping or `release()`-ing the
+/// handle is what actually releases the lock; the outer guard's
+/// scope-end drop then has nothing left to release.
+fn mutation_barrier_from<'g, 'a>(
+    guard: &'g mut Option<DispatchVisibilityGuard<'a>>,
+) -> Option<MutationBarrier<'a>>
+where
+    'a: 'g,
+{
+    match guard {
+        Some(DispatchVisibilityGuard::Exclusive(slot)) => {
+            slot.take().map(|g| MutationBarrier { guard: Some(g) })
+        }
+        _ => None,
     }
 }
 
@@ -3022,6 +3392,8 @@ fn handle_spend_batch(
     max_batch: u32,
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
+    // C-1: exclusive visibility barrier, released before replication.
+    barrier: Option<MutationBarrier<'_>>,
 ) -> ResponseFrame {
     let (params, items) = match decode_spend_batch_checked(&req.payload, max_batch) {
         Ok(r) => r,
@@ -3287,11 +3659,14 @@ fn handle_spend_batch(
     }
 
     // Phase 5: Replicate (redo already fsynced, engine already applied).
-    let repl_outcome = match replicate_all_ops(
+    // C-1: the barrier is released inside `replicate_all_ops_with_barrier`
+    // before the network round-trip.
+    let repl_outcome = match replicate_all_ops_with_barrier(
         cluster,
         &repl_ops_by_key,
         spend_redo_range,
         &spend_intent_ranges,
+        barrier,
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -3350,6 +3725,8 @@ fn handle_unspend_batch(
     max_batch: u32,
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
+    // C-1: exclusive visibility barrier, released before replication.
+    barrier: Option<MutationBarrier<'_>>,
 ) -> ResponseFrame {
     let (params, items) = match decode_unspend_batch_checked(&req.payload, max_batch) {
         Ok(r) => r,
@@ -3496,8 +3873,13 @@ fn handle_unspend_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
-    {
+    let repl_outcome = match replicate_all_ops_with_barrier(
+        cluster,
+        &repl_ops_by_key,
+        redo_range,
+        &[redo_range],
+        barrier,
+    ) {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
@@ -3528,6 +3910,8 @@ fn handle_set_mined_batch(
     max_batch: u32,
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
+    // C-1: exclusive visibility barrier, released before replication.
+    barrier: Option<MutationBarrier<'_>>,
 ) -> ResponseFrame {
     let (params, txids) = match decode_set_mined_batch_checked(&req.payload, max_batch) {
         Ok(r) => r,
@@ -3718,8 +4102,13 @@ fn handle_set_mined_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
-    {
+    let repl_outcome = match replicate_all_ops_with_barrier(
+        cluster,
+        &repl_ops_by_key,
+        redo_range,
+        &[redo_range],
+        barrier,
+    ) {
         Ok(o) => o,
         Err(e) => {
             // Gap #8: rollback uses the captured pre-unset block-entry
@@ -3850,6 +4239,8 @@ fn handle_create_batch(
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
     blob_store: Option<&dyn BlobStore>,
+    // C-1: exclusive visibility barrier, released before replication.
+    barrier: Option<MutationBarrier<'_>>,
 ) -> ResponseFrame {
     let items = match decode_create_batch_checked(&req.payload, max_batch) {
         Ok(r) => r,
@@ -4270,8 +4661,13 @@ fn handle_create_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
-    {
+    let repl_outcome = match replicate_all_ops_with_barrier(
+        cluster,
+        &repl_ops_by_key,
+        redo_range,
+        &[redo_range],
+        barrier,
+    ) {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
@@ -4318,6 +4714,8 @@ fn handle_freeze_batch(
     max_batch: u32,
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
+    // C-1: exclusive visibility barrier, released before replication.
+    barrier: Option<MutationBarrier<'_>>,
 ) -> ResponseFrame {
     let items = match decode_slot_item_batch_checked(&req.payload, max_batch) {
         Ok(r) => r,
@@ -4388,8 +4786,13 @@ fn handle_freeze_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
-    {
+    let repl_outcome = match replicate_all_ops_with_barrier(
+        cluster,
+        &repl_ops_by_key,
+        redo_range,
+        &[redo_range],
+        barrier,
+    ) {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
@@ -4431,6 +4834,8 @@ fn handle_unfreeze_batch(
     max_batch: u32,
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
+    // C-1: exclusive visibility barrier, released before replication.
+    barrier: Option<MutationBarrier<'_>>,
 ) -> ResponseFrame {
     let items = match decode_slot_item_batch_checked(&req.payload, max_batch) {
         Ok(r) => r,
@@ -4501,8 +4906,13 @@ fn handle_unfreeze_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
-    {
+    let repl_outcome = match replicate_all_ops_with_barrier(
+        cluster,
+        &repl_ops_by_key,
+        redo_range,
+        &[redo_range],
+        barrier,
+    ) {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
@@ -4544,6 +4954,8 @@ fn handle_reassign_batch(
     max_batch: u32,
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
+    // C-1: exclusive visibility barrier, released before replication.
+    barrier: Option<MutationBarrier<'_>>,
 ) -> ResponseFrame {
     let (params, items) = match decode_reassign_batch_checked(&req.payload, max_batch) {
         Ok(r) => r,
@@ -4635,8 +5047,13 @@ fn handle_reassign_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
-    {
+    let repl_outcome = match replicate_all_ops_with_barrier(
+        cluster,
+        &repl_ops_by_key,
+        redo_range,
+        &[redo_range],
+        barrier,
+    ) {
         Ok(o) => o,
         Err(e) => {
             // Gap #8: rollback restores the captured prior utxo_hash, no
@@ -4679,6 +5096,8 @@ fn handle_set_conflicting_batch(
     max_batch: u32,
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
+    // C-1: exclusive visibility barrier, released before replication.
+    barrier: Option<MutationBarrier<'_>>,
 ) -> ResponseFrame {
     let (shared, txids) = match decode_txid_batch_checked(&req.payload, 9, max_batch) {
         // value(1) + cbh(4) + bhr(4)
@@ -4770,8 +5189,13 @@ fn handle_set_conflicting_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
-    {
+    let repl_outcome = match replicate_all_ops_with_barrier(
+        cluster,
+        &repl_ops_by_key,
+        redo_range,
+        &[redo_range],
+        barrier,
+    ) {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
@@ -4815,6 +5239,8 @@ fn handle_set_locked_batch(
     max_batch: u32,
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
+    // C-1: exclusive visibility barrier, released before replication.
+    barrier: Option<MutationBarrier<'_>>,
 ) -> ResponseFrame {
     let (shared, txids) = match decode_txid_batch_checked(&req.payload, 1, max_batch) {
         Ok(r) => r,
@@ -4889,8 +5315,13 @@ fn handle_set_locked_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
-    {
+    let repl_outcome = match replicate_all_ops_with_barrier(
+        cluster,
+        &repl_ops_by_key,
+        redo_range,
+        &[redo_range],
+        barrier,
+    ) {
         Ok(o) => o,
         Err(e) => {
             if let Some(resp) = compensate_replication_failure_or_error(
@@ -4931,6 +5362,8 @@ fn handle_preserve_until_batch(
     max_batch: u32,
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
+    // C-1: exclusive visibility barrier, released before replication.
+    barrier: Option<MutationBarrier<'_>>,
 ) -> ResponseFrame {
     let (shared, txids) = match decode_txid_batch_checked(&req.payload, 4, max_batch) {
         Ok(r) => r,
@@ -5007,8 +5440,13 @@ fn handle_preserve_until_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
-    {
+    let repl_outcome = match replicate_all_ops_with_barrier(
+        cluster,
+        &repl_ops_by_key,
+        redo_range,
+        &[redo_range],
+        barrier,
+    ) {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
@@ -5138,6 +5576,8 @@ fn handle_delete_batch(
     max_batch: u32,
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
+    // C-1: exclusive visibility barrier, released before replication.
+    barrier: Option<MutationBarrier<'_>>,
 ) -> ResponseFrame {
     let (_, txids) = match decode_txid_batch_checked(&req.payload, 0, max_batch) {
         Ok(r) => r,
@@ -5450,8 +5890,13 @@ fn handle_delete_batch(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
-    {
+    let repl_outcome = match replicate_all_ops_with_barrier(
+        cluster,
+        &repl_ops_by_key,
+        redo_range,
+        &[redo_range],
+        barrier,
+    ) {
         Ok(o) => o,
         Err(e) => {
             // Compensate: re-create deleted records from snapshots, then
@@ -5598,6 +6043,8 @@ fn handle_mark_longest_chain_batch(
     max_batch: u32,
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
+    // C-1: exclusive visibility barrier, released before replication.
+    barrier: Option<MutationBarrier<'_>>,
 ) -> ResponseFrame {
     let (shared, txids) = match decode_txid_batch_checked(&req.payload, 9, max_batch) {
         Ok(r) => r,
@@ -5719,8 +6166,13 @@ fn handle_mark_longest_chain_batch(
     }
 
     // Phase 4: Replicate. Mirrors set_mined / spend handlers.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
-    {
+    let repl_outcome = match replicate_all_ops_with_barrier(
+        cluster,
+        &repl_ops_by_key,
+        redo_range,
+        &[redo_range],
+        barrier,
+    ) {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
@@ -6205,6 +6657,8 @@ fn handle_preserve_transactions(
     max_batch: u32,
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
+    // C-1: exclusive visibility barrier, released before replication.
+    barrier: Option<MutationBarrier<'_>>,
 ) -> ResponseFrame {
     // Same format as PreserveUntilBatch: [count:4][block_height:4][txids]
     let (shared, txids) = match decode_txid_batch_checked(&req.payload, 4, max_batch) {
@@ -6271,8 +6725,13 @@ fn handle_preserve_transactions(
     }
 
     // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops(cluster, &repl_ops_by_key, redo_range, &[redo_range])
-    {
+    let repl_outcome = match replicate_all_ops_with_barrier(
+        cluster,
+        &repl_ops_by_key,
+        redo_range,
+        &[redo_range],
+        barrier,
+    ) {
         Ok(o) => o,
         Err(e) => {
             let before_images = no_before_images(&repl_ops_by_key);
@@ -6338,6 +6797,8 @@ fn handle_process_expired(
     max_batch: u32,
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
+    // C-1: exclusive visibility barrier, released before replication.
+    barrier: Option<MutationBarrier<'_>>,
 ) -> ResponseFrame {
     // Payload: [current_height:4]
     if req.payload.len() < 4 {
@@ -6425,7 +6886,10 @@ fn handle_process_expired(
         flags: req.flags,
         payload: delete_payload.into(),
     };
-    let delete_resp = handle_delete_batch(&delete_req, engine, max_batch, cluster, redo_log);
+    // C-1: forward the exclusive visibility barrier so the nested delete
+    // releases it before its own replication fan-out.
+    let delete_resp =
+        handle_delete_batch(&delete_req, engine, max_batch, cluster, redo_log, barrier);
 
     // Collapse the OP_DELETE_BATCH response shape into the legacy
     // (deleted:u32, failed:u32) format that
@@ -9987,6 +10451,186 @@ mod tests {
         assert_eq!(c, ReplicationClassification::FullAck);
     }
 
+    // -----------------------------------------------------------------------
+    // D-6 — per-key quorum classifier (pure-function tests).
+    //
+    // The production path evaluates the ACK policy PER KEY against the
+    // replica set each key was actually sent to (not the union of all
+    // fan-out addresses). These pin that math.
+    // -----------------------------------------------------------------------
+
+    fn addr(n: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], n))
+    }
+
+    fn acked_set(addrs: &[SocketAddr]) -> std::collections::HashSet<SocketAddr> {
+        addrs.iter().copied().collect()
+    }
+
+    #[test]
+    fn per_key_majority_reached_is_durable() {
+        // A key whose replica set reaches the required ACKs is durable
+        // under both WriteMajority and WriteAll.
+        let acked = acked_set(&[addr(1), addr(2)]);
+        assert_eq!(
+            classify_per_key_replication(
+                &[addr(1), addr(2)],
+                &acked,
+                Some(AckPolicy::WriteMajority),
+                false,
+            ),
+            KeyReplicationVerdict::Durable,
+        );
+        assert_eq!(
+            classify_per_key_replication(
+                &[addr(1), addr(2)],
+                &acked,
+                Some(AckPolicy::WriteAll),
+                false,
+            ),
+            KeyReplicationVerdict::Durable,
+        );
+    }
+
+    #[test]
+    fn per_key_rf3_majority_below_threshold_is_failure() {
+        // RF=3 (auto → WriteMajority): a key with two replicas needs 1 ACK.
+        let policy = Some(AckPolicy::WriteMajority);
+        // Key X reached 0 of its 2 replicas → below majority → fail.
+        let none_acked = acked_set(&[]);
+        let x = classify_per_key_replication(&[addr(1), addr(2)], &none_acked, policy, false);
+        assert_eq!(
+            x,
+            KeyReplicationVerdict::Failed {
+                required: 1,
+                acked: 0,
+                targets: 2,
+            },
+            "key reaching 0 of its 2 replicas must fail RF=3 majority",
+        );
+
+        // Key Y reached 1 of its 2 replicas → meets majority → durable.
+        let one_acked = acked_set(&[addr(2)]);
+        let y = classify_per_key_replication(&[addr(1), addr(2)], &one_acked, policy, false);
+        assert_eq!(y, KeyReplicationVerdict::Durable);
+    }
+
+    #[test]
+    fn per_key_write_all_one_replica_down_is_failure() {
+        // WriteAll requires every replica in the key's own set. One of two
+        // down → failure, even though a union counter might be satisfied by
+        // other keys' ACKs.
+        let acked = acked_set(&[addr(1)]); // only one of the two ACKed
+        let v = classify_per_key_replication(
+            &[addr(1), addr(2)],
+            &acked,
+            Some(AckPolicy::WriteAll),
+            false,
+        );
+        assert_eq!(
+            v,
+            KeyReplicationVerdict::Failed {
+                required: 2,
+                acked: 1,
+                targets: 2,
+            },
+        );
+    }
+
+    #[test]
+    fn per_key_multi_key_disjoint_sets_independent_verdicts() {
+        // Different keys reach different replica subsets — verdicts are
+        // independent. Key A's replica up, key B's down, key C fully up.
+        // The shared `acked` set is the WHOLE batch's ACKs; only each key's
+        // own targets are consulted.
+        let policy = Some(AckPolicy::WriteMajority);
+        let acked = acked_set(&[addr(1), addr(5), addr(6)]);
+
+        let a = classify_per_key_replication(&[addr(1)], &acked, policy, false);
+        let b = classify_per_key_replication(&[addr(2)], &acked, policy, false);
+        let c = classify_per_key_replication(&[addr(5), addr(6)], &acked, policy, false);
+
+        assert_eq!(a, KeyReplicationVerdict::Durable, "A: 1/1");
+        assert!(b.is_failure(), "B: 0/1 must fail independently");
+        assert_eq!(c, KeyReplicationVerdict::Durable, "C: 2/2");
+    }
+
+    #[test]
+    fn per_key_empty_target_set_is_durable_rf1() {
+        // RF=1 / single-node: a key with no regular replica targets is
+        // durable on the local copy alone — no replica quorum to meet.
+        let acked = acked_set(&[]);
+        assert_eq!(
+            classify_per_key_replication(&[], &acked, Some(AckPolicy::WriteMajority), false),
+            KeyReplicationVerdict::Durable,
+        );
+        assert_eq!(
+            classify_per_key_replication(&[], &acked, None, true),
+            KeyReplicationVerdict::Durable,
+        );
+    }
+
+    #[test]
+    fn per_key_beats_old_union_counter_on_disjoint_sets() {
+        // Regression pin for the exact D-6 bug: the OLD code counted ACKs
+        // once over the UNION of all fan-out addresses. Reconstruct that
+        // computation and show it would have reported the batch durable
+        // while a key had ZERO copies — then show the per-key path fails it.
+        //
+        // RF=2 WriteMajority, two keys on disjoint single-replica sets:
+        //   key A → replica addr(1)  (ACKed)
+        //   key B → replica addr(2)  (NOT ACKed)
+        let policy = AckPolicy::WriteMajority;
+        let key_a_targets = [addr(1)];
+        let key_b_targets = [addr(2)];
+        let acked = acked_set(&[addr(1)]); // only A's replica ACKed
+
+        // OLD union math: total_targets = |{addr(1), addr(2)}| = 2,
+        // ack_count = 1, required = required_replica_acks(2, WriteMajority)
+        // = 1 → 1 >= 1 → "satisfied" → STATUS_OK for the WHOLE batch,
+        // including key B with no replica copy. This is the bug.
+        let union_total = 2usize;
+        let union_acks = 1usize;
+        let union_required =
+            crate::replication::manager::required_replica_acks(union_total, policy);
+        assert!(
+            union_acks >= union_required,
+            "old union counter wrongly reports the batch durable ({union_acks} >= {union_required})",
+        );
+        // And the old aggregate classifier agrees it is "durable" (PartialAck → STATUS_OK).
+        assert_eq!(
+            classify_replication_outcome(union_acks, union_total, Some(policy), false),
+            ReplicationClassification::PartialAck,
+            "old union classifier wrongly reports STATUS_OK for the zero-copy key batch",
+        );
+
+        // Per-key math: key B reaches 0/1 of its OWN replica set → fails.
+        let a = classify_per_key_replication(&key_a_targets, &acked, Some(policy), false);
+        let b = classify_per_key_replication(&key_b_targets, &acked, Some(policy), false);
+        assert_eq!(a, KeyReplicationVerdict::Durable);
+        assert!(
+            b.is_failure(),
+            "per-key path must fail key B (0 replica copies), unlike the old union counter",
+        );
+    }
+
+    #[test]
+    fn per_key_best_effort_quorum_miss_is_degraded_not_failure() {
+        // best_effort downgrades a per-key quorum miss to degraded
+        // durability rather than a hard failure.
+        let acked = acked_set(&[]); // key's replica did not ACK
+        let v = classify_per_key_replication(&[addr(1)], &acked, None, true);
+        assert_eq!(
+            v,
+            KeyReplicationVerdict::DegradedBestEffort {
+                acked: 0,
+                targets: 1,
+            },
+        );
+        assert!(v.is_degraded());
+        assert!(!v.is_failure());
+    }
+
     #[test]
     fn replication_timeout_migration_pressure_override() {
         assert_eq!(
@@ -10296,14 +10940,27 @@ mod tests {
         assert_eq!(entries[0].sequence, range.0);
     }
 
+    /// C-1: the exclusive visibility barrier serializes client reads
+    /// against the *local apply window* — a reader blocks while the
+    /// mutation handler holds the exclusive guard (during apply + redo
+    /// durability) and proceeds the instant it is released. After C-1 the
+    /// barrier is released *before* the replication round-trip, so this
+    /// test pins the local-apply portion of the contract (the no-torn-read
+    /// invariant) AND that `MutationBarrier::release` actually drops the
+    /// lock. The separate
+    /// `c1_barrier_released_before_replication_network_io` test pins that
+    /// the barrier is NOT held across the replication network RTT.
     #[test]
-    fn compensation_no_observable_window() {
+    fn reader_blocks_during_local_apply_window() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let engine = Arc::new(DispatchTestHarness::new().engine);
         let reader_engine = Arc::clone(&engine);
-        let mutation_guard = acquire_dispatch_visibility_guard(engine.as_ref(), OP_SPEND_BATCH)
-            .expect("mutation op should acquire the visibility barrier");
+        let mut mutation_guard = acquire_dispatch_visibility_guard(engine.as_ref(), OP_SPEND_BATCH);
+        assert!(
+            mutation_guard.is_some(),
+            "mutation op should acquire the visibility barrier",
+        );
         let reader_entered = Arc::new(AtomicBool::new(false));
         let reader_finished = Arc::new(AtomicBool::new(false));
         let reader_entered_thread = Arc::clone(&reader_entered);
@@ -10323,14 +10980,20 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         assert!(
             !reader_finished.load(Ordering::SeqCst),
-            "client reads must block while a mutation can still be rolled back"
+            "client reads must block while the mutation holds the exclusive \
+             barrier (local apply window) so no torn batch is observed"
         );
 
-        drop(mutation_guard);
+        // Releasing via the MutationBarrier handle (the C-1 early-release
+        // path) must unblock the reader exactly as dropping the whole guard
+        // does — proving `MutationBarrier::release`/drop releases the lock.
+        let barrier = mutation_barrier_from(&mut mutation_guard)
+            .expect("exclusive op yields a releasable MutationBarrier");
+        drop(barrier);
         handle.join().expect("reader thread joins");
         assert!(
             reader_finished.load(Ordering::SeqCst),
-            "reader proceeds after mutation replication/compensation window closes"
+            "reader proceeds the instant the exclusive barrier is released"
         );
     }
 
@@ -10713,6 +11376,334 @@ mod tests {
             err.contains("has no resolved address"),
             "unexpected error: {err}",
         );
+    }
+
+    #[test]
+    fn build_replication_targets_records_per_key_regular_replica_set() {
+        // D-6: the plan must carry, per key, the regular replica addresses
+        // that key was sent to — so quorum can be evaluated per key.
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let n3 = crate::cluster::shards::NodeId(3);
+        let members = vec![n1, n2, n3];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 277);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == n1 && a.replicas.contains(&n2) && !a.replicas.contains(&n3)
+            })
+            .expect("expected shard mastered by n1 with n2 (not n3) as replica");
+
+        let n2_addr: SocketAddr = "127.0.0.1:8922".parse().unwrap();
+        let n3_addr: SocketAddr = "127.0.0.1:8923".parse().unwrap();
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[
+                (n1, "127.0.0.1:8921".parse().unwrap()),
+                (n2, n2_addr),
+                (n3, n3_addr),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+
+        let tx_key = TxKey {
+            txid: txid_for_shard(shard, 19),
+        };
+        let ops = vec![(
+            tx_key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+        )];
+
+        let plan =
+            build_replication_targets(&cluster, &ops).expect("target resolution should succeed");
+
+        let entry = plan
+            .key_targets
+            .iter()
+            .find(|(k, _)| *k == tx_key)
+            .expect("key must appear in key_targets");
+        assert_eq!(
+            entry.1,
+            vec![n2_addr],
+            "per-key regular replica set must be exactly this shard's replica address",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // C-1 + D-6 — integration over a real cluster + controlled TCP receivers.
+    //
+    // These drive the production `replicate_all_ops` /
+    // `replicate_all_ops_with_barrier` fan-out against `std::net::TcpListener`
+    // receivers we control (ACK / NAK / slow), exercising the actual
+    // dense-sequence send, barrier handoff, and per-key quorum accounting
+    // end-to-end without SWIM.
+    // -----------------------------------------------------------------------
+
+    /// How a controlled replica receiver responds to each OP_REPLICA_BATCH.
+    #[derive(Clone, Copy)]
+    enum ReplicaBehaviour {
+        /// ACK every batch immediately (echoing the dense watermark).
+        Ack,
+        /// NAK every real (non-probe) batch (`ReplicaAck::Error`) — a
+        /// per-key quorum miss. The empty probe is still ACKed so the
+        /// sender's dense cursor syncs.
+        Nak,
+        /// Sleep `ms` before ACKing each non-probe batch — simulates a
+        /// slow replication RTT.
+        SlowAck(u64),
+    }
+
+    /// Spawn a minimal OP_REPLICA_BATCH receiver on `127.0.0.1:0`, returning
+    /// its address. It echoes each request's `request_id` and responds per
+    /// `behaviour`. The dense-sequence sender first sends an empty probe
+    /// (zero ops) to learn the watermark; the probe is always ACKed at
+    /// `through = 0` so the cursor adopts 1. The thread is detached.
+    fn spawn_replica_receiver(behaviour: ReplicaBehaviour) -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut stream = match conn {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let behaviour = behaviour;
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if stream.read_exact(&mut len_buf).is_err() {
+                            return;
+                        }
+                        let total = u32::from_le_bytes(len_buf) as usize;
+                        let mut body = vec![0u8; total];
+                        if stream.read_exact(&mut body).is_err() {
+                            return;
+                        }
+                        let mut full = Vec::with_capacity(4 + total);
+                        full.extend_from_slice(&len_buf);
+                        full.extend_from_slice(&body);
+                        let (req, _) = match crate::protocol::frame::RequestFrame::decode(&full) {
+                            Ok(r) => r,
+                            Err(_) => return,
+                        };
+                        let batch = match ReplicaBatch::deserialize(&req.payload) {
+                            Ok(b) => b,
+                            Err(_) => return,
+                        };
+                        // The empty probe (zero ops) is always ACKed at the
+                        // current watermark (0) regardless of behaviour so the
+                        // dense cursor can sync; only real batches are subject
+                        // to NAK / slow.
+                        let is_probe = batch.ops.is_empty();
+                        let resp = if is_probe {
+                            ResponseFrame {
+                                request_id: req.request_id,
+                                status: STATUS_OK,
+                                payload: ReplicaAck::Ok { through_sequence: 0 }.serialize(),
+                            }
+                        } else {
+                            match behaviour {
+                                ReplicaBehaviour::Ack => ResponseFrame {
+                                    request_id: req.request_id,
+                                    status: STATUS_OK,
+                                    payload: ReplicaAck::Ok {
+                                        through_sequence: batch.last_sequence(),
+                                    }
+                                    .serialize(),
+                                },
+                                ReplicaBehaviour::SlowAck(ms) => {
+                                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                                    ResponseFrame {
+                                        request_id: req.request_id,
+                                        status: STATUS_OK,
+                                        payload: ReplicaAck::Ok {
+                                            through_sequence: batch.last_sequence(),
+                                        }
+                                        .serialize(),
+                                    }
+                                }
+                                ReplicaBehaviour::Nak => ResponseFrame {
+                                    request_id: req.request_id,
+                                    status: STATUS_ERROR,
+                                    payload: ReplicaAck::Error {
+                                        failed_sequence: batch.first_sequence,
+                                        message: "test NAK".to_string(),
+                                    }
+                                    .serialize(),
+                                },
+                            }
+                        };
+                        if stream.write_all(&resp.encode()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Build a 2-node RF=2 cluster mastered by node 1 with node 2 as the
+    /// (sole) replica, its address pointed at `replica_addr`. Returns the
+    /// cluster and a key the node masters. A fresh receiver address per call
+    /// keeps the process-global dense-sequence cursor isolated per test.
+    fn two_node_rf2(
+        replica_addr: SocketAddr,
+        ack_policy: Option<AckPolicy>,
+    ) -> (crate::cluster::coordinator::RunningCluster, TxKey) {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let members = vec![n1, n2];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 41);
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == n1 && a.replicas.contains(&n2)
+            })
+            .expect("a shard mastered by n1 with n2 as replica");
+
+        let mut cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[(n1, "127.0.0.1:1".parse().unwrap()), (n2, replica_addr)],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        cluster.set_replication_policy_for_test(ack_policy, false);
+
+        let key = TxKey {
+            txid: txid_for_shard(shard, 71),
+        };
+        (cluster, key)
+    }
+
+    #[test]
+    fn d6_per_key_quorum_replica_naks_returns_replication_failed() {
+        // D-6 core guarantee: RF=2 write_majority — a key whose own (sole)
+        // replica NAKs reaches 0/1 of its replica set, below the majority
+        // requirement of 1. It MUST surface REPLICATION_FAILED, never
+        // STATUS_OK with zero replica copies.
+        let replica = spawn_replica_receiver(ReplicaBehaviour::Nak);
+        let (cluster, key) = two_node_rf2(replica, Some(AckPolicy::WriteMajority));
+
+        let ops = vec![(
+            key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: key }],
+        )];
+
+        let err = replicate_all_ops(Some(&cluster), &ops, (10, 10), &[])
+            .expect_err("a key reaching 0 of its own replicas must fail, not STATUS_OK");
+        assert!(
+            err.contains("of its own replicas"),
+            "expected per-key quorum failure, got: {err}",
+        );
+    }
+
+    #[test]
+    fn d6_per_key_quorum_replica_acks_succeeds() {
+        // Companion: the key reaches its own replica → quorum met → Full.
+        let replica = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let (cluster, key) = two_node_rf2(replica, Some(AckPolicy::WriteMajority));
+
+        let ops = vec![(
+            key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: key }],
+        )];
+
+        let outcome = replicate_all_ops(Some(&cluster), &ops, (10, 10), &[])
+            .expect("key reached its own replica — batch must succeed");
+        assert_eq!(outcome, ReplicationOutcome::Full);
+    }
+
+    #[test]
+    fn c1_barrier_released_before_replication_network_io() {
+        // C-1: a mutation whose replication RTT is slow must NOT hold the
+        // engine-wide exclusive visibility barrier across the network round-
+        // trip. We drive the real `replicate_all_ops_with_barrier` with a
+        // ~600ms-SlowAck replica while handing it the barrier, and measure
+        // HOW LONG a concurrent client read waits to acquire the SHARED
+        // barrier.
+        //
+        // After the fix the read unblocks promptly (the exclusive side is
+        // released at the start of replication, before the network send).
+        // Before the fix the barrier was held across the whole RTT, so the
+        // read would have been blocked the full ~600ms — the timing
+        // discriminates the two regimes.
+        use std::sync::atomic::Ordering;
+
+        let slow_ms = 600u64;
+        let replica = spawn_replica_receiver(ReplicaBehaviour::SlowAck(slow_ms));
+        let (cluster, key) = two_node_rf2(replica, Some(AckPolicy::WriteMajority));
+
+        let engine = Arc::new(DispatchTestHarness::new().engine);
+        let reader_engine = Arc::clone(&engine);
+
+        let mut guard = acquire_dispatch_visibility_guard(engine.as_ref(), OP_SPEND_BATCH);
+        let barrier = mutation_barrier_from(&mut guard)
+            .expect("exclusive op yields a releasable MutationBarrier");
+
+        // Shared start instant so the reader can report how long after the
+        // replication call began it managed to acquire the shared barrier.
+        let started = Arc::new(parking_lot::Mutex::new(None::<std::time::Instant>));
+        let reader_wait_ms = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let started_thread = Arc::clone(&started);
+        let reader_wait_thread = Arc::clone(&reader_wait_ms);
+        let reader = std::thread::spawn(move || {
+            // Wait until the mutation thread signals it has begun the
+            // replication call (and thus already released the barrier under
+            // the fix).
+            loop {
+                if let Some(t0) = *started_thread.lock() {
+                    let _read_guard =
+                        acquire_dispatch_visibility_guard(reader_engine.as_ref(), OP_GET_BATCH);
+                    reader_wait_thread.store(t0.elapsed().as_millis() as u64, Ordering::SeqCst);
+                    return;
+                }
+                std::thread::yield_now();
+            }
+        });
+
+        let ops = vec![(
+            key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key: key }],
+        )];
+
+        let start = std::time::Instant::now();
+        *started.lock() = Some(start);
+        let outcome =
+            replicate_all_ops_with_barrier(Some(&cluster), &ops, (10, 10), &[], Some(barrier))
+                .expect("slow ACK still satisfies WriteMajority for the one key");
+        let elapsed = start.elapsed();
+        assert_eq!(outcome, ReplicationOutcome::Full);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(slow_ms - 100),
+            "sanity: replication should have waited on the {slow_ms}ms-slow replica, took {elapsed:?}",
+        );
+
+        reader.join().expect("reader joins");
+        let waited = reader_wait_ms.load(Ordering::SeqCst);
+        // Decisive: the read acquired the shared barrier far sooner than the
+        // ~600ms replication RTT. A generous ceiling (half the RTT) keeps the
+        // test robust on loaded CI while still failing hard under the old
+        // barrier-held-across-RTT ordering (which would force `waited` to
+        // ~600ms).
+        assert!(
+            waited < slow_ms / 2,
+            "client read waited {waited}ms for the shared barrier; with the barrier released \
+             before replication it should unblock in well under {}ms (the slow RTT is {slow_ms}ms)",
+            slow_ms / 2,
+        );
+
+        drop(guard);
     }
 
     #[test]
