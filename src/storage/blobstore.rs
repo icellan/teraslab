@@ -316,6 +316,165 @@ pub trait BlobStore: Send + Sync {
     }
 }
 
+/// Outcome of [`BlobPinSet::delete_orphan_guarded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinSweepOutcome {
+    /// The blob was unpinned, the re-check confirmed it is still an orphan,
+    /// and the delete closure ran successfully.
+    Deleted,
+    /// The blob is pinned by an in-flight create — deletion skipped. The blob
+    /// is re-examined on the next sweep.
+    SkippedPinned,
+    /// The under-lock re-check found the blob is now referenced (its index
+    /// registration landed since the sweep classified it) — deletion skipped.
+    SkippedReferenced,
+}
+
+/// In-flight external-blob pin set (F-IJ-002).
+///
+/// Closes the blob-GC TOCTOU on AGED blobs: the F-G9-004 grace window only
+/// protects blobs whose mtime is fresh, but a client may stream a blob and
+/// send the referencing `OP_CREATE_BATCH` minutes later. Between the create
+/// dispatch's `digest()` check and the index registration, a periodic GC
+/// sweep would classify the aged, not-yet-referenced blob as an orphan and
+/// unlink it — acknowledging a create whose cold data is permanently gone.
+///
+/// Protocol:
+///
+/// * The create dispatch calls [`Self::pin`] BEFORE the digest check and
+///   holds the returned [`BlobPinGuard`] until after the index registration
+///   (or drops it on any failure path — the guard releases on `Drop`).
+/// * The GC sweep routes every unlink through
+///   [`Self::delete_orphan_guarded`], which atomically re-verifies "not
+///   pinned AND still unreferenced" under the pin stripe lock immediately
+///   before deleting.
+///
+/// **Why this is airtight.** Pin insertion and the sweep's check-and-delete
+/// critical section serialize on the same stripe mutex, so for any
+/// create/sweep pair exactly one of two orderings exists: (1) the pin lands
+/// first — the sweep observes it and skips; (2) the sweep's critical section
+/// completes first — if it unlinked the blob, the create's subsequent
+/// `digest()` returns `None` and the create fails with `BLOB_NOT_FOUND`
+/// instead of acknowledging lost data. A create that registered and unpinned
+/// before the sweep's critical section is caught by the under-lock index
+/// re-check (mutex acquire/release ordering makes the registration visible).
+///
+/// **Lock ordering.** The stripe mutex is the OUTERMOST lock: the sweep
+/// acquires `pin stripe -> primary-index read lock (re-check) -> filesystem
+/// unlink`. No code path acquires a pin stripe lock while holding an engine
+/// or blob-store lock, so no inversion is possible. `pin`/`unpin`/`is_pinned`
+/// hold the stripe lock only for the duration of a `HashMap` operation.
+///
+/// **Crash consistency.** Pins are process-memory only: a crashed create's
+/// pin vanishes with the process, so it can never block GC after restart
+/// (recovery's sweep is race-free by contract, and post-restart periodic
+/// sweeps see an empty pin set). Within a live process the RAII guard
+/// releases on every dispatch failure path, including unwinding panics.
+pub struct BlobPinSet {
+    /// 256 stripes keyed by `txid[0]`, matching [`FileBlobStore`]'s key-lock
+    /// striping. Each stripe maps txid -> pin count (concurrent creates for
+    /// the same txid each hold their own pin; the loser of the duplicate
+    /// race unpins on its error path).
+    stripes: Vec<parking_lot::Mutex<std::collections::HashMap<[u8; 32], u32>>>,
+}
+
+impl Default for BlobPinSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlobPinSet {
+    /// Create an empty pin set with 256 stripes.
+    pub fn new() -> Self {
+        Self {
+            stripes: (0..256)
+                .map(|_| parking_lot::Mutex::new(std::collections::HashMap::new()))
+                .collect(),
+        }
+    }
+
+    fn stripe(
+        &self,
+        key: &[u8; 32],
+    ) -> &parking_lot::Mutex<std::collections::HashMap<[u8; 32], u32>> {
+        &self.stripes[key[0] as usize]
+    }
+
+    /// Pin `key`, preventing [`Self::delete_orphan_guarded`] from deleting
+    /// the blob until the returned guard is dropped. Must be called BEFORE
+    /// the caller's blob existence/digest check — pinning after the check
+    /// re-opens the TOCTOU.
+    pub fn pin(&self, key: &[u8; 32]) -> BlobPinGuard<'_> {
+        let mut stripe = self.stripe(key).lock();
+        *stripe.entry(*key).or_insert(0) += 1;
+        BlobPinGuard {
+            set: self,
+            key: *key,
+        }
+    }
+
+    /// Whether `key` currently holds at least one pin. Observability and
+    /// test helper — GC must NOT use this (it re-checks under the stripe
+    /// lock inside [`Self::delete_orphan_guarded`] instead).
+    pub fn is_pinned(&self, key: &[u8; 32]) -> bool {
+        self.stripe(key).lock().contains_key(key)
+    }
+
+    /// Atomically delete an orphan candidate: under the stripe lock, skip if
+    /// `key` is pinned, skip if `is_still_orphan` (typically a fresh
+    /// primary-index lookup) reports the blob became referenced, otherwise
+    /// run `delete`.
+    ///
+    /// Returns the [`PinSweepOutcome`] describing which branch ran, or the
+    /// error from `delete` (the candidate is then retried on the next sweep).
+    ///
+    /// Lock ordering: callers may acquire the primary-index read lock and
+    /// perform filesystem I/O inside the closures; nothing may call back
+    /// into this pin set from within them.
+    pub fn delete_orphan_guarded<E>(
+        &self,
+        key: &[u8; 32],
+        is_still_orphan: impl FnOnce() -> bool,
+        delete: impl FnOnce() -> std::result::Result<(), E>,
+    ) -> std::result::Result<PinSweepOutcome, E> {
+        let stripe = self.stripe(key).lock();
+        if stripe.contains_key(key) {
+            return Ok(PinSweepOutcome::SkippedPinned);
+        }
+        if !is_still_orphan() {
+            return Ok(PinSweepOutcome::SkippedReferenced);
+        }
+        delete()?;
+        Ok(PinSweepOutcome::Deleted)
+    }
+
+    /// Release one pin on `key`. Called by [`BlobPinGuard::drop`].
+    fn unpin(&self, key: &[u8; 32]) {
+        let mut stripe = self.stripe(key).lock();
+        if let Some(count) = stripe.get_mut(key) {
+            *count -= 1;
+            if *count == 0 {
+                stripe.remove(key);
+            }
+        }
+    }
+}
+
+/// RAII pin on a blob key — see [`BlobPinSet::pin`]. Releases the pin on
+/// drop, so every create failure path (early `continue`, batch-level early
+/// return, unwinding panic) automatically un-pins.
+pub struct BlobPinGuard<'a> {
+    set: &'a BlobPinSet,
+    key: [u8; 32],
+}
+
+impl Drop for BlobPinGuard<'_> {
+    fn drop(&mut self) {
+        self.set.unpin(&self.key);
+    }
+}
+
 /// File-based blob store organized by hash prefix directories.
 ///
 /// ```text
@@ -332,6 +491,13 @@ pub struct FileBlobStore {
     /// the filesystem state is silently degrading reconciliation results.
     /// Exposed via [`Self::walk_failures`].
     walk_failures: Arc<AtomicU64>,
+    /// Test-only synchronization hook invoked by `FileStreamWriter::finish`
+    /// between the payload rename and the sidecar write, while the per-key
+    /// lock is held. Lets unit tests prove that readers of the
+    /// (payload, sidecar) pair — `digest()` in particular — cannot observe
+    /// the torn mid-`finish` state (audit F-IJ-009).
+    #[cfg(test)]
+    finish_mid_window_hook: Arc<parking_lot::Mutex<Option<Box<dyn Fn() + Send>>>>,
 }
 
 impl FileBlobStore {
@@ -355,7 +521,16 @@ impl FileBlobStore {
             prefix_depth,
             key_locks: Arc::new((0..256).map(|_| parking_lot::Mutex::new(())).collect()),
             walk_failures: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            finish_mid_window_hook: Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    /// Install the test-only mid-`finish` hook. See the field doc on
+    /// `finish_mid_window_hook`.
+    #[cfg(test)]
+    fn set_finish_mid_window_hook(&self, hook: Box<dyn Fn() + Send>) {
+        *self.finish_mid_window_hook.lock() = Some(hook);
     }
 
     /// Total number of `walk_dir` errors observed by `list` / `list_for_gc`
@@ -596,6 +771,9 @@ struct FileStreamWriter {
     bytes_written: u64,
     hasher: Sha256,
     finished: bool,
+    /// See `FileBlobStore::finish_mid_window_hook`.
+    #[cfg(test)]
+    finish_mid_window_hook: Arc<parking_lot::Mutex<Option<Box<dyn Fn() + Send>>>>,
 }
 
 impl BlobStreamWriter for FileStreamWriter {
@@ -626,6 +804,14 @@ impl BlobStreamWriter for FileStreamWriter {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&self.temp_path, &self.final_path)?;
+
+        // Test-only: pause here (new payload in place, sidecar still stale)
+        // so unit tests can prove readers cannot observe this torn state.
+        // The per-key lock is held — see `_guard` above.
+        #[cfg(test)]
+        if let Some(hook) = self.finish_mid_window_hook.lock().as_ref() {
+            hook();
+        }
 
         // 2. Finalize the digest and write the sidecar atomically.
         let mut sha256 = [0u8; 32];
@@ -756,6 +942,14 @@ impl BlobStore for FileBlobStore {
     }
 
     fn digest(&self, key: &[u8; 32]) -> Result<Option<BlobDigest>> {
+        // F-G9-005 (closing the gap found by audit F-IJ-009): take the
+        // per-key lock so the sidecar we read is consistent with the payload
+        // on disk. Without it, a concurrent `FileStreamWriter::finish` that
+        // has renamed the new payload into place but not yet written its
+        // sidecar lets `digest()` return the OLD digest for the NEW payload —
+        // the create dispatch then stamps a stale digest into `ExternalRef`
+        // and every subsequent read fails the record-anchored hash check.
+        let _guard = self.key_locks[Self::lock_index(key)].lock();
         let path = self.blob_path(key);
         if !path.exists() {
             return Ok(None);
@@ -855,6 +1049,8 @@ impl BlobStore for FileBlobStore {
             bytes_written: 0,
             hasher: Sha256::new(),
             finished: false,
+            #[cfg(test)]
+            finish_mid_window_hook: Arc::clone(&self.finish_mid_window_hook),
         }))
     }
 
@@ -1680,5 +1876,141 @@ mod tests {
         store.put(&k1, b"x").unwrap();
         store.delete(&k1).unwrap();
         assert!(store.list().unwrap().is_empty());
+    }
+
+    // -- BlobPinSet tests (F-IJ-002) --
+
+    #[test]
+    fn pin_guard_releases_on_drop_and_counts_nest() {
+        let pins = BlobPinSet::new();
+        let key = test_key(0x11);
+        assert!(!pins.is_pinned(&key));
+
+        let g1 = pins.pin(&key);
+        let g2 = pins.pin(&key);
+        assert!(pins.is_pinned(&key));
+        drop(g1);
+        assert!(
+            pins.is_pinned(&key),
+            "key must stay pinned while a second guard lives"
+        );
+        drop(g2);
+        assert!(!pins.is_pinned(&key));
+    }
+
+    #[test]
+    fn delete_orphan_guarded_skips_pinned_key_without_calling_delete() {
+        let pins = BlobPinSet::new();
+        let key = test_key(0x22);
+        let _g = pins.pin(&key);
+
+        let mut delete_called = false;
+        let outcome = pins
+            .delete_orphan_guarded::<()>(
+                &key,
+                || true,
+                || {
+                    delete_called = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome, PinSweepOutcome::SkippedPinned);
+        assert!(!delete_called, "delete must not run for a pinned key");
+    }
+
+    #[test]
+    fn delete_orphan_guarded_skips_when_recheck_finds_reference() {
+        let pins = BlobPinSet::new();
+        let key = test_key(0x33);
+
+        let mut delete_called = false;
+        let outcome = pins
+            .delete_orphan_guarded::<()>(
+                &key,
+                || false, // registration landed since classification
+                || {
+                    delete_called = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome, PinSweepOutcome::SkippedReferenced);
+        assert!(!delete_called, "delete must not run for a referenced key");
+    }
+
+    #[test]
+    fn delete_orphan_guarded_deletes_unpinned_orphan_and_propagates_errors() {
+        let pins = BlobPinSet::new();
+        let key = test_key(0x44);
+
+        let mut delete_called = false;
+        let outcome = pins
+            .delete_orphan_guarded::<()>(
+                &key,
+                || true,
+                || {
+                    delete_called = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome, PinSweepOutcome::Deleted);
+        assert!(delete_called);
+
+        let err = pins
+            .delete_orphan_guarded(&key, || true, || Err("unlink failed"))
+            .unwrap_err();
+        assert_eq!(err, "unlink failed");
+    }
+
+    // -- digest() per-key-lock regression (audit F-IJ-009) --
+
+    /// `digest()` must not observe the torn mid-`finish` state where the new
+    /// payload has been renamed into place but the sidecar still describes
+    /// the old payload. The mid-window hook fires inside `finish` (per-key
+    /// lock held, payload renamed, sidecar stale) and unblocks a concurrent
+    /// `digest()` call; post-fix that call blocks on the per-key lock until
+    /// `finish` completes and returns the NEW digest. Pre-fix it read the
+    /// stale sidecar during the window and returned the OLD digest.
+    #[test]
+    fn digest_cannot_observe_torn_mid_finish_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileBlobStore::new(dir.path(), 2));
+        let key = test_key(0x55);
+
+        let old_payload = b"old payload".as_slice();
+        let new_payload = b"the new payload bytes".as_slice();
+        store.put(&key, old_payload).unwrap();
+
+        // Channel pair: the hook signals "torn window reached"; the reader
+        // thread waits for it before calling digest().
+        let (window_tx, window_rx) = std::sync::mpsc::channel::<()>();
+        store.set_finish_mid_window_hook(Box::new(move || {
+            window_tx.send(()).expect("signal torn window");
+            // Give the reader thread ample time to attempt digest() inside
+            // the window. Post-fix it blocks on the per-key lock regardless
+            // of timing; pre-fix this sleep made it read the stale sidecar.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }));
+
+        let reader_store = Arc::clone(&store);
+        let reader = std::thread::spawn(move || {
+            window_rx.recv().expect("wait for torn window");
+            reader_store.digest(&key).unwrap().unwrap()
+        });
+
+        let mut writer = store.begin_stream(&key).unwrap();
+        writer.write_chunk(new_payload).unwrap();
+        let finished = writer.finish().unwrap();
+        assert_eq!(finished.sha256, expected_sha(new_payload));
+
+        let observed = reader.join().unwrap();
+        assert_eq!(
+            observed.sha256,
+            expected_sha(new_payload),
+            "digest() must not return the stale sidecar for the new payload"
+        );
+        assert_eq!(observed.length, new_payload.len() as u64);
     }
 }
