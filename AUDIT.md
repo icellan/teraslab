@@ -354,7 +354,7 @@ All milestones in §7 are complete. Verification at completion: `cargo test --al
 ### Residual gaps (explicitly NOT closed, by scope decision)
 1. **J-03**: the block-device ioctl syscall itself is still untested against a real `/dev/...` node (needs a root-only losetup/hdiutil CI job); the arithmetic it feeds is unit-tested.
 2. **N-04**: deep fuzzing is a manual nightly (`fuzz/README.md`); only the seeded smoke test is CI-enforced.
-3. **N-05**: proxy delay/reorder not implemented; per-link TCP attribution on loopback limited to the topology control plane (documented in `tests/net_proxy/mod.rs`).
+3. **N-05**: ~~proxy delay/reorder not implemented~~ — **closed**: the proxy fixture now injects per-directed-link seeded UDP delay+reorder (SplitMix64, fixed seed) and per-node inbound TCP delay, with live `tests/cluster_partition.rs` coverage (SWIM converges under heavy delay+reorder, no permanent false-dead, no minority self-activation; a detection-power test drives a node Dead via delay alone and a sabotage run confirms an over-budget delay fails the convergence assertion). Residual: per-link TCP attribution on loopback (including TCP *delay*) is still limited to the per-destination topology control plane (documented in `tests/net_proxy/mod.rs`); UDP delay/reorder is genuinely per directed link.
 4. New follow-ups discovered during remediation are logged in `_review/follow_ups.md` §E (replication-receiver frame deadline parity, cluster_secret config cross-check, stale `client/rust` crate, quiesce fabricated-voter trust model).
 
 *End of report.*

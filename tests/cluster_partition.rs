@@ -687,3 +687,263 @@ fn partitioned_minority_never_self_activates_topology() {
     shutdown_node(&node2);
     shutdown_node(&node3);
 }
+
+// ---------------------------------------------------------------------------
+// N-05 residual gap #3 — seeded delay/reorder on the SWIM (UDP) plane
+// ---------------------------------------------------------------------------
+
+/// Apply a moderate per-datagram delay plus seeded reorder to every
+/// directed inter-node SWIM link of a 3-node cluster.
+///
+/// The delay (40 ms each way) and reorder (60% of datagrams pulled up to
+/// 80 ms earlier) sit comfortably inside SWIM's failure-detection budget
+/// (direct-probe timeout 100 ms, then indirect rounds at 200/400/800 ms
+/// before Suspect), so a robust membership protocol must still:
+///
+/// 1. converge the full 3-node committed topology on every node despite
+///    datagrams arriving late and out of order (incarnation numbers, not
+///    arrival order, decide truth);
+/// 2. NOT mark any peer permanently dead — after settling, every node
+///    reports all 3 alive (no spurious false-dead from reordering);
+/// 3. NOT let any node self-activate a shrunken topology — the committed
+///    membership stays 3 on every node.
+///
+/// Determinism: all reorder decisions come from the fixture's fixed-seed
+/// PRNG; correctness is asserted by polling for the converged state, not
+/// by sleeping then reading.
+#[test]
+#[serial]
+fn swim_converges_under_heavy_udp_delay_and_reorder() {
+    let net = ProxyNet::new();
+    // Inject delay+reorder on every directed link BEFORE the nodes start
+    // gossiping, so bootstrap itself runs over the degraded plane.
+    let ids = [441u64, 442, 443];
+    let delay = Duration::from_millis(40);
+    let window = Duration::from_millis(80);
+    for &a in &ids {
+        for &b in &ids {
+            if a != b {
+                net.delay_udp_one_way(a, b, delay);
+                net.reorder_udp_one_way(a, b, 0.6, window);
+            }
+        }
+    }
+
+    let node1 = create_proxied_node(&net, 441, 2, &[]);
+    let node2 = create_proxied_node(&net, 442, 2, &[node1.proxy.swim]);
+    let node3 = create_proxied_node(&net, 443, 2, &[node1.proxy.swim, node2.proxy.swim]);
+    let nodes = [&node1, &node2, &node3];
+
+    // (1) Full 3-node convergence despite the degraded SWIM plane.
+    wait_until(
+        || {
+            nodes
+                .iter()
+                .all(|n| n.cluster.committed_topology_members().len() == 3)
+        },
+        Duration::from_secs(45),
+    )
+    .unwrap_or_else(|_| {
+        panic!(
+            "3-node cluster must converge under delay+reorder: m1={:?} m2={:?} m3={:?}",
+            node1.cluster.committed_topology_members(),
+            node2.cluster.committed_topology_members(),
+            node3.cluster.committed_topology_members(),
+        )
+    });
+
+    // (2) After convergence, every node must see all 3 alive and hold
+    // there — a delayed-but-not-dropped link must not produce a permanent
+    // false-dead. Poll for the all-alive state, then confirm it is stable
+    // across a further settle window.
+    wait_until(
+        || nodes.iter().all(|n| n.cluster.alive_node_count() == 3),
+        Duration::from_secs(20),
+    )
+    .unwrap_or_else(|_| {
+        panic!(
+            "all nodes must see 3 alive under delay+reorder: {} | {} | {}",
+            cluster_diag("node441", &node1),
+            cluster_diag("node442", &node2),
+            cluster_diag("node443", &node3),
+        )
+    });
+    // Stability: alive==3 must remain true across several probe cycles.
+    let stable = wait_until(
+        || nodes.iter().any(|n| n.cluster.alive_node_count() != 3),
+        Duration::from_secs(3),
+    );
+    assert!(
+        stable.is_err(),
+        "alive view flapped off 3 under delay+reorder: {} | {} | {}",
+        cluster_diag("node441", &node1),
+        cluster_diag("node442", &node2),
+        cluster_diag("node443", &node3),
+    );
+
+    // (3) No node may have self-activated a shrunken topology.
+    for n in nodes {
+        assert_eq!(
+            n.cluster.committed_topology_members().len(),
+            3,
+            "node {} must keep the 3-node topology under delay+reorder, got {:?}",
+            n.cluster.self_id().0,
+            n.cluster.committed_topology_members(),
+        );
+    }
+
+    shutdown_node(&node1);
+    shutdown_node(&node2);
+    shutdown_node(&node3);
+}
+
+/// Detection-power test for the delay fault: prove the injected delay
+/// actually perturbs SWIM failure-detection timing, not just "doesn't
+/// crash".
+///
+/// A 2-node cluster converges over a clean plane. Then a delay LARGER
+/// than the entire direct+indirect probe budget (which sums to roughly
+/// 100+200+400+800+1600 ms ≈ 3.1 s before Suspect, plus the 2 s
+/// suspicion timeout before Dead) is applied to BOTH directions of the
+/// 451↔452 link, so every probe and ACK is stalled well past the point
+/// where 452 must declare 451 dead. We assert 452's alive count
+/// collapses to 1 (451 declared dead) — the delay alone, with zero
+/// datagrams dropped, drives a topology-relevant state change.
+///
+/// Control: the symmetric reverse expectation. Before injecting the
+/// delay we confirm the link is healthy (both see 2). The contrast
+/// between "healthy → both see 2" and "heavy delay → 452 sees 1" is the
+/// detection-power evidence: the same plane, same nodes, only the delay
+/// magnitude changed.
+///
+/// Finally, clearing the delay must heal the dead view — proving the
+/// effect was the transient delay, not a real loss.
+#[test]
+#[serial]
+fn udp_delay_perturbs_failure_detection_observably() {
+    let net = ProxyNet::new();
+    let node1 = create_proxied_node(&net, 451, 2, &[]);
+    let node2 = create_proxied_node(&net, 452, 2, &[node1.proxy.swim]);
+
+    wait_until(
+        || {
+            node1.cluster.committed_topology_members().len() == 2
+                && node2.cluster.committed_topology_members().len() == 2
+        },
+        Duration::from_secs(20),
+    )
+    .expect("2-node cluster should converge over a clean plane first");
+
+    // Control observation: on the clean plane both nodes see 2 alive.
+    wait_until(
+        || node1.cluster.alive_node_count() == 2 && node2.cluster.alive_node_count() == 2,
+        Duration::from_secs(10),
+    )
+    .expect("clean plane: both nodes must see 2 alive before the delay");
+
+    // Inject a delay far past the full failure-detection budget on BOTH
+    // directions of the link. No datagram is dropped — they are merely
+    // stalled ~5 s, long past when 452 must give up on 451.
+    let huge = Duration::from_millis(5000);
+    net.delay_udp_one_way(451, 452, huge);
+    net.delay_udp_one_way(452, 451, huge);
+
+    // The delay alone drives 452 to declare 451 dead (alive → 1). This
+    // would NOT happen on the pass-through link (asserted as the control
+    // above), so the fault is observably perturbing timing.
+    wait_until(|| node2.cluster.alive_node_count() == 1, Duration::from_secs(15))
+        .unwrap_or_else(|_| {
+            panic!(
+                "heavy delay must drive 452 to mark 451 dead (alive==1), got {} | {}",
+                cluster_diag("node451", &node1),
+                cluster_diag("node452", &node2),
+            )
+        });
+
+    // E-01 side-effect under the delay: the 1-of-2 remnant must NOT
+    // self-activate a shrunken topology (peak=2 → activation quorum 2).
+    assert_eq!(
+        node2.cluster.committed_topology_members().len(),
+        2,
+        "node 452 must not self-activate a 1-node topology under the delay"
+    );
+
+    // Heal: clear the delay. Datagrams flow promptly again and the dead
+    // view resurrects — proving the effect was the transient delay.
+    net.clear_udp_timing(451, 452);
+    net.clear_udp_timing(452, 451);
+    wait_until(
+        || node1.cluster.alive_node_count() == 2 && node2.cluster.alive_node_count() == 2,
+        Duration::from_secs(30),
+    )
+    .expect("clearing the delay must heal the dead view back to 2 alive on both nodes");
+
+    shutdown_node(&node1);
+    shutdown_node(&node2);
+}
+
+/// Detection-power test for the per-node inbound TCP delay: a relayed
+/// request through the proxy endpoint must take measurably longer with a
+/// delay set than without, while client traffic on the real port (which
+/// bypasses the relay) is unaffected.
+///
+/// Granularity note: the delay is applied per forwarded request frame at
+/// the inbound relay (see `tests/net_proxy` module docs), so a single
+/// PING round-trip incurs one delay quantum on the request leg.
+#[test]
+#[serial]
+fn tcp_inbound_delay_slows_relayed_request_only() {
+    let net = ProxyNet::new();
+    let node1 = create_proxied_node(&net, 461, 2, &[]);
+
+    // Baseline: PING through the proxy relay with no delay is fast.
+    let mut via_proxy = connect(node1.proxy.tcp.port());
+    let t0 = std::time::Instant::now();
+    assert!(ping_ok(&mut via_proxy), "baseline relayed PING must succeed");
+    let baseline = t0.elapsed();
+    drop(via_proxy);
+
+    // Inject a 600 ms inbound delay on the request frame.
+    let delay = Duration::from_millis(600);
+    net.delay_tcp_inbound(461, delay);
+
+    // A fresh relayed PING must now take at least the injected delay.
+    let mut delayed = connect(node1.proxy.tcp.port());
+    delayed
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let t1 = std::time::Instant::now();
+    assert!(
+        ping_ok(&mut delayed),
+        "delayed relayed PING must still eventually succeed"
+    );
+    let delayed_rt = t1.elapsed();
+    assert!(
+        delayed_rt >= delay,
+        "relayed PING under a {delay:?} delay must take at least that long, took {delayed_rt:?} (baseline {baseline:?})"
+    );
+
+    // Client traffic on the real port bypasses the relay and is fast even
+    // while the relay delay is engaged.
+    let mut direct = connect(node1.real_tcp_port);
+    let t2 = std::time::Instant::now();
+    assert!(ping_ok(&mut direct), "direct PING must succeed");
+    let direct_rt = t2.elapsed();
+    assert!(
+        direct_rt < delay,
+        "direct client PING must bypass the relay delay, took {direct_rt:?}"
+    );
+
+    // Clear the delay: relayed PING is fast again.
+    net.delay_tcp_inbound(461, Duration::ZERO);
+    let mut cleared = connect(node1.proxy.tcp.port());
+    let t3 = std::time::Instant::now();
+    assert!(ping_ok(&mut cleared), "PING after clearing TCP delay");
+    let cleared_rt = t3.elapsed();
+    assert!(
+        cleared_rt < delay,
+        "relayed PING after clearing the delay must be fast again, took {cleared_rt:?}"
+    );
+
+    shutdown_node(&node1);
+}
