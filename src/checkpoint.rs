@@ -770,6 +770,69 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_joins_promptly_while_checkpoints_in_flight() {
+        // B-03: the bin signals the checkpointer via the shared shutdown
+        // flag and joins its handle (bounded by `join_with_timeout`'s
+        // 5 s). The other two shutdown tests flip the flag while the
+        // task is idle or after the trigger has settled; this one flips
+        // it mid-activity — a writer thread keeps pushing redo usage
+        // over high water so checkpoints are actively firing when the
+        // stop signal lands. The join must still complete promptly.
+        let (engine, redo, dir) = make_engine_and_redo();
+        let snap_path = dir.path().join("inflight.snap");
+        let cfg = CheckpointConfig {
+            high_water: 0.30,
+            low_water: 0.10,
+            poll_interval: Duration::from_millis(2),
+            initial_backoff: Duration::from_millis(2),
+            max_backoff: Duration::from_millis(10),
+            snapshot_path: snap_path.clone(),
+        };
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = spawn_checkpoint_task(cfg, engine, redo.clone(), shutdown.clone());
+
+        // Sustained pressure until told to stop. LogFull is acceptable
+        // here — the point is keeping the checkpointer busy, not
+        // lossless throughput.
+        let writer_stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let redo = redo.clone();
+            let stop = writer_stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = redo.lock().append(RedoOp::Checkpoint);
+                    std::thread::sleep(Duration::from_micros(50));
+                }
+            })
+        };
+
+        // Wait until at least one checkpoint has actually fired, so the
+        // stop signal demonstrably lands while checkpoints are in flight.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !snap_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            snap_path.exists(),
+            "a checkpoint must have fired before the stop signal"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        let join_start = std::time::Instant::now();
+        handle.join().expect("checkpoint thread must not panic");
+        let join_elapsed = join_start.elapsed();
+
+        writer_stop.store(true, Ordering::Relaxed);
+        writer.join().expect("writer thread must not panic");
+
+        assert!(
+            join_elapsed < Duration::from_secs(1),
+            "stop+join must be prompt while checkpoints are in flight, took {join_elapsed:?}"
+        );
+    }
+
+    #[test]
     fn background_task_shuts_down_within_bounded_time() {
         // Even with no work to do, the task must stop quickly on
         // shutdown — verified separately so a regression in
