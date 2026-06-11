@@ -481,6 +481,12 @@ impl Drop for BlobPinGuard<'_> {
 /// base_dir/ab/cd/abcdef01...789a       (full txid hex as filename)
 /// base_dir/ab/cd/abcdef01...789a.meta  (sha256 + length sidecar)
 /// ```
+/// Test-only synchronization hook type shared by [`FileBlobStore`] and
+/// `FileStreamWriter` (audit F-IJ-009). Factored into an alias to satisfy
+/// `clippy::type_complexity` under `--tests`.
+#[cfg(test)]
+type MidWindowHook = Arc<parking_lot::Mutex<Option<Box<dyn Fn() + Send>>>>;
+
 pub struct FileBlobStore {
     base_dir: PathBuf,
     prefix_depth: usize,
@@ -497,7 +503,7 @@ pub struct FileBlobStore {
     /// (payload, sidecar) pair — `digest()` in particular — cannot observe
     /// the torn mid-`finish` state (audit F-IJ-009).
     #[cfg(test)]
-    finish_mid_window_hook: Arc<parking_lot::Mutex<Option<Box<dyn Fn() + Send>>>>,
+    finish_mid_window_hook: MidWindowHook,
 }
 
 impl FileBlobStore {
@@ -773,7 +779,7 @@ struct FileStreamWriter {
     finished: bool,
     /// See `FileBlobStore::finish_mid_window_hook`.
     #[cfg(test)]
-    finish_mid_window_hook: Arc<parking_lot::Mutex<Option<Box<dyn Fn() + Send>>>>,
+    finish_mid_window_hook: MidWindowHook,
 }
 
 impl BlobStreamWriter for FileStreamWriter {
