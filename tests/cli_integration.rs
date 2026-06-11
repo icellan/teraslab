@@ -243,6 +243,40 @@ fn cli_healthcheck_nonzero_when_unreachable() {
     assert_ne!(output.status.code().unwrap_or(0), 0);
 }
 
+/// AUDIT §5(b)5: these flags used to parse but were silently ignored —
+/// an operator trap. They were removed; clap must now reject them with a
+/// usage error (exit code 2) instead of pretending to honor them.
+#[test]
+fn cli_removed_noop_flags_are_rejected() {
+    let removed: &[&[&str]] = &[
+        &["shards", "--node", "1"],
+        &["record", "deadbeef", "--slots"],
+        &["record", "deadbeef", "--raw"],
+        &["replication", "--history"],
+        &["redo", "--tail", "5"],
+        &["rebalance", "--execute"],
+        &["drain", "1", "--cancel"],
+        &["log-level", "debug", "--target", "teraslab::ops"],
+    ];
+    for args in removed {
+        // No server needed: clap rejects the argv before any connection.
+        let output = Command::new(cli_bin())
+            .args(*args)
+            .output()
+            .expect("failed to run teraslab-cli");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "args {args:?} should fail argument parsing, stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("unexpected argument"),
+            "args {args:?} stderr should name the rejected flag: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn cli_all_commands_json_valid() {
     let port = start_test_server();

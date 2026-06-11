@@ -2055,7 +2055,6 @@ teraslab-cli status                     # cluster overview (same as /status JSON
 teraslab-cli status --node <addr>       # single node status
 teraslab-cli nodes                      # list all nodes with state, shards owned, uptime
 teraslab-cli shards                     # shard distribution table
-teraslab-cli shards --node <addr>       # shards owned by specific node
 ```
 
 #### Storage and capacity
@@ -2079,31 +2078,26 @@ teraslab-cli index --secondary          # DAH + unmined secondary index stats
 
 ```
 teraslab-cli record <txid>              # full metadata dump for a record
-teraslab-cli record <txid> --slots      # include UTXO slot details
-teraslab-cli record <txid> --raw        # hex dump of raw on-disk bytes
 ```
 
 #### Replication
 
 ```
 teraslab-cli replication                # replication status per replica (lag, state)
-teraslab-cli replication --history      # recent lag history
 ```
 
 #### Redo log
 
 ```
 teraslab-cli redo                       # redo log position, checkpoint, utilization
-teraslab-cli redo --tail <n>            # show last N redo entries (diagnostic)
 ```
 
 #### Cluster operations
 
 ```
 teraslab-cli rebalance --dry-run        # show what migrations would happen
-teraslab-cli rebalance --execute        # trigger rebalance (requires confirmation)
+teraslab-cli rebalance                  # trigger rebalance
 teraslab-cli drain <node-id>            # migrate all shards off a node (for decommission)
-teraslab-cli drain <node-id> --cancel   # cancel in-progress drain
 ```
 
 #### Log management
@@ -2111,7 +2105,6 @@ teraslab-cli drain <node-id> --cancel   # cancel in-progress drain
 ```
 teraslab-cli log-level                  # show current log level
 teraslab-cli log-level debug            # set global level
-teraslab-cli log-level debug --target teraslab::ops::spend  # set per-module level
 ```
 
 #### Benchmarking / smoke test
