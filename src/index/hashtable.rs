@@ -50,6 +50,20 @@ pub enum HashTableError {
          rebuild from device scan required"
     )]
     UncleanShutdown { path: String },
+
+    /// An existing file-backed table has a size that is not a valid
+    /// power-of-two multiple of the bucket size (truncated copy,
+    /// disk-full partial write, or other corruption that changed the
+    /// length). The open fails closed and the file is preserved
+    /// untouched — it must NOT be wiped and treated as a fresh empty
+    /// index (audit G-3). The caller must rebuild from a device scan
+    /// (`PrimaryBackend::rebuild_file_backed`).
+    #[error(
+        "invalid file size for file-backed index {path}: {len} bytes is \
+         not a power-of-two multiple of the bucket size — file is \
+         corrupt or truncated; rebuild from device scan required"
+    )]
+    InvalidFileSize { path: String, len: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, HashTableError>;
@@ -650,28 +664,40 @@ impl HashTable {
     /// # Errors
     ///
     /// Returns [`HashTableError::UncleanShutdown`] when an existing file
-    /// has no clean-shutdown sentinel, and [`HashTableError::AllocFailed`]
-    /// on mapping/IO failures.
+    /// has no clean-shutdown sentinel,
+    /// [`HashTableError::InvalidFileSize`] when an existing file's
+    /// length is not a power-of-two multiple of the bucket size (the
+    /// file is preserved untouched — G-3), and
+    /// [`HashTableError::AllocFailed`] on mapping/IO failures.
     pub fn open_file_backed(path: &std::path::Path, initial_capacity: usize) -> Result<Self> {
         let bucket_size = std::mem::size_of::<Bucket>();
 
         // If the file already exists with a valid bucket-array size, use that
         // capacity instead of the caller's initial_capacity. This prevents
         // truncating a file that auto-resized to a larger capacity.
+        //
+        // G-3: an existing file with an INVALID size (truncated copy,
+        // disk-full partial write, corruption) must fail closed — never
+        // be wiped via `set_len` and reopened as an empty fresh index
+        // over a populated device. The file and any sentinel are
+        // preserved untouched; the caller drives a device-scan rebuild
+        // (`PrimaryBackend::rebuild_file_backed`, routed automatically
+        // by `server::startup::load_primary_index_file_backed`).
         let (capacity, is_existing) = if path.exists() {
-            if let Ok(meta) = std::fs::metadata(path) {
-                let file_len = meta.len() as usize;
-                if file_len >= bucket_size
-                    && file_len.is_multiple_of(bucket_size)
-                    && (file_len / bucket_size).is_power_of_two()
-                {
-                    (file_len / bucket_size, true)
-                } else {
-                    // File exists but has invalid size — treat as new.
-                    (initial_capacity.next_power_of_two().max(16), false)
-                }
+            let meta = std::fs::metadata(path).map_err(|e| {
+                HashTableError::AllocFailed(format!("stat {}: {e}", path.display()))
+            })?;
+            let file_len = meta.len() as usize;
+            if file_len >= bucket_size
+                && file_len.is_multiple_of(bucket_size)
+                && (file_len / bucket_size).is_power_of_two()
+            {
+                (file_len / bucket_size, true)
             } else {
-                (initial_capacity.next_power_of_two().max(16), false)
+                return Err(HashTableError::InvalidFileSize {
+                    path: path.display().to_string(),
+                    len: meta.len(),
+                });
             }
         } else {
             (initial_capacity.next_power_of_two().max(16), false)
@@ -2570,6 +2596,91 @@ mod tests {
         // The data file must be preserved untouched for inspection /
         // rebuild — fail closed never destroys evidence.
         assert!(path.exists(), "data file must be preserved on fail-closed");
+    }
+
+    // G-3: an EXISTING file whose size is not a valid power-of-two
+    // multiple of the bucket size (truncated copy, disk-full partial
+    // write) must fail closed — NOT be wiped via set_len and reopened
+    // as an empty fresh index over a populated device.
+    #[test]
+    fn open_file_backed_truncated_file_fails_closed_without_wiping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.idx");
+
+        // Create a populated table; Drop writes the clean-shutdown sentinel.
+        {
+            let mut t = HashTable::open_file_backed(&path, 16).unwrap();
+            t.insert(make_key(1), make_entry(4096)).unwrap();
+        }
+        let sentinel = sentinel_path_for(&path);
+        assert!(sentinel.exists(), "Drop must have written the sentinel");
+
+        // Truncate the file to an invalid size (valid len minus 100).
+        let valid_len = std::fs::metadata(&path).unwrap().len();
+        let truncated_len = valid_len - 100;
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(truncated_len).unwrap();
+        drop(f);
+        let bytes_before = std::fs::read(&path).unwrap();
+
+        // Reopen must fail closed with the typed invalid-size error.
+        let err = HashTable::open_file_backed(&path, 16)
+            .expect_err("invalid-size file must fail closed, not open as fresh");
+        match err {
+            HashTableError::InvalidFileSize { path: ref p, len } => {
+                assert_eq!(p, &path.display().to_string());
+                assert_eq!(len, truncated_len);
+            }
+            other => panic!("expected InvalidFileSize, got {other:?}"),
+        }
+
+        // The damaged file must be preserved untouched (no set_len, no
+        // bucket overwrite) and the sentinel must not be consumed —
+        // fail closed never destroys evidence.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            truncated_len,
+            "file length must not be changed by the failed open"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes_before,
+            "file bytes must not be modified by the failed open"
+        );
+        assert!(
+            sentinel.exists(),
+            "sentinel must be preserved on fail-closed open"
+        );
+    }
+
+    // G-3: a file length that is a multiple of the bucket size but not a
+    // power-of-two bucket count is equally invalid and must fail closed.
+    #[test]
+    fn open_file_backed_non_power_of_two_bucket_count_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threebuckets.idx");
+        let bucket_size = std::mem::size_of::<Bucket>() as u64;
+
+        // Hand-craft a 3-bucket file (multiple of bucket size, but 3 is
+        // not a power of two).
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(3 * bucket_size).unwrap();
+        drop(f);
+
+        let err = HashTable::open_file_backed(&path, 16)
+            .expect_err("non-power-of-two bucket count must fail closed");
+        match err {
+            HashTableError::InvalidFileSize { path: ref p, len } => {
+                assert_eq!(p, &path.display().to_string());
+                assert_eq!(len, 3 * bucket_size);
+            }
+            other => panic!("expected InvalidFileSize, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            3 * bucket_size,
+            "file must be preserved untouched"
+        );
     }
 
     // G-01: fresh creation (no data file yet) must be unaffected by the

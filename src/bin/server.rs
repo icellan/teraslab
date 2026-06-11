@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8};
 
 use parking_lot::Mutex;
-use teraslab::allocator::SlotAllocator;
 use teraslab::config::IndexBackendMode;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, DirectDevice};
@@ -31,10 +30,10 @@ use teraslab::server::Server;
 use teraslab::server::dispatch::{SecondaryStatus, set_secondary_status};
 use teraslab::server::http::{HttpState, start_http_server};
 use teraslab::server::startup::{
-    SecondaryLoadOutcome, check_replay_tolerance_with_cap, fallback_dah_index,
+    AllocatorOrigin, SecondaryLoadOutcome, check_replay_tolerance_with_cap, fallback_dah_index,
     fallback_unmined_index, load_primary_index_file_backed, load_primary_index_in_memory,
     load_primary_index_redb, open_mandatory_redo_log, rebuild_in_memory_secondaries,
-    secondaries_from_pair,
+    recover_or_create_allocator, secondaries_from_pair,
 };
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
 
@@ -321,11 +320,31 @@ fn main() {
         );
     }
 
-    // 2. Recover or create allocator
-    let allocator = match SlotAllocator::recover(device.clone()) {
-        Ok(alloc) => {
+    // 2. Recover or create allocator.
+    //
+    // Audit B-2: fail closed on a torn/corrupt header. Only a genuinely
+    // fresh device (all-zero header region) may start with a fresh
+    // allocator — a fresh allocator over a device with persisted state
+    // restarts allocation at the data-region start and its next creates
+    // overwrite live records.
+    let (allocator, allocator_origin) = match recover_or_create_allocator(device.clone()) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!(
+                err = %e,
+                "FATAL: allocator header unusable — refusing to start with a \
+                 fresh allocator over a device that may hold live records \
+                 (creates would overwrite them). Inspect the device header, \
+                 restore from a replica, or wipe the device explicitly before \
+                 restarting",
+            );
+            std::process::exit(1);
+        }
+    };
+    match allocator_origin {
+        AllocatorOrigin::Recovered => {
             tracing::info!("allocator recovered from device header");
-            let device_id_hex = alloc.device_id_hex();
+            let device_id_hex = allocator.device_id_hex();
             tracing::info!(device_id = %device_id_hex, "device identity");
 
             if let Some(ref expected) = config.device_id {
@@ -339,22 +358,25 @@ fn main() {
                 }
                 tracing::info!("device identity verified");
             }
-
-            alloc
         }
-        Err(_) => match SlotAllocator::new(device.clone()) {
-            Ok(fresh) => {
-                let device_id_hex = fresh.device_id_hex();
-                tracing::info!("allocator: fresh (no persisted state found)");
-                tracing::info!(device_id = %device_id_hex, "device identity (copy to config device_id to enable verification)");
-                fresh
-            }
-            Err(e) => {
-                tracing::error!(err = %e, "failed to create allocator");
+        AllocatorOrigin::Fresh => {
+            let device_id_hex = allocator.device_id_hex();
+            if let Some(ref expected) = config.device_id {
+                // The config expects an existing device identity, but the
+                // device is blank — the path points at the wrong device.
+                tracing::error!(
+                    expected = %expected,
+                    found = %device_id_hex,
+                    "FATAL: config device_id is set but the device has no \
+                     persisted allocator state (blank device) — the device \
+                     path points to the wrong device",
+                );
                 std::process::exit(1);
             }
-        },
-    };
+            tracing::info!("allocator: fresh (header region all zeros — new device)");
+            tracing::info!(device_id = %device_id_hex, "device identity (copy to config device_id to enable verification)");
+        }
+    }
 
     // 3. Load or rebuild index (backend selected by config)
     let index_backend_name = match &config.index.backend {

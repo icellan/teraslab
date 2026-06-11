@@ -84,6 +84,20 @@ pub enum AllocatorError {
     )]
     HeaderCorruption { expected: u32, actual: u32 },
 
+    /// The header region is all zeros — the device has never had an
+    /// allocator header persisted to it (a genuinely fresh device).
+    ///
+    /// Returned by [`SlotAllocator::recover`] so callers can distinguish
+    /// "fresh device, safe to initialize with [`SlotAllocator::new`]" from
+    /// every corruption form ([`AllocatorError::CorruptedHeader`],
+    /// [`AllocatorError::HeaderCorruption`],
+    /// [`AllocatorError::UnsupportedVersion`]), which must fail closed:
+    /// falling back to a fresh allocator over a device with persisted
+    /// state would re-allocate live regions and silently overwrite
+    /// records (audit B-2).
+    #[error("no persisted allocator state: header region is all zeros (fresh device)")]
+    NoPersistedState,
+
     /// Appending or fsyncing the allocator's redo journal entry failed.
     ///
     /// Returned by [`SlotAllocator::allocate`] and [`SlotAllocator::free`]
@@ -1153,6 +1167,15 @@ impl SlotAllocator {
     /// [`AllocatorError::HeaderCorruption`] with both the expected and
     /// actual CRC values so the operator can distinguish this from other
     /// corruption forms.
+    ///
+    /// A bad magic value is classified by inspecting the header block
+    /// (audit B-2): an all-zero region means the device never had a
+    /// header persisted and returns
+    /// [`AllocatorError::NoPersistedState`] — the only error a caller
+    /// may treat as "safe to create a fresh allocator". Any non-zero
+    /// garbage returns [`AllocatorError::CorruptedHeader`], which must
+    /// fail closed: a fresh allocator over a device with persisted
+    /// state would re-allocate live regions and overwrite records.
     pub fn recover(device: Arc<dyn BlockDevice>) -> Result<Self> {
         let alignment = device.alignment();
         let device_size = device.size();
@@ -1167,6 +1190,14 @@ impl SlotAllocator {
                 .map_err(|_| AllocatorError::CorruptedHeader)?,
         );
         if magic != ALLOCATOR_MAGIC {
+            // Distinguish "never persisted" (genuinely fresh device —
+            // every byte of the header block is zero; `persist` always
+            // writes the magic into this block first, so any persisted
+            // or torn header leaves non-zero bytes here) from "garbage
+            // header" (corruption — fail closed).
+            if header_buf.iter().all(|&b| b == 0) {
+                return Err(AllocatorError::NoPersistedState);
+            }
             return Err(AllocatorError::CorruptedHeader);
         }
 
@@ -1678,6 +1709,76 @@ mod tests {
             Err(AllocatorError::UnsupportedVersion(999)) => {}
             Err(other) => panic!("expected UnsupportedVersion(999), got: {other}"),
             Ok(_) => panic!("expected UnsupportedVersion(999), but recover succeeded"),
+        }
+    }
+
+    #[test]
+    fn recover_on_fresh_device_returns_no_persisted_state() {
+        // B-2: a genuinely fresh device (all-zero header region) must be
+        // distinguishable from a corrupt header so startup can safely
+        // create a fresh allocator ONLY in this case.
+        let dev = test_device(16);
+        match SlotAllocator::recover(dev) {
+            Err(AllocatorError::NoPersistedState) => {}
+            Err(other) => panic!("expected NoPersistedState, got: {other}"),
+            Ok(_) => panic!("expected NoPersistedState, but recover succeeded"),
+        }
+    }
+
+    #[test]
+    fn recover_nonzero_garbage_header_returns_corrupted_header() {
+        // B-2: a header region with non-zero garbage (bad magic) is
+        // corruption, NOT a fresh device — recover must return
+        // CorruptedHeader so startup fails closed instead of silently
+        // creating a fresh allocator that would overwrite live records.
+        let dev = test_device(16);
+        let mut buf = crate::device::AlignedBuf::new(4096, 4096);
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i % 251) as u8 ^ 0x5A;
+        }
+        dev.pwrite(&buf, 0).unwrap();
+
+        match SlotAllocator::recover(dev) {
+            Err(AllocatorError::CorruptedHeader) => {}
+            Err(other) => panic!("expected CorruptedHeader, got: {other}"),
+            Ok(_) => panic!("expected CorruptedHeader, but recover succeeded"),
+        }
+    }
+
+    #[test]
+    fn recover_torn_header_is_not_a_fresh_allocator() {
+        // B-2 regression: persist a valid header, then tear it (flip
+        // bytes inside the CRC-covered range, magic left intact). The
+        // failure mode under audit was `Err(_) => SlotAllocator::new`,
+        // which restarts allocation at DATA_REGION_OFFSET and overwrites
+        // the live record at o1. Recover must return HeaderCorruption.
+        let dev = test_device(16);
+        let o1;
+        {
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            o1 = alloc.allocate(8192).unwrap();
+            alloc.persist().unwrap();
+        }
+        assert_eq!(
+            o1, DATA_REGION_OFFSET,
+            "first allocation starts the data region"
+        );
+
+        // Tear the header: flip the next_offset field (bytes 8..16)
+        // without touching the magic or the stored CRC.
+        let mut buf = crate::device::AlignedBuf::new(4096, 4096);
+        dev.pread(&mut buf, 0).unwrap();
+        for b in &mut buf[8..16] {
+            *b ^= 0xFF;
+        }
+        dev.pwrite(&buf, 0).unwrap();
+
+        match SlotAllocator::recover(dev) {
+            Err(AllocatorError::HeaderCorruption { expected, actual }) => {
+                assert_ne!(expected, actual, "CRC mismatch must be reported");
+            }
+            Err(other) => panic!("expected HeaderCorruption, got: {other}"),
+            Ok(_) => panic!("expected HeaderCorruption, but recover succeeded"),
         }
     }
 

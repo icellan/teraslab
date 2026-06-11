@@ -153,8 +153,11 @@ impl Index {
     ///
     /// The hash table is pre-allocated to `expected_records / 0.7` buckets
     /// (rounded to the next power of two) to keep the load factor below 70%.
-    /// If the file already exists with the correct size, entries are recovered
-    /// from the mapped file. Otherwise a fresh empty index is created.
+    /// If the file already exists with a valid size, entries are recovered
+    /// from the mapped file; an existing file with an invalid size fails
+    /// closed ([`hashtable::HashTableError::InvalidFileSize`] — the file is
+    /// preserved for a device-scan rebuild). If no file exists, a fresh
+    /// empty index is created.
     pub fn open_file_backed(path: &std::path::Path, expected_records: usize) -> Result<Self> {
         let capacity = (expected_records as f64 / 0.7).ceil() as usize;
         let table = HashTable::open_file_backed(path, capacity.max(16))?;

@@ -28,10 +28,11 @@
 //!   [`ReplayCause::LogicError`]) fails closed regardless of count.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::allocator::SlotAllocator;
+use crate::allocator::{AllocatorError, SlotAllocator};
 use crate::config::IndexConfig;
 use crate::device::BlockDevice;
 use crate::index::{
@@ -258,6 +259,52 @@ pub(crate) fn replay_cause_label(cause: ReplayCause) -> &'static str {
     }
 }
 
+/// How the allocator returned by [`recover_or_create_allocator`] was
+/// obtained, so the caller can log and apply device-identity policy
+/// accordingly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocatorOrigin {
+    /// A valid persisted header was found and recovered.
+    Recovered,
+    /// The header region was all zeros (genuinely fresh device); a new
+    /// allocator was created.
+    Fresh,
+}
+
+/// Recover the allocator from the device header, creating a fresh one
+/// ONLY when the device has never had a header persisted.
+///
+/// Audit B-2: a torn/corrupt allocator header must never silently fall
+/// back to a fresh allocator — a fresh allocator restarts allocation at
+/// the data-region start and its next creates overwrite live records.
+/// The only error that may fall through to [`SlotAllocator::new`] is
+/// [`AllocatorError::NoPersistedState`] (all-zero header region, i.e. a
+/// genuinely fresh device); that fallthrough is logged explicitly.
+///
+/// # Errors
+///
+/// Propagates every other [`SlotAllocator::recover`] error unchanged —
+/// [`AllocatorError::HeaderCorruption`] (CRC mismatch),
+/// [`AllocatorError::CorruptedHeader`] (non-zero garbage header),
+/// [`AllocatorError::UnsupportedVersion`], and device I/O errors — so
+/// the caller fails closed at startup. Also propagates
+/// [`SlotAllocator::new`] errors on the fresh path.
+pub fn recover_or_create_allocator(
+    device: Arc<dyn BlockDevice>,
+) -> Result<(SlotAllocator, AllocatorOrigin), AllocatorError> {
+    match SlotAllocator::recover(device.clone()) {
+        Ok(alloc) => Ok((alloc, AllocatorOrigin::Recovered)),
+        Err(AllocatorError::NoPersistedState) => {
+            tracing::info!(
+                "allocator header region is all zeros — fresh device, \
+                 creating a new allocator"
+            );
+            SlotAllocator::new(device).map(|alloc| (alloc, AllocatorOrigin::Fresh))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Load the redb primary index. Restore first, fall back to a
 /// device-rebuild on a clean restore-error, fail closed otherwise.
 ///
@@ -331,7 +378,19 @@ pub fn load_primary_index_file_backed(
     let restore_suffix = if path.exists() {
         match PrimaryBackend::restore_file_backed(path, expected_records) {
             Ok(idx) => return Ok(idx),
-            Err(e) => format!("; restore failed ({e})"),
+            Err(e) => {
+                // Explicit, logged decision (G-3): the existing file is
+                // unusable (unclean shutdown, invalid size, mapping
+                // failure) — fall back to the device-scan rebuild rather
+                // than booting an empty index.
+                tracing::warn!(
+                    path = %path.display(),
+                    err = %e,
+                    "file-backed primary index restore failed — rebuilding \
+                     from device scan",
+                );
+                format!("; restore failed ({e})")
+            }
         }
     } else {
         String::new()
@@ -872,6 +931,154 @@ mod tests {
             loaded.lookup(&bogus_key).is_none(),
             "stale pre-crash entry must not survive the device rebuild"
         );
+    }
+
+    #[test]
+    fn file_backed_invalid_size_triggers_device_rebuild() {
+        // G-3: an existing file-backed index with an invalid size
+        // (truncated) must NOT be silently wiped and booted as an empty
+        // index — restore must fail closed and
+        // `load_primary_index_file_backed` must fall back to the
+        // device-scan rebuild so the booted index reflects the device.
+        use crate::index::{TxIndexEntry, TxKey};
+        use crate::io::write_full_record;
+        use crate::record::{TxMetadata, UtxoSlot};
+
+        // Ground truth: 5 real records on the device.
+        let dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut records = Vec::new();
+        for i in 0..5u64 {
+            let mut meta = TxMetadata::new(5);
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            txid[8..16].copy_from_slice(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+            meta.tx_id = txid;
+            let offset = alloc.allocate(TxMetadata::record_size_for(5)).unwrap();
+            let slots: Vec<UtxoSlot> = (0..5)
+                .map(|s| {
+                    let mut h = [0u8; 32];
+                    h[0] = s;
+                    UtxoSlot::new_unspent(h)
+                })
+                .collect();
+            write_full_record(&*dev, offset, &meta, &slots).unwrap();
+            records.push((TxKey { txid }, offset));
+        }
+
+        // Previous run: file-backed index dropped cleanly (sentinel
+        // written), then the file is truncated to an invalid size —
+        // e.g. a disk-full partial copy or filesystem corruption.
+        let tmp = TempDir::new().unwrap();
+        let fb_path = tmp.path().join("primary.idx");
+        {
+            let mut backend = PrimaryBackend::new_file_backed(&fb_path, 100).unwrap();
+            let entry = TxIndexEntry {
+                device_id: 0,
+                record_offset: 0xDEAD_0000,
+                utxo_count: 1,
+                block_entry_count: 0,
+                tx_flags: 0,
+                spent_utxos: 0,
+                dah_or_preserve: 0,
+                unmined_since: 0,
+                generation: 0,
+            };
+            backend.register(TxKey { txid: [0xAB; 32] }, entry).unwrap();
+        }
+        let valid_len = std::fs::metadata(&fb_path).unwrap().len();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fb_path)
+            .unwrap();
+        f.set_len(valid_len - 100).unwrap();
+        drop(f);
+
+        // Boot: restore fails closed (invalid size), rebuild kicks in.
+        let loaded = load_primary_index_file_backed(&fb_path, 100, &*dev, &alloc)
+            .expect("invalid-size file must fall back to device-scan rebuild");
+        assert_eq!(loaded.backend_name(), "file_backed");
+        assert_eq!(
+            loaded.len(),
+            5,
+            "rebuilt index must hold the device records, not boot empty"
+        );
+        for (key, offset) in &records {
+            let e = loaded
+                .lookup(key)
+                .expect("device record must be present after rebuild");
+            assert_eq!(e.record_offset, *offset);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Allocator recover-or-create (audit B-2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn recover_or_create_allocator_fresh_device_starts_fresh() {
+        // A genuinely blank device (all-zero header) is the ONLY case
+        // that may produce a fresh allocator.
+        let dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let (mut alloc, origin) =
+            recover_or_create_allocator(dev).expect("blank device must start fresh");
+        assert_eq!(origin, AllocatorOrigin::Fresh);
+        // The fresh allocator is fully usable.
+        let offset = alloc.allocate(4096).expect("fresh allocator must allocate");
+        assert_eq!(offset % 4096, 0);
+    }
+
+    #[test]
+    fn recover_or_create_allocator_recovers_persisted_state() {
+        let dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let o1;
+        {
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            o1 = alloc.allocate(8192).unwrap();
+            alloc.persist().unwrap();
+        }
+        let (mut alloc, origin) =
+            recover_or_create_allocator(dev).expect("persisted header must recover");
+        assert_eq!(origin, AllocatorOrigin::Recovered);
+        // A recovered allocator must not re-allocate the live region.
+        let o2 = alloc.allocate(4096).unwrap();
+        assert!(
+            o2 >= o1 + 8192 || o2 + 4096 <= o1,
+            "recovered allocator must not overlap live region [{o1}, {})",
+            o1 + 8192
+        );
+    }
+
+    #[test]
+    fn recover_or_create_allocator_corrupt_header_fails_closed() {
+        // B-2: a torn/corrupt header must abort startup, never fall back
+        // to a fresh allocator whose creates would overwrite live records.
+        use crate::device::AlignedBuf;
+
+        let dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        {
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            alloc.allocate(8192).unwrap();
+            alloc.persist().unwrap();
+        }
+        // Tear the header: flip the next_offset field (bytes 8..16),
+        // magic and stored CRC left intact -> CRC verification fails.
+        let mut buf = AlignedBuf::new(4096, 4096);
+        dev.pread(&mut buf, 0).unwrap();
+        for b in &mut buf[8..16] {
+            *b ^= 0xFF;
+        }
+        dev.pwrite(&buf, 0).unwrap();
+
+        match recover_or_create_allocator(dev) {
+            Err(AllocatorError::HeaderCorruption { expected, actual }) => {
+                assert_ne!(expected, actual, "CRC mismatch must be reported");
+            }
+            Err(other) => panic!("expected HeaderCorruption, got: {other}"),
+            Ok((_, origin)) => {
+                panic!("corrupt header must fail closed, got a {origin:?} allocator")
+            }
+        }
     }
 
     #[test]
