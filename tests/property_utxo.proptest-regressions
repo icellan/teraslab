@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d34ca66e1fd9e9fa22042c72bc337b507011b4f4c963c62860d5c9e1ec81e703 # shrinks to ops = [Create { tx: 1, utxo_count: 4 }, Spend { tx: 1, vout: 3, spender: 0 }, Unspend { tx: 1, vout: 3, spender: 0 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Unspend { tx: 0, vout: 0, spender: 0 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }, Create { tx: 0, utxo_count: 1 }]
