@@ -9357,17 +9357,19 @@ mod tests {
             3,
         );
 
+        // E-2: the commit-apply guard mirrors the propose side, so the
+        // {1,3} → {1,2,3} growth needs a matching cluster_id (node 2 is an
+        // unseen member the ever-seen fallback rejects when unset).
+        let cid = crate::cluster::topology::ClusterId([0x5C; 16]);
+        cluster.topology_authority().set_cluster_id(cid);
+
         let next_members = vec![NodeId(1), NodeId(2), NodeId(3)];
         let next_commit = crate::cluster::topology::TopologyCommit {
             term: 4,
             proposer: NodeId(1),
             members: next_members.clone(),
-            cluster_id: crate::cluster::topology::ClusterId::UNSET,
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(
-                4,
-                &crate::cluster::topology::ClusterId::UNSET,
-                &next_members,
-            ),
+            cluster_id: cid,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(4, &cid, &next_members),
             voters: next_members.clone(),
         };
         assert_eq!(
@@ -9446,15 +9448,22 @@ mod tests {
             3,
         );
 
+        // E-2: the commit-apply guard now mirrors the propose side, so a
+        // matching cluster_id is required for legitimate growth ({1,3} →
+        // {1,2,3} introduces an unseen member that the ever-seen fallback
+        // would otherwise reject when cluster_id is unset).
+        let cid = crate::cluster::topology::ClusterId([0x5A; 16]);
+        cluster.topology_authority().set_cluster_id(cid);
+
         let committed_members = vec![NodeId(1), NodeId(2), NodeId(3)];
         let next_commit = crate::cluster::topology::TopologyCommit {
             term: 4,
             proposer: NodeId(1),
             members: committed_members.clone(),
-            cluster_id: crate::cluster::topology::ClusterId::UNSET,
+            cluster_id: cid,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 4,
-                &crate::cluster::topology::ClusterId::UNSET,
+                &cid,
                 &committed_members,
             ),
             voters: committed_members.clone(),
@@ -9472,11 +9481,7 @@ mod tests {
         assert_eq!(decoded.members, committed_members);
         assert_eq!(
             decoded.digest,
-            crate::cluster::topology::TopologyTerm::compute_digest(
-                4,
-                &crate::cluster::topology::ClusterId::UNSET,
-                &committed_members
-            ),
+            crate::cluster::topology::TopologyTerm::compute_digest(4, &cid, &committed_members),
         );
     }
 

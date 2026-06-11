@@ -11154,14 +11154,17 @@ mod tests {
             Some(path.clone()),
         );
 
+        // E-2: the commit-apply guard now mirrors the propose side, so the
+        // {1} → {1,2} growth (which introduces unseen node 2) requires a
+        // matching cluster_id; the ever-seen fallback would otherwise
+        // reject it when cluster_id is unset.
+        let cid = crate::cluster::topology::ClusterId([0x5B; 16]);
+        cluster.topology_authority().set_cluster_id(cid);
+
         // Step 1: accept a proposal (sets voted_term).
         let proposer = crate::cluster::shards::NodeId(2);
-        let propose = crate::cluster::topology::TopologyTerm::new(
-            700,
-            members.clone(),
-            proposer,
-            crate::cluster::topology::ClusterId::UNSET,
-        );
+        let propose =
+            crate::cluster::topology::TopologyTerm::new(700, members.clone(), proposer, cid);
         let req = RequestFrame {
             request_id: 1,
             op_code: OP_TOPOLOGY_PROPOSE,
@@ -11185,12 +11188,8 @@ mod tests {
             term: 700,
             proposer,
             members: members.clone(),
-            cluster_id: crate::cluster::topology::ClusterId::UNSET,
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(
-                700,
-                &crate::cluster::topology::ClusterId::UNSET,
-                &members,
-            ),
+            cluster_id: cid,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(700, &cid, &members),
             voters: members.clone(),
         };
         let req = RequestFrame {
