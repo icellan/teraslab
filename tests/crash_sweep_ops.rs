@@ -411,6 +411,7 @@ fn sweep_spend() {
                         block_height_retention: RETENTION,
                         target_generation: 1,
                         updated_at: 0,
+                        utxo_hash: Some(slot_hash(1, 0)),
                     })
                     .ok();
             },
@@ -481,6 +482,7 @@ fn sweep_unspend() {
                         block_height_retention: RETENTION,
                         target_generation: 2,
                         updated_at: 0,
+                        utxo_hash: Some(slot_hash(2, 0)),
                     })
                     .ok();
             },

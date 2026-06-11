@@ -678,6 +678,7 @@ mod tests {
             block_height_retention: 0,
             target_generation: 1,
             updated_at: 0,
+            utxo_hash: None,
         })
         .unwrap();
         let spent = UtxoSlot::new_spent(slots[0].hash, spending_data);

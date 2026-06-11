@@ -637,6 +637,17 @@ fn main() {
     let mut allocator = allocator;
     let mut pending_conflicting_children = Vec::new();
     if let Some(ref mut redo) = redo_log {
+        // B-7: only the redb backend has crash-durable secondaries that
+        // already reflect committed state; when it loaded both cleanly,
+        // reconcile just the redo-touched keys (O(redo)) instead of
+        // re-deriving from a full primary-index scan (O(store)) every
+        // boot. Every other case (in-memory snapshot, file-backed, or a
+        // secondary that needed a device-scan rebuild) is treated as an
+        // unclean secondary that requires the full rebuild — matching the
+        // pre-B-7 behavior exactly, so no correctness regression.
+        let full_secondary_rebuild = !(config.index.backend == IndexBackendMode::Redb
+            && secondary_status.dah_ok
+            && secondary_status.unmined_ok);
         match teraslab::recovery::recover_all_with_allocator_collecting_pending_conflicts_progress(
             &*device,
             redo,
@@ -644,6 +655,7 @@ fn main() {
             &mut dah_index,
             &mut unmined_index,
             Some(&mut allocator),
+            full_secondary_rebuild,
         ) {
             Ok((stats, pending)) => {
                 pending_conflicting_children = pending;

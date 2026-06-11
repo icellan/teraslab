@@ -159,6 +159,18 @@ enum Command {
         #[arg(long)]
         input: std::path::PathBuf,
     },
+    /// B-5: rebuild CRC-failing UTXO slots from the redo log, or report
+    /// regions the WAL cannot repair (OFFLINE — stop the server first).
+    ///
+    /// Reconstructs torn slots covered by a V3 Spend/Unspend redo entry
+    /// (which carries the slot hash) and lists slots covered only by a
+    /// legacy entry as unrecoverable, so a torn slot is operator-fixable
+    /// instead of a permanent startup boot-loop.
+    Repair {
+        /// Server TOML config (the same file passed to `teraslab-server`).
+        #[arg(long)]
+        config: std::path::PathBuf,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1376,6 +1388,118 @@ fn cmd_import_index(
     Ok(())
 }
 
+/// B-5: offline torn-slot repair.
+///
+/// Opens the data device, redo log, and primary index from the server
+/// config (the server MUST be stopped), then rebuilds CRC-failing slots
+/// from V3 redo entries and reports any that the WAL cannot repair.
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout/stderr
+fn cmd_repair(config_path: &std::path::Path, json: bool) -> Result<(), CliError> {
+    use std::sync::Arc;
+    use teraslab::config::{IndexBackendMode, ServerConfig};
+    use teraslab::device::{BlockDevice, DirectDevice};
+    use teraslab::index::PrimaryBackend;
+    use teraslab::redo::RedoLog;
+
+    let cfg = ServerConfig::load(config_path).map_err(CliError::Other)?;
+
+    // Load the primary index for record-offset lookups. Secondary
+    // indexes are not needed for slot repair.
+    let primary = match cfg.index.backend {
+        IndexBackendMode::Redb => {
+            if teraslab::index::migration::import_in_progress(&cfg.index) {
+                return Err(CliError::Other(
+                    "a previous import-index was interrupted; resolve it before repair"
+                        .to_string(),
+                ));
+            }
+            PrimaryBackend::restore_redb(&cfg.index)?
+        }
+        IndexBackendMode::Memory => {
+            let (primary, _dah, _unmined, _flags) =
+                PrimaryBackend::restore_all(&cfg.index_snapshot_path)?;
+            primary
+        }
+        IndexBackendMode::FileBacked => {
+            return Err(CliError::Other(
+                "repair does not support the file_backed backend; its index is rebuilt \
+                 from a device scan on startup"
+                    .to_string(),
+            ));
+        }
+    };
+
+    let device_path = cfg
+        .device_paths
+        .first()
+        .ok_or_else(|| CliError::Other("config has no device_paths".to_string()))?;
+    let device: Arc<dyn BlockDevice> = Arc::new(
+        DirectDevice::open(device_path, cfg.device_size, cfg.device_alignment)
+            .map_err(|e| CliError::Other(format!("open data device: {e}")))?,
+    );
+
+    let redo_path = cfg.resolved_redo_log_path();
+    let redo_device: Arc<dyn BlockDevice> = Arc::new(
+        DirectDevice::open(&redo_path, cfg.redo_log_size, cfg.device_alignment)
+            .map_err(|e| CliError::Other(format!("open redo device: {e}")))?,
+    );
+    let redo_log = RedoLog::open(redo_device, 0, cfg.redo_log_size)
+        .map_err(|e| CliError::Other(format!("open redo log: {e}")))?;
+
+    let report = teraslab::recovery::repair_torn_slots(&*device, &redo_log, &primary)
+        .map_err(|e| CliError::Other(format!("repair pass failed: {e}")))?;
+
+    if json {
+        let unrecoverable: Vec<serde_json::Value> = report
+            .unrecoverable
+            .iter()
+            .map(|(txid, slot)| {
+                serde_json::json!({ "txid": hex_encode(txid), "slot": slot })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "entries_scanned": report.entries_scanned,
+                "slots_repaired": report.slots_repaired,
+                "missing_primary": report.missing_primary,
+                "unrecoverable": unrecoverable,
+            })
+        );
+    } else {
+        println!("scanned {} spend/unspend redo entries", report.entries_scanned);
+        println!("repaired {} torn slot(s) from the redo log", report.slots_repaired);
+        if report.missing_primary > 0 {
+            println!(
+                "{} entr(ies) had no primary index record (deleted later) — skipped",
+                report.missing_primary,
+            );
+        }
+        if report.unrecoverable.is_empty() {
+            println!("no unrecoverable regions; restart the server");
+        } else {
+            println!(
+                "{} slot(s) could NOT be repaired from the WAL:",
+                report.unrecoverable.len()
+            );
+            for (txid, slot) in &report.unrecoverable {
+                println!("  txid={} slot={slot}", hex_encode(txid));
+            }
+            println!("these regions need manual recovery (restore from a replica or snapshot)");
+        }
+    }
+    Ok(())
+}
+
+/// Lowercase hex of a byte slice for operator-facing output.
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1413,6 +1537,7 @@ fn main() -> ExitCode {
         Command::Top => cmd_top(&http),
         Command::ExportIndex { config, output } => cmd_export_index(&config, &output, cli.json),
         Command::ImportIndex { config, input } => cmd_import_index(&config, &input, cli.json),
+        Command::Repair { config } => cmd_repair(&config, cli.json),
     };
 
     match result {

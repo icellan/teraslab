@@ -3701,6 +3701,9 @@ fn handle_spend_batch(
                     block_height_retention: params.block_height_retention,
                     target_generation: post_generation,
                     updated_at: engine.now_millis(),
+                    // B-5: carry the validated slot hash so recovery can
+                    // rebuild a CRC-failing spent slot from this intent.
+                    utxo_hash: Some(item.utxo_hash),
                 });
                 key_repl_ops.push(ReplicaOp::Spend {
                     tx_key: key,
@@ -3975,6 +3978,9 @@ fn handle_unspend_batch(
             block_height_retention: params.block_height_retention,
             target_generation: pre_generation.wrapping_add(1),
             updated_at: engine.now_millis(),
+            // B-5: carry the slot hash so recovery can rebuild a
+            // CRC-failing slot to UNSPENT with the correct hash.
+            utxo_hash: Some(item.utxo_hash),
         });
         valid_items.push(ValidUnspend {
             idx: i,

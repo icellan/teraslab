@@ -145,20 +145,38 @@ const REDO_HEADER_MAGIC: [u8; 8] = *b"TSLREDO1";
 /// Current redo-log format version. Bumping this rejects older logs at
 /// open with [`RedoError::UnsupportedHeaderVersion`] rather than silently
 /// misparsing them.
-const REDO_HEADER_VERSION: u16 = 1;
+///
+/// Version 2 (B-3) appends a `logical_start` field after `checkpoint_seq`
+/// recording the byte offset (relative to the entries region) at which
+/// the first live entry begins. Version-1 logs are decoded with
+/// `logical_start = 0` (the historical implicit start), so existing
+/// on-disk logs upgrade transparently on the next compaction.
+const REDO_HEADER_VERSION: u16 = 2;
 
-/// On-disk layout of the redo-region header block (F-G4-001).
+/// On-disk layout of the redo-region header block (F-G4-001, B-3).
 ///
 /// Layout: `magic(8) | version(2) | reserved(2) | next_sequence(8) |
-/// checkpoint_seq(8) | crc32(4)` = 32 bytes; written into the first
-/// `HEADER_BLOCK_SIZE` bytes of the redo region with the remaining
-/// bytes zeroed. The CRC covers every byte before it.
-const HEADER_FIXED_LEN: usize = 8 + 2 + 2 + 8 + 8 + 4;
+/// checkpoint_seq(8) | logical_start(8) | crc32(4)` = 40 bytes; written
+/// into the first `HEADER_BLOCK_SIZE` bytes of the redo region with the
+/// remaining bytes zeroed. The CRC covers every byte before it.
+///
+/// A version-1 header (B-3 predecessor) is 32 bytes and omits the
+/// `logical_start` field; [`RedoHeader::deserialize`] decodes both.
+const HEADER_FIXED_LEN: usize = 8 + 2 + 2 + 8 + 8 + 8 + 4;
+
+/// Byte length of the legacy version-1 header (no `logical_start`).
+const HEADER_FIXED_LEN_V1: usize = 8 + 2 + 2 + 8 + 8 + 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RedoHeader {
     next_sequence: u64,
     checkpoint_seq: u64,
+    /// B-3: byte offset (relative to the entries region) of the first
+    /// live entry. Compaction advances this instead of physically
+    /// rewriting retained entries to the front of the region, so a torn
+    /// compaction write can never destroy a durable (possibly acked)
+    /// retained entry. Always `0` immediately after [`RedoLog::reset`].
+    logical_start: u64,
 }
 
 impl RedoHeader {
@@ -172,6 +190,7 @@ impl RedoHeader {
         buf.extend_from_slice(&[0u8; 2]); // reserved
         buf.extend_from_slice(&self.next_sequence.to_le_bytes());
         buf.extend_from_slice(&self.checkpoint_seq.to_le_bytes());
+        buf.extend_from_slice(&self.logical_start.to_le_bytes());
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
         debug_assert_eq!(buf.len(), HEADER_FIXED_LEN);
@@ -186,7 +205,9 @@ impl RedoHeader {
     /// but unknown-version header, [`RedoError::HeaderCrcMismatch`] if the
     /// CRC is corrupt.
     fn deserialize(data: &[u8]) -> Result<Self> {
-        if data.len() < HEADER_FIXED_LEN {
+        // The version-1 length is the smallest header we can parse; the
+        // version field then selects how many further bytes are present.
+        if data.len() < HEADER_FIXED_LEN_V1 {
             // Treat too-short region as magic mismatch so the error is
             // self-describing: callers see "expected vs found magic" with
             // the bytes that were actually present.
@@ -207,7 +228,7 @@ impl RedoHeader {
             });
         }
         let version = u16::from_le_bytes(data[8..10].try_into().unwrap());
-        if version != REDO_HEADER_VERSION {
+        if version > REDO_HEADER_VERSION {
             return Err(RedoError::UnsupportedHeaderVersion {
                 expected: REDO_HEADER_VERSION,
                 found: version,
@@ -216,8 +237,25 @@ impl RedoHeader {
         // skip reserved 2 bytes
         let next_sequence = u64::from_le_bytes(data[12..20].try_into().unwrap());
         let checkpoint_seq = u64::from_le_bytes(data[20..28].try_into().unwrap());
-        let stored_crc = u32::from_le_bytes(data[28..32].try_into().unwrap());
-        let computed = crc32fast::hash(&data[..28]);
+        // B-3: version 2 appends `logical_start(8)` before the CRC.
+        // Version 1 has the CRC immediately at byte 28 and no
+        // `logical_start` (implicit 0).
+        let (logical_start, crc_off) = if version >= 2 {
+            if data.len() < HEADER_FIXED_LEN {
+                let mut found = [0u8; 8];
+                found.copy_from_slice(&data[..8]);
+                return Err(RedoError::HeaderMagicMismatch {
+                    expected: REDO_HEADER_MAGIC,
+                    found,
+                });
+            }
+            (u64::from_le_bytes(data[28..36].try_into().unwrap()), 36)
+        } else {
+            (0u64, 28)
+        };
+        let stored_crc =
+            u32::from_le_bytes(data[crc_off..crc_off + 4].try_into().unwrap());
+        let computed = crc32fast::hash(&data[..crc_off]);
         if stored_crc != computed {
             return Err(RedoError::HeaderCrcMismatch {
                 stored: stored_crc,
@@ -227,6 +265,7 @@ impl RedoHeader {
         Ok(RedoHeader {
             next_sequence,
             checkpoint_seq,
+            logical_start,
         })
     }
 }
@@ -304,6 +343,18 @@ const OP_UNFREEZE_V2: u8 = 33;
 /// collects these entries and drains them after constructing the
 /// engine.
 const OP_APPEND_DELETED_CHILD: u8 = 34;
+/// B-5: Spend redo entry that additionally carries the slot's
+/// `utxo_hash`. A `SpendV2`/`UnspendV2` (opcodes 30/31) carries only the
+/// spending data, so a CRC-failing spent slot in the WAL window cannot be
+/// rebuilt the way `CreateV2` rebuilds a whole record — recovery
+/// fail-closed-bricks the node. The V3 entries embed the 32-byte
+/// `utxo_hash` so replay can reconstruct a torn slot from the durable
+/// redo intent. Legacy V2 entries (no hash) remain decodable with
+/// `utxo_hash = None`.
+const OP_SPEND_V3: u8 = 35;
+/// B-5: Unspend redo entry carrying the slot's `utxo_hash`. See
+/// [`OP_SPEND_V3`].
+const OP_UNSPEND_V3: u8 = 36;
 
 /// F-G4-006: hard cap on the number of parent_txids decoded from a single
 /// `CreateV2` redo entry. Bitcoin transactions in practice rarely have
@@ -336,6 +387,12 @@ pub enum RedoOp {
         block_height_retention: u32,
         target_generation: u32,
         updated_at: u64,
+        /// B-5: the spent slot's `utxo_hash`. `Some` for entries written
+        /// in the V3 format (carries the hash, serialized under
+        /// [`OP_SPEND_V3`]); `None` for legacy V2 entries that predate
+        /// the hash. When present, recovery can rebuild a CRC-failing
+        /// slot from this intent instead of fail-closed-bricking.
+        utxo_hash: Option<[u8; 32]>,
     },
     Unspend {
         tx_key: TxKey,
@@ -354,6 +411,11 @@ pub enum RedoOp {
         block_height_retention: u32,
         target_generation: u32,
         updated_at: u64,
+        /// B-5: the slot's `utxo_hash`. `Some` for V3 entries
+        /// (serialized under [`OP_UNSPEND_V3`]), `None` for legacy V2.
+        /// Lets recovery rebuild a CRC-failing slot to UNSPENT with the
+        /// correct hash instead of fail-closed-bricking.
+        utxo_hash: Option<[u8; 32]>,
     },
     SetMined {
         tx_key: TxKey,
@@ -710,8 +772,14 @@ impl RedoOp {
     fn op_type(&self) -> u8 {
         match self {
             RedoOp::Spend { .. } => OP_SPEND,
+            RedoOp::SpendV2 {
+                utxo_hash: Some(_), ..
+            } => OP_SPEND_V3,
             RedoOp::SpendV2 { .. } => OP_SPEND_V2,
             RedoOp::Unspend { .. } => OP_UNSPEND,
+            RedoOp::UnspendV2 {
+                utxo_hash: Some(_), ..
+            } => OP_UNSPEND_V3,
             RedoOp::UnspendV2 { .. } => OP_UNSPEND_V2,
             RedoOp::SetMined { .. } => OP_SET_MINED,
             RedoOp::Freeze { .. } => OP_FREEZE,
@@ -809,6 +877,7 @@ impl RedoOp {
                 block_height_retention,
                 target_generation,
                 updated_at,
+                utxo_hash,
             } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
@@ -818,6 +887,11 @@ impl RedoOp {
                 buf.extend_from_slice(&block_height_retention.to_le_bytes());
                 buf.extend_from_slice(&target_generation.to_le_bytes());
                 buf.extend_from_slice(&updated_at.to_le_bytes());
+                // B-5: V3 entries append the slot hash (32 bytes). The
+                // type byte (OP_SPEND_V3) selects this branch on decode.
+                if let Some(hash) = utxo_hash {
+                    buf.extend_from_slice(hash);
+                }
             }
             RedoOp::Unspend {
                 tx_key,
@@ -843,6 +917,7 @@ impl RedoOp {
                 block_height_retention,
                 target_generation,
                 updated_at,
+                utxo_hash,
             } => {
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&offset.to_le_bytes());
@@ -852,6 +927,10 @@ impl RedoOp {
                 buf.extend_from_slice(&block_height_retention.to_le_bytes());
                 buf.extend_from_slice(&target_generation.to_le_bytes());
                 buf.extend_from_slice(&updated_at.to_le_bytes());
+                // B-5: V3 entries append the slot hash (32 bytes).
+                if let Some(hash) = utxo_hash {
+                    buf.extend_from_slice(hash);
+                }
             }
             RedoOp::SetMined {
                 tx_key,
@@ -1096,6 +1175,26 @@ impl RedoOp {
                     new_spent_count: cnt,
                 })
             }
+            OP_SPEND_V3 if data.len() >= 128 => {
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                let offset = u32::from_le_bytes(data[32..36].try_into().unwrap());
+                let mut sd = [0u8; 36];
+                sd.copy_from_slice(&data[36..72]);
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&data[96..128]);
+                Some(RedoOp::SpendV2 {
+                    tx_key: TxKey { txid },
+                    offset,
+                    spending_data: sd,
+                    new_spent_count: u32::from_le_bytes(data[72..76].try_into().unwrap()),
+                    current_block_height: u32::from_le_bytes(data[76..80].try_into().unwrap()),
+                    block_height_retention: u32::from_le_bytes(data[80..84].try_into().unwrap()),
+                    target_generation: u32::from_le_bytes(data[84..88].try_into().unwrap()),
+                    updated_at: u64::from_le_bytes(data[88..96].try_into().unwrap()),
+                    utxo_hash: Some(hash),
+                })
+            }
             OP_SPEND_V2 if data.len() >= 96 => {
                 let mut txid = [0u8; 32];
                 txid.copy_from_slice(&data[..32]);
@@ -1111,6 +1210,7 @@ impl RedoOp {
                     block_height_retention: u32::from_le_bytes(data[80..84].try_into().unwrap()),
                     target_generation: u32::from_le_bytes(data[84..88].try_into().unwrap()),
                     updated_at: u64::from_le_bytes(data[88..96].try_into().unwrap()),
+                    utxo_hash: None,
                 })
             }
             OP_UNSPEND if data.len() >= 76 => {
@@ -1125,6 +1225,26 @@ impl RedoOp {
                     offset,
                     spending_data: Some(sd),
                     new_spent_count: cnt,
+                })
+            }
+            OP_UNSPEND_V3 if data.len() >= 128 => {
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                let offset = u32::from_le_bytes(data[32..36].try_into().unwrap());
+                let mut sd = [0u8; 36];
+                sd.copy_from_slice(&data[36..72]);
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&data[96..128]);
+                Some(RedoOp::UnspendV2 {
+                    tx_key: TxKey { txid },
+                    offset,
+                    spending_data: sd,
+                    new_spent_count: u32::from_le_bytes(data[72..76].try_into().unwrap()),
+                    current_block_height: u32::from_le_bytes(data[76..80].try_into().unwrap()),
+                    block_height_retention: u32::from_le_bytes(data[80..84].try_into().unwrap()),
+                    target_generation: u32::from_le_bytes(data[84..88].try_into().unwrap()),
+                    updated_at: u64::from_le_bytes(data[88..96].try_into().unwrap()),
+                    utxo_hash: Some(hash),
                 })
             }
             OP_UNSPEND_V2 if data.len() >= 96 => {
@@ -1142,6 +1262,7 @@ impl RedoOp {
                     block_height_retention: u32::from_le_bytes(data[80..84].try_into().unwrap()),
                     target_generation: u32::from_le_bytes(data[84..88].try_into().unwrap()),
                     updated_at: u64::from_le_bytes(data[88..96].try_into().unwrap()),
+                    utxo_hash: None,
                 })
             }
             OP_UNSPEND if data.len() >= 40 => {
@@ -1581,6 +1702,13 @@ pub struct RedoLog {
     /// region start, not the device). Advances monotonically until
     /// `reset` / `compact_prefix_through` rewinds it.
     write_pos: u64,
+    /// B-3: byte offset (relative to the entries region) of the first
+    /// live entry. The scan begins here; bytes before it are stale
+    /// post-compaction garbage that is logically reclaimed. Compaction
+    /// that retains entries advances this rather than physically moving
+    /// the retained bytes, so a torn compaction write cannot lose a
+    /// durable retained entry. Reset to 0 by [`Self::reset`].
+    logical_start: u64,
     checkpoint_seq: u64,
     next_sequence: u64,
     buffer: Vec<u8>,
@@ -1667,6 +1795,7 @@ impl RedoLog {
             log_size,
             header_block_size,
             write_pos: 0,
+            logical_start: 0,
             checkpoint_seq: 0,
             next_sequence: 1,
             buffer: Vec::new(),
@@ -1749,6 +1878,7 @@ impl RedoLog {
         let header = RedoHeader::deserialize(&buf[..HEADER_FIXED_LEN])?;
         self.next_sequence = header.next_sequence.max(1);
         self.checkpoint_seq = header.checkpoint_seq;
+        self.logical_start = header.logical_start;
         Ok(true)
     }
 
@@ -1759,6 +1889,7 @@ impl RedoLog {
         let header = RedoHeader {
             next_sequence: self.next_sequence,
             checkpoint_seq: self.checkpoint_seq,
+            logical_start: self.logical_start,
         };
         let bytes = header.serialize();
         let align = self.device.alignment();
@@ -2098,6 +2229,9 @@ impl RedoLog {
         }
         self.device.sync()?;
         self.write_pos = 0;
+        // B-3: a full reset reclaims the entire region; the live window
+        // starts at offset 0 again.
+        self.logical_start = 0;
         self.buffer.clear();
         self.entries_cache.clear();
         self.pending_entries.clear();
@@ -2115,11 +2249,38 @@ impl RedoLog {
     /// snapshot at a stable fence while concurrent or later writers keep
     /// their redo ranges available for recovery and replica catch-up.
     ///
-    /// F-G4-012: after writing the retained entries we also zero the
-    /// aligned block immediately past them so any stale entries from
-    /// before the compaction cannot be re-discovered. The on-disk header
-    /// preserves the high-water `next_sequence` so even an empty
-    /// retained set does not roll back the sequence counter (F-G4-001).
+    /// # Crash safety (B-3)
+    ///
+    /// The previous implementation rewrote the retained post-fence
+    /// entries **in place** at the start of the entries region with a
+    /// single multi-block `pwrite`. A torn power-loss write there
+    /// destroyed those retained entries — which can include already-acked
+    /// mutations from non-dispatch producers (allocator
+    /// `AllocateRegion`/`FreeRegion`, secondary-intent records,
+    /// engine-internal `AppendConflictingChild`). Compaction overwrote
+    /// the only durable copy.
+    ///
+    /// This implementation never overwrites a live entry:
+    ///
+    /// * **Empty retained set** (the common clean-checkpoint case) →
+    ///   delegate to [`Self::reset`], which zeroes the whole region and
+    ///   resets `logical_start` to 0. Nothing live exists to lose.
+    /// * **Non-empty retained set** → write a fresh copy of the retained
+    ///   entries (plus a zero sentinel block) into a region that holds NO
+    ///   live bytes — either past the current tail, or, if the tail has no
+    ///   room, into the stale front gap `[0, logical_start)` left by a
+    ///   previous compaction — and `fsync`. The original retained copy
+    ///   stays intact and is still the one the header points at. Only then
+    ///   is the CRC-protected header atomically flipped to point
+    ///   `logical_start` at the new copy. A crash *before* the header flip
+    ///   recovers the pre-compaction log (old copy, old `logical_start`);
+    ///   a crash *after* it recovers the post-compaction log (new copy,
+    ///   fully fsynced before the flip). A torn write of the new copy is
+    ///   harmless because the header was not yet flipped to it.
+    ///
+    /// The on-disk header preserves the high-water `next_sequence` so even
+    /// an empty retained set does not roll back the sequence counter
+    /// (F-G4-001).
     pub fn compact_prefix_through(&mut self, through_sequence: u64) -> Result<()> {
         if self.poisoned {
             return Err(RedoError::Poisoned);
@@ -2143,51 +2304,77 @@ impl RedoLog {
             retained.clear();
         }
 
+        // Empty retained set: nothing live to preserve — zero the whole
+        // region and reset `logical_start` to 0. This is the only path
+        // that physically reclaims the prefix, and it is crash-safe
+        // because there is no live entry to overwrite.
+        if retained.is_empty() {
+            return self.reset();
+        }
+
         let mut bytes = Vec::new();
         for entry in &retained {
             bytes.extend_from_slice(&entry.serialize());
         }
 
+        let align = self.device.alignment();
         let entries_capacity = self.entries_region_size();
-        let required = bytes
+        let content_aligned = bytes
             .len()
             .checked_add(ENTRY_HEADER_SIZE)
+            .map(|n| n.div_ceil(align) * align)
             .ok_or(RedoError::LogFull {
                 used: u64::MAX,
                 capacity: entries_capacity,
             })?;
-        if required as u64 > entries_capacity {
+        // Reserve one extra aligned block for the zero sentinel so the
+        // scan stops cleanly past the new copy (F-G4-012).
+        let total_with_tail = content_aligned.saturating_add(align);
+        let total_u64 = total_with_tail as u64;
+
+        // Pick a staging region that holds NO live bytes. Live bytes
+        // occupy `[logical_start, write_pos)`. Prefer past the tail; fall
+        // back to the stale front gap `[0, logical_start)`.
+        let new_start = if self
+            .write_pos
+            .checked_add(total_u64)
+            .is_some_and(|end| end <= entries_capacity)
+        {
+            self.write_pos
+        } else if total_u64 <= self.logical_start {
+            // The front gap left by a previous compaction is large enough.
+            // Writing here cannot touch the live `[logical_start, ..)`
+            // range, so it is just as crash-safe as the past-tail path.
+            0
+        } else {
+            // Neither stale region can hold the relocated copy without
+            // overwriting live bytes. Surface LogFull so the caller defers
+            // reclamation to the next clean checkpoint (empty-retained
+            // reset path frees the whole region).
             return Err(RedoError::LogFull {
-                used: required as u64,
+                used: self.write_pos.saturating_add(total_u64),
                 capacity: entries_capacity,
             });
-        }
+        };
 
-        let align = self.device.alignment();
-        // F-G4-012: write the retained bytes plus one extra aligned
-        // block of zeros so the next scan sees a clean tail-zero
-        // sentinel and does not re-discover stale entries left in the
-        // log region from before compaction.
-        let content_aligned = required.div_ceil(align) * align;
-        let total_with_tail = content_aligned.saturating_add(align);
         let mut buf = AlignedBuf::new(total_with_tail, align);
         buf[..bytes.len()].copy_from_slice(&bytes);
+        // Phase 1: durably stage the relocated copy in the chosen stale
+        // region. The header still points `logical_start` at the original
+        // copy, so a crash anywhere up to and including this fsync
+        // recovers the pre-compaction log intact.
         self.device
-            .pwrite_all_at(&buf, self.entries_region_offset())?;
+            .pwrite_all_at(&buf, self.entries_region_offset() + new_start)?;
         self.device.sync()?;
 
-        // Round the new write_pos UP to the alignment boundary so
-        // subsequent flushes start at an aligned offset — preserves
-        // F-G4-004's append-only invariant.
-        self.write_pos = content_aligned as u64;
+        // Phase 2: atomically flip the CRC-protected header to the new
+        // copy. After this fsync the relocated copy is authoritative.
+        self.logical_start = new_start;
+        self.write_pos = new_start + content_aligned as u64;
         self.buffer.clear();
         self.entries_cache = retained;
         self.pending_entries.clear();
         self.buffered_entries = 0;
-
-        // F-G4-001: persist next_sequence and checkpoint_seq so an
-        // empty retained set after compaction does not roll back the
-        // sequence counter after a restart.
         self.write_header()?;
         Ok(())
     }
@@ -2240,8 +2427,17 @@ impl RedoLog {
         // the entries region start). Includes any pad bytes skipped via
         // the F-G4-004 alignment-pad rule so the resulting tail is
         // aligned for subsequent appends.
-        let mut consumed_in_region: u64 = 0;
-        let mut scan_start: u64 = 0;
+        //
+        // B-3: the scan starts at `logical_start`, not at offset 0. Bytes
+        // before `logical_start` are stale entries that a prior
+        // compaction logically reclaimed by advancing the header pointer
+        // instead of physically overwriting them — so they are never read
+        // and a torn compaction write could never have destroyed a live
+        // retained entry. `logical_start` is always alignment-aligned
+        // (compaction snaps it to a block boundary), so the F-G4-004
+        // pad-gap arithmetic below stays valid.
+        let mut consumed_in_region: u64 = self.logical_start;
+        let mut scan_start: u64 = self.logical_start;
         // Set when we have just skipped over flush pad zeros to the next
         // alignment boundary. Used to soften the strict sequence-order
         // check at the first post-skip entry: a stale or unrelated entry
@@ -3413,6 +3609,7 @@ mod tests {
 
     #[test]
     fn round_trip_spend_v2() {
+        // V2 (no hash) round-trips with utxo_hash = None.
         assert_round_trip(RedoOp::SpendV2 {
             tx_key: make_txid(0xA2),
             offset: 42,
@@ -3422,6 +3619,19 @@ mod tests {
             block_height_retention: 288,
             target_generation: 12,
             updated_at: 123_456_789,
+            utxo_hash: None,
+        });
+        // B-5: V3 (with hash) round-trips preserving the 32-byte hash.
+        assert_round_trip(RedoOp::SpendV2 {
+            tx_key: make_txid(0xA2),
+            offset: 42,
+            spending_data: [0x5A; 36],
+            new_spent_count: 17,
+            current_block_height: 800_000,
+            block_height_retention: 288,
+            target_generation: 12,
+            updated_at: 123_456_789,
+            utxo_hash: Some([0x7C; 32]),
         });
     }
 
@@ -3446,6 +3656,19 @@ mod tests {
             block_height_retention: 144,
             target_generation: 13,
             updated_at: 987_654_321,
+            utxo_hash: None,
+        });
+        // B-5: V3 unspend round-trips with the hash.
+        assert_round_trip(RedoOp::UnspendV2 {
+            tx_key: make_txid(0xB3),
+            offset: 99,
+            spending_data: [0xBC; 36],
+            new_spent_count: 3,
+            current_block_height: 800_100,
+            block_height_retention: 144,
+            target_generation: 13,
+            updated_at: 987_654_321,
+            utxo_hash: Some([0x3D; 32]),
         });
     }
 
@@ -3926,12 +4149,19 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].sequence, third);
         assert!(matches!(entries[0].op, RedoOp::Freeze { .. }));
-        // F-G4-001 reserves a header block (one device alignment unit) at
-        // the start of the redo region; F-G4-004 keeps each flush
-        // block-aligned. After compaction the retained payload sits in a
-        // single aligned block, so `write_position` is at most one
-        // alignment unit (4 KiB on the in-memory device).
-        assert!(log.write_position() <= 4096);
+        // B-3: compaction with a non-empty retained set no longer
+        // rewrites the retained payload to the front (that in-place
+        // overwrite was torn-write-unsafe). Instead it relocates a fresh
+        // copy past the live tail and advances `logical_start`. The live
+        // window therefore begins at a non-zero `logical_start`, and the
+        // single retained entry plus its zero sentinel occupy at most one
+        // aligned block beyond it. Recovery sees exactly the retained
+        // entry regardless.
+        assert!(log.logical_start > 0, "retained set relocated past tail");
+        assert!(
+            log.write_position() - log.logical_start <= 4096,
+            "relocated retained payload fits one aligned block",
+        );
         assert!(first < second && second < third);
 
         drop(log);
@@ -4231,5 +4461,354 @@ mod tests {
             metrics.redo_entries_per_flush.count() > before_entries_count,
             "redo_entries_per_flush.count() should advance",
         );
+    }
+
+    // -- B-3: crash-safe compaction --------------------------------------
+
+    /// Block device with a durable shadow and a "crash on the Nth sync"
+    /// trigger. `sync()` copies live → shadow (durable). `crash()` (and
+    /// the auto-crash on the configured sync index) copies shadow → live,
+    /// modeling a power loss that drops every write issued since the last
+    /// durable sync. Unlike `MemoryDevice::new_volatile` this lets a test
+    /// pinpoint the crash to a specific sync boundary *inside*
+    /// `compact_prefix_through` (between the relocated-copy fsync and the
+    /// header-flip fsync).
+    struct CrashCowDevice {
+        live: parking_lot::Mutex<Vec<u8>>,
+        shadow: parking_lot::Mutex<Vec<u8>>,
+        alignment: usize,
+        sync_count: std::sync::atomic::AtomicU64,
+        /// Crash automatically when the sync counter reaches this value
+        /// (1-based). 0 disables auto-crash.
+        crash_at_sync: std::sync::atomic::AtomicU64,
+        crashed: AtomicBool,
+    }
+
+    impl CrashCowDevice {
+        fn new(size: usize, alignment: usize) -> Self {
+            Self {
+                live: parking_lot::Mutex::new(vec![0u8; size]),
+                shadow: parking_lot::Mutex::new(vec![0u8; size]),
+                alignment,
+                sync_count: std::sync::atomic::AtomicU64::new(0),
+                crash_at_sync: std::sync::atomic::AtomicU64::new(0),
+                crashed: AtomicBool::new(false),
+            }
+        }
+
+        fn arm_crash_at_sync(&self, n: u64) {
+            self.crash_at_sync.store(n, Ordering::SeqCst);
+        }
+
+        fn crash(&self) {
+            let shadow = self.shadow.lock();
+            let mut live = self.live.lock();
+            live.copy_from_slice(&shadow);
+            self.crashed.store(true, Ordering::SeqCst);
+        }
+
+        fn crashed(&self) -> bool {
+            self.crashed.load(Ordering::SeqCst)
+        }
+    }
+
+    impl BlockDevice for CrashCowDevice {
+        fn pread(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            let live = self.live.lock();
+            let start = offset as usize;
+            let end = start + buf.len();
+            if end > live.len() {
+                return Err(DeviceError::Io(std::io::Error::other("oob pread")));
+            }
+            buf.copy_from_slice(&live[start..end]);
+            Ok(buf.len())
+        }
+
+        fn pwrite(&self, buf: &[u8], offset: u64) -> crate::device::Result<usize> {
+            if self.crashed.load(Ordering::SeqCst) {
+                return Err(DeviceError::Io(std::io::Error::other("post-crash write")));
+            }
+            let mut live = self.live.lock();
+            let start = offset as usize;
+            let end = start + buf.len();
+            if end > live.len() {
+                return Err(DeviceError::Io(std::io::Error::other("oob pwrite")));
+            }
+            live[start..end].copy_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn alignment(&self) -> usize {
+            self.alignment
+        }
+
+        fn size(&self) -> u64 {
+            self.live.lock().len() as u64
+        }
+
+        fn sync(&self) -> crate::device::Result<()> {
+            let n = self.sync_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let target = self.crash_at_sync.load(Ordering::SeqCst);
+            if target != 0 && n == target {
+                // Power loss strikes exactly at this sync: writes issued
+                // since the previous durable sync are dropped. The sync
+                // itself does NOT make them durable.
+                self.crash();
+                return Err(DeviceError::Io(std::io::Error::other("power loss at sync")));
+            }
+            // Normal durable sync: live becomes the durable shadow.
+            let live = self.live.lock();
+            let mut shadow = self.shadow.lock();
+            shadow.copy_from_slice(&live);
+            Ok(())
+        }
+
+        // Force the redo log onto the pread/pwrite path (no zero-copy
+        // alias) so the crash/shadow model governs every byte.
+        fn as_raw_ptr(&self) -> Option<*mut u8> {
+            None
+        }
+    }
+
+    /// B-3: a torn (partial) write of the retained set during the OLD
+    /// in-place compaction strategy silently loses retained entries. This
+    /// test reproduces the historical hazard directly on the device to
+    /// document why the in-place rewrite was unsafe.
+    #[test]
+    fn old_inplace_compaction_torn_write_loses_retained_entries() {
+        let align = 4096usize;
+        let size = 256 * 1024usize;
+        let dev = Arc::new(CrashCowDevice::new(size, align));
+        let dyn_dev: Arc<dyn BlockDevice> = dev.clone();
+
+        // Lay down 200 entries in a single flush so the retained set
+        // spans several aligned blocks without per-entry block padding.
+        let mut log = RedoLog::open(dyn_dev.clone(), 0, size as u64).unwrap();
+        for i in 0..200u32 {
+            log.append(RedoOp::Freeze {
+                tx_key: test_key((i & 0xff) as u8),
+                offset: i,
+            })
+            .unwrap();
+        }
+        log.flush().unwrap();
+        drop(log);
+
+        // Simulate the OLD strategy: serialize the retained set
+        // (seq 51..=200) and rewrite it IN PLACE at the start of the
+        // entries region, but tear the write after only the first aligned
+        // block reaches the platter (the rest is lost to power failure).
+        let reopened = RedoLog::open(dyn_dev.clone(), 0, size as u64).unwrap();
+        let retained: Vec<RedoEntry> = reopened
+            .read_from_sequence(51)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(retained.len(), 150, "precondition: 150 retained entries");
+        let mut bytes = Vec::new();
+        for e in &retained {
+            bytes.extend_from_slice(&e.serialize());
+        }
+        assert!(bytes.len() > align, "retained set must span >1 block");
+        let entries_off = align as u64; // header is one aligned block
+
+        // Torn write: only the first `align` bytes land durably.
+        let mut first_block = vec![0u8; align];
+        first_block.copy_from_slice(&bytes[..align]);
+        dev.pwrite(&first_block, entries_off).unwrap();
+        dev.sync().unwrap(); // first block durable
+        dev.crash(); // remainder of the in-place rewrite lost
+
+        // Reopen and scan from offset 0 (old behavior had no
+        // logical_start). The torn front block parses only a prefix of
+        // the retained entries — the rest are gone.
+        let recovered = {
+            let mut buf = vec![0u8; align];
+            dev.pread(&mut buf, entries_off).unwrap();
+            // Count how many whole entries survive in the first block.
+            let mut count = 0;
+            let mut pos = 0;
+            while let Some((_, consumed)) = RedoEntry::deserialize(&buf[pos..]) {
+                count += 1;
+                pos += consumed;
+                if pos >= buf.len() {
+                    break;
+                }
+            }
+            count
+        };
+        assert!(
+            recovered < 150,
+            "OLD in-place torn write must lose retained entries (survived {recovered}/150)",
+        );
+    }
+
+    /// B-3: the NEW compaction strategy survives a crash at the worst
+    /// point — after the relocated copy is fsynced but before the header
+    /// flip is durable. Recovery must reproduce ALL retained (acked)
+    /// entries from the pre-compaction copy with zero loss.
+    #[test]
+    fn new_compaction_crash_before_header_flip_preserves_retained() {
+        let align = 4096usize;
+        let size = 256 * 1024usize;
+        let dev = Arc::new(CrashCowDevice::new(size, align));
+        let dyn_dev: Arc<dyn BlockDevice> = dev.clone();
+
+        let mut log = RedoLog::open(dyn_dev.clone(), 0, size as u64).unwrap();
+        for i in 1..=60u8 {
+            log.append_and_flush(RedoOp::Freeze {
+                tx_key: test_key(i),
+                offset: i as u32,
+            })
+            .unwrap();
+        }
+        let high_seq = log.current_sequence();
+
+        // Count syncs already issued, then arm the crash for the SECOND
+        // sync that occurs during compaction. compact does:
+        //   sync #A = relocated-copy fsync (durable)
+        //   sync #B = header-flip fsync     <- crash here
+        let base = dev.sync_count.load(Ordering::SeqCst);
+        dev.arm_crash_at_sync(base + 2);
+
+        let err = log.compact_prefix_through(30);
+        assert!(err.is_err(), "compaction must observe the simulated crash");
+        assert!(dev.crashed(), "device must have crashed at the header flip");
+        drop(log);
+
+        // Reopen: the header was never flipped, so logical_start still
+        // points at the ORIGINAL retained copy. All 60 entries (we
+        // compacted through 30 but the prefix bytes are still physically
+        // present and pointed at) replay — crucially seq 31..=60 (the
+        // retained, possibly-acked set) are intact.
+        let reopened = RedoLog::open(dyn_dev, 0, size as u64).unwrap();
+        let entries = reopened.read_from_sequence(31).unwrap();
+        let seqs: Vec<u64> = entries.iter().map(|e| e.sequence).collect();
+        assert_eq!(
+            seqs,
+            (31..=60).collect::<Vec<u64>>(),
+            "retained entries must survive a crash before the header flip",
+        );
+        assert_eq!(
+            reopened.current_sequence(),
+            high_seq,
+            "next_sequence must not roll back",
+        );
+    }
+
+    /// B-3: a clean (uninterrupted) compaction with a non-empty retained
+    /// set relocates the live window via `logical_start` and reopens with
+    /// exactly the retained entries — and the relocated copy survives a
+    /// reopen even though the original prefix bytes are still on disk.
+    #[test]
+    fn new_compaction_clean_relocates_via_logical_start() {
+        let align = 4096usize;
+        let size = 256 * 1024usize;
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(size as u64, align).unwrap());
+
+        let mut log = RedoLog::open(dev.clone(), 0, size as u64).unwrap();
+        for i in 1..=40u8 {
+            log.append_and_flush(RedoOp::Freeze {
+                tx_key: test_key(i),
+                offset: i as u32,
+            })
+            .unwrap();
+        }
+        let high_seq = log.current_sequence();
+        log.compact_prefix_through(25).unwrap();
+        // logical_start advanced past offset 0.
+        assert!(log.logical_start > 0, "logical_start must advance");
+        drop(log);
+
+        let reopened = RedoLog::open(dev, 0, size as u64).unwrap();
+        let seqs: Vec<u64> = reopened
+            .read_from_sequence(1)
+            .unwrap()
+            .iter()
+            .map(|e| e.sequence)
+            .collect();
+        assert_eq!(
+            seqs,
+            (26..=40).collect::<Vec<u64>>(),
+            "only retained entries 26..=40 must be visible after compaction",
+        );
+        assert_eq!(reopened.current_sequence(), high_seq);
+    }
+
+    /// B-3: when the tail has no room, compaction relocates the retained
+    /// copy into the stale front gap left by a previous compaction rather
+    /// than failing — and recovery still reproduces exactly the retained
+    /// entries.
+    #[test]
+    fn new_compaction_reuses_front_gap_when_tail_full() {
+        let align = 4096usize;
+        // Small region: header(1 block) + ~7 entry blocks.
+        let size = 8 * align;
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(size as u64, align).unwrap());
+
+        let mut log = RedoLog::open(dev.clone(), 0, size as u64).unwrap();
+        // Each append_and_flush consumes one aligned block. Fill several.
+        for i in 1..=5u8 {
+            log.append_and_flush(RedoOp::Freeze {
+                tx_key: test_key(i),
+                offset: i as u32,
+            })
+            .unwrap();
+        }
+        // First compaction: retain 4..=5 → relocates past the tail and
+        // advances logical_start, opening a front gap.
+        log.compact_prefix_through(3).unwrap();
+        let first_start = log.logical_start;
+        assert!(first_start > 0, "first compaction opens a front gap");
+
+        // Append more until the tail is near the end so the next
+        // compaction cannot fit past the tail and must reuse the front gap.
+        let mut seq = log.current_sequence();
+        loop {
+            match log.append_and_flush(RedoOp::Freeze {
+                tx_key: test_key(9),
+                offset: 0,
+            }) {
+                Ok(s) => seq = s,
+                Err(RedoError::LogFull { .. }) => break,
+                Err(e) => panic!("unexpected: {e:?}"),
+            }
+        }
+        // Retain only the final entry → small copy that fits the front gap.
+        log.compact_prefix_through(seq - 1).unwrap();
+        assert_eq!(log.logical_start, 0, "second compaction reused the front gap");
+        let high = log.current_sequence();
+        drop(log);
+
+        let reopened = RedoLog::open(dev, 0, size as u64).unwrap();
+        let seqs: Vec<u64> = reopened
+            .read_from_sequence(1)
+            .unwrap()
+            .iter()
+            .map(|e| e.sequence)
+            .collect();
+        assert_eq!(seqs, vec![seq], "only the retained entry survives");
+        assert_eq!(reopened.current_sequence(), high);
+    }
+
+    /// B-3: a version-1 header (no `logical_start`) decodes with
+    /// `logical_start = 0` and is upgraded transparently.
+    #[test]
+    fn v1_header_decodes_with_zero_logical_start() {
+        // Build a synthetic v1 header: magic|ver=1|reserved|next|ckpt|crc.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&REDO_HEADER_MAGIC);
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 2]);
+        buf.extend_from_slice(&42u64.to_le_bytes());
+        buf.extend_from_slice(&7u64.to_le_bytes());
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        assert_eq!(buf.len(), HEADER_FIXED_LEN_V1);
+
+        let header = RedoHeader::deserialize(&buf).unwrap();
+        assert_eq!(header.next_sequence, 42);
+        assert_eq!(header.checkpoint_seq, 7);
+        assert_eq!(header.logical_start, 0, "v1 logical_start defaults to 0");
     }
 }
