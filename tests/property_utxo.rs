@@ -18,7 +18,8 @@
 //! - a UTXO is accepted as spent exactly once (second spend with different
 //!   data -> `AlreadySpent` carrying the FIRST spender's data);
 //! - identical-data re-spend is idempotent (no `spent_utxos` bump);
-//! - unspend with wrong spending_data never mutates (`InvalidSpend`);
+//! - unspend with wrong spending_data never mutates (silent no-op success,
+//!   matching the Lua `callerOwnsSpend` contract);
 //! - `spent_utxos` always equals the number of spent slots;
 //! - deleted records stay deleted (until an explicit re-create).
 //!
@@ -290,16 +291,18 @@ impl Model {
                 }
                 let sd = spending_data(spender, vout);
                 match rec.slots[vout as usize].clone() {
-                    // Already unspent: no-op success, no counter change.
-                    SlotState::Unspent => Outcome::Ok,
+                    // Owned spend (stored == expected, not frozen): clear the
+                    // slot and decrement the counter.
                     SlotState::Spent(cur) if cur == sd => {
                         rec.slots[vout as usize] = SlotState::Unspent;
                         rec.spent -= 1;
                         Outcome::Ok
                     }
-                    // Wrong spending_data: rejected, nothing mutates.
-                    SlotState::Spent(cur) => Outcome::InvalidSpend(vout as u32, cur),
-                    SlotState::Frozen => Outcome::Frozen(vout as u32),
+                    // LP-1 / teranode.lua: every non-ownership case is a silent
+                    // no-op success — already unspent, wrong spending_data
+                    // (caller doesn't own the spend), or frozen (the all-0xFF
+                    // marker is never owned). Nothing mutates.
+                    SlotState::Unspent | SlotState::Spent(_) | SlotState::Frozen => Outcome::Ok,
                 }
             }
 
@@ -763,7 +766,8 @@ fn deterministic_unspend_wrong_data_never_mutates() {
             vout: 0,
             spender: 2,
         },
-        // Wrong spending_data: InvalidSpend, slot stays spent by spender 2.
+        // Wrong spending_data: silent no-op (caller doesn't own the spend),
+        // slot stays spent by spender 2.
         Op::Unspend {
             tx: 1,
             vout: 0,
