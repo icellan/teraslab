@@ -929,7 +929,7 @@ fn sweep_delete() {
                     .ok();
             },
             |engine| {
-                engine.delete(&DeleteRequest { tx_key: k }).ok();
+                engine.delete(&DeleteRequest { tx_key: k, due_guard: None }).ok();
             },
         );
 

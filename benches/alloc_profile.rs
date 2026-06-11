@@ -409,7 +409,7 @@ fn main() {
         let key = TxKey {
             txid: make_tx_id(tx_i),
         };
-        let _ = engine.delete(&DeleteRequest { tx_key: key });
+        let _ = engine.delete(&DeleteRequest { tx_key: key, due_guard: None });
         tx_i += 1;
     });
     drop(engine);

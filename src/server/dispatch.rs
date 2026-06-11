@@ -535,6 +535,8 @@ pub(crate) fn handle_request(
             cluster,
             redo_log,
             mutation_barrier,
+            // Direct client delete: unconditional (spec §3.18). No sweep guard.
+            None,
         ),
         OP_MARK_LONGEST_CHAIN_BATCH => handle_mark_longest_chain_batch(
             request,
@@ -838,7 +840,7 @@ pub(crate) fn handle_request(
                     if expected_keys.contains(&key) {
                         continue;
                     }
-                    match engine.delete(&crate::ops::remaining::DeleteRequest { tx_key: key }) {
+                    match engine.delete(&crate::ops::remaining::DeleteRequest { tx_key: key, due_guard: None }) {
                         Ok(()) | Err(crate::ops::error::SpendError::TxNotFound) => {}
                         Err(e) => {
                             return error_response(
@@ -2693,7 +2695,7 @@ fn compensate_replication_failure(
                     });
                 }
                 ReplicaOp::Create { .. } => {
-                    let req = crate::ops::remaining::DeleteRequest { tx_key: *key };
+                    let req = crate::ops::remaining::DeleteRequest { tx_key: *key, due_guard: None };
                     let _ = engine.delete(&req);
                     comp_redo.push(RedoOp::Delete {
                         tx_key: *key,
@@ -5771,6 +5773,12 @@ fn handle_delete_batch(
     redo_log: Option<&Mutex<RedoLog>>,
     // C-1: exclusive visibility barrier, released before replication.
     barrier: Option<MutationBarrier<'_>>,
+    // KO-3: when `Some(current_height)` this batch originated from the DAH
+    // sweep (`handle_process_expired`), and every `engine.delete` is gated by
+    // a fresh under-lock re-validation (`DeleteRequest::due_guard`) so a
+    // concurrently-acknowledged preservation can win the race. `None` is the
+    // unconditional client `OP_DELETE_BATCH` path (spec §3.18).
+    sweep_due_height: Option<u32>,
 ) -> ResponseFrame {
     let (_, txids) = match decode_txid_batch_checked(&req.payload, 0, max_batch) {
         Ok(r) => r,
@@ -6047,7 +6055,10 @@ fn handle_delete_batch(
         if item_failed {
             continue;
         }
-        match engine.delete(&DeleteRequest { tx_key: v.key }) {
+        match engine.delete(&DeleteRequest {
+            tx_key: v.key,
+            due_guard: sweep_due_height,
+        }) {
             Ok(()) => {
                 repl_ops_by_key.extend(item_prune_ops);
                 before_images_by_key.extend(item_prune_before);
@@ -6981,18 +6992,49 @@ fn handle_preserve_transactions(
 ///    here just defers the work to the right master.
 /// b. **Re-validation (folds in IJK-09 / R-102):** the DAH index is
 ///    a cache; before deleting, re-read the on-device metadata and
-///    verify the record still satisfies `should_delete_at_height` —
-///    i.e. `preserve_until == 0`, `delete_at_height <= current_height`,
-///    `spent_utxos == utxo_count`, `unmined_since == 0`. A stale
-///    DAH entry that points at a now-preserved record otherwise
-///    results in silent data loss.
+///    verify the record still satisfies the DAH-set predicate —
+///    `preserve_until == 0`, `delete_at_height <= current_height`, and
+///    EITHER the record is CONFLICTING (KO-2) OR
+///    `spent_utxos == utxo_count && unmined_since == 0`. A stale DAH
+///    entry that points at a now-preserved record otherwise results in
+///    silent data loss. KO-2: conflicting double-spend losers are DAH'd
+///    unconditionally by `setConflicting` (they are never all-spent and
+///    usually unmined), so the over-tightened all-spent / on-longest-chain
+///    gate that excluded them is loosened here — otherwise they
+///    accumulate forever and re-scan every sweep.
 /// c. **Replication + compensation:** for the surviving candidates,
 ///    build a synthetic OP_DELETE_BATCH payload and dispatch through
 ///    `handle_delete_batch`. That handler already has the full
 ///    replication + compensation path from R-007, including the
 ///    per-slot snapshot rebuilds. This way process-expired and
 ///    delete-batch share one rollback codepath instead of needing a
-///    duplicate maintained in lockstep.
+///    duplicate maintained in lockstep. KO-3: the synthetic batch carries
+///    a sweep guard (`sweep_due_height`), so each `engine.delete` re-checks
+///    the due predicate under the per-tx stripe lock immediately before
+///    tombstoning — a `PreserveUntilBatch` that lands after the lock-free
+///    re-validation above but before the delete is honored, not overridden.
+///
+/// # Phase 0 — expired-preservation processing (KO-1 / spec §3.18 Phase 3)
+///
+/// Before the DAH sweep, process preservations whose window has elapsed:
+/// for each record with `preserve_until` in `[1, current_height]`, set
+/// `delete_at_height = current_height + block_height_retention` and clear
+/// `preserve_until` (mirroring the Aerospike pruner's
+/// `ProcessExpiredPreservations`, `aerospike.go:999-1100`). Without this the
+/// preserved set grows monotonically and is never reclaimed. The expired
+/// records do NOT get deleted in this same call — their fresh DAH is
+/// `current_height + retention`, in the future — exactly as the reference
+/// schedules them for a later sweep.
+///
+/// # Wire payload
+///
+/// `[current_height:4]` or `[current_height:4][block_height_retention:4]`.
+/// The 8-byte form supplies the retention used for expiry-phase DAH
+/// scheduling (the Aerospike store reads it from server config; TeraSlab's
+/// hot-path mutations already carry `block_height_retention` per request, so
+/// the sweep client supplies it the same way). The legacy 4-byte form omits
+/// retention: the expiry phase is then skipped (retention treated as 0) and
+/// only the DAH sweep runs, preserving backward compatibility.
 fn handle_process_expired(
     req: &RequestFrame,
     engine: &Engine,
@@ -7002,13 +7044,52 @@ fn handle_process_expired(
     // C-1: exclusive visibility barrier, released before replication.
     barrier: Option<MutationBarrier<'_>>,
 ) -> ResponseFrame {
-    // Payload: [current_height:4]
+    // Payload: [current_height:4] or [current_height:4][retention:4].
     if req.payload.len() < 4 {
         return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed");
     }
     let Some(current_height) = le_u32_at(&req.payload, 0) else {
         return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed");
     };
+    // Optional retention suffix. Absent → 0 → expiry phase is a no-op.
+    let block_height_retention = if req.payload.len() >= 8 {
+        le_u32_at(&req.payload, 4).unwrap_or(0)
+    } else {
+        0
+    };
+
+    // Phase 0 — expired-preservation processing (KO-1 / spec §3.18 Phase 3).
+    // Scan the primary index for records whose preservation has elapsed and
+    // schedule them for deletion (set DAH = current + retention, clear
+    // preserve_until). There is no dedicated preserve secondary index, so we
+    // use the cached HAS_PRESERVE_UNTIL discriminant + `dah_or_preserve`
+    // (which holds `preserve_until` when that bit is set) to filter the scan
+    // cheaply before reading device metadata. Each match is re-validated
+    // under the stripe lock inside `expire_preservation_set_dah`. Skipped
+    // entirely when retention is 0 (legacy 4-byte payload).
+    if block_height_retention != 0 {
+        let expired_candidates = engine.scan_expired_preservations(current_height);
+        for key in &expired_candidates {
+            // Ownership: only the master schedules expiry for its records.
+            if check_shard_ownership(&key.txid, 0, cluster, false).is_some() {
+                continue;
+            }
+            match engine.expire_preservation_set_dah(key, current_height, block_height_retention) {
+                Ok(_) => {}
+                Err(e) => {
+                    // A single record's expiry failure (e.g. DAH overflow on a
+                    // misconfigured retention, or a transient device error)
+                    // must not abort the whole sweep — log and continue so the
+                    // remaining preservations and the DAH cleanup still run.
+                    tracing::warn!(
+                        txid = ?key.txid,
+                        err = %e,
+                        "process_expired: failed to expire preservation; skipping",
+                    );
+                }
+            }
+        }
+    }
 
     // Query DAH index for transactions due for deletion. The DAH index
     // is per-node and reflects only records this node knows about, so
@@ -7019,8 +7100,15 @@ fn handle_process_expired(
     // metadata.
     let candidates = engine.dah_index().range_query(current_height);
 
-    // Phase 1: filter by ownership + re-validate against current
-    // metadata. A DAH entry is a hint; the metadata is authoritative.
+    // Phase 1: filter by ownership + re-validate against current metadata.
+    // A DAH entry is a hint; the metadata is authoritative. The
+    // re-validation is performed UNDER the per-tx stripe lock
+    // (`engine.is_due_for_sweep`, KO-2/KO-3) so a concurrent mutation cannot
+    // invalidate the decision between this check and the redo-log write — a
+    // record that is no longer due is never added to `owned_due`, so it
+    // never gets a `Delete` redo op (and can never be wrongly replayed). The
+    // predicate also includes the KO-2 conflicting branch: a CONFLICTING
+    // record is due regardless of spent/longest-chain state. R-102 / IJK-09.
     let mut owned_due: Vec<[u8; 32]> = Vec::new();
     for key in &candidates {
         // Ownership: skip if not master or not yet ready to write
@@ -7028,27 +7116,9 @@ fn handle_process_expired(
         if check_shard_ownership(&key.txid, 0, cluster, false).is_some() {
             continue;
         }
-        // Re-validate: read the on-device metadata and confirm the
-        // record really is due. Skip if preserved, not fully spent,
-        // unmined, or the DAH is in the future. R-102 / IJK-09.
-        let meta = match engine.read_metadata(key) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if { meta.preserve_until } != 0 {
-            continue;
+        if engine.is_due_for_sweep(key, current_height) {
+            owned_due.push(key.txid);
         }
-        let dah = { meta.delete_at_height };
-        if dah == 0 || dah > current_height {
-            continue;
-        }
-        if { meta.spent_utxos } != { meta.utxo_count } {
-            continue;
-        }
-        if { meta.unmined_since } != 0 {
-            continue;
-        }
-        owned_due.push(key.txid);
     }
 
     let candidate_count = owned_due.len() as u32;
@@ -7091,7 +7161,17 @@ fn handle_process_expired(
     // C-1: forward the exclusive visibility barrier so the nested delete
     // releases it before its own replication fan-out.
     let delete_resp =
-        handle_delete_batch(&delete_req, engine, max_batch, cluster, redo_log, barrier);
+        handle_delete_batch(
+            &delete_req,
+            engine,
+            max_batch,
+            cluster,
+            redo_log,
+            barrier,
+            // KO-3: gate each delete on a fresh under-lock due re-validation
+            // so a preservation that lands between Phase 1 and here wins.
+            Some(current_height),
+        );
 
     // Collapse the OP_DELETE_BATCH response shape into the legacy
     // (deleted:u32, failed:u32) format that
@@ -7608,6 +7688,11 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
         SpendError::DeletedChildren { child_count, .. } => {
             (ERR_DELETED_CHILDREN, vec![*child_count])
         }
+        // KO-3: only ever produced by the guarded sweep delete. Surfaces as a
+        // distinct, benign "kept — not actually due" code so the pruner's
+        // response collapse counts it as a skipped (not deleted) candidate
+        // rather than a real failure.
+        SpendError::NotDue => (ERR_NOT_DUE, vec![]),
     };
     BatchItemError {
         item_index,
@@ -7653,7 +7738,10 @@ pub(crate) fn classify_spend_error(err: &SpendError) -> crate::metrics::Outcome 
         | SpendError::UtxoHashMismatch { .. }
         // F-G2-002: reserved-sentinel rejection is a request-shape error,
         // grouped with the other "Other" bucket entries.
-        | SpendError::ReservedSpendingData { .. } => Outcome::Other,
+        | SpendError::ReservedSpendingData { .. }
+        // KO-3: a kept-record sweep skip is not a real failure; bucket it
+        // with the other non-fatal "Other" outcomes.
+        | SpendError::NotDue => Outcome::Other,
     }
 }
 
@@ -8575,6 +8663,300 @@ mod tests {
         assert!(
             h.engine.lookup(&TxKey { txid: txid_c }).is_some(),
             "process-expired must skip records that are not actually due, even if they appear in the DAH index"
+        );
+    }
+
+    /// Helper: drive a tx to the fully-spent, mined, on-longest-chain state
+    /// with a DAH set in the past, so it is a genuine DAH-sweep candidate.
+    /// Mirrors `make_eligible` from the test above but as a reusable closure
+    /// factory keyed on the harness.
+    fn make_record_dah_eligible(h: &DispatchTestHarness, txid: [u8; 32], retention: u32) {
+        let key = TxKey { txid };
+        let entry = h.engine.lookup(&key).expect("seed lookup");
+        let utxo_count = entry.utxo_count;
+        h.engine
+            .set_mined(&crate::ops::set_mined::SetMinedRequest {
+                tx_key: key,
+                block_id: 1,
+                block_height: 50,
+                subtree_idx: 0,
+                on_longest_chain: true,
+                unset_mined: false,
+                current_block_height: 100,
+                block_height_retention: retention,
+            })
+            .expect("set_mined seed");
+        let hashes: Vec<[u8; 32]> = (0..utxo_count)
+            .map(|v| h.engine.read_slot(&key, v).unwrap().hash)
+            .collect();
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 100,
+            block_height_retention: retention,
+        };
+        let items: Vec<WireSpendItem> = (0..utxo_count)
+            .map(|i| WireSpendItem {
+                txid,
+                vout: i,
+                utxo_hash: hashes[i as usize],
+                spending_data: [(0xC0 + i as u8); 36],
+            })
+            .collect();
+        let resp = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &items));
+        assert_eq!(resp.status, STATUS_OK, "spend-all must succeed for {txid:?}");
+    }
+
+    /// Encode the `OP_PROCESS_EXPIRED_PRESERVATIONS` payload with an explicit
+    /// retention suffix (the 8-byte form that drives the expiry phase).
+    fn process_expired_payload(current_height: u32, retention: u32) -> Vec<u8> {
+        let mut p = Vec::with_capacity(8);
+        p.extend_from_slice(&current_height.to_le_bytes());
+        p.extend_from_slice(&retention.to_le_bytes());
+        p
+    }
+
+    /// Send `OP_PRESERVE_UNTIL_BATCH` for one txid at the given height.
+    fn preserve_until(h: &DispatchTestHarness, txid: [u8; 32], height: u32) -> ResponseFrame {
+        let payload = crate::protocol::codec::encode_txid_batch(&[txid], &height.to_le_bytes());
+        h.request(OP_PRESERVE_UNTIL_BATCH, payload)
+    }
+
+    // -----------------------------------------------------------------------
+    // KO-1 — expired preservations are processed (set DAH, clear preserve),
+    // then swept; an unexpired preservation is NOT pruned.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ko1_expired_preservation_is_processed_then_swept() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(40);
+        assert_eq!(h.create_tx(txid, 2).status, STATUS_OK);
+        let key = TxKey { txid };
+
+        // Make it a genuine DAH candidate, then preserve it until height 100.
+        make_record_dah_eligible(&h, txid, 1);
+        let resp = preserve_until(&h, txid, 100);
+        assert_eq!(resp.status, STATUS_OK, "preserve must succeed");
+        let meta = h.engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.preserve_until }, 100, "preserve_until must be set");
+        assert_eq!(
+            { meta.delete_at_height },
+            0,
+            "preserve clears any existing DAH"
+        );
+
+        // Run process-expired at height 50 (BEFORE preserve_until=100). The
+        // preservation is still active: nothing must change, nothing deleted.
+        let resp = h.request(
+            OP_PROCESS_EXPIRED_PRESERVATIONS,
+            process_expired_payload(50, 10),
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let deleted = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+        assert_eq!(deleted, 0, "active preservation must not be deleted");
+        let meta = h.engine.read_metadata(&key).unwrap();
+        assert_eq!(
+            { meta.preserve_until },
+            100,
+            "preserve_until still active at height 50"
+        );
+        assert_eq!({ meta.delete_at_height }, 0, "no DAH while preserved");
+
+        // Run process-expired at height 100 (preserve_until <= current). The
+        // expiry phase clears preserve_until and schedules DAH =
+        // 100 + retention(10) = 110. The record is NOT deleted this cycle
+        // (DAH is in the future).
+        let resp = h.request(
+            OP_PROCESS_EXPIRED_PRESERVATIONS,
+            process_expired_payload(100, 10),
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let deleted = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+        assert_eq!(deleted, 0, "expired preservation is scheduled, not yet swept");
+        let meta = h.engine.read_metadata(&key).unwrap();
+        assert_eq!(
+            { meta.preserve_until },
+            0,
+            "expiry must clear preserve_until"
+        );
+        assert_eq!(
+            { meta.delete_at_height },
+            110,
+            "expiry must set DAH = current + retention"
+        );
+
+        // Now sweep at a height past the DAH (110): the record is deleted.
+        let resp = h.request(
+            OP_PROCESS_EXPIRED_PRESERVATIONS,
+            process_expired_payload(200, 10),
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let deleted = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+        assert_eq!(deleted, 1, "expired-then-due record must be swept");
+        assert!(
+            h.engine.lookup(&key).is_none(),
+            "record gone after expiry + sweep (KO-1)"
+        );
+    }
+
+    /// Backward-compat: the legacy 4-byte payload (no retention) skips the
+    /// expiry phase entirely, so a preserved record is left untouched.
+    #[test]
+    fn ko1_legacy_payload_skips_expiry_phase() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(41);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+        let key = TxKey { txid };
+        make_record_dah_eligible(&h, txid, 1);
+        assert_eq!(preserve_until(&h, txid, 100).status, STATUS_OK);
+
+        // 4-byte payload at height 5000 (well past preserve_until=100).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&5000u32.to_le_bytes());
+        let resp = h.request(OP_PROCESS_EXPIRED_PRESERVATIONS, payload);
+        assert_eq!(resp.status, STATUS_OK);
+        let meta = h.engine.read_metadata(&key).unwrap();
+        assert_eq!(
+            { meta.preserve_until },
+            100,
+            "4-byte payload must not run the expiry phase"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // KO-2 — a CONFLICTING record with DAH set IS deleted by the sweep.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ko2_conflicting_record_with_dah_is_swept() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(42);
+        // 2 utxos, spend NONE — a conflicting double-spend loser is never
+        // all-spent and is unmined. Pre-fix the sweep skipped it forever.
+        assert_eq!(h.create_tx(txid, 2).status, STATUS_OK);
+        let key = TxKey { txid };
+
+        // Mark conflicting at height 100 with retention 10 → DAH = 110.
+        h.engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: true,
+                current_block_height: 100,
+                block_height_retention: 10,
+            })
+            .expect("set_conflicting");
+        let meta = h.engine.read_metadata(&key).unwrap();
+        assert!(meta.flags.contains(crate::record::TxFlags::CONFLICTING));
+        assert_eq!(
+            { meta.delete_at_height },
+            110,
+            "conflicting sets DAH = current + retention"
+        );
+        assert_ne!(
+            { meta.spent_utxos },
+            { meta.utxo_count },
+            "conflicting loser is NOT all-spent (pre-fix this blocked the sweep)"
+        );
+
+        // Sweep at height 200 (past DAH=110). KO-2: the conflicting record is
+        // deleted despite not being all-spent / on-longest-chain.
+        let resp = h.request(
+            OP_PROCESS_EXPIRED_PRESERVATIONS,
+            process_expired_payload(200, 10),
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let deleted = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+        assert_eq!(deleted, 1, "conflicting record with due DAH must be deleted");
+        assert!(
+            h.engine.lookup(&key).is_none(),
+            "conflicting record swept (KO-2)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // KO-3 — a preservation that lands before the guarded delete wins the
+    // race: the record is kept, not wrongly deleted.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ko3_guarded_delete_skips_freshly_preserved_record() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(43);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+        let key = TxKey { txid };
+
+        // Make it a due DAH candidate (DAH in the past at the sweep height).
+        make_record_dah_eligible(&h, txid, 1);
+        let meta = h.engine.read_metadata(&key).unwrap();
+        assert_ne!({ meta.delete_at_height }, 0, "must have DAH for the sweep");
+
+        // Simulate the race deterministically: preserve the record (the
+        // acked preservation pushes preserve_until far ahead and clears DAH).
+        // The guarded delete (`engine.delete` with due_guard) must then
+        // refuse to delete it — this is the under-lock recheck KO-3 adds.
+        assert_eq!(preserve_until(&h, txid, 100_000).status, STATUS_OK);
+
+        // A guarded sweep delete at height 700 must be a no-op skip.
+        match h.engine.delete(&DeleteRequest {
+            tx_key: key,
+            due_guard: Some(700),
+        }) {
+            Err(SpendError::NotDue) => {}
+            other => panic!("guarded delete of preserved record must be NotDue, got {other:?}"),
+        }
+        assert!(
+            h.engine.lookup(&key).is_some(),
+            "freshly-preserved record must survive the guarded delete (KO-3)"
+        );
+
+        // An UNGUARDED client delete is still unconditional (spec §3.18).
+        h.engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .expect("unguarded client delete is unconditional");
+        assert!(h.engine.lookup(&key).is_none());
+    }
+
+    /// End-to-end KO-3 through the sweep handler: a record that is preserved
+    /// after Phase-1 selection but before the delete is kept, and the sweep
+    /// reports it as not-deleted. We force the ordering by preserving between
+    /// the DAH index insert and the sweep (the index still lists the key, but
+    /// the under-lock re-validation sees the preservation).
+    #[test]
+    fn ko3_sweep_keeps_record_preserved_after_index_selection() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(44);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+        let key = TxKey { txid };
+        make_record_dah_eligible(&h, txid, 1);
+
+        // Stale DAH index entry remains (preserve_until clears the metadata
+        // DAH but we re-insert a stale index hint to model the race where the
+        // index still points at the now-preserved key).
+        let dah_before = { h.engine.read_metadata(&key).unwrap().delete_at_height };
+        assert_ne!(dah_before, 0);
+        assert_eq!(preserve_until(&h, txid, 100_000).status, STATUS_OK);
+        {
+            let mut dah = h.engine.dah_index();
+            dah.insert(dah_before, key, None).unwrap();
+        }
+
+        let resp = h.request(
+            OP_PROCESS_EXPIRED_PRESERVATIONS,
+            // retention 0 in the suffix? No — use a real retention but a
+            // current_height below preserve_until so the expiry phase is a
+            // no-op and only the (stale) DAH sweep runs.
+            process_expired_payload(700, 10),
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let deleted = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+        assert_eq!(deleted, 0, "preserved record must not be swept (KO-3)");
+        assert!(
+            h.engine.lookup(&key).is_some(),
+            "preserved record survives the sweep despite a stale DAH hint (KO-3)"
         );
     }
 

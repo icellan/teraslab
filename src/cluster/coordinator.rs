@@ -4032,7 +4032,7 @@ fn run_orphan_cleanup(
             format!("orphan_cleanup deleting {} key(s)", keys.len(),),
         );
         for key in &keys {
-            match engine.delete(&DeleteRequest { tx_key: *key }) {
+            match engine.delete(&DeleteRequest { tx_key: *key, due_guard: None }) {
                 Ok(()) => total_deleted += 1,
                 Err(crate::ops::error::SpendError::TxNotFound) => {}
                 Err(e) => {
@@ -4098,7 +4098,7 @@ fn cleanup_orphaned_shard_if_settled(
     let keys = engine.keys_for_shard(shard);
     let mut deleted = 0u64;
     for key in &keys {
-        match engine.delete(&DeleteRequest { tx_key: *key }) {
+        match engine.delete(&DeleteRequest { tx_key: *key, due_guard: None }) {
             Ok(()) => deleted += 1,
             Err(crate::ops::error::SpendError::TxNotFound) => {}
             Err(e) => {
@@ -7355,6 +7355,7 @@ mod tests {
         engine
             .delete(&crate::ops::remaining::DeleteRequest {
                 tx_key: deleted_key,
+                due_guard: None,
             })
             .unwrap();
 
@@ -7377,6 +7378,7 @@ mod tests {
         engine
             .delete(&crate::ops::remaining::DeleteRequest {
                 tx_key: deleted_key,
+                due_guard: None,
             })
             .unwrap();
 

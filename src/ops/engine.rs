@@ -1150,6 +1150,36 @@ impl Engine {
         self.index.read().iter().map(|(k, _)| k).collect()
     }
 
+    /// Scan the primary index for records whose preservation has expired.
+    ///
+    /// Returns the keys of records with an active `preserve_until` in
+    /// `[1, current_height]` — i.e. preservations whose window has elapsed
+    /// and which the caller should now schedule for deletion via
+    /// [`Self::expire_preservation_set_dah`] (KO-1 / spec §3.18 Phase 3).
+    ///
+    /// There is no dedicated `preserve_until` secondary index; this filters
+    /// the primary index by the cached `HAS_PRESERVE_UNTIL` discriminant and
+    /// the `dah_or_preserve` field (which holds `preserve_until` while that
+    /// bit is set), so it never touches the device. The returned keys are a
+    /// point-in-time snapshot; the caller re-validates each under the stripe
+    /// lock, so a `preserve_until` cleared or pushed forward after this scan
+    /// is handled correctly there.
+    pub fn scan_expired_preservations(&self, current_height: u32) -> Vec<TxKey> {
+        self.index
+            .read()
+            .iter()
+            .filter_map(|(k, e)| {
+                let has_preserve =
+                    TxFlags::from_bits_truncate(e.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL);
+                if has_preserve && e.dah_or_preserve != 0 && e.dah_or_preserve <= current_height {
+                    Some(k)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Return keys belonging to a specific shard.
     ///
     /// More efficient than `all_keys()` followed by filtering when only
@@ -3126,7 +3156,21 @@ impl Engine {
             }
         }
 
-        let frozen = UtxoSlot::new_frozen(req.utxo_hash);
+        // LP-4: preserve any reassignment cooldown sitting in the unspent
+        // slot's `spending_data[0..4]` instead of overwriting it with the
+        // all-`0xFF` frozen marker. The Lua reference keeps the cooldown in a
+        // separate `utxoSpendableIn` bin that freeze/unfreeze never touch
+        // (teranode.lua:928-942 vs 707-779/789-852); TeraSlab stores it in the
+        // slot, so freeze must not wipe it. The cooldown is carried through
+        // the frozen state in the first 4 bytes; the `UTXO_FROZEN` status byte
+        // remains the authoritative frozen signal. `cooldown == 0` → identical
+        // to a plain frozen marker.
+        let cooldown = slot.reassignment_cooldown();
+        let frozen = if cooldown == 0 {
+            UtxoSlot::new_frozen(req.utxo_hash)
+        } else {
+            UtxoSlot::new_frozen_with_cooldown(req.utxo_hash, cooldown)
+        };
         self.write_slot_fast(ro, req.offset, &frozen)?;
         // R-016 (A-08): bump generation, write metadata back, sync the
         // index cache so subsequent fast-path ops (set_mined,
@@ -3168,7 +3212,20 @@ impl Engine {
             return Err(SpendError::NotFrozen { offset: req.offset });
         }
 
-        let unspent = UtxoSlot::new_unspent(req.utxo_hash);
+        // LP-4: restore any reassignment cooldown that `freeze` preserved in
+        // the frozen slot's `spending_data[0..4]`. A legacy all-`0xFF` frozen
+        // slot reads back `u32::MAX` there — that is the "no cooldown" marker,
+        // not a real (absurdly-far-future) spendable height, so it restores to
+        // an immediately-spendable unspent slot. A cooldown written by
+        // `new_frozen_with_cooldown` is well below `u32::MAX` (guarded by the
+        // `checked_add` in `reassign`) and is restored verbatim, so the
+        // safety window survives the freeze/unfreeze round-trip.
+        let cooldown = slot.reassignment_cooldown();
+        let unspent = if cooldown == 0 || cooldown == u32::MAX {
+            UtxoSlot::new_unspent(req.utxo_hash)
+        } else {
+            UtxoSlot::new_unspent_with_cooldown(req.utxo_hash, cooldown)
+        };
         self.write_slot_fast(ro, req.offset, &unspent)?;
         // R-016 (A-08): see `freeze` — bump gen + sync cache so the
         // next mutation sees the post-unfreeze flags.
@@ -3249,7 +3306,17 @@ impl Engine {
 
         self.write_slot_fast(ro, req.offset, &new_slot)?;
 
-        // Update metadata (generation, updated_at, reassignment_count)
+        // Update metadata (generation, updated_at, reassignment_count).
+        // LP-3: mark the record REASSIGNED so the all-spent DAH path in
+        // `evaluate_delete_at_height` permanently excludes it — the Lua
+        // reference inflates `recordUtxos` by 1 (`teranode.lua:945`) for the
+        // same effect: a reassigned (court-ordered) record is never pruned,
+        // preserving the old-hash → new-hash audit trail. A live reassigned
+        // UTXO is already safe from deletion (frozen does not count toward
+        // `spent_utxos`, so the all-spent check is false until the reassigned
+        // slot is itself spent); this flag also covers the after-final-spend
+        // window, matching the reference's permanent retention.
+        meta.flags |= TxFlags::REASSIGNED;
         meta.reassignment_count = meta.reassignment_count.saturating_add(1);
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = self.now_millis();
@@ -4233,6 +4300,72 @@ impl Engine {
         })
     }
 
+    /// Whether a record is genuinely due for DAH-sweep deletion at
+    /// `current_block_height`, evaluated against fresh metadata.
+    ///
+    /// This is the delete-side mirror of
+    /// [`crate::ops::delete_eval::evaluate_delete_at_height`]'s DAH-*set*
+    /// policy, and the authoritative predicate the KO-3 guarded delete
+    /// ([`Self::delete`] with `due_guard`), the KO-2 sweep re-validation, and
+    /// [`Self::is_due_for_sweep`] all use:
+    ///
+    /// - `preserve_until == 0` — an active preservation always wins.
+    /// - `delete_at_height` set and `<= current_block_height` — DAH is due.
+    /// - CONFLICTING records are due unconditionally (KO-2): the
+    ///   `setConflicting` path (Lua lines 985-995) DAH's losers regardless
+    ///   of spent/longest-chain state, so the sweep MUST be able to delete
+    ///   them — a conflicting double-spend loser is never all-spent and is
+    ///   usually unmined.
+    /// - Otherwise the normal mined-record path: all-spent ∧ on-longest-chain
+    ///   (`spent_utxos == utxo_count && unmined_since == 0`).
+    fn record_due_for_sweep(meta: &TxMetadata, current_block_height: u32) -> bool {
+        if { meta.preserve_until } != 0 {
+            return false;
+        }
+        let dah = { meta.delete_at_height };
+        if dah == 0 || dah > current_block_height {
+            return false;
+        }
+        if meta.flags.contains(TxFlags::CONFLICTING) {
+            return true;
+        }
+        // LP-3: a reassigned record is never all-spent (it is retained for the
+        // audit trail), so it is never due via the mined-record path. The
+        // CONFLICTING branch above still applies.
+        if meta.flags.contains(TxFlags::REASSIGNED) {
+            return false;
+        }
+        let all_spent = { meta.spent_utxos } == { meta.utxo_count };
+        let on_longest_chain = { meta.unmined_since } == 0;
+        all_spent && on_longest_chain
+    }
+
+    /// Re-validate a DAH-sweep candidate under the per-tx stripe lock.
+    ///
+    /// KO-2 + KO-3: the DAH sweep selects candidates from the (cached, lagging)
+    /// DAH index, then must confirm each against the authoritative on-device
+    /// metadata before scheduling a delete. Taking the stripe lock here means
+    /// the decision a sweep records cannot be invalidated by a concurrent
+    /// mutation between this check and the redo-log write — only records that
+    /// pass get a `Delete` redo op, so a concurrently-preserved record is
+    /// never even scheduled (and so never wrongly replayed on recovery). The
+    /// final delete still re-checks under the lock via `due_guard` as
+    /// defense-in-depth.
+    ///
+    /// Returns `true` iff [`Self::record_due_for_sweep`] holds for the
+    /// freshly-read metadata. A missing / aliased record returns `false`.
+    pub fn is_due_for_sweep(&self, key: &TxKey, current_block_height: u32) -> bool {
+        let _guard = self.locks.lock(key);
+        let entry = match self.index.read().lookup(key) {
+            Some(e) => e,
+            None => return false,
+        };
+        match self.read_metadata_for_key(key, entry.record_offset) {
+            Ok(meta) => Self::record_due_for_sweep(&meta, current_block_height),
+            Err(_) => false,
+        }
+    }
+
     /// Delete a transaction record.
     ///
     /// Removes from index, frees device space, and cleans up secondary indexes.
@@ -4268,8 +4401,22 @@ impl Engine {
             None => return Err(SpendError::TxNotFound),
         };
 
+        // KO-3: when invoked by the DAH sweep (`due_guard == Some(height)`),
+        // re-validate the delete predicate against fresh metadata *under this
+        // stripe lock* before destroying the record. The sweep's earlier
+        // re-validation is lock-free, so a `PreserveUntilBatch` (or any state
+        // change clearing the all-spent / longest-chain predicate) that
+        // landed in the meantime would otherwise be silently overridden. The
+        // recheck reads metadata the unguarded path reads anyway, so the cost
+        // is one extra `TxFlags` test. Direct client deletes
+        // (`due_guard == None`) skip this and stay unconditional (spec §3.18).
         let record_size = {
-            let meta = self.read_metadata_fast(entry.record_offset)?;
+            let meta = self.read_metadata_for_key(&req.tx_key, entry.record_offset)?;
+            if let Some(current_height) = req.due_guard
+                && !Self::record_due_for_sweep(&meta, current_height)
+            {
+                return Err(SpendError::NotDue);
+            }
             ({ meta.record_size }) as u64
         };
 
@@ -4328,6 +4475,88 @@ impl Engine {
         }
 
         Ok(())
+    }
+
+    /// Expire a preservation whose `preserve_until` height has been reached.
+    ///
+    /// Mirror of the Aerospike pruner's `ProcessExpiredPreservations`
+    /// (`teranode/stores/utxo/aerospike/aerospike.go:999-1100`) and spec
+    /// §3.18 Phase 3 ("Expired preservation processing"): for a record whose
+    /// `preserve_until` is in `[1, current_height]`, schedule deletion by
+    /// setting `delete_at_height = current_height + block_height_retention`
+    /// and clearing `preserve_until`. The record then becomes a normal DAH
+    /// candidate and is deleted `block_height_retention` blocks later by the
+    /// sweep.
+    ///
+    /// This deliberately does NOT re-run `evaluate_delete_at_height`: the Go
+    /// pruner sets DAH unconditionally on expiry (the all-spent /
+    /// on-longest-chain gating does not apply to an expired preservation —
+    /// the preservation window having elapsed is itself the signal that the
+    /// record may be reclaimed). The record's spent/unmined/conflicting state
+    /// is irrelevant at this point; the parent it protected has had its full
+    /// `ParentPreservationBlocks` window.
+    ///
+    /// Runs under the per-tx stripe lock and re-reads the on-device metadata,
+    /// so a `preserve_until` that was pushed forward (a fresh
+    /// `PreserveUntilBatch`) between the index scan and this call is honored:
+    /// if the re-read `preserve_until` is 0 or still in the future, this is a
+    /// no-op and returns `Ok(false)`.
+    ///
+    /// Returns `Ok(true)` if the preservation was expired and DAH scheduled,
+    /// `Ok(false)` if the record no longer qualifies (preserve cleared,
+    /// pushed forward, or record gone).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpendError::DahOverflow`] if `current_block_height +
+    /// block_height_retention` overflows `u32`, and [`SpendError::StorageError`]
+    /// on device / index failures.
+    pub fn expire_preservation_set_dah(
+        &self,
+        key: &TxKey,
+        current_block_height: u32,
+        block_height_retention: u32,
+    ) -> Result<bool, SpendError> {
+        if block_height_retention == 0 {
+            return Ok(false);
+        }
+        let _guard = self.locks.lock(key);
+        let entry = match self.index.read().lookup(key) {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+        let ro = entry.record_offset;
+
+        let mut meta = self.read_metadata_for_key(key, ro)?;
+        let preserve = { meta.preserve_until };
+        // Re-validate under the lock: only expire a preservation that is
+        // genuinely set and genuinely due. A `preserve_until` that was
+        // cleared or pushed past `current_block_height` since the scan must
+        // be left untouched.
+        if preserve == 0 || preserve > current_block_height {
+            return Ok(false);
+        }
+
+        let new_dah = current_block_height
+            .checked_add(block_height_retention)
+            .ok_or(SpendError::DahOverflow {
+                current_height: current_block_height,
+                retention: block_height_retention,
+            })?;
+
+        // While `preserve_until` is set the record carries no DAH index entry
+        // (see `preserve_until`, which removes any prior DAH entry), so there
+        // is no stale entry to remove here — the transition is 0 → new_dah.
+        meta.preserve_until = 0;
+        meta.delete_at_height = new_dah;
+        meta.generation = { meta.generation }.wrapping_add(1);
+        meta.updated_at = self.now_millis();
+
+        self.write_metadata_fast(ro, &meta)?;
+        self.sync_index_cache(key, &meta)?;
+        self.update_dah_index(key, 0, new_dah)?;
+
+        Ok(true)
     }
 
     /// Read spending data for a specific UTXO (point read, no lock needed).
@@ -8057,7 +8286,7 @@ mod tests {
         assert!(!h.engine.dah_index().range_query(u32::MAX).is_empty());
 
         // Delete the record
-        let del_req = DeleteRequest { tx_key: h.key };
+        let del_req = DeleteRequest { tx_key: h.key, due_guard: None };
         h.engine.delete(&del_req).unwrap();
 
         // DAH index should be clean
@@ -9915,7 +10144,7 @@ mod tests {
         let key = req.tx_key();
 
         engine.create(&req).unwrap();
-        engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
 
         // Should succeed — txid can be reused after deletion
         engine.create(&req).unwrap();
@@ -10633,6 +10862,308 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // LP-3 — a reassigned record is never DAH'd, even after the reassigned
+    // UTXO is itself spent (Lua `recordUtxos + 1`, teranode.lua:945). Verified
+    // first that a LIVE reassigned UTXO is never deletable (frozen does not
+    // count toward spent_utxos), then that the after-final-spend window is
+    // also retained.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lp3_reassign_sets_reassigned_flag() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(0xB1, 2);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
+        engine
+            .reassign(&ReassignRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+                new_utxo_hash: [0x11; 32],
+                block_height: 1000,
+                spendable_after: 100,
+            })
+            .unwrap();
+        let meta = engine.read_metadata(&key).unwrap();
+        assert!(
+            meta.flags.contains(TxFlags::REASSIGNED),
+            "reassign must set the REASSIGNED flag (LP-3)"
+        );
+    }
+
+    #[test]
+    fn lp3_reassigned_record_never_gets_dah_after_final_spend() {
+        let engine = create_engine();
+        // Single-UTXO record so that spending the reassigned slot would, for a
+        // non-reassigned record, make it all-spent and DAH-eligible.
+        let (_, req) = make_create_req(0xB2, 1);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        // Mine it on the longest chain so the all-spent DAH path is reachable.
+        engine
+            .set_mined(&crate::ops::set_mined::SetMinedRequest {
+                tx_key: key,
+                block_id: 7,
+                block_height: 900,
+                subtree_idx: 0,
+                on_longest_chain: true,
+                unset_mined: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+
+        // Freeze + reassign the only output.
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
+        let new_hash = [0x22; 32];
+        engine
+            .reassign(&ReassignRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+                new_utxo_hash: new_hash,
+                block_height: 1000,
+                spendable_after: 100,
+            })
+            .unwrap();
+
+        // Pre-condition (audit claim): a LIVE reassigned UTXO is not
+        // all-spent — spent_utxos stays 0 while the slot is unspent — so it
+        // cannot be DAH-deleted.
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.spent_utxos }, 0, "reassigned slot is live, not spent");
+        assert_eq!(
+            { meta.delete_at_height },
+            0,
+            "live reassigned UTXO must never carry a DAH"
+        );
+
+        // Now spend the reassigned UTXO at/after the cooldown (1100). For a
+        // NON-reassigned single-output mined record this would set DAH =
+        // current + retention. LP-3: the REASSIGNED flag keeps the all-spent
+        // check false, so NO DAH is set — the audit/reorg evidence is retained.
+        let mut sd = [0u8; 36];
+        sd[0] = 0x99;
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: new_hash,
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1100,
+                block_height_retention: 288,
+            })
+            .expect("spend of reassigned UTXO at cooldown must succeed");
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.spent_utxos }, 1, "reassigned UTXO now spent");
+        assert_eq!(
+            { meta.delete_at_height },
+            0,
+            "LP-3: a reassigned record must never be DAH'd, even after final spend"
+        );
+        assert!(
+            !engine
+                .is_due_for_sweep(&key, 100_000),
+            "reassigned record must never be due for the sweep (LP-3)"
+        );
+    }
+
+    /// Contrast: an IDENTICAL flow WITHOUT reassignment DOES get a DAH on
+    /// final spend — proving the LP-3 difference is the REASSIGNED flag, not
+    /// some other property of the setup.
+    #[test]
+    fn lp3_non_reassigned_record_gets_dah_on_final_spend() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(0xB3, 1);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine
+            .set_mined(&crate::ops::set_mined::SetMinedRequest {
+                tx_key: key,
+                block_id: 7,
+                block_height: 900,
+                subtree_idx: 0,
+                on_longest_chain: true,
+                unset_mined: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+        let mut sd = [0u8; 36];
+        sd[0] = 0x77;
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1100,
+                block_height_retention: 288,
+            })
+            .unwrap();
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!(
+            { meta.delete_at_height },
+            1100 + 288,
+            "non-reassigned all-spent mined record must get DAH"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // LP-4 — the reassignment cooldown survives a freeze → unfreeze cycle
+    // (Lua keeps it in a separate `utxoSpendableIn` bin; TeraSlab preserves
+    // it in the slot's spending_data[0..4] across the freeze marker).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lp4_freeze_unfreeze_preserves_reassign_cooldown() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(0xB4, 2);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        // Freeze + reassign offset 0 with cooldown 1000 + 100 = 1100.
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+            })
+            .unwrap();
+        let new_hash = [0x33; 32];
+        engine
+            .reassign(&ReassignRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+                new_utxo_hash: new_hash,
+                block_height: 1000,
+                spendable_after: 100,
+            })
+            .unwrap();
+        let slot = engine.read_slot(&key, 0).unwrap();
+        assert_eq!(slot.reassignment_cooldown(), 1100, "cooldown set by reassign");
+
+        // Freeze the reassigned (unspent, cooled-down) slot, then unfreeze.
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: new_hash,
+            })
+            .unwrap();
+        // The frozen slot keeps the cooldown in the first 4 bytes; status is
+        // the authoritative frozen signal.
+        let frozen = engine.read_slot(&key, 0).unwrap();
+        assert!(frozen.is_frozen());
+        assert_eq!(
+            frozen.reassignment_cooldown(),
+            1100,
+            "freeze must NOT wipe the cooldown (LP-4)"
+        );
+
+        engine
+            .unfreeze(&UnfreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: new_hash,
+            })
+            .unwrap();
+        let restored = engine.read_slot(&key, 0).unwrap();
+        assert!(restored.is_unspent());
+        assert_eq!(
+            restored.reassignment_cooldown(),
+            1100,
+            "unfreeze must restore the cooldown (LP-4)"
+        );
+
+        // The cooldown is still enforced: spend below 1100 → FrozenUntil.
+        let mut sd = [0u8; 36];
+        sd[0] = 0xAA;
+        match engine.spend(&SpendRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: new_hash,
+            spending_data: sd,
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1099,
+            block_height_retention: 288,
+        }) {
+            Err(SpendError::FrozenUntil {
+                spendable_at_height: 1100,
+                ..
+            }) => {}
+            other => panic!("cooldown must survive freeze/unfreeze; expected FrozenUntil(1100), got {other:?}"),
+        }
+
+        // And spendable at the cooldown height (1100).
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: new_hash,
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1100,
+                block_height_retention: 288,
+            })
+            .expect("spend at cooldown height must succeed after freeze/unfreeze");
+    }
+
+    /// A plain freeze/unfreeze on a slot with NO cooldown stays
+    /// immediately-spendable (the LP-4 change must not introduce a phantom
+    /// cooldown on ordinary outputs).
+    #[test]
+    fn lp4_freeze_unfreeze_no_cooldown_stays_spendable() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(0xB5, 2);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 1,
+                utxo_hash: req.utxo_hashes[1],
+            })
+            .unwrap();
+        engine
+            .unfreeze(&UnfreezeRequest {
+                tx_key: key,
+                offset: 1,
+                utxo_hash: req.utxo_hashes[1],
+            })
+            .unwrap();
+        let slot = engine.read_slot(&key, 1).unwrap();
+        assert_eq!(
+            slot.spending_data, [0u8; 36],
+            "no-cooldown slot must unfreeze to fully-zeroed spending_data"
+        );
+        assert_eq!(slot.reassignment_cooldown(), 0);
+    }
+
     /// Boundary semantics — spendable AT stop (half-open `[start, stop)`).
     /// At `current_block_height == spendable_height` the UTXO MUST be
     /// spendable. Matches Teranode PR #949 fix to `teranode.lua:373`
@@ -11134,7 +11665,7 @@ mod tests {
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
-        engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
         assert!(engine.lookup(&key).is_none());
     }
 
@@ -11159,7 +11690,7 @@ mod tests {
         engine.create(&req).unwrap();
 
         syncs.store(0, Ordering::SeqCst);
-        engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
 
         assert!(
             syncs.load(Ordering::SeqCst) >= 1,
@@ -11173,7 +11704,7 @@ mod tests {
         let (_, req) = make_create_req(121, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
 
         match engine.read_metadata(&key) {
             Err(SpendError::TxNotFound) => {}
@@ -11186,6 +11717,7 @@ mod tests {
         let engine = create_engine();
         match engine.delete(&DeleteRequest {
             tx_key: TxKey { txid: [0xFF; 32] },
+            due_guard: None,
         }) {
             Err(SpendError::TxNotFound) => {}
             other => panic!("expected TxNotFound, got {other:?}"),
@@ -11200,7 +11732,7 @@ mod tests {
         let resp1 = engine.create(&req1).unwrap();
         let offset1 = resp1.record_offset;
 
-        engine.delete(&DeleteRequest { tx_key: key1 }).unwrap();
+        engine.delete(&DeleteRequest { tx_key: key1, due_guard: None }).unwrap();
 
         // Create another record — should reuse the freed space
         let (_, req2) = make_create_req(123, 100);
@@ -11215,7 +11747,7 @@ mod tests {
         let (_, req) = make_create_req(124, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
 
         let rebuilt = PrimaryBackend::rebuild(&*engine.device, &engine.allocator.lock()).unwrap();
         assert!(
@@ -11231,7 +11763,7 @@ mod tests {
         let key = req.tx_key();
         let created = engine.create(&req).unwrap();
 
-        engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
 
         let align = engine.device.alignment();
         let mut buf = AlignedBuf::new(io::align_up(METADATA_SIZE, align), align);
@@ -11464,7 +11996,7 @@ mod tests {
         let e1 = engine.clone();
         let hash0 = req.utxo_hashes[0];
 
-        let h1 = std::thread::spawn(move || e1.delete(&DeleteRequest { tx_key: key }));
+        let h1 = std::thread::spawn(move || e1.delete(&DeleteRequest { tx_key: key, due_guard: None }));
 
         let e2 = engine.clone();
         let h2 = std::thread::spawn(move || {
@@ -11772,7 +12304,7 @@ mod tests {
         assert!(!cold.is_empty(), "cold data should be present");
 
         // Delete
-        engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
 
         // Verify lookup returns None
         assert!(engine.lookup(&key).is_none());
@@ -12000,7 +12532,7 @@ mod tests {
         // pre-race baseline — any orphaned region from a losing create would
         // leave it permanently inflated.
         let used_after_race = engine.allocator_stats().used_bytes;
-        engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
         assert_eq!(
             engine.allocator_stats().used_bytes,
             used_baseline,
@@ -12031,7 +12563,7 @@ mod tests {
                             Ok(_) | Err(CreateError::DuplicateTxId) => {}
                             Err(e) => panic!("unexpected create error: {e:?}"),
                         }
-                        match engine.delete(&DeleteRequest { tx_key: key }) {
+                        match engine.delete(&DeleteRequest { tx_key: key, due_guard: None }) {
                             Ok(()) | Err(SpendError::TxNotFound) => {}
                             Err(e) => panic!("unexpected delete error: {e:?}"),
                         }
@@ -12049,7 +12581,7 @@ mod tests {
                 key.txid,
                 "index entry aliases another transaction's record"
             );
-            engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+            engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
         }
         assert_eq!(
             engine.allocator_stats().used_bytes,
@@ -12285,6 +12817,7 @@ mod tests {
         engine
             .delete(&DeleteRequest {
                 tx_key: post_init_req.tx_key(),
+                due_guard: None,
             })
             .expect("delete after lazy count initialization should succeed");
         assert_eq!(engine.shard_record_count(EXISTING_SHARD), 2);
@@ -12468,6 +13001,7 @@ mod tests {
                     let (_, req) = make_create_req(n, 1);
                     let del = DeleteRequest {
                         tx_key: req.tx_key(),
+                        due_guard: None,
                     };
                     match engine.delete(&del) {
                         Ok(()) => {}

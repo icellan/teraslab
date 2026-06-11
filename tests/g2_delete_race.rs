@@ -139,6 +139,7 @@ fn delete_does_not_alias_concurrent_create() {
                 // already did the delete — that's fine.
                 let _ = engine.delete(&DeleteRequest {
                     tx_key: TxKey::from_bytes(tx_a_inner),
+                    due_guard: None,
                 });
 
                 // Create tx_B with a fresh txid every iteration. This is
@@ -164,6 +165,7 @@ fn delete_does_not_alias_concurrent_create() {
                     // Tear it down so the freelist stays hot.
                     let _ = engine.delete(&DeleteRequest {
                         tx_key: TxKey::from_bytes(tx_b),
+                        due_guard: None,
                     });
                 }
                 local_cycle = local_cycle.wrapping_add(1);

@@ -355,7 +355,11 @@ fn seq_strategy(min: usize, max: usize) -> impl Strategy<Value = Vec<Op>> {
 enum SlotState {
     Unspent { spendable_height: u32 },
     Spent([u8; 36]),
-    Frozen,
+    /// LP-4: a frozen slot preserves any reassign cooldown (the
+    /// `spendable_height` it had while unspent) so a freeze/unfreeze cycle
+    /// cannot wipe it. `cooldown == 0` is an ordinary frozen slot whose
+    /// on-device representation is the all-`0xFF` marker.
+    Frozen { cooldown: u32 },
 }
 
 impl SlotState {
@@ -537,7 +541,7 @@ impl Model {
                         Outcome::OkBlockIds(sorted(rec.mined.clone()))
                     }
                     SlotState::Spent(cur) => Outcome::AlreadySpent(vout as u32, cur),
-                    SlotState::Frozen => Outcome::Frozen(vout as u32),
+                    SlotState::Frozen { .. } => Outcome::Frozen(vout as u32),
                 }
             }
 
@@ -572,7 +576,7 @@ impl Model {
                     // no-op success — already unspent, wrong spending_data
                     // (caller doesn't own the spend), or frozen (the all-0xFF
                     // marker is never owned). Nothing mutates.
-                    SlotState::Unspent { .. } | SlotState::Spent(_) | SlotState::Frozen => {
+                    SlotState::Unspent { .. } | SlotState::Spent(_) | SlotState::Frozen { .. } => {
                         Outcome::Ok
                     }
                 }
@@ -593,12 +597,15 @@ impl Model {
                     return Outcome::UtxoHashMismatch(vout as u32);
                 }
                 match rec.slots[vout as usize].clone() {
-                    SlotState::Frozen => Outcome::AlreadyFrozen(vout as u32),
+                    SlotState::Frozen { .. } => Outcome::AlreadyFrozen(vout as u32),
                     SlotState::Spent(cur) => Outcome::AlreadySpent(vout as u32, cur),
-                    SlotState::Unspent { .. } => {
-                        // Freeze overwrites the slot with the all-0xFF marker,
-                        // discarding any reassign cooldown.
-                        rec.slots[vout as usize] = SlotState::Frozen;
+                    SlotState::Unspent { spendable_height } => {
+                        // LP-4: freeze PRESERVES any reassign cooldown instead
+                        // of discarding it (it survives in spending_data[0..4]
+                        // through the frozen marker).
+                        rec.slots[vout as usize] = SlotState::Frozen {
+                            cooldown: spendable_height,
+                        };
                         Outcome::Ok
                     }
                 }
@@ -618,11 +625,16 @@ impl Model {
                 if wrong_hash {
                     return Outcome::UtxoHashMismatch(vout as u32);
                 }
-                if rec.slots[vout as usize] != SlotState::Frozen {
-                    return Outcome::NotFrozen(vout as u32);
-                }
-                // Unfreeze clears any cooldown (spending_data zeroed).
-                rec.slots[vout as usize] = SlotState::unspent();
+                let cooldown = match rec.slots[vout as usize] {
+                    SlotState::Frozen { cooldown } => cooldown,
+                    _ => return Outcome::NotFrozen(vout as u32),
+                };
+                // LP-4: unfreeze RESTORES the preserved cooldown rather than
+                // zeroing it. A cooldown of 0 restores to immediately
+                // spendable (matching a plain all-0xFF frozen slot).
+                rec.slots[vout as usize] = SlotState::Unspent {
+                    spendable_height: cooldown,
+                };
                 Outcome::Ok
             }
 
@@ -660,7 +672,7 @@ impl Model {
                 }
                 // The driver always supplies the correct (current) hash for
                 // reassign, so no hash-mismatch case here.
-                if rec.slots[vout as usize] != SlotState::Frozen {
+                if !matches!(rec.slots[vout as usize], SlotState::Frozen { .. }) {
                     return Outcome::NotFrozen(vout as u32);
                 }
                 // spendable_height = block_height + spendable_after; the
@@ -916,7 +928,7 @@ fn run_engine(engine: &Engine, op: &Op) -> Outcome {
         }
 
         Op::Delete { tx } => {
-            let req = DeleteRequest { tx_key: tx_key(tx) };
+            let req = DeleteRequest { tx_key: tx_key(tx), due_guard: None };
             match engine.delete(&req) {
                 Ok(()) => Outcome::Ok,
                 Err(e) => spend_error_outcome(e),
@@ -980,7 +992,15 @@ fn expected_slot_repr(slot_state: &SlotState) -> (u8, [u8; 36]) {
             (UTXO_UNSPENT, sd)
         }
         SlotState::Spent(sd) => (UTXO_SPENT, *sd),
-        SlotState::Frozen => (UTXO_FROZEN, [FROZEN_BYTE; 36]),
+        // LP-4: a frozen slot carries the preserved cooldown in the first 4
+        // bytes; a zero cooldown is the plain all-`0xFF` frozen marker.
+        SlotState::Frozen { cooldown } => {
+            let mut sd = [FROZEN_BYTE; 36];
+            if *cooldown != 0 {
+                sd[0..4].copy_from_slice(&cooldown.to_le_bytes());
+            }
+            (UTXO_FROZEN, sd)
+        }
     }
 }
 

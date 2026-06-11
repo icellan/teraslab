@@ -429,7 +429,7 @@ fn bench_delete(c: &mut Criterion) {
             let key = TxKey {
                 txid: make_tx_id(del_idx),
             };
-            let _ = engine.delete(&DeleteRequest { tx_key: key });
+            let _ = engine.delete(&DeleteRequest { tx_key: key, due_guard: None });
             del_idx += 1;
             if del_idx >= next_create {
                 // Create a new batch.
