@@ -323,6 +323,11 @@ fn alloc_mmap_buckets(capacity: usize) -> Result<(*mut Bucket, usize, bool)> {
     // On Linux, try hugepages first.
     #[cfg(target_os = "linux")]
     {
+        // SAFETY: an anonymous `mmap` with a null `addr` lets the kernel
+        // choose the mapping; `byte_len` is non-zero (checked above) and
+        // `fd == -1` is required for `MAP_ANONYMOUS`. The call has no memory
+        // preconditions and its result is validated against `MAP_FAILED`
+        // before any dereference.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -340,6 +345,10 @@ fn alloc_mmap_buckets(capacity: usize) -> Result<(*mut Bucket, usize, bool)> {
     }
 
     // Regular mmap (works on macOS and Linux).
+    // SAFETY: anonymous mapping with kernel-chosen address; `byte_len` is
+    // non-zero (checked above), `fd == -1` as required for `MAP_ANON`. No
+    // memory preconditions; the result is checked against `MAP_FAILED` below
+    // before any access.
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -371,6 +380,10 @@ fn alloc_mmap_buckets(capacity: usize) -> Result<(*mut Bucket, usize, bool)> {
 /// function must be called at most once for a given mapping.
 unsafe fn dealloc_mmap_buckets(ptr: *mut Bucket, byte_len: usize) {
     if byte_len > 0 && !ptr.is_null() {
+        // SAFETY: by this function's `# Safety` contract, `ptr`/`byte_len`
+        // are the exact pair returned by `alloc_mmap_buckets`, the region is
+        // no longer accessed, and this runs at most once for the mapping —
+        // exactly `munmap`'s requirements.
         unsafe { libc::munmap(ptr.cast(), byte_len) };
     }
 }
@@ -403,7 +416,10 @@ fn sync_file_backed(table: &HashTable) -> Result<()> {
         return Ok(());
     };
     if table.mmap_len > 0 && !table.ptr.is_null() {
-        // Safety: ptr/mmap_len describe the currently mapped region.
+        // SAFETY: the guard above guarantees `table.ptr`/`table.mmap_len`
+        // describe the currently mapped, non-empty region; `msync` only reads
+        // that mapping's metadata to flush dirty pages and requires no
+        // additional invariant.
         let rc = unsafe { libc::msync(table.ptr.cast(), table.mmap_len, libc::MS_SYNC) };
         if rc != 0 {
             return Err(HashTableError::ResizeIo(format!(
@@ -412,7 +428,9 @@ fn sync_file_backed(table: &HashTable) -> Result<()> {
             )));
         }
     }
-    // Safety: fd was obtained from File::into_raw_fd and is still open.
+    // SAFETY: `fd` was obtained from `File::into_raw_fd` and is kept open for
+    // the lifetime of the `FileBacked` backing, so it is a valid descriptor
+    // here; `fsync` takes only a descriptor and has no memory preconditions.
     let rc = unsafe { libc::fsync(*fd) };
     if rc != 0 {
         return Err(HashTableError::ResizeIo(format!(
@@ -478,6 +496,10 @@ fn alloc_file_backed_buckets(
 
     let fd = file.into_raw_fd();
 
+    // SAFETY: file-backed mapping with kernel-chosen address; `byte_len` is
+    // non-zero (checked above) and the file at `fd` was just `set_len` to at
+    // least `byte_len`, so the `MAP_SHARED` region is fully backed. The
+    // result is validated against `MAP_FAILED` before any dereference.
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -490,6 +512,8 @@ fn alloc_file_backed_buckets(
     };
 
     if ptr == libc::MAP_FAILED {
+        // SAFETY: `fd` is the open descriptor from `into_raw_fd` above and is
+        // not used after this close (we return an error).
         unsafe { libc::close(fd) };
         return Err(HashTableError::AllocFailed(format!(
             "mmap MAP_SHARED({byte_len} bytes) failed: {}",
@@ -497,6 +521,10 @@ fn alloc_file_backed_buckets(
         )));
     }
 
+    // SAFETY: `ptr`/`byte_len` describe the mapping just created above (not
+    // `MAP_FAILED`); `madvise(MADV_RANDOM)` only adjusts kernel readahead
+    // hints for that region and cannot violate memory safety. Its return is
+    // intentionally advisory and ignored.
     unsafe { libc::madvise(ptr, byte_len, libc::MADV_RANDOM) };
 
     Ok((ptr.cast::<Bucket>(), byte_len, fd))
@@ -618,7 +646,11 @@ impl HashTable {
 
         // mmap returns zeroed memory, but our empty sentinel is 0xFF (not 0x00).
         // Initialize every bucket's probe_distance byte to BUCKET_EMPTY_SENTINEL.
-        // Safety: ptr is valid for `capacity` buckets.
+        // SAFETY: `ptr`/`mmap_len` are the freshly-mapped region just
+        // returned by `alloc_mmap_buckets` (validated non-`MAP_FAILED`), so
+        // the whole `mmap_len`-byte range is writable and owned exclusively
+        // here (no other thread can hold a reference to a table that has not
+        // yet been constructed). Writing `mmap_len` bytes stays in-bounds.
         unsafe {
             // Set the entire region to 0xFF first (making all bytes 0xFF),
             // then we're done: probe_distance = 0xFF means empty, and the
@@ -752,6 +784,11 @@ impl HashTable {
             let mut count = 0usize;
             let mut max_probe = 0usize;
             for i in 0..capacity {
+                // SAFETY: `ptr` maps exactly `capacity` `Bucket`s (just
+                // allocated by `alloc_file_backed_buckets`), so `ptr.add(i)`
+                // for `i < capacity` is in-bounds and aligned. The table is
+                // still under construction — no other thread can alias it —
+                // so this shared read is sound.
                 let bucket = unsafe { &*ptr.add(i) };
                 if bucket.is_occupied() {
                     count += 1;
@@ -785,9 +822,16 @@ impl HashTable {
             Ok(table)
         } else {
             // Initialize all buckets to empty sentinel.
+            // SAFETY: `ptr`/`mmap_len` are the freshly-mapped, exclusively
+            // owned region from `alloc_file_backed_buckets`; the whole range
+            // is writable and not yet shared, so the in-bounds `write_bytes`
+            // is sound.
             unsafe {
                 std::ptr::write_bytes(ptr as *mut u8, BUCKET_EMPTY_SENTINEL, mmap_len);
             }
+            // SAFETY: `ptr`/`mmap_len` describe the mapping just initialized
+            // above; `msync` flushes its dirty pages and needs no further
+            // invariant.
             unsafe { libc::msync(ptr.cast(), mmap_len, libc::MS_SYNC) };
 
             Ok(Self {
@@ -846,9 +890,12 @@ impl HashTable {
     #[inline]
     fn bucket(&self, idx: usize) -> &Bucket {
         debug_assert!(idx < self.capacity);
-        // Safety: idx is within the mmap'd region (checked by caller or mask).
-        // Concurrent &-access from multiple threads is sound only while no
-        // thread is mutating; see the module-level Sync impl contract.
+        // SAFETY: callers index with a masked slot (`idx < self.capacity`,
+        // asserted above), so `self.ptr.add(idx)` is in-bounds and aligned in
+        // the mmap'd `Bucket` array. Producing a shared `&Bucket` is sound
+        // only while no thread holds a `&mut` to any bucket; that exclusivity
+        // is provided by the engine's `RwLock<PrimaryBackend>` (readers take
+        // the read side) — see the module-level `unsafe impl Sync` contract.
         unsafe { &*self.ptr.add(idx) }
     }
 
@@ -861,9 +908,11 @@ impl HashTable {
     #[inline]
     fn bucket_mut(&mut self, idx: usize) -> &mut Bucket {
         debug_assert!(idx < self.capacity);
-        // Safety: idx is within the mmap'd region, &mut self guarantees
-        // exclusivity within this thread. Cross-thread exclusivity is the
-        // caller's responsibility (engine RwLock).
+        // SAFETY: `idx < self.capacity` (asserted), so `self.ptr.add(idx)` is
+        // in-bounds and aligned. `&mut self` gives Rust-level exclusivity on
+        // this thread, and cross-thread exclusivity is the caller's
+        // responsibility via the engine's `RwLock` write side — so producing
+        // a unique `&mut Bucket` here cannot alias any other reference.
         unsafe { &mut *self.ptr.add(idx) }
     }
 
@@ -1044,9 +1093,11 @@ impl HashTable {
             }
         }
 
-        // Wipe the mmap region back to the empty sentinel (0xFF). Safety:
-        // we own the mapping exclusively (`&mut self`) and `mmap_len`
-        // matches the allocation returned by the constructor.
+        // Wipe the mmap region back to the empty sentinel (0xFF).
+        // SAFETY: we own the mapping exclusively (`&mut self`), `self.ptr` is
+        // the live base of the mmap and `self.mmap_len` matches the
+        // allocation from the constructor, so writing `mmap_len` bytes from
+        // it is in-bounds and free of aliasing.
         unsafe {
             std::ptr::write_bytes(self.ptr as *mut u8, BUCKET_EMPTY_SENTINEL, self.mmap_len);
         }
@@ -1262,6 +1313,10 @@ impl HashTable {
             && self.mmap_len > 0
             && !self.ptr.is_null()
         {
+            // SAFETY: the guards above ensure `self.ptr`/`self.mmap_len`
+            // describe the live, non-empty file-backed mapping; `msync`
+            // schedules writeback of those pages and needs no further
+            // invariant.
             unsafe { libc::msync(self.ptr.cast(), self.mmap_len, libc::MS_ASYNC) };
         }
     }
@@ -1479,6 +1534,15 @@ impl Drop for HashTable {
     fn drop(&mut self) {
         if self.mmap_len > 0 && !self.ptr.is_null() {
             if let Backing::FileBacked { fd, path } = &self.backing {
+                // SAFETY: in `Drop` we hold exclusive ownership of the table,
+                // and the guard above ensures `self.ptr`/`self.mmap_len`
+                // describe the live mapping. `msync` flushes it durably;
+                // `dealloc_mmap_buckets` then `munmap`s exactly that
+                // `(ptr, len)` pair once (the table is being destroyed, so it
+                // is never accessed again); `close` releases the `fd` that
+                // `FileBacked` has kept open. Ordering is msync → munmap →
+                // close so the flush completes before the mapping is torn
+                // down.
                 unsafe { libc::msync(self.ptr.cast(), self.mmap_len, libc::MS_SYNC) };
                 unsafe { dealloc_mmap_buckets(self.ptr, self.mmap_len) };
                 unsafe { libc::close(*fd) };
@@ -1501,6 +1565,10 @@ impl Drop for HashTable {
                     let _ = std::fs::File::create(&sentinel);
                 }
             } else {
+                // SAFETY: anonymous backing — in `Drop` we own the table
+                // exclusively and `self.ptr`/`self.mmap_len` are the live
+                // mapping (guarded above), so `munmap`ing exactly that pair
+                // once is sound; the region is never accessed afterwards.
                 unsafe { dealloc_mmap_buckets(self.ptr, self.mmap_len) };
             }
         }

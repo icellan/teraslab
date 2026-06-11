@@ -143,6 +143,17 @@ pub struct Engine {
     /// layer calls [`refresh_clock`] once per batch; individual operations
     /// read the cached value via [`Self::now_millis`].
     cached_millis: std::sync::atomic::AtomicU64,
+    /// KO-5: count of conflicting-child appends dropped because the parent's
+    /// on-disk children list was already at the `u8::MAX` (255) capacity.
+    ///
+    /// The 256th conflicting child of a parent cannot be recorded (the
+    /// on-device count is a single `u8`), so the best-effort propagation
+    /// wrapper records the loss here and escalates it to a `tracing::error!`
+    /// instead of letting it vanish into a `warn`. Read via
+    /// [`Self::conflicting_children_dropped`] so operators and tests can see
+    /// that a cascade was truncated rather than discovering it only in the
+    /// ops log.
+    conflicting_children_dropped: std::sync::atomic::AtomicU64,
     /// Test-only fault injector: when set to `true`, the next call to
     /// [`Self::register_with_shard_count`] returns an error WITHOUT
     /// performing the backend `register` or incrementing `shard_counts`.
@@ -153,8 +164,33 @@ pub struct Engine {
     fail_next_register: std::sync::atomic::AtomicBool,
 }
 
-// Safety: Engine's device_ptr points into an Arc'd device that outlives
-// the Engine. All access through device_ptr is guarded by stripe locks.
+// SAFETY (C-6): `Engine::device_ptr` is a raw `*mut u8` into an `Arc`'d
+// device whose allocation outlives every `Engine` that holds the pointer
+// (the `Arc<dyn BlockDevice>` is kept in `Engine::device`), so the pointer
+// is never dangling. The `*mut u8` is the only non-`Send`/`Sync` field; all
+// other fields are themselves `Send + Sync`. Sharing the pointer across
+// threads is sound because EVERY access goes through the `io::*_direct`
+// helpers, and concurrency on the bytes is serialized NOT by the engine's
+// per-record `locks` (`StripedLocks`) — those do not cover the read or
+// replica-receiver paths — but by:
+//
+//   1. `io::io_locks()`, a process-global per-record-offset `StripedRwLocks`
+//      that every `read_metadata_direct` / `write_metadata_direct` (and the
+//      slot variants) takes read- or write-side. This is what prevents torn
+//      reads of the metadata footer + CRC pair (see the BC-02 / F-X-007
+//      commentary in `crate::io`); the engine stripe locks alone do NOT,
+//      because client reads and the replica receiver bypass them.
+//   2. The `dispatch_visibility_barrier` (RwLock), which fences client-facing
+//      reads out of the local apply → failed-replication-compensation window
+//      and lets the checkpoint task snapshot a quiescent engine.
+//   3. The read-path discipline documented on `Engine` above: a reader that
+//      needs a mutation-stable view must hold the relevant stripe lock or
+//      accept a possibly-stale snapshot — it must never assume the stripe
+//      lock alone makes raw `device_ptr` access torn-read-safe.
+//
+// In short: `device_ptr` is valid for the engine's lifetime, and all access
+// is mediated by `io_locks()` + the visibility barrier, so `Engine` is
+// `Send + Sync`.
 unsafe impl Send for Engine {}
 unsafe impl Sync for Engine {}
 
@@ -198,6 +234,7 @@ impl Engine {
             shard_counts,
             shard_counts_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_millis: std::sync::atomic::AtomicU64::new(sys_millis()),
+            conflicting_children_dropped: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             fail_next_register: std::sync::atomic::AtomicBool::new(false),
         }
@@ -966,6 +1003,12 @@ impl Engine {
         record_offset: u64,
     ) -> std::result::Result<TxMetadata, SpendError> {
         if !self.device_ptr.is_null() {
+            // SAFETY: the enclosing `is_null` check guarantees `device_ptr`
+            // is the live base pointer of this engine's `Arc`'d device (which
+            // outlives the engine). `record_offset` is an allocator-issued,
+            // in-bounds record offset. `read_metadata_direct` takes the
+            // per-offset `io_locks()` read side internally, so this read is
+            // serialized against concurrent direct writers (no torn read).
             unsafe { io::read_metadata_direct(self.device_ptr, record_offset) }.map_err(|e| {
                 SpendError::StorageError {
                     detail: format!("{e}"),
@@ -1015,6 +1058,12 @@ impl Engine {
         metadata: &TxMetadata,
     ) -> std::result::Result<(), SpendError> {
         if !self.device_ptr.is_null() {
+            // SAFETY: `device_ptr` is non-null (checked above) and is the
+            // live base of this engine's owned device; `record_offset` is an
+            // allocator-issued in-bounds offset. `write_metadata_direct`
+            // takes the per-offset `io_locks()` write side and publishes the
+            // footer+CRC via the chunked atomic transfer, so concurrent
+            // direct readers never observe a torn header.
             unsafe { io::write_metadata_direct(self.device_ptr, record_offset, metadata) };
             Ok(())
         } else {
@@ -1031,8 +1080,14 @@ impl Engine {
         record_offset: u64,
     ) -> std::result::Result<(), SpendError> {
         if !self.device_ptr.is_null() {
-            // Safety: `device_ptr` points to the mapped device region owned by
-            // this engine. Callers pass allocator-aligned record offsets.
+            // SAFETY: `device_ptr` is non-null (checked above) and points to
+            // this engine's owned device region; `record_offset` is an
+            // allocator-aligned, in-bounds record offset, so
+            // `device_ptr.add(record_offset)` is in-bounds and writing
+            // `METADATA_SIZE` zero bytes from it stays within the record. The
+            // caller holds the record's stripe lock for this tombstone write
+            // (delete path), and the following `Release` fence publishes the
+            // zeroing to other threads.
             unsafe {
                 std::ptr::write_bytes(
                     self.device_ptr.add(record_offset as usize),
@@ -1073,6 +1128,11 @@ impl Engine {
         slot_index: u32,
     ) -> std::result::Result<UtxoSlot, SpendError> {
         if !self.device_ptr.is_null() {
+            // SAFETY: `device_ptr` is non-null (checked above) and live for
+            // the engine's lifetime; `record_offset` + `slot_index` address
+            // an allocator-valid slot within the record.
+            // `read_utxo_slot_direct` takes the per-offset `io_locks()` read
+            // side, serializing against concurrent direct writers.
             unsafe { io::read_utxo_slot_direct(self.device_ptr, record_offset, slot_index) }
                 .map_err(|e| SpendError::StorageError {
                     detail: format!("{e}"),
@@ -1095,6 +1155,12 @@ impl Engine {
         slot: &UtxoSlot,
     ) -> std::result::Result<(), SpendError> {
         if !self.device_ptr.is_null() {
+            // SAFETY: `device_ptr` is non-null (checked above) and live for
+            // the engine's lifetime; `record_offset` + `slot_index` address
+            // an allocator-valid slot within the record.
+            // `write_utxo_slot_direct` takes the per-offset `io_locks()`
+            // write side, so the slot publish is serialized against
+            // concurrent direct readers/writers.
             unsafe { io::write_utxo_slot_direct(self.device_ptr, record_offset, slot_index, slot) };
             Ok(())
         } else {
@@ -1737,6 +1803,11 @@ impl Engine {
         // 8. Write metadata. R-004: propagate the write error rather
         // than logging-and-continuing.
         if !self.device_ptr.is_null() {
+            // SAFETY: `device_ptr` is non-null (checked above) and live for
+            // the engine's lifetime; `record_offset` is allocator-valid. The
+            // caller holds this record's stripe lock, and
+            // `write_metadata_direct` additionally takes the per-offset
+            // `io_locks()` write side for torn-read-safe publication.
             unsafe { io::write_metadata_direct(self.device_ptr, record_offset, &metadata) };
         } else {
             self.write_metadata_fast(record_offset, &metadata)?;
@@ -1892,6 +1963,11 @@ impl Engine {
         //    the dispatch layer can still classify it as idempotent.
         if caller_owns_spend || new_dah != old_dah {
             if !self.device_ptr.is_null() {
+                // SAFETY: `device_ptr` is non-null (checked above) and live
+                // for the engine's lifetime; `record_offset` is
+                // allocator-valid. The unspend caller holds this record's
+                // stripe lock, and `write_metadata_direct` takes the
+                // per-offset `io_locks()` write side for safe publication.
                 unsafe { io::write_metadata_direct(self.device_ptr, record_offset, &metadata) };
             } else {
                 self.write_metadata_fast(record_offset, &metadata)?;
@@ -1958,115 +2034,139 @@ impl Engine {
         // ---------------------------------------------------------------
         let cached_count = entry.block_entry_count;
         if !req.unset_mined && cached_count == 0 && !self.device_ptr.is_null() {
-            let new_count = cached_count + 1;
-            let new_entry = BlockEntry {
-                block_id: req.block_id,
-                block_height: req.block_height,
-                subtree_idx: req.subtree_idx,
+            // F-G2-011 / KO-11: read the authoritative on-device metadata
+            // up front and derive EVERY DAH/flag/counter input from it,
+            // never from the cached `entry`. The fast path already needs
+            // this read for the RMW (CRC must cover the full post-state),
+            // so it is free. The cached `entry` can be stale after a prior
+            // mutation that wrote metadata but failed at `sync_index_cache`
+            // (the device advanced while the cache did not). F-G2-011 fixed
+            // only `generation` from `meta`; KO-11 extends that to the DAH,
+            // preserve discriminant, flags, and the spent/unmined counters
+            // so a stale-cache scenario cannot write a wrong `old_dah`,
+            // mis-flagged `tf`, or wrong DAH-index delta.
+            // SAFETY: `device_ptr` is non-null (the fast path is gated on
+            // `!self.device_ptr.is_null()`) and live for the engine's
+            // lifetime; `record_offset` is allocator-valid. The set_mined
+            // caller holds this record's stripe lock, and
+            // `read_metadata_direct` takes the per-offset `io_locks()` read
+            // side, so the read is torn-read-safe.
+            let mut meta = unsafe {
+                io::read_metadata_direct(self.device_ptr, record_offset).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("{e}"),
+                    }
+                })?
             };
 
-            // Compute new field values from cached state
-            let mut tf = TxFlags::from_bits_truncate(entry.tx_flags);
-            tf.remove(TxFlags::LOCKED); // setMined clears LOCKED
-            let new_unmined = if req.on_longest_chain {
-                0u32
+            // Fast-path eligibility is the cache's `count == 0` signal; the
+            // fresh read must agree, otherwise the cache was stale about the
+            // block-entry count and writing into inline slot 0 would clobber
+            // an existing entry. Fall through to the slow path, which reads
+            // and reconciles the full entry list.
+            if { meta.block_entry_count } != 0 {
+                // Re-read via the slow path below (it re-reads metadata).
             } else {
-                entry.unmined_since
-            };
-            let old_unmined = entry.unmined_since;
-            let has_preserve = tf.contains(TxFlags::HAS_PRESERVE_UNTIL);
-            let old_dah = if has_preserve {
-                0
-            } else {
-                entry.dah_or_preserve
-            };
+                let new_count = 1u8;
+                let new_entry = BlockEntry {
+                    block_id: req.block_id,
+                    block_height: req.block_height,
+                    subtree_idx: req.subtree_idx,
+                };
 
-            // DAH evaluation from cached fields
-            let (signal, dah_patch) = crate::ops::delete_eval::evaluate_dah_cached(
-                tf,
-                entry.spent_utxos,
-                entry.utxo_count,
-                new_count,
-                new_unmined,
-                has_preserve,
-                entry.dah_or_preserve,
-                req.current_block_height,
-                req.block_height_retention,
-            )?;
-            let mut new_dah = old_dah;
-            if let Some(ref patch) = dah_patch {
-                tf.set(TxFlags::LAST_SPENT_ALL, patch.last_spent_all);
-                new_dah = patch.new_delete_at_height;
-            }
+                // Derive flags + DAH inputs from the FRESH meta (not cache).
+                let mut tf = meta.flags;
+                tf.remove(TxFlags::LOCKED); // setMined clears LOCKED
+                let meta_unmined = { meta.unmined_since };
+                let new_unmined = if req.on_longest_chain { 0u32 } else { meta_unmined };
+                let old_unmined = meta_unmined;
+                let preserve = { meta.preserve_until };
+                let has_preserve = preserve != 0;
+                let meta_dah = { meta.delete_at_height };
+                // `old_dah` is the DAH the secondary index currently
+                // reflects: the on-device DAH when not preserved, else 0
+                // (preservation clears the DAH).
+                let old_dah = if has_preserve { 0 } else { meta_dah };
+                let meta_spent = { meta.spent_utxos };
+                let meta_utxo_count = { meta.utxo_count };
 
-            let updated_at = self.now_millis();
+                // DAH evaluation from fresh-meta fields.
+                let (signal, dah_patch) = crate::ops::delete_eval::evaluate_dah_cached(
+                    tf,
+                    meta_spent,
+                    meta_utxo_count,
+                    new_count,
+                    new_unmined,
+                    has_preserve,
+                    if has_preserve { preserve } else { meta_dah },
+                    req.current_block_height,
+                    req.block_height_retention,
+                )?;
+                let mut new_dah = old_dah;
+                if let Some(ref patch) = dah_patch {
+                    tf.set(TxFlags::LAST_SPENT_ALL, patch.last_spent_all);
+                    new_dah = patch.new_delete_at_height;
+                }
 
-            // Read-modify-write so CRC covers the full post-state
-            // (block-entry-count, inline entry, and footer fields).
-            //
-            // F-G2-011: derive the new generation from `meta.generation`
-            // (the on-device, authoritative value) rather than
-            // `entry.generation` (the cached value). The fast path
-            // already reads metadata for the RMW; consulting it for
-            // the increment basis costs nothing and closes the rare
-            // race where a prior mutation wrote metadata but failed at
-            // `sync_index_cache` — the device sat at N+1 while the
-            // cache showed N, and the next fast-path mutation would
-            // stamp on-device generation as N+1 again, returning that
-            // value to the client even though no advance had occurred.
-            let generation;
-            unsafe {
-                let mut meta =
-                    io::read_metadata_direct(self.device_ptr, record_offset).map_err(|e| {
-                        SpendError::StorageError {
-                            detail: format!("{e}"),
-                        }
-                    })?;
-                generation = { meta.generation }.wrapping_add(1);
+                let updated_at = self.now_millis();
+
+                // Read-modify-write so CRC covers the full post-state
+                // (block-entry-count, inline entry, and footer fields).
+                // Generation is taken from the on-device value (F-G2-011).
+                let generation = { meta.generation }.wrapping_add(1);
                 meta.flags = tf;
                 meta.generation = generation;
                 meta.updated_at = updated_at;
                 meta.delete_at_height = new_dah;
                 meta.unmined_since = new_unmined;
                 meta.block_entry_count = new_count;
-                meta.block_entries_inline[cached_count as usize] = new_entry;
-                io::write_metadata_direct(self.device_ptr, record_offset, &meta);
-            }
+                meta.block_entries_inline[0] = new_entry;
+                // SAFETY: `device_ptr` is non-null (fast-path gate) and live
+                // for the engine's lifetime; `record_offset` is
+                // allocator-valid. The caller holds this record's stripe
+                // lock; `write_metadata_direct` takes the per-offset
+                // `io_locks()` write side for torn-read-safe publication.
+                unsafe {
+                    io::write_metadata_direct(self.device_ptr, record_offset, &meta);
+                }
 
-            // Sync all cached fields to index
-            let dah_or_preserve = if has_preserve {
-                entry.dah_or_preserve
-            } else {
-                new_dah
-            };
-            let mut sync_tf = tf;
-            if has_preserve {
-                sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
-            }
-            self.index
-                .write()
-                .update_cached_fields(
+                // Sync all cached fields to index from the post-state.
+                let dah_or_preserve = if has_preserve { preserve } else { new_dah };
+                let mut sync_tf = tf;
+                if has_preserve {
+                    sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
+                }
+                self.index
+                    .write()
+                    .update_cached_fields(
+                        tx_key,
+                        sync_tf.bits(),
+                        new_count,
+                        meta_spent,
+                        dah_or_preserve,
+                        new_unmined,
+                        generation,
+                    )
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("index update_cached_fields failed: {e}"),
+                    })?;
+
+                // Update secondary indexes with two-phase durability.
+                // Batched into a single redo fsync when both change.
+                self.update_both_secondary_indexes(
                     tx_key,
-                    sync_tf.bits(),
-                    new_count,
-                    entry.spent_utxos,
-                    dah_or_preserve,
+                    old_dah,
+                    new_dah,
+                    old_unmined,
                     new_unmined,
+                )?;
+
+                return Ok(SetMinedResponse {
+                    signal,
+                    block_ids: vec![req.block_id],
                     generation,
-                )
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("index update_cached_fields failed: {e}"),
-                })?;
-
-            // Update secondary indexes with two-phase durability. Batched
-            // into a single redo fsync when both change.
-            self.update_both_secondary_indexes(tx_key, old_dah, new_dah, old_unmined, new_unmined)?;
-
-            return Ok(SetMinedResponse {
-                signal,
-                block_ids: vec![req.block_id],
-                generation,
-            });
+                });
+            }
         }
 
         // ---------------------------------------------------------------
@@ -2335,6 +2435,11 @@ impl Engine {
         // Targeted mined footer when direct, full write otherwise.
         // The on-device metadata is the primary durable source of truth.
         if !self.device_ptr.is_null() {
+            // SAFETY: `device_ptr` is non-null (checked above) and live for
+            // the engine's lifetime; `record_offset` is allocator-valid. The
+            // set_mined slow path holds this record's stripe lock;
+            // `write_metadata_direct` takes the per-offset `io_locks()` write
+            // side for torn-read-safe publication.
             unsafe { io::write_metadata_direct(self.device_ptr, record_offset, &metadata) };
         } else {
             self.write_metadata_fast(record_offset, &metadata)?;
@@ -3512,8 +3617,12 @@ impl Engine {
 
             children.push(child_txid);
             if children.len() > u8::MAX as usize {
-                return Err(SpendError::StorageError {
-                    detail: "conflicting children limit exceeded".into(),
+                // KO-5: the on-device count is a single `u8`; the 256th child
+                // cannot be recorded. Surface a distinct, typed overflow so
+                // the best-effort wrapper can escalate + count the loss
+                // instead of swallowing a generic I/O error into a warn.
+                return Err(SpendError::ConflictingChildrenFull {
+                    cap: u8::MAX as usize,
                 });
             }
 
@@ -3743,14 +3852,47 @@ impl Engine {
         source: &'static str,
     ) {
         if let Err(err) = self.append_conflicting_child(parent_key, child_txid) {
-            tracing::warn!(
-                ?parent_key,
-                ?child_txid,
-                ?err,
-                source,
-                "failed to append conflicting child"
-            );
+            if let SpendError::ConflictingChildrenFull { cap } = err {
+                // KO-5: capacity overflow is a correctness-relevant loss (a
+                // counter-conflicting descendant is dropped from the parent's
+                // cascade list), not a transient I/O hiccup. Record it on an
+                // engine counter and escalate to ERROR so it is observable
+                // rather than vanishing into a warn-level ops-log Easter egg.
+                self.conflicting_children_dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    target: "teraslab::engine::conflicting",
+                    overflow = true,
+                    cap,
+                    ?parent_key,
+                    ?child_txid,
+                    source,
+                    "conflicting-children list full; child dropped — counter-conflicting cascade truncated"
+                );
+            } else {
+                tracing::warn!(
+                    ?parent_key,
+                    ?child_txid,
+                    ?err,
+                    source,
+                    "failed to append conflicting child"
+                );
+            }
         }
+    }
+
+    /// KO-5: number of conflicting-child appends that have been dropped
+    /// because the parent record's on-disk children list was already at the
+    /// `u8::MAX` (255) capacity.
+    ///
+    /// A non-zero value means at least one counter-conflicting cascade was
+    /// truncated server-side: the dropped child txid is NOT present in the
+    /// parent's `CONFLICTING_CHILDREN` field, so a client relying on that
+    /// field to enumerate descendants will miss it. Operators should alert
+    /// on any increase. Monotonic for the lifetime of the engine.
+    pub fn conflicting_children_dropped(&self) -> u64 {
+        self.conflicting_children_dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // -----------------------------------------------------------------------
@@ -4092,15 +4234,42 @@ impl Engine {
             .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
-        // Fast path: DAH evaluation from cached fields, no metadata read.
+        // Fast path: read the authoritative on-device metadata once and
+        // derive every flag/DAH/counter/generation input from it. The RMW
+        // already needs this read for the CRC, so it is free.
+        //
+        // KO-11: pre-fix this path sourced `tf`, `has_preserve`, `old_dah`,
+        // the `evaluate_dah_cached` inputs, AND `generation` from the cached
+        // `entry`. After a prior mutation that wrote metadata but failed at
+        // `sync_index_cache`, those cached fields are stale — the device had
+        // already advanced. Using stale `old_dah`/flags here would compute a
+        // wrong DAH-index delta and stamp a mis-flagged post-state. F-G2-011
+        // had fixed only `generation` in the set_mined path; this brings the
+        // set_conflicting path fully onto fresh `meta`.
         let response = if !self.device_ptr.is_null() {
-            let mut tf = TxFlags::from_bits_truncate(entry.tx_flags);
-            let has_preserve = tf.contains(TxFlags::HAS_PRESERVE_UNTIL);
-            let old_dah = if has_preserve {
-                0
-            } else {
-                entry.dah_or_preserve
+            // SAFETY: `device_ptr` is non-null (fast-path gate) and live for
+            // the engine's lifetime; `ro` is the allocator-valid record
+            // offset from the index entry. The set_conflicting caller holds
+            // this record's stripe lock; `read_metadata_direct` takes the
+            // per-offset `io_locks()` read side, so the read is
+            // torn-read-safe.
+            let mut meta = unsafe {
+                io::read_metadata_direct(self.device_ptr, ro).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("{e}"),
+                    }
+                })?
             };
+
+            let mut tf = meta.flags;
+            let preserve = { meta.preserve_until };
+            let has_preserve = preserve != 0;
+            let meta_dah = { meta.delete_at_height };
+            let old_dah = if has_preserve { 0 } else { meta_dah };
+            let meta_spent = { meta.spent_utxos };
+            let meta_utxo_count = { meta.utxo_count };
+            let meta_block_count = { meta.block_entry_count };
+            let meta_unmined = { meta.unmined_since };
 
             if req.value {
                 tf.insert(TxFlags::CONFLICTING);
@@ -4110,12 +4279,12 @@ impl Engine {
 
             let (signal, dah_patch) = crate::ops::delete_eval::evaluate_dah_cached(
                 tf,
-                entry.spent_utxos,
-                entry.utxo_count,
-                entry.block_entry_count,
-                entry.unmined_since,
+                meta_spent,
+                meta_utxo_count,
+                meta_block_count,
+                meta_unmined,
                 has_preserve,
-                entry.dah_or_preserve,
+                if has_preserve { preserve } else { meta_dah },
                 req.current_block_height,
                 req.block_height_retention,
             )?;
@@ -4125,31 +4294,27 @@ impl Engine {
                 new_dah = patch.new_delete_at_height;
             }
 
-            // Generation is cached in the index — zero device reads.
-            let generation = entry.generation.wrapping_add(1);
+            // Generation derives from the on-device value, not the cache.
+            let generation = { meta.generation }.wrapping_add(1);
             let updated_at = self.now_millis();
 
             // Read-modify-write so CRC is computed over the complete
             // post-state. One mmap memcpy for the 320-byte header.
+            meta.flags = tf;
+            meta.generation = generation;
+            meta.updated_at = updated_at;
+            meta.delete_at_height = new_dah;
+            // SAFETY: `device_ptr` is non-null (fast-path gate) and live for
+            // the engine's lifetime; `ro` is allocator-valid. The caller
+            // holds this record's stripe lock; `write_metadata_direct` takes
+            // the per-offset `io_locks()` write side for torn-read-safe
+            // publication.
             unsafe {
-                let mut meta = io::read_metadata_direct(self.device_ptr, ro).map_err(|e| {
-                    SpendError::StorageError {
-                        detail: format!("{e}"),
-                    }
-                })?;
-                meta.flags = tf;
-                meta.generation = generation;
-                meta.updated_at = updated_at;
-                meta.delete_at_height = new_dah;
                 io::write_metadata_direct(self.device_ptr, ro, &meta);
             }
 
-            // Sync index cache
-            let dah_or_preserve = if has_preserve {
-                entry.dah_or_preserve
-            } else {
-                new_dah
-            };
+            // Sync index cache from the post-state.
+            let dah_or_preserve = if has_preserve { preserve } else { new_dah };
             let mut sync_tf = tf;
             if has_preserve {
                 sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
@@ -4159,10 +4324,10 @@ impl Engine {
                 .update_cached_fields(
                     &req.tx_key,
                     sync_tf.bits(),
-                    entry.block_entry_count,
-                    entry.spent_utxos,
+                    meta_block_count,
+                    meta_spent,
                     dah_or_preserve,
-                    entry.unmined_since,
+                    meta_unmined,
                     generation,
                 )
                 .map_err(|e| SpendError::StorageError {
@@ -4319,6 +4484,14 @@ impl Engine {
 
             // Read-modify-write so CRC is computed over the complete
             // post-state. One mmap memcpy for the 320-byte header.
+            //
+            // SAFETY: `device_ptr` is non-null (fast-path gate) and live for
+            // the engine's lifetime; `ro` is the allocator-valid record
+            // offset. `set_locked_with_before_image` holds this record's
+            // stripe lock (`self.locks.lock(&req.tx_key)` at the top). Both
+            // `read_metadata_direct` and `write_metadata_direct` take the
+            // per-offset `io_locks()` read/write side, so the RMW is
+            // torn-read-safe against concurrent direct accessors.
             unsafe {
                 let mut meta = io::read_metadata_direct(self.device_ptr, ro).map_err(|e| {
                     SpendError::StorageError {
@@ -4597,6 +4770,20 @@ impl Engine {
     /// key. Even if the ordering ever regresses, `read_metadata_for_key`
     /// verifies `meta.tx_id == key.txid` and surfaces a mismatch as
     /// `TxNotFound`.
+    ///
+    /// # External blob reclamation is DEFERRED (IJ-LOW)
+    ///
+    /// For an `EXTERNAL`-flagged record, this method frees only the on-device
+    /// inline record (metadata footer + slots) and removes the index entries.
+    /// It does NOT synchronously unlink the external cold-data blob. The blob
+    /// is reclaimed asynchronously by the periodic blob-GC sweep (R-049 /
+    /// F-G9-004), which unlinks blobs that are no longer referenced by any
+    /// index entry and are older than the GC grace window (and not currently
+    /// pinned by an in-flight create). Callers MUST NOT assume the blob bytes
+    /// are gone the instant `delete` returns; between the delete and the next
+    /// sweep the blob remains on the blob store (orphaned but harmless — no
+    /// index entry references it). This keeps the delete hot path off the
+    /// blob-store I/O path and lets the sweep batch unlinks.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
@@ -5221,6 +5408,12 @@ impl<'a> ValidatedSpend<'a> {
         // 9. Write metadata (targeted spend footer when direct, full otherwise).
         // R-004: propagate the write error.
         if !engine.device_ptr.is_null() {
+            // SAFETY: `engine.device_ptr` is non-null (checked above) and
+            // live for the engine's lifetime; `record_offset` is
+            // allocator-valid. This spend `apply` still holds the record's
+            // stripe lock (`_guard`, captured at prepare time);
+            // `write_metadata_direct` takes the per-offset `io_locks()` write
+            // side for torn-read-safe publication.
             unsafe { io::write_metadata_direct(engine.device_ptr, record_offset, &metadata) };
         } else {
             engine.write_metadata_fast(record_offset, &metadata)?;
@@ -7767,6 +7960,153 @@ mod tests {
         assert!(at_new.contains(&h.key));
     }
 
+    /// KO-11 regression (set_conflicting fast path): when the cached index
+    /// entry is stale relative to the on-device metadata, the fast path must
+    /// derive `old_dah` / preserve / flags from the FRESH `meta`, never from
+    /// the stale cache.
+    ///
+    /// Repro: the on-device record is PRESERVED (`preserve_until` set, so its
+    /// DAH is necessarily 0), but the index cache lies — it shows a non-zero
+    /// `dah_or_preserve` interpreted as a DAH (no `HAS_PRESERVE_UNTIL`), as
+    /// would happen after a prior mutation wrote metadata but failed at
+    /// `sync_index_cache`. Pre-fix, set_conflicting read `has_preserve=false`
+    /// and `old_dah=1288` from the cache and re-synced the cache to a bogus
+    /// DAH of 1288 — resurrecting a deletable-looking record that is actually
+    /// preserved. Post-fix it reads `preserve_until` from `meta`, keeps the
+    /// DAH cleared, and re-syncs the cache to `dah_or_preserve=5000` with the
+    /// `HAS_PRESERVE_UNTIL` discriminant.
+    #[test]
+    fn set_conflicting_fast_path_uses_fresh_meta_not_stale_cache() {
+        // On-device record is preserved until height 5000 (DAH must be 0).
+        let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
+            m.preserve_until = 5000;
+            m.delete_at_height = 0;
+        });
+
+        // Poison the cache: pretend a prior failed `sync_index_cache` left a
+        // stale DAH (1288) with NO preserve discriminant, while the device
+        // sits at preserve_until=5000.
+        {
+            let mut idx = h.engine.index.write();
+            let updated = idx
+                .update_cached_fields(
+                    &h.key,
+                    TxFlags::empty().bits(), // no HAS_PRESERVE_UNTIL
+                    0,                        // block_entry_count
+                    0,                        // spent_utxos
+                    1288,                     // stale dah_or_preserve (as DAH)
+                    0,                        // unmined_since
+                    0,                        // generation
+                )
+                .unwrap();
+            assert!(updated, "cache poison must hit the entry");
+        }
+
+        let req = SetConflictingRequest {
+            tx_key: h.key,
+            value: true,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        h.engine.set_conflicting(&req).unwrap();
+
+        // Device DAH must remain 0 (record is preserved).
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!(
+            { meta.delete_at_height },
+            0,
+            "preserved record must not gain a DAH",
+        );
+        assert_eq!({ meta.preserve_until }, 5000, "preserve must survive");
+
+        // Cache must now reflect the device truth: preserve discriminant set,
+        // dah_or_preserve == preserve_until (5000) — NOT the stale 1288.
+        let entry = h.engine.index.read().lookup(&h.key).unwrap();
+        assert_eq!(
+            entry.dah_or_preserve, 5000,
+            "cache must resync to preserve_until from fresh meta, not the stale DAH",
+        );
+        assert!(
+            TxFlags::from_bits_truncate(entry.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL),
+            "cache must carry the HAS_PRESERVE_UNTIL discriminant from fresh meta",
+        );
+
+        // The DAH secondary index must hold no entry for a preserved record.
+        let dah = h.engine.dah_index();
+        assert!(
+            !dah.range_query(u32::MAX).contains(&h.key),
+            "preserved record must not leak a DAH-index entry",
+        );
+    }
+
+    /// KO-11 regression (set_mined fast path): identical stale-cache hazard.
+    /// The first-ever setMined fast path must take `old_dah` / preserve /
+    /// flags / counters from the fresh `meta`, not the cached entry. F-G2-011
+    /// had fixed only `generation`; this asserts the DAH/preserve fields too.
+    #[test]
+    fn set_mined_fast_path_uses_fresh_meta_not_stale_cache() {
+        // Preserved, unmined record (no block entries yet → fast path).
+        let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
+            m.preserve_until = 5000;
+            m.delete_at_height = 0;
+            m.block_entry_count = 0;
+        });
+
+        // Poison cache: stale DAH 1288, no preserve discriminant.
+        {
+            let mut idx = h.engine.index.write();
+            idx.update_cached_fields(
+                &h.key,
+                TxFlags::empty().bits(),
+                0,
+                0,
+                1288,
+                0,
+                0,
+            )
+            .unwrap();
+        }
+
+        let req = SetMinedRequest {
+            tx_key: h.key,
+            block_id: 7,
+            block_height: 900,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let resp = h.engine.set_mined(&req).unwrap();
+        assert_eq!(resp.block_ids, vec![7]);
+
+        // Preserved record keeps DAH == 0.
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!(
+            { meta.delete_at_height },
+            0,
+            "preserved record must not gain a DAH on setMined",
+        );
+        assert_eq!({ meta.preserve_until }, 5000);
+        assert_eq!({ meta.block_entry_count }, 1, "block entry must be recorded");
+
+        let entry = h.engine.index.read().lookup(&h.key).unwrap();
+        assert_eq!(
+            entry.dah_or_preserve, 5000,
+            "cache must resync to preserve_until from fresh meta, not the stale DAH",
+        );
+        assert!(
+            TxFlags::from_bits_truncate(entry.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL),
+            "cache must carry HAS_PRESERVE_UNTIL from fresh meta",
+        );
+
+        let dah = h.engine.dah_index();
+        assert!(
+            !dah.range_query(u32::MAX).contains(&h.key),
+            "preserved record must not leak a DAH-index entry on setMined",
+        );
+    }
+
     // -- Concurrency additional tests --
 
     #[test]
@@ -7967,6 +8307,79 @@ mod tests {
         let meta = h.engine.read_metadata(&h.key).unwrap();
         assert_eq!({ meta.conflicting_children_count }, 3);
         assert_ne!({ meta.conflicting_children_offset }, 0);
+    }
+
+    /// KO-5 regression: the conflicting-children list is capped at the
+    /// on-disk `u8::MAX` (255) count. The 256th distinct child MUST NOT be
+    /// silently dropped while reporting success.
+    ///
+    /// Two guarantees are asserted:
+    ///  1. The direct, fallible entry point `append_conflicting_child`
+    ///     returns the typed [`SpendError::ConflictingChildrenFull`] for the
+    ///     256th child (pre-fix it returned an opaque `StorageError`; the
+    ///     real hazard was the best-effort wrapper swallowing it).
+    ///  2. The best-effort propagation wrapper does not let the loss vanish:
+    ///     it increments the observable
+    ///     [`Engine::conflicting_children_dropped`] counter (pre-fix the
+    ///     drop was invisible — a `tracing::warn!` only).
+    #[test]
+    fn append_conflicting_child_overflow_is_not_silent() {
+        let h = TestHarness::new(1, TxFlags::empty());
+
+        // Fill the list to the u8 capacity (255 distinct children).
+        for i in 0..255u32 {
+            let mut child = [0u8; 32];
+            child[0..4].copy_from_slice(&i.to_le_bytes());
+            // Disambiguate beyond the first 4 bytes so no two collide.
+            child[4] = 0x5A;
+            h.engine
+                .append_conflicting_child(&h.key, child)
+                .expect("first 255 children must append successfully");
+        }
+
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!(
+            { meta.conflicting_children_count },
+            255,
+            "list must be exactly at capacity before the overflowing append",
+        );
+
+        // Child #256 — direct path must surface the typed overflow, not OK
+        // and not an opaque StorageError.
+        let mut child_256 = [0u8; 32];
+        child_256[0] = 0xFF;
+        child_256[1] = 0xEE;
+        let err = h
+            .engine
+            .append_conflicting_child(&h.key, child_256)
+            .expect_err("the 256th child must NOT silently succeed");
+        assert!(
+            matches!(err, SpendError::ConflictingChildrenFull { cap } if cap == 255),
+            "256th child must yield ConflictingChildrenFull, got {err:?}",
+        );
+
+        // The on-disk list must still hold exactly 255 (the overflow did not
+        // corrupt the count).
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!(
+            { meta.conflicting_children_count },
+            255,
+            "overflowing append must leave the on-disk count at capacity",
+        );
+
+        // Best-effort path: the drop must be observable on the counter.
+        assert_eq!(
+            h.engine.conflicting_children_dropped(),
+            0,
+            "no drop counted before the best-effort overflow",
+        );
+        h.engine
+            .append_conflicting_child_best_effort(&h.key, child_256, "test");
+        assert_eq!(
+            h.engine.conflicting_children_dropped(),
+            1,
+            "best-effort overflow must increment the dropped counter, not vanish into a warn",
+        );
     }
 
     /// R-143 regression: `append_conflicting_child` must not hold the parent

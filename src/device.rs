@@ -532,15 +532,25 @@ pub struct MemoryDevice {
     durable_shadow: Option<parking_lot::Mutex<Box<[u8]>>>,
 }
 
-// Safety: MemoryDevice owns the heap allocation pointed to by `raw_ptr`
+// SAFETY (C-6): MemoryDevice owns the heap allocation pointed to by `raw_ptr`
 // exclusively (the Box was consumed via `into_raw` and the pointer is
 // reconstituted only in Drop). The pre-F-G1-004 double-alias between an
-// `RwLock<Vec<u8>>` and `raw_ptr` is gone, so the single owning
-// provenance can be Send/Sync-shared safely; concurrent same-range
-// `pread`/`pwrite` is the caller's responsibility (Engine stripe locks),
-// and the direct-pointer path in `crate::io` uses atomic chunked
-// transfer (F-G1-003) for the writer-vs-reader race the CRC originally
-// guarded against.
+// `RwLock<Vec<u8>>` and `raw_ptr` is gone, so the single owning provenance
+// can be Send/Sync-shared safely.
+//
+// Concurrency on the bytes is the caller's responsibility, but — correcting
+// the earlier note — it is NOT the engine's `StripedLocks` that makes the
+// raw-pointer path safe. Raw `as_raw_ptr` access flows through the
+// `crate::io` `*_direct` helpers, which serialize per record offset via
+// `io::io_locks()` (a process-global `StripedRwLocks`): readers take its
+// read side, writers its write side. That per-offset RW discipline — plus
+// the chunked atomic transfer in `crate::io` (F-G1-003) — is what closes the
+// writer-vs-reader torn-read race the CRC originally (insufficiently)
+// guarded. The engine stripe locks serialize logical record mutations but
+// do NOT cover the read path or the replica-receiver path, so they cannot be
+// cited as the byte-level safety mechanism here. The plain `pread`/`pwrite`
+// API (non-direct) likewise relies on the caller not issuing overlapping
+// same-range writes.
 unsafe impl Send for MemoryDevice {}
 unsafe impl Sync for MemoryDevice {}
 

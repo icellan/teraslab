@@ -7751,6 +7751,12 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
         // response collapse counts it as a skipped (not deleted) candidate
         // rather than a real failure.
         SpendError::NotDue => (ERR_NOT_DUE, vec![]),
+        // KO-5: never reaches the wire in practice — `ConflictingChildrenFull`
+        // is produced only inside `append_conflicting_child`, whose sole
+        // callers are the best-effort propagation wrapper (which counts +
+        // logs the loss and returns OK) and tests. This arm exists so the
+        // match stays exhaustive; bucketed with the storage/integrity errors.
+        SpendError::ConflictingChildrenFull { .. } => (ERR_STORAGE_IO, vec![]),
     };
     BatchItemError {
         item_index,
@@ -7793,6 +7799,9 @@ pub(crate) fn classify_spend_error(err: &SpendError) -> crate::metrics::Outcome 
         // F-IJ-001: a missing external blob is a storage-integrity failure
         // (the bytes are gone), bucketed with the other storage errors.
         | SpendError::BlobNotFound { .. }
+        // KO-5: conflicting-children capacity overflow — a storage-shaped
+        // integrity loss (the on-disk list cannot hold the child).
+        | SpendError::ConflictingChildrenFull { .. }
         | SpendError::ReassignOverflow { .. } => Outcome::ErrStorage,
         SpendError::CoinbaseImmature { .. }
         | SpendError::UtxoNotFound { .. }

@@ -208,4 +208,28 @@ pub enum SpendError {
     /// unconditional per spec §3.18.
     #[error("NOT_DUE: record no longer due for sweep deletion (preserved or state changed)")]
     NotDue,
+
+    /// KO-5: a parent record's conflicting-children list is already at the
+    /// on-disk capacity (`u8::MAX` = 255 txids) and cannot accept another
+    /// child. The on-device metadata stores the child count in a single
+    /// `u8` ([`crate::record::TxMetadata::conflicting_children_count`]), so
+    /// 255 is a hard structural limit, not a tunable.
+    ///
+    /// Pre-fix this surfaced as a generic [`SpendError::StorageError`] that
+    /// the best-effort propagation wrapper swallowed into a `tracing::warn!`,
+    /// so the 256th conflicting child of a parent was dropped while the
+    /// triggering `set_conflicting` / create still returned OK — a silent
+    /// truncation of the Go client's counter-conflicting cascade.
+    ///
+    /// It is now a distinct variant so (a) direct callers of
+    /// [`crate::ops::engine::Engine::append_conflicting_child`] see the
+    /// overflow rather than an opaque I/O error, and (b) the best-effort
+    /// wrapper escalates it to a `tracing::error!` and bumps an engine
+    /// counter ([`crate::ops::engine::Engine::conflicting_children_dropped`])
+    /// so the loss is observable instead of invisible.
+    #[error("CONFLICTING_CHILDREN_FULL: parent list at capacity ({cap}), child dropped")]
+    ConflictingChildrenFull {
+        /// The capacity that was hit (the on-disk `u8` count maximum, 255).
+        cap: usize,
+    },
 }
