@@ -106,7 +106,14 @@ pub fn evaluate_delete_at_height(
 
     let spent_utxos = { metadata.spent_utxos };
     let utxo_count = { metadata.utxo_count };
-    let all_spent = spent_utxos == utxo_count;
+    // LP-3: a reassigned record is never treated as all-spent, mirroring the
+    // Lua reference's `recordUtxos + 1` (teranode.lua:945) which permanently
+    // keeps the all-spent check false so the court-ordered reassignment audit
+    // trail is retained forever. The CONFLICTING branch above is unaffected
+    // (the Lua `+1` only touches the all-spent computation), so a reassigned
+    // record later marked conflicting still gets DAH'd.
+    let all_spent =
+        spent_utxos == utxo_count && !metadata.flags.contains(TxFlags::REASSIGNED);
     let has_blocks = metadata.block_entry_count > 0;
     let on_longest_chain = { metadata.unmined_since } == 0;
     let was_all_spent = metadata.flags.contains(TxFlags::LAST_SPENT_ALL);
@@ -241,7 +248,10 @@ pub fn evaluate_dah_cached(
         return Ok((Signal::None, None));
     }
 
-    let all_spent = spent_utxos == utxo_count;
+    // LP-3: reassigned records are never all-spent (see
+    // `evaluate_delete_at_height`). The discriminant rides in `tx_flags`,
+    // synced from metadata by `sync_index_cache`.
+    let all_spent = spent_utxos == utxo_count && !tx_flags.contains(TxFlags::REASSIGNED);
     let has_blocks = block_entry_count > 0;
     let on_longest_chain = unmined_since == 0;
     let was_all_spent = tx_flags.contains(TxFlags::LAST_SPENT_ALL);
@@ -447,6 +457,54 @@ mod tests {
         assert_eq!(sig, Signal::DeleteAtHeightUnset);
         let p = patch.unwrap();
         assert_eq!(p.new_delete_at_height, 0);
+    }
+
+    #[test]
+    fn lp3_reassigned_record_not_all_spent_no_dah() {
+        // All slots SPENT, mined, on longest chain — but REASSIGNED set, so
+        // the all-spent check is forced false and no DAH is set (LP-3 /
+        // Lua recordUtxos+1).
+        let m = with_blocks(make_meta(
+            10,
+            10,
+            TxFlags::REASSIGNED,
+        ));
+        let (sig, patch) = evaluate_delete_at_height(&m, 1000, 288).expect("no overflow");
+        // Not all-spent (reassigned) and no DAH was set → no signal, no patch.
+        assert_eq!(sig, Signal::None);
+        assert!(
+            patch.is_none(),
+            "reassigned record must not be DAH'd (LP-3); got {patch:?}"
+        );
+    }
+
+    #[test]
+    fn lp3_reassigned_conflicting_still_dahd() {
+        // The Lua `recordUtxos + 1` only affects the all-spent computation;
+        // a reassigned record later marked conflicting still gets DAH'd.
+        let m = make_meta(10, 5, TxFlags::REASSIGNED | TxFlags::CONFLICTING);
+        let (_sig, patch) = evaluate_delete_at_height(&m, 100, 288).expect("no overflow");
+        let p = patch.expect("conflicting reassigned record must still be DAH'd");
+        assert_eq!(p.new_delete_at_height, 388);
+    }
+
+    #[test]
+    fn lp3_reassigned_cached_path_not_all_spent() {
+        // Same exclusion on the cached-fields fast path.
+        let (sig, patch) = evaluate_dah_cached(
+            TxFlags::REASSIGNED,
+            10,
+            10,
+            1,
+            0,
+            false,
+            0,
+            1000,
+            288,
+        )
+        .expect("no overflow");
+        assert_eq!(sig, Signal::None);
+        assert!(patch.is_none(), "cached path must also exclude reassigned");
     }
 
     #[test]

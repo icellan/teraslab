@@ -319,6 +319,7 @@ fn drive_workload(engine: &Engine) {
     engine
         .delete(&DeleteRequest {
             tx_key: TxKey { txid: mktx(2) },
+            due_guard: None,
         })
         .unwrap();
 

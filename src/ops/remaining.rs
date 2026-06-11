@@ -104,6 +104,19 @@ pub struct PreserveUntilResponse {
 #[derive(Debug, Clone)]
 pub struct DeleteRequest {
     pub tx_key: TxKey,
+    /// KO-3 (TOCTOU guard). When `None` (the direct client `OP_DELETE_BATCH`
+    /// path) the delete is unconditional, matching spec §3.18. When
+    /// `Some(current_block_height)` (the DAH sweep path) the engine
+    /// re-validates the delete predicate under the per-tx stripe lock
+    /// immediately before tombstoning — `preserve_until == 0`,
+    /// `delete_at_height` set and `<= current_block_height`, and the record
+    /// still satisfies the DAH-set predicate (CONFLICTING, or
+    /// all-spent ∧ on-longest-chain). If a concurrent `PreserveUntilBatch`
+    /// or state change has invalidated that predicate since the sweep's
+    /// lock-free re-validation, the delete is skipped with
+    /// [`crate::ops::error::SpendError::NotDue`] instead of silently dropping
+    /// a freshly-preserved record.
+    pub due_guard: Option<u32>,
 }
 
 // -- GetSpend --

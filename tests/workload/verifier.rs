@@ -415,7 +415,7 @@ impl StateVerifier {
             }
 
             WorkloadOp::Delete { tx_key } => {
-                let req = DeleteRequest { tx_key: *tx_key };
+                let req = DeleteRequest { tx_key: *tx_key, due_guard: None };
 
                 engine
                     .delete(&req)

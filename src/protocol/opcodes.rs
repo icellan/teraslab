@@ -381,6 +381,17 @@ pub const ERR_STREAM_INVARIANT: u16 = 34;
 /// observability and reorg-storm detection).
 pub const ERR_DELETED_CHILDREN: u16 = 35;
 
+/// KO-3 — a guarded DAH-sweep delete re-validated the record under the
+/// per-tx stripe lock and found it no longer due (a concurrent
+/// `PreserveUntilBatch` set/extended `preserve_until`, or the record's
+/// spent/longest-chain state regressed since the sweep's lock-free
+/// re-validation). The record is intentionally KEPT, not deleted; the
+/// pruner counts it as a skipped candidate rather than a deletion. Only
+/// ever produced by the internal sweep path
+/// (`OP_PROCESS_EXPIRED_PRESERVATIONS`); a direct client `OP_DELETE_BATCH`
+/// is unconditional and never returns this code.
+pub const ERR_NOT_DUE: u16 = 36;
+
 /// P3.10 / F-G5-017 — wire protocol revision.
 ///
 /// `1` is the historical implicit version: legacy clients and servers do

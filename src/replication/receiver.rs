@@ -1083,7 +1083,7 @@ fn apply_create_replica(
         Err(CreateError::DuplicateTxId)
             if existing_create_payload_matches(engine, create_req, metadata_bytes.len() >= 46) => {}
         Err(CreateError::DuplicateTxId) => {
-            match engine.delete(&DeleteRequest { tx_key: *tx_key }) {
+            match engine.delete(&DeleteRequest { tx_key: *tx_key, due_guard: None }) {
                 Ok(()) | Err(crate::ops::error::SpendError::TxNotFound) => {}
                 Err(e) => return Err(format!("replace duplicate create delete: {e}")),
             }
@@ -1696,7 +1696,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             apply_create_replica(engine, tx_key, &create_req, metadata_bytes, cold_data)
         }
         ReplicaOp::Delete { tx_key } => {
-            let req = DeleteRequest { tx_key: *tx_key };
+            let req = DeleteRequest { tx_key: *tx_key, due_guard: None };
             match engine.delete(&req) {
                 Ok(()) => Ok(()),
                 Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),

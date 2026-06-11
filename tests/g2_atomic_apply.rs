@@ -237,6 +237,7 @@ fn run_one_race_round(engine: &Arc<Engine>, tx_id: [u8; 32], iteration: u32) -> 
     engine
         .delete(&teraslab::ops::remaining::DeleteRequest {
             tx_key: TxKey::from_bytes(tx_id),
+            due_guard: None,
         })
         .expect("delete must succeed");
 

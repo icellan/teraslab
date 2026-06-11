@@ -143,6 +143,64 @@ impl UtxoSlot {
         }
     }
 
+    /// Create a frozen UTXO slot that preserves a reassignment cooldown (LP-4).
+    ///
+    /// The frozen state is carried by the `status` byte (`UTXO_FROZEN`), which
+    /// is the authoritative frozen signal everywhere in the engine
+    /// ([`Self::is_frozen`] checks `status`, and the spend path matches the
+    /// `UTXO_FROZEN` status arm). The reassignment cooldown
+    /// (`block_height + spendable_after`, spec §2.4) normally lives in
+    /// `spending_data[0..4]` of an *unspent* slot; a plain
+    /// [`Self::new_frozen`] overwrites those 4 bytes with the all-`0xFF`
+    /// marker, silently erasing the cooldown so a later `unfreeze` makes the
+    /// court-ordered reassigned output immediately spendable — bypassing the
+    /// safety window.
+    ///
+    /// This constructor keeps the 4-byte cooldown in `spending_data[0..4]` and
+    /// fills the remaining 32 bytes with the frozen marker, so the cooldown
+    /// survives a freeze/unfreeze round-trip. When `cooldown == 0` the result
+    /// is byte-identical to [`Self::new_frozen`].
+    pub fn new_frozen_with_cooldown(hash: [u8; 32], cooldown: u32) -> Self {
+        let mut spending_data = [FROZEN_BYTE; 36];
+        spending_data[0..4].copy_from_slice(&cooldown.to_le_bytes());
+        Self {
+            hash,
+            status: UTXO_FROZEN,
+            spending_data,
+        }
+    }
+
+    /// Create an unspent UTXO slot carrying a reassignment cooldown (LP-4).
+    ///
+    /// `spending_data[0..4]` encodes the cooldown height (0 = immediately
+    /// spendable); the remaining 32 bytes are zeroed. This is the inverse of
+    /// [`Self::new_frozen_with_cooldown`] used by `unfreeze` to restore the
+    /// cooldown that a freeze cycle would otherwise have wiped. When
+    /// `cooldown == 0` the result is byte-identical to [`Self::new_unspent`].
+    pub fn new_unspent_with_cooldown(hash: [u8; 32], cooldown: u32) -> Self {
+        let mut spending_data = [0u8; 36];
+        spending_data[0..4].copy_from_slice(&cooldown.to_le_bytes());
+        Self {
+            hash,
+            status: UTXO_UNSPENT,
+            spending_data,
+        }
+    }
+
+    /// Extract the reassignment cooldown height from a slot's `spending_data`.
+    ///
+    /// Reads `spending_data[0..4]` as a little-endian `u32`. For an unspent
+    /// slot this is the spendable-at height (0 = immediately spendable); for a
+    /// frozen slot written by [`Self::new_frozen_with_cooldown`] it is the
+    /// preserved cooldown (and `0xFFFF_FFFF` for a legacy all-`0xFF` frozen
+    /// slot that carried no cooldown — treated as "no cooldown to restore" by
+    /// `unfreeze`).
+    pub fn reassignment_cooldown(&self) -> u32 {
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(&self.spending_data[0..4]);
+        u32::from_le_bytes(buf)
+    }
+
     /// Create a new spent UTXO slot with the given hash and spending data.
     ///
     /// `spending_data` must be exactly 36 bytes: txid(32) + vin(4 LE).
@@ -358,6 +416,22 @@ bitflags! {
         /// When set in `TxIndexEntry.tx_flags`, the `dah_or_preserve` field
         /// holds `preserve_until` instead of `delete_at_height`.
         const HAS_PRESERVE_UNTIL = 0b0010_0000;
+        /// Bit 6 — write-once-ish, set by `reassign` on first reassignment
+        /// (LP-3). Persisted to device metadata.
+        ///
+        /// Mirrors the Aerospike Lua `reassign` which inflates
+        /// `recordUtxos` by 1 (`teranode.lua:945`) so the all-spent check
+        /// (`spent_utxos == utxo_count`) can never become true on a
+        /// reassigned record — keeping the court-ordered reassignment's
+        /// audit trail (old hash → new hash) on the store permanently.
+        /// TeraSlab cannot fabricate a phantom UTXO slot, so it carries the
+        /// "this record has been reassigned" fact in this flag instead and
+        /// excludes such records from the all-spent DAH path in
+        /// `evaluate_delete_at_height`. The CONFLICTING DAH branch is
+        /// unaffected (the Lua `+1` only touches the all-spent computation),
+        /// so a reassigned record that is later marked conflicting still
+        /// gets DAH'd, matching the reference.
+        const REASSIGNED = 0b0100_0000;
     }
 }
 

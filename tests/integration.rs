@@ -596,7 +596,7 @@ fn full_lifecycle_single_tx() {
     assert_eq!(meta.block_entry_count, 1);
 
     // Delete
-    engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+    engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
     assert!(engine.lookup(&key).is_none());
 }
 
@@ -681,7 +681,7 @@ fn engine_lifecycle_for_backend(mode: IndexBackendMode) {
     );
 
     // Delete.
-    engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+    engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
     assert!(engine.lookup(&key).is_none(), "deleted on {mode:?}");
     assert!(
         engine.read_metadata(&key).is_err(),
@@ -1396,7 +1396,7 @@ fn delete_cleans_secondary_indexes() {
     // Should be in unmined index (created without block info)
     assert!(!engine.unmined_index().range_query(u32::MAX).is_empty());
 
-    engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+    engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
 
     // Secondary indexes should be clean
     assert!(engine.unmined_index().range_query(u32::MAX).is_empty());

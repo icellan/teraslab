@@ -176,4 +176,19 @@ pub enum SpendError {
         /// The slot offset the request targeted.
         offset: u32,
     },
+
+    /// KO-3: a guarded sweep delete ([`crate::ops::engine::Engine::delete`]
+    /// with `DeleteRequest::due_guard == Some(height)`) re-validated the
+    /// record under the per-tx stripe lock and found it no longer due:
+    /// either a `preserve_until` was set or pushed past the height between
+    /// the sweep's lock-free re-validation and the actual delete, or the
+    /// `delete_at_height` is now unset / in the future, or the record's
+    /// spent/longest-chain state regressed. This is NOT an error toward the
+    /// pruner — it means a concurrent preservation (or state change) won the
+    /// race and the record must be kept. The DAH sweep treats it as a
+    /// skipped (not-deleted) candidate. Never returned for an unguarded
+    /// client `OP_DELETE_BATCH` (`due_guard == None`), which stays
+    /// unconditional per spec §3.18.
+    #[error("NOT_DUE: record no longer due for sweep deletion (preserved or state changed)")]
+    NotDue,
 }
