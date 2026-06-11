@@ -750,7 +750,6 @@ fn simulation_combined_faults() {
             crash_probability: 0.005,
             io_error_probability: 0.002,
             seed: seed + 300,
-            ..SimulationConfig::default()
         });
         assert!(
             !result.data_loss_detected,

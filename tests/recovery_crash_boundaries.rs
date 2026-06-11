@@ -655,7 +655,7 @@ fn inline_block_ids(meta: &TxMetadata) -> Vec<u32> {
     (0..inline)
         .map(|i| {
             let e = { meta.block_entries_inline[i] };
-            { e.block_id }
+            e.block_id
         })
         .collect()
 }

@@ -7211,8 +7211,11 @@ mod tests {
 
     #[test]
     fn stale_migration_failure_does_not_clear_new_epoch_state() {
+        // A real membership change (node 3 replaces node 1) is needed to move
+        // shards: compute_with_epoch sorts members internally (F-01), so a
+        // mere permutation of the same set yields an identical table.
         let old_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(1)], 2, 2);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 2);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 old_table.target_assignment(s).master != new_table.target_assignment(s).master
