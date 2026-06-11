@@ -1556,7 +1556,7 @@ mod tests {
     /// build modes: in debug the drop panics (caught by `catch_unwind`)
     /// after the increment; in release it just runs. The counter is
     /// process-wide and monotonic, so we assert a relative increase
-    /// (`>= before + 1`) to stay robust against other tests dropping
+    /// (`> before`) to stay robust against other tests dropping
     /// unstamped tokens concurrently.
     #[test]
     fn footer_pending_crc_drop_increments_release_counter() {
