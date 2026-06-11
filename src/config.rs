@@ -629,15 +629,13 @@ pub struct ServerConfig {
     /// When `true`, refuse to start in multi-node configurations
     /// (`node_id > 0` OR `replication_factor > 1`) without a `cluster_secret`.
     ///
-    /// Default is `false` (matches the trusted-overlay deployment model
-    /// documented in `docs/DEPLOYMENT_ASSUMPTIONS.md`): a missing secret
-    /// triggers a prominent boot-time `tracing::warn!` instead of a hard
-    /// refuse, so demo / single-host clusters spin up without ceremony but
-    /// operators always see the warning.
-    ///
-    /// Operators that need a hard-mode (production) start with no fallback
-    /// can flip this to `true` via TOML or `--strict-auth` on the daemon
-    /// CLI. See F-X-001.
+    /// Default is `true` (production-safe, per F-X-002): a clustered config
+    /// with a missing secret is a hard refuse at startup, not a warning.
+    /// Operators who want the older trusted-overlay behavior (a missing
+    /// secret triggers a boot-time `tracing::warn!` instead of refusing, so
+    /// demo / single-host clusters spin up without ceremony) can opt out by
+    /// setting `strict_auth = false` in TOML. See F-X-001 / F-X-002 and
+    /// `docs/DEPLOYMENT_ASSUMPTIONS.md`.
     pub strict_auth: bool,
 
     /// Maximum concurrent migration threads per topology change.

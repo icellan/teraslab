@@ -12,22 +12,22 @@ TeraSlab pre-allocates UTXO slots at full size during creation and mutates them 
 
 | Property | Value |
 |----------|-------|
-| Logical spend payload | 41 bytes per slot (1-byte status + 36-byte spending data + 4-byte slot CRC) + 256-byte metadata update |
+| Logical spend payload | 41 bytes per slot (1-byte status + 36-byte spending data + 4-byte slot CRC) + 320-byte metadata update |
 | Slot total size on disk | 73 bytes (32-byte hash + slot payload + CRC) |
 | On-device write size | One device sector per touched slot, one per metadata block. On `MemoryDevice` this is the exact byte range; on `DirectDevice` with `O_DIRECT` it amplifies to 4096-byte sectors. |
 | p99.9 latency target | Low (no copy-on-write, no defrag spikes) — not yet measured on production hardware |
 | Replication bandwidth | ~120 MB/s target (operation-based, not full-record) |
-| Memory per record | 72 bytes in-memory (hash table bucket) or ~0 with on-disk redb backend |
+| Memory per record | 64-byte hash-table bucket (one cache line) in-memory — effective bytes/record is 64 ÷ load factor; or ~0 with on-disk redb backend |
 
 ### Performance methodology
 
 The published benchmarks (`benches/`) all run against `MemoryDevice` (anonymous `mmap`). They measure the in-memory throughput ceiling — useful for catching algorithmic regressions, but **not** representative of production deployment on NVMe + `O_DIRECT` + redo-log durability. NVMe bench results, fault-injection numbers, and tail-latency histograms on a real device are tracked as outstanding work; the README will be updated to cite them when they exist. Until then, treat any throughput figure as "MemoryDevice ceiling, no fsync."
 
-The `io_uring` backend in `src/device_io/` is scaffolding only and is NOT wired into the production write path today; every device write goes through the synchronous `pwrite` fallback at queue-depth-1.
+The production write path is synchronous `O_DIRECT` I/O via `src/device.rs` (`DirectDevice`), at queue-depth-1. There is no async/io_uring backend: the earlier `src/device_io/` scaffolding (a `DeviceIo` trait plus io_uring/sync fallback backends, never wired into any caller) was deleted on 2026-05-28.
 
 ## Status
 
-**Pre-production.** All 14 build phases (0–13) are implemented; phases 1–7, 12, 13 are fully shipped, while phases 0, 8–11 are partial — production code paths work but specific telemetry / lifecycle / scale-up follow-ups remain. Each `phases/NN_*.md` carries its own `Status:` header.
+**Pre-production.** All 14 build phases (0–13) are implemented; phases 1–10, 12, 13 are shipped, while phases 0 and 11 are partial — production code paths work but specific follow-ups remain (phase 0: the standalone `SPEC_VALIDATION_REPORT.md` was folded into the per-phase docs; phase 11: the separate-NVMe middle tier is intentionally not enabled). Each `phases/NN_*.md` carries its own `Status:` header.
 
 | Probe | Result |
 |-------|-------:|
@@ -83,11 +83,17 @@ cargo clippy --all -- -D warnings
 ```
 
 This starts TeraSlab with all defaults:
-- **TCP wire protocol** on `0.0.0.0:3300`
-- **HTTP observability** on `0.0.0.0:9100`
+- **TCP wire protocol** on `127.0.0.1:3300` (loopback only by default)
+- **HTTP observability** on `127.0.0.1:9100` (loopback only by default)
 - Data file: `teraslab-data.dat` (1 GiB, created if missing)
 - Index: in-memory (snapshot: `teraslab-index.snap`). See [Index backends](#index-backends) for the on-disk alternative.
 - Single-node mode (no clustering)
+
+> **Loopback by default.** Both listeners default to `127.0.0.1`, so a remote Teranode
+> client cannot connect to a no-config server. To accept remote connections you must both
+> bind a non-loopback address (e.g. `0.0.0.0:3300`) **and** set `enable_remote_bind = true`
+> — the server refuses to start on a non-loopback bind without it (`ConfigError::RemoteBindRefused`).
+> See the [full configuration reference](#full-configuration-reference) and [security knobs](#security-and-access-control).
 
 ### Configuration file
 
@@ -101,6 +107,7 @@ All settings have sensible defaults. Only specify what you want to override.
 
 ```toml
 listen_addr = "0.0.0.0:3300"
+enable_remote_bind = true  # required for any non-loopback bind — only safe on a private network
 # Use stable paths — /dev/nvme* numbers can change on reboot
 device_paths = ["/dev/disk/by-id/nvme-Samsung_990_PRO_S73WNJ0X123456-part1"]
 device_size = 107374182400  # 100 GiB (ignored for raw block devices; actual size is queried)
@@ -111,6 +118,7 @@ expected_records = 50000000
 
 ```toml
 listen_addr = "0.0.0.0:3300"
+enable_remote_bind = true  # required for any non-loopback bind — only safe on a private network
 device_paths = ["/dev/disk/by-id/nvme-Samsung_990_PRO_S73WNJ0X123456-part1"]
 device_size = 107374182400  # 100 GiB
 
@@ -128,10 +136,24 @@ This uses the redb on-disk index, keeping RAM usage under 512 MiB regardless of 
 
 ```toml
 # --- Network ---
-listen_addr = "0.0.0.0:3300"       # TCP binary protocol
-http_listen_addr = "0.0.0.0:9100"  # HTTP observability endpoints
+# Defaults are loopback (127.0.0.1:3300 / 127.0.0.1:9100). Binding any
+# non-loopback address requires enable_remote_bind = true or the server
+# refuses to start (ConfigError::RemoteBindRefused). See "Security and
+# access control" below.
+listen_addr = "0.0.0.0:3300"       # TCP binary protocol (default 127.0.0.1:3300)
+http_listen_addr = "0.0.0.0:9100"  # HTTP observability endpoints (default 127.0.0.1:9100)
+enable_remote_bind = true          # default false; must be true for any non-loopback bind above
 max_connections = 1024              # Max concurrent TCP connections
+max_connections_per_ip = 64         # Per-source-IP connection cap (NAT'd client fleets share one)
 max_batch_size = 8192               # Max items per batch request
+
+# --- Security and access control (all default to off/unset) ---
+enable_admin_endpoints = false      # mount the gated /debug/* and /admin/* HTTP routes + admin opcodes
+admin_token = ""                    # required when enable_admin_endpoints = true; bearer token for every gated request
+                                    # (overridable via the TERASLAB_ADMIN_TOKEN env var)
+strict_auth = true                  # default true: refuse to start a clustered config (node_id > 0 OR
+                                    # replication_factor > 1) without a cluster_secret
+max_inflight_request_bytes = 268435456  # 256 MiB aggregate in-flight request memory; exhaustion → ERR_RATE_LIMITED (31)
 
 # --- Storage ---
 # Both raw block devices and regular file paths are supported.
@@ -162,10 +184,12 @@ redb_cache_size = 268435456               # redb page cache in bytes (256 MiB de
 lock_stripes = 65536                  # Per-transaction lock stripes (power of 2)
 
 # --- Pruning ---
-block_height_retention = 288          # Blocks to retain unmined transactions
+block_height_retention = 288          # Blocks to retain fully-spent mined records before DAH deletion
+                                      # (reorg-safety window). Unmined txs are governed separately by the
+                                      # client-supplied OP_QUERY_OLD_UNMINED cutoff, not by this knob.
 
 # --- Cold data ---
-blobstore_path = "/blobstore"         # Directory for large transaction blobs (>1 MiB)
+blobstore_path = "./teraslab-blobstore" # Directory for large transaction blobs (cold data >8 KiB serialized)
 
 # --- Cluster (set node_id > 0 to enable) ---
 node_id = 0                           # 0 = single-node mode
@@ -179,21 +203,62 @@ cluster_secret = ""                   # Shared secret for HMAC-SHA256 SWIM + int
 max_migration_threads = 16            # Max concurrent migration threads per topology change
 
 # --- Replication durability ---
-ack_policy = "auto"                   # "auto", "write_all", "write_majority", or "best_effort"
+ack_policy = "auto"                   # "auto", "write_all", "write_majority", or "best_effort".
+                                      # "best_effort" is rejected at startup when replication_factor > 1.
 replication_timeout_ms = 3000         # Timeout for each replication batch ACK
-replication_degraded_mode = "reject"  # "reject" or "best_effort" when ack policy fails
+replication_degraded_mode = "reject"  # "reject" or "best_effort" when ack policy fails.
+                                      # "best_effort" is rejected at startup when replication_factor > 1
+                                      # (acknowledged writes could be lost if the master crashes before
+                                      # replicas catch up), so status 5 (DEGRADED_DURABILITY) is only
+                                      # reachable with RF = 1 — see the response-status table below.
 
 # --- Migration performance ---
 migration_pool_size = 128             # Parallel TCP connections per migration target
 migration_batch_size = 500            # Records per baseline streaming batch
 replica_lag_check_interval_secs = 30  # Interval between replica lag checks (0 to disable)
+replica_lag_warn_threshold_ops = 10000 # Replica lag (ops) that degrades /health/ready
+
+# --- Cluster identity / device pinning (optional) ---
+# cluster_id   = "..."   # 32 hex chars (16 bytes); pins cluster membership
+# device_id    = "..."   # 32 hex chars; startup refuses if the device's stored id mismatches
+# advertise_addr = "..." # address peers should dial if different from listen_addr
 ```
+
+### Security and access control
+
+Several knobs gate whether the server starts at all and whether the admin surface exists. All default to the safe (closed) setting:
+
+| Knob | Default | Effect |
+|------|---------|--------|
+| `enable_remote_bind` | `false` | Required to bind any non-loopback `listen_addr` / `http_listen_addr`. Without it a non-loopback bind fails at startup (`ConfigError::RemoteBindRefused`). Only safe on a trusted private network. |
+| `enable_admin_endpoints` | `false` | Mounts the gated `/debug/*` and `/admin/*` HTTP routes and the admin opcodes. When `false`, those routes return 404. |
+| `admin_token` | unset | Bearer token required on every gated HTTP request when `enable_admin_endpoints = true` (the config is rejected if the endpoints are enabled without a token). Settable via TOML or the `TERASLAB_ADMIN_TOKEN` env var. When both `enable_admin_endpoints` and `enable_remote_bind` are on, a minimum token length is enforced. |
+| `strict_auth` | `true` | Refuses to start a clustered config (`node_id > 0` OR `replication_factor > 1`) without a `cluster_secret`. |
+| `cluster_secret` | unset | Shared secret for HMAC-SHA256 SWIM + inter-node TCP auth. Required under `strict_auth` for clustered configs. With a secret set, the cluster-authority opcodes (including 104 `AdminDiagnoseKey` and 106 `AdminClusterHealth`) require HMAC-signed frames; unsigned clients get `CLUSTER_AUTH_FAILED` (27). |
+| `max_connections_per_ip` | `64` | Per-source-IP connection cap. A NAT'd client fleet sharing one source IP hits this. |
+| `max_inflight_request_bytes` | `256 MiB` | Aggregate in-flight request memory budget; exhaustion returns `RATE_LIMITED` (31). |
+
+Other operationally significant knobs (all read, mostly with safe defaults): `max_stream_total_bytes`
+(4 GiB per-connection streaming cap; env `TERASLAB_MAX_STREAM_TOTAL_BYTES`),
+`replica_lag_warn_threshold_ops` (10000 — replica lag past this degrades `/health/ready`),
+`device_id` / `cluster_id` (32-hex-char identifiers; a pinned `device_id` mismatch refuses startup),
+`advertise_addr`, `blob_gc_interval_secs`, the `checkpoint_high_water` / `checkpoint_low_water` /
+`checkpoint_poll_interval_ms` watermarks, and the `[observability]` block. Most migration/observability
+knobs accept a `TERASLAB_*` environment override.
+
+#### Wire-protocol size caps
+
+The wire protocol enforces fixed caps (`src/protocol/opcodes.rs`): max frame 16 MiB
+(`MAX_FRAME_SIZE`), max cold data per create item 4 MiB (`MAX_COLD_DATA_PER_ITEM`), max UTXO
+hashes per create item 131072, max parent txids per create item 65536. Oversize requests are
+rejected with `PAYLOAD_MALFORMED` (28).
 
 ### Cluster deployment (3 nodes, RF=2)
 
 Node 1:
 ```toml
 listen_addr = "0.0.0.0:3300"
+enable_remote_bind = true  # required for the non-loopback bind — only safe on a private network
 node_id = 1
 swim_port = 3301
 cluster_secret = "change-me-shared-cluster-secret"  # required: strict_auth (default on) rejects clustered configs without one
@@ -206,6 +271,7 @@ device_size = 107374182400
 Node 2:
 ```toml
 listen_addr = "0.0.0.0:3300"
+enable_remote_bind = true  # required for the non-loopback bind — only safe on a private network
 node_id = 2
 swim_port = 3301
 cluster_secret = "change-me-shared-cluster-secret"  # required: strict_auth (default on) rejects clustered configs without one
@@ -218,6 +284,7 @@ device_size = 107374182400
 Node 3:
 ```toml
 listen_addr = "0.0.0.0:3300"
+enable_remote_bind = true  # required for the non-loopback bind — only safe on a private network
 node_id = 3
 swim_port = 3301
 cluster_secret = "change-me-shared-cluster-secret"  # required: strict_auth (default on) rejects clustered configs without one
@@ -316,9 +383,9 @@ All operations are batch-oriented. Single-item operations are batches of size 1.
 | 101 | `Health` | Health check |
 | 102 | `Ping` | Latency measurement |
 | 103 | `GetCommittedTopology` | Fetch the latest quorum-committed topology |
-| 104 | `AdminDiagnoseKey` | Diagnose per-key routing and local shard state |
+| 104 | `AdminDiagnoseKey` | Diagnose per-key routing and local shard state. **Cluster-authority opcode:** when a `cluster_secret` is configured, requires an HMAC-signed frame; unsigned clients get `CLUSTER_AUTH_FAILED` (27). |
 | 105 | `PartitionVersionReport` | Inter-node shard version report after topology commit |
-| 106 | `AdminClusterHealth` | Cluster readiness snapshot for clients/tests |
+| 106 | `AdminClusterHealth` | Cluster readiness snapshot for clients/tests. **Cluster-authority opcode:** when a `cluster_secret` is configured, requires an HMAC-signed frame; unsigned clients get `CLUSTER_AUTH_FAILED` (27). |
 | 107 | `Hello` | Protocol-version handshake; empty request, response is the server's 2-byte LE protocol version (pre-v2 servers reject with `OPCODE_UNSUPPORTED` or `INTERNAL`) |
 
 **Inter-node replication, migration, and topology:**
@@ -345,14 +412,14 @@ All operations are batch-oriented. Single-item operations are batches of size 1.
 | 3 | `ALREADY_SPENT` | UTXO is already spent (error data: 36-byte existing spending data) |
 | 4 | `ALREADY_FROZEN` | UTXO is already frozen |
 | 5 | `UTXO_NOT_FROZEN` | Expected frozen UTXO but it is not frozen |
-| 6 | `INVALID_SPEND` | Spending data targets a deleted/pruned UTXO |
+| 6 | `INVALID_SPEND` | Spending data targets a deleted/pruned UTXO (error data: 36-byte stored spending data) |
 | 7 | `FROZEN` | Cannot spend a frozen UTXO |
 | 8 | `CONFLICTING` | Transaction is marked conflicting |
 | 9 | `LOCKED` | Transaction is locked |
 | 10 | `COINBASE_IMMATURE` | Coinbase UTXO not yet spendable (error data: 4-byte required height) |
 | 11 | `VOUT_OUT_OF_RANGE` | UTXO index exceeds slot count |
 | 12 | `ALREADY_EXISTS` | Duplicate transaction creation |
-| 13 | `FROZEN_UNTIL` | Reassignment cooldown not met |
+| 13 | `FROZEN_UNTIL` | Reassignment cooldown not met (error data: 4-byte spendable-at height) |
 | 14 | `REDIRECT` | Shard owned by another node (payload contains target address) |
 | 15 | `NO_QUORUM` | Cluster quorum not met, mutations rejected |
 | 16 | `STREAM_NOT_FOUND` | Blob stream not found for this txid on this connection |
@@ -386,11 +453,20 @@ All operations are batch-oriented. Single-item operations are batches of size 1.
 | 2 | `NOT_FOUND` | Requested object was not found |
 | 3 | `REDIRECT` | Retry against the shard owner in the payload |
 | 4 | `PARTIAL_ERROR` | Batch partially succeeded; per-item errors are encoded in the payload |
-| 5 | `DEGRADED_DURABILITY` | Local mutation succeeded, but best-effort replication did not satisfy the configured ACK policy |
+| 5 | `DEGRADED_DURABILITY` | Local mutation succeeded, but best-effort replication did not satisfy the configured ACK policy. Only reachable with `replication_factor = 1` and a best-effort mode — startup rejects best-effort when RF > 1, so a validated multi-replica config never emits this status. |
 
 ## HTTP observability
 
-The HTTP server (default port 9100) exposes health checks, Prometheus metrics, and debug endpoints.
+The HTTP server (default `127.0.0.1:9100`) exposes health checks, Prometheus metrics, and debug endpoints.
+
+> **Only five routes are public:** `/metrics`, `/health/live`, `/health/ready`, `/status`, and the
+> `/ui/*` assets. **Every `/debug/*`, `/admin/*`, and `/ws/top` route below is gated** — it is mounted
+> only when `enable_admin_endpoints = true` **and** a non-empty `admin_token` is configured, and every
+> request to a gated route must carry `Authorization: Bearer <admin_token>`. With the defaults
+> (`enable_admin_endpoints = false`), the gated routes return **404**. Set the token in TOML
+> (`admin_token = "..."`) or via the `TERASLAB_ADMIN_TOKEN` env var; the `teraslab-cli`'s `--admin-token`
+> flag supplies it for CLI commands that hit gated endpoints. The `curl` examples below omit the
+> `Authorization` header for brevity — add `-H "Authorization: Bearer $TOKEN"` to each gated call.
 
 ### Health checks
 
@@ -412,7 +488,7 @@ Exports counters for every operation type:
 - `teraslab_spends_attempted_total`, `teraslab_spends_succeeded_total`, `teraslab_spends_failed_total`
 - Same pattern for `unspends`, `creates`, `set_mined`, `freezes`, `gets`, etc.
 
-### Debug endpoints
+### Debug endpoints (gated — requires `enable_admin_endpoints` + bearer `admin_token`)
 
 ```bash
 # Index statistics (load factor, entry count, capacity)
@@ -439,7 +515,7 @@ curl -X PUT http://localhost:9100/debug/log-level -d 'DEBUG'
 curl http://localhost:9100/status
 ```
 
-### Admin endpoints
+### Admin endpoints (gated — requires `enable_admin_endpoints` + bearer `admin_token`)
 
 ```bash
 # Shard migration status
@@ -470,7 +546,7 @@ curl -X PUT http://localhost:9100/admin/drain/2
 curl -X PUT http://localhost:9100/admin/rebalance
 ```
 
-### WebSocket
+### WebSocket (gated — requires `enable_admin_endpoints` + bearer `admin_token`)
 
 ```bash
 # Real-time metrics push (updates every second)
@@ -494,22 +570,22 @@ client, err := teraslab.New(ctx, teraslab.ClientConfig{
 defer client.Close()
 
 // Create a transaction with 3 UTXOs
-err = client.CreateBatch(ctx, []teraslab.CreateItem{{
-    TxID:         txid,
-    TxVersion:    1,
-    Fee:          500,
-    SizeInBytes:  225,
-    UTXOHashes:   [][32]byte{hash0, hash1, hash2},
-    BlockHeight:  800000,
+res, err := client.CreateBatch(ctx, []teraslab.CreateItem{{
+    TxID:        txid,
+    TxVersion:   1,
+    Fee:         500,
+    SizeInBytes: 225,
+    UtxoHashes:  []teraslab.UtxoHash{hash0, hash1, hash2},
+    BlockHeight: 800000,
 }})
 
-// Spend a UTXO
-results, err := client.SpendBatch(ctx, []teraslab.SpendItem{{
+// Spend a UTXO — params come first, then the items
+results, err := client.SpendBatch(ctx, teraslab.SpendBatchParams{CurrentBlockHeight: 800001}, []teraslab.SpendItem{{
     TxID:         txid,
     Vout:         0,
-    UTXOHash:     hash0,
+    UtxoHash:     hash0,
     SpendingData: spendingData, // 36 bytes: spending txid + vout
-}}, teraslab.SpendParams{CurrentBlockHeight: 800001})
+}})
 ```
 
 Full documentation in [`client/go/README.md`](client/go/README.md).
@@ -519,8 +595,8 @@ Full documentation in [`client/go/README.md`](client/go/README.md).
 ```rust
 use teraslab_client::{Client, ClientConfig};
 
-let client = Client::connect(ClientConfig {
-    addr: "localhost:3300".to_string(),
+let client = Client::new(ClientConfig {
+    addr: Some("localhost:3300".to_string()),
     ..Default::default()
 }).await?;
 
@@ -567,17 +643,17 @@ When the shard table changes (node join/leave), data migrates automatically:
 Each transaction occupies a contiguous region on the block device:
 
 ```
-[TxMetadata: 256 bytes][UtxoSlot 0: 73 bytes][UtxoSlot 1: 73 bytes]...[UtxoSlot N-1: 73 bytes]
+[TxMetadata: 320 bytes][UtxoSlot 0: 73 bytes][UtxoSlot 1: 73 bytes]...[UtxoSlot N-1: 73 bytes]
 ```
 
-**TxMetadata** (256 bytes, padded for alignment) contains: txid, version, locktime, fee, size, extended size, flags (conflicting, locked, external, coinbase, last_spent_all), block entries (up to 3 inline, overflow stored separately), spending height, creation timestamp, generation counter, update timestamp, unmined_since, delete_at_height, preserve_until, reassignment tracking, external storage reference, and conflicting children tracking.
+**TxMetadata** (320 bytes, compile-asserted, 64-byte aligned) contains: txid, version, locktime, fee, size, extended size, flags (conflicting, locked, external, coinbase, last_spent_all), block entries (up to 3 inline, overflow stored separately), spending height, creation timestamp, generation counter, update timestamp, unmined_since, delete_at_height, preserve_until, reassignment tracking, external storage reference, conflicting children tracking, and a trailing CRC32 over the whole header.
 
-**UtxoSlot** (73 bytes each): 32-byte hash, 1-byte status (unspent/spent/frozen/pruned), 36-byte spending data (spending txid + vout), 4-byte CRC32 (torn-write protection per slot — BC-02 / F-X-007). Slots are pre-allocated at full size during creation. A spend writes the 41-byte status+spending+CRC region in place, plus updates the 256-byte metadata (generation, counters, timestamps). On `DirectDevice` (`O_DIRECT`), each in-place write amplifies to the device's sector size (4096 bytes on most NVMe drives).
+**UtxoSlot** (73 bytes each): 32-byte hash, 1-byte status (unspent/spent/frozen/pruned), 36-byte spending data (spending txid + vout), 4-byte CRC32 (torn-write protection per slot — BC-02 / F-X-007). Slots are pre-allocated at full size during creation. A spend writes the 41-byte status+spending+CRC region in place, plus updates the 320-byte metadata (generation, counters, timestamps). On `DirectDevice` (`O_DIRECT`), each in-place write amplifies to the device's sector size (4096 bytes on most NVMe drives).
 
 ### Tiered storage
 
 - **Hot path** (NVMe): Metadata + UTXO slots. All spend/setMined/freeze operations touch only this tier.
-- **Cold data** (filesystem blob store): Transaction inputs, outputs, and inpoints. Stored inline if <8 KiB, otherwise in the external blob store. The earlier separate-device middle tier is not enabled because current metadata has no durable offset/length fields for it.
+- **Cold data** (filesystem blob store): Transaction inputs, outputs, and inpoints. Stored inline if the serialized cold data is ≤ 8 KiB (8192 bytes, inclusive), otherwise in the external blob store. The earlier separate-device middle tier is not enabled because current metadata has no durable offset/length fields for it.
 
 ### Crash recovery
 
@@ -586,15 +662,15 @@ A write-ahead redo log records all mutations. On crash recovery:
 2. Replay all entries after the checkpoint (operations are idempotent)
 3. Resume normal operation
 
-The redo log is a fixed-size circular buffer on a separate device file.
+The redo log is a fixed-size **linear** log on a separate device file (not a circular buffer): `write_pos` advances monotonically and never wraps in place. When the log fills before the next checkpoint, appends return `RedoError::LogFull` and writers stall until the periodic checkpoint task snapshots engine state and resets `write_pos` back to the start. Size `redo_log_size` so the log holds the mutations produced between checkpoints under peak load.
 
 ## Index backends
 
-TeraSlab supports two index backends for the primary index and secondary indexes (DAH, unmined). The backend is selected at startup via configuration and cannot be changed at runtime.
+TeraSlab supports three index backends for the primary index and secondary indexes (DAH, unmined): `memory` (default), `redb`, and `file_backed`. The backend is selected at startup via configuration and cannot be changed at runtime. The two documented, supported backends are `memory` and `redb`; `file_backed` (`backend = "file_backed"`) is also accepted — it uses a memory-mapped persistent primary index with in-memory secondaries and redo-based crash recovery — but it is not the recommended path and is excluded from the index export/import tooling (its secondaries can only be rebuilt from a device scan).
 
 ### In-memory (default)
 
-The default backend stores the index in a Robin Hood hash table backed by anonymous `mmap`. This is the fastest option, targeting the 10M+ ops/sec design ceiling on `MemoryDevice` (not yet measured on NVMe — see [Performance methodology](#performance-methodology)). It requires approximately **72 bytes per record** of RAM. For 100M records, this means ~7.2 GB of RAM for the index alone.
+The default backend stores the index in a Robin Hood hash table backed by anonymous `mmap`. This is the fastest option, targeting the 10M+ ops/sec design ceiling on `MemoryDevice` (not yet measured on NVMe — see [Performance methodology](#performance-methodology)). Each entry occupies a **64-byte hash-table bucket** (one cache line, compile-asserted). The table is sized for a 0.7 target load factor and rounded up to a power-of-two capacity, so effective RAM per record is 64 ÷ load factor (≥ ~91 bytes/record, higher right after a power-of-two resize). For 100M records, budget on the order of 9-18 GB of RAM for the index alone depending on where the count falls relative to the next power of two.
 
 On clean shutdown the index is snapshotted to `index_snapshot_path` and restored on next startup. On crash, the index is rebuilt from the device scan + redo log replay.
 
@@ -633,7 +709,7 @@ redb_cache_size = 268435456  # 256 MiB (default)
 | | In-memory | redb |
 |--|-----------|------|
 | **Throughput** | 10M+ ops/sec target on `MemoryDevice`; lower on NVMe (not yet measured) | ~100K-500K ops/sec (I/O bound) |
-| **RAM per 10M records** | ~720 MB | ~256 MB (page cache only) |
+| **RAM per 10M records** | ~0.9-1.2 GB (64-byte buckets at 0.7 load factor, power-of-two capacity) | ~256 MB (page cache only) |
 | **Crash recovery** | Rebuild from device + redo replay | Instant (already on disk) |
 | **Startup time** | Seconds (snapshot restore) to minutes (full rebuild) | Instant (open existing files) |
 | **Snapshot needed** | Yes (`index_snapshot_path`) | No (crash-durable by default) |
@@ -659,13 +735,22 @@ teraslab-cli import-index --config /etc/teraslab/server-redb.toml --input /tmp/i
 
 The export format is the same binary snapshot format used for in-memory index persistence, making it backend-agnostic. For the memory backend, export reads the on-disk index snapshot (shut the server down cleanly first so it is current) and import persists the result back to `index_snapshot_path`. The `file_backed` backend is not supported (its secondaries can only be rebuilt from a device scan).
 
+If an `import-index` is interrupted mid-write, it leaves an import-in-progress sentinel and the **next server startup deliberately refuses to start** (rather than open a partially-imported redb file) until the sentinel is cleaned up; the startup error includes the remediation steps.
+
 ## Admin CLI
 
 The `teraslab-cli` binary provides operator commands that consume the HTTP observability endpoints and binary wire protocol. Supports both table-formatted and JSON output.
 
 ```bash
-./target/release/teraslab-cli --addr localhost:9100 <command>
+# --addr must include the scheme (it is used as-is to build request URLs); default is http://localhost:9100
+./target/release/teraslab-cli --addr http://localhost:9100 <command>
 ```
+
+Commands that hit gated `/debug/*` or `/admin/*` endpoints (e.g. `nodes`, `memory`, `records`,
+`record`, `index`, `replication`, `redo`, `rebalance`, `drain`, `log-level`, `top`) require the
+server to have `enable_admin_endpoints = true` and an `admin_token`; pass the matching token with
+`--admin-token <token>` (or `TERASLAB_ADMIN_TOKEN`). Only `status`, `healthcheck`, and `bench`
+(against the public surface) work without it.
 
 Available commands:
 
@@ -696,13 +781,12 @@ teraslab/
 │   ├── bin/server.rs         Server binary entry point
 │   ├── bin/cli.rs            Admin CLI binary
 │   ├── config.rs             Configuration (TOML)
-│   ├── device.rs             Block device abstraction (MemoryDevice, DirectDevice)
-│   ├── device_io/            I/O backend scaffolding (sync fallback; io_uring not production-wired)
+│   ├── device.rs             Block device abstraction (MemoryDevice, DirectDevice; synchronous O_DIRECT)
 │   ├── record.rs             On-disk record types (TxMetadata, UtxoSlot)
 │   ├── allocator.rs          Freelist-based slot allocator
-│   ├── index/                Primary + secondary indexes (in-memory and redb on-disk backends)
+│   ├── index/                Primary + secondary indexes (in-memory, redb, and file_backed backends)
 │   ├── locks.rs              Striped per-transaction locking
-│   ├── redo.rs               Write-ahead redo log (circular buffer)
+│   ├── redo.rs               Write-ahead redo log (fixed-size linear log with checkpoint reset)
 │   ├── recovery.rs           Crash recovery replay
 │   ├── io.rs                 Aligned I/O utilities
 │   ├── metrics.rs            Operation counters and latency histograms

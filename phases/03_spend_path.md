@@ -1,6 +1,6 @@
 # Phase 3: The spend path
 
-**Status:** shipped — `src/ops/spend.rs`, `src/ops/unspend.rs`, `src/locks.rs` (striped per-record locking) in main; io_uring backend lives behind a `pub(crate)` boundary as scaffolding (see Phase 10 / `src/device_io/`).
+**Status:** shipped — `src/ops/spend.rs`, `src/ops/unspend.rs`, `src/locks.rs` (striped per-record locking) in main; device I/O is synchronous `O_DIRECT` via `src/device.rs` (the `src/device_io/` io_uring scaffolding was deleted 2026-05-28, never having been wired into any caller).
 
 ## Goal
 

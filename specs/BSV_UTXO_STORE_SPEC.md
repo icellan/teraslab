@@ -45,7 +45,7 @@ The original implementation uses a forked general-purpose database server (branc
 | Latency p99 | Baseline | Sub-10ms |
 | Latency p99.9 | Baseline | 2-5x better |
 | SSD wear per spend | Full record rewrite | 69 bytes (10-50x reduction) |
-| Memory per index entry | 64 bytes (red-black tree) | ~16 bytes (hash table) |
+| Memory per index entry | 64 bytes (red-black tree) | 64-byte hash-table bucket (one cache line), as implemented in `src/index/hashtable.rs` — the original ~16-byte estimate predates the current bucket layout |
 | Replication bandwidth (RF=2 at 10M TPS) | N/A (legacy backend can't sustain 10M) | ~400 MB/s |
 | Dataset scale | Billions of UTXO records | 10-100 billion UTXO records |
 | Largest single transaction | 320 MB | 320 MB (blob store) |
@@ -448,7 +448,7 @@ Operations return signals that drive follow-up actions:
 5. Per-UTXO validation:
    - Slot at offset must exist → `UTXO_NOT_FOUND`
    - Hash must match (native `memcmp`, not Lua byte-by-byte) → `UTXO_HASH_MISMATCH`
-   - If status == `0x00` and `u32_from_le(spending_data[0..4]) != 0` and `u32_from_le(spending_data[0..4]) >= current_block_height` → `FROZEN_UNTIL`
+   - If status == `0x00` and `u32_from_le(spending_data[0..4]) != 0` and `u32_from_le(spending_data[0..4]) > current_block_height` → `FROZEN_UNTIL` (the UTXO is spendable exactly AT the unlock height; the comparator is `>`, **not** `>=`, matching `teranode.lua:373` and Teranode PR #949. The implementation in `engine.rs` uses `>` deliberately; an earlier draft of this rule said `>=`, which false-rejected at the exact unlock height — do not "fix" the code back to `>=`.) This cooldown check is scoped to unspent (`0x00`) slots only.
    - If status == `PRUNED` (0x02) → `INVALID_SPEND` (child tx was pruned, UTXO is permanently consumed)
    - If already spent (status == 0x01):
      - Same spending data → idempotent success
@@ -470,11 +470,24 @@ Operations return signals that drive follow-up actions:
 
 **For `spendMulti`**: Batch all slot reads as parallel io_uring SQEs → validate all in-memory → batch all writes as parallel SQEs → single counter update.
 
-**Response:**
-- `status: OK | ERROR`
-- `errors: Map<idx, {error_code, message, spending_data?}>` — per-item errors
-- `block_ids: Vec<u32>` — current block IDs
-- `signal: Option<Signal>` — ALLSPENT/NOTALLSPENT/DAHSET/DAHUNSET
+**Response (wire contract):**
+- `status: OK | PARTIAL_ERROR | ERROR`
+- `errors: Map<idx, {error_code, message, spending_data?}>` — per-item errors (sparse, sorted by index)
+
+> **Decision (LP-5 — signals and `childCount` / `block_ids` are server-internal, NOT on the wire).**
+> The legacy Lua `spend`/`spendMulti`/`setMined`/`setConflicting`/`preserveUntil` responses carry
+> `signal` (ALLSPENT/NOTALLSPENT/DAHSET/DAHUNSET/PRESERVE), `childCount`, and `block_ids` so the
+> *Aerospike Go client* can drive follow-up actions (set/clear DAH on the external `.tx` blob, fan
+> out to pagination child records, evict the tx-meta cache). In TeraSlab **every one of those
+> consumers is internalized**: pagination records do not exist (so `childCount` is meaningless — see
+> §2.2), the blob store is server-side with its own GC, and parent-prune / DAH transitions are
+> performed inside the engine during the same op. The engine still *computes* the signal internally
+> to drive that work, but the dispatcher does **not** serialize `signal`, `childCount`, or `block_ids`
+> into mutation responses. Mutation responses are therefore status + per-item errors only. This is the
+> authoritative contract; the earlier `block_ids` / `signal` response fields above are retained for
+> historical reference only and are NOT emitted. (If a future client genuinely needs post-op block
+> IDs, use a follow-up `GetBatch` with the block-entry field mask rather than reviving the spend/
+> setMined response fields.)
 
 **Atomicity**: All spends to the same txid are atomic (single lock held).
 **Idempotency**: Spending with identical spending_data is a no-op (detected by memcmp).
@@ -551,7 +564,7 @@ Operations return signals that drive follow-up actions:
 
 **Batch pattern**: Up to `MaxMinedBatchSize` (default 1024) transactions per batch, with `MaxMinedRoutines` (default 128) concurrent workers.
 
-**Response**: Map of txid → current block_ids list.
+**Response**: status + per-item errors only. Per the LP-5 decision (§3.4), the per-txid block-ID list is **not** serialized — the engine computes it internally (to clear the LOCKED flag and evaluate DAH) but the dispatcher does not put it on the wire. A client that needs the post-setMined block IDs issues a follow-up `GetBatch` with the block-entry field mask.
 
 **Atomicity**: Per-record.
 **Idempotency**: Setting mined with same block_id is a no-op (detected by scan).
@@ -666,10 +679,14 @@ Operations return signals that drive follow-up actions:
 **Atomicity**: Per-record.
 **Idempotency**: Setting same value is a no-op (writes same byte).
 
-**Response:**
-- `status: OK | ERROR`
-- `signal: Option<Signal>` — DAHSET
-- For each txid processed: UTXO slot spending data (needed by Go client for counter-conflicting cascade)
+**Response:** status + per-item errors only.
+
+> The legacy `signal` (DAHSET) is server-internal per the LP-5 decision (§3.4) and not serialized.
+> An earlier draft of this section required the response to carry per-txid "UTXO slot spending data
+> (needed by Go client for counter-conflicting cascade)". That was a **spec error** (KO-4, retracted):
+> the real `teranode.lua:1066-1092` `setConflicting` returns no spending data either — the Go client
+> gathers it itself via per-output `GetSpend` (`stores/utxo/conflicting.go`). TeraSlab is at parity
+> with the reference; the response is status + errors only.
 
 **Disk regions written**: Metadata only (metadata).
 
@@ -1452,6 +1469,16 @@ Each node processes its batch independently, returns per-item results.
 
 ## 10. Wire Protocol
 
+> **SUPERSEDED BY THE IMPLEMENTATION.** §10.2 and §10.3 below are the original draft design and do
+> **not** match the shipped protocol. The authoritative wire format is defined in `src/protocol/frame.rs`
+> and `src/protocol/opcodes.rs`, and documented in the README ("Wire protocol" section). Key
+> divergences: the implemented frame is `[total_length:u32][request_id:u64][op_code:u16][flags:u16][payload]`
+> — there is **no** magic number, **no** version byte, and **no** trailing frame CRC32 (the draft below
+> shows all three). The handshake/version is carried by the `Hello` opcode (107), not a per-frame version
+> byte. Opcode numbers also differ: the implementation uses `OP_HEARTBEAT = 250` (the draft's `0x00FF` /
+> 255 is `OP_INCREMENT_SPENT_EXTRA_RECS`), and the implementation has post-draft opcodes (103-107,
+> 242-243, 251-253) absent below. Implement clients from the README / `opcodes.rs`, not from §10.2-§10.3.
+
 ### 10.1 Design Principles
 
 - Binary protocol, not text
@@ -1528,8 +1555,8 @@ BatchSpendMulti response:
     { status: u8, error_code: Option<u16>, spending_data: Option<[u8;72]> },
     ...
   ]
-  block_ids: Vec<u32>
-  signal: Option<u8>
+  # NOTE: block_ids / signal are NOT serialized — see the LP-5 decision in §3.4.
+  # The implemented BatchSpendMulti response is status + sparse per-item entries only.
 ```
 
 ### 10.5 Streaming for Large Transaction Reads
