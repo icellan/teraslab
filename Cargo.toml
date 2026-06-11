@@ -1,3 +1,13 @@
+# NOTE: this is intentionally a single-package crate, NOT a Cargo workspace.
+# The sibling crates `client/rust` (teraslab-client) and `teraslab-tests/client`
+# depend on `teraslab` by path but are kept OUT of a workspace so a plain
+# `cargo build` / `cargo test --all` at the root stays lean (no clap CLI / test
+# harness deps pulled into every default build). The trade-off is that root
+# `cargo test --all` does NOT traverse them — which is how `client/rust` once
+# rotted out of compilation (follow-up E-3). They are covered instead by
+# dedicated `--manifest-path` steps in `.github/workflows/ci.yml` (rustfmt,
+# clippy, and `cargo test`), so a recurrence is caught in CI. If you add a new
+# sibling crate, add matching CI steps for it there.
 [package]
 name = "teraslab"
 version = "0.1.0"
