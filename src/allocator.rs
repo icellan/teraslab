@@ -67,6 +67,27 @@ pub enum AllocatorError {
     #[error("invalid free: offset {offset} + size {size} outside data region")]
     InvalidFree { offset: u64, size: u64 },
 
+    /// IJ-7: attempted to free a region `[offset, offset + size)` that
+    /// overlaps an already-free region `[free_offset, free_offset +
+    /// free_size)`. A double-free (or a free of a range that overlaps the
+    /// freelist) would corrupt the freelist's disjoint-region invariant —
+    /// the overlapping bytes would be counted free twice and could later be
+    /// handed out to two distinct allocations (double-allocation). The
+    /// allocator rejects it instead of silently merging the overlap.
+    #[error(
+        "double free: range [{offset}, {offset}+{size}) overlaps free region [{free_offset}, {free_offset}+{free_size})"
+    )]
+    DoubleFree {
+        /// Start offset of the rejected free.
+        offset: u64,
+        /// Aligned size of the rejected free.
+        size: u64,
+        /// Start offset of the existing free region it overlaps.
+        free_offset: u64,
+        /// Size of the existing free region it overlaps.
+        free_size: u64,
+    },
+
     /// Failed to generate random bytes for device identity.
     #[error("failed to generate device identity: {0}")]
     Getrandom(getrandom::Error),
@@ -639,6 +660,34 @@ impl SlotAllocator {
             return Err(AllocatorError::InvalidFree {
                 offset,
                 size: aligned_size,
+            });
+        }
+
+        // IJ-7: reject a double-free / overlapping-free BEFORE journaling or
+        // mutating the freelist. Without this, freeing a range that overlaps
+        // an existing free region would double-count those bytes and let a
+        // later allocation hand the same offset out twice. Two free regions
+        // can overlap `[offset, end)`:
+        //   1. the region at or before `offset` (it may extend past it), and
+        //   2. the first region whose start is `>= offset` (it overlaps iff
+        //      its start is `< end`).
+        // Both are O(log n) ordered-map lookups.
+        if let Some((free_offset, free_size)) = self.free_region_containing(offset) {
+            return Err(AllocatorError::DoubleFree {
+                offset,
+                size: aligned_size,
+                free_offset,
+                free_size,
+            });
+        }
+        if let Some((free_offset, free_size)) = self.freelist.next_from(offset)
+            && free_offset < end
+        {
+            return Err(AllocatorError::DoubleFree {
+                offset,
+                size: aligned_size,
+                free_offset,
+                free_size,
             });
         }
 
@@ -1558,6 +1607,102 @@ mod tests {
         // Allocate something smaller — should use the freed region
         let o2 = alloc.allocate(4096).unwrap();
         assert_eq!(o2, o1);
+    }
+
+    /// IJ-7: an exact double-free of the same region must be rejected with
+    /// [`AllocatorError::DoubleFree`], not silently corrupt the freelist.
+    #[test]
+    fn double_free_exact_rejected() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        let o1 = alloc.allocate(4096).unwrap();
+
+        alloc.free(o1, 4096).unwrap();
+        let before = alloc.free_region_count();
+
+        let err = alloc.free(o1, 4096).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AllocatorError::DoubleFree { offset, free_offset, .. }
+                    if offset == o1 && free_offset == o1
+            ),
+            "exact double-free must yield DoubleFree, got {err:?}",
+        );
+        // Rejected free must not have mutated the freelist.
+        assert_eq!(
+            alloc.free_region_count(),
+            before,
+            "rejected double-free must leave the freelist unchanged",
+        );
+
+        // The single legitimately-freed region is still allocatable exactly
+        // once (no double-allocation).
+        let a = alloc.allocate(4096).unwrap();
+        assert_eq!(a, o1);
+        let b = alloc.allocate(4096).unwrap();
+        assert_ne!(b, o1, "the freed region must not be handed out twice");
+    }
+
+    /// IJ-7: a free whose range partially overlaps an existing free region
+    /// (sharing the leading or trailing bytes) must be rejected.
+    #[test]
+    fn overlapping_free_rejected() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        // Two adjacent 4 KiB regions, freed and merged into [o1, o1+8192).
+        let o1 = alloc.allocate(4096).unwrap();
+        let o2 = alloc.allocate(4096).unwrap();
+        assert_eq!(o2, o1 + 4096);
+        alloc.free(o1, 4096).unwrap();
+        alloc.free(o2, 4096).unwrap();
+        assert_eq!(alloc.free_region_count(), 1);
+        let before = alloc.free_region_count();
+
+        // Free [o1, o1+8192) — fully covers the existing merged free region.
+        let err = alloc.free(o1, 8192).unwrap_err();
+        assert!(
+            matches!(err, AllocatorError::DoubleFree { .. }),
+            "free overlapping the front of a free region must be rejected, got {err:?}",
+        );
+
+        // Free [o2, o2+4096) — sits inside the existing free region (its
+        // start is after the region start). Must also be rejected.
+        let err = alloc.free(o2, 4096).unwrap_err();
+        assert!(
+            matches!(err, AllocatorError::DoubleFree { .. }),
+            "free overlapping the back of a free region must be rejected, got {err:?}",
+        );
+
+        assert_eq!(
+            alloc.free_region_count(),
+            before,
+            "rejected overlapping frees must leave the freelist unchanged",
+        );
+    }
+
+    /// IJ-7: a free of a never-allocated hole that overlaps the freelist is
+    /// rejected, while a genuine free of a freshly allocated region still
+    /// succeeds (no false positives on the legitimate path).
+    #[test]
+    fn legitimate_free_after_double_free_guard_still_works() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        let o1 = alloc.allocate(4096).unwrap();
+        let o2 = alloc.allocate(4096).unwrap();
+        // o1 and o2 are non-adjacent in the freelist sense once freed in a
+        // gap pattern; free o2 first, then o1 — both legitimate.
+        alloc.free(o2, 4096).unwrap();
+        alloc.free(o1, 4096).unwrap();
+        // Re-freeing either now overlaps and must be rejected.
+        assert!(matches!(
+            alloc.free(o1, 4096).unwrap_err(),
+            AllocatorError::DoubleFree { .. }
+        ));
+        assert!(matches!(
+            alloc.free(o2, 4096).unwrap_err(),
+            AllocatorError::DoubleFree { .. }
+        ));
     }
 
     #[test]
