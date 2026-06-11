@@ -656,7 +656,19 @@ impl ReplicaOp {
                 need(rest, pos + 4)?;
                 let hash_count = r_u32(rest, pos) as usize;
                 pos += 4;
-                need(rest, pos + hash_count * 32)?;
+                // Use checked_mul for consistency with the sibling create-path
+                // decoders (codec.rs `validate_batch_count`, dispatch.rs
+                // migration entry_count). An attacker-controlled hash_count
+                // cannot overflow `usize` here on 64-bit, but an overflowed
+                // `need` would underflow the bound check; treat overflow as an
+                // unsatisfiable length (BufferTooShort).
+                let hashes_bytes = hash_count
+                    .checked_mul(32)
+                    .ok_or(ProtocolError::BufferTooShort {
+                        need: usize::MAX,
+                        have: rest.len(),
+                    })?;
+                need(rest, pos + hashes_bytes)?;
                 let mut utxo_hashes = Vec::with_capacity(hash_count);
                 for _ in 0..hash_count {
                     let mut h = [0u8; 32];

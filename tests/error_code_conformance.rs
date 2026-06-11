@@ -20,15 +20,17 @@ use std::net::TcpStream;
 use std::sync::Arc;
 
 use teraslab::allocator::SlotAllocator;
+use teraslab::cluster::shards::ShardTable;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, UnminedIndex};
+use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
 use teraslab::protocol::codec::*;
 use teraslab::protocol::frame::*;
 use teraslab::protocol::opcodes::*;
 use teraslab::server::Server;
+use teraslab::storage::blobstore::FileBlobStore;
 
 /// Start a server on a random port and return (server_handle, port).
 ///
@@ -681,6 +683,428 @@ fn t6_reserved_spending_data_returns_invalid_spend_with_empty_payload() {
         }],
     );
     assert_eq!(resp.status, STATUS_OK, "slot must remain spendable");
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// N-6 / N-LOW — wire-level conformance for the typed control/stream codes
+// that previously had only constant pins in codec.rs and no behavioral test.
+//
+// Reachability summary (single-node server, no RunningCluster):
+//   - 32 ERR_NOT_CLUSTERED       → any cluster control opcode (topology
+//                                   propose) on a non-clustered server.
+//   - 33 ERR_INVARIANT_VIOLATION → OP_MIGRATION_COMPLETE with the shard-id
+//                                   request_id upper-48-bit guard violated;
+//                                   fires before the cluster check.
+//   - 34 ERR_STREAM_INVARIANT    → a stream chunk exceeding the per-stream
+//                                   total-bytes cap (needs a blob store, so a
+//                                   dedicated server with FileBlobStore +
+//                                   tiny cap is used here).
+//   - 21 ERR_MIGRATION_MANIFEST_REQUIRED → migration-complete with no
+//                                   manifest evidence; not cluster-gated.
+//   - 22 ERR_MIGRATION_MANIFEST_MISMATCH → migration-complete whose manifest
+//                                   hash disagrees with the local shard
+//                                   contents; not cluster-gated.
+//   - 23 ERR_TOPOLOGY_PERSIST_FAILED, 24 ERR_STALE_EPOCH,
+//     25 ERR_CLUSTER_NOT_READY, 26 ERR_INDEX_DEGRADED, and
+//     STATUS_DEGRADED_DURABILITY are produced ONLY behind RunningCluster /
+//     degraded-backend / RF=1 best-effort state that a single-node test
+//     server never enters, so they are not wire-reachable here without fault
+//     injection. They remain pinned by the constant tests in codec.rs.
+// ---------------------------------------------------------------------------
+
+/// Start a single-node server (no `RunningCluster`) that accepts UNSIGNED
+/// inter-node opcodes. `ServerConfig` defaults `strict_auth = true`, which
+/// would short-circuit any inter-node opcode with `ERR_CLUSTER_AUTH_FAILED`
+/// (27) at the auth gate before the handler runs — masking the typed control
+/// codes these tests pin. Setting `strict_auth = false` with no
+/// `cluster_secret` is the documented trusted-overlay fail-open mode and lets
+/// the unsigned frame route through to dispatch, where the migration/topology
+/// handlers (cluster=None) produce the real 32/33/21/22 / payload-malformed
+/// codes.
+fn start_inter_node_test_server() -> (Arc<Server>, u16) {
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+    let alloc = SlotAllocator::new(dev.clone()).unwrap();
+    let index = Index::new(10_000).unwrap();
+    let engine = Arc::new(Engine::new(
+        dev,
+        index,
+        alloc,
+        StripedLocks::new(1024),
+        DahIndex::new(),
+        UnminedIndex::new(),
+    ));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let config = ServerConfig {
+        listen_addr: format!("127.0.0.1:{port}"),
+        max_connections: 10,
+        max_batch_size: 8192,
+        strict_auth: false,
+        ..Default::default()
+    };
+
+    let server = Arc::new(Server::new(engine, config));
+    let server_clone = server.clone();
+    std::thread::spawn(move || {
+        server_clone.run().unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    (server, port)
+}
+
+/// Start a server backed by a real `FileBlobStore` with a tiny per-stream
+/// byte cap, so a single oversized chunk trips the cap and surfaces
+/// `ERR_STREAM_INVARIANT`. Returns (server, port, tempdir kept alive).
+fn start_test_server_with_blobstore(
+    max_stream_total_bytes: u64,
+) -> (Arc<Server>, u16, tempfile::TempDir) {
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+    let alloc = SlotAllocator::new(dev.clone()).unwrap();
+    let index = Index::new(10_000).unwrap();
+    let engine = Arc::new(Engine::new(
+        dev,
+        index,
+        alloc,
+        StripedLocks::new(1024),
+        DahIndex::new(),
+        UnminedIndex::new(),
+    ));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let config = ServerConfig {
+        listen_addr: format!("127.0.0.1:{port}"),
+        max_connections: 10,
+        max_batch_size: 8192,
+        max_stream_total_bytes,
+        ..Default::default()
+    };
+
+    let blob_dir = tempfile::tempdir().unwrap();
+    let blob_store = Arc::new(FileBlobStore::new(blob_dir.path(), 2));
+    let server = Arc::new(Server::new(engine, config).with_blob_store(blob_store));
+    let server_clone = server.clone();
+    std::thread::spawn(move || {
+        server_clone.run().unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    (server, port, blob_dir)
+}
+
+/// N-6 (code 32): a cluster control opcode (`OP_TOPOLOGY_PROPOSE`) sent to a
+/// single-node server with no `RunningCluster` must surface
+/// `ERR_NOT_CLUSTERED` (32) in a `STATUS_ERROR` payload — the structural
+/// "this server cannot serve cluster ops, do not retry" signal.
+#[test]
+fn n6_topology_propose_on_single_node_returns_err_not_clustered() {
+    let (server, port) = start_inter_node_test_server();
+    let mut stream = connect(port);
+
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 4242,
+            op_code: OP_TOPOLOGY_PROPOSE,
+            flags: 0,
+            payload: Vec::new().into(),
+        },
+    );
+
+    assert_eq!(resp.request_id, 4242);
+    assert_eq!(resp.status, STATUS_ERROR);
+    let (code, msg) = decode_error_payload(&resp.payload).unwrap();
+    assert_eq!(code, ERR_NOT_CLUSTERED, "expected wire code 32 (ERR_NOT_CLUSTERED)");
+    assert_eq!(msg, "not clustered");
+
+    server.shutdown();
+}
+
+/// N-6 (code 33): `OP_MIGRATION_COMPLETE` overloads `request_id` to carry the
+/// shard number in its low 16 bits. A caller that sets any upper bit must be
+/// rejected with `ERR_INVARIANT_VIOLATION` (33) — the guard fires before the
+/// cluster check, so it is reachable on a single-node server.
+#[test]
+fn n6_migration_complete_request_id_upper_bits_returns_invariant_violation() {
+    let (server, port) = start_inter_node_test_server();
+    let mut stream = connect(port);
+
+    // request_id with bit 16 set → upper 48 bits non-zero.
+    let bad_request_id: u64 = 1u64 << 16 | 7;
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: bad_request_id,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: vec![0u8; 8].into(), // record_count = 0
+        },
+    );
+
+    assert_eq!(resp.request_id, bad_request_id);
+    assert_eq!(resp.status, STATUS_ERROR);
+    let (code, msg) = decode_error_payload(&resp.payload).unwrap();
+    assert_eq!(
+        code, ERR_INVARIANT_VIOLATION,
+        "expected wire code 33 (ERR_INVARIANT_VIOLATION)"
+    );
+    assert!(
+        msg.contains("request_id must encode shard"),
+        "unexpected message: {msg}"
+    );
+
+    server.shutdown();
+}
+
+/// N-6 (code 34): a stream chunk whose data would push the stream past the
+/// configured per-stream total-bytes cap is rejected with
+/// `ERR_STREAM_INVARIANT` (34). Uses a server with a real blob store and a
+/// 4-byte cap so a 16-byte chunk overflows it.
+#[test]
+fn n6_stream_chunk_exceeding_total_cap_returns_stream_invariant() {
+    let (server, port, _blob_dir) = start_test_server_with_blobstore(4);
+    let mut stream = connect(port);
+
+    let txid = test_txid(7777);
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 7777,
+            op_code: OP_STREAM_CHUNK,
+            flags: 0,
+            // 16 bytes at offset 0 > 4-byte cap.
+            payload: encode_stream_chunk(&txid, 0, &[0xABu8; 16]).into(),
+        },
+    );
+
+    assert_eq!(resp.request_id, 7777);
+    assert_eq!(resp.status, STATUS_ERROR);
+    let (code, msg) = decode_error_payload(&resp.payload).unwrap();
+    assert_eq!(
+        code, ERR_STREAM_INVARIANT,
+        "expected wire code 34 (ERR_STREAM_INVARIANT)"
+    );
+    assert!(
+        msg.contains("exceeds maximum total bytes"),
+        "unexpected message: {msg}"
+    );
+
+    server.shutdown();
+}
+
+/// N-6 (code 21): `OP_MIGRATION_COMPLETE` with a record count but no manifest
+/// evidence (no SHA-256 hash, no exact-entry list) must be rejected with
+/// `ERR_MIGRATION_MANIFEST_REQUIRED` (21) — R-219 forbids clearing inbound
+/// state without cryptographic proof. Not cluster-gated, so reachable here.
+#[test]
+fn n6_migration_complete_without_manifest_returns_manifest_required() {
+    let (server, port) = start_inter_node_test_server();
+    let mut stream = connect(port);
+
+    // payload = record_count(8) only; < 56 bytes so no manifest hash, < 60
+    // bytes so no exact-entry list → no manifest evidence.
+    let mut payload = vec![0u8; 8];
+    payload[0] = 5; // record_count = 5
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 3, // shard 3, upper bits clear
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        },
+    );
+
+    assert_eq!(resp.status, STATUS_ERROR);
+    let (code, msg) = decode_error_payload(&resp.payload).unwrap();
+    assert_eq!(
+        code, ERR_MIGRATION_MANIFEST_REQUIRED,
+        "expected wire code 21 (ERR_MIGRATION_MANIFEST_REQUIRED)"
+    );
+    assert!(msg.contains("requires manifest"), "unexpected message: {msg}");
+
+    server.shutdown();
+}
+
+/// N-6 (code 22): `OP_MIGRATION_COMPLETE` whose record count matches the
+/// local shard but whose SHA-256 manifest hash disagrees with the local
+/// contents must be rejected with `ERR_MIGRATION_MANIFEST_MISMATCH` (22).
+/// We create one record, compute its shard, then claim record_count=1 with a
+/// deliberately wrong (all-0xAA) manifest hash for that shard.
+#[test]
+fn n6_migration_complete_manifest_hash_mismatch_returns_manifest_mismatch() {
+    let (server, port) = start_inter_node_test_server();
+    let mut stream = connect(port);
+
+    let txid = test_txid(8801);
+    let resp = create_records(&mut stream, &[make_create_item(txid, 1, 8801)], 1);
+    assert_eq!(resp.status, STATUS_OK);
+
+    let shard = ShardTable::shard_for_key(&TxKey { txid });
+
+    // payload: record_count(8)=1, fence(8), epoch(8), manifest_hash(32) all
+    // 0xAA (non-zero → treated as a real, mismatching manifest). 56 bytes
+    // total: a manifest hash but no exact-entry list (< 60 bytes).
+    let mut payload = vec![0u8; 56];
+    payload[0] = 1; // record_count = 1
+    for b in payload.iter_mut().skip(24) {
+        *b = 0xAA;
+    }
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        },
+    );
+
+    assert_eq!(resp.status, STATUS_ERROR);
+    let (code, msg) = decode_error_payload(&resp.payload).unwrap();
+    assert_eq!(
+        code, ERR_MIGRATION_MANIFEST_MISMATCH,
+        "expected wire code 22 (ERR_MIGRATION_MANIFEST_MISMATCH)"
+    );
+    assert!(msg.contains("manifest hash mismatch"), "unexpected message: {msg}");
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// H-LOW — malformed OP_MIGRATION_COMPLETE payloads must report
+// ERR_PAYLOAD_MALFORMED (a hard "your bytes are wrong" error), NOT
+// ERR_MIGRATION_IN_PROGRESS (a transient/retryable signal a peer would spin
+// on forever).
+// ---------------------------------------------------------------------------
+
+/// H-LOW: an `OP_MIGRATION_COMPLETE` frame whose declared exact-manifest
+/// `entry_count` does not match the trailing bytes (entry_count says 4 but
+/// the payload is too short for them) must be rejected with
+/// `ERR_PAYLOAD_MALFORMED`, matching the batched sibling — not
+/// `ERR_MIGRATION_IN_PROGRESS`.
+#[test]
+fn h_low_migration_complete_malformed_entry_count_returns_payload_malformed() {
+    let (server, port) = start_inter_node_test_server();
+    let mut stream = connect(port);
+
+    // 60-byte header: record_count(8), fence(8), epoch(8), manifest(32),
+    // entry_count(4). Set entry_count = 4 but provide no entry bytes after,
+    // so `payload.len() (60) < needed (60 + 4*36)`.
+    let mut payload = vec![0u8; 60];
+    payload[0] = 4; // record_count = 4
+    // manifest hash bytes [24..56] left zero → None (no SHA manifest).
+    payload[56..60].copy_from_slice(&4u32.to_le_bytes()); // entry_count = 4
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 9, // shard 9, upper bits clear
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        },
+    );
+
+    assert_eq!(resp.status, STATUS_ERROR);
+    let (code, _msg) = decode_error_payload(&resp.payload).unwrap();
+    assert_eq!(
+        code, ERR_PAYLOAD_MALFORMED,
+        "malformed migration-complete must be ERR_PAYLOAD_MALFORMED (28), \
+         not ERR_MIGRATION_IN_PROGRESS (a retryable signal)"
+    );
+    assert_ne!(
+        code, ERR_MIGRATION_IN_PROGRESS,
+        "must not return the retryable ERR_MIGRATION_IN_PROGRESS for malformed bytes"
+    );
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// N-LOW — opcode 255 over the wire, and empty-batch (count=0) semantics.
+// ---------------------------------------------------------------------------
+
+/// N-LOW: opcode 255 (`OP_INCREMENT_SPENT_EXTRA_RECS`) is a legacy
+/// compatibility no-op shim. Pin its wire contract: it must return
+/// `STATUS_OK` with an EMPTY payload (callers expect success and do not parse
+/// a body), regardless of the request payload.
+#[test]
+fn n_low_opcode_255_increment_spent_extra_recs_is_ok_noop() {
+    let (server, port) = start_test_server();
+    let mut stream = connect(port);
+
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 255255,
+            op_code: OP_INCREMENT_SPENT_EXTRA_RECS,
+            flags: 0,
+            payload: vec![0xDE, 0xAD, 0xBE, 0xEF].into(),
+        },
+    );
+
+    assert_eq!(resp.request_id, 255255);
+    assert_eq!(resp.status, STATUS_OK, "opcode 255 must be an OK no-op");
+    assert!(
+        resp.payload.is_empty(),
+        "opcode 255 must return an empty payload, got {:?}",
+        resp.payload
+    );
+
+    server.shutdown();
+}
+
+/// N-LOW: an empty spend batch (count = 0) must be accepted cleanly with
+/// `STATUS_OK` and an empty sparse-error payload — pinning the "no items, no
+/// errors" semantics so it is never silently reinterpreted as a malformed
+/// frame or a partial error.
+#[test]
+fn n_low_empty_spend_batch_returns_ok_with_no_errors() {
+    let (server, port) = start_test_server();
+    let mut stream = connect(port);
+
+    let resp = spend(&mut stream, 600, &default_spend_params(), &[]);
+
+    assert_eq!(resp.request_id, 600);
+    // The no-error fast path returns STATUS_OK with an EMPTY payload (not an
+    // encoded count=0 sparse list) — pin exactly that contract.
+    assert_eq!(
+        resp.status, STATUS_OK,
+        "an empty batch is not an error, got status {} payload {:?}",
+        resp.status, resp.payload
+    );
+    assert!(
+        resp.payload.is_empty(),
+        "empty-batch STATUS_OK must carry an empty payload, got {:?}",
+        resp.payload
+    );
+
+    server.shutdown();
+}
+
+/// N-LOW: an empty create batch (count = 0) must likewise be accepted with
+/// `STATUS_OK` and no item errors.
+#[test]
+fn n_low_empty_create_batch_returns_ok_with_no_errors() {
+    let (server, port) = start_test_server();
+    let mut stream = connect(port);
+
+    let resp = create_records(&mut stream, &[], 601);
+
+    assert_eq!(resp.request_id, 601);
+    assert_eq!(
+        resp.status, STATUS_OK,
+        "an empty create batch is not an error, got status {} payload {:?}",
+        resp.status, resp.payload
+    );
 
     server.shutdown();
 }

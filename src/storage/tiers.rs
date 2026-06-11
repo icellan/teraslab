@@ -14,10 +14,17 @@ pub fn inline_cold_offset(utxo_count: u32) -> u64 {
     METADATA_SIZE as u64 + utxo_count as u64 * UTXO_SLOT_SIZE as u64
 }
 
-/// Cold data up to and including this serialized size (`<=` 8 KiB = 8192
-/// bytes, i.e. 8180 bytes of user data plus the 12-byte `ColdData` length
-/// prefixes) is stored inline in the same NVMe allocation as the hot record
-/// (metadata + UTXO slots + cold data in one write).
+/// Advisory inline-size guideline (IJ-3): cold data up to and including this
+/// serialized size (`<=` 8 KiB = 8192 bytes, i.e. 8180 bytes of user data
+/// plus the 12-byte `ColdData` length prefixes) is *recommended* to be stored
+/// inline in the same NVMe allocation as the hot record.
+///
+/// IMPORTANT: this threshold is **not consulted by the server write path**.
+/// Tier placement is client-driven via the `FLAG_EXTERNAL_BLOB` request flag
+/// (see `tier_for_size` and the README "Tiered storage" section). This
+/// constant exists as a documented size guideline clients may use to decide
+/// whether to pre-upload a blob via the streaming protocol; the server honors
+/// whatever the client's flag says.
 pub const INLINE_THRESHOLD: usize = 8 * 1024; // 8 KiB, inclusive
 
 /// Which storage tier to use for the given serialized cold data size.
@@ -36,8 +43,15 @@ pub enum StorageTier {
     External,
 }
 
-/// Determine the storage tier for a given serialized cold data size
-/// (inclusive boundary: `data_size <= INLINE_THRESHOLD` is Inline).
+/// Advisory helper (IJ-3): suggest a storage tier for a given serialized cold
+/// data size (inclusive boundary: `data_size <= INLINE_THRESHOLD` is Inline).
+///
+/// NOTE: this is **not** the production placement decision. The shipped server
+/// write path never calls this function — tier placement is driven entirely by
+/// the client's `FLAG_EXTERNAL_BLOB` request flag (the client pre-uploads the
+/// blob via the streaming chunk protocol, then flags the create item
+/// external). `tier_for_size` is retained as a client-facing size guideline
+/// and for tier-classification tests; it does not gate any server behavior.
 pub fn tier_for_size(data_size: usize) -> StorageTier {
     if data_size <= INLINE_THRESHOLD {
         StorageTier::Inline

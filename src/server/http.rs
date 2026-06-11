@@ -23,7 +23,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, put};
 use rust_embed::Embed;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
@@ -130,6 +130,12 @@ pub struct HttpState {
     /// Replica lag threshold used by `/health/ready` in clustered mode.
     /// A value of 0 disables readiness degradation for lag.
     pub replica_lag_warn_threshold_ops: u64,
+    /// LM-3: per-instance cache for the `/health/ready` replica-lag verdict.
+    /// Packs `(timestamp_ns << 1) | exceeds_threshold`; `0` means "no
+    /// cached verdict yet". Previously a process-global `static`, which
+    /// leaked verdicts across instances in multi-node test processes — a
+    /// per-instance field keeps each node's readiness independent.
+    pub replica_lag_cache: AtomicU64,
 }
 
 /// Bearer-token state shared with the admin auth middleware.
@@ -1302,18 +1308,14 @@ fn compute_health_ready(state: &HttpState) -> ReadyState {
 /// nanosecond timestamp it was captured.
 const READINESS_LAG_CACHE_TTL_MS: u64 = 500;
 
-/// Cached `(timestamp_ns, exceeds_threshold)` pair for the replica-lag
-/// readiness check. `timestamp_ns == 0` means "no cached verdict yet".
-/// `AtomicU64` packs the bool as the low bit and the timestamp in the
-/// upper 63 bits so the read+verdict observation is atomic.
-static REPLICA_LAG_CACHE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 fn cached_replica_lag_exceeds(state: &HttpState) -> bool {
     let now_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let cached = REPLICA_LAG_CACHE.load(Ordering::Relaxed);
+    // LM-3: read the per-instance cache (was a process-global static, which
+    // leaked verdicts across nodes sharing one test process).
+    let cached = state.replica_lag_cache.load(Ordering::Relaxed);
     if cached != 0 {
         let cached_ts = cached >> 1;
         let cached_val = (cached & 1) != 0;
@@ -1328,7 +1330,7 @@ fn cached_replica_lag_exceeds(state: &HttpState) -> bool {
         (0..MAX_REPLICAS).any(|i| r.lag(i) > state.replica_lag_warn_threshold_ops)
     });
     let packed = (now_ns << 1) | u64::from(exceeds);
-    REPLICA_LAG_CACHE.store(packed, Ordering::Relaxed);
+    state.replica_lag_cache.store(packed, Ordering::Relaxed);
     exceeds
 }
 
@@ -3104,7 +3106,7 @@ mod tests {
         use crate::index::{DahIndex, Index, UnminedIndex};
         use crate::locks::StripedLocks;
         use crate::ops::engine::Engine;
-        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize};
 
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
@@ -3139,6 +3141,7 @@ mod tests {
             active_connections: Arc::new(AtomicUsize::new(0)),
             http_port: 0,
             replica_lag_warn_threshold_ops: 10_000,
+            replica_lag_cache: AtomicU64::new(0),
         };
 
         let snap = build_local_top_snapshot(&state);
@@ -3272,7 +3275,7 @@ mod tests {
         };
         use crate::ops::engine::Engine;
         use std::sync::OnceLock;
-        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize};
 
         static REPL: OnceLock<ReplicationMetrics> = OnceLock::new();
         static REDO: OnceLock<RedoMetrics> = OnceLock::new();
@@ -3311,6 +3314,7 @@ mod tests {
             active_connections: Arc::new(AtomicUsize::new(0)),
             http_port: 0,
             replica_lag_warn_threshold_ops: 10_000,
+            replica_lag_cache: AtomicU64::new(0),
         };
 
         let snap = build_local_top_snapshot(&state);
@@ -3357,7 +3361,7 @@ mod tests {
         };
         use crate::ops::engine::Engine;
         use std::sync::OnceLock;
-        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize};
 
         static REPL: OnceLock<ReplicationMetrics> = OnceLock::new();
         static REDO: OnceLock<RedoMetrics> = OnceLock::new();
@@ -3396,6 +3400,7 @@ mod tests {
             active_connections: Arc::new(AtomicUsize::new(0)),
             http_port: 0,
             replica_lag_warn_threshold_ops: 10_000,
+            replica_lag_cache: AtomicU64::new(0),
         };
 
         // The single-node `/ws/top` loop serializes this exact object as
@@ -3580,6 +3585,7 @@ mod tests {
             active_connections: Arc::new(AtomicUsize::new(0)),
             http_port: 0,
             replica_lag_warn_threshold_ops: 0,
+            replica_lag_cache: AtomicU64::new(0),
         })
     }
 
@@ -3726,6 +3732,81 @@ mod tests {
         repl.per_replica[0]
             .last_acked_seq
             .store(0, Ordering::Relaxed);
+    }
+
+    /// LM-3: the replica-lag readiness verdict is cached PER-INSTANCE in
+    /// `HttpState`, not in a process-global `static`. Two states sharing one
+    /// test process must not contaminate each other's cached verdict.
+    ///
+    /// This is verified deterministically (without touching the shared global
+    /// `replication_metrics()`, which other tests mutate concurrently) by
+    /// pre-seeding each instance's `replica_lag_cache` with a fresh, distinct
+    /// verdict and asserting that `cached_replica_lag_exceeds` returns each
+    /// instance's OWN cached value. If the cache were a process-global static,
+    /// the second seed would overwrite the first and both would read alike —
+    /// the contamination LM-3 fixes.
+    #[test]
+    fn replica_lag_cache_is_per_instance_not_process_global() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+
+        let make_state = || {
+            let cluster = Arc::new(new_test_running_cluster(
+                NodeId(1),
+                ShardTable::compute(&[NodeId(1)], 1),
+                &[],
+                &[NodeId(1)],
+                &[],
+                &[],
+                &[],
+                0,
+            ));
+            let mut state = build_ready_test_state(true, Some(cluster));
+            Arc::get_mut(&mut state)
+                .expect("unique test state")
+                .replica_lag_warn_threshold_ops = 50;
+            state
+        };
+
+        // A fresh timestamp so the TTL keeps both seeded verdicts "live" for
+        // the duration of the test (READINESS_LAG_CACHE_TTL_MS = 500 ms).
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // Packing: (timestamp_ns << 1) | exceeds_bit.
+        let seed_true = (now_ns << 1) | 1;
+        let seed_false = now_ns << 1; // exceeds bit = 0
+
+        // Instance A: cached verdict "exceeds = true".
+        let state_a = make_state();
+        state_a.replica_lag_cache.store(seed_true, Ordering::Relaxed);
+
+        // Instance B: cached verdict "exceeds = false".
+        let state_b = make_state();
+        state_b.replica_lag_cache.store(seed_false, Ordering::Relaxed);
+
+        // Each instance must return ITS OWN cached verdict within the TTL.
+        // A process-global cache would make both read whichever was stored
+        // last (false) — the cross-instance leak.
+        assert!(
+            cached_replica_lag_exceeds(&state_a),
+            "instance A must serve its own cached `true` verdict",
+        );
+        assert!(
+            !cached_replica_lag_exceeds(&state_b),
+            "instance B must serve its own cached `false` verdict, not A's",
+        );
+
+        // Re-read in the opposite order to prove neither read mutated the
+        // other's cache.
+        assert!(
+            !cached_replica_lag_exceeds(&state_b),
+            "instance B still independent after A was read",
+        );
+        assert!(
+            cached_replica_lag_exceeds(&state_a),
+            "instance A still independent after B was read",
+        );
     }
 
     #[tokio::test]
