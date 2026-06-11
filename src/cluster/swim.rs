@@ -259,6 +259,15 @@ const REPLAY_WINDOW_BITS: u64 = 256;
 /// already set, is rejected as a replay.
 #[derive(Debug, Clone, Default)]
 struct ReplayWindow {
+    /// Sender incarnation this window's seq space belongs to. The outbound
+    /// seq counter resets to 1 on every process start, so a window is only
+    /// meaningful within a single `(NodeId, incarnation)` run. A strictly
+    /// higher incarnation supersedes the window — SWIM semantics treat a
+    /// higher incarnation as a legitimately new sender (a reboot), not a
+    /// replay — while a strictly lower incarnation is an old-run replay and
+    /// is rejected. The keying decision lives in
+    /// [`ReplayWindow::check_and_record_for_incarnation`].
+    incarnation: u64,
     /// Highest seq accepted from this peer.
     highest: u64,
     /// Bitmap of accepted seq positions in `[highest - 255, highest - 1]`.
@@ -267,8 +276,39 @@ struct ReplayWindow {
 }
 
 impl ReplayWindow {
-    /// Attempt to record `seq`. Returns true if accepted (not a replay),
-    /// false if `seq` has already been seen or is too old.
+    /// Incarnation-aware entry point. Returns true if `(incarnation, seq)`
+    /// is fresh (must be processed), false if it is a replay.
+    ///
+    /// Keying the anti-replay window by `(NodeId, incarnation)` is what
+    /// makes rejoin-after-reboot work: a rebooted peer advances its
+    /// incarnation (per SWIM, mirroring [`Membership::mark_alive`]) and
+    /// restarts its seq counter at 1. Without the incarnation check those
+    /// low seqs would be dropped against the previous run's `highest`.
+    ///
+    /// * `incarnation > self.incarnation` — a strictly newer run (reboot).
+    ///   Reset the window to this incarnation's fresh seq space and accept.
+    /// * `incarnation < self.incarnation` — a message from an *old* run
+    ///   replayed after we have already advanced. Reject as a replay.
+    /// * `incarnation == self.incarnation` — same run: defer to the normal
+    ///   sliding-window seq check, which still rejects in-run replays.
+    fn check_and_record_for_incarnation(&mut self, incarnation: u64, seq: u64) -> bool {
+        match incarnation.cmp(&self.incarnation) {
+            std::cmp::Ordering::Greater => {
+                // Newer run supersedes — reset the seq space for it.
+                self.incarnation = incarnation;
+                self.highest = 0;
+                self.bitmap = [0u64; 4];
+                self.check_and_record(seq)
+            }
+            std::cmp::Ordering::Less => false, // old-run replay
+            std::cmp::Ordering::Equal => self.check_and_record(seq),
+        }
+    }
+
+    /// Attempt to record `seq` within the current incarnation's seq space.
+    /// Returns true if accepted (not a replay), false if `seq` has already
+    /// been seen or is too old. Callers go through
+    /// [`Self::check_and_record_for_incarnation`].
     fn check_and_record(&mut self, seq: u64) -> bool {
         // First-message-from-peer: always accept and seed `highest`.
         if self.highest == 0 && self.bitmap == [0u64; 4] {
@@ -387,17 +427,21 @@ pub struct SwimRunner {
     /// Increments once per outgoing SWIM message. The signed payload
     /// carries this value so that peers can reject any replayed packet
     /// whose seq has already been seen (or that falls below their
-    /// sliding window). A reboot resumes from `0` — the
-    /// `sender_incarnation` bump separates new boots from prior runs
-    /// (incarnation is part of the signed payload too, so a replay from
-    /// an old run cannot impersonate the fresh run's seq space).
+    /// sliding window). A reboot resumes from `0`; the new run is told
+    /// apart from prior runs by the `sender_incarnation` bump, which the
+    /// receiver consults in [`ReplayWindow::check_and_record_for_incarnation`]
+    /// to reset the per-peer seq space (incarnation is part of the signed
+    /// payload too, so an old-run replay cannot impersonate the fresh
+    /// run's incarnation).
     next_outbound_seq: u64,
-    /// Per-peer sliding window of accepted SWIM message seqs. Sized
-    /// at [`REPLAY_WINDOW_BITS`] bits per peer; a peer entry is created
-    /// on first verified message. Bounded growth is enforced indirectly
-    /// by the membership lifecycle: peers that drop out and are forgotten
-    /// after [`DEAD_MEMBER_FORGET_AFTER`] can be GC'd from this map by
-    /// the membership reaper.
+    /// Per-peer sliding window of accepted SWIM message seqs, keyed by
+    /// `(NodeId, incarnation)`. Sized at [`REPLAY_WINDOW_BITS`] bits per
+    /// peer; a peer entry is created on first verified message and its seq
+    /// space is reset when a strictly-higher incarnation is observed (so a
+    /// rebooted peer is not seq-dropped). Growth is bounded by the
+    /// membership lifecycle: an entry is removed when its peer transitions
+    /// to Dead (`NodeLeft`) and again when the reaper forgets the peer
+    /// after [`DEAD_MEMBER_FORGET_AFTER`].
     seen_seq: HashMap<NodeId, ReplayWindow>,
 }
 
@@ -655,6 +699,12 @@ impl SwimRunner {
                     for id in &forgotten {
                         peers.remove(id);
                         swim.remove(id);
+                        // Honor the documented bound on `seen_seq`: drop the
+                        // replay window alongside the address maps. Safe for
+                        // the same reason as the Dead-transition GC above — a
+                        // forgotten node can only return at a higher
+                        // incarnation, which resets the window anyway.
+                        self.seen_seq.remove(id);
                     }
                     tracing::info!(
                         count = forgotten.len(),
@@ -759,11 +809,18 @@ impl SwimRunner {
 
         // F-G8-003 replay defense: each peer maintains a monotonic seq;
         // reject anything we've already accepted (or that falls below the
-        // sliding window). Tag verification above guarantees the seq
-        // value is authentic — an attacker cannot forge a fresh seq
-        // without the cluster_secret.
+        // sliding window). Tag verification above guarantees both the seq
+        // and the incarnation are authentic — an attacker cannot forge a
+        // fresh seq or a higher incarnation without the cluster_secret.
+        //
+        // The window is keyed by `(NodeId, incarnation)`: a rebooted peer
+        // advances its incarnation and restarts its seq at 1, so we must
+        // not measure those low seqs against the previous run's `highest`
+        // (that is the rejoin-after-reboot bug). A strictly-higher
+        // incarnation resets the seq space; a strictly-lower one is an
+        // old-run replay and is rejected.
         let window = self.seen_seq.entry(sender_id).or_default();
-        if !window.check_and_record(sender_seq) {
+        if !window.check_and_record_for_incarnation(sender_incarnation, sender_seq) {
             return vec![];
         }
 
@@ -923,6 +980,19 @@ impl SwimRunner {
                 let updates = self.collect_member_updates();
                 let ping = self.encode_message(MSG_PING, &updates);
                 let _ = socket.send_to(&ping, target_swim_addr);
+            }
+        }
+
+        // GC the replay window for any peer that just transitioned to Dead
+        // (`NodeLeft`). The rest of that peer's per-node state is cleaned
+        // up by membership, and dropping its `seen_seq` entry here keeps the
+        // map bounded by live membership (the LOW unbounded-growth finding).
+        // This does not reopen the replay hole: a node that later rejoins
+        // comes back at a strictly-higher incarnation, so even a stale entry
+        // would be reset — removing it early is purely a space optimization.
+        for event in &events {
+            if let ClusterEvent::NodeLeft(id) = event {
+                self.seen_seq.remove(id);
             }
         }
 
@@ -1695,5 +1765,60 @@ mod tests {
             after - before,
             "ping_req_dropped_total() wrapper must agree with SwimMetrics counter",
         );
+    }
+
+    // ── F-G8-003 / E-1: incarnation-keyed replay window ─────────────────
+
+    /// Within a single incarnation the window behaves exactly like the
+    /// seq-only check: forward seqs accepted, exact/old seqs rejected.
+    #[test]
+    fn replay_window_same_incarnation_rejects_old_seq() {
+        let mut w = ReplayWindow::default();
+        assert!(w.check_and_record_for_incarnation(7, 1), "first seq accepted");
+        assert!(w.check_and_record_for_incarnation(7, 2), "next seq accepted");
+        assert!(
+            !w.check_and_record_for_incarnation(7, 1),
+            "replay of seq 1 in same incarnation must be rejected",
+        );
+        assert!(
+            !w.check_and_record_for_incarnation(7, 2),
+            "replay of seq 2 in same incarnation must be rejected",
+        );
+    }
+
+    /// A strictly-higher incarnation resets the seq space: a rebooted
+    /// peer restarting at seq 1 is accepted even though the previous run
+    /// reached a high `highest`. This is the core of the E-1 fix.
+    #[test]
+    fn replay_window_higher_incarnation_resets_seq_space() {
+        let mut w = ReplayWindow::default();
+        // Old run (incarnation 3) advances far.
+        for seq in 1..=5000 {
+            assert!(w.check_and_record_for_incarnation(3, seq));
+        }
+        assert_eq!(w.highest, 5000);
+        // Reboot: incarnation 4, seq restarts at 1. Must be accepted.
+        assert!(
+            w.check_and_record_for_incarnation(4, 1),
+            "rebooted peer (incarnation+1, seq=1) must be accepted, not seq-dropped",
+        );
+        assert_eq!(w.incarnation, 4, "window must adopt the new incarnation");
+        assert_eq!(w.highest, 1, "seq space must have been reset for the new run");
+        assert!(w.check_and_record_for_incarnation(4, 2), "subsequent seq accepted");
+    }
+
+    /// A message from an *old* incarnation, replayed after we have already
+    /// advanced to a newer one, must be rejected — even if its seq would
+    /// otherwise look fresh in the old space.
+    #[test]
+    fn replay_window_lower_incarnation_is_rejected() {
+        let mut w = ReplayWindow::default();
+        assert!(w.check_and_record_for_incarnation(9, 100));
+        // Old-run packet at incarnation 8 with a high seq: still a replay.
+        assert!(
+            !w.check_and_record_for_incarnation(8, 999_999),
+            "old-incarnation message must be rejected as a stale-run replay",
+        );
+        assert_eq!(w.incarnation, 9, "old-run replay must not regress the window");
     }
 }
