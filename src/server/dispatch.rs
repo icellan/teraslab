@@ -987,7 +987,9 @@ pub(crate) fn handle_request(
             // proposer treats it as "no vote / retry".
             let cluster = match cluster {
                 Some(c) => c,
-                None => return error_response(request.request_id, ERR_NOT_CLUSTERED, "not clustered"),
+                None => {
+                    return error_response(request.request_id, ERR_NOT_CLUSTERED, "not clustered");
+                }
             };
             match crate::cluster::topology::TopologyTerm::deserialize(&request.payload) {
                 Some(propose) => {
@@ -1024,7 +1026,9 @@ pub(crate) fn handle_request(
             // not here. We just return OK with any resulting commit.
             let cluster = match cluster {
                 Some(c) => c,
-                None => return error_response(request.request_id, ERR_NOT_CLUSTERED, "not clustered"),
+                None => {
+                    return error_response(request.request_id, ERR_NOT_CLUSTERED, "not clustered");
+                }
             };
             match crate::cluster::topology::TopologyVote::deserialize(&request.payload) {
                 Some(vote) => {
@@ -1039,7 +1043,11 @@ pub(crate) fn handle_request(
                         payload,
                     }
                 }
-                None => error_response(request.request_id, ERR_PAYLOAD_MALFORMED, "malformed topology vote"),
+                None => error_response(
+                    request.request_id,
+                    ERR_PAYLOAD_MALFORMED,
+                    "malformed topology vote",
+                ),
             }
         }
         OP_TOPOLOGY_COMMIT => {
@@ -1047,7 +1055,9 @@ pub(crate) fn handle_request(
             // Activate the shard table with the committed members.
             let cluster = match cluster {
                 Some(c) => c,
-                None => return error_response(request.request_id, ERR_NOT_CLUSTERED, "not clustered"),
+                None => {
+                    return error_response(request.request_id, ERR_NOT_CLUSTERED, "not clustered");
+                }
             };
             match crate::cluster::topology::TopologyCommit::deserialize(&request.payload) {
                 Some(commit) => {
@@ -6313,7 +6323,13 @@ fn handle_stream_chunk(
 ) -> ResponseFrame {
     let chunk = match decode_stream_chunk(&req.payload) {
         Some(c) => c,
-        None => return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed stream chunk"),
+        None => {
+            return error_response(
+                req.request_id,
+                ERR_PAYLOAD_MALFORMED,
+                "malformed stream chunk",
+            );
+        }
     };
 
     // Check shard ownership — streaming writes are mutations on the master.
@@ -6343,7 +6359,11 @@ fn handle_stream_chunk(
                 bytes_received: 0,
             }),
             Err(e) => {
-                return error_response(req.request_id, ERR_STORAGE_IO, &format!("begin_stream: {e}"));
+                return error_response(
+                    req.request_id,
+                    ERR_STORAGE_IO,
+                    &format!("begin_stream: {e}"),
+                );
             }
         },
     };
@@ -6370,7 +6390,11 @@ fn handle_stream_chunk(
             if let Some(s) = conn_state.streams.remove(&chunk.txid) {
                 let _ = s.writer.abort();
             }
-            return error_response(req.request_id, ERR_STREAM_INVARIANT, "stream byte counter overflow");
+            return error_response(
+                req.request_id,
+                ERR_STREAM_INVARIANT,
+                "stream byte counter overflow",
+            );
         }
     };
     let max_stream_total_bytes = conn_state.max_stream_total_bytes;
@@ -6413,7 +6437,13 @@ fn handle_stream_chunk(
 fn handle_stream_end(req: &RequestFrame, conn_state: &mut super::ConnectionState) -> ResponseFrame {
     let end = match decode_stream_end(&req.payload) {
         Some(e) => e,
-        None => return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed stream end"),
+        None => {
+            return error_response(
+                req.request_id,
+                ERR_PAYLOAD_MALFORMED,
+                "malformed stream end",
+            );
+        }
     };
 
     let stream = match conn_state.streams.remove(&end.txid) {
@@ -6644,13 +6674,8 @@ pub(crate) fn classify_wire_error_code(code: u16) -> crate::metrics::Outcome {
     match code {
         ERR_REDIRECT => Outcome::Redirect,
         ERR_TX_NOT_FOUND => Outcome::ErrNotFound,
-        ERR_CONFLICTING
-        | ERR_ALREADY_SPENT
-        | ERR_INVALID_SPEND
-        | ERR_ALREADY_EXISTS
-        | ERR_DELETED_CHILDREN => {
-            Outcome::ErrConflicting
-        }
+        ERR_CONFLICTING | ERR_ALREADY_SPENT | ERR_INVALID_SPEND | ERR_ALREADY_EXISTS
+        | ERR_DELETED_CHILDREN => Outcome::ErrConflicting,
         ERR_LOCKED | ERR_FROZEN | ERR_FROZEN_UNTIL | ERR_ALREADY_FROZEN | ERR_UTXO_NOT_FROZEN => {
             Outcome::ErrFrozen
         }

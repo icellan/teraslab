@@ -83,7 +83,11 @@ pub struct ShardTable {
 }
 
 impl ShardTable {
-    /// Compute a shard table deterministically from a sorted member list.
+    /// Compute a shard table deterministically from a member list.
+    ///
+    /// The input is sorted internally (F-01), so callers may pass members
+    /// in any order — every node derives the identical table from the
+    /// same member *set*.
     ///
     /// This is a **pure function**: same inputs → same output on every node.
     ///
@@ -105,6 +109,11 @@ impl ShardTable {
             !members.is_empty(),
             "cannot compute shard table with 0 members"
         );
+        // F-01: sort a local copy so every node derives the identical
+        // table regardless of caller ordering. One unsorted call site
+        // would otherwise yield two masters for the same shard.
+        let mut members = members.to_vec();
+        members.sort_unstable();
         let n = members.len();
         let mut assignments = Vec::with_capacity(NUM_SHARDS);
 
@@ -1046,6 +1055,32 @@ mod tests {
             assert_eq!(
                 t1.assignments[i].replicas, t2.assignments[i].replicas,
                 "shard {i} replicas differ"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_unsorted_members_identical_to_sorted() {
+        // F-01: `compute_with_epoch` must sort the member list internally,
+        // so a call site passing an UNSORTED slice derives the exact same
+        // table as one passing a sorted slice. Without the internal sort,
+        // one unsorted caller would derive a different master for the same
+        // shard than every other node → two masters → double-spend window.
+        let unsorted = nodes(&[3, 1, 2]);
+        let mut sorted = nodes(&[3, 1, 2]);
+        sorted.sort();
+
+        let t_unsorted = ShardTable::compute_with_epoch(&unsorted, 2, 1);
+        let t_sorted = ShardTable::compute_with_epoch(&sorted, 2, 1);
+
+        for i in 0..NUM_SHARDS {
+            assert_eq!(
+                t_unsorted.assignments[i].master, t_sorted.assignments[i].master,
+                "shard {i} master differs between unsorted and sorted input"
+            );
+            assert_eq!(
+                t_unsorted.assignments[i].replicas, t_sorted.assignments[i].replicas,
+                "shard {i} replicas differ between unsorted and sorted input"
             );
         }
     }

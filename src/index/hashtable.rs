@@ -38,6 +38,18 @@ pub enum HashTableError {
     /// Redo log journaling failure during a crash-atomic resize.
     #[error("resize redo log failure: {0}")]
     ResizeRedo(String),
+
+    /// An existing file-backed table is missing its clean-shutdown
+    /// sentinel: the previous run crashed (or never reached the Drop
+    /// path), so the bucket bytes may include torn writes. The open
+    /// fails closed; the caller must rebuild the index from a device
+    /// scan (`PrimaryBackend::rebuild_file_backed`).
+    #[error(
+        "unclean shutdown detected for file-backed index {path}: \
+         clean-shutdown sentinel missing — bucket bytes may be torn; \
+         rebuild from device scan required"
+    )]
+    UncleanShutdown { path: String },
 }
 
 pub type Result<T> = std::result::Result<T, HashTableError>;
@@ -603,14 +615,15 @@ impl HashTable {
 
     /// Sidecar suffix appended to the table path to mark a clean shutdown.
     ///
-    /// F-G3-016: when the table file is reopened, the absence of this
-    /// sentinel indicates that the previous run either crashed or did not
-    /// reach the clean-shutdown path (Drop impl). The bucket bytes alone
-    /// have no header, magic, or per-bucket CRC, so we cannot tell torn
-    /// writes apart from valid state by inspecting the file. The sidecar
-    /// is the only durable signal the caller has — if it is missing, an
-    /// operator-visible `tracing::warn!` fires and the caller should
-    /// consider invoking the rebuild path (`PrimaryBackend::rebuild_file_backed`).
+    /// F-G3-016 / G-01: when the table file is reopened, the absence of
+    /// this sentinel indicates that the previous run either crashed or did
+    /// not reach the clean-shutdown path (Drop impl). The bucket bytes
+    /// alone have no header, magic, or per-bucket CRC, so we cannot tell
+    /// torn writes apart from valid state by inspecting the file. The
+    /// sidecar is the only durable signal the caller has — if it is
+    /// missing, [`HashTable::open_file_backed`] fails closed with
+    /// [`HashTableError::UncleanShutdown`] and the index must be rebuilt
+    /// from a device scan (`PrimaryBackend::rebuild_file_backed`).
     pub(crate) const SHUTDOWN_CLEAN_SUFFIX: &'static str = ".shutdown_clean";
 
     /// Open or create a file-backed hash table at `path`.
@@ -622,14 +635,23 @@ impl HashTable {
     ///
     /// The capacity is rounded up to the next power of two (minimum 16).
     ///
-    /// F-G3-016: a sidecar file at `<path>.shutdown_clean` is written by
-    /// the Drop impl after a final `msync(MS_SYNC)`. On reopen the
-    /// sentinel is checked — if missing, the previous run did not reach
-    /// the clean-shutdown path and the in-memory bucket bytes may include
-    /// torn writes. A `tracing::warn!` fires so operators can decide
-    /// whether to drive a rebuild via `PrimaryBackend::rebuild_file_backed`.
-    /// The open still succeeds (preserving compatibility); the redo log
-    /// remains the canonical safety net for the data plane.
+    /// F-G3-016 / G-01: a sidecar file at `<path>.shutdown_clean` is
+    /// written by the Drop impl after a final `msync(MS_SYNC)`. On reopen
+    /// of an EXISTING file the sentinel is checked — if missing, the
+    /// previous run did not reach the clean-shutdown path and the bucket
+    /// bytes may include torn writes, so the open fails closed with
+    /// [`HashTableError::UncleanShutdown`]. The data file is preserved;
+    /// the caller must rebuild from a device scan
+    /// (`PrimaryBackend::rebuild_file_backed` — driven automatically by
+    /// `server::startup::load_primary_index_file_backed`). Fresh creation
+    /// (no file at `path`) is unaffected; any stale sentinel found there
+    /// is removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HashTableError::UncleanShutdown`] when an existing file
+    /// has no clean-shutdown sentinel, and [`HashTableError::AllocFailed`]
+    /// on mapping/IO failures.
     pub fn open_file_backed(path: &std::path::Path, initial_capacity: usize) -> Result<Self> {
         let bucket_size = std::mem::size_of::<Bucket>();
 
@@ -655,25 +677,32 @@ impl HashTable {
             (initial_capacity.next_power_of_two().max(16), false)
         };
 
-        // F-G3-016 sentinel check: only meaningful for existing files.
+        // F-G3-016 / G-01 sentinel check: only meaningful for existing files.
+        let sentinel = sentinel_path_for(path);
         if is_existing {
-            let sentinel = sentinel_path_for(path);
             if !sentinel.exists() {
-                tracing::warn!(
-                    target: "teraslab::index",
-                    path = %path.display(),
-                    "HashTable::open_file_backed: clean-shutdown sentinel missing — \
-                     previous run may have crashed; bucket bytes may include torn writes. \
-                     Operator should consider PrimaryBackend::rebuild_file_backed if the \
-                     redo log replay does not bring the data plane to a consistent state.",
-                );
-            } else {
-                // Remove the sentinel — its presence implies a clean
-                // shutdown, but the moment we open the file we no longer
-                // have that guarantee. Drop will recreate it on a clean
-                // close.
-                let _ = std::fs::remove_file(&sentinel);
+                // G-01: fail closed. Without the sentinel the previous run
+                // crashed (or never reached Drop) and the bucket bytes may
+                // include torn writes — a torn bucket can resolve to a
+                // wrong record_offset and serve the wrong UTXO. The caller
+                // must rebuild from a device scan
+                // (`PrimaryBackend::rebuild_file_backed`); the startup path
+                // (`server::startup::load_primary_index_file_backed`) does
+                // this automatically.
+                return Err(HashTableError::UncleanShutdown {
+                    path: path.display().to_string(),
+                });
             }
+            // Remove the sentinel — its presence implies a clean
+            // shutdown, but the moment we open the file we no longer
+            // have that guarantee. Drop will recreate it on a clean
+            // close.
+            let _ = std::fs::remove_file(&sentinel);
+        } else {
+            // Fresh creation: a leftover sentinel (e.g. from a rebuild
+            // that deleted the data file) is stale and must not be able
+            // to mask a future crash of the table created here.
+            let _ = std::fs::remove_file(&sentinel);
         }
 
         let (ptr, mmap_len, fd) = alloc_file_backed_buckets(path, capacity)?;
@@ -1295,7 +1324,17 @@ impl HashTable {
         // File-backed path with crash-atomic rename.
         let old_path = match &self.backing {
             Backing::FileBacked { path, .. } => path.clone(),
-            Backing::Anonymous => unreachable!("checked above"),
+            // Unreachable today (the Anonymous case returns early above),
+            // but G-02: a future Backing variant or a reordered early
+            // return must surface as a typed error on the resize path,
+            // not a panic.
+            Backing::Anonymous => {
+                return Err(HashTableError::ResizeIo(
+                    "build_resized: Anonymous backing reached the file-backed path \
+                     — early-return guard failed (logic error)"
+                        .into(),
+                ));
+            }
         };
         let tmp_path = old_path.with_extension("tmp");
 
@@ -1674,7 +1713,11 @@ mod tests {
             let k = make_key(i);
             let b1 = bucket_index(&k, t.seed, t.mask);
             let b2 = bucket_index(&k, t.seed, t.mask);
-            assert_eq!(b1, b2, "bucket_index is not deterministic for seed={}", t.seed);
+            assert_eq!(
+                b1, b2,
+                "bucket_index is not deterministic for seed={}",
+                t.seed
+            );
         }
     }
 
@@ -2496,35 +2539,59 @@ mod tests {
         );
     }
 
-    // F-G3-016: when the sentinel is missing, open must still succeed
-    // (preserving the redo-log-driven recovery contract) but the warn
-    // path must run.
+    // G-01: when the sentinel is missing on an EXISTING file, the bucket
+    // bytes may include torn writes from a crash. Open must fail closed
+    // with a typed error so the caller drives a device-scan rebuild
+    // instead of serving possibly-wrong record offsets.
     #[test]
-    fn open_file_backed_succeeds_when_sentinel_missing() {
+    fn open_file_backed_fails_closed_when_sentinel_missing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing.idx");
 
-        // First open creates the file but we delete the sentinel before
-        // Drop — simulating a crash that did not reach the Drop path.
+        // First open creates the file; Drop writes the sentinel.
         {
             let mut t = HashTable::open_file_backed(&path, 16).unwrap();
             t.insert(make_key(1), make_entry(4096)).unwrap();
-            // Force-remove any pre-existing sentinel before drop so the
-            // drop's recreate is what we observe.
         }
         let sentinel = sentinel_path_for(&path);
         // Drop ran -> sentinel is present. Remove it to simulate crash.
-        if sentinel.exists() {
-            std::fs::remove_file(&sentinel).unwrap();
-        }
-        assert!(!sentinel.exists(), "sentinel should be removed");
+        assert!(sentinel.exists(), "Drop must have written the sentinel");
+        std::fs::remove_file(&sentinel).unwrap();
 
-        // Reopen must still succeed.
-        let t = HashTable::open_file_backed(&path, 16).unwrap();
-        assert_eq!(
-            t.len(),
-            1,
-            "previously inserted entry must still be recovered from the mmap"
+        // Reopen must fail closed with the typed unclean-shutdown error.
+        let err = HashTable::open_file_backed(&path, 16)
+            .expect_err("reopen without sentinel must fail closed");
+        match err {
+            HashTableError::UncleanShutdown { path: ref p } => {
+                assert_eq!(p, &path.display().to_string());
+            }
+            other => panic!("expected UncleanShutdown, got {other:?}"),
+        }
+        // The data file must be preserved untouched for inspection /
+        // rebuild — fail closed never destroys evidence.
+        assert!(path.exists(), "data file must be preserved on fail-closed");
+    }
+
+    // G-01: fresh creation (no data file yet) must be unaffected by the
+    // fail-closed check, and a stale sentinel left next to a nonexistent
+    // data file must be cleaned up so it cannot mask a later crash.
+    #[test]
+    fn open_file_backed_fresh_creation_removes_stale_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.idx");
+        let sentinel = sentinel_path_for(&path);
+
+        // Plant a stale sentinel with no data file (e.g. leftover after a
+        // rebuild deleted the data file but a crash skipped the sentinel).
+        std::fs::File::create(&sentinel).unwrap();
+
+        let mut t = HashTable::open_file_backed(&path, 16)
+            .expect("fresh creation must succeed regardless of stale sentinel");
+        assert!(
+            !sentinel.exists(),
+            "stale sentinel must be removed on fresh creation"
         );
+        t.insert(make_key(7), make_entry(8192)).unwrap();
+        assert_eq!(t.len(), 1);
     }
 }
